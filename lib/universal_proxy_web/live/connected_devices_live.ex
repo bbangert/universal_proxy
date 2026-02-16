@@ -1,4 +1,4 @@
-defmodule UniversalProxyWeb.DeviceMappingLive do
+defmodule UniversalProxyWeb.ConnectedDevicesLive do
   use UniversalProxyWeb, :live_view
 
   @refresh_interval 10_000
@@ -58,7 +58,7 @@ defmodule UniversalProxyWeb.DeviceMappingLive do
   def render(assigns) do
     ~H"""
     <div>
-      <.page_title title="Device Mapping" />
+      <.page_title title="Connected Devices" />
       <.body>
         Connected serial ports from Circuits.UART.enumerate(). Shows only devices with descriptions. Refreshes every 10 seconds.
       </.body>

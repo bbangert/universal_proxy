@@ -19,7 +19,7 @@ defmodule UniversalProxyWeb.Router do
 
     live_session :default, on_mount: [UniversalProxyWeb.NavHooks] do
       live "/", HomeLive
-      live "/devices", DeviceMappingLive
+      live "/devices", ConnectedDevicesLive
       live "/esphome-config", ESPhomeConfigLive
     end
   end
