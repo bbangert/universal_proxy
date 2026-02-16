@@ -1,3 +1,12 @@
+defmodule UniversalProxy.Protos.SerialProxyPortType do
+  @moduledoc false
+  use Protobuf, enum: true, protoc_gen_elixir_version: "0.16.0", syntax: :proto3
+
+  field :SERIAL_PROXY_PORT_TYPE_TTL, 0
+  field :SERIAL_PROXY_PORT_TYPE_RS232, 1
+  field :SERIAL_PROXY_PORT_TYPE_RS485, 2
+end
+
 defmodule UniversalProxy.Protos.EntityCategory do
   @moduledoc false
   use Protobuf, enum: true, protoc_gen_elixir_version: "0.16.0", syntax: :proto3
@@ -434,6 +443,22 @@ defmodule UniversalProxy.Protos.ZWaveProxyRequestType do
   field :ZWAVE_PROXY_REQUEST_TYPE_HOME_ID_CHANGE, 2
 end
 
+defmodule UniversalProxy.Protos.SerialProxyParity do
+  @moduledoc false
+  use Protobuf, enum: true, protoc_gen_elixir_version: "0.16.0", syntax: :proto3
+
+  field :SERIAL_PROXY_PARITY_NONE, 0
+  field :SERIAL_PROXY_PARITY_EVEN, 1
+  field :SERIAL_PROXY_PARITY_ODD, 2
+end
+
+defmodule UniversalProxy.Protos.SerialProxyRequestType do
+  @moduledoc false
+  use Protobuf, enum: true, protoc_gen_elixir_version: "0.16.0", syntax: :proto3
+
+  field :SERIAL_PROXY_REQUEST_TYPE_FLUSH, 0
+end
+
 defmodule UniversalProxy.Protos.HelloRequest do
   @moduledoc false
   use Protobuf, protoc_gen_elixir_version: "0.16.0", syntax: :proto3
@@ -509,6 +534,18 @@ defmodule UniversalProxy.Protos.DeviceInfo do
   field :area_id, 3, type: :uint32, json_name: "areaId"
 end
 
+defmodule UniversalProxy.Protos.SerialProxyInfo do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.16.0", syntax: :proto3
+
+  field :name, 1, type: :string
+
+  field :port_type, 2,
+    type: UniversalProxy.Protos.SerialProxyPortType,
+    json_name: "portType",
+    enum: true
+end
+
 defmodule UniversalProxy.Protos.DeviceInfoResponse do
   @moduledoc false
   use Protobuf, protoc_gen_elixir_version: "0.16.0", syntax: :proto3
@@ -569,6 +606,12 @@ defmodule UniversalProxy.Protos.DeviceInfoResponse do
     deprecated: false
 
   field :zwave_home_id, 24, type: :uint32, json_name: "zwaveHomeId", deprecated: false
+
+  field :serial_proxies, 25,
+    repeated: true,
+    type: UniversalProxy.Protos.SerialProxyInfo,
+    json_name: "serialProxies",
+    deprecated: false
 end
 
 defmodule UniversalProxy.Protos.ListEntitiesRequest do
@@ -2501,4 +2544,65 @@ defmodule UniversalProxy.Protos.InfraredRFReceiveEvent do
   field :device_id, 1, type: :uint32, json_name: "deviceId", deprecated: false
   field :key, 2, type: :fixed32
   field :timings, 3, repeated: true, type: :sint32, packed: true, deprecated: false
+end
+
+defmodule UniversalProxy.Protos.SerialProxyConfigureRequest do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.16.0", syntax: :proto3
+
+  field :instance, 1, type: :uint32
+  field :baudrate, 2, type: :uint32
+  field :flow_control, 3, type: :bool, json_name: "flowControl"
+  field :parity, 4, type: UniversalProxy.Protos.SerialProxyParity, enum: true
+  field :stop_bits, 5, type: :uint32, json_name: "stopBits"
+  field :data_size, 6, type: :uint32, json_name: "dataSize"
+end
+
+defmodule UniversalProxy.Protos.SerialProxyDataReceived do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.16.0", syntax: :proto3
+
+  field :instance, 1, type: :uint32
+  field :data, 2, type: :bytes
+end
+
+defmodule UniversalProxy.Protos.SerialProxyWriteRequest do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.16.0", syntax: :proto3
+
+  field :instance, 1, type: :uint32
+  field :data, 2, type: :bytes
+end
+
+defmodule UniversalProxy.Protos.SerialProxySetModemPinsRequest do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.16.0", syntax: :proto3
+
+  field :instance, 1, type: :uint32
+  field :rts, 2, type: :bool
+  field :dtr, 3, type: :bool
+end
+
+defmodule UniversalProxy.Protos.SerialProxyGetModemPinsRequest do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.16.0", syntax: :proto3
+
+  field :instance, 1, type: :uint32
+end
+
+defmodule UniversalProxy.Protos.SerialProxyGetModemPinsResponse do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.16.0", syntax: :proto3
+
+  field :instance, 1, type: :uint32
+  field :rts, 2, type: :bool
+  field :dtr, 3, type: :bool
+end
+
+defmodule UniversalProxy.Protos.SerialProxyRequest do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.16.0", syntax: :proto3
+
+  field :instance, 1, type: :uint32
+  field :type, 2, type: UniversalProxy.Protos.SerialProxyRequestType, enum: true
 end
