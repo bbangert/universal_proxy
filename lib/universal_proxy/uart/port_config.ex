@@ -9,6 +9,7 @@ defmodule UniversalProxy.UART.PortConfig do
 
   @type t :: %__MODULE__{
           name: binary(),
+          friendly_name: String.t() | nil,
           speed: non_neg_integer(),
           data_bits: 5..8,
           stop_bits: 1..2,
@@ -28,6 +29,7 @@ defmodule UniversalProxy.UART.PortConfig do
         }
 
   defstruct name: nil,
+            friendly_name: nil,
             speed: 9600,
             data_bits: 8,
             stop_bits: 1,
@@ -89,8 +91,9 @@ defmodule UniversalProxy.UART.PortConfig do
   """
   @spec new(binary(), keyword()) :: t()
   def new(name, opts \\ []) when is_binary(name) do
+    friendly_name = Keyword.get(opts, :friendly_name)
     fields = Keyword.take(opts, @uart_option_keys)
-    struct!(__MODULE__, [{:name, name} | fields])
+    struct!(__MODULE__, [{:name, name}, {:friendly_name, friendly_name} | fields])
   end
 
   @doc """
@@ -103,7 +106,7 @@ defmodule UniversalProxy.UART.PortConfig do
   def to_uart_opts(%__MODULE__{} = config) do
     config
     |> Map.from_struct()
-    |> Map.drop([:name])
+    |> Map.drop([:name, :friendly_name])
     |> Enum.reject(fn {_k, v} -> is_nil(v) end)
     |> Keyword.new()
   end

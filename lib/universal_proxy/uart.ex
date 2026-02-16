@@ -140,4 +140,85 @@ defmodule UniversalProxy.UART do
   def port_info(port_name) do
     Server.port_info(port_name)
   end
+
+  @doc """
+  List opened ports with their friendly names.
+
+  Returns a sorted list of maps with `:path`, `:friendly_name`, and `:speed`
+  keys. Useful for display in the web UI.
+
+  ## Examples
+
+      UniversalProxy.UART.named_ports()
+      #=> [%{path: "/dev/ttyUSB0", friendly_name: "tty1234", speed: 9600}]
+
+  """
+  @spec named_ports() :: [map()]
+  def named_ports do
+    Server.named_ports()
+  end
+
+  # -- Persistent Config API (delegates to UART.Store) --
+
+  alias UniversalProxy.UART.Store
+
+  @doc """
+  Save or update a persistent UART device configuration.
+
+  The configuration is keyed by `serial_number` and persists across reboots.
+
+  ## Examples
+
+      :ok = UniversalProxy.UART.save_config("ABC123", %{speed: 115200, auto_open: true})
+
+  """
+  @spec save_config(String.t(), map()) :: :ok
+  def save_config(serial_number, params) do
+    Store.save_config(serial_number, params)
+  end
+
+  @doc """
+  Delete a saved device configuration by serial number.
+
+  ## Examples
+
+      :ok = UniversalProxy.UART.delete_config("ABC123")
+
+  """
+  @spec delete_config(String.t()) :: :ok
+  def delete_config(serial_number) do
+    Store.delete_config(serial_number)
+  end
+
+  @doc """
+  Look up a saved configuration by serial number.
+
+  Returns `{:ok, config_map}` or `:error` if not found.
+
+  ## Examples
+
+      {:ok, config} = UniversalProxy.UART.get_config("ABC123")
+      config.speed
+      #=> 115200
+
+  """
+  @spec get_config(String.t()) :: {:ok, map()} | :error
+  def get_config(serial_number) do
+    Store.get_config(serial_number)
+  end
+
+  @doc """
+  List all saved device configurations.
+
+  Returns a list of config maps (one per saved device).
+
+  ## Examples
+
+      configs = UniversalProxy.UART.saved_configs()
+
+  """
+  @spec saved_configs() :: [map()]
+  def saved_configs do
+    Store.all_configs()
+  end
 end

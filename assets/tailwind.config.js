@@ -12,6 +12,15 @@ module.exports = {
     "../lib/*_web.ex",
     "../lib/*_web/**/*.*ex"
   ],
+  safelist: [
+    "text-green-700", "text-green-800", "text-red-700", "text-red-800",
+    "text-yellow-800", "bg-green-100", "bg-red-100", "bg-yellow-100",
+    "border-green-400/40", "border-red-400/40",
+    "dark:text-green-300", "dark:text-red-300", "dark:text-yellow-300",
+    "dark:bg-green-900/30", "dark:bg-red-900/30", "dark:bg-yellow-900/30",
+    "hover:bg-green-100", "hover:bg-red-100",
+    "dark:hover:bg-green-900/20", "dark:hover:bg-red-900/20"
+  ],
   theme: {
     extend: {
       colors: {
