@@ -1,0 +1,11 @@
+# Copyright (c) 2025
+# This file is distributed under the same license as the universal_proxy package.
+#
+msgid ""
+msgstr ""
+"Language: en\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+
+#: lib/universal_proxy_web/components/core_components.ex:1
+msgid "can't be blank"
+msgstr ""

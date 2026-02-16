@@ -1,0 +1,16 @@
+## `msgid`s in this file come from POT (errors.pot) files.
+##
+## Do not add, change, or remove `msgid`s manually here as
+## they're tied to the ones in the corresponding POT file
+## (with the same domain).
+##
+## Use `mix gettext.extract --merge` or `mix gettext.merge`
+## to merge POT files into PO files.
+msgid ""
+msgstr ""
+"Language: en\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+
+#: lib/universal_proxy_web/components/core_components.ex:1
+msgid "can't be blank"
+msgstr "can't be blank"
