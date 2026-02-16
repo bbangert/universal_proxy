@@ -1,0 +1,27 @@
+{
+  "name": "Universal Proxy",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "runArgs": ["--network=host"],
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": true,
+      "configureZshAsDefaultShell": true
+    }
+  },
+  "postCreateCommand": "mise install && mix local.hex --force && mix local.rebar --force && mix archive.install hex nerves_bootstrap --force && mix deps.get",
+  "postStartCommand": "bash -c 'eval \"$(mise activate bash)\" && mix archive.install hex nerves_bootstrap --force'",
+  "remoteEnv": {
+    "MIX_TARGET": "rpi3"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "elixir-lsp.elixir-ls",
+        "phoenixframework.phoenix"
+      ]
+    }
+  }
+}
