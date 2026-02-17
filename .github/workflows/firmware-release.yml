@@ -1,0 +1,95 @@
+name: Build Firmware Releases
+
+on:
+  release:
+    types: [created]
+
+permissions:
+  contents: write
+
+env:
+  MIX_ENV: prod
+  ELIXIR_VERSION: "1.19.5"
+  OTP_VERSION: "28.3"
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - bbb
+          - grisp2
+          - osd32mp1
+          - mangopi_mq_pro
+          - qemu_aarch64
+          - rpi
+          - rpi0
+          - rpi0_2
+          - rpi2
+          - rpi3
+          - rpi4
+          - rpi5
+          - x86_64
+
+    env:
+      MIX_TARGET: ${{ matrix.target }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential automake autoconf \
+            pkg-config libssl-dev libncurses5-dev libmnl-dev \
+            squashfs-tools protobuf-compiler libarchive-dev
+
+      - name: Install fwup
+        run: |
+          FWUP_VERSION="1.10.2"
+          curl -fsSL "https://github.com/fwup-home/fwup/releases/download/v${FWUP_VERSION}/fwup_${FWUP_VERSION}_amd64.deb" -o /tmp/fwup.deb
+          sudo dpkg -i /tmp/fwup.deb
+
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+
+      - name: Install Nerves bootstrap
+        run: mix archive.install hex nerves_bootstrap --force
+
+      - name: Cache deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build/${{ matrix.target }}_prod
+          key: ${{ runner.os }}-${{ matrix.target }}-mix-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-mix-
+
+      - name: Fetch dependencies
+        run: mix deps.get
+
+      - name: Build assets
+        run: |
+          mix assets.setup
+          mix assets.deploy
+
+      - name: Build firmware
+        run: mix firmware
+
+      - name: Rename firmware artifact
+        run: |
+          cp _build/${MIX_TARGET}_prod/nerves/images/universal_proxy.fw \
+             universal_proxy_${MIX_TARGET}.fw
+
+      - name: Upload firmware to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: universal_proxy_${{ matrix.target }}.fw
