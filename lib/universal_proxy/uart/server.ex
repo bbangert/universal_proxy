@@ -10,6 +10,10 @@ defmodule UniversalProxy.UART.Server do
   Ports are opened and closed exclusively by ESPHome clients via serial
   proxy protocol messages. There is no auto-open behaviour.
 
+  Periodically polls `Circuits.UART.enumerate()` to detect USB hotplug
+  events. When the set of connected serial numbers changes, the ESPHome
+  supervisor is restarted so clients reconnect with the updated device list.
+
   Incoming UART data is broadcast to PubSub topic `"uart:<friendly_name>"`.
   """
 
@@ -20,6 +24,7 @@ defmodule UniversalProxy.UART.Server do
   alias UniversalProxy.UART.PortConfig
 
   @pubsub UniversalProxy.PubSub
+  @hotplug_interval 5_000
 
   # -- Client API --
 
@@ -95,7 +100,10 @@ defmodule UniversalProxy.UART.Server do
 
   @impl true
   def init(_opts) do
-    {:ok, %{ports: %{}}}
+    :timer.send_interval(@hotplug_interval, self(), :check_hotplug)
+    known = current_serial_set()
+    Logger.info("UART server started, #{MapSet.size(known)} serial devices detected")
+    {:ok, %{ports: %{}, known_serials: known}}
   end
 
   @impl true
@@ -178,7 +186,61 @@ defmodule UniversalProxy.UART.Server do
   end
 
   @impl true
-  def handle_info({:circuits_uart, port_name, data}, state) do
+  def handle_info(:check_hotplug, state) do
+    current = current_serial_set()
+
+    if current != state.known_serials do
+      added = MapSet.difference(current, state.known_serials)
+      removed = MapSet.difference(state.known_serials, current)
+
+      if MapSet.size(added) > 0 do
+        Logger.info("UART hotplug: devices added: #{Enum.join(added, ", ")}")
+      end
+
+      if MapSet.size(removed) > 0 do
+        Logger.info("UART hotplug: devices removed: #{Enum.join(removed, ", ")}")
+      end
+
+      Task.start(fn ->
+        UniversalProxy.ESPHome.Supervisor.restart()
+      end)
+
+      {:noreply, %{state | known_serials: current}}
+    else
+      {:noreply, state}
+    end
+  end
+
+  def handle_info({:circuits_uart, port_name, {:error, reason}}, state) do
+    case Map.fetch(state.ports, port_name) do
+      {:ok, %{config: config, pid: pid, monitor_ref: ref}} ->
+        friendly_name = config.friendly_name || port_name
+        Logger.warning("UART #{friendly_name} (#{port_name}) error: #{inspect(reason)} -- closing port and restarting ESPHome")
+
+        Process.demonitor(ref, [:flush])
+        try do
+          Circuits.UART.close(pid)
+          Circuits.UART.stop(pid)
+        catch
+          _, _ -> :ok
+        end
+
+        new_state = %{state | ports: Map.delete(state.ports, port_name)}
+        broadcast_lifecycle("uart:port_closed", port_name, config)
+
+        Task.start(fn ->
+          UniversalProxy.ESPHome.Supervisor.restart()
+        end)
+
+        {:noreply, new_state}
+
+      :error ->
+        Logger.debug("UART error from untracked port #{port_name}: #{inspect(reason)}")
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:circuits_uart, port_name, data}, state) when is_binary(data) do
     case Map.fetch(state.ports, port_name) do
       {:ok, %{config: config}} ->
         friendly_name = config.friendly_name || port_name
@@ -232,6 +294,20 @@ defmodule UniversalProxy.UART.Server do
         error
     end
   end
+
+  defp current_serial_set do
+    Circuits.UART.enumerate()
+    |> Enum.filter(fn {_path, info} -> present?(info[:serial_number]) end)
+    |> Enum.map(fn {_path, info} -> info[:serial_number] end)
+    |> MapSet.new()
+  rescue
+    _ -> MapSet.new()
+  end
+
+  defp present?(nil), do: false
+  defp present?(""), do: false
+  defp present?(s) when is_binary(s), do: String.trim(s) != ""
+  defp present?(_), do: false
 
   defp broadcast_lifecycle(topic, port_name, config) do
     Phoenix.PubSub.broadcast(
