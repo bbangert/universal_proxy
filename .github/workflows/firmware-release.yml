@@ -54,6 +54,9 @@ jobs:
           curl -fsSL "https://github.com/fwup-home/fwup/releases/download/v${FWUP_VERSION}/fwup_${FWUP_VERSION}_amd64.deb" -o /tmp/fwup.deb
           sudo dpkg -i /tmp/fwup.deb
 
+      - name: Generate SSH key for Nerves config
+        run: ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519
+
       - name: Set up Elixir
         uses: erlef/setup-beam@v1
         with:
