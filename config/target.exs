@@ -8,7 +8,7 @@ config :universal_proxy, UniversalProxyWeb.Endpoint,
   # so runtime.exs prod block doesn't run; we must enable the server here)
   server: true,
   # Bind to all interfaces so the web UI is accessible on the network
-  http: [ip: {0, 0, 0, 0}, port: 4000],
+  http: [ip: {0, 0, 0, 0}, port: 80],
   # Allow websocket connections from any origin (hostname, IP, .local)
   # so LiveView works when accessing via universal_proxy.local, nerves-xxxx.local, or IP
   check_origin: false

@@ -1,4 +1,4 @@
-defmodule UniversalProxyWeb.HomeLive do
+defmodule UniversalProxyWeb.DashboardLive do
   use UniversalProxyWeb, :live_view
 
   alias UniversalProxy.UART
@@ -55,7 +55,7 @@ defmodule UniversalProxyWeb.HomeLive do
   def render(assigns) do
     ~H"""
     <div>
-      <.page_title title="Home" />
+      <.page_title title="Dashboard" />
 
       <div class="mt-6">
         <h2 class="text-lg font-semibold text-zinc-800 dark:text-zinc-200 font-mono mb-3">
