@@ -102,6 +102,17 @@ defmodule UniversalProxy.UART do
     Server.named_ports()
   end
 
+  @doc """
+  Close all currently open UART ports.
+
+  Used during ESPHome supervisor restarts to ensure ports opened by
+  connection handlers are properly released before the handlers are killed.
+  """
+  @spec close_all_ports() :: :ok
+  def close_all_ports do
+    Server.close_all_ports()
+  end
+
   # -- Persistent Config API (delegates to UART.Store) --
 
   @doc """

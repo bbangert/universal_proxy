@@ -23,12 +23,19 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   @doc """
   Restart the ESPHome supervisor tree.
 
-  Terminates and restarts this supervisor under the application supervisor,
-  which forces all active client connections to drop and reconnect. Clients
-  will then re-read the updated device info (including serial_proxies).
+  Closes all UART ports opened by connection handlers, then terminates and
+  restarts this supervisor under the application supervisor. This forces all
+  active client connections to drop and reconnect, re-reading the updated
+  device info (including serial_proxies).
   """
   @spec restart() :: {:ok, pid()} | {:error, term()}
   def restart do
+    try do
+      UniversalProxy.UART.Server.close_all_ports()
+    catch
+      :exit, _ -> :ok
+    end
+
     Supervisor.terminate_child(UniversalProxy.Supervisor, __MODULE__)
     Supervisor.restart_child(UniversalProxy.Supervisor, __MODULE__)
   end

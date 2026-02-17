@@ -96,6 +96,17 @@ defmodule UniversalProxy.UART.Server do
     GenServer.call(__MODULE__, {:port_info, port_name})
   end
 
+  @doc """
+  Close all currently open UART ports.
+
+  Used during ESPHome supervisor restarts to ensure ports opened by
+  connection handlers are properly released before the handlers are killed.
+  """
+  @spec close_all_ports() :: :ok
+  def close_all_ports do
+    GenServer.call(__MODULE__, :close_all_ports)
+  end
+
   # -- Server Callbacks --
 
   @impl true
@@ -183,6 +194,24 @@ defmodule UniversalProxy.UART.Server do
       :error ->
         {:reply, {:error, :not_found}, state}
     end
+  end
+
+  def handle_call(:close_all_ports, _from, state) do
+    Enum.each(state.ports, fn {port_name, %{pid: pid, config: config, monitor_ref: ref}} ->
+      Process.demonitor(ref, [:flush])
+
+      try do
+        Circuits.UART.close(pid)
+        Circuits.UART.stop(pid)
+      catch
+        _, _ -> :ok
+      end
+
+      broadcast_lifecycle("uart:port_closed", port_name, config)
+      Logger.info("UART closed #{config.friendly_name || port_name} (#{port_name}) during ESPHome restart")
+    end)
+
+    {:reply, :ok, %{state | ports: %{}}}
   end
 
   @impl true
