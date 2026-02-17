@@ -5,6 +5,11 @@ defmodule UniversalProxy.ESPHome.Connection do
   Each accepted TCP connection gets its own handler process managed by
   ThousandIsland. It buffers incoming data, decodes plaintext protocol
   frames, and dispatches protobuf messages to the appropriate handler.
+
+  Serial proxy instances are resolved at connection time from the ESPHome
+  Server's instance map. When a client sends `SerialProxyConfigureRequest`,
+  the corresponding UART port is opened. When the client disconnects, all
+  ports opened by this connection are automatically closed.
   """
 
   use ThousandIsland.Handler
@@ -12,17 +17,26 @@ defmodule UniversalProxy.ESPHome.Connection do
   require Logger
 
   alias UniversalProxy.ESPHome.{DeviceConfig, MessageTypes, Protocol, Server}
-  alias UniversalProxy.Protos
+  alias UniversalProxy.{Protos, UART}
+
+  @pubsub UniversalProxy.PubSub
 
   @impl ThousandIsland.Handler
   def handle_connection(socket, _state) do
     device_config = Server.get_config()
+    instance_map = Server.instance_map()
     Server.register_connection(self())
     peer = peer_label(socket)
 
-    Logger.info("ESPHome client connected from #{peer}")
+    Logger.info("ESPHome client connected from #{peer} (#{map_size(instance_map)} serial proxy instances available)")
 
-    {:continue, %{buffer: <<>>, device_config: device_config, peer: peer}}
+    {:continue, %{
+      buffer: <<>>,
+      device_config: device_config,
+      peer: peer,
+      instance_map: instance_map,
+      opened_ports: %{}
+    }}
   end
 
   @impl ThousandIsland.Handler
@@ -35,29 +49,56 @@ defmodule UniversalProxy.ESPHome.Connection do
         {:continue, state}
 
       {:close, state} ->
+        close_all_ports(state)
         {:close, state}
 
       {:error, reason, state} ->
+        close_all_ports(state)
         {:error, reason, state}
     end
   end
 
   @impl ThousandIsland.Handler
   def handle_close(_socket, state) do
+    close_all_ports(state)
     Logger.info("ESPHome client #{state.peer} disconnected (closed)")
     :ok
   end
 
   @impl ThousandIsland.Handler
   def handle_error(reason, _socket, state) do
+    close_all_ports(state)
     Logger.warning("ESPHome client #{state.peer} connection error: #{inspect(reason)}")
     :ok
   end
 
   @impl ThousandIsland.Handler
   def handle_timeout(_socket, state) do
+    close_all_ports(state)
     Logger.warning("ESPHome client #{state.peer} timed out")
     :ok
+  end
+
+  # -- PubSub for UART data --
+
+  @impl GenServer
+  def handle_info({:uart_data, message}, {socket, state}) do
+    instance = find_instance_for_friendly_name(state, message.name)
+
+    if instance do
+      response = %Protos.SerialProxyDataReceived{
+        instance: instance,
+        data: message.data
+      }
+
+      send_message(response, socket)
+    end
+
+    {:noreply, {socket, state}}
+  end
+
+  def handle_info(_msg, state) do
+    {:noreply, state}
   end
 
   # -- Frame Processing --
@@ -92,6 +133,8 @@ defmodule UniversalProxy.ESPHome.Connection do
     end
   end
 
+  # -- Core protocol handlers --
+
   defp dispatch(%Protos.HelloRequest{} = req, socket, state) do
     Logger.info("ESPHome client #{state.peer} hello: client_info=#{inspect(req.client_info)}")
 
@@ -120,8 +163,9 @@ defmodule UniversalProxy.ESPHome.Connection do
   end
 
   defp dispatch(%Protos.DeviceInfoRequest{}, socket, state) do
-    response = DeviceConfig.to_device_info_response(state.device_config)
-    Logger.info("ESPHome client #{state.peer} device info requested (name=#{response.name})")
+    serial_proxies = Server.serial_proxies()
+    response = DeviceConfig.to_device_info_response(state.device_config, serial_proxies)
+    Logger.info("ESPHome client #{state.peer} device info requested (name=#{response.name}, #{length(serial_proxies)} serial proxies)")
     send_message(response, socket)
     {:ok, state}
   end
@@ -169,12 +213,121 @@ defmodule UniversalProxy.ESPHome.Connection do
     {:ok, state}
   end
 
+  # -- Serial Proxy handlers --
+
+  defp dispatch(%Protos.SerialProxyConfigureRequest{} = req, _socket, state) do
+    instance = req.instance
+
+    case Map.fetch(state.instance_map, instance) do
+      {:ok, %{path: path, friendly_name: friendly_name}} ->
+        opts = [
+          speed: if(req.baudrate > 0, do: req.baudrate, else: 9600),
+          data_bits: if(req.data_size > 0, do: req.data_size, else: 8),
+          stop_bits: if(req.stop_bits > 0, do: req.stop_bits, else: 1),
+          parity: proto_parity_to_atom(req.parity),
+          flow_control: if(req.flow_control, do: :hardware, else: :none),
+          friendly_name: friendly_name
+        ]
+
+        # Close if already open from a previous configure
+        if Map.has_key?(state.opened_ports, instance) do
+          UART.close(path)
+        end
+
+        case UART.open(path, opts) do
+          {:ok, _pid} ->
+            Phoenix.PubSub.subscribe(@pubsub, "uart:#{friendly_name}")
+            Logger.info("ESPHome client #{state.peer} configured serial proxy #{instance} (#{friendly_name} @ #{path}, #{opts[:speed]} baud)")
+            new_opened = Map.put(state.opened_ports, instance, path)
+            {:ok, %{state | opened_ports: new_opened}}
+
+          {:error, reason} ->
+            Logger.warning("ESPHome client #{state.peer} failed to open serial proxy #{instance} (#{path}): #{inspect(reason)}")
+            {:ok, state}
+        end
+
+      :error ->
+        Logger.warning("ESPHome client #{state.peer} serial proxy configure for unknown instance #{instance}")
+        {:ok, state}
+    end
+  end
+
+  defp dispatch(%Protos.SerialProxyWriteRequest{} = req, _socket, state) do
+    instance = req.instance
+
+    case Map.fetch(state.opened_ports, instance) do
+      {:ok, path} ->
+        case UART.write(path, req.data) do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            Logger.warning("ESPHome client #{state.peer} serial proxy write failed for instance #{instance}: #{inspect(reason)}")
+        end
+
+      :error ->
+        Logger.warning("ESPHome client #{state.peer} serial proxy write for unopened instance #{instance}")
+    end
+
+    {:ok, state}
+  end
+
+  defp dispatch(%Protos.SerialProxySetModemPinsRequest{} = req, _socket, state) do
+    Logger.info("ESPHome client #{state.peer} serial proxy set modem pins instance #{req.instance} (RTS=#{req.rts}, DTR=#{req.dtr}) -- not implemented")
+    {:ok, state}
+  end
+
+  defp dispatch(%Protos.SerialProxyGetModemPinsRequest{} = req, socket, state) do
+    Logger.info("ESPHome client #{state.peer} serial proxy get modem pins instance #{req.instance} -- not implemented")
+
+    response = %Protos.SerialProxyGetModemPinsResponse{
+      instance: req.instance,
+      rts: false,
+      dtr: false
+    }
+
+    send_message(response, socket)
+    {:ok, state}
+  end
+
+  defp dispatch(%Protos.SerialProxyRequest{} = req, _socket, state) do
+    Logger.info("ESPHome client #{state.peer} serial proxy request instance #{req.instance} type #{inspect(req.type)}")
+    {:ok, state}
+  end
+
+  # -- Catch-all --
+
   defp dispatch(unknown, _socket, state) do
     Logger.debug("ESPHome unhandled message: #{inspect(unknown.__struct__)}")
     {:ok, state}
   end
 
-  # -- Peer Helpers --
+  # -- Port Cleanup --
+
+  defp close_all_ports(state) do
+    Enum.each(state.opened_ports, fn {instance, path} ->
+      case UART.close(path) do
+        :ok ->
+          Logger.info("ESPHome client #{state.peer} closed serial proxy #{instance} (#{path})")
+
+        {:error, reason} ->
+          Logger.warning("ESPHome client #{state.peer} failed to close serial proxy #{instance} (#{path}): #{inspect(reason)}")
+      end
+    end)
+  end
+
+  # -- Helpers --
+
+  defp find_instance_for_friendly_name(state, friendly_name) do
+    Enum.find_value(state.instance_map, fn {index, info} ->
+      if info.friendly_name == friendly_name, do: index
+    end)
+  end
+
+  defp proto_parity_to_atom(:SERIAL_PROXY_PARITY_NONE), do: :none
+  defp proto_parity_to_atom(:SERIAL_PROXY_PARITY_EVEN), do: :even
+  defp proto_parity_to_atom(:SERIAL_PROXY_PARITY_ODD), do: :odd
+  defp proto_parity_to_atom(_), do: :none
 
   defp peer_label(socket) do
     case ThousandIsland.Socket.peername(socket) do
@@ -185,8 +338,6 @@ defmodule UniversalProxy.ESPHome.Connection do
         "unknown"
     end
   end
-
-  # -- Send Helpers --
 
   defp send_message(message, socket) do
     case MessageTypes.encode_message(message) do

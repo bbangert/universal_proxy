@@ -7,9 +7,8 @@ defmodule UniversalProxy.UART.Server do
   tracks the mapping of port names to their PIDs and configurations, and
   monitors each UART process to clean up on unexpected exits.
 
-  On startup, reads saved configs from `UniversalProxy.UART.Store` that have
-  `auto_open: true`, matches them against currently enumerated hardware by
-  serial number, and opens the matching ports with their saved settings.
+  Ports are opened and closed exclusively by ESPHome clients via serial
+  proxy protocol messages. There is no auto-open behaviour.
 
   Incoming UART data is broadcast to PubSub topic `"uart:<friendly_name>"`.
   """
@@ -22,7 +21,7 @@ defmodule UniversalProxy.UART.Server do
 
   @pubsub UniversalProxy.PubSub
 
-  # -- Client API (called by UniversalProxy.UART public module) --
+  # -- Client API --
 
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -50,6 +49,16 @@ defmodule UniversalProxy.UART.Server do
   @spec close_port(binary()) :: :ok | {:error, term()}
   def close_port(port_name) do
     GenServer.call(__MODULE__, {:close_port, port_name})
+  end
+
+  @doc """
+  Write binary data to an opened serial port.
+
+  Returns `:ok` on success or `{:error, reason}` on failure.
+  """
+  @spec write_port(binary(), binary()) :: :ok | {:error, term()}
+  def write_port(port_name, data) do
+    GenServer.call(__MODULE__, {:write_port, port_name, data})
   end
 
   @doc """
@@ -86,7 +95,6 @@ defmodule UniversalProxy.UART.Server do
 
   @impl true
   def init(_opts) do
-    send(self(), :auto_open_devices)
     {:ok, %{ports: %{}}}
   end
 
@@ -118,6 +126,17 @@ defmodule UniversalProxy.UART.Server do
         new_state = %{state | ports: Map.delete(state.ports, port_name)}
         broadcast_lifecycle("uart:port_closed", port_name, config)
         {:reply, :ok, new_state}
+
+      :error ->
+        {:reply, {:error, :not_found}, state}
+    end
+  end
+
+  def handle_call({:write_port, port_name, data}, _from, state) do
+    case Map.fetch(state.ports, port_name) do
+      {:ok, %{pid: pid}} ->
+        result = Circuits.UART.write(pid, data)
+        {:reply, result, state}
 
       :error ->
         {:reply, {:error, :not_found}, state}
@@ -159,11 +178,6 @@ defmodule UniversalProxy.UART.Server do
   end
 
   @impl true
-  def handle_info(:auto_open_devices, state) do
-    new_state = auto_open_devices(state)
-    {:noreply, new_state}
-  end
-
   def handle_info({:circuits_uart, port_name, data}, state) do
     case Map.fetch(state.ports, port_name) do
       {:ok, %{config: config}} ->
@@ -203,63 +217,6 @@ defmodule UniversalProxy.UART.Server do
 
   # -- Private Helpers --
 
-  defp auto_open_devices(state) do
-    alias UniversalProxy.UART.Store
-
-    configs = Store.auto_open_configs()
-
-    if configs == [] do
-      Logger.info("UART auto-open: no saved configs with auto_open enabled")
-      state
-    else
-      enumerated = Circuits.UART.enumerate()
-
-      # Build a lookup: serial_number -> device_path
-      serial_to_path =
-        enumerated
-        |> Enum.filter(fn {_path, info} -> present?(info[:serial_number]) end)
-        |> Enum.into(%{}, fn {path, info} -> {info[:serial_number], path} end)
-
-      Enum.reduce(configs, state, fn config, acc ->
-        serial = config[:serial_number]
-        friendly_name = config[:friendly_name] || "tty#{serial}"
-
-        case Map.fetch(serial_to_path, serial) do
-          {:ok, path} ->
-            opts = [
-              speed: config[:speed] || 9600,
-              data_bits: config[:data_bits] || 8,
-              stop_bits: config[:stop_bits] || 1,
-              parity: config[:parity] || :none,
-              flow_control: config[:flow_control] || :none,
-              friendly_name: friendly_name
-            ]
-
-            case start_and_open(path, opts) do
-              {:ok, pid, port_config} ->
-                ref = Process.monitor(pid)
-                entry = %{pid: pid, config: port_config, monitor_ref: ref}
-                Logger.info("UART auto-opened #{path} as #{friendly_name} (serial: #{serial})")
-                broadcast_lifecycle("uart:port_opened", path, port_config)
-                put_in(acc, [:ports, path], entry)
-
-              {:error, reason} ->
-                Logger.warning("UART failed to auto-open #{path} (#{friendly_name}): #{inspect(reason)}")
-                acc
-            end
-
-          :error ->
-            Logger.info("UART auto-open: device with serial #{serial} (#{friendly_name}) not currently connected")
-            acc
-        end
-      end)
-    end
-  rescue
-    e ->
-      Logger.warning("UART auto-open enumeration failed: #{inspect(e)}")
-      state
-  end
-
   defp start_and_open(port_name, opts) do
     config = PortConfig.new(port_name, opts)
     uart_opts = PortConfig.to_uart_opts(config)
@@ -284,9 +241,4 @@ defmodule UniversalProxy.UART.Server do
        %{path: port_name, friendly_name: config.friendly_name || port_name}}
     )
   end
-
-  defp present?(nil), do: false
-  defp present?(""), do: false
-  defp present?(s) when is_binary(s), do: String.trim(s) != ""
-  defp present?(_), do: false
 end

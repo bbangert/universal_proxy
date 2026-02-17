@@ -1,11 +1,16 @@
 defmodule UniversalProxy.ESPHome.Server do
   @moduledoc """
-  GenServer that holds the ESPHome device configuration and tracks
-  active client connections.
+  GenServer that holds the ESPHome device configuration, tracks
+  active client connections, and builds the serial proxy instance list
+  from the UART config store.
 
   The device identity (name, MAC, version, etc.) is configurable at
   runtime via `update_config/1`. Active connections are tracked via
   process monitors so the registry stays clean when connections close.
+
+  On init, reads saved UART configs from the Store and matches them
+  against currently enumerated hardware to build a list of advertised
+  serial proxy instances (used in `DeviceInfoResponse`).
   """
 
   use GenServer
@@ -13,8 +18,9 @@ defmodule UniversalProxy.ESPHome.Server do
   require Logger
 
   alias UniversalProxy.ESPHome.DeviceConfig
+  alias UniversalProxy.Protos
 
-  defstruct [:config, connections: MapSet.new()]
+  defstruct [:config, connections: MapSet.new(), serial_proxies: [], instance_map: %{}]
 
   # -- Client API --
 
@@ -64,14 +70,36 @@ defmodule UniversalProxy.ESPHome.Server do
     GenServer.call(__MODULE__, :connection_count)
   end
 
+  @doc """
+  Returns the list of `%SerialProxyInfo{}` structs for DeviceInfoResponse.
+  """
+  @spec serial_proxies() :: [Protos.SerialProxyInfo.t()]
+  def serial_proxies do
+    GenServer.call(__MODULE__, :serial_proxies)
+  end
+
+  @doc """
+  Returns the instance map: `%{instance_index => %{path: ..., friendly_name: ..., serial: ...}}`.
+
+  Used by connection handlers to resolve instance indices to device paths.
+  """
+  @spec instance_map() :: map()
+  def instance_map do
+    GenServer.call(__MODULE__, :instance_map)
+  end
+
   # -- Server Callbacks --
 
   @impl true
   def init(opts) do
     config = DeviceConfig.new(opts)
     advertise_mdns(config)
-    Logger.info("ESPHome server started (port #{config.port}, name #{inspect(config.name)})")
-    {:ok, %__MODULE__{config: config}}
+
+    {proxies, inst_map} = build_serial_proxies()
+
+    Logger.info("ESPHome server started (port #{config.port}, name #{inspect(config.name)}, #{length(proxies)} serial proxies)")
+
+    {:ok, %__MODULE__{config: config, serial_proxies: proxies, instance_map: inst_map}}
   end
 
   @impl true
@@ -91,6 +119,14 @@ defmodule UniversalProxy.ESPHome.Server do
 
   def handle_call(:connection_count, _from, state) do
     {:reply, MapSet.size(state.connections), state}
+  end
+
+  def handle_call(:serial_proxies, _from, state) do
+    {:reply, state.serial_proxies, state}
+  end
+
+  def handle_call(:instance_map, _from, state) do
+    {:reply, state.instance_map, state}
   end
 
   @impl true
@@ -114,6 +150,61 @@ defmodule UniversalProxy.ESPHome.Server do
   end
 
   # -- Private helpers --
+
+  defp build_serial_proxies do
+    configs = UniversalProxy.UART.Store.all_configs()
+    enumerated = Circuits.UART.enumerate()
+
+    serial_to_path =
+      enumerated
+      |> Enum.filter(fn {_path, info} -> present?(info[:serial_number]) end)
+      |> Enum.into(%{}, fn {path, info} -> {info[:serial_number], path} end)
+
+    # Only include configs whose device is currently connected
+    connected_configs =
+      configs
+      |> Enum.filter(fn config -> Map.has_key?(serial_to_path, config[:serial_number]) end)
+      |> Enum.sort_by(fn config -> config[:friendly_name] || "tty#{config[:serial_number]}" end)
+
+    proxies =
+      connected_configs
+      |> Enum.map(fn config ->
+        %Protos.SerialProxyInfo{
+          name: config[:friendly_name] || "tty#{config[:serial_number]}",
+          port_type: port_type_to_proto(config[:port_type] || :ttl)
+        }
+      end)
+
+    instance_map =
+      connected_configs
+      |> Enum.with_index()
+      |> Enum.into(%{}, fn {config, index} ->
+        serial = config[:serial_number]
+        {index, %{
+          path: Map.get(serial_to_path, serial),
+          friendly_name: config[:friendly_name] || "tty#{serial}",
+          serial: serial
+        }}
+      end)
+
+    Logger.info("ESPHome serial proxies: #{length(proxies)} configured, #{map_size(instance_map)} connected")
+
+    {proxies, instance_map}
+  rescue
+    e ->
+      Logger.warning("ESPHome failed to build serial proxies: #{inspect(e)}")
+      {[], %{}}
+  end
+
+  defp port_type_to_proto(:ttl), do: :SERIAL_PROXY_PORT_TYPE_TTL
+  defp port_type_to_proto(:rs232), do: :SERIAL_PROXY_PORT_TYPE_RS232
+  defp port_type_to_proto(:rs485), do: :SERIAL_PROXY_PORT_TYPE_RS485
+  defp port_type_to_proto(_), do: :SERIAL_PROXY_PORT_TYPE_TTL
+
+  defp present?(nil), do: false
+  defp present?(""), do: false
+  defp present?(s) when is_binary(s), do: String.trim(s) != ""
+  defp present?(_), do: false
 
   defp advertise_mdns(config) do
     service = DeviceConfig.to_mdns_service(config)

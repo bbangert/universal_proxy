@@ -145,7 +145,15 @@ defmodule UniversalProxy.ESPHome.MessageTypes do
     134 => Protos.WaterHeaterCommandRequest,
     135 => Protos.ListEntitiesInfraredResponse,
     136 => Protos.InfraredRFTransmitRawTimingsRequest,
-    137 => Protos.InfraredRFReceiveEvent
+    137 => Protos.InfraredRFReceiveEvent,
+    # Serial Proxy messages
+    138 => Protos.SerialProxyConfigureRequest,
+    139 => Protos.SerialProxyDataReceived,
+    140 => Protos.SerialProxyWriteRequest,
+    141 => Protos.SerialProxySetModemPinsRequest,
+    142 => Protos.SerialProxyGetModemPinsRequest,
+    143 => Protos.SerialProxyGetModemPinsResponse,
+    144 => Protos.SerialProxyRequest
   }
 
   @reverse_types Map.new(@message_types, fn {id, mod} -> {mod, id} end)

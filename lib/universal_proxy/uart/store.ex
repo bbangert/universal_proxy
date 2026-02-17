@@ -3,8 +3,15 @@ defmodule UniversalProxy.UART.Store do
   DETS-backed persistence for UART device configurations.
 
   Stores device configs keyed by serial number so they survive reboots.
+  Each config only holds the `port_type` (TTL, RS232, RS485) and a
+  `friendly_name`. Serial settings (baudrate, parity, etc.) are provided
+  at runtime by ESPHome clients via `SerialProxyConfigureRequest`.
+
   The DETS file lives on the writable data partition on Nerves
   (`/data/uart_configs.dets`) and in `_build/` on the host for development.
+
+  Saving or deleting a config triggers an ESPHome supervisor restart
+  so clients reconnect and re-read the updated device info.
   """
 
   use GenServer
@@ -21,6 +28,8 @@ defmodule UniversalProxy.UART.Store do
 
   @doc """
   Save or update a device configuration keyed by serial number.
+
+  Restarts the ESPHome supervisor to force client reconnects.
   """
   @spec save_config(String.t(), map()) :: :ok
   def save_config(serial_number, params) when is_binary(serial_number) do
@@ -29,6 +38,8 @@ defmodule UniversalProxy.UART.Store do
 
   @doc """
   Delete a saved device configuration.
+
+  Restarts the ESPHome supervisor to force client reconnects.
   """
   @spec delete_config(String.t()) :: :ok
   def delete_config(serial_number) when is_binary(serial_number) do
@@ -49,14 +60,6 @@ defmodule UniversalProxy.UART.Store do
   @spec all_configs() :: [map()]
   def all_configs do
     GenServer.call(__MODULE__, :all)
-  end
-
-  @doc """
-  Return only configs that have `auto_open: true`.
-  """
-  @spec auto_open_configs() :: [map()]
-  def auto_open_configs do
-    GenServer.call(__MODULE__, :auto_open)
   end
 
   # -- Server Callbacks --
@@ -91,12 +94,14 @@ defmodule UniversalProxy.UART.Store do
 
     :dets.insert(state.table, {serial_number, config})
     :dets.sync(state.table)
+    restart_esphome()
     {:reply, :ok, state}
   end
 
   def handle_call({:delete, serial_number}, _from, state) do
     :dets.delete(state.table, serial_number)
     :dets.sync(state.table)
+    restart_esphome()
     {:reply, :ok, state}
   end
 
@@ -117,19 +122,6 @@ defmodule UniversalProxy.UART.Store do
     {:reply, configs, state}
   end
 
-  def handle_call(:auto_open, _from, state) do
-    configs =
-      :dets.foldl(
-        fn {_key, config}, acc ->
-          if config[:auto_open], do: [config | acc], else: acc
-        end,
-        [],
-        state.table
-      )
-
-    {:reply, configs, state}
-  end
-
   # -- Private --
 
   defp dets_path do
@@ -142,23 +134,9 @@ defmodule UniversalProxy.UART.Store do
 
   defp normalize_config(params) when is_map(params) do
     %{
-      speed: to_integer(params[:speed] || params["speed"], 9600),
-      data_bits: to_integer(params[:data_bits] || params["data_bits"], 8),
-      stop_bits: to_integer(params[:stop_bits] || params["stop_bits"], 1),
-      parity: to_atom(params[:parity] || params["parity"], :none),
-      flow_control: to_atom(params[:flow_control] || params["flow_control"], :none),
-      auto_open: to_boolean(params[:auto_open] || params["auto_open"], false)
+      port_type: to_atom(params[:port_type] || params["port_type"], :ttl)
     }
   end
-
-  defp to_integer(val, _default) when is_integer(val), do: val
-  defp to_integer(val, default) when is_binary(val) do
-    case Integer.parse(val) do
-      {n, _} -> n
-      :error -> default
-    end
-  end
-  defp to_integer(_, default), do: default
 
   defp to_atom(val, _default) when is_atom(val), do: val
   defp to_atom(val, default) when is_binary(val) do
@@ -171,8 +149,9 @@ defmodule UniversalProxy.UART.Store do
   end
   defp to_atom(_, default), do: default
 
-  defp to_boolean(true, _), do: true
-  defp to_boolean("true", _), do: true
-  defp to_boolean("on", _), do: true
-  defp to_boolean(_, default), do: default
+  defp restart_esphome do
+    Task.start(fn ->
+      UniversalProxy.ESPHome.Supervisor.restart()
+    end)
+  end
 end

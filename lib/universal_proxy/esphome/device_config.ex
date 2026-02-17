@@ -71,9 +71,12 @@ defmodule UniversalProxy.ESPHome.DeviceConfig do
 
   @doc """
   Convert this config to a `DeviceInfoResponse` protobuf struct.
+
+  Accepts an optional list of `%SerialProxyInfo{}` structs to populate
+  the `serial_proxies` field in the response.
   """
-  @spec to_device_info_response(t()) :: DeviceInfoResponse.t()
-  def to_device_info_response(%__MODULE__{} = config) do
+  @spec to_device_info_response(t(), [map()]) :: DeviceInfoResponse.t()
+  def to_device_info_response(%__MODULE__{} = config, serial_proxies \\ []) do
     %DeviceInfoResponse{
       name: config.name,
       friendly_name: config.friendly_name,
@@ -88,7 +91,8 @@ defmodule UniversalProxy.ESPHome.DeviceConfig do
       webserver_port: 0,
       has_deep_sleep: false,
       uses_password: false,
-      api_encryption_supported: false
+      api_encryption_supported: false,
+      serial_proxies: serial_proxies
     }
   end
 

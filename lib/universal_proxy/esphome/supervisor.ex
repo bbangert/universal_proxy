@@ -20,6 +20,19 @@ defmodule UniversalProxy.ESPHome.Supervisor do
     Supervisor.start_link(__MODULE__, init_arg, name: __MODULE__)
   end
 
+  @doc """
+  Restart the ESPHome supervisor tree.
+
+  Terminates and restarts this supervisor under the application supervisor,
+  which forces all active client connections to drop and reconnect. Clients
+  will then re-read the updated device info (including serial_proxies).
+  """
+  @spec restart() :: {:ok, pid()} | {:error, term()}
+  def restart do
+    Supervisor.terminate_child(UniversalProxy.Supervisor, __MODULE__)
+    Supervisor.restart_child(UniversalProxy.Supervisor, __MODULE__)
+  end
+
   @impl true
   def init(_init_arg) do
     config = UniversalProxy.ESPHome.DeviceConfig.new()
