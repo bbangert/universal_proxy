@@ -108,7 +108,7 @@ defmodule UniversalProxy.MixProject do
       {:nerves_system_bbb, "~> 2.19", runtime: false, targets: :bbb},
       {:nerves_system_grisp2, "~> 0.17", runtime: false, targets: :grisp2},
       {:nerves_system_osd32mp1, "~> 0.15", runtime: false, targets: :osd32mp1},
-      {:nerves_system_mangopi_mq_pro, "~> 0.6", runtime: false, targets: :mangopi_mq_pro},
+      {:nerves_system_mangopi_mq_pro, "~> 0.15", runtime: false, targets: :mangopi_mq_pro},
       {:nerves_system_qemu_aarch64, "~> 0.1", runtime: false, targets: :qemu_aarch64},
       {:nerves_system_rpi, "~> 2.0", runtime: false, targets: :rpi},
       {:nerves_system_rpi0, "~> 1.24", runtime: false, targets: :rpi0},
