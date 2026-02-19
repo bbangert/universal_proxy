@@ -27,7 +27,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Install fwup from GitHub releases (not in Ubuntu repos)
-RUN FWUP_VERSION="1.10.2" && \
+RUN FWUP_VERSION="1.15.0" && \
     curl -fsSL "https://github.com/fwup-home/fwup/releases/download/v${FWUP_VERSION}/fwup_${FWUP_VERSION}_amd64.deb" -o /tmp/fwup.deb && \
     dpkg -i /tmp/fwup.deb && \
     rm /tmp/fwup.deb
