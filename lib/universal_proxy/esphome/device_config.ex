@@ -7,6 +7,7 @@ defmodule UniversalProxy.ESPHome.DeviceConfig do
   the server listens on.
   """
 
+  alias UniversalProxy.ESPHome.ZWave
   alias UniversalProxy.Protos.DeviceInfoResponse
 
   @default_port 6053
@@ -92,6 +93,8 @@ defmodule UniversalProxy.ESPHome.DeviceConfig do
       has_deep_sleep: false,
       uses_password: false,
       api_encryption_supported: false,
+      zwave_proxy_feature_flags: zwave_feature_flags(),
+      zwave_home_id: zwave_home_id(),
       serial_proxies: serial_proxies
     }
   end
@@ -152,5 +155,18 @@ defmodule UniversalProxy.ESPHome.DeviceConfig do
     else
       _ -> "00:00:00:00:00:00"
     end
+  end
+
+  # Bit 0 = FEATURE_ZWAVE_PROXY_ENABLED
+  defp zwave_feature_flags do
+    if ZWave.available?(), do: 1, else: 0
+  rescue
+    _ -> 0
+  end
+
+  defp zwave_home_id do
+    ZWave.home_id()
+  rescue
+    _ -> 0
   end
 end

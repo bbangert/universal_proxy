@@ -160,10 +160,13 @@ defmodule UniversalProxy.ESPHome.Server do
       |> Enum.filter(fn {_path, info} -> present?(info[:serial_number]) end)
       |> Enum.into(%{}, fn {path, info} -> {info[:serial_number], path} end)
 
-    # Only include configs whose device is currently connected
+    # Only include configs whose device is currently connected, excluding Z-Wave devices
     connected_configs =
       configs
-      |> Enum.filter(fn config -> Map.has_key?(serial_to_path, config[:serial_number]) end)
+      |> Enum.filter(fn config ->
+        Map.has_key?(serial_to_path, config[:serial_number]) and
+          config[:port_type] != :zwave
+      end)
       |> Enum.sort_by(fn config -> config[:friendly_name] || "tty#{config[:serial_number]}" end)
 
     proxies =
