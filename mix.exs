@@ -111,7 +111,7 @@ defmodule UniversalProxy.MixProject do
       {:nerves_system_mangopi_mq_pro, "~> 0.6", runtime: false, targets: :mangopi_mq_pro},
       {:nerves_system_qemu_aarch64, "~> 0.1", runtime: false, targets: :qemu_aarch64},
       {:nerves_system_rpi, "~> 2.0", runtime: false, targets: :rpi},
-      {:nerves_system_rpi0, "~> 1.24", runtime: false, targets: :rpi0},
+      {:nerves_system_rpi0, "~> 2.0", runtime: false, targets: :rpi0},
       {:nerves_system_rpi0_2, "~> 1.31", runtime: false, targets: :rpi0_2},
       {:nerves_system_rpi2, "~> 1.24", runtime: false, targets: :rpi2},
       {:nerves_system_rpi3, "~> 1.24", runtime: false, targets: :rpi3},
