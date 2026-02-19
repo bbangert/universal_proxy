@@ -16,7 +16,7 @@ defmodule UniversalProxy.ESPHome.Connection do
 
   require Logger
 
-  alias UniversalProxy.ESPHome.{DeviceConfig, MessageTypes, Protocol, Server}
+  alias UniversalProxy.ESPHome.{DeviceConfig, MessageTypes, Protocol, Server, ZWave}
   alias UniversalProxy.{Protos, UART}
 
   @pubsub UniversalProxy.PubSub
@@ -28,6 +28,8 @@ defmodule UniversalProxy.ESPHome.Connection do
     Server.register_connection(self())
     peer = peer_label(socket)
 
+    Phoenix.PubSub.subscribe(@pubsub, ZWave.home_id_changed_topic())
+
     Logger.info("ESPHome client connected from #{peer} (#{map_size(instance_map)} serial proxy instances available)")
 
     {:continue, %{
@@ -35,7 +37,8 @@ defmodule UniversalProxy.ESPHome.Connection do
       device_config: device_config,
       peer: peer,
       instance_map: instance_map,
-      opened_ports: %{}
+      opened_ports: %{},
+      zwave_subscribed: false
     }}
   end
 
@@ -94,6 +97,25 @@ defmodule UniversalProxy.ESPHome.Connection do
       send_message(response, socket)
     end
 
+    {:noreply, {socket, state}}
+  end
+
+  def handle_info({:zwave_frame, data}, {socket, state}) do
+    if state.zwave_subscribed do
+      frame = %Protos.ZWaveProxyFrame{data: data}
+      send_message(frame, socket)
+    end
+
+    {:noreply, {socket, state}}
+  end
+
+  def handle_info({:zwave_home_id_changed, home_id_bytes}, {socket, state}) do
+    msg = %Protos.ZWaveProxyRequest{
+      type: :ZWAVE_PROXY_REQUEST_TYPE_HOME_ID_CHANGE,
+      data: home_id_bytes
+    }
+
+    send_message(msg, socket)
     {:noreply, {socket, state}}
   end
 
@@ -295,6 +317,53 @@ defmodule UniversalProxy.ESPHome.Connection do
     {:ok, state}
   end
 
+  # -- Z-Wave Proxy handlers --
+
+  defp dispatch(%Protos.ZWaveProxyRequest{type: :ZWAVE_PROXY_REQUEST_TYPE_SUBSCRIBE}, socket, state) do
+    case ZWave.subscribe(self()) do
+      {:ok, home_id_bytes} ->
+        Logger.info("ESPHome client #{state.peer} subscribed to Z-Wave proxy")
+
+        if home_id_bytes != <<0, 0, 0, 0>> do
+          notify = %Protos.ZWaveProxyRequest{
+            type: :ZWAVE_PROXY_REQUEST_TYPE_HOME_ID_CHANGE,
+            data: home_id_bytes
+          }
+
+          send_message(notify, socket)
+        end
+
+        {:ok, %{state | zwave_subscribed: true}}
+
+      {:error, reason} ->
+        Logger.warning("ESPHome client #{state.peer} Z-Wave subscribe failed: #{inspect(reason)}")
+        {:ok, state}
+    end
+  end
+
+  defp dispatch(%Protos.ZWaveProxyRequest{type: :ZWAVE_PROXY_REQUEST_TYPE_UNSUBSCRIBE}, _socket, state) do
+    ZWave.unsubscribe(self())
+    Logger.info("ESPHome client #{state.peer} unsubscribed from Z-Wave proxy")
+    {:ok, %{state | zwave_subscribed: false}}
+  end
+
+  defp dispatch(%Protos.ZWaveProxyRequest{} = req, _socket, state) do
+    Logger.debug("ESPHome client #{state.peer} unhandled Z-Wave proxy request type: #{inspect(req.type)}")
+    {:ok, state}
+  end
+
+  defp dispatch(%Protos.ZWaveProxyFrame{} = frame, _socket, state) do
+    case ZWave.send_frame(frame.data) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("ESPHome client #{state.peer} Z-Wave send_frame failed: #{inspect(reason)}")
+    end
+
+    {:ok, state}
+  end
+
   # -- Catch-all --
 
   defp dispatch(unknown, _socket, state) do
@@ -305,6 +374,10 @@ defmodule UniversalProxy.ESPHome.Connection do
   # -- Port Cleanup --
 
   defp close_all_ports(state) do
+    if state.zwave_subscribed do
+      ZWave.unsubscribe(self())
+    end
+
     Enum.each(state.opened_ports, fn {instance, path} ->
       case UART.close(path) do
         :ok ->
