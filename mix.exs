@@ -114,7 +114,7 @@ defmodule UniversalProxy.MixProject do
       {:nerves_system_rpi0, "~> 2.0", runtime: false, targets: :rpi0},
       {:nerves_system_rpi0_2, "~> 1.31", runtime: false, targets: :rpi0_2},
       {:nerves_system_rpi2, "~> 1.24", runtime: false, targets: :rpi2},
-      {:nerves_system_rpi3, "~> 1.24", runtime: false, targets: :rpi3},
+      {:nerves_system_rpi3, "~> 2.0", runtime: false, targets: :rpi3},
       {:nerves_system_rpi4, "~> 1.24", runtime: false, targets: :rpi4},
       {:nerves_system_rpi5, "~> 0.8", runtime: false, targets: :rpi5},
       {:nerves_system_x86_64, "~> 1.24", runtime: false, targets: :x86_64}
