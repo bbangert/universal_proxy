@@ -1,6 +1,6 @@
 [tools]
 erlang = "28.3.1"
-elixir = "1.19.5-otp-28"
+elixir = "1.19.5"
 
 [env]
 MIX_TARGET = "rpi3"
