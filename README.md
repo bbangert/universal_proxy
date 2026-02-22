@@ -9,14 +9,21 @@ are exposed to Home Assistant as **serial proxies** through the ESPHome Native
 API. Home Assistant can then open, configure, and stream data from those serial
 ports exactly as it would with an ESPHome device that has a built-in UART.
 
-This is useful for connecting RS-232, RS-485, or TTL serial devices to Home
-Assistant over the network without needing a dedicated ESPHome microcontroller
-for each one.
+Additionally, the [Home Assistant Connect ZWA-2](https://www.home-assistant.io/connect/zwa-2/) USB Z-Wave
+controller is supported as a **Z-Wave proxy**. The proxy speaks the Z-Wave
+Serial API protocol locally, handling latency-sensitive ACK/NAK/CAN responses at
+the device while forwarding complete frames to Home Assistant over the network.
+
+This is useful for connecting RS-232, RS-485, TTL serial, or Z-Wave devices to
+Home Assistant over the network without needing a dedicated ESPHome
+microcontroller for each one.
 
 ## Features
 
 - Speaks the ESPHome Native API (protobuf over TCP on port 6053)
 - Automatic mDNS advertisement -- discovered by Home Assistant like any ESPHome device
+- Serial proxy for TTL, RS-232, and RS-485 USB adapters
+- Z-Wave proxy for USB Z-Wave controllers with local ACK handling
 - Web UI for configuration (accessible at `http://<device-ip>`)
 - USB hotplug detection -- plug/unplug serial adapters at any time
 - DETS-backed persistent device configuration across reboots
@@ -67,6 +74,15 @@ To remove a device from Home Assistant, click **Delete** on its configuration.
 Saving or deleting a configuration automatically restarts the ESPHome server,
 causing Home Assistant to reconnect and pick up the updated device list.
 
+The [Home Assistant Connect ZWA-2](https://www.home-assistant.io/connect/zwa-2/)
+is **auto-detected** when plugged in -- no manual configuration needed. It
+appears in the Connected Devices list with an "Auto-detected" badge. The proxy
+opens the controller at 115200 baud, parses Z-Wave Serial API framing, and sends
+ACK/NAK/CAN responses locally (avoiding network round-trip latency). Complete
+frames are forwarded to Home Assistant's Z-Wave JS integration over the ESPHome
+API. Only one Home Assistant instance can subscribe to the Z-Wave proxy at a
+time.
+
 ### Editing ESPHome device configuration
 
 1. Go to the **ESPHome Config** tab (`/esphome-config`).
@@ -85,7 +101,7 @@ Once the device is powered on and connected to the network:
 1. Home Assistant should auto-discover it via mDNS under **Settings > Devices & Services**.
 2. If not, manually add an ESPHome integration pointing to `universal_proxy.local` (or the IP).
 3. No API password is required.
-4. Configured serial adapters appear as serial proxy entities on the device.
+4. Configured serial adapters appear as serial proxy entities on the device. An auto-detected ZWA-2 appears as a Z-Wave proxy.
 
 ---
 
@@ -124,6 +140,7 @@ lib/
   universal_proxy/
     uart/                  # UART subsystem (Server, Store, PortConfig, Supervisor)
     esphome/               # ESPHome Native API (Server, Connection, Protocol, Supervisor)
+      zwave/               # Z-Wave proxy (Frame, Parser, Server)
   universal_proxy_web/
     live/                  # Phoenix LiveView pages (Home, Connected Devices, ESPHome Config)
 priv/
@@ -248,6 +265,7 @@ This project supports all standard Nerves targets:
 ## Learn more
 
 - [ESPHome Native API protocol](https://developers.esphome.io/architecture/api/protocol_details/)
+- [ESPHome Z-Wave proxy component](https://github.com/esphome/esphome/tree/dev/esphome/components/zwave_proxy)
 - [Nerves documentation](https://hexdocs.pm/nerves/getting-started.html)
 - [Phoenix LiveView](https://hexdocs.pm/phoenix_live_view/)
 - [Circuits.UART](https://hexdocs.pm/circuits_uart/)

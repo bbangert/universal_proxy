@@ -173,6 +173,7 @@ defmodule UniversalProxyWeb.ConnectedDevicesLive do
   defp port_type_label(:ttl), do: "TTL"
   defp port_type_label(:rs232), do: "RS-232"
   defp port_type_label(:rs485), do: "RS-485"
+  defp port_type_label(:zwave), do: "Z-Wave"
   defp port_type_label(other), do: to_string(other) |> String.upcase()
 
   # -- Template --
@@ -185,6 +186,7 @@ defmodule UniversalProxyWeb.ConnectedDevicesLive do
       <.body>
         Serial devices discovered via hardware enumeration. Configure a port type to advertise the
         device as a serial proxy to ESPHome clients. Serial settings are provided by clients at runtime.
+        Home Assistant Connect ZWA-2 controllers are auto-detected and configured as Z-Wave proxies.
       </.body>
 
       <div class="mt-6 space-y-4">
@@ -323,6 +325,11 @@ defmodule UniversalProxyWeb.ConnectedDevicesLive do
     <div class="border-t border-zinc-200 dark:border-neon-purple/10 px-4 py-2 flex flex-wrap gap-x-6 gap-y-1 text-xs text-zinc-500 dark:text-zinc-400">
       <span><strong class="text-zinc-600 dark:text-zinc-300">Port type:</strong> <%= port_type_label(@port_type) %></span>
       <span><strong class="text-zinc-600 dark:text-zinc-300">Friendly name:</strong> <%= @friendly_name %></span>
+      <%= if @port_type == :zwave do %>
+        <span class="inline-flex items-center rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-800 dark:bg-blue-900/30 dark:text-blue-300">
+          Auto-detected
+        </span>
+      <% end %>
     </div>
     """
   end
