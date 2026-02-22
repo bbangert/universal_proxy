@@ -136,10 +136,13 @@ defmodule UniversalProxy.UART.Store do
 
   defp normalize_config(params) when is_map(params) do
     port_type = to_atom(params[:port_type] || params["port_type"], :ttl)
+    friendly_name = params[:friendly_name] || params["friendly_name"]
 
-    %{
+    config = %{
       port_type: if(port_type in @valid_port_types, do: port_type, else: :ttl)
     }
+
+    if friendly_name, do: Map.put(config, :friendly_name, friendly_name), else: config
   end
 
   defp to_atom(val, _default) when is_atom(val), do: val

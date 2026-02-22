@@ -113,6 +113,7 @@ defmodule UniversalProxy.UART.Server do
   def init(_opts) do
     :timer.send_interval(@hotplug_interval, self(), :check_hotplug)
     known = current_serial_set()
+    auto_detect_zwave_devices()
     Logger.info("UART server started, #{MapSet.size(known)} serial devices detected")
     {:ok, %{ports: %{}, known_serials: known}}
   end
@@ -224,6 +225,7 @@ defmodule UniversalProxy.UART.Server do
 
       if MapSet.size(added) > 0 do
         Logger.info("UART hotplug: devices added: #{Enum.join(added, ", ")}")
+        auto_detect_zwave_devices()
       end
 
       if MapSet.size(removed) > 0 do
@@ -345,5 +347,40 @@ defmodule UniversalProxy.UART.Server do
       {String.to_atom(String.replace(topic, ":", "_")),
        %{path: port_name, friendly_name: config.friendly_name || port_name}}
     )
+  end
+
+  @zwa2_manufacturer "Nabu Casa"
+  @zwa2_product "ZWA-2"
+
+  defp auto_detect_zwave_devices do
+    enumerated = Circuits.UART.enumerate()
+    store = UniversalProxy.UART.Store
+
+    enumerated
+    |> Enum.filter(fn {_path, info} -> zwa2_device?(info) end)
+    |> Enum.each(fn {_path, info} ->
+      serial = info[:serial_number]
+
+      if present?(serial) do
+        case store.get_config(serial) do
+          {:ok, _} ->
+            :ok
+
+          :error ->
+            Logger.info("Auto-detected #{@zwa2_product} (SN: #{serial}), configuring as Z-Wave proxy")
+            store.save_config(serial, %{port_type: :zwave, friendly_name: @zwa2_product})
+        end
+      end
+    end)
+  rescue
+    e -> Logger.warning("Z-Wave auto-detection failed: #{inspect(e)}")
+  end
+
+  defp zwa2_device?(info) do
+    manufacturer = to_string(info[:manufacturer] || "")
+    description = to_string(info[:description] || "")
+
+    String.contains?(manufacturer, @zwa2_manufacturer) and
+      String.contains?(description, @zwa2_product)
   end
 end
