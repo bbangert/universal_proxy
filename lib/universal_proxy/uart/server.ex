@@ -349,20 +349,17 @@ defmodule UniversalProxy.UART.Server do
     )
   end
 
-  # Known Z-Wave USB devices identified by VID/PID.
-  # Values sourced from Home Assistant's zwave_js manifest.
-  @known_zwave_devices [
-    %{vid: 0x0658, pid: 0x0200, name: "Aeotec Z-Stick Gen5+"},
-    %{vid: 0x10C4, pid: 0x8A2A, name: "Nortek HUSBZB-1"},
-    %{vid: 0x303A, pid: 0x4001, name: "Nabu Casa ZWA-2"}
-  ]
+  # ZWA-2 USB VID/PID from Home Assistant's zwave_js manifest.
+  @zwa2_vid 0x303A
+  @zwa2_pid 0x4001
+  @zwa2_product "Nabu Casa ZWA-2"
 
   defp auto_detect_zwave_devices do
     enumerated = Circuits.UART.enumerate()
     store = UniversalProxy.UART.Store
 
     enumerated
-    |> Enum.filter(fn {_path, info} -> zwave_device?(info) end)
+    |> Enum.filter(fn {_path, info} -> zwa2_device?(info) end)
     |> Enum.each(fn {_path, info} ->
       serial = info[:serial_number]
 
@@ -372,9 +369,8 @@ defmodule UniversalProxy.UART.Server do
             :ok
 
           :error ->
-            friendly_name = zwave_device_name(info)
-            Logger.info("Auto-detected #{friendly_name} (SN: #{serial}), configuring as Z-Wave proxy")
-            store.save_config(serial, %{port_type: :zwave, friendly_name: friendly_name})
+            Logger.info("Auto-detected #{@zwa2_product} (SN: #{serial}), configuring as Z-Wave proxy")
+            store.save_config(serial, %{port_type: :zwave, friendly_name: @zwa2_product})
         end
       end
     end)
@@ -383,21 +379,7 @@ defmodule UniversalProxy.UART.Server do
   end
 
   @doc false
-  def zwave_device?(info), do: find_zwave_device(info) != nil
-
-  defp zwave_device_name(info) do
-    case find_zwave_device(info) do
-      %{name: name} -> name
-      nil -> "Z-Wave Device"
-    end
-  end
-
-  defp find_zwave_device(info) do
-    vid = info[:vendor_id]
-    pid = info[:product_id]
-
-    if is_integer(vid) and is_integer(pid) do
-      Enum.find(@known_zwave_devices, fn dev -> dev.vid == vid and dev.pid == pid end)
-    end
+  def zwa2_device?(info) do
+    info[:vendor_id] == @zwa2_vid and info[:product_id] == @zwa2_pid
   end
 end
