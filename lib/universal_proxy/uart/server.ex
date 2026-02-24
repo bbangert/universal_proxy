@@ -349,8 +349,10 @@ defmodule UniversalProxy.UART.Server do
     )
   end
 
-  @zwa2_manufacturer "Nabu Casa"
-  @zwa2_product "ZWA-2"
+  # ZWA-2 USB VID/PID from Home Assistant's zwave_js manifest.
+  @zwa2_vid 0x303A
+  @zwa2_pid 0x4001
+  @zwa2_product "Nabu Casa ZWA-2"
 
   defp auto_detect_zwave_devices do
     enumerated = Circuits.UART.enumerate()
@@ -376,11 +378,8 @@ defmodule UniversalProxy.UART.Server do
     e -> Logger.warning("Z-Wave auto-detection failed: #{inspect(e)}")
   end
 
-  defp zwa2_device?(info) do
-    manufacturer = to_string(info[:manufacturer] || "")
-    description = to_string(info[:description] || "")
-
-    String.contains?(manufacturer, @zwa2_manufacturer) and
-      String.contains?(description, @zwa2_product)
+  @doc false
+  def zwa2_device?(info) do
+    info[:vendor_id] == @zwa2_vid and info[:product_id] == @zwa2_pid
   end
 end
