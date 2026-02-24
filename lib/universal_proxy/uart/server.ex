@@ -383,21 +383,21 @@ defmodule UniversalProxy.UART.Server do
   end
 
   @doc false
-  def zwave_device?(info) do
-    vid = info[:vendor_id]
-    pid = info[:product_id]
-
-    is_integer(vid) and is_integer(pid) and
-      Enum.any?(@known_zwave_devices, fn dev -> dev.vid == vid and dev.pid == pid end)
-  end
+  def zwave_device?(info), do: find_zwave_device(info) != nil
 
   defp zwave_device_name(info) do
+    case find_zwave_device(info) do
+      %{name: name} -> name
+      nil -> "Z-Wave Device"
+    end
+  end
+
+  defp find_zwave_device(info) do
     vid = info[:vendor_id]
     pid = info[:product_id]
 
-    case Enum.find(@known_zwave_devices, fn dev -> dev.vid == vid and dev.pid == pid end) do
-      %{name: name} -> name
-      nil -> "Z-Wave Device"
+    if is_integer(vid) and is_integer(pid) do
+      Enum.find(@known_zwave_devices, fn dev -> dev.vid == vid and dev.pid == pid end)
     end
   end
 end
