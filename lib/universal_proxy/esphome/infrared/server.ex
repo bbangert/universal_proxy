@@ -129,39 +129,17 @@ defmodule UniversalProxy.ESPHome.Infrared.Server do
   end
 
   def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
-    if MapSet.member?(state.subscribers, pid) do
-      Logger.debug("Infrared subscriber #{inspect(pid)} down, auto-unsubscribing")
-      {:noreply, remove_subscriber(state, pid)}
-    else
-      worker_entry =
-        Enum.find(state.workers, fn {_key, {_mod, worker_pid}} -> worker_pid == pid end)
+    cond do
+      MapSet.member?(state.subscribers, pid) ->
+        Logger.debug("Infrared subscriber #{inspect(pid)} down, auto-unsubscribing")
+        {:noreply, remove_subscriber(state, pid)}
 
-      case worker_entry do
-        {key, {_mod, _pid}} ->
-          Logger.warning("Infrared worker for key #{key} crashed, attempting restart")
-          entity = Enum.find(state.entities, &(&1.key == key))
+      entry = find_worker_by_pid(state.workers, pid) ->
+        {key, _} = entry
+        {:noreply, restart_worker(state, key)}
 
-          if entity do
-            case start_worker(entity) do
-              {:ok, new_pid} ->
-                Logger.info("Infrared worker for key #{key} restarted")
-                workers = Map.put(state.workers, key, {entity.device_module, new_pid})
-                {:noreply, %{state | workers: workers}}
-
-              {:error, reason} ->
-                Logger.error(
-                  "Failed to restart infrared worker for key #{key}: #{inspect(reason)}"
-                )
-
-                {:noreply, %{state | workers: Map.delete(state.workers, key)}}
-            end
-          else
-            {:noreply, %{state | workers: Map.delete(state.workers, key)}}
-          end
-
-        nil ->
-          {:noreply, state}
-      end
+      true ->
+        {:noreply, state}
     end
   end
 
@@ -171,15 +149,32 @@ defmodule UniversalProxy.ESPHome.Infrared.Server do
 
   # -- Private --
 
-  defp remove_subscriber(state, pid) do
-    case Map.pop(state.monitors, pid) do
-      {nil, monitors} ->
-        %{state | subscribers: MapSet.delete(state.subscribers, pid), monitors: monitors}
+  defp find_worker_by_pid(workers, pid) do
+    Enum.find(workers, fn {_key, {_mod, worker_pid}} -> worker_pid == pid end)
+  end
 
-      {ref, monitors} ->
-        Process.demonitor(ref, [:flush])
-        %{state | subscribers: MapSet.delete(state.subscribers, pid), monitors: monitors}
+  defp restart_worker(state, key) do
+    case Enum.find(state.entities, &(&1.key == key)) do
+      nil ->
+        %{state | workers: Map.delete(state.workers, key)}
+
+      entity ->
+        case start_worker(entity) do
+          {:ok, new_pid} ->
+            Logger.info("Infrared worker for key #{key} restarted")
+            %{state | workers: Map.put(state.workers, key, {entity.device_module, new_pid})}
+
+          {:error, reason} ->
+            Logger.error("Failed to restart infrared worker for key #{key}: #{inspect(reason)}")
+            %{state | workers: Map.delete(state.workers, key)}
+        end
     end
+  end
+
+  defp remove_subscriber(state, pid) do
+    {ref, monitors} = Map.pop(state.monitors, pid)
+    if ref, do: Process.demonitor(ref, [:flush])
+    %{state | subscribers: MapSet.delete(state.subscribers, pid), monitors: monitors}
   end
 
   defp build_inventory do
@@ -187,9 +182,10 @@ defmodule UniversalProxy.ESPHome.Infrared.Server do
     enumerated = Circuits.UART.enumerate()
 
     serial_to_entry =
-      enumerated
-      |> Enum.filter(fn {_path, info} -> present?(info[:serial_number]) end)
-      |> Enum.into(%{}, fn {path, info} -> {info[:serial_number], {path, info}} end)
+      for {path, info} <- enumerated,
+          present?(info[:serial_number]),
+          into: %{},
+          do: {info[:serial_number], {path, info}}
 
     ir_configs =
       Enum.filter(configs, fn config ->
@@ -197,41 +193,36 @@ defmodule UniversalProxy.ESPHome.Infrared.Server do
           Map.has_key?(serial_to_entry, config[:serial_number])
       end)
 
-    entities_and_workers =
-      ir_configs
-      |> Enum.flat_map(fn config ->
-        serial = config[:serial_number]
-        {path, info} = Map.fetch!(serial_to_entry, serial)
-
-        case find_product_module(info) do
-          {:ok, mod} ->
-            entity = mod.build_entity(config, path, info)
-
-            case start_worker(entity) do
-              {:ok, worker_pid} ->
-                [{entity, worker_pid}]
-
-              {:error, reason} ->
-                Logger.warning(
-                  "Failed to start infrared worker for #{entity.name} (#{path}): #{inspect(reason)}"
-                )
-
-                []
-            end
-
-          :error ->
-            Logger.debug("No product module matched infrared device at #{path}")
-            []
-        end
-      end)
-
-    entities = Enum.map(entities_and_workers, &elem(&1, 0))
-    workers = Enum.into(entities_and_workers, %{}, fn {e, pid} -> {e.key, {e.device_module, pid}} end)
+    pairs = Enum.flat_map(ir_configs, &start_entity(&1, serial_to_entry))
+    entities = Enum.map(pairs, &elem(&1, 0))
+    workers = Map.new(pairs, fn {e, pid} -> {e.key, {e.device_module, pid}} end)
     {entities, workers}
   rescue
     e ->
-      Logger.warning("Infrared inventory build failed: #{inspect(e)}")
+      Logger.warning(
+        "Infrared inventory build failed: #{Exception.format(:error, e, __STACKTRACE__)}"
+      )
+
       {[], %{}}
+  end
+
+  defp start_entity(config, serial_to_entry) do
+    serial = config[:serial_number]
+    {path, info} = Map.fetch!(serial_to_entry, serial)
+
+    with {:ok, mod} <- find_product_module(info),
+         entity = mod.build_entity(config, path, info),
+         {:ok, pid} <- start_worker(entity) do
+      [{entity, pid}]
+    else
+      :error ->
+        Logger.debug("No product module matched infrared device at #{path}")
+        []
+
+      {:error, reason} ->
+        Logger.warning("Failed to start infrared worker at #{path}: #{inspect(reason)}")
+        []
+    end
   end
 
   defp find_product_module(info) do
@@ -244,18 +235,12 @@ defmodule UniversalProxy.ESPHome.Infrared.Server do
   defp start_worker(entity) do
     spec = entity.device_module.child_spec(entity, self())
 
-    case DynamicSupervisor.start_child(@worker_supervisor, spec) do
-      {:ok, pid} ->
-        Process.monitor(pid)
-        {:ok, pid}
-
-      error ->
-        error
+    with {:ok, pid} <- DynamicSupervisor.start_child(@worker_supervisor, spec) do
+      Process.monitor(pid)
+      {:ok, pid}
     end
   end
 
-  defp present?(nil), do: false
-  defp present?(""), do: false
-  defp present?(s) when is_binary(s), do: String.trim(s) != ""
+  defp present?(s) when is_binary(s) and s != "", do: String.trim(s) != ""
   defp present?(_), do: false
 end
