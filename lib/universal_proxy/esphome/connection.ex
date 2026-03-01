@@ -234,6 +234,7 @@ defmodule UniversalProxy.ESPHome.Connection do
       missing_state: false
     }, socket)
 
+    state = maybe_subscribe_infrared(state)
     Logger.info("ESPHome client #{state.peer} subscribed to states")
     {:ok, state}
   end

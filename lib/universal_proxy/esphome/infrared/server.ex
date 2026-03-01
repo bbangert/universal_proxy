@@ -98,16 +98,20 @@ defmodule UniversalProxy.ESPHome.Infrared.Server do
   end
 
   def handle_call({:subscribe, pid}, _from, state) do
-    ref = Process.monitor(pid)
+    if MapSet.member?(state.subscribers, pid) do
+      {:reply, :ok, state}
+    else
+      ref = Process.monitor(pid)
 
-    state = %{
-      state
-      | subscribers: MapSet.put(state.subscribers, pid),
-        monitors: Map.put(state.monitors, pid, ref)
-    }
+      state = %{
+        state
+        | subscribers: MapSet.put(state.subscribers, pid),
+          monitors: Map.put(state.monitors, pid, ref)
+      }
 
-    Logger.debug("Infrared subscriber added: #{inspect(pid)}")
-    {:reply, :ok, state}
+      Logger.debug("Infrared subscriber added: #{inspect(pid)}")
+      {:reply, :ok, state}
+    end
   end
 
   def handle_call({:unsubscribe, pid}, _from, state) do
@@ -221,7 +225,15 @@ defmodule UniversalProxy.ESPHome.Infrared.Server do
 
   defp start_worker(entity) do
     spec = entity.device_module.child_spec(entity, self())
-    DynamicSupervisor.start_child(@worker_supervisor, spec)
+
+    case DynamicSupervisor.start_child(@worker_supervisor, spec) do
+      {:ok, pid} ->
+        Process.monitor(pid)
+        {:ok, pid}
+
+      error ->
+        error
+    end
   end
 
   defp present?(nil), do: false

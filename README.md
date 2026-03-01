@@ -86,8 +86,9 @@ time.
 
 IRDroid / IR Toy USB infrared devices are also **auto-detected** by USB ID
 (VID `0x04D8`, PID `0xFD08` or `0xF58B`) and shown in Connected Devices with an
-"Auto-detected" badge. In this release, infrared detection is UI/configuration
-only and infrared devices are not yet advertised as ESPHome serial proxies.
+"Auto-detected" badge. When connected, these infrared devices are exposed to
+Home Assistant via the ESPHome Native API as **Infrared entities**, supporting
+infrared transmit and receive operations.
 
 ### Editing ESPHome device configuration
 

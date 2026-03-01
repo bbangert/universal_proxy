@@ -4,11 +4,9 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.ProtocolTest do
   alias UniversalProxy.ESPHome.Infrared.Irdroid.Protocol
 
   # Timer count <-> microsecond conversion factor:
-  # 48 MHz / 256 prescaler = 187500 Hz -> 1 count = ~5.3333 us
-  # So 1 us = 48_000_000 / 256 / 1_000_000 = 0.1875 counts
-  # And 1 count = 1 / 0.1875 = 5.3333 us
-  #
-  # The protocol module uses the inverse: us_per_count = 48e6/256/1e6
+  # PIC18F Fosc = 48 MHz, instruction clock = Fosc/4 = 12 MHz
+  # Timer0 with 1:256 prescaler = 12 MHz / 256 = 46,875 Hz
+  # 1 count = ~21.3333 us, 1 us = 0.046875 counts
 
   describe "command builders" do
     test "reset returns 0x00" do
@@ -70,11 +68,11 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.ProtocolTest do
     end
 
     test "timing values are big-endian uint16" do
-      # 9000 us -> count = round(9000 * 48e6/256/1e6) = round(9000 * 0.1875) = round(1687.5) = 1688
+      # 9000 us -> count = round(9000 * 0.046875) = round(421.875) = 422
       timings = [9000]
       <<0x25, 0x03, hi, lo, 0xFF, 0xFF>> = Protocol.encode_transmit(timings)
       count = hi * 256 + lo
-      expected = round(9000 * 48_000_000 / 256 / 1_000_000)
+      expected = round(9000 * 48_000_000 / 4 / 256 / 1_000_000)
       assert count == expected
     end
 
@@ -82,7 +80,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.ProtocolTest do
       timings = [-4500]
       <<0x25, 0x03, hi, lo, 0xFF, 0xFF>> = Protocol.encode_transmit(timings)
       count = hi * 256 + lo
-      expected = round(4500 * 48_000_000 / 256 / 1_000_000)
+      expected = round(4500 * 48_000_000 / 4 / 256 / 1_000_000)
       assert count == expected
     end
 
@@ -145,8 +143,8 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.ProtocolTest do
       [mark, space] = timings
       assert mark > 0
       assert space < 0
-      assert mark == round(100 / (48_000_000 / 256 / 1_000_000))
-      assert space == -round(50 / (48_000_000 / 256 / 1_000_000))
+      assert mark == round(100 / (48_000_000 / 4 / 256 / 1_000_000))
+      assert space == -round(50 / (48_000_000 / 4 / 256 / 1_000_000))
     end
 
     test "handles split data across multiple feed calls" do
@@ -247,18 +245,18 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.ProtocolTest do
       <<timing_data::binary-size(data_len), 0xFF, 0xFF>> = encoded_data
 
       # Decode: device counts -> us (simulating what feed/2 does)
-      count_to_us = 1 / (48_000_000 / 256 / 1_000_000)
-      us_per_count = 48_000_000 / 256 / 1_000_000
+      counts_per_us = 48_000_000 / 4 / 256 / 1_000_000
+      us_per_count = 1 / counts_per_us
 
       decoded =
         for <<hi, lo <- timing_data>> do
           raw = hi * 256 + lo
-          round(raw * count_to_us)
+          round(raw * us_per_count)
         end
 
       for {original, decoded} <- Enum.zip(Enum.map(original_timings, &abs/1), decoded) do
-        # Rounding error should be at most 1 count = ~5.3 us
-        assert abs(original - decoded) <= ceil(1 / us_per_count) + 1,
+        # Rounding error should be at most 1 count = ~21.3 us
+        assert abs(original - decoded) <= ceil(us_per_count) + 1,
                "Expected #{original} ~= #{decoded}"
       end
     end

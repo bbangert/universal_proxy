@@ -21,7 +21,7 @@ graph TB
   end
 
   subgraph boundary ["Boundary (GenServers, product-agnostic)"]
-    IRServer -->|"starts via entity.worker_module"| IRWorker["Irdroid.DeviceWorker"]
+    IRServer -->|"starts via entity.device_module.child_spec/2"| IRWorker["Irdroid.DeviceWorker"]
     IRWorker -->|"owns"| CircuitsUART["Circuits.UART process"]
     IRServer -->|"tracks"| Subscribers["subscriber pids"]
     IRServer -->|"holds"| Inventory["Entity list"]
@@ -120,20 +120,20 @@ defstruct [
   :port_path,
   :product_id,
   :capabilities,
-  :worker_module
+  :device_module
 ]
 ```
 
 **Key functions:**
 
-- `new/1` -- takes a keyword list / map with serial_number, port_path, product_id, name, capabilities, worker_module; returns `%Entity{}` with:
+- `new/1` -- takes a keyword list / map with serial_number, port_path, product_id, name, capabilities, device_module; returns `%Entity{}` with:
   - `key` = `:erlang.phash2({serial_number, "infrared"}, 0xFFFFFFFF)` (stable per device)
   - `object_id` = `"infrared_#{serial_number}"`
 - `to_list_entities_response/1` -- converts to `%Protos.ListEntitiesInfraredResponse{}`
 - `can_receive?/1` -- returns true if capabilities include `:receive`
 - `can_transmit?/1` -- returns true if capabilities include `:transmit`
 
-The `worker_module` field stores the GenServer module to start for this device (e.g. `Infrared.Irdroid.DeviceWorker`). This allows the generic `Server` to start the correct worker per product family.
+The `device_module` field stores the product-specific module implementing the `Infrared.Device` behaviour (e.g. `Infrared.Irdroid.Device`). This allows the generic `Server` to start the correct worker per product family via `device_module.child_spec/2`.
 
 ### 2. Data Layer: `lib/universal_proxy/esphome/infrared/irdroid/protocol.ex`
 
@@ -236,7 +236,7 @@ This mirrors the pure-data approach from `ZWave.Parser` -- a functional state ma
 **Key functions:**
 
 - `match?/1` -- takes enumeration info map, returns `true` if vendor_id and product_id match a known IRDroid device
-- `build_entity/2` -- takes a saved config map and enumeration info, returns an `%Entity{}` with `worker_module: Irdroid.DeviceWorker` and capabilities derived from the product ID
+- `build_entity/3` -- takes a saved config map, port path, and enumeration info, returns an `%Entity{}` with `device_module: Irdroid.Device` and capabilities derived from the product ID
 
 ### 5. Boundary Layer: `lib/universal_proxy/esphome/infrared/server.ex`
 
@@ -254,7 +254,7 @@ This mirrors the pure-data approach from `ZWave.Parser` -- a functional state ma
 
 **Responsibilities:**
 
-- **Init:** builds inventory by joining `UART.Store.all_configs()` (where `port_type == :infrared`) with `Circuits.UART.enumerate()` (matching serial number to path + reading product_id). For each device, consults registered product modules (currently only `Irdroid.Device`) via `match?/1` to identify it and `build_entity/2` to create an entity. Only configured + connected + recognized devices produce entities. Starts the appropriate worker (from `entity.worker_module`) for each entity under the `Infrared.WorkerSupervisor` DynamicSupervisor.
+- **Init:** builds inventory by joining `UART.Store.all_configs()` (where `port_type == :infrared`) with `Circuits.UART.enumerate()` (matching serial number to path + reading product_id). For each device, consults registered product modules (currently only `Irdroid.Device`) via `match?/1` to identify it and `build_entity/3` to create an entity. Only configured + connected + recognized devices produce entities. Starts the appropriate worker (via `entity.device_module.child_spec/2`) for each entity under the `Infrared.WorkerSupervisor` DynamicSupervisor.
 - `**list_entities/0`:** returns the current entity list (for `ListEntitiesRequest` handler)
 - `**transmit_raw/3`:** looks up worker by entity key, delegates transmit call
 - `**subscribe/1`:** adds connection pid to subscribers set, monitors it. Receive events from workers are forwarded to all subscribers.

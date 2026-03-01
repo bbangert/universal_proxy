@@ -18,8 +18,9 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.Protocol do
 
   ## Timing conversion
 
-  The device uses 16-bit timer counts at ~21.3333 us per count
-  (48 MHz / 256 prescaler). Conversion:
+  The PIC18F2550 runs at 48 MHz Fosc but the instruction clock is Fosc/4 =
+  12 MHz. Timer0 with a 1:256 prescaler gives 12 MHz / 256 = 46,875 Hz,
+  or ~21.3333 us per count. Conversion:
 
   - Device -> ESPHome: `round(raw_count * 21.3333)` us, alternating sign
   - ESPHome -> Device: `round(abs(us) / 21.3333)` as big-endian uint16
@@ -29,8 +30,8 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.Protocol do
 
   import Bitwise
 
-  @us_per_count 48_000_000 / 256 / 1_000_000
-  @count_to_us 1 / @us_per_count
+  @counts_per_us 48_000_000 / 4 / 256 / 1_000_000
+  @us_per_count 1 / @counts_per_us
 
   @type mode :: :idle | :version | :mode_ack | :receive | :transmit
 
@@ -107,7 +108,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.Protocol do
     timing_bytes =
       timings
       |> Enum.map(fn us ->
-        count = round(abs(us) * @us_per_count)
+        count = round(abs(us) * @counts_per_us)
         count = count |> max(1) |> min(0xFFFE)
         <<count::big-unsigned-16>>
       end)
@@ -189,7 +190,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.Protocol do
         parse(state, rest, actions ++ [{:rx_timings, timings}])
       end
     else
-      us = round(raw * @count_to_us)
+      us = round(raw * @us_per_count)
       timing = if state.pulse, do: us, else: -us
       state = %{state | rx_timings: [timing | state.rx_timings], pulse: not state.pulse}
       parse(state, rest, actions)

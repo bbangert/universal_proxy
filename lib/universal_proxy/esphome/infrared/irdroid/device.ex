@@ -48,7 +48,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.Device do
     %{
       id: entity.key,
       start: {DeviceWorker, :start_link, [[entity: entity, server_pid: server_pid]]},
-      restart: :temporary
+      restart: :transient
     }
   end
 
