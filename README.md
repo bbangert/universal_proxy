@@ -24,6 +24,7 @@ microcontroller for each one.
 - Automatic mDNS advertisement -- discovered by Home Assistant like any ESPHome device
 - Serial proxy for TTL, RS-232, and RS-485 USB adapters
 - Z-Wave proxy for USB Z-Wave controllers with local ACK handling
+- Auto-detection for IRDroid / IR Toy USB infrared devices (VID `0x04D8`, PID `0xFD08`/`0xF58B`)
 - Web UI for configuration (accessible at `http://<device-ip>`)
 - USB hotplug detection -- plug/unplug serial adapters at any time
 - DETS-backed persistent device configuration across reboots
@@ -82,6 +83,12 @@ ACK/NAK/CAN responses locally (avoiding network round-trip latency). Complete
 frames are forwarded to Home Assistant's Z-Wave JS integration over the ESPHome
 API. Only one Home Assistant instance can subscribe to the Z-Wave proxy at a
 time.
+
+IRDroid / IR Toy USB infrared devices are also **auto-detected** by USB ID
+(VID `0x04D8`, PID `0xFD08` or `0xF58B`) and shown in Connected Devices with an
+"Auto-detected" badge. When connected, these infrared devices are exposed to
+Home Assistant via the ESPHome Native API as **Infrared entities**, supporting
+infrared transmit and receive operations.
 
 ### Editing ESPHome device configuration
 

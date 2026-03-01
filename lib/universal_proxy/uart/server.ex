@@ -25,6 +25,9 @@ defmodule UniversalProxy.UART.Server do
 
   @pubsub UniversalProxy.PubSub
   @hotplug_interval 5_000
+  @irdroid_vendor_id 0x04D8
+  @irdroid_product_ids MapSet.new([0xFD08, 0xF58B])
+  @irdroid_product "IRDroid / IR Toy"
 
   # -- Client API --
 
@@ -113,7 +116,7 @@ defmodule UniversalProxy.UART.Server do
   def init(_opts) do
     :timer.send_interval(@hotplug_interval, self(), :check_hotplug)
     known = current_serial_set()
-    auto_detect_zwave_devices()
+    auto_detect_known_devices()
     Logger.info("UART server started, #{MapSet.size(known)} serial devices detected")
     {:ok, %{ports: %{}, known_serials: known}}
   end
@@ -225,7 +228,7 @@ defmodule UniversalProxy.UART.Server do
 
       if MapSet.size(added) > 0 do
         Logger.info("UART hotplug: devices added: #{Enum.join(added, ", ")}")
-        auto_detect_zwave_devices()
+        auto_detect_known_devices()
       end
 
       if MapSet.size(removed) > 0 do
@@ -354,6 +357,11 @@ defmodule UniversalProxy.UART.Server do
   @zwa2_pid 0x4001
   @zwa2_product "Nabu Casa ZWA-2"
 
+  defp auto_detect_known_devices do
+    auto_detect_zwave_devices()
+    auto_detect_infrared_devices()
+  end
+
   defp auto_detect_zwave_devices do
     enumerated = Circuits.UART.enumerate()
     store = UniversalProxy.UART.Store
@@ -378,8 +386,55 @@ defmodule UniversalProxy.UART.Server do
     e -> Logger.warning("Z-Wave auto-detection failed: #{inspect(e)}")
   end
 
+  defp auto_detect_infrared_devices do
+    enumerated = Circuits.UART.enumerate()
+    store = UniversalProxy.UART.Store
+
+    enumerated
+    |> Enum.filter(fn {_path, info} -> irdroid_device?(info) end)
+    |> Enum.each(fn {_path, info} ->
+      serial = info[:serial_number]
+
+      if present?(serial) do
+        case store.get_config(serial) do
+          {:ok, _} ->
+            :ok
+
+          :error ->
+            vendor_id = format_usb_id(info[:vendor_id])
+            product_id = format_usb_id(info[:product_id])
+
+            Logger.info(
+              "Auto-detected #{@irdroid_product} (SN: #{serial}, VID:#{vendor_id}, PID:#{product_id}), configuring as infrared device"
+            )
+
+            store.save_config(serial, %{port_type: :infrared, friendly_name: @irdroid_product})
+        end
+      end
+    end)
+  rescue
+    e -> Logger.warning("Infrared auto-detection failed: #{inspect(e)}")
+  end
+
   @doc false
   def zwa2_device?(info) do
     info[:vendor_id] == @zwa2_vid and info[:product_id] == @zwa2_pid
   end
+
+  @doc false
+  def irdroid_device?(info) do
+    vendor_id_matches?(info[:vendor_id]) and product_id_matches?(info[:product_id])
+  end
+
+  defp vendor_id_matches?(id) when is_integer(id), do: id == @irdroid_vendor_id
+  defp vendor_id_matches?(id) when is_binary(id), do: UniversalProxy.USB.parse_id(id) == @irdroid_vendor_id
+  defp vendor_id_matches?(_), do: false
+
+  defp product_id_matches?(id) when is_integer(id), do: MapSet.member?(@irdroid_product_ids, id)
+  defp product_id_matches?(id) when is_binary(id), do: MapSet.member?(@irdroid_product_ids, UniversalProxy.USB.parse_id(id))
+  defp product_id_matches?(_), do: false
+
+  defp format_usb_id(id) when is_integer(id), do: "0x" <> String.upcase(Integer.to_string(id, 16))
+  defp format_usb_id(id) when is_binary(id), do: id
+  defp format_usb_id(_), do: "?"
 end
