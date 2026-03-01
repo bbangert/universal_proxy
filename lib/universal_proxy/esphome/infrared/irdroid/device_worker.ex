@@ -69,7 +69,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
     case open_uart(entity.port_path) do
       {:ok, uart_pid} ->
         state = %{state | uart_pid: uart_pid}
-        initialize_device(state)
+        state = initialize_device(state)
         {:ok, state}
 
       {:error, reason} ->
@@ -137,6 +137,8 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
 
     if Entity.can_receive?(state.entity) do
       enter_receive_mode(state)
+    else
+      state
     end
   end
 

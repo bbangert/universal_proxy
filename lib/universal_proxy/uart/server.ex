@@ -426,36 +426,12 @@ defmodule UniversalProxy.UART.Server do
   end
 
   defp vendor_id_matches?(id) when is_integer(id), do: id == @irdroid_vendor_id
-  defp vendor_id_matches?(id) when is_binary(id), do: parse_usb_id(id) == @irdroid_vendor_id
+  defp vendor_id_matches?(id) when is_binary(id), do: UniversalProxy.USB.parse_id(id) == @irdroid_vendor_id
   defp vendor_id_matches?(_), do: false
 
   defp product_id_matches?(id) when is_integer(id), do: MapSet.member?(@irdroid_product_ids, id)
-  defp product_id_matches?(id) when is_binary(id), do: MapSet.member?(@irdroid_product_ids, parse_usb_id(id))
+  defp product_id_matches?(id) when is_binary(id), do: MapSet.member?(@irdroid_product_ids, UniversalProxy.USB.parse_id(id))
   defp product_id_matches?(_), do: false
-
-  defp parse_usb_id(value) when is_binary(value) do
-    normalized =
-      value
-      |> String.trim()
-      |> String.downcase()
-    cond do
-      normalized == "" ->
-        nil
-
-      String.starts_with?(normalized, "0x") ->
-        parse_base(String.trim_leading(normalized, "0x"), 16)
-
-      true ->
-        parse_base(normalized, 10) || parse_base(normalized, 16)
-    end
-  end
-
-  defp parse_base(value, base) do
-    case Integer.parse(value, base) do
-      {parsed, ""} -> parsed
-      _ -> nil
-    end
-  end
 
   defp format_usb_id(id) when is_integer(id), do: "0x" <> String.upcase(Integer.to_string(id, 16))
   defp format_usb_id(id) when is_binary(id), do: id

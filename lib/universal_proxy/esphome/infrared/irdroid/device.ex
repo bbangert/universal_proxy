@@ -21,15 +21,15 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.Device do
 
   @impl true
   def match?(info) when is_map(info) do
-    vid = parse_usb_id(info[:vendor_id])
-    pid = parse_usb_id(info[:product_id])
+    vid = UniversalProxy.USB.parse_id(info[:vendor_id])
+    pid = UniversalProxy.USB.parse_id(info[:product_id])
 
     vid == @vendor_id and is_map_key(@known_product_ids, pid)
   end
 
   @impl true
   def build_entity(config, port_path, info) do
-    pid = parse_usb_id(info[:product_id])
+    pid = UniversalProxy.USB.parse_id(info[:product_id])
     serial = config[:serial_number]
     capabilities = Map.get(@known_product_ids, pid, [:transmit])
 
@@ -55,32 +55,4 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.Device do
   @impl true
   defdelegate transmit(worker, timings, opts), to: DeviceWorker
 
-  defp parse_usb_id(value) when is_integer(value), do: value
-
-  defp parse_usb_id(value) when is_binary(value) do
-    normalized = value |> String.trim() |> String.downcase()
-
-    cond do
-      normalized == "" ->
-        nil
-
-      String.starts_with?(normalized, "0x") ->
-        case Integer.parse(String.trim_leading(normalized, "0x"), 16) do
-          {parsed, ""} -> parsed
-          _ -> nil
-        end
-
-      true ->
-        case Integer.parse(normalized, 10) do
-          {parsed, ""} -> parsed
-          _ ->
-            case Integer.parse(normalized, 16) do
-              {parsed, ""} -> parsed
-              _ -> nil
-            end
-        end
-    end
-  end
-
-  defp parse_usb_id(_), do: nil
 end
