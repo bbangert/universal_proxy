@@ -94,6 +94,11 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
     {:noreply, state}
   end
 
+  def handle_info({:circuits_uart, _port, {:error, reason}}, state) do
+    Logger.warning("IRDroid UART error on #{state.port_path}: #{inspect(reason)}")
+    {:noreply, state}
+  end
+
   def handle_info(_msg, state) do
     {:noreply, state}
   end
