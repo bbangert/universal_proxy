@@ -187,7 +187,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
 
   defp await_mode_ack(state) do
     receive do
-      {:circuits_uart, _port, data} ->
+      {:circuits_uart, _port, data} when is_binary(data) ->
         {protocol, actions} = Protocol.feed(state.protocol, data)
         state = %{state | protocol: protocol}
 
@@ -200,6 +200,10 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
           state = execute_actions(state, actions)
           await_mode_ack(state)
         end
+
+      {:circuits_uart, _port, {:error, reason}} ->
+        Logger.warning("IRDroid UART error during mode ack on #{state.port_path}: #{inspect(reason)}")
+        {:error, {:uart_error, reason}}
     after
       @mode_ack_timeout ->
         Logger.warning("IRDroid mode ack timeout on #{state.port_path}")
@@ -209,7 +213,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
 
   defp await_tx_completion(state) do
     receive do
-      {:circuits_uart, _port, data} ->
+      {:circuits_uart, _port, data} when is_binary(data) ->
         {protocol, actions} = Protocol.feed(state.protocol, data)
         state = %{state | protocol: protocol}
 
@@ -224,6 +228,10 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
           true ->
             await_tx_completion(state)
         end
+
+      {:circuits_uart, _port, {:error, reason}} ->
+        Logger.warning("IRDroid UART error during TX on #{state.port_path}: #{inspect(reason)}")
+        {:error, {:uart_error, reason}, state}
     after
       @tx_completion_timeout ->
         Logger.warning("IRDroid TX completion timeout on #{state.port_path}")
@@ -249,7 +257,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
     state = %{state | protocol: protocol, current_mode: :receive}
 
     receive do
-      {:circuits_uart, _port, data} ->
+      {:circuits_uart, _port, data} when is_binary(data) ->
         {protocol, actions} = Protocol.feed(state.protocol, data)
         state = %{state | protocol: protocol}
 
@@ -261,6 +269,10 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
           protocol = Protocol.set_receive_mode(state.protocol)
           %{state | protocol: protocol}
         end
+
+      {:circuits_uart, _port, {:error, reason}} ->
+        Logger.warning("IRDroid UART error entering RX mode on #{state.port_path}: #{inspect(reason)}")
+        state
     after
       @mode_ack_timeout ->
         Logger.warning("IRDroid RX mode ack timeout on #{state.port_path}")
