@@ -19,7 +19,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Entity do
           port_path: String.t(),
           product_id: non_neg_integer(),
           capabilities: [capability()],
-          worker_module: module()
+          device_module: module()
         }
 
   defstruct [
@@ -30,7 +30,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Entity do
     :port_path,
     :product_id,
     :capabilities,
-    :worker_module
+    :device_module
   ]
 
   @capability_transmit 0x01
@@ -54,7 +54,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Entity do
       port_path: Keyword.fetch!(attrs, :port_path),
       product_id: Keyword.fetch!(attrs, :product_id),
       capabilities: Keyword.fetch!(attrs, :capabilities),
-      worker_module: Keyword.fetch!(attrs, :worker_module)
+      device_module: Keyword.fetch!(attrs, :device_module)
     }
   end
 

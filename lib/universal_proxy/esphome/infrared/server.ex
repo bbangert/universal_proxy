@@ -82,10 +82,10 @@ defmodule UniversalProxy.ESPHome.Infrared.Server do
 
   def handle_call({:transmit_raw, key, timings, opts}, _from, state) do
     case Map.fetch(state.workers, key) do
-      {:ok, worker_pid} ->
+      {:ok, {device_module, worker_pid}} ->
         result =
           try do
-            GenServer.call(worker_pid, {:transmit, timings, opts}, 12_000)
+            device_module.transmit(worker_pid, timings, opts)
           catch
             :exit, reason -> {:error, {:worker_exit, reason}}
           end
@@ -130,10 +130,10 @@ defmodule UniversalProxy.ESPHome.Infrared.Server do
       {:noreply, remove_subscriber(state, pid)}
     else
       worker_entry =
-        Enum.find(state.workers, fn {_key, worker_pid} -> worker_pid == pid end)
+        Enum.find(state.workers, fn {_key, {_mod, worker_pid}} -> worker_pid == pid end)
 
       case worker_entry do
-        {key, _pid} ->
+        {key, {_mod, _pid}} ->
           Logger.warning("Infrared worker for key #{key} crashed, removing")
           {:noreply, %{state | workers: Map.delete(state.workers, key)}}
 
@@ -204,7 +204,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Server do
       end)
 
     entities = Enum.map(entities_and_workers, &elem(&1, 0))
-    workers = Enum.into(entities_and_workers, %{}, fn {e, pid} -> {e.key, pid} end)
+    workers = Enum.into(entities_and_workers, %{}, fn {e, pid} -> {e.key, {e.device_module, pid}} end)
     {entities, workers}
   rescue
     e ->
@@ -220,12 +220,8 @@ defmodule UniversalProxy.ESPHome.Infrared.Server do
   end
 
   defp start_worker(entity) do
-    child_spec = {
-      entity.worker_module,
-      entity: entity, server_pid: self()
-    }
-
-    DynamicSupervisor.start_child(@worker_supervisor, child_spec)
+    spec = entity.device_module.child_spec(entity, self())
+    DynamicSupervisor.start_child(@worker_supervisor, spec)
   end
 
   defp present?(nil), do: false

@@ -1,10 +1,13 @@
 defmodule UniversalProxy.ESPHome.Infrared.Irdroid.Device do
   @moduledoc """
-  IRDroid-specific device identification and entity factory.
+  IRDroid-specific implementation of the `Infrared.Device` behaviour.
 
-  Encapsulates the USB vendor/product ID matching and per-PID capability
-  mapping for the IRDroid / IR Toy family of USB infrared transceivers.
+  Encapsulates USB vendor/product ID matching, per-PID capability mapping,
+  worker lifecycle, and transmit delegation for the IRDroid / IR Toy family
+  of USB infrared transceivers.
   """
+
+  @behaviour UniversalProxy.ESPHome.Infrared.Device
 
   alias UniversalProxy.ESPHome.Infrared.Entity
   alias UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker
@@ -16,10 +19,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.Device do
     0xF58B => [:transmit, :receive]
   }
 
-  @doc """
-  Returns true if the enumeration info map matches a known IRDroid device.
-  """
-  @spec match?(map()) :: boolean()
+  @impl true
   def match?(info) when is_map(info) do
     vid = parse_usb_id(info[:vendor_id])
     pid = parse_usb_id(info[:product_id])
@@ -27,12 +27,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.Device do
     vid == @vendor_id and is_map_key(@known_product_ids, pid)
   end
 
-  @doc """
-  Build an `%Entity{}` from a saved UART config and enumeration info.
-
-  The config comes from `UART.Store`, the info from `Circuits.UART.enumerate()`.
-  """
-  @spec build_entity(map(), String.t(), map()) :: Entity.t()
+  @impl true
   def build_entity(config, port_path, info) do
     pid = parse_usb_id(info[:product_id])
     serial = config[:serial_number]
@@ -44,9 +39,21 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.Device do
       product_id: pid,
       name: config[:friendly_name] || "IRDroid / IR Toy",
       capabilities: capabilities,
-      worker_module: DeviceWorker
+      device_module: __MODULE__
     )
   end
+
+  @impl true
+  def child_spec(entity, server_pid) do
+    %{
+      id: entity.key,
+      start: {DeviceWorker, :start_link, [[entity: entity, server_pid: server_pid]]},
+      restart: :temporary
+    }
+  end
+
+  @impl true
+  defdelegate transmit(worker, timings, opts), to: DeviceWorker
 
   defp parse_usb_id(value) when is_integer(value), do: value
 

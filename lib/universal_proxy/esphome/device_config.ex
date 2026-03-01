@@ -13,6 +13,14 @@ defmodule UniversalProxy.ESPHome.DeviceConfig do
   @default_port 6053
   @api_version_major 1
   @api_version_minor 10
+  @compilation_time (fn ->
+                       {{y, mo, d}, {h, mi, s}} = :erlang.universaltime()
+                       months = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
+                       month = elem(months, mo - 1)
+                       pad2 = fn n -> n |> Integer.to_string() |> String.pad_leading(2, "0") end
+                       day_str = d |> Integer.to_string() |> String.pad_leading(2)
+                       "#{month} #{day_str} #{y}, #{pad2.(h)}:#{pad2.(mi)}:#{pad2.(s)}"
+                     end).()
 
   @type t :: %__MODULE__{
           name: String.t(),
@@ -32,7 +40,7 @@ defmodule UniversalProxy.ESPHome.DeviceConfig do
             friendly_name: "Universal Proxy",
             mac_address: "00:00:00:00:00:00",
             esphome_version: "2026.1.0",
-            compilation_time: "",
+            compilation_time: @compilation_time,
             model: "Universal Proxy",
             manufacturer: "UniversalProxy",
             suggested_area: "",
@@ -136,26 +144,56 @@ defmodule UniversalProxy.ESPHome.DeviceConfig do
   end
 
   @doc """
-  Detect the MAC address of the `eth0` network interface.
+  Detect the MAC address from the first available network interface.
 
-  Returns the hardware address as an `"AA:BB:CC:DD:EE:FF"` string,
-  or `"00:00:00:00:00:00"` if the interface is not found.
+  Tries `eth0`, `end0`, `wlan0`, and `wlp*` in order. Returns the
+  hardware address as an `"AA:BB:CC:DD:EE:FF"` string, or
+  `"00:00:00:00:00:00"` if no suitable interface is found.
   """
   @spec detect_mac_address() :: String.t()
   def detect_mac_address do
-    with {:ok, ifaddrs} <- :inet.getifaddrs(),
-         {_name, opts} <- List.keyfind(ifaddrs, ~c"eth0", 0),
-         [_ | _] = hwaddr <- Keyword.get(opts, :hwaddr) do
+    case :inet.getifaddrs() do
+      {:ok, ifaddrs} ->
+        find_hwaddr(ifaddrs, [~c"eth0", ~c"end0", ~c"wlan0"]) ||
+          find_first_hwaddr(ifaddrs) ||
+          "00:00:00:00:00:00"
+
+      _ ->
+        "00:00:00:00:00:00"
+    end
+  end
+
+  defp find_hwaddr(ifaddrs, candidates) do
+    Enum.find_value(candidates, fn name ->
+      case List.keyfind(ifaddrs, name, 0) do
+        {_name, opts} -> format_hwaddr(Keyword.get(opts, :hwaddr))
+        nil -> nil
+      end
+    end)
+  end
+
+  defp find_first_hwaddr(ifaddrs) do
+    Enum.find_value(ifaddrs, fn {name, opts} ->
+      if name != ~c"lo" do
+        format_hwaddr(Keyword.get(opts, :hwaddr))
+      end
+    end)
+  end
+
+  defp format_hwaddr([_ | _] = hwaddr) when length(hwaddr) == 6 do
+    if Enum.all?(hwaddr, &(&1 == 0)) do
+      nil
+    else
       hwaddr
       |> Enum.map(fn byte ->
         byte |> Integer.to_string(16) |> String.pad_leading(2, "0")
       end)
       |> Enum.join(":")
       |> String.upcase()
-    else
-      _ -> "00:00:00:00:00:00"
     end
   end
+
+  defp format_hwaddr(_), do: nil
 
   # Bit 0 = FEATURE_ZWAVE_PROXY_ENABLED
   defp zwave_feature_flags do

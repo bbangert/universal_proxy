@@ -10,7 +10,7 @@ defmodule UniversalProxy.ESPHome.Infrared.EntityTest do
     product_id: 0xF58B,
     name: "Test IR Device",
     capabilities: [:transmit, :receive],
-    worker_module: SomeWorker
+    device_module: SomeDevice
   ]
 
   describe "new/1" do
@@ -24,7 +24,7 @@ defmodule UniversalProxy.ESPHome.Infrared.EntityTest do
       assert entity.port_path == "/dev/ttyACM0"
       assert entity.product_id == 0xF58B
       assert entity.capabilities == [:transmit, :receive]
-      assert entity.worker_module == SomeWorker
+      assert entity.device_module == SomeDevice
     end
 
     test "same serial number always produces same key" do

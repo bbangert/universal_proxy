@@ -2,7 +2,6 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceTest do
   use ExUnit.Case, async: true
 
   alias UniversalProxy.ESPHome.Infrared.Irdroid.Device
-  alias UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker
 
   describe "match?/1" do
     test "matches IRDroid transceiver (0x04D8 / 0xF58B)" do
@@ -54,7 +53,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceTest do
       assert entity.product_id == 0xF58B
       assert :transmit in entity.capabilities
       assert :receive in entity.capabilities
-      assert entity.worker_module == DeviceWorker
+      assert entity.device_module == Device
     end
 
     test "builds entity with transmit-only for PID 0xFD08" do

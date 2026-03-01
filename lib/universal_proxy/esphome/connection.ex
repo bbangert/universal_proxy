@@ -21,6 +21,7 @@ defmodule UniversalProxy.ESPHome.Connection do
   alias UniversalProxy.{Protos, UART}
 
   @pubsub UniversalProxy.PubSub
+  @status_key :erlang.phash2("status_binary_sensor", 0xFFFFFFFF)
 
   @impl ThousandIsland.Handler
   def handle_connection(socket, _state) do
@@ -204,18 +205,35 @@ defmodule UniversalProxy.ESPHome.Connection do
   end
 
   defp dispatch(%Protos.ListEntitiesRequest{}, socket, state) do
+    send_message(%Protos.ListEntitiesBinarySensorResponse{
+      object_id: "status",
+      key: @status_key,
+      name: "Status",
+      device_class: "connectivity",
+      is_status_binary_sensor: true,
+      disabled_by_default: false,
+      icon: "",
+      entity_category: :ENTITY_CATEGORY_DIAGNOSTIC
+    }, socket)
+
     ir_entities = Infrared.list_entities()
 
     Enum.each(ir_entities, fn entity ->
       send_message(IREntity.to_list_entities_response(entity), socket)
     end)
 
-    Logger.info("ESPHome client #{state.peer} list entities requested (#{length(ir_entities)} infrared)")
+    Logger.info("ESPHome client #{state.peer} list entities requested (1 status + #{length(ir_entities)} infrared)")
     send_message(%Protos.ListEntitiesDoneResponse{}, socket)
     {:ok, state}
   end
 
-  defp dispatch(%Protos.SubscribeStatesRequest{}, _socket, state) do
+  defp dispatch(%Protos.SubscribeStatesRequest{}, socket, state) do
+    send_message(%Protos.BinarySensorStateResponse{
+      key: @status_key,
+      state: true,
+      missing_state: false
+    }, socket)
+
     Logger.info("ESPHome client #{state.peer} subscribed to states")
     {:ok, state}
   end
