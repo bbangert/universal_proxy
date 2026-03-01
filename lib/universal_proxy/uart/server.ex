@@ -417,13 +417,6 @@ defmodule UniversalProxy.UART.Server do
   end
 
   defp zwa2_device?(info) do
-    manufacturer = to_string(info[:manufacturer] || "")
-    description = to_string(info[:description] || "")
-
-    String.contains?(manufacturer, @zwa2_manufacturer) and
-      String.contains?(description, @zwa2_product)
-  @doc false
-  def zwa2_device?(info) do
     info[:vendor_id] == @zwa2_vid and info[:product_id] == @zwa2_pid
   end
 
