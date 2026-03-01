@@ -146,8 +146,9 @@ defmodule UniversalProxy.ESPHome.DeviceConfig do
   @doc """
   Detect the MAC address from the first available network interface.
 
-  Tries `eth0`, `end0`, `wlan0`, and `wlp*` in order. Returns the
-  hardware address as an `"AA:BB:CC:DD:EE:FF"` string, or
+  Tries `eth0`, `end0`, and `wlan0` in order, then falls back to the
+  first non-loopback interface with a non-zero hardware address. Returns
+  the address as an `"AA:BB:CC:DD:EE:FF"` string, or
   `"00:00:00:00:00:00"` if no suitable interface is found.
   """
   @spec detect_mac_address() :: String.t()

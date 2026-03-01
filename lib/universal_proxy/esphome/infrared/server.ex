@@ -138,8 +138,26 @@ defmodule UniversalProxy.ESPHome.Infrared.Server do
 
       case worker_entry do
         {key, {_mod, _pid}} ->
-          Logger.warning("Infrared worker for key #{key} crashed, removing")
-          {:noreply, %{state | workers: Map.delete(state.workers, key)}}
+          Logger.warning("Infrared worker for key #{key} crashed, attempting restart")
+          entity = Enum.find(state.entities, &(&1.key == key))
+
+          if entity do
+            case start_worker(entity) do
+              {:ok, new_pid} ->
+                Logger.info("Infrared worker for key #{key} restarted")
+                workers = Map.put(state.workers, key, {entity.device_module, new_pid})
+                {:noreply, %{state | workers: workers}}
+
+              {:error, reason} ->
+                Logger.error(
+                  "Failed to restart infrared worker for key #{key}: #{inspect(reason)}"
+                )
+
+                {:noreply, %{state | workers: Map.delete(state.workers, key)}}
+            end
+          else
+            {:noreply, %{state | workers: Map.delete(state.workers, key)}}
+          end
 
         nil ->
           {:noreply, state}

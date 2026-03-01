@@ -201,7 +201,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
     after
       @mode_ack_timeout ->
         Logger.warning("IRDroid mode ack timeout on #{state.port_path}")
-        {:ok, state}
+        {:error, :mode_ack_timeout}
     end
   end
 
@@ -225,7 +225,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
     after
       @tx_completion_timeout ->
         Logger.warning("IRDroid TX completion timeout on #{state.port_path}")
-        {:ok, state}
+        {:error, :tx_timeout, state}
     end
   end
 
