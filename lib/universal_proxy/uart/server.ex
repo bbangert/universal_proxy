@@ -352,8 +352,10 @@ defmodule UniversalProxy.UART.Server do
     )
   end
 
-  @zwa2_manufacturer "Nabu Casa"
-  @zwa2_product "ZWA-2"
+  # ZWA-2 USB VID/PID from Home Assistant's zwave_js manifest.
+  @zwa2_vid 0x303A
+  @zwa2_pid 0x4001
+  @zwa2_product "Nabu Casa ZWA-2"
 
   defp auto_detect_known_devices do
     auto_detect_zwave_devices()
@@ -420,6 +422,9 @@ defmodule UniversalProxy.UART.Server do
 
     String.contains?(manufacturer, @zwa2_manufacturer) and
       String.contains?(description, @zwa2_product)
+  @doc false
+  def zwa2_device?(info) do
+    info[:vendor_id] == @zwa2_vid and info[:product_id] == @zwa2_pid
   end
 
   defp irdroid_device?(info) do
