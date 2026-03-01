@@ -53,7 +53,7 @@ defmodule UniversalProxy.USB do
 
   defp parse_int(value, base) do
     case Integer.parse(value, base) do
-      {parsed, ""} -> parsed
+      {parsed, ""} when parsed >= 0 -> parsed
       _ -> nil
     end
   end

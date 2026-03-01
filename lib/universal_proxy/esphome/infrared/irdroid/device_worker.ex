@@ -66,15 +66,14 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
       server_pid: server_pid
     }
 
-    case open_uart(entity.port_path) do
-      {:ok, uart_pid} ->
-        state = %{state | uart_pid: uart_pid}
-        state = initialize_device(state)
-        {:ok, state}
-
+    with {:ok, uart_pid} <- open_uart(entity.port_path),
+         state = %{state | uart_pid: uart_pid},
+         {:ok, state} <- initialize_device(state) do
+      {:ok, state}
+    else
       {:error, reason} ->
-        Logger.error("IRDroid worker failed to open #{entity.port_path}: #{inspect(reason)}")
-        {:stop, {:uart_open_failed, reason}}
+        Logger.error("IRDroid worker failed to start on #{entity.port_path}: #{inspect(reason)}")
+        {:stop, {:init_failed, reason}}
     end
   end
 
@@ -96,7 +95,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
 
   def handle_info({:circuits_uart, _port, {:error, reason}}, state) do
     Logger.warning("IRDroid UART error on #{state.port_path}: #{inspect(reason)}")
-    {:noreply, state}
+    {:stop, {:uart_error, reason}, state}
   end
 
   def handle_info(_msg, state) do
@@ -135,15 +134,18 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
   end
 
   defp initialize_device(state) do
-    uart_write(state, Protocol.reset())
-    Process.sleep(50)
-    uart_write(state, Protocol.get_version())
-    Process.sleep(50)
+    with :ok <- uart_write(state, Protocol.reset()),
+         _ = Process.sleep(50),
+         :ok <- uart_write(state, Protocol.get_version()),
+         _ = Process.sleep(50) do
+      state =
+        if Entity.can_receive?(state.entity) do
+          enter_receive_mode(state)
+        else
+          state
+        end
 
-    if Entity.can_receive?(state.entity) do
-      enter_receive_mode(state)
-    else
-      state
+      {:ok, state}
     end
   end
 
@@ -172,21 +174,14 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
   end
 
   defp switch_to_transmit_mode(state) do
-    uart_write(state, Protocol.reset())
-    Process.sleep(10)
-
-    protocol = Protocol.set_idle(state.protocol)
-    state = %{state | protocol: protocol, current_mode: :idle}
-
-    uart_write(state, Protocol.enter_transmit_mode())
-
-    case await_mode_ack(state) do
-      {:ok, state} ->
-        protocol = Protocol.set_transmit_mode(state.protocol)
-        {:ok, %{state | protocol: protocol, current_mode: :transmit}}
-
-      error ->
-        error
+    with :ok <- uart_write(state, Protocol.reset()),
+         _ = Process.sleep(10),
+         protocol = Protocol.set_idle(state.protocol),
+         state = %{state | protocol: protocol, current_mode: :idle},
+         :ok <- uart_write(state, Protocol.enter_transmit_mode()),
+         {:ok, state} <- await_mode_ack(state) do
+      protocol = Protocol.set_transmit_mode(state.protocol)
+      {:ok, %{state | protocol: protocol, current_mode: :transmit}}
     end
   end
 
@@ -196,10 +191,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
         {protocol, actions} = Protocol.feed(state.protocol, data)
         state = %{state | protocol: protocol}
 
-        if Enum.any?(actions, fn
-             {:mode_entered, _} -> true
-             _ -> false
-           end) do
+        if Enum.any?(actions, &match?({:mode_entered, _}, &1)) do
           {:ok, state}
         else
           state = execute_actions(state, actions)
@@ -258,7 +250,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
 
   defp enter_receive_mode(state) do
     uart_write(state, Protocol.enter_receive_mode())
-    protocol = state.protocol |> Protocol.set_idle()
+    protocol = Protocol.set_idle(state.protocol)
     state = %{state | protocol: protocol, current_mode: :receive}
 
     receive do
@@ -266,14 +258,12 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
         {protocol, actions} = Protocol.feed(state.protocol, data)
         state = %{state | protocol: protocol}
 
-        if Enum.any?(actions, &match?({:mode_entered, _}, &1)) do
-          protocol = Protocol.set_receive_mode(state.protocol)
-          %{state | protocol: protocol}
-        else
-          state = execute_actions(state, actions)
-          protocol = Protocol.set_receive_mode(state.protocol)
-          %{state | protocol: protocol}
-        end
+        state =
+          if Enum.any?(actions, &match?({:mode_entered, _}, &1)),
+            do: state,
+            else: execute_actions(state, actions)
+
+        %{state | protocol: Protocol.set_receive_mode(state.protocol)}
 
       {:circuits_uart, _port, {:error, reason}} ->
         Logger.warning("IRDroid UART error entering RX mode on #{state.port_path}: #{inspect(reason)}")
