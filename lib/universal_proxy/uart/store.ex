@@ -132,7 +132,7 @@ defmodule UniversalProxy.UART.Store do
     end
   end
 
-  @valid_port_types [:ttl, :rs232, :rs485, :zwave]
+  @valid_port_types [:ttl, :rs232, :rs485, :zwave, :infrared]
 
   defp normalize_config(params) when is_map(params) do
     port_type = to_atom(params[:port_type] || params["port_type"], :ttl)

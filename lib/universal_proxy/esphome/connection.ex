@@ -16,7 +16,8 @@ defmodule UniversalProxy.ESPHome.Connection do
 
   require Logger
 
-  alias UniversalProxy.ESPHome.{DeviceConfig, MessageTypes, Protocol, Server, ZWave}
+  alias UniversalProxy.ESPHome.{DeviceConfig, Infrared, MessageTypes, Protocol, Server, ZWave}
+  alias UniversalProxy.ESPHome.Infrared.Entity, as: IREntity
   alias UniversalProxy.{Protos, UART}
 
   @pubsub UniversalProxy.PubSub
@@ -38,7 +39,8 @@ defmodule UniversalProxy.ESPHome.Connection do
       peer: peer,
       instance_map: instance_map,
       opened_ports: %{},
-      zwave_subscribed: false
+      zwave_subscribed: false,
+      infrared_subscribed: false
     }}
   end
 
@@ -104,6 +106,15 @@ defmodule UniversalProxy.ESPHome.Connection do
     if state.zwave_subscribed do
       frame = %Protos.ZWaveProxyFrame{data: data}
       send_message(frame, socket)
+    end
+
+    {:noreply, {socket, state}}
+  end
+
+  def handle_info({:infrared_receive, key, timings}, {socket, state}) do
+    if state.infrared_subscribed do
+      event = %Protos.InfraredRFReceiveEvent{key: key, timings: timings}
+      send_message(event, socket)
     end
 
     {:noreply, {socket, state}}
@@ -193,7 +204,13 @@ defmodule UniversalProxy.ESPHome.Connection do
   end
 
   defp dispatch(%Protos.ListEntitiesRequest{}, socket, state) do
-    Logger.info("ESPHome client #{state.peer} list entities requested (0 entities)")
+    ir_entities = Infrared.list_entities()
+
+    Enum.each(ir_entities, fn entity ->
+      send_message(IREntity.to_list_entities_response(entity), socket)
+    end)
+
+    Logger.info("ESPHome client #{state.peer} list entities requested (#{length(ir_entities)} infrared)")
     send_message(%Protos.ListEntitiesDoneResponse{}, socket)
     {:ok, state}
   end
@@ -317,6 +334,27 @@ defmodule UniversalProxy.ESPHome.Connection do
     {:ok, state}
   end
 
+  # -- Infrared Proxy handlers --
+
+  defp dispatch(%Protos.InfraredRFTransmitRawTimingsRequest{} = req, _socket, state) do
+    state = maybe_subscribe_infrared(state)
+
+    opts = [
+      carrier_frequency: if(req.carrier_frequency > 0, do: req.carrier_frequency, else: 38_000),
+      repeat_count: if(req.repeat_count > 0, do: req.repeat_count, else: 1)
+    ]
+
+    case Infrared.transmit_raw(req.key, req.timings, opts) do
+      :ok ->
+        Logger.info("ESPHome client #{state.peer} infrared transmit OK (key=#{req.key}, #{length(req.timings)} timings)")
+
+      {:error, reason} ->
+        Logger.warning("ESPHome client #{state.peer} infrared transmit failed: #{inspect(reason)}")
+    end
+
+    {:ok, state}
+  end
+
   # -- Z-Wave Proxy handlers --
 
   defp dispatch(%Protos.ZWaveProxyRequest{type: :ZWAVE_PROXY_REQUEST_TYPE_SUBSCRIBE}, socket, state) do
@@ -378,6 +416,10 @@ defmodule UniversalProxy.ESPHome.Connection do
       ZWave.unsubscribe(self())
     end
 
+    if state.infrared_subscribed do
+      Infrared.unsubscribe(self())
+    end
+
     Enum.each(state.opened_ports, fn {instance, path} ->
       case UART.close(path) do
         :ok ->
@@ -409,6 +451,19 @@ defmodule UniversalProxy.ESPHome.Connection do
 
       _ ->
         "unknown"
+    end
+  end
+
+  defp maybe_subscribe_infrared(%{infrared_subscribed: true} = state), do: state
+
+  defp maybe_subscribe_infrared(state) do
+    case Infrared.subscribe(self()) do
+      :ok ->
+        Logger.info("ESPHome client #{state.peer} subscribed to infrared proxy")
+        %{state | infrared_subscribed: true}
+
+      _ ->
+        state
     end
   end
 
