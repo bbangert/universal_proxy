@@ -416,7 +416,8 @@ defmodule UniversalProxy.UART.Server do
     e -> Logger.warning("Infrared auto-detection failed: #{inspect(e)}")
   end
 
-  defp zwa2_device?(info) do
+  @doc false
+  def zwa2_device?(info) do
     info[:vendor_id] == @zwa2_vid and info[:product_id] == @zwa2_pid
   end
 
