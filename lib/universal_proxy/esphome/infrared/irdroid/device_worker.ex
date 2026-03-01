@@ -263,8 +263,8 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
         end
     after
       @mode_ack_timeout ->
-        protocol = Protocol.set_receive_mode(state.protocol)
-        %{state | protocol: protocol}
+        Logger.warning("IRDroid RX mode ack timeout on #{state.port_path}")
+        state
     end
   end
 
@@ -286,7 +286,12 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
 
   defp execute_action({:mode_entered, version}, state) do
     Logger.debug("IRDroid #{state.port_path} mode entered: #{version}")
-    state
+
+    if receive_pending?(state) do
+      %{state | protocol: Protocol.set_receive_mode(state.protocol)}
+    else
+      state
+    end
   end
 
   defp execute_action(:tx_complete, state) do
@@ -307,6 +312,10 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
     else
       state
     end
+  end
+
+  defp receive_pending?(state) do
+    state.current_mode == :receive and state.protocol.mode == :idle
   end
 
   defp uart_write(%{uart_pid: pid}, data) when pid != nil do
