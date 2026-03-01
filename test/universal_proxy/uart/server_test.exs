@@ -29,4 +29,36 @@ defmodule UniversalProxy.UART.ServerTest do
       refute Server.zwa2_device?(info)
     end
   end
+
+  describe "irdroid_device?/1" do
+    test "matches IRDroid by integer VID/PID" do
+      assert Server.irdroid_device?(%{vendor_id: 0x04D8, product_id: 0xFD08})
+      assert Server.irdroid_device?(%{vendor_id: 0x04D8, product_id: 0xF58B})
+    end
+
+    test "matches IRDroid by hex-string VID/PID" do
+      assert Server.irdroid_device?(%{vendor_id: "0x04D8", product_id: "0xFD08"})
+      assert Server.irdroid_device?(%{vendor_id: "0x04d8", product_id: "0xf58b"})
+    end
+
+    test "matches IRDroid by bare hex-string VID/PID" do
+      assert Server.irdroid_device?(%{vendor_id: "04D8", product_id: "FD08"})
+    end
+
+    test "matches IRDroid by decimal-string PID" do
+      assert Server.irdroid_device?(%{vendor_id: "1240", product_id: "64776"})
+    end
+
+    test "rejects wrong vendor" do
+      refute Server.irdroid_device?(%{vendor_id: 0x1234, product_id: 0xFD08})
+    end
+
+    test "rejects wrong product" do
+      refute Server.irdroid_device?(%{vendor_id: 0x04D8, product_id: 0x0000})
+    end
+
+    test "rejects missing keys" do
+      refute Server.irdroid_device?(%{serial_number: "abc123"})
+    end
+  end
 end

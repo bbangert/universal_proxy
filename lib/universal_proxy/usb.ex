@@ -31,7 +31,8 @@ defmodule UniversalProxy.USB do
       nil
   """
   @spec parse_id(term()) :: non_neg_integer() | nil
-  def parse_id(value) when is_integer(value), do: value
+  def parse_id(value) when is_integer(value) and value >= 0, do: value
+  def parse_id(value) when is_integer(value), do: nil
 
   def parse_id(value) when is_binary(value) do
     normalized = value |> String.trim() |> String.downcase()

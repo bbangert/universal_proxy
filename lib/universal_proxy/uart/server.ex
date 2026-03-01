@@ -421,7 +421,8 @@ defmodule UniversalProxy.UART.Server do
     info[:vendor_id] == @zwa2_vid and info[:product_id] == @zwa2_pid
   end
 
-  defp irdroid_device?(info) do
+  @doc false
+  def irdroid_device?(info) do
     vendor_id_matches?(info[:vendor_id]) and product_id_matches?(info[:product_id])
   end
 

@@ -8,7 +8,9 @@ Targets **firmware v2.5+** which added dedicated transmit (`'n'`) and receive (`
 
 ## Architecture
 
-Following the Data / Boundary / Lifecycle layering:
+> **Note:** The supervision tree and layering diagrams have been updated in
+> [09_infrared_architecture.md](09_infrared_architecture.md), which reflects
+> the `Infrared.Supervisor` extraction and behaviour refactor.
 
 ```mermaid
 graph TB
@@ -16,8 +18,10 @@ graph TB
     ESPHomeSup["ESPHome.Supervisor :rest_for_one"]
     ESPHomeSup --> ESPHomeServer["ESPHome.Server"]
     ESPHomeSup --> ZWaveServer["ZWave.Server"]
-    ESPHomeSup --> IRServer["Infrared.Server"]
+    ESPHomeSup --> IRSup["Infrared.Supervisor :one_for_all"]
     ESPHomeSup --> ThousandIsland["ThousandIsland TCP"]
+    IRSup --> WorkerSup["WorkerSupervisor (DynamicSupervisor)"]
+    IRSup --> IRServer["Infrared.Server"]
   end
 
   subgraph boundary ["Boundary (GenServers, product-agnostic)"]

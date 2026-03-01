@@ -6,9 +6,9 @@ defmodule UniversalProxy.ESPHome.Supervisor do
 
   1. `Server` -- holds device config and tracks connections (must be up first)
   2. `ZWave.Server` -- manages the Z-Wave UART port and frame parsing
-  3. `Infrared.WorkerSupervisor` -- DynamicSupervisor for per-device IR workers
-  4. `Infrared.Server` -- infrared inventory, subscriber tracking, transmit routing
-  5. `ThousandIsland` -- TCP server that accepts connections and spawns
+  3. `Infrared.Supervisor` -- groups the IR WorkerSupervisor and Server
+     under `:one_for_all` so both restart together
+  4. `ThousandIsland` -- TCP server that accepts connections and spawns
      `Connection` handler processes for each client
 
   If any server crashes, everything below restarts too (since Connection
@@ -51,8 +51,7 @@ defmodule UniversalProxy.ESPHome.Supervisor do
     children = [
       Server,
       {ZWave.Server, port_path: zwave_port_path},
-      {DynamicSupervisor, name: Infrared.WorkerSupervisor, strategy: :one_for_one},
-      Infrared.Server,
+      Infrared.Supervisor,
       {ThousandIsland,
        port: config.port,
        handler_module: Connection,
