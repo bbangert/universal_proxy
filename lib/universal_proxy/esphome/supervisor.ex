@@ -17,7 +17,8 @@ defmodule UniversalProxy.ESPHome.Supervisor do
 
   use Supervisor
 
-  alias UniversalProxy.ESPHome.{Connection, Infrared, Server, ZWave}
+  alias UniversalProxy.ESPHome.{Connection, DeviceConfig, Infrared, Server, ZWave}
+  alias UniversalProxy.UART.Store, as: UARTStore
 
   def start_link(init_arg) do
     Supervisor.start_link(__MODULE__, init_arg, name: __MODULE__)
@@ -45,7 +46,7 @@ defmodule UniversalProxy.ESPHome.Supervisor do
 
   @impl true
   def init(_init_arg) do
-    config = UniversalProxy.ESPHome.DeviceConfig.new()
+    config = DeviceConfig.new()
     zwave_port_path = resolve_zwave_port()
 
     children = [
@@ -64,7 +65,7 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   end
 
   defp resolve_zwave_port do
-    configs = UniversalProxy.UART.Store.all_configs()
+    configs = UARTStore.all_configs()
     enumerated = Circuits.UART.enumerate()
 
     serial_to_path =

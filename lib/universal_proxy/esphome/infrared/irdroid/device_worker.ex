@@ -134,18 +134,21 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
   end
 
   defp initialize_device(state) do
-    with :ok <- uart_write(state, Protocol.reset()),
-         _ = Process.sleep(50),
-         :ok <- uart_write(state, Protocol.get_version()),
-         _ = Process.sleep(50) do
-      state =
-        if Entity.can_receive?(state.entity) do
-          enter_receive_mode(state)
-        else
-          state
-        end
+    with :ok <- uart_write(state, Protocol.reset()) do
+      Process.sleep(50)
 
-      {:ok, state}
+      with :ok <- uart_write(state, Protocol.get_version()) do
+        Process.sleep(50)
+
+        state =
+          if Entity.can_receive?(state.entity) do
+            enter_receive_mode(state)
+          else
+            state
+          end
+
+        {:ok, state}
+      end
     end
   end
 
