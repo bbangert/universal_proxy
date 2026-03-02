@@ -16,7 +16,9 @@
   "postCreateCommand": "bash .devcontainer/setup.sh",
   "postStartCommand": "bash -c 'eval \"$(mise env)\" && mix archive.install hex nerves_bootstrap --force'",
   "remoteEnv": {
-    "MIX_TARGET": "rpi3"
+    "MIX_TARGET": "rpi3",
+    "PATH": "/home/ubuntu/.local/share/mise/shims:${containerEnv:PATH}",
+    "SHELL": "/bin/zsh"
   },
   "customizations": {
     "vscode": {
