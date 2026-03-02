@@ -136,6 +136,7 @@ defmodule UniversalProxy.ESPHome.DeviceConfig do
 
     %{
       id: :esphomelib,
+      instance_name: :unspecified,
       protocol: "esphomelib",
       transport: "tcp",
       port: config.port,

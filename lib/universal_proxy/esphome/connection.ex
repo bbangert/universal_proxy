@@ -479,14 +479,9 @@ defmodule UniversalProxy.ESPHome.Connection do
   defp maybe_subscribe_infrared(%{infrared_subscribed: true} = state), do: state
 
   defp maybe_subscribe_infrared(state) do
-    case Infrared.subscribe(self()) do
-      :ok ->
-        Logger.info("ESPHome client #{state.peer} subscribed to infrared proxy")
-        %{state | infrared_subscribed: true}
-
-      _ ->
-        state
-    end
+    Infrared.subscribe(self())
+    Logger.info("ESPHome client #{state.peer} subscribed to infrared proxy")
+    %{state | infrared_subscribed: true}
   end
 
   defp send_message(message, socket) do

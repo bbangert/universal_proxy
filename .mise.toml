@@ -4,3 +4,7 @@ elixir = "1.19.5-otp-28"
 
 [env]
 MIX_TARGET = "rpi3"
+
+[tasks.test]
+description = "Run tests with MIX_TARGET=host"
+run = "MIX_TARGET=host mix test"

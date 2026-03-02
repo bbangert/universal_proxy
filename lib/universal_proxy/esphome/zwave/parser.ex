@@ -47,7 +47,6 @@ defmodule UniversalProxy.ESPHome.ZWave.Parser do
           | :wait_checksum
           | :send_ack
           | :send_nak
-          | :send_can
           | :read_bl_menu
 
   @type action ::
@@ -201,12 +200,11 @@ defmodule UniversalProxy.ESPHome.ZWave.Parser do
   # -- Response handling (mirrors C++ response_handler_) --
 
   defp handle_response(%{state: state} = parser, actions)
-       when state in [:send_ack, :send_nak, :send_can] do
+       when state in [:send_ack, :send_nak] do
     response_byte =
       case state do
         :send_ack -> Frame.ack()
         :send_nak -> Frame.nak()
-        :send_can -> Frame.can()
       end
 
     parser = %{parser | last_response: response_byte, state: :wait_start}

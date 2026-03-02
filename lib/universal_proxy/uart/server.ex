@@ -329,13 +329,18 @@ defmodule UniversalProxy.UART.Server do
     end
   end
 
+  @spec current_serial_set() :: MapSet.t(String.t())
   defp current_serial_set do
-    Circuits.UART.enumerate()
-    |> Enum.filter(fn {_path, info} -> present?(info[:serial_number]) end)
-    |> Enum.map(fn {_path, info} -> info[:serial_number] end)
-    |> MapSet.new()
-  rescue
-    _ -> MapSet.new()
+    serials =
+      try do
+        Circuits.UART.enumerate()
+        |> Enum.filter(fn {_path, info} -> present?(info[:serial_number]) end)
+        |> Enum.map(fn {_path, info} -> info[:serial_number] end)
+      rescue
+        _ -> []
+      end
+
+    MapSet.new(serials)
   end
 
   defp present?(nil), do: false
