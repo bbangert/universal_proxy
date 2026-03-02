@@ -186,10 +186,9 @@ defmodule UniversalProxy.ESPHome.DeviceConfig do
       nil
     else
       hwaddr
-      |> Enum.map(fn byte ->
+      |> Enum.map_join(":", fn byte ->
         byte |> Integer.to_string(16) |> String.pad_leading(2, "0")
       end)
-      |> Enum.join(":")
       |> String.upcase()
     end
   end

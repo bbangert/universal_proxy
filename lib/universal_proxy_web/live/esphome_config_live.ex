@@ -66,23 +66,20 @@ defmodule UniversalProxyWeb.ESPhomeConfigLive do
   end
 
   defp form_to_keyword(params) do
-    @config_fields
-    |> Enum.map(fn {key, _label, _hint} ->
+    Enum.map(@config_fields, fn {key, _label, _hint} ->
       raw = Map.get(params, Atom.to_string(key), "")
-
-      value =
-        if key == :port do
-          case Integer.parse(raw) do
-            {n, _} -> n
-            :error -> 6053
-          end
-        else
-          raw
-        end
-
-      {key, value}
+      {key, parse_field(key, raw)}
     end)
   end
+
+  defp parse_field(:port, raw) do
+    case Integer.parse(raw) do
+      {n, _} -> n
+      :error -> 6053
+    end
+  end
+
+  defp parse_field(_key, raw), do: raw
 
   # -- Template --
 

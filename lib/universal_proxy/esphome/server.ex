@@ -19,6 +19,7 @@ defmodule UniversalProxy.ESPHome.Server do
 
   alias UniversalProxy.ESPHome.DeviceConfig
   alias UniversalProxy.Protos
+  alias UniversalProxy.UART.Store, as: UARTStore
 
   defstruct [:config, connections: MapSet.new(), serial_proxies: [], instance_map: %{}]
 
@@ -152,7 +153,7 @@ defmodule UniversalProxy.ESPHome.Server do
   # -- Private helpers --
 
   defp build_serial_proxies do
-    configs = UniversalProxy.UART.Store.all_configs()
+    configs = UARTStore.all_configs()
     enumerated = Circuits.UART.enumerate()
 
     serial_to_path =

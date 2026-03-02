@@ -22,6 +22,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Server do
 
   alias UniversalProxy.ESPHome.Infrared.Entity
   alias UniversalProxy.ESPHome.Infrared.Irdroid
+  alias UniversalProxy.UART.Store, as: UARTStore
 
   @product_modules [Irdroid.Device]
 
@@ -178,7 +179,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Server do
   end
 
   defp build_inventory do
-    configs = UniversalProxy.UART.Store.all_configs()
+    configs = UARTStore.all_configs()
     enumerated = Circuits.UART.enumerate()
 
     serial_to_entry =

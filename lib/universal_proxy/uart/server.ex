@@ -369,17 +369,10 @@ defmodule UniversalProxy.UART.Server do
     enumerated
     |> Enum.filter(fn {_path, info} -> zwa2_device?(info) end)
     |> Enum.each(fn {_path, info} ->
-      serial = info[:serial_number]
-
-      if present?(serial) do
-        case store.get_config(serial) do
-          {:ok, _} ->
-            :ok
-
-          :error ->
-            Logger.info("Auto-detected #{@zwa2_product} (SN: #{serial}), configuring as Z-Wave proxy")
-            store.save_config(serial, %{port_type: :zwave, friendly_name: @zwa2_product})
-        end
+      with serial when is_binary(serial) and serial != "" <- info[:serial_number],
+           :error <- store.get_config(serial) do
+        Logger.info("Auto-detected #{@zwa2_product} (SN: #{serial}), configuring as Z-Wave proxy")
+        store.save_config(serial, %{port_type: :zwave, friendly_name: @zwa2_product})
       end
     end)
   rescue
@@ -393,23 +386,16 @@ defmodule UniversalProxy.UART.Server do
     enumerated
     |> Enum.filter(fn {_path, info} -> irdroid_device?(info) end)
     |> Enum.each(fn {_path, info} ->
-      serial = info[:serial_number]
+      with serial when is_binary(serial) and serial != "" <- info[:serial_number],
+           :error <- store.get_config(serial) do
+        vendor_id = format_usb_id(info[:vendor_id])
+        product_id = format_usb_id(info[:product_id])
 
-      if present?(serial) do
-        case store.get_config(serial) do
-          {:ok, _} ->
-            :ok
+        Logger.info(
+          "Auto-detected #{@irdroid_product} (SN: #{serial}, VID:#{vendor_id}, PID:#{product_id}), configuring as infrared device"
+        )
 
-          :error ->
-            vendor_id = format_usb_id(info[:vendor_id])
-            product_id = format_usb_id(info[:product_id])
-
-            Logger.info(
-              "Auto-detected #{@irdroid_product} (SN: #{serial}, VID:#{vendor_id}, PID:#{product_id}), configuring as infrared device"
-            )
-
-            store.save_config(serial, %{port_type: :infrared, friendly_name: @irdroid_product})
-        end
+        store.save_config(serial, %{port_type: :infrared, friendly_name: @irdroid_product})
       end
     end)
   rescue

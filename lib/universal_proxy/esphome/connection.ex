@@ -278,31 +278,7 @@ defmodule UniversalProxy.ESPHome.Connection do
 
     case Map.fetch(state.instance_map, instance) do
       {:ok, %{path: path, friendly_name: friendly_name}} ->
-        opts = [
-          speed: if(req.baudrate > 0, do: req.baudrate, else: 9600),
-          data_bits: if(req.data_size > 0, do: req.data_size, else: 8),
-          stop_bits: if(req.stop_bits > 0, do: req.stop_bits, else: 1),
-          parity: proto_parity_to_atom(req.parity),
-          flow_control: if(req.flow_control, do: :hardware, else: :none),
-          friendly_name: friendly_name
-        ]
-
-        # Close if already open from a previous configure
-        if Map.has_key?(state.opened_ports, instance) do
-          UART.close(path)
-        end
-
-        case UART.open(path, opts) do
-          {:ok, _pid} ->
-            Phoenix.PubSub.subscribe(@pubsub, "uart:#{friendly_name}")
-            Logger.info("ESPHome client #{state.peer} configured serial proxy #{instance} (#{friendly_name} @ #{path}, #{opts[:speed]} baud)")
-            new_opened = Map.put(state.opened_ports, instance, path)
-            {:ok, %{state | opened_ports: new_opened}}
-
-          {:error, reason} ->
-            Logger.warning("ESPHome client #{state.peer} failed to open serial proxy #{instance} (#{path}): #{inspect(reason)}")
-            {:ok, state}
-        end
+        open_serial_proxy(state, instance, path, friendly_name, req)
 
       :error ->
         Logger.warning("ESPHome client #{state.peer} serial proxy configure for unknown instance #{instance}")
@@ -451,6 +427,33 @@ defmodule UniversalProxy.ESPHome.Connection do
   end
 
   # -- Helpers --
+
+  defp open_serial_proxy(state, instance, path, friendly_name, req) do
+    opts = [
+      speed: if(req.baudrate > 0, do: req.baudrate, else: 9600),
+      data_bits: if(req.data_size > 0, do: req.data_size, else: 8),
+      stop_bits: if(req.stop_bits > 0, do: req.stop_bits, else: 1),
+      parity: proto_parity_to_atom(req.parity),
+      flow_control: if(req.flow_control, do: :hardware, else: :none),
+      friendly_name: friendly_name
+    ]
+
+    if Map.has_key?(state.opened_ports, instance) do
+      UART.close(path)
+    end
+
+    case UART.open(path, opts) do
+      {:ok, _pid} ->
+        Phoenix.PubSub.subscribe(@pubsub, "uart:#{friendly_name}")
+        Logger.info("ESPHome client #{state.peer} configured serial proxy #{instance} (#{friendly_name} @ #{path}, #{opts[:speed]} baud)")
+        new_opened = Map.put(state.opened_ports, instance, path)
+        {:ok, %{state | opened_ports: new_opened}}
+
+      {:error, reason} ->
+        Logger.warning("ESPHome client #{state.peer} failed to open serial proxy #{instance} (#{path}): #{inspect(reason)}")
+        {:ok, state}
+    end
+  end
 
   defp find_instance_for_friendly_name(state, friendly_name) do
     Enum.find_value(state.instance_map, fn {index, info} ->

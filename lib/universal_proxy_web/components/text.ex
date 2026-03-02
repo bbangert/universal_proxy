@@ -1,4 +1,6 @@
 defmodule UniversalProxyWeb.Components.Text do
+  @moduledoc "Reusable text components for page titles, body text, and links."
+
   use Phoenix.Component
 
   attr :title, :string, required: true
