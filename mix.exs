@@ -77,6 +77,10 @@ defmodule UniversalProxy.MixProject do
       {:jason, "~> 1.2"},
       {:plug_cowboy, "~> 2.5"},
 
+      # Static analysis
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
+
       # UART/serial port enumeration
       {:circuits_uart, "~> 1.5"},
 

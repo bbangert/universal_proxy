@@ -2,6 +2,7 @@ FROM ubuntu:24.04
 
 # Avoid prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=C.UTF-8
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -26,27 +27,21 @@ RUN apt-get update && apt-get install -y \
     libconfuse-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# ARM userspace libraries for QEMU user-mode emulation of Nerves cross-compiled binaries
-RUN dpkg --add-architecture armhf && \
-    apt-get update && \
-    apt-get install -y libc6:armhf && \
-    rm -rf /var/lib/apt/lists/*
-
 # Install fwup from GitHub releases (not in Ubuntu repos)
 RUN FWUP_VERSION="1.15.0" && \
     curl -fsSL "https://github.com/fwup-home/fwup/releases/download/v${FWUP_VERSION}/fwup_${FWUP_VERSION}_amd64.deb" -o /tmp/fwup.deb && \
     dpkg -i /tmp/fwup.deb && \
     rm /tmp/fwup.deb
 
+RUN id ubuntu &>/dev/null || useradd -m -s /bin/bash ubuntu \
+    && mkdir -p /workspaces && chown ubuntu:ubuntu /workspaces
+
+USER ubuntu
+
 # Install mise
 RUN curl https://mise.run | sh
-ENV PATH="/root/.local/bin:${PATH}"
+ENV PATH="/home/ubuntu/.local/bin:${PATH}"
 
-# Activate mise in shell
-RUN echo 'eval "$(mise activate bash)"' >> ~/.bashrc \
-    && echo 'eval "$(mise activate zsh)"' >> ~/.zshrc
-
-# Set up mise to trust the project directory
 RUN mise settings set experimental true
 
-WORKDIR /workspace
+WORKDIR /workspaces
