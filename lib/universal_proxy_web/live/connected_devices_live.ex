@@ -266,8 +266,11 @@ defmodule UniversalProxyWeb.ConnectedDevicesLive do
     """
   end
 
-  defp status_classes(:configured), do: "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300"
-  defp status_classes(:unconfigured), do: "bg-zinc-100 text-zinc-600 dark:bg-zinc-800/50 dark:text-zinc-400"
+  defp status_classes(:configured),
+    do: "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300"
+
+  defp status_classes(:unconfigured),
+    do: "bg-zinc-100 text-zinc-600 dark:bg-zinc-800/50 dark:text-zinc-400"
 
   defp status_label(:configured), do: "Configured"
   defp status_label(:unconfigured), do: "Unconfigured"

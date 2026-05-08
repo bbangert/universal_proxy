@@ -49,10 +49,14 @@ keys =
         {output, 0} ->
           output
           |> String.split("\n", trim: true)
-          |> Enum.filter(&String.starts_with?(&1, ["ssh-rsa ", "ssh-ed25519 ", "ssh-ecdsa ", "ssh-dss "]))
+          |> Enum.filter(
+            &String.starts_with?(&1, ["ssh-rsa ", "ssh-ed25519 ", "ssh-ecdsa ", "ssh-dss "])
+          )
+
         _ ->
           []
       end
+
     key_files ->
       Enum.map(key_files, &File.read!/1)
   end
@@ -118,14 +122,9 @@ config :mdns_lite,
       protocol: "http",
       transport: "tcp",
       port: 80
-    },
-    # ESPHome Native API - enables Home Assistant discovery
-    %{
-      id: :esphomelib,
-      protocol: "esphomelib",
-      transport: "tcp",
-      port: 6053
     }
+    # ESPHome Native API mDNS service is registered dynamically by
+    # `Espex.Mdns.MdnsLite` from the live device configuration.
   ]
 
 # Import target specific config. This must remain at the bottom

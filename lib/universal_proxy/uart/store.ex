@@ -146,6 +146,7 @@ defmodule UniversalProxy.UART.Store do
   end
 
   defp to_atom(val, _default) when is_atom(val), do: val
+
   defp to_atom(val, default) when is_binary(val) do
     case val do
       "" -> default
@@ -154,6 +155,7 @@ defmodule UniversalProxy.UART.Store do
   rescue
     ArgumentError -> default
   end
+
   defp to_atom(_, default), do: default
 
   defp restart_esphome do

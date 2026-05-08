@@ -8,8 +8,8 @@ defmodule UniversalProxyWeb.CoreComponents do
   Renders a [Hero Icon](https://heroicons.com).
   Icons are loaded from the heroicons dependency when available.
   """
-  attr :name, :string, required: true
-  attr :class, :string, default: nil
+  attr(:name, :string, required: true)
+  attr(:class, :string, default: nil)
 
   def icon(assigns) do
     ~H"""

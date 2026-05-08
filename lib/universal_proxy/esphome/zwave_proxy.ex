@@ -1,7 +1,7 @@
-defmodule UniversalProxy.ESPHome.ZWave.Server do
+defmodule UniversalProxy.ESPHome.ZWaveProxy do
   @moduledoc """
-  GenServer that manages the Z-Wave UART port and bridges between the
-  frame parser and ESPHome client connections.
+  `Espex.ZWaveProxy` adapter and the GenServer that owns the Z-Wave UART
+  port for the duration of the application's lifetime.
 
   This is the single owner of the Z-Wave serial port. It is NOT managed
   through the shared `UART.Server` because Z-Wave requires protocol-level
@@ -12,29 +12,30 @@ defmodule UniversalProxy.ESPHome.ZWave.Server do
   - On init, if a Z-Wave port path is provided, opens `Circuits.UART`
     at 115200/8N1 and sends a GET_NETWORK_IDS command to discover the
     home ID.
-  - Incoming UART bytes are fed through the pure `Parser`, which produces
-    actions: local ACK/NAK/CAN responses are written back to the UART
-    immediately, and complete frames are forwarded to the subscribed
-    API connection.
-  - Only one API connection may subscribe at a time (Z-Wave Serial API
-    is single-master). The subscriber is monitored and auto-unsubscribed
+  - Incoming UART bytes are fed through `Espex.ZWaveProxy.Parser`, which
+    returns local ACK/NAK/CAN responses to write back to the UART, and
+    complete frames to forward to the subscribed espex connection.
+  - Only one connection may subscribe at a time (Z-Wave Serial API is
+    single-master). The subscriber is monitored and auto-unsubscribed
     on crash.
-
-  ## Client API
-
-  All public functions are called by `ESPHome.Connection` dispatch clauses
-  through the `ESPHome.ZWave` facade module.
   """
 
   use GenServer
 
+  @behaviour Espex.ZWaveProxy
+
   require Logger
 
-  alias UniversalProxy.ESPHome.ZWave.{Frame, Parser}
+  alias UniversalProxy.ESPHome.ZWaveProxy.{Frame, Parser}
 
-  @pubsub UniversalProxy.PubSub
-  @home_id_changed_topic "zwave:home_id_changed"
   @uart_speed 115_200
+
+  # GenServer call timeouts. Espex calls these from the connection
+  # handler; a hung adapter must not stall connection setup, so we set
+  # tight, per-call ceilings instead of the 5 s default. `:exit` from a
+  # timeout or terminated server is caught and mapped to a sane default.
+  @short_call_timeout 1_000
+  @send_frame_timeout 3_000
 
   defstruct [
     :uart_pid,
@@ -42,66 +43,59 @@ defmodule UniversalProxy.ESPHome.ZWave.Server do
     :subscriber,
     :monitor_ref,
     parser: nil,
-    home_id: <<0, 0, 0, 0>>,
-    home_id_ready: false
+    home_id: <<0, 0, 0, 0>>
   ]
 
-  # -- Client API --
+  # -- Adapter wiring --
 
   def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+    name = Keyword.get(opts, :name, __MODULE__)
+    GenServer.start_link(__MODULE__, opts, name: name)
   end
 
-  @doc """
-  Subscribe the calling connection as the Z-Wave frame receiver.
-
-  Only one subscriber is allowed at a time. Returns `{:ok, home_id_bytes}`
-  on success, or `{:error, reason}` if already subscribed or unavailable.
-  """
-  @spec subscribe(pid()) :: {:ok, binary()} | {:error, :already_subscribed | :unavailable}
-  def subscribe(pid) when is_pid(pid) do
-    GenServer.call(__MODULE__, {:subscribe, pid})
+  @impl Espex.ZWaveProxy
+  @spec available?(GenServer.server()) :: boolean()
+  def available?(server \\ __MODULE__) do
+    GenServer.call(server, :available?, @short_call_timeout)
+  catch
+    :exit, _ -> false
   end
 
-  @doc """
-  Unsubscribe the calling connection.
-
-  Returns `:ok` regardless of whether the pid was actually subscribed.
-  """
-  @spec unsubscribe(pid()) :: :ok
-  def unsubscribe(pid) when is_pid(pid) do
-    GenServer.call(__MODULE__, {:unsubscribe, pid})
+  @impl Espex.ZWaveProxy
+  @spec home_id(GenServer.server()) :: non_neg_integer()
+  def home_id(server \\ __MODULE__) do
+    GenServer.call(server, :home_id_int, @short_call_timeout)
+  catch
+    :exit, _ -> 0
   end
 
-  @doc """
-  Send a frame from the API client to the Z-Wave stick.
-
-  Writes raw bytes to UART with duplicate single-byte response suppression.
-  """
-  @spec send_frame(binary()) :: :ok | {:error, term()}
-  def send_frame(data) when is_binary(data) do
-    GenServer.call(__MODULE__, {:send_frame, data})
+  @impl Espex.ZWaveProxy
+  def feature_flags do
+    if available?(), do: 0x01, else: 0
   end
 
-  @doc """
-  Returns the current home ID as a uint32.
-  """
-  @spec home_id() :: non_neg_integer()
-  def home_id do
-    GenServer.call(__MODULE__, :home_id)
+  @impl Espex.ZWaveProxy
+  @spec subscribe(GenServer.server(), pid()) ::
+          {:ok, <<_::32>>} | {:error, :already_subscribed | :unavailable}
+  def subscribe(server \\ __MODULE__, pid) when is_pid(pid) do
+    GenServer.call(server, {:subscribe, pid}, @short_call_timeout)
   end
 
-  @doc """
-  Returns whether a Z-Wave device is connected and the port is open.
-  """
-  @spec available?() :: boolean()
-  def available? do
-    GenServer.call(__MODULE__, :available?)
+  @impl Espex.ZWaveProxy
+  @spec unsubscribe(GenServer.server(), pid()) :: :ok
+  def unsubscribe(server \\ __MODULE__, pid) when is_pid(pid) do
+    GenServer.call(server, {:unsubscribe, pid}, @short_call_timeout)
+  end
+
+  @impl Espex.ZWaveProxy
+  @spec send_frame(GenServer.server(), binary()) :: :ok | {:error, term()}
+  def send_frame(server \\ __MODULE__, data) when is_binary(data) do
+    GenServer.call(server, {:send_frame, data}, @send_frame_timeout)
   end
 
   # -- Server Callbacks --
 
-  @impl true
+  @impl GenServer
   def init(opts) do
     port_path = Keyword.get(opts, :port_path)
 
@@ -128,7 +122,15 @@ defmodule UniversalProxy.ESPHome.ZWave.Server do
     end
   end
 
-  @impl true
+  @impl GenServer
+  def handle_call(:available?, _from, state) do
+    {:reply, state.uart_pid != nil, state}
+  end
+
+  def handle_call(:home_id_int, _from, state) do
+    {:reply, Frame.encode_home_id(state.home_id), state}
+  end
+
   def handle_call({:subscribe, _pid}, _from, %{uart_pid: nil} = state) do
     Logger.warning("Z-Wave subscribe rejected: no device available")
     {:reply, {:error, :unavailable}, state}
@@ -159,19 +161,10 @@ defmodule UniversalProxy.ESPHome.ZWave.Server do
   end
 
   def handle_call({:send_frame, data}, _from, state) do
-    result = write_frame(state, data)
-    {:reply, result, state}
+    {:reply, write_frame(state, data), state}
   end
 
-  def handle_call(:home_id, _from, state) do
-    {:reply, Frame.encode_home_id(state.home_id), state}
-  end
-
-  def handle_call(:available?, _from, state) do
-    {:reply, state.uart_pid != nil, state}
-  end
-
-  @impl true
+  @impl GenServer
   def handle_info({:circuits_uart, _port, {:error, reason}}, state) do
     Logger.warning("Z-Wave UART error: #{inspect(reason)}")
     {:noreply, %{state | uart_pid: nil}}
@@ -193,7 +186,7 @@ defmodule UniversalProxy.ESPHome.ZWave.Server do
     {:noreply, state}
   end
 
-  @impl true
+  @impl GenServer
   def terminate(_reason, state) do
     if state.uart_pid do
       try do
@@ -211,29 +204,27 @@ defmodule UniversalProxy.ESPHome.ZWave.Server do
 
   defp open_port(port_path) do
     with {:ok, pid} <- Circuits.UART.start_link(),
-         :ok <- Circuits.UART.open(pid, port_path,
-           speed: @uart_speed,
-           data_bits: 8,
-           stop_bits: 1,
-           parity: :none,
-           flow_control: :none,
-           active: true
-         ) do
+         :ok <-
+           Circuits.UART.open(pid, port_path,
+             speed: @uart_speed,
+             data_bits: 8,
+             stop_bits: 1,
+             parity: :none,
+             flow_control: :none,
+             active: true
+           ) do
       {:ok, pid}
     end
   end
 
   defp request_home_id(%{uart_pid: pid}) when pid != nil do
-    cmd = Frame.get_network_ids_command()
-    Circuits.UART.write(pid, cmd)
+    Circuits.UART.write(pid, Frame.get_network_ids_command())
   end
 
   defp request_home_id(_state), do: :ok
 
   defp execute_actions(state, actions) do
-    Enum.reduce(actions, state, fn action, state ->
-      execute_action(state, action)
-    end)
+    Enum.reduce(actions, state, &execute_action(&2, &1))
   end
 
   defp execute_action(state, {:send_response, byte}) do
@@ -248,7 +239,7 @@ defmodule UniversalProxy.ESPHome.ZWave.Server do
     state = maybe_update_home_id(state, frame_data)
 
     if state.subscriber do
-      send(state.subscriber, {:zwave_frame, frame_data})
+      send(state.subscriber, {:espex_zwave_frame, frame_data})
     end
 
     state
@@ -256,35 +247,24 @@ defmodule UniversalProxy.ESPHome.ZWave.Server do
 
   defp maybe_update_home_id(state, frame_data) do
     case Frame.extract_home_id(frame_data) do
-      {:ok, new_home_id} ->
-        if new_home_id != state.home_id do
-          Logger.info("Z-Wave home ID changed: #{inspect(new_home_id)}")
-          broadcast_home_id_changed(new_home_id)
-          %{state | home_id: new_home_id, home_id_ready: true}
-        else
-          %{state | home_id_ready: true}
+      {:ok, new_home_id} when new_home_id != state.home_id ->
+        Logger.info("Z-Wave home ID changed: #{inspect(new_home_id)}")
+
+        if state.subscriber do
+          send(state.subscriber, {:espex_zwave_home_id_changed, new_home_id})
         end
 
-      :error ->
+        %{state | home_id: new_home_id}
+
+      _ ->
         state
     end
   end
 
-  defp broadcast_home_id_changed(home_id_bytes) do
-    Phoenix.PubSub.broadcast(
-      @pubsub,
-      @home_id_changed_topic,
-      {:zwave_home_id_changed, home_id_bytes}
-    )
-  end
-
   defp write_frame(%{uart_pid: nil}, _data), do: {:error, :unavailable}
+  defp write_frame(_state, <<>>), do: {:error, :empty_frame}
 
-  defp write_frame(%{uart_pid: pid} = _state, data) when is_binary(data) do
-    if byte_size(data) == 0 do
-      {:error, :empty_frame}
-    else
-      Circuits.UART.write(pid, data)
-    end
+  defp write_frame(%{uart_pid: pid}, data) when is_binary(data) do
+    Circuits.UART.write(pid, data)
   end
 end

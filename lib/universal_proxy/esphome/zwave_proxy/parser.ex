@@ -1,4 +1,4 @@
-defmodule UniversalProxy.ESPHome.ZWave.Parser do
+defmodule UniversalProxy.ESPHome.ZWaveProxy.Parser do
   @moduledoc """
   Pure functional state machine for parsing Z-Wave Serial API frames.
 
@@ -29,7 +29,7 @@ defmodule UniversalProxy.ESPHome.ZWave.Parser do
 
   """
 
-  alias UniversalProxy.ESPHome.ZWave.Frame
+  alias UniversalProxy.ESPHome.ZWaveProxy.Frame
 
   @sof Frame.sof()
   @ack Frame.ack()

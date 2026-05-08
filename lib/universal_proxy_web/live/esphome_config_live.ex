@@ -2,36 +2,24 @@ defmodule UniversalProxyWeb.ESPhomeConfigLive do
   use UniversalProxyWeb, :live_view
 
   alias UniversalProxy.ESPHome
-
-  @config_fields [
-    {:name, "Device Name", "Hostname used in mDNS and the Native API"},
-    {:friendly_name, "Friendly Name", "Human-readable name shown in dashboards"},
-    {:mac_address, "MAC Address", "Hardware address reported to clients"},
-    {:esphome_version, "ESPHome Version", "Emulated ESPHome firmware version"},
-    {:compilation_time, "Compilation Time", "Build timestamp string"},
-    {:model, "Model", "Device hardware model"},
-    {:manufacturer, "Manufacturer", "Device manufacturer"},
-    {:suggested_area, "Suggested Area", "Default area hint for Home Assistant"},
-    {:project_name, "Project Name", "Project identifier"},
-    {:project_version, "Project Version", "Project version string"},
-    {:port, "API Port", "TCP port for the ESPHome Native API (requires restart)"}
-  ]
+  alias UniversalProxy.ESPHome.ConfigStore
 
   @impl true
   def mount(_params, _session, socket) do
     config = ESPHome.config()
+    fields = ConfigStore.form_fields()
 
     {:ok,
      socket
      |> assign(:config, config)
      |> assign(:editing, false)
-     |> assign(:form_data, config_to_form(config))
-     |> assign(:config_fields, @config_fields)}
+     |> assign(:form_data, config_to_form(config, fields))
+     |> assign(:config_fields, fields)}
   end
 
   @impl true
   def handle_event("edit", _params, socket) do
-    form_data = config_to_form(socket.assigns.config)
+    form_data = config_to_form(socket.assigns.config, socket.assigns.config_fields)
     {:noreply, assign(socket, editing: true, form_data: form_data)}
   end
 
@@ -44,29 +32,29 @@ defmodule UniversalProxyWeb.ESPhomeConfigLive do
   end
 
   def handle_event("save", %{"config" => params}, socket) do
-    updates = form_to_keyword(params)
+    updates = form_to_keyword(params, socket.assigns.config_fields)
     new_config = ESPHome.update_config(updates)
 
     {:noreply,
      socket
      |> assign(:config, new_config)
-     |> assign(:form_data, config_to_form(new_config))
+     |> assign(:form_data, config_to_form(new_config, socket.assigns.config_fields))
      |> assign(:editing, false)
      |> put_flash(:info, "Configuration updated successfully.")}
   end
 
   # -- Private helpers --
 
-  defp config_to_form(config) do
-    @config_fields
+  defp config_to_form(config, fields) do
+    fields
     |> Enum.map(fn {key, _label, _hint} ->
-      {Atom.to_string(key), to_string(Map.get(config, key))}
+      {Atom.to_string(key), to_string(Map.get(config, key, ""))}
     end)
     |> Map.new()
   end
 
-  defp form_to_keyword(params) do
-    Enum.map(@config_fields, fn {key, _label, _hint} ->
+  defp form_to_keyword(params, fields) do
+    Enum.map(fields, fn {key, _label, _hint} ->
       raw = Map.get(params, Atom.to_string(key), "")
       {key, parse_field(key, raw)}
     end)

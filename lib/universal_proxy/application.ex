@@ -15,9 +15,13 @@ defmodule UniversalProxy.Application do
         {Phoenix.PubSub, name: UniversalProxy.PubSub},
         # Start the Endpoint (http/https)
         UniversalProxyWeb.Endpoint,
+        # Task supervisor for fire-and-forget work (e.g. async ESPHome restarts)
+        {Task.Supervisor, name: UniversalProxy.TaskSupervisor},
         # Start the UART subsystem (DynamicSupervisor + registry server)
         UniversalProxy.UART.Supervisor,
-        # Start the ESPHome Native API subsystem (TCP server + connections)
+        # ESPHome device identity store (DETS)
+        UniversalProxy.ESPHome.ConfigStore,
+        # Espex-backed ESPHome Native API server with our hardware adapters
         UniversalProxy.ESPHome.Supervisor
       ] ++ target_children()
 
