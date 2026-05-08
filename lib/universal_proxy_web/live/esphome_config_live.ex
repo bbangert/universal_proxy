@@ -33,14 +33,21 @@ defmodule UniversalProxyWeb.ESPhomeConfigLive do
 
   def handle_event("save", %{"config" => params}, socket) do
     updates = form_to_keyword(params, socket.assigns.config_fields)
-    new_config = ESPHome.update_config(updates)
 
-    {:noreply,
-     socket
-     |> assign(:config, new_config)
-     |> assign(:form_data, config_to_form(new_config, socket.assigns.config_fields))
-     |> assign(:editing, false)
-     |> put_flash(:info, "Configuration updated successfully.")}
+    case ESPHome.update_config(updates) do
+      {:ok, new_config} ->
+        {:noreply,
+         socket
+         |> assign(:config, new_config)
+         |> assign(:form_data, config_to_form(new_config, socket.assigns.config_fields))
+         |> assign(:editing, false)
+         |> put_flash(:info, "Configuration updated successfully.")}
+
+      {:error, reason} ->
+        {:noreply,
+         socket
+         |> put_flash(:error, "Failed to save configuration: #{inspect(reason)}")}
+    end
   end
 
   # -- Private helpers --

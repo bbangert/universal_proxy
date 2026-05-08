@@ -37,8 +37,7 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
     case Enum.at(inventory(), instance) do
       %{path: path, friendly_name: friendly_name} ->
         with {:ok, _pid} <- UART.open(path, Keyword.put(opts, :friendly_name, friendly_name)),
-             {:ok, relay} <-
-               Relay.start_link(path: path, friendly_name: friendly_name, subscriber: subscriber) do
+             {:ok, relay} <- start_relay_or_close(path, friendly_name, subscriber) do
           Logger.info(
             "ESPHome serial proxy opened instance #{instance} (#{friendly_name} @ #{path}, #{opts[:speed]} baud)"
           )
@@ -55,6 +54,20 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
 
       nil ->
         {:error, :no_such_instance}
+    end
+  end
+
+  # If the UART port opened but the relay can't start, the port would stay
+  # registered against this connection forever — release it before bubbling
+  # the error.
+  defp start_relay_or_close(path, friendly_name, subscriber) do
+    case Relay.start_link(path: path, friendly_name: friendly_name, subscriber: subscriber) do
+      {:ok, relay} ->
+        {:ok, relay}
+
+      {:error, _} = err ->
+        _ = UART.close(path)
+        err
     end
   end
 

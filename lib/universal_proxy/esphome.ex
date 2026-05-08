@@ -34,20 +34,26 @@ defmodule UniversalProxy.ESPHome do
   Persist the given keyword list of device configuration overrides and
   restart the ESPHome supervisor so the changes take effect.
 
-  Returns the updated config map.
+  Returns `{:ok, config}` on success or `{:error, reason}` if the
+  underlying DETS write fails. The supervisor restart is only scheduled
+  when persistence succeeds.
   """
-  @spec update_config(keyword()) :: map()
+  @spec update_config(keyword()) :: {:ok, map()} | {:error, term()}
   def update_config(opts) when is_list(opts) do
-    :ok = ConfigStore.put(opts)
+    case ConfigStore.put(opts) do
+      :ok ->
+        Task.Supervisor.start_child(UniversalProxy.TaskSupervisor, fn ->
+          case Supervisor.restart() do
+            {:ok, _pid} -> :ok
+            {:error, reason} -> Logger.error("ESPHome restart failed: #{inspect(reason)}")
+          end
+        end)
 
-    Task.Supervisor.start_child(UniversalProxy.TaskSupervisor, fn ->
-      case Supervisor.restart() do
-        {:ok, _pid} -> :ok
-        {:error, reason} -> Logger.error("ESPHome restart failed: #{inspect(reason)}")
-      end
-    end)
+        {:ok, ConfigStore.current()}
 
-    ConfigStore.current()
+      {:error, _reason} = err ->
+        err
+    end
   end
 
   @doc """

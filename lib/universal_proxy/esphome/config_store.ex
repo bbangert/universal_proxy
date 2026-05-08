@@ -169,23 +169,49 @@ defmodule UniversalProxy.ESPHome.ConfigStore do
     end
   end
 
+  # Normalised values that should be silently dropped (rather than persisted).
+  # Returning :skip from a normaliser means "this update is bogus — leave the
+  # existing override (or the default) in place".
+  @skip :skip
+  @valid_port_range 1..65_535
+
   defp sanitize(updates) do
     updates
     |> Enum.flat_map(fn
-      {k, v} when k in @config_fields -> [{k, normalize(k, v)}]
-      _ -> []
+      {k, v} when k in @config_fields ->
+        case normalize(k, v) do
+          @skip -> []
+          normalized -> [{k, normalized}]
+        end
+
+      _ ->
+        []
     end)
     |> Map.new()
   end
 
-  defp normalize(:port, v) when is_integer(v), do: v
+  defp normalize(:port, v) when is_integer(v) and v in @valid_port_range, do: v
+
+  defp normalize(:port, v) when is_integer(v) do
+    Logger.warning(
+      "ESPHome port #{v} out of range #{inspect(@valid_port_range)}; ignoring update"
+    )
+
+    @skip
+  end
 
   defp normalize(:port, v) when is_binary(v) do
     case Integer.parse(v) do
-      {n, _} -> n
-      :error -> @default_port
+      {n, _} when n in @valid_port_range ->
+        n
+
+      _ ->
+        Logger.warning(~s|ESPHome port "#{v}" is not a valid TCP port; falling back to default|)
+        @default_port
     end
   end
+
+  defp normalize(:port, _), do: @skip
 
   defp normalize(:project_name, v) when is_binary(v) do
     trimmed = String.trim(v)
@@ -206,8 +232,16 @@ defmodule UniversalProxy.ESPHome.ConfigStore do
     end
   end
 
+  defp normalize(:project_name, _), do: @skip
+
   defp normalize(_, v) when is_binary(v), do: v
-  defp normalize(_, v), do: to_string(v)
+  defp normalize(_, nil), do: @skip
+  defp normalize(_, v) when is_atom(v), do: Atom.to_string(v)
+
+  defp normalize(key, v) do
+    Logger.warning("ESPHome config #{inspect(key)} got unsupported value #{inspect(v)}; ignoring")
+    @skip
+  end
 
   defp dets_path do
     if File.dir?("/data") do

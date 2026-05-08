@@ -167,7 +167,8 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
   @impl GenServer
   def handle_info({:circuits_uart, _port, {:error, reason}}, state) do
     Logger.warning("Z-Wave UART error: #{inspect(reason)}")
-    {:noreply, %{state | uart_pid: nil}}
+    cleanup_uart(state.uart_pid)
+    {:noreply, %{state | uart_pid: nil, parser: Parser.new()}}
   end
 
   def handle_info({:circuits_uart, _port, data}, state) when is_binary(data) do
@@ -188,19 +189,24 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
 
   @impl GenServer
   def terminate(_reason, state) do
-    if state.uart_pid do
-      try do
-        Circuits.UART.close(state.uart_pid)
-        Circuits.UART.stop(state.uart_pid)
-      catch
-        _, _ -> :ok
-      end
-    end
-
+    cleanup_uart(state.uart_pid)
     :ok
   end
 
   # -- Private --
+
+  defp cleanup_uart(nil), do: :ok
+
+  defp cleanup_uart(pid) when is_pid(pid) do
+    try do
+      Circuits.UART.close(pid)
+      Circuits.UART.stop(pid)
+    catch
+      _, _ -> :ok
+    end
+
+    :ok
+  end
 
   defp open_port(port_path) do
     with {:ok, pid} <- Circuits.UART.start_link(),

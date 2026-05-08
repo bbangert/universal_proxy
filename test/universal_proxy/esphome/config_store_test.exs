@@ -61,6 +61,51 @@ defmodule UniversalProxy.ESPHome.ConfigStoreTest do
       :ok = ConfigStore.put(server, port: 7000)
       assert ConfigStore.current(server).port == 7000
     end
+
+    test "out-of-range integer port is dropped (existing value preserved)", %{server: server} do
+      :ok = ConfigStore.put(server, port: 7000)
+      :ok = ConfigStore.put(server, port: 70_000)
+      assert ConfigStore.current(server).port == 7000
+    end
+
+    test "negative integer port is dropped", %{server: server} do
+      :ok = ConfigStore.put(server, port: -1)
+      assert ConfigStore.current(server).port == 6053
+    end
+
+    test "out-of-range numeric string port falls back to default", %{server: server} do
+      :ok = ConfigStore.put(server, port: "70000")
+      assert ConfigStore.current(server).port == 6053
+    end
+
+    test "nil port is dropped (existing value preserved)", %{server: server} do
+      :ok = ConfigStore.put(server, port: 7000)
+      :ok = ConfigStore.put(server, port: nil)
+      assert ConfigStore.current(server).port == 7000
+    end
+  end
+
+  describe "non-binary value handling" do
+    test "nil values are silently dropped (default preserved)", %{server: server} do
+      :ok = ConfigStore.put(server, name: nil)
+      assert ConfigStore.current(server).name == "universal-proxy"
+    end
+
+    test "atom values are coerced to strings", %{server: server} do
+      :ok = ConfigStore.put(server, name: :kitchen)
+      assert ConfigStore.current(server).name == "kitchen"
+    end
+
+    test "unsupported types (tuple/map/list) are dropped, not crashed on", %{server: server} do
+      :ok = ConfigStore.put(server, name: {:bad, :tuple})
+      :ok = ConfigStore.put(server, friendly_name: %{nope: 1})
+      :ok = ConfigStore.put(server, model: [1, 2, 3])
+
+      config = ConfigStore.current(server)
+      assert config.name == "universal-proxy"
+      assert config.friendly_name == "Universal Proxy"
+      assert config.model == "Universal Proxy"
+    end
   end
 
   describe "unknown keys" do
