@@ -16,12 +16,20 @@ defmodule UniversalProxy.ESPHome.Infrared.Device do
   expressed as a callback.
   """
 
-  alias UniversalProxy.ESPHome.Infrared.Entity
+  alias Espex.InfraredProxy.Entity
+
+  @type entry :: %{
+          entity: Entity.t(),
+          device_module: module(),
+          serial_number: String.t(),
+          port_path: String.t(),
+          worker_pid: pid() | nil
+        }
 
   @doc "Returns true if the USB enumeration info matches this product family."
   @callback match?(info :: map()) :: boolean()
 
-  @doc "Build an Entity from a saved UART config, port path, and enumeration info."
+  @doc "Build an `Espex.InfraredProxy.Entity` from a saved UART config, port path, and enumeration info."
   @callback build_entity(config :: map(), port_path :: String.t(), info :: map()) :: Entity.t()
 
   @doc """
@@ -31,7 +39,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Device do
   when IR signals are received (timings as signed microsecond integers,
   positive = mark, negative = space).
   """
-  @callback child_spec(entity :: Entity.t(), server_pid :: pid()) :: Supervisor.child_spec()
+  @callback child_spec(entry :: entry(), server_pid :: pid()) :: Supervisor.child_spec()
 
   @doc """
   Transmit ESPHome-native IR timings through a running worker process.

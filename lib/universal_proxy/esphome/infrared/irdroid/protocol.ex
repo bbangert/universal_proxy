@@ -172,13 +172,17 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.Protocol do
   # -- Receive mode: 16-bit BE timing pairs, 0xFFFF = terminator --
   # Six consecutive 0xFF bytes indicate device overflow
 
-  defp parse(%{mode: :receive} = state, <<0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, rest::binary>>, actions) do
+  defp parse(
+         %{mode: :receive} = state,
+         <<0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, rest::binary>>,
+         actions
+       ) do
     state = %{state | rx_timings: [], pulse: true, buffer: <<>>}
     parse(state, rest, actions ++ [:rx_overflow])
   end
 
   defp parse(%{mode: :receive} = state, <<hi, lo, rest::binary>>, actions) do
-    raw = (hi <<< 8) ||| lo
+    raw = hi <<< 8 ||| lo
 
     if raw == 0xFFFF do
       timings = Enum.reverse(state.rx_timings)

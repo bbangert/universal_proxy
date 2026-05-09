@@ -3,7 +3,7 @@ defmodule UniversalProxyWeb.Components.Text do
 
   use Phoenix.Component
 
-  attr :title, :string, required: true
+  attr(:title, :string, required: true)
 
   def page_title(assigns) do
     ~H"""
@@ -13,7 +13,7 @@ defmodule UniversalProxyWeb.Components.Text do
     """
   end
 
-  slot :inner_block, required: true
+  slot(:inner_block, required: true)
 
   def body(assigns) do
     ~H"""
@@ -23,8 +23,8 @@ defmodule UniversalProxyWeb.Components.Text do
     """
   end
 
-  attr :href, :string, required: true
-  slot :inner_block, required: true
+  attr(:href, :string, required: true)
+  slot(:inner_block, required: true)
 
   def link_to(assigns) do
     ~H"""

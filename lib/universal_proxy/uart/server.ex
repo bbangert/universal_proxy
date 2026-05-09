@@ -212,7 +212,10 @@ defmodule UniversalProxy.UART.Server do
       end
 
       broadcast_lifecycle("uart:port_closed", port_name, config)
-      Logger.info("UART closed #{config.friendly_name || port_name} (#{port_name}) during ESPHome restart")
+
+      Logger.info(
+        "UART closed #{config.friendly_name || port_name} (#{port_name}) during ESPHome restart"
+      )
     end)
 
     {:reply, :ok, %{state | ports: %{}}}
@@ -249,9 +252,13 @@ defmodule UniversalProxy.UART.Server do
     case Map.fetch(state.ports, port_name) do
       {:ok, %{config: config, pid: pid, monitor_ref: ref}} ->
         friendly_name = config.friendly_name || port_name
-        Logger.warning("UART #{friendly_name} (#{port_name}) error: #{inspect(reason)} -- closing port and restarting ESPHome")
+
+        Logger.warning(
+          "UART #{friendly_name} (#{port_name}) error: #{inspect(reason)} -- closing port and restarting ESPHome"
+        )
 
         Process.demonitor(ref, [:flush])
+
         try do
           Circuits.UART.close(pid)
           Circuits.UART.stop(pid)
@@ -317,10 +324,11 @@ defmodule UniversalProxy.UART.Server do
     config = PortConfig.new(port_name, opts)
     uart_opts = PortConfig.to_uart_opts(config)
 
-    with {:ok, pid} <- DynamicSupervisor.start_child(
-           UniversalProxy.UART.PortSupervisor,
-           {Circuits.UART, []}
-         ),
+    with {:ok, pid} <-
+           DynamicSupervisor.start_child(
+             UniversalProxy.UART.PortSupervisor,
+             {Circuits.UART, []}
+           ),
          :ok <- Circuits.UART.open(pid, port_name, uart_opts) do
       {:ok, pid, config}
     else
@@ -418,11 +426,17 @@ defmodule UniversalProxy.UART.Server do
   end
 
   defp vendor_id_matches?(id) when is_integer(id), do: id == @irdroid_vendor_id
-  defp vendor_id_matches?(id) when is_binary(id), do: UniversalProxy.USB.parse_id(id) == @irdroid_vendor_id
+
+  defp vendor_id_matches?(id) when is_binary(id),
+    do: UniversalProxy.USB.parse_id(id) == @irdroid_vendor_id
+
   defp vendor_id_matches?(_), do: false
 
   defp product_id_matches?(id) when is_integer(id), do: MapSet.member?(@irdroid_product_ids, id)
-  defp product_id_matches?(id) when is_binary(id), do: MapSet.member?(@irdroid_product_ids, UniversalProxy.USB.parse_id(id))
+
+  defp product_id_matches?(id) when is_binary(id),
+    do: MapSet.member?(@irdroid_product_ids, UniversalProxy.USB.parse_id(id))
+
   defp product_id_matches?(_), do: false
 
   defp format_usb_id(id) when is_integer(id), do: "0x" <> String.upcase(Integer.to_string(id, 16))

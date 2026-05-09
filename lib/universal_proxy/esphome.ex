@@ -2,93 +2,63 @@ defmodule UniversalProxy.ESPHome do
   @moduledoc """
   Public API for the ESPHome Native API subsystem.
 
-  This component makes the device discoverable and controllable as an
-  ESPHome device by listening on TCP port 6053 (configurable) and
-  speaking the ESPHome plaintext protocol with protobuf-encoded messages.
+  The wire protocol, framing, encryption, and connection lifecycle are
+  provided by the [`espex`](https://hexdocs.pm/espex) library. This module
+  is a thin façade for reading and updating the device identity used at
+  start-up time.
 
   ## Examples
 
       # View current device identity
       UniversalProxy.ESPHome.config()
 
-      # Update the device name at runtime
+      # Update the device name (persisted; takes effect after a restart)
       UniversalProxy.ESPHome.update_config(name: "my-proxy", friendly_name: "My Proxy")
-
-      # Check how many clients are connected
-      UniversalProxy.ESPHome.connections()
 
       # Get the listening port
       UniversalProxy.ESPHome.port()
 
   """
 
-  alias UniversalProxy.ESPHome.Server
+  require Logger
+
+  alias UniversalProxy.ESPHome.{ConfigStore, Supervisor}
 
   @doc """
-  Returns the current ESPHome device configuration.
-
-  ## Examples
-
-      config = UniversalProxy.ESPHome.config()
-      config.name
-      #=> "universal-proxy"
-
+  Returns the merged device configuration (defaults + persisted overrides).
   """
-  @spec config() :: UniversalProxy.ESPHome.DeviceConfig.t()
-  def config do
-    Server.get_config()
-  end
+  @spec config() :: map()
+  def config, do: ConfigStore.current()
 
   @doc """
-  Update the device configuration at runtime.
+  Persist the given keyword list of device configuration overrides and
+  restart the ESPHome supervisor so the changes take effect.
 
-  Accepts a keyword list of fields to change. Only provided fields are
-  updated; all others retain their current values.
-
-  Note: changing the `:port` does not rebind the TCP listener. The port
-  setting only takes effect on (re)start.
-
-  Returns the updated config.
-
-  ## Examples
-
-      UniversalProxy.ESPHome.update_config(
-        name: "my-device",
-        friendly_name: "Living Room Proxy",
-        mac_address: "AA:BB:CC:DD:EE:FF"
-      )
-
+  Returns `{:ok, config}` on success or `{:error, reason}` if the
+  underlying DETS write fails. The supervisor restart is only scheduled
+  when persistence succeeds.
   """
-  @spec update_config(keyword()) :: UniversalProxy.ESPHome.DeviceConfig.t()
+  @spec update_config(keyword()) :: {:ok, map()} | {:error, term()}
   def update_config(opts) when is_list(opts) do
-    Server.update_config(opts)
+    case ConfigStore.put(opts) do
+      :ok ->
+        Task.Supervisor.start_child(UniversalProxy.TaskSupervisor, fn ->
+          case Supervisor.restart() do
+            {:ok, _pid} -> :ok
+            {:error, reason} -> Logger.error("ESPHome restart failed: #{inspect(reason)}")
+          end
+        end)
+
+        {:ok, ConfigStore.current()}
+
+      {:error, _reason} = err ->
+        err
+    end
   end
 
   @doc """
-  Returns a list of PIDs for currently active client connections.
-
-  ## Examples
-
-      UniversalProxy.ESPHome.connections()
-      #=> [#PID<0.456.0>, #PID<0.489.0>]
-
-  """
-  @spec connections() :: [pid()]
-  def connections do
-    Server.list_connections()
-  end
-
-  @doc """
-  Returns the TCP port the ESPHome API is listening on.
-
-  ## Examples
-
-      UniversalProxy.ESPHome.port()
-      #=> 6053
-
+  Returns the TCP port the ESPHome API is configured to listen on.
   """
   @spec port() :: non_neg_integer()
-  def port do
-    config().port
-  end
+  def port, do: Map.fetch!(config(), :port)
 end

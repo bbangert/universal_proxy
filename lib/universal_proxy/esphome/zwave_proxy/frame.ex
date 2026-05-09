@@ -1,4 +1,4 @@
-defmodule UniversalProxy.ESPHome.ZWave.Frame do
+defmodule UniversalProxy.ESPHome.ZWaveProxy.Frame do
   @moduledoc """
   Pure functions and constants for the Z-Wave Serial API frame format.
 
@@ -121,7 +121,7 @@ defmodule UniversalProxy.ESPHome.ZWave.Frame do
   """
   @spec encode_home_id(<<_::32>>) :: non_neg_integer()
   def encode_home_id(<<a, b, c, d>>) do
-    (a <<< 24) ||| (b <<< 16) ||| (c <<< 8) ||| d
+    a <<< 24 ||| b <<< 16 ||| c <<< 8 ||| d
   end
 
   def encode_home_id(_), do: 0

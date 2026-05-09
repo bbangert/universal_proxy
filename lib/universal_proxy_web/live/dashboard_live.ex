@@ -153,7 +153,8 @@ defmodule UniversalProxyWeb.DashboardLive do
   end
 
   defp format_timestamp(%DateTime{} = dt) do
-    Calendar.strftime(dt, "%H:%M:%S.") <> String.pad_leading("#{dt.microsecond |> elem(0) |> div(1000)}", 3, "0")
+    Calendar.strftime(dt, "%H:%M:%S.") <>
+      String.pad_leading("#{dt.microsecond |> elem(0) |> div(1000)}", 3, "0")
   end
 
   defp format_data(data) when is_binary(data) do

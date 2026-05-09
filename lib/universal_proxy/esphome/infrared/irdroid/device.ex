@@ -9,8 +9,8 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.Device do
 
   @behaviour UniversalProxy.ESPHome.Infrared.Device
 
-  alias UniversalProxy.ESPHome.Infrared.Entity
   alias UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker
+  alias UniversalProxy.ESPHome.Infrared.Server
 
   @vendor_id 0x04D8
 
@@ -28,31 +28,27 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.Device do
   end
 
   @impl true
-  def build_entity(config, port_path, info) do
+  def build_entity(config, _port_path, info) do
     pid = UniversalProxy.USB.parse_id(info[:product_id])
     serial = config[:serial_number]
     capabilities = Map.get(@known_product_ids, pid, [:transmit])
 
-    Entity.new(
+    Server.build_entity(
       serial_number: serial,
-      port_path: port_path,
-      product_id: pid,
       name: config[:friendly_name] || "IRDroid / IR Toy",
-      capabilities: capabilities,
-      device_module: __MODULE__
+      capabilities: capabilities
     )
   end
 
   @impl true
-  def child_spec(entity, server_pid) do
+  def child_spec(entry, server_pid) do
     %{
-      id: entity.key,
-      start: {DeviceWorker, :start_link, [[entity: entity, server_pid: server_pid]]},
+      id: entry.entity.key,
+      start: {DeviceWorker, :start_link, [[entry: entry, server_pid: server_pid]]},
       restart: :temporary
     }
   end
 
   @impl true
   defdelegate transmit(worker, timings, opts), to: DeviceWorker
-
 end

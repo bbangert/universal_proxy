@@ -1,6 +1,7 @@
 defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceTest do
   use ExUnit.Case, async: true
 
+  alias Espex.InfraredProxy.Entity
   alias UniversalProxy.ESPHome.Infrared.Irdroid.Device
 
   describe "match?/1" do
@@ -45,24 +46,24 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceTest do
       config = %{serial_number: "SN001", friendly_name: "My IRDroid"}
       info = %{vendor_id: 0x04D8, product_id: 0xF58B}
 
-      entity = Device.build_entity(config, "/dev/ttyACM0", info)
+      assert %Entity{} = entity = Device.build_entity(config, "/dev/ttyACM0", info)
 
-      assert entity.serial_number == "SN001"
-      assert entity.port_path == "/dev/ttyACM0"
+      assert entity.object_id == "infrared_SN001"
       assert entity.name == "My IRDroid"
-      assert entity.product_id == 0xF58B
       assert :transmit in entity.capabilities
       assert :receive in entity.capabilities
-      assert entity.device_module == Device
+      # The key is a deterministic hash of the serial number so Home
+      # Assistant's stored entity ID survives reboots and reconnects.
+      assert entity.key == :erlang.phash2({"SN001", "infrared"}, 0xFFFFFFFF)
     end
 
     test "builds entity with transmit-only for PID 0xFD08" do
       config = %{serial_number: "SN002", friendly_name: nil}
       info = %{vendor_id: 0x04D8, product_id: 0xFD08}
 
-      entity = Device.build_entity(config, "/dev/ttyACM1", info)
+      assert %Entity{} = entity = Device.build_entity(config, "/dev/ttyACM1", info)
 
-      assert entity.product_id == 0xFD08
+      assert entity.object_id == "infrared_SN002"
       assert entity.capabilities == [:transmit]
       assert entity.name == "IRDroid / IR Toy"
     end

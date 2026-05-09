@@ -3,7 +3,21 @@ defmodule UniversalProxy.MixProject do
 
   @app :universal_proxy
   @version "0.1.0"
-  @all_targets [:bbb, :grisp2, :osd32mp1, :mangopi_mq_pro, :qemu_aarch64, :rpi, :rpi0, :rpi0_2, :rpi2, :rpi3, :rpi4, :rpi5, :x86_64]
+  @all_targets [
+    :bbb,
+    :grisp2,
+    :osd32mp1,
+    :mangopi_mq_pro,
+    :qemu_aarch64,
+    :rpi,
+    :rpi0,
+    :rpi0_2,
+    :rpi2,
+    :rpi3,
+    :rpi4,
+    :rpi5,
+    :x86_64
+  ]
 
   def project do
     [
@@ -29,14 +43,7 @@ defmodule UniversalProxy.MixProject do
       setup: ["deps.get", "assets.setup", "assets.build"],
       "assets.setup": ["tailwind.install --if-missing", "esbuild.install --if-missing"],
       "assets.build": ["tailwind default", "esbuild default"],
-      "assets.deploy": ["tailwind default --minify", "esbuild default --minify", "phx.digest"],
-      protobuf: [
-        "protobuf.generate --output-path=./lib --include-path=./priv/protos --package-prefix=universal_proxy.protos priv/protos/api_options.proto priv/protos/api.proto"
-      ],
-      compile: [
-        "protobuf.generate --output-path=./lib --include-path=./priv/protos --package-prefix=universal_proxy.protos priv/protos/api_options.proto priv/protos/api.proto",
-        "compile"
-      ]
+      "assets.deploy": ["tailwind default --minify", "esbuild default --minify", "phx.digest"]
     ]
   end
 
@@ -84,12 +91,8 @@ defmodule UniversalProxy.MixProject do
       # UART/serial port enumeration
       {:circuits_uart, "~> 1.5"},
 
-      # TCP server for ESPHome Native API
-      {:thousand_island, "~> 1.4"},
-
-      # Protobuf code generation
-      {:protobuf, "~> 0.12"},
-      {:protobuf_generate, "~> 0.2", runtime: false},
+      # ESPHome Native API server library
+      {:espex, "~> 0.1.1"},
 
       # Dependencies for all targets
       {:nerves, "~> 1.10", runtime: false},

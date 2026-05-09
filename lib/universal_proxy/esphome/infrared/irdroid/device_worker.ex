@@ -26,7 +26,6 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
 
   require Logger
 
-  alias UniversalProxy.ESPHome.Infrared.Entity
   alias UniversalProxy.ESPHome.Infrared.Irdroid.Protocol
 
   @tx_completion_timeout 5_000
@@ -35,7 +34,8 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
   defstruct [
     :uart_pid,
     :port_path,
-    :entity,
+    :entity_key,
+    :can_receive,
     :server_pid,
     protocol: Protocol.new(),
     current_mode: :idle
@@ -57,23 +57,31 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
 
   @impl true
   def init(opts) do
-    entity = Keyword.fetch!(opts, :entity)
+    entry = Keyword.fetch!(opts, :entry)
     server_pid = Keyword.fetch!(opts, :server_pid)
+    can_receive = :receive in entry.entity.capabilities
 
     state = %__MODULE__{
-      port_path: entity.port_path,
-      entity: entity,
+      port_path: entry.port_path,
+      entity_key: entry.entity.key,
+      can_receive: can_receive,
       server_pid: server_pid
     }
 
-    with {:ok, uart_pid} <- open_uart(entity.port_path),
+    {:ok, state, {:continue, :initialize}}
+  end
+
+  @impl true
+  def handle_continue(:initialize, state) do
+    with {:ok, uart_pid} <- open_uart(state.port_path),
          state = %{state | uart_pid: uart_pid},
          {:ok, state} <- initialize_device(state) do
-      {:ok, state}
+      {:noreply, state}
     else
       {:error, reason} ->
-        Logger.error("IRDroid worker failed to start on #{entity.port_path}: #{inspect(reason)}")
-        {:stop, {:init_failed, reason}}
+        Logger.error("IRDroid worker failed to start on #{state.port_path}: #{inspect(reason)}")
+
+        {:stop, {:init_failed, reason}, state}
     end
   end
 
@@ -141,7 +149,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
         Process.sleep(50)
 
         state =
-          if Entity.can_receive?(state.entity) do
+          if state.can_receive do
             enter_receive_mode(state)
           else
             state
@@ -202,7 +210,10 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
         end
 
       {:circuits_uart, _port, {:error, reason}} ->
-        Logger.warning("IRDroid UART error during mode ack on #{state.port_path}: #{inspect(reason)}")
+        Logger.warning(
+          "IRDroid UART error during mode ack on #{state.port_path}: #{inspect(reason)}"
+        )
+
         {:error, {:uart_error, reason}}
     after
       @mode_ack_timeout ->
@@ -243,7 +254,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
     uart_write(state, Protocol.reset())
     Process.sleep(10)
 
-    if Entity.can_receive?(state.entity) do
+    if state.can_receive do
       enter_receive_mode(state)
     else
       protocol = Protocol.set_idle(state.protocol)
@@ -269,7 +280,10 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
         %{state | protocol: Protocol.set_receive_mode(state.protocol)}
 
       {:circuits_uart, _port, {:error, reason}} ->
-        Logger.warning("IRDroid UART error entering RX mode on #{state.port_path}: #{inspect(reason)}")
+        Logger.warning(
+          "IRDroid UART error entering RX mode on #{state.port_path}: #{inspect(reason)}"
+        )
+
         state
     after
       @mode_ack_timeout ->
@@ -285,7 +299,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
   end
 
   defp execute_action({:rx_timings, timings}, state) do
-    send(state.server_pid, {:infrared_receive, state.entity.key, timings})
+    send(state.server_pid, {:infrared_receive, state.entity_key, timings})
     state
   end
 
@@ -317,7 +331,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
   defp execute_action(:rx_overflow, state) do
     Logger.warning("IRDroid #{state.port_path} RX overflow, re-entering receive mode")
 
-    if Entity.can_receive?(state.entity) do
+    if state.can_receive do
       enter_receive_mode(state)
     else
       state
