@@ -14,6 +14,11 @@ defmodule UniversalProxy.System do
   # `Code.ensure_loaded?` checks gate every call.
   @compile {:no_warn_undefined, [Nerves.Runtime, Nerves.Runtime.KV, VintageNet, RingLogger]}
 
+  # Captured at compile time. `Mix` is a build-time tool and isn't
+  # loaded in mix releases on Nerves, so calling `Mix.target/0` at
+  # runtime would raise `UndefinedFunctionError`.
+  @target Mix.target() |> to_string()
+
   # ── Firmware metadata ──────────────────────────────────────────────
 
   @doc """
@@ -26,7 +31,7 @@ defmodule UniversalProxy.System do
 
     %{
       version: kv["nerves_fw_version"] || application_version(),
-      target: kv["nerves_fw_platform"] || to_string(Mix.target()),
+      target: kv["nerves_fw_platform"] || @target,
       hardware: device_tree_model() || host_label(),
       uuid: kv["nerves_fw_uuid"],
       vcs_identifier: blank_to_nil(kv["nerves_fw_vcs_identifier"]),
@@ -58,10 +63,8 @@ defmodule UniversalProxy.System do
   end
 
   defp host_label do
-    case :inet.gethostname() do
-      {:ok, name} -> "Host (#{name})"
-      _ -> "Host"
-    end
+    {:ok, name} = :inet.gethostname()
+    "Host (#{name})"
   end
 
   @doc """
@@ -87,10 +90,8 @@ defmodule UniversalProxy.System do
   end
 
   defp hostname do
-    case :inet.gethostname() do
-      {:ok, name} -> "#{name}.local"
-      _ -> "—"
-    end
+    {:ok, name} = :inet.gethostname()
+    "#{name}.local"
   end
 
   defp primary_ipv4 do
