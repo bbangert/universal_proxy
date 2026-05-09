@@ -9,6 +9,9 @@ env:
   MIX_TARGET: host
   ELIXIR_VERSION: "1.19.5"
   OTP_VERSION: "28.3"
+  # System packages required to compile NIFs that mix deps.get pulls in
+  # (libmnl-dev for vintage_net, libssl-dev for crypto-using NIFs).
+  APT_PACKAGES: build-essential automake autoconf pkg-config libssl-dev libmnl-dev
 
 jobs:
   format:
@@ -16,6 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - run: sudo apt-get update && sudo apt-get install -y ${{ env.APT_PACKAGES }}
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
@@ -36,6 +40,7 @@ jobs:
       MIX_ENV: dev
     steps:
       - uses: actions/checkout@v6
+      - run: sudo apt-get update && sudo apt-get install -y ${{ env.APT_PACKAGES }}
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
@@ -58,6 +63,7 @@ jobs:
       MIX_ENV: dev
     steps:
       - uses: actions/checkout@v6
+      - run: sudo apt-get update && sudo apt-get install -y ${{ env.APT_PACKAGES }}
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
@@ -80,6 +86,7 @@ jobs:
       MIX_ENV: test
     steps:
       - uses: actions/checkout@v6
+      - run: sudo apt-get update && sudo apt-get install -y ${{ env.APT_PACKAGES }}
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
@@ -102,6 +109,7 @@ jobs:
       MIX_ENV: dev
     steps:
       - uses: actions/checkout@v6
+      - run: sudo apt-get update && sudo apt-get install -y ${{ env.APT_PACKAGES }}
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
@@ -128,6 +136,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - run: sudo apt-get update && sudo apt-get install -y ${{ env.APT_PACKAGES }}
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
