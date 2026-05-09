@@ -40,8 +40,13 @@ defmodule UniversalProxy.ESPHome.ConfigStore do
   # -- Client API --
 
   def start_link(opts \\ []) do
-    name = Keyword.get(opts, :name, __MODULE__)
-    GenServer.start_link(__MODULE__, opts, name: name)
+    gen_opts =
+      case Keyword.get(opts, :name, __MODULE__) do
+        nil -> []
+        name -> [name: name]
+      end
+
+    GenServer.start_link(__MODULE__, opts, gen_opts)
   end
 
   @doc """
@@ -96,15 +101,15 @@ defmodule UniversalProxy.ESPHome.ConfigStore do
   @impl true
   def init(opts) do
     table_name = Keyword.get(opts, :table, :esphome_config)
-    path = (Keyword.get(opts, :dets_path) || dets_path()) |> to_charlist()
+    path = Keyword.get(opts, :dets_path) || dets_path()
 
-    case :dets.open_file(table_name, file: path, type: :set) do
+    case :dets.open_file(table_name, file: to_charlist(path), type: :set) do
       {:ok, table} ->
         Logger.info("ESPHome config store opened at #{path}")
         {:ok, %{table: table}}
 
       {:error, reason} ->
-        Logger.error("ESPHome config store failed to open: #{inspect(reason)}")
+        Logger.error("ESPHome config store failed to open #{path}: #{inspect(reason)}")
         {:stop, reason}
     end
   end

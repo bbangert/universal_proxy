@@ -1,49 +1,64 @@
 defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
-  # Each test gets its own GenServer name + no UART hardware (port_path: nil).
+  # Each test gets its own unnamed GenServer (pid only — no atom leakage)
+  # and no UART hardware (port_path: nil).
   use ExUnit.Case, async: true
 
   alias UniversalProxy.ESPHome.ZWaveProxy
 
   setup do
-    name = :"zwave_proxy_test_#{System.unique_integer([:positive])}"
-    pid = start_supervised!({ZWaveProxy, name: name, port_path: nil})
-    {:ok, server: pid, name: name}
+    pid = start_supervised!({ZWaveProxy, name: nil, port_path: nil})
+    {:ok, server: pid}
   end
 
   describe "without hardware" do
-    test "available? returns false", %{name: server} do
+    test "available? returns false", %{server: server} do
       refute ZWaveProxy.available?(server)
     end
 
-    test "home_id returns 0 when no controller", %{name: server} do
+    test "home_id returns 0 when no controller", %{server: server} do
       assert ZWaveProxy.home_id(server) == 0
     end
 
-    test "subscribe is rejected with :unavailable", %{name: server} do
+    test "subscribe is rejected with :unavailable", %{server: server} do
       assert {:error, :unavailable} = ZWaveProxy.subscribe(server, self())
     end
 
-    test "send_frame returns {:error, :unavailable}", %{name: server} do
+    test "send_frame returns {:error, :unavailable}", %{server: server} do
       assert {:error, :unavailable} = ZWaveProxy.send_frame(server, <<1, 2, 3>>)
     end
 
-    test "unsubscribe is idempotent for an unknown pid", %{name: server} do
+    test "unsubscribe is idempotent for an unknown pid", %{server: server} do
       assert :ok = ZWaveProxy.unsubscribe(server, self())
     end
   end
 
-  describe "available?/0 / home_id/0 fallback" do
-    test "returns false / 0 when the server is dead" do
-      # Start a fresh instance, stop it, then call the public API targeting
-      # that name — the catch :exit clause should kick in.
-      name = :"zwave_proxy_dead_#{System.unique_integer([:positive])}"
-      {:ok, pid} = ZWaveProxy.start_link(name: name, port_path: nil)
+  describe "callbacks tolerate a dead/missing server" do
+    setup do
+      {:ok, pid} = ZWaveProxy.start_link(name: nil, port_path: nil)
       ref = Process.monitor(pid)
       GenServer.stop(pid)
       assert_receive {:DOWN, ^ref, :process, ^pid, _}
+      {:ok, dead: pid}
+    end
 
-      refute ZWaveProxy.available?(name)
-      assert ZWaveProxy.home_id(name) == 0
+    test "available? returns false", %{dead: pid} do
+      refute ZWaveProxy.available?(pid)
+    end
+
+    test "home_id returns 0", %{dead: pid} do
+      assert ZWaveProxy.home_id(pid) == 0
+    end
+
+    test "subscribe returns {:error, :unavailable}", %{dead: pid} do
+      assert {:error, :unavailable} = ZWaveProxy.subscribe(pid, self())
+    end
+
+    test "unsubscribe returns :ok (idempotent)", %{dead: pid} do
+      assert :ok = ZWaveProxy.unsubscribe(pid, self())
+    end
+
+    test "send_frame returns {:error, :unavailable}", %{dead: pid} do
+      assert {:error, :unavailable} = ZWaveProxy.send_frame(pid, <<1>>)
     end
   end
 end

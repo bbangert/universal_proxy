@@ -49,8 +49,13 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
   # -- Adapter wiring --
 
   def start_link(opts \\ []) do
-    name = Keyword.get(opts, :name, __MODULE__)
-    GenServer.start_link(__MODULE__, opts, name: name)
+    gen_opts =
+      case Keyword.get(opts, :name, __MODULE__) do
+        nil -> []
+        name -> [name: name]
+      end
+
+    GenServer.start_link(__MODULE__, opts, gen_opts)
   end
 
   @impl Espex.ZWaveProxy
@@ -79,18 +84,25 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
           {:ok, <<_::32>>} | {:error, :already_subscribed | :unavailable}
   def subscribe(server \\ __MODULE__, pid) when is_pid(pid) do
     GenServer.call(server, {:subscribe, pid}, @short_call_timeout)
+  catch
+    :exit, _ -> {:error, :unavailable}
   end
 
   @impl Espex.ZWaveProxy
   @spec unsubscribe(GenServer.server(), pid()) :: :ok
   def unsubscribe(server \\ __MODULE__, pid) when is_pid(pid) do
     GenServer.call(server, {:unsubscribe, pid}, @short_call_timeout)
+  catch
+    # Idempotent contract — a missing server is "already unsubscribed".
+    :exit, _ -> :ok
   end
 
   @impl Espex.ZWaveProxy
   @spec send_frame(GenServer.server(), binary()) :: :ok | {:error, term()}
   def send_frame(server \\ __MODULE__, data) when is_binary(data) do
     GenServer.call(server, {:send_frame, data}, @send_frame_timeout)
+  catch
+    :exit, _ -> {:error, :unavailable}
   end
 
   # -- Server Callbacks --

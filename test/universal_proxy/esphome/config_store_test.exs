@@ -1,17 +1,27 @@
 defmodule UniversalProxy.ESPHome.ConfigStoreTest do
-  use ExUnit.Case, async: true
+  # async: false because DETS table names must be atoms; reusing a single
+  # constant atom across tests prevents per-test atom-table growth. The
+  # GenServer itself is unnamed (name: nil), so the only atom in play is
+  # @table below.
+  use ExUnit.Case, async: false
 
   alias UniversalProxy.ESPHome.ConfigStore
 
+  @table :config_store_test
+
   setup do
-    table = :"config_store_test_#{System.unique_integer([:positive])}"
-    path = Path.join(System.tmp_dir!(), "#{table}.dets")
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "config_store_test_#{System.unique_integer([:positive])}.dets"
+      )
+
     on_exit(fn -> File.rm(path) end)
 
     pid =
-      start_supervised!({ConfigStore, name: table, table: table, dets_path: path})
+      start_supervised!({ConfigStore, name: nil, table: @table, dets_path: path})
 
-    {:ok, server: pid, table: table}
+    {:ok, server: pid}
   end
 
   describe "current/1" do
