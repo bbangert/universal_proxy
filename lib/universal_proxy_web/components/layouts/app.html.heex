@@ -1,46 +1,78 @@
-<div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
-  <header class="py-6">
-    <nav class="flex gap-1 border-b border-zinc-200 dark:border-neon-purple/20">
-      <.link
-        navigate={~p"/"}
-        class={[
-          "px-4 py-2 text-sm font-medium transition-all border-b-2 -mb-px",
-          if(@current_path == "/",
-            do: "border-neon-purple text-zinc-900 dark:text-neon-purple",
-            else: "border-transparent text-zinc-500 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
-          )
-        ]}
+<div class="min-h-screen flex flex-col">
+  <%!-- Topbar --%>
+  <header class="h-14 flex items-center gap-4 px-5 bg-surface border-b border-border-1">
+    <div class="flex items-center gap-2.5 text-fg-1">
+      <span class="text-md font-semibold tracking-tight">Universal Proxy</span>
+    </div>
+    <div class="flex-1"></div>
+    <button
+      id="theme-toggle"
+      type="button"
+      phx-hook="ThemeToggle"
+      title="Toggle theme"
+      aria-label="Toggle theme"
+      class="inline-flex items-center justify-center w-7 h-7 rounded-md text-fg-1 hover:bg-sunken transition-colors"
+    >
+      <svg
+        data-icon="auto"
+        width="16"
+        height="16"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        class="hidden"
       >
-        Dashboard
-      </.link>
-      <.link
-        navigate={~p"/devices"}
-        class={[
-          "px-4 py-2 text-sm font-medium transition-all border-b-2 -mb-px",
-          if(@current_path == "/devices",
-            do: "border-neon-purple text-zinc-900 dark:text-neon-purple",
-            else: "border-transparent text-zinc-500 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
-          )
-        ]}
+        <circle cx="12" cy="12" r="9" /><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none" />
+      </svg>
+      <svg
+        data-icon="light"
+        width="16"
+        height="16"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        class="hidden"
       >
-        Connected Devices
-      </.link>
-      <.link
-        navigate={~p"/esphome-config"}
-        class={[
-          "px-4 py-2 text-sm font-medium transition-all border-b-2 -mb-px",
-          if(@current_path == "/esphome-config",
-            do: "border-neon-purple text-zinc-900 dark:text-neon-purple",
-            else: "border-transparent text-zinc-500 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
-          )
-        ]}
+        <circle cx="12" cy="12" r="4" />
+        <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
+      </svg>
+      <svg
+        data-icon="dark"
+        width="16"
+        height="16"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        class="hidden"
       >
-        ESPHome Config
-      </.link>
-    </nav>
+        <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+      </svg>
+    </button>
   </header>
 
-  <main class="py-10">
-    <%= @inner_content %>
+  <%!-- Tab strip --%>
+  <nav class="flex gap-1 px-6 bg-surface border-b border-border-1 sticky top-0 z-10">
+    <.tab path="/" current={@current_path} label="Overview" />
+    <.tab path="/traffic" current={@current_path} label="Traffic" />
+    <.tab path="/discovery" current={@current_path} label="Discovery" />
+    <.tab path="/security" current={@current_path} label="Security" />
+    <.tab path="/system" current={@current_path} label="System" />
+  </nav>
+
+  <%!-- Flash --%>
+  <.flash_group flash={@flash} />
+
+  <%!-- Page content --%>
+  <main class="flex-1 px-6 py-6">
+    {@inner_content}
   </main>
 </div>

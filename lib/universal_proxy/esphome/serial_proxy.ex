@@ -19,9 +19,8 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
 
   alias Espex.SerialProxy.Info
   alias UniversalProxy.ESPHome.SerialProxy.Relay
+  alias UniversalProxy.Hardware
   alias UniversalProxy.UART
-  alias UniversalProxy.UART.Enumerate, as: UARTEnumerate
-  alias UniversalProxy.UART.Store, as: UARTStore
 
   @impl true
   def list_instances do
@@ -95,23 +94,23 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
 
   # -- Private --
 
+  # Build the serial-port inventory from `Hardware.list_ports/0` so we
+  # surface auto-detected chipset defaults AND user-saved overrides
+  # uniformly. The `:ha_name` field on each port matches what Home
+  # Assistant's serial picker shows in the Overview UI ("FTDI FT232RL
+  # (1-1.1.2)") so the user sees the same label everywhere.
   defp inventory do
-    serial_to_path = UARTEnumerate.serial_to_path(UARTEnumerate.safe())
-
-    UARTStore.all_configs()
-    |> Enum.filter(fn config ->
-      Map.has_key?(serial_to_path, config[:serial_number]) and
-        config[:port_type] not in [:zwave, :infrared]
+    Hardware.list_ports()
+    |> Enum.filter(fn port ->
+      port.connected and port.configured and port.kind in [:ttl, :rs232, :rs485]
     end)
-    |> Enum.sort_by(fn config -> config[:friendly_name] || "tty#{config[:serial_number]}" end)
-    |> Enum.map(fn config ->
-      serial = config[:serial_number]
-
+    |> Enum.map(fn port ->
       %{
-        path: Map.fetch!(serial_to_path, serial),
-        friendly_name: config[:friendly_name] || "tty#{serial}",
-        port_type: config[:port_type] || :ttl
+        path: port.tty_name,
+        friendly_name: port.ha_name,
+        port_type: port.kind
       }
     end)
+    |> Enum.sort_by(& &1.friendly_name)
   end
 end

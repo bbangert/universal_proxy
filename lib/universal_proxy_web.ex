@@ -90,8 +90,6 @@ defmodule UniversalProxyWeb do
       # Shortcut for generating JS commands
       alias Phoenix.LiveView.JS
 
-      # Import components
-      import UniversalProxyWeb.Components.Text
       # Routes generation with the ~p sigil
       unquote(verified_routes())
     end
