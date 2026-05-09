@@ -12,3 +12,8 @@ config :logger, level: :warning
 
 # Initialize plugs at runtime for faster test compilation
 config :phoenix, :plug_init_mode, :runtime
+
+# vintage_net (transitive of nerves_pack) writes /etc/resolv.conf at app
+# startup. Redirect to a writable path so the test VM can boot in sandboxed
+# environments (CI runners, devcontainers).
+config :vintage_net, resolvconf: "/tmp/universal_proxy_test_resolv.conf"

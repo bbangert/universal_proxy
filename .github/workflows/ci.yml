@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  MIX_TARGET: host
+  ELIXIR_VERSION: "1.19.5"
+  OTP_VERSION: "28.3"
+
+jobs:
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+      - run: mix archive.install hex nerves_bootstrap --force
+      - uses: actions/cache@v5
+        with:
+          path: deps
+          key: ${{ runner.os }}-host-deps-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-host-deps-
+      - run: mix deps.get
+      - run: mix format --check-formatted
+
+  compile:
+    name: Compile (warnings as errors)
+    runs-on: ubuntu-latest
+    env:
+      MIX_ENV: dev
+    steps:
+      - uses: actions/checkout@v6
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+      - run: mix archive.install hex nerves_bootstrap --force
+      - uses: actions/cache@v5
+        with:
+          path: |
+            deps
+            _build/host_dev
+          key: ${{ runner.os }}-host-dev-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-host-dev-
+      - run: mix deps.get
+      - run: mix compile --warnings-as-errors
+
+  credo:
+    name: Credo
+    runs-on: ubuntu-latest
+    env:
+      MIX_ENV: dev
+    steps:
+      - uses: actions/checkout@v6
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+      - run: mix archive.install hex nerves_bootstrap --force
+      - uses: actions/cache@v5
+        with:
+          path: |
+            deps
+            _build/host_dev
+          key: ${{ runner.os }}-host-dev-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-host-dev-
+      - run: mix deps.get
+      - run: mix credo --strict
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    env:
+      MIX_ENV: test
+    steps:
+      - uses: actions/checkout@v6
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+      - run: mix archive.install hex nerves_bootstrap --force
+      - uses: actions/cache@v5
+        with:
+          path: |
+            deps
+            _build/host_test
+          key: ${{ runner.os }}-host-test-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-host-test-
+      - run: mix deps.get
+      - run: mix test --warnings-as-errors
+
+  dialyzer:
+    name: Dialyzer
+    runs-on: ubuntu-latest
+    env:
+      MIX_ENV: dev
+    steps:
+      - uses: actions/checkout@v6
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+      - run: mix archive.install hex nerves_bootstrap --force
+      - uses: actions/cache@v5
+        with:
+          path: |
+            deps
+            _build/host_dev
+          key: ${{ runner.os }}-host-dev-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-host-dev-
+      - uses: actions/cache@v5
+        with:
+          path: priv/plts
+          key: ${{ runner.os }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+      - run: mix deps.get
+      - run: mix dialyzer --format github
+
+  hex-audit:
+    name: Hex audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+      - run: mix archive.install hex nerves_bootstrap --force
+      - uses: actions/cache@v5
+        with:
+          path: deps
+          key: ${{ runner.os }}-host-deps-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-host-deps-
+      - run: mix deps.get
+      - run: mix hex.audit
+      - run: mix deps.unlock --check-unused
