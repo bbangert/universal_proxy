@@ -31,7 +31,8 @@ defmodule UniversalProxy.MixProject do
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       releases: [{@app, release()}],
-      aliases: aliases()
+      aliases: aliases(),
+      dialyzer: [plt_local_path: "priv/plts", plt_core_path: "priv/plts"]
     ]
   end
 
