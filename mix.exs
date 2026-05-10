@@ -32,7 +32,11 @@ defmodule UniversalProxy.MixProject do
       deps: deps(),
       releases: [{@app, release()}],
       aliases: aliases(),
-      dialyzer: [plt_local_path: "priv/plts", plt_core_path: "priv/plts"]
+      dialyzer: [
+        plt_local_path: "priv/plts",
+        plt_core_path: "priv/plts",
+        ignore_warnings: ".dialyzer_ignore.exs"
+      ]
     ]
   end
 
