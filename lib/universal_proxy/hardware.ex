@@ -378,10 +378,14 @@ defmodule UniversalProxy.Hardware do
       "USB Serial Adapter"
   end
 
-  # `UniversalProxy.UART.Store` auto-fills `friendly_name` with the
-  # placeholder "tty<serial>" when the user doesn't supply one. We treat
-  # that placeholder as "no name set" so the device-table name (e.g.
-  # "USB Serial Adapter") wins.
+  # Defends against legacy DETS records: an earlier revision of
+  # `UniversalProxy.UART.Store` auto-filled `friendly_name` with the
+  # placeholder `"tty<serial>"` when the caller didn't supply one. The
+  # current Store leaves `friendly_name` absent in that case, but
+  # `prune_legacy_records/1` only drops entries with non-tuple keys, so
+  # a tuple-keyed record carrying that legacy placeholder can survive
+  # across the migration. Treat the placeholder as "no name set" so the
+  # device-table name (e.g. "USB Serial Adapter") wins.
   defp user_friendly_name(nil), do: nil
 
   defp user_friendly_name(saved_cfg) do

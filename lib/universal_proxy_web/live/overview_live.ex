@@ -116,10 +116,23 @@ defmodule UniversalProxyWeb.OverviewLive do
 
     if port && port.connected do
       key = {port.slot_sub, port.vendor_id, port.product_id}
-      UART.save_config(key, %{port_type: kind_str, serial_number: port.serial})
+      UART.save_config(key, save_params(kind_str, port.serial))
     end
 
     assign(socket, :ports, Hardware.list_ports())
+  end
+
+  # `Hardware.build_port/6` substitutes the em-dash placeholder for a
+  # nil/missing serial number at render time. Don't let that placeholder
+  # leak into DETS — pass `serial_number` only when the underlying
+  # serial is real.
+  defp save_params(kind_str, serial) do
+    base = %{port_type: kind_str}
+
+    case serial do
+      s when is_binary(s) and s not in ["—", "-", ""] -> Map.put(base, :serial_number, s)
+      _ -> base
+    end
   end
 
   @impl true
@@ -628,12 +641,12 @@ defmodule UniversalProxyWeb.OverviewLive do
         []
       end
 
-    tail = [
-      {"Claimed by", port.user || "Not claimed", false},
-      {"Connected", port.since || "—", false},
-      {"Errors (24h)", to_string(port.errors), false},
-      {"Notes", port.notes, false}
-    ]
+    tail =
+      [
+        {"Claimed by", port.user || "Not claimed", false},
+        {"Connected", port.since || "—", false},
+        {"Errors (24h)", to_string(port.errors), false}
+      ] ++ if port.notes, do: [{"Notes", port.notes, false}], else: []
 
     base ++ serial ++ tail
   end
