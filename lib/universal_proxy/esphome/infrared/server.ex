@@ -31,6 +31,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Server do
 
   alias Espex.InfraredProxy.Entity
   alias UniversalProxy.ESPHome.Infrared.Irdroid
+  alias UniversalProxy.Hardware
   alias UniversalProxy.UART.Enumerate, as: UARTEnumerate
   alias UniversalProxy.UART.Store, as: UARTStore
 
@@ -197,18 +198,48 @@ defmodule UniversalProxy.ESPHome.Infrared.Server do
   end
 
   defp build_inventory do
-    serial_to_entry =
-      for {path, info} <- UARTEnumerate.safe(),
-          UARTEnumerate.present?(info[:serial_number]),
-          into: %{},
-          do: {info[:serial_number], {path, info}}
+    enumerated = UARTEnumerate.safe()
+    key_to_tty = Hardware.live_port_keys(enumerated: enumerated)
 
-    UARTStore.all_configs()
-    |> Enum.filter(fn config ->
-      config[:port_type] == :infrared and
-        Map.has_key?(serial_to_entry, config[:serial_number])
-    end)
-    |> Enum.flat_map(&start_entry(&1, serial_to_entry))
+    # Auto-detected IR adapters from Hardware.list_ports/0 — these
+    # don't need a saved config (they're branded products that the
+    # device-table classifies as :ir on sight).
+    auto =
+      Hardware.list_ports()
+      |> Enum.filter(&(&1.connected and &1.kind == :ir))
+      |> Enum.flat_map(fn port ->
+        info = Map.get(enumerated, port.tty_name, %{})
+
+        # Pretend a synthetic config so start_entry/2 can render an
+        # entity for these unsaved-but-classified ports.
+        synthesized = %{
+          port_type: :infrared,
+          serial_number: port.serial,
+          friendly_name: port.name,
+          slot_sub: port.slot_sub,
+          vendor_id: port.vendor_id,
+          product_id: port.product_id
+        }
+
+        start_entry(synthesized, port.tty_name, info)
+      end)
+
+    # User-saved IR overrides on otherwise-unclassified hardware.
+    saved =
+      UARTStore.all_configs()
+      |> Enum.flat_map(fn config ->
+        key = {config[:slot_sub], config[:vendor_id], config[:product_id]}
+
+        with true <- config[:port_type] == :infrared,
+             tty when is_binary(tty) <- Map.get(key_to_tty, key) do
+          info = Map.get(enumerated, tty, %{})
+          start_entry(config, tty, info)
+        else
+          _ -> []
+        end
+      end)
+
+    auto ++ saved
   rescue
     e ->
       Logger.warning(
@@ -218,9 +249,11 @@ defmodule UniversalProxy.ESPHome.Infrared.Server do
       []
   end
 
-  defp start_entry(config, serial_to_entry) do
+  defp start_entry(config, tty_name, info) do
     serial = config[:serial_number]
-    {path, info} = Map.fetch!(serial_to_entry, serial)
+    # Match what `Circuits.UART.enumerate/0` returned originally: just
+    # the basename (e.g. "ttyUSB0"), not "/dev/ttyUSB0".
+    path = tty_name
 
     case find_product_module(info) do
       {:ok, mod} ->

@@ -19,7 +19,7 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   use Supervisor
 
   alias UniversalProxy.ESPHome.{ConfigStore, Infrared, SerialProxy, ZWaveProxy}
-  alias UniversalProxy.UART.Enumerate, as: UARTEnumerate
+  alias UniversalProxy.Hardware
   alias UniversalProxy.UART.Store, as: UARTStore
 
   def start_link(init_arg) do
@@ -65,17 +65,31 @@ defmodule UniversalProxy.ESPHome.Supervisor do
     Supervisor.init(children, strategy: :rest_for_one)
   end
 
+  # Resolve the tty path of the Z-Wave-classified port. Two sources
+  # cooperate:
+  #
+  #   1. `Hardware.list_ports/0` already auto-classifies the Nabu Casa
+  #      Connect ZWA-2 by VID/PID (`0x10C4:0xEA60`), so the common case
+  #      needs no saved config.
+  #   2. A user-saved `:zwave` override on a generic port still wins.
   defp resolve_zwave_port do
-    serial_to_path = UARTEnumerate.serial_to_path(UARTEnumerate.safe())
+    case Enum.find(Hardware.list_ports(), &(&1.connected and &1.kind == :zwave)) do
+      nil ->
+        # Fallback for pre-existing saved configs that target a port
+        # whose adapter isn't currently classified as Z-Wave by
+        # Hardware (e.g. a CP2102N on a non-ZWA-2 device).
+        key_to_tty = Hardware.live_port_keys()
 
-    config =
-      Enum.find(UARTStore.all_configs(), fn cfg ->
-        cfg[:port_type] == :zwave and Map.has_key?(serial_to_path, cfg[:serial_number])
-      end)
+        case Enum.find(UARTStore.all_configs(), fn cfg ->
+               cfg[:port_type] == :zwave and
+                 Map.has_key?(key_to_tty, {cfg[:slot_sub], cfg[:vendor_id], cfg[:product_id]})
+             end) do
+          nil -> nil
+          cfg -> Map.get(key_to_tty, {cfg[:slot_sub], cfg[:vendor_id], cfg[:product_id]})
+        end
 
-    case config do
-      nil -> nil
-      cfg -> Map.get(serial_to_path, cfg[:serial_number])
+      port ->
+        port.tty_name
     end
   end
 end

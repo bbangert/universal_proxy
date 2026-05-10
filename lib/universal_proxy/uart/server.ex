@@ -27,7 +27,6 @@ defmodule UniversalProxy.UART.Server do
   @hotplug_interval 5_000
   @irdroid_vendor_id 0x04D8
   @irdroid_product_ids MapSet.new([0xFD08, 0xF58B])
-  @irdroid_product "IRDroid / IR Toy"
 
   # -- Client API --
 
@@ -116,7 +115,6 @@ defmodule UniversalProxy.UART.Server do
   def init(_opts) do
     :timer.send_interval(@hotplug_interval, self(), :check_hotplug)
     known = current_serial_set()
-    auto_detect_known_devices()
     Logger.info("UART server started, #{MapSet.size(known)} serial devices detected")
     {:ok, %{ports: %{}, known_serials: known}}
   end
@@ -231,7 +229,6 @@ defmodule UniversalProxy.UART.Server do
 
       if MapSet.size(added) > 0 do
         Logger.info("UART hotplug: devices added: #{Enum.join(added, ", ")}")
-        auto_detect_known_devices()
       end
 
       if MapSet.size(removed) > 0 do
@@ -356,64 +353,37 @@ defmodule UniversalProxy.UART.Server do
   defp present?(s) when is_binary(s), do: String.trim(s) != ""
   defp present?(_), do: false
 
-  defp broadcast_lifecycle(topic, port_name, config) do
+  # Two lifecycle topics; the broadcast tag mirrors the topic name so
+  # subscribers can pattern-match on `{:uart_port_opened, info}` etc.
+  # The atoms must be created statically — never via `String.to_atom/1`
+  # — to avoid atom-exhaustion exposure if `topic` ever became dynamic.
+  defp broadcast_lifecycle("uart:port_opened" = topic, port_name, config) do
+    do_broadcast(topic, :uart_port_opened, port_name, config)
+  end
+
+  defp broadcast_lifecycle("uart:port_closed" = topic, port_name, config) do
+    do_broadcast(topic, :uart_port_closed, port_name, config)
+  end
+
+  defp do_broadcast(topic, event, port_name, config) do
     Phoenix.PubSub.broadcast(
       @pubsub,
       topic,
-      {String.to_atom(String.replace(topic, ":", "_")),
-       %{path: port_name, friendly_name: config.friendly_name || port_name}}
+      {event, %{path: port_name, friendly_name: config.friendly_name || port_name}}
     )
   end
+
+  # Branded-device VID/PID predicates retained for the test suite and
+  # for any caller that wants to ask "is this a ZWA-2/IRdroid?" by USB
+  # descriptor. Auto-classification of the saved-config kind is handled
+  # by `UniversalProxy.Hardware`'s `@usb_devices` table — those branded
+  # entries carry `locked: true` so ESPHome consumers (Supervisor and
+  # Infrared.Server) pick them up directly via `Hardware.list_ports/0`
+  # without needing a saved-config row.
 
   # ZWA-2 USB VID/PID from Home Assistant's zwave_js manifest.
   @zwa2_vid 0x303A
   @zwa2_pid 0x4001
-  @zwa2_product "Nabu Casa ZWA-2"
-
-  defp auto_detect_known_devices do
-    auto_detect_zwave_devices()
-    auto_detect_infrared_devices()
-  end
-
-  defp auto_detect_zwave_devices do
-    enumerated = Circuits.UART.enumerate()
-    store = UniversalProxy.UART.Store
-
-    enumerated
-    |> Enum.filter(fn {_path, info} -> zwa2_device?(info) end)
-    |> Enum.each(fn {_path, info} ->
-      with serial when is_binary(serial) and serial != "" <- info[:serial_number],
-           :error <- store.get_config(serial) do
-        Logger.info("Auto-detected #{@zwa2_product} (SN: #{serial}), configuring as Z-Wave proxy")
-        store.save_config(serial, %{port_type: :zwave, friendly_name: @zwa2_product})
-      end
-    end)
-  rescue
-    e -> Logger.warning("Z-Wave auto-detection failed: #{inspect(e)}")
-  end
-
-  defp auto_detect_infrared_devices do
-    enumerated = Circuits.UART.enumerate()
-    store = UniversalProxy.UART.Store
-
-    enumerated
-    |> Enum.filter(fn {_path, info} -> irdroid_device?(info) end)
-    |> Enum.each(fn {_path, info} ->
-      with serial when is_binary(serial) and serial != "" <- info[:serial_number],
-           :error <- store.get_config(serial) do
-        vendor_id = format_usb_id(info[:vendor_id])
-        product_id = format_usb_id(info[:product_id])
-
-        Logger.info(
-          "Auto-detected #{@irdroid_product} (SN: #{serial}, VID:#{vendor_id}, PID:#{product_id}), configuring as infrared device"
-        )
-
-        store.save_config(serial, %{port_type: :infrared, friendly_name: @irdroid_product})
-      end
-    end)
-  rescue
-    e -> Logger.warning("Infrared auto-detection failed: #{inspect(e)}")
-  end
 
   @doc false
   def zwa2_device?(info) do
@@ -438,8 +408,4 @@ defmodule UniversalProxy.UART.Server do
     do: MapSet.member?(@irdroid_product_ids, UniversalProxy.USB.parse_id(id))
 
   defp product_id_matches?(_), do: false
-
-  defp format_usb_id(id) when is_integer(id), do: "0x" <> String.upcase(Integer.to_string(id, 16))
-  defp format_usb_id(id) when is_binary(id), do: id
-  defp format_usb_id(_), do: "?"
 end

@@ -115,36 +115,42 @@ defmodule UniversalProxy.UART do
 
   # -- Persistent Config API (delegates to UART.Store) --
 
+  @typedoc """
+  Composite identifier for a saved port configuration:
+  `{usb_bus_path, vendor_id, product_id}`. Keys configs by physical
+  receptacle + chip identity rather than by serial (which is not
+  always unique on cheap USB-serial chips).
+  """
+  @type port_key :: Store.port_key()
+
   @doc """
   Save or update a persistent UART device configuration.
 
-  The configuration is keyed by `serial_number` and persists across reboots.
-  Only stores `port_type` (:ttl, :rs232, :rs485). Triggers an ESPHome
-  supervisor restart to force client reconnects.
+  Triggers an ESPHome supervisor restart to force client reconnects.
   """
-  @spec save_config(String.t(), map()) :: :ok
-  def save_config(serial_number, params) do
-    Store.save_config(serial_number, params)
+  @spec save_config(port_key(), map()) :: :ok
+  def save_config({_, _, _} = key, params) do
+    Store.save_config(key, params)
   end
 
   @doc """
-  Delete a saved device configuration by serial number.
+  Delete a saved device configuration by composite key.
 
   Triggers an ESPHome supervisor restart to force client reconnects.
   """
-  @spec delete_config(String.t()) :: :ok
-  def delete_config(serial_number) do
-    Store.delete_config(serial_number)
+  @spec delete_config(port_key()) :: :ok
+  def delete_config({_, _, _} = key) do
+    Store.delete_config(key)
   end
 
   @doc """
-  Look up a saved configuration by serial number.
+  Look up a saved configuration by composite key.
 
   Returns `{:ok, config_map}` or `:error` if not found.
   """
-  @spec get_config(String.t()) :: {:ok, map()} | :error
-  def get_config(serial_number) do
-    Store.get_config(serial_number)
+  @spec get_config(port_key()) :: {:ok, map()} | :error
+  def get_config({_, _, _} = key) do
+    Store.get_config(key)
   end
 
   @doc """

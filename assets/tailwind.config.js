@@ -2,57 +2,117 @@
 // https://tailwindcss.com/docs/configuration
 
 const plugin = require("tailwindcss/plugin")
-const fs = require("fs")
-const path = require("path")
 
 module.exports = {
-  darkMode: "class",
+  // Hassever design system uses [data-theme="dark"] on <html>; tell Tailwind
+  // to look for that selector instead of the default `class` strategy.
+  darkMode: ["selector", '[data-theme="dark"]'],
   content: [
     "./js/**/*.js",
     "../lib/*_web.ex",
     "../lib/*_web/**/*.*ex"
   ],
-  safelist: [
-    "text-green-700", "text-green-800", "text-red-700", "text-red-800",
-    "text-yellow-800", "bg-green-100", "bg-red-100", "bg-yellow-100",
-    "border-green-400/40", "border-red-400/40",
-    "dark:text-green-300", "dark:text-red-300", "dark:text-yellow-300",
-    "dark:bg-green-900/30", "dark:bg-red-900/30", "dark:bg-yellow-900/30",
-    "hover:bg-green-100", "hover:bg-red-100",
-    "dark:hover:bg-green-900/20", "dark:hover:bg-red-900/20"
-  ],
   theme: {
     extend: {
       colors: {
-        brand: "#FD4F00",
-        neon: {
-          purple: "#a855f7",
-          violet: "#8b5cf6",
-          fuchsia: "#d946ef",
-          pink: "#ec4899"
-        },
-        cyber: {
-          bg: "#0a0a0f",
-          surface: "#12121a",
-          border: "#1e1e2e"
-        }
+        // Surfaces
+        canvas: "var(--hs-bg-canvas)",
+        surface: "var(--hs-bg-surface)",
+        sunken: "var(--hs-bg-sunken)",
+        raised: "var(--hs-bg-raised)",
+        overlay: "var(--hs-bg-overlay)",
+
+        // Foregrounds
+        "fg-1": "var(--hs-fg-1)",
+        "fg-2": "var(--hs-fg-2)",
+        "fg-3": "var(--hs-fg-3)",
+        "fg-4": "var(--hs-fg-4)",
+        "fg-on-accent": "var(--hs-fg-on-accent)",
+
+        // Borders
+        "border-1": "var(--hs-border-1)",
+        "border-2": "var(--hs-border-2)",
+        "border-strong": "var(--hs-border-strong)",
+
+        // Brand & state
+        accent: "var(--hs-accent)",
+        "accent-hover": "var(--hs-accent-hover)",
+        "accent-soft": "var(--hs-accent-soft)",
+        "accent-soft-border": "var(--hs-accent-soft-border)",
+        success: "var(--hs-success)",
+        "success-soft": "var(--hs-success-soft)",
+        warning: "var(--hs-warning)",
+        "warning-soft": "var(--hs-warning-soft)",
+        danger: "var(--hs-danger)",
+        "danger-soft": "var(--hs-danger-soft)",
+
+        // Port-kind tints (used in traffic stream, dot indicators, sparklines)
+        zwave: "#7c4dff",
+        ir: "#f0a818",
+        rs232: "#e5484d",
+        rs485: "#03a9f4",
+        ttl: "#2fb866"
+      },
+      borderRadius: {
+        xs: "4px",
+        sm: "6px",
+        md: "10px",
+        lg: "14px",
+        xl: "20px"
       },
       boxShadow: {
-        "neon-purple": "0 0 5px #a855f7, 0 0 20px #a855f7, 0 0 40px rgba(168, 85, 247, 0.3)",
-        "neon-violet": "0 0 5px #8b5cf6, 0 0 20px #8b5cf6, 0 0 40px rgba(139, 92, 246, 0.3)",
-        "neon-glow": "0 0 10px rgba(168, 85, 247, 0.5), inset 0 0 10px rgba(168, 85, 247, 0.05)"
+        xs: "0 1px 2px rgba(17, 24, 33, 0.04)",
+        sm: "0 1px 3px rgba(17, 24, 33, 0.06), 0 1px 2px rgba(17, 24, 33, 0.04)",
+        md: "0 4px 12px rgba(17, 24, 33, 0.06), 0 2px 4px rgba(17, 24, 33, 0.04)",
+        lg: "0 16px 32px rgba(17, 24, 33, 0.08), 0 4px 8px rgba(17, 24, 33, 0.04)",
+        focus: "0 0 0 3px rgba(3, 169, 244, 0.25)"
       },
       fontFamily: {
-        mono: ["JetBrains Mono", "Fira Code", "ui-monospace", "monospace"]
+        sans: [
+          "Inter",
+          "Inter var",
+          "-apple-system",
+          "BlinkMacSystemFont",
+          "Segoe UI Variable",
+          "Segoe UI",
+          "Roboto",
+          "Helvetica Neue",
+          "Arial",
+          "Noto Sans",
+          "sans-serif"
+        ],
+        mono: [
+          "JetBrains Mono",
+          "SF Mono",
+          "ui-monospace",
+          "Menlo",
+          "Consolas",
+          "Roboto Mono",
+          "monospace"
+        ]
+      },
+      fontSize: {
+        // Hassever scale anchored at 14px body
+        xs: ["11px", { lineHeight: "1.35" }],
+        sm: ["13px", { lineHeight: "1.35" }],
+        base: ["14px", { lineHeight: "1.5" }],
+        md: ["16px", { lineHeight: "1.5" }],
+        lg: ["18px", { lineHeight: "1.35" }],
+        xl: ["22px", { lineHeight: "1.2" }],
+        "2xl": ["28px", { lineHeight: "1.2" }],
+        "3xl": ["34px", { lineHeight: "1.2" }],
+        "4xl": ["44px", { lineHeight: "1.1" }]
+      },
+      letterSpacing: {
+        caps: "0.08em",
+        wide: "0.04em"
+      },
+      transitionTimingFunction: {
+        standard: "cubic-bezier(0.2, 0, 0, 1)"
       }
     }
   },
   plugins: [
-    // Allows prefixing tailwind classes with LiveView classes to add rules
-    // only when LiveView classes are applied, for example:
-    //
-    // .phx-click-loading { ... }
-    //
     plugin(({ addVariant }) => addVariant("phx-click-loading", [".phx-click-loading&", ".phx-click-loading &"])),
     plugin(({ addVariant }) => addVariant("phx-submit-loading", [".phx-submit-loading&", ".phx-submit-loading &"])),
     plugin(({ addVariant }) => addVariant("phx-change-loading", [".phx-change-loading&", ".phx-change-loading &"]))

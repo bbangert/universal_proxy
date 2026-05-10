@@ -18,9 +18,11 @@ defmodule UniversalProxyWeb.Router do
     pipe_through(:browser)
 
     live_session :default, on_mount: [UniversalProxyWeb.NavHooks] do
-      live("/", DashboardLive)
-      live("/devices", ConnectedDevicesLive)
-      live("/esphome-config", ESPhomeConfigLive)
+      live("/", OverviewLive)
+      live("/traffic", TrafficLive)
+      live("/discovery", DiscoveryLive)
+      live("/security", SecurityLive)
+      live("/system", SystemLive)
     end
   end
 
