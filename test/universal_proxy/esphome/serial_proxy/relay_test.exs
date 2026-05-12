@@ -16,20 +16,25 @@ defmodule UniversalProxy.ESPHome.SerialProxy.RelayTest do
     {:ok, relay} =
       Relay.start_link(path: path, friendly_name: friendly_name, subscriber: self())
 
-    # Make sure the relay's PubSub.subscribe has run before we publish.
-    _ = :sys.get_state(relay)
-
     {:ok, relay: relay, friendly_name: friendly_name, path: path}
   end
 
+  # Phoenix.PubSub broadcasts `:uart_data` on `uart:<friendly_name>` to
+  # simulate inbound UART RX without real hardware.
   defp publish(friendly_name, data) do
     Phoenix.PubSub.broadcast(@pubsub, "uart:#{friendly_name}", {:uart_data, %{data: data}})
   end
 
+  # Synchronous round-trip through the GenServer: forces all preceding
+  # messages in the relay's mailbox to be drained before the test proceeds.
+  defp drain(relay), do: :sys.get_state(relay)
+
   test "drops RX bytes by default (not subscribed)", %{
+    relay: relay,
     friendly_name: friendly_name
   } do
     publish(friendly_name, "ignored")
+    drain(relay)
     refute_receive {:espex_serial_data, _, _}, 50
   end
 
@@ -54,7 +59,8 @@ defmodule UniversalProxy.ESPHome.SerialProxy.RelayTest do
 
     :ok = Relay.unsubscribe(relay)
     publish(friendly_name, "dropped")
-    refute_receive {:espex_serial_data, _, "dropped"}, 50
+    drain(relay)
+    refute_receive {:espex_serial_data, _, _}, 50
   end
 
   test "subscribe and unsubscribe are idempotent", %{
@@ -71,10 +77,75 @@ defmodule UniversalProxy.ESPHome.SerialProxy.RelayTest do
     assert :ok = Relay.unsubscribe(relay)
     assert :ok = Relay.unsubscribe(relay)
     publish(friendly_name, "no")
+    drain(relay)
     refute_receive {:espex_serial_data, _, _}, 50
   end
 
-  test "relay shuts down when its subscriber exits" do
+  test "subscribe → unsubscribe → subscribe cycle restores forwarding", %{
+    relay: relay,
+    friendly_name: friendly_name
+  } do
+    :ok = Relay.subscribe(relay)
+    publish(friendly_name, "first")
+    assert_receive {:espex_serial_data, _, "first"}, 200
+
+    :ok = Relay.unsubscribe(relay)
+    publish(friendly_name, "gap")
+    drain(relay)
+    refute_receive {:espex_serial_data, _, _}, 50
+
+    :ok = Relay.subscribe(relay)
+    publish(friendly_name, "back")
+    assert_receive {:espex_serial_data, _, "back"}, 200
+  end
+
+  test "no buffered replay: messages broadcast while unsubscribed are not delivered on subscribe",
+       %{
+         relay: relay,
+         friendly_name: friendly_name
+       } do
+    for chunk <- ["a", "b", "c", "d", "e"] do
+      publish(friendly_name, chunk)
+    end
+
+    drain(relay)
+    :ok = Relay.subscribe(relay)
+    refute_receive {:espex_serial_data, _, _}, 50
+
+    publish(friendly_name, "after")
+    assert_receive {:espex_serial_data, _, "after"}, 200
+  end
+
+  test "relay shuts down :normal even when subscriber is killed with :kill" do
+    friendly_name = "kill-port-#{System.unique_integer([:positive])}"
+
+    parent = self()
+
+    owner =
+      spawn(fn ->
+        {:ok, relay} =
+          Relay.start_link(
+            path: "/dev/null",
+            friendly_name: friendly_name,
+            subscriber: self()
+          )
+
+        send(parent, {:relay, relay})
+
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    assert_receive {:relay, relay}, 200
+    ref = Process.monitor(relay)
+
+    Process.exit(owner, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^relay, reason}, 500
+    assert reason == :normal
+  end
+
+  test "relay shuts down when its subscriber exits normally" do
     friendly_name = "owner-port-#{System.unique_integer([:positive])}"
 
     parent = self()
@@ -99,6 +170,7 @@ defmodule UniversalProxy.ESPHome.SerialProxy.RelayTest do
     ref = Process.monitor(relay)
 
     send(owner, :stop)
-    assert_receive {:DOWN, ^ref, :process, ^relay, :normal}, 500
+    assert_receive {:DOWN, ^ref, :process, ^relay, reason}, 500
+    assert reason == :normal
   end
 end

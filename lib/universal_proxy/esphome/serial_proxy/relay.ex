@@ -11,20 +11,20 @@ defmodule UniversalProxy.ESPHome.SerialProxy.Relay do
 
   ## Subscribe / unsubscribe
 
-  The relay tracks an explicit `:subscribed?` flag that gates forwarding
-  of UART RX bytes to the espex subscriber. This matches the ESPHome
-  reference semantics for `SerialProxyRequest` (subscribe before any data
-  flows, unsubscribe to stop). The flag starts as `false` — `open/3`
-  configures the port but does **not** stream data until the client
-  issues a `SERIAL_PROXY_REQUEST_TYPE_SUBSCRIBE`.
-
-  Use `subscribe/1` and `unsubscribe/1` to toggle; both are idempotent.
+  Matches the ESPHome reference semantics for `SerialProxyRequest`:
+  `open/3` configures the port but the relay does **not** subscribe to
+  UART PubSub until the client issues a
+  `SERIAL_PROXY_REQUEST_TYPE_SUBSCRIBE`. `unsubscribe/1` detaches the
+  subscription so no `:uart_data` messages enter the mailbox while idle.
+  The `:subscribed?` flag exists only to make both operations
+  idempotent (subscribing twice would duplicate-deliver via PubSub).
   """
 
   use GenServer
 
   @pubsub UniversalProxy.PubSub
 
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts)
   end
@@ -43,12 +43,12 @@ defmodule UniversalProxy.ESPHome.SerialProxy.Relay do
     friendly_name = Keyword.fetch!(opts, :friendly_name)
     subscriber = Keyword.fetch!(opts, :subscriber)
 
-    Phoenix.PubSub.subscribe(@pubsub, "uart:#{friendly_name}")
     ref = Process.monitor(subscriber)
 
     {:ok,
      %{
        path: path,
+       friendly_name: friendly_name,
        subscriber: subscriber,
        monitor_ref: ref,
        subscribed?: false
@@ -56,13 +56,21 @@ defmodule UniversalProxy.ESPHome.SerialProxy.Relay do
   end
 
   @impl true
-  def handle_call(:subscribe, _from, state) do
+  def handle_call(:subscribe, _from, %{subscribed?: false} = state) do
+    # PubSub topic keys on `friendly_name`; the forwarded espex handle uses
+    # `path`. They are intentionally different identifiers for the same port.
+    :ok = Phoenix.PubSub.subscribe(@pubsub, "uart:#{state.friendly_name}")
     {:reply, :ok, %{state | subscribed?: true}}
   end
 
-  def handle_call(:unsubscribe, _from, state) do
+  def handle_call(:subscribe, _from, state), do: {:reply, :ok, state}
+
+  def handle_call(:unsubscribe, _from, %{subscribed?: true} = state) do
+    :ok = Phoenix.PubSub.unsubscribe(@pubsub, "uart:#{state.friendly_name}")
     {:reply, :ok, %{state | subscribed?: false}}
   end
+
+  def handle_call(:unsubscribe, _from, state), do: {:reply, :ok, state}
 
   @impl true
   def handle_info({:uart_data, %{data: data}}, %{subscribed?: true} = state) do
@@ -70,9 +78,10 @@ defmodule UniversalProxy.ESPHome.SerialProxy.Relay do
     {:noreply, state}
   end
 
-  # While unsubscribed, drop incoming bytes — mirrors the ESPHome native
-  # implementation, which keeps the read loop disabled until a client
-  # subscribes.
+  # Race-window guard: a `:uart_data` broadcast can land in the mailbox during
+  # the gap between the broadcaster's send and our `PubSub.unsubscribe` taking
+  # effect. The flag check drops those stragglers instead of forwarding after
+  # the client believes the channel is closed.
   def handle_info({:uart_data, _msg}, state), do: {:noreply, state}
 
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %{monitor_ref: ref} = state) do

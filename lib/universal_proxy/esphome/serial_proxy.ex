@@ -101,6 +101,14 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
   @impl true
   def get_modem_pins(_handle), do: {:error, :not_supported}
 
+  @doc """
+  Handle an `Espex.SerialProxy` request.
+
+  Routes `:subscribe` and `:unsubscribe` to the per-instance `Relay` to
+  toggle UART RX forwarding (ESPHome `SerialProxyRequest` semantics).
+  Any unknown request type returns `{:ok, :not_supported}` so the espex
+  layer can respond to the client without crashing.
+  """
   @impl true
   def request({relay, _path}, :subscribe) do
     :ok = Relay.subscribe(relay)
