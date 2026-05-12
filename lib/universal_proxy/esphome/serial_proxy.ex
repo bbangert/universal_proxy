@@ -11,6 +11,15 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
   Each opened instance gets a `SerialProxy.Relay` GenServer that subscribes
   to the per-port PubSub topic and forwards incoming bytes to the espex
   connection handler as `{:espex_serial_data, handle, binary}`.
+
+  ## Subscribe / unsubscribe
+
+  Forwarding is gated by an explicit subscribe/unsubscribe toggle that
+  matches the ESPHome reference semantics: after `open/3`, the port is
+  configured but *no* RX data flows until the client issues a
+  `SERIAL_PROXY_REQUEST_TYPE_SUBSCRIBE`. `UNSUBSCRIBE` halts forwarding
+  again. Both are handled through `c:Espex.SerialProxy.request/2` and
+  routed to the per-instance `Relay`.
   """
 
   @behaviour Espex.SerialProxy
@@ -91,6 +100,27 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
 
   @impl true
   def get_modem_pins(_handle), do: {:error, :not_supported}
+
+  @doc """
+  Handle an `Espex.SerialProxy` request.
+
+  Routes `:subscribe` and `:unsubscribe` to the per-instance `Relay` to
+  toggle UART RX forwarding (ESPHome `SerialProxyRequest` semantics).
+  Any unknown request type returns `{:ok, :not_supported}` so the espex
+  layer can respond to the client without crashing.
+  """
+  @impl true
+  def request({relay, _path}, :subscribe) do
+    :ok = Relay.subscribe(relay)
+    {:ok, :ok}
+  end
+
+  def request({relay, _path}, :unsubscribe) do
+    :ok = Relay.unsubscribe(relay)
+    {:ok, :ok}
+  end
+
+  def request(_handle, _type), do: {:ok, :not_supported}
 
   # -- Private --
 
