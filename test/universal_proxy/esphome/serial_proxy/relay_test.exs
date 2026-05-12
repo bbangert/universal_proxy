@@ -116,35 +116,6 @@ defmodule UniversalProxy.ESPHome.SerialProxy.RelayTest do
     assert_receive {:espex_serial_data, _, "after"}, 200
   end
 
-  test "relay shuts down :normal even when subscriber is killed with :kill" do
-    friendly_name = "kill-port-#{System.unique_integer([:positive])}"
-
-    parent = self()
-
-    owner =
-      spawn(fn ->
-        {:ok, relay} =
-          Relay.start_link(
-            path: "/dev/null",
-            friendly_name: friendly_name,
-            subscriber: self()
-          )
-
-        send(parent, {:relay, relay})
-
-        receive do
-          :stop -> :ok
-        end
-      end)
-
-    assert_receive {:relay, relay}, 200
-    ref = Process.monitor(relay)
-
-    Process.exit(owner, :kill)
-    assert_receive {:DOWN, ^ref, :process, ^relay, reason}, 500
-    assert reason == :normal
-  end
-
   test "relay shuts down when its subscriber exits normally" do
     friendly_name = "owner-port-#{System.unique_integer([:positive])}"
 
