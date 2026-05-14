@@ -22,15 +22,15 @@ defmodule UniversalProxyWeb.OverviewLive do
   def mount(_params, _session, socket) do
     ports = Hardware.list_ports()
 
-    {packet_rate, subscribed} =
+    {packet_rate, snapshots} =
       if connected?(socket) do
         Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "uart:port_opened")
         Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "uart:port_closed")
         Phoenix.PubSub.subscribe(UniversalProxy.PubSub, History.packet_rate_topic())
         :timer.send_interval(@refresh_interval, self(), :refresh)
-        {History.packets_per_minute(), reconcile_throughputs(MapSet.new(), ports)}
+        {History.packets_per_minute(), reconcile_throughputs(%{}, ports)}
       else
-        {0, MapSet.new()}
+        {0, %{}}
       end
 
     {:ok,
@@ -38,7 +38,7 @@ defmodule UniversalProxyWeb.OverviewLive do
      |> assign(:page_title, "Overview")
      |> assign(:target, Sys.device_summary())
      |> assign(:selected_port, nil)
-     |> assign(:subscribed_throughput_ports, subscribed)
+     |> assign(:throughput_snapshots, snapshots)
      |> assign(:packet_rate, packet_rate)
      |> assign(:pending_kind_change, nil)
      |> set_ports(ports)}
@@ -163,8 +163,8 @@ defmodule UniversalProxyWeb.OverviewLive do
       socket
       |> assign(:target, Sys.device_summary())
       |> assign(
-        :subscribed_throughput_ports,
-        reconcile_throughputs(socket.assigns.subscribed_throughput_ports, ports)
+        :throughput_snapshots,
+        reconcile_throughputs(socket.assigns.throughput_snapshots, ports)
       )
       |> set_ports(ports)
     end
@@ -183,21 +183,26 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   # Subscribe to History throughput for every port the table will draw
   # a sparkline for (`connected and configured`). Unsubscribe from any
-  # name that is no longer in the desired set. We discard the snapshots
-  # the subscribe calls return — components start with `nil` samples
-  # (flat line) and fill in on the next tick. Returns the new set.
-  defp reconcile_throughputs(current, ports) do
+  # name that is no longer in the desired set. The snapshots returned
+  # by `throughput_subscribe_and_snapshot/1` are kept so newly mounted
+  # `PortSparkline` LiveComponents can be seeded via `:initial_samples`
+  # instead of waiting up to a full second for the first tick. Returns
+  # a `%{name => samples}` map.
+  defp reconcile_throughputs(existing, ports) do
     desired = throughput_target_names(ports)
+    current = existing |> Map.keys() |> MapSet.new()
 
-    current
-    |> MapSet.difference(desired)
+    MapSet.difference(current, desired)
     |> Enum.each(&History.throughput_unsubscribe/1)
 
-    desired
-    |> MapSet.difference(current)
-    |> Enum.each(fn name -> _ = History.throughput_subscribe_and_snapshot(name) end)
+    additions =
+      desired
+      |> MapSet.difference(current)
+      |> Map.new(fn name -> {name, History.throughput_subscribe_and_snapshot(name)} end)
 
-    desired
+    existing
+    |> Map.take(MapSet.to_list(desired))
+    |> Map.merge(additions)
   end
 
   defp throughput_target_names(ports) do
@@ -250,7 +255,10 @@ defmodule UniversalProxyWeb.OverviewLive do
       <.hardware_table ports={@ports} />
     </div>
 
-    <.maybe_port_drawer port={find_port(@ports, @selected_port)} />
+    <.maybe_port_drawer
+      port={find_port(@ports, @selected_port)}
+      throughput_snapshots={@throughput_snapshots}
+    />
 
     <.modal
       open={@pending_kind_change != nil}
@@ -277,10 +285,15 @@ defmodule UniversalProxyWeb.OverviewLive do
   defp find_port(ports, id), do: Enum.find(ports, &(&1.id == id))
 
   attr(:port, :map, default: nil)
+  attr(:throughput_snapshots, :map, required: true)
 
   defp maybe_port_drawer(assigns) do
     ~H"""
-    <.port_drawer :if={@port} port={@port} />
+    <.port_drawer
+      :if={@port}
+      port={@port}
+      initial_samples={@throughput_snapshots[@port.ha_name]}
+    />
     """
   end
 
@@ -430,6 +443,7 @@ defmodule UniversalProxyWeb.OverviewLive do
           id={"spark-#{@port.id}"}
           port_kind={@port.kind}
           variant={:compact}
+          initial_samples={@throughput_snapshots[@port.ha_name]}
         />
         <span :if={!(@port.connected and @port.configured)} class="text-fg-4 text-base">
           —
@@ -561,6 +575,7 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   # ── Right-side detail drawer ──────────────────────────────────────────
   attr(:port, :map, required: true)
+  attr(:initial_samples, :any, default: nil)
 
   defp port_drawer(assigns) do
     assigns = assign(assigns, :status, MockData.port_status(assigns.port))
@@ -613,6 +628,7 @@ defmodule UniversalProxyWeb.OverviewLive do
           id={"drawer-spark-#{@port.id}"}
           port_kind={@port.kind}
           variant={:full}
+          initial_samples={@initial_samples}
         />
 
         <%!-- Footer actions --%>

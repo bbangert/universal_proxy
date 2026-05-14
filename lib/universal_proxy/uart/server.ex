@@ -353,6 +353,16 @@ defmodule UniversalProxy.UART.Server do
   defp present?(s) when is_binary(s), do: String.trim(s) != ""
   defp present?(_), do: false
 
+  # Broadcasts run synchronously inside the GenServer so subscribers
+  # receive `:uart_data` messages in the same order this process saw
+  # the underlying read/write. `UART.History` assigns its display id
+  # on arrival, so an out-of-order broadcast (e.g. via
+  # `Task.Supervisor.start_child`) would show TX echoes in the
+  # Traffic log *after* the RX response they triggered. At our scale
+  # (single node, ≤ a few subscribers per port, in-process PG2
+  # backend) the fanout cost is negligible — if it ever isn't, a
+  # dedicated serial broadcaster GenServer is the right next step
+  # rather than fire-and-forget tasks.
   defp broadcast_data(friendly_name, data, timestamp, dir) do
     Phoenix.PubSub.broadcast(
       @pubsub,

@@ -14,6 +14,18 @@ defmodule UniversalProxyWeb.TrafficLive do
   port chip row stays in sync with hardware state. Z-Wave/IR adapters
   that bypass `UART.Server` will not appear here.
 
+  ## Disconnected-port frames
+
+  History intentionally retains buffered frames past `port_closed` so a
+  briefly unplugged adapter still shows its last bytes when it comes
+  back. `frame_to_line/2` here filters out any frame whose
+  `friendly_name` no longer resolves against `Hardware.list_ports/0`,
+  so the Traffic log only displays frames for ports currently
+  enumerated by the hardware tree. If a port is physically removed,
+  its retained frames disappear from this view (but remain in the
+  History buffer until the eviction grace window — see
+  `@port_eviction_grace_ms` in `UART.History` — expires).
+
   Payloads render as ASCII: printable bytes (0x20–0x7E) appear
   verbatim, everything else is escaped as `\\xNN`.
   """

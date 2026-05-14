@@ -354,7 +354,12 @@ defmodule UniversalProxy.UART.HistoryTest do
     refute_receive {:uart_throughput, _}, 50
   end
 
-  test "packets_per_minute counts every incoming frame across ports", %{server: server} do
+  test "packets_per_minute counts RX-only frames across ports", %{server: server} do
+    # `packets_per_minute` reflects "frames received". TX frames are
+    # broadcast through the same `:uart_data` topic for the Traffic
+    # log + per-direction throughput, but they must NOT bump the
+    # global counter — otherwise every full-duplex link's rate
+    # roughly doubles versus what the device-summary card claims.
     a = "port-a-#{System.unique_integer([:positive])}"
     b = "port-b-#{System.unique_integer([:positive])}"
     publish_open(a)
@@ -365,7 +370,7 @@ defmodule UniversalProxy.UART.HistoryTest do
     for _ <- 1..5, do: publish(b, "y", :tx)
     drain(server)
 
-    assert History.packets_per_minute(server) == 8
+    assert History.packets_per_minute(server) == 3
   end
 
   test "single tick broadcasts the current packets/min count", %{server: server} do

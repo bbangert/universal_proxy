@@ -43,16 +43,18 @@ defmodule UniversalProxyWeb.Components.PortSparkline do
     socket =
       socket
       |> assign_new(:variant, fn -> :compact end)
-      |> assign_new(:samples, fn -> nil end)
       |> apply_assigns(assigns)
 
     {:ok, socket}
   end
 
-  # `send_update` routes live ticks here as `%{samples: …}`. The
-  # initial-mount path receives `:port_kind`, `:variant`, and
-  # `:initial_samples`. Either path may also carry `:id` (always set by
-  # the framework).
+  # `send_update` routes live ticks here as `%{samples: …}` and they
+  # always win over whatever was previously assigned. The initial-mount
+  # path receives `:port_kind`, `:variant`, and optionally
+  # `:initial_samples`, which is consulted exactly once (via
+  # `assign_new`) so subsequent live ticks aren't overwritten by a
+  # re-render that re-passes the same prop. Either path may also carry
+  # `:id` (always set by the framework).
   defp apply_assigns(socket, %{samples: samples} = assigns) do
     socket
     |> assign(:samples, samples)
@@ -60,15 +62,11 @@ defmodule UniversalProxyWeb.Components.PortSparkline do
   end
 
   defp apply_assigns(socket, assigns) do
-    case Map.get(assigns, :initial_samples) do
-      nil ->
-        assign(socket, Map.delete(assigns, :initial_samples))
+    {initial, rest} = Map.pop(assigns, :initial_samples)
 
-      initial ->
-        socket
-        |> assign(Map.delete(assigns, :initial_samples))
-        |> assign_new(:samples, fn -> initial end)
-    end
+    socket
+    |> assign(rest)
+    |> assign_new(:samples, fn -> initial end)
   end
 
   @impl true

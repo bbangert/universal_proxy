@@ -39,6 +39,12 @@ defmodule UniversalProxy.UART.History do
   @throughput_tick_ms 1_000
   @packet_rate_window 60
   @packet_rate_topic "uart:packet_rate"
+  # Grace window between `:uart_port_closed` and the actual eviction
+  # of a port's buffer + PubSub subscription. Keeps history visible
+  # for a transient unplug while bounding the long-tail leak from
+  # unique friendly_names that never come back.
+  @port_eviction_grace_ms 5 * 60 * 1_000
+  @max_subscriber_mailbox 1_000
 
   @type frame :: %{
           id: pos_integer(),
@@ -195,9 +201,25 @@ defmodule UniversalProxy.UART.History do
   end
 
   # Keep the buffer & subscription on close so the LV can still show
-  # the most recent frames of a port that just disconnected. The next
-  # `:uart_port_opened` for the same friendly_name is a no-op.
+  # the most recent frames of a port that just disconnected — but
+  # schedule a delayed eviction so a never-returning port doesn't
+  # leak its buffer + PubSub subscription forever. If the port comes
+  # back inside the grace window the `:evict` message will find it
+  # in `UART.named_ports/0` and bail.
+  def handle_info({:uart_port_closed, %{friendly_name: name}}, state) do
+    Process.send_after(self(), {:evict_port, name}, @port_eviction_grace_ms)
+    {:noreply, state}
+  end
+
   def handle_info({:uart_port_closed, _info}, state), do: {:noreply, state}
+
+  def handle_info({:evict_port, name}, state) do
+    if port_still_absent?(name) do
+      {:noreply, evict_port(state, name)}
+    else
+      {:noreply, state}
+    end
+  end
 
   def handle_info({:uart_data, msg}, state) do
     frame = Map.put(msg, :id, state.next_id)
@@ -213,10 +235,16 @@ defmodule UniversalProxy.UART.History do
       end)
 
     throughput = accumulate_throughput(state.throughput, msg)
-    packet_buckets = bump_head(state.packet_buckets)
+    # Only count RX so "packets/min" matches the conventional
+    # "incoming frames" reading instead of doubling on full-duplex
+    # links where every write echoes through `UART.Server`'s TX
+    # broadcast. Per-direction byte counts are still captured in
+    # `throughput` above.
+    packet_buckets =
+      if msg.dir == :rx, do: bump_head(state.packet_buckets), else: state.packet_buckets
 
     for {pid, _ref} <- state.subscribers do
-      send(pid, {:uart_history_frame, frame})
+      bounded_send(pid, {:uart_history_frame, frame})
     end
 
     {:noreply,
@@ -247,7 +275,7 @@ defmodule UniversalProxy.UART.History do
     # Step 2 (effects): fan out per-port samples to subscribers.
     Enum.each(new_throughput, fn {name, %{samples: samples}} ->
       for {pid, _ref} <- Map.get(state.throughput_subscribers, name, %{}) do
-        send(pid, {:uart_throughput, %{name: name, samples: samples}})
+        bounded_send(pid, {:uart_throughput, %{name: name, samples: samples}})
       end
     end)
 
@@ -307,6 +335,56 @@ defmodule UniversalProxy.UART.History do
 
   defp open_friendly_names do
     UART.named_ports() |> Enum.map(& &1.friendly_name)
+  end
+
+  # Send only when the receiver's mailbox is short enough to keep up.
+  # A backgrounded LV tab whose websocket is congested can otherwise
+  # accumulate per-frame messages indefinitely under sustained
+  # throughput, snowballing the LV's `handle_info` cost. Above the
+  # threshold we drop with a debug log — the LV gets a partial view
+  # until it catches up but the History process stays responsive.
+  # `Process.info(pid, :message_queue_len)` returns `nil` if the pid
+  # is already dead; the `:DOWN` handler will clean up shortly.
+  defp bounded_send(pid, msg) do
+    case Process.info(pid, :message_queue_len) do
+      {:message_queue_len, len} when len < @max_subscriber_mailbox ->
+        send(pid, msg)
+
+      {:message_queue_len, _len} ->
+        Logger.debug(fn ->
+          "history: dropping #{inspect(elem(msg, 0))} for slow subscriber #{inspect(pid)}"
+        end)
+
+      nil ->
+        :ok
+    end
+  end
+
+  defp port_still_absent?(name) do
+    not Enum.any?(UART.named_ports(), &(&1.friendly_name == name))
+  end
+
+  # Drop every trace of `name` from state and the PubSub topic. Any
+  # throughput subscribers still holding a monitor for this port get
+  # their refs flushed so a later `:DOWN` doesn't process empty work.
+  defp evict_port(state, name) do
+    Phoenix.PubSub.unsubscribe(@pubsub, "uart:#{name}")
+
+    case Map.get(state.throughput_subscribers, name) do
+      nil ->
+        :ok
+
+      subs ->
+        Enum.each(subs, fn {_pid, ref} -> Process.demonitor(ref, [:flush]) end)
+    end
+
+    %{
+      state
+      | subscribed_topics: MapSet.delete(state.subscribed_topics, name),
+        buffers: Map.delete(state.buffers, name),
+        throughput: Map.delete(state.throughput, name),
+        throughput_subscribers: Map.delete(state.throughput_subscribers, name)
+    }
   end
 
   # The shape we initialise a throughput entry to — zero-filled `current`
