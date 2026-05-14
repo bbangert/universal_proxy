@@ -19,7 +19,8 @@ defmodule UniversalProxy.UART.Supervisor do
     children = [
       {DynamicSupervisor, name: UniversalProxy.UART.PortSupervisor, strategy: :one_for_one},
       UniversalProxy.UART.Store,
-      UniversalProxy.UART.Server
+      UniversalProxy.UART.Server,
+      UniversalProxy.UART.History
     ]
 
     Supervisor.init(children, strategy: :rest_for_one)

@@ -24,6 +24,7 @@ defmodule UniversalProxyWeb.RenderSmokeTest do
     {:ok, _view, html} = live(conn, "/traffic")
     assert html =~ "Live traffic"
     assert html =~ "All ports"
+    assert html =~ "waiting for traffic"
   end
 
   test "Discovery tab renders", %{conn: conn} do

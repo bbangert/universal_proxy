@@ -22,7 +22,21 @@ defmodule UniversalProxy.ESPHome.SerialProxy.RelayTest do
   # Phoenix.PubSub broadcasts `:uart_data` on `uart:<friendly_name>` to
   # simulate inbound UART RX without real hardware.
   defp publish(friendly_name, data) do
-    Phoenix.PubSub.broadcast(@pubsub, "uart:#{friendly_name}", {:uart_data, %{data: data}})
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "uart:#{friendly_name}",
+      {:uart_data, %{data: data, dir: :rx}}
+    )
+  end
+
+  # Mirror of `publish/2` but with `dir: :tx`, used to verify the relay
+  # drops our own write echoes instead of forwarding them as RX.
+  defp publish_tx(friendly_name, data) do
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "uart:#{friendly_name}",
+      {:uart_data, %{data: data, dir: :tx}}
+    )
   end
 
   # Synchronous round-trip through the GenServer: forces all preceding
@@ -47,6 +61,20 @@ defmodule UniversalProxy.ESPHome.SerialProxy.RelayTest do
 
     publish(friendly_name, "hello")
     assert_receive {:espex_serial_data, {^relay, ^path}, "hello"}, 200
+  end
+
+  # Regression guard: when UART.Server broadcasts our own writes back on
+  # the same topic with `dir: :tx`, the relay must drop them. Echoing TX
+  # back to the espex client would corrupt the protocol stream.
+  test "drops TX echoes even while subscribed", %{
+    relay: relay,
+    friendly_name: friendly_name
+  } do
+    :ok = Relay.subscribe(relay)
+
+    publish_tx(friendly_name, "echo")
+    drain(relay)
+    refute_receive {:espex_serial_data, _, _}, 50
   end
 
   test "unsubscribe halts forwarding again", %{

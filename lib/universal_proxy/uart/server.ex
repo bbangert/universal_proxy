@@ -155,9 +155,16 @@ defmodule UniversalProxy.UART.Server do
 
   def handle_call({:write_port, port_name, data}, _from, state) do
     case Map.fetch(state.ports, port_name) do
-      {:ok, %{pid: pid}} ->
-        result = Circuits.UART.write(pid, data)
-        {:reply, result, state}
+      {:ok, %{pid: pid, config: config}} ->
+        case Circuits.UART.write(pid, data) do
+          :ok ->
+            friendly_name = config.friendly_name || port_name
+            broadcast_data(friendly_name, data, DateTime.utc_now(), :tx)
+            {:reply, :ok, state}
+
+          other ->
+            {:reply, other, state}
+        end
 
       :error ->
         {:reply, {:error, :not_found}, state}
@@ -282,14 +289,7 @@ defmodule UniversalProxy.UART.Server do
     case Map.fetch(state.ports, port_name) do
       {:ok, %{config: config}} ->
         friendly_name = config.friendly_name || port_name
-
-        message = %{
-          name: friendly_name,
-          data: data,
-          timestamp: DateTime.utc_now()
-        }
-
-        Phoenix.PubSub.broadcast(@pubsub, "uart:#{friendly_name}", {:uart_data, message})
+        broadcast_data(friendly_name, data, DateTime.utc_now(), :rx)
 
       :error ->
         Logger.debug("UART data from untracked port: #{port_name}")
@@ -352,6 +352,14 @@ defmodule UniversalProxy.UART.Server do
   defp present?(""), do: false
   defp present?(s) when is_binary(s), do: String.trim(s) != ""
   defp present?(_), do: false
+
+  defp broadcast_data(friendly_name, data, timestamp, dir) do
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "uart:#{friendly_name}",
+      {:uart_data, %{name: friendly_name, data: data, timestamp: timestamp, dir: dir}}
+    )
+  end
 
   # Two lifecycle topics; the broadcast tag mirrors the topic name so
   # subscribers can pattern-match on `{:uart_port_opened, info}` etc.
