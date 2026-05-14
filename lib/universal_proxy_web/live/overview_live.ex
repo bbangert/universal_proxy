@@ -12,25 +12,36 @@ defmodule UniversalProxyWeb.OverviewLive do
   alias UniversalProxy.Hardware
   alias UniversalProxy.System, as: Sys
   alias UniversalProxy.UART
+  alias UniversalProxy.UART.History
+  alias UniversalProxyWeb.Components.PortSparkline
   alias UniversalProxyWeb.MockData
 
   @refresh_interval 10_000
 
   @impl true
   def mount(_params, _session, socket) do
-    if connected?(socket) do
-      Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "uart:port_opened")
-      Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "uart:port_closed")
-      :timer.send_interval(@refresh_interval, self(), :refresh)
-    end
+    ports = Hardware.list_ports()
+
+    {packet_rate, snapshots} =
+      if connected?(socket) do
+        Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "uart:port_opened")
+        Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "uart:port_closed")
+        Phoenix.PubSub.subscribe(UniversalProxy.PubSub, History.packet_rate_topic())
+        :timer.send_interval(@refresh_interval, self(), :refresh)
+        {History.packets_per_minute(), reconcile_throughputs(%{}, ports)}
+      else
+        {0, %{}}
+      end
 
     {:ok,
      socket
      |> assign(:page_title, "Overview")
-     |> assign(:ports, Hardware.list_ports())
      |> assign(:target, Sys.device_summary())
      |> assign(:selected_port, nil)
-     |> assign(:pending_kind_change, nil)}
+     |> assign(:throughput_snapshots, snapshots)
+     |> assign(:packet_rate, packet_rate)
+     |> assign(:pending_kind_change, nil)
+     |> set_ports(ports)}
   end
 
   @impl true
@@ -95,21 +106,114 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   @impl true
   def handle_info(:refresh, socket) do
-    {:noreply,
-     socket
-     |> assign(:ports, Hardware.list_ports())
-     |> assign(:target, Sys.device_summary())}
+    {:noreply, refresh_ports(socket)}
   end
 
   def handle_info({:uart_port_opened, _info}, socket) do
-    {:noreply, assign(socket, :ports, Hardware.list_ports())}
+    {:noreply, refresh_ports(socket)}
   end
 
   def handle_info({:uart_port_closed, _info}, socket) do
-    {:noreply, assign(socket, :ports, Hardware.list_ports())}
+    {:noreply, refresh_ports(socket)}
+  end
+
+  # Per-port throughput updates land here once per second per
+  # subscribed port. Storing the samples in socket assigns would dirty
+  # the entire table on every tick; instead, we route the update
+  # straight to the matching `PortSparkline` LiveComponent(s) so only
+  # their assigns are re-rendered. There are up to two instances per
+  # port — one in the table row, one in the drawer (when open).
+  def handle_info({:uart_throughput, %{name: name, samples: samples}}, socket) do
+    port = Enum.find(socket.assigns.ports, &(&1.ha_name == name))
+
+    if port do
+      Phoenix.LiveView.send_update(PortSparkline,
+        id: table_spark_id(port.id),
+        samples: samples
+      )
+
+      if socket.assigns.selected_port == port.id do
+        Phoenix.LiveView.send_update(PortSparkline,
+          id: drawer_spark_id(port.id),
+          samples: samples
+        )
+      end
+    end
+
+    {:noreply, socket}
+  end
+
+  def handle_info({:uart_packet_rate, count}, socket) do
+    {:noreply, assign(socket, :packet_rate, count)}
   end
 
   def handle_info(_msg, socket), do: {:noreply, socket}
+
+  # Refresh the port list AND reconcile throughput subscriptions so new
+  # hot-plugged adapters get a live sparkline and removed ones stop
+  # leaking subscriptions to History. Short-circuits when the port list
+  # is unchanged — the 10s `:refresh` tick normally lands here with the
+  # same ports, and re-assigning would force a full table re-render.
+  defp refresh_ports(socket) do
+    ports = Hardware.list_ports()
+
+    if ports == socket.assigns.ports do
+      assign(socket, :target, Sys.device_summary())
+    else
+      socket
+      |> assign(:target, Sys.device_summary())
+      |> assign(
+        :throughput_snapshots,
+        reconcile_throughputs(socket.assigns.throughput_snapshots, ports)
+      )
+      |> set_ports(ports)
+    end
+  end
+
+  # Memoize derived counts so the device-summary card doesn't recompute
+  # them on every render — only when `:ports` actually changes.
+  defp set_ports(socket, ports) do
+    socket
+    |> assign(:ports, ports)
+    |> assign(:connected_count, Enum.count(ports, & &1.connected))
+    |> assign(:active_count, Enum.count(ports, & &1.in_use))
+    |> assign(:idle_count, Enum.count(ports, &(&1.connected and not &1.in_use)))
+    |> assign(:total_count, length(ports))
+  end
+
+  # Subscribe to History throughput for every port the table will draw
+  # a sparkline for (`connected and configured`). Unsubscribe from any
+  # name that is no longer in the desired set. The snapshots returned
+  # by `throughput_subscribe_and_snapshot/1` are kept so newly mounted
+  # `PortSparkline` LiveComponents can be seeded via `:initial_samples`
+  # instead of waiting up to a full second for the first tick. Returns
+  # a `%{name => samples}` map.
+  defp reconcile_throughputs(existing, ports) do
+    desired = throughput_target_names(ports)
+    current = existing |> Map.keys() |> MapSet.new()
+
+    MapSet.difference(current, desired)
+    |> Enum.each(&History.throughput_unsubscribe/1)
+
+    additions =
+      desired
+      |> MapSet.difference(current)
+      |> Map.new(fn name -> {name, History.throughput_subscribe_and_snapshot(name)} end)
+
+    existing
+    |> Map.take(MapSet.to_list(desired))
+    |> Map.merge(additions)
+  end
+
+  defp throughput_target_names(ports) do
+    for %{connected: true, configured: true, ha_name: name} <- ports,
+        is_binary(name),
+        into: MapSet.new(),
+        do: name
+  end
+
+  defp table_spark_id(port_id), do: "spark-#{port_id}"
+  defp drawer_spark_id(port_id), do: "drawer-spark-#{port_id}"
 
   defp apply_kind_change(socket, port_id, kind_str) do
     port = Enum.find(socket.assigns.ports, &(&1.id == port_id))
@@ -137,27 +241,24 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   @impl true
   def render(assigns) do
-    assigns =
-      assigns
-      |> assign(:connected, Enum.count(assigns.ports, & &1.connected))
-      |> assign(:active, Enum.count(assigns.ports, & &1.in_use))
-      |> assign(:idle, Enum.count(assigns.ports, &(&1.connected and not &1.in_use)))
-      |> assign(:total, length(assigns.ports))
-
     ~H"""
     <div class="max-w-[1120px] mx-auto space-y-4">
       <.device_summary
         target={@target}
-        connected={@connected}
-        active={@active}
-        idle={@idle}
-        total={@total}
+        connected={@connected_count}
+        active={@active_count}
+        idle={@idle_count}
+        total={@total_count}
+        packet_rate={@packet_rate}
       />
 
       <.hardware_table ports={@ports} />
     </div>
 
-    <.maybe_port_drawer port={find_port(@ports, @selected_port)} />
+    <.maybe_port_drawer
+      port={find_port(@ports, @selected_port)}
+      throughput_snapshots={@throughput_snapshots}
+    />
 
     <.modal
       open={@pending_kind_change != nil}
@@ -184,10 +285,15 @@ defmodule UniversalProxyWeb.OverviewLive do
   defp find_port(ports, id), do: Enum.find(ports, &(&1.id == id))
 
   attr(:port, :map, default: nil)
+  attr(:throughput_snapshots, :map, required: true)
 
   defp maybe_port_drawer(assigns) do
     ~H"""
-    <.port_drawer :if={@port} port={@port} />
+    <.port_drawer
+      :if={@port}
+      port={@port}
+      initial_samples={@throughput_snapshots[@port.ha_name]}
+    />
     """
   end
 
@@ -202,6 +308,7 @@ defmodule UniversalProxyWeb.OverviewLive do
   attr(:active, :integer, required: true)
   attr(:idle, :integer, required: true)
   attr(:total, :integer, required: true)
+  attr(:packet_rate, :integer, required: true)
 
   defp device_summary(assigns) do
     ~H"""
@@ -221,7 +328,7 @@ defmodule UniversalProxyWeb.OverviewLive do
         <.summary_stat label="Slots in use" value={@connected} total={@total} tint="text-accent" />
         <.summary_stat label="Active" value={@active} tint="text-success" />
         <.summary_stat label="Idle" value={@idle} tint="text-warning" />
-        <.summary_stat label="Packets/min" value={92} tint="text-fg-1" />
+        <.summary_stat label="Packets/min" value={@packet_rate} tint="text-fg-1" />
       </div>
     </.card>
     """
@@ -253,8 +360,6 @@ defmodule UniversalProxyWeb.OverviewLive do
     <.card padding={:none} class="overflow-hidden">
       <div class="flex items-center px-4 py-3.5 border-b border-border-1">
         <div class="text-base font-semibold">Connected hardware</div>
-        <div class="flex-1"></div>
-        <div class="text-sm text-fg-3">Scanned 4 s ago</div>
       </div>
       <table class="w-full table-fixed border-collapse">
         <colgroup>
@@ -332,7 +437,14 @@ defmodule UniversalProxyWeb.OverviewLive do
         </span>
       </td>
       <td class="px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle">
-        <.throughput_spark :if={@port.connected and @port.configured} port={@port} />
+        <.live_component
+          :if={@port.connected and @port.configured}
+          module={PortSparkline}
+          id={"spark-#{@port.id}"}
+          port_kind={@port.kind}
+          variant={:compact}
+          initial_samples={@throughput_snapshots[@port.ha_name]}
+        />
         <span :if={!(@port.connected and @port.configured)} class="text-fg-4 text-base">
           —
         </span>
@@ -461,62 +573,9 @@ defmodule UniversalProxyWeb.OverviewLive do
     """
   end
 
-  # ── Throughput sparkline (static SVG; mock waveform per port) ─────────
-  attr(:port, :map, required: true)
-
-  defp throughput_spark(assigns) do
-    points = sparkline_points(assigns.port)
-    width = 84
-    height = 24
-    seed_index = :erlang.phash2(assigns.port.id, length(points))
-    pts = points |> Enum.split(seed_index) |> then(fn {a, b} -> b ++ a end)
-
-    path =
-      pts
-      |> Enum.with_index()
-      |> Enum.map(fn {v, i} ->
-        x = Float.round(i / (length(pts) - 1) * width, 1)
-        y = Float.round(height - v * height, 1)
-        cmd = if i == 0, do: "M", else: "L"
-        "#{cmd}#{x},#{y}"
-      end)
-      |> Enum.join(" ")
-
-    fill_path = "#{path} L#{width},#{height} L0,#{height} Z"
-    tint = MockData.kind_meta(assigns.port.kind).tint
-
-    assigns =
-      assigns
-      |> assign(:path, path)
-      |> assign(:fill_path, fill_path)
-      |> assign(:tint, tint)
-      |> assign(:w, width)
-      |> assign(:h, height)
-
-    ~H"""
-    <svg width={@w} height={@h} class="block">
-      <path d={@fill_path} fill={@tint} opacity="0.12" />
-      <path d={@path} stroke={@tint} stroke-width="1.5" fill="none" />
-    </svg>
-    """
-  end
-
-  defp sparkline_points(%{in_use: false}) do
-    List.duplicate(0.05, 24)
-  end
-
-  defp sparkline_points(%{id: id}) do
-    seed = :binary.first(id)
-
-    Enum.map(0..23, fn i ->
-      t = i / 4.0 + seed / 10.0
-      v = 0.5 + :math.sin(t) * 0.3 + :math.sin(t * 1.7 + seed / 20) * 0.2
-      max(0.05, v)
-    end)
-  end
-
   # ── Right-side detail drawer ──────────────────────────────────────────
   attr(:port, :map, required: true)
+  attr(:initial_samples, :any, default: nil)
 
   defp port_drawer(assigns) do
     assigns = assign(assigns, :status, MockData.port_status(assigns.port))
@@ -563,25 +622,14 @@ defmodule UniversalProxyWeb.OverviewLive do
         </dl>
 
         <%!-- Live throughput --%>
-        <div
+        <.live_component
           :if={@port.connected and @port.in_use}
-          class="mx-6 mb-4 p-3.5 bg-sunken rounded-md"
-        >
-          <.eyebrow class="mb-2.5">Live throughput</.eyebrow>
-          <.throughput_spark port={@port} />
-          <div class="flex gap-5 mt-2.5 text-sm text-fg-3">
-            <span>
-              <span class="text-fg-2 font-mono">↓ {@port.throughput.in} {@port.throughput.unit}</span>
-              in
-            </span>
-            <span>
-              <span class="text-fg-2 font-mono">
-                ↑ {@port.throughput.out} {@port.throughput.unit}
-              </span>
-              out
-            </span>
-          </div>
-        </div>
+          module={PortSparkline}
+          id={"drawer-spark-#{@port.id}"}
+          port_kind={@port.kind}
+          variant={:full}
+          initial_samples={@initial_samples}
+        />
 
         <%!-- Footer actions --%>
         <div class="mt-auto px-6 py-4 border-t border-border-1 flex gap-2 flex-wrap">

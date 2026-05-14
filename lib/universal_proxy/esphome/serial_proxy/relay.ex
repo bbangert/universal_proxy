@@ -73,15 +73,17 @@ defmodule UniversalProxy.ESPHome.SerialProxy.Relay do
   def handle_call(:unsubscribe, _from, state), do: {:reply, :ok, state}
 
   @impl true
-  def handle_info({:uart_data, %{data: data}}, %{subscribed?: true} = state) do
+  def handle_info({:uart_data, %{data: data, dir: :rx}}, %{subscribed?: true} = state) do
     send(state.subscriber, {:espex_serial_data, {self(), state.path}, data})
     {:noreply, state}
   end
 
-  # Race-window guard: a `:uart_data` broadcast can land in the mailbox during
-  # the gap between the broadcaster's send and our `PubSub.unsubscribe` taking
-  # effect. The flag check drops those stragglers instead of forwarding after
-  # the client believes the channel is closed.
+  # Drops:
+  #   * TX echoes (our own writes broadcast back on the same topic)
+  #   * Race-window RX stragglers that landed in the mailbox between a
+  #     broadcaster's send and our `PubSub.unsubscribe` taking effect —
+  #     forwarding those would deliver after the client believes the
+  #     channel is closed.
   def handle_info({:uart_data, _msg}, state), do: {:noreply, state}
 
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %{monitor_ref: ref} = state) do

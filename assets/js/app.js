@@ -62,6 +62,23 @@ window.addEventListener("phx:copy", event => {
   }
 })
 
+// Traffic tab's Export button: server pushes the formatted log; we
+// stuff it into a Blob and trigger a same-page download.
+window.addEventListener("phx:traffic-export", event => {
+  const detail = event.detail || {}
+  const content = detail.content || ""
+  const filename = detail.filename || "traffic.log"
+  const blob = new Blob([content], {type: "text/plain;charset=utf-8"})
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement("a")
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+})
+
 let csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")
 let liveSocket = new LiveSocket("/live", Socket, {
   longPollFallbackMs: false,
