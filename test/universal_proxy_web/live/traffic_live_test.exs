@@ -26,8 +26,12 @@ defmodule UniversalProxyWeb.TrafficLiveTest do
 
   setup do
     case Enum.find(Hardware.list_ports(), &(&1.connected and is_binary(&1.ha_name))) do
-      nil -> {:skip, "no connected USB serial adapter on this host"}
-      port -> {:ok, conn: Phoenix.ConnTest.build_conn(), port: port}
+      # ExUnit treats the `:skip` context key as a signal to skip the
+      # test (with the bound string shown as the skip reason). A bare
+      # `{:skip, _}` return tuple is not valid setup output and crashes
+      # the test instead.
+      nil -> %{skip: "no connected USB serial adapter on this host"}
+      port -> %{conn: Phoenix.ConnTest.build_conn(), port: port}
     end
   end
 

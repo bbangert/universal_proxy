@@ -368,9 +368,7 @@ defmodule UniversalProxy.UART.HistoryTest do
     assert History.packets_per_minute(server) == 8
   end
 
-  test "packet rate broadcasts after each tick and rolls off after the window", %{
-    server: server
-  } do
+  test "single tick broadcasts the current packets/min count", %{server: server} do
     Phoenix.PubSub.subscribe(@pubsub, History.packet_rate_topic())
 
     name = "port-#{System.unique_integer([:positive])}"
@@ -380,18 +378,28 @@ defmodule UniversalProxy.UART.HistoryTest do
     for _ <- 1..4, do: publish(name, "x", :rx)
     drain(server)
     tick(server)
-    assert_receive {:uart_packet_rate, 4}, 200
 
-    # Drive the head bucket past the 60-element window — the original
-    # 4 packets must roll off and the rate falls back to 0. Drain each
-    # intermediate broadcast so only the final `{…, 0}` is left for the
-    # closing `assert_receive`.
-    for _ <- 1..60 do
-      tick(server)
-      assert_receive {:uart_packet_rate, _}, 200
-    end
+    assert_receive {:uart_packet_rate, 4}, 500
+  end
 
-    assert_receive {:uart_packet_rate, 0}, 200
+  test "packets older than the 60-tick window roll off", %{server: server} do
+    # The broadcast is fanned out via `Task.Supervisor` so ordering of
+    # arrival messages isn't guaranteed across 60 ticks. State, by
+    # contrast, is mutated synchronously inside the tick handler — so
+    # we read it back via `packets_per_minute/1` (a `GenServer.call`,
+    # which serialises behind any in-flight tick).
+    name = "port-#{System.unique_integer([:positive])}"
+    publish_open(name)
+    drain(server)
+
+    for _ <- 1..4, do: publish(name, "x", :rx)
+    drain(server)
+    tick(server)
+    assert History.packets_per_minute(server) == 4
+
+    for _ <- 1..60, do: tick(server)
+
+    assert History.packets_per_minute(server) == 0
   end
 
   test "throughput subscriber is dropped when its process dies", %{
