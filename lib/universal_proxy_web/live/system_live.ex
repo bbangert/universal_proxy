@@ -239,7 +239,7 @@ defmodule UniversalProxyWeb.SystemLive do
             {@fw_update.message}
           </div>
 
-          <div :if={@show_fw_actions} class="mt-4 flex gap-2">
+          <div :if={@show_fw_actions} class="mt-4 flex gap-2 flex-wrap">
             <.button
               variant={:secondary}
               size={:sm}
@@ -250,6 +250,17 @@ defmodule UniversalProxyWeb.SystemLive do
             >
               <.icon name={:refresh} size={14} class="mr-1.5" />
               {check_button_label(@fw_update.phase)}
+            </.button>
+            <.button
+              :if={update_available?(@fw_update, @firmware)}
+              variant={:primary}
+              size={:sm}
+              phx-click="fw_install"
+              disabled={
+                @fw_update.phase in [:checking, :downloading, :verifying, :flashing]
+              }
+            >
+              Install update
             </.button>
             <.button
               :if={@fw_update.last_release}
