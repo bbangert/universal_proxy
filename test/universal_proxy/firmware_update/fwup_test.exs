@@ -15,11 +15,9 @@ defmodule UniversalProxy.FirmwareUpdate.FwupTest do
     end
   end
 
-  @tag :hardware
   describe "fwup integration (requires fwup on PATH)" do
     @describetag :hardware
 
-    @tag :hardware
     test "applies a tiny .fw against a loopback file" do
       # Skipped by default. Run with: mise run test -- --include hardware
       fwup = System.find_executable("fwup")
