@@ -252,7 +252,7 @@ defmodule UniversalProxyWeb.OverviewLive do
         packet_rate={@packet_rate}
       />
 
-      <.hardware_table ports={@ports} />
+      <.hardware_table ports={@ports} throughput_snapshots={@throughput_snapshots} />
     </div>
 
     <.maybe_port_drawer
@@ -354,6 +354,7 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   # ── Connected hardware table ──────────────────────────────────────────
   attr(:ports, :list, required: true)
+  attr(:throughput_snapshots, :map, required: true)
 
   defp hardware_table(assigns) do
     ~H"""
@@ -393,7 +394,11 @@ defmodule UniversalProxyWeb.OverviewLive do
           </tr>
         </thead>
         <tbody>
-          <.port_row :for={port <- @ports} port={port} />
+          <.port_row
+            :for={port <- @ports}
+            port={port}
+            throughput_snapshots={@throughput_snapshots}
+          />
         </tbody>
       </table>
     </.card>
@@ -402,6 +407,7 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   # ── Single row in the hardware table ──────────────────────────────────
   attr(:port, :map, required: true)
+  attr(:throughput_snapshots, :map, required: true)
 
   defp port_row(assigns) do
     assigns = assign(assigns, :status, MockData.port_status(assigns.port))
