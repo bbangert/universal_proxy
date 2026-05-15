@@ -1,7 +1,6 @@
 defmodule UniversalProxy.FirmwareUpdate.Fwup do
   @moduledoc """
-  Streams a `.fw` to `fwup --apply --framing --exit-handshake` via an
-  Erlang Port.
+  Streams a `.fw` to `fwup --apply --framing` via an Erlang Port.
 
   Library-shape: no host dependencies.
 
@@ -30,12 +29,6 @@ defmodule UniversalProxy.FirmwareUpdate.Fwup do
   `ssh_subsystem_fwup` use the same parser. We rely on
   `Port.command/2`'s blocking semantics for back-pressure: when fwup's
   stdin buffer is full, the write blocks until fwup drains.
-
-  ## Exit handshake
-
-  `--exit-handshake` tells fwup not to close its stdout until the
-  caller writes `Y` to its stdin. We send `Y` after the zero-length
-  terminator so fwup gets a clean shutdown rather than a broken pipe.
   """
 
   @default_chunk_size 64 * 1024

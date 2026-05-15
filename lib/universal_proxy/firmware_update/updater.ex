@@ -141,7 +141,11 @@ defmodule UniversalProxy.FirmwareUpdate.Updater do
         {:reply, {:error, :no_release_cached}, state}
 
       true ->
-        send(self(), :do_install)
+        # Snapshot opts + release at call time so a concurrent
+        # `update_config/2` slipping into the mailbox before this
+        # self-message is dequeued can't change what this install uses.
+        # See @moduledoc on the in-flight-opts contract.
+        send(self(), {:do_install, state.opts, state.last_release})
         {:reply, :ok, state}
     end
   end
@@ -165,14 +169,16 @@ defmodule UniversalProxy.FirmwareUpdate.Updater do
 
   def handle_cast(:check, state) do
     state = %{state | phase: :idle, last_error: nil}
-    send(self(), :do_check)
+    # Snapshot opts at cast-time for the same reason install_latest does:
+    # update_config/2 reaching the mailbox before :do_check would
+    # otherwise change what this check uses.
+    send(self(), {:do_check, state.opts})
     {:noreply, state}
   end
 
   @impl true
-  def handle_info(:do_check, state) do
+  def handle_info({:do_check, opts}, state) do
     state = transition(state, :checking, "Checking for updates…")
-    opts = state.opts
 
     client = Map.get(opts, :client, UniversalProxy.FirmwareUpdate.GithubClient)
     repo = Map.fetch!(opts, :owner_repo)
@@ -194,15 +200,14 @@ defmodule UniversalProxy.FirmwareUpdate.Updater do
     end
   end
 
-  def handle_info(:do_install, %{last_release: nil} = state), do: {:noreply, state}
+  def handle_info({:do_install, _opts, nil}, state), do: {:noreply, state}
 
-  def handle_info(:do_install, state) do
-    opts = state.opts
+  def handle_info({:do_install, opts, release}, state) do
     matcher = Map.fetch!(opts, :asset_matcher)
 
-    case matcher.(state.last_release.tag_name, state.last_release.assets) do
+    case matcher.(release.tag_name, release.assets) do
       {:ok, fw_asset, sig_asset} ->
-        do_download_install(state, fw_asset, sig_asset)
+        do_download_install(state, opts, fw_asset, sig_asset)
 
       {:error, reason} ->
         {:noreply, fail(state, "No matching firmware asset: #{format_error(reason)}", reason)}
@@ -211,8 +216,7 @@ defmodule UniversalProxy.FirmwareUpdate.Updater do
 
   # -- Private --
 
-  defp do_download_install(state, fw_asset, sig_asset) do
-    opts = state.opts
+  defp do_download_install(state, opts, fw_asset, sig_asset) do
     client = Map.get(opts, :client, UniversalProxy.FirmwareUpdate.GithubClient)
     download_dir = Map.fetch!(opts, :download_dir)
     verify_required = Map.get(opts, :verification_required, false)
@@ -235,7 +239,7 @@ defmodule UniversalProxy.FirmwareUpdate.Updater do
     with :ok <- fw_dl,
          :ok <- maybe_download_sig(client, sig_asset, sig_path, opts, verify_required),
          :ok <- maybe_verify(state, fw_path, sig_path, opts, verify_required),
-         {:ok, state} <- do_flash(state, fw_path) do
+         {:ok, state} <- do_flash(state, opts, fw_path) do
       cleanup_partials([fw_path, sig_path])
       new_state = transition(state, :idle, "Install complete; rebooting.", 100)
       run_reboot(opts)
@@ -284,8 +288,7 @@ defmodule UniversalProxy.FirmwareUpdate.Updater do
     sig_mod.verify(fw_path, sig_path, pubkey)
   end
 
-  defp do_flash(state, fw_path) do
-    opts = state.opts
+  defp do_flash(state, opts, fw_path) do
     fwup = Map.get(opts, :fwup, UniversalProxy.FirmwareUpdate.Fwup)
     devpath = Map.get(opts, :fwup_devpath) || resolve_devpath(opts)
     task = Map.get(opts, :fwup_task, "upgrade")

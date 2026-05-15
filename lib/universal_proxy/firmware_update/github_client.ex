@@ -165,7 +165,7 @@ defmodule UniversalProxy.FirmwareUpdate.GithubClient do
       delta = new_written - acc.last_reported
 
       acc =
-        if delta >= unquote(@progress_chunk_bytes) and acc.total > 0 do
+        if delta >= @progress_chunk_bytes and acc.total > 0 do
           pct = min(round(new_written * 100 / acc.total), 99)
           acc.progress_fn.({:downloading, pct})
           %{acc | written: new_written, last_reported: new_written}
