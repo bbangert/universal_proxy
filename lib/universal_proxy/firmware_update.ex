@@ -44,10 +44,6 @@ defmodule UniversalProxy.FirmwareUpdate do
 
   @target Mix.target() |> to_string()
 
-  # Mutable keys that propagate into the live Updater. ConfigStore
-  # also accepts these (plus its own validation rules).
-  @propagated_keys [:owner_repo, :github_token, :public_key, :verification_required]
-
   # -- Public child_spec / start_link --
 
   def child_spec(opts) do
@@ -149,7 +145,22 @@ defmodule UniversalProxy.FirmwareUpdate do
   @spec update_config(keyword()) :: :ok | {:error, term()}
   def update_config(updates) when is_list(updates) do
     with :ok <- ConfigStore.put(updates) do
-      propagated = Keyword.take(updates, @propagated_keys)
+      # Always propagate the post-sanitization snapshot, not the raw
+      # input. Two reasons:
+      # 1. ConfigStore drops invalid values (empty repo, wrong-sized
+      #    pubkey) — the live Updater must see the same sanitized
+      #    state, not the bad user input.
+      # 2. The user-facing key is `:repo`; the Updater opts use
+      #    `:owner_repo`. Translating here keeps the SSH/IEx surface
+      #    clean while still reaching the live process.
+      snap = ConfigStore.snapshot()
+
+      propagated = [
+        owner_repo: snap.repo,
+        github_token: snap.github_token,
+        public_key: snap.public_key,
+        verification_required: snap.verification_required
+      ]
 
       case Updater.update_config(Updater, propagated) do
         :ok ->

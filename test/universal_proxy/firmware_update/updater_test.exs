@@ -101,11 +101,18 @@ defmodule UniversalProxy.FirmwareUpdate.UpdaterTest do
   defp set_signature_result(r), do: :persistent_term.put({StubSignature, :result}, r)
 
   defp start_updater(opts \\ []) do
+    # Each updater gets its own dir under System.tmp_dir!() and registers
+    # its own cleanup — the previous pattern of `./tmp_updater_*` in cwd
+    # was orphaned because the setup's on_exit only cleaned setup's dir.
+    dir = Path.join(System.tmp_dir!(), "updater_test_dir_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    ExUnit.Callbacks.on_exit(fn -> File.rm_rf(dir) end)
+
     base = [
       name: nil,
       owner_repo: "owner/repo",
       asset_matcher: &simple_matcher/2,
-      download_dir: Path.expand("./tmp_updater_#{System.unique_integer([:positive])}"),
+      download_dir: dir,
       pubsub: UniversalProxy.PubSub,
       pubsub_topic: @topic,
       client: StubClient,

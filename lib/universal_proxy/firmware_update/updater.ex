@@ -141,12 +141,22 @@ defmodule UniversalProxy.FirmwareUpdate.Updater do
         {:reply, {:error, :no_release_cached}, state}
 
       true ->
-        # Snapshot opts + release at call time so a concurrent
-        # `update_config/2` slipping into the mailbox before this
-        # self-message is dequeued can't change what this install uses.
-        # See @moduledoc on the in-flight-opts contract.
+        # Lock the phase synchronously so a second `install_latest/1`
+        # arriving before :do_install is dequeued falls into the
+        # :busy branch above instead of enqueuing a duplicate install
+        # (and a duplicate reboot). Snapshot opts + release at call
+        # time for the same reason — see @moduledoc on the in-flight
+        # opts contract.
+        new_state =
+          transition(
+            %{state | last_error: nil},
+            :downloading,
+            "Downloading firmware…",
+            0
+          )
+
         send(self(), {:do_install, state.opts, state.last_release})
-        {:reply, :ok, state}
+        {:reply, :ok, new_state}
     end
   end
 
@@ -168,18 +178,18 @@ defmodule UniversalProxy.FirmwareUpdate.Updater do
   end
 
   def handle_cast(:check, state) do
-    state = %{state | phase: :idle, last_error: nil}
-    # Snapshot opts at cast-time for the same reason install_latest does:
-    # update_config/2 reaching the mailbox before :do_check would
-    # otherwise change what this check uses.
-    send(self(), {:do_check, state.opts})
-    {:noreply, state}
+    # Transition to :checking synchronously. A second :check cast
+    # arriving before :do_check is dequeued falls into the busy
+    # guard above instead of enqueuing a duplicate API call.
+    # Snapshot opts here for the same opts-race reason install_latest
+    # does — see @moduledoc.
+    new_state = transition(%{state | last_error: nil}, :checking, "Checking for updates…")
+    send(self(), {:do_check, new_state.opts})
+    {:noreply, new_state}
   end
 
   @impl true
   def handle_info({:do_check, opts}, state) do
-    state = transition(state, :checking, "Checking for updates…")
-
     client = Map.get(opts, :client, UniversalProxy.FirmwareUpdate.GithubClient)
     repo = Map.fetch!(opts, :owner_repo)
 
@@ -224,7 +234,8 @@ defmodule UniversalProxy.FirmwareUpdate.Updater do
     fw_path = Path.join(download_dir, "firmware_pending.fw")
     sig_path = Path.join(download_dir, "firmware_pending.fw.sig")
 
-    state = transition(state, :downloading, "Downloading firmware…", 0)
+    # Phase was set to :downloading synchronously in handle_call(:install_latest, ...)
+    # so the busy-check rejects concurrent installs. No need to re-transition here.
 
     fw_dl =
       client.download_asset(fw_asset.url, fw_path,
@@ -238,7 +249,7 @@ defmodule UniversalProxy.FirmwareUpdate.Updater do
 
     with :ok <- fw_dl,
          :ok <- maybe_download_sig(client, sig_asset, sig_path, opts, verify_required),
-         :ok <- maybe_verify(state, fw_path, sig_path, opts, verify_required),
+         {:ok, state} <- maybe_verify(state, fw_path, sig_path, opts, verify_required),
          {:ok, state} <- do_flash(state, opts, fw_path) do
       cleanup_partials([fw_path, sig_path])
       new_state = transition(state, :idle, "Install complete; rebooting.", 100)
@@ -272,20 +283,24 @@ defmodule UniversalProxy.FirmwareUpdate.Updater do
     )
   end
 
-  defp maybe_verify(_state, _fw_path, _sig_path, _opts, false) do
+  defp maybe_verify(state, _fw_path, _sig_path, _opts, false) do
     Logger.warning(
       "Firmware install proceeding without signature verification (verification_required=false)"
     )
 
-    :ok
+    {:ok, state}
   end
 
   defp maybe_verify(state, fw_path, sig_path, opts, true) do
     sig_mod = Map.get(opts, :signature, UniversalProxy.FirmwareUpdate.Signature)
     pubkey = Map.get(opts, :public_key)
 
-    _state = transition(state, :verifying, "Verifying signature…")
-    sig_mod.verify(fw_path, sig_path, pubkey)
+    new_state = transition(state, :verifying, "Verifying signature…")
+
+    case sig_mod.verify(fw_path, sig_path, pubkey) do
+      :ok -> {:ok, new_state}
+      {:error, _} = err -> err
+    end
   end
 
   defp do_flash(state, opts, fw_path) do
