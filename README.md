@@ -50,13 +50,41 @@ fwup universal_proxy_rpi3.fw
 
 ### Upgrading firmware
 
-Once the device is running, you can upload new firmware over the network:
+#### From the web UI (in-app updates)
+
+Open `http://<device>/system` and use the Firmware card. The device polls
+the configured GitHub repo for the latest release matching its target
+(filename pattern `universal_proxy_<target>.fw`), verifies the detached
+Ed25519 signature against a public key baked into the rootfs, applies
+the firmware via `fwup --framing`, and reboots. The boot-time
+`Nerves.Runtime.StartupGuard` will auto-revert if the new firmware
+fails to come up healthy.
+
+The first ConfigStore default targets `bbangert/universal_proxy`. To
+point the device at a different fork, or to enable/disable signature
+verification on a soak-testing device, SSH in and use the facade
+(propagates to the live process without a restart):
+
+```elixir
+ssh user@universal_proxy.local
+iex> UniversalProxy.FirmwareUpdate.update_config(repo: "myfork/proxy")
+:ok
+iex> UniversalProxy.FirmwareUpdate.update_config(verification_required: true)
+:ok
+iex> UniversalProxy.FirmwareUpdate.check()
+:ok   # the next check uses the new repo
+```
+
+The web UI deliberately exposes **no form** for these — they're the
+trust boundary and only live on the SSH/IEx surface.
+
+#### Over the network with `mix upload`
 
 ```bash
 mix upload universal_proxy.local
 ```
 
-Or manually with fwup:
+#### Manually with fwup (forks / dev workflow)
 
 ```bash
 cat universal_proxy_rpi3.fw | ssh universal_proxy.local "fwup -aU -d /dev/rootdisk0 -t upgrade && reboot"

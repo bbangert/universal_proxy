@@ -21,6 +21,9 @@ defmodule UniversalProxy.Application do
         UniversalProxy.UART.Supervisor,
         # ESPHome device identity store (DETS)
         UniversalProxy.ESPHome.ConfigStore,
+        # Firmware update flow (ConfigStore + library Supervisor, wired
+        # together so the snapshot lands before the library starts).
+        UniversalProxy.FirmwareUpdate,
         # Espex-backed ESPHome Native API server with our hardware adapters
         UniversalProxy.ESPHome.Supervisor
       ] ++ target_children()
