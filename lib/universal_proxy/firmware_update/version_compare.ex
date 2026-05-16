@@ -85,9 +85,7 @@ defmodule UniversalProxy.FirmwareUpdate.VersionCompare do
   end
 
   defp parse(s) when is_binary(s), do: s |> normalize() |> Version.parse()
-  defp parse(_), do: :error
 
   defp normalize("v" <> rest), do: rest
   defp normalize(s) when is_binary(s), do: s
-  defp normalize(_), do: nil
 end
