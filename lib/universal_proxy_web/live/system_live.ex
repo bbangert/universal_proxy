@@ -398,21 +398,15 @@ defmodule UniversalProxyWeb.SystemLive do
   defp check_button_label(:error), do: "Check for updates"
   defp check_button_label(_), do: "Check for updates"
 
-  defp update_available?(%{last_release: nil}, _firmware), do: false
-
-  defp update_available?(%{last_release: %{tag_name: tag}}, %{version: current}) do
-    normalize(tag) != normalize(current)
+  defp update_available?(%{last_release: last_release}, %{version: current}) do
+    tag = last_release && last_release.tag_name
+    UniversalProxy.FirmwareUpdate.VersionCompare.update_available?(tag, current)
   end
 
-  defp fw_up_to_date?(%{last_release: nil}, _), do: false
-
-  defp fw_up_to_date?(%{last_release: %{tag_name: tag}}, %{version: current}) do
-    normalize(tag) == normalize(current)
+  defp fw_up_to_date?(%{last_release: last_release}, %{version: current}) do
+    tag = last_release && last_release.tag_name
+    UniversalProxy.FirmwareUpdate.VersionCompare.up_to_date?(tag, current)
   end
-
-  defp normalize(nil), do: nil
-  defp normalize("v" <> rest), do: rest
-  defp normalize(s) when is_binary(s), do: s
 
   defp format_date(nil), do: ""
 
