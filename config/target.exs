@@ -25,6 +25,14 @@ config :logger, backends: [RingLogger]
 
 config :shoehorn, init: [:nerves_runtime, :nerves_pack]
 
+# Enable Nerves.Runtime.StartupGuard so the bootloader's two-slot auto-revert
+# fires when a new firmware boots unhealthy. The guard waits for the full
+# supervision tree to come up, then calls Nerves.Runtime.validate_firmware/0.
+#
+# See the "StartupGuard" section of the nerves_runtime README:
+# https://github.com/nerves-project/nerves_runtime#startupguard
+config :nerves_runtime, startup_guard_enabled: true
+
 # Erlinit can be configured without a rootfs_overlay. See
 # https://github.com/nerves-project/erlinit/ for more information on
 # configuring erlinit.

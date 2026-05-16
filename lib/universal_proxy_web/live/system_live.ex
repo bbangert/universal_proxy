@@ -13,14 +13,21 @@ defmodule UniversalProxyWeb.SystemLive do
   import UniversalProxyWeb.Components.Icons
 
   alias UniversalProxy.System, as: Sys
+  alias UniversalProxy.FirmwareUpdate
 
   @refresh_interval 2_000
   @log_window 80
+
+  # Captured at compile time; `Mix.target/0` is a build-time tool and
+  # isn't loaded in mix releases on Nerves.
+  @target Mix.target()
+  @show_fw_actions @target != :host
 
   @impl true
   def mount(_params, _session, socket) do
     if connected?(socket) do
       :timer.send_interval(@refresh_interval, self(), :refresh)
+      Phoenix.PubSub.subscribe(FirmwareUpdate.pubsub(), FirmwareUpdate.topic())
     end
 
     {entries, since} = Sys.recent_log(count: @log_window)
@@ -33,7 +40,10 @@ defmodule UniversalProxyWeb.SystemLive do
      |> assign(:sys_log, entries)
      |> assign(:log_since, since)
      |> assign(:rebooting, false)
-     |> assign(:confirm_reboot, false)}
+     |> assign(:confirm_reboot, false)
+     |> assign(:fw_update, FirmwareUpdate.state())
+     |> assign(:show_fw_actions, @show_fw_actions)
+     |> assign(:show_release_notes, false)}
   end
 
   @impl true
@@ -55,6 +65,37 @@ defmodule UniversalProxyWeb.SystemLive do
      |> assign(:confirm_reboot, false)
      |> assign(:rebooting, true)
      |> put_flash(:info, "Rebooting — back in about 25 seconds.")}
+  end
+
+  def handle_event("fw_check", _params, socket) do
+    case FirmwareUpdate.check() do
+      :ok ->
+        {:noreply, socket}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, "Check failed: #{inspect(reason)}")}
+    end
+  end
+
+  def handle_event("fw_install", _params, socket) do
+    case FirmwareUpdate.install_latest() do
+      :ok ->
+        {:noreply, assign(socket, :show_release_notes, false)}
+
+      {:error, reason} ->
+        {:noreply,
+         socket
+         |> assign(:show_release_notes, false)
+         |> put_flash(:error, "Install failed: #{inspect(reason)}")}
+    end
+  end
+
+  def handle_event("show_release_notes", _params, socket) do
+    {:noreply, assign(socket, :show_release_notes, true)}
+  end
+
+  def handle_event("hide_release_notes", _params, socket) do
+    {:noreply, assign(socket, :show_release_notes, false)}
   end
 
   def handle_event("factory_reset", _params, socket) do
@@ -92,6 +133,20 @@ defmodule UniversalProxyWeb.SystemLive do
     {:noreply, socket}
   end
 
+  def handle_info({:fw_update_progress, payload}, socket) do
+    fw = Map.merge(socket.assigns.fw_update, payload)
+    # Refresh the cached last_release / verification_required from the
+    # source whenever idle, so the UI sees the freshly-fetched release.
+    fw =
+      if payload[:phase] == :idle do
+        FirmwareUpdate.state()
+      else
+        fw
+      end
+
+    {:noreply, assign(socket, :fw_update, fw)}
+  end
+
   def handle_info(_msg, socket), do: {:noreply, socket}
 
   @impl true
@@ -106,6 +161,36 @@ defmodule UniversalProxyWeb.SystemLive do
             <div class="text-xl font-semibold tabular-nums">{@firmware.version}</div>
             <.badge :if={@firmware.validated} variant={:success} dot>Validated</.badge>
             <.badge :if={!@firmware.validated} variant={:warning} dot>Pending validation</.badge>
+            <.badge
+              :if={update_available?(@fw_update, @firmware)}
+              variant={:accent}
+              dot
+            >
+              Update available
+            </.badge>
+            <.badge
+              :if={fw_up_to_date?(@fw_update, @firmware)}
+              variant={:success}
+              dot
+            >
+              Up to date
+            </.badge>
+            <.badge
+              :if={!@fw_update.verification_required}
+              variant={:warning}
+              dot
+            >
+              Signature checks disabled
+            </.badge>
+          </div>
+          <div
+            :if={@fw_update.last_release}
+            class="text-xs text-fg-3 mt-1"
+          >
+            Latest: <span class="font-mono">{@fw_update.last_release.tag_name}</span>
+            <span :if={@fw_update.last_release.published_at}>
+              · {format_date(@fw_update.last_release.published_at)}
+            </span>
           </div>
           <div :if={@firmware.uuid} class="text-sm text-fg-3 mt-1">
             UUID <span class="font-mono">{short_uuid(@firmware.uuid)}</span>
@@ -132,6 +217,59 @@ defmodule UniversalProxyWeb.SystemLive do
               </div>
               <div class="text-fg-1 mt-0.5">{@firmware.hardware}</div>
             </div>
+          </div>
+
+          <div
+            :if={@fw_update.phase in [:downloading, :verifying, :flashing]}
+            class="mt-3"
+          >
+            <div class="text-xs text-fg-3 mb-1">{@fw_update.message}</div>
+            <progress
+              class="w-full h-1.5"
+              max="100"
+              value={@fw_update.pct || 0}
+            >
+            </progress>
+          </div>
+
+          <div
+            :if={@fw_update.phase == :error}
+            class="mt-3 px-3 py-2 rounded border border-danger/40 bg-danger/5 text-sm text-danger"
+          >
+            {@fw_update.message}
+          </div>
+
+          <div :if={@show_fw_actions} class="mt-4 flex gap-2 flex-wrap">
+            <.button
+              variant={:secondary}
+              size={:sm}
+              phx-click="fw_check"
+              disabled={
+                @fw_update.phase in [:checking, :downloading, :verifying, :flashing]
+              }
+            >
+              <.icon name={:refresh} size={14} class="mr-1.5" />
+              {check_button_label(@fw_update.phase)}
+            </.button>
+            <.button
+              :if={update_available?(@fw_update, @firmware)}
+              variant={:primary}
+              size={:sm}
+              phx-click="fw_install"
+              disabled={
+                @fw_update.phase in [:checking, :downloading, :verifying, :flashing]
+              }
+            >
+              Install update
+            </.button>
+            <.button
+              :if={@fw_update.last_release}
+              variant={:ghost}
+              size={:sm}
+              phx-click="show_release_notes"
+            >
+              Release notes
+            </.button>
           </div>
         </.card>
 
@@ -219,6 +357,29 @@ defmodule UniversalProxyWeb.SystemLive do
         <.button variant={:primary} size={:sm} phx-click="confirm_reboot">Reboot now</.button>
       </:footer>
     </.modal>
+
+    <.modal
+      :if={@fw_update.last_release}
+      open={@show_release_notes}
+      on_close="hide_release_notes"
+      title={@fw_update.last_release.tag_name}
+      subtitle={"Released " <> format_date(@fw_update.last_release.published_at)}
+    >
+      <div class="max-h-[60vh] overflow-auto whitespace-pre-wrap text-sm font-mono">
+        {@fw_update.last_release.body}
+      </div>
+      <:footer>
+        <.button variant={:ghost} size={:sm} phx-click="hide_release_notes">Close</.button>
+        <.button
+          :if={update_available?(@fw_update, @firmware)}
+          variant={:primary}
+          size={:sm}
+          phx-click="fw_install"
+        >
+          Install now
+        </.button>
+      </:footer>
+    </.modal>
     """
   end
 
@@ -228,4 +389,37 @@ defmodule UniversalProxyWeb.SystemLive do
   defp log_level_class("WARN"), do: "text-warning"
   defp log_level_class("ERROR"), do: "text-danger"
   defp log_level_class(_), do: "text-fg-3"
+
+  defp check_button_label(:idle), do: "Check for updates"
+  defp check_button_label(:checking), do: "Checking…"
+  defp check_button_label(:downloading), do: "Downloading…"
+  defp check_button_label(:verifying), do: "Verifying…"
+  defp check_button_label(:flashing), do: "Installing…"
+  defp check_button_label(:error), do: "Check for updates"
+  defp check_button_label(_), do: "Check for updates"
+
+  defp update_available?(%{last_release: nil}, _firmware), do: false
+
+  defp update_available?(%{last_release: %{tag_name: tag}}, %{version: current}) do
+    normalize(tag) != normalize(current)
+  end
+
+  defp fw_up_to_date?(%{last_release: nil}, _), do: false
+
+  defp fw_up_to_date?(%{last_release: %{tag_name: tag}}, %{version: current}) do
+    normalize(tag) == normalize(current)
+  end
+
+  defp normalize(nil), do: nil
+  defp normalize("v" <> rest), do: rest
+  defp normalize(s) when is_binary(s), do: s
+
+  defp format_date(nil), do: ""
+
+  defp format_date(iso) when is_binary(iso) do
+    case DateTime.from_iso8601(iso) do
+      {:ok, dt, _} -> Calendar.strftime(dt, "%Y-%m-%d")
+      _ -> iso
+    end
+  end
 end
