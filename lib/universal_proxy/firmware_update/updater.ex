@@ -17,6 +17,18 @@ defmodule UniversalProxy.FirmwareUpdate.Updater do
   next `check/1`. There is no retry, no cancel, no HTTP-range resume
   (conservative error policy — see plan Q7).
 
+  ## Progress snapshot caveat
+
+  `state.pct` is updated on phase transitions only (so a `state/1`
+  snapshot reports `0` at the start of `:downloading` / `:flashing`).
+  Intermediate per-byte progress is broadcast via PubSub but does
+  not mutate the GenServer state — the install runs inside a
+  single `handle_info/2` that blocks the GenServer, so routing
+  progress through self-messages would just buffer them all until
+  the install completes. A LiveView that reconnects mid-install
+  therefore sees a stale `pct` for the brief window until the next
+  PubSub event lands and corrects it.
+
   ## Conditional verification
 
   When opts `:verification_required` is `false` (v1 default), the
@@ -28,7 +40,7 @@ defmodule UniversalProxy.FirmwareUpdate.Updater do
 
     * `:client` — module implementing `latest_release/2` and
       `download_asset/3` (default `UniversalProxy.FirmwareUpdate.GithubClient`).
-    * `:fwup` — module implementing `apply/3` (default
+    * `:fwup` — module implementing `apply/2` (default
       `UniversalProxy.FirmwareUpdate.Fwup`).
     * `:signature` — module implementing `verify/3` (default
       `UniversalProxy.FirmwareUpdate.Signature`).

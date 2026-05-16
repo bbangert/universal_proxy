@@ -1,6 +1,6 @@
 defmodule UniversalProxy.FirmwareUpdate.Signature do
   @moduledoc """
-  Detached Ed25519 signature verification using OTP's `:public_key`.
+  Detached Ed25519 signature verification using `:crypto.verify/5`.
 
   Library-shape: pure functions, no host dependencies.
 
@@ -8,9 +8,17 @@ defmodule UniversalProxy.FirmwareUpdate.Signature do
 
   Rather than `fwup --public-key` (which bakes signature material into
   the `.fw` itself), we keep the firmware bytes untouched and ship a
-  separate `<name>.fw.sig` produced by AWS KMS in CI. This lets the
-  device's verification module use OTP's `:public_key.verify/4`
-  directly — no KMS-format-specific decoding needed.
+  separate `<name>.fw.sig` produced by AWS KMS in CI.
+
+  We verify with `:crypto.verify(:eddsa, :none, msg, sig, [pubkey,
+  :ed25519])` rather than the higher-level `:public_key.verify/4` —
+  on OTP 28, `:public_key.verify` with the `{:ed_pub, :ed25519, bin}`
+  3-tuple raises `ArgumentError`, and the surrounding `:public_key`
+  API expects ASN.1-encoded records that don't round-trip cleanly
+  with the raw 32-byte key bytes we extract from KMS. `:crypto.verify`
+  is what `:public_key` ultimately delegates to for EdDSA and accepts
+  the raw key bytes directly. The wire format matches KMS's
+  `ED25519_SHA_512` output byte-for-byte.
 
   ## Placeholder pubkey
 
