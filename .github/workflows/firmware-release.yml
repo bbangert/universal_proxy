@@ -50,7 +50,7 @@ jobs:
 
       - name: Install fwup
         run: |
-          FWUP_VERSION="1.10.2"
+          FWUP_VERSION="1.15.0"
           curl -fsSL "https://github.com/fwup-home/fwup/releases/download/v${FWUP_VERSION}/fwup_${FWUP_VERSION}_amd64.deb" -o /tmp/fwup.deb
           sudo dpkg -i /tmp/fwup.deb
 
