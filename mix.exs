@@ -26,13 +26,19 @@ defmodule UniversalProxy.MixProject do
       elixir: "~> 1.19",
       elixirc_paths: elixirc_paths(Mix.env()),
       archives: [nerves_bootstrap: "~> 1.14"],
-      compilers: Mix.compilers(),
+      # :sendspin_player runs BEFORE :app so the freshly built C++ binary
+      # is in priv/ when :app finalises the application bundle. In dev/test
+      # priv is a symlink (writes flow through regardless of order), but
+      # release tooling that snapshots priv at the :app step would otherwise
+      # miss it on a first compile.
+      compilers: (Mix.compilers() -- [:app]) ++ [:sendspin_player, :app],
       listeners: listeners(Mix.target(), Mix.env()),
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       releases: [{@app, release()}],
       aliases: aliases(),
       dialyzer: [
+        plt_add_apps: [:mix],
         plt_local_path: "priv/plts",
         plt_core_path: "priv/plts",
         ignore_warnings: ".dialyzer_ignore.exs"
@@ -97,6 +103,9 @@ defmodule UniversalProxy.MixProject do
 
       # UART/serial port enumeration
       {:circuits_uart, "~> 1.5"},
+
+      # Supervised OS process management for the sendspin_player C++ binary
+      {:muontrap, "~> 1.8"},
 
       # ESPHome Native API server library
       {:espex, "~> 0.1.2"},
