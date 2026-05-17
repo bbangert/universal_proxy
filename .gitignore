@@ -42,6 +42,10 @@ erl_crash.dump
 /priv/static/**/*-*.gz
 /priv/static/**/*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]*.*
 
+# sendspin_player C++ binary build artifacts
+/c_src/sendspin_player/_build/
+/priv/sendspin_player/
+
 # OS generated files
 .DS_Store
 Thumbs.db

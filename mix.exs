@@ -26,7 +26,7 @@ defmodule UniversalProxy.MixProject do
       elixir: "~> 1.19",
       elixirc_paths: elixirc_paths(Mix.env()),
       archives: [nerves_bootstrap: "~> 1.14"],
-      compilers: Mix.compilers(),
+      compilers: Mix.compilers() ++ [:sendspin_player],
       listeners: listeners(Mix.target(), Mix.env()),
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -97,6 +97,9 @@ defmodule UniversalProxy.MixProject do
 
       # UART/serial port enumeration
       {:circuits_uart, "~> 1.5"},
+
+      # Supervised OS process management for the sendspin_player C++ binary
+      {:muontrap, "~> 1.8"},
 
       # ESPHome Native API server library
       {:espex, "~> 0.1.2"},
