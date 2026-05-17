@@ -11,7 +11,9 @@ env:
   OTP_VERSION: "28.3"
   # System packages required to compile NIFs that mix deps.get pulls in
   # (libmnl-dev for vintage_net, libssl-dev for crypto-using NIFs).
-  APT_PACKAGES: build-essential automake autoconf pkg-config libssl-dev libmnl-dev
+  # libasound2-dev is needed by the sendspin_player Mix compiler, which
+  # builds c_src/sendspin_player/ as part of `mix compile`.
+  APT_PACKAGES: build-essential automake autoconf pkg-config libssl-dev libmnl-dev libasound2-dev
 
 jobs:
   format:
