@@ -33,6 +33,7 @@ defmodule UniversalProxy.MixProject do
       releases: [{@app, release()}],
       aliases: aliases(),
       dialyzer: [
+        plt_add_apps: [:mix],
         plt_local_path: "priv/plts",
         plt_core_path: "priv/plts",
         ignore_warnings: ".dialyzer_ignore.exs"
