@@ -19,6 +19,10 @@ defmodule UniversalProxy.Application do
         {Task.Supervisor, name: UniversalProxy.TaskSupervisor},
         # Start the UART subsystem (DynamicSupervisor + registry server)
         UniversalProxy.UART.Supervisor,
+        # Audio (Sendspin) subsystem — enumerates ALSA outputs, persists
+        # per-output config, broadcasts lifecycle events. Phase 1 holds
+        # an empty PlayerSupervisor; Phase 3 adds player children.
+        UniversalProxy.Audio.Supervisor,
         # ESPHome device identity store (DETS)
         UniversalProxy.ESPHome.ConfigStore,
         # Firmware update flow (ConfigStore + library Supervisor, wired
