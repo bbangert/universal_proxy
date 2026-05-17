@@ -24,20 +24,24 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <getopt.h>
 #include <iostream>
 #include <mutex>
+#include <poll.h>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 using namespace sendspin;
 
@@ -357,10 +361,18 @@ private:
 
 }  // namespace
 
+// Returns true on a well-formed line. `value_kind` is "" (no value),
+// "int", or "bool" — the dispatcher uses it to enforce per-command
+// value shapes (set_volume requires int, set_muted requires bool,
+// shutdown requires no value). Without this, the value-less and
+// wrong-type cases would silently land in `int_val == 0` / `bool_val
+// == false` and be processed as if the operator had asked for 0.
 static bool parse_command(const std::string& line, std::string& cmd,
+                          std::string& value_kind,
                           int& int_val, bool& bool_val) {
     Scanner sc(line);
     std::string key;
+    value_kind.clear();
     int_val = 0;
     bool_val = false;
     if (!sc.expect('{')) return false;
@@ -373,36 +385,96 @@ static bool parse_command(const std::string& line, std::string& cmd,
         if (!sc.expect(':')) return false;
         auto kind = sc.value(int_val, bool_val);
         if (kind.empty()) return false;
+        value_kind.assign(kind);
     }
     if (!sc.expect('}')) return false;
     if (!sc.at_end()) return false;
     return true;
 }
 
-static void stdin_thread(AlsaPipeSink* sink, PlayerRole* player) {
-    std::string line;
-    while (g_running.load() && std::getline(std::cin, line)) {
-        std::string cmd;
-        int int_val = 0;
-        bool bool_val = false;
-        if (!parse_command(line, cmd, int_val, bool_val)) continue;
-        if (cmd == "set_volume") {
-            auto v = static_cast<uint8_t>(std::clamp(int_val, 0, 100));
-            sink->set_volume(v);
-            player->update_volume(v);
-            std::ostringstream os;
-            os << "{\"event\":\"volume\",\"value\":" << static_cast<int>(v) << "}";
-            emit_json(os.str());
-        } else if (cmd == "set_muted") {
-            sink->set_muted(bool_val);
-            std::ostringstream os;
-            os << "{\"event\":\"mute\",\"value\":" << (bool_val ? "true" : "false") << "}";
-            emit_json(os.str());
-        } else if (cmd == "shutdown") {
-            g_running.store(false);
-            break;
-        }
+// ---------------------------------------------------------------------------
+// Stdin line poller (non-blocking, single-threaded)
+// ---------------------------------------------------------------------------
+//
+// Previously the binary had a dedicated reader thread that blocked on
+// std::getline and was woken by close(STDIN_FILENO) from main at shutdown.
+// POSIX explicitly leaves concurrent close/read undefined, so we fold
+// stdin handling into the main loop with non-blocking read+poll instead.
+// No thread → no wake races, no join hangs, no self-pipe scaffolding.
+
+namespace {
+
+class StdinLinePoller {
+public:
+    StdinLinePoller() {
+        int flags = ::fcntl(STDIN_FILENO, F_GETFL, 0);
+        if (flags >= 0) ::fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
     }
+
+    // Drains anything available on stdin without blocking, returning each
+    // complete (newline-terminated) line. Remainder is held in the internal
+    // buffer until the next call. `eof` is set when stdin is closed.
+    std::vector<std::string> poll_lines(bool& eof) {
+        eof = false;
+        struct pollfd pfd = {STDIN_FILENO, POLLIN, 0};
+        while (::poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLIN | POLLHUP))) {
+            char chunk[4096];
+            ssize_t n = ::read(STDIN_FILENO, chunk, sizeof(chunk));
+            if (n == 0) {
+                eof = true;
+                break;
+            }
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                eof = true;
+                break;
+            }
+            buf_.append(chunk, static_cast<size_t>(n));
+            pfd.revents = 0;
+        }
+
+        std::vector<std::string> lines;
+        size_t pos;
+        while ((pos = buf_.find('\n')) != std::string::npos) {
+            lines.emplace_back(buf_, 0, pos);
+            buf_.erase(0, pos + 1);
+        }
+        return lines;
+    }
+
+private:
+    std::string buf_;
+};
+
+}  // namespace
+
+// Dispatches a single parsed command line. Silently ignores lines that
+// don't match a known cmd shape — BEAM is the sole writer so a malformed
+// frame is a programmer bug, not user input we need to surface.
+static void dispatch_command(const std::string& line, AlsaPipeSink& sink,
+                             PlayerRole& player) {
+    std::string cmd;
+    std::string kind;
+    int int_val = 0;
+    bool bool_val = false;
+    if (!parse_command(line, cmd, kind, int_val, bool_val)) return;
+
+    if (cmd == "set_volume" && kind == "int") {
+        auto v = static_cast<uint8_t>(std::clamp(int_val, 0, 100));
+        sink.set_volume(v);
+        player.update_volume(v);
+        std::ostringstream os;
+        os << "{\"event\":\"volume\",\"value\":" << static_cast<int>(v) << "}";
+        emit_json(os.str());
+    } else if (cmd == "set_muted" && kind == "bool") {
+        sink.set_muted(bool_val);
+        std::ostringstream os;
+        os << "{\"event\":\"mute\",\"value\":" << (bool_val ? "true" : "false") << "}";
+        emit_json(os.str());
+    } else if (cmd == "shutdown" && kind.empty()) {
+        g_running.store(false);
+    }
+    // Wrong value type, unknown cmd, or extra value on shutdown: drop.
 }
 
 // ---------------------------------------------------------------------------
@@ -576,7 +648,7 @@ int main(int argc, char* argv[]) {
         emit_json(os.str());
     }
 
-    std::thread stdin_reader(stdin_thread, &audio_sink, &player);
+    StdinLinePoller stdin_poller;
 
     using clock = std::chrono::steady_clock;
     static constexpr auto RECONNECT_INTERVAL = std::chrono::seconds(5);
@@ -585,6 +657,12 @@ int main(int argc, char* argv[]) {
 
     while (g_running.load()) {
         client.loop();
+
+        bool stdin_eof = false;
+        for (auto& line : stdin_poller.poll_lines(stdin_eof)) {
+            dispatch_command(line, audio_sink, player);
+        }
+        if (stdin_eof) g_running.store(false);
 
         bool now_connected = client.is_connected();
         if (now_connected != was_connected) {
@@ -612,12 +690,5 @@ int main(int argc, char* argv[]) {
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     emit_json("{\"event\":\"shutdown\"}");
-
-    // Unblock the stdin reader by closing fd 0 — std::getline's underlying
-    // read() returns 0 (EOF) and the thread exits cleanly. Then join so no
-    // thread outlives main(). On Linux this is the canonical "wake a thread
-    // blocked in a blocking read" pattern.
-    ::close(STDIN_FILENO);
-    if (stdin_reader.joinable()) stdin_reader.join();
     return 0;
 }

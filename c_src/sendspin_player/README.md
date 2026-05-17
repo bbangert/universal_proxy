@@ -30,9 +30,12 @@ c_src/sendspin_player/
 
 `alsa_pipe_sink.{h,cpp}` are vendored verbatim from
 [`LeoLTM/sendspin-armv6@main`](https://github.com/LeoLTM/sendspin-armv6) under
-Apache-2.0. The file headers carry the original attribution. To pull a newer
-revision, copy the files and the LICENSE again — keep the header comments
-intact.
+Apache-2.0. Upstream does not place per-file copyright headers on these
+files — attribution flows through `LICENSE-sendspin-armv6` (a copy of the
+upstream LICENSE) which lives next to them in this directory. To pull a
+newer revision, copy the source files **and** re-pull `LICENSE-sendspin-armv6`.
+Do not add per-file headers locally — keep the files byte-identical to
+upstream so future re-syncs apply cleanly.
 
 `main.cpp` is our own adaptation of upstream `src/main.cpp`. The shape stayed
 close to upstream so future patches there can land here with minimal effort.
