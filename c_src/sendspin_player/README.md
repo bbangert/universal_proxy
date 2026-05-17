@@ -28,14 +28,25 @@ c_src/sendspin_player/
 
 ## Vendoring
 
-`alsa_pipe_sink.{h,cpp}` are vendored verbatim from
+`alsa_pipe_sink.{h,cpp}` are vendored from
 [`LeoLTM/sendspin-armv6@main`](https://github.com/LeoLTM/sendspin-armv6) under
 Apache-2.0. Upstream does not place per-file copyright headers on these
 files — attribution flows through `LICENSE-sendspin-armv6` (a copy of the
 upstream LICENSE) which lives next to them in this directory. To pull a
 newer revision, copy the source files **and** re-pull `LICENSE-sendspin-armv6`.
-Do not add per-file headers locally — keep the files byte-identical to
-upstream so future re-syncs apply cleanly.
+Do not add per-file headers locally.
+
+### Local divergence
+
+The vendored files carry one local fix vs. upstream:
+
+- `alsa_pipe_sink.cpp::stop()` — join the playback thread unconditionally
+  so a self-clearing `running_` (after an ALSA write error inside the
+  playback loop) does not leave the `std::thread` joinable, which would
+  otherwise trip `std::terminate` from the destructor. The change is
+  flagged inline with a comment in `alsa_pipe_sink.cpp` and is intended
+  to be sent upstream — once it merges, we can re-vendor verbatim and
+  drop the divergence.
 
 `main.cpp` is our own adaptation of upstream `src/main.cpp`. The shape stayed
 close to upstream so future patches there can land here with minimal effort.

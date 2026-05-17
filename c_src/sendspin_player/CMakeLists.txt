@@ -34,11 +34,17 @@ FetchContent_Declare(
     GIT_TAG        ${SENDSPIN_CPP_REF}
     # GIT_SHALLOW with a SHA is supported by recent CMake but rejected by
     # older git; leave it off for robust SHA-based fetches.
-    # -N --forward makes patch idempotent: on first configure the patch
-    # applies cleanly; on every subsequent configure (FetchContent re-runs
-    # PATCH_COMMAND) it detects the patch is already applied and exits 0.
-    # Without this, re-configures fail with "3 out of 3 hunks ignored".
-    PATCH_COMMAND  patch -p1 -N --forward -i ${CMAKE_CURRENT_LIST_DIR}/patches/0001-configurable-ws-port.patch || true
+    #
+    # Patch idempotency: FetchContent re-runs PATCH_COMMAND on every
+    # CMake configure. We can't use `patch -N --forward || true` because
+    # that masks real failures (e.g. a partial hunk apply on upstream
+    # context drift) — silent breakage would slip past CI and only
+    # surface when the second player instance failed to bind. Instead,
+    # gate the apply on a marker grep: if the env-var hook is already
+    # present, the patch has run; otherwise apply with default semantics
+    # so any failure (missing context, conflicting edit) is loud and
+    # fatal at configure time.
+    PATCH_COMMAND  sh -c "grep -q SENDSPIN_WS_PORT src/host/ws_server.cpp || patch -p1 -i ${CMAKE_CURRENT_LIST_DIR}/patches/0001-configurable-ws-port.patch"
 )
 
 # Manual populate + add_subdirectory(EXCLUDE_FROM_ALL) for compatibility with
@@ -53,21 +59,26 @@ if(NOT sendspin-cpp_POPULATED)
                      EXCLUDE_FROM_ALL)
 endif()
 
-# Defence in depth: verify our port-config patch landed. If `patch` fuzzy-
-# applied at the wrong offset (or silently no-applied due to upstream drift),
-# the binary would compile but ignore SENDSPIN_WS_PORT and crash on the
-# second player instance. Fail loud at configure time instead.
+# Defence in depth: verify the port-config patch landed both halves.
+# Marker #1 (env_marker): the SENDSPIN_WS_PORT-reading block exists.
+# Marker #2 (bind_marker): the WebSocketServer constructor was actually
+# rewritten to use the runtime `port` variable. Without #2, a partial
+# apply could leave the env-read block in place while the constructor
+# still passes DEFAULT_SERVER_PORT — silently honouring 8928 only.
 file(READ "${sendspin-cpp_SOURCE_DIR}/src/host/ws_server.cpp" _ws_server_src)
-string(FIND "${_ws_server_src}" "SENDSPIN_WS_PORT" _patch_marker)
-if(_patch_marker EQUAL -1)
+string(FIND "${_ws_server_src}" "SENDSPIN_WS_PORT" _env_marker)
+string(FIND "${_ws_server_src}" "WebSocketServer>(port," _bind_marker)
+if(_env_marker EQUAL -1 OR _bind_marker EQUAL -1)
     message(FATAL_ERROR
-        "sendspin-cpp port-config patch did not apply: SENDSPIN_WS_PORT "
-        "marker not found in ${sendspin-cpp_SOURCE_DIR}/src/host/ws_server.cpp. "
+        "sendspin-cpp port-config patch did not apply cleanly: "
+        "env_marker=${_env_marker} bind_marker=${_bind_marker} in "
+        "${sendspin-cpp_SOURCE_DIR}/src/host/ws_server.cpp. "
         "Re-validate patches/0001-configurable-ws-port.patch against the "
         "current SENDSPIN_CPP_REF (${SENDSPIN_CPP_REF}).")
 endif()
 unset(_ws_server_src)
-unset(_patch_marker)
+unset(_env_marker)
+unset(_bind_marker)
 
 add_executable(sendspin_player
     src/main.cpp

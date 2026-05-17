@@ -160,13 +160,18 @@ bool AlsaPipeSink::configure(uint32_t sample_rate, uint8_t channels,
 }
 
 void AlsaPipeSink::stop() {
+    // Local divergence from upstream LeoLTM/sendspin-armv6 (tracked for
+    // upstream PR): the playback loop can clear running_ itself after a
+    // hard ALSA write error, which means a subsequent stop() would see
+    // exchange(false) return false and skip the join. The std::thread
+    // is then still joinable when the destructor runs → std::terminate.
+    // Use the exchange result only to decide whether to send the
+    // drop/notify, and join unconditionally.
     if (running_.exchange(false)) {
-        // snd_pcm_drop() unblocks any pending snd_pcm_writei() in the
-        // playback thread so it observes running_ == false and exits.
         if (pcm_) snd_pcm_drop(PCM);
         ring_cv_.notify_all();
-        if (playback_thread_.joinable()) playback_thread_.join();
     }
+    if (playback_thread_.joinable()) playback_thread_.join();
     close_alsa();
     {
         std::lock_guard<std::mutex> lk(ring_mtx_);
