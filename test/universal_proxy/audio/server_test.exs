@@ -463,6 +463,13 @@ defmodule UniversalProxy.Audio.ServerTest do
 
       assert DynamicSupervisor.which_children(sup) == []
       assert {:terminated, @hp_key} in PlayerStubCalls.calls()
+
+      # Orderly :shutdown exit must NOT pollute unusable_ports.
+      # `maybe_mark_port_unusable/3` has explicit clauses for `:normal`
+      # / `:shutdown` / `{:shutdown, _}` — a regression there would
+      # mark the port unusable on every set_enabled toggle and the
+      # allocator would slowly climb.
+      assert :sys.get_state(server).unusable_ports == MapSet.new()
     end
 
     test "persists binary-emitted volume events to DETS (MA-side slider, etc)",
@@ -480,8 +487,12 @@ defmodule UniversalProxy.Audio.ServerTest do
         {:sendspin_state, @hp_key, %{event: "volume", value: 37}}
       )
 
-      # PubSub delivery is asynchronous; let Server.handle_info run.
-      Process.sleep(50)
+      # `:sys.get_state/1` is a synchronous GenServer call — it queues
+      # in Server's mailbox AFTER the broadcast message and only
+      # returns once Server has processed everything in front of it,
+      # including Store.save_config from the handle_info path. No
+      # fixed sleep needed.
+      :sys.get_state(server)
 
       assert {:ok, %{volume: 37}} = Store.get_config(store, @hp_key)
       assert :sys.get_state(server).outputs[@hp_key].volume == 37
@@ -494,7 +505,7 @@ defmodule UniversalProxy.Audio.ServerTest do
         {:sendspin_state, @hp_key, %{event: "mute", value: true}}
       )
 
-      Process.sleep(50)
+      :sys.get_state(server)
 
       assert {:ok, %{muted: true}} = Store.get_config(store, @hp_key)
       assert :sys.get_state(server).outputs[@hp_key].muted == true
@@ -516,10 +527,11 @@ defmodule UniversalProxy.Audio.ServerTest do
       :ok = GenServer.stop(old_pid, :killed_for_test, 1_000)
       assert_receive {:DOWN, ^ref, :process, ^old_pid, _}, 1_000
 
-      # Give Server's :DOWN handler a moment to process.
-      Process.sleep(50)
-      assert DynamicSupervisor.which_children(sup) == []
+      # Test process's DOWN doesn't imply Server's DOWN has been
+      # processed. `:sys.get_state/1` flushes Server's mailbox —
+      # returns only after Server has run its own :DOWN handler.
       assert :sys.get_state(server).players == %{}
+      assert DynamicSupervisor.which_children(sup) == []
 
       # Now drive a poll — convergence should respawn.
       :ok = Server.check_now(server)
@@ -540,6 +552,254 @@ defmodule UniversalProxy.Audio.ServerTest do
       # Two `:started` events recorded (initial + after re-enable).
       starts = Enum.count(PlayerStubCalls.calls(), &match?({:started, @hp_key, _}, &1))
       assert starts == 2
+    end
+  end
+
+  describe "binary_missing tracking" do
+    @binary_missing_topic "binary_missing_attempts"
+
+    defmodule BinaryMissingPlayer do
+      @moduledoc false
+      use GenServer, restart: :temporary
+
+      def start_link(opts) do
+        # Broadcast attempts so the test can observe retries (the
+        # flag clears mid-flight then re-fills on the failed retry,
+        # so end-state inspection alone can't tell whether a retry
+        # actually happened).
+        Phoenix.PubSub.broadcast(
+          UniversalProxy.PubSub,
+          "binary_missing_attempts",
+          {:binary_missing_attempt, Keyword.fetch!(opts, :key)}
+        )
+
+        GenServer.start_link(__MODULE__, [])
+      end
+
+      @impl true
+      def init(_), do: {:stop, {:binary_missing, "/tmp/never_built/sendspin_player"}}
+    end
+
+    setup do
+      path =
+        Path.join(
+          System.tmp_dir!(),
+          "audio_server_missing_#{System.unique_integer([:positive])}.dets"
+        )
+
+      on_exit(fn -> File.rm(path) end)
+
+      player_sup =
+        start_supervised!(
+          {DynamicSupervisor, strategy: :one_for_one, name: nil},
+          id: :missing_player_sup
+        )
+
+      store =
+        start_supervised!({Store, name: nil, table: :missing_store, dets_path: path},
+          id: :missing_store
+        )
+
+      server =
+        start_supervised!(
+          {Server,
+           name: nil,
+           store: store,
+           enumerate_module: EnumerateStub,
+           start_timer: false,
+           player_supervisor: player_sup,
+           player_module: BinaryMissingPlayer,
+           mdns_discovery: nil},
+          id: :missing_server
+        )
+
+      EnumerateStub.set(%{
+        @hp_key => %{
+          card_index: 0,
+          alsa_device: "plughw:0,0",
+          card_name: "bcm2835 Headphones"
+        }
+      })
+
+      :ok = Phoenix.PubSub.subscribe(@pubsub, @binary_missing_topic)
+
+      :ok = Server.check_now(server)
+      assert_receive {:sendspin_output_added, _}
+      # Drain the initial-spawn attempt notification.
+      assert_receive {:binary_missing_attempt, @hp_key}, 500
+
+      {:ok, server: server, player_sup: player_sup}
+    end
+
+    test "marks keys with :binary_missing once and skips them on subsequent polls",
+         %{server: server, player_sup: sup} do
+      # Setup already drained the first attempt notification.
+      # `binary_missing` is set and no player exists.
+      assert DynamicSupervisor.which_children(sup) == []
+      assert MapSet.member?(:sys.get_state(server).binary_missing, @hp_key)
+
+      # Subsequent polls must NOT attempt the spawn again. No new
+      # `:binary_missing_attempt` messages should arrive.
+      :ok = Server.check_now(server)
+      :ok = Server.check_now(server)
+      refute_receive {:binary_missing_attempt, _}, 200
+      assert DynamicSupervisor.which_children(sup) == []
+      assert MapSet.member?(:sys.get_state(server).binary_missing, @hp_key)
+    end
+
+    test "set_enabled(true) clears the flag so the user can retry", %{
+      server: server
+    } do
+      assert MapSet.member?(:sys.get_state(server).binary_missing, @hp_key)
+
+      :ok = Server.set_enabled(server, @hp_key, false)
+      assert_receive {:sendspin_state, @hp_key, %{enabled: false}}
+      # Disabling must not attempt a spawn.
+      refute_receive {:binary_missing_attempt, _}, 100
+
+      :ok = Server.set_enabled(server, @hp_key, true)
+      assert_receive {:sendspin_state, @hp_key, %{enabled: true}}
+
+      # The retry attempt is the observable proof that
+      # `binary_missing` was cleared. The flag re-fills synchronously
+      # when the retry fails, so end-state inspection alone can't
+      # distinguish "never cleared" from "cleared+re-filled".
+      assert_receive {:binary_missing_attempt, @hp_key}, 500
+    end
+
+    test "hotplug remove clears the flag for that key", %{server: server} do
+      assert MapSet.member?(:sys.get_state(server).binary_missing, @hp_key)
+
+      EnumerateStub.set(%{})
+      :ok = Server.check_now(server)
+      assert_receive {:sendspin_output_removed, %{key: @hp_key}}
+
+      refute MapSet.member?(:sys.get_state(server).binary_missing, @hp_key)
+    end
+  end
+
+  describe "unusable_ports tracking" do
+    defmodule SelfCrashingPlayer do
+      @moduledoc false
+      use GenServer, restart: :temporary
+
+      def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
+
+      @impl true
+      def init(opts) do
+        Process.flag(:trap_exit, true)
+        port = Keyword.fetch!(opts, :mdns_port)
+        # Drop a marker so the test can verify which port we got
+        # allocated. {:continue, :die} crashes us immediately AFTER
+        # init returns — emulates a binary that fails to bind its
+        # port.
+        send(self(), :__bind_failed__)
+        {:ok, %{port: port}, {:continue, :die}}
+      end
+
+      @impl true
+      def handle_continue(:die, state),
+        do: {:stop, :simulated_port_bind_failure, state}
+    end
+
+    setup do
+      path =
+        Path.join(
+          System.tmp_dir!(),
+          "audio_server_unusable_#{System.unique_integer([:positive])}.dets"
+        )
+
+      on_exit(fn -> File.rm(path) end)
+
+      player_sup =
+        start_supervised!(
+          {DynamicSupervisor, strategy: :one_for_one, name: nil},
+          id: :unusable_player_sup
+        )
+
+      store =
+        start_supervised!({Store, name: nil, table: :unusable_store, dets_path: path},
+          id: :unusable_store
+        )
+
+      server =
+        start_supervised!(
+          {Server,
+           name: nil,
+           store: store,
+           enumerate_module: EnumerateStub,
+           start_timer: false,
+           player_supervisor: player_sup,
+           player_module: SelfCrashingPlayer,
+           mdns_discovery: nil},
+          id: :unusable_server
+        )
+
+      EnumerateStub.set(%{
+        @hp_key => %{
+          card_index: 0,
+          alsa_device: "plughw:0,0",
+          card_name: "bcm2835 Headphones"
+        }
+      })
+
+      {:ok, server: server, player_sup: player_sup}
+    end
+
+    test "abnormal player exit marks its port unusable and the allocator skips it",
+         %{server: server} do
+      # First poll: allocator picks port 8928 (base), starts
+      # SelfCrashingPlayer which immediately dies → Server's :DOWN
+      # handler runs `maybe_mark_port_unusable` with reason
+      # `:simulated_port_bind_failure`.
+      :ok = await_player_crash(server, 8928)
+
+      # Next poll: respawn_missing_players tries again. Allocator must
+      # skip 8928 (just marked unusable) and pick the next free port.
+      # SelfCrashingPlayer dies on the new port too, so we accumulate.
+      :ok = await_player_crash(server, 8929)
+
+      state = :sys.get_state(server)
+      assert MapSet.member?(state.unusable_ports, 8928)
+      assert MapSet.member?(state.unusable_ports, 8929)
+    end
+
+    # Drives `check_now` and waits for the spawned SelfCrashingPlayer
+    # to die. The player's `handle_continue` may race with
+    # `:sys.get_state` — by the time we read state, the player may
+    # already be gone (or not). Poll for `state.players` to be empty
+    # and the new port to land in `unusable_ports` before letting the
+    # test assert.
+    defp await_player_crash(server, expected_port) do
+      :ok = Server.check_now(server)
+
+      eventually(
+        fn ->
+          state = :sys.get_state(server)
+          state.players == %{} and MapSet.member?(state.unusable_ports, expected_port)
+        end,
+        1_000
+      )
+
+      :ok
+    end
+
+    defp eventually(check, timeout_ms) do
+      deadline = System.monotonic_time(:millisecond) + timeout_ms
+      do_eventually(check, deadline)
+    end
+
+    defp do_eventually(check, deadline) do
+      if check.() do
+        :ok
+      else
+        if System.monotonic_time(:millisecond) > deadline do
+          flunk("eventually/2 condition did not hold within timeout")
+        else
+          Process.sleep(10)
+          do_eventually(check, deadline)
+        end
+      end
     end
   end
 end

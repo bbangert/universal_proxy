@@ -147,7 +147,19 @@ defmodule UniversalProxy.Audio.Server do
       outputs: %{},
       # %{key => %{pid: pid, monitor: ref, mdns_port: 8928}}
       players: %{},
-      port_base: Keyword.get(opts, :port_base, @mdns_port_base)
+      port_base: Keyword.get(opts, :port_base, @mdns_port_base),
+      # Keys whose `Player.start_link` returned `:binary_missing` —
+      # `respawn_missing_players/1` skips them so we don't log an
+      # error every 5 s for the life of the firmware. Cleared on
+      # hotplug remove or `set_enabled(_, true)` (user-initiated
+      # retry signal).
+      binary_missing: MapSet.new(),
+      # Ports the allocator picked but the player died on (typically
+      # because another process held the port). The allocator skips
+      # these so we don't allocate the same dud port over and over.
+      # Never explicitly cleared — port space is 56k+ wide, so even
+      # a worst-case crash rate takes years to exhaust.
+      unusable_ports: MapSet.new()
     }
 
     # Subscribe to our own state topic so binary-emitted volume/mute
@@ -244,6 +256,15 @@ defmodule UniversalProxy.Audio.Server do
          {:ok, saved} <- Store.get_config(state.store, key) do
       merged = merge(key, hardware_fields(existing), saved)
       state1 = put_in(state.outputs[key], merged)
+
+      # User-initiated enable signals a retry intent. Clear any sticky
+      # `binary_missing` flag for this key so the next convergence
+      # pass actually tries to spawn the player again.
+      state1 =
+        if enabled?,
+          do: %{state1 | binary_missing: MapSet.delete(state1.binary_missing, key)},
+          else: state1
+
       state2 = toggle_player(state1, merged, enabled?)
       broadcast_state(key, %{enabled: enabled?})
       {:reply, :ok, state2}
@@ -284,9 +305,14 @@ defmodule UniversalProxy.Audio.Server do
     # doesn't auto-restart). Drop it from `state.players`; the next
     # hotplug poll will respawn if the output is still enabled.
     case Enum.find(state.players, fn {_k, %{monitor: m}} -> m == ref end) do
-      {key, _entry} ->
+      {key, %{mdns_port: port}} ->
         Logger.warning("Audio.Player for #{inspect(key)} went down: #{inspect(reason)}")
-        {:noreply, %{state | players: Map.delete(state.players, key)}}
+
+        state =
+          %{state | players: Map.delete(state.players, key)}
+          |> maybe_mark_port_unusable(port, reason)
+
+        {:noreply, state}
 
       nil ->
         {:noreply, state}
@@ -334,6 +360,13 @@ defmodule UniversalProxy.Audio.Server do
       end)
 
     final_outputs = Enum.reduce(removed, with_adds, &Map.delete(&2, &1))
+
+    # A hotplug remove clears any sticky `binary_missing` flag and
+    # any `unusable_ports` claimed for that output's previous player.
+    # The next add will get a fresh start.
+    binary_missing_after = MapSet.difference(state.binary_missing, removed)
+
+    state = %{state | binary_missing: binary_missing_after}
 
     # Update state with new outputs map, then sync player processes
     # (stop removed, spawn enabled adds) BEFORE broadcasting. A
@@ -447,10 +480,16 @@ defmodule UniversalProxy.Audio.Server do
   # so a player that died between polls (binary `kill -9`, DETS bounce,
   # etc.) is brought back without waiting for a hot-unplug-then-plug
   # cycle.
+  #
+  # Skips keys in `state.binary_missing` — those previously failed
+  # with `:binary_missing` and would just log the same error on every
+  # poll. They're cleared on hotplug remove or `set_enabled(_, true)`.
   defp respawn_missing_players(state) do
     state.outputs
     |> Enum.filter(fn {key, merged} ->
-      merged.enabled and not Map.has_key?(state.players, key)
+      merged.enabled and
+        not Map.has_key?(state.players, key) and
+        not MapSet.member?(state.binary_missing, key)
     end)
     |> Enum.reduce(state, fn {_key, merged}, acc -> start_player(acc, merged) end)
   end
@@ -481,6 +520,19 @@ defmodule UniversalProxy.Audio.Server do
           ref = Process.monitor(pid)
 
           put_in(state.players[key], %{pid: pid, monitor: ref, mdns_port: mdns_port})
+
+        {:error, {:binary_missing, path}} ->
+          # Binary not built for this target (or stripped from priv/).
+          # Log once and add to `binary_missing` so the next
+          # `respawn_missing_players/1` pass skips it instead of
+          # logging this every 5 s. User retry via `set_enabled` or
+          # a hotplug remove+add clears the flag.
+          Logger.error(
+            "Audio.Player binary missing at #{path} for #{inspect(key)}; " <>
+              "will not retry until set_enabled or hotplug re-add"
+          )
+
+          %{state | binary_missing: MapSet.put(state.binary_missing, key)}
 
         {:error, reason} ->
           Logger.error("Audio.Player start failed for #{inspect(key)}: #{inspect(reason)}")
@@ -578,8 +630,22 @@ defmodule UniversalProxy.Audio.Server do
       |> Enum.map(& &1.mdns_port)
       |> MapSet.new()
 
+    skip = MapSet.union(used, state.unusable_ports)
+
     Stream.iterate(state.port_base, &(&1 + 1))
-    |> Enum.find(fn port -> not MapSet.member?(used, port) end)
+    |> Enum.find(fn port -> not MapSet.member?(skip, port) end)
+  end
+
+  # `:normal` and `:shutdown` (incl. tuple form) are orderly exits —
+  # the port is fine, keep it. Anything else means the player died
+  # before terminate/2 ran cleanly; the port may be held by another
+  # process or otherwise unbindable, so don't allocate it again.
+  defp maybe_mark_port_unusable(state, _port, :normal), do: state
+  defp maybe_mark_port_unusable(state, _port, :shutdown), do: state
+  defp maybe_mark_port_unusable(state, _port, {:shutdown, _}), do: state
+
+  defp maybe_mark_port_unusable(state, port, _abnormal_reason) do
+    %{state | unusable_ports: MapSet.put(state.unusable_ports, port)}
   end
 
   defp current_server_url(state) do
