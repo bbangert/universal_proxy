@@ -9,6 +9,7 @@ defmodule UniversalProxyWeb.OverviewLive do
   import UniversalProxyWeb.Components.UI
   import UniversalProxyWeb.Components.Icons
 
+  alias UniversalProxy.Audio
   alias UniversalProxy.Hardware
   alias UniversalProxy.System, as: Sys
   alias UniversalProxy.UART
@@ -27,6 +28,9 @@ defmodule UniversalProxyWeb.OverviewLive do
         Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "uart:port_opened")
         Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "uart:port_closed")
         Phoenix.PubSub.subscribe(UniversalProxy.PubSub, History.packet_rate_topic())
+        Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:output_added")
+        Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:output_removed")
+        Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:state")
         :timer.send_interval(@refresh_interval, self(), :refresh)
         {History.packets_per_minute(), reconcile_throughputs(%{}, ports)}
       else
@@ -41,6 +45,7 @@ defmodule UniversalProxyWeb.OverviewLive do
      |> assign(:throughput_snapshots, snapshots)
      |> assign(:packet_rate, packet_rate)
      |> assign(:pending_kind_change, nil)
+     |> assign(:audio_outputs, build_audio_index(Audio.list_outputs()))
      |> set_ports(ports)}
   end
 
@@ -147,6 +152,38 @@ defmodule UniversalProxyWeb.OverviewLive do
     {:noreply, assign(socket, :packet_rate, count)}
   end
 
+  def handle_info({:sendspin_output_added, output}, socket) do
+    {:noreply, update(socket, :audio_outputs, &Map.put(&1, output.key, output))}
+  end
+
+  def handle_info({:sendspin_output_removed, %{key: key}}, socket) do
+    {:noreply, update(socket, :audio_outputs, &Map.delete(&1, key))}
+  end
+
+  # Track binary-emitted connection events per key so the "Streaming" /
+  # "Stopped" badge on the Overview row can flip without re-fetching the
+  # output list. Server-originated `:sendspin_state` partials (enable,
+  # rename, etc.) patch other fields on the same map.
+  def handle_info({:sendspin_state, key, %{event: "connected"}}, socket) do
+    {:noreply, update_audio_output(socket, key, %{connection: :connected})}
+  end
+
+  def handle_info({:sendspin_state, key, %{event: event}}, socket)
+      when event in ["disconnected", "shutdown"] do
+    {:noreply, update_audio_output(socket, key, %{connection: :disconnected})}
+  end
+
+  def handle_info({:sendspin_state, key, %{enabled: enabled?}}, socket)
+      when is_boolean(enabled?) do
+    {:noreply, update_audio_output(socket, key, %{enabled: enabled?})}
+  end
+
+  def handle_info({:sendspin_state, key, %{friendly_name: name}}, socket) when is_binary(name) do
+    {:noreply, update_audio_output(socket, key, %{friendly_name: name})}
+  end
+
+  def handle_info({:sendspin_state, _key, _partial}, socket), do: {:noreply, socket}
+
   def handle_info(_msg, socket), do: {:noreply, socket}
 
   # Refresh the port list AND reconcile throughput subscriptions so new
@@ -205,6 +242,19 @@ defmodule UniversalProxyWeb.OverviewLive do
     |> Map.merge(additions)
   end
 
+  defp build_audio_index(outputs) do
+    Map.new(outputs, fn output -> {output.key, output} end)
+  end
+
+  defp update_audio_output(socket, key, patch) do
+    update(socket, :audio_outputs, fn outputs ->
+      case Map.fetch(outputs, key) do
+        {:ok, existing} -> Map.put(outputs, key, Map.merge(existing, patch))
+        :error -> outputs
+      end
+    end)
+  end
+
   defp throughput_target_names(ports) do
     for %{connected: true, configured: true, ha_name: name} <- ports,
         is_binary(name),
@@ -253,6 +303,8 @@ defmodule UniversalProxyWeb.OverviewLive do
       />
 
       <.hardware_table ports={@ports} throughput_snapshots={@throughput_snapshots} />
+
+      <.audio_outputs_card :if={map_size(@audio_outputs) > 0} outputs={@audio_outputs} />
     </div>
 
     <.maybe_port_drawer
@@ -703,5 +755,64 @@ defmodule UniversalProxyWeb.OverviewLive do
       ] ++ if port.notes, do: [{"Notes", port.notes, false}], else: []
 
     base ++ serial ++ tail
+  end
+
+  # ── Audio outputs summary (links to /audio) ───────────────────────────
+  attr(:outputs, :map, required: true)
+
+  defp audio_outputs_card(assigns) do
+    sorted =
+      assigns.outputs
+      |> Map.values()
+      |> Enum.sort_by(& &1.friendly_name)
+
+    assigns = assign(assigns, :sorted, sorted)
+
+    ~H"""
+    <.card padding={:none} class="overflow-hidden">
+      <div class="flex items-center justify-between px-4 py-3.5 border-b border-border-1">
+        <div class="text-base font-semibold">Audio outputs</div>
+        <.link
+          navigate="/audio"
+          class="text-sm text-accent hover:underline"
+        >
+          Manage
+        </.link>
+      </div>
+      <ul class="divide-y divide-border-2">
+        <li :for={out <- @sorted} class="px-4 py-3 flex items-center gap-3">
+          <div class="flex-1 min-w-0">
+            <div class="text-base text-fg-1 font-medium truncate">{out.friendly_name}</div>
+            <div class="text-xs text-fg-3 mt-0.5">
+              <span class="font-mono">{out.alsa_device}</span> · {out.card_name}
+            </div>
+          </div>
+          <.audio_status_badge
+            enabled={out.enabled}
+            connection={Map.get(out, :connection, :unknown)}
+          />
+        </li>
+      </ul>
+    </.card>
+    """
+  end
+
+  attr(:enabled, :boolean, required: true)
+  attr(:connection, :atom, required: true)
+
+  defp audio_status_badge(assigns) do
+    cond do
+      not assigns.enabled ->
+        ~H"<.badge variant={:neutral} dot>Disabled</.badge>"
+
+      assigns.connection == :connected ->
+        ~H"<.badge variant={:success} dot>Streaming</.badge>"
+
+      assigns.connection == :disconnected ->
+        ~H"<.badge variant={:warning} dot>Searching</.badge>"
+
+      true ->
+        ~H"<.badge variant={:neutral} dot>Stopped</.badge>"
+    end
   end
 end

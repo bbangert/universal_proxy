@@ -548,6 +548,49 @@ defmodule UniversalProxy.Audio.ServerTest do
       assert :sys.get_state(server).outputs[@hp_key].muted == true
     end
 
+    test "exposes binary-emitted connection state to list_outputs late subscribers",
+         %{server: server} do
+      # Late-subscriber bug regression: a LiveView that mounts *after*
+      # the binary emits `connected` would otherwise show "Stopped" /
+      # "Idle" until the next event landed. Server now caches the
+      # derived state and merges it into list_outputs.
+      [out] = Server.list_outputs(server)
+      assert out.connection == :unknown
+      assert out.stream == nil
+
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "sendspin:state",
+        {:sendspin_state, @hp_key, %{event: "connected"}}
+      )
+
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "sendspin:state",
+        {:sendspin_state, @hp_key,
+         %{event: "stream_start", codec: "opus", sample_rate: 48_000, bit_depth: 16, channels: 2}}
+      )
+
+      :sys.get_state(server)
+
+      [out] = Server.list_outputs(server)
+      assert out.connection == :connected
+      assert out.stream == %{codec: "opus", sample_rate: 48_000, bit_depth: 16, channels: 2}
+
+      # `disconnected` clears the stream and flips the connection flag.
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "sendspin:state",
+        {:sendspin_state, @hp_key, %{event: "disconnected"}}
+      )
+
+      :sys.get_state(server)
+
+      [out] = Server.list_outputs(server)
+      assert out.connection == :disconnected
+      assert out.stream == nil
+    end
+
     test "respawns the player on the next poll when it dies unexpectedly", %{
       server: server,
       player_sup: sup

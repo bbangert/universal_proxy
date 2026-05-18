@@ -25,6 +25,10 @@ microcontroller for each one.
 - Serial proxy for TTL, RS-232, and RS-485 USB adapters
 - Z-Wave proxy for USB Z-Wave controllers with local ACK handling
 - Auto-detection for IRDroid / IR Toy USB infrared devices (VID `0x04D8`, PID `0xFD08`/`0xF58B`)
+- **Sendspin audio playback** -- each ALSA output is exposed as an
+  independently discoverable [Sendspin](https://github.com/Sendspin/sendspin-cpp)
+  player for synchronized multi-room audio. See
+  [docs/plans/10_sendspin_audio.md](docs/plans/10_sendspin_audio.md).
 - Web UI for configuration (accessible at `http://<device-ip>`)
 - USB hotplug detection -- plug/unplug serial adapters at any time
 - DETS-backed persistent device configuration across reboots

@@ -165,7 +165,15 @@ defmodule UniversalProxy.Audio.Server do
       # these so we don't allocate the same dud port over and over.
       # Never explicitly cleared — port space is 56k+ wide, so even
       # a worst-case crash rate takes years to exhaust.
-      unusable_ports: MapSet.new()
+      unusable_ports: MapSet.new(),
+      # Derived live-state per output, fed by binary-emitted PubSub
+      # events. LiveView mounts can read this through `list_outputs/0`
+      # so a late subscriber doesn't have to wait for the next event to
+      # learn that the player is already connected and streaming.
+      # %{key => %{connection: :connected | :disconnected | :unknown,
+      #            stream: %{codec, sample_rate, bit_depth, channels} | nil,
+      #            last_error: String.t() | nil}}
+      connection_state: %{}
     }
 
     # Subscribe to our own state topic so binary-emitted volume/mute
@@ -209,13 +217,20 @@ defmodule UniversalProxy.Audio.Server do
     rows =
       state.outputs
       |> Map.values()
+      |> Enum.map(&merge_connection_state(&1, state.connection_state))
       |> Enum.sort_by(& &1.friendly_name)
 
     {:reply, rows, state}
   end
 
   def handle_call({:get_output, key}, _from, state) do
-    {:reply, Map.fetch(state.outputs, key), state}
+    case Map.fetch(state.outputs, key) do
+      {:ok, output} ->
+        {:reply, {:ok, merge_connection_state(output, state.connection_state)}, state}
+
+      :error ->
+        {:reply, :error, state}
+    end
   end
 
   def handle_call({:update_config, key, params}, _from, state) do
@@ -315,6 +330,42 @@ defmodule UniversalProxy.Audio.Server do
     {:noreply, persist_binary_state(state, key, %{muted: m})}
   end
 
+  # Track derived connection / stream state for late LiveView subscribers.
+  # Without this, switching between Overview and /audio resets the badge
+  # to "Stopped" / "Idle" until the binary's next event lands — even when
+  # the player is actively streaming.
+  def handle_info({:sendspin_state, key, %{event: "connected"}}, state) do
+    {:noreply, update_connection_state(state, key, %{connection: :connected, last_error: nil})}
+  end
+
+  def handle_info({:sendspin_state, key, %{event: "disconnected"}}, state) do
+    {:noreply, update_connection_state(state, key, %{connection: :disconnected, stream: nil})}
+  end
+
+  def handle_info({:sendspin_state, key, %{event: "stream_start"} = payload}, state) do
+    stream = %{
+      codec: Map.get(payload, :codec),
+      sample_rate: Map.get(payload, :sample_rate),
+      channels: Map.get(payload, :channels),
+      bit_depth: Map.get(payload, :bit_depth)
+    }
+
+    {:noreply, update_connection_state(state, key, %{stream: stream})}
+  end
+
+  def handle_info({:sendspin_state, key, %{event: "stream_end"}}, state) do
+    {:noreply, update_connection_state(state, key, %{stream: nil})}
+  end
+
+  def handle_info({:sendspin_state, key, %{event: "error"} = payload}, state) do
+    msg = Map.get(payload, :msg, "error")
+    {:noreply, update_connection_state(state, key, %{last_error: msg})}
+  end
+
+  def handle_info({:sendspin_state, key, %{event: "shutdown"}}, state) do
+    {:noreply, update_connection_state(state, key, %{connection: :disconnected, stream: nil})}
+  end
+
   def handle_info({:sendspin_state, _key, _other}, state), do: {:noreply, state}
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
@@ -378,6 +429,12 @@ defmodule UniversalProxy.Audio.Server do
 
     final_outputs = Enum.reduce(removed, with_adds, &Map.delete(&2, &1))
 
+    # Drop live-state entries for outputs that disappeared. Keeping
+    # stale connection / stream data around would surface "Streaming"
+    # for a card whose hardware is unplugged.
+    connection_state_after =
+      Enum.reduce(removed, state.connection_state, &Map.delete(&2, &1))
+
     # Hotplug remove clears the `binary_missing` flag for the gone
     # key so a re-add later gets a fresh spawn attempt. `unusable_ports`
     # is deliberately NOT cleared — a port that failed to bind for one
@@ -386,7 +443,11 @@ defmodule UniversalProxy.Audio.Server do
     # 56k+ wide, so unbounded growth isn't a practical concern.
     binary_missing_after = MapSet.difference(state.binary_missing, removed)
 
-    state = %{state | binary_missing: binary_missing_after}
+    state = %{
+      state
+      | binary_missing: binary_missing_after,
+        connection_state: connection_state_after
+    }
 
     # Update state with new outputs map, then sync player processes
     # (stop removed, spawn enabled adds) BEFORE broadcasting. A
@@ -687,6 +748,18 @@ defmodule UniversalProxy.Audio.Server do
 
   defp maybe_mark_port_unusable(state, port, _abnormal_reason) do
     %{state | unusable_ports: MapSet.put(state.unusable_ports, port)}
+  end
+
+  @default_live_state %{connection: :unknown, stream: nil, last_error: nil}
+
+  defp update_connection_state(state, key, patch) do
+    existing = Map.get(state.connection_state, key, @default_live_state)
+    %{state | connection_state: Map.put(state.connection_state, key, Map.merge(existing, patch))}
+  end
+
+  defp merge_connection_state(output, connection_state) do
+    live = Map.get(connection_state, output.key, @default_live_state)
+    Map.merge(output, live)
   end
 
   defp current_server_url(state) do

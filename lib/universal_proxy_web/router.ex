@@ -20,6 +20,7 @@ defmodule UniversalProxyWeb.Router do
     live_session :default, on_mount: [UniversalProxyWeb.NavHooks] do
       live("/", OverviewLive)
       live("/traffic", TrafficLive)
+      live("/audio", AudioLive)
       live("/discovery", DiscoveryLive)
       live("/security", SecurityLive)
       live("/system", SystemLive)
