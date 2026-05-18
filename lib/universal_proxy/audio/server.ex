@@ -45,10 +45,17 @@ defmodule UniversalProxy.Audio.Server do
 
   require Logger
 
-  alias UniversalProxy.Audio.{Params, Store}
+  alias UniversalProxy.Audio.{MdnsDiscovery, Params, Player, Store}
 
   @pubsub UniversalProxy.PubSub
   @hotplug_interval 5_000
+  @mdns_port_base 8928
+  # TCP port range cap. The C++ binary's `--mdns-port` arg has no
+  # upper-bound check on the BEAM side, but the kernel rejects bind()
+  # with EINVAL for anything > 65535. Capping here turns "binary
+  # immediately fails to bind" into an explicit `nil` from the
+  # allocator that the caller logs and skips.
+  @mdns_port_max 65_535
 
   @topic_added "sendspin:output_added"
   @topic_removed "sendspin:output_removed"
@@ -131,11 +138,58 @@ defmodule UniversalProxy.Audio.Server do
     interval = Keyword.get(opts, :hotplug_interval, @hotplug_interval)
     timer? = Keyword.get(opts, :start_timer, true)
 
+    player_supervisor =
+      Keyword.get(opts, :player_supervisor, UniversalProxy.Audio.PlayerSupervisor)
+
+    player_module = Keyword.get(opts, :player_module, Player)
+    mdns_discovery = Keyword.get(opts, :mdns_discovery, MdnsDiscovery)
+
     state = %{
       enumerate_module: enumerate_module,
       store: store,
-      outputs: %{}
+      player_supervisor: player_supervisor,
+      player_module: player_module,
+      mdns_discovery: mdns_discovery,
+      outputs: %{},
+      # %{key => %{pid: pid, monitor: ref, mdns_port: 8928}}
+      players: %{},
+      port_base: Keyword.get(opts, :port_base, @mdns_port_base),
+      # Keys whose `Player.start_link` returned `:binary_missing` —
+      # `respawn_missing_players/1` skips them so we don't log an
+      # error every 5 s for the life of the firmware. Cleared on
+      # hotplug remove or `set_enabled(_, true)` (user-initiated
+      # retry signal).
+      binary_missing: MapSet.new(),
+      # Ports the allocator picked but the player died on (typically
+      # because another process held the port). The allocator skips
+      # these so we don't allocate the same dud port over and over.
+      # Never explicitly cleared — port space is 56k+ wide, so even
+      # a worst-case crash rate takes years to exhaust.
+      unusable_ports: MapSet.new()
     }
+
+    # Subscribe to our own state topic so binary-emitted volume/mute
+    # events (Music Assistant's slider, group sync, etc.) get persisted
+    # to DETS. Without this the cached `state.outputs[key].volume` and
+    # the DETS row stay frozen at the last value BEAM itself set —
+    # and the next respawn (kill -9, reboot) would restore that stale
+    # value via `--initial-volume`. Server broadcasts on the same
+    # topic from `update_config`, but those payloads don't carry an
+    # `:event` key, so the handler ignores them.
+    Phoenix.PubSub.subscribe(@pubsub, @topic_state)
+
+    # Restart hygiene: any PlayerSupervisor children left over from a
+    # previous Server incarnation (Server crashed but PlayerSupervisor
+    # didn't, per `rest_for_one` semantics) are terminated. New players
+    # are spawned by the immediate `:check_hotplug` below.
+    #
+    # NOTE: each `terminate_child` call blocks up to ~500 ms while the
+    # Player's terminate/2 waits for the binary to acknowledge shutdown
+    # (see `Audio.Player.@shutdown_grace_ms`). At N players that's
+    # N × 500 ms of synchronous wait here — acceptable for occasional
+    # Server-only restarts, but cold-reboot latency scales with the
+    # number of active outputs.
+    state = terminate_all_players(state)
 
     # Start the timer AFTER state is built so a future failure between
     # the two doesn't leak a timer pointing at a soon-to-be-dead PID.
@@ -170,9 +224,43 @@ defmodule UniversalProxy.Audio.Server do
          :ok <- Store.save_config(state.store, key, update),
          {:ok, saved} <- Store.get_config(state.store, key) do
       merged = merge(key, hardware_fields(existing), saved)
-      new_state = put_in(state.outputs[key], merged)
-      broadcast_state(key, update)
-      {:reply, :ok, new_state}
+      state1 = put_in(state.outputs[key], merged)
+
+      # Normalize the payload before forwarding/broadcasting. Values
+      # come from `merged` (post `Store.merge_defaults` /
+      # `clamp_volume` / `!!`), so subscribers and the player can
+      # never see caller-supplied garbage like `%{volume: "77"}`.
+      # `update` is still the presence check so calls that didn't
+      # ask to change a field don't re-send the cached value.
+      normalized = Map.take(merged, Map.keys(update))
+
+      state2 =
+        cond do
+          rename?(existing, merged) and merged.enabled ->
+            # The binary's `--name` and mDNS TXT `name=` are baked in
+            # at spawn time and there's no `set_name` stdin command.
+            # The only way to propagate a rename is to restart the
+            # player; the new instance gets the new name as a fresh
+            # CLI arg and re-registers mDNS. ~5 s audio gap is
+            # acceptable since renames are user-initiated and rare.
+            state1 |> stop_player(key) |> start_player(merged)
+
+          rename?(existing, merged) ->
+            # Output is disabled. Stop any stale player (defensive —
+            # toggle_player should already have done this on the
+            # `set_enabled(_, false)` that disabled it) but don't
+            # spawn a fresh one. Spawning a player for an output the
+            # user just disabled would broadcast it via mDNS again
+            # and stream audio they explicitly turned off.
+            stop_player(state1, key)
+
+          true ->
+            forward_to_player(state1, key, normalized)
+            state1
+        end
+
+      broadcast_state(key, normalized)
+      {:reply, :ok, state2}
     else
       :error -> {:reply, {:error, :not_found}, state}
       {:error, _reason} = err -> {:reply, err, state}
@@ -184,9 +272,19 @@ defmodule UniversalProxy.Audio.Server do
          :ok <- Store.save_config(state.store, key, %{enabled: enabled?}),
          {:ok, saved} <- Store.get_config(state.store, key) do
       merged = merge(key, hardware_fields(existing), saved)
-      new_state = put_in(state.outputs[key], merged)
+      state1 = put_in(state.outputs[key], merged)
+
+      # User-initiated enable signals a retry intent. Clear any sticky
+      # `binary_missing` flag for this key so the next convergence
+      # pass actually tries to spawn the player again.
+      state1 =
+        if enabled?,
+          do: %{state1 | binary_missing: MapSet.delete(state1.binary_missing, key)},
+          else: state1
+
+      state2 = toggle_player(state1, merged, enabled?)
       broadcast_state(key, %{enabled: enabled?})
-      {:reply, :ok, new_state}
+      {:reply, :ok, state2}
     else
       :error -> {:reply, {:error, :not_found}, state}
       {:error, _reason} = err -> {:reply, err, state}
@@ -202,6 +300,42 @@ defmodule UniversalProxy.Audio.Server do
     {:noreply, refresh_outputs(state)}
   end
 
+  # Binary-emitted volume/mute events flow back through PubSub. Persist
+  # them so a respawn (kill -9, reboot) restores the actual last-known
+  # value rather than whatever BEAM last wrote. Internal Server-issued
+  # `:sendspin_state` payloads (from `update_config`/`set_enabled`) lack
+  # the `:event` key and fall through to the catch-all clause below.
+  def handle_info({:sendspin_state, key, %{event: "volume", value: v}}, state)
+      when is_integer(v) do
+    {:noreply, persist_binary_state(state, key, %{volume: clamp_volume(v)})}
+  end
+
+  def handle_info({:sendspin_state, key, %{event: "mute", value: m}}, state)
+      when is_boolean(m) do
+    {:noreply, persist_binary_state(state, key, %{muted: m})}
+  end
+
+  def handle_info({:sendspin_state, _key, _other}, state), do: {:noreply, state}
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
+    # A player crashed (we use `:temporary` so the DynamicSupervisor
+    # doesn't auto-restart). Drop it from `state.players`; the next
+    # hotplug poll will respawn if the output is still enabled.
+    case Enum.find(state.players, fn {_k, %{monitor: m}} -> m == ref end) do
+      {key, %{mdns_port: port}} ->
+        Logger.warning("Audio.Player for #{inspect(key)} went down: #{inspect(reason)}")
+
+        state =
+          %{state | players: Map.delete(state.players, key)}
+          |> maybe_mark_port_unusable(port, reason)
+
+        {:noreply, state}
+
+      nil ->
+        {:noreply, state}
+    end
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
 
   # -- Private --
@@ -214,10 +348,6 @@ defmodule UniversalProxy.Audio.Server do
     added = MapSet.difference(new_keys, current_keys)
     removed = MapSet.difference(current_keys, new_keys)
 
-    # Build the new state first, then broadcast. A synchronous
-    # subscriber that reacts to `:sendspin_output_added` by calling
-    # `list_outputs/1` must see the new entry already in state — Phase
-    # 3's Player startup will be driven from here and depends on it.
     {with_adds, merged_adds} =
       Enum.reduce(added, {state.outputs, []}, fn key, {acc, broadcasts} ->
         info = Map.fetch!(enumerated, key)
@@ -248,10 +378,37 @@ defmodule UniversalProxy.Audio.Server do
 
     final_outputs = Enum.reduce(removed, with_adds, &Map.delete(&2, &1))
 
+    # Hotplug remove clears the `binary_missing` flag for the gone
+    # key so a re-add later gets a fresh spawn attempt. `unusable_ports`
+    # is deliberately NOT cleared — a port that failed to bind for one
+    # output will fail for the next one too (the issue is the port
+    # being held externally, not the output identity). The space is
+    # 56k+ wide, so unbounded growth isn't a practical concern.
+    binary_missing_after = MapSet.difference(state.binary_missing, removed)
+
+    state = %{state | binary_missing: binary_missing_after}
+
+    # Update state with new outputs map, then sync player processes
+    # (stop removed, spawn enabled adds) BEFORE broadcasting. A
+    # subscriber that reacts to `:sendspin_output_added` by calling
+    # `Audio.set_volume/2` must find the player already started.
+    #
+    # The trailing `respawn_missing_players/1` makes refresh idempotent:
+    # any enabled output without a live player is (re)spawned. This is
+    # what brings the player back after the binary is killed externally
+    # (`kill -9`) — the `:DOWN` handler clears `state.players[key]` but
+    # leaves `outputs[key]` untouched, so the diff above shows "no adds,
+    # no removes" and would never respawn on its own.
+    new_state =
+      %{state | outputs: final_outputs}
+      |> stop_players(removed)
+      |> start_players_for_enabled(merged_adds)
+      |> respawn_missing_players()
+
     Enum.each(merged_adds, &broadcast_added/1)
     Enum.each(removed, &broadcast_removed/1)
 
-    %{state | outputs: final_outputs}
+    new_state
   end
 
   defp merge(key, hardware, config) do
@@ -289,5 +446,265 @@ defmodule UniversalProxy.Audio.Server do
       :audio_enumerate_module,
       UniversalProxy.Audio.Enumerate
     )
+  end
+
+  # -- Player process management --
+
+  defp start_players_for_enabled(state, merged_adds) do
+    Enum.reduce(merged_adds, state, fn merged, acc ->
+      if merged.enabled, do: start_player(acc, merged), else: acc
+    end)
+  end
+
+  # Update DETS + the in-memory cache with values reported by the
+  # binary. Only writes when the value actually differs — avoids
+  # hammering DETS on every `time_sync` style event chatter.
+  defp persist_binary_state(state, key, update) do
+    case Map.fetch(state.outputs, key) do
+      {:ok, existing} ->
+        if changed?(existing, update) do
+          case Store.save_config(state.store, key, update) do
+            :ok ->
+              {:ok, saved} = Store.get_config(state.store, key)
+              merged = merge(key, hardware_fields(existing), saved)
+              put_in(state.outputs[key], merged)
+
+            {:error, reason} ->
+              Logger.warning(
+                "Audio.Server: persisting binary state for #{inspect(key)} failed: #{inspect(reason)}"
+              )
+
+              state
+          end
+        else
+          state
+        end
+
+      :error ->
+        # Output disappeared between broadcast and handler — drop.
+        state
+    end
+  end
+
+  defp changed?(existing, update) do
+    Enum.any?(update, fn {k, v} -> Map.get(existing, k) != v end)
+  end
+
+  defp clamp_volume(v) when is_integer(v) and v >= 0 and v <= 100, do: v
+  defp clamp_volume(v) when is_integer(v) and v < 0, do: 0
+  defp clamp_volume(v) when is_integer(v) and v > 100, do: 100
+  defp clamp_volume(_), do: 50
+
+  # Convergence pass: ensure every enabled, currently-tracked output
+  # has a live player. Called at the end of each `refresh_outputs/1`
+  # so a player that died between polls (binary `kill -9`, DETS bounce,
+  # etc.) is brought back without waiting for a hot-unplug-then-plug
+  # cycle.
+  #
+  # Skips keys in `state.binary_missing` — those previously failed
+  # with `:binary_missing` and would just log the same error on every
+  # poll. They're cleared on hotplug remove or `set_enabled(_, true)`.
+  defp respawn_missing_players(state) do
+    state.outputs
+    |> Enum.filter(fn {key, merged} ->
+      merged.enabled and
+        not Map.has_key?(state.players, key) and
+        not MapSet.member?(state.binary_missing, key)
+    end)
+    |> Enum.reduce(state, fn {_key, merged}, acc -> start_player(acc, merged) end)
+  end
+
+  defp start_player(%{player_supervisor: nil} = state, _merged), do: state
+
+  defp start_player(state, merged) do
+    key = merged.key
+
+    cond do
+      Map.has_key?(state.players, key) ->
+        state
+
+      true ->
+        case allocate_mdns_port(state) do
+          nil ->
+            Logger.error(
+              "Audio.Server: mDNS port range #{state.port_base}..#{@mdns_port_max} " <>
+                "exhausted (used+unusable saturated); skipping spawn for #{inspect(key)}"
+            )
+
+            state
+
+          mdns_port ->
+            start_player_with_port(state, merged, mdns_port)
+        end
+    end
+  end
+
+  defp start_player_with_port(state, merged, mdns_port) do
+    key = merged.key
+    server_url = current_server_url(state)
+
+    opts = [
+      key: key,
+      config: merged,
+      mdns_port: mdns_port,
+      server_url: server_url
+    ]
+
+    case DynamicSupervisor.start_child(
+           state.player_supervisor,
+           {state.player_module, opts}
+         ) do
+      {:ok, pid} ->
+        ref = Process.monitor(pid)
+
+        put_in(state.players[key], %{pid: pid, monitor: ref, mdns_port: mdns_port})
+
+      {:error, {:binary_missing, path}} ->
+        # Binary not built for this target (or stripped from priv/).
+        # Log once and add to `binary_missing` so the next
+        # `respawn_missing_players/1` pass skips it instead of
+        # logging this every 5 s. User retry via `set_enabled` or
+        # a hotplug remove+add clears the flag.
+        Logger.error(
+          "Audio.Player binary missing at #{path} for #{inspect(key)}; " <>
+            "will not retry until set_enabled or hotplug re-add"
+        )
+
+        %{state | binary_missing: MapSet.put(state.binary_missing, key)}
+
+      {:error, reason} ->
+        Logger.error("Audio.Player start failed for #{inspect(key)}: #{inspect(reason)}")
+
+        state
+    end
+  end
+
+  defp stop_players(state, keys) do
+    Enum.reduce(keys, state, fn key, acc -> stop_player(acc, key) end)
+  end
+
+  defp stop_player(%{player_supervisor: nil} = state, _key), do: state
+
+  defp stop_player(state, key) do
+    case Map.fetch(state.players, key) do
+      {:ok, %{pid: pid, monitor: ref}} ->
+        Process.demonitor(ref, [:flush])
+        _ = DynamicSupervisor.terminate_child(state.player_supervisor, pid)
+        %{state | players: Map.delete(state.players, key)}
+
+      :error ->
+        state
+    end
+  end
+
+  defp toggle_player(state, merged, true), do: start_player(state, merged)
+  defp toggle_player(state, merged, false), do: stop_player(state, merged.key)
+
+  defp terminate_all_players(%{player_supervisor: nil} = state), do: state
+
+  defp terminate_all_players(state) do
+    state.player_supervisor
+    |> safe_which_children()
+    |> Enum.each(fn {_id, pid, _type, _modules} when is_pid(pid) ->
+      _ = DynamicSupervisor.terminate_child(state.player_supervisor, pid)
+    end)
+
+    %{state | players: %{}}
+  end
+
+  defp safe_which_children(supervisor) do
+    DynamicSupervisor.which_children(supervisor)
+  rescue
+    _ -> []
+  catch
+    :exit, _ -> []
+  end
+
+  defp rename?(existing, merged) do
+    Map.get(existing, :friendly_name) != merged.friendly_name
+  end
+
+  # Caller passes pre-normalized values (atom keys, types matching
+  # `Player.set_volume/2` and `set_muted/2` guards). The map's keys
+  # double as the presence check — a call that didn't ask to change
+  # `:volume` shouldn't re-push the cached value.
+  defp forward_to_player(state, key, normalized) do
+    case Map.fetch(state.players, key) do
+      {:ok, %{pid: pid}} ->
+        # The player can die between `Map.fetch` and the `GenServer.call`
+        # — `:DOWN` arrives later. Without this guard the EXIT signal
+        # would propagate through Server's own handle_call and crash
+        # the whole audio subsystem. Swallow the exit; the next
+        # hotplug poll will respawn the player.
+        try do
+          if Map.has_key?(normalized, :volume) do
+            state.player_module.set_volume(pid, normalized.volume)
+          end
+
+          if Map.has_key?(normalized, :muted) do
+            state.player_module.set_muted(pid, normalized.muted)
+          end
+
+          :ok
+        catch
+          :exit, reason ->
+            Logger.warning(
+              "Audio.Player call for #{inspect(key)} exited: #{inspect(reason)}; will respawn at next poll"
+            )
+
+            :ok
+        end
+
+      :error ->
+        :ok
+    end
+  end
+
+  # Returns the smallest free port in `[port_base, @mdns_port_max]` not
+  # currently in use or known-bad, or `nil` if the range is exhausted.
+  # Unbounded `Stream.iterate` would happily return 65536+ and the
+  # binary would fail to bind every time — turn that into an explicit
+  # failure the caller surfaces in logs.
+  defp allocate_mdns_port(state) do
+    used =
+      state.players
+      |> Map.values()
+      |> Enum.map(& &1.mdns_port)
+      |> MapSet.new()
+
+    skip = MapSet.union(used, state.unusable_ports)
+
+    Enum.find(state.port_base..@mdns_port_max, fn port -> not MapSet.member?(skip, port) end)
+  end
+
+  # `:normal` and `:shutdown` (incl. tuple form) are orderly exits —
+  # the port is fine, keep it. Anything else means the player died
+  # before terminate/2 ran cleanly; the port may be held by another
+  # process or otherwise unbindable, so don't allocate it again.
+  defp maybe_mark_port_unusable(state, _port, :normal), do: state
+  defp maybe_mark_port_unusable(state, _port, :shutdown), do: state
+  defp maybe_mark_port_unusable(state, _port, {:shutdown, _}), do: state
+
+  defp maybe_mark_port_unusable(state, port, _abnormal_reason) do
+    %{state | unusable_ports: MapSet.put(state.unusable_ports, port)}
+  end
+
+  defp current_server_url(state) do
+    case state.mdns_discovery do
+      nil ->
+        nil
+
+      mod ->
+        try do
+          case mod.current_server() do
+            {:ok, url} -> url
+            _ -> nil
+          end
+        rescue
+          _ -> nil
+        catch
+          :exit, _ -> nil
+        end
+    end
   end
 end
