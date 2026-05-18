@@ -64,21 +64,6 @@ defmodule UniversalProxy.Audio.Player do
   @topic_state "sendspin:state"
   @shutdown_grace_ms 500
 
-  # JSON keys the binary may emit on stdout. Listing them here interns
-  # them as atoms at compile time so `Jason.decode(line, keys: :atoms!)`
-  # below finds them. Without this every `stream_start` line raised
-  # `ArgumentError` (rescued as a warning, event dropped) — the
-  # `keys: :atoms!` variant deliberately refuses to *intern* unknown
-  # keys, so we have to pre-declare any key the binary can emit.
-  #
-  # This list is the BEAM-side contract — keep it in sync with
-  # `c_src/sendspin_player/src/main.cpp`'s `emit_json` call sites.
-  @known_event_atoms ~w(
-    event value name client_id mdns_port alsa_device server
-    initial_volume sample_rate channels bit_depth codec kind msg
-  )a
-  _ = @known_event_atoms
-
   defstruct [
     :key,
     :config,
@@ -229,7 +214,13 @@ defmodule UniversalProxy.Audio.Player do
 
   @impl true
   def handle_info({port, {:data, {:eol, line}}}, %{port: port} = state) do
-    case Jason.decode(line, keys: :atoms!) do
+    # `keys: :atoms` (NOT `:atoms!`) — interns unknown keys. The C++
+    # binary's `emit_json` call sites are the only producers and their
+    # key set is statically defined in `c_src/sendspin_player/src/main.cpp`,
+    # so the keyspace is finite and code-controlled. Values can be
+    # network-derived (codec strings, error messages from the Sendspin
+    # server) but values aren't atomised by `:atoms`, only keys.
+    case Jason.decode(line, keys: :atoms) do
       {:ok, %{event: _} = event} ->
         broadcast_state(state, event)
         {:noreply, %{state | last_event: event}}
@@ -238,18 +229,13 @@ defmodule UniversalProxy.Audio.Player do
         Logger.debug("Audio.Player #{inspect(state.key)} got non-event JSON: #{line}")
         {:noreply, state}
 
-      {:error, _reason} ->
-        # ArgumentError surfaces when binary emits an unknown atom key —
-        # treat the same as malformed: log and skip. Without this we'd
-        # crash the player on a sendspin-cpp event we don't recognise yet.
-        Logger.warning("Audio.Player #{inspect(state.key)} could not decode line: #{line}")
+      {:error, reason} ->
+        Logger.warning(
+          "Audio.Player #{inspect(state.key)} could not decode line (#{inspect(reason)}): #{line}"
+        )
+
         {:noreply, state}
     end
-  rescue
-    ArgumentError ->
-      # `keys: :atoms!` raises on unknown atoms — treat as ignorable.
-      Logger.warning("Audio.Player #{inspect(state.key)} got JSON with unknown atom: #{line}")
-      {:noreply, state}
   end
 
   def handle_info({port, {:exit_status, status}}, %{port: port} = state) do

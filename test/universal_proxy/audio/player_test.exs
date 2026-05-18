@@ -230,14 +230,15 @@ defmodule UniversalProxy.Audio.PlayerTest do
   end
 
   describe "JSON atom contract" do
-    test "stream_start events round-trip through Jason.decode keys: :atoms!" do
-      # `Jason.decode/2` with `keys: :atoms!` raises on any JSON key
-      # not already in the atom table. The binary emits stream_start
-      # with `sample_rate`/`channels`/`bit_depth`/`codec` — if those
-      # atoms aren't pre-interned via `@known_event_atoms`, every
-      # stream_start raises and the event never reaches the cache or
-      # PubSub subscribers. Caught as a runtime warning during Pi-3
-      # validation.
+    test "stream_start events round-trip through Jason.decode" do
+      # The binary emits `stream_start` with `sample_rate`/`channels`/
+      # `bit_depth`/`codec` — keys that may not exist as atoms at the
+      # time decode runs. We use `keys: :atoms` (NOT `:atoms!`) so
+      # Jason interns them on the fly. The binary's emit_json call
+      # sites in main.cpp define a closed key set, so unbounded atom
+      # growth is not a concern. Caught when an earlier attempt with
+      # `:atoms!` + a module-attribute "interning" trick failed at
+      # runtime because dead-code elimination dropped the literal.
       tmp_dir = System.tmp_dir!()
 
       stream_fake =
