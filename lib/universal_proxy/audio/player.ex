@@ -192,7 +192,19 @@ defmodule UniversalProxy.Audio.Player do
           end
 
         register_mdns(state)
-        {:ok, %{state | port: port, mdns_id: mdns_service_id(key), os_pid: os_pid}}
+        new_state = %{state | port: port, mdns_id: mdns_service_id(key), os_pid: os_pid}
+
+        # `--initial-volume` is the only startup config the binary
+        # accepts on its CLI; there's no `--initial-muted`. If DETS
+        # says this output is muted, push a `set_muted` command over
+        # stdin right after the port is open so the binary's default
+        # (unmuted) doesn't briefly play before the BEAM tells it the
+        # truth. Volume is already covered by `--initial-volume`.
+        if Map.get(config, :muted, false) do
+          send_command(new_state, {:set_muted, true})
+        end
+
+        {:ok, new_state}
     end
   end
 
@@ -285,10 +297,18 @@ defmodule UniversalProxy.Audio.Player do
     end
 
     if state.mdns_id do
+      # Best-effort. `remove_mdns_service/1` is a GenServer.call into
+      # MdnsLite — if MdnsLite is stopped or restarting during our
+      # shutdown, the call exits (`:noproc` / `:timeout`) rather than
+      # raises. We need to catch both shapes so an mDNS hiccup never
+      # aborts terminate/2 mid-cleanup (port already closed by here,
+      # but the log noise + non-:ok return matters).
       try do
         state.mdns_module.remove_mdns_service(state.mdns_id)
       rescue
         _ -> :ok
+      catch
+        :exit, _ -> :ok
       end
     end
 
@@ -395,6 +415,15 @@ defmodule UniversalProxy.Audio.Player do
       # not LAN-discoverable.
       Logger.warning("MdnsLite advertise failed for #{inspect(key)}: #{Exception.message(e)}")
 
+      :ok
+  catch
+    # MdnsLite.add_mdns_service/1 is a GenServer.call. If the
+    # MdnsLite TableServer is stopped or mid-restart it exits with
+    # `:noproc`/`:timeout` — not an exception. `rescue` alone misses
+    # these; we want best-effort registration regardless of the
+    # signal shape.
+    :exit, reason ->
+      Logger.warning("MdnsLite advertise exited for #{inspect(key)}: #{inspect(reason)}")
       :ok
   end
 

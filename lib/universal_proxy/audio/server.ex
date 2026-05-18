@@ -229,17 +229,28 @@ defmodule UniversalProxy.Audio.Server do
       normalized = Map.take(merged, Map.keys(update))
 
       state2 =
-        if rename?(existing, merged) do
-          # The binary's `--name` and mDNS TXT `name=` are baked in
-          # at spawn time and there's no `set_name` stdin command.
-          # The only way to propagate a rename is to restart the
-          # player; the new instance gets the new name as a fresh
-          # CLI arg and re-registers mDNS. ~5 s audio gap is
-          # acceptable since renames are user-initiated and rare.
-          state1 |> stop_player(key) |> start_player(merged)
-        else
-          forward_to_player(state1, key, normalized)
-          state1
+        cond do
+          rename?(existing, merged) and merged.enabled ->
+            # The binary's `--name` and mDNS TXT `name=` are baked in
+            # at spawn time and there's no `set_name` stdin command.
+            # The only way to propagate a rename is to restart the
+            # player; the new instance gets the new name as a fresh
+            # CLI arg and re-registers mDNS. ~5 s audio gap is
+            # acceptable since renames are user-initiated and rare.
+            state1 |> stop_player(key) |> start_player(merged)
+
+          rename?(existing, merged) ->
+            # Output is disabled. Stop any stale player (defensive —
+            # toggle_player should already have done this on the
+            # `set_enabled(_, false)` that disabled it) but don't
+            # spawn a fresh one. Spawning a player for an output the
+            # user just disabled would broadcast it via mDNS again
+            # and stream audio they explicitly turned off.
+            stop_player(state1, key)
+
+          true ->
+            forward_to_player(state1, key, normalized)
+            state1
         end
 
       broadcast_state(key, normalized)
@@ -361,9 +372,12 @@ defmodule UniversalProxy.Audio.Server do
 
     final_outputs = Enum.reduce(removed, with_adds, &Map.delete(&2, &1))
 
-    # A hotplug remove clears any sticky `binary_missing` flag and
-    # any `unusable_ports` claimed for that output's previous player.
-    # The next add will get a fresh start.
+    # Hotplug remove clears the `binary_missing` flag for the gone
+    # key so a re-add later gets a fresh spawn attempt. `unusable_ports`
+    # is deliberately NOT cleared — a port that failed to bind for one
+    # output will fail for the next one too (the issue is the port
+    # being held externally, not the output identity). The space is
+    # 56k+ wide, so unbounded growth isn't a practical concern.
     binary_missing_after = MapSet.difference(state.binary_missing, removed)
 
     state = %{state | binary_missing: binary_missing_after}

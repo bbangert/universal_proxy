@@ -203,6 +203,22 @@ defmodule UniversalProxy.Audio.PlayerTest do
       :ok = Player.set_muted(pid, false)
       assert_receive {:sendspin_state, @key, %{event: "mute", value: false}}, 1_000
     end
+
+    test "applies persisted :muted state on player start via stdin" do
+      # `build_cli_args/1` only passes `--initial-volume`; there's no
+      # `--initial-muted`. If DETS says the output is muted, Player
+      # must send a `set_muted true` over stdin right after the port
+      # is open so the binary's default (unmuted) doesn't briefly
+      # play before BEAM corrects it. Without this fix a muted output
+      # comes back unmuted after reboot/respawn.
+      muted_config = Map.put(config(), :muted, true)
+      _pid = start_player!(config: muted_config)
+
+      # `started` event + initial-volume event + our follow-up mute
+      # event. assert_receive selectively matches the mute event in
+      # the mailbox.
+      assert_receive {:sendspin_state, @key, %{event: "mute", value: true}}, 2_000
+    end
   end
 
   describe "termination" do

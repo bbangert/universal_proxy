@@ -57,7 +57,12 @@ defmodule UniversalProxy.Audio.ServerTest do
       # event.
       Process.flag(:trap_exit, true)
       key = Keyword.fetch!(opts, :key)
-      record({:started, key, Keyword.fetch!(opts, :mdns_port)})
+      mdns_port = Keyword.fetch!(opts, :mdns_port)
+      config = Keyword.fetch!(opts, :config)
+      # Record the full config so rename tests can verify that the
+      # respawned player received the NEW friendly_name (a regression
+      # that restarted with stale config would otherwise pass).
+      record({:started, key, mdns_port, config})
       {:ok, %{key: key}}
     end
 
@@ -380,7 +385,7 @@ defmodule UniversalProxy.Audio.ServerTest do
       assert length(children) == 1
 
       calls = PlayerStubCalls.calls()
-      assert {:started, @hp_key, 8928} in calls
+      assert Enum.any?(calls, &match?({:started, @hp_key, 8928, _config}, &1))
     end
 
     test "update_config with volume forwards to set_volume", %{server: server} do
@@ -423,18 +428,50 @@ defmodule UniversalProxy.Audio.ServerTest do
       # `--name` and the mDNS TXT `name=` are baked at spawn — there's
       # no `set_name` stdin command — so the only way to propagate a
       # rename is to stop+start the player. Verify the lifecycle
-      # records a terminate + a new start with the new merged config.
+      # records a terminate + a new start carrying the NEW config (a
+      # regression that restarted with the stale config would still
+      # show "terminated + started" but with the old friendly_name).
       [{:undefined, old_pid, _, _}] = DynamicSupervisor.which_children(sup)
 
       :ok = Server.update_config(server, @hp_key, %{friendly_name: "Living Room"})
 
-      # PlayerStub.terminate fires synchronously on terminate_child,
-      # then start_player records the new {:started, ...} via init.
       calls = PlayerStubCalls.calls()
       assert {:terminated, @hp_key} in calls
 
+      # The most recent :started entry must carry the renamed config.
+      latest_start =
+        calls
+        |> Enum.reverse()
+        |> Enum.find(&match?({:started, @hp_key, _, _}, &1))
+
+      assert {:started, @hp_key, _port, %{friendly_name: "Living Room"}} = latest_start
+
       [{:undefined, new_pid, _, _}] = DynamicSupervisor.which_children(sup)
       assert new_pid != old_pid
+      assert :sys.get_state(server).outputs[@hp_key].friendly_name == "Living Room"
+    end
+
+    test "renaming a disabled output does NOT spawn a player", %{
+      server: server,
+      player_sup: sup
+    } do
+      # First disable the output. PlayerStub.terminate fires.
+      :ok = Server.set_enabled(server, @hp_key, false)
+      assert_receive {:sendspin_state, @hp_key, %{enabled: false}}
+      assert DynamicSupervisor.which_children(sup) == []
+      starts_before = Enum.count(PlayerStubCalls.calls(), &match?({:started, _, _, _}, &1))
+
+      # Renaming a disabled output must not respawn — that would
+      # broadcast mDNS again and stream audio the user explicitly
+      # turned off.
+      :ok = Server.update_config(server, @hp_key, %{friendly_name: "Living Room"})
+
+      assert DynamicSupervisor.which_children(sup) == []
+      starts_after = Enum.count(PlayerStubCalls.calls(), &match?({:started, _, _, _}, &1))
+      assert starts_after == starts_before
+
+      # Persistence still happens though — re-enable should pick up
+      # the new name.
       assert :sys.get_state(server).outputs[@hp_key].friendly_name == "Living Room"
     end
 
@@ -550,7 +587,7 @@ defmodule UniversalProxy.Audio.ServerTest do
 
       assert length(DynamicSupervisor.which_children(sup)) == 1
       # Two `:started` events recorded (initial + after re-enable).
-      starts = Enum.count(PlayerStubCalls.calls(), &match?({:started, @hp_key, _}, &1))
+      starts = Enum.count(PlayerStubCalls.calls(), &match?({:started, @hp_key, _, _}, &1))
       assert starts == 2
     end
   end
