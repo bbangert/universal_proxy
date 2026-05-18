@@ -801,6 +801,29 @@ defmodule UniversalProxy.Audio.ServerTest do
       assert MapSet.member?(state.unusable_ports, 8929)
     end
 
+    test "allocator returns nil when port range is exhausted; spawn is skipped",
+         %{server: server, player_sup: sup} do
+      # Saturate the unusable_ports set so the allocator has no
+      # candidate left in [port_base, 65_535]. Before this fix the
+      # unbounded `Stream.iterate` would happily return 65_536 → the
+      # binary would fail to bind every time → permanent respawn loop
+      # with invalid `--mdns-port`.
+      saturated =
+        Map.update!(:sys.get_state(server), :unusable_ports, fn _ ->
+          MapSet.new(8928..65_535)
+        end)
+
+      :sys.replace_state(server, fn _ -> saturated end)
+
+      # `check_now` triggers respawn convergence. Allocator returns nil
+      # → start_player logs + skips → no child appears. No crash, no
+      # invalid port number leaving the BEAM.
+      :ok = Server.check_now(server)
+
+      assert DynamicSupervisor.which_children(sup) == []
+      assert :sys.get_state(server).players == %{}
+    end
+
     # Drives `check_now` and waits for the spawned SelfCrashingPlayer
     # to die. The player's `handle_continue` may race with
     # `:sys.get_state` — by the time we read state, the player may

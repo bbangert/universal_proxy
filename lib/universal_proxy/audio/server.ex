@@ -50,6 +50,12 @@ defmodule UniversalProxy.Audio.Server do
   @pubsub UniversalProxy.PubSub
   @hotplug_interval 5_000
   @mdns_port_base 8928
+  # TCP port range cap. The C++ binary's `--mdns-port` arg has no
+  # upper-bound check on the BEAM side, but the kernel rejects bind()
+  # with EINVAL for anything > 65535. Capping here turns "binary
+  # immediately fails to bind" into an explicit `nil` from the
+  # allocator that the caller logs and skips.
+  @mdns_port_max 65_535
 
   @topic_added "sendspin:output_added"
   @topic_removed "sendspin:output_removed"
@@ -513,46 +519,63 @@ defmodule UniversalProxy.Audio.Server do
   defp start_player(state, merged) do
     key = merged.key
 
-    if Map.has_key?(state.players, key) do
-      state
-    else
-      mdns_port = allocate_mdns_port(state)
-      server_url = current_server_url(state)
+    cond do
+      Map.has_key?(state.players, key) ->
+        state
 
-      opts = [
-        key: key,
-        config: merged,
-        mdns_port: mdns_port,
-        server_url: server_url
-      ]
+      true ->
+        case allocate_mdns_port(state) do
+          nil ->
+            Logger.error(
+              "Audio.Server: mDNS port range #{state.port_base}..#{@mdns_port_max} " <>
+                "exhausted (used+unusable saturated); skipping spawn for #{inspect(key)}"
+            )
 
-      case DynamicSupervisor.start_child(
-             state.player_supervisor,
-             {state.player_module, opts}
-           ) do
-        {:ok, pid} ->
-          ref = Process.monitor(pid)
+            state
 
-          put_in(state.players[key], %{pid: pid, monitor: ref, mdns_port: mdns_port})
+          mdns_port ->
+            start_player_with_port(state, merged, mdns_port)
+        end
+    end
+  end
 
-        {:error, {:binary_missing, path}} ->
-          # Binary not built for this target (or stripped from priv/).
-          # Log once and add to `binary_missing` so the next
-          # `respawn_missing_players/1` pass skips it instead of
-          # logging this every 5 s. User retry via `set_enabled` or
-          # a hotplug remove+add clears the flag.
-          Logger.error(
-            "Audio.Player binary missing at #{path} for #{inspect(key)}; " <>
-              "will not retry until set_enabled or hotplug re-add"
-          )
+  defp start_player_with_port(state, merged, mdns_port) do
+    key = merged.key
+    server_url = current_server_url(state)
 
-          %{state | binary_missing: MapSet.put(state.binary_missing, key)}
+    opts = [
+      key: key,
+      config: merged,
+      mdns_port: mdns_port,
+      server_url: server_url
+    ]
 
-        {:error, reason} ->
-          Logger.error("Audio.Player start failed for #{inspect(key)}: #{inspect(reason)}")
+    case DynamicSupervisor.start_child(
+           state.player_supervisor,
+           {state.player_module, opts}
+         ) do
+      {:ok, pid} ->
+        ref = Process.monitor(pid)
 
-          state
-      end
+        put_in(state.players[key], %{pid: pid, monitor: ref, mdns_port: mdns_port})
+
+      {:error, {:binary_missing, path}} ->
+        # Binary not built for this target (or stripped from priv/).
+        # Log once and add to `binary_missing` so the next
+        # `respawn_missing_players/1` pass skips it instead of
+        # logging this every 5 s. User retry via `set_enabled` or
+        # a hotplug remove+add clears the flag.
+        Logger.error(
+          "Audio.Player binary missing at #{path} for #{inspect(key)}; " <>
+            "will not retry until set_enabled or hotplug re-add"
+        )
+
+        %{state | binary_missing: MapSet.put(state.binary_missing, key)}
+
+      {:error, reason} ->
+        Logger.error("Audio.Player start failed for #{inspect(key)}: #{inspect(reason)}")
+
+        state
     end
   end
 
@@ -637,6 +660,11 @@ defmodule UniversalProxy.Audio.Server do
     end
   end
 
+  # Returns the smallest free port in `[port_base, @mdns_port_max]` not
+  # currently in use or known-bad, or `nil` if the range is exhausted.
+  # Unbounded `Stream.iterate` would happily return 65536+ and the
+  # binary would fail to bind every time — turn that into an explicit
+  # failure the caller surfaces in logs.
   defp allocate_mdns_port(state) do
     used =
       state.players
@@ -646,8 +674,7 @@ defmodule UniversalProxy.Audio.Server do
 
     skip = MapSet.union(used, state.unusable_ports)
 
-    Stream.iterate(state.port_base, &(&1 + 1))
-    |> Enum.find(fn port -> not MapSet.member?(skip, port) end)
+    Enum.find(state.port_base..@mdns_port_max, fn port -> not MapSet.member?(skip, port) end)
   end
 
   # `:normal` and `:shutdown` (incl. tuple form) are orderly exits —

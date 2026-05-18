@@ -38,12 +38,25 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--server", default="")
     p.add_argument("--alsa-device", default="")
-    p.add_argument("--name", default="")
-    p.add_argument("--client-id", default="")
+    # Match the real binary's startup invariants
+    # (c_src/sendspin_player/src/main.cpp:236-241): `--name` and
+    # `--client-id` are mandatory; passing an empty string is a
+    # fatal error. Marking them required here means a regression
+    # that drops either arg from `Audio.Player.build_cli_args/1`
+    # surfaces as a non-zero exit from the fake, which Player.init
+    # reports as `{:binary_exited, _}` and tests fail.
+    p.add_argument("--name", required=True)
+    p.add_argument("--client-id", required=True)
     p.add_argument("--mdns-port", type=int, default=0)
     p.add_argument("--initial-volume", type=int, default=50)
     p.add_argument("--log-level", default="info")
     args = p.parse_args()
+
+    # Empty-string defense: argparse `required=True` only checks
+    # presence, not non-empty. Real binary explicitly rejects empties.
+    if not args.name or not args.client_id:
+        sys.stderr.write("Error: --name and --client-id must be non-empty\n")
+        return 2
 
     # Match the real binary's `started` payload: event, version, port,
     # name, alsa_device (see c_src/sendspin_player/src/main.cpp:626-633).
