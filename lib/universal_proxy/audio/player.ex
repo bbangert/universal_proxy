@@ -64,6 +64,21 @@ defmodule UniversalProxy.Audio.Player do
   @topic_state "sendspin:state"
   @shutdown_grace_ms 500
 
+  # JSON keys the binary may emit on stdout. Listing them here interns
+  # them as atoms at compile time so `Jason.decode(line, keys: :atoms!)`
+  # below finds them. Without this every `stream_start` line raised
+  # `ArgumentError` (rescued as a warning, event dropped) — the
+  # `keys: :atoms!` variant deliberately refuses to *intern* unknown
+  # keys, so we have to pre-declare any key the binary can emit.
+  #
+  # This list is the BEAM-side contract — keep it in sync with
+  # `c_src/sendspin_player/src/main.cpp`'s `emit_json` call sites.
+  @known_event_atoms ~w(
+    event value name client_id mdns_port alsa_device server
+    initial_volume sample_rate channels bit_depth codec kind msg
+  )a
+  _ = @known_event_atoms
+
   defstruct [
     :key,
     :config,

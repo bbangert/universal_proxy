@@ -229,6 +229,52 @@ defmodule UniversalProxy.Audio.PlayerTest do
     end
   end
 
+  describe "JSON atom contract" do
+    test "stream_start events round-trip through Jason.decode keys: :atoms!" do
+      # `Jason.decode/2` with `keys: :atoms!` raises on any JSON key
+      # not already in the atom table. The binary emits stream_start
+      # with `sample_rate`/`channels`/`bit_depth`/`codec` — if those
+      # atoms aren't pre-interned via `@known_event_atoms`, every
+      # stream_start raises and the event never reaches the cache or
+      # PubSub subscribers. Caught as a runtime warning during Pi-3
+      # validation.
+      tmp_dir = System.tmp_dir!()
+
+      stream_fake =
+        Path.join(tmp_dir, "player_stream_start_fake_#{System.unique_integer([:positive])}.sh")
+
+      on_exit(fn -> File.rm(stream_fake) end)
+
+      File.write!(stream_fake, """
+      #!/bin/sh
+      echo '{"event":"started","name":"x","client_id":"x","mdns_port":0,"alsa_device":"x","server":"","initial_volume":0}'
+      echo '{"event":"stream_start","sample_rate":44100,"channels":2,"bit_depth":16,"codec":"flac"}'
+      # Keep the process alive so terminate/2 runs the shutdown handshake.
+      exec cat
+      """)
+
+      File.chmod!(stream_fake, 0o755)
+
+      pid = start_player!(binary_path: stream_fake, mdns_port: 19_100)
+
+      # Drain the `started` event, then wait for `stream_start`.
+      assert_receive {:sendspin_state, @key, %{event: "started"}}, 2_000
+
+      assert_receive {:sendspin_state, @key,
+                      %{
+                        event: "stream_start",
+                        sample_rate: 44_100,
+                        channels: 2,
+                        bit_depth: 16,
+                        codec: "flac"
+                      }},
+                     1_000
+
+      # And the cache must hold the latest parsed event.
+      assert %{event: "stream_start", codec: "flac"} = Player.last_event(pid)
+    end
+  end
+
   describe "last_event/1" do
     test "caches the most recent event for late subscribers" do
       pid = start_player!()
