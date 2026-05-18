@@ -207,7 +207,7 @@ defmodule UniversalProxy.Audio.Server do
          {:ok, saved} <- Store.get_config(state.store, key) do
       merged = merge(key, hardware_fields(existing), saved)
       new_state = put_in(state.outputs[key], merged)
-      forward_to_player(new_state, key, update)
+      forward_to_player(new_state, key, update, merged)
       broadcast_state(key, update)
       {:reply, :ok, new_state}
     else
@@ -509,7 +509,16 @@ defmodule UniversalProxy.Audio.Server do
     :exit, _ -> []
   end
 
-  defp forward_to_player(state, key, update) do
+  # `update` is the raw, sanitized-keys-only map from `sanitize_update/1`
+  # — values pass through unvalidated, so `%{volume: "77"}` or
+  # `%{volume: 101}` survive untouched. `merged` is post-`Store.merge_defaults`
+  # and is guaranteed to hold an integer in 0..100 for `:volume` and a
+  # boolean for `:muted`. Forward the merged values so the player's
+  # guard (`is_integer(value) and value in 0..100`) can't crash the
+  # Server with `FunctionClauseError`. `update` is still the
+  # presence-check source so a call that didn't ask to change volume
+  # doesn't re-send the cached value.
+  defp forward_to_player(state, key, update, merged) do
     case Map.fetch(state.players, key) do
       {:ok, %{pid: pid}} ->
         # The player can die between `Map.fetch` and the `GenServer.call`
@@ -519,11 +528,11 @@ defmodule UniversalProxy.Audio.Server do
         # hotplug poll will respawn the player.
         try do
           if Map.has_key?(update, :volume) do
-            state.player_module.set_volume(pid, update.volume)
+            state.player_module.set_volume(pid, merged.volume)
           end
 
           if Map.has_key?(update, :muted) do
-            state.player_module.set_muted(pid, update.muted)
+            state.player_module.set_muted(pid, merged.muted)
           end
 
           :ok

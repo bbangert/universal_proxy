@@ -385,6 +385,29 @@ defmodule UniversalProxy.Audio.ServerTest do
       assert {:set_volume, @hp_key, 77} in calls
     end
 
+    test "update_config forwards normalized (not raw) values to the player", %{server: server} do
+      # `Player.set_volume/2` is guarded `is_integer(value) and value in 0..100`.
+      # If Server forwarded the caller-supplied `update` map unchanged,
+      # callers like `%{volume: "77"}` or `%{volume: 101}` would raise
+      # `FunctionClauseError` inside `Player.set_volume/2`, which
+      # propagates through Server's own handle_call and crashes the
+      # audio subsystem. Server now forwards `merged.volume` (post
+      # `Store.merge_defaults`/`clamp_volume`) instead — always an
+      # integer in 0..100.
+      #
+      # String input → Store.clamp_volume/1 default of 50.
+      :ok = Server.update_config(server, @hp_key, %{volume: "77"})
+      assert {:set_volume, @hp_key, 50} in PlayerStubCalls.calls()
+
+      # Out-of-range integer → clamped to 100.
+      :ok = Server.update_config(server, @hp_key, %{volume: 999})
+      assert {:set_volume, @hp_key, 100} in PlayerStubCalls.calls()
+
+      # Negative integer → clamped to 0.
+      :ok = Server.update_config(server, @hp_key, %{volume: -5})
+      assert {:set_volume, @hp_key, 0} in PlayerStubCalls.calls()
+    end
+
     test "update_config with muted forwards to set_muted", %{server: server} do
       :ok = Server.update_config(server, @hp_key, %{muted: true})
       assert_receive {:sendspin_state, @hp_key, %{muted: true}}
