@@ -23,9 +23,15 @@ defmodule UniversalProxy.Audio.Supervisor do
 
   @impl true
   def init(_init_arg) do
+    # Order matters: PlayerSupervisor first (Server-mediated children
+    # land here), then Store (Server reads/writes DETS), then
+    # MdnsDiscovery (Server consults it for server URLs at player
+    # spawn time), then Server itself. `:rest_for_one` so that a
+    # crash anywhere in the dependency chain cascades downstream.
     children = [
       {DynamicSupervisor, name: UniversalProxy.Audio.PlayerSupervisor, strategy: :one_for_one},
       UniversalProxy.Audio.Store,
+      UniversalProxy.Audio.MdnsDiscovery,
       UniversalProxy.Audio.Server
     ]
 

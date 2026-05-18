@@ -45,10 +45,11 @@ defmodule UniversalProxy.Audio.Server do
 
   require Logger
 
-  alias UniversalProxy.Audio.{Params, Store}
+  alias UniversalProxy.Audio.{MdnsDiscovery, Params, Player, Store}
 
   @pubsub UniversalProxy.PubSub
   @hotplug_interval 5_000
+  @mdns_port_base 8928
 
   @topic_added "sendspin:output_added"
   @topic_removed "sendspin:output_removed"
@@ -131,11 +132,36 @@ defmodule UniversalProxy.Audio.Server do
     interval = Keyword.get(opts, :hotplug_interval, @hotplug_interval)
     timer? = Keyword.get(opts, :start_timer, true)
 
+    player_supervisor =
+      Keyword.get(opts, :player_supervisor, UniversalProxy.Audio.PlayerSupervisor)
+
+    player_module = Keyword.get(opts, :player_module, Player)
+    mdns_discovery = Keyword.get(opts, :mdns_discovery, MdnsDiscovery)
+
     state = %{
       enumerate_module: enumerate_module,
       store: store,
-      outputs: %{}
+      player_supervisor: player_supervisor,
+      player_module: player_module,
+      mdns_discovery: mdns_discovery,
+      outputs: %{},
+      # %{key => %{pid: pid, monitor: ref, mdns_port: 8928}}
+      players: %{},
+      port_base: Keyword.get(opts, :port_base, @mdns_port_base)
     }
+
+    # Restart hygiene: any PlayerSupervisor children left over from a
+    # previous Server incarnation (Server crashed but PlayerSupervisor
+    # didn't, per `rest_for_one` semantics) are terminated. New players
+    # are spawned by the immediate `:check_hotplug` below.
+    #
+    # NOTE: each `terminate_child` call blocks up to ~500 ms while the
+    # Player's terminate/2 waits for the binary to acknowledge shutdown
+    # (see `Audio.Player.@shutdown_grace_ms`). At N players that's
+    # N × 500 ms of synchronous wait here — acceptable for occasional
+    # Server-only restarts, but cold-reboot latency scales with the
+    # number of active outputs.
+    state = terminate_all_players(state)
 
     # Start the timer AFTER state is built so a future failure between
     # the two doesn't leak a timer pointing at a soon-to-be-dead PID.
@@ -171,6 +197,7 @@ defmodule UniversalProxy.Audio.Server do
          {:ok, saved} <- Store.get_config(state.store, key) do
       merged = merge(key, hardware_fields(existing), saved)
       new_state = put_in(state.outputs[key], merged)
+      forward_to_player(new_state, key, update)
       broadcast_state(key, update)
       {:reply, :ok, new_state}
     else
@@ -184,9 +211,10 @@ defmodule UniversalProxy.Audio.Server do
          :ok <- Store.save_config(state.store, key, %{enabled: enabled?}),
          {:ok, saved} <- Store.get_config(state.store, key) do
       merged = merge(key, hardware_fields(existing), saved)
-      new_state = put_in(state.outputs[key], merged)
+      state1 = put_in(state.outputs[key], merged)
+      state2 = toggle_player(state1, merged, enabled?)
       broadcast_state(key, %{enabled: enabled?})
-      {:reply, :ok, new_state}
+      {:reply, :ok, state2}
     else
       :error -> {:reply, {:error, :not_found}, state}
       {:error, _reason} = err -> {:reply, err, state}
@@ -202,6 +230,20 @@ defmodule UniversalProxy.Audio.Server do
     {:noreply, refresh_outputs(state)}
   end
 
+  def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
+    # A player crashed (we use `:temporary` so the DynamicSupervisor
+    # doesn't auto-restart). Drop it from `state.players`; the next
+    # hotplug poll will respawn if the output is still enabled.
+    case Enum.find(state.players, fn {_k, %{monitor: m}} -> m == ref end) do
+      {key, _entry} ->
+        Logger.warning("Audio.Player for #{inspect(key)} went down: #{inspect(reason)}")
+        {:noreply, %{state | players: Map.delete(state.players, key)}}
+
+      nil ->
+        {:noreply, state}
+    end
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
 
   # -- Private --
@@ -214,10 +256,6 @@ defmodule UniversalProxy.Audio.Server do
     added = MapSet.difference(new_keys, current_keys)
     removed = MapSet.difference(current_keys, new_keys)
 
-    # Build the new state first, then broadcast. A synchronous
-    # subscriber that reacts to `:sendspin_output_added` by calling
-    # `list_outputs/1` must see the new entry already in state — Phase
-    # 3's Player startup will be driven from here and depends on it.
     {with_adds, merged_adds} =
       Enum.reduce(added, {state.outputs, []}, fn key, {acc, broadcasts} ->
         info = Map.fetch!(enumerated, key)
@@ -248,10 +286,19 @@ defmodule UniversalProxy.Audio.Server do
 
     final_outputs = Enum.reduce(removed, with_adds, &Map.delete(&2, &1))
 
+    # Update state with new outputs map, then sync player processes
+    # (stop removed, spawn enabled adds) BEFORE broadcasting. A
+    # subscriber that reacts to `:sendspin_output_added` by calling
+    # `Audio.set_volume/2` must find the player already started.
+    new_state =
+      %{state | outputs: final_outputs}
+      |> stop_players(removed)
+      |> start_players_for_enabled(merged_adds)
+
     Enum.each(merged_adds, &broadcast_added/1)
     Enum.each(removed, &broadcast_removed/1)
 
-    %{state | outputs: final_outputs}
+    new_state
   end
 
   defp merge(key, hardware, config) do
@@ -289,5 +336,151 @@ defmodule UniversalProxy.Audio.Server do
       :audio_enumerate_module,
       UniversalProxy.Audio.Enumerate
     )
+  end
+
+  # -- Player process management --
+
+  defp start_players_for_enabled(state, merged_adds) do
+    Enum.reduce(merged_adds, state, fn merged, acc ->
+      if merged.enabled, do: start_player(acc, merged), else: acc
+    end)
+  end
+
+  defp start_player(%{player_supervisor: nil} = state, _merged), do: state
+
+  defp start_player(state, merged) do
+    key = merged.key
+
+    if Map.has_key?(state.players, key) do
+      state
+    else
+      mdns_port = allocate_mdns_port(state)
+      server_url = current_server_url(state)
+
+      opts = [
+        key: key,
+        config: merged,
+        mdns_port: mdns_port,
+        server_url: server_url
+      ]
+
+      case DynamicSupervisor.start_child(
+             state.player_supervisor,
+             {state.player_module, opts}
+           ) do
+        {:ok, pid} ->
+          ref = Process.monitor(pid)
+
+          put_in(state.players[key], %{pid: pid, monitor: ref, mdns_port: mdns_port})
+
+        {:error, reason} ->
+          Logger.error("Audio.Player start failed for #{inspect(key)}: #{inspect(reason)}")
+
+          state
+      end
+    end
+  end
+
+  defp stop_players(state, keys) do
+    Enum.reduce(keys, state, fn key, acc -> stop_player(acc, key) end)
+  end
+
+  defp stop_player(%{player_supervisor: nil} = state, _key), do: state
+
+  defp stop_player(state, key) do
+    case Map.fetch(state.players, key) do
+      {:ok, %{pid: pid, monitor: ref}} ->
+        Process.demonitor(ref, [:flush])
+        _ = DynamicSupervisor.terminate_child(state.player_supervisor, pid)
+        %{state | players: Map.delete(state.players, key)}
+
+      :error ->
+        state
+    end
+  end
+
+  defp toggle_player(state, merged, true), do: start_player(state, merged)
+  defp toggle_player(state, merged, false), do: stop_player(state, merged.key)
+
+  defp terminate_all_players(%{player_supervisor: nil} = state), do: state
+
+  defp terminate_all_players(state) do
+    state.player_supervisor
+    |> safe_which_children()
+    |> Enum.each(fn {_id, pid, _type, _modules} when is_pid(pid) ->
+      _ = DynamicSupervisor.terminate_child(state.player_supervisor, pid)
+    end)
+
+    %{state | players: %{}}
+  end
+
+  defp safe_which_children(supervisor) do
+    DynamicSupervisor.which_children(supervisor)
+  rescue
+    _ -> []
+  catch
+    :exit, _ -> []
+  end
+
+  defp forward_to_player(state, key, update) do
+    case Map.fetch(state.players, key) do
+      {:ok, %{pid: pid}} ->
+        # The player can die between `Map.fetch` and the `GenServer.call`
+        # — `:DOWN` arrives later. Without this guard the EXIT signal
+        # would propagate through Server's own handle_call and crash
+        # the whole audio subsystem. Swallow the exit; the next
+        # hotplug poll will respawn the player.
+        try do
+          if Map.has_key?(update, :volume) do
+            state.player_module.set_volume(pid, update.volume)
+          end
+
+          if Map.has_key?(update, :muted) do
+            state.player_module.set_muted(pid, update.muted)
+          end
+
+          :ok
+        catch
+          :exit, reason ->
+            Logger.warning(
+              "Audio.Player call for #{inspect(key)} exited: #{inspect(reason)}; will respawn at next poll"
+            )
+
+            :ok
+        end
+
+      :error ->
+        :ok
+    end
+  end
+
+  defp allocate_mdns_port(state) do
+    used =
+      state.players
+      |> Map.values()
+      |> Enum.map(& &1.mdns_port)
+      |> MapSet.new()
+
+    Stream.iterate(state.port_base, &(&1 + 1))
+    |> Enum.find(fn port -> not MapSet.member?(used, port) end)
+  end
+
+  defp current_server_url(state) do
+    case state.mdns_discovery do
+      nil ->
+        nil
+
+      mod ->
+        try do
+          case mod.current_server() do
+            {:ok, url} -> url
+            _ -> nil
+          end
+        rescue
+          _ -> nil
+        catch
+          :exit, _ -> nil
+        end
+    end
   end
 end

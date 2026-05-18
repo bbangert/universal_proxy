@@ -1,0 +1,397 @@
+defmodule UniversalProxy.Audio.Player do
+  @moduledoc """
+  GenServer wrapping a single `sendspin_player` OS process.
+
+  One `Audio.Player` per enabled ALSA output, supervised under the
+  `UniversalProxy.Audio.PlayerSupervisor` `DynamicSupervisor`. The
+  player owns:
+
+    * A `Port` opened with `{:spawn_executable, binary_path}` and
+      `{:line, 4096}` packet mode — stdout JSON events arrive as
+      `{port, {:data, {:eol, line}}}` messages.
+    * Stdin commands (`set_volume`, `set_muted`, `shutdown`) written
+      via `Port.command/2` as line-delimited JSON.
+    * The `MdnsLite` service advertisement for `_sendspin._tcp` so
+      Sendspin servers can discover this player.
+
+  ## Why raw Port (no MuonTrap)
+
+  `MuonTrap.Daemon` closes stdin and routes stdout through Logger —
+  unusable for bidirectional JSON IPC. Wrapping muontrap with
+  `--capture-output` requires implementing its byte-ack protocol and
+  loses `{:line, N}` packet framing. See `scratchpad.md` ("Phase 3
+  IPC decision") for the full trade-off. Net: on a BEAM crash a
+  binary may be orphaned briefly, but Nerves reboots on crash and
+  the kernel reaps orphans on reboot.
+
+  ## JSON protocol
+
+  Events (binary → BEAM, one per stdout line):
+
+      {"event":"started","server":"...","client_id":"...","mdns_port":8928}
+      {"event":"connected","server":"ws://..."}
+      {"event":"disconnected"}
+      {"event":"stream_start","sample_rate":48000,"channels":2,"bit_depth":16,"codec":"opus"}
+      {"event":"stream_end"}
+      {"event":"volume","value":80}
+      {"event":"mute","value":false}
+      {"event":"error","kind":"alsa_open","msg":"..."}
+
+  Commands (BEAM → binary, written to stdin):
+
+      {"cmd":"set_volume","value":75}
+      {"cmd":"set_muted","value":true}
+      {"cmd":"shutdown"}
+
+  Each event is broadcast on PubSub topic `"sendspin:state"` as
+  `{:sendspin_state, key, event_map}` so `LiveView` (Phase 4) and the
+  `Audio.Server` cache can stay in sync without polling.
+  """
+
+  # `:temporary` — the parent `DynamicSupervisor` never restarts us
+  # automatically. Restart policy lives in `Audio.Server`, which owns
+  # the per-output state (port allocation, mDNS id, config) needed to
+  # spawn a sensible replacement. A `DynamicSupervisor`-driven restart
+  # would produce a fresh PID that `Audio.Server` doesn't know about,
+  # so its `Player.set_volume/2` calls would hit a dead process.
+  use GenServer, restart: :temporary
+
+  require Logger
+
+  alias UniversalProxy.Audio.Store
+
+  @pubsub UniversalProxy.PubSub
+  @topic_state "sendspin:state"
+  @shutdown_grace_ms 500
+
+  defstruct [
+    :key,
+    :config,
+    :binary_path,
+    :mdns_port,
+    :server_url,
+    :pubsub,
+    :mdns_module,
+    port: nil,
+    mdns_id: nil,
+    last_event: %{},
+    os_pid: nil
+  ]
+
+  @type t :: %__MODULE__{
+          key: Store.output_key(),
+          config: map(),
+          binary_path: String.t(),
+          mdns_port: pos_integer(),
+          server_url: String.t() | nil,
+          pubsub: module(),
+          mdns_module: module(),
+          port: port() | nil,
+          mdns_id: term(),
+          last_event: map(),
+          os_pid: pos_integer() | nil
+        }
+
+  # -- Client API --
+
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name))
+  end
+
+  @doc """
+  Push `{"cmd":"set_volume","value":n}` to the binary's stdin.
+  Returns `:ok` even when the port is closed (the player is exiting);
+  the next `start_link` will pick up the new volume from DETS via
+  `--initial-volume`.
+  """
+  @spec set_volume(GenServer.server(), 0..100) :: :ok
+  def set_volume(server, value) when is_integer(value) and value in 0..100 do
+    GenServer.call(server, {:set_volume, value})
+  end
+
+  @doc """
+  Push `{"cmd":"set_muted","value":true|false}` to the binary's
+  stdin.
+  """
+  @spec set_muted(GenServer.server(), boolean()) :: :ok
+  def set_muted(server, muted?) when is_boolean(muted?) do
+    GenServer.call(server, {:set_muted, muted?})
+  end
+
+  @doc """
+  Return the last parsed status event, or `%{}` if no event has been
+  received yet. Tests and the LiveView read through this on mount
+  before subscribing to PubSub.
+  """
+  @spec last_event(GenServer.server()) :: map()
+  def last_event(server), do: GenServer.call(server, :last_event)
+
+  @doc false
+  # Test seam: send an arbitrary JSON command to the binary's stdin.
+  # Used by `Audio.PlayerTest` to drive the fake binary's
+  # `force_exit` command without exposing a "send raw bytes to a child
+  # process" API to production callers.
+  @spec __send_command__(GenServer.server(), map()) :: :ok
+  def __send_command__(server, cmd) when is_map(cmd) do
+    GenServer.cast(server, {:__send_command__, cmd})
+  end
+
+  # -- Server Callbacks --
+
+  @impl true
+  def init(opts) do
+    # Trap exits so `DynamicSupervisor.terminate_child/2` triggers our
+    # `terminate/2` — without this, the supervisor's `:shutdown` exit
+    # signal kills us instantly and we'd leak the OS process and the
+    # mDNS advertisement. `GenServer.stop` calls `terminate/2` either
+    # way, so test parity is preserved.
+    Process.flag(:trap_exit, true)
+
+    key = Keyword.fetch!(opts, :key)
+    config = Keyword.fetch!(opts, :config)
+    mdns_port = Keyword.fetch!(opts, :mdns_port)
+    binary_path = Keyword.get(opts, :binary_path) || default_binary_path()
+    server_url = Keyword.get(opts, :server_url)
+    pubsub = Keyword.get(opts, :pubsub, @pubsub)
+    mdns_module = Keyword.get(opts, :mdns_module, MdnsLite)
+
+    state = %__MODULE__{
+      key: key,
+      config: config,
+      binary_path: binary_path,
+      mdns_port: mdns_port,
+      server_url: server_url,
+      pubsub: pubsub,
+      mdns_module: mdns_module
+    }
+
+    cond do
+      not File.exists?(binary_path) ->
+        Logger.error(
+          "Audio.Player binary missing at #{binary_path}; refusing to start #{inspect(key)}"
+        )
+
+        {:stop, {:binary_missing, binary_path}}
+
+      true ->
+        port = open_port(state)
+        # Port.info/2 returns `nil` if the port closed between open and
+        # this call — happens when the binary exits immediately (bad arg,
+        # missing libasound). `force_kill/1` already guards against
+        # `os_pid: nil`, so we just pattern-match here instead of
+        # crashing init with a misleading ArgumentError.
+        os_pid =
+          case Port.info(port, :os_pid) do
+            {:os_pid, pid} -> pid
+            nil -> nil
+          end
+
+        register_mdns(state)
+        {:ok, %{state | port: port, mdns_id: mdns_service_id(key), os_pid: os_pid}}
+    end
+  end
+
+  @impl true
+  def handle_call({:set_volume, value}, _from, state) do
+    send_command(state, %{cmd: "set_volume", value: value})
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:set_muted, muted?}, _from, state) do
+    send_command(state, %{cmd: "set_muted", value: muted?})
+    {:reply, :ok, state}
+  end
+
+  def handle_call(:last_event, _from, state) do
+    {:reply, state.last_event, state}
+  end
+
+  @impl true
+  def handle_cast({:__send_command__, cmd}, state) do
+    send_command(state, cmd)
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_info({port, {:data, {:eol, line}}}, %{port: port} = state) do
+    case Jason.decode(line, keys: :atoms!) do
+      {:ok, %{event: _} = event} ->
+        broadcast_state(state, event)
+        {:noreply, %{state | last_event: event}}
+
+      {:ok, _other} ->
+        Logger.debug("Audio.Player #{inspect(state.key)} got non-event JSON: #{line}")
+        {:noreply, state}
+
+      {:error, _reason} ->
+        # ArgumentError surfaces when binary emits an unknown atom key —
+        # treat the same as malformed: log and skip. Without this we'd
+        # crash the player on a sendspin-cpp event we don't recognise yet.
+        Logger.warning("Audio.Player #{inspect(state.key)} could not decode line: #{line}")
+        {:noreply, state}
+    end
+  rescue
+    ArgumentError ->
+      # `keys: :atoms!` raises on unknown atoms — treat as ignorable.
+      Logger.warning("Audio.Player #{inspect(state.key)} got JSON with unknown atom: #{line}")
+      {:noreply, state}
+  end
+
+  def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
+    Logger.warning(
+      "Audio.Player #{inspect(state.key)} binary exited with status #{status}; supervisor will decide whether to restart"
+    )
+
+    # Returning :stop lets the supervisor's restart strategy fire.
+    {:stop, {:binary_exited, status}, %{state | port: nil}}
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
+
+  @impl true
+  def terminate(reason, state) do
+    # Best-effort graceful shutdown:
+    #   1. ask the binary to exit via JSON
+    #   2. wait briefly for {:exit_status, _}
+    #   3. fall through to Port.close (and a SIGKILL backstop if we
+    #      still have an os_pid) so we never leave a stray process.
+    Logger.info("Audio.Player #{inspect(state.key)} terminating (#{inspect(reason)})")
+
+    if state.port do
+      send_command(state, %{cmd: "shutdown"})
+
+      receive do
+        {port, {:exit_status, _}} when port == state.port -> :ok
+      after
+        @shutdown_grace_ms ->
+          Logger.warning(
+            "Audio.Player #{inspect(state.key)} didn't exit within #{@shutdown_grace_ms}ms; forcing"
+          )
+
+          force_kill(state)
+      end
+
+      safe_port_close(state.port)
+    end
+
+    if state.mdns_id do
+      try do
+        state.mdns_module.remove_mdns_service(state.mdns_id)
+      rescue
+        _ -> :ok
+      end
+    end
+
+    :ok
+  end
+
+  # -- Private --
+
+  defp open_port(%__MODULE__{} = state) do
+    args = build_cli_args(state)
+
+    Port.open(
+      {:spawn_executable, String.to_charlist(state.binary_path)},
+      [:binary, :exit_status, {:line, 4096}, {:args, args}]
+    )
+  end
+
+  defp build_cli_args(%__MODULE__{config: cfg} = state) do
+    base = [
+      "--alsa-device",
+      Map.fetch!(cfg, :alsa_device),
+      "--name",
+      Map.fetch!(cfg, :friendly_name),
+      "--client-id",
+      Map.fetch!(cfg, :client_id),
+      "--mdns-port",
+      Integer.to_string(state.mdns_port),
+      "--initial-volume",
+      Integer.to_string(Map.get(cfg, :volume, 50)),
+      "--log-level",
+      "info"
+    ]
+
+    case state.server_url do
+      nil -> base
+      url when is_binary(url) -> base ++ ["--server", url]
+    end
+  end
+
+  defp send_command(%__MODULE__{port: nil}, _cmd), do: :ok
+
+  defp send_command(%__MODULE__{port: port}, cmd) do
+    Port.command(port, [Jason.encode!(cmd), "\n"])
+  rescue
+    ArgumentError ->
+      # Port was closed between our nil-check and the command — fine,
+      # the binary is on its way out.
+      :ok
+  end
+
+  defp register_mdns(%__MODULE__{key: key, config: cfg, mdns_port: port, mdns_module: mod}) do
+    service = %{
+      id: mdns_service_id(key),
+      protocol: "sendspin",
+      transport: "tcp",
+      port: port,
+      txt_payload: [
+        "path=/sendspin",
+        "name=#{Map.fetch!(cfg, :friendly_name)}",
+        "client_id=#{Map.fetch!(cfg, :client_id)}"
+      ]
+    }
+
+    case mod.add_mdns_service(service) do
+      :ok ->
+        :ok
+
+      other ->
+        Logger.warning("MdnsLite.add_mdns_service returned #{inspect(other)} for #{inspect(key)}")
+
+        :ok
+    end
+  rescue
+    e ->
+      # mdns_lite may not be running in dev / on host with no
+      # network — log and continue. Player still functions; just
+      # not LAN-discoverable.
+      Logger.warning("MdnsLite advertise failed for #{inspect(key)}: #{Exception.message(e)}")
+
+      :ok
+  end
+
+  defp mdns_service_id({slot_sub, vid, pid}) do
+    {:sendspin_player, slot_sub, vid, pid}
+  end
+
+  defp broadcast_state(%__MODULE__{key: key, pubsub: pubsub}, event) do
+    Phoenix.PubSub.broadcast(pubsub, @topic_state, {:sendspin_state, key, event})
+  end
+
+  defp force_kill(%__MODULE__{os_pid: nil}), do: :ok
+
+  defp force_kill(%__MODULE__{os_pid: pid}) do
+    # SIGKILL via :os.cmd is portable and doesn't require muontrap.
+    # The kernel will reap; we don't care about the result.
+    _ = :os.cmd(~c"kill -9 #{pid} 2>/dev/null")
+    :ok
+  end
+
+  defp safe_port_close(port) do
+    Port.close(port)
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp default_binary_path do
+    target = Application.get_env(:universal_proxy, :mix_target, "host")
+
+    Path.join([
+      :code.priv_dir(:universal_proxy) |> List.to_string(),
+      "sendspin_player",
+      to_string(target),
+      "sendspin_player"
+    ])
+  end
+end
