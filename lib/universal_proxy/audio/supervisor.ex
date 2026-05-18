@@ -2,17 +2,24 @@ defmodule UniversalProxy.Audio.Supervisor do
   @moduledoc """
   Top-level supervisor for the audio subsystem.
 
-  Mirrors `UniversalProxy.UART.Supervisor`'s shape: a
-  `DynamicSupervisor` for per-output `Audio.Player` processes
-  (populated in Phase 3) followed by the `Audio.Store` DETS owner and
-  the `Audio.Server` registry. Strategy is `:rest_for_one` so that a
-  restart of the DynamicSupervisor cleanly tears down the store +
-  server that hold references to the now-defunct player children.
+  Mirrors `UniversalProxy.UART.Supervisor`'s shape and uses
+  `:rest_for_one` so that a crash anywhere in the dependency chain
+  cascades cleanly downstream. Children in start order:
 
-  In Phase 1 the DynamicSupervisor sits empty — `Audio.Server` does
-  not yet start `Audio.Player` children. The supervisor still owns
-  the `PlayerSupervisor` registration so Phase 3 can wire players in
-  without touching the application tree.
+    1. `UniversalProxy.Audio.PlayerSupervisor` (DynamicSupervisor) —
+       owns one `Audio.Player` GenServer per enabled ALSA output;
+       populated at runtime by `Audio.Server` as outputs hotplug
+       in/out and `set_enabled` toggles.
+    2. `UniversalProxy.Audio.Store` — DETS-backed persistence for
+       per-output config (`friendly_name`, `enabled`, `client_id`,
+       `volume`, `muted`).
+    3. `UniversalProxy.Audio.MdnsDiscovery` — placeholder GenServer
+       providing the future Sendspin-server discovery contract;
+       currently a stub (`current_server/0` → `:error`) because
+       `mdns_lite 0.9.1` has no PTR browser.
+    4. `UniversalProxy.Audio.Server` — the registry/orchestrator
+       that polls enumeration, manages player lifecycle via the
+       DynamicSupervisor above, and brokers PubSub events.
   """
 
   use Supervisor

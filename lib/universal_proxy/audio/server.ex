@@ -206,10 +206,32 @@ defmodule UniversalProxy.Audio.Server do
          :ok <- Store.save_config(state.store, key, update),
          {:ok, saved} <- Store.get_config(state.store, key) do
       merged = merge(key, hardware_fields(existing), saved)
-      new_state = put_in(state.outputs[key], merged)
-      forward_to_player(new_state, key, update, merged)
-      broadcast_state(key, update)
-      {:reply, :ok, new_state}
+      state1 = put_in(state.outputs[key], merged)
+
+      # Normalize the payload before forwarding/broadcasting. Values
+      # come from `merged` (post `Store.merge_defaults` /
+      # `clamp_volume` / `!!`), so subscribers and the player can
+      # never see caller-supplied garbage like `%{volume: "77"}`.
+      # `update` is still the presence check so calls that didn't
+      # ask to change a field don't re-send the cached value.
+      normalized = Map.take(merged, Map.keys(update))
+
+      state2 =
+        if rename?(existing, merged) do
+          # The binary's `--name` and mDNS TXT `name=` are baked in
+          # at spawn time and there's no `set_name` stdin command.
+          # The only way to propagate a rename is to restart the
+          # player; the new instance gets the new name as a fresh
+          # CLI arg and re-registers mDNS. ~5 s audio gap is
+          # acceptable since renames are user-initiated and rare.
+          state1 |> stop_player(key) |> start_player(merged)
+        else
+          forward_to_player(state1, key, normalized)
+          state1
+        end
+
+      broadcast_state(key, normalized)
+      {:reply, :ok, state2}
     else
       :error -> {:reply, {:error, :not_found}, state}
       {:error, _reason} = err -> {:reply, err, state}
@@ -381,11 +403,6 @@ defmodule UniversalProxy.Audio.Server do
     end)
   end
 
-  # Convergence pass: ensure every enabled, currently-tracked output
-  # has a live player. Called at the end of each `refresh_outputs/1`
-  # so a player that died between polls (binary `kill -9`, DETS bounce,
-  # etc.) is brought back without waiting for a hot-unplug-then-plug
-  # cycle.
   # Update DETS + the in-memory cache with values reported by the
   # binary. Only writes when the value actually differs — avoids
   # hammering DETS on every `time_sync` style event chatter.
@@ -425,6 +442,11 @@ defmodule UniversalProxy.Audio.Server do
   defp clamp_volume(v) when is_integer(v) and v > 100, do: 100
   defp clamp_volume(_), do: 50
 
+  # Convergence pass: ensure every enabled, currently-tracked output
+  # has a live player. Called at the end of each `refresh_outputs/1`
+  # so a player that died between polls (binary `kill -9`, DETS bounce,
+  # etc.) is brought back without waiting for a hot-unplug-then-plug
+  # cycle.
   defp respawn_missing_players(state) do
     state.outputs
     |> Enum.filter(fn {key, merged} ->
@@ -509,16 +531,15 @@ defmodule UniversalProxy.Audio.Server do
     :exit, _ -> []
   end
 
-  # `update` is the raw, sanitized-keys-only map from `sanitize_update/1`
-  # — values pass through unvalidated, so `%{volume: "77"}` or
-  # `%{volume: 101}` survive untouched. `merged` is post-`Store.merge_defaults`
-  # and is guaranteed to hold an integer in 0..100 for `:volume` and a
-  # boolean for `:muted`. Forward the merged values so the player's
-  # guard (`is_integer(value) and value in 0..100`) can't crash the
-  # Server with `FunctionClauseError`. `update` is still the
-  # presence-check source so a call that didn't ask to change volume
-  # doesn't re-send the cached value.
-  defp forward_to_player(state, key, update, merged) do
+  defp rename?(existing, merged) do
+    Map.get(existing, :friendly_name) != merged.friendly_name
+  end
+
+  # Caller passes pre-normalized values (atom keys, types matching
+  # `Player.set_volume/2` and `set_muted/2` guards). The map's keys
+  # double as the presence check — a call that didn't ask to change
+  # `:volume` shouldn't re-push the cached value.
+  defp forward_to_player(state, key, normalized) do
     case Map.fetch(state.players, key) do
       {:ok, %{pid: pid}} ->
         # The player can die between `Map.fetch` and the `GenServer.call`
@@ -527,12 +548,12 @@ defmodule UniversalProxy.Audio.Server do
         # the whole audio subsystem. Swallow the exit; the next
         # hotplug poll will respawn the player.
         try do
-          if Map.has_key?(update, :volume) do
-            state.player_module.set_volume(pid, merged.volume)
+          if Map.has_key?(normalized, :volume) do
+            state.player_module.set_volume(pid, normalized.volume)
           end
 
-          if Map.has_key?(update, :muted) do
-            state.player_module.set_muted(pid, merged.muted)
+          if Map.has_key?(normalized, :muted) do
+            state.player_module.set_muted(pid, normalized.muted)
           end
 
           :ok

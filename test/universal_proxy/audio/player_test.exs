@@ -1,7 +1,9 @@
 defmodule UniversalProxy.Audio.PlayerTest do
-  # async: false — Player processes subscribe to global PubSub and
-  # share a named MdnsStub Agent across the suite. Two concurrent
-  # tests would tangle each other's mDNS calls and broadcasts.
+  # async: false — the suite shares a named `MdnsStub` Agent across
+  # tests, and each test subscribes to the global `sendspin:state`
+  # PubSub topic to observe Player's broadcasts. Two tests running
+  # concurrently would tangle each other's mDNS calls and crossed
+  # PubSub messages.
   use ExUnit.Case, async: false
 
   alias UniversalProxy.Audio.Player
@@ -73,16 +75,26 @@ defmodule UniversalProxy.Audio.PlayerTest do
   end
 
   describe "startup" do
+    # `started` event shape is documented in
+    # `c_src/sendspin_player/README.md` ("Stdout events"). The fake
+    # binary mirrors that shape exactly so this test would catch a
+    # drift in either direction. `client_id` is passed to the binary
+    # as a CLI arg + advertised in mDNS TXT but is NOT echoed back on
+    # `started`; `initial_volume` is reported via a separate `volume`
+    # event right after `started`.
     test "spawns the binary and forwards CLI args via the `started` event" do
       pid = start_player!()
 
       assert_receive {:sendspin_state, @key, event}, 2_000
       assert event.event == "started"
       assert event.name == "Headphones"
-      assert event.client_id == "deadbeef"
-      assert event.mdns_port == 18_928
+      assert event.port == 18_928
       assert event.alsa_device == "plughw:0,0"
-      assert event.initial_volume == 60
+      assert is_binary(event.version)
+
+      # Real binary emits `volume` immediately after `started` to
+      # publish the initial volume; the fake mirrors that.
+      assert_receive {:sendspin_state, @key, %{event: "volume", value: 60}}, 1_000
 
       assert Process.alive?(pid)
     end
@@ -105,11 +117,12 @@ defmodule UniversalProxy.Audio.PlayerTest do
     end
 
     test "refuses to start when the binary is missing" do
-      # `trap_exit` would otherwise leak into the next test in this
-      # async: false suite — ExUnit doesn't reset process flags between
-      # tests. Restore via on_exit.
+      # `trap_exit` so `start_link/1` reports `{:error, _}` to the
+      # caller (this test process) instead of propagating an `:EXIT`
+      # signal that would kill us. ExUnit runs each test in its own
+      # process and the flag dies with that process; no cleanup
+      # needed.
       Process.flag(:trap_exit, true)
-      on_exit(fn -> Process.flag(:trap_exit, false) end)
 
       assert {:error, {:binary_missing, "/tmp/nope"}} =
                Player.start_link(
@@ -155,7 +168,7 @@ defmodule UniversalProxy.Audio.PlayerTest do
 
       File.write!(recorder, """
       #!/bin/sh
-      echo '{"event":"started","name":"x","client_id":"x","mdns_port":0,"alsa_device":"x","server":"","initial_volume":0}'
+      echo '{"event":"started","version":"0.0.0-fake","port":19001,"name":"x","alsa_device":"x"}'
       cat > "#{tmp}"
       """)
 
@@ -207,11 +220,11 @@ defmodule UniversalProxy.Audio.PlayerTest do
 
   describe "binary unexpected exit" do
     test "Player stops with {:binary_exited, status} when the binary exits abnormally" do
-      # `trap_exit` so we can observe the Player's exit reason instead
-      # of having the EXIT signal kill the test process. Restored at
-      # end of test to avoid leaking into the next test.
+      # `trap_exit` so the test process can observe `:DOWN` instead of
+      # being killed by the player's EXIT signal. ExUnit gives each
+      # test its own process, so the flag dies with this test — no
+      # cleanup needed.
       Process.flag(:trap_exit, true)
-      on_exit(fn -> Process.flag(:trap_exit, false) end)
 
       pid = start_player!()
       assert_receive {:sendspin_state, @key, %{event: "started"}}, 2_000
@@ -248,7 +261,7 @@ defmodule UniversalProxy.Audio.PlayerTest do
 
       File.write!(stream_fake, """
       #!/bin/sh
-      echo '{"event":"started","name":"x","client_id":"x","mdns_port":0,"alsa_device":"x","server":"","initial_volume":0}'
+      echo '{"event":"started","version":"0.0.0-fake","port":19100,"name":"x","alsa_device":"x"}'
       echo '{"event":"stream_start","sample_rate":44100,"channels":2,"bit_depth":16,"codec":"flac"}'
       # Keep the process alive so terminate/2 runs the shutdown handshake.
       exec cat

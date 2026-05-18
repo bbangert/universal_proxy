@@ -38,8 +38,16 @@ defmodule UniversalProxy.Audio.ServerTest do
 
     def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
 
-    def set_volume(pid, value), do: GenServer.call(pid, {:set_volume, value})
-    def set_muted(pid, value), do: GenServer.call(pid, {:set_muted, value})
+    # Guards mirror the real `Audio.Player.set_volume/2` and
+    # `set_muted/2` so a regression that lets caller-supplied strings
+    # or out-of-range integers through Server's forwarding path
+    # surfaces as a `FunctionClauseError` here too, instead of being
+    # silently accepted by the stub.
+    def set_volume(pid, value) when is_integer(value) and value in 0..100,
+      do: GenServer.call(pid, {:set_volume, value})
+
+    def set_muted(pid, value) when is_boolean(value),
+      do: GenServer.call(pid, {:set_muted, value})
 
     @impl true
     def init(opts) do
@@ -406,6 +414,39 @@ defmodule UniversalProxy.Audio.ServerTest do
       # Negative integer → clamped to 0.
       :ok = Server.update_config(server, @hp_key, %{volume: -5})
       assert {:set_volume, @hp_key, 0} in PlayerStubCalls.calls()
+    end
+
+    test "renaming an output restarts the player so --name / mDNS TXT update", %{
+      server: server,
+      player_sup: sup
+    } do
+      # `--name` and the mDNS TXT `name=` are baked at spawn — there's
+      # no `set_name` stdin command — so the only way to propagate a
+      # rename is to stop+start the player. Verify the lifecycle
+      # records a terminate + a new start with the new merged config.
+      [{:undefined, old_pid, _, _}] = DynamicSupervisor.which_children(sup)
+
+      :ok = Server.update_config(server, @hp_key, %{friendly_name: "Living Room"})
+
+      # PlayerStub.terminate fires synchronously on terminate_child,
+      # then start_player records the new {:started, ...} via init.
+      calls = PlayerStubCalls.calls()
+      assert {:terminated, @hp_key} in calls
+
+      [{:undefined, new_pid, _, _}] = DynamicSupervisor.which_children(sup)
+      assert new_pid != old_pid
+      assert :sys.get_state(server).outputs[@hp_key].friendly_name == "Living Room"
+    end
+
+    test "broadcasts normalized values, not raw caller input", %{server: server} do
+      # Caller passes a string volume that `Store.clamp_volume/1`
+      # rejects → falls back to default 50. The broadcast must carry
+      # the normalized integer, not the raw `"77"`, so PubSub
+      # subscribers (LiveView in Phase 4) never have to re-validate.
+      :ok = Server.update_config(server, @hp_key, %{volume: "77"})
+
+      assert_receive {:sendspin_state, @hp_key, %{volume: 50}}
+      refute_receive {:sendspin_state, @hp_key, %{volume: "77"}}, 100
     end
 
     test "update_config with muted forwards to set_muted", %{server: server} do

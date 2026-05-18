@@ -26,16 +26,21 @@ defmodule UniversalProxy.Audio.Player do
 
   ## JSON protocol
 
-  Events (binary → BEAM, one per stdout line):
+  Events (binary → BEAM, one per stdout line). Wire format is the
+  canonical contract documented in `c_src/sendspin_player/README.md`
+  ("Stdout events" section) — keep this list in sync with that
+  README and with `main.cpp`'s `emit_json` call sites.
 
-      {"event":"started","server":"...","client_id":"...","mdns_port":8928}
-      {"event":"connected","server":"ws://..."}
+      {"event":"started","version":"0.1.0","port":8928,"name":"Out 1","alsa_device":"plughw:0,0"}
+      {"event":"connected","server":"ws://music.local:8927/sendspin"}
       {"event":"disconnected"}
       {"event":"stream_start","sample_rate":48000,"channels":2,"bit_depth":16,"codec":"opus"}
       {"event":"stream_end"}
+      {"event":"time_sync","error_us":42.3}
       {"event":"volume","value":80}
       {"event":"mute","value":false}
-      {"event":"error","kind":"alsa_open","msg":"..."}
+      {"event":"error","kind":"alsa_configure","msg":"..."}
+      {"event":"shutdown"}
 
   Commands (BEAM → binary, written to stdin):
 
@@ -240,10 +245,14 @@ defmodule UniversalProxy.Audio.Player do
 
   def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
     Logger.warning(
-      "Audio.Player #{inspect(state.key)} binary exited with status #{status}; supervisor will decide whether to restart"
+      "Audio.Player #{inspect(state.key)} binary exited with status #{status}; will be respawned by Audio.Server's next hotplug poll"
     )
 
-    # Returning :stop lets the supervisor's restart strategy fire.
+    # `restart: :temporary` means the DynamicSupervisor does NOT
+    # auto-restart. Audio.Server's `:DOWN` handler clears its
+    # `state.players[key]` entry and the next poll's
+    # `respawn_missing_players/1` convergence pass spawns a fresh
+    # player instance.
     {:stop, {:binary_exited, status}, %{state | port: nil}}
   end
 

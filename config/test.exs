@@ -17,3 +17,13 @@ config :phoenix, :plug_init_mode, :runtime
 # startup. Redirect to a writable path so the test VM can boot in sandboxed
 # environments (CI runners, devcontainers).
 config :vintage_net, resolvconf: "/tmp/universal_proxy_test_resolv.conf"
+
+# The application tree starts a singleton `Audio.Server` that polls
+# enumeration every 5 s. On a Linux test host with ALSA outputs in
+# `/proc/asound/cards` the default `Audio.Enumerate` would surface
+# them and the Server would fork real `sendspin_player` binaries
+# during the test suite — leaking mDNS, eating port 8928, and
+# coupling the tests to host audio state. Stub it out; focused audio
+# tests still supply their own `enumerate_module:` opt for
+# deterministic test enumeration.
+config :universal_proxy, :audio_enumerate_module, UniversalProxy.Audio.NullEnumerate

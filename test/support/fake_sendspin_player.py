@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """Fake sendspin_player for Audio.Player tests.
 
-Mimics the line-delimited JSON protocol of the real C++ binary:
+Mimics the line-delimited JSON wire protocol of the real C++ binary as
+documented in c_src/sendspin_player/README.md ("Stdout events" /
+"Stdin commands"). Stays narrow on purpose — only the events the
+Player tests need to drive.
 
-  stdin commands  → stdout events
+  startup       → {"event":"started","version":...,"port":...,"name":...,"alsa_device":...}
+                  {"event":"volume","value":<initial_volume>}
+  stdin commands → stdout events
+    {"cmd":"set_volume","value":N} → {"event":"volume","value":N}
+    {"cmd":"set_muted","value":B}  → {"event":"mute","value":B}
+    {"cmd":"shutdown"}             → {"event":"shutdown"} + exit 0
+    {"cmd":"force_exit"}           → exit 7 (test-only; no event)
 
-    {"cmd":"set_volume","value":N}   → {"event":"volume","value":N}
-    {"cmd":"set_muted","value":B}    → {"event":"mute","value":B}
-    {"cmd":"shutdown"}               → {"event":"shutdown_received"} + exit 0
-
-On launch emits {"event":"started", "name":..., "client_id":..., "mdns_port":...,
-"alsa_device":..., "server":...} so the test can verify CLI args were
-forwarded correctly. Unknown commands are silently dropped, matching the
-real binary's parse_command behaviour.
+Unknown commands are silently dropped, matching the real binary's
+parse_command behaviour.
 
 No external dependencies. sys.stdout is explicitly flushed after every
 write so the BEAM port sees events line-by-line.
@@ -20,6 +23,10 @@ write so the BEAM port sees events line-by-line.
 import argparse
 import json
 import sys
+
+# Hard-coded version string so the `started` event has a stable shape
+# for assertions. The real binary substitutes its own VERSION here.
+FAKE_VERSION = "0.0.0-fake"
 
 
 def emit(event):
@@ -38,15 +45,21 @@ def main():
     p.add_argument("--log-level", default="info")
     args = p.parse_args()
 
+    # Match the real binary's `started` payload: event, version, port,
+    # name, alsa_device (see c_src/sendspin_player/src/main.cpp:626-633).
+    # client_id, mdns_port (the CLI arg, same as port here), server,
+    # and initial_volume are NOT echoed on `started`.
     emit({
         "event": "started",
+        "version": FAKE_VERSION,
+        "port": args.mdns_port,
         "name": args.name,
-        "client_id": args.client_id,
-        "mdns_port": args.mdns_port,
         "alsa_device": args.alsa_device,
-        "server": args.server,
-        "initial_volume": args.initial_volume,
     })
+
+    # Real binary emits a separate `volume` event after `started` to
+    # publish the initial volume (main.cpp:642-649).
+    emit({"event": "volume", "value": args.initial_volume})
 
     for line in sys.stdin:
         line = line.strip()
@@ -66,12 +79,12 @@ def main():
         elif kind == "set_muted":
             emit({"event": "mute", "value": cmd.get("value")})
         elif kind == "shutdown":
-            emit({"event": "shutdown_received"})
+            emit({"event": "shutdown"})
             return 0
         elif kind == "force_exit":
-            # Test-only: simulate an abnormal binary exit (no
-            # `shutdown_received` event, non-zero status). Drives the
-            # `:exit_status` handling path in Audio.Player.
+            # Test-only: abnormal exit (non-zero status, no shutdown
+            # event). Drives the `:exit_status` handling path in
+            # Audio.Player.
             return 7
         # Unknown commands: ignore, like the real binary.
 
