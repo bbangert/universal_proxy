@@ -193,12 +193,12 @@ defmodule UniversalProxy.Audio.Player do
 
   @impl true
   def handle_call({:set_volume, value}, _from, state) do
-    send_command(state, %{cmd: "set_volume", value: value})
+    send_command(state, {:set_volume, value})
     {:reply, :ok, state}
   end
 
   def handle_call({:set_muted, muted?}, _from, state) do
-    send_command(state, %{cmd: "set_muted", value: muted?})
+    send_command(state, {:set_muted, muted?})
     {:reply, :ok, state}
   end
 
@@ -258,7 +258,7 @@ defmodule UniversalProxy.Audio.Player do
     Logger.info("Audio.Player #{inspect(state.key)} terminating (#{inspect(reason)})")
 
     if state.port do
-      send_command(state, %{cmd: "shutdown"})
+      send_command(state, :shutdown)
 
       receive do
         {port, {:exit_status, _}} when port == state.port -> :ok
@@ -318,10 +318,37 @@ defmodule UniversalProxy.Audio.Player do
     end
   end
 
+  # The C++ binary's stdin parser is a strict left-to-right scanner that
+  # requires the literal field order `{"cmd":...[,"value":...]}` (see
+  # `c_src/sendspin_player/src/main.cpp` `parse_command`). `Jason.encode!/1`
+  # on a map iterates in hash order, which for our 2-key maps is
+  # unstable — sometimes it emits `cmd` first, sometimes `value`. When
+  # `value` came first the binary silently dropped the command. We
+  # build the wire bytes manually so order is locked.
+  #
+  # The map-shaped clause stays for `__send_command__/2` (test seam);
+  # the fake binary uses `json.loads` which is order-insensitive, so
+  # `Jason.encode!` is safe there.
   defp send_command(%__MODULE__{port: nil}, _cmd), do: :ok
 
-  defp send_command(%__MODULE__{port: port}, cmd) do
-    Port.command(port, [Jason.encode!(cmd), "\n"])
+  defp send_command(state, {:set_volume, value}) when is_integer(value) do
+    send_raw(state, [~s({"cmd":"set_volume","value":), Integer.to_string(value), ~s(})])
+  end
+
+  defp send_command(state, {:set_muted, muted?}) when is_boolean(muted?) do
+    send_raw(state, [~s({"cmd":"set_muted","value":), to_string(muted?), ~s(})])
+  end
+
+  defp send_command(state, :shutdown) do
+    send_raw(state, ~s({"cmd":"shutdown"}))
+  end
+
+  defp send_command(state, cmd) when is_map(cmd) do
+    send_raw(state, Jason.encode!(cmd))
+  end
+
+  defp send_raw(%__MODULE__{port: port}, iodata) when is_port(port) do
+    Port.command(port, [iodata, "\n"])
   rescue
     ArgumentError ->
       # Port was closed between our nil-check and the command — fine,
@@ -384,13 +411,19 @@ defmodule UniversalProxy.Audio.Player do
     ArgumentError -> :ok
   end
 
-  defp default_binary_path do
-    target = Application.get_env(:universal_proxy, :mix_target, "host")
+  # `Mix.target/0` is evaluated at compile time and baked into the
+  # release. Reading it from `Application.get_env` at runtime
+  # (with a "host" default) was wrong — on the device nothing sets
+  # that env, so we'd look in `priv/sendspin_player/host/` which is
+  # excluded from the rpi3 firmware. The C++ compile task already
+  # places the binary at `priv/sendspin_player/<MIX_TARGET>/sendspin_player`.
+  @target_dir to_string(Mix.target())
 
+  defp default_binary_path do
     Path.join([
       :code.priv_dir(:universal_proxy) |> List.to_string(),
       "sendspin_player",
-      to_string(target),
+      @target_dir,
       "sendspin_player"
     ])
   end

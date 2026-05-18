@@ -401,6 +401,69 @@ defmodule UniversalProxy.Audio.ServerTest do
       assert {:terminated, @hp_key} in PlayerStubCalls.calls()
     end
 
+    test "persists binary-emitted volume events to DETS (MA-side slider, etc)",
+         %{server: server, store: store} do
+      # When Music Assistant moves its slider, the binary emits a
+      # `{"event":"volume","value":N}` line that Player broadcasts on
+      # `sendspin:state`. Server subscribes to that topic and must
+      # persist the new value so the next respawn or reboot restores
+      # the actual last-known volume — not whatever BEAM last wrote.
+      # Caught on Pi-3 validation when audio resumed after `kill -9`
+      # at a different volume than MA's slider position.
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "sendspin:state",
+        {:sendspin_state, @hp_key, %{event: "volume", value: 37}}
+      )
+
+      # PubSub delivery is asynchronous; let Server.handle_info run.
+      Process.sleep(50)
+
+      assert {:ok, %{volume: 37}} = Store.get_config(store, @hp_key)
+      assert :sys.get_state(server).outputs[@hp_key].volume == 37
+    end
+
+    test "persists binary-emitted mute events to DETS", %{server: server, store: store} do
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "sendspin:state",
+        {:sendspin_state, @hp_key, %{event: "mute", value: true}}
+      )
+
+      Process.sleep(50)
+
+      assert {:ok, %{muted: true}} = Store.get_config(store, @hp_key)
+      assert :sys.get_state(server).outputs[@hp_key].muted == true
+    end
+
+    test "respawns the player on the next poll when it dies unexpectedly", %{
+      server: server,
+      player_sup: sup
+    } do
+      # Simulates the production case where the OS binary is killed
+      # (kill -9) — Player exits with {:binary_exited, _}, Server's
+      # :DOWN handler clears state.players[key], but state.outputs[key]
+      # remains. Without `respawn_missing_players/1` the next hotplug
+      # poll's add/remove diff would be empty and the player would
+      # never come back. Caught on real Pi hardware during Phase 3
+      # validation.
+      [{:undefined, old_pid, _, _}] = DynamicSupervisor.which_children(sup)
+      ref = Process.monitor(old_pid)
+      :ok = GenServer.stop(old_pid, :killed_for_test, 1_000)
+      assert_receive {:DOWN, ^ref, :process, ^old_pid, _}, 1_000
+
+      # Give Server's :DOWN handler a moment to process.
+      Process.sleep(50)
+      assert DynamicSupervisor.which_children(sup) == []
+      assert :sys.get_state(server).players == %{}
+
+      # Now drive a poll — convergence should respawn.
+      :ok = Server.check_now(server)
+
+      [{:undefined, new_pid, _, _}] = DynamicSupervisor.which_children(sup)
+      assert new_pid != old_pid
+    end
+
     test "set_enabled(true) after disable respawns the player", %{server: server, player_sup: sup} do
       :ok = Server.set_enabled(server, @hp_key, false)
       assert_receive {:sendspin_state, @hp_key, %{enabled: false}}

@@ -150,6 +150,16 @@ defmodule UniversalProxy.Audio.Server do
       port_base: Keyword.get(opts, :port_base, @mdns_port_base)
     }
 
+    # Subscribe to our own state topic so binary-emitted volume/mute
+    # events (Music Assistant's slider, group sync, etc.) get persisted
+    # to DETS. Without this the cached `state.outputs[key].volume` and
+    # the DETS row stay frozen at the last value BEAM itself set —
+    # and the next respawn (kill -9, reboot) would restore that stale
+    # value via `--initial-volume`. Server broadcasts on the same
+    # topic from `update_config`, but those payloads don't carry an
+    # `:event` key, so the handler ignores them.
+    Phoenix.PubSub.subscribe(@pubsub, @topic_state)
+
     # Restart hygiene: any PlayerSupervisor children left over from a
     # previous Server incarnation (Server crashed but PlayerSupervisor
     # didn't, per `rest_for_one` semantics) are terminated. New players
@@ -230,6 +240,23 @@ defmodule UniversalProxy.Audio.Server do
     {:noreply, refresh_outputs(state)}
   end
 
+  # Binary-emitted volume/mute events flow back through PubSub. Persist
+  # them so a respawn (kill -9, reboot) restores the actual last-known
+  # value rather than whatever BEAM last wrote. Internal Server-issued
+  # `:sendspin_state` payloads (from `update_config`/`set_enabled`) lack
+  # the `:event` key and fall through to the catch-all clause below.
+  def handle_info({:sendspin_state, key, %{event: "volume", value: v}}, state)
+      when is_integer(v) do
+    {:noreply, persist_binary_state(state, key, %{volume: clamp_volume(v)})}
+  end
+
+  def handle_info({:sendspin_state, key, %{event: "mute", value: m}}, state)
+      when is_boolean(m) do
+    {:noreply, persist_binary_state(state, key, %{muted: m})}
+  end
+
+  def handle_info({:sendspin_state, _key, _other}, state), do: {:noreply, state}
+
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
     # A player crashed (we use `:temporary` so the DynamicSupervisor
     # doesn't auto-restart). Drop it from `state.players`; the next
@@ -290,10 +317,18 @@ defmodule UniversalProxy.Audio.Server do
     # (stop removed, spawn enabled adds) BEFORE broadcasting. A
     # subscriber that reacts to `:sendspin_output_added` by calling
     # `Audio.set_volume/2` must find the player already started.
+    #
+    # The trailing `respawn_missing_players/1` makes refresh idempotent:
+    # any enabled output without a live player is (re)spawned. This is
+    # what brings the player back after the binary is killed externally
+    # (`kill -9`) — the `:DOWN` handler clears `state.players[key]` but
+    # leaves `outputs[key]` untouched, so the diff above shows "no adds,
+    # no removes" and would never respawn on its own.
     new_state =
       %{state | outputs: final_outputs}
       |> stop_players(removed)
       |> start_players_for_enabled(merged_adds)
+      |> respawn_missing_players()
 
     Enum.each(merged_adds, &broadcast_added/1)
     Enum.each(removed, &broadcast_removed/1)
@@ -344,6 +379,58 @@ defmodule UniversalProxy.Audio.Server do
     Enum.reduce(merged_adds, state, fn merged, acc ->
       if merged.enabled, do: start_player(acc, merged), else: acc
     end)
+  end
+
+  # Convergence pass: ensure every enabled, currently-tracked output
+  # has a live player. Called at the end of each `refresh_outputs/1`
+  # so a player that died between polls (binary `kill -9`, DETS bounce,
+  # etc.) is brought back without waiting for a hot-unplug-then-plug
+  # cycle.
+  # Update DETS + the in-memory cache with values reported by the
+  # binary. Only writes when the value actually differs — avoids
+  # hammering DETS on every `time_sync` style event chatter.
+  defp persist_binary_state(state, key, update) do
+    case Map.fetch(state.outputs, key) do
+      {:ok, existing} ->
+        if changed?(existing, update) do
+          case Store.save_config(state.store, key, update) do
+            :ok ->
+              {:ok, saved} = Store.get_config(state.store, key)
+              merged = merge(key, hardware_fields(existing), saved)
+              put_in(state.outputs[key], merged)
+
+            {:error, reason} ->
+              Logger.warning(
+                "Audio.Server: persisting binary state for #{inspect(key)} failed: #{inspect(reason)}"
+              )
+
+              state
+          end
+        else
+          state
+        end
+
+      :error ->
+        # Output disappeared between broadcast and handler — drop.
+        state
+    end
+  end
+
+  defp changed?(existing, update) do
+    Enum.any?(update, fn {k, v} -> Map.get(existing, k) != v end)
+  end
+
+  defp clamp_volume(v) when is_integer(v) and v >= 0 and v <= 100, do: v
+  defp clamp_volume(v) when is_integer(v) and v < 0, do: 0
+  defp clamp_volume(v) when is_integer(v) and v > 100, do: 100
+  defp clamp_volume(_), do: 50
+
+  defp respawn_missing_players(state) do
+    state.outputs
+    |> Enum.filter(fn {key, merged} ->
+      merged.enabled and not Map.has_key?(state.players, key)
+    end)
+    |> Enum.reduce(state, fn {_key, merged}, acc -> start_player(acc, merged) end)
   end
 
   defp start_player(%{player_supervisor: nil} = state, _merged), do: state

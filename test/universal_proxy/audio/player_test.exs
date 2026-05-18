@@ -133,6 +133,50 @@ defmodule UniversalProxy.Audio.PlayerTest do
       :ok = Player.set_volume(pid, 5)
       assert_receive {:sendspin_state, @key, %{event: "volume", value: 5}}, 1_000
     end
+
+    # The C++ binary's stdin parser is a strict left-to-right scanner —
+    # `Jason.encode!/1` on a map iterates in unstable hash order, so
+    # naively encoding `%{cmd: ..., value: ...}` emits `value` first
+    # roughly half the time, and the binary silently drops the command.
+    # Lock the literal wire bytes so a regression here is caught
+    # without needing a real-binary integration test.
+    test "produces deterministic field order `{\"cmd\":...,\"value\":...}`" do
+      # Spawn a recording fake whose only job is to capture the raw
+      # bytes received on stdin, then assert the exact sequence.
+      tmp_dir = System.tmp_dir!()
+      uniq = System.unique_integer([:positive])
+      tmp = Path.join(tmp_dir, "player_test_stdin_#{uniq}.log")
+      recorder = Path.join(tmp_dir, "player_test_stdin_recorder_#{uniq}.sh")
+
+      on_exit(fn ->
+        File.rm(tmp)
+        File.rm(recorder)
+      end)
+
+      File.write!(recorder, """
+      #!/bin/sh
+      echo '{"event":"started","name":"x","client_id":"x","mdns_port":0,"alsa_device":"x","server":"","initial_volume":0}'
+      cat > "#{tmp}"
+      """)
+
+      File.chmod!(recorder, 0o755)
+
+      pid = start_player!(binary_path: recorder, mdns_port: 19_001)
+      assert_receive {:sendspin_state, @key, %{event: "started"}}, 2_000
+
+      :ok = Player.set_volume(pid, 80)
+      :ok = Player.set_muted(pid, true)
+
+      # GenServer.stop sends shutdown JSON then closes the port,
+      # which flushes our recorder's `cat` to disk.
+      :ok = GenServer.stop(pid, :normal, 2_000)
+
+      lines = tmp |> File.read!() |> String.split("\n", trim: true)
+
+      assert ~s({"cmd":"set_volume","value":80}) in lines
+      assert ~s({"cmd":"set_muted","value":true}) in lines
+      assert ~s({"cmd":"shutdown"}) in lines
+    end
   end
 
   describe "set_muted/2" do
