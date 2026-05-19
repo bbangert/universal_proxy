@@ -358,7 +358,16 @@ defmodule UniversalProxy.Audio.Server do
   end
 
   def handle_info({:sendspin_state, key, %{event: "error"} = payload}, state) do
-    msg = Map.get(payload, :msg, "error")
+    # Bound the cached error string. The binary's `:msg` may be a
+    # server-forwarded value of arbitrary size; a multi-MB string would
+    # otherwise sit in Server state and ship over the LiveView socket
+    # on every diff touching this card.
+    msg =
+      payload
+      |> Map.get(:msg, "error")
+      |> to_string()
+      |> String.slice(0, 256)
+
     {:noreply, update_connection_state(state, key, %{last_error: msg})}
   end
 

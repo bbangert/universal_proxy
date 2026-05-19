@@ -800,6 +800,10 @@ defmodule UniversalProxyWeb.OverviewLive do
   attr(:enabled, :boolean, required: true)
   attr(:connection, :atom, required: true)
 
+  # `:unknown` connection (enabled, no event yet) renders as "Stopped"
+  # on Overview to keep the row consistent with the surrounding UART
+  # vocabulary ("Active / Idle / Stopped"). AudioLive renders the same
+  # state as "Idle" — see `AudioLive.status_badge/1` for the rationale.
   defp audio_status_badge(assigns) do
     cond do
       not assigns.enabled ->

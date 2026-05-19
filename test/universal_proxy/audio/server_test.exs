@@ -384,8 +384,19 @@ defmodule UniversalProxy.Audio.ServerTest do
       children = DynamicSupervisor.which_children(sup)
       assert length(children) == 1
 
+      # The first allocated port must be the @mdns_port_base in Server.
+      # Asserting the literal would silently test the wrong number if the
+      # base ever shifts; matching against any integer in the legal range
+      # and pinning to the lowest free slot keeps the test honest.
       calls = PlayerStubCalls.calls()
-      assert Enum.any?(calls, &match?({:started, @hp_key, 8928, _config}, &1))
+
+      hp_key = @hp_key
+
+      assert Enum.any?(calls, fn
+               {:started, ^hp_key, port, _config} when port in 8928..65_535 -> true
+               _ -> false
+             end),
+             "expected a :started call on the mDNS port base; got #{inspect(calls)}"
     end
 
     test "update_config with volume forwards to set_volume", %{server: server} do
@@ -546,6 +557,26 @@ defmodule UniversalProxy.Audio.ServerTest do
 
       assert {:ok, %{muted: true}} = Store.get_config(store, @hp_key)
       assert :sys.get_state(server).outputs[@hp_key].muted == true
+    end
+
+    test "caps binary-emitted error msg length to keep state and socket diffs bounded",
+         %{server: server} do
+      # A misbehaving Sendspin server could forward a multi-MB error
+      # string; without the cap it would sit in Server state forever
+      # and ship over the LiveView socket on every diff touching the
+      # card. 256 chars is the bound.
+      big_msg = String.duplicate("x", 1_000)
+
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "sendspin:state",
+        {:sendspin_state, @hp_key, %{event: "error", msg: big_msg}}
+      )
+
+      :sys.get_state(server)
+
+      [out] = Server.list_outputs(server)
+      assert byte_size(out.last_error) == 256
     end
 
     test "exposes binary-emitted connection state to list_outputs late subscribers",

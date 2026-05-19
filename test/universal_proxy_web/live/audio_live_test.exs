@@ -12,34 +12,18 @@ defmodule UniversalProxyWeb.AudioLiveTest do
   use ExUnit.Case, async: false
   import Phoenix.LiveViewTest
   import Phoenix.ConnTest
+  import UniversalProxy.AudioFixtures
 
   @endpoint UniversalProxyWeb.Endpoint
   @pubsub UniversalProxy.PubSub
 
-  @hp_key {"bcm2835 Headphones", nil, nil}
+  @hp_key UniversalProxy.AudioFixtures.hp_key()
 
   setup do
     {:ok, conn: Phoenix.ConnTest.build_conn()}
   end
 
   defp encode(key), do: key |> :erlang.term_to_binary() |> Base.url_encode64(padding: false)
-
-  defp sample_output(overrides \\ %{}) do
-    Map.merge(
-      %{
-        key: @hp_key,
-        card_index: 0,
-        alsa_device: "plughw:0,0",
-        card_name: "bcm2835 Headphones",
-        friendly_name: "Headphones",
-        enabled: true,
-        volume: 50,
-        muted: false,
-        client_id: "test-client-id"
-      },
-      overrides
-    )
-  end
 
   test "renders the empty state when no outputs are present", %{conn: conn} do
     {:ok, _view, html} = live(conn, "/audio")
@@ -207,6 +191,144 @@ defmodule UniversalProxyWeb.AudioLiveTest do
     # Non-integer "value" — handler falls through to :noreply.
     html = render_hook(view, "set_volume", %{"key" => id, "value" => "not-a-number"})
     assert html =~ "Headphones"
+  end
+
+  test ":sendspin_state with stream_end clears the stream label", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/audio")
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:output_added",
+      {:sendspin_output_added, sample_output()}
+    )
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:state",
+      {:sendspin_state, @hp_key,
+       %{event: "stream_start", codec: "opus", sample_rate: 48_000, bit_depth: 16, channels: 2}}
+    )
+
+    assert render(view) =~ "OPUS"
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:state",
+      {:sendspin_state, @hp_key, %{event: "stream_end"}}
+    )
+
+    html = render(view)
+    refute html =~ "OPUS"
+    refute html =~ "48 kHz"
+  end
+
+  test ":sendspin_state with error event renders last_error in the card", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/audio")
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:output_added",
+      {:sendspin_output_added, sample_output()}
+    )
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:state",
+      {:sendspin_state, @hp_key, %{event: "error", msg: "ALSA open failed"}}
+    )
+
+    assert render(view) =~ "ALSA open failed"
+  end
+
+  test ":sendspin_state with shutdown event clears connection and stream", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/audio")
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:output_added",
+      {:sendspin_output_added, sample_output()}
+    )
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:state",
+      {:sendspin_state, @hp_key, %{event: "connected"}}
+    )
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:state",
+      {:sendspin_state, @hp_key,
+       %{event: "stream_start", codec: "opus", sample_rate: 48_000, bit_depth: 16, channels: 2}}
+    )
+
+    assert render(view) =~ "Streaming"
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:state",
+      {:sendspin_state, @hp_key, %{event: "shutdown"}}
+    )
+
+    html = render(view)
+    refute html =~ "Streaming"
+    refute html =~ "OPUS"
+    assert html =~ "Searching"
+  end
+
+  test "renders the Disabled badge when an output is not enabled", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/audio")
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:output_added",
+      {:sendspin_output_added, sample_output(%{enabled: false})}
+    )
+
+    html = render(view)
+    assert html =~ "Disabled"
+    refute html =~ ">Streaming<"
+    refute html =~ ">Idle<"
+  end
+
+  test "rename with all-control-chars name is silently dropped (no flash, no dispatch)",
+       %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/audio")
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:output_added",
+      {:sendspin_output_added, sample_output()}
+    )
+
+    id = encode(@hp_key)
+
+    # `~r/[[:cntrl:]]/u` in `sanitize_friendly_name/1` strips control
+    # chars first, then trim. An all-cntrl input strips to "" → handler
+    # short-circuits with `{:error, :empty_name}` and returns `{:noreply,
+    # socket}` WITHOUT calling `Audio.update_config` and WITHOUT putting
+    # a flash. (A non-empty post-strip would dispatch and the app-tree
+    # Server's `{:error, :not_found}` would surface as a flash — that's
+    # the natural code path, not the property under test here.)
+    html = render_hook(view, "rename", %{"key" => id, "name" => "\t\n\v\r"})
+
+    refute html =~ "Rename failed"
+    # Original name unchanged.
+    assert html =~ ~s|value="Headphones"|
+  end
+
+  test "rename rejects correctly-encoded but wrong-shape keys", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/audio")
+
+    # A valid base64 of a valid Erlang term that isn't a 3-tuple. The
+    # shape guard in `valid_key_shape?/1` must reject this so a
+    # tampered DOM param can't reach `update_config/2`.
+    bad_id = :not_a_key |> :erlang.term_to_binary() |> Base.url_encode64(padding: false)
+
+    html = render_hook(view, "rename", %{"key" => bad_id, "name" => "X"})
+
+    refute html =~ "Rename failed"
+    assert html =~ "No audio outputs detected"
   end
 
   test "sorts output cards by friendly_name", %{conn: conn} do

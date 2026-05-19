@@ -9,31 +9,15 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
   use ExUnit.Case, async: false
   import Phoenix.LiveViewTest
   import Phoenix.ConnTest
+  import UniversalProxy.AudioFixtures
 
   @endpoint UniversalProxyWeb.Endpoint
   @pubsub UniversalProxy.PubSub
 
-  @hp_key {"bcm2835 Headphones", nil, nil}
+  @hp_key UniversalProxy.AudioFixtures.hp_key()
 
   setup do
     {:ok, conn: Phoenix.ConnTest.build_conn()}
-  end
-
-  defp sample_output(overrides \\ %{}) do
-    Map.merge(
-      %{
-        key: @hp_key,
-        card_index: 0,
-        alsa_device: "plughw:0,0",
-        card_name: "bcm2835 Headphones",
-        friendly_name: "Headphones",
-        enabled: true,
-        volume: 50,
-        muted: false,
-        client_id: "test-client-id"
-      },
-      overrides
-    )
   end
 
   test "Overview omits the audio card when no outputs are present", %{conn: conn} do

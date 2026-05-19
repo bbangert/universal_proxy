@@ -272,6 +272,12 @@ defmodule UniversalProxyWeb.AudioLive do
   attr(:connection, :atom, required: true)
   attr(:enabled, :boolean, required: true)
 
+  # `:unknown` connection (enabled, no event yet) renders as "Idle" on
+  # this page — the nuance matters here because the user is on a screen
+  # dedicated to audio playback, where "could stream if a server
+  # appears" is the meaningful state. OverviewLive renders the same
+  # state as "Stopped" to match the existing UART-row vocabulary
+  # ("Active / Idle / Stopped"); the two phrasings are deliberate.
   defp status_badge(assigns) do
     cond do
       not assigns.enabled ->
@@ -352,7 +358,7 @@ defmodule UniversalProxyWeb.AudioLive do
         %{acc | stream: nil}
 
       {:event, "error"}, acc ->
-        %{acc | last_error: Map.get(partial, :msg) || "error"}
+        %{acc | last_error: as_binary(Map.get(partial, :msg)) || "error"}
 
       {:event, "shutdown"}, acc ->
         %{acc | connection: :disconnected, stream: nil}
@@ -362,14 +368,26 @@ defmodule UniversalProxyWeb.AudioLive do
     end)
   end
 
+  # Boundary coercion: the binary's JSON keys are statically defined in
+  # `c_src/sendspin_player/src/main.cpp`, but a hypothetical bug there
+  # could emit a float (e.g. `48000.0`) or a non-binary codec. `div/2`
+  # below in `stream_label/1` raises on non-integers; type-guarding at
+  # the boundary keeps a binary regression from crashing the LiveView
+  # render.
   defp stream_params_from(partial) do
     %{
-      codec: Map.get(partial, :codec),
-      sample_rate: Map.get(partial, :sample_rate),
-      channels: Map.get(partial, :channels),
-      bit_depth: Map.get(partial, :bit_depth)
+      codec: as_binary(Map.get(partial, :codec)),
+      sample_rate: as_integer(Map.get(partial, :sample_rate)),
+      channels: as_integer(Map.get(partial, :channels)),
+      bit_depth: as_integer(Map.get(partial, :bit_depth))
     }
   end
+
+  defp as_integer(v) when is_integer(v), do: v
+  defp as_integer(_), do: nil
+
+  defp as_binary(v) when is_binary(v), do: v
+  defp as_binary(_), do: nil
 
   defp stream_label(nil), do: "—"
 
