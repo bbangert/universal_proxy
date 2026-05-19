@@ -215,7 +215,11 @@ defmodule UniversalProxyWeb.AudioLive do
             <span class="font-mono">{@output.alsa_device}</span> · {@output.card_name}
           </div>
         </div>
-        <.status_badge connection={@output.connection} enabled={@output.enabled} />
+        <.status_badge
+          connection={@output.connection}
+          stream={@output.stream}
+          enabled={@output.enabled}
+        />
       </div>
 
       <dl class="m-0 grid grid-cols-[110px_1fr] gap-x-3 gap-y-1.5 text-sm">
@@ -270,8 +274,15 @@ defmodule UniversalProxyWeb.AudioLive do
   end
 
   attr(:connection, :atom, required: true)
+  attr(:stream, :any, required: true)
   attr(:enabled, :boolean, required: true)
 
+  # The Sendspin client keeps its WebSocket open to the server between
+  # songs, so `:connection == :connected` stays true even when no audio
+  # is flowing. "Streaming" requires the additional signal that a
+  # `stream_start` event landed without a subsequent `stream_end` —
+  # tracked as `:stream` in `Audio.Server`'s `connection_state` map.
+  #
   # `:unknown` connection (enabled, no event yet) renders as "Idle" on
   # this page — the nuance matters here because the user is on a screen
   # dedicated to audio playback, where "could stream if a server
@@ -283,8 +294,11 @@ defmodule UniversalProxyWeb.AudioLive do
       not assigns.enabled ->
         ~H"<.badge variant={:neutral} dot>Disabled</.badge>"
 
-      assigns.connection == :connected ->
+      assigns.connection == :connected and not is_nil(assigns.stream) ->
         ~H"<.badge variant={:success} dot>Streaming</.badge>"
+
+      assigns.connection == :connected ->
+        ~H"<.badge variant={:accent} dot>Connected</.badge>"
 
       assigns.connection == :disconnected ->
         ~H"<.badge variant={:warning} dot>Searching</.badge>"

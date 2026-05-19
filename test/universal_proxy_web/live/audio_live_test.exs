@@ -116,7 +116,7 @@ defmodule UniversalProxyWeb.AudioLiveTest do
     refute html =~ ~s|value="Headphones"|
   end
 
-  test ":sendspin_state connection event flips the status badge", %{conn: conn} do
+  test ":sendspin_state events flip the status badge through its states", %{conn: conn} do
     {:ok, view, _html} = live(conn, "/audio")
 
     Phoenix.PubSub.broadcast(
@@ -128,14 +128,44 @@ defmodule UniversalProxyWeb.AudioLiveTest do
     # Initial state: enabled + unknown connection → "Idle".
     assert render(view) =~ "Idle"
 
+    # `connected` alone — WebSocket is up but the server hasn't pushed a
+    # stream yet. Badge reads "Connected", NOT "Streaming". The
+    # Sendspin client holds the socket open between songs, so this is
+    # the long-lived idle-but-attached state.
     Phoenix.PubSub.broadcast(
       @pubsub,
       "sendspin:state",
       {:sendspin_state, @hp_key, %{event: "connected"}}
     )
 
+    html = render(view)
+    assert html =~ "Connected"
+    refute html =~ ">Streaming<"
+
+    # `stream_start` flips to "Streaming".
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:state",
+      {:sendspin_state, @hp_key,
+       %{event: "stream_start", codec: "opus", sample_rate: 48_000, bit_depth: 16, channels: 2}}
+    )
+
     assert render(view) =~ "Streaming"
 
+    # `stream_end` while still connected drops back to "Connected", not
+    # "Streaming" — the bug PR fixes. Server is still reachable, just
+    # not pushing audio.
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:state",
+      {:sendspin_state, @hp_key, %{event: "stream_end"}}
+    )
+
+    html = render(view)
+    assert html =~ "Connected"
+    refute html =~ ">Streaming<"
+
+    # Then `disconnected` — server reachability lost.
     Phoenix.PubSub.broadcast(
       @pubsub,
       "sendspin:state",

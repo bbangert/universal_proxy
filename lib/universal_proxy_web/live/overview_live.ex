@@ -161,16 +161,29 @@ defmodule UniversalProxyWeb.OverviewLive do
   end
 
   # Track binary-emitted connection events per key so the "Streaming" /
-  # "Stopped" badge on the Overview row can flip without re-fetching the
-  # output list. Server-originated `:sendspin_state` partials (enable,
-  # rename, etc.) patch other fields on the same map.
+  # "Connected" / "Stopped" badge on the Overview row can flip without
+  # re-fetching the output list. Server-originated `:sendspin_state`
+  # partials (enable, rename, etc.) patch other fields on the same map.
   def handle_info({:sendspin_state, key, %{event: "connected"}}, socket) do
     {:noreply, update_audio_output(socket, key, %{connection: :connected})}
   end
 
   def handle_info({:sendspin_state, key, %{event: event}}, socket)
       when event in ["disconnected", "shutdown"] do
-    {:noreply, update_audio_output(socket, key, %{connection: :disconnected})}
+    # Disconnecting must clear the cached stream snapshot — the binary
+    # can't be playing audio over a socket it doesn't have. Without
+    # this, the row would read "Streaming" right up until the next
+    # `stream_end` event, which never arrives because the server is
+    # gone.
+    {:noreply, update_audio_output(socket, key, %{connection: :disconnected, stream: nil})}
+  end
+
+  def handle_info({:sendspin_state, key, %{event: "stream_start"} = payload}, socket) do
+    {:noreply, update_audio_output(socket, key, %{stream: stream_summary(payload)})}
+  end
+
+  def handle_info({:sendspin_state, key, %{event: "stream_end"}}, socket) do
+    {:noreply, update_audio_output(socket, key, %{stream: nil})}
   end
 
   def handle_info({:sendspin_state, key, %{enabled: enabled?}}, socket)
@@ -244,6 +257,14 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   defp build_audio_index(outputs) do
     Map.new(outputs, fn output -> {output.key, output} end)
+  end
+
+  # Cheap projection of the binary's stream_start payload to a non-nil
+  # term — the Overview row's badge only branches on `is_nil(stream)`,
+  # so we don't need the full codec/rate/bit-depth breakdown that
+  # AudioLive renders.
+  defp stream_summary(payload) when is_map(payload) do
+    %{codec: Map.get(payload, :codec)}
   end
 
   defp update_audio_output(socket, key, patch) do
@@ -790,6 +811,7 @@ defmodule UniversalProxyWeb.OverviewLive do
           <.audio_status_badge
             enabled={out.enabled}
             connection={Map.get(out, :connection, :unknown)}
+            stream={Map.get(out, :stream)}
           />
         </li>
       </ul>
@@ -799,7 +821,14 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   attr(:enabled, :boolean, required: true)
   attr(:connection, :atom, required: true)
+  attr(:stream, :any, required: true)
 
+  # "Streaming" requires both a live WebSocket (`:connected`) AND a
+  # current `stream_start` (non-nil `:stream`). The Sendspin client
+  # holds the WebSocket open between songs, so a bare `:connected`
+  # signal alone leaves the badge stuck on "Streaming" even after
+  # playback ends. See `AudioLive.status_badge/1` for the same logic.
+  #
   # `:unknown` connection (enabled, no event yet) renders as "Stopped"
   # on Overview to keep the row consistent with the surrounding UART
   # vocabulary ("Active / Idle / Stopped"). AudioLive renders the same
@@ -809,8 +838,11 @@ defmodule UniversalProxyWeb.OverviewLive do
       not assigns.enabled ->
         ~H"<.badge variant={:neutral} dot>Disabled</.badge>"
 
-      assigns.connection == :connected ->
+      assigns.connection == :connected and not is_nil(assigns.stream) ->
         ~H"<.badge variant={:success} dot>Streaming</.badge>"
+
+      assigns.connection == :connected ->
+        ~H"<.badge variant={:accent} dot>Connected</.badge>"
 
       assigns.connection == :disconnected ->
         ~H"<.badge variant={:warning} dot>Searching</.badge>"
