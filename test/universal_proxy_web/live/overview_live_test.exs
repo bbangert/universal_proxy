@@ -44,7 +44,8 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
     assert html =~ "Stopped"
   end
 
-  test "binary connection events flip the badge to Streaming", %{conn: conn} do
+  test "binary events progress the badge through Stopped → Connected → Streaming",
+       %{conn: conn} do
     {:ok, view, _html} = live(conn, "/")
 
     Phoenix.PubSub.broadcast(
@@ -55,13 +56,104 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
 
     assert render(view) =~ "Stopped"
 
+    # WebSocket up but no audio yet → "Connected", not "Streaming".
+    # The Sendspin client holds the socket open between songs, so this
+    # is the long-lived idle-but-attached state.
     Phoenix.PubSub.broadcast(
       @pubsub,
       "sendspin:state",
       {:sendspin_state, @hp_key, %{event: "connected"}}
     )
 
+    html = render(view)
+    assert html =~ "Connected"
+    refute html =~ ">Streaming<"
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:state",
+      {:sendspin_state, @hp_key,
+       %{event: "stream_start", codec: "opus", sample_rate: 48_000, bit_depth: 16, channels: 2}}
+    )
+
     assert render(view) =~ "Streaming"
+  end
+
+  test "stream_end while still connected drops the badge back to Connected", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/")
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:output_added",
+      {:sendspin_output_added, sample_output()}
+    )
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:state",
+      {:sendspin_state, @hp_key, %{event: "connected"}}
+    )
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:state",
+      {:sendspin_state, @hp_key,
+       %{event: "stream_start", codec: "opus", sample_rate: 48_000, bit_depth: 16, channels: 2}}
+    )
+
+    assert render(view) =~ "Streaming"
+
+    # The exact bug PR #41 fixes — track ends, server keeps the
+    # WebSocket open, badge must NOT stay on "Streaming".
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:state",
+      {:sendspin_state, @hp_key, %{event: "stream_end"}}
+    )
+
+    html = render(view)
+    assert html =~ "Connected"
+    refute html =~ ">Streaming<"
+  end
+
+  test "disconnected clears the stream snapshot so badge can't read Streaming",
+       %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/")
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:output_added",
+      {:sendspin_output_added, sample_output()}
+    )
+
+    # Race scenario: server pushed `stream_start`, then the socket
+    # dropped before `stream_end`. The disconnected handler must clear
+    # the cached stream — otherwise the badge would read "Streaming"
+    # right up until the next `stream_end`, which never arrives.
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:state",
+      {:sendspin_state, @hp_key, %{event: "connected"}}
+    )
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:state",
+      {:sendspin_state, @hp_key,
+       %{event: "stream_start", codec: "opus", sample_rate: 48_000, bit_depth: 16, channels: 2}}
+    )
+
+    assert render(view) =~ "Streaming"
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:state",
+      {:sendspin_state, @hp_key, %{event: "disconnected"}}
+    )
+
+    html = render(view)
+    assert html =~ "Searching"
+    refute html =~ ">Streaming<"
   end
 
   test "Manage link points at /audio", %{conn: conn} do
