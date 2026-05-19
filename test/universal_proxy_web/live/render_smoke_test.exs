@@ -33,6 +33,13 @@ defmodule UniversalProxyWeb.RenderSmokeTest do
     assert html =~ "Friendly name"
   end
 
+  test "Audio tab renders", %{conn: conn} do
+    {:ok, _view, html} = live(conn, "/audio")
+    assert html =~ "Sendspin players"
+    # NullEnumerate in test env → empty list → empty-state copy.
+    assert html =~ "No audio outputs detected"
+  end
+
   test "Security tab renders (off by default)", %{conn: conn} do
     {:ok, _view, html} = live(conn, "/security")
     assert html =~ "API encryption"

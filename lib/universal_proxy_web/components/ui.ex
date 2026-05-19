@@ -89,7 +89,7 @@ defmodule UniversalProxyWeb.Components.UI do
   # ── Toggle (switch) ───────────────────────────────────────────────────
   # `rest` accepts any phx-* attributes (phx-click, phx-value-*, etc.) directly.
   attr(:checked, :boolean, default: false)
-  attr(:rest, :global)
+  attr(:rest, :global, include: ~w(disabled))
 
   def toggle(assigns) do
     ~H"""
