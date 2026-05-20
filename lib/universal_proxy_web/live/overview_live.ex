@@ -195,6 +195,19 @@ defmodule UniversalProxyWeb.OverviewLive do
     {:noreply, update_audio_output(socket, key, %{friendly_name: name})}
   end
 
+  # The audio summary row renders a mini volume bar driven by the
+  # output's :volume and :muted, so server-originated partials for
+  # those fields must patch through to the cached map. (Without this
+  # the bar would freeze at the mount-time value until the user
+  # navigates away and back.)
+  def handle_info({:sendspin_state, key, %{volume: volume}}, socket) when is_integer(volume) do
+    {:noreply, update_audio_output(socket, key, %{volume: volume})}
+  end
+
+  def handle_info({:sendspin_state, key, %{muted: muted}}, socket) when is_boolean(muted) do
+    {:noreply, update_audio_output(socket, key, %{muted: muted})}
+  end
+
   def handle_info({:sendspin_state, _key, _partial}, socket), do: {:noreply, socket}
 
   def handle_info(_msg, socket), do: {:noreply, socket}
@@ -791,64 +804,213 @@ defmodule UniversalProxyWeb.OverviewLive do
 
     ~H"""
     <.card padding={:none} class="overflow-hidden">
-      <div class="flex items-center justify-between px-4 py-3.5 border-b border-border-1">
-        <div class="text-base font-semibold">Audio outputs</div>
+      <div class="flex items-center gap-2.5 px-4.5 py-3.5 border-b border-border-1">
+        <div class="w-[26px] h-[26px] rounded-md bg-audio-soft text-audio flex items-center justify-center flex-none">
+          <.speaker_glyph size={15} />
+        </div>
+        <div class="text-sm font-semibold text-fg-1">Audio outputs</div>
+        <.badge variant={:neutral}>{length(@sorted)}</.badge>
+        <div class="flex-1"></div>
         <.link
           navigate="/audio"
-          class="text-sm text-accent hover:underline"
+          class="text-sm text-accent font-medium flex items-center gap-1 px-2 py-1 rounded-sm hover:underline"
         >
-          Manage
+          Manage <.icon name={:chevron} size={13} />
         </.link>
       </div>
-      <ul class="divide-y divide-border-2">
-        <li :for={out <- @sorted} class="px-4 py-3 flex items-center gap-3">
-          <div class="flex-1 min-w-0">
-            <div class="text-base text-fg-1 font-medium truncate">{out.friendly_name}</div>
-            <div class="text-xs text-fg-3 mt-0.5">
-              <span class="font-mono">{out.alsa_device}</span> · {out.card_name}
-            </div>
-          </div>
-          <.audio_status_badge
-            enabled={out.enabled}
-            connection={Map.get(out, :connection, :unknown)}
-            stream={Map.get(out, :stream)}
-          />
-        </li>
+      <ul class="m-0 p-0 list-none">
+        <.audio_summary_row :for={{out, last?} <- with_last(@sorted)} out={out} last?={last?} />
       </ul>
     </.card>
     """
   end
 
-  attr(:enabled, :boolean, required: true)
-  attr(:connection, :atom, required: true)
-  attr(:stream, :any, required: true)
+  attr(:out, :map, required: true)
+  attr(:last?, :boolean, required: true)
 
-  # "Streaming" requires both a live WebSocket (`:connected`) AND a
-  # current `stream_start` (non-nil `:stream`). The Sendspin client
-  # holds the WebSocket open between songs, so a bare `:connected`
-  # signal alone leaves the badge stuck on "Streaming" even after
-  # playback ends. See `AudioLive.status_badge/1` for the same logic.
+  # Five-column grid: tint spine | speaker tile | name + alsa path |
+  # mini volume bar | status badge. The tint spine inherits the badge
+  # color so the row reads at a glance: same hue end-to-end means a
+  # healthy stream.
+  defp audio_summary_row(assigns) do
+    assigns =
+      assign(assigns, :status, audio_status(assigns.out))
+      |> assign(:streaming?, audio_streaming?(assigns.out))
+      |> assign(:connected?, audio_connected?(assigns.out))
+      |> assign(:volume, Map.get(assigns.out, :volume, 0))
+      |> assign(:muted, Map.get(assigns.out, :muted, false))
+
+    ~H"""
+    <li class={[
+      "grid grid-cols-[4px_36px_1fr_220px_110px] items-center min-h-[64px]",
+      not @last? && "border-b border-border-2"
+    ]}>
+      <div
+        class={["self-stretch", @out.enabled || "opacity-40"]}
+        style={"background: #{@status.tint_var};"}
+      >
+      </div>
+
+      <div class="pl-3 pr-1 flex justify-center">
+        <div class={[
+          "w-[30px] h-[30px] rounded-md flex items-center justify-center",
+          if(@out.enabled, do: "bg-audio-soft text-audio", else: "bg-sunken text-fg-4")
+        ]}>
+          <.speaker_glyph size={17} muted={@muted} level={speaker_level(@volume)} />
+        </div>
+      </div>
+
+      <div class="px-3 py-2.5 min-w-0">
+        <div class="flex items-center gap-2">
+          <span class="text-sm font-medium text-fg-1 truncate">{@out.friendly_name}</span>
+          <span
+            :if={@streaming?}
+            class="inline-flex items-center gap-1 text-[11px] font-semibold text-audio"
+          >
+            <.eq_bars active={true} />
+            {stream_label(Map.get(@out, :stream))}
+          </span>
+          <span
+            :if={not @streaming? and @connected?}
+            class="inline-flex items-center gap-1 text-[11px] font-semibold text-accent"
+          >
+            <.icon name={:pause} size={10} stroke={2.4} /> Paused
+          </span>
+        </div>
+        <div class="text-[11px] text-fg-3 mt-0.5">
+          <span class="font-mono">{@out.alsa_device}</span> · <span>{@out.card_name}</span>
+        </div>
+      </div>
+
+      <div class="px-4 flex items-center gap-2.5">
+        <div class="flex-1 h-1 rounded-[2px] bg-sunken relative overflow-hidden">
+          <div
+            class={[
+              "absolute inset-y-0 left-0 rounded-[2px]",
+              if(@out.enabled, do: "bg-audio", else: "bg-fg-4"),
+              @muted && "opacity-30"
+            ]}
+            style={"width: #{volume_bar_width(@out.enabled, @muted, @volume)}%;"}
+          >
+          </div>
+        </div>
+        <div class="text-xs font-mono tabular-nums text-fg-2 min-w-[28px] text-right">
+          {if @muted, do: "MUTE", else: @volume}
+        </div>
+      </div>
+
+      <div class="px-4">
+        <.badge variant={@status.variant} dot>{@status.label}</.badge>
+      </div>
+    </li>
+    """
+  end
+
+  # Pair each element in `xs` with a boolean indicating "is last?".
+  # Used to skip the bottom border on the final row.
+  defp with_last([]), do: []
+
+  defp with_last(xs) do
+    n = length(xs)
+    Enum.with_index(xs) |> Enum.map(fn {x, i} -> {x, i == n - 1} end)
+  end
+
+  # Single source of truth for the audio status state machine — shared
+  # between Overview's summary row and AudioLive's card badge. Returns
+  # the user-visible label, the badge variant, and a CSS variable to
+  # tint the leading row spine.
   #
-  # `:unknown` connection (enabled, no event yet) renders as "Stopped"
-  # on Overview to keep the row consistent with the surrounding UART
-  # vocabulary ("Active / Idle / Stopped"). AudioLive renders the same
-  # state as "Idle" — see `AudioLive.status_badge/1` for the rationale.
-  defp audio_status_badge(assigns) do
+  # The same vocabulary applies in both places (the original "Idle vs
+  # Stopped" split was a footgun — see the design handoff README).
+  defp audio_status(out) do
+    enabled? = out.enabled
+    connection = Map.get(out, :connection, :unknown)
+    stream = Map.get(out, :stream)
+
     cond do
-      not assigns.enabled ->
-        ~H"<.badge variant={:neutral} dot>Disabled</.badge>"
+      not enabled? ->
+        %{label: "Disabled", variant: :neutral, tint_var: "var(--hs-fg-4)"}
 
-      assigns.connection == :connected and not is_nil(assigns.stream) ->
-        ~H"<.badge variant={:success} dot>Streaming</.badge>"
+      connection == :connected and not is_nil(stream) ->
+        %{label: "Streaming", variant: :success, tint_var: "var(--hs-success)"}
 
-      assigns.connection == :connected ->
-        ~H"<.badge variant={:accent} dot>Connected</.badge>"
+      connection == :connected ->
+        %{label: "Connected", variant: :accent, tint_var: "var(--hs-accent)"}
 
-      assigns.connection == :disconnected ->
-        ~H"<.badge variant={:warning} dot>Searching</.badge>"
+      connection == :disconnected ->
+        %{label: "Searching", variant: :warning, tint_var: "var(--hs-warning)"}
 
       true ->
-        ~H"<.badge variant={:neutral} dot>Stopped</.badge>"
+        %{label: "Searching", variant: :warning, tint_var: "var(--hs-warning)"}
     end
+  end
+
+  defp audio_streaming?(out) do
+    out.enabled and Map.get(out, :connection) == :connected and not is_nil(Map.get(out, :stream))
+  end
+
+  defp audio_connected?(out) do
+    out.enabled and Map.get(out, :connection) == :connected
+  end
+
+  # Map a 0-100 volume to the speaker glyph's "wave count" so the
+  # icon visually tracks loudness: silence → no waves, normal → one,
+  # loud → two.
+  defp speaker_level(volume) when is_integer(volume) and volume > 60, do: 2
+  defp speaker_level(volume) when is_integer(volume) and volume > 0, do: 1
+  defp speaker_level(_), do: 0
+
+  defp volume_bar_width(false, _muted, _vol), do: 0
+  defp volume_bar_width(true, true, _vol), do: 0
+  defp volume_bar_width(true, false, vol) when is_integer(vol), do: vol
+  defp volume_bar_width(_, _, _), do: 0
+
+  defp stream_label(nil), do: "Streaming"
+
+  defp stream_label(%{} = stream) do
+    parts =
+      [
+        stream
+        |> Map.get(:codec)
+        |> as_label()
+        |> case do
+          nil -> nil
+          codec -> String.upcase(codec)
+        end,
+        stream |> Map.get(:sample_rate) |> as_khz(),
+        stream |> Map.get(:bit_depth) |> as_bit_depth()
+      ]
+      |> Enum.reject(&is_nil/1)
+
+    case parts do
+      [] -> "Streaming"
+      _ -> Enum.join(parts, " · ")
+    end
+  end
+
+  defp stream_label(_), do: "Streaming"
+
+  defp as_label(v) when is_binary(v), do: v
+  defp as_label(_), do: nil
+
+  defp as_khz(v) when is_integer(v) and v > 0, do: "#{div(v, 1000)} kHz"
+  defp as_khz(_), do: nil
+
+  defp as_bit_depth(v) when is_integer(v) and v > 0, do: "#{v}-bit"
+  defp as_bit_depth(_), do: nil
+
+  # Five vertical bars; CSS handles the animation when `active`.
+  attr(:active, :boolean, required: true)
+
+  defp eq_bars(assigns) do
+    ~H"""
+    <span class={["audio-eq", @active && "audio-eq--active"]}>
+      <span class="audio-eq__bar"></span>
+      <span class="audio-eq__bar"></span>
+      <span class="audio-eq__bar"></span>
+      <span class="audio-eq__bar"></span>
+      <span class="audio-eq__bar"></span>
+    </span>
+    """
   end
 end

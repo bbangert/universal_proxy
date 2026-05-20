@@ -441,15 +441,36 @@ defmodule UniversalProxy.Audio.Player do
   end
 
   defp register_mdns(%__MODULE__{key: key, config: cfg, mdns_port: port, mdns_module: mod}) do
+    friendly_name = Map.fetch!(cfg, :friendly_name)
+    client_id = Map.fetch!(cfg, :client_id)
+
+    # Set the mDNS *instance name* to the user-facing friendly name.
+    # Without this, all our `_sendspin._tcp` services share the host's
+    # default instance name (e.g. `nerves-507f._sendspin._tcp.local`),
+    # which means:
+    #   1. Music Assistant's python-zeroconf can't distinguish two
+    #      ALSA outputs on the same Pi — they collide on the instance
+    #      name.
+    #   2. Renaming an output doesn't change the instance name, so
+    #      MA's `_handle_service_added` sees no service-instance
+    #      change and its UI keeps showing the old name forever.
+    # By setting instance_name = friendly_name we get a clean
+    # Removed/Added cycle on rename, and the new name lands in MA's
+    # display the next time it processes the Added event.
+    #
+    # `sanitize_instance_name/1` strips control chars and trims; the
+    # mDNS wire format allows arbitrary UTF-8 in instance names, so
+    # spaces, accents, etc. are fine and don't need escaping.
     service = %{
       id: mdns_service_id(key),
+      instance_name: sanitize_instance_name(friendly_name),
       protocol: "sendspin",
       transport: "tcp",
       port: port,
       txt_payload: [
         "path=/sendspin",
-        "name=#{Map.fetch!(cfg, :friendly_name)}",
-        "client_id=#{Map.fetch!(cfg, :client_id)}"
+        "name=#{friendly_name}",
+        "client_id=#{client_id}"
       ]
     }
 
@@ -484,6 +505,24 @@ defmodule UniversalProxy.Audio.Player do
   defp mdns_service_id({slot_sub, vid, pid}) do
     {:sendspin_player, slot_sub, vid, pid}
   end
+
+  # mDNS allows arbitrary UTF-8 in the *instance* portion of a service
+  # name (the FQDN's leftmost label). The wire-format DNS label still
+  # has to be < 64 bytes and we don't want control chars sneaking
+  # through, but spaces, accents, emoji etc. are spec-legal. Falls
+  # back to a stable placeholder so an unexpectedly-empty name doesn't
+  # produce a malformed mDNS RR.
+  defp sanitize_instance_name(raw) when is_binary(raw) do
+    cleaned =
+      raw
+      |> String.replace(~r/[[:cntrl:]]/u, "")
+      |> String.trim()
+      |> String.slice(0, 63)
+
+    if cleaned == "", do: "sendspin", else: cleaned
+  end
+
+  defp sanitize_instance_name(_), do: "sendspin"
 
   defp broadcast_state(%__MODULE__{key: key, pubsub: pubsub}, event) do
     Phoenix.PubSub.broadcast(pubsub, @topic_state, {:sendspin_state, key, event})

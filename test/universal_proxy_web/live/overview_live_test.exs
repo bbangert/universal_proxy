@@ -40,11 +40,13 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
     assert html =~ "Audio outputs"
     assert html =~ "Headphones"
     assert html =~ "plughw:0,0"
-    # Default badge for enabled-but-not-yet-streaming output.
-    assert html =~ "Stopped"
+    # Default badge for enabled-but-no-event-yet output. Audio + Overview
+    # collapse to one vocabulary; "Searching" is the warning-tinted
+    # "we'd like to be streaming but nothing has connected" label.
+    assert html =~ "Searching"
   end
 
-  test "binary events progress the badge through Stopped → Connected → Streaming",
+  test "binary events progress the badge through Searching → Connected → Streaming",
        %{conn: conn} do
     {:ok, view, _html} = live(conn, "/")
 
@@ -54,7 +56,7 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
       {:sendspin_output_added, sample_output()}
     )
 
-    assert render(view) =~ "Stopped"
+    assert render(view) =~ "Searching"
 
     # WebSocket up but no audio yet → "Connected", not "Streaming".
     # The Sendspin client holds the socket open between songs, so this

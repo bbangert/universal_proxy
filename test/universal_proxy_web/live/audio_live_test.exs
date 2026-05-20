@@ -80,8 +80,16 @@ defmodule UniversalProxyWeb.AudioLiveTest do
       {:sendspin_output_added, sample_output()}
     )
 
-    # Empty state for stream is the em-dash.
-    assert render(view) =~ "—"
+    # The redesigned card surfaces the codec/rate/depth label inside the
+    # stream banner — which only renders the codec text when both
+    # `:connected` AND a stream snapshot are present. The real binary
+    # always emits `connected` before `stream_start`, so we mirror that
+    # ordering here.
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:state",
+      {:sendspin_state, @hp_key, %{event: "connected"}}
+    )
 
     Phoenix.PubSub.broadcast(
       @pubsub,
@@ -113,7 +121,11 @@ defmodule UniversalProxyWeb.AudioLiveTest do
 
     html = render(view)
     assert html =~ "Living Room"
-    refute html =~ ~s|value="Headphones"|
+    # The card_name sub-line ("bcm2835 Headphones") still contains the
+    # substring "Headphones" — that's the underlying ALSA card name,
+    # which a rename doesn't change. Assert specifically that the
+    # friendly_name button no longer renders the old value.
+    refute html =~ ">Headphones<"
   end
 
   test ":sendspin_state events flip the status badge through its states", %{conn: conn} do
@@ -125,8 +137,11 @@ defmodule UniversalProxyWeb.AudioLiveTest do
       {:sendspin_output_added, sample_output()}
     )
 
-    # Initial state: enabled + unknown connection → "Idle".
-    assert render(view) =~ "Idle"
+    # Initial state: enabled + no event yet → "Searching". The redesign
+    # collapses the original "Idle vs Stopped" split between
+    # AudioLive and OverviewLive into one shared vocabulary
+    # (Streaming / Connected / Searching / Disabled).
+    assert render(view) =~ "Searching"
 
     # `connected` alone — WebSocket is up but the server hasn't pushed a
     # stream yet. Badge reads "Connected", NOT "Streaming". The
@@ -175,7 +190,7 @@ defmodule UniversalProxyWeb.AudioLiveTest do
     assert render(view) =~ "Searching"
   end
 
-  test "rename event with empty name does not crash and does not put a flash", %{conn: conn} do
+  test "confirm_rename with empty draft is a soft cancel — no flash, no dispatch", %{conn: conn} do
     {:ok, view, _html} = live(conn, "/audio")
 
     Phoenix.PubSub.broadcast(
@@ -186,23 +201,24 @@ defmodule UniversalProxyWeb.AudioLiveTest do
 
     id = encode(@hp_key)
 
-    # phx-blur on the name input fires `rename`. The form's hidden
-    # `key` field provides the encoded id; the input's `name` field
-    # provides the new name. We bypass the form element and render the
-    # hook directly to avoid coupling to the form internals.
-    html = render_hook(view, "rename", %{"key" => id, "name" => "   "})
+    # Open the modal, then submit an all-whitespace draft. The
+    # post-clean string is empty, so `confirm_rename` short-circuits to
+    # close without calling `Audio.update_config` or putting a flash.
+    _ = render_hook(view, "open_rename", %{"id" => id})
+    _ = render_hook(view, "rename_draft", %{"value" => "   "})
+    html = render_hook(view, "confirm_rename", %{})
 
     refute html =~ "Rename failed"
-    # Original name unchanged.
-    assert html =~ ~s|value="Headphones"|
+    # Card header still shows the original name (it's a button now —
+    # no `value="…"` to check for).
+    assert html =~ "Headphones"
   end
 
-  test "rename event with invalid key id is silently ignored", %{conn: conn} do
+  test "open_rename event with invalid key id is silently ignored", %{conn: conn} do
     {:ok, view, _html} = live(conn, "/audio")
 
-    # Garbage id → decode fails → handler returns :noreply with no
-    # flash, no crash.
-    html = render_hook(view, "rename", %{"key" => "not-a-real-key", "name" => "Foo"})
+    # Garbage id → handler can't find the card → no-op, no crash.
+    html = render_hook(view, "open_rename", %{"id" => "not-a-real-key"})
     refute html =~ "Rename failed"
     assert html =~ "No audio outputs detected"
   end
@@ -230,6 +246,15 @@ defmodule UniversalProxyWeb.AudioLiveTest do
       @pubsub,
       "sendspin:output_added",
       {:sendspin_output_added, sample_output()}
+    )
+
+    # Stream banner only surfaces the codec text when both `connected`
+    # AND a stream snapshot are present. The real binary always emits
+    # `connected` before `stream_start`, so we mirror that here.
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:state",
+      {:sendspin_state, @hp_key, %{event: "connected"}}
     )
 
     Phoenix.PubSub.broadcast(
@@ -321,7 +346,7 @@ defmodule UniversalProxyWeb.AudioLiveTest do
     refute html =~ ">Idle<"
   end
 
-  test "rename with all-control-chars name is silently dropped (no flash, no dispatch)",
+  test "confirm_rename with all-control-chars draft is silently dropped",
        %{conn: conn} do
     {:ok, view, _html} = live(conn, "/audio")
 
@@ -333,29 +358,29 @@ defmodule UniversalProxyWeb.AudioLiveTest do
 
     id = encode(@hp_key)
 
-    # `~r/[[:cntrl:]]/u` in `sanitize_friendly_name/1` strips control
-    # chars first, then trim. An all-cntrl input strips to "" → handler
-    # short-circuits with `{:error, :empty_name}` and returns `{:noreply,
-    # socket}` WITHOUT calling `Audio.update_config` and WITHOUT putting
-    # a flash. (A non-empty post-strip would dispatch and the app-tree
-    # Server's `{:error, :not_found}` would surface as a flash — that's
-    # the natural code path, not the property under test here.)
-    html = render_hook(view, "rename", %{"key" => id, "name" => "\t\n\v\r"})
+    # Open the modal, then push an all-control-chars draft. `clean_friendly_name/1`
+    # strips controls and trims — the result is "" — so `confirm_rename`
+    # treats this as a soft cancel: no `Audio.update_config` call, no
+    # flash, modal just closes.
+    _ = render_hook(view, "open_rename", %{"id" => id})
+    _ = render_hook(view, "rename_draft", %{"value" => "\t\n\v\r"})
+    html = render_hook(view, "confirm_rename", %{})
 
     refute html =~ "Rename failed"
-    # Original name unchanged.
-    assert html =~ ~s|value="Headphones"|
+    # Card header still shows the original name.
+    assert html =~ "Headphones"
   end
 
-  test "rename rejects correctly-encoded but wrong-shape keys", %{conn: conn} do
+  test "open_rename rejects correctly-encoded but wrong-shape keys", %{conn: conn} do
     {:ok, view, _html} = live(conn, "/audio")
 
-    # A valid base64 of a valid Erlang term that isn't a 3-tuple. The
-    # shape guard in `valid_key_shape?/1` must reject this so a
-    # tampered DOM param can't reach `update_config/2`.
+    # A valid base64 of a valid Erlang term that isn't a 3-tuple. Even
+    # if a tampered DOM param survived `Base.url_decode64`, `open_rename`
+    # only succeeds when the id is present in the cached outputs map —
+    # which a wrong-shape key never can be. No crash, no modal opens.
     bad_id = :not_a_key |> :erlang.term_to_binary() |> Base.url_encode64(padding: false)
 
-    html = render_hook(view, "rename", %{"key" => bad_id, "name" => "X"})
+    html = render_hook(view, "open_rename", %{"id" => bad_id})
 
     refute html =~ "Rename failed"
     assert html =~ "No audio outputs detected"

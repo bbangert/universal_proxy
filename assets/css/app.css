@@ -62,6 +62,12 @@
   --hs-warning-soft: #fcecc9;
   --hs-danger: #c63439;
   --hs-danger-soft: #fbdcd7;
+
+  /* Audio (Sendspin) kind tint — distinct from the port-kind palette
+     but harmonious with it. Used for /audio cards and the audio
+     summary block on Overview. */
+  --hs-audio: #c84cd1;
+  --hs-audio-soft: rgba(200, 76, 209, 0.14);
 }
 
 [data-theme="dark"] {
@@ -94,6 +100,9 @@
   --hs-warning-soft: rgba(240, 168, 24, 0.14);
   --hs-danger: #ff7a7e;
   --hs-danger-soft: rgba(229, 72, 77, 0.14);
+
+  --hs-audio: #d970e2;
+  --hs-audio-soft: rgba(217, 112, 226, 0.16);
 }
 
 /* ── Base ──────────────────────────────────────────────────────────────── */
@@ -161,3 +170,83 @@
 .animate-pop  { animation: hs-pop 220ms cubic-bezier(0.2, 0, 0, 1); }
 .animate-slide-in { animation: hs-slide-in 220ms cubic-bezier(0.2, 0, 0, 1); }
 .animate-rec-pulse { animation: hs-pulse 1.2s ease-in-out infinite; }
+
+/* ── Audio EQ bars ─────────────────────────────────────────────────────
+   Five staggered keyframes give the bars a non-mechanical motion when
+   a player is actively streaming. Mirrors the prototype in
+   `proxy_assets/.../Audio.jsx`. */
+@keyframes audio-eq-0 { from { transform: scaleY(0.35) } to { transform: scaleY(1) } }
+@keyframes audio-eq-1 { from { transform: scaleY(0.70) } to { transform: scaleY(0.40) } }
+@keyframes audio-eq-2 { from { transform: scaleY(0.40) } to { transform: scaleY(1) } }
+@keyframes audio-eq-3 { from { transform: scaleY(0.85) } to { transform: scaleY(0.50) } }
+@keyframes audio-eq-4 { from { transform: scaleY(0.50) } to { transform: scaleY(0.90) } }
+
+.audio-eq { display: inline-flex; align-items: flex-end; gap: 2px; height: 14px; }
+.audio-eq__bar {
+  width: 2px;
+  background: currentColor;
+  border-radius: 1px;
+  transform-origin: bottom;
+  opacity: 0.45;
+}
+.audio-eq--active .audio-eq__bar { opacity: 1; height: 100%; }
+.audio-eq--active .audio-eq__bar:nth-child(1) { animation: audio-eq-0 0.70s ease-in-out infinite alternate; }
+.audio-eq--active .audio-eq__bar:nth-child(2) { animation: audio-eq-1 0.83s ease-in-out infinite alternate; }
+.audio-eq--active .audio-eq__bar:nth-child(3) { animation: audio-eq-2 0.96s ease-in-out infinite alternate; }
+.audio-eq--active .audio-eq__bar:nth-child(4) { animation: audio-eq-3 1.09s ease-in-out infinite alternate; }
+.audio-eq--active .audio-eq__bar:nth-child(5) { animation: audio-eq-4 1.22s ease-in-out infinite alternate; }
+/* Static low bars (for the "not streaming" use of EqBars). */
+.audio-eq:not(.audio-eq--active) .audio-eq__bar:nth-child(1) { height: 30% }
+.audio-eq:not(.audio-eq--active) .audio-eq__bar:nth-child(2) { height: 34% }
+.audio-eq:not(.audio-eq--active) .audio-eq__bar:nth-child(3) { height: 38% }
+.audio-eq:not(.audio-eq--active) .audio-eq__bar:nth-child(4) { height: 42% }
+.audio-eq:not(.audio-eq--active) .audio-eq__bar:nth-child(5) { height: 46% }
+
+/* ── Volume slider with tinted filled track ───────────────────────────
+   Native <input type=range> with a CSS gradient on the track for the
+   filled portion. The gradient stops are set inline via style="--vol:NN"
+   so per-element fill stays in sync with the assign. Keyboard/screen-
+   reader behavior comes free with the native control. */
+.audio-volume {
+  --vol: 0;
+  --vol-tint: var(--hs-audio);
+  width: 100%;
+  height: 6px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: linear-gradient(
+    to right,
+    var(--vol-tint) 0%,
+    var(--vol-tint) calc(var(--vol) * 1%),
+    var(--hs-bg-sunken) calc(var(--vol) * 1%),
+    var(--hs-bg-sunken) 100%
+  );
+  border-radius: 999px;
+  outline: none;
+  cursor: pointer;
+}
+.audio-volume:disabled {
+  --vol-tint: var(--hs-fg-4);
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+.audio-volume::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--hs-bg-surface);
+  border: 2px solid var(--vol-tint);
+  cursor: inherit;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
+}
+.audio-volume::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--hs-bg-surface);
+  border: 2px solid var(--vol-tint);
+  cursor: inherit;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
+}

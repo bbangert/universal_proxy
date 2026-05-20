@@ -47,6 +47,36 @@ const Hooks = {
     scrollToBottom() {
       this.el.scrollTop = this.el.scrollHeight
     }
+  },
+
+  // Copy the element's `data-clipboard` attr to the system clipboard on
+  // click. Used by the Audio tab's per-card "more" disclosure for the
+  // client_id. Briefly mutates the button's text to give the user a
+  // visible "Copied" cue without round-tripping through the server.
+  CopyToClipboard: {
+    mounted() {
+      this.el.addEventListener("click", () => {
+        const text = this.el.dataset.clipboard
+        if (!text || !navigator.clipboard) return
+        navigator.clipboard.writeText(text).then(() => {
+          const original = this.el.textContent
+          this.el.textContent = "Copied"
+          setTimeout(() => { this.el.textContent = original }, 1200)
+        }).catch(err => console.warn("Clipboard copy failed:", err))
+      })
+    }
+  },
+
+  // Focus + select-all on mount, with a small delay so the modal
+  // mount transition doesn't steal the caret. Used by the Audio rename
+  // modal's text input.
+  AutofocusSelect: {
+    mounted() {
+      setTimeout(() => {
+        this.el.focus()
+        if (typeof this.el.select === "function") this.el.select()
+      }, 30)
+    }
   }
 }
 
