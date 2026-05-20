@@ -664,6 +664,146 @@ defmodule UniversalProxy.Audio.ServerTest do
       starts = Enum.count(PlayerStubCalls.calls(), &match?({:started, @hp_key, _, _}, &1))
       assert starts == 2
     end
+
+    test "set_enabled(false) clears cached connection/stream state and broadcasts shutdown", %{
+      server: server
+    } do
+      # Caught during P5-T5 hardware verification on a Pi 3 B+: an
+      # output that was actively streaming would, on disable+re-enable,
+      # briefly show "Streaming" in the UI before the freshly-spawned
+      # binary's first event arrived. Root cause was the Server's
+      # `connection_state` cache surviving the player's death and the
+      # LiveView's per-card assigns mirroring the same stale data.
+      # The fix synchronously resets cached state and broadcasts a
+      # synthetic `{event: "shutdown"}` so subscribers refresh.
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "sendspin:state",
+        {:sendspin_state, @hp_key, %{event: "connected"}}
+      )
+
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "sendspin:state",
+        {:sendspin_state, @hp_key,
+         %{event: "stream_start", codec: "flac", sample_rate: 44_100, bit_depth: 16, channels: 2}}
+      )
+
+      :sys.get_state(server)
+
+      [out] = Server.list_outputs(server)
+      assert out.connection == :connected
+      assert out.stream == %{codec: "flac", sample_rate: 44_100, bit_depth: 16, channels: 2}
+
+      # Drain the two `:sendspin_state` messages we just injected so
+      # the post-disable assert_receive matches our broadcast, not
+      # leftover setup chatter.
+      assert_receive {:sendspin_state, @hp_key, %{event: "connected"}}
+      assert_receive {:sendspin_state, @hp_key, %{event: "stream_start"} = _}
+
+      :ok = Server.set_enabled(server, @hp_key, false)
+
+      # Two broadcasts go out: the `enabled: false` from set_enabled
+      # and the synthetic `{event: "shutdown"}` from stop_player's
+      # reset_connection_state path. Order isn't part of the contract
+      # so accept either ordering.
+      assert_receive {:sendspin_state, @hp_key, %{event: "shutdown"}}
+      assert_receive {:sendspin_state, @hp_key, %{enabled: false}}
+
+      :sys.get_state(server)
+
+      [out] = Server.list_outputs(server)
+      assert out.enabled == false
+      assert out.connection == :disconnected
+      assert out.stream == nil
+    end
+
+    test "disable then re-enable does not surface stale streaming state", %{server: server} do
+      # End-to-end of the user-visible regression from the badge work.
+      # Without the fix, the second `list_outputs/0` below returned
+      # `connection: :connected` with the pre-disable `stream` map,
+      # which the LiveView rendered as "Streaming" until the new
+      # player's first event arrived. With the fix, the re-enabled
+      # row returns to a clean default until the binary reports in.
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "sendspin:state",
+        {:sendspin_state, @hp_key, %{event: "connected"}}
+      )
+
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "sendspin:state",
+        {:sendspin_state, @hp_key,
+         %{event: "stream_start", codec: "flac", sample_rate: 44_100, bit_depth: 16, channels: 2}}
+      )
+
+      :sys.get_state(server)
+
+      :ok = Server.set_enabled(server, @hp_key, false)
+      :sys.get_state(server)
+
+      :ok = Server.set_enabled(server, @hp_key, true)
+      :sys.get_state(server)
+
+      [out] = Server.list_outputs(server)
+      assert out.enabled == true
+      # The freshly-spawned player hasn't reported in yet; the badge
+      # contract says "disconnected + enabled = Searching", which is
+      # the truthful state. Anything that asserted `:connected` here
+      # would be the very bug we're guarding against.
+      assert out.connection == :disconnected
+      assert out.stream == nil
+    end
+
+    test ":DOWN clears cached connection/stream state and broadcasts shutdown", %{
+      server: server,
+      player_sup: sup
+    } do
+      # Symmetric to the set_enabled(false) test but for the
+      # binary-crashed path (no stop_player demonitor, so the :DOWN
+      # message actually reaches Server). Without the fix, a `kill -9`
+      # of the C++ binary would leave Streaming visible on the card
+      # forever — or at least until the next clean event from the
+      # respawned binary.
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "sendspin:state",
+        {:sendspin_state, @hp_key, %{event: "connected"}}
+      )
+
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "sendspin:state",
+        {:sendspin_state, @hp_key,
+         %{event: "stream_start", codec: "flac", sample_rate: 44_100, bit_depth: 16, channels: 2}}
+      )
+
+      :sys.get_state(server)
+
+      # Drain the connected/stream_start broadcasts injected above so
+      # the later assert_receive can match the post-DOWN shutdown
+      # without contention from earlier messages.
+      assert_receive {:sendspin_state, @hp_key, %{event: "connected"}}
+      assert_receive {:sendspin_state, @hp_key, %{event: "stream_start"} = _}
+
+      [{:undefined, pid, _, _}] = DynamicSupervisor.which_children(sup)
+
+      # `GenServer.stop/3` with a non-:normal reason still triggers
+      # PlayerStub.terminate (orderly) but exits the process with a
+      # reason that propagates as a :DOWN message — which is what we
+      # want here. The Server :DOWN handler (not stop_player) runs
+      # because the monitor was never demonitored.
+      :ok = GenServer.stop(pid, :killed_for_test, 1_000)
+
+      assert_receive {:sendspin_state, @hp_key, %{event: "shutdown"}}, 1_000
+
+      :sys.get_state(server)
+
+      [out] = Server.list_outputs(server)
+      assert out.connection == :disconnected
+      assert out.stream == nil
+    end
   end
 
   describe "binary_missing tracking" do
