@@ -123,6 +123,15 @@ defmodule UniversalProxy.MixProject do
       # Dependencies for all targets except :host
       {:nerves_pack, "~> 0.7.1", targets: @all_targets},
 
+      # Vendored fork of mdns_lite — adds `MdnsLite.announce_all/0` so
+      # services we publish via `add_mdns_service/1` actually trigger
+      # unsolicited multicast announces per RFC 6762 §8.3. Upstream
+      # 0.9.1 only emits records in reply to queries, which means peers
+      # like Music Assistant's python-zeroconf don't notice newly
+      # registered services until their next poll (60+ s). Track upstream
+      # `nerves-networking/mdns_lite#213` for the eventual fix.
+      {:mdns_lite, path: "deps_local/mdns_lite", override: true},
+
       # Dependencies for specific targets
       # NOTE: It's generally low risk and recommended to follow minor version
       # bumps to Nerves systems. Since these include Linux kernel and Erlang

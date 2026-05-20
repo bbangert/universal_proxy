@@ -388,6 +388,7 @@ defmodule UniversalProxy.Audio.Server do
         state =
           %{state | players: Map.delete(state.players, key)}
           |> maybe_mark_port_unusable(port, reason)
+          |> reset_connection_state(key)
 
         {:noreply, state}
 
@@ -660,7 +661,9 @@ defmodule UniversalProxy.Audio.Server do
       {:ok, %{pid: pid, monitor: ref}} ->
         Process.demonitor(ref, [:flush])
         _ = DynamicSupervisor.terminate_child(state.player_supervisor, pid)
+
         %{state | players: Map.delete(state.players, key)}
+        |> reset_connection_state(key)
 
       :error ->
         state
@@ -764,6 +767,31 @@ defmodule UniversalProxy.Audio.Server do
   defp update_connection_state(state, key, patch) do
     existing = Map.get(state.connection_state, key, @default_live_state)
     %{state | connection_state: Map.put(state.connection_state, key, Map.merge(existing, patch))}
+  end
+
+  # Called when a player process is gone (set_enabled(false), rename
+  # restart, programmatic stop, or crash). Without this, the cached
+  # connection / stream payload — last seen as `:connected` /
+  # `stream: %{...}` — would survive the player's death and surface
+  # on the next list_outputs/0 call, painting a "Streaming" badge on
+  # a card whose binary is dead. On re-enable the LiveView's own
+  # per-card cache (built from this state) would render the stale
+  # data until the freshly-started player's "connected" event lands.
+  #
+  # Guard with `Map.has_key?` so hotplug-removed outputs (already
+  # cleared by refresh_outputs/1) don't double-broadcast.
+  defp reset_connection_state(state, key) do
+    if Map.has_key?(state.connection_state, key) do
+      broadcast_state(key, %{event: "shutdown"})
+
+      update_connection_state(state, key, %{
+        connection: :disconnected,
+        stream: nil,
+        last_error: nil
+      })
+    else
+      state
+    end
   end
 
   defp merge_connection_state(output, connection_state) do

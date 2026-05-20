@@ -13,7 +13,11 @@ defmodule UniversalProxy.Audio.PlayerTest do
   @key {"bcm2835 Headphones", nil, nil}
 
   defmodule MdnsStub do
-    @moduledoc false
+    @moduledoc """
+    Stands in for `MdnsLite` in tests. Records calls so assertions
+    can verify Player wired add/remove/announce_all correctly. The
+    `announce_all/0` shape mirrors our vendored `MdnsLite.announce_all/0`.
+    """
     use Agent
 
     def start_link(_initial \\ []) do
@@ -21,18 +25,22 @@ defmodule UniversalProxy.Audio.PlayerTest do
     end
 
     def add_mdns_service(service) do
-      Agent.update(__MODULE__, fn s ->
-        %{s | calls: [{:add, service} | s.calls]}
-      end)
-
+      Agent.update(__MODULE__, fn s -> %{s | calls: [{:add, service} | s.calls]} end)
       :ok
     end
 
     def remove_mdns_service(id) do
-      Agent.update(__MODULE__, fn s ->
-        %{s | calls: [{:remove, id} | s.calls]}
-      end)
+      Agent.update(__MODULE__, fn s -> %{s | calls: [{:remove, id} | s.calls]} end)
+      :ok
+    end
 
+    def announce_all do
+      Agent.update(__MODULE__, fn s -> %{s | calls: [:announce_all | s.calls]} end)
+      :ok
+    end
+
+    def goodbye_service(id) do
+      Agent.update(__MODULE__, fn s -> %{s | calls: [{:goodbye, id} | s.calls]} end)
       :ok
     end
 
@@ -66,7 +74,11 @@ defmodule UniversalProxy.Audio.PlayerTest do
           config: config(),
           mdns_port: 18_928,
           binary_path: @fake_binary,
-          mdns_module: MdnsStub
+          mdns_module: MdnsStub,
+          # Default to no re-announces in existing tests; the dedicated
+          # describe block opts back in. Otherwise every test would
+          # schedule timers that fire after the test process exits.
+          reannounce_delays_ms: []
         ],
         overrides
       )
@@ -232,6 +244,29 @@ defmodule UniversalProxy.Audio.PlayerTest do
       calls = MdnsStub.calls()
       assert {:remove, {:sendspin_player, "bcm2835 Headphones", nil, nil}} in calls
     end
+
+    test "sends a TTL=0 goodbye BEFORE removing the mDNS service" do
+      # Without this ordering, peer caches (python-zeroconf, avahi) hold
+      # our records for their full mDNS TTL even after we yank the
+      # service from the responder table — and a later announce of the
+      # same instance is treated as a cache refresh, not a re-discovery.
+      # Caught when Music Assistant refused to reconnect on re-enable
+      # because its python-zeroconf hadn't seen a Removed event.
+      pid = start_player!()
+      assert_receive {:sendspin_state, @key, %{event: "started"}}, 2_000
+
+      :ok = GenServer.stop(pid, :normal, 2_000)
+
+      id = {:sendspin_player, "bcm2835 Headphones", nil, nil}
+      calls = MdnsStub.calls()
+
+      goodbye_idx = Enum.find_index(calls, &match?({:goodbye, ^id}, &1))
+      remove_idx = Enum.find_index(calls, &match?({:remove, ^id}, &1))
+
+      assert goodbye_idx != nil, "expected MdnsStub.goodbye_service/1 to be called"
+      assert remove_idx != nil, "expected MdnsStub.remove_mdns_service/1 to be called"
+      assert goodbye_idx < remove_idx, "goodbye must come before remove, got #{inspect(calls)}"
+    end
   end
 
   describe "binary unexpected exit" do
@@ -315,5 +350,59 @@ defmodule UniversalProxy.Audio.PlayerTest do
 
       assert %{event: "volume", value: 33} = Player.last_event(pid)
     end
+  end
+
+  describe "RFC 6762 §8.3 re-announce schedule" do
+    # User-visible regression: re-enabling an output didn't notify
+    # Music Assistant until MA's next polling cycle (30-60+ s). Player
+    # schedules `MdnsLite.announce_all/0` (vendored fork only — upstream
+    # 0.9.1 doesn't have it) a few times right after the responder
+    # registers our service so peer caches update immediately.
+    test "fires the configured re-announce schedule via mdns_module.announce_all" do
+      _pid = start_player!(reannounce_delays_ms: [10, 25, 50])
+
+      assert_receive {:sendspin_state, @key, _started}, 2_000
+
+      # Three announce_all calls should land within ~250 ms of the
+      # schedule (50 ms last delay + generous slack for slow CI).
+      eventually(
+        fn -> Enum.count(MdnsStub.calls(), &(&1 == :announce_all)) == 3 end,
+        1_000
+      )
+    end
+
+    test "an empty schedule fires no announces" do
+      _pid = start_player!()
+      assert_receive {:sendspin_state, @key, _started}, 2_000
+
+      # Default `reannounce_delays_ms: []` in `start_player!/1` means
+      # MdnsStub.announce_all should never be called.
+      Process.sleep(50)
+      refute Enum.any?(MdnsStub.calls(), &(&1 == :announce_all))
+    end
+  end
+
+  # Poll a predicate every 10 ms until it returns true or the timeout
+  # elapses. Used in lieu of a fixed `Process.sleep` so the test
+  # finishes as soon as the scheduled timers have fired, not after a
+  # worst-case sleep.
+  defp eventually(check, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+
+    loop = fn loop ->
+      cond do
+        check.() ->
+          :ok
+
+        System.monotonic_time(:millisecond) >= deadline ->
+          flunk("eventually/2 timed out after #{timeout_ms} ms")
+
+        true ->
+          Process.sleep(10)
+          loop.(loop)
+      end
+    end
+
+    loop.(loop)
   end
 end

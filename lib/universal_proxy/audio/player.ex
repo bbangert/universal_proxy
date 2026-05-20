@@ -69,6 +69,13 @@ defmodule UniversalProxy.Audio.Player do
   @topic_state "sendspin:state"
   @shutdown_grace_ms 500
 
+  # RFC 6762 §8.3 announces. We call `MdnsLite.announce_all/0` (added
+  # in our vendored fork) to emit proper multicast response packets
+  # from port 5353 with TTL>0 — exactly the shape peers like Music
+  # Assistant's `python-zeroconf` accept. Spaced over the first few
+  # seconds to cover initial peer-discovery jitter.
+  @reannounce_delays_ms [500, 1_500, 3_500]
+
   defstruct [
     :key,
     :config,
@@ -204,6 +211,8 @@ defmodule UniversalProxy.Audio.Player do
           send_command(new_state, {:set_muted, true})
         end
 
+        schedule_reannounces(opts)
+
         {:ok, new_state}
     end
   end
@@ -268,6 +277,17 @@ defmodule UniversalProxy.Audio.Player do
     {:stop, {:binary_exited, status}, %{state | port: nil}}
   end
 
+  def handle_info(:reannounce, state) do
+    # Trigger our vendored `MdnsLite.announce_all/0` (RFC 6762 §8.3
+    # unsolicited announce). The library multicasts a proper response
+    # packet via the responder's own socket — source port 5353, every
+    # registered service type. Peer cache update + `Added` callback on
+    # python-zeroconf et al. should fire from this. Failure is
+    # non-fatal: peers fall back to discovery on their next poll.
+    _ = state.mdns_module.announce_all()
+    {:noreply, state}
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
 
   @impl true
@@ -297,6 +317,28 @@ defmodule UniversalProxy.Audio.Player do
     end
 
     if state.mdns_id do
+      # Send a TTL=0 PTR goodbye BEFORE removing the service from the
+      # responder's table. Without this, peer caches like
+      # python-zeroconf hold our records for their full TTL — and a
+      # subsequent unsolicited announce on re-enable is treated as a
+      # cache refresh, never producing an `Added` callback. Music
+      # Assistant therefore never re-discovers the player until its
+      # cache TTL expires (default 120 s). With the goodbye, peers
+      # evict the records immediately and the next announce produces
+      # the `Added` event MA listens for.
+      #
+      # `goodbye_service/1` (vendored extension to mdns_lite) routes
+      # the response through the responder's port-5353 socket, which
+      # is the source port RFC 6762 §6 requires for response packets.
+      _ =
+        try do
+          state.mdns_module.goodbye_service(state.mdns_id)
+        rescue
+          _ -> :ok
+        catch
+          :exit, _ -> :ok
+        end
+
       # Best-effort. `remove_mdns_service/1` is a GenServer.call into
       # MdnsLite — if MdnsLite is stopped or restarting during our
       # shutdown, the call exits (`:noproc` / `:timeout`) rather than
@@ -316,6 +358,18 @@ defmodule UniversalProxy.Audio.Player do
   end
 
   # -- Private --
+
+  # RFC 6762 §8.3 calls for at least two unsolicited announcements ~1 s
+  # apart when a service comes up. mdns_lite 0.9.1 sends zero, so we
+  # synthesize them via `Audio.MdnsAnnouncer.announce/1`. Tests can
+  # override `reannounce_delays_ms:` to skip the schedule.
+  defp schedule_reannounces(opts) do
+    delays = Keyword.get(opts, :reannounce_delays_ms, @reannounce_delays_ms)
+
+    Enum.each(delays, fn ms when is_integer(ms) and ms >= 0 ->
+      Process.send_after(self(), :reannounce, ms)
+    end)
+  end
 
   defp open_port(%__MODULE__{} = state) do
     args = build_cli_args(state)
