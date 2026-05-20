@@ -63,11 +63,18 @@ defmodule UniversalProxy.Audio.Player do
 
   require Logger
 
-  alias UniversalProxy.Audio.Store
+  alias UniversalProxy.Audio.{MdnsAnnouncer, Store}
 
   @pubsub UniversalProxy.PubSub
   @topic_state "sendspin:state"
   @shutdown_grace_ms 500
+
+  # RFC 6762 §8.3 says at least two unsolicited announces, one second
+  # apart, when a service comes up. mdns_lite 0.9.1 sends zero (see
+  # `Audio.MdnsAnnouncer` @moduledoc), so we spread three over the
+  # first ~5 s to cover discovery-loop windows on peers like Music
+  # Assistant.
+  @reannounce_delays_ms [500, 1_500, 3_500]
 
   defstruct [
     :key,
@@ -77,6 +84,7 @@ defmodule UniversalProxy.Audio.Player do
     :server_url,
     :pubsub,
     :mdns_module,
+    :mdns_announcer,
     port: nil,
     mdns_id: nil,
     last_event: %{},
@@ -91,6 +99,7 @@ defmodule UniversalProxy.Audio.Player do
           server_url: String.t() | nil,
           pubsub: module(),
           mdns_module: module(),
+          mdns_announcer: module(),
           port: port() | nil,
           mdns_id: term(),
           last_event: map(),
@@ -159,6 +168,7 @@ defmodule UniversalProxy.Audio.Player do
     server_url = Keyword.get(opts, :server_url)
     pubsub = Keyword.get(opts, :pubsub, @pubsub)
     mdns_module = Keyword.get(opts, :mdns_module, MdnsLite)
+    mdns_announcer = Keyword.get(opts, :mdns_announcer, MdnsAnnouncer)
 
     state = %__MODULE__{
       key: key,
@@ -167,7 +177,8 @@ defmodule UniversalProxy.Audio.Player do
       mdns_port: mdns_port,
       server_url: server_url,
       pubsub: pubsub,
-      mdns_module: mdns_module
+      mdns_module: mdns_module,
+      mdns_announcer: mdns_announcer
     }
 
     cond do
@@ -203,6 +214,8 @@ defmodule UniversalProxy.Audio.Player do
         if Map.get(config, :muted, false) do
           send_command(new_state, {:set_muted, true})
         end
+
+        schedule_reannounces(opts)
 
         {:ok, new_state}
     end
@@ -268,6 +281,14 @@ defmodule UniversalProxy.Audio.Player do
     {:stop, {:binary_exited, status}, %{state | port: nil}}
   end
 
+  def handle_info(:reannounce, state) do
+    # Workaround for mdns_lite 0.9.1 not implementing RFC 6762 §8.3.
+    # See `Audio.MdnsAnnouncer` @moduledoc. Failure is non-fatal —
+    # peers will discover via their next poll cycle in the worst case.
+    _ = state.mdns_announcer.announce()
+    {:noreply, state}
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
 
   @impl true
@@ -316,6 +337,18 @@ defmodule UniversalProxy.Audio.Player do
   end
 
   # -- Private --
+
+  # RFC 6762 §8.3 calls for at least two unsolicited announcements ~1 s
+  # apart when a service comes up. mdns_lite 0.9.1 sends zero, so we
+  # synthesize them via `Audio.MdnsAnnouncer.announce/1`. Tests can
+  # override `reannounce_delays_ms:` to skip the schedule.
+  defp schedule_reannounces(opts) do
+    delays = Keyword.get(opts, :reannounce_delays_ms, @reannounce_delays_ms)
+
+    Enum.each(delays, fn ms when is_integer(ms) and ms >= 0 ->
+      Process.send_after(self(), :reannounce, ms)
+    end)
+  end
 
   defp open_port(%__MODULE__{} = state) do
     args = build_cli_args(state)

@@ -39,8 +39,25 @@ defmodule UniversalProxy.Audio.PlayerTest do
     def calls, do: Agent.get(__MODULE__, & &1.calls) |> Enum.reverse()
   end
 
+  defmodule AnnouncerStub do
+    @moduledoc false
+    use Agent
+
+    def start_link(_initial \\ []) do
+      Agent.start_link(fn -> [] end, name: __MODULE__)
+    end
+
+    def announce(service_type \\ "_sendspin._tcp") do
+      Agent.update(__MODULE__, fn calls -> [service_type | calls] end)
+      :ok
+    end
+
+    def calls, do: __MODULE__ |> Agent.get(& &1) |> Enum.reverse()
+  end
+
   setup do
     start_supervised!(MdnsStub)
+    start_supervised!(AnnouncerStub)
     :ok = Phoenix.PubSub.subscribe(@pubsub, "sendspin:state")
     :ok
   end
@@ -66,7 +83,12 @@ defmodule UniversalProxy.Audio.PlayerTest do
           config: config(),
           mdns_port: 18_928,
           binary_path: @fake_binary,
-          mdns_module: MdnsStub
+          mdns_module: MdnsStub,
+          mdns_announcer: AnnouncerStub,
+          # Default to no re-announces in existing tests; the dedicated
+          # describe block opts back in. Otherwise every test would
+          # schedule timers that fire after the test process exits.
+          reannounce_delays_ms: []
         ],
         overrides
       )
@@ -315,5 +337,63 @@ defmodule UniversalProxy.Audio.PlayerTest do
 
       assert %{event: "volume", value: 33} = Player.last_event(pid)
     end
+  end
+
+  describe "RFC 6762 §8.3 re-announce workaround" do
+    # Tracks the user-visible regression where re-enabling an output
+    # didn't notify Music Assistant until MA's next polling cycle
+    # (30-60 s). Player schedules a few synthetic PTR queries via
+    # `Audio.MdnsAnnouncer` to coax the local mdns_lite responder
+    # into broadcasting unsolicited records. Watch upstream
+    # `mdns_lite#213`; this whole describe block goes away once it
+    # lands.
+    test "fires the configured re-announce schedule via the injected announcer" do
+      _pid = start_player!(reannounce_delays_ms: [10, 25, 50])
+
+      # Drain the startup event so the rest of the test isn't racing
+      # against the binary's initial output.
+      assert_receive {:sendspin_state, @key, _started}, 2_000
+
+      # Three announces should land within ~250 ms of the schedule
+      # (50 ms last delay + generous slack for slow CI).
+      eventually(fn -> length(AnnouncerStub.calls()) == 3 end, 1_000)
+
+      assert AnnouncerStub.calls() == ["_sendspin._tcp", "_sendspin._tcp", "_sendspin._tcp"]
+    end
+
+    test "an empty schedule fires no announces (used by the rest of this suite)" do
+      _pid = start_player!()
+      assert_receive {:sendspin_state, @key, _started}, 2_000
+
+      # Give any errant timers a generous window to fire. The default
+      # `reannounce_delays_ms: []` in `start_player!/1` means the
+      # AnnouncerStub should never be called.
+      Process.sleep(50)
+      assert AnnouncerStub.calls() == []
+    end
+  end
+
+  # Poll a predicate every 10 ms until it returns true or the timeout
+  # elapses. Used in lieu of a fixed `Process.sleep` so the test
+  # finishes as soon as the scheduled timers have fired, not after a
+  # worst-case sleep.
+  defp eventually(check, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+
+    loop = fn loop ->
+      cond do
+        check.() ->
+          :ok
+
+        System.monotonic_time(:millisecond) >= deadline ->
+          flunk("eventually/2 timed out after #{timeout_ms} ms")
+
+        true ->
+          Process.sleep(10)
+          loop.(loop)
+      end
+    end
+
+    loop.(loop)
   end
 end
