@@ -50,6 +50,12 @@ defmodule UniversalProxy.Audio.Server do
   @pubsub UniversalProxy.PubSub
   @hotplug_interval 5_000
   @mdns_port_base 8928
+  # Service types we always publish — used at boot to send a
+  # pre-emptive TTL=0 PTR goodbye so peers like Music Assistant's
+  # python-zeroconf evict any stale cache from a previous (ungraceful)
+  # shutdown. Without this a hard power-cycle can leave MA stuck for
+  # the full mDNS TTL (~120 s) before it sees a fresh `Added` event.
+  @preemptive_goodbye_types ["_sendspin._tcp"]
   # TCP port range cap. The C++ binary's `--mdns-port` arg has no
   # upper-bound check on the BEAM side, but the kernel rejects bind()
   # with EINVAL for anything > 65535. Capping here turns "binary
@@ -143,6 +149,7 @@ defmodule UniversalProxy.Audio.Server do
 
     player_module = Keyword.get(opts, :player_module, Player)
     mdns_discovery = Keyword.get(opts, :mdns_discovery, MdnsDiscovery)
+    mdns_module = Keyword.get(opts, :mdns_module, MdnsLite)
 
     state = %{
       enumerate_module: enumerate_module,
@@ -150,6 +157,7 @@ defmodule UniversalProxy.Audio.Server do
       player_supervisor: player_supervisor,
       player_module: player_module,
       mdns_discovery: mdns_discovery,
+      mdns_module: mdns_module,
       outputs: %{},
       # %{key => %{pid: pid, monitor: ref, mdns_port: 8928}}
       players: %{},
@@ -198,6 +206,13 @@ defmodule UniversalProxy.Audio.Server do
     # Server-only restarts, but cold-reboot latency scales with the
     # number of active outputs.
     state = terminate_all_players(state)
+
+    # Pre-emptive mDNS goodbye for every service type we publish. After
+    # an ungraceful shutdown we never sent a TTL=0 record, so peers may
+    # still have cached PTR entries pointing at us. Clearing those
+    # caches now means the announces from `Audio.Player.init/1` produce
+    # a fresh `Added` event on peers instead of a silent refresh.
+    send_preemptive_goodbyes(state)
 
     # Start the timer AFTER state is built so a future failure between
     # the two doesn't leak a timer pointing at a soon-to-be-dead PID.
@@ -517,6 +532,30 @@ defmodule UniversalProxy.Audio.Server do
       :audio_enumerate_module,
       UniversalProxy.Audio.Enumerate
     )
+  end
+
+  defp send_preemptive_goodbyes(%{mdns_module: nil}), do: :ok
+
+  defp send_preemptive_goodbyes(state) do
+    Enum.each(@preemptive_goodbye_types, fn type ->
+      try do
+        state.mdns_module.goodbye_for_type(type)
+      rescue
+        e ->
+          Logger.warning(
+            "Audio.Server pre-emptive goodbye for #{type} raised: #{Exception.message(e)}"
+          )
+
+          :ok
+      catch
+        :exit, reason ->
+          Logger.warning(
+            "Audio.Server pre-emptive goodbye for #{type} exited: #{inspect(reason)}"
+          )
+
+          :ok
+      end
+    end)
   end
 
   # -- Player process management --

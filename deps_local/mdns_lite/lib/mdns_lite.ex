@@ -217,6 +217,35 @@ defmodule MdnsLite do
   end
 
   @doc """
+  Emit an mDNS goodbye for a service *type* without requiring the
+  service to be present in the responder's table.
+
+  Useful at boot: after an ungraceful shutdown (hard power-cycle,
+  crash) we never got a chance to send a goodbye for our services,
+  so peer caches like python-zeroconf hold our records for the full
+  TTL. Sending a TTL=0 PTR for the type the moment we come back
+  clears those stale caches; subsequent announces then produce a
+  proper `Added` event on the peer instead of a silent cache
+  refresh.
+
+  The instance is derived from the responder's configured host
+  (`config.instance_name` or `hd(config.hosts)`) — same logic
+  `Table.Builder` uses when building real PTR responses, so the
+  goodbye targets the same name peers actually cached.
+
+  No-op if no responder is running yet.
+
+  > #### Vendored extension {: .info}
+  >
+  > Downstream addition pending an upstream announce/goodbye API in
+  > [`nerves-networking/mdns_lite#213`](https://github.com/nerves-networking/mdns_lite/pull/213).
+  """
+  @spec goodbye_for_type(String.t()) :: :ok
+  def goodbye_for_type(type) when is_binary(type) do
+    MdnsLite.Responder.goodbye_for_type(type)
+  end
+
+  @doc """
   Lookup a hostname using mDNS
 
   The hostname should be a .local name since the query only goes out via mDNS.

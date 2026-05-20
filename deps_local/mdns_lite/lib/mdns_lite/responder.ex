@@ -140,6 +140,25 @@ defmodule MdnsLite.Responder do
   end
 
   @doc """
+  Broadcast a TTL=0 PTR goodbye for a service *type* (e.g.
+  `"_sendspin._tcp"`) using the current host config to derive the
+  instance domain. Does not require the service to be in the table.
+
+  Synchronous call; safe to follow immediately with announces.
+  """
+  @spec goodbye_for_type(String.t()) :: :ok
+  def goodbye_for_type(type) when is_binary(type) do
+    Registry.lookup(MdnsLite.Responders, __MODULE__)
+    |> Enum.each(fn {pid, _} ->
+      try do
+        GenServer.call(pid, {:goodbye_for_type, type}, 1_000)
+      catch
+        :exit, _ -> :ok
+      end
+    end)
+  end
+
+  @doc """
   Leave the mDNS group - close the UDP port. Stop this GenServer.
   """
   @spec stop_server(String.t(), :inet.ip_address()) :: :ok
@@ -295,6 +314,24 @@ defmodule MdnsLite.Responder do
       service -> send_goodbye_for(service, state)
     end
 
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:goodbye_for_type, _type}, _from, %{family: :inet6} = state) do
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:goodbye_for_type, _type}, _from, %{udp: nil} = state) do
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:goodbye_for_type, type}, _from, state) do
+    # Build the instance domain from the configured host, mirroring
+    # what Table.Builder produces when the service is normally
+    # registered. We don't require the service to be in the table —
+    # this is specifically for boot-time pre-emptive goodbyes.
+    config = TableServer.options()
+    send_goodbye_for_type(type, config, state)
     {:reply, :ok, state}
   end
 
@@ -482,6 +519,60 @@ defmodule MdnsLite.Responder do
 
       service_instance_name ->
         to_charlist("#{service_instance_name}.#{service.type}.local")
+    end
+  end
+
+  defp send_goodbye_for_type(type, config, state) do
+    # No per-service instance name available, so we use the host-level
+    # instance (`config.instance_name` or `hd(config.hosts)`). That's
+    # the same instance name `Table.Builder` would have used when our
+    # services were originally advertised — so the TTL=0 PTR will
+    # match what peers actually cached.
+    type_domain = to_charlist("#{type}.local")
+    instance_domain = instance_domain_for_type(type, config)
+
+    rr =
+      dns_rr(
+        domain: type_domain,
+        class: :in,
+        type: :ptr,
+        ttl: 0,
+        data: instance_domain
+      )
+
+    response =
+      dns_rec(
+        header:
+          dns_header(
+            id: 0,
+            qr: true,
+            opcode: :query,
+            aa: true,
+            tc: false,
+            rd: false,
+            ra: false,
+            rcode: 0
+          ),
+        qdlist: [],
+        anlist: [rr],
+        nslist: [],
+        arlist: []
+      )
+
+    data = DNS.encode(response)
+    dest = %{family: state.family, port: @mdns_port, addr: multicast_ip(state.family)}
+    _ = :socket.sendto(state.udp, data, dest)
+    :ok
+  end
+
+  defp instance_domain_for_type(type, config) do
+    case config.instance_name do
+      :unspecified ->
+        host = hd(config.hosts)
+        to_charlist("#{host}.#{type}.local")
+
+      host_instance_name ->
+        to_charlist("#{host_instance_name}.#{type}.local")
     end
   end
 
