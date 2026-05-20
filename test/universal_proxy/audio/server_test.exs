@@ -137,12 +137,16 @@ defmodule UniversalProxy.Audio.ServerTest do
           # `UniversalProxy.Audio.PlayerTest`; `player_supervisor: nil`
           # short-circuits the DynamicSupervisor.start_child path so we
           # don't fork real `sendspin_player` binaries here.
+          # `mdns_module: nil` skips the boot-time pre-emptive goodbye —
+          # MdnsLite isn't running in the test app, and these tests
+          # don't care about the goodbye path.
           name: nil,
           store: store,
           enumerate_module: EnumerateStub,
           start_timer: false,
           player_supervisor: nil,
-          mdns_discovery: nil
+          mdns_discovery: nil,
+          mdns_module: nil
         },
         id: :server
       )
@@ -152,6 +156,96 @@ defmodule UniversalProxy.Audio.ServerTest do
     :ok = Phoenix.PubSub.subscribe(@pubsub, "sendspin:state")
 
     {:ok, server: server, store: store}
+  end
+
+  describe "boot-time pre-emptive mDNS goodbye" do
+    # Ungraceful shutdowns (hard power-cycle, crash) leave peer caches
+    # like python-zeroconf holding our stale records. Without a fresh
+    # goodbye at boot, the announces from re-registered Players just
+    # refresh those cached entries — no `Added` event on peers, so MA
+    # can't discover us until the cache TTL expires (~120 s).
+    defmodule MdnsModuleStub do
+      @moduledoc false
+      use Agent
+
+      def start_link(_opts \\ []) do
+        Agent.start_link(fn -> [] end, name: __MODULE__)
+      end
+
+      def goodbye_for_type(type) do
+        Agent.update(__MODULE__, fn calls -> [{:goodbye_for_type, type} | calls] end)
+        :ok
+      end
+
+      def calls, do: __MODULE__ |> Agent.get(& &1) |> Enum.reverse()
+    end
+
+    test "Server.init calls goodbye_for_type for each configured service type" do
+      start_supervised!(MdnsModuleStub)
+
+      path =
+        Path.join(System.tmp_dir!(), "goodbye_test_#{System.unique_integer([:positive])}.dets")
+
+      on_exit(fn -> File.rm(path) end)
+
+      store =
+        start_supervised!({Store, name: nil, table: :goodbye_store, dets_path: path},
+          id: :goodbye_store
+        )
+
+      _server =
+        start_supervised!(
+          {Server,
+           name: nil,
+           store: store,
+           enumerate_module: EnumerateStub,
+           start_timer: false,
+           player_supervisor: nil,
+           mdns_discovery: nil,
+           mdns_module: MdnsModuleStub},
+          id: :goodbye_server
+        )
+
+      # Server.init is synchronous; calls have already happened by the
+      # time start_supervised!/1 returns.
+      assert {:goodbye_for_type, "_sendspin._tcp"} in MdnsModuleStub.calls()
+    end
+
+    test "Server.init survives goodbye errors without crashing the boot path" do
+      # Simulate the mdns_lite responder being unavailable (e.g. mid-boot
+      # or in a broken target). Server should log + continue, not crash.
+      start_supervised!(MdnsModuleStub)
+
+      defmodule RaisingMdnsModule do
+        @moduledoc false
+        def goodbye_for_type(_type), do: raise("boom")
+      end
+
+      path =
+        Path.join(System.tmp_dir!(), "goodbye_err_#{System.unique_integer([:positive])}.dets")
+
+      on_exit(fn -> File.rm(path) end)
+
+      store =
+        start_supervised!({Store, name: nil, table: :goodbye_err_store, dets_path: path},
+          id: :goodbye_err_store
+        )
+
+      server =
+        start_supervised!(
+          {Server,
+           name: nil,
+           store: store,
+           enumerate_module: EnumerateStub,
+           start_timer: false,
+           player_supervisor: nil,
+           mdns_discovery: nil,
+           mdns_module: RaisingMdnsModule},
+          id: :goodbye_err_server
+        )
+
+      assert Process.alive?(server)
+    end
   end
 
   describe "hotplug add" do
@@ -362,7 +456,8 @@ defmodule UniversalProxy.Audio.ServerTest do
            start_timer: false,
            player_supervisor: player_sup,
            player_module: PlayerStub,
-           mdns_discovery: nil},
+           mdns_discovery: nil,
+           mdns_module: nil},
           id: :lifecycle_server
         )
 
