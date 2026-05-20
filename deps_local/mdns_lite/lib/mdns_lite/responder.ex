@@ -129,8 +129,7 @@ defmodule MdnsLite.Responder do
   """
   @spec goodbye_service(MdnsLite.service_id()) :: :ok
   def goodbye_service(id) do
-    Registry.lookup(MdnsLite.Responders, __MODULE__)
-    |> Enum.each(fn {pid, _} ->
+    each_responder(fn pid ->
       try do
         GenServer.call(pid, {:goodbye_service, id}, 1_000)
       catch
@@ -148,14 +147,27 @@ defmodule MdnsLite.Responder do
   """
   @spec goodbye_for_type(String.t()) :: :ok
   def goodbye_for_type(type) when is_binary(type) do
-    Registry.lookup(MdnsLite.Responders, __MODULE__)
-    |> Enum.each(fn {pid, _} ->
+    each_responder(fn pid ->
       try do
         GenServer.call(pid, {:goodbye_for_type, type}, 1_000)
       catch
         :exit, _ -> :ok
       end
     end)
+  end
+
+  # Run `fun` for every registered Responder. Returns `:ok` without
+  # raising if `:mdns_lite` isn't started yet — `Registry.lookup/2`
+  # raises `ArgumentError` for an unknown registry, which would crash
+  # callers that documented this function as a no-op when the app
+  # isn't running.
+  defp each_responder(fun) do
+    if Process.whereis(MdnsLite.Responders) do
+      Registry.lookup(MdnsLite.Responders, __MODULE__)
+      |> Enum.each(fn {pid, _} -> fun.(pid) end)
+    end
+
+    :ok
   end
 
   @doc """
