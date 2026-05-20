@@ -32,6 +32,7 @@ defmodule UniversalProxyWeb.AudioLive do
 
   import UniversalProxyWeb.Components.UI
   import UniversalProxyWeb.Components.Icons
+  import UniversalProxyWeb.Components.Audio
 
   alias UniversalProxy.Audio
 
@@ -58,9 +59,11 @@ defmodule UniversalProxyWeb.AudioLive do
      |> assign(:outputs, build_outputs_map(outputs))
      # Rename modal state. `rename_target` holds the DOM-encoded key of
      # the card whose name is being edited; `nil` means the modal is
-     # closed. `rename_draft` mirrors the input value live so the char
-     # counter and the save-disabled check stay in sync without a
-     # round-trip per keystroke (we use phx-keyup for that).
+     # closed. `rename_draft` mirrors the input value live (the modal
+     # form uses `phx-change="rename_draft"` so every keystroke
+     # updates the server-side draft; this drives the live char
+     # counter and the save-disabled guard). Cheap enough for a
+     # rename surface that isn't a high-throughput input.
      |> assign(:rename_target, nil)
      |> assign(:rename_draft, "")
      # Per-card "more" disclosure (footer chevron expands to show card
@@ -682,25 +685,6 @@ defmodule UniversalProxyWeb.AudioLive do
   defp as_binary(v) when is_binary(v), do: v
   defp as_binary(_), do: nil
 
-  defp stream_label(nil), do: "Streaming"
-
-  defp stream_label(%{codec: codec, sample_rate: rate, bit_depth: depth}) do
-    parts =
-      [
-        codec && String.upcase(to_string(codec)),
-        rate && "#{div(rate, 1000)} kHz",
-        depth && "#{depth}-bit"
-      ]
-      |> Enum.reject(&is_nil/1)
-
-    case parts do
-      [] -> "Streaming"
-      _ -> Enum.join(parts, " · ")
-    end
-  end
-
-  defp stream_label(_), do: "Streaming"
-
   defp sorted_outputs(outputs) do
     outputs
     |> Map.to_list()
@@ -712,60 +696,6 @@ defmodule UniversalProxyWeb.AudioLive do
       {:ok, _} = ok -> ok
       :error -> {:error, :not_found}
     end
-  end
-
-  # ── Status state machine (mirrors OverviewLive.audio_status/1) ─────
-  # See `OverviewLive.audio_status/1` for the rationale on collapsing
-  # to a single vocabulary (Streaming / Connected / Searching /
-  # Disabled). The two copies are deliberately kept in sync — duplicate
-  # this if you find yourself updating one side.
-  defp audio_status(out) do
-    enabled? = out.enabled
-    connection = Map.get(out, :connection, :unknown)
-    stream = Map.get(out, :stream)
-
-    cond do
-      not enabled? ->
-        %{label: "Disabled", variant: :neutral, tint_var: "var(--hs-fg-4)"}
-
-      connection == :connected and not is_nil(stream) ->
-        %{label: "Streaming", variant: :success, tint_var: "var(--hs-success)"}
-
-      connection == :connected ->
-        %{label: "Connected", variant: :accent, tint_var: "var(--hs-accent)"}
-
-      connection == :disconnected ->
-        %{label: "Searching", variant: :warning, tint_var: "var(--hs-warning)"}
-
-      true ->
-        %{label: "Searching", variant: :warning, tint_var: "var(--hs-warning)"}
-    end
-  end
-
-  defp audio_streaming?(out) do
-    out.enabled and Map.get(out, :connection) == :connected and not is_nil(Map.get(out, :stream))
-  end
-
-  defp audio_connected?(out) do
-    out.enabled and Map.get(out, :connection) == :connected
-  end
-
-  defp speaker_level(volume) when is_integer(volume) and volume > 60, do: 2
-  defp speaker_level(volume) when is_integer(volume) and volume > 0, do: 1
-  defp speaker_level(_), do: 0
-
-  attr(:active, :boolean, required: true)
-
-  defp eq_bars(assigns) do
-    ~H"""
-    <span class={["audio-eq", @active && "audio-eq--active"]}>
-      <span class="audio-eq__bar"></span>
-      <span class="audio-eq__bar"></span>
-      <span class="audio-eq__bar"></span>
-      <span class="audio-eq__bar"></span>
-      <span class="audio-eq__bar"></span>
-    </span>
-    """
   end
 
   # The form passes `id` as a string; reconstitute the tuple via

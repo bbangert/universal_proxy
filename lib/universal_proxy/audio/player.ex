@@ -508,21 +508,35 @@ defmodule UniversalProxy.Audio.Player do
 
   # mDNS allows arbitrary UTF-8 in the *instance* portion of a service
   # name (the FQDN's leftmost label). The wire-format DNS label still
-  # has to be < 64 bytes and we don't want control chars sneaking
-  # through, but spaces, accents, emoji etc. are spec-legal. Falls
-  # back to a stable placeholder so an unexpectedly-empty name doesn't
-  # produce a malformed mDNS RR.
+  # has to be ≤ 63 BYTES (RFC 1035 §2.3.4), not codepoints — multi-byte
+  # UTF-8 sequences (accents, CJK, emoji) easily push past the limit
+  # if we count graphemes. We trim to the byte budget at codepoint
+  # boundaries so the resulting string is always valid UTF-8 and never
+  # produces a malformed mDNS RR. Control chars get stripped first,
+  # and an empty post-clean string falls back to a stable placeholder.
   defp sanitize_instance_name(raw) when is_binary(raw) do
     cleaned =
       raw
       |> String.replace(~r/[[:cntrl:]]/u, "")
       |> String.trim()
-      |> String.slice(0, 63)
+      |> truncate_to_byte_limit(63)
 
     if cleaned == "", do: "sendspin", else: cleaned
   end
 
   defp sanitize_instance_name(_), do: "sendspin"
+
+  defp truncate_to_byte_limit(s, max) when byte_size(s) <= max, do: s
+
+  defp truncate_to_byte_limit(s, max) do
+    s
+    |> String.codepoints()
+    |> Enum.reduce_while({"", 0}, fn cp, {acc, sz} ->
+      new_sz = sz + byte_size(cp)
+      if new_sz > max, do: {:halt, {acc, sz}}, else: {:cont, {acc <> cp, new_sz}}
+    end)
+    |> elem(0)
+  end
 
   defp broadcast_state(%__MODULE__{key: key, pubsub: pubsub}, event) do
     Phoenix.PubSub.broadcast(pubsub, @topic_state, {:sendspin_state, key, event})

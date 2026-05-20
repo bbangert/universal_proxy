@@ -8,6 +8,7 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   import UniversalProxyWeb.Components.UI
   import UniversalProxyWeb.Components.Icons
+  import UniversalProxyWeb.Components.Audio
 
   alias UniversalProxy.Audio
   alias UniversalProxy.Hardware
@@ -915,102 +916,8 @@ defmodule UniversalProxyWeb.OverviewLive do
     Enum.with_index(xs) |> Enum.map(fn {x, i} -> {x, i == n - 1} end)
   end
 
-  # Single source of truth for the audio status state machine — shared
-  # between Overview's summary row and AudioLive's card badge. Returns
-  # the user-visible label, the badge variant, and a CSS variable to
-  # tint the leading row spine.
-  #
-  # The same vocabulary applies in both places (the original "Idle vs
-  # Stopped" split was a footgun — see the design handoff README).
-  defp audio_status(out) do
-    enabled? = out.enabled
-    connection = Map.get(out, :connection, :unknown)
-    stream = Map.get(out, :stream)
-
-    cond do
-      not enabled? ->
-        %{label: "Disabled", variant: :neutral, tint_var: "var(--hs-fg-4)"}
-
-      connection == :connected and not is_nil(stream) ->
-        %{label: "Streaming", variant: :success, tint_var: "var(--hs-success)"}
-
-      connection == :connected ->
-        %{label: "Connected", variant: :accent, tint_var: "var(--hs-accent)"}
-
-      connection == :disconnected ->
-        %{label: "Searching", variant: :warning, tint_var: "var(--hs-warning)"}
-
-      true ->
-        %{label: "Searching", variant: :warning, tint_var: "var(--hs-warning)"}
-    end
-  end
-
-  defp audio_streaming?(out) do
-    out.enabled and Map.get(out, :connection) == :connected and not is_nil(Map.get(out, :stream))
-  end
-
-  defp audio_connected?(out) do
-    out.enabled and Map.get(out, :connection) == :connected
-  end
-
-  # Map a 0-100 volume to the speaker glyph's "wave count" so the
-  # icon visually tracks loudness: silence → no waves, normal → one,
-  # loud → two.
-  defp speaker_level(volume) when is_integer(volume) and volume > 60, do: 2
-  defp speaker_level(volume) when is_integer(volume) and volume > 0, do: 1
-  defp speaker_level(_), do: 0
-
   defp volume_bar_width(false, _muted, _vol), do: 0
   defp volume_bar_width(true, true, _vol), do: 0
   defp volume_bar_width(true, false, vol) when is_integer(vol), do: vol
   defp volume_bar_width(_, _, _), do: 0
-
-  defp stream_label(nil), do: "Streaming"
-
-  defp stream_label(%{} = stream) do
-    parts =
-      [
-        stream
-        |> Map.get(:codec)
-        |> as_label()
-        |> case do
-          nil -> nil
-          codec -> String.upcase(codec)
-        end,
-        stream |> Map.get(:sample_rate) |> as_khz(),
-        stream |> Map.get(:bit_depth) |> as_bit_depth()
-      ]
-      |> Enum.reject(&is_nil/1)
-
-    case parts do
-      [] -> "Streaming"
-      _ -> Enum.join(parts, " · ")
-    end
-  end
-
-  defp stream_label(_), do: "Streaming"
-
-  defp as_label(v) when is_binary(v), do: v
-  defp as_label(_), do: nil
-
-  defp as_khz(v) when is_integer(v) and v > 0, do: "#{div(v, 1000)} kHz"
-  defp as_khz(_), do: nil
-
-  defp as_bit_depth(v) when is_integer(v) and v > 0, do: "#{v}-bit"
-  defp as_bit_depth(_), do: nil
-
-  # Five vertical bars; CSS handles the animation when `active`.
-  attr(:active, :boolean, required: true)
-
-  defp eq_bars(assigns) do
-    ~H"""
-    <span class={["audio-eq", @active && "audio-eq--active"]}>
-      <span class="audio-eq__bar"></span>
-      <span class="audio-eq__bar"></span>
-      <span class="audio-eq__bar"></span>
-      <span class="audio-eq__bar"></span>
-      <span class="audio-eq__bar"></span>
-    </span>
-    """
-  end
 end
