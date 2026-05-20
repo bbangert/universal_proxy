@@ -63,17 +63,17 @@ defmodule UniversalProxy.Audio.Player do
 
   require Logger
 
-  alias UniversalProxy.Audio.{MdnsAnnouncer, Store}
+  alias UniversalProxy.Audio.Store
 
   @pubsub UniversalProxy.PubSub
   @topic_state "sendspin:state"
   @shutdown_grace_ms 500
 
-  # RFC 6762 §8.3 says at least two unsolicited announces, one second
-  # apart, when a service comes up. mdns_lite 0.9.1 sends zero (see
-  # `Audio.MdnsAnnouncer` @moduledoc), so we spread three over the
-  # first ~5 s to cover discovery-loop windows on peers like Music
-  # Assistant.
+  # RFC 6762 §8.3 announces. We call `MdnsLite.announce_all/0` (added
+  # in our vendored fork) to emit proper multicast response packets
+  # from port 5353 with TTL>0 — exactly the shape peers like Music
+  # Assistant's `python-zeroconf` accept. Spaced over the first few
+  # seconds to cover initial peer-discovery jitter.
   @reannounce_delays_ms [500, 1_500, 3_500]
 
   defstruct [
@@ -84,7 +84,6 @@ defmodule UniversalProxy.Audio.Player do
     :server_url,
     :pubsub,
     :mdns_module,
-    :mdns_announcer,
     port: nil,
     mdns_id: nil,
     last_event: %{},
@@ -99,7 +98,6 @@ defmodule UniversalProxy.Audio.Player do
           server_url: String.t() | nil,
           pubsub: module(),
           mdns_module: module(),
-          mdns_announcer: module(),
           port: port() | nil,
           mdns_id: term(),
           last_event: map(),
@@ -168,7 +166,6 @@ defmodule UniversalProxy.Audio.Player do
     server_url = Keyword.get(opts, :server_url)
     pubsub = Keyword.get(opts, :pubsub, @pubsub)
     mdns_module = Keyword.get(opts, :mdns_module, MdnsLite)
-    mdns_announcer = Keyword.get(opts, :mdns_announcer, MdnsAnnouncer)
 
     state = %__MODULE__{
       key: key,
@@ -177,8 +174,7 @@ defmodule UniversalProxy.Audio.Player do
       mdns_port: mdns_port,
       server_url: server_url,
       pubsub: pubsub,
-      mdns_module: mdns_module,
-      mdns_announcer: mdns_announcer
+      mdns_module: mdns_module
     }
 
     cond do
@@ -282,10 +278,13 @@ defmodule UniversalProxy.Audio.Player do
   end
 
   def handle_info(:reannounce, state) do
-    # Workaround for mdns_lite 0.9.1 not implementing RFC 6762 §8.3.
-    # See `Audio.MdnsAnnouncer` @moduledoc. Failure is non-fatal —
-    # peers will discover via their next poll cycle in the worst case.
-    _ = state.mdns_announcer.announce()
+    # Trigger our vendored `MdnsLite.announce_all/0` (RFC 6762 §8.3
+    # unsolicited announce). The library multicasts a proper response
+    # packet via the responder's own socket — source port 5353, every
+    # registered service type. Peer cache update + `Added` callback on
+    # python-zeroconf et al. should fire from this. Failure is
+    # non-fatal: peers fall back to discovery on their next poll.
+    _ = state.mdns_module.announce_all()
     {:noreply, state}
   end
 
@@ -318,6 +317,28 @@ defmodule UniversalProxy.Audio.Player do
     end
 
     if state.mdns_id do
+      # Send a TTL=0 PTR goodbye BEFORE removing the service from the
+      # responder's table. Without this, peer caches like
+      # python-zeroconf hold our records for their full TTL — and a
+      # subsequent unsolicited announce on re-enable is treated as a
+      # cache refresh, never producing an `Added` callback. Music
+      # Assistant therefore never re-discovers the player until its
+      # cache TTL expires (default 120 s). With the goodbye, peers
+      # evict the records immediately and the next announce produces
+      # the `Added` event MA listens for.
+      #
+      # `goodbye_service/1` (vendored extension to mdns_lite) routes
+      # the response through the responder's port-5353 socket, which
+      # is the source port RFC 6762 §6 requires for response packets.
+      _ =
+        try do
+          state.mdns_module.goodbye_service(state.mdns_id)
+        rescue
+          _ -> :ok
+        catch
+          :exit, _ -> :ok
+        end
+
       # Best-effort. `remove_mdns_service/1` is a GenServer.call into
       # MdnsLite — if MdnsLite is stopped or restarting during our
       # shutdown, the call exits (`:noproc` / `:timeout`) rather than
