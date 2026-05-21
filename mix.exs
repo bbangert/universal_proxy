@@ -54,7 +54,14 @@ defmodule UniversalProxy.MixProject do
       setup: ["deps.get", "assets.setup", "assets.build"],
       "assets.setup": ["tailwind.install --if-missing", "esbuild.install --if-missing"],
       "assets.build": ["tailwind default", "esbuild default"],
-      "assets.deploy": ["tailwind default --minify", "esbuild default --minify", "phx.digest"]
+      "assets.deploy": ["tailwind default --minify", "esbuild default --minify", "phx.digest"],
+      # Convenience target: deploy assets, THEN build firmware. Without
+      # the assets.deploy step, Tailwind class additions ship in source
+      # but not in the served CSS — `mix firmware` embeds whatever
+      # bundle is already in `priv/static/assets/` at build time.
+      # Use this instead of bare `mix firmware` whenever frontend
+      # tokens or class names have changed.
+      "firmware.deploy": ["assets.deploy", "firmware"]
     ]
   end
 

@@ -163,6 +163,65 @@ defmodule UniversalProxyWeb.Components.Icons do
     """
   end
 
+  defp paths(:pencil) do
+    assigns = %{}
+
+    ~H"""
+    <path d="M12 20h9" />
+    <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z" />
+    """
+  end
+
+  defp paths(:more) do
+    assigns = %{}
+
+    ~H"""
+    <circle cx="5" cy="12" r="1" fill="currentColor" />
+    <circle cx="12" cy="12" r="1" fill="currentColor" />
+    <circle cx="19" cy="12" r="1" fill="currentColor" />
+    """
+  end
+
+  defp paths(:copy) do
+    assigns = %{}
+
+    ~H"""
+    <rect x="9" y="9" width="13" height="13" rx="2" />
+    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+    """
+  end
+
+  # Speaker glyph with mute slash + wave-count variants. Drawn here
+  # rather than as a `paths/1` clause because the wave count depends
+  # on volume level (0 → no waves, 1+ → one wave, 60+ → two waves),
+  # which is a per-call decision the caller makes.
+  attr(:size, :integer, default: 22)
+  attr(:muted, :boolean, default: false)
+  attr(:level, :integer, default: 1)
+  attr(:stroke, :float, default: 1.7)
+  attr(:class, :string, default: nil)
+
+  def speaker_glyph(assigns) do
+    ~H"""
+    <svg
+      width={@size}
+      height={@size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width={@stroke}
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      class={@class}
+    >
+      <path d="M3 9v6h3l5 4V5L6 9H3z" />
+      <path :if={not @muted and @level >= 1} d="M15 9a4 4 0 0 1 0 6" />
+      <path :if={not @muted and @level >= 2} d="M18 6a8 8 0 0 1 0 12" />
+      <path :if={@muted} d="M16 9l5 6M21 9l-5 6" />
+    </svg>
+    """
+  end
+
   # Port-kind glyphs (drawn separately from outline icons since they have
   # mixed fills/strokes and meaningful color tints).
   attr(:kind, :atom, required: true)

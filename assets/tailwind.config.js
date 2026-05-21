@@ -45,6 +45,8 @@ module.exports = {
         "warning-soft": "var(--hs-warning-soft)",
         danger: "var(--hs-danger)",
         "danger-soft": "var(--hs-danger-soft)",
+        audio: "var(--hs-audio)",
+        "audio-soft": "var(--hs-audio-soft)",
 
         // Port-kind tints (used in traffic stream, dot indicators, sparklines)
         zwave: "#7c4dff",

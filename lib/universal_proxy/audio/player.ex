@@ -441,15 +441,36 @@ defmodule UniversalProxy.Audio.Player do
   end
 
   defp register_mdns(%__MODULE__{key: key, config: cfg, mdns_port: port, mdns_module: mod}) do
+    friendly_name = Map.fetch!(cfg, :friendly_name)
+    client_id = Map.fetch!(cfg, :client_id)
+
+    # Set the mDNS *instance name* to the user-facing friendly name.
+    # Without this, all our `_sendspin._tcp` services share the host's
+    # default instance name (e.g. `nerves-507f._sendspin._tcp.local`),
+    # which means:
+    #   1. Music Assistant's python-zeroconf can't distinguish two
+    #      ALSA outputs on the same Pi — they collide on the instance
+    #      name.
+    #   2. Renaming an output doesn't change the instance name, so
+    #      MA's `_handle_service_added` sees no service-instance
+    #      change and its UI keeps showing the old name forever.
+    # By setting instance_name = friendly_name we get a clean
+    # Removed/Added cycle on rename, and the new name lands in MA's
+    # display the next time it processes the Added event.
+    #
+    # `sanitize_instance_name/1` strips control chars and trims; the
+    # mDNS wire format allows arbitrary UTF-8 in instance names, so
+    # spaces, accents, etc. are fine and don't need escaping.
     service = %{
       id: mdns_service_id(key),
+      instance_name: sanitize_instance_name(friendly_name),
       protocol: "sendspin",
       transport: "tcp",
       port: port,
       txt_payload: [
         "path=/sendspin",
-        "name=#{Map.fetch!(cfg, :friendly_name)}",
-        "client_id=#{Map.fetch!(cfg, :client_id)}"
+        "name=#{friendly_name}",
+        "client_id=#{client_id}"
       ]
     }
 
@@ -483,6 +504,38 @@ defmodule UniversalProxy.Audio.Player do
 
   defp mdns_service_id({slot_sub, vid, pid}) do
     {:sendspin_player, slot_sub, vid, pid}
+  end
+
+  # mDNS allows arbitrary UTF-8 in the *instance* portion of a service
+  # name (the FQDN's leftmost label). The wire-format DNS label still
+  # has to be ≤ 63 BYTES (RFC 1035 §2.3.4), not codepoints — multi-byte
+  # UTF-8 sequences (accents, CJK, emoji) easily push past the limit
+  # if we count graphemes. We trim to the byte budget at codepoint
+  # boundaries so the resulting string is always valid UTF-8 and never
+  # produces a malformed mDNS RR. Control chars get stripped first,
+  # and an empty post-clean string falls back to a stable placeholder.
+  defp sanitize_instance_name(raw) when is_binary(raw) do
+    cleaned =
+      raw
+      |> String.replace(~r/[[:cntrl:]]/u, "")
+      |> String.trim()
+      |> truncate_to_byte_limit(63)
+
+    if cleaned == "", do: "sendspin", else: cleaned
+  end
+
+  defp sanitize_instance_name(_), do: "sendspin"
+
+  defp truncate_to_byte_limit(s, max) when byte_size(s) <= max, do: s
+
+  defp truncate_to_byte_limit(s, max) do
+    s
+    |> String.codepoints()
+    |> Enum.reduce_while({"", 0}, fn cp, {acc, sz} ->
+      new_sz = sz + byte_size(cp)
+      if new_sz > max, do: {:halt, {acc, sz}}, else: {:cont, {acc <> cp, new_sz}}
+    end)
+    |> elem(0)
   end
 
   defp broadcast_state(%__MODULE__{key: key, pubsub: pubsub}, event) do

@@ -126,6 +126,56 @@ defmodule UniversalProxy.Audio.PlayerTest do
       assert service.port == 18_928
       assert "name=Headphones" in service.txt_payload
       assert "client_id=deadbeef" in service.txt_payload
+      # instance_name = friendly_name (sanitized) so each output gets
+      # its own mDNS instance instead of colliding on the host's
+      # default. Renames produce a clean Removed/Added cycle on peer
+      # caches like avahi.
+      assert service.instance_name == "Headphones"
+    end
+
+    test "mDNS instance_name truncates by BYTES, not graphemes" do
+      # DNS labels are limited to 63 bytes on the wire (RFC 1035
+      # §2.3.4). A friendly name full of multi-byte UTF-8 codepoints
+      # (e.g. CJK characters at 3 bytes each, emoji at 4) can exceed
+      # the byte budget even when its grapheme/codepoint count is
+      # well below 63. We truncate at codepoint boundaries so the
+      # resulting string is valid UTF-8 AND ≤ 63 bytes.
+      #
+      # 30 × 3-byte chars = 90 bytes. After byte-truncation we expect
+      # at most 21 chars (21 × 3 = 63) and byte_size ≤ 63.
+      long_name = String.duplicate("漢", 30)
+      assert byte_size(long_name) == 90
+
+      _pid =
+        start_player!(
+          config: Map.put(config(), :friendly_name, long_name),
+          mdns_port: 18_900
+        )
+
+      assert_receive {:sendspin_state, @key, _started}, 2_000
+
+      [{:add, service}] = MdnsStub.calls()
+      assert byte_size(service.instance_name) <= 63
+      assert String.valid?(service.instance_name)
+      # The first 21 chars of the original are what fits — verify we
+      # kept the prefix rather than mangling the boundary.
+      assert String.starts_with?(long_name, service.instance_name)
+    end
+
+    test "mDNS instance_name falls back to a placeholder when blank" do
+      # All-whitespace / all-control-chars / empty name after clean-up
+      # would produce a zero-byte DNS label, which mdns_lite rejects.
+      # We substitute "sendspin" instead.
+      _pid =
+        start_player!(
+          config: Map.put(config(), :friendly_name, "   \t\r\n  "),
+          mdns_port: 18_901
+        )
+
+      assert_receive {:sendspin_state, @key, _started}, 2_000
+
+      [{:add, service}] = MdnsStub.calls()
+      assert service.instance_name == "sendspin"
     end
 
     test "refuses to start when the binary is missing" do

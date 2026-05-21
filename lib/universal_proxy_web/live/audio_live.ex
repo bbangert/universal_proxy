@@ -19,6 +19,11 @@ defmodule UniversalProxyWeb.AudioLive do
   URL-safe base64 of `:erlang.term_to_binary/1` and decoded with
   `[:safe]` on the way back in. The shape is asserted post-decode so a
   malformed param surfaces as an ignored event, never as a crash.
+
+  Renames open a confirm modal because every save re-advertises over
+  mDNS, which momentarily disconnects any paired Sendspin server. The
+  earlier inline-blur rename pattern made accidental clicks user-
+  hostile; the modal forces an explicit commit step.
   """
 
   use UniversalProxyWeb, :live_view
@@ -26,6 +31,8 @@ defmodule UniversalProxyWeb.AudioLive do
   require Logger
 
   import UniversalProxyWeb.Components.UI
+  import UniversalProxyWeb.Components.Icons
+  import UniversalProxyWeb.Components.Audio
 
   alias UniversalProxy.Audio
 
@@ -49,30 +56,70 @@ defmodule UniversalProxyWeb.AudioLive do
      socket
      |> assign(:page_title, "Audio")
      |> assign(:friendly_name_max, @friendly_name_max)
-     |> assign(:outputs, build_outputs_map(outputs))}
+     |> assign(:outputs, build_outputs_map(outputs))
+     # Rename modal state. `rename_target` holds the DOM-encoded key of
+     # the card whose name is being edited; `nil` means the modal is
+     # closed. `rename_draft` mirrors the input value live (the modal
+     # form uses `phx-change="rename_draft"` so every keystroke
+     # updates the server-side draft; this drives the live char
+     # counter and the save-disabled guard). Cheap enough for a
+     # rename surface that isn't a high-throughput input.
+     |> assign(:rename_target, nil)
+     |> assign(:rename_draft, "")
+     # Per-card "more" disclosure (footer chevron expands to show card
+     # index + client_id). Tracking as a MapSet keyed on the same
+     # encoded ids the cards use.
+     |> assign(:more_open, MapSet.new())}
   end
 
   @impl true
-  def handle_event("rename", %{"key" => id, "name" => raw_name}, socket) do
-    with {:ok, key} <- decode_key(id),
-         {:ok, name} <- sanitize_friendly_name(raw_name) do
+  def handle_event("open_rename", %{"id" => id}, socket) do
+    case fetch_output(socket, id) do
+      {:ok, output} ->
+        {:noreply,
+         socket
+         |> assign(:rename_target, id)
+         |> assign(:rename_draft, output.friendly_name)}
+
+      {:error, :not_found} ->
+        {:noreply, socket}
+    end
+  end
+
+  def handle_event("cancel_rename", _params, socket) do
+    {:noreply, close_rename(socket)}
+  end
+
+  def handle_event("rename_draft", %{"value" => raw}, socket) do
+    {:noreply, assign(socket, :rename_draft, clean_friendly_name(raw))}
+  end
+
+  def handle_event("confirm_rename", _params, socket) do
+    with id when is_binary(id) <- socket.assigns.rename_target,
+         {:ok, key} <- decode_key(id),
+         {:ok, output} <- fetch_output(socket, id),
+         {:ok, name} <- sanitize_friendly_name(socket.assigns.rename_draft),
+         true <- name != output.friendly_name do
       case Audio.update_config(key, %{friendly_name: name}) do
         :ok ->
-          {:noreply, socket}
+          {:noreply, close_rename(socket)}
 
         {:error, reason} ->
           Logger.warning("Audio rename failed for #{inspect(key)}: #{inspect(reason)}")
-          {:noreply, put_flash(socket, :error, "Rename failed: #{inspect(reason)}")}
+
+          {:noreply,
+           socket
+           |> close_rename()
+           |> put_flash(:error, "Rename failed: #{inspect(reason)}")}
       end
     else
-      {:error, :invalid_key} ->
-        {:noreply, socket}
+      # `name == current name` returns `false` from the guard above —
+      # treat as a soft cancel so the user isn't stuck.
+      false ->
+        {:noreply, close_rename(socket)}
 
-      {:error, :empty_name} ->
-        # Empty / whitespace-only — silently ignore, leave the existing
-        # name as-is. The current value is still in assigns and the
-        # PubSub broadcast we'd otherwise echo never happens.
-        {:noreply, socket}
+      _ ->
+        {:noreply, close_rename(socket)}
     end
   end
 
@@ -121,13 +168,34 @@ defmodule UniversalProxyWeb.AudioLive do
     end
   end
 
+  def handle_event("toggle_more", %{"id" => id}, socket) do
+    {:noreply,
+     update(socket, :more_open, fn open ->
+       if MapSet.member?(open, id) do
+         MapSet.delete(open, id)
+       else
+         MapSet.put(open, id)
+       end
+     end)}
+  end
+
   @impl true
   def handle_info({:sendspin_output_added, output}, socket) do
     {:noreply, update(socket, :outputs, &Map.put(&1, encode_key(output.key), build_card(output)))}
   end
 
   def handle_info({:sendspin_output_removed, %{key: key}}, socket) do
-    {:noreply, update(socket, :outputs, &Map.delete(&1, encode_key(key)))}
+    id = encode_key(key)
+
+    socket =
+      socket
+      |> update(:outputs, &Map.delete(&1, id))
+      |> update(:more_open, &MapSet.delete(&1, id))
+
+    socket =
+      if socket.assigns.rename_target == id, do: close_rename(socket), else: socket
+
+    {:noreply, socket}
   end
 
   def handle_info({:sendspin_state, key, partial}, socket) do
@@ -150,37 +218,62 @@ defmodule UniversalProxyWeb.AudioLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <div class="max-w-[960px] mx-auto space-y-4">
-      <div>
-        <.eyebrow>Audio</.eyebrow>
-        <h2 class="text-xl font-semibold mt-1 mb-1.5 text-fg-1">
-          Sendspin players
-        </h2>
-        <p class="text-base text-fg-2 m-0">
-          Each ALSA output is advertised as an independent Sendspin player on the LAN.
-          Music Assistant (or any Sendspin server) can group them with players on other devices.
-        </p>
-      </div>
+    <div class="max-w-[960px] mx-auto">
+      <.audio_header count={map_size(@outputs)} />
 
       <.empty_state :if={map_size(@outputs) == 0} />
 
-      <div :if={map_size(@outputs) > 0} class="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div
+        :if={map_size(@outputs) > 0}
+        class="grid grid-cols-1 [grid-template-columns:repeat(auto-fit,minmax(420px,1fr))] gap-4"
+      >
         <.output_card
           :for={{id, output} <- sorted_outputs(@outputs)}
           id={id}
           output={output}
-          name_max={@friendly_name_max}
+          more_open?={MapSet.member?(@more_open, id)}
         />
       </div>
+    </div>
+
+    <.rename_modal
+      :if={@rename_target}
+      target={@rename_target}
+      draft={@rename_draft}
+      current={current_name(@outputs, @rename_target)}
+      max={@friendly_name_max}
+    />
+    """
+  end
+
+  attr(:count, :integer, required: true)
+
+  defp audio_header(assigns) do
+    ~H"""
+    <div class="mb-5">
+      <.eyebrow>Audio</.eyebrow>
+      <h2 class="text-xl font-semibold mt-1 mb-1.5 text-fg-1 flex items-center gap-2.5">
+        Sendspin players
+        <span :if={@count > 0} class="text-sm font-medium text-fg-3">
+          · {@count} {if @count == 1, do: "output", else: "outputs"}
+        </span>
+      </h2>
+      <p class="text-base text-fg-2 m-0 max-w-[640px]">
+        Each ALSA output is advertised as an independent Sendspin player on the LAN.
+        Music Assistant (or any Sendspin server) can group them with players on other devices.
+      </p>
     </div>
     """
   end
 
   defp empty_state(assigns) do
     ~H"""
-    <.card padding={:lg} class="text-center">
-      <div class="text-base font-semibold text-fg-1">No audio outputs detected</div>
-      <p class="text-sm text-fg-2 mt-1 m-0">
+    <.card padding={:lg} class="text-center !p-9">
+      <div class="w-12 h-12 rounded-md bg-audio-soft text-audio mx-auto mb-3 flex items-center justify-center">
+        <.speaker_glyph size={26} />
+      </div>
+      <div class="text-md font-semibold text-fg-1">No audio outputs detected</div>
+      <p class="text-sm text-fg-2 mt-1.5 m-0">
         Connect a supported audio device, or check that <span class="font-mono">dtparam=audio=on</span>
         is set in the boot config. The list refreshes automatically.
       </p>
@@ -190,125 +283,314 @@ defmodule UniversalProxyWeb.AudioLive do
 
   attr(:id, :string, required: true)
   attr(:output, :map, required: true)
-  attr(:name_max, :integer, required: true)
+  attr(:more_open?, :boolean, required: true)
 
+  # Single player card. Layout is a vertical flex with three logical
+  # blocks:
+  #
+  #   1. Header (variable height — wraps when the ALSA path is long)
+  #   2. Anchored middle block (stream banner + volume row) — pushes
+  #      itself to the bottom via `mt-auto` so volume sliders stay
+  #      horizontally aligned across a row of cards whose headers
+  #      wrap to different heights.
+  #   3. Footer (enable toggle + more disclosure) — stuck under the
+  #      anchored block.
+  #
+  # A 3px left status spine runs the full card height for at-a-glance
+  # state. The whole card fades to 70% opacity when the output is
+  # disabled.
   defp output_card(assigns) do
+    assigns =
+      assigns
+      |> assign(:status, audio_status(assigns.output))
+      |> assign(:streaming?, audio_streaming?(assigns.output))
+      |> assign(:connected?, audio_connected?(assigns.output))
+
     ~H"""
-    <.card padding={:lg} class="space-y-4">
-      <div class="flex items-start gap-3">
-        <div class="flex-1 min-w-0">
-          <form phx-submit="rename" class="flex items-center gap-2">
-            <input type="hidden" name="key" value={@id} />
-            <input
-              type="text"
-              name="name"
-              value={@output.friendly_name}
-              phx-blur="rename"
-              maxlength={@name_max}
-              class="flex-1 min-w-0 px-2 py-1 -mx-2 -my-1 text-md font-semibold tracking-tight
-                     bg-transparent text-fg-1 rounded-sm
-                     border border-transparent hover:border-border-1 focus:border-accent
-                     focus:bg-surface focus:shadow-focus outline-none transition-colors"
+    <.card
+      padding={:none}
+      class={"relative flex flex-col overflow-hidden transition-opacity duration-200 #{if @output.enabled, do: "", else: "opacity-70"}"}
+    >
+      <%!-- Left status spine --%>
+      <div
+        class="absolute inset-y-0 left-0 w-[3px]"
+        style={"background: #{@status.tint_var}; opacity: #{if @output.enabled, do: 1, else: 0.4};"}
+      >
+      </div>
+
+      <%!-- Header --%>
+      <div class="pt-[18px] pr-5 pb-0 pl-[22px]">
+        <div class="flex items-start gap-3.5">
+          <div class={[
+            "w-11 h-11 rounded-md flex items-center justify-center flex-none",
+            if(@output.enabled, do: "bg-audio-soft text-audio", else: "bg-sunken text-fg-4")
+          ]}>
+            <.speaker_glyph
+              size={24}
+              muted={@output.muted}
+              level={speaker_level(@output.volume)}
             />
-          </form>
-          <div class="text-sm text-fg-3 mt-1">
-            <span class="font-mono">{@output.alsa_device}</span> · {@output.card_name}
           </div>
+          <div class="flex-1 min-w-0">
+            <button
+              type="button"
+              phx-click="open_rename"
+              phx-value-id={@id}
+              aria-label={"Rename #{@output.friendly_name}"}
+              class="group inline-flex items-center gap-1.5 -mx-2 -my-1 px-2 py-1 rounded-sm
+                     border border-transparent hover:border-border-1
+                     bg-transparent cursor-pointer transition-colors text-left"
+            >
+              <span class="text-md font-semibold text-fg-1">{@output.friendly_name}</span>
+              <span class="text-fg-3 opacity-45 group-hover:opacity-100 transition-opacity inline-flex">
+                <.icon name={:pencil} size={13} />
+              </span>
+            </button>
+            <div class="text-xs text-fg-3 mt-1">
+              <span class="font-mono">{@output.alsa_device}</span>
+              <span class="mx-1.5">·</span>
+              <span>{@output.card_name}</span>
+            </div>
+          </div>
+          <.badge variant={@status.variant} dot>{@status.label}</.badge>
         </div>
-        <.status_badge
-          connection={@output.connection}
-          stream={@output.stream}
-          enabled={@output.enabled}
-        />
       </div>
 
-      <dl class="m-0 grid grid-cols-[110px_1fr] gap-x-3 gap-y-1.5 text-sm">
-        <dt class="text-fg-3">Stream</dt>
-        <dd class="m-0 text-fg-1">{stream_label(@output.stream)}</dd>
-        <dt class="text-fg-3">Group</dt>
-        <dd class="m-0 text-fg-2">{@output.group || "—"}</dd>
-        <dt class="text-fg-3">Client id</dt>
-        <dd class="m-0 text-fg-2 font-mono text-[11px] truncate">{@output.client_id}</dd>
-      </dl>
+      <%!-- Anchored middle block: stream banner + volume row.
+           `mt-auto` makes the block stick to the card's bottom edge
+           above the footer, so volume sliders align across rows. --%>
+      <div class="mt-auto pt-3.5 px-5 pb-3 pl-[22px]">
+        <.stream_banner output={@output} streaming?={@streaming?} connected?={@connected?} />
 
-      <div class="space-y-2">
-        <div class="flex items-center justify-between">
-          <label class="text-sm font-medium text-fg-2" for={"vol-#{@id}"}>Volume</label>
-          <span class="text-sm tabular-nums text-fg-1">{@output.volume}</span>
-        </div>
-        <form phx-change="set_volume">
-          <input type="hidden" name="key" value={@id} />
-          <input
-            type="range"
-            id={"vol-#{@id}"}
-            name="value"
-            min="0"
-            max="100"
-            value={@output.volume}
-            phx-debounce="200"
-            disabled={not @output.enabled}
-            class="w-full"
-          />
-        </form>
-      </div>
-
-      <div class="flex items-center justify-between pt-1">
-        <div class="flex items-center gap-3">
-          <.toggle
-            checked={@output.muted}
+        <div class="mt-4 flex items-center gap-3">
+          <button
+            type="button"
             phx-click="toggle_mute"
             phx-value-id={@id}
             disabled={not @output.enabled}
-          />
-          <span class="text-sm text-fg-2">{if @output.muted, do: "Muted", else: "Unmuted"}</span>
-        </div>
-        <div class="flex items-center gap-3">
-          <.toggle checked={@output.enabled} phx-click="toggle_enabled" phx-value-id={@id} />
-          <span class="text-sm text-fg-2">{if @output.enabled, do: "Enabled", else: "Disabled"}</span>
+            title={if @output.muted, do: "Unmute", else: "Mute"}
+            class={[
+              "w-9 h-9 rounded-md border border-border-1 flex items-center justify-center flex-none",
+              if(@output.muted,
+                do: "bg-warning-soft text-warning",
+                else: "bg-surface text-fg-2"
+              ),
+              if(@output.enabled, do: "cursor-pointer", else: "cursor-not-allowed")
+            ]}
+          >
+            <.speaker_glyph
+              size={18}
+              muted={@output.muted}
+              level={speaker_level(@output.volume)}
+            />
+          </button>
+          <form phx-change="set_volume" class="flex-1 min-w-0">
+            <input type="hidden" name="key" value={@id} />
+            <input
+              type="range"
+              name="value"
+              min="0"
+              max="100"
+              value={@output.volume}
+              phx-debounce="200"
+              disabled={not @output.enabled or @output.muted}
+              class="audio-volume"
+              style={"--vol: #{@output.volume};"}
+              aria-label={"Volume for #{@output.friendly_name}"}
+            />
+          </form>
+          <div class="text-md font-semibold font-mono tabular-nums text-fg-1 min-w-9 text-right">
+            {@output.volume}
+          </div>
         </div>
       </div>
 
-      <div :if={@output.last_error} class="text-xs text-danger">{@output.last_error}</div>
+      <%!-- Footer --%>
+      <div class="flex items-center gap-3 pt-3 pr-5 pb-3 pl-[22px] border-t border-border-2 bg-sunken">
+        <.toggle checked={@output.enabled} phx-click="toggle_enabled" phx-value-id={@id} />
+        <span class="text-sm text-fg-2">
+          {if @output.enabled, do: "Output enabled", else: "Output disabled"}
+        </span>
+        <div class="flex-1"></div>
+        <button
+          type="button"
+          phx-click="toggle_more"
+          phx-value-id={@id}
+          aria-label="Show details"
+          aria-expanded={@more_open?}
+          class="text-fg-3 hover:text-fg-2 p-1.5 rounded-sm flex items-center cursor-pointer bg-transparent border-none"
+        >
+          <.icon name={:more} size={16} />
+        </button>
+      </div>
+
+      <%!-- Disclosure: card index + client id (mono) + copy --%>
+      <div
+        :if={@more_open?}
+        class="px-[22px] pt-2.5 pb-3.5 border-t border-border-2 bg-sunken
+               grid grid-cols-[auto_1fr_auto] gap-x-3 gap-y-1 items-center text-[11px] text-fg-3"
+      >
+        <span>Card</span>
+        <span class="font-mono text-fg-2">{@output.card_index}</span>
+        <span></span>
+        <span>Client ID</span>
+        <span class="font-mono text-fg-2 truncate">{@output.client_id}</span>
+        <button
+          type="button"
+          phx-hook="CopyToClipboard"
+          data-clipboard={@output.client_id}
+          id={"copy-client-#{@id}"}
+          class="text-accent text-[11px] cursor-pointer bg-transparent border-none p-0"
+        >
+          Copy
+        </button>
+      </div>
+
+      <%!-- Last-error footnote (only when present) --%>
+      <div
+        :if={@output.last_error}
+        class="px-[22px] py-2 border-t border-border-2 bg-danger-soft text-danger text-xs"
+      >
+        {@output.last_error}
+      </div>
     </.card>
     """
   end
 
-  attr(:connection, :atom, required: true)
-  attr(:stream, :any, required: true)
-  attr(:enabled, :boolean, required: true)
-
-  # The Sendspin client keeps its WebSocket open to the server between
-  # songs, so `:connection == :connected` stays true even when no audio
-  # is flowing. "Streaming" requires the additional signal that a
-  # `stream_start` event landed without a subsequent `stream_end` —
-  # tracked as `:stream` in `Audio.Server`'s `connection_state` map.
+  # Stream banner: colored block under the header that summarizes the
+  # player's connection state in plain language. Four states:
   #
-  # `:unknown` connection (enabled, no event yet) renders as "Idle" on
-  # this page — the nuance matters here because the user is on a screen
-  # dedicated to audio playback, where "could stream if a server
-  # appears" is the meaningful state. OverviewLive renders the same
-  # state as "Stopped" to match the existing UART-row vocabulary
-  # ("Active / Idle / Stopped"); the two phrasings are deliberate.
-  defp status_badge(assigns) do
-    cond do
-      not assigns.enabled ->
-        ~H"<.badge variant={:neutral} dot>Disabled</.badge>"
+  #   * Streaming (audio-tint-soft + animated EQ + codec/rate label)
+  #   * Connected (accent-soft + pause icon + "paused on server")
+  #   * Searching (sunken + static low EQ + "waiting for a server")
+  #   * Disabled  (sunken + static low EQ + "won't advertise")
+  attr(:output, :map, required: true)
+  attr(:streaming?, :boolean, required: true)
+  attr(:connected?, :boolean, required: true)
 
-      assigns.connection == :connected and not is_nil(assigns.stream) ->
-        ~H"<.badge variant={:success} dot>Streaming</.badge>"
+  defp stream_banner(assigns) do
+    ~H"""
+    <div class={[
+      "px-3 py-2.5 rounded-md flex items-center gap-2.5",
+      cond do
+        @streaming? -> "bg-audio-soft text-audio"
+        @connected? -> "bg-accent-soft text-accent"
+        true -> "bg-sunken text-fg-2"
+      end
+    ]}>
+      <%= cond do %>
+        <% @streaming? -> %>
+          <.eq_bars active={true} />
+        <% @connected? -> %>
+          <.icon name={:pause} size={14} stroke={2.0} />
+        <% true -> %>
+          <.eq_bars active={false} />
+      <% end %>
 
-      assigns.connection == :connected ->
-        ~H"<.badge variant={:accent} dot>Connected</.badge>"
+      <div class={["text-xs flex-1", (@streaming? or @connected?) && "font-semibold"]}>
+        <%= cond do %>
+          <% @streaming? -> %>
+            {stream_label(@output.stream)}
+          <% @connected? -> %>
+            Connected — paused on server
+          <% @output.enabled -> %>
+            Waiting for a Sendspin server on the LAN…
+          <% true -> %>
+            Output disabled — won't advertise on the network.
+        <% end %>
+      </div>
 
-      assigns.connection == :disconnected ->
-        ~H"<.badge variant={:warning} dot>Searching</.badge>"
+      <div
+        :if={@output.group}
+        class="text-[11px] text-fg-3 flex items-center gap-1.5 font-normal"
+      >
+        <span class="w-1.5 h-1.5 rounded-full bg-fg-3"></span>
+        Group: <span class="text-fg-2 font-medium">{@output.group}</span>
+      </div>
+    </div>
+    """
+  end
 
-      true ->
-        ~H"<.badge variant={:neutral} dot>Idle</.badge>"
-    end
+  # Rename confirm modal. The form is owned by the LiveView — keystrokes
+  # flow through `rename_draft` and the actual commit is `confirm_rename`.
+  # Escape and the backdrop click both cancel via the existing modal
+  # component's `on_close` behavior.
+  attr(:target, :string, required: true)
+  attr(:draft, :string, required: true)
+  attr(:current, :string, required: true)
+  attr(:max, :integer, required: true)
+
+  defp rename_modal(assigns) do
+    assigns =
+      assigns
+      |> assign(:cleaned, clean_friendly_name(assigns.draft))
+
+    assigns =
+      assign(
+        assigns,
+        :can_save?,
+        String.length(assigns.cleaned) > 0 and assigns.cleaned != assigns.current
+      )
+
+    ~H"""
+    <.modal open={true} on_close="cancel_rename" title="Rename player">
+      <:footer>
+        <.button variant={:ghost} size={:sm} phx-click="cancel_rename">Cancel</.button>
+        <.button
+          variant={:primary}
+          size={:sm}
+          phx-click="confirm_rename"
+          disabled={not @can_save?}
+        >
+          Save & re-advertise
+        </.button>
+      </:footer>
+      <p class="text-sm text-fg-2 mb-2 mt-0">
+        Saving re-advertises the player over mDNS, which will momentarily disconnect
+        any paired Sendspin server. Music Assistant will reconnect automatically.
+      </p>
+      <p class="text-xs text-fg-3 mb-4 mt-0">
+        Music Assistant remembers the name it first paired this player under and won't
+        update its display from this rename. To change the name there too, rename the
+        player from inside Music Assistant's settings.
+      </p>
+      <form phx-submit="confirm_rename" phx-change="rename_draft" class="space-y-2">
+        <div class="flex items-center justify-between text-xs">
+          <label for="rename-input" class="font-medium text-fg-2">Friendly name</label>
+          <span class="text-fg-3 font-mono tabular-nums">
+            {String.length(@cleaned)} / {@max}
+          </span>
+        </div>
+        <input
+          id="rename-input"
+          type="text"
+          name="value"
+          value={@draft}
+          maxlength={@max}
+          autocomplete="off"
+          phx-hook="AutofocusSelect"
+          class="w-full px-3 py-2 text-base text-fg-1 bg-surface border border-border-1 rounded-sm
+                 focus:border-accent focus:outline-none transition-colors"
+        />
+      </form>
+    </.modal>
+    """
   end
 
   # ── Helpers ───────────────────────────────────────────────────────────
+
+  defp close_rename(socket) do
+    socket
+    |> assign(:rename_target, nil)
+    |> assign(:rename_draft, "")
+  end
+
+  defp current_name(outputs, id) do
+    case Map.fetch(outputs, id) do
+      {:ok, %{friendly_name: name}} -> name
+      _ -> ""
+    end
+  end
 
   defp build_outputs_map(outputs) do
     Map.new(outputs, fn output -> {encode_key(output.key), build_card(output)} end)
@@ -403,25 +685,6 @@ defmodule UniversalProxyWeb.AudioLive do
   defp as_binary(v) when is_binary(v), do: v
   defp as_binary(_), do: nil
 
-  defp stream_label(nil), do: "—"
-
-  defp stream_label(%{codec: codec, sample_rate: rate, bit_depth: depth}) do
-    parts =
-      [
-        codec && String.upcase(to_string(codec)),
-        rate && "#{div(rate, 1000)} kHz",
-        depth && "#{depth}-bit"
-      ]
-      |> Enum.reject(&is_nil/1)
-
-    case parts do
-      [] -> "Streaming"
-      _ -> Enum.join(parts, " · ")
-    end
-  end
-
-  defp stream_label(_), do: "Streaming"
-
   defp sorted_outputs(outputs) do
     outputs
     |> Map.to_list()
@@ -468,17 +731,20 @@ defmodule UniversalProxyWeb.AudioLive do
     key |> :erlang.term_to_binary() |> Base.url_encode64(padding: false)
   end
 
-  # Length cap matches the mDNS TXT budget. Control chars are stripped
-  # rather than rejected so a user paste that happens to include a tab
-  # or zero-width character doesn't get bounced. Empty-after-strip is
-  # treated as a no-op in the caller.
-  defp sanitize_friendly_name(raw) when is_binary(raw) do
-    cleaned =
-      raw
-      |> String.replace(~r/[[:cntrl:]]/u, "")
-      |> String.trim()
-      |> String.slice(0, @friendly_name_max)
+  # Strip control chars + trim + cap length. Used both in the modal's
+  # live char counter and in the final commit path. Returns the raw
+  # cleaned string (not wrapped in {:ok, _}) for use in templates.
+  defp clean_friendly_name(raw) when is_binary(raw) do
+    raw
+    |> String.replace(~r/[[:cntrl:]]/u, "")
+    |> String.trim()
+    |> String.slice(0, @friendly_name_max)
+  end
 
+  defp clean_friendly_name(_), do: ""
+
+  defp sanitize_friendly_name(raw) when is_binary(raw) do
+    cleaned = clean_friendly_name(raw)
     if cleaned == "", do: {:error, :empty_name}, else: {:ok, cleaned}
   end
 
