@@ -41,7 +41,10 @@ defmodule UniversalProxy.Application do
   # List all child processes to be supervised
   defp target_children do
     [
-      # Children for all targets
+      # Phase 0 BT spike — child_spec returns `:ignore` outside rpi3
+      # so this is a no-op on host and on Pi targets not yet wired
+      # (see UniversalProxy.Bluetooth @moduledoc).
+      UniversalProxy.Bluetooth
     ]
   end
 
