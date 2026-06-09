@@ -37,22 +37,14 @@ defmodule BlueHeron.HCI.Transport.UART.Framing do
 
   @impl Framing
   def remove_framing(new_data, state) do
-    result = process(state.frame <> new_data, %{state | frame: <<>>})
-
-    case result do
-      {:in_frame, [], %{frame: leftover} = s} when byte_size(leftover) > 0 ->
-        :logger.warning(%{
-          msg: "framing: STALLED",
-          type: s.type,
-          leftover: byte_size(leftover),
-          hex: :binary.encode_hex(binary_part(leftover, 0, min(byte_size(leftover), 20)))
-        })
-
-        result
-
-      _ ->
-        result
-    end
+    # A partial frame (`:in_frame` with leftover bytes) is the NORMAL case
+    # for byte-by-byte UART arrival — the framer accumulates until a full
+    # HCI packet is present. Upstream logged a `:warning` here on every
+    # such call, which on the receive hot path (continuous BLE adverts)
+    # floods the Logger synchronously inside the Circuits.UART GenServer,
+    # backing up its mailbox into the millions and pegging a CPU core.
+    # Removed: this state is not an error and must not be logged per frame.
+    process(state.frame <> new_data, %{state | frame: <<>>})
   end
 
   def process(<<0x2, rest::binary>>, %{type: nil} = state) do

@@ -76,7 +76,60 @@ intent" so we remember to backport. Mirror of how `deps_local/mdns_lite/`
 documents downstream `announce_all/0` / `goodbye_service/1` (see
 [memory:mdns_lite_vendored](../../.claude/projects/-workspaces-universal-proxy/memory/mdns_lite_vendored.md)).
 
-### `BroadcomInit` post-LaunchRAM UART recovery sequence (Linux-equivalent)
+### FirmwareLoader: LMP `0x6119` is BCM4345C0, not C5 (the real Pi 3 B+ fix)
+
+**File:** `lib/blue_heron/hci/transport/uart/firmware_loader.ex`
+
+Upstream blue_heron's `@firmware_table` mapped LMP subversion
+`0x6119 => "BCM4345C5.hcd"`. **This is wrong.** `0x6119` is the
+`BCM4345C0` (Pi 3 B+ / 3 A+); `BCM4345C5` is `0x6606` (Pi 400 / CM4).
+Verified three ways:
+
+- Linux kernel `drivers/bluetooth/btbcm.c` `bcm_uart_subver_table`:
+  `{ 0x6119, "BCM4345C0" }`, `{ 0x6606, "BCM4345C5" }`. The kernel
+  matches on subver alone (no rev disambiguation) and builds the
+  filename directly: `brcm/BCM4345C0.hcd`.
+- `RPi-Distro/bluez-firmware` symlinks the Pi 3 B+ (and 3 A+) BT
+  firmware to `BCM4345C0.hcd`; C5 is only for Pi 400 / CM4.
+- This repo's own Nerves build tree:
+  `deps/nerves_system_br/package/rpi-distro-bluez-firmware/rpi-distro-bluez-firmware.mk`
+  symlinks `BCM4345C0.raspberrypi,3-model-b-plus.hcd → BCM4345C0.hcd`.
+
+Why it presents as "silent after LaunchRAM": loading the C5 `.hcd`
+onto C0 silicon still lets every `Write_RAM` (`0xFC4C`) and the final
+`LaunchRAM` (`0xFC4E`) return `Command Complete status 0` (RAM writes
+always ack), but the chip then relaunches into a wrong-variant image
+and emits zero bytes for every subsequent HCI command. This burned
+weeks of UART-layer debugging (see scratchpad) before the firmware
+mapping was checked.
+
+Fix: `0x6119 => "BCM4345C0.hcd"`, and add the correct `0x6606 =>
+"BCM4345C5.hcd"`.
+
+**Upstream-PR intent:** straightforward table correction against
+blue_heron, citing the kernel `bcm_uart_subver_table`. Likely fixes
+the long-standing "rpi3 post-firmware silent" reports (issue #21 /
+PR #138 discussion, pxp9 Feb 2026).
+
+### `UART.Framing.remove_framing/2` — drop per-frame STALLED warning
+
+**File:** `lib/blue_heron/hci/transport/uart/framing.ex`
+
+Upstream logged `:logger.warning(%{msg: "framing: STALLED", ...})` every
+time `remove_framing/2` was called with a partial frame in the buffer.
+That is the *normal* case for byte-by-byte UART arrival — the framer
+accumulates bytes until a full HCI packet is present. On the receive
+hot path under a continuous BLE advertisement stream it fires per chunk,
+synchronously, inside the `Circuits.UART` GenServer's message loop. The
+`Logger` call (made worse by a `Phoenix.LiveDashboard` PubSub backend
+fanning out every log) can't keep up; the UART process's mailbox backs
+up into the **millions** of messages (~150 MB) and pegs a CPU core, so
+load climbs and memory leaks. Because it's `:warning`, raising the
+`Logger` level to `:info` does not suppress it. Removed the log entirely
+(partial-frame is not an error). **Upstream-PR intent:** delete or
+demote to `:debug` upstream.
+
+### `BroadcomInit` post-LaunchRAM sequence (Linux btbcm-equivalent)
 
 **Files:**
 - `lib/blue_heron/hci/transport/broadcom_init.ex` (post-firmware sequence)
@@ -88,47 +141,26 @@ documents downstream `announce_all/0` / `goodbye_service/1` (see
   overload, `configure/2` passthrough, and `pulse_break/2`
   wrapper around `Circuits.UART.set_break/2`)
 
-Symptom this addresses: on a Pi 3 B+ (BCM4345C5, LMP `0x6119`), the
-firmware download completes — every `Write_RAM` (`0xFC4C`) and the
-final `LaunchRAM` (`0xFC4E`) return `Command Complete status 0` — but
-the chip then refuses to respond to **any** post-LaunchRAM HCI
-command. `Reset (0x0C03)`, `UpdateBaudrate (0xFC18)`, and
-`Read_BD_ADDR (0x1009)` all time out forever; the chip sends zero
-bytes back. CYW43436S on RPi Zero 2W (which PR #138 was tested on)
-doesn't exhibit this; its `bcm43430_device_data` sets quirks that
-change init timing. The Pi 3 B+ BCM4345C5 path is a known unfixed
-gap in blue_heron (issue #21 / PR #138 discussion, pxp9 Feb 2026
-confirmation).
-
-What this change does (mirrors Linux `btbcm`/`hci_bcm`):
-
-1. Wait 3s for chip to relaunch from patch RAM (top of Pi 3 B+'s
-   documented 1.5–3s init window).
-2. Flush host UART RX so framer mid-frame state is clean.
-3. Re-apply termios (mirrors `host_set_baudrate(hu, init_speed)` →
-   `tty_set_termios` side effects: FIFO drop/re-arm).
-4. Pulse a 20ms UART BREAK to wake the chip if its patch firmware
-   enabled sleep mode by default.
-5. Sync on `Read_BD_ADDR` (NOT Reset) — what Linux `btbcm_initialize`
-   actually uses post-firmware. The kernel driver elides Reset
-   entirely after LaunchRAM.
+The default post-firmware sequence mirrors the Linux `btbcm` finalize
+path: settle, flush host RX, then HCI Reset.
 
 ```
 ..hcd records..
-{:delay, 3000},
+{:delay, 250},              # Linux btbcm_patchram: 250ms after LaunchRAM
 :uart_flush_rx,             # Circuits.UART.flush(:receive)
-{:delay, 200},
-:uart_configure_resync,     # Circuits.UART.configure(115200, :hardware)
-{:delay, 50},
-:uart_break_wake,           # 20ms UART BREAK pulse
-{:delay, 50},
-%InformationalParameters.ReadBdAddr{}
+%ControllerAndBaseband.Reset{},   # first cmd against patched firmware
+{:delay, 100}               # Linux btbcm_reset: 100ms after Reset
 ```
 
-Each new step has a dedicated `handle_continue/2` clause wrapped in
-`try/catch` and logged at info — a failure must not crash the
-transport GenServer (a crash here cascades into max_restarts and
-ultimately a bootloop, see the StartupGuard discussion below).
+`:uart_configure_resync` (termios re-apply) and `:uart_break_wake`
+(20ms UART BREAK) were added while misdiagnosing the wrong-firmware
+silence above. They are **no longer in the default sequence** but
+their `handle_continue/2` clauses are retained as opt-in helpers for
+controllers that genuinely need a termios re-apply or a sleep-wake
+BREAK. Each clause is wrapped in `try/catch` and logged at info — a
+failure must not crash the transport GenServer (a crash here cascades
+into max_restarts and ultimately a bootloop; see StartupGuard
+discussion below).
 
 `Circuits.UART.drain/1` is deliberately NOT used anywhere.
 `tcdrain(3)` blocks until the TX buffer is empty, and on a freshly-
@@ -138,29 +170,10 @@ stuck in `handle_call`, every subsequent op times out, setup
 fails, max_restarts fires, and the boot is unhealthy — observed
 2026-05-22.
 
-### Status on Pi 3 B+ as of 2026-05-22
-
-These steps are necessary but **not yet sufficient** on this
-hardware. After all four (flush + configure_resync + break_wake +
-Read_BD_ADDR), the chip is still silent post-LaunchRAM. The
-hypothesis under active investigation is **miniUART vs PL011**:
-`nerves_system_rpi3` ships `dtoverlay=miniuart-bt` (BT on
-`/dev/ttyS0` = BCM2835 mini UART; console on PL011). Raspberry Pi
-OS does the opposite (BT on PL011 — higher quality, fewer quirks).
-Pre-firmware works because Write_RAM/LaunchRAM frames are slow and
-simple; post-firmware likely fails because the patched chip uses
-timing or burst patterns the mini UART can't decode.
-
-The above changes are kept because they are **structurally correct
-mirrors of what Linux btbcm does**, plus belt-and-suspenders
-defensive logging. They will be needed once the underlying UART
-issue is resolved (most likely by switching BT to PL011).
-
-**Upstream-PR intent:** file as one PR against blue_heron once the
-spike confirms it works on real hardware. Title suggestion:
-"Pi 3 B+ BCM4345C5 post-LaunchRAM recovery (mirrors Linux btbcm)".
-Reference upstream issue #21 and the Feb 2026 pxp9 comment about
-rpi3 not being fixed by #138.
+**Upstream-PR intent:** the 250ms/Reset/100ms sequence and the RX
+flush are safe to upstream alongside the FirmwareLoader fix. The
+configure_resync / break_wake helpers can stay downstream until a
+controller is found that needs them.
 
 ### `BlueHeron.Observer` — LE scan driver (Central / Observer role)
 

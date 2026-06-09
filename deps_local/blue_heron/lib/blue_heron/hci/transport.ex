@@ -316,10 +316,14 @@ defmodule BlueHeron.HCI.Transport do
   # `tty_set_termios` is what we're mirroring. tty_set_termios does
   # more than just set baud: it drops/re-arms the FIFOs and toggles
   # the modem control lines as a side effect of termios re-apply.
-  # Empirically the BCM4345C5 on Pi 3 B+ refuses to respond to ANY
-  # post-LaunchRAM HCI command (Reset 0x0C03, UpdateBaudrate 0xFC18)
-  # without this trigger — the chip emits zero bytes back even on a
-  # well-formed command at the correct baud. Observed 2026-05-22.
+  # NOTE: this step was added while chasing a "chip is silent after
+  # LaunchRAM" symptom on the Pi 3 B+ that was actually caused by
+  # loading the wrong-variant firmware (BCM4345C5.hcd for an LMP 0x6119
+  # chip that is really a BCM4345C0 — fixed in FirmwareLoader). With the
+  # correct .hcd, the plain post-firmware Reset works and this resync is
+  # NOT required. It is retained as an opt-in helper for controllers
+  # that genuinely need a termios re-apply, but is no longer emitted by
+  # BroadcomInit's default sequence.
   #
   # `Circuits.UART.configure/2` at the SAME baud as before is enough
   # to trigger termios re-apply at the Linux serdev layer. Hardcoded

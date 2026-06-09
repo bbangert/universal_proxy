@@ -33,15 +33,61 @@ defmodule UniversalProxy.Bluetooth do
     @impl Supervisor
     def init(_opts) do
       children = [
-        {BlueHeron.Observer, callback: &log_advertisement/1}
+        # filter_duplicates: true → controller reports each device once per
+        # scan window instead of every beacon, keeping the advert log (and
+        # the UART/Logger load) sane in a busy RF environment.
+        #
+        # scan_params: ~10% duty cycle (window 30ms every 300ms). The
+        # vendored default is window=interval=10ms = 100% duty (continuous
+        # listening), which fire-hoses every advert over the rpi3 miniUART
+        # and keeps the `circuits_uart` receive path hot (~8% of a core).
+        # A 10% duty cycle cuts that ~6x (port CPU → ~1.3% of a core, BEAM
+        # scheduler util 5.3% → 1%) while still discovering ~80 distinct
+        # devices within seconds. Tunable per deployment in Phase 0b.
+        {BlueHeron.Observer,
+         callback: &log_advertisement/1,
+         filter_duplicates: true,
+         scan_params: [le_scan_interval: 0x01E0, le_scan_window: 0x0030]}
       ]
 
       Supervisor.init(children, strategy: :one_for_one)
     end
 
-    defp log_advertisement(device) do
-      Logger.info("BLE adv: #{inspect(device, pretty: true, limit: :infinity)}")
+    # Compact, single-line advert log. The previous
+    # `inspect(device, pretty: true, limit: :infinity)` emitted a large
+    # multi-line blob per advert, which is heavy to format and floods the
+    # log/LiveDashboard. Log just MAC, signed RSSI, and the local name.
+    defp log_advertisement(%{address: address, rss: rss, data: data}) do
+      Logger.info(
+        "BLE adv #{format_mac(address)} rssi=#{signed_rssi(rss)}dBm#{name_suffix(data)}"
+      )
     end
+
+    defp format_mac(address) when is_integer(address) do
+      address
+      |> Integer.to_string(16)
+      |> String.pad_leading(12, "0")
+      |> String.replace(~r/..(?!$)/, "\\0:")
+    end
+
+    # rss arrives as a raw unsigned byte; RSSI is 8-bit two's complement.
+    defp signed_rssi(rss) when rss > 127, do: rss - 256
+    defp signed_rssi(rss), do: rss
+
+    # AD structures: a local-name element starts with 0x08 (shortened) or
+    # 0x09 (complete). Non-binary entries (e.g. manufacturer-data tuples)
+    # are skipped.
+    defp name_suffix(data) when is_list(data) do
+      case Enum.find_value(data, fn
+             <<t, rest::binary>> when t in [0x08, 0x09] -> rest
+             _ -> nil
+           end) do
+        nil -> ""
+        name -> " name=#{inspect(name)}"
+      end
+    end
+
+    defp name_suffix(_), do: ""
   else
     @doc false
     def child_spec(opts), do: %{id: __MODULE__, start: {__MODULE__, :start_link, [opts]}}

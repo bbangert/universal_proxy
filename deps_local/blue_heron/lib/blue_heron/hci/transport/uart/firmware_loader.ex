@@ -24,7 +24,17 @@ defmodule BlueHeron.HCI.Transport.UART.FirmwareLoader do
     0x6106 => "BCM43430A1.hcd",
     0x6107 => "BCM43430B0.hcd",
     0x6109 => "BCM4345C0.hcd",
-    0x6119 => "BCM4345C5.hcd",
+    # 0x6119 is BCM4345C0 (Pi 3 B+ / 3 A+), NOT C5. Verified against the
+    # Linux kernel btbcm.c `bcm_uart_subver_table` (0x6119 => "BCM4345C0",
+    # 0x6606 => "BCM4345C5") and RPi-Distro/bluez-firmware, which symlinks
+    # the Pi 3 B+ BT firmware to BCM4345C0.hcd. The kernel matches on
+    # subver alone (no rev disambiguation). Upstream blue_heron mapped
+    # this to C5, which loads the wrong-variant patch RAM: every Write_RAM
+    # and the final LaunchRAM complete normally, then the chip relaunches
+    # into a C5 image on C0 silicon and goes silent (no UART bytes for any
+    # subsequent HCI command). C5 is correctly reached via 0x6606 below.
+    0x6119 => "BCM4345C0.hcd",
+    0x6606 => "BCM4345C5.hcd",
     0x620E => "BCM4356A2.hcd",
     0x6611 => "BCM4354A2.hcd"
   }
