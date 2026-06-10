@@ -32,10 +32,6 @@ defmodule UniversalProxy.Bluetooth do
   later step — flip `@bluetooth_targets`.
   """
 
-  require Logger
-
-  alias UniversalProxy.ESPHome.BluetoothScanner
-
   @bluetooth_targets [:rpi3]
 
   # Compile-time constant: `Mix.target/0` is unavailable at runtime in a
@@ -55,6 +51,11 @@ defmodule UniversalProxy.Bluetooth do
 
   if @bluetooth_supported do
     use Supervisor
+
+    # Aliased inside the guard: on non-BT targets this branch is compiled
+    # out, so a top-level alias would be flagged unused under
+    # --warnings-as-errors (CI compiles MIX_TARGET=host).
+    alias UniversalProxy.ESPHome.BluetoothScanner
 
     def start_link(opts \\ []) do
       Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
