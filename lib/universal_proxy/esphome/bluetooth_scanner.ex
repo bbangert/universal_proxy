@@ -74,7 +74,9 @@ defmodule UniversalProxy.ESPHome.BluetoothScanner do
     # without waiting for a state transition. espex calls subscribe/1 in the
     # subscriber's own process, so `self() == pid`; and Registry can only
     # register the calling process anyway, so we notify `self()` to keep
-    # registration and the initial state acting on the same process.
+    # registration and the initial state acting on the same process. We
+    # deliberately do NOT send to an arbitrary `pid` — that would split
+    # delivery from registration if the espex invariant were ever violated.
     send(self(), {:espex_ble_scanner_state, :running, :passive, :passive})
     :ok
   rescue

@@ -62,7 +62,12 @@ defmodule UniversalProxy.ESPHome.BluetoothScannerTest do
   defp wait_until(_fun, 0), do: flunk("condition not met in time")
 
   defp wait_until(fun, retries) do
-    if fun.(), do: :ok, else: Process.sleep(10) && wait_until(fun, retries - 1)
+    if fun.() do
+      :ok
+    else
+      Process.sleep(10)
+      wait_until(fun, retries - 1)
+    end
   end
 
   describe "on_advertisement/1 mapping (E1)" do
