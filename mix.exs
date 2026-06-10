@@ -139,13 +139,14 @@ defmodule UniversalProxy.MixProject do
       # `nerves-networking/mdns_lite#213` for the eventual fix.
       {:mdns_lite, path: "deps_local/mdns_lite", override: true},
 
-      # Vendored fork of blue_heron — applies upstream PR #138 (RPi Zero 2W
-      # Broadcom vendor HCI firmware load) + #139 (bundled BCM*.hcd blobs
-      # + RPi 4 LMP mapping). Without these the radio is unusable on the
-      # Pi 3/4/0_2 targets we support. See deps_local/blue_heron/VENDORED.md
-      # for cherry-pick provenance. Upstream is dormant (last release
-      # 2025-03-31, no merges in over a year); treat as long-lived.
-      # `targets:` keeps blue_heron off host and off Pi 5 / non-Pi targets.
+      # Fork of blue_heron, consumed as a git submodule at
+      # deps_local/blue_heron (bbangert/blue_heron, branch phase0-rpi3-fixes).
+      # Base applies upstream PR #138 (RPi Zero 2W Broadcom vendor HCI
+      # firmware load) + #139 (bundled BCM*.hcd blobs + RPi 4 LMP mapping);
+      # on top are our Pi 3 B+ fixes (0x6119→BCM4345C0, framing-log flood,
+      # Observer scan driver). See deps_local/blue_heron/VENDORED.md.
+      # Run `git submodule update --init` after cloning. `targets:` keeps
+      # blue_heron off host and off Pi 5 / non-Pi targets.
       {:blue_heron,
        path: "deps_local/blue_heron", override: true, targets: [:rpi0, :rpi0_2, :rpi3, :rpi4]},
 
