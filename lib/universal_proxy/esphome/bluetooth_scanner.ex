@@ -22,15 +22,19 @@ defmodule UniversalProxy.ESPHome.BluetoothScanner do
   deliberately **not referenced** here (we pattern-match a plain map; a
   `%BlueHeron...Device{}` struct is a map and matches the same).
 
-  ## Passive-only — `set_scanner_mode/1` is deliberately NOT implemented
+  ## Scanner mode — passive-only, but reports STATE_AND_MODE
 
-  This is a passive scanner. `Espex.BluetoothScanner` makes
-  `set_scanner_mode/1` optional, and espex only sets the `STATE_AND_MODE`
-  (`0x40`) feature bit when the adapter exports it
-  (`Espex.Connection` checks `function_exported?/3`). By omitting it we keep
-  the advertised flags at `PASSIVE_SCAN | RAW_ADVERTISEMENTS` (`0x21`) and HA
-  never sends `BluetoothScannerSetModeRequest`. Active scan / GATT is Phase 1+
-  (`Espex.BluetoothProxy`) — out of scope here. `E4` asserts this stays false.
+  The scanner only ever runs passively (`BlueHeron.Observer` is scan-only),
+  but `set_scanner_mode/1` IS implemented: `:passive` is accepted as a no-op
+  `:ok`, `:active` is honestly refused (`{:error, :not_supported}`).
+  Exporting the optional callback makes espex advertise the `STATE_AND_MODE`
+  (`0x40`) bit (`Espex.Connection` checks `function_exported?/3`), so the
+  feature flags are `PASSIVE_SCAN | RAW_ADVERTISEMENTS | STATE_AND_MODE`
+  (`0x61`). That is what lets Home Assistant track our
+  `{:espex_ble_scanner_state, :running, :passive, :passive}` report and show
+  the adapter as **"Auto (passive)"** rather than "No scanning". HA will not
+  ask us to switch to active because we don't advertise `ACTIVE_CONNECTIONS`
+  (`0x02`) — active scan / GATT is Phase 1+ (`Espex.BluetoothProxy`).
 
   ## Address byte order — validated on rpi3 (plan Decision #5 / F4)
 
@@ -91,6 +95,16 @@ defmodule UniversalProxy.ESPHome.BluetoothScanner do
     ArgumentError -> :ok
   end
 
+  @impl Espex.BluetoothScanner
+  @spec set_scanner_mode(:passive | :active) :: :ok | {:error, :not_supported}
+  # Passive-only scanner. This callback exists chiefly to flip on the
+  # STATE_AND_MODE feature bit (see moduledoc) so HA shows "Auto (passive)".
+  # Accept :passive (already our only mode); refuse :active honestly rather
+  # than lie. HA shouldn't request :active — we don't advertise
+  # ACTIVE_CONNECTIONS — but we handle it safely if it does.
+  def set_scanner_mode(:passive), do: :ok
+  def set_scanner_mode(:active), do: {:error, :not_supported}
+
   @doc """
   `BlueHeron.Observer` callback. Maps one advertised device to the espex
   advertisement tuple and fans it out to every subscribed connection.
@@ -112,7 +126,7 @@ defmodule UniversalProxy.ESPHome.BluetoothScanner do
         raw_data: raw_data
       })
       when is_binary(raw_data) do
-    # Decision #5 / F4: if HA shows reversed MACs, byte-swap `address` here.
+    # Address byte order validated on rpi3 (F4) — forwarded as-is, no swap.
     rssi = signed_rssi(rss)
 
     Registry.dispatch(@registry, :subscribers, fn entries ->

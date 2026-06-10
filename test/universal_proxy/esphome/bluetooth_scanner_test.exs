@@ -161,11 +161,16 @@ defmodule UniversalProxy.ESPHome.BluetoothScannerTest do
     end
   end
 
-  describe "passive-only contract (E4)" do
-    test "set_scanner_mode/1 is NOT exported (keeps STATE_AND_MODE flag off)" do
+  describe "scanner mode (E4)" do
+    test "set_scanner_mode/1 IS exported so espex advertises STATE_AND_MODE (0x61)" do
       Code.ensure_loaded!(BluetoothScanner)
 
-      refute function_exported?(BluetoothScanner, :set_scanner_mode, 1)
+      assert function_exported?(BluetoothScanner, :set_scanner_mode, 1)
+    end
+
+    test "accepts :passive and refuses :active (passive-only scanner)" do
+      assert :ok = BluetoothScanner.set_scanner_mode(:passive)
+      assert {:error, :not_supported} = BluetoothScanner.set_scanner_mode(:active)
     end
   end
 
