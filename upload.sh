@@ -90,4 +90,4 @@ echo "Platform: $FIRMWARE_PLATFORM"
 echo
 echo "Uploading to $DESTINATION..."
 
-cat "$FILENAME" | ssh -s $SSH_OPTIONS $DESTINATION fwup
+ssh -s $SSH_OPTIONS "$DESTINATION" fwup < "$FILENAME"

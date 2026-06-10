@@ -145,10 +145,13 @@ defmodule UniversalProxy.MixProject do
       # firmware load) + #139 (bundled BCM*.hcd blobs + RPi 4 LMP mapping);
       # on top are our Pi 3 B+ fixes (0x6119→BCM4345C0, framing-log flood,
       # Observer scan driver). See deps_local/blue_heron/VENDORED.md.
-      # Run `git submodule update --init` after cloning. `targets:` keeps
-      # blue_heron off host and off Pi 5 / non-Pi targets.
-      {:blue_heron,
-       path: "deps_local/blue_heron", override: true, targets: [:rpi0, :rpi0_2, :rpi3, :rpi4]},
+      # Run `git submodule update --init` after cloning. Phase 0 is rpi3-only:
+      # `UniversalProxy.Bluetooth` is compile-guarded to [:rpi3] and only rpi3
+      # has `:blue_heron, :transport` config, so restricting `targets:` to
+      # [:rpi3] keeps blue_heron's OTP app from starting a device-less
+      # transport on other Pi targets. Phase 0b broadens this with per-target
+      # transport wiring.
+      {:blue_heron, path: "deps_local/blue_heron", override: true, targets: [:rpi3]},
 
       # Dependencies for specific targets
       # NOTE: It's generally low risk and recommended to follow minor version
