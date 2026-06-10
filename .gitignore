@@ -46,6 +46,9 @@ erl_crash.dump
 /c_src/sendspin_player/_build/
 /priv/sendspin_player/
 
+# Claude Code local workspace (plans, scratchpads, solutions, reviews) — not repo content
+/.claude/
+
 # OS generated files
 .DS_Store
 Thumbs.db

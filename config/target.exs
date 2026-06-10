@@ -25,13 +25,25 @@ config :logger, backends: [RingLogger]
 
 config :shoehorn, init: [:nerves_runtime, :nerves_pack]
 
-# Enable Nerves.Runtime.StartupGuard so the bootloader's two-slot auto-revert
-# fires when a new firmware boots unhealthy. The guard waits for the full
-# supervision tree to come up, then calls Nerves.Runtime.validate_firmware/0.
+# Nerves.Runtime.StartupGuard auto-calls validate_firmware/0 once the full
+# supervision tree comes up, so the bootloader stops auto-reverting. That's
+# normally what we want.
+#
+# DISABLED on rpi3 (Phase 0 BT bring-up): the Bluetooth init can fail in a
+# way that still lets the rest of the app boot (web UI, SSH, etc.) just
+# long enough that StartupGuard validates a firmware whose BT subsystem
+# crash-loops. Once validated, the bootloader's two-slot auto-revert no
+# longer fires — the Pi has to be SD-card reflashed to recover. Observed
+# 2026-05-22. While the BT init is unstable, require explicit manual
+# validation: SSH in, confirm `BlueHeron.HCI.Transport.setup_complete?/0`
+# returns true and `Process.alive?(Process.whereis(BlueHeron.Observer))`,
+# then call `Nerves.Runtime.validate_firmware/0`. Re-enable when Phase 0
+# is green and BT is no longer the riskiest subsystem at boot.
 #
 # See the "StartupGuard" section of the nerves_runtime README:
 # https://github.com/nerves-project/nerves_runtime#startupguard
-config :nerves_runtime, startup_guard_enabled: true
+config :nerves_runtime,
+  startup_guard_enabled: Mix.target() != :rpi3
 
 # Erlinit can be configured without a rootfs_overlay. See
 # https://github.com/nerves-project/erlinit/ for more information on
@@ -134,6 +146,16 @@ config :mdns_lite,
     # ESPHome Native API mDNS service is registered dynamically by
     # `Espex.Mdns.MdnsLite` from the live device configuration.
   ]
+
+# Bluetooth (Phase 0 spike — rpi3 only). Configures the vendored
+# blue_heron transport so its OTP-application autostart can reach the
+# Broadcom radio over `/dev/ttyS0` (miniUART on rpi3 with `dtoverlay=
+# miniuart-bt`). Hardware flow control is the rpi3 BT-chip default.
+# Phase 0b broadens to rpi4/rpi0/rpi0_2 (rpi4 device path differs).
+if Mix.target() == :rpi3 do
+  config :blue_heron,
+    transport: [device: "/dev/ttyS0", speed: 115_200, flow_control: :hardware]
+end
 
 # Import target specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.

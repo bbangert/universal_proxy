@@ -40,6 +40,10 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
+        with:
+          # blue_heron is a git submodule (deps_local/blue_heron); the rpi3
+          # target build needs it present or `mix firmware` fails.
+          submodules: recursive
 
       - name: Install system dependencies
         run: |

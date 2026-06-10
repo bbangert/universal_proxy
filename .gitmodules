@@ -1,0 +1,4 @@
+[submodule "deps_local/blue_heron"]
+	path = deps_local/blue_heron
+	url = https://github.com/bbangert/blue_heron.git
+	branch = phase0-rpi3-fixes
