@@ -21,8 +21,9 @@ defmodule UniversalProxy.Bluetooth do
   config (see `config/target.exs`); we only add the scanner driver and the
   HA-facing fan-out registry on top.
 
-  Compile-time guarded: `child_spec/1` returns `:ignore` on host and on any
-  Nerves target outside BT scope, so this module is a no-op there (and
+  Compile-time guarded: off-target (host, or any Nerves target outside BT
+  scope), `child_spec/1` returns a normal spec whose `start_link/1` returns
+  `:ignore`, so the supervisor treats this module as a no-op there (and
   `:blue_heron` isn't even a dep off-target). The advert fan-out adapter
   (`UniversalProxy.ESPHome.BluetoothScanner`) is itself unguarded so it can
   be unit-tested on the host against a registry started in the test.

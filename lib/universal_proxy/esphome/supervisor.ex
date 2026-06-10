@@ -78,9 +78,10 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   # Boot ordering: this supervisor starts (see `application.ex`) BEFORE
   # `target_children()`, where the `UniversalProxy.Bluetooth` subtree — and
   # thus the scanner registry the adapter dispatches over — lives. That is
-  # safe: `BluetoothScanner.subscribe/1` guards the early-boot window with
-  # `catch :exit`, and a client can only subscribe long after boot (once HA
-  # connects and sends `SubscribeBluetoothLEAdvertisementsRequest`).
+  # safe: `BluetoothScanner.subscribe/1` guards the early-boot window by
+  # rescuing `ArgumentError` (an un-started Registry raises, it does not
+  # exit), and a client can only subscribe long after boot (once HA connects
+  # and sends `SubscribeBluetoothLEAdvertisementsRequest`).
   defp bluetooth_scanner_opt do
     if UniversalProxy.Bluetooth.supported?() do
       [bluetooth_scanner: BluetoothScanner]

@@ -43,6 +43,9 @@ defmodule UniversalProxy.ESPHome.BluetoothScannerTest do
         relay(test_pid, tag)
       end)
 
+    # Unsupervised + infinite receive loop — kill it at test end so these
+    # don't leak across the suite.
+    on_exit(fn -> Process.exit(pid, :kill) end)
     assert_receive {:ready, ^tag}
     pid
   end

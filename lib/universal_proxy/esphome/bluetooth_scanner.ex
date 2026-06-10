@@ -32,17 +32,15 @@ defmodule UniversalProxy.ESPHome.BluetoothScanner do
   never sends `BluetoothScannerSetModeRequest`. Active scan / GATT is Phase 1+
   (`Espex.BluetoothProxy`) — out of scope here. `E4` asserts this stays false.
 
-  ## Address byte order — pending hardware verification (plan Decision #5 / F4)
+  ## Address byte order — validated on rpi3 (plan Decision #5 / F4)
 
-  `device.address` is forwarded as-is. blue_heron parses BD_ADDR as a 48-bit
-  integer; HCI delivers it little-endian on the wire while HA expects an
-  MSB-first MAC integer. If HA shows reversed MACs on hardware, swap the
-  48 bits at the marked point in `on_advertisement/1`.
+  `device.address` is forwarded as-is. blue_heron decodes BD_ADDR (delivered
+  little-endian on the wire) into the MSB-first MAC integer HA expects, and
+  espex passes it straight through. Validated on rpi3 against HA (correct
+  MACs shown) — no byte-swap needed.
   """
 
   @behaviour Espex.BluetoothScanner
-
-  require Logger
 
   # Duplicate-key registry: every subscribed connection-handler pid is one
   # entry under the `:subscribers` key. Owned by `UniversalProxy.Bluetooth`.
@@ -69,8 +67,11 @@ defmodule UniversalProxy.ESPHome.BluetoothScanner do
     Registry.register(@registry, :subscribers, nil)
 
     # Tell HA the scanner is already live so it starts ingesting adverts
-    # without waiting for a state transition.
-    send(pid, {:espex_ble_scanner_state, :running, :passive, :passive})
+    # without waiting for a state transition. espex calls subscribe/1 in the
+    # subscriber's own process, so `self() == pid`; and Registry can only
+    # register the calling process anyway, so we notify `self()` to keep
+    # registration and the initial state acting on the same process.
+    send(self(), {:espex_ble_scanner_state, :running, :passive, :passive})
     :ok
   rescue
     # An un-started registry raises ArgumentError ("unknown registry: ...")
