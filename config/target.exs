@@ -26,24 +26,20 @@ config :logger, backends: [RingLogger]
 config :shoehorn, init: [:nerves_runtime, :nerves_pack]
 
 # Nerves.Runtime.StartupGuard auto-calls validate_firmware/0 once the full
-# supervision tree comes up, so the bootloader stops auto-reverting. That's
-# normally what we want.
+# supervision tree comes up, so the bootloader stops auto-reverting and
+# nerves_heart stops rebooting the (otherwise pending-validation) firmware.
 #
-# DISABLED on rpi3 (Phase 0 BT bring-up): the Bluetooth init can fail in a
-# way that still lets the rest of the app boot (web UI, SSH, etc.) just
-# long enough that StartupGuard validates a firmware whose BT subsystem
-# crash-loops. Once validated, the bootloader's two-slot auto-revert no
-# longer fires — the Pi has to be SD-card reflashed to recover. Observed
-# 2026-05-22. While the BT init is unstable, require explicit manual
-# validation: SSH in, confirm `BlueHeron.HCI.Transport.setup_complete?/0`
-# returns true and `Process.alive?(Process.whereis(BlueHeron.Observer))`,
-# then call `Nerves.Runtime.validate_firmware/0`. Re-enable when Phase 0
-# is green and BT is no longer the riskiest subsystem at boot.
+# This was DISABLED on rpi3 during Phase 0 Bluetooth bring-up (2026-05-22)
+# because a half-working BT subsystem could validate a crash-looping
+# firmware before the BT subtree fell over. Phase 0 is now green and BT is
+# stable, so it's re-enabled for all targets. (While disabled, every fresh
+# flash stayed unvalidated, so nerves_heart rebooted it ~every 10 min until
+# manually validated via `Nerves.Runtime.validate_firmware/0`.)
 #
 # See the "StartupGuard" section of the nerves_runtime README:
 # https://github.com/nerves-project/nerves_runtime#startupguard
 config :nerves_runtime,
-  startup_guard_enabled: Mix.target() != :rpi3
+  startup_guard_enabled: true
 
 # Erlinit can be configured without a rootfs_overlay. See
 # https://github.com/nerves-project/erlinit/ for more information on
