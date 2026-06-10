@@ -18,7 +18,7 @@ defmodule UniversalProxy.ESPHome.Supervisor do
 
   use Supervisor
 
-  alias UniversalProxy.ESPHome.{ConfigStore, Infrared, SerialProxy, ZWaveProxy}
+  alias UniversalProxy.ESPHome.{BluetoothScanner, ConfigStore, Infrared, SerialProxy, ZWaveProxy}
   alias UniversalProxy.Hardware
   alias UniversalProxy.UART.Store, as: UARTStore
 
@@ -51,18 +51,42 @@ defmodule UniversalProxy.ESPHome.Supervisor do
     zwave_port_path = resolve_zwave_port()
     device_config = ConfigStore.device_config_opts()
 
+    espex_opts =
+      [
+        device_config: device_config,
+        serial_proxy: SerialProxy,
+        zwave_proxy: ZWaveProxy,
+        infrared_proxy: Infrared.Server,
+        mdns: Espex.Mdns.MdnsLite
+      ] ++ bluetooth_scanner_opt()
+
     children = [
       {ZWaveProxy, port_path: zwave_port_path},
       Infrared.Supervisor,
-      {Espex,
-       device_config: device_config,
-       serial_proxy: SerialProxy,
-       zwave_proxy: ZWaveProxy,
-       infrared_proxy: Infrared.Server,
-       mdns: Espex.Mdns.MdnsLite}
+      {Espex, espex_opts}
     ]
 
     Supervisor.init(children, strategy: :rest_for_one)
+  end
+
+  # Wire the passive BLE scanner adapter into espex ONLY on BT-capable
+  # targets. `UniversalProxy.Bluetooth.supported?/0` is the single gate (a
+  # compile-time constant) so `:rpi3` isn't hardcoded here as well. Off
+  # target the key is omitted entirely, so espex leaves the scanner feature
+  # disabled and the bluetooth_proxy feature flags stay 0.
+  #
+  # Boot ordering: this supervisor starts (see `application.ex`) BEFORE
+  # `target_children()`, where the `UniversalProxy.Bluetooth` subtree — and
+  # thus the scanner registry the adapter dispatches over — lives. That is
+  # safe: `BluetoothScanner.subscribe/1` guards the early-boot window with
+  # `catch :exit`, and a client can only subscribe long after boot (once HA
+  # connects and sends `SubscribeBluetoothLEAdvertisementsRequest`).
+  defp bluetooth_scanner_opt do
+    if UniversalProxy.Bluetooth.supported?() do
+      [bluetooth_scanner: BluetoothScanner]
+    else
+      []
+    end
   end
 
   # Resolve the tty path of the Z-Wave-classified port. Two sources

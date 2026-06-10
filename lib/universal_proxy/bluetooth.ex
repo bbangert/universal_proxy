@@ -1,29 +1,59 @@
 defmodule UniversalProxy.Bluetooth do
   @moduledoc """
-  Phase 0 Bluetooth spike supervisor.
+  Bluetooth subtree: owns the passive BLE scanner and the subscriber
+  registry that feeds advertisements to Home Assistant.
 
-  Starts `BlueHeron.Observer` once the vendored blue_heron supervision
-  tree has come up. `blue_heron` registers itself as an OTP application
+  Two children, started `:rest_for_one` (registry first, Observer second):
+
+    1. a duplicate-key `Registry`
+       (`UniversalProxy.ESPHome.BluetoothScanner.registry_name/0`) holding
+       every subscribed ESPHome connection-handler pid. Registry-up-before-
+       Observer guarantees the Observer callback's `Registry.dispatch` never
+       hits a missing table; if the registry crashes, `:rest_for_one`
+       restarts the Observer too so it re-dispatches against a live table.
+    2. `BlueHeron.Observer` — turns on LE scan and invokes
+       `UniversalProxy.ESPHome.BluetoothScanner.on_advertisement/1` per
+       advertised device, which fans the raw advert out over the registry.
+
+  `blue_heron` registers itself as an OTP application
   (`mod: {BlueHeron.Application, []}`) and brings up Registry / SMP /
   Peripheral / HCI Transport on its own from `:blue_heron, :transport`
-  config (see `config/target.exs`). We just need to start a subscriber
-  that turns on LE scan and logs incoming adverts.
+  config (see `config/target.exs`); we only add the scanner driver and the
+  HA-facing fan-out registry on top.
 
-  Compile-time guarded: returns `:ignore` from `child_spec/1` on host
-  and on any Nerves target outside Phase 0 scope, so this module
-  doesn't fail the application supervisor on non-Pi targets where
-  `:blue_heron` isn't even a dep.
+  Compile-time guarded: `child_spec/1` returns `:ignore` on host and on any
+  Nerves target outside BT scope, so this module is a no-op there (and
+  `:blue_heron` isn't even a dep off-target). The advert fan-out adapter
+  (`UniversalProxy.ESPHome.BluetoothScanner`) is itself unguarded so it can
+  be unit-tested on the host against a registry started in the test.
 
-  Phase 0 = `:rpi3` only. Phase 0b will broaden to rpi4/rpi0/rpi0_2
-  (rpi4 needs a different device path; rpi0/0_2 share `/dev/ttyS0`
-  with rpi3).
+  BT scope = `:rpi3` only for now. Broadening to rpi4/rpi0/rpi0_2 (rpi4
+  needs a different device path; rpi0/0_2 share `/dev/ttyS0` with rpi3) is a
+  later step — flip `@bluetooth_targets`.
   """
 
   require Logger
 
-  @phase_0_targets [:rpi3]
+  alias UniversalProxy.ESPHome.BluetoothScanner
 
-  if Mix.target() in @phase_0_targets do
+  @bluetooth_targets [:rpi3]
+
+  # Compile-time constant: `Mix.target/0` is unavailable at runtime in a
+  # Nerves release, so bake the predicate in. Single source of truth for
+  # gating both this subtree and the espex `bluetooth_scanner:` wiring.
+  @bluetooth_supported Mix.target() in @bluetooth_targets
+
+  @doc """
+  Whether this build targets BT-capable hardware (compile-time constant).
+
+  `UniversalProxy.ESPHome.Supervisor` reads this to decide whether to wire
+  the `bluetooth_scanner:` adapter into espex, so `:rpi3` is not hardcoded
+  in two places.
+  """
+  @spec supported?() :: boolean()
+  def supported?, do: @bluetooth_supported
+
+  if @bluetooth_supported do
     use Supervisor
 
     def start_link(opts \\ []) do
@@ -33,9 +63,14 @@ defmodule UniversalProxy.Bluetooth do
     @impl Supervisor
     def init(_opts) do
       children = [
+        # Subscriber registry FIRST so the Observer callback's dispatch
+        # always finds a live table. Duplicate keys: N connections fan out
+        # under the single `:subscribers` key.
+        {Registry, keys: :duplicate, name: BluetoothScanner.registry_name()},
+
         # filter_duplicates: true → controller reports each device once per
-        # scan window instead of every beacon, keeping the advert log (and
-        # the UART/Logger load) sane in a busy RF environment.
+        # scan window instead of every beacon, keeping the UART/dispatch
+        # load sane in a busy RF environment.
         #
         # scan_params: ~10% duty cycle (window 30ms every 300ms). The
         # vendored default is window=interval=10ms = 100% duty (continuous
@@ -43,51 +78,18 @@ defmodule UniversalProxy.Bluetooth do
         # and keeps the `circuits_uart` receive path hot (~8% of a core).
         # A 10% duty cycle cuts that ~6x (port CPU → ~1.3% of a core, BEAM
         # scheduler util 5.3% → 1%) while still discovering ~80 distinct
-        # devices within seconds. Tunable per deployment in Phase 0b.
+        # devices within seconds. Tunable per deployment.
         {BlueHeron.Observer,
-         callback: &log_advertisement/1,
+         callback: &BluetoothScanner.on_advertisement/1,
          filter_duplicates: true,
          scan_params: [le_scan_interval: 0x01E0, le_scan_window: 0x0030]}
       ]
 
-      Supervisor.init(children, strategy: :one_for_one)
+      # rest_for_one: registry restart cascades to the Observer (which then
+      # re-dispatches against the fresh table); an Observer restart leaves
+      # the registry — and its subscribers — untouched.
+      Supervisor.init(children, strategy: :rest_for_one)
     end
-
-    # Compact, single-line advert log. The previous
-    # `inspect(device, pretty: true, limit: :infinity)` emitted a large
-    # multi-line blob per advert, which is heavy to format and floods the
-    # log/LiveDashboard. Log just MAC, signed RSSI, and the local name.
-    defp log_advertisement(%{address: address, rss: rss, data: data}) do
-      Logger.info(
-        "BLE adv #{format_mac(address)} rssi=#{signed_rssi(rss)}dBm#{name_suffix(data)}"
-      )
-    end
-
-    defp format_mac(address) when is_integer(address) do
-      address
-      |> Integer.to_string(16)
-      |> String.pad_leading(12, "0")
-      |> String.replace(~r/..(?!$)/, "\\0:")
-    end
-
-    # rss arrives as a raw unsigned byte; RSSI is 8-bit two's complement.
-    defp signed_rssi(rss) when rss > 127, do: rss - 256
-    defp signed_rssi(rss), do: rss
-
-    # AD structures: a local-name element starts with 0x08 (shortened) or
-    # 0x09 (complete). Non-binary entries (e.g. manufacturer-data tuples)
-    # are skipped.
-    defp name_suffix(data) when is_list(data) do
-      case Enum.find_value(data, fn
-             <<t, rest::binary>> when t in [0x08, 0x09] -> rest
-             _ -> nil
-           end) do
-        nil -> ""
-        name -> " name=#{inspect(name)}"
-      end
-    end
-
-    defp name_suffix(_), do: ""
   else
     @doc false
     def child_spec(opts), do: %{id: __MODULE__, start: {__MODULE__, :start_link, [opts]}}
