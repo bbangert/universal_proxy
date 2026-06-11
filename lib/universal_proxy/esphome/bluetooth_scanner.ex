@@ -1,7 +1,8 @@
 defmodule UniversalProxy.ESPHome.BluetoothScanner do
   @moduledoc """
   `Espex.BluetoothScanner` adapter: bridges the rpi3's passive BLE scan
-  (`BlueHeron.Observer`) to Home Assistant through the ESPHome Native API.
+  (BlueZ via `UniversalProxy.Bluez.Client`) to Home Assistant through the
+  ESPHome Native API.
 
   ## Shape — pure module functions over a Registry (no GenServer)
 
@@ -11,21 +12,20 @@ defmodule UniversalProxy.ESPHome.BluetoothScanner do
   duplicate-key `Registry` records exactly the right pid and gets free
   auto-cleanup when that connection dies — `Registry` monitors registered
   processes. Advertisement fan-out is a single `Registry.dispatch/3` called
-  inline from the `Observer` callback (`on_advertisement/1`): one ETS read
-  plus N non-blocking `send/2`, no extra mailbox hop on the slow miniUART
-  hot path.
+  inline from `on_advertisement/1` (invoked by the BlueZ client): one ETS read
+  plus N non-blocking `send/2`, no extra mailbox hop on the advert hot path.
 
-  The `Registry` and the `Observer` are owned by the `UniversalProxy.Bluetooth`
-  subtree (rpi3-only). This module is just the behaviour implementation that
-  reads/writes that registry, so it compiles and unit-tests on the host with
-  a registry started in the test — `BlueHeron` is an rpi3-only dep and is
-  deliberately **not referenced** here (we pattern-match a plain map; a
-  `%BlueHeron...Device{}` struct is a map and matches the same).
+  The `Registry` is owned by the `UniversalProxy.Bluetooth` subtree (rpi3-only,
+  which also starts `UniversalProxy.Bluez`). This module is just the behaviour
+  implementation that reads/writes that registry, so it compiles and
+  unit-tests on the host with a registry started in the test. It is
+  source-agnostic: `on_advertisement/1` takes a plain map, so the same code
+  served the earlier blue_heron `Observer` and now the BlueZ client.
 
   ## Scanner mode — passive-only, but reports STATE_AND_MODE
 
-  The scanner only ever runs passively (`BlueHeron.Observer` is scan-only),
-  but `set_scanner_mode/1` IS implemented: `:passive` is accepted as a no-op
+  The scanner only ever runs passively (the BlueZ client only does LE
+  discovery), but `set_scanner_mode/1` IS implemented: `:passive` is a no-op
   `:ok`, `:active` is honestly refused (`{:error, :not_supported}`).
   Exporting the optional callback makes espex advertise the `STATE_AND_MODE`
   (`0x40`) bit (`Espex.Connection` checks `function_exported?/3`), so the
@@ -38,10 +38,11 @@ defmodule UniversalProxy.ESPHome.BluetoothScanner do
 
   ## Address byte order — validated on rpi3 (plan Decision #5 / F4)
 
-  `device.address` is forwarded as-is. blue_heron decodes BD_ADDR (delivered
-  little-endian on the wire) into the MSB-first MAC integer HA expects, and
-  espex passes it straight through. Validated on rpi3 against HA (correct
-  MACs shown) — no byte-swap needed.
+  `address` is forwarded as-is: an MSB-first MAC integer (`0xAABBCCDDEEFF`),
+  which is what HA expects and espex passes straight through.
+  `UniversalProxy.Bluez.Advert` parses BlueZ's `"AA:BB:CC:DD:EE:FF"` string
+  into that form (it matches what blue_heron produced, validated on rpi3
+  against HA — no byte-swap needed).
   """
 
   @behaviour Espex.BluetoothScanner
@@ -108,15 +109,15 @@ defmodule UniversalProxy.ESPHome.BluetoothScanner do
   def set_scanner_mode(:active), do: {:error, :not_supported}
 
   @doc """
-  `BlueHeron.Observer` callback. Maps one advertised device to the espex
-  advertisement tuple and fans it out to every subscribed connection.
+  Maps one advertised device to the espex advertisement tuple and fans it out
+  to every subscribed connection. Invoked by `UniversalProxy.Bluez.Client` per
+  reconstructed advert.
 
-  Accepts a plain map (the `Observer` passes a
-  `BlueHeron.HCI.Event.LEMeta.AdvertisingReport.Device` struct, which is a
-  map). Skips entries whose `:raw_data` is `nil` — only the verbatim
-  over-the-air AD bytes (the vendored `raw_data` field, see VENDORED.md) can
-  be forwarded to HA intact; the re-serialized parsed `:data` would corrupt
-  unknown AD types such as BTHome's `0xFCD2`.
+  Accepts a plain map (`%{address:, rss:, address_type:, raw_data:}`). Skips
+  entries whose `:raw_data` is `nil`. `raw_data` is the AD byte structure
+  `UniversalProxy.Bluez.Advert` reconstructs from BlueZ's parsed properties —
+  faithful for the manufacturer/service-data elements HA decoders use (e.g.
+  BTHome's `0xFCD2`).
   """
   @spec on_advertisement(map()) :: :ok
   def on_advertisement(%{raw_data: nil}), do: :ok

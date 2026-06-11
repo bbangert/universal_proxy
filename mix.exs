@@ -139,19 +139,22 @@ defmodule UniversalProxy.MixProject do
       # `nerves-networking/mdns_lite#213` for the eventual fix.
       {:mdns_lite, path: "deps_local/mdns_lite", override: true},
 
-      # Fork of blue_heron, consumed as a git submodule at
-      # deps_local/blue_heron (bbangert/blue_heron, branch phase0-rpi3-fixes).
-      # Base applies upstream PR #138 (RPi Zero 2W Broadcom vendor HCI
-      # firmware load) + #139 (bundled BCM*.hcd blobs + RPi 4 LMP mapping);
-      # on top are our Pi 3 B+ fixes (0x6119→BCM4345C0, framing-log flood,
-      # Observer scan driver). See deps_local/blue_heron/VENDORED.md.
-      # Run `git submodule update --init` after cloning. Phase 0 is rpi3-only:
-      # `UniversalProxy.Bluetooth` is compile-guarded to [:rpi3] and only rpi3
-      # has `:blue_heron, :transport` config, so restricting `targets:` to
-      # [:rpi3] keeps blue_heron's OTP app from starting a device-less
-      # transport on other Pi targets. Phase 0b broadens this with per-target
-      # transport wiring.
-      {:blue_heron, path: "deps_local/blue_heron", override: true, targets: [:rpi3]},
+      # blue_heron (the vendored raw-HCI fork) has been retired on rpi3 in
+      # favour of the kernel BlueZ stack (`UniversalProxy.Bluez`): the two
+      # cannot coexist on one chip, and blue_heron crash-loops at boot without
+      # a transport. It's fully removed — no dependency, and the
+      # deps_local/blue_heron submodule + .gitmodules entry have been dropped.
+
+      # Pure-Elixir D-Bus client for talking to org.bluez on the system bus.
+      # Forked (bbangert/rebus, branch dbus-service, off the 0.2.0 release) and
+      # consumed as a git submodule at deps_local/rebus: upstream rebus is
+      # client-only and crashes on inbound method calls, so the fork adds
+      # service-side handling (reply to method calls) needed to export an
+      # org.bluez AdvertisementMonitor for passive scanning. Available on all
+      # targets so UniversalProxy.Bluez.Client compiles on host (CI builds host
+      # with --warnings-as-errors); only *started* on rpi3 via UniversalProxy.Bluez.
+      # Run `git submodule update --init` after cloning.
+      {:rebus, path: "deps_local/rebus", override: true},
 
       # Dependencies for specific targets
       # NOTE: It's generally low risk and recommended to follow minor version
@@ -167,7 +170,17 @@ defmodule UniversalProxy.MixProject do
       {:nerves_system_rpi0, "~> 2.0", runtime: false, targets: :rpi0},
       {:nerves_system_rpi0_2, "~> 2.0", runtime: false, targets: :rpi0_2},
       {:nerves_system_rpi2, "~> 2.0", runtime: false, targets: :rpi2},
-      {:nerves_system_rpi3, "~> 2.0", runtime: false, targets: :rpi3},
+      # Custom Nerves system with BlueZ + D-Bus (kernel btbcm firmware, dbus,
+      # bluez5-utils) for the Bluetooth proxy. Prebuilt artifact is pulled from
+      # the releases repo; no local buildroot required (host must be
+      # linux/x86_64). Upstream nerves_system_rpi3 lacks the BT userspace.
+      {:nerves_system_rpi3,
+       github: "bbangert/nerves_systems_universal_proxy",
+       sparse: "rpi3",
+       tag: "v0.1.1",
+       runtime: false,
+       targets: :rpi3,
+       override: true},
       {:nerves_system_rpi4, "~> 2.0", runtime: false, targets: :rpi4},
       {:nerves_system_rpi5, "~> 2.0", runtime: false, targets: :rpi5},
       {:nerves_system_x86_64, "~> 1.33.1", runtime: false, targets: :x86_64}
