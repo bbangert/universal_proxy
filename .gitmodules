@@ -1,0 +1,4 @@
+[submodule "deps_local/rebus"]
+	path = deps_local/rebus
+	url = https://github.com/bbangert/rebus.git
+	branch = dbus-service

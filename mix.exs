@@ -145,12 +145,16 @@ defmodule UniversalProxy.MixProject do
       # a transport. The submodule at deps_local/blue_heron and VENDORED.md
       # remain in-tree for reference but are no longer a dependency.
 
-      # Pure-Elixir D-Bus client (no native deps) for talking to org.bluez on
-      # the system bus: StartDiscovery + InterfacesAdded/PropertiesChanged
-      # signal handling (UniversalProxy.Bluez.Client). Available on all targets
-      # so UniversalProxy.Bluez.Client compiles on host (CI builds host with
-      # --warnings-as-errors); it's only *started* on rpi3 via UniversalProxy.Bluez.
-      {:rebus, "~> 0.2"},
+      # Pure-Elixir D-Bus client for talking to org.bluez on the system bus.
+      # Forked (bbangert/rebus, branch dbus-service, off the 0.2.0 release) and
+      # consumed as a git submodule at deps_local/rebus: upstream rebus is
+      # client-only and crashes on inbound method calls, so the fork adds
+      # service-side handling (reply to method calls) needed to export an
+      # org.bluez AdvertisementMonitor for passive scanning. Available on all
+      # targets so UniversalProxy.Bluez.Client compiles on host (CI builds host
+      # with --warnings-as-errors); only *started* on rpi3 via UniversalProxy.Bluez.
+      # Run `git submodule update --init` after cloning.
+      {:rebus, path: "deps_local/rebus", override: true},
 
       # Dependencies for specific targets
       # NOTE: It's generally low risk and recommended to follow minor version

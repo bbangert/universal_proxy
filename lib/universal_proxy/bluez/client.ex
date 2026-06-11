@@ -1,27 +1,35 @@
 defmodule UniversalProxy.Bluez.Client do
   @moduledoc """
-  Persistent `rebus` D-Bus client to `org.bluez`. Holds the system-bus
-  connection open (BlueZ ties discovery to the calling connection, so a
-  long-lived owner is required), powers on the adapter, sets an LE discovery
-  filter, starts discovery, and turns BlueZ device signals into
-  advertisements for `UniversalProxy.ESPHome.BluetoothScanner`.
+  Persistent `rebus` D-Bus client + service to `org.bluez`, driving **passive**
+  BLE scanning via the BlueZ `AdvertisementMonitor` API and turning device
+  signals into advertisements for `UniversalProxy.ESPHome.BluetoothScanner`.
+
+  Passive (vs `StartDiscovery`, which is active and makes scannable peripherals
+  burn battery answering our scan requests) requires us to *export* a D-Bus
+  object that BlueZ calls back into — so this process is both a client and a
+  service (via the forked rebus's `set_method_handler/2`).
 
   Flow:
 
-    1. `Rebus.connect(:system)` → the system bus at `/run/dbus/system_bus_socket`
-       (the socket `UniversalProxy.Bluez`'s `dbus-daemon` listens on).
-    2. `Adapter1.Powered = true`, `Adapter1.SetDiscoveryFilter({Transport: le,
-       DuplicateData: true})`, `Adapter1.StartDiscovery`.
-    3. Subscribe to all signals; handle `InterfacesAdded` (new device, full
-       props) and `PropertiesChanged` (RSSI/data updates, partial props) for
-       `org.bluez.Device1` objects under the adapter.
-    4. Merge each device's props in a cache, hand them to
-       `UniversalProxy.Bluez.Advert.reconstruct/1`, and fan the reconstructed
-       advert out via `BluetoothScanner.on_advertisement/1`.
+    1. `Rebus.connect(:system)` and `set_method_handler(self())`; install bus
+       match rules for org.bluez device signals.
+    2. Power the adapter on, then `AdvertisementMonitorManager1.RegisterMonitor`
+       our root object. BlueZ enumerates our monitor via
+       `ObjectManager.GetManagedObjects` and calls `Activate`/`DeviceFound` on
+       it; the monitor's `or_patterns` (FLAGS \\x02/\\x06/\\x1a) match
+       effectively all advertisers (the habluetooth "match all" recipe — BlueZ
+       requires ≥1 pattern).
+    3. Matched devices surface as `InterfacesAdded`/`PropertiesChanged` signals
+       (same as before); each is merged into a per-device prop cache, handed to
+       `UniversalProxy.Bluez.Advert`, and — gated to payload-changes + a
+       heartbeat — fanned out via `BluetoothScanner.on_advertisement/1`.
 
-  Defensive by design: D-Bus body shapes are parsed with `try`/`rescue` so a
-  surprising shape logs and is skipped rather than crashing the client (which
-  would restart the whole BlueZ subtree).
+  RegisterMonitor is issued from a Task: BlueZ calls `GetManagedObjects` back on
+  us *before* RegisterMonitor returns, so the GenServer must stay free to
+  service that inbound call (otherwise deadlock).
+
+  Defensive: inbound bodies are parsed under `try`/`rescue` so a surprising
+  shape logs and is skipped rather than crashing the BlueZ subtree.
   """
 
   use GenServer
@@ -33,9 +41,16 @@ defmodule UniversalProxy.Bluez.Client do
   @adapter_path "/org/bluez/hci0"
   @adapter_iface "org.bluez.Adapter1"
   @device_iface "org.bluez.Device1"
+  @advmon_mgr_iface "org.bluez.AdvertisementMonitorManager1"
+  @advmon_iface "org.bluez.AdvertisementMonitor1"
   @props_iface "org.freedesktop.DBus.Properties"
   @om_iface "org.freedesktop.DBus.ObjectManager"
+  @introspect_iface "org.freedesktop.DBus.Introspectable"
   @bluez "org.bluez"
+
+  # Our exported ObjectManager root + the single monitor object beneath it.
+  @root_path "/org/universalproxy/advmon"
+  @monitor_path "/org/universalproxy/advmon/monitor0"
 
   # bluetoothd may not have claimed org.bluez/hci0 the instant we start.
   @setup_retries 20
@@ -43,9 +58,7 @@ defmodule UniversalProxy.Bluez.Client do
 
   # Forward an advert immediately when its advertising payload changes (sensor
   # data), but coalesce RSSI-only churn to at most one forward per device per
-  # this interval. BlueZ emits a PropertiesChanged for every received advert
-  # (RSSI always differs), so without this the espex→HA forward path runs on
-  # every PDU; this restores a blue_heron-like "once per window" cadence while
+  # this interval — restores a blue_heron-like "once per window" cadence while
   # keeping data-change latency at zero.
   @rssi_heartbeat_ms 10_000
 
@@ -58,15 +71,14 @@ defmodule UniversalProxy.Bluez.Client do
     case Rebus.connect(:system) do
       {:ok, conn} ->
         ref = Rebus.add_signal_handler(conn)
-        # rebus registers a *local* handler but does not install bus-side match
-        # rules, so org.bluez's signals would never be routed to us. Tell the
-        # daemon which signals to deliver.
+        # Receive inbound method calls (BlueZ → our monitor object) too.
+        Rebus.set_method_handler(conn, self())
+        # rebus installs no bus-side match rules, so org.bluez's device signals
+        # wouldn't reach us; ask the daemon to route them.
         add_signal_matches(conn)
-        # devices: %{object_path => merged props map (unwrapped)}
         {:ok, %{conn: conn, sig_ref: ref, devices: %{}}, {:continue, {:setup, @setup_retries}}}
 
       {:error, reason} ->
-        # Let the supervisor retry; the bus may not be up yet.
         {:stop, {:dbus_connect_failed, reason}}
     end
   end
@@ -76,10 +88,12 @@ defmodule UniversalProxy.Bluez.Client do
     case adapter_present?(state.conn) do
       true ->
         power_on(state.conn)
-        set_le_filter(state.conn)
-        start_discovery(state.conn)
-        seed_existing(state)
-        Logger.info("Bluez.Client: discovery started on #{@adapter_path}")
+        state = seed_existing(state)
+        # Register from a Task: BlueZ calls GetManagedObjects back on us before
+        # RegisterMonitor returns, so this process must stay free to answer it.
+        conn = state.conn
+        me = self()
+        Task.start(fn -> Kernel.send(me, {:monitor_registered, register_monitor(conn)}) end)
         {:noreply, state}
 
       false when retries > 0 ->
@@ -93,50 +107,152 @@ defmodule UniversalProxy.Bluez.Client do
   end
 
   @impl GenServer
-  # Signals arrive as {handler_ref, %Rebus.Message{type: :signal, ...}}.
+  # org.bluez device signals arrive as {handler_ref, %Message{type: :signal}}.
   def handle_info({ref, %Rebus.Message{type: :signal} = msg}, %{sig_ref: ref} = state) do
     {:noreply, handle_signal(msg, state)}
   end
 
+  # Inbound method calls from BlueZ into our exported monitor/ObjectManager.
+  def handle_info({:dbus_call, %Rebus.Message{} = msg}, state) do
+    dispatch_method_call(msg, state)
+    {:noreply, state}
+  end
+
+  def handle_info({:monitor_registered, :ok}, state) do
+    Logger.info("Bluez.Client: passive AdvertisementMonitor registered on #{@adapter_path}")
+    {:noreply, state}
+  end
+
+  def handle_info({:monitor_registered, {:error, reason}}, state) do
+    Logger.error("Bluez.Client: RegisterMonitor failed: #{inspect(reason)}")
+    {:noreply, state}
+  end
+
   def handle_info(_other, state), do: {:noreply, state}
 
-  # ── signal dispatch ────────────────────────────────────────────────────
+  # ── inbound method-call dispatch (we are the service BlueZ calls) ────────
+
+  defp dispatch_method_call(%Rebus.Message{header_fields: hf} = msg, state) do
+    conn = state.conn
+
+    case {hf[:interface], hf[:member]} do
+      {@om_iface, "GetManagedObjects"} ->
+        Rebus.reply(conn, msg, [managed_objects()], "a{oa{sa{sv}}}")
+
+      {@props_iface, "GetAll"} ->
+        Rebus.reply(conn, msg, [monitor_props()], "a{sv}")
+
+      {@props_iface, "Get"} ->
+        prop = msg.body |> Enum.at(1)
+
+        case List.keyfind(monitor_props(), prop, 0) do
+          {_p, variant} -> Rebus.reply(conn, msg, [variant], "v")
+          nil -> Rebus.reply_error(conn, msg, "org.freedesktop.DBus.Error.UnknownProperty", prop)
+        end
+
+      {@advmon_iface, "Activate"} ->
+        Logger.info("Bluez.Client: AdvertisementMonitor activated (passive scanning)")
+        Rebus.reply(conn, msg)
+
+      {@advmon_iface, member} when member in ["Release", "DeviceFound", "DeviceLost"] ->
+        # We learn device data from InterfacesAdded/PropertiesChanged, so these
+        # are just acknowledged.
+        Rebus.reply(conn, msg)
+
+      {@introspect_iface, "Introspect"} ->
+        Rebus.reply(conn, msg, [introspect_xml(hf[:path])], "s")
+
+      {iface, member} ->
+        Rebus.reply_error(
+          conn,
+          msg,
+          "org.freedesktop.DBus.Error.UnknownMethod",
+          "#{iface}.#{member}"
+        )
+    end
+  rescue
+    e -> Logger.warning("Bluez.Client: inbound call handling raised #{inspect(e)}")
+  end
+
+  # The single advertisement monitor we expose. `or_patterns` matching the
+  # common Flags values is BlueZ's documented "match all devices" workaround
+  # (passive scanning requires ≥1 pattern); RSSISamplingPeriod=0 reports every
+  # received advert (forwarding is throttled downstream by emit?/3).
+  defp monitor_props do
+    [
+      {"Type", {"s", "or_patterns"}},
+      {"RSSISamplingPeriod", {"q", 0}},
+      {"Patterns", {"a(yyay)", [[0, 0x01, [0x02]], [0, 0x01, [0x06]], [0, 0x01, [0x1A]]]}}
+    ]
+  end
+
+  defp managed_objects do
+    [{@monitor_path, [{@advmon_iface, monitor_props()}]}]
+  end
+
+  defp introspect_xml(path) do
+    interfaces =
+      cond do
+        path == @root_path -> ~s(<interface name="#{@om_iface}"/>)
+        path == @monitor_path -> ~s(<interface name="#{@advmon_iface}"/>)
+        true -> ""
+      end
+
+    ~s(<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">\n<node>#{interfaces}</node>)
+  end
+
+  defp register_monitor(conn) do
+    msg =
+      Rebus.Message.new!(:method_call,
+        destination: @bluez,
+        path: @adapter_path,
+        interface: @advmon_mgr_iface,
+        member: "RegisterMonitor",
+        signature: "o",
+        body: [@root_path]
+      )
+
+    case Rebus.Connection.send(conn, msg) do
+      %Rebus.Message{type: :method_return} -> :ok
+      %Rebus.Message{type: :error, header_fields: hf} -> {:error, hf[:error_name]}
+    end
+  rescue
+    e -> {:error, e}
+  end
+
+  # ── org.bluez device signal handling (advert source) ────────────────────
 
   defp handle_signal(
          %Rebus.Message{header_fields: %{member: "InterfacesAdded"}, body: body},
          state
        ) do
-    try do
-      [path, interfaces] = body
+    [path, interfaces] = body
 
-      case List.keyfind(interfaces, @device_iface, 0) do
-        {_iface, props_list} -> upsert_device(state, path, unwrap_props(props_list))
-        nil -> state
-      end
-    rescue
-      e ->
-        Logger.warning("Bluez.Client: bad InterfacesAdded shape: #{inspect(e)}")
-        state
+    case List.keyfind(interfaces, @device_iface, 0) do
+      {_iface, props_list} -> upsert_device(state, path, unwrap_props(props_list))
+      nil -> state
     end
+  rescue
+    e ->
+      Logger.warning("Bluez.Client: bad InterfacesAdded shape: #{inspect(e)}")
+      state
   end
 
   defp handle_signal(
          %Rebus.Message{header_fields: %{member: "PropertiesChanged", path: path}, body: body},
          state
        ) do
-    try do
-      [iface, changed, _invalidated] = body
+    [iface, changed, _invalidated] = body
 
-      if iface == @device_iface and String.starts_with?(path, @adapter_path <> "/dev_") do
-        upsert_device(state, path, unwrap_props(changed))
-      else
-        state
-      end
-    rescue
-      e ->
-        Logger.warning("Bluez.Client: bad PropertiesChanged shape: #{inspect(e)}")
-        state
+    if iface == @device_iface and String.starts_with?(path, @adapter_path <> "/dev_") do
+      upsert_device(state, path, unwrap_props(changed))
+    else
+      state
     end
+  rescue
+    e ->
+      Logger.warning("Bluez.Client: bad PropertiesChanged shape: #{inspect(e)}")
+      state
   end
 
   defp handle_signal(
@@ -152,9 +268,8 @@ defmodule UniversalProxy.Bluez.Client do
   defp handle_signal(_msg, state), do: state
 
   # Merge new/changed props into the device cache, reconstruct, then emit only
-  # on a payload change or once per heartbeat interval (see @rssi_heartbeat_ms).
-  # Cache value: %{props: merged props, last_raw: last-emitted AD bytes,
-  # last_emit: monotonic ms of last emit}.
+  # on a payload change or once per heartbeat. Cache value: %{props:, last_raw:,
+  # last_emit:}.
   defp upsert_device(state, path, new_props) do
     entry = Map.get(state.devices, path, %{props: %{}, last_raw: nil, last_emit: nil})
     merged = Map.merge(entry.props, new_props)
@@ -173,13 +288,13 @@ defmodule UniversalProxy.Bluez.Client do
           {entry.last_raw, entry.last_emit}
       end
 
-    new_entry = %{props: merged, last_raw: last_raw, last_emit: last_emit}
-    %{state | devices: Map.put(state.devices, path, new_entry)}
+    %{
+      state
+      | devices:
+          Map.put(state.devices, path, %{props: merged, last_raw: last_raw, last_emit: last_emit})
+    }
   end
 
-  # Emit on first sight, whenever the advertising payload changes, or when the
-  # heartbeat interval has elapsed (keeps RSSI/last-seen fresh for HA without
-  # forwarding every PDU).
   defp emit?(_raw, nil, _last_emit), do: true
   defp emit?(raw, last_raw, _last_emit) when raw != last_raw, do: true
 
@@ -196,12 +311,8 @@ defmodule UniversalProxy.Bluez.Client do
     })
   end
 
-  # ── org.bluez method calls ─────────────────────────────────────────────
+  # ── outbound org.bluez calls + helpers ──────────────────────────────────
 
-  # Install bus-side match rules so the daemon routes org.bluez's signals to
-  # this connection. ObjectManager covers InterfacesAdded/Removed (device
-  # appear/disappear); PropertiesChanged (scoped to Device1 via arg0) carries
-  # RSSI/data updates.
   defp add_signal_matches(conn) do
     rules = [
       "type='signal',interface='org.freedesktop.DBus.ObjectManager'",
@@ -231,31 +342,9 @@ defmodule UniversalProxy.Bluez.Client do
   end
 
   defp power_on(conn) do
-    # Properties.Set(ssv): interface, name, value-variant.
-    call(conn, @adapter_path, @props_iface, "Set", "ssv", [
-      @adapter_iface,
-      "Powered",
-      {"b", true}
-    ])
+    call(conn, @adapter_path, @props_iface, "Set", "ssv", [@adapter_iface, "Powered", {"b", true}])
   end
 
-  defp set_le_filter(conn) do
-    # SetDiscoveryFilter(a{sv}). DuplicateData=false lets BlueZ coalesce
-    # identical re-broadcasts and only emit PropertiesChanged when a device's
-    # advertising data actually changes (plus periodic RSSI) — the same intent
-    # as blue_heron's controller-side filter_duplicates. true (report every
-    # PDU) is a firehose that drove the BEAM hot decoding/forwarding every
-    # repeat; sensor freshness is preserved because a data change still emits.
-    filter = [{"Transport", {"s", "le"}}, {"DuplicateData", {"b", false}}]
-    call(conn, @adapter_path, @adapter_iface, "SetDiscoveryFilter", "a{sv}", [filter])
-  end
-
-  defp start_discovery(conn) do
-    call(conn, @adapter_path, @adapter_iface, "StartDiscovery", "", [])
-  end
-
-  # Pull devices that org.bluez already knows about (from before we started)
-  # so cached sensors don't wait for their next advert.
   defp seed_existing(state) do
     case get_managed_objects(state.conn) do
       {:ok, objects} ->
@@ -282,16 +371,9 @@ defmodule UniversalProxy.Bluez.Client do
     end
   end
 
-  # Issue a method call and return {:ok, body} | {:error, reason}.
+  # Outbound method call → {:ok, body} | {:error, reason}.
   defp call(conn, path, interface, member, signature, body) do
-    opts = [
-      destination: @bluez,
-      path: path,
-      interface: interface,
-      member: member,
-      body: body
-    ]
-
+    opts = [destination: @bluez, path: path, interface: interface, member: member, body: body]
     opts = if signature == "", do: opts, else: Keyword.put(opts, :signature, signature)
 
     case Rebus.Connection.send(conn, Rebus.Message.new!(:method_call, opts)) do
@@ -308,26 +390,20 @@ defmodule UniversalProxy.Bluez.Client do
       {:error, e}
   end
 
-  # ── variant unwrapping ─────────────────────────────────────────────────
+  # ── variant unwrapping ──────────────────────────────────────────────────
 
-  # a{sv} props_list = [{key, {sig, value}}] -> %{key => unwrapped value}.
   defp unwrap_props(props_list) when is_list(props_list) do
     Map.new(props_list, fn {key, variant} -> {key, unwrap(key, variant)} end)
   end
 
-  # ManufacturerData (a{qv}): [{company_id, {"ay", bytes}}] -> %{id => binary}.
   defp unwrap("ManufacturerData", {_sig, entries}) when is_list(entries) do
     Map.new(entries, fn {id, {_s, bytes}} -> {id, to_binary(bytes)} end)
   end
 
-  # ServiceData (a{sv}): [{uuid, {"ay", bytes}}] -> %{uuid => binary}.
   defp unwrap("ServiceData", {_sig, entries}) when is_list(entries) do
     Map.new(entries, fn {uuid, {_s, bytes}} -> {uuid, to_binary(bytes)} end)
   end
 
-  # Everything else: a plain variant {sig, value}; an "ay" value is a byte
-  # list we leave as-is unless a consumer wants a binary (Advert handles the
-  # data fields above; Name/UUIDs/RSSI/TxPower are plain).
   defp unwrap(_key, {_sig, value}), do: value
   defp unwrap(_key, value), do: value
 

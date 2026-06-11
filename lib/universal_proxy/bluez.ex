@@ -78,12 +78,14 @@ defmodule UniversalProxy.Bluez do
       __MODULE__.BusReady,
 
       # The BlueZ daemon. -n keeps it in the foreground (MuonTrap tracks it);
-      # stderr carries its logs, surfaced via RingLogger for bring-up.
+      # -E enables experimental interfaces, required for
+      # org.bluez.AdvertisementMonitorManager1 (passive scanning). stderr
+      # carries its logs, surfaced via RingLogger for bring-up.
       Supervisor.child_spec(
         {MuonTrap.Daemon,
          [
            @bluetoothd,
-           ["-n"],
+           ["-n", "-E"],
            [
              name: __MODULE__.Bluetoothd,
              env: [{"DBUS_SYSTEM_BUS_ADDRESS", "unix:path=#{@socket_path}"}],
