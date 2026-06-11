@@ -297,8 +297,13 @@ defmodule UniversalProxy.Bluez.Client do
          state
        ) do
     case body do
-      [path | _] -> %{state | cache: DeviceCache.remove(state.cache, path)}
-      _ -> state
+      [path | _] ->
+        if String.starts_with?(path, @adapter_path <> "/dev_"),
+          do: %{state | cache: DeviceCache.remove(state.cache, path)},
+          else: state
+
+      _ ->
+        state
     end
   end
 
@@ -325,9 +330,11 @@ defmodule UniversalProxy.Bluez.Client do
   # ── outbound org.bluez calls + helpers ──────────────────────────────────
 
   defp add_signal_matches(conn) do
+    # Scope to org.bluez so we only receive the daemon's signals, not
+    # ObjectManager/PropertiesChanged from unrelated bus peers.
     rules = [
-      "type='signal',interface='org.freedesktop.DBus.ObjectManager'",
-      "type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',arg0='#{@device_iface}'"
+      "type='signal',sender='#{@bluez}',interface='org.freedesktop.DBus.ObjectManager'",
+      "type='signal',sender='#{@bluez}',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',arg0='#{@device_iface}'"
     ]
 
     Enum.each(rules, fn rule ->
