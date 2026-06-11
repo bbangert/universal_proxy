@@ -56,22 +56,33 @@ defmodule UniversalProxy.Bluez.Advert do
   """
   @spec reconstruct(map()) :: {:ok, advert()} | :skip
   def reconstruct(props) when is_map(props) do
-    case props["Address"] do
-      addr when is_binary(addr) ->
-        {:ok,
-         %{
-           address: address_to_integer(addr),
-           rss: Map.get(props, "RSSI", 0),
-           address_type: address_type(Map.get(props, "AddressType")),
-           raw_data: build_ad(props)
-         }}
-
-      _ ->
-        :skip
+    # Require a syntactically valid MAC before parsing — a non-MAC Address
+    # string would otherwise make address_to_integer/1 raise, and reconstruct
+    # is called from paths without a rescue (e.g. seed_existing).
+    with addr when is_binary(addr) <- props["Address"],
+         true <- valid_mac?(addr) do
+      {:ok,
+       %{
+         address: address_to_integer(addr),
+         rss: Map.get(props, "RSSI", 0),
+         address_type: address_type(Map.get(props, "AddressType")),
+         raw_data: build_ad(props)
+       }}
+    else
+      _ -> :skip
     end
   end
 
   def reconstruct(_), do: :skip
+
+  defp valid_mac?(mac) do
+    case String.split(mac, ":") do
+      parts when length(parts) == 6 -> Enum.all?(parts, &hex_byte?/1)
+      _ -> false
+    end
+  end
+
+  defp hex_byte?(s), do: byte_size(s) in 1..2 and match?({_, ""}, Integer.parse(s, 16))
 
   @doc """
   Parse `"AA:BB:CC:DD:EE:FF"` into the MSB-first integer Home Assistant
@@ -127,8 +138,7 @@ defmodule UniversalProxy.Bluez.Advert do
   # 0x03 Complete List of 16-bit Service Class UUIDs (only the 16-bit ones).
   defp ad_service_uuids(list) when is_list(list) do
     u16s =
-      for uuid <- list, match?({:ok, _}, short_uuid16(uuid)) do
-        {:ok, u16} = short_uuid16(uuid)
+      for uuid <- list, {:ok, u16} <- [short_uuid16(uuid)] do
         <<u16::little-16>>
       end
 
@@ -149,9 +159,15 @@ defmodule UniversalProxy.Bluez.Advert do
   defp ad_tx_power(_), do: []
 
   # One AD structure: <<length, type, data...>> where length counts type+data.
-  defp ad_element(type, data) when is_integer(type) and is_binary(data) do
+  # The length is a single byte, so data must be <= 254; a larger field (e.g. a
+  # device advertising an oversized ServiceData/ManufacturerData blob) is
+  # dropped rather than emitted with a wrapped/overflowed length byte.
+  defp ad_element(type, data)
+       when is_integer(type) and is_binary(data) and byte_size(data) <= 254 do
     <<byte_size(data) + 1, type, data::binary>>
   end
+
+  defp ad_element(_type, _data), do: <<>>
 
   # "0000fcd2-0000-1000-8000-00805f9b34fb" -> {:ok, 0xFCD2} for SIG base UUIDs
   # whose high 16 bits of the first group are zero (true 16-bit UUIDs).

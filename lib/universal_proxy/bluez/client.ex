@@ -11,31 +11,35 @@ defmodule UniversalProxy.Bluez.Client do
 
   Flow:
 
-    1. `Rebus.connect(:system)` and `set_method_handler(self())`; install bus
-       match rules for org.bluez device signals.
+    1. `Rebus.connect(:system)`, `set_method_handler(self())`, monitor the
+       connection, and install bus match rules for org.bluez device signals.
     2. Power the adapter on, then `AdvertisementMonitorManager1.RegisterMonitor`
        our root object. BlueZ enumerates our monitor via
        `ObjectManager.GetManagedObjects` and calls `Activate`/`DeviceFound` on
        it; the monitor's `or_patterns` (FLAGS \\x02/\\x06/\\x1a) match
-       effectively all advertisers (the habluetooth "match all" recipe — BlueZ
-       requires ≥1 pattern).
-    3. Matched devices surface as `InterfacesAdded`/`PropertiesChanged` signals
-       (same as before); each is merged into a per-device prop cache, handed to
-       `UniversalProxy.Bluez.Advert`, and — gated to payload-changes + a
-       heartbeat — fanned out via `BluetoothScanner.on_advertisement/1`.
+       effectively all advertisers (the habluetooth "match all" recipe).
+    3. Matched devices surface as `InterfacesAdded`/`PropertiesChanged` signals;
+       props are unwrapped (`UniversalProxy.Bluez.Variant`) and fed to
+       `UniversalProxy.Bluez.DeviceCache`, which reconstructs + emit-gates and
+       returns the adverts to fan out via `BluetoothScanner.on_advertisement/1`.
 
-  RegisterMonitor is issued from a Task: BlueZ calls `GetManagedObjects` back on
-  us *before* RegisterMonitor returns, so the GenServer must stay free to
-  service that inbound call (otherwise deadlock).
+  Resilience:
 
-  Defensive: inbound bodies are parsed under `try`/`rescue` so a surprising
-  shape logs and is skipped rather than crashing the BlueZ subtree.
+    * RegisterMonitor runs in a Task (BlueZ calls `GetManagedObjects` back
+      before RegisterMonitor returns — the GenServer must stay free to answer),
+      and the Task catches `:exit` (a `GenServer.call` timeout) so a wedged
+      BlueZ surfaces as a logged error, not a silent dropped Task.
+    * The rebus connection is monitored; if it dies (e.g. a malformed bus
+      frame `:stop`s it) the Client stops and the supervisor restarts it,
+      re-establishing the connection.
+    * Setup retries via `send_after` (not `Process.sleep`) so the GenServer
+      stays responsive while waiting for `bluetoothd` to claim org.bluez.
   """
 
   use GenServer
   require Logger
 
-  alias UniversalProxy.Bluez.Advert
+  alias UniversalProxy.Bluez.{DeviceCache, Variant}
   alias UniversalProxy.ESPHome.BluetoothScanner
 
   @adapter_path "/org/bluez/hci0"
@@ -56,11 +60,8 @@ defmodule UniversalProxy.Bluez.Client do
   @setup_retries 20
   @setup_retry_ms 500
 
-  # Forward an advert immediately when its advertising payload changes (sensor
-  # data), but coalesce RSSI-only churn to at most one forward per device per
-  # this interval — restores a blue_heron-like "once per window" cadence while
-  # keeping data-change latency at zero.
-  @rssi_heartbeat_ms 10_000
+  # Timeout for the (Task-issued) RegisterMonitor call to BlueZ.
+  @register_timeout_ms 10_000
 
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -73,10 +74,14 @@ defmodule UniversalProxy.Bluez.Client do
         ref = Rebus.add_signal_handler(conn)
         # Receive inbound method calls (BlueZ → our monitor object) too.
         Rebus.set_method_handler(conn, self())
+        # Restart (and reconnect) if the connection dies.
+        conn_ref = Process.monitor(conn)
         # rebus installs no bus-side match rules, so org.bluez's device signals
         # wouldn't reach us; ask the daemon to route them.
         add_signal_matches(conn)
-        {:ok, %{conn: conn, sig_ref: ref, devices: %{}}, {:continue, {:setup, @setup_retries}}}
+
+        state = %{conn: conn, conn_ref: conn_ref, sig_ref: ref, cache: DeviceCache.new()}
+        {:ok, state, {:continue, {:setup, @setup_retries}}}
 
       {:error, reason} ->
         {:stop, {:dbus_connect_failed, reason}}
@@ -84,29 +89,19 @@ defmodule UniversalProxy.Bluez.Client do
   end
 
   @impl GenServer
-  def handle_continue({:setup, retries}, state) do
-    case adapter_present?(state.conn) do
-      true ->
-        power_on(state.conn)
-        state = seed_existing(state)
-        # Register from a Task: BlueZ calls GetManagedObjects back on us before
-        # RegisterMonitor returns, so this process must stay free to answer it.
-        conn = state.conn
-        me = self()
-        Task.start(fn -> Kernel.send(me, {:monitor_registered, register_monitor(conn)}) end)
-        {:noreply, state}
-
-      false when retries > 0 ->
-        Process.sleep(@setup_retry_ms)
-        {:noreply, state, {:continue, {:setup, retries - 1}}}
-
-      false ->
-        Logger.error("Bluez.Client: #{@adapter_path} never appeared on org.bluez")
-        {:stop, :no_adapter, state}
-    end
-  end
+  def handle_continue({:setup, retries}, state), do: attempt_setup(state, retries)
 
   @impl GenServer
+  # Connection died (e.g. malformed frame stopped it). Stop so the supervisor
+  # restarts us and we reconnect; rebus connections are :temporary and don't
+  # restart themselves.
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{conn_ref: ref} = state) do
+    {:stop, {:dbus_connection_down, reason}, state}
+  end
+
+  # Non-blocking setup retry (adapter not yet present).
+  def handle_info({:setup_retry, retries}, state), do: attempt_setup(state, retries)
+
   # org.bluez device signals arrive as {handler_ref, %Message{type: :signal}}.
   def handle_info({ref, %Rebus.Message{type: :signal} = msg}, %{sig_ref: ref} = state) do
     {:noreply, handle_signal(msg, state)}
@@ -129,6 +124,55 @@ defmodule UniversalProxy.Bluez.Client do
   end
 
   def handle_info(_other, state), do: {:noreply, state}
+
+  # ── setup ────────────────────────────────────────────────────────────────
+
+  defp attempt_setup(state, retries) do
+    cond do
+      adapter_present?(state.conn) ->
+        power_on(state.conn)
+        state = seed_existing(state)
+        register_monitor_async(state.conn)
+        {:noreply, state}
+
+      retries > 0 ->
+        Process.send_after(self(), {:setup_retry, retries - 1}, @setup_retry_ms)
+        {:noreply, state}
+
+      true ->
+        Logger.error("Bluez.Client: #{@adapter_path} never appeared on org.bluez")
+        {:stop, :no_adapter, state}
+    end
+  end
+
+  # Register from a Task: BlueZ calls GetManagedObjects back on us before
+  # RegisterMonitor returns, so this process must stay free to answer it.
+  defp register_monitor_async(conn) do
+    me = self()
+    Task.start(fn -> Kernel.send(me, {:monitor_registered, register_monitor(conn)}) end)
+  end
+
+  defp register_monitor(conn) do
+    msg =
+      Rebus.Message.new!(:method_call,
+        destination: @bluez,
+        path: @adapter_path,
+        interface: @advmon_mgr_iface,
+        member: "RegisterMonitor",
+        signature: "o",
+        body: [@root_path]
+      )
+
+    case GenServer.call(conn, {:send, msg}, @register_timeout_ms) do
+      %Rebus.Message{type: :method_return} -> :ok
+      %Rebus.Message{type: :error, header_fields: hf} -> {:error, hf[:error_name]}
+    end
+  rescue
+    e -> {:error, e}
+  catch
+    # GenServer.call timeout / dead connection raise an exit, not an exception.
+    :exit, reason -> {:error, {:exit, reason}}
+  end
 
   # ── inbound method-call dispatch (we are the service BlueZ calls) ────────
 
@@ -177,7 +221,7 @@ defmodule UniversalProxy.Bluez.Client do
   # The single advertisement monitor we expose. `or_patterns` matching the
   # common Flags values is BlueZ's documented "match all devices" workaround
   # (passive scanning requires ≥1 pattern); RSSISamplingPeriod=0 reports every
-  # received advert (forwarding is throttled downstream by emit?/3).
+  # received advert (forwarding is throttled downstream by DeviceCache).
   defp monitor_props do
     [
       {"Type", {"s", "or_patterns"}},
@@ -201,25 +245,6 @@ defmodule UniversalProxy.Bluez.Client do
     ~s(<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">\n<node>#{interfaces}</node>)
   end
 
-  defp register_monitor(conn) do
-    msg =
-      Rebus.Message.new!(:method_call,
-        destination: @bluez,
-        path: @adapter_path,
-        interface: @advmon_mgr_iface,
-        member: "RegisterMonitor",
-        signature: "o",
-        body: [@root_path]
-      )
-
-    case Rebus.Connection.send(conn, msg) do
-      %Rebus.Message{type: :method_return} -> :ok
-      %Rebus.Message{type: :error, header_fields: hf} -> {:error, hf[:error_name]}
-    end
-  rescue
-    e -> {:error, e}
-  end
-
   # ── org.bluez device signal handling (advert source) ────────────────────
 
   defp handle_signal(
@@ -229,7 +254,7 @@ defmodule UniversalProxy.Bluez.Client do
     [path, interfaces] = body
 
     case List.keyfind(interfaces, @device_iface, 0) do
-      {_iface, props_list} -> upsert_device(state, path, unwrap_props(props_list))
+      {_iface, props_list} -> ingest(state, path, Variant.unwrap_props(props_list))
       nil -> state
     end
   rescue
@@ -245,7 +270,7 @@ defmodule UniversalProxy.Bluez.Client do
     [iface, changed, _invalidated] = body
 
     if iface == @device_iface and String.starts_with?(path, @adapter_path <> "/dev_") do
-      upsert_device(state, path, unwrap_props(changed))
+      ingest(state, path, Variant.unwrap_props(changed))
     else
       state
     end
@@ -260,46 +285,20 @@ defmodule UniversalProxy.Bluez.Client do
          state
        ) do
     case body do
-      [path | _] -> %{state | devices: Map.delete(state.devices, path)}
+      [path | _] -> %{state | cache: DeviceCache.remove(state.cache, path)}
       _ -> state
     end
   end
 
   defp handle_signal(_msg, state), do: state
 
-  # Merge new/changed props into the device cache, reconstruct, then emit only
-  # on a payload change or once per heartbeat. Cache value: %{props:, last_raw:,
-  # last_emit:}.
-  defp upsert_device(state, path, new_props) do
-    entry = Map.get(state.devices, path, %{props: %{}, last_raw: nil, last_emit: nil})
-    merged = Map.merge(entry.props, new_props)
+  # Merge props into the cache and emit whatever adverts it returns.
+  defp ingest(state, path, props) do
+    {cache, adverts} =
+      DeviceCache.upsert(state.cache, path, props, System.monotonic_time(:millisecond))
 
-    {last_raw, last_emit} =
-      case Advert.reconstruct(merged) do
-        {:ok, advert} ->
-          if emit?(advert.raw_data, entry.last_raw, entry.last_emit) do
-            emit(advert)
-            {advert.raw_data, System.monotonic_time(:millisecond)}
-          else
-            {entry.last_raw, entry.last_emit}
-          end
-
-        :skip ->
-          {entry.last_raw, entry.last_emit}
-      end
-
-    %{
-      state
-      | devices:
-          Map.put(state.devices, path, %{props: merged, last_raw: last_raw, last_emit: last_emit})
-    }
-  end
-
-  defp emit?(_raw, nil, _last_emit), do: true
-  defp emit?(raw, last_raw, _last_emit) when raw != last_raw, do: true
-
-  defp emit?(_raw, _last_raw, last_emit) do
-    System.monotonic_time(:millisecond) - last_emit >= @rssi_heartbeat_ms
+    Enum.each(adverts, &emit/1)
+    %{state | cache: cache}
   end
 
   defp emit(%{address: address, rss: rss, address_type: address_type, raw_data: raw_data}) do
@@ -351,7 +350,7 @@ defmodule UniversalProxy.Bluez.Client do
         Enum.reduce(objects, state, fn
           {path, ifaces}, acc ->
             case List.keyfind(ifaces, @device_iface, 0) do
-              {_i, props} -> upsert_device(acc, path, unwrap_props(props))
+              {_i, props} -> ingest(acc, path, Variant.unwrap_props(props))
               nil -> acc
             end
 
@@ -388,25 +387,9 @@ defmodule UniversalProxy.Bluez.Client do
     e ->
       Logger.warning("Bluez.Client: #{member} raised #{inspect(e)}")
       {:error, e}
+  catch
+    :exit, reason ->
+      Logger.warning("Bluez.Client: #{member} exited #{inspect(reason)}")
+      {:error, {:exit, reason}}
   end
-
-  # ── variant unwrapping ──────────────────────────────────────────────────
-
-  defp unwrap_props(props_list) when is_list(props_list) do
-    Map.new(props_list, fn {key, variant} -> {key, unwrap(key, variant)} end)
-  end
-
-  defp unwrap("ManufacturerData", {_sig, entries}) when is_list(entries) do
-    Map.new(entries, fn {id, {_s, bytes}} -> {id, to_binary(bytes)} end)
-  end
-
-  defp unwrap("ServiceData", {_sig, entries}) when is_list(entries) do
-    Map.new(entries, fn {uuid, {_s, bytes}} -> {uuid, to_binary(bytes)} end)
-  end
-
-  defp unwrap(_key, {_sig, value}), do: value
-  defp unwrap(_key, value), do: value
-
-  defp to_binary(bytes) when is_list(bytes), do: :erlang.list_to_binary(bytes)
-  defp to_binary(bytes) when is_binary(bytes), do: bytes
 end

@@ -114,6 +114,9 @@ defmodule UniversalProxy.Bluez do
   def prepare_runtime do
     File.mkdir_p!(@run_dir)
     File.mkdir_p!(@bluetooth_state_dir)
+    # bluetoothd stores pairing/link keys + the adapter identity here; keep it
+    # owner-only rather than the default world-readable 0755.
+    File.chmod!(@bluetooth_state_dir, 0o700)
     ensure_machine_id()
     :ok
   end
