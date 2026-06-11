@@ -139,19 +139,11 @@ defmodule UniversalProxy.MixProject do
       # `nerves-networking/mdns_lite#213` for the eventual fix.
       {:mdns_lite, path: "deps_local/mdns_lite", override: true},
 
-      # Fork of blue_heron, consumed as a git submodule at
-      # deps_local/blue_heron (bbangert/blue_heron, branch phase0-rpi3-fixes).
-      # Base applies upstream PR #138 (RPi Zero 2W Broadcom vendor HCI
-      # firmware load) + #139 (bundled BCM*.hcd blobs + RPi 4 LMP mapping);
-      # on top are our Pi 3 B+ fixes (0x6119→BCM4345C0, framing-log flood,
-      # Observer scan driver). See deps_local/blue_heron/VENDORED.md.
-      # Run `git submodule update --init` after cloning. Phase 0 is rpi3-only:
-      # `UniversalProxy.Bluetooth` is compile-guarded to [:rpi3] and only rpi3
-      # has `:blue_heron, :transport` config, so restricting `targets:` to
-      # [:rpi3] keeps blue_heron's OTP app from starting a device-less
-      # transport on other Pi targets. Phase 0b broadens this with per-target
-      # transport wiring.
-      {:blue_heron, path: "deps_local/blue_heron", override: true, targets: [:rpi3]},
+      # blue_heron (the vendored raw-HCI fork) has been retired on rpi3 in
+      # favour of the kernel BlueZ stack (`UniversalProxy.Bluez`): the two
+      # cannot coexist on one chip, and blue_heron crash-loops at boot without
+      # a transport. The submodule at deps_local/blue_heron and VENDORED.md
+      # remain in-tree for reference but are no longer a dependency.
 
       # Dependencies for specific targets
       # NOTE: It's generally low risk and recommended to follow minor version

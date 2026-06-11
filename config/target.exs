@@ -143,15 +143,11 @@ config :mdns_lite,
     # `Espex.Mdns.MdnsLite` from the live device configuration.
   ]
 
-# Bluetooth (Phase 0 spike — rpi3 only). Configures the vendored
-# blue_heron transport so its OTP-application autostart can reach the
-# Broadcom radio over `/dev/ttyS0` (miniUART on rpi3 with `dtoverlay=
-# miniuart-bt`). Hardware flow control is the rpi3 BT-chip default.
-# Phase 0b broadens to rpi4/rpi0/rpi0_2 (rpi4 device path differs).
-if Mix.target() == :rpi3 do
-  config :blue_heron,
-    transport: [device: "/dev/ttyS0", speed: 115_200, flow_control: :hardware]
-end
+# Bluetooth: the BlueZ migration (UniversalProxy.Bluez) drives the controller
+# through the kernel (`hci0`) over D-Bus. blue_heron's raw mini-UART stack has
+# been removed (it's no longer a dependency — see mix.exs): the two cannot
+# coexist on one chip, and blue_heron crash-loops at boot without a transport.
+# Hence no `:blue_heron` config here anymore.
 
 # Import target specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.

@@ -1,36 +1,37 @@
 defmodule UniversalProxy.Bluetooth do
   @moduledoc """
-  Bluetooth subtree: owns the passive BLE scanner and the subscriber
-  registry that feeds advertisements to Home Assistant.
+  Bluetooth subtree: owns the BlueZ stack and the subscriber registry that
+  feeds advertisements to Home Assistant.
 
-  Two children, started `:rest_for_one` (registry first, Observer second):
+  Children, started `:rest_for_one` (registry first):
 
     1. a duplicate-key `Registry`
        (`UniversalProxy.ESPHome.BluetoothScanner.registry_name/0`) holding
-       every subscribed ESPHome connection-handler pid. Registry-up-before-
-       Observer guarantees the Observer callback's `Registry.dispatch` never
-       hits a missing table; if the registry crashes, `:rest_for_one`
-       restarts the Observer too so it re-dispatches against a live table.
-    2. `BlueHeron.Observer` — turns on LE scan and invokes
-       `UniversalProxy.ESPHome.BluetoothScanner.on_advertisement/1` per
-       advertised device, which fans the raw advert out over the registry.
+       every subscribed ESPHome connection-handler pid. Registry-up-first
+       guarantees the advert fan-out's `Registry.dispatch` never hits a
+       missing table.
+    2. `UniversalProxy.Bluez` — brings up `dbus-daemon` + `bluetoothd` so the
+       kernel-attached controller (`hci0`) is managed by BlueZ over D-Bus.
+       The `rebus` client + advertisement reconstruction that call
+       `UniversalProxy.ESPHome.BluetoothScanner.on_advertisement/1` attach
+       inside that subtree (Stage B).
 
-  `blue_heron` registers itself as an OTP application
-  (`mod: {BlueHeron.Application, []}`) and brings up Registry / SMP /
-  Peripheral / HCI Transport on its own from `:blue_heron, :transport`
-  config (see `config/target.exs`); we only add the scanner driver and the
-  HA-facing fan-out registry on top.
+  ## Migration off blue_heron
+
+  This replaces the vendored `blue_heron` raw-HCI stack on rpi3, which has
+  been removed as a dependency. The two cannot coexist — both drive the same
+  physical chip, and `blue_heron`'s raw mini-UART access knocks the kernel's
+  `hci0` off the mgmt interface (see `UniversalProxy.Bluez`). It also
+  crash-loops at boot without a transport, so it can't simply be left idle.
 
   Compile-time guarded: off-target (host, or any Nerves target outside BT
   scope), `child_spec/1` returns a normal spec whose `start_link/1` returns
-  `:ignore`, so the supervisor treats this module as a no-op there (and
-  `:blue_heron` isn't even a dep off-target). The advert fan-out adapter
-  (`UniversalProxy.ESPHome.BluetoothScanner`) is itself unguarded so it can
-  be unit-tested on the host against a registry started in the test.
+  `:ignore`, so the supervisor treats this module as a no-op there. The advert
+  fan-out adapter (`UniversalProxy.ESPHome.BluetoothScanner`) is itself
+  unguarded so it can be unit-tested on the host against a registry started in
+  the test.
 
-  BT scope = `:rpi3` only for now. Broadening to rpi4/rpi0/rpi0_2 (rpi4
-  needs a different device path; rpi0/0_2 share `/dev/ttyS0` with rpi3) is a
-  later step — flip `@bluetooth_targets`.
+  BT scope = `:rpi3` only for now (`@bluetooth_targets`).
   """
 
   @bluetooth_targets [:rpi3]
@@ -65,31 +66,20 @@ defmodule UniversalProxy.Bluetooth do
     @impl Supervisor
     def init(_opts) do
       children = [
-        # Subscriber registry FIRST so the Observer callback's dispatch
-        # always finds a live table. Duplicate keys: N connections fan out
-        # under the single `:subscribers` key.
+        # Subscriber registry FIRST so the advert fan-out's dispatch always
+        # finds a live table. Duplicate keys: N connections fan out under the
+        # single `:subscribers` key.
         {Registry, keys: :duplicate, name: BluetoothScanner.registry_name()},
 
-        # filter_duplicates: true → controller reports each device once per
-        # scan window instead of every beacon, keeping the UART/dispatch
-        # load sane in a busy RF environment.
-        #
-        # scan_params: ~10% duty cycle (window 30ms every 300ms). The
-        # vendored default is window=interval=10ms = 100% duty (continuous
-        # listening), which fire-hoses every advert over the rpi3 miniUART
-        # and keeps the `circuits_uart` receive path hot (~8% of a core).
-        # A 10% duty cycle cuts that ~6x (port CPU → ~1.3% of a core, BEAM
-        # scheduler util 5.3% → 1%) while still discovering ~80 distinct
-        # devices within seconds. Tunable per deployment.
-        {BlueHeron.Observer,
-         callback: &BluetoothScanner.on_advertisement/1,
-         filter_duplicates: true,
-         scan_params: [le_scan_interval: 0x01E0, le_scan_window: 0x0030]}
+        # BlueZ stack (dbus-daemon + bluetoothd). The rebus client that turns
+        # on discovery and reconstructs adverts into
+        # `BluetoothScanner.on_advertisement/1` lives inside this subtree.
+        UniversalProxy.Bluez
       ]
 
-      # rest_for_one: registry restart cascades to the Observer (which then
-      # re-dispatches against the fresh table); an Observer restart leaves
-      # the registry — and its subscribers — untouched.
+      # rest_for_one: a registry restart cascades into the BlueZ subtree so
+      # any advert dispatcher re-runs against the fresh table; a BlueZ restart
+      # leaves the registry — and its subscribers — untouched.
       Supervisor.init(children, strategy: :rest_for_one)
     end
   else
