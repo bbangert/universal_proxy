@@ -142,8 +142,8 @@ defmodule UniversalProxy.MixProject do
       # blue_heron (the vendored raw-HCI fork) has been retired on rpi3 in
       # favour of the kernel BlueZ stack (`UniversalProxy.Bluez`): the two
       # cannot coexist on one chip, and blue_heron crash-loops at boot without
-      # a transport. The submodule at deps_local/blue_heron and VENDORED.md
-      # remain in-tree for reference but are no longer a dependency.
+      # a transport. It's fully removed — no dependency, and the
+      # deps_local/blue_heron submodule + .gitmodules entry have been dropped.
 
       # Pure-Elixir D-Bus client for talking to org.bluez on the system bus.
       # Forked (bbangert/rebus, branch dbus-service, off the 0.2.0 release) and

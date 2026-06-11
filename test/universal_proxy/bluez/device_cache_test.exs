@@ -22,6 +22,10 @@ defmodule UniversalProxy.Bluez.DeviceCacheTest do
     test "unchanged payload after the heartbeat emits" do
       assert DeviceCache.emit?(<<1>>, <<1>>, 0, 10_000, @heartbeat)
     end
+
+    test "is total: last_raw present but last_emit nil emits (no arithmetic on nil)" do
+      assert DeviceCache.emit?(<<1>>, <<1>>, nil, 5_000, @heartbeat)
+    end
   end
 
   describe "upsert/4" do

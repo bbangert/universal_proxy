@@ -62,8 +62,9 @@ defmodule UniversalProxy.Bluez.AdvertTest do
         })
 
       # Order is map-iteration order; assert both elements are present.
-      assert raw =~ <<4, 0xFF, 0x4C, 0x00, 0xAA>>
-      assert raw =~ <<4, 0xFF, 0x06, 0x00, 0xBB>>
+      # :binary.match (not =~) because AD bytes are arbitrary, not UTF-8 text.
+      assert :binary.match(raw, <<4, 0xFF, 0x4C, 0x00, 0xAA>>) != :nomatch
+      assert :binary.match(raw, <<4, 0xFF, 0x06, 0x00, 0xBB>>) != :nomatch
       assert byte_size(raw) == 10
     end
 
@@ -130,15 +131,15 @@ defmodule UniversalProxy.Bluez.AdvertTest do
           "TxPower" => -4
         })
 
-      assert raw =~ <<6, 0x09, "Govee">>
-      assert raw =~ <<2, 0x0A, 0xFC>>
+      assert :binary.match(raw, <<6, 0x09, "Govee">>) != :nomatch
+      assert :binary.match(raw, <<2, 0x0A, 0xFC>>) != :nomatch
     end
 
     test "empty name produces no 0x09 element" do
       {:ok, %{raw_data: raw}} =
         Advert.reconstruct(%{"Address" => "11:22:33:44:55:66", "Name" => ""})
 
-      refute raw =~ <<0x09>>
+      assert :binary.match(raw, <<0x09>>) == :nomatch
       assert raw == <<>>
     end
 

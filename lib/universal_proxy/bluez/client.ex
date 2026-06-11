@@ -215,7 +215,16 @@ defmodule UniversalProxy.Bluez.Client do
         )
     end
   rescue
-    e -> Logger.warning("Bluez.Client: inbound call handling raised #{inspect(e)}")
+    e ->
+      Logger.warning("Bluez.Client: inbound call handling raised #{inspect(e)}")
+      # Always answer a reply-expecting call so BlueZ doesn't block until its
+      # timeout; reply_error/4 no-ops for NO_REPLY_EXPECTED notifications.
+      Rebus.reply_error(
+        state.conn,
+        msg,
+        "org.freedesktop.DBus.Error.Failed",
+        Exception.message(e)
+      )
   end
 
   # The single advertisement monitor we expose. `or_patterns` matching the
@@ -253,9 +262,12 @@ defmodule UniversalProxy.Bluez.Client do
        ) do
     [path, interfaces] = body
 
-    case List.keyfind(interfaces, @device_iface, 0) do
-      {_iface, props_list} -> ingest(state, path, Variant.unwrap_props(props_list))
-      nil -> state
+    with true <- String.starts_with?(path, @adapter_path <> "/dev_"),
+         {_iface, props_list} <- List.keyfind(interfaces, @device_iface, 0) do
+      ingest(state, path, Variant.unwrap_props(props_list))
+    else
+      # Not a Device1 under our adapter — ignore (matches PropertiesChanged).
+      _ -> state
     end
   rescue
     e ->

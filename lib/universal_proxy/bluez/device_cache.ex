@@ -72,6 +72,9 @@ defmodule UniversalProxy.Bluez.DeviceCache do
   @spec emit?(binary(), binary() | nil, integer() | nil, integer(), integer()) :: boolean()
   def emit?(_raw, nil, _last_emit, _now, _heartbeat_ms), do: true
   def emit?(raw, last_raw, _last_emit, _now, _heartbeat_ms) when raw != last_raw, do: true
+  # No prior emit time — treat as never emitted (also keeps the function total:
+  # avoids `now - nil` when called with last_raw present but last_emit nil).
+  def emit?(_raw, _last_raw, nil, _now, _heartbeat_ms), do: true
   def emit?(_raw, _last_raw, last_emit, now, heartbeat_ms), do: now - last_emit >= heartbeat_ms
 
   # Evict the least-recently-seen entries until at or below the cap. The
