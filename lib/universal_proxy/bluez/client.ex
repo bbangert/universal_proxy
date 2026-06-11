@@ -41,6 +41,14 @@ defmodule UniversalProxy.Bluez.Client do
   @setup_retries 20
   @setup_retry_ms 500
 
+  # Forward an advert immediately when its advertising payload changes (sensor
+  # data), but coalesce RSSI-only churn to at most one forward per device per
+  # this interval. BlueZ emits a PropertiesChanged for every received advert
+  # (RSSI always differs), so without this the espex→HA forward path runs on
+  # every PDU; this restores a blue_heron-like "once per window" cadence while
+  # keeping data-change latency at zero.
+  @rssi_heartbeat_ms 10_000
+
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
@@ -143,16 +151,40 @@ defmodule UniversalProxy.Bluez.Client do
 
   defp handle_signal(_msg, state), do: state
 
-  # Merge new/changed props into the device cache, then reconstruct + emit.
+  # Merge new/changed props into the device cache, reconstruct, then emit only
+  # on a payload change or once per heartbeat interval (see @rssi_heartbeat_ms).
+  # Cache value: %{props: merged props, last_raw: last-emitted AD bytes,
+  # last_emit: monotonic ms of last emit}.
   defp upsert_device(state, path, new_props) do
-    merged = Map.merge(Map.get(state.devices, path, %{}), new_props)
+    entry = Map.get(state.devices, path, %{props: %{}, last_raw: nil, last_emit: nil})
+    merged = Map.merge(entry.props, new_props)
 
-    case Advert.reconstruct(merged) do
-      {:ok, advert} -> emit(advert)
-      :skip -> :ok
-    end
+    {last_raw, last_emit} =
+      case Advert.reconstruct(merged) do
+        {:ok, advert} ->
+          if emit?(advert.raw_data, entry.last_raw, entry.last_emit) do
+            emit(advert)
+            {advert.raw_data, System.monotonic_time(:millisecond)}
+          else
+            {entry.last_raw, entry.last_emit}
+          end
 
-    %{state | devices: Map.put(state.devices, path, merged)}
+        :skip ->
+          {entry.last_raw, entry.last_emit}
+      end
+
+    new_entry = %{props: merged, last_raw: last_raw, last_emit: last_emit}
+    %{state | devices: Map.put(state.devices, path, new_entry)}
+  end
+
+  # Emit on first sight, whenever the advertising payload changes, or when the
+  # heartbeat interval has elapsed (keeps RSSI/last-seen fresh for HA without
+  # forwarding every PDU).
+  defp emit?(_raw, nil, _last_emit), do: true
+  defp emit?(raw, last_raw, _last_emit) when raw != last_raw, do: true
+
+  defp emit?(_raw, _last_raw, last_emit) do
+    System.monotonic_time(:millisecond) - last_emit >= @rssi_heartbeat_ms
   end
 
   defp emit(%{address: address, rss: rss, address_type: address_type, raw_data: raw_data}) do
@@ -208,10 +240,13 @@ defmodule UniversalProxy.Bluez.Client do
   end
 
   defp set_le_filter(conn) do
-    # SetDiscoveryFilter(a{sv}). DuplicateData=true so every advert (not just
-    # the first per device) produces a PropertiesChanged — that's the stream
-    # the passive scanner needs.
-    filter = [{"Transport", {"s", "le"}}, {"DuplicateData", {"b", true}}]
+    # SetDiscoveryFilter(a{sv}). DuplicateData=false lets BlueZ coalesce
+    # identical re-broadcasts and only emit PropertiesChanged when a device's
+    # advertising data actually changes (plus periodic RSSI) — the same intent
+    # as blue_heron's controller-side filter_duplicates. true (report every
+    # PDU) is a firehose that drove the BEAM hot decoding/forwarding every
+    # repeat; sensor freshness is preserved because a data change still emits.
+    filter = [{"Transport", {"s", "le"}}, {"DuplicateData", {"b", false}}]
     call(conn, @adapter_path, @adapter_iface, "SetDiscoveryFilter", "a{sv}", [filter])
   end
 
