@@ -93,7 +93,12 @@ defmodule UniversalProxy.Bluez do
            ]
          ]},
         id: :bluetoothd
-      )
+      ),
+
+      # Persistent rebus client: owns the discovery session and turns BlueZ
+      # device signals into advertisements for the ESPHome scanner. Last in
+      # rest_for_one order so it (re)connects only once bluetoothd is up.
+      __MODULE__.Client
     ]
 
     Supervisor.init(children, strategy: :rest_for_one)

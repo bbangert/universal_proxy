@@ -145,6 +145,13 @@ defmodule UniversalProxy.MixProject do
       # a transport. The submodule at deps_local/blue_heron and VENDORED.md
       # remain in-tree for reference but are no longer a dependency.
 
+      # Pure-Elixir D-Bus client (no native deps) for talking to org.bluez on
+      # the system bus: StartDiscovery + InterfacesAdded/PropertiesChanged
+      # signal handling (UniversalProxy.Bluez.Client). Available on all targets
+      # so UniversalProxy.Bluez.Client compiles on host (CI builds host with
+      # --warnings-as-errors); it's only *started* on rpi3 via UniversalProxy.Bluez.
+      {:rebus, "~> 0.2"},
+
       # Dependencies for specific targets
       # NOTE: It's generally low risk and recommended to follow minor version
       # bumps to Nerves systems. Since these include Linux kernel and Erlang
