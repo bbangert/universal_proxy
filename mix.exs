@@ -167,7 +167,17 @@ defmodule UniversalProxy.MixProject do
       {:nerves_system_rpi0, "~> 2.0", runtime: false, targets: :rpi0},
       {:nerves_system_rpi0_2, "~> 2.0", runtime: false, targets: :rpi0_2},
       {:nerves_system_rpi2, "~> 2.0", runtime: false, targets: :rpi2},
-      {:nerves_system_rpi3, "~> 2.0", runtime: false, targets: :rpi3},
+      # Custom Nerves system with BlueZ + D-Bus (kernel btbcm firmware, dbus,
+      # bluez5-utils) for the Bluetooth proxy. Prebuilt artifact is pulled from
+      # the releases repo; no local buildroot required (host must be
+      # linux/x86_64). Upstream nerves_system_rpi3 lacks the BT userspace.
+      {:nerves_system_rpi3,
+       github: "bbangert/nerves_systems_universal_proxy",
+       sparse: "rpi3",
+       tag: "v0.1.1",
+       runtime: false,
+       targets: :rpi3,
+       override: true},
       {:nerves_system_rpi4, "~> 2.0", runtime: false, targets: :rpi4},
       {:nerves_system_rpi5, "~> 2.0", runtime: false, targets: :rpi5},
       {:nerves_system_x86_64, "~> 1.33.1", runtime: false, targets: :x86_64}
