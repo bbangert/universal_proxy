@@ -43,9 +43,11 @@ defmodule UniversalProxy.Bluez.Client do
       ref so a stale Task result can't corrupt state. A `set_mode/1` arriving
       mid-transition parks in a one-slot pending queue (latest wins; a
       displaced caller gets `{:error, :superseded}`).
-    * Disengage is best-effort (monitor and discovery can legally coexist in
-      BlueZ, so a failed teardown doesn't block the new mode). Self-healing
-      lives in engage's idempotency: whatever drifted, re-engaging treats
+    * Transitions engage the new mode BEFORE disengaging the old one
+      (monitor and discovery can legally coexist in BlueZ): a failed engage
+      leaves the previous mode still scanning rather than going dark.
+      Disengage is best-effort, and self-healing lives in engage's
+      idempotency: whatever drifted, re-engaging treats
       `AlreadyExists`/`InProgress` as success, so the next transition always
       converges on the target mode.
     * The configured mode persists in `:persistent_term` across Client
@@ -171,7 +173,7 @@ defmodule UniversalProxy.Bluez.Client do
 
         {:noreply, %{state | pending: {from, target}}}
 
-      # Already there (and actually engaged — a failed engage leaves
+      # Already there (and actually engaged — a failed initial setup leaves
       # engaged: :none, which falls through and retries).
       state.mode == target and state.engaged != :none ->
         {:reply, :ok, state}
@@ -294,16 +296,22 @@ defmodule UniversalProxy.Bluez.Client do
     end
   end
 
-  # Runs in the Task. Disengage is best-effort: monitor + discovery can
-  # legally coexist in BlueZ, so a failed teardown must not block the new
-  # mode (engage idempotency below self-heals the drift next transition).
+  # Runs in the Task. Engage-first: monitor + discovery can legally coexist
+  # in BlueZ, so bring the new mode up before tearing the old one down. A
+  # failed engage then leaves the previous mode still scanning — engaged
+  # unchanged, so the eventual teardown still targets the right strategy —
+  # instead of going dark. Disengage stays best-effort (engage idempotency
+  # below self-heals any drift on the next transition).
   # Returns {:ok, engaged} | {:error, reason, engaged}.
   defp apply_mode(conn, engaged, target) do
-    disengage(conn, engaged)
-
     case engage(conn, target) do
-      :ok -> {:ok, engaged_for(target)}
-      {:error, reason} -> {:error, reason, :none}
+      :ok ->
+        new_engaged = engaged_for(target)
+        if engaged != new_engaged, do: disengage(conn, engaged)
+        {:ok, new_engaged}
+
+      {:error, reason} ->
+        {:error, reason, engaged}
     end
   end
 
