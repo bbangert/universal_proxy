@@ -98,9 +98,20 @@ defmodule UniversalProxy.Bluez do
       ),
 
       # Persistent rebus client: owns the discovery session and turns BlueZ
-      # device signals into advertisements for the ESPHome scanner. Last in
-      # rest_for_one order so it (re)connects only once bluetoothd is up.
-      __MODULE__.Client
+      # device signals into advertisements for the ESPHome scanner. After
+      # bluetoothd in rest_for_one order so it (re)connects only once
+      # bluetoothd is up.
+      __MODULE__.Client,
+
+      # Active connections + GATT (Phase 1): every BlueZ call the GATT
+      # client makes runs under this Task.Supervisor so its GenServer loop
+      # never blocks on D-Bus (Device1.Connect alone can take ~25 s).
+      {Task.Supervisor, name: __MODULE__.Gatt.task_supervisor()},
+
+      # The GATT client itself (its own rebus connection, separate from
+      # Client). Last so a bluetoothd/Client restart also rebuilds it —
+      # its device objects and connection state die with bluetoothd.
+      __MODULE__.Gatt
     ]
 
     Supervisor.init(children, strategy: :rest_for_one)

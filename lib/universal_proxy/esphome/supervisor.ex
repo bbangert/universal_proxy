@@ -18,7 +18,15 @@ defmodule UniversalProxy.ESPHome.Supervisor do
 
   use Supervisor
 
-  alias UniversalProxy.ESPHome.{BluetoothScanner, ConfigStore, Infrared, SerialProxy, ZWaveProxy}
+  alias UniversalProxy.ESPHome.{
+    BluetoothProxy,
+    BluetoothScanner,
+    ConfigStore,
+    Infrared,
+    SerialProxy,
+    ZWaveProxy
+  }
+
   alias UniversalProxy.Hardware
   alias UniversalProxy.UART.Store, as: UARTStore
 
@@ -58,7 +66,7 @@ defmodule UniversalProxy.ESPHome.Supervisor do
         zwave_proxy: ZWaveProxy,
         infrared_proxy: Infrared.Server,
         mdns: Espex.Mdns.MdnsLite
-      ] ++ bluetooth_scanner_opt()
+      ] ++ bluetooth_opts()
 
     children = [
       {ZWaveProxy, port_path: zwave_port_path},
@@ -69,22 +77,24 @@ defmodule UniversalProxy.ESPHome.Supervisor do
     Supervisor.init(children, strategy: :rest_for_one)
   end
 
-  # Wire the passive BLE scanner adapter into espex ONLY on BT-capable
-  # targets. `UniversalProxy.Bluetooth.supported?/0` is the single gate (a
-  # compile-time constant) so `:rpi3` isn't hardcoded here as well. Off
-  # target the key is omitted entirely, so espex leaves the scanner feature
-  # disabled and the bluetooth_proxy feature flags stay 0.
+  # Wire the BLE adapters (passive scanner + active GATT proxy) into espex
+  # ONLY on BT-capable targets. `UniversalProxy.Bluetooth.supported?/0` is
+  # the single gate (a compile-time constant) so `:rpi3` isn't hardcoded
+  # here as well. Off target both keys are omitted entirely, so espex
+  # leaves the bluetooth feature flags at 0. With both wired the flags are
+  # PASSIVE_SCAN | ACTIVE_CONNECTIONS | REMOTE_CACHING | RAW_ADVERTISEMENTS
+  # | STATE_AND_MODE (0x67) — HA can now request connections + GATT.
   #
   # Boot ordering: this supervisor starts (see `application.ex`) BEFORE
   # `target_children()`, where the `UniversalProxy.Bluetooth` subtree — and
-  # thus the scanner registry the adapter dispatches over — lives. That is
-  # safe: `BluetoothScanner.subscribe/1` guards the early-boot window by
-  # rescuing `ArgumentError` (an un-started Registry raises, it does not
-  # exit), and a client can only subscribe long after boot (once HA connects
-  # and sends `SubscribeBluetoothLEAdvertisementsRequest`).
-  defp bluetooth_scanner_opt do
+  # thus the scanner registry / `Bluez.Gatt` the adapters talk to — lives.
+  # That is safe: `BluetoothScanner.subscribe/1` rescues the un-started
+  # Registry's `ArgumentError`, `BluetoothProxy` handles a not-running
+  # `Bluez.Gatt`, and a client can only issue BLE requests long after boot
+  # (once HA connects and subscribes).
+  defp bluetooth_opts do
     if UniversalProxy.Bluetooth.supported?() do
-      [bluetooth_scanner: BluetoothScanner]
+      [bluetooth_scanner: BluetoothScanner, bluetooth_proxy: BluetoothProxy]
     else
       []
     end

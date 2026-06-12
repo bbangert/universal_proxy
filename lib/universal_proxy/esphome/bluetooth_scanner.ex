@@ -32,9 +32,10 @@ defmodule UniversalProxy.ESPHome.BluetoothScanner do
   feature flags are `PASSIVE_SCAN | RAW_ADVERTISEMENTS | STATE_AND_MODE`
   (`0x61`). That is what lets Home Assistant track our
   `{:espex_ble_scanner_state, :running, :passive, :passive}` report and show
-  the adapter as **"Auto (passive)"** rather than "No scanning". HA will not
-  ask us to switch to active because we don't advertise `ACTIVE_CONNECTIONS`
-  (`0x02`) — active scan / GATT is Phase 1+ (`Espex.BluetoothProxy`).
+  the adapter as **"Auto (passive)"** rather than "No scanning". Active
+  *connections* + GATT are Phase 1, served by the separate
+  `UniversalProxy.ESPHome.BluetoothProxy` adapter — orthogonal to the
+  scanner *mode*, which stays passive-only (we never send scan requests).
 
   ## Address byte order — validated on rpi3 (plan Decision #5 / F4)
 
