@@ -55,9 +55,15 @@ defmodule UniversalProxy.Bluez.Gatt do
   database (they differ only in the espex reply envelope; the bond, if any,
   goes too — same observable semantics as ESP32's
   `esp_ble_remove_bond_device`). RemoveDevice destroys the device object —
-  and the live link with it — so on success the subscriber gets the op
-  reply followed by a not-connected connection envelope, and the entry is
-  dropped.
+  and the live link with it.
+
+  Hardware-observed ordering hazard: BlueZ disconnects the device (and
+  emits `Connected=false`) *while processing* RemoveDevice, before the
+  method returns — and a failed `Pair()` can likewise drop the link before
+  its error reply lands. Either way the signal path tears the entry down
+  first, so pair/remove Task messages carry the subscriber pid themselves:
+  the op reply is always delivered, and entry teardown happens via
+  whichever of the two paths (signal or result) still finds the entry.
 
   All three require a live connection entry: espex routes their replies to
   the subscriber captured at `connect/3`, so for an unknown address there
@@ -356,7 +362,7 @@ defmodule UniversalProxy.Bluez.Gatt do
         {:noreply, state}
 
       entry ->
-        run_pair(state.conn, address, entry.path, entry.gen)
+        run_pair(state.conn, address, entry.path, entry.gen, entry.subscriber)
         {:noreply, state}
     end
   end
@@ -432,38 +438,41 @@ defmodule UniversalProxy.Bluez.Gatt do
     end
   end
 
-  def handle_info({:pair_result, address, gen, result}, state) do
-    case {state.conns[address], result} do
-      {%{gen: ^gen} = entry, :ok} ->
-        send(entry.subscriber, {:espex_ble_pair, address, true, 0})
-        {:noreply, state}
-
-      {%{gen: ^gen} = entry, {:error, code}} ->
-        send(entry.subscriber, {:espex_ble_pair, address, false, code})
-        {:noreply, state}
-
-      _stale ->
-        {:noreply, state}
+  # Pair/remove replies go to the subscriber captured when the op was
+  # dispatched, NOT via an entry lookup: the op itself can drop the link
+  # (failed SMP, RemoveDevice's own disconnect), and BlueZ emits that
+  # Connected=false BEFORE the method returns — the signal path then tears
+  # the entry down first and an entry-keyed reply would be lost (espex/HA
+  # would time the request out). Hardware-observed on the H60B0.
+  def handle_info({:pair_result, address, _gen, subscriber, result}, state) do
+    case result do
+      :ok -> send(subscriber, {:espex_ble_pair, address, true, 0})
+      {:error, code} -> send(subscriber, {:espex_ble_pair, address, false, code})
     end
+
+    {:noreply, state}
   end
 
-  def handle_info({:remove_result, address, gen, tag, result}, state) do
-    case {state.conns[address], result} do
-      {%{gen: ^gen} = entry, :ok} ->
-        send(entry.subscriber, {tag, address, true, 0})
-        # RemoveDevice destroyed the BlueZ device object (and any live link
-        # with it); a removed object emits no Connected=false signal, so
-        # report the disconnect and drop the entry ourselves. Order matters:
-        # the op reply must precede the connection teardown envelope.
-        cancel_resolve_timer(entry)
-        send(entry.subscriber, {:espex_ble_connection, address, {:error, @err_not_connected}})
-        {:noreply, drop_entry(state, address)}
+  def handle_info({:remove_result, address, gen, tag, subscriber, result}, state) do
+    case result do
+      :ok ->
+        send(subscriber, {tag, address, true, 0})
 
-      {%{gen: ^gen} = entry, {:error, code}} ->
-        send(entry.subscriber, {tag, address, false, code})
-        {:noreply, state}
+        # The device object is gone. If the Connected=false signal raced us,
+        # the entry (and its teardown envelope) is already handled; otherwise
+        # finish the teardown here — op reply first, then the envelope.
+        case state.conns[address] do
+          %{gen: ^gen} = entry ->
+            cancel_resolve_timer(entry)
+            send(subscriber, {:espex_ble_connection, address, {:error, @err_not_connected}})
+            {:noreply, drop_entry(state, address)}
 
-      _stale ->
+          _gone_or_replaced ->
+            {:noreply, state}
+        end
+
+      {:error, code} ->
+        send(subscriber, {tag, address, false, code})
         {:noreply, state}
     end
   end
@@ -709,7 +718,7 @@ defmodule UniversalProxy.Bluez.Gatt do
         {:noreply, state}
 
       entry ->
-        run_remove_device(state.conn, address, entry.path, entry.gen, tag)
+        run_remove_device(state.conn, address, entry.path, entry.gen, tag, entry.subscriber)
         {:noreply, state}
     end
   end
@@ -788,7 +797,7 @@ defmodule UniversalProxy.Bluez.Gatt do
     end)
   end
 
-  defp run_pair(conn, address, path, gen) do
+  defp run_pair(conn, address, path, gen, subscriber) do
     run_task(fn ->
       # Bracket the (possibly slow) Pair call so the default agent only
       # authorizes this pairing while it is actually in flight. The expect
@@ -813,11 +822,11 @@ defmodule UniversalProxy.Bluez.Gatt do
         end
 
       PairingAgent.pairing_done(path)
-      {:pair_result, address, gen, result}
+      {:pair_result, address, gen, subscriber, result}
     end)
   end
 
-  defp run_remove_device(conn, address, path, gen, tag) do
+  defp run_remove_device(conn, address, path, gen, tag, subscriber) do
     adapter = DevicePath.adapter_path()
 
     run_task(fn ->
@@ -834,7 +843,7 @@ defmodule UniversalProxy.Bluez.Gatt do
             {:error, error_code(reason)}
         end
 
-      {:remove_result, address, gen, tag, result}
+      {:remove_result, address, gen, tag, subscriber, result}
     end)
   end
 

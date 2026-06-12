@@ -37,7 +37,7 @@ defmodule UniversalProxy.Bluez.GattTest do
       state = state(self())
 
       assert {:noreply, ^state} =
-               Gatt.handle_info({:pair_result, @address, @gen, :ok}, state)
+               Gatt.handle_info({:pair_result, @address, @gen, self(), :ok}, state)
 
       assert_receive {:espex_ble_pair, @address, true, 0}
     end
@@ -46,18 +46,21 @@ defmodule UniversalProxy.Bluez.GattTest do
       state = state(self())
 
       assert {:noreply, ^state} =
-               Gatt.handle_info({:pair_result, @address, @gen, {:error, -1}}, state)
+               Gatt.handle_info({:pair_result, @address, @gen, self(), {:error, -1}}, state)
 
       assert_receive {:espex_ble_pair, @address, false, -1}
     end
 
-    test "stale generation is dropped silently" do
-      state = state(self())
+    test "reply is delivered even when the entry is already gone" do
+      # A failed Pair can drop the link; the Connected=false signal tears
+      # the entry down before the pair Task's result arrives. The reply
+      # must still reach the captured subscriber (hw-observed on H60B0).
+      state = %{conns: %{}, notify_paths: %{}, gen_seq: @gen}
 
       assert {:noreply, ^state} =
-               Gatt.handle_info({:pair_result, @address, @gen - 1, :ok}, state)
+               Gatt.handle_info({:pair_result, @address, @gen, self(), {:error, -1}}, state)
 
-      refute_received {:espex_ble_pair, _, _, _}
+      assert_receive {:espex_ble_pair, @address, false, -1}
     end
   end
 
@@ -74,7 +77,10 @@ defmodule UniversalProxy.Bluez.GattTest do
         })
 
       assert {:noreply, new_state} =
-               Gatt.handle_info({:remove_result, @address, @gen, :espex_ble_unpair, :ok}, state)
+               Gatt.handle_info(
+                 {:remove_result, @address, @gen, :espex_ble_unpair, self(), :ok},
+                 state
+               )
 
       # The op reply must land before the connection teardown envelope.
       assert {:messages,
@@ -96,7 +102,7 @@ defmodule UniversalProxy.Bluez.GattTest do
 
       assert {:noreply, new_state} =
                Gatt.handle_info(
-                 {:remove_result, @address, @gen, :espex_ble_clear_cache, :ok},
+                 {:remove_result, @address, @gen, :espex_ble_clear_cache, self(), :ok},
                  state
                )
 
@@ -110,7 +116,7 @@ defmodule UniversalProxy.Bluez.GattTest do
 
       assert {:noreply, ^state} =
                Gatt.handle_info(
-                 {:remove_result, @address, @gen, :espex_ble_unpair, {:error, -1}},
+                 {:remove_result, @address, @gen, :espex_ble_unpair, self(), {:error, -1}},
                  state
                )
 
@@ -118,16 +124,37 @@ defmodule UniversalProxy.Bluez.GattTest do
       refute_received {:espex_ble_connection, _, _}
     end
 
-    test "stale generation is dropped silently" do
+    test "success after the Connected=false signal already tore the entry down" do
+      # BlueZ disconnects the device DURING RemoveDevice, before the method
+      # returns — the signal path can drop the entry (and send its own
+      # teardown envelope) first. The op reply must still be delivered, with
+      # no duplicate teardown envelope (hw-observed on H60B0).
+      state = %{conns: %{}, notify_paths: %{}, gen_seq: @gen}
+
+      assert {:noreply, ^state} =
+               Gatt.handle_info(
+                 {:remove_result, @address, @gen, :espex_ble_clear_cache, self(), :ok},
+                 state
+               )
+
+      assert_receive {:espex_ble_clear_cache, @address, true, 0}
+      refute_received {:espex_ble_connection, _, _}
+    end
+
+    test "success for a replaced entry replies without touching the new entry" do
+      # A new connect generation owns the address; the old op's reply goes
+      # to its captured subscriber and the fresh entry stays intact.
       state = state(self())
 
       assert {:noreply, ^state} =
                Gatt.handle_info(
-                 {:remove_result, @address, @gen + 1, :espex_ble_unpair, :ok},
+                 {:remove_result, @address, @gen - 1, :espex_ble_unpair, self(), :ok},
                  state
                )
 
-      refute_received {:espex_ble_unpair, _, _, _}
+      assert_receive {:espex_ble_unpair, @address, true, 0}
+      refute_received {:espex_ble_connection, _, _}
+      assert map_size(state.conns) == 1
     end
   end
 
