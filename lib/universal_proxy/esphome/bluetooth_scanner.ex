@@ -22,20 +22,24 @@ defmodule UniversalProxy.ESPHome.BluetoothScanner do
   source-agnostic: `on_advertisement/1` takes a plain map, so the same code
   served the earlier blue_heron `Observer` and now the BlueZ client.
 
-  ## Scanner mode — passive-only, but reports STATE_AND_MODE
+  ## Scanner mode — runtime passive/active switching
 
-  The scanner only ever runs passively (the BlueZ client only does LE
-  discovery), but `set_scanner_mode/1` IS implemented: `:passive` is a no-op
-  `:ok`, `:active` is honestly refused (`{:error, :not_supported}`).
+  `set_scanner_mode/1` delegates to `UniversalProxy.Bluez.Client.set_mode/1`,
+  which swaps the BlueZ scan strategy at runtime: `:passive` uses an
+  AdvertisementMonitor (no scan requests sent), `:active` uses
+  `StartDiscovery` (SCAN_RSP data collected — ESP32-proxy parity). On
+  success the new mode is broadcast to every subscribed connection as
+  `{:espex_ble_scanner_state, :running, mode, mode}` so HA's UI tracks the
+  switch on all its connections, not just the requesting one.
+
   Exporting the optional callback makes espex advertise the `STATE_AND_MODE`
-  (`0x40`) bit (`Espex.Connection` checks `function_exported?/3`), so the
-  feature flags are `PASSIVE_SCAN | RAW_ADVERTISEMENTS | STATE_AND_MODE`
-  (`0x61`). That is what lets Home Assistant track our
-  `{:espex_ble_scanner_state, :running, :passive, :passive}` report and show
-  the adapter as **"Auto (passive)"** rather than "No scanning". Active
-  *connections* + GATT are Phase 1, served by the separate
-  `UniversalProxy.ESPHome.BluetoothProxy` adapter — orthogonal to the
-  scanner *mode*, which stays passive-only (we never send scan requests).
+  (`0x40`) bit (`Espex.Connection` checks `function_exported?/3`). The
+  Client persists the configured mode (`Bluez.Client.configured_mode/0`),
+  so `subscribe/1` reports whatever HA last chose — including across Client
+  restarts. When the Client isn't running (host, early boot) `set_mode`'s
+  `GenServer.call` exits; that is caught (`catch :exit` — NOT the registry's
+  `ArgumentError` raise, a different failure mode) and surfaces as
+  `{:error, :unavailable}`.
 
   ## Address byte order — validated on rpi3 (plan Decision #5 / F4)
 
@@ -47,6 +51,8 @@ defmodule UniversalProxy.ESPHome.BluetoothScanner do
   """
 
   @behaviour Espex.BluetoothScanner
+
+  alias UniversalProxy.Bluez
 
   # Duplicate-key registry: every subscribed connection-handler pid is one
   # entry under the `:subscribers` key. Owned by `UniversalProxy.Bluetooth`.
@@ -79,7 +85,8 @@ defmodule UniversalProxy.ESPHome.BluetoothScanner do
     # registration and the initial state acting on the same process. We
     # deliberately do NOT send to an arbitrary `pid` — that would split
     # delivery from registration if the espex invariant were ever violated.
-    send(self(), {:espex_ble_scanner_state, :running, :passive, :passive})
+    mode = Bluez.Client.configured_mode()
+    send(self(), {:espex_ble_scanner_state, :running, mode, mode})
     :ok
   rescue
     # An un-started registry raises ArgumentError ("unknown registry: ...")
@@ -100,14 +107,39 @@ defmodule UniversalProxy.ESPHome.BluetoothScanner do
   end
 
   @impl Espex.BluetoothScanner
-  @spec set_scanner_mode(:passive | :active) :: :ok | {:error, :not_supported}
-  # Passive-only scanner. This callback exists chiefly to flip on the
-  # STATE_AND_MODE feature bit (see moduledoc) so HA shows "Auto (passive)".
-  # Accept :passive (already our only mode); refuse :active honestly rather
-  # than lie. HA shouldn't request :active — we don't advertise
-  # ACTIVE_CONNECTIONS — but we handle it safely if it does.
-  def set_scanner_mode(:passive), do: :ok
-  def set_scanner_mode(:active), do: {:error, :not_supported}
+  @spec set_scanner_mode(:passive | :active) :: :ok | {:error, term()}
+  # Runs in the requesting connection-handler process. The Client call blocks
+  # until BlueZ actually switched (bounded by Client's set_mode timeout); on
+  # success every subscriber — this connection included — learns the new mode.
+  def set_scanner_mode(mode) when mode in [:passive, :active] do
+    case Bluez.Client.set_mode(mode) do
+      :ok ->
+        broadcast_state(:running, mode, mode)
+        :ok
+
+      {:error, _reason} = error ->
+        error
+    end
+  catch
+    # Client not running (host, early boot, BT subtree down) or transition
+    # timed out — GenServer.call exits; espex logs the error tuple.
+    :exit, _reason -> {:error, :unavailable}
+  end
+
+  # Fan a scanner-state change out to every subscribed connection (the same
+  # dispatch shape as on_advertisement/1).
+  defp broadcast_state(state, mode, configured_mode) do
+    Registry.dispatch(@registry, :subscribers, fn entries ->
+      Enum.each(entries, fn {pid, _} ->
+        send(pid, {:espex_ble_scanner_state, state, mode, configured_mode})
+      end)
+    end)
+
+    :ok
+  rescue
+    # Registry not started — nobody to notify.
+    ArgumentError -> :ok
+  end
 
   @doc """
   Maps one advertised device to the espex advertisement tuple and fans it out

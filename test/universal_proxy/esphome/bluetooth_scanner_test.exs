@@ -8,6 +8,34 @@ defmodule UniversalProxy.ESPHome.BluetoothScannerTest do
 
   alias UniversalProxy.ESPHome.BluetoothScanner
 
+  # The Client's :persistent_term key for the HA-configured scanner mode
+  # (private @mode_key in UniversalProxy.Bluez.Client).
+  #
+  # GLOBAL-STATE CAVEAT: this key and the FakeClient name below are VM-global.
+  # That is safe under async: true only because (a) ExUnit runs the tests
+  # within one module sequentially — async: true parallelizes across test
+  # MODULES (a file may define several) — and (b) no other test module, in
+  # this file or any other, registers UniversalProxy.Bluez.Client or touches
+  # this key. If another module ever needs either, it must coordinate with
+  # this one (or both go async: false).
+  @mode_key {UniversalProxy.Bluez.Client, :configured_mode}
+
+  # Stands in for UniversalProxy.Bluez.Client on the host: registers under
+  # the real module name (never started outside the rpi3 target) and answers
+  # {:set_mode, mode} with a canned reply.
+  defmodule FakeClient do
+    use GenServer
+
+    def start_link(reply),
+      do: GenServer.start_link(__MODULE__, reply, name: UniversalProxy.Bluez.Client)
+
+    @impl GenServer
+    def init(reply), do: {:ok, reply}
+
+    @impl GenServer
+    def handle_call({:set_mode, _mode}, _from, reply), do: {:reply, reply, reply}
+  end
+
   setup context do
     # Fresh, isolated registry per test (torn down automatically). The name
     # is the same global one the adapter dispatches over. Tag a test
@@ -173,9 +201,54 @@ defmodule UniversalProxy.ESPHome.BluetoothScannerTest do
       assert function_exported?(BluetoothScanner, :set_scanner_mode, 1)
     end
 
-    test "accepts :passive and refuses :active (passive-only scanner)" do
-      assert :ok = BluetoothScanner.set_scanner_mode(:passive)
-      assert {:error, :not_supported} = BluetoothScanner.set_scanner_mode(:active)
+    test "without the BlueZ Client running, both modes are {:error, :unavailable}" do
+      # GenServer.call to the absent Client exits (:noproc) — the adapter must
+      # catch :exit (NOT rescue ArgumentError, the registry's failure mode).
+      assert {:error, :unavailable} = BluetoothScanner.set_scanner_mode(:passive)
+      assert {:error, :unavailable} = BluetoothScanner.set_scanner_mode(:active)
+    end
+
+    test "delegates to the Client and broadcasts the new mode to every subscriber" do
+      start_supervised!({FakeClient, :ok})
+      start_subscriber(self(), :a)
+      start_subscriber(self(), :b)
+      # Initial subscribe states — drain so the broadcast assertion is clean.
+      assert_receive {:a, {:espex_ble_scanner_state, :running, _, _}}
+      assert_receive {:b, {:espex_ble_scanner_state, :running, _, _}}
+
+      assert :ok = BluetoothScanner.set_scanner_mode(:active)
+
+      assert_receive {:a, {:espex_ble_scanner_state, :running, :active, :active}}
+      assert_receive {:b, {:espex_ble_scanner_state, :running, :active, :active}}
+    end
+
+    test "a Client error passes through and nothing is broadcast" do
+      start_supervised!({FakeClient, {:error, "org.bluez.Error.NotReady"}})
+      BluetoothScanner.subscribe(self())
+      assert_receive {:espex_ble_scanner_state, :running, _, _}
+
+      assert {:error, "org.bluez.Error.NotReady"} = BluetoothScanner.set_scanner_mode(:active)
+
+      refute_receive {:espex_ble_scanner_state, _, _, _}
+    end
+  end
+
+  describe "configured-mode reporting (E5)" do
+    test "subscribe reports the persisted configured mode, not hardcoded :passive" do
+      :persistent_term.put(@mode_key, :active)
+      on_exit(fn -> :persistent_term.erase(@mode_key) end)
+
+      BluetoothScanner.subscribe(self())
+
+      assert_receive {:espex_ble_scanner_state, :running, :active, :active}
+    end
+
+    test "defaults to :passive when nothing was ever configured" do
+      :persistent_term.erase(@mode_key)
+
+      BluetoothScanner.subscribe(self())
+
+      assert_receive {:espex_ble_scanner_state, :running, :passive, :passive}
     end
   end
 
