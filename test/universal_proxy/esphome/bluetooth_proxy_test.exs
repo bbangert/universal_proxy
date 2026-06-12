@@ -106,6 +106,15 @@ defmodule UniversalProxy.ESPHome.BluetoothProxyTest do
 
       BluetoothProxy.gatt_notify(@address, 12, true)
       assert_receive {:cast, {:notify, @address, 12, true}}
+
+      BluetoothProxy.pair(@address)
+      assert_receive {:cast, {:pair, @address}}
+
+      BluetoothProxy.unpair(@address)
+      assert_receive {:cast, {:unpair, @address}}
+
+      BluetoothProxy.clear_cache(@address)
+      assert_receive {:cast, {:clear_cache, @address}}
     end
 
     test "connections_free/0 returns Gatt's answer" do
@@ -115,10 +124,16 @@ defmodule UniversalProxy.ESPHome.BluetoothProxyTest do
   end
 
   describe "behaviour contract" do
-    test "does NOT export the optional Phase 2+ callbacks (feature flags stay off)" do
-      refute function_exported?(BluetoothProxy, :pair, 1)
-      refute function_exported?(BluetoothProxy, :unpair, 1)
-      refute function_exported?(BluetoothProxy, :clear_cache, 1)
+    test "exports the Phase 2 optional callbacks (PAIRING + CACHE_CLEARING flags)" do
+      # Espex requires BOTH pair/1 and unpair/1 for the PAIRING bit (0x08)
+      # and clear_cache/1 for CACHE_CLEARING (0x10) — together with Phase 1
+      # this advertises 0x7F, full ESP32-proxy feature parity.
+      assert function_exported?(BluetoothProxy, :pair, 1)
+      assert function_exported?(BluetoothProxy, :unpair, 1)
+      assert function_exported?(BluetoothProxy, :clear_cache, 1)
+    end
+
+    test "does NOT export set_connection_params/2 (no org.bluez API for it)" do
       refute function_exported?(BluetoothProxy, :set_connection_params, 2)
     end
   end
