@@ -11,10 +11,13 @@ defmodule UniversalProxy.ESPHome.BluetoothProxy do
 
   Wiring this module into `Espex.start_link/1` (see
   `UniversalProxy.ESPHome.Supervisor`) is what makes espex advertise
-  `ACTIVE_CONNECTIONS` (0x02) and `REMOTE_CACHING` (0x04) to HA. The
-  optional pair/unpair/clear_cache callbacks are deliberately not exported
-  (Phase 2+), so their feature bits stay off and espex auto-answers those
-  requests with "not supported".
+  `ACTIVE_CONNECTIONS` (0x02) and `REMOTE_CACHING` (0x04) to HA, and the
+  exported `pair`/`unpair`/`clear_cache` callbacks add `PAIRING` (0x08)
+  and `CACHE_CLEARING` (0x10) — feature-flag parity with ESP32 proxies
+  (0x7F). The one optional callback deliberately NOT exported is
+  `set_connection_params/2`: org.bluez has no per-connection parameter
+  API, so espex auto-answers those requests with "not supported" (no
+  feature bit depends on it).
 
   ## Defensiveness
 
@@ -78,6 +81,20 @@ defmodule UniversalProxy.ESPHome.BluetoothProxy do
 
   @impl Espex.BluetoothProxy
   def gatt_notify(address, handle, enable?), do: Gatt.notify(address, handle, enable?)
+
+  # Like the GATT ops above, these only have a reply route (the subscriber
+  # captured at connect/3) for addresses with a live connection; Gatt logs
+  # and drops them otherwise, and a dead Gatt makes the cast a silent no-op
+  # (HA times the request out — same posture as every other cast here).
+
+  @impl Espex.BluetoothProxy
+  def pair(address), do: Gatt.pair(address)
+
+  @impl Espex.BluetoothProxy
+  def unpair(address), do: Gatt.unpair(address)
+
+  @impl Espex.BluetoothProxy
+  def clear_cache(address), do: Gatt.clear_cache(address)
 
   @impl Espex.BluetoothProxy
   def connections_free do

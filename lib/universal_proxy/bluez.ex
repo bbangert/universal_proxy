@@ -103,6 +103,12 @@ defmodule UniversalProxy.Bluez do
       # bluetoothd is up.
       __MODULE__.Client,
 
+      # Default org.bluez pairing agent (Phase 2): bluetoothd routes the IO
+      # for Gatt's Device1.Pair() calls here. Before Gatt in rest_for_one
+      # order — Gatt depends on it (weakly: its casts no-op when the Agent
+      # is down), never the other way around.
+      __MODULE__.Agent,
+
       # Active connections + GATT (Phase 1): every BlueZ call the GATT
       # client makes runs under this Task.Supervisor so its GenServer loop
       # never blocks on D-Bus (Device1.Connect alone can take ~25 s).

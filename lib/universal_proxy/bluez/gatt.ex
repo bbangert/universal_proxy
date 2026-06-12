@@ -43,13 +43,41 @@ defmodule UniversalProxy.Bluez.Gatt do
   Espex owns cross-client address locking; this module trusts that
   `connect` arrives at most once per address per ownership cycle, but stays
   defensive (a stale entry is torn down and replaced).
+
+  ## Pairing and cache clearing (Phase 2)
+
+  `pair/1` calls `Device1.Pair()` — IO is negotiated through
+  `UniversalProxy.Bluez.Agent` (the default NoInputNoOutput agent), and the
+  Pair Task brackets the call with `expect_pairing/1`/`pairing_done/1` so
+  the agent only authorizes pairings we initiated. `unpair/1` and
+  `clear_cache/1` both map to `Adapter1.RemoveDevice` — BlueZ's only
+  bond-removal API, and the only D-Bus way to drop a device's cached GATT
+  database (they differ only in the espex reply envelope; the bond, if any,
+  goes too — same observable semantics as ESP32's
+  `esp_ble_remove_bond_device`). RemoveDevice destroys the device object —
+  and the live link with it.
+
+  Hardware-observed ordering hazard: BlueZ disconnects the device (and
+  emits `Connected=false`) *while processing* RemoveDevice, before the
+  method returns — and a failed `Pair()` can likewise drop the link before
+  its error reply lands. Either way the signal path tears the entry down
+  first, so pair/remove Task messages carry the subscriber pid themselves:
+  the op reply is always delivered, and entry teardown happens via
+  whichever of the two paths (signal or result) still finds the entry.
+
+  All three require a live connection entry: espex routes their replies to
+  the subscriber captured at `connect/3`, so for an unknown address there
+  is no one to answer — those requests are logged and dropped (HA only
+  issues them on connected devices).
   """
 
   use GenServer
   require Logger
 
   alias UniversalProxy.Bluez.{DBus, DevicePath, GattTree, Variant}
+  alias UniversalProxy.Bluez.Agent, as: PairingAgent
 
+  @adapter_iface "org.bluez.Adapter1"
   @device_iface "org.bluez.Device1"
   @char_iface "org.bluez.GattCharacteristic1"
   @desc_iface "org.bluez.GattDescriptor1"
@@ -69,6 +97,9 @@ defmodule UniversalProxy.Bluez.Gatt do
   @resolve_timeout 30_000
   # GATT reads/writes block up to the ATT transaction timeout.
   @op_timeout 32_000
+  # Device1.Pair blocks through connect (if needed) + SMP pairing; BlueZ's
+  # own bonding timeout is shorter, so this is the outer patience bound.
+  @pair_timeout 35_000
 
   @default_mtu 23
 
@@ -130,6 +161,15 @@ defmodule UniversalProxy.Bluez.Gatt do
   @spec notify(address(), non_neg_integer(), boolean()) :: :ok
   def notify(address, handle, enable?),
     do: GenServer.cast(__MODULE__, {:notify, address, handle, enable?})
+
+  @spec pair(address()) :: :ok
+  def pair(address), do: GenServer.cast(__MODULE__, {:pair, address})
+
+  @spec unpair(address()) :: :ok
+  def unpair(address), do: GenServer.cast(__MODULE__, {:unpair, address})
+
+  @spec clear_cache(address()) :: :ok
+  def clear_cache(address), do: GenServer.cast(__MODULE__, {:clear_cache, address})
 
   @doc "Free / total connection slots, for `c:Espex.BluetoothProxy.connections_free/0`."
   @spec connections_free() :: {non_neg_integer(), non_neg_integer()}
@@ -313,6 +353,26 @@ defmodule UniversalProxy.Bluez.Gatt do
     end)
   end
 
+  # Pairing works on any entry status: Pair() on a half-open link just
+  # surfaces BlueZ's own error, and a :ready link is the normal HA flow.
+  def handle_cast({:pair, address}, state) do
+    case state.conns[address] do
+      nil ->
+        Logger.debug("Bluez.Gatt: pair for unknown address #{fmt(address)} dropped")
+        {:noreply, state}
+
+      entry ->
+        run_pair(state.conn, address, entry.path, entry.gen, entry.subscriber)
+        {:noreply, state}
+    end
+  end
+
+  def handle_cast({:unpair, address}, state),
+    do: remove_device(state, address, :espex_ble_unpair)
+
+  def handle_cast({:clear_cache, address}, state),
+    do: remove_device(state, address, :espex_ble_clear_cache)
+
   @impl GenServer
   def handle_call(:connections_free, _from, state) do
     free = max(@max_connections - map_size(state.conns), 0)
@@ -374,6 +434,45 @@ defmodule UniversalProxy.Bluez.Gatt do
         {:noreply, fail_connection(state, address, @err_generic)}
 
       _ ->
+        {:noreply, state}
+    end
+  end
+
+  # Pair/remove replies go to the subscriber captured when the op was
+  # dispatched, NOT via an entry lookup: the op itself can drop the link
+  # (failed SMP, RemoveDevice's own disconnect), and BlueZ emits that
+  # Connected=false BEFORE the method returns — the signal path then tears
+  # the entry down first and an entry-keyed reply would be lost (espex/HA
+  # would time the request out). Hardware-observed on the H60B0.
+  def handle_info({:pair_result, address, _gen, subscriber, result}, state) do
+    case result do
+      :ok -> send(subscriber, {:espex_ble_pair, address, true, 0})
+      {:error, code} -> send(subscriber, {:espex_ble_pair, address, false, code})
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_info({:remove_result, address, gen, tag, subscriber, result}, state) do
+    case result do
+      :ok ->
+        send(subscriber, {tag, address, true, 0})
+
+        # The device object is gone. If the Connected=false signal raced us,
+        # the entry (and its teardown envelope) is already handled; otherwise
+        # finish the teardown here — op reply first, then the envelope.
+        case state.conns[address] do
+          %{gen: ^gen} = entry ->
+            cancel_resolve_timer(entry)
+            send(subscriber, {:espex_ble_connection, address, {:error, @err_not_connected}})
+            {:noreply, drop_entry(state, address)}
+
+          _gone_or_replaced ->
+            {:noreply, state}
+        end
+
+      {:error, code} ->
+        send(subscriber, {tag, address, false, code})
         {:noreply, state}
     end
   end
@@ -610,6 +709,20 @@ defmodule UniversalProxy.Bluez.Gatt do
     end)
   end
 
+  # unpair and clear_cache are the same BlueZ operation (RemoveDevice);
+  # only the espex reply envelope (`tag`) differs.
+  defp remove_device(state, address, tag) do
+    case state.conns[address] do
+      nil ->
+        Logger.debug("Bluez.Gatt: #{tag} for unknown address #{fmt(address)} dropped")
+        {:noreply, state}
+
+      entry ->
+        run_remove_device(state.conn, address, entry.path, entry.gen, tag, entry.subscriber)
+        {:noreply, state}
+    end
+  end
+
   defp espex_envelope(:gatt_read), do: :espex_ble_gatt_read
   defp espex_envelope(:gatt_write), do: :espex_ble_gatt_write
 
@@ -681,6 +794,56 @@ defmodule UniversalProxy.Bluez.Gatt do
         end
 
       {:op_result, gen, envelope, result}
+    end)
+  end
+
+  defp run_pair(conn, address, path, gen, subscriber) do
+    run_task(fn ->
+      # Bracket the (possibly slow) Pair call so the default agent only
+      # authorizes this pairing while it is actually in flight. The expect
+      # is synchronous (must be registered before Pair triggers bluetoothd's
+      # callbacks) and TTL-backed in the Agent, so a Task that dies before
+      # pairing_done/1 can't leave the path authorized forever.
+      PairingAgent.expect_pairing(path)
+
+      result =
+        case DBus.call(conn, path, @device_iface, "Pair", "", [], @pair_timeout) do
+          {:ok, _} ->
+            :ok
+
+          # Already bonded — the goal state.
+          {:error, "org.bluez.Error.AlreadyExists"} ->
+            :ok
+
+          {:error, reason} ->
+            # Best-effort: don't leave a half-finished SMP exchange dangling.
+            DBus.call(conn, path, @device_iface, "CancelPairing", "", [])
+            {:error, error_code(reason)}
+        end
+
+      PairingAgent.pairing_done(path)
+      {:pair_result, address, gen, subscriber, result}
+    end)
+  end
+
+  defp run_remove_device(conn, address, path, gen, tag, subscriber) do
+    adapter = DevicePath.adapter_path()
+
+    run_task(fn ->
+      result =
+        case DBus.call(conn, adapter, @adapter_iface, "RemoveDevice", "o", [path], @op_timeout) do
+          {:ok, _} ->
+            :ok
+
+          # Object already gone — bond and GATT cache died with it.
+          {:error, "org.bluez.Error.DoesNotExist"} ->
+            :ok
+
+          {:error, reason} ->
+            {:error, error_code(reason)}
+        end
+
+      {:remove_result, address, gen, tag, subscriber, result}
     end)
   end
 
