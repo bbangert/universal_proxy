@@ -1,34 +1,58 @@
 defmodule UniversalProxy.Bluez.Client do
   @moduledoc """
-  Persistent `rebus` D-Bus client + service to `org.bluez`, driving **passive**
-  BLE scanning via the BlueZ `AdvertisementMonitor` API and turning device
-  signals into advertisements for `UniversalProxy.ESPHome.BluetoothScanner`.
+  Persistent `rebus` D-Bus client + service to `org.bluez`, driving BLE
+  scanning and turning device signals into advertisements for
+  `UniversalProxy.ESPHome.BluetoothScanner`.
 
-  Passive (vs `StartDiscovery`, which is active and makes scannable peripherals
-  burn battery answering our scan requests) requires us to *export* a D-Bus
-  object that BlueZ calls back into — so this process is both a client and a
-  service (via the forked rebus's `set_method_handler/2`).
+  Supports both scanner modes Home Assistant can request (`set_mode/1`,
+  called via `BluetoothScanner.set_scanner_mode/1`):
+
+    * `:passive` (default) — a BlueZ `AdvertisementMonitor`. We never send
+      scan requests, so scannable peripherals don't burn battery answering
+      us. Requires *exporting* a D-Bus object BlueZ calls back into, so this
+      process is both a client and a service (via the forked rebus's
+      `set_method_handler/2`).
+    * `:active` — `Adapter1.StartDiscovery` with an LE filter. BlueZ sends
+      scan requests, so SCAN_RSP data (e.g. device names) is collected —
+      parity with ESP32 proxies' active mode.
+
+  Device data arrives the same way in both modes
+  (`InterfacesAdded`/`PropertiesChanged` on `Device1` objects), so the
+  advert pipeline downstream is mode-agnostic.
 
   Flow:
 
     1. `Rebus.connect(:system)`, `set_method_handler(self())`, monitor the
        connection, and install bus match rules for org.bluez device signals.
-    2. Power the adapter on, then `AdvertisementMonitorManager1.RegisterMonitor`
-       our root object. BlueZ enumerates our monitor via
-       `ObjectManager.GetManagedObjects` and calls `Activate`/`DeviceFound` on
-       it; the monitor's `or_patterns` (FLAGS \\x02/\\x06/\\x1a) match
-       effectively all advertisers (the habluetooth "match all" recipe).
+    2. Power the adapter on, then engage `configured_mode/0`: either
+       `AdvertisementMonitorManager1.RegisterMonitor` our root object (BlueZ
+       enumerates the monitor via `ObjectManager.GetManagedObjects` and calls
+       `Activate`/`DeviceFound` on it; the monitor's `or_patterns` (FLAGS
+       \\x02/\\x06/\\x1a) match effectively all advertisers — the habluetooth
+       "match all" recipe), or `SetDiscoveryFilter` + `StartDiscovery`.
     3. Matched devices surface as `InterfacesAdded`/`PropertiesChanged` signals;
        props are unwrapped (`UniversalProxy.Bluez.Variant`) and fed to
        `UniversalProxy.Bluez.DeviceCache`, which reconstructs + emit-gates and
        returns the adverts to fan out via `BluetoothScanner.on_advertisement/1`.
 
+  Mode transitions:
+
+    * Run in a Task — BlueZ calls `GetManagedObjects` back on us before
+      `RegisterMonitor` returns, so the GenServer must stay free to answer —
+      and are serialized: at most one in flight, identified by a generation
+      ref so a stale Task result can't corrupt state. A `set_mode/1` arriving
+      mid-transition parks in a one-slot pending queue (latest wins; a
+      displaced caller gets `{:error, :superseded}`).
+    * Disengage is best-effort (monitor and discovery can legally coexist in
+      BlueZ, so a failed teardown doesn't block the new mode) and engage is
+      idempotent (`AlreadyExists`/`InProgress` count as success), so state
+      drift self-heals on the next transition.
+    * The configured mode persists in `:persistent_term` across Client
+      restarts: a bluetoothd/connection crash re-engages what HA chose
+      rather than silently reverting to passive.
+
   Resilience:
 
-    * RegisterMonitor runs in a Task (BlueZ calls `GetManagedObjects` back
-      before RegisterMonitor returns — the GenServer must stay free to answer),
-      and the Task catches `:exit` (a `GenServer.call` timeout) so a wedged
-      BlueZ surfaces as a logged error, not a silent dropped Task.
     * The rebus connection is monitored; if it dies (e.g. a malformed bus
       frame `:stop`s it) the Client stops and the supervisor restarts it,
       re-establishing the connection.
@@ -63,9 +87,38 @@ defmodule UniversalProxy.Bluez.Client do
   # Timeout for the (Task-issued) RegisterMonitor call to BlueZ.
   @register_timeout_ms 10_000
 
+  # set_mode/1 callers wait for the whole transition: worst case is a
+  # best-effort disengage (5 s D-Bus default) + RegisterMonitor (10 s).
+  @set_mode_timeout_ms 16_000
+
+  # :persistent_term key for the HA-configured scanner mode. Survives Client
+  # restarts (within a boot) so re-init re-engages what HA chose.
+  @mode_key {__MODULE__, :configured_mode}
+
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
+
+  @doc """
+  Switch the scanner between `:passive` (AdvertisementMonitor) and `:active`
+  (StartDiscovery) at runtime. Returns once the BlueZ transition completes;
+  `{:error, :superseded}` if a newer `set_mode/1` displaced this one.
+
+  Callers must `catch :exit` for the not-running/timeout cases (see
+  `UniversalProxy.ESPHome.BluetoothScanner.set_scanner_mode/1`).
+  """
+  @spec set_mode(:passive | :active) :: :ok | {:error, term()}
+  def set_mode(mode) when mode in [:passive, :active] do
+    GenServer.call(__MODULE__, {:set_mode, mode}, @set_mode_timeout_ms)
+  end
+
+  @doc """
+  The HA-configured scanner mode (`:passive` default). Pure
+  `:persistent_term` read — safe on any target, with or without the Client
+  running (host tests, early boot).
+  """
+  @spec configured_mode() :: :passive | :active
+  def configured_mode, do: :persistent_term.get(@mode_key, :passive)
 
   @impl GenServer
   def init(_opts) do
@@ -80,7 +133,21 @@ defmodule UniversalProxy.Bluez.Client do
         # wouldn't reach us; ask the daemon to route them.
         add_signal_matches(conn)
 
-        state = %{conn: conn, conn_ref: conn_ref, sig_ref: ref, cache: DeviceCache.new()}
+        state = %{
+          conn: conn,
+          conn_ref: conn_ref,
+          sig_ref: ref,
+          cache: DeviceCache.new(),
+          # mode = last successfully applied mode; engaged = what BlueZ is
+          # actually doing for us right now (:none until setup engages).
+          mode: nil,
+          engaged: :none,
+          # transition = generation ref of the in-flight Task (nil = idle);
+          # pending = one-slot queue of {from, target} parked behind it.
+          transition: nil,
+          pending: nil
+        }
+
         {:ok, state, {:continue, {:setup, @setup_retries}}}
 
       {:error, reason} ->
@@ -90,6 +157,28 @@ defmodule UniversalProxy.Bluez.Client do
 
   @impl GenServer
   def handle_continue({:setup, retries}, state), do: attempt_setup(state, retries)
+
+  @impl GenServer
+  def handle_call({:set_mode, target}, from, state) do
+    cond do
+      # A transition is running: park behind it (latest wins).
+      state.transition != nil ->
+        case state.pending do
+          {old_from, _old_target} -> GenServer.reply(old_from, {:error, :superseded})
+          nil -> :ok
+        end
+
+        {:noreply, %{state | pending: {from, target}}}
+
+      # Already there (and actually engaged — a failed engage leaves
+      # engaged: :none, which falls through and retries).
+      state.mode == target and state.engaged != :none ->
+        {:reply, :ok, state}
+
+      true ->
+        {:noreply, start_transition(state, target, from)}
+    end
+  end
 
   @impl GenServer
   # Connection died (e.g. malformed frame stopped it). Stop so the supervisor
@@ -113,13 +202,32 @@ defmodule UniversalProxy.Bluez.Client do
     {:noreply, state}
   end
 
-  def handle_info({:monitor_registered, :ok}, state) do
-    Logger.info("Bluez.Client: passive AdvertisementMonitor registered on #{@adapter_path}")
-    {:noreply, state}
+  # Current transition finished — commit the outcome, answer the caller,
+  # then run whatever parked behind it.
+  def handle_info({:mode_transition, ref, target, from, result}, %{transition: ref} = state) do
+    state = %{state | transition: nil}
+
+    state =
+      case result do
+        {:ok, engaged} ->
+          :persistent_term.put(@mode_key, target)
+          if from, do: GenServer.reply(from, :ok)
+          Logger.info("Bluez.Client: scanner mode #{target} engaged (#{engaged})")
+          %{state | mode: target, engaged: engaged}
+
+        {:error, reason, engaged} ->
+          if from, do: GenServer.reply(from, {:error, reason})
+          Logger.error("Bluez.Client: scanner mode #{target} failed: #{inspect(reason)}")
+          %{state | engaged: engaged}
+      end
+
+    {:noreply, run_pending(state)}
   end
 
-  def handle_info({:monitor_registered, {:error, reason}}, state) do
-    Logger.error("Bluez.Client: RegisterMonitor failed: #{inspect(reason)}")
+  # Stale transition result (generation ref mismatch — superseded while its
+  # Task ran). Never commit it; just make sure its caller isn't left hanging.
+  def handle_info({:mode_transition, _ref, _target, from, _result}, state) do
+    if from, do: GenServer.reply(from, {:error, :superseded})
     {:noreply, state}
   end
 
@@ -132,7 +240,14 @@ defmodule UniversalProxy.Bluez.Client do
       adapter_present?(state.conn) ->
         power_on(state.conn)
         state = seed_existing(state)
-        register_monitor_async(state.conn)
+        # An early set_mode/1 may already have a transition in flight (its
+        # D-Bus calls work as soon as the adapter answers) — don't race it;
+        # it engages the caller's mode and run_pending takes over from there.
+        state =
+          if state.transition == nil,
+            do: start_transition(state, configured_mode(), nil),
+            else: state
+
         {:noreply, state}
 
       retries > 0 ->
@@ -145,11 +260,101 @@ defmodule UniversalProxy.Bluez.Client do
     end
   end
 
-  # Register from a Task: BlueZ calls GetManagedObjects back on us before
-  # RegisterMonitor returns, so this process must stay free to answer it.
-  defp register_monitor_async(conn) do
+  # ── scanner mode transitions ─────────────────────────────────────────────
+
+  # Kick a Task that moves BlueZ from `state.engaged` to `target`. Runs off
+  # the GenServer loop because RegisterMonitor re-enters us (BlueZ calls
+  # GetManagedObjects back before it returns). The generation ref ties the
+  # Task's result to this transition; handle_info ignores stale ones.
+  defp start_transition(state, target, from) do
     me = self()
-    Task.start(fn -> Kernel.send(me, {:monitor_registered, register_monitor(conn)}) end)
+    conn = state.conn
+    engaged = state.engaged
+    ref = make_ref()
+
+    Task.start(fn ->
+      Kernel.send(me, {:mode_transition, ref, target, from, apply_mode(conn, engaged, target)})
+    end)
+
+    %{state | transition: ref}
+  end
+
+  # After a transition: serve the parked set_mode, if any.
+  defp run_pending(%{pending: nil} = state), do: state
+
+  defp run_pending(%{pending: {from, target}} = state) do
+    state = %{state | pending: nil}
+
+    if state.mode == target and state.engaged != :none do
+      GenServer.reply(from, :ok)
+      state
+    else
+      start_transition(state, target, from)
+    end
+  end
+
+  # Runs in the Task. Disengage is best-effort: monitor + discovery can
+  # legally coexist in BlueZ, so a failed teardown must not block the new
+  # mode (engage idempotency below self-heals the drift next transition).
+  # Returns {:ok, engaged} | {:error, reason, engaged}.
+  defp apply_mode(conn, engaged, target) do
+    disengage(conn, engaged)
+
+    case engage(conn, target) do
+      :ok -> {:ok, engaged_for(target)}
+      {:error, reason} -> {:error, reason, :none}
+    end
+  end
+
+  defp engaged_for(:passive), do: :monitor
+  defp engaged_for(:active), do: :discovery
+
+  defp disengage(_conn, :none), do: :ok
+
+  defp disengage(conn, :monitor) do
+    case call(conn, @adapter_path, @advmon_mgr_iface, "UnregisterMonitor", "o", [@root_path]) do
+      {:ok, _} -> :ok
+      # Wasn't registered (engage failed earlier) — already disengaged.
+      {:error, "org.bluez.Error.DoesNotExist"} -> :ok
+      {:error, reason} -> Logger.warning("Bluez.Client: UnregisterMonitor: #{inspect(reason)}")
+    end
+  end
+
+  defp disengage(conn, :discovery) do
+    case call(conn, @adapter_path, @adapter_iface, "StopDiscovery", "", []) do
+      {:ok, _} -> :ok
+      {:error, reason} -> Logger.warning("Bluez.Client: StopDiscovery: #{inspect(reason)}")
+    end
+  end
+
+  defp engage(conn, :passive) do
+    case register_monitor(conn) do
+      :ok -> :ok
+      # Already registered (a drifted earlier state) — goal reached.
+      {:error, "org.bluez.Error.AlreadyExists"} -> :ok
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp engage(conn, :active) do
+    # DuplicateData=false lets BlueZ coalesce identical re-broadcasts and only
+    # signal when a device's advertising data actually changes (plus periodic
+    # RSSI) — DeviceCache still emit-gates downstream.
+    filter = [{"Transport", {"s", "le"}}, {"DuplicateData", {"b", false}}]
+
+    with {:ok, _} <-
+           call(conn, @adapter_path, @adapter_iface, "SetDiscoveryFilter", "a{sv}", [filter]),
+         {:ok, _} <- start_discovery(conn) do
+      :ok
+    end
+  end
+
+  defp start_discovery(conn) do
+    case call(conn, @adapter_path, @adapter_iface, "StartDiscovery", "", []) do
+      # Already discovering (a drifted earlier state) — goal reached.
+      {:error, "org.bluez.Error.InProgress"} -> {:ok, []}
+      other -> other
+    end
   end
 
   defp register_monitor(conn) do
