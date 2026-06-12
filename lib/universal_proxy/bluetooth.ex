@@ -62,7 +62,7 @@ defmodule UniversalProxy.Bluetooth do
   picked up by the next cycle.
   """
 
-  alias UniversalProxy.Bluetooth.{Manager, RadioMonitor}
+  alias UniversalProxy.Bluetooth.{Manager, RadioMonitor, Settings}
 
   @bluetooth_targets [:rpi0, :rpi0_2, :rpi3, :rpi4, :rpi5]
 
@@ -141,13 +141,90 @@ defmodule UniversalProxy.Bluetooth do
     :exit, _ -> []
   end
 
+  @doc """
+  Master Bluetooth switch: persist, start/stop the BlueZ subtree, then
+  restart espex so the bluetooth feature flags HA sees follow the setting
+  (flags 0 when disabled). HA connections drop and reconnect within
+  seconds — the same accepted behavior as UART config writes.
+  """
+  @spec set_enabled(boolean()) :: :ok | {:error, term()}
+  def set_enabled(enabled) when is_boolean(enabled) do
+    with :ok <- Settings.set_enabled(enabled) do
+      :ok = Manager.reconcile()
+      _ = RadioMonitor.refresh()
+      restart_esphome()
+      :ok
+    end
+  catch
+    :exit, _ -> {:error, :unavailable}
+  end
+
+  @doc """
+  Allow/forbid HA opening active (GATT) connections. The BlueZ subtree is
+  untouched (Gatt idles harmlessly when espex isn't wired to it); only the
+  espex adapter wiring — and therefore the feature flags — changes, so HA
+  drops to a passive-only scanner when off.
+  """
+  @spec set_active_connections(boolean()) :: :ok | {:error, term()}
+  def set_active_connections(allowed) when is_boolean(allowed) do
+    with :ok <- Settings.set_active_connections(allowed) do
+      # No lifecycle change — reconcile only rebroadcasts the status map.
+      :ok = Manager.reconcile()
+      restart_esphome()
+      :ok
+    end
+  catch
+    :exit, _ -> {:error, :unavailable}
+  end
+
+  @doc """
+  Switch the BlueZ stack to the radio with the given MAC (`nil` = auto:
+  first/onboard controller). Persist, then stop/start the BlueZ subtree
+  pointed at the new adapter — active BLE connections drop by design and
+  the scanner re-engages on the new radio. No espex restart: the feature
+  flags don't depend on which radio is in use.
+
+  `{:error, :unknown_radio}` if no enumerated radio has that MAC.
+  """
+  @spec select_radio(String.t() | nil) :: :ok | {:error, term()}
+  def select_radio(nil) do
+    with :ok <- Settings.set_adapter(nil) do
+      :ok = Manager.reconcile(restart: true)
+      _ = RadioMonitor.refresh()
+      :ok
+    end
+  catch
+    :exit, _ -> {:error, :unavailable}
+  end
+
+  def select_radio(mac) when is_binary(mac) do
+    normalized = String.upcase(mac)
+
+    if Enum.any?(list_radios(), &(&1.address == normalized)) do
+      with :ok <- Settings.set_adapter(normalized) do
+        :ok = Manager.reconcile(restart: true)
+        _ = RadioMonitor.refresh()
+        :ok
+      end
+    else
+      {:error, :unknown_radio}
+    end
+  catch
+    :exit, _ -> {:error, :unavailable}
+  end
+
+  # Espex restart so device-info feature flags follow the settings —
+  # async fire-and-forget, the UART.Store precedent.
+  defp restart_esphome do
+    Task.start(fn -> UniversalProxy.ESPHome.Supervisor.restart() end)
+  end
+
   if @bluetooth_supported do
     use Supervisor
 
     # Aliased inside the guard: on non-BT targets this branch is compiled
     # out, so a top-level alias would be flagged unused under
     # --warnings-as-errors (CI compiles MIX_TARGET=host).
-    alias UniversalProxy.Bluetooth.Settings
     alias UniversalProxy.ESPHome.BluetoothScanner
 
     def start_link(opts \\ []) do

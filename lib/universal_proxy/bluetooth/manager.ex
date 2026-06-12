@@ -81,9 +81,12 @@ defmodule UniversalProxy.Bluetooth.Manager do
   Broadcasts the resulting status either way.
   """
   @spec reconcile(GenServer.server(), keyword()) :: :ok
-  def reconcile(server \\ __MODULE__, opts \\ []) do
-    GenServer.call(server, {:reconcile, opts})
-  end
+  def reconcile(server \\ __MODULE__, opts \\ [])
+
+  # `reconcile(restart: true)` — a lone keyword list is the opts, not the
+  # server (default-arg filling would otherwise bind it to `server`).
+  def reconcile(opts, []) when is_list(opts), do: GenServer.call(__MODULE__, {:reconcile, opts})
+  def reconcile(server, opts), do: GenServer.call(server, {:reconcile, opts})
 
   @impl GenServer
   def init(opts) do
