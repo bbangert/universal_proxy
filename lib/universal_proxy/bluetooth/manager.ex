@@ -44,8 +44,8 @@ defmodule UniversalProxy.Bluetooth.Manager do
   require Logger
 
   alias UniversalProxy.Bluetooth.{Radios, Settings}
+  alias UniversalProxy.Bluez.DevicePath
 
-  @adapter_path_key {UniversalProxy.Bluez, :adapter_path}
   @default_adapter_path "/org/bluez/hci0"
 
   # Delay before re-binding the monitor after the subtree dies — the
@@ -84,10 +84,6 @@ defmodule UniversalProxy.Bluetooth.Manager do
   def reconcile(server \\ __MODULE__, opts \\ []) do
     GenServer.call(server, {:reconcile, opts})
   end
-
-  @doc false
-  @spec adapter_path_key() :: tuple()
-  def adapter_path_key, do: @adapter_path_key
 
   @impl GenServer
   def init(opts) do
@@ -175,7 +171,7 @@ defmodule UniversalProxy.Bluetooth.Manager do
     {path, adapter} = resolve_adapter(config, state.sysfs_root)
     # MUST land before the subtree boots: everything under Bluez reads the
     # adapter path from this term (a crash-restart re-reads it unchanged).
-    :persistent_term.put(@adapter_path_key, path)
+    :persistent_term.put(DevicePath.adapter_path_key(), path)
 
     case DynamicSupervisor.start_child(state.dynsup, state.bluez_child) do
       {:ok, pid} ->

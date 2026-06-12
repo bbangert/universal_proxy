@@ -1,5 +1,7 @@
 defmodule UniversalProxy.Bluez.DevicePathTest do
-  use ExUnit.Case, async: true
+  # async: false — the runtime-prefix tests below write the global
+  # :persistent_term adapter path other async modules read at its default.
+  use ExUnit.Case, async: false
 
   alias UniversalProxy.Bluez.DevicePath
 
@@ -60,6 +62,34 @@ defmodule UniversalProxy.Bluez.DevicePathTest do
       assert DevicePath.to_address("/org/bluez/hci0/dev_AA_BB_CC_DD_EE_GG") == :error
       assert DevicePath.to_address("/org/bluez/hci0") == :error
       assert DevicePath.to_address("") == :error
+    end
+  end
+
+  describe "runtime adapter path" do
+    setup do
+      :persistent_term.put(DevicePath.adapter_path_key(), "/org/bluez/hci1")
+      on_exit(fn -> :persistent_term.erase(DevicePath.adapter_path_key()) end)
+    end
+
+    test "adapter_path/0 reflects the published term" do
+      assert DevicePath.adapter_path() == "/org/bluez/hci1"
+    end
+
+    test "from_address/1 builds paths under the published adapter" do
+      assert DevicePath.from_address(0xAABBCCDDEEFF) ==
+               "/org/bluez/hci1/dev_AA_BB_CC_DD_EE_FF"
+    end
+
+    test "to_address/1 follows the published adapter and rejects the old one" do
+      assert DevicePath.to_address("/org/bluez/hci1/dev_AA_BB_CC_DD_EE_FF") ==
+               {:ok, 0xAABBCCDDEEFF}
+
+      assert DevicePath.to_address("/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF") == :error
+    end
+
+    test "round-trips under the published adapter" do
+      assert 0xC0FFEE010203 |> DevicePath.from_address() |> DevicePath.to_address() ==
+               {:ok, 0xC0FFEE010203}
     end
   end
 end
