@@ -186,10 +186,9 @@ defmodule UniversalProxy.Bluez.GattTreeTest do
       tree = GattTree.build(objects() ++ [dup], @dev)
 
       # Both chars claim declaration handle 0x0B → value handle 0x0C. The
-      # by_handle map is built with Map.new, so exactly one survives —
-      # document the (BlueZ-shouldn't-do-this) behaviour rather than crash.
-      assert {:characteristic, path} = tree.by_handle[0x0C]
-      assert path in [@dev <> "/service000a/char000b", @dev <> "/service0010/char000b"]
+      # LAST object in bus order wins in the op maps (BlueZ shouldn't emit
+      # duplicates; this documents the deterministic tie-break).
+      assert tree.by_handle[0x0C] == {:characteristic, @dev <> "/service0010/char000b"}
     end
   end
 

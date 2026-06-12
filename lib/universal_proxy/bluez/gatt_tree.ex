@@ -96,6 +96,12 @@ defmodule UniversalProxy.Bluez.GattTree do
           end
       end
 
+    # The reduce prepends, so restore true bus order: Map.new keeps the last
+    # element it sees, and "last object in bus order wins" (for duplicate
+    # handles BlueZ shouldn't emit) only holds on the un-reversed lists.
+    grouped =
+      Map.new(grouped, fn {kind, entries} -> {kind, Enum.reverse(entries)} end)
+
     descs_by_char =
       Enum.group_by(grouped.descs, fn {_p, _h, props} -> props["Characteristic"] end)
 
