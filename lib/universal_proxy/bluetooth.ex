@@ -1,35 +1,50 @@
 defmodule UniversalProxy.Bluetooth do
   @moduledoc """
-  Bluetooth subtree: owns the BlueZ stack and the subscriber registry that
-  feeds advertisements to Home Assistant.
+  Bluetooth subtree: owns the BlueZ stack, the runtime enable/disable +
+  radio-selection settings behind the `/bluetooth` web tab, and the
+  subscriber registry that feeds advertisements to Home Assistant.
 
-  Children, started `:rest_for_one` (registry first):
+  Children, started `:rest_for_one`:
 
     1. a duplicate-key `Registry`
        (`UniversalProxy.ESPHome.BluetoothScanner.registry_name/0`) holding
        every subscribed ESPHome connection-handler pid. Registry-up-first
        guarantees the advert fan-out's `Registry.dispatch` never hits a
        missing table.
-    2. `UniversalProxy.Bluez` — brings up `dbus-daemon` + `bluetoothd` so the
-       kernel-attached controller (`hci0`) is managed by BlueZ over D-Bus.
-       The `rebus` client + advertisement reconstruction that call
-       `UniversalProxy.ESPHome.BluetoothScanner.on_advertisement/1` attach
-       inside that subtree (Stage B).
+    2. `UniversalProxy.Bluetooth.Settings` — DETS-persisted user settings
+       (enabled / active-connections / selected radio MAC).
+    3. a `DynamicSupervisor` the BlueZ subtree runs under.
+    4. `UniversalProxy.Bluetooth.Manager` — the runtime gate: starts/stops
+       `UniversalProxy.Bluez` under the DynamicSupervisor per the `enabled`
+       setting, resolving the selected radio MAC to an adapter path
+       (`:persistent_term`) **before** each subtree start.
 
-  ## Migration off blue_heron
+  `UniversalProxy.Bluez` brings up `dbus-daemon` + `bluetoothd` so the
+  kernel-attached controller is managed by BlueZ over D-Bus; the `rebus`
+  client + advertisement reconstruction that call
+  `UniversalProxy.ESPHome.BluetoothScanner.on_advertisement/1` attach
+  inside that subtree.
 
-  This replaces the vendored `blue_heron` raw-HCI stack on rpi3, which has
-  been removed as a dependency. The two cannot coexist — both drive the same
-  physical chip, and `blue_heron`'s raw mini-UART access knocks the kernel's
-  `hci0` off the mgmt interface (see `UniversalProxy.Bluez`). It also
-  crash-loops at boot without a transport, so it can't simply be left idle.
+  ## Public API (consumed by the Bluetooth LiveView)
 
-  Compile-time guarded: off-target (host, or any Nerves target outside BT
-  scope), `child_spec/1` returns a normal spec whose `start_link/1` returns
-  `:ignore`, so the supervisor treats this module as a no-op there. The advert
-  fan-out adapter (`UniversalProxy.ESPHome.BluetoothScanner`) is itself
-  unguarded so it can be unit-tested on the host against a registry started in
-  the test.
+  The functions in this module are safe on every target and in every
+  lifecycle state: on non-BT targets (or while the subtree is down) the
+  readers return a disabled-shaped status and the setters return clean
+  errors instead of raising — same defensive posture as the espex adapters.
+
+  State changes are broadcast on `Phoenix.PubSub` (`UniversalProxy.PubSub`):
+
+    * `state_topic()` (`"bluetooth:state"`) — `{:bluetooth_state, status}`
+      on any toggle / radio switch / subtree lifecycle change.
+
+  ## Compile-time gating
+
+  Off-target (host, or any Nerves target outside BT scope), `child_spec/1`
+  returns a normal spec whose `start_link/1` returns `:ignore`, so the
+  supervisor treats this module as a no-op there. The advert fan-out
+  adapter (`UniversalProxy.ESPHome.BluetoothScanner`) is itself unguarded
+  so it can be unit-tested on the host against a registry started in the
+  test — as are `Settings`, `Manager`, and `Radios`.
 
   BT scope (`@bluetooth_targets`) = every Pi running a custom
   BlueZ-enabled system. Only rpi3 is hardware-validated; the others share
@@ -41,11 +56,13 @@ defmodule UniversalProxy.Bluetooth do
   On a board whose BT bring-up fails (broken DT, no onboard radio, no USB
   dongle yet), `UniversalProxy.Bluez.Client` gives up after ~10 s
   (`:no_adapter`) and the `Bluez` subtree restarts. Each cycle takes
-  longer than the supervisor's intensity window, so this is a benign
+  longer than the DynamicSupervisor's intensity window, so this is a benign
   endless retry loop, not an escalating crash: the app stays healthy, and
   a USB BT dongle (btusb is in the custom systems) hot-plugged later is
   picked up by the next cycle.
   """
+
+  alias UniversalProxy.Bluetooth.Manager
 
   @bluetooth_targets [:rpi0, :rpi0_2, :rpi3, :rpi4, :rpi5]
 
@@ -53,6 +70,8 @@ defmodule UniversalProxy.Bluetooth do
   # Nerves release, so bake the predicate in. Single source of truth for
   # gating both this subtree and the espex `bluetooth_scanner:` wiring.
   @bluetooth_supported Mix.target() in @bluetooth_targets
+
+  @state_topic "bluetooth:state"
 
   @doc """
   Whether this build targets BT-capable hardware (compile-time constant).
@@ -64,12 +83,40 @@ defmodule UniversalProxy.Bluetooth do
   @spec supported?() :: boolean()
   def supported?, do: @bluetooth_supported
 
+  @doc "PubSub topic carrying `{:bluetooth_state, status}` broadcasts."
+  @spec state_topic() :: String.t()
+  def state_topic, do: @state_topic
+
+  @doc """
+  Current Bluetooth status for the web tab:
+
+      %{enabled: boolean(), proxying?: boolean(),
+        adapter: %{hci: String.t(), address: String.t() | nil, name: String.t() | nil} | nil,
+        active_connections: %{allowed?: boolean(), used: n, limit: n}}
+
+  Safe on any target: when the Manager isn't running (non-BT target, early
+  boot) this returns a disabled-shaped map instead of raising.
+  """
+  @spec status() :: map()
+  def status do
+    Manager.status()
+  catch
+    :exit, _ ->
+      %{
+        enabled: false,
+        proxying?: false,
+        adapter: nil,
+        active_connections: %{allowed?: false, used: 0, limit: 0}
+      }
+  end
+
   if @bluetooth_supported do
     use Supervisor
 
     # Aliased inside the guard: on non-BT targets this branch is compiled
     # out, so a top-level alias would be flagged unused under
     # --warnings-as-errors (CI compiles MIX_TARGET=host).
+    alias UniversalProxy.Bluetooth.Settings
     alias UniversalProxy.ESPHome.BluetoothScanner
 
     def start_link(opts \\ []) do
@@ -84,15 +131,22 @@ defmodule UniversalProxy.Bluetooth do
         # single `:subscribers` key.
         {Registry, keys: :duplicate, name: BluetoothScanner.registry_name()},
 
-        # BlueZ stack (dbus-daemon + bluetoothd). The rebus client that turns
-        # on discovery and reconstructs adverts into
-        # `BluetoothScanner.on_advertisement/1` lives inside this subtree.
-        UniversalProxy.Bluez
+        # Persisted user settings. Before the Manager, which reads them to
+        # decide whether to bring the BlueZ stack up.
+        Settings,
+
+        # The BlueZ subtree (dbus-daemon + bluetoothd + scanner/GATT
+        # clients) runs under here, started/stopped by the Manager.
+        {DynamicSupervisor, name: __MODULE__.DynamicSupervisor, strategy: :one_for_one},
+
+        # Runtime lifecycle gate (see its @moduledoc).
+        Manager
       ]
 
-      # rest_for_one: a registry restart cascades into the BlueZ subtree so
-      # any advert dispatcher re-runs against the fresh table; a BlueZ restart
-      # leaves the registry — and its subscribers — untouched.
+      # rest_for_one: a registry restart cascades into everything below so
+      # any advert dispatcher re-runs against the fresh table; a
+      # Manager-only restart leaves the registry — and its subscribers —
+      # untouched.
       Supervisor.init(children, strategy: :rest_for_one)
     end
   else
