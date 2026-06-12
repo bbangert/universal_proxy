@@ -1,6 +1,6 @@
 defmodule UniversalProxy.Bluez.Agent do
   @moduledoc """
-  The `org.bluez.Agent1` pairing agent backing `Bluez.Gatt`'s `pair/2`
+  The `org.bluez.Agent1` pairing agent backing `Bluez.Gatt`'s `pair/1`
   (Phase 2 of the Bluetooth proxy).
 
   bluetoothd resolves pairing IO through an agent: when `Device1.Pair()`
