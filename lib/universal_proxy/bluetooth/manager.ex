@@ -93,6 +93,8 @@ defmodule UniversalProxy.Bluetooth.Manager do
       bluez_child: Keyword.get(opts, :bluez_child, UniversalProxy.Bluez),
       sysfs_root: Keyword.get(opts, :sysfs_root, "/sys/class/bluetooth"),
       pubsub: Keyword.get(opts, :pubsub, UniversalProxy.PubSub),
+      adapters_info_fun:
+        Keyword.get(opts, :adapters_info_fun, &UniversalProxy.Bluez.Client.adapters_info/0),
       bluez_pid: nil,
       monitor: nil,
       # The sysfs adapter the path was resolved to at the last subtree
@@ -256,9 +258,20 @@ defmodule UniversalProxy.Bluetooth.Manager do
     %{
       enabled: config.enabled,
       proxying?: running?,
-      adapter: adapter && %{hci: adapter.hci, address: adapter.address, name: nil},
+      adapter:
+        adapter &&
+          %{hci: adapter.hci, address: adapter.address, name: adapter_name(state, adapter.hci)},
       active_connections: %{allowed?: config.active_connections, used: used, limit: limit}
     }
+  end
+
+  # Live Adapter1.Name from the daemon, when it's up (nil otherwise —
+  # adapters_info/0 is exit-safe and returns [] with the subtree down).
+  defp adapter_name(state, hci) do
+    state.adapters_info_fun.()
+    |> Enum.find_value(fn %{path: path, name: name} ->
+      if Path.basename(path) == hci, do: name
+    end)
   end
 
   defp connection_usage do

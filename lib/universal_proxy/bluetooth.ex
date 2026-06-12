@@ -62,7 +62,7 @@ defmodule UniversalProxy.Bluetooth do
   picked up by the next cycle.
   """
 
-  alias UniversalProxy.Bluetooth.Manager
+  alias UniversalProxy.Bluetooth.{Manager, RadioMonitor}
 
   @bluetooth_targets [:rpi0, :rpi0_2, :rpi3, :rpi4, :rpi5]
 
@@ -72,6 +72,7 @@ defmodule UniversalProxy.Bluetooth do
   @bluetooth_supported Mix.target() in @bluetooth_targets
 
   @state_topic "bluetooth:state"
+  @radios_topic "bluetooth:radios"
 
   @doc """
   Whether this build targets BT-capable hardware (compile-time constant).
@@ -86,6 +87,10 @@ defmodule UniversalProxy.Bluetooth do
   @doc "PubSub topic carrying `{:bluetooth_state, status}` broadcasts."
   @spec state_topic() :: String.t()
   def state_topic, do: @state_topic
+
+  @doc "PubSub topic carrying `{:bluetooth_radios, radios}` broadcasts."
+  @spec radios_topic() :: String.t()
+  def radios_topic, do: @radios_topic
 
   @doc """
   Current Bluetooth status for the web tab:
@@ -108,6 +113,32 @@ defmodule UniversalProxy.Bluetooth do
         adapter: nil,
         active_connections: %{allowed?: false, used: 0, limit: 0}
       }
+  end
+
+  @doc """
+  The known radios (cached, ≤ 5 s old):
+
+      [%{hci:, address:, name:, chip:, bus:, detail:, bt_version:,
+         ble?:, bredr?:, in_use?:}]
+
+  `[]` on non-BT targets or before the monitor is up.
+  """
+  @spec list_radios() :: [map()]
+  def list_radios do
+    RadioMonitor.list()
+  catch
+    :exit, _ -> []
+  end
+
+  @doc """
+  Re-enumerate radios right now (the UI's Rescan button); broadcasts on
+  `radios_topic()` if anything changed and returns the fresh list.
+  """
+  @spec refresh_radios() :: [map()]
+  def refresh_radios do
+    RadioMonitor.refresh()
+  catch
+    :exit, _ -> []
   end
 
   if @bluetooth_supported do
@@ -140,7 +171,13 @@ defmodule UniversalProxy.Bluetooth do
         {DynamicSupervisor, name: __MODULE__.DynamicSupervisor, strategy: :one_for_one},
 
         # Runtime lifecycle gate (see its @moduledoc).
-        Manager
+        Manager,
+
+        # Radio list for the web tab (5 s hotplug poll). Runs even while
+        # Bluetooth is disabled — the tab lists radios to pick before
+        # enabling. After the Manager: its in_use? mark reads the
+        # Manager-owned adapter path + status.
+        RadioMonitor
       ]
 
       # rest_for_one: a registry restart cascades into everything below so

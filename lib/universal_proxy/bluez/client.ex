@@ -131,6 +131,27 @@ defmodule UniversalProxy.Bluez.Client do
   @spec configured_mode() :: :passive | :active
   def configured_mode, do: :persistent_term.get(@mode_key, :passive)
 
+  @doc """
+  `org.bluez.Adapter1` properties for every adapter object the daemon
+  exposes: `[%{path:, address:, name:, powered:}]`. Used by
+  `UniversalProxy.Bluetooth.RadioMonitor` to overlay live daemon state on
+  the sysfs radio list. Returns `[]` when this Client isn't running (BT
+  subtree down, host) or the daemon can't answer.
+  """
+  @spec adapters_info() :: [
+          %{
+            path: String.t(),
+            address: String.t() | nil,
+            name: String.t() | nil,
+            powered: boolean()
+          }
+        ]
+  def adapters_info do
+    GenServer.call(__MODULE__, :adapters_info)
+  catch
+    :exit, _ -> []
+  end
+
   @impl GenServer
   def init(_opts) do
     case Rebus.connect(:system) do
@@ -171,6 +192,29 @@ defmodule UniversalProxy.Bluez.Client do
   def handle_continue({:setup, retries}, state), do: attempt_setup(state, retries)
 
   @impl GenServer
+  def handle_call(:adapters_info, _from, state) do
+    reply =
+      case get_managed_objects(state.conn) do
+        {:ok, objects} ->
+          for {path, ifaces} <- objects,
+              {_iface, props} <- [List.keyfind(ifaces, @adapter_iface, 0)] do
+            unwrapped = Variant.unwrap_props(props)
+
+            %{
+              path: path,
+              address: unwrapped["Address"],
+              name: unwrapped["Name"],
+              powered: unwrapped["Powered"] == true
+            }
+          end
+
+        {:error, _} ->
+          []
+      end
+
+    {:reply, reply, state}
+  end
+
   def handle_call({:set_mode, target}, from, state) do
     cond do
       # A transition is running: park behind it. Same-target callers pile
