@@ -92,9 +92,11 @@ defmodule UniversalProxy.Bluez.Client do
   # Timeout for the (Task-issued) RegisterMonitor call to BlueZ.
   @register_timeout_ms 10_000
 
-  # set_mode/1 callers wait for the whole transition: worst case is a
-  # best-effort disengage (5 s D-Bus default) + RegisterMonitor (10 s).
-  @set_mode_timeout_ms 16_000
+  # set_mode/1 callers wait for the whole transition — and a caller parked
+  # behind an in-flight transition waits for that one too. Budget two
+  # back-to-back worst cases (each: engage RegisterMonitor 10 s + best-effort
+  # disengage 5 s) plus margin; normal transitions complete in milliseconds.
+  @set_mode_timeout_ms 32_000
 
   # :persistent_term key for the HA-configured scanner mode. Survives Client
   # restarts (within a boot) so re-init re-engages what HA chose.
@@ -291,7 +293,20 @@ defmodule UniversalProxy.Bluez.Client do
     ref = make_ref()
 
     Task.start(fn ->
-      send(me, {:mode_transition, ref, target, froms, apply_mode(conn, engaged, target)})
+      # The completion message must ALWAYS arrive — a Task that dies without
+      # sending it leaves `transition` stuck non-nil and every future
+      # set_mode/1 parking until timeout. apply_mode/3 shouldn't raise
+      # (DBus.call normalizes errors), but don't bet the state machine on it.
+      result =
+        try do
+          apply_mode(conn, engaged, target)
+        rescue
+          e -> {:error, e, engaged}
+        catch
+          kind, reason -> {:error, {kind, reason}, engaged}
+        end
+
+      send(me, {:mode_transition, ref, target, froms, result})
     end)
 
     %{state | transition: ref}
