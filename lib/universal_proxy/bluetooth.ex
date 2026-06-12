@@ -31,10 +31,23 @@ defmodule UniversalProxy.Bluetooth do
   unguarded so it can be unit-tested on the host against a registry started in
   the test.
 
-  BT scope = `:rpi3` only for now (`@bluetooth_targets`).
+  BT scope (`@bluetooth_targets`) = every Pi running a custom
+  BlueZ-enabled system. Only rpi3 is hardware-validated; the others share
+  its design (rpi0/rpi0_2: same miniuart-bt serdev path; rpi4/rpi5:
+  device-tree UNVERIFIED — see the bluetooth-dbus-migration handoff).
+
+  ## When the controller never appears
+
+  On a board whose BT bring-up fails (broken DT, no onboard radio, no USB
+  dongle yet), `UniversalProxy.Bluez.Client` gives up after ~10 s
+  (`:no_adapter`) and the `Bluez` subtree restarts. Each cycle takes
+  longer than the supervisor's intensity window, so this is a benign
+  endless retry loop, not an escalating crash: the app stays healthy, and
+  a USB BT dongle (btusb is in the custom systems) hot-plugged later is
+  picked up by the next cycle.
   """
 
-  @bluetooth_targets [:rpi3]
+  @bluetooth_targets [:rpi0, :rpi0_2, :rpi3, :rpi4, :rpi5]
 
   # Compile-time constant: `Mix.target/0` is unavailable at runtime in a
   # Nerves release, so bake the predicate in. Single source of truth for

@@ -8,3 +8,13 @@ MIX_TARGET = "rpi3"
 [tasks.test]
 description = "Run tests with MIX_TARGET=host"
 run = "MIX_TARGET=host mix test"
+
+[tasks.firmware]
+description = "Build firmware for a target: mise run firmware -- rpi3"
+# Clean ALL per-target player binaries first: a foreign-arch binary left in
+# priv/ ships into the release and the Nerves rootfs scrubber rejects it.
+run = 'rm -rf priv/sendspin_player && MIX_TARGET="{{arg(name="target")}}" mix firmware'
+
+[tasks.mix-for]
+description = "Run a mix task for a target: mise run mix-for -- rpi0 deps.get"
+run = 'MIX_TARGET="{{arg(name="target")}}" mix "{{arg(name="task")}}"'
