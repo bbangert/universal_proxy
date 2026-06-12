@@ -62,7 +62,7 @@ defmodule UniversalProxy.Bluetooth do
   picked up by the next cycle.
   """
 
-  alias UniversalProxy.Bluetooth.{Manager, RadioMonitor, Settings}
+  alias UniversalProxy.Bluetooth.{Manager, RadioMonitor, Settings, Stats}
 
   @bluetooth_targets [:rpi0, :rpi0_2, :rpi3, :rpi4, :rpi5]
 
@@ -73,6 +73,7 @@ defmodule UniversalProxy.Bluetooth do
 
   @state_topic "bluetooth:state"
   @radios_topic "bluetooth:radios"
+  @stats_topic "bluetooth:stats"
 
   @doc """
   Whether this build targets BT-capable hardware (compile-time constant).
@@ -91,6 +92,10 @@ defmodule UniversalProxy.Bluetooth do
   @doc "PubSub topic carrying `{:bluetooth_radios, radios}` broadcasts."
   @spec radios_topic() :: String.t()
   def radios_topic, do: @radios_topic
+
+  @doc "PubSub topic carrying `{:bluetooth_stats, stats}` broadcasts (1 s tick)."
+  @spec stats_topic() :: String.t()
+  def stats_topic, do: @stats_topic
 
   @doc """
   Current Bluetooth status for the web tab:
@@ -113,6 +118,20 @@ defmodule UniversalProxy.Bluetooth do
         adapter: nil,
         active_connections: %{allowed?: false, used: 0, limit: 0}
       }
+  end
+
+  @doc """
+  Live statistics for the web tab (last computed tick):
+
+      %{ads_per_s: n, devices_15min: n, connections: %{used: n, limit: n}}
+
+  Zeros on non-BT targets or while the subsystem is down.
+  """
+  @spec stats() :: map()
+  def stats do
+    Stats.current()
+  catch
+    :exit, _ -> %{ads_per_s: 0, devices_15min: 0, connections: %{used: 0, limit: 0}}
   end
 
   @doc """
@@ -254,7 +273,11 @@ defmodule UniversalProxy.Bluetooth do
         # Bluetooth is disabled — the tab lists radios to pick before
         # enabling. After the Manager: its in_use? mark reads the
         # Manager-owned adapter path + status.
-        RadioMonitor
+        RadioMonitor,
+
+        # 1 s stats tick (ads/s, devices seen, GATT slots). Sources are
+        # read defensively, so it ticks zeros while the subtree is down.
+        Stats
       ]
 
       # rest_for_one: a registry restart cascades into everything below so

@@ -152,6 +152,18 @@ defmodule UniversalProxy.Bluez.Client do
     :exit, _ -> []
   end
 
+  @doc """
+  Distinct devices the advert cache has seen in the last `window_ms`
+  (`UniversalProxy.Bluez.DeviceCache.seen_within/3`). `0` when this Client
+  isn't running. Used by `UniversalProxy.Bluetooth.Stats`.
+  """
+  @spec devices_seen(pos_integer()) :: non_neg_integer()
+  def devices_seen(window_ms) when is_integer(window_ms) and window_ms > 0 do
+    GenServer.call(__MODULE__, {:devices_seen, window_ms})
+  catch
+    :exit, _ -> 0
+  end
+
   @impl GenServer
   def init(_opts) do
     case Rebus.connect(:system) do
@@ -213,6 +225,11 @@ defmodule UniversalProxy.Bluez.Client do
       end
 
     {:reply, reply, state}
+  end
+
+  def handle_call({:devices_seen, window_ms}, _from, state) do
+    now = System.monotonic_time(:millisecond)
+    {:reply, DeviceCache.seen_within(state.cache, now, window_ms), state}
   end
 
   def handle_call({:set_mode, target}, from, state) do

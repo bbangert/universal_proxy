@@ -162,6 +162,10 @@ defmodule UniversalProxy.ESPHome.BluetoothScanner do
         raw_data: raw_data
       })
       when is_binary(raw_data) do
+    # ads/s stat for the web tab — atomic counter bump, no-op when the
+    # stats server isn't running.
+    UniversalProxy.Bluetooth.Stats.bump_ad()
+
     # Address byte order validated on rpi3 (F4) — forwarded as-is, no swap.
     rssi = signed_rssi(rss)
 
