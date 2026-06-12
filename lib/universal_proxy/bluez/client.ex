@@ -108,9 +108,13 @@ defmodule UniversalProxy.Bluez.Client do
 
   @doc """
   Switch the scanner between `:passive` (AdvertisementMonitor) and `:active`
-  (StartDiscovery) at runtime. Returns once the BlueZ transition completes;
-  `{:error, :superseded}` if a newer `set_mode/1` asking for a *different*
-  mode displaced this one (same-mode callers coalesce and succeed together).
+  (StartDiscovery) at runtime. Returns once the BlueZ transition completes.
+
+  A caller whose transition is already in flight always gets that
+  transition's own result. Only callers parked *behind* an in-flight
+  transition can get `{:error, :superseded}` — when a newer `set_mode/1`
+  asking for a different mode displaces them (same-mode callers coalesce
+  and succeed together).
 
   Callers must `catch :exit` for the not-running/timeout cases (see
   `UniversalProxy.ESPHome.BluetoothScanner.set_scanner_mode/1`).
