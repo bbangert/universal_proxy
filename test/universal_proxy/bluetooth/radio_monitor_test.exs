@@ -49,8 +49,7 @@ defmodule UniversalProxy.Bluetooth.RadioMonitorTest do
            poll_ms: 60_000,
            adapters_info_fun: fn ->
              [%{path: "/org/bluez/hci0", address: @pi_mac, name: "raspberrypi", powered: true}]
-           end,
-           proxying_fun: fn -> true end
+           end
          ]})
 
     # init's first enumeration runs in handle_continue — synchronize.
@@ -81,17 +80,12 @@ defmodule UniversalProxy.Bluetooth.RadioMonitorTest do
     assert [%{hci: "hci0", in_use?: false}] = RadioMonitor.list(monitor)
   end
 
-  test "nothing is in use while the subtree is down", ctx do
+  test "nothing is in use while the daemon is down (no overlay)", ctx do
     :persistent_term.put(DevicePath.adapter_path_key(), "/org/bluez/hci0")
-    monitor = start_monitor(ctx, proxying_fun: fn -> false end)
-
-    assert [%{hci: "hci0", in_use?: false}] = RadioMonitor.list(monitor)
-  end
-
-  test "radios without live daemon info get name: nil", ctx do
     monitor = start_monitor(ctx, adapters_info_fun: fn -> [] end)
 
-    assert [%{hci: "hci0", name: nil}] = RadioMonitor.list(monitor)
+    assert [%{hci: "hci0", in_use?: false, name: nil, address: nil}] =
+             RadioMonitor.list(monitor)
   end
 
   test "the first enumeration broadcasts; refresh broadcasts only on change", ctx do

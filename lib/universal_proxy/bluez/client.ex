@@ -303,7 +303,6 @@ defmodule UniversalProxy.Bluez.Client do
     cond do
       claim_adapter(state.conn) ->
         power_on(state.conn)
-        power_off_others(state.conn)
         state = seed_existing(state)
         # An early set_mode/1 may already have a transition in flight (its
         # D-Bus calls work as soon as the adapter answers) — don't race it;
@@ -691,28 +690,16 @@ defmodule UniversalProxy.Bluez.Client do
     end
   end
 
+  # Power the claimed adapter on — required to scan through it. Other
+  # adapters' power state is deliberately NOT managed: from the Elixir
+  # side all that matters is which adapter we utilize over rebus, not the
+  # device-wide Bluetooth on/off state.
   defp power_on(conn) do
     call(conn, adapter_path(), @props_iface, "Set", "ssv", [
       @adapter_iface,
       "Powered",
       {"b", true}
     ])
-  end
-
-  # Best-effort: power every adapter we are NOT driving down so a
-  # deselected radio stops radiating after a radio switch (bluetoothd's
-  # AutoEnable may have powered it). Failures are ignored — a radio left
-  # powered is cosmetic, and the next subtree start retries anyway.
-  defp power_off_others(conn) do
-    with {:ok, objects} <- get_managed_objects(conn) do
-      for {path, ifaces} <- objects,
-          path != adapter_path(),
-          List.keymember?(ifaces, @adapter_iface, 0) do
-        call(conn, path, @props_iface, "Set", "ssv", [@adapter_iface, "Powered", {"b", false}])
-      end
-    end
-
-    :ok
   end
 
   # The adapter object path the whole subtree drives — resolved by

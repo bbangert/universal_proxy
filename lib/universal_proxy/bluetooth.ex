@@ -14,10 +14,10 @@ defmodule UniversalProxy.Bluetooth do
     2. `UniversalProxy.Bluetooth.Settings` — DETS-persisted user settings
        (enabled / active-connections / selected radio MAC).
     3. a `DynamicSupervisor` the BlueZ subtree runs under.
-    4. `UniversalProxy.Bluetooth.Manager` — the runtime gate: starts/stops
-       `UniversalProxy.Bluez` under the DynamicSupervisor per the `enabled`
-       setting, resolving the selected radio MAC to an adapter path
-       (`:persistent_term`) **before** each subtree start.
+    4. `UniversalProxy.Bluetooth.Manager` — keeps `UniversalProxy.Bluez`
+       running (always — the `enabled` setting gates espex wiring, not the
+       stack) and performs radio switches, publishing the selected radio
+       MAC (`:persistent_term`) **before** each subtree (re)start.
 
   `UniversalProxy.Bluez` brings up `dbus-daemon` + `bluetoothd` so the
   kernel-attached controller is managed by BlueZ over D-Bus; the `rebus`
@@ -161,9 +161,12 @@ defmodule UniversalProxy.Bluetooth do
   end
 
   @doc """
-  Master Bluetooth switch: persist, start/stop the BlueZ subtree, then
-  restart espex so the bluetooth feature flags HA sees follow the setting
-  (flags 0 when disabled). HA connections drop and reconnect within
+  Master Bluetooth switch — purely an espex-wiring gate. The BlueZ stack
+  (and its radios) keeps running either way; what changes is whether the
+  scanner/GATT adapters are wired into espex, so HA sees bluetooth
+  feature flags 0 and no data when disabled (nothing subscribes — the
+  scan data is ignored at the Elixir layer). Persist → rebroadcast
+  status → restart espex. HA connections drop and reconnect within
   seconds — the same accepted behavior as UART config writes.
   """
   @spec set_enabled(boolean()) :: :ok | {:error, term()}

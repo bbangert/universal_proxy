@@ -2,11 +2,20 @@ defmodule UniversalProxy.Bluetooth.Manager do
   @moduledoc """
   Runtime lifecycle owner for the BlueZ stack.
 
-  The compile-time gate (`UniversalProxy.Bluetooth.supported?/0`) decides
-  whether this subsystem exists at all; this Manager adds the *runtime*
-  gate: it starts and stops the `UniversalProxy.Bluez` subtree under the
-  sibling `DynamicSupervisor` according to the persisted
-  `UniversalProxy.Bluetooth.Settings`.
+  The BlueZ subtree runs **whenever the hardware supports it** — the
+  `enabled` setting does NOT stop it. All radios stay powered and the
+  scanner keeps running on the selected one; what `enabled` (and
+  `active_connections`) gate is the *espex wiring*
+  (`UniversalProxy.ESPHome.Supervisor.bluetooth_opts/2`): with Bluetooth
+  disabled, espex advertises no BT feature flags and nothing subscribes,
+  so scan data is simply ignored at the Elixir layer. That keeps toggles
+  instant (no daemon churn) and keeps the radio list (whose MACs only
+  exist via the daemon) fully populated while disabled.
+
+  What this Manager owns is subtree *liveness* (start at boot, retry
+  failed starts, re-bind after crashes) and **radio switching**: a
+  `reconcile(restart: true)` stop/start cycle re-points the stack at a
+  newly selected adapter.
 
   ## Adapter-selection ordering invariant
 
@@ -47,6 +56,13 @@ defmodule UniversalProxy.Bluetooth.Manager do
   # is normally enough; the rebind loops while enabled in case it isn't.
   @rebind_ms 1_000
 
+  # Retry delay after DynamicSupervisor.start_child returns an error. A
+  # failed START isn't a crash — nothing restarts it for us (unlike a
+  # started-then-crashed :permanent child), so the Manager owns this loop.
+  # Hardware-found: the first start after a runtime stop can lose a race
+  # with the old subtree's teardown remnants.
+  @start_retry_ms 2_000
+
   def start_link(opts \\ []) do
     gen_opts =
       case Keyword.get(opts, :name, __MODULE__) do
@@ -67,10 +83,11 @@ defmodule UniversalProxy.Bluetooth.Manager do
   end
 
   @doc """
-  Re-read settings and converge the Bluez subtree on them: start it when
-  enabled and down, stop it when disabled and up. `restart: true` forces a
-  stop/start cycle even when already running — used by radio selection,
-  which must re-resolve the adapter path.
+  Re-read settings and converge: the subtree is (re)started if it isn't
+  running — the `enabled` setting doesn't stop it, it only changes the
+  broadcast status. `restart: true` forces a stop/start cycle even when
+  already running — used by radio selection, which must re-resolve the
+  desired adapter.
 
   Broadcasts the resulting status either way.
   """
@@ -92,6 +109,7 @@ defmodule UniversalProxy.Bluetooth.Manager do
       pubsub: Keyword.get(opts, :pubsub, UniversalProxy.PubSub),
       adapters_info_fun:
         Keyword.get(opts, :adapters_info_fun, &UniversalProxy.Bluez.Client.adapters_info/0),
+      start_retry_ms: Keyword.get(opts, :start_retry_ms, @start_retry_ms),
       bluez_pid: nil,
       monitor: nil
     }
@@ -137,14 +155,23 @@ defmodule UniversalProxy.Bluetooth.Manager do
         {:noreply, state}
 
       nil ->
-        # Not back yet (restart backoff / escalation in progress). Keep
-        # looking while the subtree is supposed to be up.
-        if settings(state).enabled, do: Process.send_after(self(), :rebind, @rebind_ms)
+        # Not back yet (restart backoff / escalation in progress). The
+        # subtree is always supposed to be up — keep looking.
+        Process.send_after(self(), :rebind, @rebind_ms)
         {:noreply, state}
     end
   end
 
   def handle_info(:rebind, state), do: {:noreply, state}
+
+  # A start_child failure scheduled this.
+  def handle_info(:retry_start, %{bluez_pid: nil} = state) do
+    state = do_reconcile(state, [])
+    broadcast(state)
+    {:noreply, state}
+  end
+
+  def handle_info(:retry_start, state), do: {:noreply, state}
 
   def handle_info(_other, state), do: {:noreply, state}
 
@@ -156,9 +183,8 @@ defmodule UniversalProxy.Bluetooth.Manager do
     running? = running?(state)
 
     cond do
-      config.enabled and not running? -> start_bluez(state, config)
-      config.enabled and restart? -> state |> stop_bluez() |> start_bluez(config)
-      not config.enabled and running? -> stop_bluez(state)
+      not running? -> start_bluez(state, config)
+      restart? -> state |> stop_bluez() |> start_bluez(config)
       true -> state
     end
   end
@@ -185,7 +211,12 @@ defmodule UniversalProxy.Bluetooth.Manager do
         %{state | bluez_pid: pid, monitor: Process.monitor(pid)}
 
       {:error, reason} ->
-        Logger.error("Bluetooth.Manager: Bluez subtree failed to start: #{inspect(reason)}")
+        Logger.error(
+          "Bluetooth.Manager: Bluez subtree failed to start " <>
+            "(retrying in #{state.start_retry_ms} ms): #{inspect(reason)}"
+        )
+
+        Process.send_after(self(), :retry_start, state.start_retry_ms)
         %{state | bluez_pid: nil, monitor: nil}
     end
   end
@@ -215,7 +246,10 @@ defmodule UniversalProxy.Bluetooth.Manager do
 
     %{
       enabled: config.enabled,
-      proxying?: running?,
+      # The stack itself is always on — "proxying" means HA-facing: data
+      # only reaches espex (and the flags are only advertised) when the
+      # user has Bluetooth enabled.
+      proxying?: config.enabled and running?,
       adapter: adapter_status(state, running?),
       active_connections: %{allowed?: config.active_connections, used: used, limit: limit}
     }

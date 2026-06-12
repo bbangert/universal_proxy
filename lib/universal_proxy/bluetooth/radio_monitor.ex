@@ -2,8 +2,9 @@ defmodule UniversalProxy.Bluetooth.RadioMonitor do
   @moduledoc """
   Maintains the Bluetooth radio list for the web tab: sysfs enumeration
   (`UniversalProxy.Bluetooth.Radios.enumerate/1`) overlaid with live
-  `org.bluez.Adapter1` properties (Name) when the daemon is up, plus an
-  `in_use?` mark on the radio the running BlueZ subtree is driving.
+  `org.bluez.Adapter1` properties (Address, Name) when the daemon is up,
+  plus an `in_use?` mark on the radio the BlueZ subtree is driving
+  (selected/claimed — independent of the HA-facing `enabled` toggle).
 
   Polls every 5 s — the same hotplug strategy as the Audio subsystem's
   output enumeration — and broadcasts `{:bluetooth_radios, radios}` on
@@ -18,11 +19,9 @@ defmodule UniversalProxy.Bluetooth.RadioMonitor do
 
   ## Options (host-testability)
 
-  `:name`, `:sysfs_root`, `:pubsub`, `:poll_ms`, plus two injection
-  points: `:adapters_info_fun` (defaults to
-  `UniversalProxy.Bluez.Client.adapters_info/0`) and `:proxying_fun`
-  (defaults to reading `UniversalProxy.Bluetooth.status/0`, which never
-  raises).
+  `:name`, `:sysfs_root`, `:pubsub`, `:poll_ms`, plus the
+  `:adapters_info_fun` injection point (defaults to
+  `UniversalProxy.Bluez.Client.adapters_info/0`).
   """
 
   use GenServer
@@ -67,7 +66,6 @@ defmodule UniversalProxy.Bluetooth.RadioMonitor do
       poll_ms: Keyword.get(opts, :poll_ms, @poll_ms),
       adapters_info_fun:
         Keyword.get(opts, :adapters_info_fun, &UniversalProxy.Bluez.Client.adapters_info/0),
-      proxying_fun: Keyword.get(opts, :proxying_fun, &default_proxying?/0),
       radios: []
     }
 
@@ -117,18 +115,19 @@ defmodule UniversalProxy.Bluetooth.RadioMonitor do
   defp compute(state) do
     sysfs = Radios.enumerate(state.sysfs_root)
     live = by_hci(state.adapters_info_fun.())
-    proxying? = state.proxying_fun.()
     active_path = DevicePath.adapter_path()
 
     for radio <- sysfs do
       adapter = Map.get(live, radio.hci, %{})
 
       # Address and Name exist only via the daemon (the kernel exposes no
-      # BT MAC in sysfs) — nil while the BlueZ subtree is down.
+      # BT MAC in sysfs) — nil while the BlueZ subtree is down. in_use? =
+      # the adapter our stack claimed AND the daemon is answering for it;
+      # independent of the HA-facing enabled toggle.
       radio
       |> Map.put(:address, adapter[:address])
       |> Map.put(:name, adapter[:name])
-      |> Map.put(:in_use?, proxying? and "/org/bluez/#{radio.hci}" == active_path)
+      |> Map.put(:in_use?, adapter != %{} and "/org/bluez/#{radio.hci}" == active_path)
     end
   end
 
@@ -140,7 +139,4 @@ defmodule UniversalProxy.Bluetooth.RadioMonitor do
   defp by_hci(_), do: %{}
 
   defp schedule(state), do: Process.send_after(self(), :poll, state.poll_ms)
-
-  # The public status/0 is exit-safe on every target, so this never raises.
-  defp default_proxying?, do: UniversalProxy.Bluetooth.status().proxying?
 end

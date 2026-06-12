@@ -102,17 +102,19 @@ defmodule UniversalProxy.BluetoothTest do
   end
 
   describe "toggles" do
-    test "set_enabled/1 persists, stops/starts the subtree, and broadcasts" do
+    test "set_enabled/1 persists and broadcasts WITHOUT touching the subtree" do
       %{dynsup: dynsup} = start_subsystem()
       assert %{enabled: true, proxying?: true} = Bluetooth.status()
+      [{_, pid, _, _}] = DynamicSupervisor.which_children(dynsup)
 
       assert Bluetooth.set_enabled(false) == :ok
       assert %{enabled: false} = Settings.get()
-      assert DynamicSupervisor.which_children(dynsup) == []
+      # The stack stays up — only the espex wiring (and proxying?) change.
+      assert [{_, ^pid, _, _}] = DynamicSupervisor.which_children(dynsup)
       assert_receive {:bluetooth_state, %{enabled: false, proxying?: false}}
 
       assert Bluetooth.set_enabled(true) == :ok
-      assert [_] = DynamicSupervisor.which_children(dynsup)
+      assert [{_, ^pid, _, _}] = DynamicSupervisor.which_children(dynsup)
       assert_receive {:bluetooth_state, %{enabled: true, proxying?: true}}
     end
 

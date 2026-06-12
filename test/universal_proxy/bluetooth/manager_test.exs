@@ -19,6 +19,23 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
     def start_link(_opts), do: Agent.start_link(fn -> :ok end)
   end
 
+  defmodule FlakyBluez do
+    @moduledoc "Fails its first start (counter slot 1 = failures left)."
+
+    def child_spec(counter) do
+      %{id: __MODULE__, start: {__MODULE__, :start_link, [counter]}}
+    end
+
+    def start_link(counter) do
+      if :counters.get(counter, 1) > 0 do
+        :counters.sub(counter, 1, 1)
+        {:error, :boom}
+      else
+        Agent.start_link(fn -> :ok end)
+      end
+    end
+  end
+
   setup do
     tmp = Path.join(System.tmp_dir!(), "bt_manager_test_#{System.unique_integer([:positive])}")
 
@@ -49,17 +66,19 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
   end
 
   defp start_manager(ctx, opts \\ []) do
+    # Per-test overrides FIRST — Keyword.get takes the first match.
     manager =
       start_supervised!(
         {Manager,
-         [
-           name: nil,
-           settings: ctx.settings,
-           dynamic_supervisor: ctx.dynsup,
-           bluez_child: StubBluez,
-           sysfs_root: ctx.sysfs,
-           pubsub: @pubsub
-         ] ++ opts}
+         opts ++
+           [
+             name: nil,
+             settings: ctx.settings,
+             dynamic_supervisor: ctx.dynsup,
+             bluez_child: StubBluez,
+             sysfs_root: ctx.sysfs,
+             pubsub: @pubsub
+           ]}
       )
 
     # start_supervised! returns after init/1, but the boot reconcile runs in
@@ -89,11 +108,12 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
       assert_receive {:bluetooth_state, %{proxying?: true}}
     end
 
-    test "disabled: leaves the subtree down but still reports a radio", ctx do
+    test "disabled: subtree still runs, but proxying? (HA-facing) is false", ctx do
       :ok = Settings.set_enabled(ctx.settings, false)
       manager = start_manager(ctx)
 
-      assert child_count(ctx.dynsup) == 0
+      # The stack is always on — enabled only gates the espex wiring.
+      assert child_count(ctx.dynsup) == 1
 
       assert %{enabled: false, proxying?: false, adapter: %{hci: "hci0"}} =
                Manager.status(manager)
@@ -123,36 +143,34 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
                Manager.status(manager)
     end
 
-    test "no controllers in sysfs: subtree still starts, no adapter shown when down", ctx do
+    test "no controllers in sysfs: subtree still starts (its retry loop owns absence)", ctx do
       File.rm_rf!(ctx.sysfs)
-      :ok = Settings.set_enabled(ctx.settings, false)
       manager = start_manager(ctx)
 
-      assert %{proxying?: false, adapter: nil} = Manager.status(manager)
-
-      # Enabling still starts the subtree — its own retry loop owns
-      # controller absence.
-      :ok = Settings.set_enabled(ctx.settings, true)
-      :ok = Manager.reconcile(manager)
       assert child_count(ctx.dynsup) == 1
+      # Running but unidentified: the default claimed path names hci0,
+      # identity appears once the daemon answers.
+      assert %{proxying?: true, adapter: %{hci: "hci0", address: nil}} =
+               Manager.status(manager)
     end
   end
 
   describe "reconcile/2" do
-    test "disable stops the subtree and broadcasts; enable restarts it", ctx do
+    test "the enabled toggle flips proxying? without touching the subtree", ctx do
       manager = start_manager(ctx)
       assert_receive {:bluetooth_state, %{proxying?: true}}
+      [{_, pid, _, _}] = DynamicSupervisor.which_children(ctx.dynsup)
 
       :ok = Settings.set_enabled(ctx.settings, false)
       :ok = Manager.reconcile(manager)
 
-      assert child_count(ctx.dynsup) == 0
+      assert [{_, ^pid, _, _}] = DynamicSupervisor.which_children(ctx.dynsup)
       assert_receive {:bluetooth_state, %{enabled: false, proxying?: false}}
 
       :ok = Settings.set_enabled(ctx.settings, true)
       :ok = Manager.reconcile(manager)
 
-      assert child_count(ctx.dynsup) == 1
+      assert [{_, ^pid, _, _}] = DynamicSupervisor.which_children(ctx.dynsup)
       assert_receive {:bluetooth_state, %{enabled: true, proxying?: true}}
     end
 
@@ -175,6 +193,28 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
       [{_, pid_after, _, _}] = DynamicSupervisor.which_children(ctx.dynsup)
       assert pid_after != pid_before
       assert :persistent_term.get(DevicePath.desired_adapter_key()) == @hci1_mac
+    end
+  end
+
+  describe "failed start" do
+    test "a start_child error is retried until it succeeds", ctx do
+      failures_left = :counters.new(1, [])
+      :counters.put(failures_left, 1, 1)
+
+      manager =
+        start_manager(ctx,
+          bluez_child: FlakyBluez.child_spec(failures_left),
+          start_retry_ms: 50
+        )
+
+      # First attempt failed (broadcast says down)…
+      assert_receive {:bluetooth_state, %{proxying?: false}}
+
+      # …then the retry tick brings it up without any external nudge.
+      # (No child-count assert between the two — the 50 ms retry races it.)
+      assert_receive {:bluetooth_state, %{proxying?: true}}, 2_000
+      assert child_count(ctx.dynsup) == 1
+      assert %{proxying?: true} = Manager.status(manager)
     end
   end
 
