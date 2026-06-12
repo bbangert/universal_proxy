@@ -102,9 +102,20 @@ defmodule UniversalProxy.Bluetooth.Radios do
     end
   end
 
-  @doc ~S|The numeric index of an `"hciX"` name (`"hci10"` → `10`).|
+  @doc ~S"""
+  The numeric index of an `"hciX"` name (`"hci10"` → `10`).
+
+  sysfs entry names are kernel-owned (always `hci<digits>` here, and
+  `sysfs_adapters/1` filters on that), so a malformed name can only come
+  from a broken fixture tree — sorted to the end rather than crashed on.
+  """
   @spec hci_index(String.t()) :: non_neg_integer()
-  def hci_index("hci" <> index), do: String.to_integer(index)
+  def hci_index("hci" <> index) do
+    case Integer.parse(index) do
+      {n, ""} -> n
+      _ -> 999_999
+    end
+  end
 
   # ── sysfs reads ──────────────────────────────────────────────────────────
 

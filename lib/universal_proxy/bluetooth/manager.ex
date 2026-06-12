@@ -184,6 +184,10 @@ defmodule UniversalProxy.Bluetooth.Manager do
         %{state | bluez_pid: pid, monitor: Process.monitor(pid), adapter: adapter}
 
       {:error, {:already_started, pid}} ->
+        # A replacement child we hadn't re-bound to yet (crash-restart racing
+        # a reconcile). Drop any stale monitor before taking the new one, or
+        # its late :DOWN would clear bluez_pid on a live subtree.
+        if state.monitor, do: Process.demonitor(state.monitor, [:flush])
         %{state | bluez_pid: pid, monitor: Process.monitor(pid), adapter: adapter}
 
       {:error, reason} ->

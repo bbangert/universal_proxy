@@ -145,8 +145,31 @@ defmodule UniversalProxy.Bluetooth.Settings do
   # the defaults instead of crashing every reader.
   defp read(table) do
     case :dets.lookup(table, @record_key) do
-      [{@record_key, stored}] when is_map(stored) -> Map.merge(@defaults, stored)
+      [{@record_key, stored}] when is_map(stored) -> sanitize(Map.merge(@defaults, stored))
       _ -> @defaults
+    end
+  end
+
+  # The setters validate writes, but the file can outlive them (corrupt
+  # sector, hand-edited DETS, a buggy future firmware). Per-field type
+  # validation on READ keeps lifecycle logic safe: a non-boolean `enabled`
+  # would otherwise raise BadBooleanError inside the Manager's reconcile.
+  # Also drops unknown keys, so readers always get exactly this shape.
+  defp sanitize(stored) do
+    %{
+      enabled: bool_or(stored.enabled, @defaults.enabled),
+      active_connections: bool_or(stored.active_connections, @defaults.active_connections),
+      adapter: stored_adapter(stored.adapter)
+    }
+  end
+
+  defp bool_or(value, _default) when is_boolean(value), do: value
+  defp bool_or(_value, default), do: default
+
+  defp stored_adapter(mac) do
+    case normalize_adapter(mac) do
+      {:ok, normalized} -> normalized
+      :error -> nil
     end
   end
 

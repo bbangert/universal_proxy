@@ -219,6 +219,9 @@ defmodule UniversalProxy.Bluetooth do
   def select_radio(mac) when is_binary(mac) do
     normalized = String.upcase(mac)
 
+    # Validates against an enumeration snapshot — a radio unplugged between
+    # this check and the restart is fine: the Manager falls back to the
+    # first present controller when the persisted MAC can't be resolved.
     if Enum.any?(list_radios(), &(&1.address == normalized)) do
       with :ok <- Settings.set_adapter(normalized) do
         :ok = Manager.reconcile(restart: true)
@@ -232,10 +235,15 @@ defmodule UniversalProxy.Bluetooth do
     :exit, _ -> {:error, :unavailable}
   end
 
-  # Espex restart so device-info feature flags follow the settings —
-  # async fire-and-forget, the UART.Store precedent.
+  # Espex restart so device-info feature flags follow the settings — async
+  # fire-and-forget under the app's Task.Supervisor (crash visibility), the
+  # UART.Store precedent. NOTE for the LiveView layer: every call bounces
+  # espex (drops HA connections), so debounce/disable the toggles in the UI
+  # while a write is in flight — same exposure as UART/Audio config saves.
   defp restart_esphome do
-    Task.start(fn -> UniversalProxy.ESPHome.Supervisor.restart() end)
+    Task.Supervisor.start_child(UniversalProxy.TaskSupervisor, fn ->
+      UniversalProxy.ESPHome.Supervisor.restart()
+    end)
   end
 
   if @bluetooth_supported do

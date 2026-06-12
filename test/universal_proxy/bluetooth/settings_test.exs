@@ -90,6 +90,30 @@ defmodule UniversalProxy.Bluetooth.SettingsTest do
                Settings.get(pid)
     end
 
+    test "corrupt field types are sanitized on read, not just on write", %{
+      server: server,
+      dets_path: path
+    } do
+      :ok = Settings.set_enabled(server, false)
+      stop_supervised!(Settings)
+
+      {:ok, table} = :dets.open_file(@table, file: to_charlist(path), type: :set)
+
+      :ok =
+        :dets.insert(
+          table,
+          {:settings, %{enabled: "yes", active_connections: 1, adapter: "not-a-mac", junk: :x}}
+        )
+
+      :ok = :dets.sync(table)
+      :ok = :dets.close(table)
+
+      pid = start_supervised!({Settings, name: nil, table: @table, dets_path: path})
+
+      # Every bad field degrades to its default; unknown keys are dropped.
+      assert Settings.get(pid) == %{enabled: true, active_connections: true, adapter: nil}
+    end
+
     test "a stored record missing newer fields reads back with defaults", %{
       server: server,
       dets_path: path
