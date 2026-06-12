@@ -10,6 +10,13 @@ defmodule UniversalProxy.ESPHome.BluetoothScannerTest do
 
   # The Client's :persistent_term key for the HA-configured scanner mode
   # (private @mode_key in UniversalProxy.Bluez.Client).
+  #
+  # GLOBAL-STATE CAVEAT: this key and the FakeClient name below are VM-global.
+  # That is safe under async: true only because (a) ExUnit runs tests within
+  # one module sequentially — async only parallelizes across files — and
+  # (b) no other test file registers UniversalProxy.Bluez.Client or touches
+  # this key. If another file ever needs either, that file and this one must
+  # coordinate (or go async: false).
   @mode_key {UniversalProxy.Bluez.Client, :configured_mode}
 
   # Stands in for UniversalProxy.Bluez.Client on the host: registers under

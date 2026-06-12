@@ -44,9 +44,10 @@ defmodule UniversalProxy.Bluez.Client do
       mid-transition parks in a one-slot pending queue (latest wins; a
       displaced caller gets `{:error, :superseded}`).
     * Disengage is best-effort (monitor and discovery can legally coexist in
-      BlueZ, so a failed teardown doesn't block the new mode) and engage is
-      idempotent (`AlreadyExists`/`InProgress` count as success), so state
-      drift self-heals on the next transition.
+      BlueZ, so a failed teardown doesn't block the new mode). Self-healing
+      lives in engage's idempotency: whatever drifted, re-engaging treats
+      `AlreadyExists`/`InProgress` as success, so the next transition always
+      converges on the target mode.
     * The configured mode persists in `:persistent_term` across Client
       restarts: a bluetoothd/connection crash re-engages what HA chose
       rather than silently reverting to passive.
@@ -273,7 +274,7 @@ defmodule UniversalProxy.Bluez.Client do
     ref = make_ref()
 
     Task.start(fn ->
-      Kernel.send(me, {:mode_transition, ref, target, from, apply_mode(conn, engaged, target)})
+      send(me, {:mode_transition, ref, target, from, apply_mode(conn, engaged, target)})
     end)
 
     %{state | transition: ref}
