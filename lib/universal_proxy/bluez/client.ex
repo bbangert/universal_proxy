@@ -39,7 +39,7 @@ defmodule UniversalProxy.Bluez.Client do
   use GenServer
   require Logger
 
-  alias UniversalProxy.Bluez.{DeviceCache, Variant}
+  alias UniversalProxy.Bluez.{DBus, DeviceCache, Variant}
   alias UniversalProxy.ESPHome.BluetoothScanner
 
   @adapter_path "/org/bluez/hci0"
@@ -337,19 +337,7 @@ defmodule UniversalProxy.Bluez.Client do
       "type='signal',sender='#{@bluez}',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',arg0='#{@device_iface}'"
     ]
 
-    Enum.each(rules, fn rule ->
-      Rebus.Connection.send(
-        conn,
-        Rebus.Message.new!(:method_call,
-          destination: "org.freedesktop.DBus",
-          path: "/org/freedesktop/DBus",
-          interface: "org.freedesktop.DBus",
-          member: "AddMatch",
-          signature: "s",
-          body: [rule]
-        )
-      )
-    end)
+    Enum.each(rules, &DBus.add_match(conn, &1))
   end
 
   defp adapter_present?(conn) do
@@ -382,33 +370,11 @@ defmodule UniversalProxy.Bluez.Client do
     end
   end
 
-  defp get_managed_objects(conn) do
-    case call(conn, "/", @om_iface, "GetManagedObjects", "", []) do
-      {:ok, [objects]} -> {:ok, objects}
-      other -> other
-    end
-  end
+  defp get_managed_objects(conn), do: DBus.get_managed_objects(conn)
 
-  # Outbound method call → {:ok, body} | {:error, reason}.
+  # Outbound method call → {:ok, body} | {:error, reason}. Extracted to
+  # UniversalProxy.Bluez.DBus so the GATT client shares it.
   defp call(conn, path, interface, member, signature, body) do
-    opts = [destination: @bluez, path: path, interface: interface, member: member, body: body]
-    opts = if signature == "", do: opts, else: Keyword.put(opts, :signature, signature)
-
-    case Rebus.Connection.send(conn, Rebus.Message.new!(:method_call, opts)) do
-      %Rebus.Message{type: :method_return, body: reply_body} ->
-        {:ok, reply_body}
-
-      %Rebus.Message{type: :error, header_fields: hf, body: eb} ->
-        Logger.warning("Bluez.Client: #{member} error #{inspect(hf[:error_name])} #{inspect(eb)}")
-        {:error, hf[:error_name]}
-    end
-  rescue
-    e ->
-      Logger.warning("Bluez.Client: #{member} raised #{inspect(e)}")
-      {:error, e}
-  catch
-    :exit, reason ->
-      Logger.warning("Bluez.Client: #{member} exited #{inspect(reason)}")
-      {:error, {:exit, reason}}
+    DBus.call(conn, path, interface, member, signature, body)
   end
 end

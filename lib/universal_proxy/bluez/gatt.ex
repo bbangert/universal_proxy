@@ -1,0 +1,735 @@
+defmodule UniversalProxy.Bluez.Gatt do
+  @moduledoc """
+  Active BLE connections + GATT client over BlueZ D-Bus — the engine behind
+  the `Espex.BluetoothProxy` adapter (`UniversalProxy.ESPHome.BluetoothProxy`).
+
+  Owns its own `rebus` connection, separate from `UniversalProxy.Bluez.Client`
+  (the passive scanner): independent match rules, independent failure domain,
+  and zero changes to the hardware-verified advert path. Concurrent method
+  calls on one rebus connection don't serialize (replies are correlated by
+  serial), but every call still blocks its *calling* process — so all BlueZ
+  calls here run in `Task`s under `#{inspect(__MODULE__)}.Tasks`, never in
+  this GenServer's own loop. `Device1.Connect` alone can take ~25 s.
+
+  ## Connection lifecycle
+
+      connect cast ─→ Device1.Connect (Task) ─→ ServicesResolved? ──true──┐
+                                                   │false                 │
+                                                   └─ wait for signal ────┤
+                                                      (resolve timeout)   ▼
+                                       GetManagedObjects ─→ GattTree.build
+                                                   │
+                          {:espex_ble_connection, addr, {:ok, mtu}} ──→ HA
+
+  The espex connection reply is deliberately deferred until BlueZ has
+  resolved services: every subsequent GATT request is handle-keyed, and the
+  handle ↔ object-path map only exists once the GATT objects are visible.
+  MTU comes from the experimental `MTU` characteristic property
+  (`bluetoothd -E`), falling back to the BLE minimum (23).
+
+  Unexpected disconnects surface as `Device1.PropertiesChanged
+  Connected=false`; espex is told via the same connection envelope with an
+  error code. Requested disconnects remove state immediately and need no
+  follow-up message.
+
+  ## Notifications
+
+  `StartNotify` makes BlueZ emit `PropertiesChanged` with `Value` on the
+  characteristic path — the same signal mechanism as adverts. The
+  char-path → `{address, handle}` route is registered *before* the
+  StartNotify call returns (and rolled back on error) so no early value
+  can race past us.
+
+  Espex owns cross-client address locking; this module trusts that
+  `connect` arrives at most once per address per ownership cycle, but stays
+  defensive (a stale entry is torn down and replaced).
+  """
+
+  use GenServer
+  require Logger
+
+  alias UniversalProxy.Bluez.{DBus, DevicePath, GattTree, Variant}
+
+  @device_iface "org.bluez.Device1"
+  @char_iface "org.bluez.GattCharacteristic1"
+  @desc_iface "org.bluez.GattDescriptor1"
+  @props_iface "org.freedesktop.DBus.Properties"
+
+  @task_sup __MODULE__.Tasks
+
+  # Active-connection slots reported to HA. BlueZ has no hard kernel limit
+  # this low, but 3 matches what ESP32 proxies advertise and keeps the
+  # single shared radio responsive for passive scanning.
+  @max_connections 3
+
+  # Device1.Connect blocks until the link is up or BlueZ gives up (~25 s
+  # internally); the caller's patience must outlast it.
+  @connect_timeout 32_000
+  # ServicesResolved usually follows within a couple of seconds of connect.
+  @resolve_timeout 30_000
+  # GATT reads/writes block up to the ATT transaction timeout.
+  @op_timeout 32_000
+
+  @default_mtu 23
+
+  # Max ATT attribute value length (Core spec) — reject larger writes before
+  # expanding them into byte lists for marshalling.
+  @max_attr_len 512
+
+  # espex BluetoothProxy error codes (Espex.BluetoothProxy.ErrorCodes is
+  # @moduledoc false, so mirror the two we use).
+  @err_generic -1
+  @err_not_connected -2
+
+  @typedoc "Packed 48-bit MAC, MSB-first — the espex address form."
+  @type address :: non_neg_integer()
+
+  def child_spec(opts) do
+    %{id: __MODULE__, start: {__MODULE__, :start_link, [opts]}}
+  end
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @doc "Name of the Task.Supervisor all BlueZ calls run under."
+  @spec task_supervisor() :: module()
+  def task_supervisor, do: @task_sup
+
+  @doc "Total active-connection slots this GATT client offers."
+  @spec max_connections() :: pos_integer()
+  def max_connections, do: @max_connections
+
+  # ── adapter-facing API (cast-style, results go to the subscriber pid) ────
+
+  @spec connect(address(), keyword(), pid()) :: :ok
+  def connect(address, opts, subscriber),
+    do: GenServer.cast(__MODULE__, {:connect, address, opts, subscriber})
+
+  @spec disconnect(address()) :: :ok
+  def disconnect(address), do: GenServer.cast(__MODULE__, {:disconnect, address})
+
+  @spec get_services(address()) :: :ok
+  def get_services(address), do: GenServer.cast(__MODULE__, {:get_services, address})
+
+  @spec read(address(), non_neg_integer()) :: :ok
+  def read(address, handle), do: GenServer.cast(__MODULE__, {:read, address, handle})
+
+  @spec write(address(), non_neg_integer(), binary(), boolean()) :: :ok
+  def write(address, handle, data, response?),
+    do: GenServer.cast(__MODULE__, {:write, address, handle, data, response?})
+
+  @spec read_descriptor(address(), non_neg_integer()) :: :ok
+  def read_descriptor(address, handle),
+    do: GenServer.cast(__MODULE__, {:read_descriptor, address, handle})
+
+  @spec write_descriptor(address(), non_neg_integer(), binary()) :: :ok
+  def write_descriptor(address, handle, data),
+    do: GenServer.cast(__MODULE__, {:write_descriptor, address, handle, data})
+
+  @spec notify(address(), non_neg_integer(), boolean()) :: :ok
+  def notify(address, handle, enable?),
+    do: GenServer.cast(__MODULE__, {:notify, address, handle, enable?})
+
+  @doc "Free / total connection slots, for `c:Espex.BluetoothProxy.connections_free/0`."
+  @spec connections_free() :: {non_neg_integer(), non_neg_integer()}
+  def connections_free, do: GenServer.call(__MODULE__, :connections_free)
+
+  # ── GenServer ─────────────────────────────────────────────────────────────
+
+  @impl GenServer
+  def init(_opts) do
+    case Rebus.connect(:system) do
+      {:ok, conn} ->
+        sig_ref = Rebus.add_signal_handler(conn)
+        conn_ref = Process.monitor(conn)
+
+        # rebus installs no bus-side match rules; route org.bluez's Device1
+        # (Connected/ServicesResolved) and GattCharacteristic1 (Value)
+        # property changes to this connection.
+        for iface <- [@device_iface, @char_iface] do
+          DBus.add_match(
+            conn,
+            "type='signal',sender='org.bluez',interface='#{@props_iface}'," <>
+              "member='PropertiesChanged',arg0='#{iface}'"
+          )
+        end
+
+        {:ok,
+         %{
+           conn: conn,
+           conn_ref: conn_ref,
+           sig_ref: sig_ref,
+           # address => connection entry (see new_entry/3)
+           conns: %{},
+           # char object path => {address, reported handle}, for routing
+           # notification Values back to the right subscriber.
+           notify_paths: %{},
+           # Monotonic connection generation. Every Task message carries the
+           # generation of the entry that spawned it; results whose
+           # generation no longer matches the live entry are stale (the
+           # entry was replaced or torn down meanwhile) and are dropped.
+           gen_seq: 0
+         }}
+
+      {:error, reason} ->
+        {:stop, {:dbus_connect_failed, reason}}
+    end
+  end
+
+  @impl GenServer
+  def handle_cast({:connect, address, _opts, subscriber}, state) do
+    cond do
+      # The wire address is uint64; only 48-bit MACs are representable.
+      # Refuse cleanly — a crafted address must not crash this server.
+      not DevicePath.valid?(address) ->
+        Logger.warning("Bluez.Gatt: connect refused — invalid address #{inspect(address)}")
+        send(subscriber, {:espex_ble_connection, address, {:error, @err_generic}})
+        {:noreply, state}
+
+      true ->
+        state = teardown_stale_entry(state, address)
+
+        if map_size(state.conns) >= @max_connections do
+          Logger.warning("Bluez.Gatt: connect #{fmt(address)} refused — no free slots")
+          send(subscriber, {:espex_ble_connection, address, {:error, @err_generic}})
+          {:noreply, state}
+        else
+          gen = state.gen_seq + 1
+          path = DevicePath.from_address(address)
+          run_connect(state.conn, address, gen, path)
+
+          {:noreply,
+           %{state | gen_seq: gen}
+           |> put_in([:conns, address], new_entry(path, subscriber, gen))}
+        end
+    end
+  end
+
+  def handle_cast({:disconnect, address}, state) do
+    case state.conns[address] do
+      nil ->
+        {:noreply, state}
+
+      entry ->
+        # Requested teardown: espex needs no follow-up message. Drop state
+        # first so the Connected=false signal doesn't report an unexpected
+        # disconnect for an address we no longer track.
+        run_disconnect(state.conn, entry.path)
+        {:noreply, drop_entry(state, address)}
+    end
+  end
+
+  def handle_cast({:get_services, address}, state) do
+    # On a not-ready link, ESPHome's convention for a get-services failure
+    # is a GATT error with handle 0 (what the C++ proxy sends).
+    with_ready_entry(state, address, {:espex_ble_gatt_read, address, 0}, fn entry ->
+      Enum.each(entry.tree.services, fn service ->
+        send(entry.subscriber, {:espex_ble_gatt_service, address, service})
+      end)
+
+      send(entry.subscriber, {:espex_ble_gatt_services_done, address})
+      {:noreply, state}
+    end)
+  end
+
+  def handle_cast({:read, address, handle}, state) do
+    gatt_op(state, address, {:gatt_read, address, handle}, [:characteristic, :descriptor], fn
+      path, kind, gen -> read_value(state.conn, path, kind, gen, {:gatt_read, address, handle})
+    end)
+  end
+
+  def handle_cast({:read_descriptor, address, handle}, state) do
+    gatt_op(state, address, {:gatt_read, address, handle}, [:descriptor, :characteristic], fn
+      path, kind, gen -> read_value(state.conn, path, kind, gen, {:gatt_read, address, handle})
+    end)
+  end
+
+  # Writes larger than an ATT attribute can ever be are refused up front —
+  # don't expand multi-megabyte hostile payloads into byte lists just so
+  # BlueZ can reject them.
+  def handle_cast({:write, address, handle, data, _response?}, state)
+      when byte_size(data) > @max_attr_len do
+    {:noreply, refuse_oversized_write(state, address, handle)}
+  end
+
+  def handle_cast({:write, address, handle, data, response?}, state) do
+    gatt_op(state, address, {:gatt_write, address, handle}, [:characteristic], fn path, _k, gen ->
+      write_value(
+        state.conn,
+        path,
+        @char_iface,
+        data,
+        response?,
+        gen,
+        {:gatt_write, address, handle}
+      )
+    end)
+  end
+
+  def handle_cast({:write_descriptor, address, handle, data}, state)
+      when byte_size(data) > @max_attr_len do
+    {:noreply, refuse_oversized_write(state, address, handle)}
+  end
+
+  def handle_cast({:write_descriptor, address, handle, data}, state) do
+    gatt_op(state, address, {:gatt_write, address, handle}, [:descriptor], fn path, _kind, gen ->
+      write_value(state.conn, path, @desc_iface, data, true, gen, {:gatt_write, address, handle})
+    end)
+  end
+
+  def handle_cast({:notify, address, handle, enable?}, state) do
+    with_ready_entry(state, address, {:espex_ble_gatt_notify, address, handle}, fn entry ->
+      case entry.tree.by_handle[handle] do
+        {:characteristic, path} ->
+          member = if enable?, do: "StartNotify", else: "StopNotify"
+
+          run_notify(
+            state.conn,
+            path,
+            member,
+            entry.gen,
+            {:gatt_notify, address, handle, enable?, path}
+          )
+
+          # Register the notification route BEFORE StartNotify completes so
+          # an immediate first Value can't race past us; rolled back if the
+          # call errors (see :op_result below).
+          state =
+            if enable?,
+              do: put_in(state.notify_paths[path], {address, handle}),
+              else: update_in(state.notify_paths, &Map.delete(&1, path))
+
+          {:noreply, state}
+
+        _other ->
+          send(
+            entry.subscriber,
+            {:espex_ble_gatt_notify, address, handle, {:error, @err_generic}}
+          )
+
+          {:noreply, state}
+      end
+    end)
+  end
+
+  @impl GenServer
+  def handle_call(:connections_free, _from, state) do
+    free = max(@max_connections - map_size(state.conns), 0)
+    {:reply, {free, @max_connections}, state}
+  end
+
+  # ── async results from BlueZ-call Tasks ──────────────────────────────────
+
+  @impl GenServer
+  def handle_info({:connect_step, address, gen, step}, state) do
+    case {state.conns[address], step} do
+      {%{gen: ^gen, status: :connecting} = entry, :resolved} ->
+        run_fetch_tree(state.conn, address, gen)
+        {:noreply, put_in(state.conns[address], %{entry | status: :fetching})}
+
+      {%{gen: ^gen, status: :connecting} = entry, :unresolved} ->
+        # Connected, but service discovery still running — wait for the
+        # ServicesResolved PropertiesChanged signal, bounded by a timer.
+        timer = Process.send_after(self(), {:resolve_timeout, address, gen}, @resolve_timeout)
+
+        {:noreply,
+         put_in(state.conns[address], %{entry | status: :resolving, resolve_timer: timer})}
+
+      {%{gen: ^gen}, {:failed, reason}} ->
+        Logger.warning("Bluez.Gatt: connect #{fmt(address)} failed: #{inspect(reason)}")
+        {:noreply, fail_connection(state, address, error_code(reason))}
+
+      # Wrong generation (entry replaced/dropped meanwhile) or an unexpected
+      # status for this step — stale Task result, drop it.
+      _stale ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:tree_result, address, gen, result}, state) do
+    case {state.conns[address], result} do
+      {%{gen: ^gen, status: :fetching} = entry, {:ok, objects}} ->
+        tree = GattTree.build(objects, entry.path)
+        entry = %{entry | status: :ready, tree: tree, resolve_timer: nil}
+        send(entry.subscriber, {:espex_ble_connection, address, {:ok, tree.mtu || @default_mtu}})
+        {:noreply, put_in(state.conns[address], entry)}
+
+      {%{gen: ^gen}, {:error, reason}} ->
+        Logger.warning(
+          "Bluez.Gatt: GATT enumeration for #{fmt(address)} failed: #{inspect(reason)}"
+        )
+
+        {:noreply, fail_connection(state, address, @err_generic)}
+
+      _stale ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:resolve_timeout, address, gen}, state) do
+    case state.conns[address] do
+      %{gen: ^gen, status: :resolving} ->
+        Logger.warning("Bluez.Gatt: #{fmt(address)} never resolved services")
+        {:noreply, fail_connection(state, address, @err_generic)}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:op_result, gen, envelope, result}, state) do
+    address = elem(envelope, 1)
+
+    case state.conns[address] do
+      %{gen: ^gen} = entry ->
+        # A failed StartNotify rolls its optimistic route registration back;
+        # a failed StopNotify re-registers nothing (route already removed,
+        # stale Values for it are dropped by design).
+        state =
+          case {envelope, result} do
+            {{:gatt_notify, _address, _handle, true, path}, {:error, _}} ->
+              update_in(state.notify_paths, &Map.delete(&1, path))
+
+            _ ->
+              state
+          end
+
+        forward_op_result(entry, envelope, result)
+        {:noreply, state}
+
+      _stale ->
+        {:noreply, state}
+    end
+  end
+
+  # org.bluez signals (device property changes + notification values).
+  def handle_info({ref, %Rebus.Message{type: :signal} = msg}, %{sig_ref: ref} = state) do
+    {:noreply, handle_signal(msg, state)}
+  end
+
+  # The rebus connection died; stop so the supervisor reconnects us.
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{conn_ref: ref} = state) do
+    {:stop, {:dbus_connection_down, reason}, state}
+  end
+
+  def handle_info(_other, state), do: {:noreply, state}
+
+  # ── signal handling ──────────────────────────────────────────────────────
+
+  defp handle_signal(
+         %Rebus.Message{header_fields: %{member: "PropertiesChanged", path: path}, body: body},
+         state
+       ) do
+    case body do
+      [@device_iface, changed, _invalidated] ->
+        device_props_changed(state, path, Variant.unwrap_props(changed))
+
+      [@char_iface, changed, _invalidated] ->
+        char_props_changed(state, path, Variant.unwrap_props(changed))
+
+      _other ->
+        state
+    end
+  rescue
+    e ->
+      Logger.warning("Bluez.Gatt: bad PropertiesChanged shape: #{inspect(e)}")
+      state
+  end
+
+  defp handle_signal(_msg, state), do: state
+
+  defp device_props_changed(state, path, props) do
+    case DevicePath.to_address(path) do
+      {:ok, address} ->
+        entry = state.conns[address]
+
+        cond do
+          is_nil(entry) ->
+            state
+
+          props["Connected"] == false ->
+            # Unexpected drop (requested disconnects clear the entry before
+            # BlueZ emits this). Same envelope as a failed connect — espex
+            # forwards it as a connected=false response either way.
+            Logger.info("Bluez.Gatt: #{fmt(address)} disconnected unexpectedly")
+            cancel_resolve_timer(entry)
+            send(entry.subscriber, {:espex_ble_connection, address, {:error, @err_generic}})
+            drop_entry(state, address)
+
+          props["ServicesResolved"] == true and entry.status == :resolving ->
+            # :fetching makes this a one-shot — a duplicate ServicesResolved
+            # signal (or one racing the connect Task's own check) can't
+            # spawn a second tree fetch.
+            cancel_resolve_timer(entry)
+            run_fetch_tree(state.conn, address, entry.gen)
+            put_in(state.conns[address], %{entry | status: :fetching, resolve_timer: nil})
+
+          true ->
+            state
+        end
+
+      :error ->
+        state
+    end
+  end
+
+  defp char_props_changed(state, path, props) do
+    with {address, handle} <- state.notify_paths[path],
+         %{} = entry <- state.conns[address],
+         value when not is_nil(value) <- props["Value"] do
+      send(entry.subscriber, {:espex_ble_gatt_notify_data, address, handle, to_bin(value)})
+      state
+    else
+      _ -> state
+    end
+  end
+
+  # ── connection state helpers ─────────────────────────────────────────────
+
+  # Entry statuses: :connecting → :resolving (waiting for the
+  # ServicesResolved signal) → :fetching (GetManagedObjects in flight) →
+  # :ready. `gen` stamps every Task message this entry spawns.
+  defp new_entry(path, subscriber, gen) do
+    %{
+      path: path,
+      subscriber: subscriber,
+      status: :connecting,
+      tree: nil,
+      resolve_timer: nil,
+      gen: gen
+    }
+  end
+
+  defp forward_op_result(entry, envelope, result) do
+    case envelope do
+      {:gatt_read, address, handle} ->
+        send(entry.subscriber, {:espex_ble_gatt_read, address, handle, result})
+
+      {:gatt_write, address, handle} ->
+        send(entry.subscriber, {:espex_ble_gatt_write, address, handle, result})
+
+      {:gatt_notify, address, handle, _enable?, _path} ->
+        send(entry.subscriber, {:espex_ble_gatt_notify, address, handle, result})
+
+      other ->
+        Logger.warning("Bluez.Gatt: unhandled op_result envelope #{inspect(other)}")
+    end
+  end
+
+  # The link (if known) gets the write error; an unknown address is a stale
+  # op and is dropped, same as with_ready_entry/4.
+  defp refuse_oversized_write(state, address, handle) do
+    case state.conns[address] do
+      %{subscriber: subscriber} ->
+        Logger.warning("Bluez.Gatt: write to #{fmt(address)} handle #{handle} exceeds ATT limit")
+        send(subscriber, {:espex_ble_gatt_write, address, handle, {:error, @err_generic}})
+
+      nil ->
+        :ok
+    end
+
+    state
+  end
+
+  # Espex guarantees connect-at-most-once per ownership cycle, but if a
+  # stale entry exists anyway (e.g. espex restarted), replace it cleanly.
+  defp teardown_stale_entry(state, address) do
+    case state.conns[address] do
+      nil ->
+        state
+
+      entry ->
+        Logger.warning("Bluez.Gatt: replacing stale connection state for #{fmt(address)}")
+        cancel_resolve_timer(entry)
+        run_disconnect(state.conn, entry.path)
+        drop_entry(state, address)
+    end
+  end
+
+  defp fail_connection(state, address, code) do
+    case state.conns[address] do
+      nil ->
+        state
+
+      entry ->
+        cancel_resolve_timer(entry)
+        send(entry.subscriber, {:espex_ble_connection, address, {:error, code}})
+        # Best-effort cleanup: a half-open link would otherwise hold the slot
+        # on the controller until BlueZ notices.
+        run_disconnect(state.conn, entry.path)
+        drop_entry(state, address)
+    end
+  end
+
+  defp drop_entry(state, address) do
+    {_entry, state} = pop_in(state.conns[address])
+
+    update_in(state.notify_paths, fn paths ->
+      paths |> Enum.reject(fn {_path, {addr, _h}} -> addr == address end) |> Map.new()
+    end)
+  end
+
+  defp cancel_resolve_timer(%{resolve_timer: nil}), do: :ok
+  defp cancel_resolve_timer(%{resolve_timer: timer}), do: Process.cancel_timer(timer)
+
+  # Look up a :ready entry; on a known-but-not-ready link, answer with the
+  # op's own error envelope (`error_envelope` is the `{tag, address, handle}`
+  # prefix the result tuple is built from). An *unknown* address has no
+  # subscriber to tell — espex gates ops on ownership, so that's a stale op
+  # and gets dropped (per the espex contract).
+  defp with_ready_entry(state, address, error_envelope, fun) do
+    case state.conns[address] do
+      %{status: :ready} = entry ->
+        fun.(entry)
+
+      %{subscriber: subscriber} ->
+        send(subscriber, error_msg(error_envelope, @err_not_connected))
+        {:noreply, state}
+
+      nil ->
+        Logger.debug("Bluez.Gatt: op for unknown address #{fmt(address)} dropped")
+        {:noreply, state}
+    end
+  end
+
+  # Common shape of read/write ops: resolve handle → path, kind-check, run.
+  defp gatt_op(state, address, {tag, _addr, handle}, allowed_kinds, run) do
+    error_envelope = {espex_envelope(tag), address, handle}
+
+    with_ready_entry(state, address, error_envelope, fn entry ->
+      with {kind, path} <- entry.tree.by_handle[handle],
+           true <- kind in allowed_kinds do
+        run.(path, kind, entry.gen)
+        {:noreply, state}
+      else
+        _other ->
+          send(entry.subscriber, error_msg(error_envelope, @err_generic))
+          {:noreply, state}
+      end
+    end)
+  end
+
+  defp espex_envelope(:gatt_read), do: :espex_ble_gatt_read
+  defp espex_envelope(:gatt_write), do: :espex_ble_gatt_write
+
+  defp error_msg({tag, address, handle}, code), do: {tag, address, handle, {:error, code}}
+
+  # ── BlueZ calls (always from Tasks) ──────────────────────────────────────
+
+  defp run_connect(conn, address, gen, path) do
+    run_task(fn ->
+      with {:ok, _} <- DBus.call(conn, path, @device_iface, "Connect", "", [], @connect_timeout),
+           {:ok, resolved?} <- services_resolved?(conn, path) do
+        {:connect_step, address, gen, if(resolved?, do: :resolved, else: :unresolved)}
+      else
+        {:error, reason} -> {:connect_step, address, gen, {:failed, reason}}
+      end
+    end)
+  end
+
+  defp services_resolved?(conn, path) do
+    case DBus.call(conn, path, @props_iface, "Get", "ss", [@device_iface, "ServicesResolved"]) do
+      {:ok, [{_sig, resolved?}]} -> {:ok, resolved? == true}
+      # Can't read the property? Don't fail the connect — wait for the signal.
+      {:error, _reason} -> {:ok, false}
+    end
+  end
+
+  defp run_fetch_tree(conn, address, gen) do
+    run_task(fn ->
+      {:tree_result, address, gen, DBus.get_managed_objects(conn, @op_timeout)}
+    end)
+  end
+
+  defp run_disconnect(conn, path) do
+    run_task(fn ->
+      case DBus.call(conn, path, @device_iface, "Disconnect", "", [], @op_timeout) do
+        {:ok, _} -> :ok
+        {:error, reason} -> Logger.debug("Bluez.Gatt: Disconnect #{path}: #{inspect(reason)}")
+      end
+
+      :noreply_to_server
+    end)
+  end
+
+  defp read_value(conn, path, kind, gen, envelope) do
+    iface = if kind == :descriptor, do: @desc_iface, else: @char_iface
+
+    run_task(fn ->
+      result =
+        case DBus.call(conn, path, iface, "ReadValue", "a{sv}", [[]], @op_timeout) do
+          {:ok, [value]} -> {:ok, to_bin(value)}
+          {:error, reason} -> {:error, error_code(reason)}
+        end
+
+      {:op_result, gen, envelope, result}
+    end)
+  end
+
+  defp write_value(conn, path, iface, data, response?, gen, envelope) do
+    # BlueZ write type: "request" = Write With Response, "command" = Write
+    # Without Response. Descriptor writes are always requests.
+    type = if response?, do: "request", else: "command"
+    body = [:binary.bin_to_list(data), [{"type", {"s", type}}]]
+
+    run_task(fn ->
+      result =
+        case DBus.call(conn, path, iface, "WriteValue", "aya{sv}", body, @op_timeout) do
+          {:ok, _} -> {:ok, :done}
+          {:error, reason} -> {:error, error_code(reason)}
+        end
+
+      {:op_result, gen, envelope, result}
+    end)
+  end
+
+  defp run_notify(conn, path, member, gen, envelope) do
+    run_task(fn ->
+      result =
+        case DBus.call(conn, path, @char_iface, member, "", [], @op_timeout) do
+          {:ok, _} -> {:ok, :done}
+          {:error, reason} -> {:error, error_code(reason)}
+        end
+
+      {:op_result, gen, envelope, result}
+    end)
+  end
+
+  # Run a BlueZ call off-loop; the task's return message (unless flagged
+  # :noreply_to_server) is delivered to this GenServer's mailbox.
+  defp run_task(fun) do
+    server = self()
+
+    case Task.Supervisor.start_child(@task_sup, fn ->
+           case fun.() do
+             :noreply_to_server -> :ok
+             msg -> send(server, msg)
+           end
+         end) do
+      {:ok, _pid} ->
+        :ok
+
+      other ->
+        # Task.Supervisor down/overloaded — the op's reply will never come;
+        # at least make the silence diagnosable.
+        Logger.warning("Bluez.Gatt: failed to start BlueZ-call task: #{inspect(other)}")
+    end
+  end
+
+  # ── misc helpers ─────────────────────────────────────────────────────────
+
+  # rebus decodes `ay` to a byte list (or binary, depending on path).
+  defp to_bin(value) when is_binary(value), do: value
+  defp to_bin(value) when is_list(value), do: :erlang.list_to_binary(value)
+  defp to_bin(_other), do: <<>>
+
+  defp error_code("org.bluez.Error.NotConnected"), do: @err_not_connected
+  defp error_code(_reason), do: @err_generic
+
+  defp fmt(address) when is_integer(address) do
+    address
+    |> Integer.to_string(16)
+    |> String.pad_leading(12, "0")
+  end
+end
