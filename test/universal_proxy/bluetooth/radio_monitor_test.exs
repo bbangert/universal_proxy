@@ -11,6 +11,10 @@ defmodule UniversalProxy.Bluetooth.RadioMonitorTest do
   @dongle_mac "AA:BB:CC:DD:EE:FF"
 
   setup do
+    # Pre-clear too — a crashed predecessor's stale adapter path would
+    # flip in_use? assertions.
+    :persistent_term.erase(DevicePath.adapter_path_key())
+
     root = Path.join(System.tmp_dir!(), "radio_mon_test_#{System.unique_integer([:positive])}")
     add_uart_radio(root, "hci0", @pi_mac)
 

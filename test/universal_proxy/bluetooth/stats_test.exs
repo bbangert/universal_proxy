@@ -35,19 +35,29 @@ defmodule UniversalProxy.Bluetooth.StatsTest do
     assert %{devices_15min: 7, connections: %{used: 1, limit: 3}} = Stats.current(stats)
   end
 
-  test "bump_ad/0 counts adverts into the next tick, then resets" do
+  test "bump_ad/0 counts adverts exactly once, then the counter drains" do
     stats = start_stats()
     # Wait for one tick so we know the counter is being drained per tick.
     assert_receive {:bluetooth_stats, _}, 1_000
 
     for _ <- 1..5, do: Stats.bump_ad()
 
-    # The count lands in exactly one tick…
-    assert_receive {:bluetooth_stats, %{ads_per_s: 5}}, 1_000
-    assert %{ads_per_s: 5} = Stats.current(stats)
+    # The bumps may straddle a 50 ms tick boundary — assert the total
+    # across ticks is exactly 5 (no loss, no double count)…
+    assert collect_ads(0) == 5
 
-    # …and the following tick is back to zero.
+    # …and once drained, ticks are back to zero.
     assert_receive {:bluetooth_stats, %{ads_per_s: 0}}, 1_000
+    assert %{ads_per_s: 0} = Stats.current(stats)
+  end
+
+  # Sum ads_per_s over successive ticks until the expected total arrives
+  # (an overshoot returns the larger sum and fails the caller's assert).
+  defp collect_ads(sum) when sum >= 5, do: sum
+
+  defp collect_ads(sum) do
+    assert_receive {:bluetooth_stats, %{ads_per_s: n}}, 1_000
+    collect_ads(sum + n)
   end
 
   test "bump_ad/0 is a no-op without a counter published" do

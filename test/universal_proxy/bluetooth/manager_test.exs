@@ -37,6 +37,12 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
   end
 
   setup do
+    # Pre-clear as well as on_exit-clear: a crashed predecessor test (whose
+    # on_exit never ran) must not leak a stale adapter path/MAC into the
+    # "auto" assertions below.
+    :persistent_term.erase(DevicePath.adapter_path_key())
+    :persistent_term.erase(DevicePath.desired_adapter_key())
+
     tmp = Path.join(System.tmp_dir!(), "bt_manager_test_#{System.unique_integer([:positive])}")
 
     sysfs = Path.join(tmp, "sys_class_bluetooth")
@@ -176,11 +182,14 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
 
     test "reconcile without changes is a no-op (still broadcasts)", ctx do
       manager = start_manager(ctx)
+      # Drain the boot broadcast so the assertion below is the reconcile's.
+      assert_receive {:bluetooth_state, _}
       [{_, pid, _, _}] = DynamicSupervisor.which_children(ctx.dynsup)
 
       :ok = Manager.reconcile(manager)
 
       assert [{_, ^pid, _, _}] = DynamicSupervisor.which_children(ctx.dynsup)
+      assert_receive {:bluetooth_state, %{proxying?: true}}
     end
 
     test "restart: true cycles the subtree and republishes the desired radio", ctx do
@@ -228,8 +237,10 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
 
       assert_receive {:bluetooth_state, %{proxying?: false}}, 1_000
       # Rebind tick is 1 s; the DynamicSupervisor restarts the child
-      # immediately, so the next broadcast reports it back up.
-      assert_receive {:bluetooth_state, %{proxying?: true}}, 3_000
+      # immediately, so the next broadcast reports it back up. Generous
+      # absolute timeout — the down message above may have consumed up to
+      # its own budget already on a loaded CI box.
+      assert_receive {:bluetooth_state, %{proxying?: true}}, 5_000
 
       assert %{proxying?: true} = Manager.status(manager)
       [{_, new_pid, _, _}] = DynamicSupervisor.which_children(ctx.dynsup)

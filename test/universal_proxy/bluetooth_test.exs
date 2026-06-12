@@ -23,6 +23,11 @@ defmodule UniversalProxy.BluetoothTest do
   end
 
   setup do
+    # Pre-clear AND on_exit-clear — a crashed predecessor must not leak
+    # adapter terms into the "subsystem down" / auto-selection tests.
+    :persistent_term.erase(DevicePath.adapter_path_key())
+    :persistent_term.erase(DevicePath.desired_adapter_key())
+
     on_exit(fn ->
       :persistent_term.erase(DevicePath.adapter_path_key())
       :persistent_term.erase(DevicePath.desired_adapter_key())
@@ -96,6 +101,14 @@ defmodule UniversalProxy.BluetoothTest do
     test "radio reads degrade to empty lists" do
       assert Bluetooth.list_radios() == []
       assert Bluetooth.refresh_radios() == []
+    end
+
+    test "stats/0 degrades to zeros" do
+      assert Bluetooth.stats() == %{
+               ads_per_s: 0,
+               devices_15min: 0,
+               connections: %{used: 0, limit: 0}
+             }
     end
 
     test "setters return a clean error" do
