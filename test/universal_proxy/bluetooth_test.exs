@@ -23,7 +23,11 @@ defmodule UniversalProxy.BluetoothTest do
   end
 
   setup do
-    on_exit(fn -> :persistent_term.erase(DevicePath.adapter_path_key()) end)
+    on_exit(fn ->
+      :persistent_term.erase(DevicePath.adapter_path_key())
+      :persistent_term.erase(DevicePath.desired_adapter_key())
+    end)
+
     :ok = Phoenix.PubSub.subscribe(@pubsub, Bluetooth.state_topic())
     :ok
   end
@@ -46,9 +50,19 @@ defmodule UniversalProxy.BluetoothTest do
        dynamic_supervisor: dynsup, bluez_child: StubBluez, sysfs_root: sysfs, pubsub: @pubsub}
     )
 
+    # Radio MACs only exist via the daemon overlay (sysfs has none), so
+    # select_radio's membership check depends on this stub.
     start_supervised!(
       {RadioMonitor,
-       sysfs_root: sysfs, pubsub: @pubsub, poll_ms: 60_000, adapters_info_fun: fn -> [] end}
+       sysfs_root: sysfs,
+       pubsub: @pubsub,
+       poll_ms: 60_000,
+       adapters_info_fun: fn ->
+         [
+           %{path: "/org/bluez/hci0", address: @hci0_mac, name: "pi", powered: true},
+           %{path: "/org/bluez/hci1", address: @hci1_mac, name: "dongle", powered: true}
+         ]
+       end}
     )
 
     # Both run their first pass in handle_continue — synchronize before
@@ -122,9 +136,9 @@ defmodule UniversalProxy.BluetoothTest do
 
       assert Bluetooth.select_radio(@hci1_mac) == :ok
 
-      assert :persistent_term.get(DevicePath.adapter_path_key()) == "/org/bluez/hci1"
+      # The MAC is published for Bluez.Client to resolve at its setup.
+      assert :persistent_term.get(DevicePath.desired_adapter_key()) == @hci1_mac
       assert %{adapter: @hci1_mac} = Settings.get()
-      assert %{adapter: %{hci: "hci1"}} = Bluetooth.status()
       [{_, pid_after, _, _}] = DynamicSupervisor.which_children(dynsup)
       assert pid_after != pid_before
     end
@@ -142,7 +156,7 @@ defmodule UniversalProxy.BluetoothTest do
 
       assert Bluetooth.select_radio(nil) == :ok
       assert %{adapter: nil} = Settings.get()
-      assert :persistent_term.get(DevicePath.adapter_path_key()) == "/org/bluez/hci0"
+      assert :persistent_term.get(DevicePath.desired_adapter_key(), :unset) == nil
     end
 
     test "a MAC no enumerated radio has is rejected" do

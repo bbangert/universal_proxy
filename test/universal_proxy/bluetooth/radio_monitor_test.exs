@@ -102,10 +102,11 @@ defmodule UniversalProxy.Bluetooth.RadioMonitorTest do
     _ = RadioMonitor.refresh(monitor)
     refute_receive {:bluetooth_radios, _}, 100
 
-    # Hotplug: a dongle appears, refresh picks it up and broadcasts.
+    # Hotplug: a dongle appears, refresh picks it up and broadcasts. No
+    # daemon overlay entry for it → no address yet.
     add_uart_radio(ctx.root, "hci1", @dongle_mac)
 
-    assert [%{hci: "hci0"}, %{hci: "hci1", address: @dongle_mac}] =
+    assert [%{hci: "hci0"}, %{hci: "hci1", address: nil}] =
              RadioMonitor.refresh(monitor)
 
     assert_receive {:bluetooth_radios, [_, %{hci: "hci1"}]}

@@ -4,33 +4,35 @@ defmodule UniversalProxy.Bluetooth.Radios do
 
   sysfs (`/sys/class/bluetooth/hci*/`) is the discovery source that works
   regardless of whether `bluetoothd` is running — the kernel creates these
-  entries as soon as a controller binds, so the radio list (and MAC → hciX
-  resolution) is available even while the BlueZ subtree is stopped or the
-  daemon is still coming up. Live `org.bluez` properties (Name, Powered)
-  are merged on top by `UniversalProxy.Bluetooth.RadioMonitor` when the
-  daemon is up.
+  entries as soon as a controller binds, so controller presence, bus type,
+  and chip identity are available even while the BlueZ subtree is stopped.
 
-  Addresses are normalized to uppercase `AA:BB:CC:DD:EE:FF` — the same form
-  `UniversalProxy.Bluetooth.Settings` persists, so resolution is a plain
-  string compare. An all-zero address (controller not yet initialized by
-  the kernel) reads back as `nil`.
+  **sysfs has NO MAC address for BT controllers** (verified on hardware:
+  `hciX/` exposes only device/subsystem/rfkill/power/uevent) — addresses
+  exist only via `org.bluez` `Adapter1.Address`, merged on top by
+  `UniversalProxy.Bluetooth.RadioMonitor` when the daemon is up. That's
+  also why MAC → hciX resolution lives in `UniversalProxy.Bluez.Client`.
 
   Chip name / BT version / BLE+BR-EDR capability badges come from a small
   static lookup over the device modalias (DT compatible strings for SoC
   radios, VID:PID for USB dongles) — best-effort with an "Unknown"
   fallback; there is no clean kernel API for these without the mgmt socket
-  (which belongs to `bluetoothd`).
+  (which belongs to `bluetoothd`). The Pi firmware reuses the SAME
+  `brcm,bcm43438-bt` compatible across boards with different chips, so SoC
+  radios are further disambiguated via `/proc/device-tree/model`.
 
-  The sysfs root is a parameter so host tests can point at a fixture tree.
+  Everything here is trusted kernel-owned input. The sysfs root and the
+  device-tree model path are parameters so host tests can point at
+  fixture trees.
   """
 
   @default_root "/sys/class/bluetooth"
+  @default_model_path "/proc/device-tree/model"
 
-  @type adapter :: %{hci: String.t(), address: String.t() | nil}
+  @type adapter :: %{hci: String.t()}
 
   @type radio :: %{
           hci: String.t(),
-          address: String.t() | nil,
           bus: :uart | :usb | :unknown,
           detail: String.t(),
           chip: String.t(),
@@ -52,11 +54,23 @@ defmodule UniversalProxy.Bluetooth.Radios do
 
   # SoC radios by DT-compatible substring (from the `of:` modalias). Order
   # matters: more specific first ("bcm43455" would also substring-match a
-  # hypothetical shorter key).
+  # hypothetical shorter key). NB the Pi firmware uses "brcm,bcm43438-bt"
+  # on boards whose actual chip differs (3B+ carries a BCM4345C0 — LMP
+  # 0x6119, hardware-verified) — board_chips/1 refines those by DT model.
   @of_chips [
     {"bcm43455", %{chip: "Broadcom BCM4345C0 (CYW43455)", bt_version: "5.0"}},
     {"bcm4345c0", %{chip: "Broadcom BCM4345C0", bt_version: "5.0"}},
     {"bcm43438", %{chip: "Broadcom BCM43438 (CYW43438)", bt_version: "4.1"}}
+  ]
+
+  # /proc/device-tree/model substring → chip, for SoC radios whose DT
+  # compatible is ambiguous. First match wins; order specific-first
+  # ("Pi 3 Model B Plus" before "Pi 3 Model B").
+  @board_chips [
+    {"Pi 3 Model B Plus", %{chip: "Broadcom BCM4345C0 (CYW43455)", bt_version: "5.0"}},
+    {"Pi 4", %{chip: "Broadcom BCM4345C0 (CYW43455)", bt_version: "5.0"}},
+    {"Pi 5", %{chip: "Broadcom BCM4345C0 (CYW43455)", bt_version: "5.0"}},
+    {"Pi Zero 2", %{chip: "Broadcom BCM43436 (CYW43436)", bt_version: "4.2"}}
   ]
 
   # All radios we can identify do both BLE and BR/EDR; the unknown fallback
@@ -78,7 +92,7 @@ defmodule UniversalProxy.Bluetooth.Radios do
         entries
         |> Enum.filter(&Regex.match?(~r/^hci\d+$/, &1))
         |> Enum.sort_by(&hci_index/1)
-        |> Enum.map(fn hci -> %{hci: hci, address: read_address(root, hci)} end)
+        |> Enum.map(fn hci -> %{hci: hci} end)
 
       {:error, _} ->
         []
@@ -88,17 +102,21 @@ defmodule UniversalProxy.Bluetooth.Radios do
   @doc """
   Full enumeration: `sysfs_adapters/1` plus bus classification (UART SoC
   vs USB dongle, with the USB port and link speed) and the static chip
-  lookup. Everything here is kernel-sourced — live BlueZ properties are
-  merged elsewhere.
+  lookup. Everything here is kernel-sourced — live BlueZ properties
+  (Address, Name) are merged elsewhere.
+
+  Options: `:model_path` overrides the device-tree model file (tests).
   """
-  @spec enumerate(Path.t()) :: [radio()]
-  def enumerate(root \\ @default_root) do
-    for %{hci: hci, address: address} <- sysfs_adapters(root) do
+  @spec enumerate(Path.t(), keyword()) :: [radio()]
+  def enumerate(root \\ @default_root, opts \\ []) do
+    model_path = Keyword.get(opts, :model_path, @default_model_path)
+
+    for %{hci: hci} <- sysfs_adapters(root) do
       modalias = read_modalias(root, hci)
       {bus, detail, usb_id} = classify_bus(root, hci, modalias)
 
-      %{hci: hci, address: address, bus: bus, detail: detail}
-      |> Map.merge(chip_lookup(modalias, usb_id))
+      %{hci: hci, bus: bus, detail: detail}
+      |> Map.merge(chip_lookup(modalias, usb_id, model_path))
     end
   end
 
@@ -118,21 +136,6 @@ defmodule UniversalProxy.Bluetooth.Radios do
   end
 
   # ── sysfs reads ──────────────────────────────────────────────────────────
-
-  defp read_address(root, hci) do
-    case File.read(Path.join([root, hci, "address"])) do
-      {:ok, raw} ->
-        case raw |> String.trim() |> String.upcase() do
-          # The kernel reports all-zeros until the controller is initialized.
-          "00:00:00:00:00:00" -> nil
-          "" -> nil
-          address -> address
-        end
-
-      {:error, _} ->
-        nil
-    end
-  end
 
   # The parent device's modalias identifies the transport and the chip:
   # `of:N...Cbrcm,bcm43438-bt` for DT/serdev radios, `usb:vXXXXpYYYY...`
@@ -241,18 +244,40 @@ defmodule UniversalProxy.Bluetooth.Radios do
 
   # ── chip lookup ──────────────────────────────────────────────────────────
 
-  defp chip_lookup(_modalias, usb_id) when usb_id != nil do
+  defp chip_lookup(_modalias, usb_id, _model_path) when usb_id != nil do
     case Map.fetch(@usb_chips, usb_id) do
       {:ok, entry} -> Map.merge(entry, @chip_defaults)
       :error -> @unknown_chip
     end
   end
 
-  defp chip_lookup(modalias, nil) when is_binary(modalias) do
+  defp chip_lookup(modalias, nil, model_path) when is_binary(modalias) do
+    # "bcm43438" is the one compatible the Pi firmware reuses across
+    # boards with different chips — only there does the board model win.
+    if String.contains?(modalias, "bcm43438") do
+      board_chip(model_path) || of_chip(modalias)
+    else
+      of_chip(modalias)
+    end
+  end
+
+  defp chip_lookup(_, _, _), do: @unknown_chip
+
+  defp of_chip(modalias) do
     Enum.find_value(@of_chips, @unknown_chip, fn {fragment, entry} ->
       if String.contains?(modalias, fragment), do: Map.merge(entry, @chip_defaults)
     end)
   end
 
-  defp chip_lookup(_, _), do: @unknown_chip
+  defp board_chip(model_path) do
+    case File.read(model_path) do
+      {:ok, model} ->
+        Enum.find_value(@board_chips, fn {fragment, entry} ->
+          if String.contains?(model, fragment), do: Map.merge(entry, @chip_defaults)
+        end)
+
+      {:error, _} ->
+        nil
+    end
+  end
 end

@@ -9,19 +9,28 @@ defmodule UniversalProxy.Bluez.DevicePath do
 
   ## Adapter path
 
-  Which `hciX` the whole BlueZ subtree drives is decided at subtree start:
-  `UniversalProxy.Bluetooth.Manager` resolves the selected radio MAC and
-  publishes the adapter object path as `:persistent_term`
-  (`adapter_path_key/0`) **before** (re)starting the subtree, so every
-  read here is consistent for the lifetime of a subtree incarnation
-  (crash-restarts re-read the unchanged term). The default — term never
-  written, e.g. host tests — is `/org/bluez/hci0`.
+  Which `hciX` the whole BlueZ subtree drives is resolved in two steps
+  (the kernel exposes no BT MAC in sysfs, so the MAC → adapter mapping
+  only exists once `bluetoothd` answers):
+
+    1. `UniversalProxy.Bluetooth.Manager` publishes the user-selected
+       radio MAC (or `nil` = auto) as `:persistent_term`
+       (`desired_adapter_key/0`) **before** (re)starting the subtree.
+    2. `UniversalProxy.Bluez.Client` — already waiting for the daemon in
+       its setup phase — matches that MAC against the `Adapter1` objects
+       and writes the resolved object path (`adapter_path_key/0`),
+       falling back to the lowest-index adapter when the MAC is absent.
+
+  The path is then consistent for the lifetime of a subtree incarnation
+  (crash-restarts re-resolve against the same desired MAC). The default —
+  term never written, e.g. host tests or pre-setup — is `/org/bluez/hci0`.
 
   Reading the term costs nanoseconds, so callers just call
   `adapter_path/0` per use rather than caching it.
   """
 
   @adapter_path_key {UniversalProxy.Bluez, :adapter_path}
+  @desired_adapter_key {UniversalProxy.Bluez, :desired_adapter}
   @default_adapter_path "/org/bluez/hci0"
   @max_address 0xFFFFFFFFFFFF
 
@@ -34,11 +43,24 @@ defmodule UniversalProxy.Bluez.DevicePath do
   def adapter_path, do: :persistent_term.get(@adapter_path_key, @default_adapter_path)
 
   @doc """
-  The `:persistent_term` key the adapter path is published under. Written
-  exclusively by `UniversalProxy.Bluetooth.Manager` (and tests).
+  The `:persistent_term` key the resolved adapter path is published
+  under. Written by `UniversalProxy.Bluez.Client` at setup (and tests).
   """
   @spec adapter_path_key() :: tuple()
   def adapter_path_key, do: @adapter_path_key
+
+  @doc """
+  The `:persistent_term` key holding the user-selected radio MAC
+  (`"AA:BB:CC:DD:EE:FF"` | `nil` = auto). Written by
+  `UniversalProxy.Bluetooth.Manager` before each subtree start; read by
+  `UniversalProxy.Bluez.Client.desired_adapter/0` during setup.
+  """
+  @spec desired_adapter_key() :: tuple()
+  def desired_adapter_key, do: @desired_adapter_key
+
+  @doc "The selected radio MAC (`nil` = auto/first)."
+  @spec desired_adapter() :: String.t() | nil
+  def desired_adapter, do: :persistent_term.get(@desired_adapter_key, nil)
 
   @doc """
   Whether `address` is a representable 48-bit MAC. The wire type is uint64,

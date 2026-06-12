@@ -8,21 +8,17 @@ defmodule UniversalProxy.Bluetooth.Manager do
   sibling `DynamicSupervisor` according to the persisted
   `UniversalProxy.Bluetooth.Settings`.
 
-  ## Adapter-path ordering invariant
+  ## Adapter-selection ordering invariant
 
-  Before every (re)start of the Bluez subtree the Manager resolves the
-  persisted radio MAC to an adapter object path (via sysfs — works while
-  `bluetoothd` is down) and publishes it as
-  `:persistent_term` `{UniversalProxy.Bluez, :adapter_path}`. Everything
-  inside the subtree reads the path through
-  `UniversalProxy.Bluez.DevicePath.adapter_path/0`, so a crash-restart of
-  the subtree re-reads the same term — consistent by construction. The
-  default (term never written) is `/org/bluez/hci0`.
-
-  Resolution falls back to the first (lowest-index) controller when the
-  persisted MAC isn't present (dongle unplugged), and to `hci0` when sysfs
-  shows no controller at all — the subtree's benign ~10 s retry loop
-  handles actual absence.
+  Before every (re)start of the Bluez subtree the Manager publishes the
+  persisted radio MAC (or `nil` = auto) as `:persistent_term`
+  (`UniversalProxy.Bluez.DevicePath.desired_adapter_key/0`). The kernel
+  exposes no BT MAC in sysfs, so the MAC → hciX resolution happens
+  inside the subtree: `UniversalProxy.Bluez.Client` matches the desired
+  MAC against bluetoothd's `Adapter1` objects during setup and writes
+  the resolved adapter path (`adapter_path_key/0`) itself, falling back
+  to the lowest-index adapter when the MAC is absent. A crash-restart
+  re-resolves against the same desired MAC — consistent by construction.
 
   ## Broadcasts
 
@@ -45,8 +41,6 @@ defmodule UniversalProxy.Bluetooth.Manager do
 
   alias UniversalProxy.Bluetooth.{Radios, Settings}
   alias UniversalProxy.Bluez.DevicePath
-
-  @default_adapter_path "/org/bluez/hci0"
 
   # Delay before re-binding the monitor after the subtree dies — the
   # DynamicSupervisor restarts a :permanent child immediately, so one tick
@@ -99,10 +93,7 @@ defmodule UniversalProxy.Bluetooth.Manager do
       adapters_info_fun:
         Keyword.get(opts, :adapters_info_fun, &UniversalProxy.Bluez.Client.adapters_info/0),
       bluez_pid: nil,
-      monitor: nil,
-      # The sysfs adapter the path was resolved to at the last subtree
-      # start (%{hci:, address:} | nil) — what status reports while running.
-      adapter: nil
+      monitor: nil
     }
 
     {:ok, state, {:continue, :reconcile}}
@@ -173,26 +164,29 @@ defmodule UniversalProxy.Bluetooth.Manager do
   end
 
   defp start_bluez(state, config) do
-    {path, adapter} = resolve_adapter(config, state.sysfs_root)
-    # MUST land before the subtree boots: everything under Bluez reads the
-    # adapter path from this term (a crash-restart re-reads it unchanged).
-    :persistent_term.put(DevicePath.adapter_path_key(), path)
+    # MUST land before the subtree boots: Bluez.Client resolves this MAC
+    # against bluetoothd's adapters during setup (a crash-restart
+    # re-resolves the same term).
+    :persistent_term.put(DevicePath.desired_adapter_key(), config.adapter)
 
     case DynamicSupervisor.start_child(state.dynsup, state.bluez_child) do
       {:ok, pid} ->
-        Logger.info("Bluetooth.Manager: Bluez subtree started on #{path}")
-        %{state | bluez_pid: pid, monitor: Process.monitor(pid), adapter: adapter}
+        Logger.info(
+          "Bluetooth.Manager: Bluez subtree started (radio: #{config.adapter || "auto"})"
+        )
+
+        %{state | bluez_pid: pid, monitor: Process.monitor(pid)}
 
       {:error, {:already_started, pid}} ->
         # A replacement child we hadn't re-bound to yet (crash-restart racing
         # a reconcile). Drop any stale monitor before taking the new one, or
         # its late :DOWN would clear bluez_pid on a live subtree.
         if state.monitor, do: Process.demonitor(state.monitor, [:flush])
-        %{state | bluez_pid: pid, monitor: Process.monitor(pid), adapter: adapter}
+        %{state | bluez_pid: pid, monitor: Process.monitor(pid)}
 
       {:error, reason} ->
         Logger.error("Bluetooth.Manager: Bluez subtree failed to start: #{inspect(reason)}")
-        %{state | bluez_pid: nil, monitor: nil, adapter: adapter}
+        %{state | bluez_pid: nil, monitor: nil}
     end
   end
 
@@ -212,73 +206,41 @@ defmodule UniversalProxy.Bluetooth.Manager do
     %{state | bluez_pid: nil, monitor: nil}
   end
 
-  # ── adapter resolution ───────────────────────────────────────────────────
-
-  # MAC → "/org/bluez/hciX" via sysfs. Falls back to the first controller
-  # when the persisted MAC isn't present, and to hci0 when there are no
-  # controllers at all.
-  defp resolve_adapter(config, sysfs_root) do
-    adapters = Radios.sysfs_adapters(sysfs_root)
-
-    chosen =
-      case config.adapter do
-        nil ->
-          List.first(adapters)
-
-        mac ->
-          case Enum.find(adapters, &(&1.address == mac)) do
-            nil ->
-              Logger.warning(
-                "Bluetooth.Manager: selected radio #{mac} not present, " <>
-                  "falling back to #{inspect(List.first(adapters) || "hci0")}"
-              )
-
-              List.first(adapters)
-
-            found ->
-              found
-          end
-      end
-
-    case chosen do
-      nil -> {@default_adapter_path, nil}
-      %{hci: hci} = adapter -> {"/org/bluez/#{hci}", adapter}
-    end
-  end
-
   # ── status ───────────────────────────────────────────────────────────────
 
   defp build_status(state) do
     config = settings(state)
     running? = running?(state)
-
-    adapter =
-      if running? do
-        state.adapter
-      else
-        {_path, adapter} = resolve_adapter(config, state.sysfs_root)
-        adapter
-      end
-
     {used, limit} = connection_usage()
 
     %{
       enabled: config.enabled,
       proxying?: running?,
-      adapter:
-        adapter &&
-          %{hci: adapter.hci, address: adapter.address, name: adapter_name(state, adapter.hci)},
+      adapter: adapter_status(state, running?),
       active_connections: %{allowed?: config.active_connections, used: used, limit: limit}
     }
   end
 
-  # Live Adapter1.Name from the daemon, when it's up (nil otherwise —
-  # adapters_info/0 is exit-safe and returns [] with the subtree down).
-  defp adapter_name(state, hci) do
-    state.adapters_info_fun.()
-    |> Enum.find_value(fn %{path: path, name: name} ->
-      if Path.basename(path) == hci, do: name
-    end)
+  # While running: identify the claimed adapter (path published by
+  # Bluez.Client) with its live Adapter1 identity. The kernel exposes no
+  # BT MAC in sysfs, so while the subtree is DOWN all we can show is the
+  # first controller's hci name — address/name appear once the daemon is
+  # up (adapters_info_fun is exit-safe and returns [] until then).
+  defp adapter_status(state, running?) do
+    if running? do
+      path = DevicePath.adapter_path()
+      hci = Path.basename(path)
+
+      case Enum.find(state.adapters_info_fun.(), &(&1.path == path)) do
+        %{address: address, name: name} -> %{hci: hci, address: address, name: name}
+        nil -> %{hci: hci, address: nil, name: nil}
+      end
+    else
+      case Radios.sysfs_adapters(state.sysfs_root) do
+        [%{hci: hci} | _] -> %{hci: hci, address: nil, name: nil}
+        [] -> nil
+      end
+    end
   end
 
   defp connection_usage do

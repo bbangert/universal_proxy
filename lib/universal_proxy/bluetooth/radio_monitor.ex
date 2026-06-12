@@ -123,7 +123,10 @@ defmodule UniversalProxy.Bluetooth.RadioMonitor do
     for radio <- sysfs do
       adapter = Map.get(live, radio.hci, %{})
 
+      # Address and Name exist only via the daemon (the kernel exposes no
+      # BT MAC in sysfs) — nil while the BlueZ subtree is down.
       radio
+      |> Map.put(:address, adapter[:address])
       |> Map.put(:name, adapter[:name])
       |> Map.put(:in_use?, proxying? and "/org/bluez/#{radio.hci}" == active_path)
     end

@@ -205,26 +205,7 @@ defmodule UniversalProxy.Bluez.Client do
 
   @impl GenServer
   def handle_call(:adapters_info, _from, state) do
-    reply =
-      case get_managed_objects(state.conn) do
-        {:ok, objects} ->
-          for {path, ifaces} <- objects,
-              {_iface, props} <- [List.keyfind(ifaces, @adapter_iface, 0)] do
-            unwrapped = Variant.unwrap_props(props)
-
-            %{
-              path: path,
-              address: unwrapped["Address"],
-              name: unwrapped["Name"],
-              powered: unwrapped["Powered"] == true
-            }
-          end
-
-        {:error, _} ->
-          []
-      end
-
-    {:reply, reply, state}
+    {:reply, adapter_objects(state.conn), state}
   end
 
   def handle_call({:devices_seen, window_ms}, _from, state) do
@@ -320,7 +301,7 @@ defmodule UniversalProxy.Bluez.Client do
 
   defp attempt_setup(state, retries) do
     cond do
-      adapter_present?(state.conn) ->
+      claim_adapter(state.conn) ->
         power_on(state.conn)
         power_off_others(state.conn)
         state = seed_existing(state)
@@ -649,10 +630,64 @@ defmodule UniversalProxy.Bluez.Client do
     Enum.each(rules, &DBus.add_match(conn, &1))
   end
 
-  defp adapter_present?(conn) do
+  # Resolve which adapter this subtree drives and publish its object path.
+  # The kernel exposes no BT MAC in sysfs, so the user-selected MAC
+  # (DevicePath.desired_adapter/0, written by Bluetooth.Manager before the
+  # subtree started) can only be matched here, against bluetoothd's
+  # Adapter1 objects: the desired MAC's adapter if present, else the
+  # lowest-index one (auto/onboard). Returns false while bluetoothd has no
+  # adapter yet (setup retries).
+  defp claim_adapter(conn) do
+    case adapter_objects(conn) do
+      [] ->
+        false
+
+      adapters ->
+        desired = DevicePath.desired_adapter()
+
+        chosen =
+          Enum.find(adapters, fn %{address: address} -> address == desired end) ||
+            fallback_adapter(adapters, desired)
+
+        :persistent_term.put(DevicePath.adapter_path_key(), chosen.path)
+        Logger.info("Bluez.Client: driving #{chosen.path} (#{chosen.address})")
+        true
+    end
+  end
+
+  defp fallback_adapter(adapters, desired) do
+    if desired != nil do
+      Logger.warning("Bluez.Client: selected radio #{desired} not present, using first adapter")
+    end
+
+    Enum.min_by(adapters, &path_index(&1.path))
+  end
+
+  defp path_index(path) do
+    case path |> Path.basename() |> String.replace_prefix("hci", "") |> Integer.parse() do
+      {n, ""} -> n
+      _ -> 999_999
+    end
+  end
+
+  # All org.bluez Adapter1 objects with their identity props.
+  defp adapter_objects(conn) do
     case get_managed_objects(conn) do
-      {:ok, objects} -> List.keymember?(objects, adapter_path(), 0)
-      _ -> false
+      {:ok, objects} ->
+        for {path, ifaces} <- objects,
+            {_iface, props} <- [List.keyfind(ifaces, @adapter_iface, 0)] do
+          unwrapped = Variant.unwrap_props(props)
+
+          %{
+            path: path,
+            address: unwrapped["Address"],
+            name: unwrapped["Name"],
+            powered: unwrapped["Powered"] == true
+          }
+        end
+
+      {:error, _} ->
+        []
     end
   end
 

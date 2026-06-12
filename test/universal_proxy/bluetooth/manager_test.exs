@@ -30,6 +30,7 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
 
     on_exit(fn ->
       :persistent_term.erase(DevicePath.adapter_path_key())
+      :persistent_term.erase(DevicePath.desired_adapter_key())
       File.rm_rf(tmp)
     end)
 
@@ -71,16 +72,17 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
   defp child_count(dynsup), do: DynamicSupervisor.which_children(dynsup) |> length()
 
   describe "boot reconcile" do
-    test "enabled (default): starts the subtree and resolves the first adapter", ctx do
+    test "enabled (default): starts the subtree and publishes the desired radio (auto)", ctx do
       manager = start_manager(ctx)
 
       assert child_count(ctx.dynsup) == 1
-      assert :persistent_term.get(DevicePath.adapter_path_key()) == "/org/bluez/hci0"
+      # nil = auto; the MAC → path resolution is Bluez.Client's job now.
+      assert :persistent_term.get(DevicePath.desired_adapter_key(), :unset) == nil
 
       assert %{
                enabled: true,
                proxying?: true,
-               adapter: %{hci: "hci0", address: @hci0_mac, name: nil},
+               adapter: %{hci: "hci0", address: nil, name: nil},
                active_connections: %{allowed?: true, used: 0, limit: 3}
              } = Manager.status(manager)
 
@@ -99,30 +101,40 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
       assert_receive {:bluetooth_state, %{enabled: false, proxying?: false}}
     end
 
-    test "a selected radio MAC resolves to its hci path", ctx do
+    test "a selected radio MAC is published as the desired adapter", ctx do
       :ok = Settings.set_adapter(ctx.settings, @hci1_mac)
-      manager = start_manager(ctx)
+      _manager = start_manager(ctx)
 
-      assert :persistent_term.get(DevicePath.adapter_path_key()) == "/org/bluez/hci1"
-      assert %{adapter: %{hci: "hci1", address: @hci1_mac}} = Manager.status(manager)
+      assert :persistent_term.get(DevicePath.desired_adapter_key()) == @hci1_mac
     end
 
-    test "an absent selected MAC falls back to the first adapter", ctx do
-      :ok = Settings.set_adapter(ctx.settings, "00:11:22:33:44:55")
-      manager = start_manager(ctx)
+    test "status identifies the claimed adapter via live daemon info while running", ctx do
+      # Simulate Bluez.Client having claimed hci1 and the daemon answering.
+      :persistent_term.put(DevicePath.adapter_path_key(), "/org/bluez/hci1")
 
-      assert :persistent_term.get(DevicePath.adapter_path_key()) == "/org/bluez/hci0"
-      assert %{adapter: %{hci: "hci0"}} = Manager.status(manager)
+      manager =
+        start_manager(ctx,
+          adapters_info_fun: fn ->
+            [%{path: "/org/bluez/hci1", address: @hci1_mac, name: "dongle", powered: true}]
+          end
+        )
+
+      assert %{adapter: %{hci: "hci1", address: @hci1_mac, name: "dongle"}} =
+               Manager.status(manager)
     end
 
-    test "no controllers in sysfs: defaults to hci0 with no adapter shown", ctx do
+    test "no controllers in sysfs: subtree still starts, no adapter shown when down", ctx do
       File.rm_rf!(ctx.sysfs)
+      :ok = Settings.set_enabled(ctx.settings, false)
       manager = start_manager(ctx)
 
-      # Subtree still starts — its own retry loop owns controller absence.
+      assert %{proxying?: false, adapter: nil} = Manager.status(manager)
+
+      # Enabling still starts the subtree — its own retry loop owns
+      # controller absence.
+      :ok = Settings.set_enabled(ctx.settings, true)
+      :ok = Manager.reconcile(manager)
       assert child_count(ctx.dynsup) == 1
-      assert :persistent_term.get(DevicePath.adapter_path_key()) == "/org/bluez/hci0"
-      assert %{proxying?: true, adapter: nil} = Manager.status(manager)
     end
   end
 
@@ -153,7 +165,7 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
       assert [{_, ^pid, _, _}] = DynamicSupervisor.which_children(ctx.dynsup)
     end
 
-    test "restart: true cycles the subtree and re-resolves the adapter path", ctx do
+    test "restart: true cycles the subtree and republishes the desired radio", ctx do
       manager = start_manager(ctx)
       [{_, pid_before, _, _}] = DynamicSupervisor.which_children(ctx.dynsup)
 
@@ -162,8 +174,7 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
 
       [{_, pid_after, _, _}] = DynamicSupervisor.which_children(ctx.dynsup)
       assert pid_after != pid_before
-      assert :persistent_term.get(DevicePath.adapter_path_key()) == "/org/bluez/hci1"
-      assert %{adapter: %{hci: "hci1"}} = Manager.status(manager)
+      assert :persistent_term.get(DevicePath.desired_adapter_key()) == @hci1_mac
     end
   end
 

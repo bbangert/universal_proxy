@@ -20,10 +20,11 @@ defmodule UniversalProxy.Bluetooth.RadiosTest do
 
   # ── fixture builders ──────────────────────────────────────────────────────
 
-  defp add_uart_radio(root, hci, mac, modalias_source \\ :modalias) do
+  # NB real /sys/class/bluetooth/hciX dirs carry NO address attribute
+  # (hardware-verified) — the fixtures don't either.
+  defp add_uart_radio(root, hci, _mac, modalias_source \\ :modalias) do
     class_dir = Path.join(root, hci)
     File.mkdir_p!(class_dir)
-    File.write!(Path.join(class_dir, "address"), mac <> "\n")
 
     device_dir = Path.join(root, "devices/platform/soc/3f201000.serial/serial0/serial0-0")
     File.mkdir_p!(device_dir)
@@ -37,14 +38,13 @@ defmodule UniversalProxy.Bluetooth.RadiosTest do
     File.ln_s!(device_dir, Path.join(class_dir, "device"))
   end
 
-  defp add_usb_radio(root, hci, mac, opts \\ []) do
+  defp add_usb_radio(root, hci, _mac, opts \\ []) do
     modalias = Keyword.get(opts, :modalias, @bt500_modalias)
     speed = Keyword.get(opts, :speed, "480")
     port = Keyword.get(opts, :port, "1-1.2")
 
     class_dir = Path.join(root, hci)
     File.mkdir_p!(class_dir)
-    File.write!(Path.join(class_dir, "address"), mac <> "\n")
 
     usb_device_dir = Path.join(root, "devices/platform/soc/3f980000.usb/usb1/1-1/#{port}")
     intf_dir = Path.join(usb_device_dir, "#{port}:1.0")
@@ -66,17 +66,11 @@ defmodule UniversalProxy.Bluetooth.RadiosTest do
       assert Radios.sysfs_adapters("/nonexistent/sysfs") == []
     end
 
-    test "sorts by hci index and normalizes addresses", %{root: root} do
+    test "sorts by hci index, numerically not lexically", %{root: root} do
       add_uart_radio(root, "hci10", "b8:27:eb:00:00:10")
       add_usb_radio(root, "hci2", @dongle_mac)
 
-      assert [%{hci: "hci2"}, %{hci: "hci10", address: "B8:27:EB:00:00:10"}] =
-               Radios.sysfs_adapters(root)
-    end
-
-    test "all-zero address (uninitialized controller) reads as nil", %{root: root} do
-      add_uart_radio(root, "hci0", "00:00:00:00:00:00")
-      assert [%{hci: "hci0", address: nil}] = Radios.sysfs_adapters(root)
+      assert [%{hci: "hci2"}, %{hci: "hci10"}] = Radios.sysfs_adapters(root)
     end
   end
 
@@ -89,7 +83,6 @@ defmodule UniversalProxy.Bluetooth.RadiosTest do
       assert [
                %{
                  hci: "hci0",
-                 address: @pi_mac,
                  bus: :uart,
                  detail: "SoC · UART",
                  chip: "Broadcom BCM43438 (CYW43438)",
@@ -98,6 +91,25 @@ defmodule UniversalProxy.Bluetooth.RadiosTest do
                  bredr?: true
                }
              ] = Radios.enumerate(root)
+    end
+
+    test "the board model disambiguates the firmware-reused bcm43438 compatible", %{root: root} do
+      add_uart_radio(root, "hci0", @pi_mac)
+      model_path = Path.join(root, "dt_model")
+      # /proc/device-tree/model content is NUL-terminated on real boards.
+      File.write!(model_path, "Raspberry Pi 3 Model B Plus Rev 1.3" <> <<0>>)
+
+      assert [%{chip: "Broadcom BCM4345C0 (CYW43455)", bt_version: "5.0"}] =
+               Radios.enumerate(root, model_path: model_path)
+    end
+
+    test "an unknown board model falls back to the DT-compatible entry", %{root: root} do
+      add_uart_radio(root, "hci0", @pi_mac)
+      model_path = Path.join(root, "dt_model")
+      File.write!(model_path, "Some Other Board" <> <<0>>)
+
+      assert [%{chip: "Broadcom BCM43438 (CYW43438)"}] =
+               Radios.enumerate(root, model_path: model_path)
     end
 
     test "falls back to the uevent MODALIAS line when modalias is absent", %{root: root} do
@@ -121,7 +133,6 @@ defmodule UniversalProxy.Bluetooth.RadiosTest do
       assert [
                %{
                  hci: "hci1",
-                 address: @dongle_mac,
                  bus: :usb,
                  detail: "USB 2.0 · port 1-1.2",
                  chip: "Realtek RTL8761B (ASUS USB-BT500)",
@@ -160,7 +171,6 @@ defmodule UniversalProxy.Bluetooth.RadiosTest do
     test "device entry that is a plain dir with no hints → unknown bus", %{root: root} do
       class_dir = Path.join(root, "hci0")
       File.mkdir_p!(Path.join(class_dir, "device"))
-      File.write!(Path.join(class_dir, "address"), @pi_mac)
 
       assert [%{bus: :unknown, detail: "Unknown", chip: "Unknown"}] = Radios.enumerate(root)
     end
