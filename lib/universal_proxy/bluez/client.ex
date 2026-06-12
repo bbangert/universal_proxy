@@ -41,8 +41,10 @@ defmodule UniversalProxy.Bluez.Client do
       `RegisterMonitor` returns, so the GenServer must stay free to answer —
       and are serialized: at most one in flight, identified by a generation
       ref so a stale Task result can't corrupt state. A `set_mode/1` arriving
-      mid-transition parks in a one-slot pending queue (latest wins; a
-      displaced caller gets `{:error, :superseded}`).
+      mid-transition parks in a one-slot pending queue keyed by target mode:
+      callers asking for the same target coalesce (all get `:ok` when it
+      lands); a different target displaces them with `{:error, :superseded}`
+      (latest target wins).
     * Transitions engage the new mode BEFORE disengaging the old one
       (monitor and discovery can legally coexist in BlueZ): a failed engage
       leaves the previous mode still scanning rather than going dark.
@@ -105,7 +107,8 @@ defmodule UniversalProxy.Bluez.Client do
   @doc """
   Switch the scanner between `:passive` (AdvertisementMonitor) and `:active`
   (StartDiscovery) at runtime. Returns once the BlueZ transition completes;
-  `{:error, :superseded}` if a newer `set_mode/1` displaced this one.
+  `{:error, :superseded}` if a newer `set_mode/1` asking for a *different*
+  mode displaced this one (same-mode callers coalesce and succeed together).
 
   Callers must `catch :exit` for the not-running/timeout cases (see
   `UniversalProxy.ESPHome.BluetoothScanner.set_scanner_mode/1`).
@@ -146,7 +149,8 @@ defmodule UniversalProxy.Bluez.Client do
           mode: nil,
           engaged: :none,
           # transition = generation ref of the in-flight Task (nil = idle);
-          # pending = one-slot queue of {from, target} parked behind it.
+          # pending = one-slot queue parked behind it: {target, [from]} —
+          # same-target callers coalesce, a new target displaces them.
           transition: nil,
           pending: nil
         }
@@ -164,14 +168,24 @@ defmodule UniversalProxy.Bluez.Client do
   @impl GenServer
   def handle_call({:set_mode, target}, from, state) do
     cond do
-      # A transition is running: park behind it (latest wins).
+      # A transition is running: park behind it. Same-target callers pile
+      # into one pending slot and all succeed together; a different target
+      # displaces them (latest target wins).
       state.transition != nil ->
-        case state.pending do
-          {old_from, _old_target} -> GenServer.reply(old_from, {:error, :superseded})
-          nil -> :ok
-        end
+        pending =
+          case state.pending do
+            {^target, froms} ->
+              {target, [from | froms]}
 
-        {:noreply, %{state | pending: {from, target}}}
+            {_other_target, froms} ->
+              Enum.each(froms, &GenServer.reply(&1, {:error, :superseded}))
+              {target, [from]}
+
+            nil ->
+              {target, [from]}
+          end
+
+        {:noreply, %{state | pending: pending}}
 
       # Already there (and actually engaged — a failed initial setup leaves
       # engaged: :none, which falls through and retries).
@@ -179,7 +193,7 @@ defmodule UniversalProxy.Bluez.Client do
         {:reply, :ok, state}
 
       true ->
-        {:noreply, start_transition(state, target, from)}
+        {:noreply, start_transition(state, target, [from])}
     end
   end
 
@@ -205,21 +219,21 @@ defmodule UniversalProxy.Bluez.Client do
     {:noreply, state}
   end
 
-  # Current transition finished — commit the outcome, answer the caller,
+  # Current transition finished — commit the outcome, answer the callers,
   # then run whatever parked behind it.
-  def handle_info({:mode_transition, ref, target, from, result}, %{transition: ref} = state) do
+  def handle_info({:mode_transition, ref, target, froms, result}, %{transition: ref} = state) do
     state = %{state | transition: nil}
 
     state =
       case result do
         {:ok, engaged} ->
           :persistent_term.put(@mode_key, target)
-          if from, do: GenServer.reply(from, :ok)
+          Enum.each(froms, &GenServer.reply(&1, :ok))
           Logger.info("Bluez.Client: scanner mode #{target} engaged (#{engaged})")
           %{state | mode: target, engaged: engaged}
 
         {:error, reason, engaged} ->
-          if from, do: GenServer.reply(from, {:error, reason})
+          Enum.each(froms, &GenServer.reply(&1, {:error, reason}))
           Logger.error("Bluez.Client: scanner mode #{target} failed: #{inspect(reason)}")
           %{state | engaged: engaged}
       end
@@ -228,9 +242,9 @@ defmodule UniversalProxy.Bluez.Client do
   end
 
   # Stale transition result (generation ref mismatch — superseded while its
-  # Task ran). Never commit it; just make sure its caller isn't left hanging.
-  def handle_info({:mode_transition, _ref, _target, from, _result}, state) do
-    if from, do: GenServer.reply(from, {:error, :superseded})
+  # Task ran). Never commit it; just make sure its callers aren't left hanging.
+  def handle_info({:mode_transition, _ref, _target, froms, _result}, state) do
+    Enum.each(froms, &GenServer.reply(&1, {:error, :superseded}))
     {:noreply, state}
   end
 
@@ -248,7 +262,7 @@ defmodule UniversalProxy.Bluez.Client do
         # it engages the caller's mode and run_pending takes over from there.
         state =
           if state.transition == nil,
-            do: start_transition(state, configured_mode(), nil),
+            do: start_transition(state, configured_mode(), []),
             else: state
 
         {:noreply, state}
@@ -265,34 +279,35 @@ defmodule UniversalProxy.Bluez.Client do
 
   # ── scanner mode transitions ─────────────────────────────────────────────
 
-  # Kick a Task that moves BlueZ from `state.engaged` to `target`. Runs off
+  # Kick a Task that moves BlueZ from `state.engaged` to `target`, replying
+  # to every caller in `froms` ([] for setup-initiated engages). Runs off
   # the GenServer loop because RegisterMonitor re-enters us (BlueZ calls
   # GetManagedObjects back before it returns). The generation ref ties the
   # Task's result to this transition; handle_info ignores stale ones.
-  defp start_transition(state, target, from) do
+  defp start_transition(state, target, froms) do
     me = self()
     conn = state.conn
     engaged = state.engaged
     ref = make_ref()
 
     Task.start(fn ->
-      send(me, {:mode_transition, ref, target, from, apply_mode(conn, engaged, target)})
+      send(me, {:mode_transition, ref, target, froms, apply_mode(conn, engaged, target)})
     end)
 
     %{state | transition: ref}
   end
 
-  # After a transition: serve the parked set_mode, if any.
+  # After a transition: serve the parked set_mode callers, if any.
   defp run_pending(%{pending: nil} = state), do: state
 
-  defp run_pending(%{pending: {from, target}} = state) do
+  defp run_pending(%{pending: {target, froms}} = state) do
     state = %{state | pending: nil}
 
     if state.mode == target and state.engaged != :none do
-      GenServer.reply(from, :ok)
+      Enum.each(froms, &GenServer.reply(&1, :ok))
       state
     else
-      start_transition(state, target, from)
+      start_transition(state, target, froms)
     end
   end
 
