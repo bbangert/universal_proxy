@@ -63,6 +63,14 @@ defmodule UniversalProxy.Bluetooth.Manager do
   # with the old subtree's teardown remnants.
   @start_retry_ms 2_000
 
+  # Settle time between stop and start on a restart (radio switch).
+  # Hardware-found: the old bluetoothd releases its L2CAP listening
+  # sockets a beat after its process is told to exit; a new bluetoothd
+  # started immediately fails adapter registration ("l2cap_bind: Address
+  # already in use") and sits adapterless until the Client's :no_adapter
+  # loop bounces the subtree (~10 s). This pause makes switches clean.
+  @restart_settle_ms 1_500
+
   def start_link(opts \\ []) do
     gen_opts =
       case Keyword.get(opts, :name, __MODULE__) do
@@ -110,6 +118,7 @@ defmodule UniversalProxy.Bluetooth.Manager do
       adapters_info_fun:
         Keyword.get(opts, :adapters_info_fun, &UniversalProxy.Bluez.Client.adapters_info/0),
       start_retry_ms: Keyword.get(opts, :start_retry_ms, @start_retry_ms),
+      restart_settle_ms: Keyword.get(opts, :restart_settle_ms, @restart_settle_ms),
       bluez_pid: nil,
       monitor: nil
     }
@@ -183,9 +192,18 @@ defmodule UniversalProxy.Bluetooth.Manager do
     running? = running?(state)
 
     cond do
-      not running? -> start_bluez(state, config)
-      restart? -> state |> stop_bluez() |> start_bluez(config)
-      true -> state
+      not running? ->
+        start_bluez(state, config)
+
+      restart? ->
+        state = stop_bluez(state)
+        # Blocking the Manager here is fine: radio switches are rare,
+        # explicit user actions, and the caller waits anyway.
+        Process.sleep(state.restart_settle_ms)
+        start_bluez(state, config)
+
+      true ->
+        state
     end
   end
 

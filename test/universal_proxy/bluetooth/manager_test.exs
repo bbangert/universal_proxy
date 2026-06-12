@@ -68,18 +68,18 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
   defp start_manager(ctx, opts \\ []) do
     # Per-test overrides FIRST — Keyword.get takes the first match.
     manager =
-      start_supervised!(
-        {Manager,
-         opts ++
-           [
-             name: nil,
-             settings: ctx.settings,
-             dynamic_supervisor: ctx.dynsup,
-             bluez_child: StubBluez,
-             sysfs_root: ctx.sysfs,
-             pubsub: @pubsub
-           ]}
-      )
+      start_supervised!({Manager,
+       opts ++
+         [
+           name: nil,
+           settings: ctx.settings,
+           dynamic_supervisor: ctx.dynsup,
+           bluez_child: StubBluez,
+           sysfs_root: ctx.sysfs,
+           pubsub: @pubsub,
+           # No OS daemons in host tests — skip the L2CAP settle pause.
+           restart_settle_ms: 0
+         ]})
 
     # start_supervised! returns after init/1, but the boot reconcile runs in
     # handle_continue — synchronize on a call so assertions that query the

@@ -47,7 +47,11 @@ defmodule UniversalProxy.BluetoothTest do
 
     start_supervised!(
       {Manager,
-       dynamic_supervisor: dynsup, bluez_child: StubBluez, sysfs_root: sysfs, pubsub: @pubsub}
+       dynamic_supervisor: dynsup,
+       bluez_child: StubBluez,
+       sysfs_root: sysfs,
+       pubsub: @pubsub,
+       restart_settle_ms: 0}
     )
 
     # Radio MACs only exist via the daemon overlay (sysfs has none), so
