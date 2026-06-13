@@ -6,10 +6,16 @@ defmodule UniversalProxy.Bluetooth.Settings do
   A single record holding:
 
       %{
-        enabled: boolean(),            # master switch for the whole BT stack
+        enabled: boolean(),            # gate HA-facing proxying (espex wiring)
         active_connections: boolean(), # allow HA to open GATT connections
         adapter: String.t() | nil      # selected radio MAC, nil = auto
       }
+
+  `enabled` is NOT a power switch for the radio stack: the BlueZ subtree
+  runs whenever the hardware supports it. `enabled` gates only whether the
+  scanner/GATT adapters are wired into espex (and therefore whether HA
+  sees any Bluetooth data) — see `UniversalProxy.Bluetooth` and
+  `UniversalProxy.ESPHome.Supervisor.bluetooth_opts/2`.
 
   The adapter is keyed by **MAC address** (`"AA:BB:CC:DD:EE:FF"`), not by
   hci index — hci indices are assigned in probe order and are not stable
@@ -17,9 +23,10 @@ defmodule UniversalProxy.Bluetooth.Settings do
   adapter).
 
   This module is pure persistence: no restarts, no broadcasts. The
-  lifecycle consequences of a settings change (starting/stopping the BlueZ
-  subtree, restarting espex) belong to `UniversalProxy.Bluetooth`'s public
-  API, which writes here first and then acts.
+  consequences of a settings change (restarting espex so HA sees the new
+  feature flags, or restarting the BlueZ subtree on a radio switch)
+  belong to `UniversalProxy.Bluetooth`'s public API, which writes here
+  first and then acts.
 
   The DETS file lives on the writable data partition on Nerves
   (`/data/bluetooth_config.dets`) and in `_build/` on the host for

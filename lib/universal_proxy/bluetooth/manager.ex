@@ -99,7 +99,10 @@ defmodule UniversalProxy.Bluetooth.Manager do
 
   Broadcasts the resulting status either way.
   """
-  @spec reconcile(GenServer.server(), keyword()) :: :ok
+  # First arg is a server OR (for the lone-keyword call below) the opts
+  # themselves — the spec must admit both or dialyzer rejects
+  # `reconcile(restart: true)` at the call site.
+  @spec reconcile(GenServer.server() | keyword(), keyword()) :: :ok
   def reconcile(server \\ __MODULE__, opts \\ [])
 
   # `reconcile(restart: true)` — a lone keyword list is the opts, not the
