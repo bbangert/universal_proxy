@@ -11,6 +11,7 @@ defmodule UniversalProxyWeb.OverviewLive do
   import UniversalProxyWeb.Components.Audio
 
   alias UniversalProxy.Audio
+  alias UniversalProxy.Bluetooth
   alias UniversalProxy.Hardware
   alias UniversalProxy.System, as: Sys
   alias UniversalProxy.UART
@@ -32,6 +33,9 @@ defmodule UniversalProxyWeb.OverviewLive do
         Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:output_added")
         Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:output_removed")
         Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:state")
+        # USB Bluetooth radios surface in the hardware list too; the radio
+        # list (incl. in_use?) is rebroadcast on enumeration change.
+        Phoenix.PubSub.subscribe(UniversalProxy.PubSub, Bluetooth.radios_topic())
         :timer.send_interval(@refresh_interval, self(), :refresh)
         {History.packets_per_minute(), reconcile_throughputs(%{}, ports)}
       else
@@ -47,6 +51,7 @@ defmodule UniversalProxyWeb.OverviewLive do
      |> assign(:packet_rate, packet_rate)
      |> assign(:pending_kind_change, nil)
      |> assign(:audio_outputs, build_audio_index(Audio.list_outputs()))
+     |> assign(:bt_radios, Bluetooth.list_radios())
      |> set_ports(ports)}
   end
 
@@ -60,6 +65,14 @@ defmodule UniversalProxyWeb.OverviewLive do
   end
 
   def handle_event("ignore", _params, socket), do: {:noreply, socket}
+
+  # Peripheral rows (USB audio / USB Bluetooth) are claimed automatically
+  # by their built-in service, so clicking routes to the managing tab
+  # rather than opening the serial-port drawer.
+  def handle_event("goto_tab", %{"path" => path}, socket)
+      when path in ["/audio", "/bluetooth"] do
+    {:noreply, push_navigate(socket, to: path)}
+  end
 
   def handle_event(
         "request_kind_change",
@@ -151,6 +164,10 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   def handle_info({:uart_packet_rate, count}, socket) do
     {:noreply, assign(socket, :packet_rate, count)}
+  end
+
+  def handle_info({:bluetooth_radios, radios}, socket) do
+    {:noreply, assign(socket, :bt_radios, radios)}
   end
 
   def handle_info({:sendspin_output_added, output}, socket) do
@@ -337,7 +354,11 @@ defmodule UniversalProxyWeb.OverviewLive do
         packet_rate={@packet_rate}
       />
 
-      <.hardware_table ports={@ports} throughput_snapshots={@throughput_snapshots} />
+      <.hardware_table
+        ports={@ports}
+        peripherals={peripherals(@audio_outputs, @bt_radios)}
+        throughput_snapshots={@throughput_snapshots}
+      />
 
       <.audio_outputs_card :if={map_size(@audio_outputs) > 0} outputs={@audio_outputs} />
     </div>
@@ -441,6 +462,7 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   # ── Connected hardware table ──────────────────────────────────────────
   attr(:ports, :list, required: true)
+  attr(:peripherals, :list, default: [])
   attr(:throughput_snapshots, :map, required: true)
 
   defp hardware_table(assigns) do
@@ -486,6 +508,10 @@ defmodule UniversalProxyWeb.OverviewLive do
             port={port}
             throughput_snapshots={@throughput_snapshots}
           />
+          <%!-- USB audio cards + USB Bluetooth radios: claimed automatically
+               by their built-in service, so they appear here but route to
+               the managing tab on click instead of the port drawer. --%>
+          <.peripheral_row :for={p <- @peripherals} p={p} />
         </tbody>
       </table>
     </.card>
@@ -544,6 +570,61 @@ defmodule UniversalProxyWeb.OverviewLive do
       </td>
       <td class="px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle">
         <.badge variant={@status.variant} dot>{@status.label}</.badge>
+      </td>
+    </tr>
+    """
+  end
+
+  # ── Peripheral row (USB sound card / USB Bluetooth radio) ─────────────
+  # Same six-column shape as a port row, but the whole row navigates to
+  # the managing tab (these devices are claimed by a built-in service, not
+  # configured here). No throughput sparkline — neither service exposes a
+  # per-device byte rate.
+  attr(:p, :map, required: true)
+
+  defp peripheral_row(assigns) do
+    ~H"""
+    <tr
+      class="cursor-pointer hover:bg-sunken last:[&_td]:border-b-0"
+      phx-click="goto_tab"
+      phx-value-path={@p.tab}
+    >
+      <td class="px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle">
+        <div class="text-xs font-semibold text-fg-2 tracking-wide">{@p.type_label}</div>
+        <div class="font-mono text-[11px] text-fg-3 mt-0.5">{@p.sub}</div>
+      </td>
+      <td class="px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle">
+        <div class="flex items-center gap-3">
+          <div class={["w-8 h-8 rounded-sm flex items-center justify-center flex-none", @p.soft_class]}>
+            <.port_glyph kind={@p.kind} size={18} />
+          </div>
+          <div class="min-w-0">
+            <div class="text-base font-medium text-fg-1 truncate">{@p.name}</div>
+            <div class="text-sm text-fg-3 mt-px">{@p.detail}</div>
+          </div>
+        </div>
+      </td>
+      <td class="px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle">
+        <div class="flex items-center gap-2">
+          <span class={["w-1.5 h-1.5 rounded-full flex-none", @p.dot_class]}></span>
+          <span class="text-sm text-fg-1">{@p.type_label}</span>
+        </div>
+      </td>
+      <td class="px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle">
+        <.link
+          navigate={@p.tab}
+          phx-click="ignore"
+          onclick="event.stopPropagation()"
+          class="text-accent text-base no-underline"
+        >
+          {@p.managed_by}
+        </.link>
+      </td>
+      <td class="px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle">
+        <span class="text-fg-4 text-base">—</span>
+      </td>
+      <td class="px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle">
+        <.badge variant={@p.status.variant} dot>{@p.status.label}</.badge>
       </td>
     </tr>
     """
@@ -790,6 +871,80 @@ defmodule UniversalProxyWeb.OverviewLive do
       ] ++ if port.notes, do: [{"Notes", port.notes, false}], else: []
 
     base ++ serial ++ tail
+  end
+
+  # ── Peripheral rows: USB audio cards + USB Bluetooth radios ───────────
+  # Only USB-attached devices belong in the physical hardware list —
+  # onboard SoC audio (nil vid/pid) and the onboard UART Bluetooth radio
+  # live in their own tabs, not on a USB slot. Audio first, then
+  # Bluetooth, each alphabetised, so ordering is stable across renders.
+  defp peripherals(audio_outputs, bt_radios) do
+    usb_audio_peripherals(audio_outputs) ++ usb_bt_peripherals(bt_radios)
+  end
+
+  defp usb_audio_peripherals(audio_outputs) do
+    audio_outputs
+    |> Map.values()
+    |> Enum.filter(&usb_audio?/1)
+    |> Enum.sort_by(& &1.friendly_name)
+    |> Enum.map(fn out ->
+      status = audio_status(out)
+
+      %{
+        kind: :audio,
+        type_label: "Sound card",
+        name: out.friendly_name,
+        detail: out.card_name,
+        sub: out.alsa_device,
+        managed_by: "Sendspin",
+        tab: "/audio",
+        status: status,
+        soft_class: "bg-audio-soft text-audio",
+        dot_class: "bg-audio"
+      }
+    end)
+  end
+
+  # USB audio outputs carry a real {vid, pid} in their key; onboard SoC
+  # cards key as {card_name, nil, nil}.
+  defp usb_audio?(%{key: {_slot_sub, vid, pid}}) when is_integer(vid) and is_integer(pid),
+    do: true
+
+  defp usb_audio?(_), do: false
+
+  defp usb_bt_peripherals(bt_radios) do
+    bt_radios
+    |> Enum.filter(&(&1.bus == :usb))
+    |> Enum.sort_by(& &1.hci)
+    |> Enum.map(fn radio ->
+      %{
+        kind: :bluetooth,
+        type_label: "Bluetooth",
+        name: bt_radio_name(radio),
+        detail: bt_radio_detail(radio),
+        sub: radio.hci,
+        managed_by: "Bluetooth proxy",
+        tab: "/bluetooth",
+        status:
+          if(radio.in_use?,
+            do: %{label: "In use", variant: :success},
+            else: %{label: "Idle", variant: :warning}
+          ),
+        soft_class: "bg-accent-soft text-accent",
+        dot_class: "bg-accent"
+      }
+    end)
+  end
+
+  defp bt_radio_name(%{name: name}) when is_binary(name) and name != "", do: name
+  defp bt_radio_name(_), do: "USB Bluetooth adapter"
+
+  # "Realtek RTL8761B · USB 2.0 · port 1-1.2" — chip + bus detail, each
+  # dropped when unknown so the line never reads "Unknown · …".
+  defp bt_radio_detail(radio) do
+    [radio[:chip], radio[:detail]]
+    |> Enum.reject(&(&1 in [nil, "", "Unknown"]))
+    |> Enum.join(" · ")
   end
 
   # ── Audio outputs summary (links to /audio) ───────────────────────────

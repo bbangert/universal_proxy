@@ -40,6 +40,14 @@ defmodule UniversalProxyWeb.RenderSmokeTest do
     assert html =~ "No audio outputs detected"
   end
 
+  test "Bluetooth tab renders", %{conn: conn} do
+    {:ok, _view, html} = live(conn, "/bluetooth")
+    assert html =~ "Bluetooth proxy"
+    # Non-BT host target → subsystem down → disabled status + empty radios.
+    assert html =~ "Off"
+    assert html =~ "No Bluetooth radios found"
+  end
+
   test "Security tab renders (off by default)", %{conn: conn} do
     {:ok, _view, html} = live(conn, "/security")
     assert html =~ "API encryption"

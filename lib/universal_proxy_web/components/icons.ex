@@ -191,6 +191,34 @@ defmodule UniversalProxyWeb.Components.Icons do
     """
   end
 
+  defp paths(:bluetooth) do
+    assigns = %{}
+
+    ~H"""
+    <path d="M7 7l10 10-5 5V2l5 5L7 17" />
+    """
+  end
+
+  defp paths(:chip) do
+    assigns = %{}
+
+    ~H"""
+    <rect x="6" y="6" width="12" height="12" rx="2" />
+    <path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4" />
+    """
+  end
+
+  defp paths(:usb) do
+    assigns = %{}
+
+    ~H"""
+    <rect x="7" y="3" width="10" height="8" rx="1" />
+    <path d="M10 3v-1M14 3v-1" />
+    <path d="M9 11v4a3 3 0 0 0 3 3 3 3 0 0 0 3-3v-4" />
+    <path d="M12 18v4" />
+    """
+  end
+
   # Speaker glyph with mute slash + wave-count variants. Drawn here
   # rather than as a `paths/1` clause because the wave count depends
   # on volume level (0 → no waves, 1+ → one wave, 60+ → two waves),
@@ -302,6 +330,37 @@ defmodule UniversalProxyWeb.Components.Icons do
       stroke-width="1.6"
       stroke-linecap="round"
     />
+    """
+  end
+
+  defp kind_glyph(:bluetooth) do
+    assigns = %{}
+
+    ~H"""
+    <path
+      d="M7 7l10 10-5 5V2l5 5L7 17"
+      stroke="currentColor"
+      stroke-width="1.6"
+      fill="none"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    />
+    """
+  end
+
+  defp kind_glyph(:audio) do
+    assigns = %{}
+
+    ~H"""
+    <path
+      d="M3 9v6h3l5 4V5L6 9H3z"
+      stroke="currentColor"
+      stroke-width="1.6"
+      fill="none"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    />
+    <path d="M15 9a4 4 0 0 1 0 6M18 6a8 8 0 0 1 0 12" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" />
     """
   end
 
