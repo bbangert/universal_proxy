@@ -6,11 +6,21 @@ defmodule UniversalProxy.Bluetooth.RadioMonitor do
   plus an `in_use?` mark on the radio the BlueZ subtree is driving
   (selected/claimed — independent of the HA-facing `enabled` toggle).
 
-  Polls every 5 s — the same hotplug strategy as the Audio subsystem's
-  output enumeration — and broadcasts `{:bluetooth_radios, radios}` on
-  `UniversalProxy.Bluetooth.radios_topic()` whenever the list changes.
-  `refresh/1` re-enumerates immediately (the UI's Rescan button and the
-  radio-selection flow).
+  ## Event-driven, not polled
+
+  The radio set only changes on discrete events, so this re-enumerates on
+  those rather than on a timer (an SoC radio is soldered in; USB dongles
+  announce themselves). The trigger is
+  `UniversalProxy.Bluez.Client.adapters_topic/0`, on which the Client
+  broadcasts `{:bluetooth_adapters_changed}` when it claims an adapter at
+  setup (boot, and after a radio-switch restart) and on every adapter
+  `InterfacesAdded`/`InterfacesRemoved` (hotplug). Subscribing before the
+  first enumeration closes the lost-edge race if a claim lands during init.
+  `refresh/1` re-enumerates on demand (the UI's Rescan button), the manual
+  escape hatch if an event is ever missed.
+
+  Broadcasts `{:bluetooth_radios, radios}` on
+  `UniversalProxy.Bluetooth.radios_topic/0` whenever the list changes.
 
   Runs even while Bluetooth is disabled: the tab must list radios to pick
   *before* the stack is enabled. Every external source is read
@@ -19,17 +29,17 @@ defmodule UniversalProxy.Bluetooth.RadioMonitor do
 
   ## Options (host-testability)
 
-  `:name`, `:sysfs_root`, `:pubsub`, `:poll_ms`, plus the
-  `:adapters_info_fun` injection point (defaults to
-  `UniversalProxy.Bluez.Client.adapters_info/0`).
+  `:name`, `:sysfs_root`, `:pubsub`, plus the `:adapters_info_fun`
+  injection point (defaults to
+  `UniversalProxy.Bluez.Client.adapters_info/0`). Tests drive a
+  re-enumeration by broadcasting `{:bluetooth_adapters_changed}` on
+  `UniversalProxy.Bluez.Client.adapters_topic/0`.
   """
 
   use GenServer
 
   alias UniversalProxy.Bluetooth.Radios
-  alias UniversalProxy.Bluez.DevicePath
-
-  @poll_ms 5_000
+  alias UniversalProxy.Bluez.{Client, DevicePath}
 
   def start_link(opts \\ []) do
     gen_opts =
@@ -42,7 +52,7 @@ defmodule UniversalProxy.Bluetooth.RadioMonitor do
   end
 
   @doc """
-  The current radio list (cached from the last poll/refresh):
+  The current radio list (cached from the last enumeration):
 
       [%{hci:, address:, name:, chip:, bus:, detail:, bt_version:,
          ble?:, bredr?:, in_use?:}]
@@ -63,21 +73,20 @@ defmodule UniversalProxy.Bluetooth.RadioMonitor do
     state = %{
       sysfs_root: Keyword.get(opts, :sysfs_root, "/sys/class/bluetooth"),
       pubsub: Keyword.get(opts, :pubsub, UniversalProxy.PubSub),
-      poll_ms: Keyword.get(opts, :poll_ms, @poll_ms),
       adapters_info_fun:
         Keyword.get(opts, :adapters_info_fun, &UniversalProxy.Bluez.Client.adapters_info/0),
       radios: []
     }
 
-    {:ok, state, {:continue, :first_poll}}
+    # Subscribe BEFORE the first enumerate so a claim landing in between
+    # still triggers a re-enumerate (no lost-edge race).
+    Phoenix.PubSub.subscribe(state.pubsub, Client.adapters_topic())
+
+    {:ok, state, {:continue, :enumerate}}
   end
 
   @impl GenServer
-  def handle_continue(:first_poll, state) do
-    state = poll(state)
-    schedule(state)
-    {:noreply, state}
-  end
+  def handle_continue(:enumerate, state), do: {:noreply, poll(state)}
 
   @impl GenServer
   def handle_call(:list, _from, state), do: {:reply, state.radios, state}
@@ -88,11 +97,9 @@ defmodule UniversalProxy.Bluetooth.RadioMonitor do
   end
 
   @impl GenServer
-  def handle_info(:poll, state) do
-    state = poll(state)
-    schedule(state)
-    {:noreply, state}
-  end
+  # The adapter set changed (claim at setup, hotplug add/remove) — the only
+  # thing that moves the radio list. Re-enumerate.
+  def handle_info({:bluetooth_adapters_changed}, state), do: {:noreply, poll(state)}
 
   def handle_info(_other, state), do: {:noreply, state}
 
@@ -137,6 +144,4 @@ defmodule UniversalProxy.Bluetooth.RadioMonitor do
   end
 
   defp by_hci(_), do: %{}
-
-  defp schedule(state), do: Process.send_after(self(), :poll, state.poll_ms)
 end

@@ -3,7 +3,7 @@ defmodule UniversalProxy.Bluetooth.RadioMonitorTest do
   use ExUnit.Case, async: false
 
   alias UniversalProxy.Bluetooth.RadioMonitor
-  alias UniversalProxy.Bluez.DevicePath
+  alias UniversalProxy.Bluez.{Client, DevicePath}
 
   @pubsub UniversalProxy.PubSub
 
@@ -42,23 +42,28 @@ defmodule UniversalProxy.Bluetooth.RadioMonitorTest do
   defp start_monitor(ctx, opts \\ []) do
     # Per-test overrides FIRST — Keyword.get takes the first match.
     monitor =
-      start_supervised!({RadioMonitor,
-       opts ++
-         [
-           name: nil,
-           sysfs_root: ctx.root,
-           pubsub: @pubsub,
-           # Long enough that tests drive refresh explicitly unless they
-           # opt into a fast poll.
-           poll_ms: 60_000,
-           adapters_info_fun: fn ->
-             [%{path: "/org/bluez/hci0", address: @pi_mac, name: "raspberrypi", powered: true}]
-           end
-         ]})
+      start_supervised!(
+        {RadioMonitor,
+         opts ++
+           [
+             name: nil,
+             sysfs_root: ctx.root,
+             pubsub: @pubsub,
+             adapters_info_fun: fn ->
+               [%{path: "/org/bluez/hci0", address: @pi_mac, name: "raspberrypi", powered: true}]
+             end
+           ]}
+      )
 
     # init's first enumeration runs in handle_continue — synchronize.
     _ = RadioMonitor.list(monitor)
     monitor
+  end
+
+  # Simulate the Bluez.Client adapter-change broadcast that drives a
+  # re-enumeration (claim at setup, or a hotplug InterfacesAdded/Removed).
+  defp signal_adapters_changed do
+    Phoenix.PubSub.broadcast(@pubsub, Client.adapters_topic(), {:bluetooth_adapters_changed})
   end
 
   test "list/1 overlays the live Adapter1 name and marks the radio in use", ctx do
@@ -110,11 +115,14 @@ defmodule UniversalProxy.Bluetooth.RadioMonitorTest do
     assert_receive {:bluetooth_radios, [_, %{hci: "hci1"}]}
   end
 
-  test "the poll picks up hotplug without an explicit refresh", ctx do
-    monitor = start_monitor(ctx, poll_ms: 50)
+  test "an adapter-change signal re-enumerates without an explicit refresh", ctx do
+    monitor = start_monitor(ctx)
     assert_receive {:bluetooth_radios, [%{hci: "hci0"}]}
 
+    # A dongle appears and the Client broadcasts the adapter-change event;
+    # RadioMonitor re-enumerates and broadcasts the new list — no poll.
     add_uart_radio(ctx.root, "hci1", @dongle_mac)
+    signal_adapters_changed()
 
     assert_receive {:bluetooth_radios, [_, %{hci: "hci1"}]}, 1_000
     assert [_, %{hci: "hci1"}] = RadioMonitor.list(monitor)
