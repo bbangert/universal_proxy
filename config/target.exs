@@ -16,8 +16,13 @@ config :universal_proxy, UniversalProxyWeb.Endpoint,
 # Use Ringlogger as the logger backend and remove :console.
 # See https://hexdocs.pm/ring_logger/readme.html for more information on
 # configuring ring_logger.
-
-config :logger, backends: [RingLogger]
+#
+# Default to :info. Nerves firmware builds in MIX_ENV=dev, where the
+# Logger level would otherwise default to :debug — capturing very chatty
+# debug output (notably espex's per-advertisement logging) into the ring
+# buffer by default. Bump to :debug at runtime when troubleshooting via
+# `Logger.configure(level: :debug)` or `RingLogger`.
+config :logger, level: :info, backends: [RingLogger]
 
 # Use shoehorn to start the main application. See the shoehorn
 # library documentation for more control in ordering how OTP

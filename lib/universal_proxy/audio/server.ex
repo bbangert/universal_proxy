@@ -3,9 +3,11 @@ defmodule UniversalProxy.Audio.Server do
   Tracks the live set of ALSA outputs and brokers state changes
   between hardware, DETS, and the rest of the system.
 
-  Polls `Audio.Enumerate.safe/0` every 5 s — same cadence and
-  rationale as `UniversalProxy.UART.Server`. Whenever the enumerated
-  set diverges from the in-memory cache the server:
+  Re-enumerates `Audio.Enumerate.safe/0` on `sound`-subsystem kernel
+  uevents (via `NervesUEvent`, debounced) — falling back to a 5 s poll
+  only on host/dev where uevents aren't available. Either way an initial
+  enumeration runs at boot. Whenever the enumerated set diverges from the
+  in-memory cache the server:
 
     * ensures a DETS row exists for new outputs (default `enabled =
       true`, `volume = 50`, `muted = false`, fresh `client_id`),
@@ -49,6 +51,10 @@ defmodule UniversalProxy.Audio.Server do
 
   @pubsub UniversalProxy.PubSub
   @hotplug_interval 5_000
+  # Delay between a `sound` uevent and the re-enumeration it triggers:
+  # gives ALSA a beat to finish creating the card's sub-devices, and
+  # coalesces the burst of uevents one card emits into a single check.
+  @hotplug_debounce_ms 1_000
   @mdns_port_base 8928
   # Service types we always publish — used at boot to send a
   # pre-emptive TTL=0 PTR goodbye so peers like Music Assistant's
@@ -181,7 +187,11 @@ defmodule UniversalProxy.Audio.Server do
       # %{key => %{connection: :connected | :disconnected | :unknown,
       #            stream: %{codec, sample_rate, bit_depth, channels} | nil,
       #            last_error: String.t() | nil}}
-      connection_state: %{}
+      connection_state: %{},
+      # Debounce flag: a `sound` uevent schedules one delayed
+      # `:check_hotplug` and sets this; the burst of sub-device uevents a
+      # single card emits then coalesces into that one re-enumeration.
+      hotplug_pending: false
     }
 
     # Subscribe to our own state topic so binary-emitted volume/mute
@@ -214,13 +224,20 @@ defmodule UniversalProxy.Audio.Server do
     # a fresh `Added` event on peers instead of a silent refresh.
     send_preemptive_goodbyes(state)
 
-    # Start the timer AFTER state is built so a future failure between
-    # the two doesn't leak a timer pointing at a soon-to-be-dead PID.
-    # The immediate `send(self(), :check_hotplug)` makes the first
-    # poll fire on boot rather than after `interval` ms — Phase 4's
-    # LiveView would otherwise show an empty `/audio` page for 5 s.
-    if timer? and is_integer(interval) and interval > 0 do
-      :timer.send_interval(interval, self(), :check_hotplug)
+    # Hotplug detection. ALSA cards change only on discrete events, so
+    # prefer kernel uevents over a timer: subscribe to `NervesUEvent` and
+    # re-enumerate on `sound`-subsystem changes (debounced). Only when
+    # uevents aren't available (host/dev — `nerves_uevent` runs on Nerves
+    # targets only) do we fall back to the periodic `interval` poll. Either
+    # way the immediate `:check_hotplug` enumerates once at boot so the
+    # `/audio` page isn't empty until the first event. `start_timer: false`
+    # (tests) disables both; they drive enumeration via `check_now/1`.
+    if timer? do
+      unless subscribe_uevents() do
+        if is_integer(interval) and interval > 0,
+          do: :timer.send_interval(interval, self(), :check_hotplug)
+      end
+
       send(self(), :check_hotplug)
     end
 
@@ -327,7 +344,20 @@ defmodule UniversalProxy.Audio.Server do
 
   @impl true
   def handle_info(:check_hotplug, state) do
-    {:noreply, refresh_outputs(state)}
+    {:noreply, refresh_outputs(%{state | hotplug_pending: false})}
+  end
+
+  # Kernel uevent (via NervesUEvent's PropertyTable). Only `sound`-subsystem
+  # changes can move the ALSA output set; everything else is ignored.
+  # Debounced through `hotplug_pending` so one card's burst of sub-device
+  # uevents triggers a single re-enumeration.
+  def handle_info(%PropertyTable.Event{property: path}, state) do
+    if "sound" in path and not state.hotplug_pending do
+      Process.send_after(self(), :check_hotplug, @hotplug_debounce_ms)
+      {:noreply, %{state | hotplug_pending: true}}
+    else
+      {:noreply, state}
+    end
   end
 
   # Binary-emitted volume/mute events flow back through PubSub. Persist
@@ -415,6 +445,27 @@ defmodule UniversalProxy.Audio.Server do
   def handle_info(_msg, state), do: {:noreply, state}
 
   # -- Private --
+
+  # Subscribe to kernel uevents (all `devices`; `handle_info` filters for
+  # the `sound` subsystem). Returns false when `nerves_uevent` isn't
+  # running (host/dev) so the caller falls back to a timer. The broad
+  # `["devices"]` pattern is a prefix match — the `sound` segment sits at a
+  # bus-dependent depth that a narrower pattern can't pin.
+  #
+  # The subscribe call itself is the readiness check (not a prior
+  # `Process.whereis`): if nerves_uevent hasn't started yet — e.g. this
+  # Server initialized before it on a cold boot — fall back to the timer
+  # for this incarnation, no whereis/subscribe TOCTOU race. An unstarted
+  # PropertyTable raises `ArgumentError` (unknown registry); a process
+  # that dies mid-call exits. Both mean "not available" → false.
+  defp subscribe_uevents do
+    NervesUEvent.subscribe(["devices"])
+    true
+  rescue
+    ArgumentError -> false
+  catch
+    :exit, _ -> false
+  end
 
   defp refresh_outputs(state) do
     enumerated = state.enumerate_module.safe()

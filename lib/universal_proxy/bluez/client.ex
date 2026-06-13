@@ -101,6 +101,13 @@ defmodule UniversalProxy.Bluez.Client do
   # restarts (within a boot) so re-init re-engages what HA chose.
   @mode_key {__MODULE__, :configured_mode}
 
+  # PubSub topic carrying `{:bluetooth_adapters_changed}` whenever the set
+  # of org.bluez adapters changes (claim at setup, hotplug add/remove).
+  # `UniversalProxy.Bluetooth.RadioMonitor` subscribes and re-enumerates —
+  # this is the event source that replaced its periodic poll. Owned here
+  # (the broadcaster) so the Bluez layer carries no upward dependency.
+  @adapters_topic "bluetooth:adapters"
+
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
@@ -130,6 +137,10 @@ defmodule UniversalProxy.Bluez.Client do
   """
   @spec configured_mode() :: :passive | :active
   def configured_mode, do: :persistent_term.get(@mode_key, :passive)
+
+  @doc "PubSub topic carrying `{:bluetooth_adapters_changed}` on adapter add/remove."
+  @spec adapters_topic() :: String.t()
+  def adapters_topic, do: @adapters_topic
 
   @doc """
   `org.bluez.Adapter1` properties for every adapter object the daemon
@@ -190,7 +201,12 @@ defmodule UniversalProxy.Bluez.Client do
           # pending = one-slot queue parked behind it: {target, [from]} —
           # same-target callers coalesce, a new target displaces them.
           transition: nil,
-          pending: nil
+          pending: nil,
+          # Set of org.bluez adapter object paths ("/org/bluez/hciN"),
+          # seeded at setup and maintained from InterfacesAdded/Removed.
+          # `adapters_info/0` does a cheap per-path GetAll over this set
+          # instead of a whole-tree GetManagedObjects.
+          adapters: MapSet.new()
         }
 
         {:ok, state, {:continue, {:setup, @setup_retries}}}
@@ -205,7 +221,7 @@ defmodule UniversalProxy.Bluez.Client do
 
   @impl GenServer
   def handle_call(:adapters_info, _from, state) do
-    {:reply, adapter_objects(state.conn), state}
+    {:reply, adapter_props_for(state.conn, state.adapters), state}
   end
 
   def handle_call({:devices_seen, window_ms}, _from, state) do
@@ -300,10 +316,33 @@ defmodule UniversalProxy.Bluez.Client do
   # ── setup ────────────────────────────────────────────────────────────────
 
   defp attempt_setup(state, retries) do
-    cond do
-      claim_adapter(state.conn) ->
+    case discover_adapters(state.conn) do
+      [] when retries > 0 ->
+        Process.send_after(self(), {:setup_retry, retries - 1}, @setup_retry_ms)
+        {:noreply, state}
+
+      [] ->
+        # No controllers at all — don't log adapter_path()/the resolved
+        # path here: it's a persistent_term that defaults to hci0 (or a
+        # previously-selected radio) and would misrepresent the failure.
+        # Report the absence + the desired radio for context.
+        Logger.error(
+          "Bluez.Client: no Bluetooth adapter appeared on org.bluez " <>
+            "(desired: #{DevicePath.desired_adapter() || "auto"})"
+        )
+
+        {:stop, :no_adapter, state}
+
+      adapters ->
+        claim_adapter(adapters)
+        state = %{state | adapters: MapSet.new(adapters, & &1.path)}
         power_on(state.conn)
         state = seed_existing(state)
+        # Tell RadioMonitor the adapter set is live (its identity is now
+        # readable). This is the boot/claim edge of the event stream that
+        # replaced its poll; hotplug edges come from InterfacesAdded/Removed.
+        broadcast_adapters_changed()
+
         # An early set_mode/1 may already have a transition in flight (its
         # D-Bus calls work as soon as the adapter answers) — don't race it;
         # it engages the caller's mode and run_pending takes over from there.
@@ -313,14 +352,6 @@ defmodule UniversalProxy.Bluez.Client do
             else: state
 
         {:noreply, state}
-
-      retries > 0 ->
-        Process.send_after(self(), {:setup_retry, retries - 1}, @setup_retry_ms)
-        {:noreply, state}
-
-      true ->
-        Logger.error("Bluez.Client: #{adapter_path()} never appeared on org.bluez")
-        {:stop, :no_adapter, state}
     end
   end
 
@@ -551,12 +582,29 @@ defmodule UniversalProxy.Bluez.Client do
        ) do
     [path, interfaces] = body
 
-    with true <- String.starts_with?(path, adapter_path() <> "/dev_"),
-         {_iface, props_list} <- List.keyfind(interfaces, @device_iface, 0) do
-      ingest(state, path, Variant.unwrap_props(props_list))
-    else
-      # Not a Device1 under our adapter — ignore (matches PropertiesChanged).
-      _ -> state
+    cond do
+      # A new adapter object (e.g. a USB dongle hot-plugged) — track it and
+      # tell RadioMonitor. This is the hotplug edge that replaced its poll.
+      # Update the set BEFORE broadcasting: RadioMonitor's adapters_info/0 is
+      # a GenServer.call back into us, so it can't run until this handler
+      # returns anyway, but committing first keeps the ordering obvious.
+      List.keyfind(interfaces, @adapter_iface, 0) != nil ->
+        if MapSet.member?(state.adapters, path) do
+          state
+        else
+          state = %{state | adapters: MapSet.put(state.adapters, path)}
+          broadcast_adapters_changed()
+          state
+        end
+
+      String.starts_with?(path, adapter_path() <> "/dev_") ->
+        case List.keyfind(interfaces, @device_iface, 0) do
+          {_iface, props_list} -> ingest(state, path, Variant.unwrap_props(props_list))
+          nil -> state
+        end
+
+      true ->
+        state
     end
   rescue
     e ->
@@ -586,6 +634,22 @@ defmodule UniversalProxy.Bluez.Client do
          state
        ) do
     case body do
+      [path, ifaces] when is_list(ifaces) ->
+        cond do
+          # An adapter went away (dongle unplugged) — untrack + notify
+          # (set committed before the broadcast, as in InterfacesAdded).
+          @adapter_iface in ifaces and MapSet.member?(state.adapters, path) ->
+            state = %{state | adapters: MapSet.delete(state.adapters, path)}
+            broadcast_adapters_changed()
+            state
+
+          String.starts_with?(path, adapter_path() <> "/dev_") ->
+            %{state | cache: DeviceCache.remove(state.cache, path)}
+
+          true ->
+            state
+        end
+
       [path | _] ->
         if String.starts_with?(path, adapter_path() <> "/dev_"),
           do: %{state | cache: DeviceCache.remove(state.cache, path)},
@@ -629,29 +693,21 @@ defmodule UniversalProxy.Bluez.Client do
     Enum.each(rules, &DBus.add_match(conn, &1))
   end
 
-  # Resolve which adapter this subtree drives and publish its object path.
-  # The kernel exposes no BT MAC in sysfs, so the user-selected MAC
-  # (DevicePath.desired_adapter/0, written by Bluetooth.Manager before the
-  # subtree started) can only be matched here, against bluetoothd's
-  # Adapter1 objects: the desired MAC's adapter if present, else the
-  # lowest-index one (auto/onboard). Returns false while bluetoothd has no
-  # adapter yet (setup retries).
-  defp claim_adapter(conn) do
-    case adapter_objects(conn) do
-      [] ->
-        false
+  # Resolve which of the discovered adapters this subtree drives and publish
+  # its object path. The kernel exposes no BT MAC in sysfs, so the
+  # user-selected MAC (DevicePath.desired_adapter/0, written by
+  # Bluetooth.Manager before the subtree started) can only be matched here,
+  # against bluetoothd's Adapter1 objects: the desired MAC's adapter if
+  # present, else the lowest-index one (auto/onboard).
+  defp claim_adapter(adapters) do
+    desired = DevicePath.desired_adapter()
 
-      adapters ->
-        desired = DevicePath.desired_adapter()
+    chosen =
+      Enum.find(adapters, fn %{address: address} -> address == desired end) ||
+        fallback_adapter(adapters, desired)
 
-        chosen =
-          Enum.find(adapters, fn %{address: address} -> address == desired end) ||
-            fallback_adapter(adapters, desired)
-
-        :persistent_term.put(DevicePath.adapter_path_key(), chosen.path)
-        Logger.info("Bluez.Client: driving #{chosen.path} (#{chosen.address})")
-        true
-    end
+    :persistent_term.put(DevicePath.adapter_path_key(), chosen.path)
+    Logger.info("Bluez.Client: driving #{chosen.path} (#{chosen.address})")
   end
 
   defp fallback_adapter(adapters, desired) do
@@ -669,8 +725,12 @@ defmodule UniversalProxy.Bluez.Client do
     end
   end
 
-  # All org.bluez Adapter1 objects with their identity props.
-  defp adapter_objects(conn) do
+  # All org.bluez Adapter1 objects, discovered from the full object tree.
+  # GetManagedObjects is expensive (whole tree, scales with discovered BLE
+  # devices) — called only at setup (including each retry while waiting for
+  # an adapter to appear), never on the steady-state path. The steady
+  # `adapters_info/0` reads `adapter_props_for/2` (per-path GetAll) instead.
+  defp discover_adapters(conn) do
     case get_managed_objects(conn) do
       {:ok, objects} ->
         for {path, ifaces} <- objects,
@@ -688,6 +748,35 @@ defmodule UniversalProxy.Bluez.Client do
       {:error, _} ->
         []
     end
+  end
+
+  # Cheap identity read for the tracked adapter paths: one small
+  # `Properties.GetAll(Adapter1)` per adapter (1-2 objects) rather than the
+  # whole org.bluez tree. Dropped silently if an adapter vanished between
+  # the signal and this call.
+  defp adapter_props_for(conn, paths) do
+    for path <- paths, {:ok, [props]} <- [adapter_get_all(conn, path)] do
+      unwrapped = Variant.unwrap_props(props)
+
+      %{
+        path: path,
+        address: unwrapped["Address"],
+        name: unwrapped["Name"],
+        powered: unwrapped["Powered"] == true
+      }
+    end
+  end
+
+  defp adapter_get_all(conn, path) do
+    call(conn, path, @props_iface, "GetAll", "s", [@adapter_iface])
+  end
+
+  defp broadcast_adapters_changed do
+    Phoenix.PubSub.broadcast(
+      UniversalProxy.PubSub,
+      @adapters_topic,
+      {:bluetooth_adapters_changed}
+    )
   end
 
   # Power the claimed adapter on — required to scan through it. Other

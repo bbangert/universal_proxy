@@ -320,6 +320,34 @@ defmodule UniversalProxy.Audio.ServerTest do
     end
   end
 
+  describe "uevent-driven hotplug" do
+    # A `sound`-subsystem kernel uevent triggers a (debounced) re-enumerate
+    # exactly like `check_now`, replacing the old 5s poll. Non-`sound`
+    # uevents are ignored so unrelated device churn never wakes a refresh.
+    test "a sound uevent re-enumerates; an unrelated uevent does not", %{server: server} do
+      EnumerateStub.set(%{
+        @hp_key => %{card_index: 0, alsa_device: "plughw:0,0", card_name: "bcm2835 Headphones"}
+      })
+
+      # Unrelated subsystem → ignored, no enumeration.
+      send(server, %PropertyTable.Event{
+        property: ["devices", "platform", "soc", "3f980000.usb", "usb1", "1-1"],
+        value: %{}
+      })
+
+      refute_receive {:sendspin_output_added, _}, 200
+
+      # Sound subsystem → debounced re-enumerate picks up the new card.
+      send(server, %PropertyTable.Event{
+        property: ["devices", "platform", "soc", "sound", "card0"],
+        value: %{}
+      })
+
+      # Debounce is 1s; give the scheduled re-enumerate margin past it.
+      assert_receive {:sendspin_output_added, %{key: @hp_key}}, 2_000
+    end
+  end
+
   describe "list_outputs/1 + get_output/2" do
     test "returns merged maps sorted by friendly_name", %{server: server} do
       EnumerateStub.set(%{
