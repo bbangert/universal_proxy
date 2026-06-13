@@ -14,9 +14,17 @@ controller is supported as a **Z-Wave proxy**. The proxy speaks the Z-Wave
 Serial API protocol locally, handling latency-sensitive ACK/NAK/CAN responses at
 the device while forwarding complete frames to Home Assistant over the network.
 
+The device also acts as a **Bluetooth proxy**: it relays nearby Bluetooth Low
+Energy advertisements to Home Assistant over the ESPHome Native API (the same
+model as ESPHome's `bluetooth_proxy` component), with optional active
+connections so Home Assistant can reach BLE sensors, trackers, and locks that
+are out of range of its own radio. On boards with more than one Bluetooth radio
+(the onboard SoC radio plus any USB adapters), the bound radio is selectable
+from the web UI.
+
 This is useful for connecting RS-232, RS-485, TTL serial, or Z-Wave devices to
-Home Assistant over the network without needing a dedicated ESPHome
-microcontroller for each one.
+Home Assistant over the network -- and for extending Home Assistant's Bluetooth
+range -- without needing a dedicated ESPHome microcontroller for each one.
 
 ## Features
 
@@ -25,6 +33,10 @@ microcontroller for each one.
 - Serial proxy for TTL, RS-232, and RS-485 USB adapters
 - Z-Wave proxy for USB Z-Wave controllers with local ACK handling
 - Auto-detection for IRDroid / IR Toy USB infrared devices (VID `0x04D8`, PID `0xFD08`/`0xF58B`)
+- **Bluetooth proxy** -- relays BLE advertisements to Home Assistant over the
+  ESPHome Native API (passive scanning plus optional active GATT connections),
+  driven by the on-device BlueZ stack. The web UI shows live stats and lets you
+  pick which radio (onboard or USB) is bound. BT-capable Pi targets only.
 - **Sendspin audio playback** -- each ALSA output is exposed as an
   independently discoverable [Sendspin](https://github.com/Sendspin/sendspin-cpp)
   player for synchronized multi-room audio. See
@@ -178,10 +190,17 @@ The devcontainer is preconfigured with `MIX_TARGET=rpi3`. Change this in
 lib/
   universal_proxy/
     uart/                  # UART subsystem (Server, Store, PortConfig, Supervisor)
-    esphome/               # ESPHome Native API (Server, Connection, Protocol, Supervisor)
-      zwave/               # Z-Wave proxy (Frame, Parser, Server)
+    bluetooth/             # Bluetooth lifecycle: Settings, Manager, RadioMonitor, Stats, Radios
+    bluez/                 # BlueZ/D-Bus stack: Client (scanner), Gatt, Agent, DeviceCache
+    audio/                 # Sendspin audio: Enumerate, per-output Server/Store, Player
+    firmware_update/       # In-app firmware update flow
+    esphome/               # ESPHome Native API adapters + Supervisor
+      serial_proxy/        # Serial proxy
+      zwave_proxy/         # Z-Wave proxy
+      infrared/            # IR proxy
   universal_proxy_web/
-    live/                  # Phoenix LiveView pages (Home, Connected Devices, ESPHome Config)
+    live/                  # Phoenix LiveView pages: Overview, Traffic, Audio,
+                           #   Bluetooth, Discovery, Security, System
 priv/
   protos/                  # ESPHome protobuf definitions (api.proto, api_options.proto)
   static/                  # Static web assets
@@ -216,18 +235,31 @@ This is also run automatically as part of `mix compile`.
 
 ### Building firmware
 
+The repo drives builds through [mise](https://mise.jdx.dev/) tasks (the
+devcontainer sets these up). Build for a target with:
+
 ```bash
-# Set your target board (already set in devcontainer)
-export MIX_TARGET=rpi3
-
-# Fetch dependencies
 mix deps.get
-
-# Build the firmware image
-mix firmware
+mise run firmware -- rpi3
 ```
 
+> The mise shell hook pins `MIX_TARGET`, so a bare `MIX_TARGET=rpi3 mix firmware`
+> is **silently overridden** -- always go through `mise run firmware`. The task
+> also pre-cleans stale per-target player binaries that would otherwise fail the
+> Nerves rootfs scrubber.
+
 The firmware file is written to `_build/rpi3_dev/nerves/images/universal_proxy.fw`.
+
+**If you changed anything in the web UI** (HEEx, Tailwind classes, JS), rebuild
+the assets first -- `mix firmware` packages whatever is already in
+`priv/static/`, so new Tailwind classes won't reach the served CSS otherwise:
+
+```bash
+mix assets.deploy && mise run firmware -- rpi3
+```
+
+Other mise tasks: `mise run test` (host test suite) and
+`mise run mix-for -- <target> <task>` (run an arbitrary mix task for a target).
 
 ### Writing to an SD card
 
@@ -259,8 +291,19 @@ The device will reboot with the new firmware automatically.
 ### Running tests
 
 ```bash
-# Tests run on the host target
-mix test
+mise run test                 # full host suite
+mise run test -- test/path_test.exs   # pass flags/paths through
+```
+
+> Tests run on the `host` target. A bare `MIX_TARGET=host mix test` is
+> overridden by the mise hook -- use `mise run test`.
+
+Dialyzer is a CI gate but runs **only** on the host target and isn't part of
+the test alias. Because of the `MIX_TARGET` pin above, reproduce it through a
+clean subshell:
+
+```bash
+mise exec -- sh -c 'MIX_TARGET=host MIX_ENV=dev mix dialyzer'
 ```
 
 ### Connecting to a running device
@@ -275,7 +318,8 @@ From the IEx shell, you can inspect the system, view logs, and interact with
 the application directly:
 
 ```elixir
-# View debug logs
+# View logs (device logs at :info by default;
+# Logger.configure(level: :debug) to see debug output)
 RingLogger.attach()
 
 # Enumerate serial devices
@@ -300,6 +344,12 @@ This project supports all standard Nerves targets:
 | `rpi5` | Raspberry Pi 5 |
 | `bbb`  | BeagleBone Black |
 | `x86_64` | Generic x86_64 |
+
+**Bluetooth** is available only on the Raspberry Pi targets that ship the
+custom BlueZ-enabled Nerves system -- `rpi0`, `rpi0_2`, `rpi3`, `rpi4`, and
+`rpi5`. Only `rpi3` is hardware-validated so far (`rpi4`/`rpi5` device trees
+are unverified). On every other target the Bluetooth subsystem is compiled out
+and the rest of the proxy runs normally.
 
 ## Learn more
 
