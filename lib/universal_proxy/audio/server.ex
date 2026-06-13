@@ -446,16 +446,23 @@ defmodule UniversalProxy.Audio.Server do
 
   # Subscribe to kernel uevents (all `devices`; `handle_info` filters for
   # the `sound` subsystem). Returns false when `nerves_uevent` isn't
-  # running (host/dev), so the caller can fall back to a timer. The broad
+  # running (host/dev) so the caller falls back to a timer. The broad
   # `["devices"]` pattern is a prefix match — the `sound` segment sits at a
   # bus-dependent depth that a narrower pattern can't pin.
+  #
+  # The subscribe call itself is the readiness check (not a prior
+  # `Process.whereis`): if nerves_uevent hasn't started yet — e.g. this
+  # Server initialized before it on a cold boot — fall back to the timer
+  # for this incarnation, no whereis/subscribe TOCTOU race. An unstarted
+  # PropertyTable raises `ArgumentError` (unknown registry); a process
+  # that dies mid-call exits. Both mean "not available" → false.
   defp subscribe_uevents do
-    if Process.whereis(NervesUEvent) do
-      NervesUEvent.subscribe(["devices"])
-      true
-    else
-      false
-    end
+    NervesUEvent.subscribe(["devices"])
+    true
+  rescue
+    ArgumentError -> false
+  catch
+    :exit, _ -> false
   end
 
   defp refresh_outputs(state) do

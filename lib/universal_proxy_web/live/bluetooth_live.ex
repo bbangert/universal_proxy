@@ -53,11 +53,22 @@ defmodule UniversalProxyWeb.BluetoothLive do
      |> assign(:busy, false)}
   end
 
+  # The mutating handlers below early-return while `busy`. The HTML
+  # `disabled` attribute already stops a normal browser from firing these,
+  # but a scripted websocket client could still send one mid-write — and
+  # every setter bounces espex, so this is the authoritative server-side
+  # guard against stacking restarts (the HTML disabled is only UX).
   @impl true
+  def handle_event("toggle_enabled", _params, %{assigns: %{busy: true}} = socket),
+    do: {:noreply, socket}
+
   def handle_event("toggle_enabled", _params, socket) do
     target = not socket.assigns.status.enabled
     {:noreply, run_setter(socket, fn -> Bluetooth.set_enabled(target) end)}
   end
+
+  def handle_event("toggle_active_connections", _params, %{assigns: %{busy: true}} = socket),
+    do: {:noreply, socket}
 
   def handle_event("toggle_active_connections", _params, socket) do
     status = socket.assigns.status
@@ -70,6 +81,9 @@ defmodule UniversalProxyWeb.BluetoothLive do
       {:noreply, socket}
     end
   end
+
+  def handle_event("select_radio", _params, %{assigns: %{busy: true}} = socket),
+    do: {:noreply, socket}
 
   def handle_event("select_radio", %{"mac" => mac}, socket) when is_binary(mac) do
     {:noreply, run_setter(socket, fn -> Bluetooth.select_radio(mac) end)}
@@ -243,11 +257,10 @@ defmodule UniversalProxyWeb.BluetoothLive do
 
         <.card :if={@radio_count > 0} padding={:none} class="overflow-hidden">
           <.bt_radio_row
-            :for={{radio, last?} <- with_last(@radios)}
+            :for={radio <- @radios}
             radio={radio}
             proxying?={@status.proxying?}
             busy={@busy}
-            last?={last?}
           />
         </.card>
 
@@ -278,14 +291,10 @@ defmodule UniversalProxyWeb.BluetoothLive do
   attr(:radio, :map, required: true)
   attr(:proxying?, :boolean, required: true)
   attr(:busy, :boolean, required: true)
-  attr(:last?, :boolean, required: true)
 
   defp bt_radio_row(assigns) do
     ~H"""
-    <div class={[
-      "flex items-center gap-3.5 p-[14px_18px]",
-      not @last? && "border-b border-border-2"
-    ]}>
+    <div class="flex items-center gap-3.5 p-[14px_18px] border-b border-border-2 last:border-b-0">
       <%!-- Bus tile --%>
       <div class={[
         "w-9 h-9 rounded-md flex items-center justify-center flex-none",
@@ -354,11 +363,4 @@ defmodule UniversalProxyWeb.BluetoothLive do
   defp radio_name(%{name: name}) when is_binary(name) and name != "", do: name
   defp radio_name(%{bus: :usb}), do: "USB Bluetooth adapter"
   defp radio_name(_), do: "Onboard radio"
-
-  defp with_last([]), do: []
-
-  defp with_last(xs) do
-    n = length(xs)
-    xs |> Enum.with_index() |> Enum.map(fn {x, i} -> {x, i == n - 1} end)
-  end
 end
