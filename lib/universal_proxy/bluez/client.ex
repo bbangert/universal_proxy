@@ -322,7 +322,15 @@ defmodule UniversalProxy.Bluez.Client do
         {:noreply, state}
 
       [] ->
-        Logger.error("Bluez.Client: #{adapter_path()} never appeared on org.bluez")
+        # No controllers at all — don't log adapter_path()/the resolved
+        # path here: it's a persistent_term that defaults to hci0 (or a
+        # previously-selected radio) and would misrepresent the failure.
+        # Report the absence + the desired radio for context.
+        Logger.error(
+          "Bluez.Client: no Bluetooth adapter appeared on org.bluez " <>
+            "(desired: #{DevicePath.desired_adapter() || "auto"})"
+        )
+
         {:stop, :no_adapter, state}
 
       adapters ->
