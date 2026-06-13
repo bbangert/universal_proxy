@@ -3,9 +3,11 @@ defmodule UniversalProxy.Audio.Server do
   Tracks the live set of ALSA outputs and brokers state changes
   between hardware, DETS, and the rest of the system.
 
-  Polls `Audio.Enumerate.safe/0` every 5 s — same cadence and
-  rationale as `UniversalProxy.UART.Server`. Whenever the enumerated
-  set diverges from the in-memory cache the server:
+  Re-enumerates `Audio.Enumerate.safe/0` on `sound`-subsystem kernel
+  uevents (via `NervesUEvent`, debounced) — falling back to a 5 s poll
+  only on host/dev where uevents aren't available. Either way an initial
+  enumeration runs at boot. Whenever the enumerated set diverges from the
+  in-memory cache the server:
 
     * ensures a DETS row exists for new outputs (default `enabled =
       true`, `volume = 50`, `muted = false`, fresh `client_id`),

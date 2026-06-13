@@ -577,12 +577,16 @@ defmodule UniversalProxy.Bluez.Client do
     cond do
       # A new adapter object (e.g. a USB dongle hot-plugged) — track it and
       # tell RadioMonitor. This is the hotplug edge that replaced its poll.
+      # Update the set BEFORE broadcasting: RadioMonitor's adapters_info/0 is
+      # a GenServer.call back into us, so it can't run until this handler
+      # returns anyway, but committing first keeps the ordering obvious.
       List.keyfind(interfaces, @adapter_iface, 0) != nil ->
         if MapSet.member?(state.adapters, path) do
           state
         else
+          state = %{state | adapters: MapSet.put(state.adapters, path)}
           broadcast_adapters_changed()
-          %{state | adapters: MapSet.put(state.adapters, path)}
+          state
         end
 
       String.starts_with?(path, adapter_path() <> "/dev_") ->
@@ -624,10 +628,12 @@ defmodule UniversalProxy.Bluez.Client do
     case body do
       [path, ifaces] when is_list(ifaces) ->
         cond do
-          # An adapter went away (dongle unplugged) — untrack + notify.
+          # An adapter went away (dongle unplugged) — untrack + notify
+          # (set committed before the broadcast, as in InterfacesAdded).
           @adapter_iface in ifaces and MapSet.member?(state.adapters, path) ->
+            state = %{state | adapters: MapSet.delete(state.adapters, path)}
             broadcast_adapters_changed()
-            %{state | adapters: MapSet.delete(state.adapters, path)}
+            state
 
           String.starts_with?(path, adapter_path() <> "/dev_") ->
             %{state | cache: DeviceCache.remove(state.cache, path)}
@@ -713,7 +719,8 @@ defmodule UniversalProxy.Bluez.Client do
 
   # All org.bluez Adapter1 objects, discovered from the full object tree.
   # GetManagedObjects is expensive (whole tree, scales with discovered BLE
-  # devices) — called ONCE at setup, never on the steady path. The steady
+  # devices) — called only at setup (including each retry while waiting for
+  # an adapter to appear), never on the steady-state path. The steady
   # `adapters_info/0` reads `adapter_props_for/2` (per-path GetAll) instead.
   defp discover_adapters(conn) do
     case get_managed_objects(conn) do
