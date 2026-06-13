@@ -66,6 +66,19 @@ defmodule UniversalProxy.Bluez.DeviceCache do
   def remove(%__MODULE__{} = cache, path), do: %{cache | devices: Map.delete(cache.devices, path)}
 
   @doc """
+  Distinct devices seen within the last `window_ms` of monotonic `now_ms` —
+  the web tab's "devices (15 min)" stat. A plain scan bounded by the LRU
+  cap, so it's cheap enough to run per stats tick.
+
+  Note the cap also bounds the answer: with > `#{@max_devices}` active
+  devices the count saturates at the cap (eviction forgets the oldest).
+  """
+  @spec seen_within(t(), integer(), pos_integer()) :: non_neg_integer()
+  def seen_within(%__MODULE__{devices: devices}, now_ms, window_ms) do
+    Enum.count(devices, fn {_path, entry} -> now_ms - entry.last_seen <= window_ms end)
+  end
+
+  @doc """
   Emit decision (pure). Emit on first sight (`last_raw == nil`), on a payload
   change, or once the heartbeat interval has elapsed.
   """

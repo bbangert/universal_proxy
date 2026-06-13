@@ -130,6 +130,12 @@ defmodule UniversalProxy.Bluez do
   @spec prepare_runtime() :: :ok
   def prepare_runtime do
     File.mkdir_p!(@run_dir)
+    # A previous incarnation's socket file survives its dbus-daemon
+    # (runtime stop/start via Bluetooth.Manager) — and a stale file makes
+    # BusReady wave clients through to ECONNREFUSED before the NEW daemon
+    # has bound it. Hardware-found on the first enable→disable→enable
+    # round-trip. Remove it so socket existence again implies a listener.
+    _ = File.rm(@socket_path)
     File.mkdir_p!(@bluetooth_state_dir)
     # bluetoothd stores pairing/link keys + the adapter identity here; keep it
     # owner-only rather than the default world-readable 0755.

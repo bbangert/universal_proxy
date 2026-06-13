@@ -238,6 +238,7 @@ defmodule UniversalProxy.Bluez.Gatt do
           gen = state.gen_seq + 1
           path = DevicePath.from_address(address)
           run_connect(state.conn, address, gen, path)
+          notify_connections_changed()
 
           {:noreply,
            %{state | gen_seq: gen}
@@ -663,10 +664,18 @@ defmodule UniversalProxy.Bluez.Gatt do
 
   defp drop_entry(state, address) do
     {_entry, state} = pop_in(state.conns[address])
+    notify_connections_changed()
 
     update_in(state.notify_paths, fn paths ->
       paths |> Enum.reject(fn {_path, {addr, _h}} -> addr == address end) |> Map.new()
     end)
+  end
+
+  # Slot usage changed (entry created or dropped) — let the stats server
+  # push an off-tick update to the web tab. Cast: fire-and-forget, no-op
+  # when Stats isn't running.
+  defp notify_connections_changed do
+    UniversalProxy.Bluetooth.Stats.connections_changed()
   end
 
   defp cancel_resolve_timer(%{resolve_timer: nil}), do: :ok

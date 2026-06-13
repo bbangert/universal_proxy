@@ -28,24 +28,20 @@ defmodule UniversalProxy.Application do
         # Firmware update flow (ConfigStore + library Supervisor, wired
         # together so the snapshot lands before the library starts).
         UniversalProxy.FirmwareUpdate,
+        # Bluetooth subtree (registry, settings store, Bluez lifecycle).
+        # BEFORE the ESPHome supervisor: its bluetooth_opts/0 reads the
+        # persisted Bluetooth settings at espex boot. child_spec returns
+        # `:ignore` outside BT-capable targets, so this is a no-op on host
+        # (see UniversalProxy.Bluetooth @moduledoc).
+        UniversalProxy.Bluetooth,
         # Espex-backed ESPHome Native API server with our hardware adapters
         UniversalProxy.ESPHome.Supervisor
-      ] ++ target_children()
+      ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html
     # for other strategies and supported options
     opts = [strategy: :one_for_one, name: UniversalProxy.Supervisor]
     Supervisor.start_link(children, opts)
-  end
-
-  # List all child processes to be supervised
-  defp target_children do
-    [
-      # Phase 0 BT spike — child_spec returns `:ignore` outside rpi3
-      # so this is a no-op on host and on Pi targets not yet wired
-      # (see UniversalProxy.Bluetooth @moduledoc).
-      UniversalProxy.Bluetooth
-    ]
   end
 
   # Tell Phoenix to update the endpoint configuration

@@ -79,4 +79,30 @@ defmodule UniversalProxy.Bluez.DeviceCacheTest do
       assert DeviceCache.size(DeviceCache.remove(cache, "/dev/a")) == 0
     end
   end
+
+  describe "seen_within/3" do
+    test "counts distinct devices inside the window, boundary inclusive" do
+      cache = DeviceCache.new()
+      {cache, _} = DeviceCache.upsert(cache, "/dev/old", @props, 0)
+      {cache, _} = DeviceCache.upsert(cache, "/dev/edge", @props, 5_000)
+      {cache, _} = DeviceCache.upsert(cache, "/dev/fresh", @props, 9_000)
+
+      now = 10_000
+      assert DeviceCache.seen_within(cache, now, 5_000) == 2
+      assert DeviceCache.seen_within(cache, now, 500) == 0
+      assert DeviceCache.seen_within(cache, now, 60_000) == 3
+    end
+
+    test "re-seeing a device refreshes its window membership without double-counting" do
+      cache = DeviceCache.new()
+      {cache, _} = DeviceCache.upsert(cache, "/dev/a", @props, 0)
+      {cache, _} = DeviceCache.upsert(cache, "/dev/a", @props, 8_000)
+
+      assert DeviceCache.seen_within(cache, 10_000, 5_000) == 1
+    end
+
+    test "empty cache → 0" do
+      assert DeviceCache.seen_within(DeviceCache.new(), 1_000, 1_000) == 0
+    end
+  end
 end

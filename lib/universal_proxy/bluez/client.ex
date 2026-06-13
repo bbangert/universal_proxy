@@ -68,10 +68,9 @@ defmodule UniversalProxy.Bluez.Client do
   use GenServer
   require Logger
 
-  alias UniversalProxy.Bluez.{DBus, DeviceCache, Variant}
+  alias UniversalProxy.Bluez.{DBus, DeviceCache, DevicePath, Variant}
   alias UniversalProxy.ESPHome.BluetoothScanner
 
-  @adapter_path "/org/bluez/hci0"
   @adapter_iface "org.bluez.Adapter1"
   @device_iface "org.bluez.Device1"
   @advmon_mgr_iface "org.bluez.AdvertisementMonitorManager1"
@@ -132,6 +131,39 @@ defmodule UniversalProxy.Bluez.Client do
   @spec configured_mode() :: :passive | :active
   def configured_mode, do: :persistent_term.get(@mode_key, :passive)
 
+  @doc """
+  `org.bluez.Adapter1` properties for every adapter object the daemon
+  exposes: `[%{path:, address:, name:, powered:}]`. Used by
+  `UniversalProxy.Bluetooth.RadioMonitor` to overlay live daemon state on
+  the sysfs radio list. Returns `[]` when this Client isn't running (BT
+  subtree down, host) or the daemon can't answer.
+  """
+  @spec adapters_info() :: [
+          %{
+            path: String.t(),
+            address: String.t() | nil,
+            name: String.t() | nil,
+            powered: boolean()
+          }
+        ]
+  def adapters_info do
+    GenServer.call(__MODULE__, :adapters_info)
+  catch
+    :exit, _ -> []
+  end
+
+  @doc """
+  Distinct devices the advert cache has seen in the last `window_ms`
+  (`UniversalProxy.Bluez.DeviceCache.seen_within/3`). `0` when this Client
+  isn't running. Used by `UniversalProxy.Bluetooth.Stats`.
+  """
+  @spec devices_seen(pos_integer()) :: non_neg_integer()
+  def devices_seen(window_ms) when is_integer(window_ms) and window_ms > 0 do
+    GenServer.call(__MODULE__, {:devices_seen, window_ms})
+  catch
+    :exit, _ -> 0
+  end
+
   @impl GenServer
   def init(_opts) do
     case Rebus.connect(:system) do
@@ -172,6 +204,15 @@ defmodule UniversalProxy.Bluez.Client do
   def handle_continue({:setup, retries}, state), do: attempt_setup(state, retries)
 
   @impl GenServer
+  def handle_call(:adapters_info, _from, state) do
+    {:reply, adapter_objects(state.conn), state}
+  end
+
+  def handle_call({:devices_seen, window_ms}, _from, state) do
+    now = System.monotonic_time(:millisecond)
+    {:reply, DeviceCache.seen_within(state.cache, now, window_ms), state}
+  end
+
   def handle_call({:set_mode, target}, from, state) do
     cond do
       # A transition is running: park behind it. Same-target callers pile
@@ -260,7 +301,7 @@ defmodule UniversalProxy.Bluez.Client do
 
   defp attempt_setup(state, retries) do
     cond do
-      adapter_present?(state.conn) ->
+      claim_adapter(state.conn) ->
         power_on(state.conn)
         state = seed_existing(state)
         # An early set_mode/1 may already have a transition in flight (its
@@ -278,7 +319,7 @@ defmodule UniversalProxy.Bluez.Client do
         {:noreply, state}
 
       true ->
-        Logger.error("Bluez.Client: #{@adapter_path} never appeared on org.bluez")
+        Logger.error("Bluez.Client: #{adapter_path()} never appeared on org.bluez")
         {:stop, :no_adapter, state}
     end
   end
@@ -355,7 +396,7 @@ defmodule UniversalProxy.Bluez.Client do
   defp disengage(_conn, :none), do: :ok
 
   defp disengage(conn, :monitor) do
-    case call(conn, @adapter_path, @advmon_mgr_iface, "UnregisterMonitor", "o", [@root_path]) do
+    case call(conn, adapter_path(), @advmon_mgr_iface, "UnregisterMonitor", "o", [@root_path]) do
       {:ok, _} -> :ok
       # Wasn't registered (engage failed earlier) — already disengaged.
       {:error, "org.bluez.Error.DoesNotExist"} -> :ok
@@ -364,7 +405,7 @@ defmodule UniversalProxy.Bluez.Client do
   end
 
   defp disengage(conn, :discovery) do
-    case call(conn, @adapter_path, @adapter_iface, "StopDiscovery", "", []) do
+    case call(conn, adapter_path(), @adapter_iface, "StopDiscovery", "", []) do
       {:ok, _} -> :ok
       {:error, reason} -> Logger.warning("Bluez.Client: StopDiscovery: #{inspect(reason)}")
     end
@@ -386,14 +427,14 @@ defmodule UniversalProxy.Bluez.Client do
     filter = [{"Transport", {"s", "le"}}, {"DuplicateData", {"b", false}}]
 
     with {:ok, _} <-
-           call(conn, @adapter_path, @adapter_iface, "SetDiscoveryFilter", "a{sv}", [filter]),
+           call(conn, adapter_path(), @adapter_iface, "SetDiscoveryFilter", "a{sv}", [filter]),
          {:ok, _} <- start_discovery(conn) do
       :ok
     end
   end
 
   defp start_discovery(conn) do
-    case call(conn, @adapter_path, @adapter_iface, "StartDiscovery", "", []) do
+    case call(conn, adapter_path(), @adapter_iface, "StartDiscovery", "", []) do
       # Already discovering (a drifted earlier state) — goal reached.
       {:error, "org.bluez.Error.InProgress"} -> {:ok, []}
       other -> other
@@ -404,7 +445,7 @@ defmodule UniversalProxy.Bluez.Client do
     msg =
       Rebus.Message.new!(:method_call,
         destination: @bluez,
-        path: @adapter_path,
+        path: adapter_path(),
         interface: @advmon_mgr_iface,
         member: "RegisterMonitor",
         signature: "o",
@@ -510,7 +551,7 @@ defmodule UniversalProxy.Bluez.Client do
        ) do
     [path, interfaces] = body
 
-    with true <- String.starts_with?(path, @adapter_path <> "/dev_"),
+    with true <- String.starts_with?(path, adapter_path() <> "/dev_"),
          {_iface, props_list} <- List.keyfind(interfaces, @device_iface, 0) do
       ingest(state, path, Variant.unwrap_props(props_list))
     else
@@ -529,7 +570,7 @@ defmodule UniversalProxy.Bluez.Client do
        ) do
     [iface, changed, _invalidated] = body
 
-    if iface == @device_iface and String.starts_with?(path, @adapter_path <> "/dev_") do
+    if iface == @device_iface and String.starts_with?(path, adapter_path() <> "/dev_") do
       ingest(state, path, Variant.unwrap_props(changed))
     else
       state
@@ -546,7 +587,7 @@ defmodule UniversalProxy.Bluez.Client do
        ) do
     case body do
       [path | _] ->
-        if String.starts_with?(path, @adapter_path <> "/dev_"),
+        if String.starts_with?(path, adapter_path() <> "/dev_"),
           do: %{state | cache: DeviceCache.remove(state.cache, path)},
           else: state
 
@@ -588,16 +629,85 @@ defmodule UniversalProxy.Bluez.Client do
     Enum.each(rules, &DBus.add_match(conn, &1))
   end
 
-  defp adapter_present?(conn) do
-    case get_managed_objects(conn) do
-      {:ok, objects} -> List.keymember?(objects, @adapter_path, 0)
-      _ -> false
+  # Resolve which adapter this subtree drives and publish its object path.
+  # The kernel exposes no BT MAC in sysfs, so the user-selected MAC
+  # (DevicePath.desired_adapter/0, written by Bluetooth.Manager before the
+  # subtree started) can only be matched here, against bluetoothd's
+  # Adapter1 objects: the desired MAC's adapter if present, else the
+  # lowest-index one (auto/onboard). Returns false while bluetoothd has no
+  # adapter yet (setup retries).
+  defp claim_adapter(conn) do
+    case adapter_objects(conn) do
+      [] ->
+        false
+
+      adapters ->
+        desired = DevicePath.desired_adapter()
+
+        chosen =
+          Enum.find(adapters, fn %{address: address} -> address == desired end) ||
+            fallback_adapter(adapters, desired)
+
+        :persistent_term.put(DevicePath.adapter_path_key(), chosen.path)
+        Logger.info("Bluez.Client: driving #{chosen.path} (#{chosen.address})")
+        true
     end
   end
 
-  defp power_on(conn) do
-    call(conn, @adapter_path, @props_iface, "Set", "ssv", [@adapter_iface, "Powered", {"b", true}])
+  defp fallback_adapter(adapters, desired) do
+    if desired != nil do
+      Logger.warning("Bluez.Client: selected radio #{desired} not present, using first adapter")
+    end
+
+    Enum.min_by(adapters, &path_index(&1.path))
   end
+
+  defp path_index(path) do
+    case path |> Path.basename() |> String.replace_prefix("hci", "") |> Integer.parse() do
+      {n, ""} -> n
+      _ -> 999_999
+    end
+  end
+
+  # All org.bluez Adapter1 objects with their identity props.
+  defp adapter_objects(conn) do
+    case get_managed_objects(conn) do
+      {:ok, objects} ->
+        for {path, ifaces} <- objects,
+            {_iface, props} <- [List.keyfind(ifaces, @adapter_iface, 0)] do
+          unwrapped = Variant.unwrap_props(props)
+
+          %{
+            path: path,
+            address: unwrapped["Address"],
+            name: unwrapped["Name"],
+            powered: unwrapped["Powered"] == true
+          }
+        end
+
+      {:error, _} ->
+        []
+    end
+  end
+
+  # Power the claimed adapter on — required to scan through it. Other
+  # adapters' power state is deliberately NOT managed: from the Elixir
+  # side all that matters is which adapter we utilize over rebus, not the
+  # device-wide Bluetooth on/off state.
+  defp power_on(conn) do
+    call(conn, adapter_path(), @props_iface, "Set", "ssv", [
+      @adapter_iface,
+      "Powered",
+      {"b", true}
+    ])
+  end
+
+  # The adapter object path the whole subtree drives — resolved by
+  # UniversalProxy.Bluetooth.Manager before this subtree (re)starts and
+  # published via :persistent_term, so it's stable for this process's
+  # lifetime. Read per use (a persistent_term read is ~free) rather than
+  # cached in state.
+  defp adapter_path, do: DevicePath.adapter_path()
 
   defp seed_existing(state) do
     case get_managed_objects(state.conn) do

@@ -78,26 +78,49 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   end
 
   # Wire the BLE adapters (passive scanner + active GATT proxy) into espex
-  # ONLY on BT-capable targets. `UniversalProxy.Bluetooth.supported?/0` is
-  # the single gate (a compile-time constant) so `:rpi3` isn't hardcoded
-  # here as well. Off target both keys are omitted entirely, so espex
-  # leaves the bluetooth feature flags at 0. With both wired the flags are
-  # PASSIVE_SCAN | ACTIVE_CONNECTIONS | REMOTE_CACHING | RAW_ADVERTISEMENTS
-  # | STATE_AND_MODE (0x67) — HA can now request connections + GATT.
+  # ONLY on BT-capable targets — and on those, only as far as the user's
+  # Bluetooth settings allow. Off target (or BT disabled) both keys are
+  # omitted entirely, so espex leaves the bluetooth feature flags at 0.
   #
-  # Boot ordering: this supervisor starts (see `application.ex`) BEFORE
-  # `target_children()`, where the `UniversalProxy.Bluetooth` subtree — and
-  # thus the scanner registry / `Bluez.Gatt` the adapters talk to — lives.
-  # That is safe: `BluetoothScanner.subscribe/1` rescues the un-started
-  # Registry's `ArgumentError`, `BluetoothProxy` handles a not-running
-  # `Bluez.Gatt`, and a client can only issue BLE requests long after boot
-  # (once HA connects and subscribes).
+  # Boot ordering: `UniversalProxy.Bluetooth` (the registry, settings
+  # store, and Bluez lifecycle) starts BEFORE this supervisor (see
+  # `application.ex`), so the settings read here sees the persisted state
+  # on first boot. The adapters stay defensive regardless:
+  # `BluetoothScanner.subscribe/1` rescues an un-started Registry's
+  # `ArgumentError` and `BluetoothProxy` handles a not-running `Bluez.Gatt`.
   defp bluetooth_opts do
-    if UniversalProxy.Bluetooth.supported?() do
-      [bluetooth_scanner: BluetoothScanner, bluetooth_proxy: BluetoothProxy]
-    else
-      []
-    end
+    bluetooth_opts(UniversalProxy.Bluetooth.supported?(), bluetooth_settings())
+  end
+
+  @doc """
+  The espex adapter wiring for a given BT support level + settings — pure,
+  so the enabled × active_connections matrix is host-testable.
+
+    * unsupported target or `enabled: false` → no adapters (flags 0)
+    * `active_connections: false` → scanner only (HA sees a passive-only
+      proxy: no ACTIVE_CONNECTIONS / REMOTE_CACHING / PAIRING flags)
+    * both on → scanner + GATT proxy (full flag set, 0x7F)
+  """
+  @spec bluetooth_opts(boolean(), %{
+          required(:enabled) => boolean(),
+          required(:active_connections) => boolean(),
+          optional(atom()) => term()
+        }) :: keyword()
+  def bluetooth_opts(false, _settings), do: []
+  def bluetooth_opts(true, %{enabled: false}), do: []
+
+  def bluetooth_opts(true, %{active_connections: false}),
+    do: [bluetooth_scanner: BluetoothScanner]
+
+  def bluetooth_opts(true, _settings),
+    do: [bluetooth_scanner: BluetoothScanner, bluetooth_proxy: BluetoothProxy]
+
+  # Defensive read: if the settings store isn't up (it always is on BT
+  # targets by boot order, but stay safe), fall back to the defaults.
+  defp bluetooth_settings do
+    UniversalProxy.Bluetooth.Settings.get()
+  catch
+    :exit, _ -> UniversalProxy.Bluetooth.Settings.defaults()
   end
 
   # Resolve the tty path of the Z-Wave-classified port. Two sources
