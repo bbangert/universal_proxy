@@ -64,12 +64,14 @@ defmodule UniversalProxy.Audio.EnumerateTest do
                {"bcm2835 Headphones", nil, nil} => %{
                  card_index: 0,
                  alsa_device: "plughw:0,0",
-                 card_name: "bcm2835 Headphones"
+                 card_name: "bcm2835 Headphones",
+                 usb_port: nil
                },
                {"vc4-hdmi", nil, nil} => %{
                  card_index: 1,
                  alsa_device: "plughw:1,0",
-                 card_name: "vc4-hdmi"
+                 card_name: "vc4-hdmi",
+                 usb_port: nil
                }
              }
     end
@@ -96,7 +98,42 @@ defmodule UniversalProxy.Audio.EnumerateTest do
                {"USB Audio Gadget", 0x1D6B, 0x0104} => %{
                  card_index: 0,
                  alsa_device: "plughw:0,0",
-                 card_name: "USB Audio Gadget"
+                 card_name: "USB Audio Gadget",
+                 usb_port: nil
+               }
+             }
+    end
+
+    @tag :tmp_dir
+    test "lifts the USB bus path from the card's device symlink", %{tmp_dir: tmp_dir} do
+      proc_root = Path.join(tmp_dir, "proc")
+      sys_root = Path.join(tmp_dir, "sys")
+      File.mkdir_p!(Path.join(proc_root, "asound"))
+
+      # The real USB interface dir the card's `device` symlink points at; the
+      # bus path "1-1.3" is the interface segment ("1-1.3:1.0") before the colon.
+      iface = Path.join([sys_root, "usbdev", "1-1.3", "1-1.3:1.0"])
+      File.mkdir_p!(iface)
+
+      File.write!(Path.join(iface, "uevent"), """
+      DRIVER=snd-usb-audio
+      PRODUCT=0bda/4e27/18
+      """)
+
+      File.mkdir_p!(Path.join(sys_root, "card0"))
+      File.ln_s!("../usbdev/1-1.3/1-1.3:1.0", Path.join([sys_root, "card0", "device"]))
+
+      File.write!(Path.join([proc_root, "asound", "cards"]), """
+       0 [Adapter        ]: USB-Audio - USB SPDIF Adapter
+                            USB SPDIF Adapter
+      """)
+
+      assert Enumerate.list_outputs(proc_root: proc_root, sys_root: sys_root) == %{
+               {"USB SPDIF Adapter", 0x0BDA, 0x4E27} => %{
+                 card_index: 0,
+                 alsa_device: "plughw:0,0",
+                 card_name: "USB SPDIF Adapter",
+                 usb_port: "1-1.3"
                }
              }
     end
@@ -123,7 +160,8 @@ defmodule UniversalProxy.Audio.EnumerateTest do
                {"bcm2835 Headphones", nil, nil} => %{
                  card_index: 0,
                  alsa_device: "plughw:0,0",
-                 card_name: "bcm2835 Headphones"
+                 card_name: "bcm2835 Headphones",
+                 usb_port: nil
                }
              }
     end

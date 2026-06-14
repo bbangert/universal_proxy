@@ -10,11 +10,11 @@ defmodule UniversalProxy.Audio.Enumerate do
   Outputs are keyed by a `{slot_sub, vendor_id, product_id}` tuple,
   identical in spirit to `UniversalProxy.UART.Store`'s key shape. For
   built-in SoC cards (Pi 3 / Pi 4 `bcm2835_*`) the VID/PID slots are
-  `nil` and `slot_sub` is the long card name. USB DAC support is
-  out of scope for v1 but the key shape leaves room for it: a
-  hot-plugged USB DAC will surface as
-  `{usb_bus_path, vendor_id, product_id}` once a custom Nerves system
-  enables `CONFIG_SND_USB_AUDIO` in the kernel.
+  `nil` and `slot_sub` is the long card name; a USB DAC carries its real
+  `{card_name, vendor_id, product_id}`. USB DACs are supported (the
+  custom Nerves system enables `CONFIG_SND_USB_AUDIO`); each output also
+  carries `:usb_port` — the physical USB-A bus path (e.g. `"1-1.3"`, `nil`
+  for SoC cards) — so the Overview can render it in its declared slot.
 
   ## Filesystem roots
 
@@ -40,7 +40,8 @@ defmodule UniversalProxy.Audio.Enumerate do
   @type output_info :: %{
           card_index: non_neg_integer(),
           alsa_device: String.t(),
-          card_name: String.t()
+          card_name: String.t(),
+          usb_port: String.t() | nil
         }
 
   @doc """
@@ -78,7 +79,8 @@ defmodule UniversalProxy.Audio.Enumerate do
           info = %{
             card_index: index,
             alsa_device: "plughw:#{index},0",
-            card_name: card_name
+            card_name: card_name,
+            usb_port: read_usb_port(sys_root, index)
           }
 
           {key, info}
@@ -157,6 +159,41 @@ defmodule UniversalProxy.Audio.Enumerate do
       _ ->
         {nil, nil}
     end
+  end
+
+  # -- USB bus path lookup --
+
+  # The physical USB-A receptacle a USB sound card occupies, e.g. "1-1.3",
+  # so the Overview can place it in its declared slot instead of a separate
+  # row (mirrors `UniversalProxy.Bluetooth.Radios` for BT dongles). The card's
+  # `device` symlink resolves to the bound USB interface
+  # (".../1-1/1-1.3/1-1.3:1.0"); the bus path is the interface segment before
+  # the colon. `nil` for SoC cards (the symlink points at a platform device
+  # with no USB segment) and in tests where `device` is a plain dir (no link).
+  @usb_iface_re ~r/^(\d+-[\d.]+):\d+\.\d+$/
+  @usb_dev_re ~r/^\d+-[\d.]+$/
+
+  defp read_usb_port(sys_root, index) do
+    link = Path.join([sys_root, "card#{index}", "device"])
+
+    case File.read_link(link) do
+      {:ok, target} -> usb_bus_path(target)
+      _ -> nil
+    end
+  end
+
+  defp usb_bus_path(symlink_target) do
+    segments = String.split(symlink_target, "/")
+
+    interface =
+      Enum.find_value(segments, fn seg ->
+        case Regex.run(@usb_iface_re, seg) do
+          [_, bus] -> bus
+          _ -> nil
+        end
+      end)
+
+    interface || Enum.find(segments, &Regex.match?(@usb_dev_re, &1))
   end
 
   # -- Filesystem root configuration --

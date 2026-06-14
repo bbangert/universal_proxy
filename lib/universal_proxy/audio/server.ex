@@ -554,7 +554,7 @@ defmodule UniversalProxy.Audio.Server do
     |> Map.merge(config)
   end
 
-  @hardware_keys [:card_index, :alsa_device, :card_name]
+  @hardware_keys [:card_index, :alsa_device, :card_name, :usb_port]
 
   defp hardware_fields(output), do: Map.take(output, @hardware_keys)
 

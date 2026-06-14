@@ -975,11 +975,14 @@ defmodule UniversalProxyWeb.OverviewLive do
       %{
         kind: :audio,
         type_label: "Sound card",
+        # `slot`/`slot_sub` default to the type + USB bus path; reconcile in
+        # hardware_rows/2 promotes a USB card into the declared "USB N" slot it
+        # occupies (SoC cards carry usb_port: nil → no slot_sub → they trail).
         slot: "Sound card",
-        slot_sub: nil,
+        slot_sub: out[:usb_port],
         name: out.friendly_name,
         detail: out.card_name,
-        sub: out.alsa_device,
+        sub: out[:usb_port] || out.alsa_device,
         managed_by: "Sendspin",
         tab: "/audio",
         status: status,
