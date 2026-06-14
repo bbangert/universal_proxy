@@ -6,6 +6,8 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   use UniversalProxyWeb, :live_view
 
+  require Logger
+
   import UniversalProxyWeb.Components.UI
   import UniversalProxyWeb.Components.Icons
   import UniversalProxyWeb.Components.Audio
@@ -546,6 +548,14 @@ defmodule UniversalProxyWeb.OverviewLive do
     """
   end
 
+  # Defensive: `hardware_rows/2` only ever emits the two tags above, so an
+  # unknown shape means that contract changed — drop the row rather than
+  # crash the whole table render.
+  defp hardware_row(assigns) do
+    Logger.warning("hardware_row/1: unexpected row shape, skipping: #{inspect(assigns.row)}")
+    ~H""
+  end
+
   # ── Single row in the hardware table ──────────────────────────────────
   attr(:port, :map, required: true)
   attr(:throughput_snapshots, :map, required: true)
@@ -923,18 +933,26 @@ defmodule UniversalProxyWeb.OverviewLive do
   # label, so the USB rows stay in fixed hardware order regardless of which
   # device fills them. Peripherals matching no declared empty slot (USB
   # audio, or a dongle on a dynamic-enumeration target) trail at the end.
-  defp hardware_rows(ports, peripherals) do
+  #
+  # Public only so it can be unit-tested directly (the host test env has no
+  # declared slots, so the promotion path is unreachable via a live mount).
+  @doc false
+  def hardware_rows(ports, peripherals) do
     promotable =
       for p <- peripherals, is_binary(p.slot_sub), into: %{}, do: {p.slot_sub, p}
 
     {rows, claimed} =
       Enum.map_reduce(ports, MapSet.new(), fn port, claimed ->
-        case not port.connected && Map.get(promotable, port.slot_sub) do
-          peripheral when is_map(peripheral) ->
-            {{:peripheral, %{peripheral | slot: port.slot}}, MapSet.put(claimed, port.slot_sub)}
+        # The peripheral occupying this slot, or nil: only empty (unconnected)
+        # declared slots can be claimed; `promotable` holds maps only.
+        claimer = if port.connected, do: nil, else: Map.get(promotable, port.slot_sub)
 
-          _ ->
+        case claimer do
+          nil ->
             {{:port, port}, claimed}
+
+          peripheral ->
+            {{:peripheral, %{peripheral | slot: port.slot}}, MapSet.put(claimed, port.slot_sub)}
         end
       end)
 

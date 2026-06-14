@@ -114,7 +114,7 @@ defmodule UniversalProxy.Bluetooth.Radios do
 
     for %{hci: hci} <- sysfs_adapters(root) do
       modalias = read_modalias(root, hci)
-      {bus, detail, usb_id, port} = classify_bus(root, hci, modalias)
+      %{bus: bus, detail: detail, usb_id: usb_id, port: port} = classify_bus(root, hci, modalias)
 
       %{hci: hci, bus: bus, detail: detail, port: port}
       |> Map.merge(chip_lookup(modalias, usb_id, model_path))
@@ -171,23 +171,23 @@ defmodule UniversalProxy.Bluetooth.Radios do
     cond do
       usb_id = parse_usb_modalias(modalias) ->
         {detail, port} = usb_detail(root, hci)
-        {:usb, detail, usb_id, port}
+        %{bus: :usb, detail: detail, usb_id: usb_id, port: port}
 
       is_binary(modalias) and String.starts_with?(modalias, "of:") ->
-        {:uart, "SoC · UART", nil, nil}
+        %{bus: :uart, detail: "SoC · UART", usb_id: nil, port: nil}
 
       is_binary(modalias) and String.starts_with?(modalias, "serial:") ->
-        {:uart, "SoC · UART", nil, nil}
+        %{bus: :uart, detail: "SoC · UART", usb_id: nil, port: nil}
 
       device_path_contains?(root, hci, "/usb") ->
         {detail, port} = usb_detail(root, hci)
-        {:usb, detail, nil, port}
+        %{bus: :usb, detail: detail, usb_id: nil, port: port}
 
       device_path_contains?(root, hci, "serial") ->
-        {:uart, "SoC · UART", nil, nil}
+        %{bus: :uart, detail: "SoC · UART", usb_id: nil, port: nil}
 
       true ->
-        {:unknown, "Unknown", nil, nil}
+        %{bus: :unknown, detail: "Unknown", usb_id: nil, port: nil}
     end
   end
 

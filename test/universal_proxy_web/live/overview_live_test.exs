@@ -11,6 +11,8 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
   import Phoenix.ConnTest
   import UniversalProxy.AudioFixtures
 
+  alias UniversalProxyWeb.OverviewLive
+
   @endpoint UniversalProxyWeb.Endpoint
   @pubsub UniversalProxy.PubSub
 
@@ -202,5 +204,65 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
     )
 
     assert render(view) =~ ~s|href="/audio"|
+  end
+
+  # `hardware_rows/2` is the slot-promotion + ordering core. It can't be
+  # exercised through a live mount here: the host test env enumerates ports
+  # dynamically (no declared `@external_slots`), so no empty slot ever
+  # exists for a peripheral to be promoted into. Drive it directly instead.
+  describe "hardware_rows/2 (slot promotion + ordering)" do
+    defp slot(sub, n, opts \\ []) do
+      %{slot: "USB #{n}", slot_sub: sub, connected: Keyword.get(opts, :connected, false)}
+    end
+
+    defp bt(sub) do
+      %{type_label: "Bluetooth", slot: "Bluetooth", slot_sub: sub, name: "Dongle"}
+    end
+
+    defp audio do
+      %{type_label: "Sound card", slot: "Sound card", slot_sub: nil, name: "Card"}
+    end
+
+    test "promotes a dongle into its matching empty slot, keeping declared order" do
+      ports = [slot("1-1.1.2", 1), slot("1-1.1.3", 2), slot("1-1.2", 3), slot("1-1.3", 4)]
+
+      assert [
+               {:peripheral, %{slot: "USB 1", slot_sub: "1-1.1.2"}},
+               {:port, %{slot_sub: "1-1.1.3"}},
+               {:port, %{slot_sub: "1-1.2"}},
+               {:port, %{slot_sub: "1-1.3"}}
+             ] = OverviewLive.hardware_rows(ports, [bt("1-1.1.2")])
+    end
+
+    test "promotes into the correct slot regardless of which one the dongle fills" do
+      ports = [slot("1-1.1.2", 1), slot("1-1.1.3", 2), slot("1-1.2", 3)]
+
+      assert [
+               {:port, %{slot_sub: "1-1.1.2"}},
+               {:port, %{slot_sub: "1-1.1.3"}},
+               {:peripheral, %{slot: "USB 3", slot_sub: "1-1.2"}}
+             ] = OverviewLive.hardware_rows(ports, [bt("1-1.2")])
+    end
+
+    test "never replaces a connected port; an unclaimed dongle trails" do
+      ports = [slot("1-1.1.2", 1, connected: true)]
+
+      assert [
+               {:port, %{slot_sub: "1-1.1.2", connected: true}},
+               {:peripheral, %{slot: "Bluetooth", slot_sub: "1-1.1.2"}}
+             ] = OverviewLive.hardware_rows(ports, [bt("1-1.1.2")])
+    end
+
+    test "audio cards (no slot path) and unmatched dongles trail in order" do
+      ports = [slot("1-1.1.2", 1), slot("1-1.1.3", 2)]
+      peripherals = [audio(), bt("1-1.1.2"), bt("9-9.9")]
+
+      assert [
+               {:peripheral, %{slot: "USB 1", slot_sub: "1-1.1.2"}},
+               {:port, %{slot_sub: "1-1.1.3"}},
+               {:peripheral, %{type_label: "Sound card"}},
+               {:peripheral, %{slot: "Bluetooth", slot_sub: "9-9.9"}}
+             ] = OverviewLive.hardware_rows(ports, peripherals)
+    end
   end
 end
