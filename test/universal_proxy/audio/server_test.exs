@@ -257,7 +257,8 @@ defmodule UniversalProxy.Audio.ServerTest do
         @hp_key => %{
           card_index: 0,
           alsa_device: "plughw:0,0",
-          card_name: "bcm2835 Headphones"
+          card_name: "bcm2835 Headphones",
+          usb_port: nil
         }
       })
 
@@ -300,10 +301,7 @@ defmodule UniversalProxy.Audio.ServerTest do
                Store.get_config(store, usb_key)
     end
 
-    test "first sighting of a persisted (renamed) card keeps the user's name", %{
-      server: server,
-      store: store
-    } do
+    test "first sighting of a persisted (renamed) card keeps the user's name", %{store: store} do
       usb_key = {"1-1.3", 0x0BDA, 0x4E27}
       :ok = Store.save_config(store, usb_key, %{friendly_name: "Living Room DAC"})
 
@@ -316,7 +314,23 @@ defmodule UniversalProxy.Audio.ServerTest do
         }
       })
 
-      :ok = Server.check_now(server)
+      # Fresh Server simulates a reboot: the rename is already in DETS and the
+      # card re-appears as an "add" (in-memory output state starts empty). The
+      # default name must NOT overwrite the persisted rename.
+      reboot_server =
+        start_supervised!(
+          {Server,
+           name: nil,
+           store: store,
+           enumerate_module: EnumerateStub,
+           start_timer: false,
+           player_supervisor: nil,
+           mdns_discovery: nil,
+           mdns_module: nil},
+          id: :reboot_server
+        )
+
+      :ok = Server.check_now(reboot_server)
 
       assert_receive {:sendspin_output_added, output}
       assert output.friendly_name == "Living Room DAC"
@@ -327,7 +341,8 @@ defmodule UniversalProxy.Audio.ServerTest do
         @hp_key => %{
           card_index: 0,
           alsa_device: "plughw:0,0",
-          card_name: "bcm2835 Headphones"
+          card_name: "bcm2835 Headphones",
+          usb_port: nil
         }
       })
 
@@ -348,7 +363,8 @@ defmodule UniversalProxy.Audio.ServerTest do
         @hp_key => %{
           card_index: 0,
           alsa_device: "plughw:0,0",
-          card_name: "bcm2835 Headphones"
+          card_name: "bcm2835 Headphones",
+          usb_port: nil
         }
       })
 
@@ -370,7 +386,12 @@ defmodule UniversalProxy.Audio.ServerTest do
     # uevents are ignored so unrelated device churn never wakes a refresh.
     test "a sound uevent re-enumerates; an unrelated uevent does not", %{server: server} do
       EnumerateStub.set(%{
-        @hp_key => %{card_index: 0, alsa_device: "plughw:0,0", card_name: "bcm2835 Headphones"}
+        @hp_key => %{
+          card_index: 0,
+          alsa_device: "plughw:0,0",
+          card_name: "bcm2835 Headphones",
+          usb_port: nil
+        }
       })
 
       # Unrelated subsystem → ignored, no enumeration.
@@ -398,12 +419,14 @@ defmodule UniversalProxy.Audio.ServerTest do
         @hp_key => %{
           card_index: 0,
           alsa_device: "plughw:0,0",
-          card_name: "bcm2835 Headphones"
+          card_name: "bcm2835 Headphones",
+          usb_port: nil
         },
         @hdmi_key => %{
           card_index: 1,
           alsa_device: "plughw:1,0",
-          card_name: "vc4-hdmi"
+          card_name: "vc4-hdmi",
+          usb_port: nil
         }
       })
 
@@ -433,7 +456,8 @@ defmodule UniversalProxy.Audio.ServerTest do
         @hp_key => %{
           card_index: 0,
           alsa_device: "plughw:0,0",
-          card_name: "bcm2835 Headphones"
+          card_name: "bcm2835 Headphones",
+          usb_port: nil
         }
       })
 
@@ -478,7 +502,8 @@ defmodule UniversalProxy.Audio.ServerTest do
         @hp_key => %{
           card_index: 0,
           alsa_device: "plughw:0,0",
-          card_name: "bcm2835 Headphones"
+          card_name: "bcm2835 Headphones",
+          usb_port: nil
         }
       })
 
@@ -537,7 +562,8 @@ defmodule UniversalProxy.Audio.ServerTest do
         @hp_key => %{
           card_index: 0,
           alsa_device: "plughw:0,0",
-          card_name: "bcm2835 Headphones"
+          card_name: "bcm2835 Headphones",
+          usb_port: nil
         }
       })
 
@@ -1035,7 +1061,8 @@ defmodule UniversalProxy.Audio.ServerTest do
         @hp_key => %{
           card_index: 0,
           alsa_device: "plughw:0,0",
-          card_name: "bcm2835 Headphones"
+          card_name: "bcm2835 Headphones",
+          usb_port: nil
         }
       })
 
@@ -1157,7 +1184,8 @@ defmodule UniversalProxy.Audio.ServerTest do
         @hp_key => %{
           card_index: 0,
           alsa_device: "plughw:0,0",
-          card_name: "bcm2835 Headphones"
+          card_name: "bcm2835 Headphones",
+          usb_port: nil
         }
       })
 

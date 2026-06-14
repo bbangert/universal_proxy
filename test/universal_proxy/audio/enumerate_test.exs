@@ -141,6 +141,40 @@ defmodule UniversalProxy.Audio.EnumerateTest do
     end
 
     @tag :tmp_dir
+    test "two identical adapters in different ports are distinct outputs",
+         %{tmp_dir: tmp_dir} do
+      proc_root = Path.join(tmp_dir, "proc")
+      sys_root = Path.join(tmp_dir, "sys")
+      File.mkdir_p!(Path.join(proc_root, "asound"))
+
+      # Same model (name + VID/PID) in two receptacles; only the bus path
+      # differs. Keying by port must keep them as two outputs, not one.
+      for {idx, port} <- [{0, "1-1.2"}, {1, "1-1.3"}] do
+        iface = Path.join([sys_root, "usbdev", port, "#{port}:1.0"])
+        File.mkdir_p!(iface)
+        File.write!(Path.join(iface, "uevent"), "DRIVER=snd-usb-audio\nPRODUCT=0bda/4e27/18\n")
+        File.mkdir_p!(Path.join(sys_root, "card#{idx}"))
+        File.ln_s!("../usbdev/#{port}/#{port}:1.0", Path.join([sys_root, "card#{idx}", "device"]))
+      end
+
+      File.write!(Path.join([proc_root, "asound", "cards"]), """
+       0 [Adapter        ]: USB-Audio - USB SPDIF Adapter
+                            USB SPDIF Adapter
+       1 [Adapter_1      ]: USB-Audio - USB SPDIF Adapter
+                            USB SPDIF Adapter
+      """)
+
+      outputs = Enumerate.list_outputs(proc_root: proc_root, sys_root: sys_root)
+
+      assert map_size(outputs) == 2
+
+      assert %{
+               {"1-1.2", 0x0BDA, 0x4E27} => %{card_index: 0, usb_port: "1-1.2"},
+               {"1-1.3", 0x0BDA, 0x4E27} => %{card_index: 1, usb_port: "1-1.3"}
+             } = outputs
+    end
+
+    @tag :tmp_dir
     test "tolerates malformed uevent (no PRODUCT line) by emitting nil VID/PID",
          %{tmp_dir: tmp_dir} do
       proc_root = Path.join(tmp_dir, "proc")

@@ -165,71 +165,31 @@ defmodule UniversalProxy.MixProject do
       {:nerves_system_grisp2, "~> 0.17", runtime: false, targets: :grisp2},
       {:nerves_system_osd32mp1, "~> 0.24", runtime: false, targets: :osd32mp1},
       {:nerves_system_mangopi_mq_pro, "~> 0.15", runtime: false, targets: :mangopi_mq_pro},
-      {:nerves_system_qemu_aarch64, "~> 0.3", runtime: false, targets: :qemu_aarch64},
-      # Custom Nerves systems (forks of upstream) with BlueZ + D-Bus and USB
-      # support: kernel BT serdev/btusb + btbcm/rtl_bt firmware, USB-audio
-      # (snd-usb-audio — DAC playback + ADC capture), dbus, bluez5-utils — so
-      # the Bluetooth proxy and USB audio work on every target. Prebuilt
-      # artifacts are pulled from the releases repo; no local buildroot required
-      # (host must be linux/x86_64). rpi/rpi2 have no onboard BT but support USB
-      # BT dongles; x86_64 omits the Pi-only BT firmware package.
-      {:nerves_system_rpi,
+      {:nerves_system_qemu_aarch64, "~> 0.3", runtime: false, targets: :qemu_aarch64}
+    ] ++ up_nerves_systems()
+  end
+
+  # Custom Nerves systems (forks of upstream) with BlueZ + D-Bus and USB
+  # support: kernel BT serdev/btusb + btbcm/rtl_bt firmware, USB-audio
+  # (snd-usb-audio — DAC playback + ADC capture), dbus, bluez5-utils — so the
+  # Bluetooth proxy and USB audio work on every target. Prebuilt artifacts are
+  # pulled from the releases repo; no local buildroot required (host must be
+  # linux/x86_64). rpi/rpi2 have no onboard BT but support USB BT dongles;
+  # x86_64 omits the Pi-only BT firmware package. One pinned tag for all
+  # targets — bump @up_systems_tag to move every target to a new release.
+  @up_systems_tag "v0.1.2"
+  @up_systems_targets [:rpi, :rpi0, :rpi0_2, :rpi2, :rpi3, :rpi4, :rpi5, :x86_64]
+
+  defp up_nerves_systems do
+    Enum.map(@up_systems_targets, fn target ->
+      {:"nerves_system_#{target}",
        github: "bbangert/nerves_systems_universal_proxy",
-       sparse: "rpi",
-       tag: "v0.1.2",
+       sparse: to_string(target),
+       tag: @up_systems_tag,
        runtime: false,
-       targets: :rpi,
-       override: true},
-      {:nerves_system_rpi0,
-       github: "bbangert/nerves_systems_universal_proxy",
-       sparse: "rpi0",
-       tag: "v0.1.2",
-       runtime: false,
-       targets: :rpi0,
-       override: true},
-      {:nerves_system_rpi0_2,
-       github: "bbangert/nerves_systems_universal_proxy",
-       sparse: "rpi0_2",
-       tag: "v0.1.2",
-       runtime: false,
-       targets: :rpi0_2,
-       override: true},
-      {:nerves_system_rpi2,
-       github: "bbangert/nerves_systems_universal_proxy",
-       sparse: "rpi2",
-       tag: "v0.1.2",
-       runtime: false,
-       targets: :rpi2,
-       override: true},
-      {:nerves_system_rpi3,
-       github: "bbangert/nerves_systems_universal_proxy",
-       sparse: "rpi3",
-       tag: "v0.1.2",
-       runtime: false,
-       targets: :rpi3,
-       override: true},
-      {:nerves_system_rpi4,
-       github: "bbangert/nerves_systems_universal_proxy",
-       sparse: "rpi4",
-       tag: "v0.1.2",
-       runtime: false,
-       targets: :rpi4,
-       override: true},
-      {:nerves_system_rpi5,
-       github: "bbangert/nerves_systems_universal_proxy",
-       sparse: "rpi5",
-       tag: "v0.1.2",
-       runtime: false,
-       targets: :rpi5,
-       override: true},
-      {:nerves_system_x86_64,
-       github: "bbangert/nerves_systems_universal_proxy",
-       sparse: "x86_64",
-       tag: "v0.1.2",
-       runtime: false,
-       targets: :x86_64,
+       targets: target,
        override: true}
-    ]
+    end)
   end
 
   def release do

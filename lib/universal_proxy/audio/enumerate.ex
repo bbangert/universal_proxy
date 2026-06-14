@@ -174,11 +174,13 @@ defmodule UniversalProxy.Audio.Enumerate do
   # so the Overview can place it in its declared slot instead of a separate
   # row (mirrors `UniversalProxy.Bluetooth.Radios` for BT dongles). The card's
   # `device` symlink resolves to the bound USB interface
-  # (".../1-1/1-1.3/1-1.3:1.0"); the bus path is the interface segment before
-  # the colon. `nil` for SoC cards (the symlink points at a platform device
-  # with no USB segment) and in tests where `device` is a plain dir (no link).
+  # (".../1-1/1-1.3/1-1.3:1.0"); the bus path is the interface segment
+  # (".../1-1.3:1.0") with the ":interface" suffix stripped. We match only the
+  # interface form — never a bare parent segment like "1-1" — so we can't
+  # mistake the hub for the device. `nil` when no interface segment is present
+  # (SoC cards point at a platform device; tests where `device` is a plain dir
+  # have no symlink), which leaves the card to trail rather than mis-slot it.
   @usb_iface_re ~r/^(\d+-[\d.]+):\d+\.\d+$/
-  @usb_dev_re ~r/^\d+-[\d.]+$/
 
   defp read_usb_port(sys_root, index) do
     link = Path.join([sys_root, "card#{index}", "device"])
@@ -190,17 +192,14 @@ defmodule UniversalProxy.Audio.Enumerate do
   end
 
   defp usb_bus_path(symlink_target) do
-    segments = String.split(symlink_target, "/")
-
-    interface =
-      Enum.find_value(segments, fn seg ->
-        case Regex.run(@usb_iface_re, seg) do
-          [_, bus] -> bus
-          _ -> nil
-        end
-      end)
-
-    interface || Enum.find(segments, &Regex.match?(@usb_dev_re, &1))
+    symlink_target
+    |> String.split("/")
+    |> Enum.find_value(fn seg ->
+      case Regex.run(@usb_iface_re, seg) do
+        [_, bus] -> bus
+        _ -> nil
+      end
+    end)
   end
 
   # -- Filesystem root configuration --
