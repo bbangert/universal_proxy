@@ -35,6 +35,7 @@ defmodule UniversalProxy.Bluetooth.Radios do
           hci: String.t(),
           bus: :uart | :usb | :unknown,
           detail: String.t(),
+          port: String.t() | nil,
           chip: String.t(),
           bt_version: String.t() | nil,
           ble?: boolean(),
@@ -113,9 +114,9 @@ defmodule UniversalProxy.Bluetooth.Radios do
 
     for %{hci: hci} <- sysfs_adapters(root) do
       modalias = read_modalias(root, hci)
-      {bus, detail, usb_id} = classify_bus(root, hci, modalias)
+      {bus, detail, usb_id, port} = classify_bus(root, hci, modalias)
 
-      %{hci: hci, bus: bus, detail: detail}
+      %{hci: hci, bus: bus, detail: detail, port: port}
       |> Map.merge(chip_lookup(modalias, usb_id, model_path))
     end
   end
@@ -169,22 +170,24 @@ defmodule UniversalProxy.Bluetooth.Radios do
   defp classify_bus(root, hci, modalias) do
     cond do
       usb_id = parse_usb_modalias(modalias) ->
-        {:usb, usb_detail(root, hci), usb_id}
+        {detail, port} = usb_detail(root, hci)
+        {:usb, detail, usb_id, port}
 
       is_binary(modalias) and String.starts_with?(modalias, "of:") ->
-        {:uart, "SoC · UART", nil}
+        {:uart, "SoC · UART", nil, nil}
 
       is_binary(modalias) and String.starts_with?(modalias, "serial:") ->
-        {:uart, "SoC · UART", nil}
+        {:uart, "SoC · UART", nil, nil}
 
       device_path_contains?(root, hci, "/usb") ->
-        {:usb, usb_detail(root, hci), nil}
+        {detail, port} = usb_detail(root, hci)
+        {:usb, detail, nil, port}
 
       device_path_contains?(root, hci, "serial") ->
-        {:uart, "SoC · UART", nil}
+        {:uart, "SoC · UART", nil, nil}
 
       true ->
-        {:unknown, "Unknown", nil}
+        {:unknown, "Unknown", nil, nil}
     end
   end
 
@@ -197,18 +200,20 @@ defmodule UniversalProxy.Bluetooth.Radios do
 
   defp parse_usb_modalias(_), do: nil
 
-  # "USB 2.0 · port 1-1.2": port from the interface directory name in the
-  # resolved device path (".../1-1.2/1-1.2:1.0"), USB version from the USB
-  # device's `speed` attribute one level up.
+  # `{"USB 2.0 · port 1-1.2", "1-1.2"}`: port from the interface directory
+  # name in the resolved device path (".../1-1.2/1-1.2:1.0"), USB version
+  # from the USB device's `speed` attribute one level up. The bare port is
+  # returned alongside the display string so callers can match it against a
+  # physical USB-A slot table; `nil` when the device link can't be resolved.
   defp usb_detail(root, hci) do
     case resolved_device_path(root, hci) do
       nil ->
-        "USB"
+        {"USB", nil}
 
       real ->
         port = real |> Path.basename() |> String.split(":") |> hd()
         speed = read_speed(Path.dirname(real))
-        "#{usb_generation(speed)} · port #{port}"
+        {"#{usb_generation(speed)} · port #{port}", port}
     end
   end
 

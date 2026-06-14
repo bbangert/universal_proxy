@@ -85,6 +85,7 @@ defmodule UniversalProxy.Bluetooth.RadiosTest do
                  hci: "hci0",
                  bus: :uart,
                  detail: "SoC · UART",
+                 port: nil,
                  chip: "Broadcom BCM43438 (CYW43438)",
                  bt_version: "4.1",
                  ble?: true,
@@ -135,6 +136,7 @@ defmodule UniversalProxy.Bluetooth.RadiosTest do
                  hci: "hci1",
                  bus: :usb,
                  detail: "USB 2.0 · port 1-1.2",
+                 port: "1-1.2",
                  chip: "Realtek RTL8761B (ASUS USB-BT500)",
                  bt_version: "5.0",
                  ble?: true,
@@ -163,7 +165,7 @@ defmodule UniversalProxy.Bluetooth.RadiosTest do
     test "missing speed attribute degrades to plain USB", %{root: root} do
       add_usb_radio(root, "hci1", @dongle_mac, speed: nil)
 
-      assert [%{detail: "USB · port 1-1.2"}] = Radios.enumerate(root)
+      assert [%{detail: "USB · port 1-1.2", port: "1-1.2"}] = Radios.enumerate(root)
     end
   end
 

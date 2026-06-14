@@ -20,6 +20,40 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
     {:ok, conn: Phoenix.ConnTest.build_conn()}
   end
 
+  test "USB Bluetooth row is keyed by its physical USB port, not its hci name",
+       %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/")
+
+    # A USB dongle the kernel resolved to receptacle 1-1.1.2. The Overview
+    # hardware table should present it by that physical port (matching how
+    # the Bluetooth page reads), never by the placeless "hci1" sysfs name.
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "bluetooth:radios",
+      {:bluetooth_radios,
+       [
+         %{
+           hci: "hci1",
+           bus: :usb,
+           port: "1-1.1.2",
+           detail: "USB 2.0 · port 1-1.1.2",
+           chip: "Realtek RTL8761B",
+           bt_version: "5.1",
+           ble?: true,
+           bredr?: true,
+           name: "ASUS USB-BT500",
+           address: nil,
+           in_use?: false
+         }
+       ]}
+    )
+
+    html = render(view)
+    assert html =~ "1-1.1.2"
+    assert html =~ "Bluetooth proxy"
+    refute html =~ "hci1"
+  end
+
   test "Overview omits the audio card when no outputs are present", %{conn: conn} do
     {:ok, _view, html} = live(conn, "/")
     # Audio summary card is gated on a non-empty list, and the

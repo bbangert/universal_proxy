@@ -343,6 +343,10 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   @impl true
   def render(assigns) do
+    rows = hardware_rows(assigns.ports, peripherals(assigns.audio_outputs, assigns.bt_radios))
+
+    assigns = assign(assigns, :hardware_rows, rows)
+
     ~H"""
     <div class="max-w-[1120px] mx-auto space-y-4">
       <.device_summary
@@ -355,8 +359,7 @@ defmodule UniversalProxyWeb.OverviewLive do
       />
 
       <.hardware_table
-        ports={@ports}
-        peripherals={peripherals(@audio_outputs, @bt_radios)}
+        rows={@hardware_rows}
         throughput_snapshots={@throughput_snapshots}
       />
 
@@ -461,8 +464,10 @@ defmodule UniversalProxyWeb.OverviewLive do
   end
 
   # ── Connected hardware table ──────────────────────────────────────────
-  attr(:ports, :list, required: true)
-  attr(:peripherals, :list, default: [])
+  # `rows` is the ordered, tagged list from `hardware_rows/2`: `{:port, _}`
+  # for a physical USB slot, `{:peripheral, _}` for a service-claimed device
+  # (a promoted slot or a trailing audio/BT row).
+  attr(:rows, :list, required: true)
   attr(:throughput_snapshots, :map, required: true)
 
   defp hardware_table(assigns) do
@@ -503,18 +508,41 @@ defmodule UniversalProxyWeb.OverviewLive do
           </tr>
         </thead>
         <tbody>
-          <.port_row
-            :for={port <- @ports}
-            port={port}
+          <%!-- Slots render in declared hardware order. A {:peripheral, _}
+               is a USB audio card or Bluetooth radio: claimed automatically
+               by its built-in service, so it routes to the managing tab on
+               click instead of the port drawer. --%>
+          <.hardware_row
+            :for={row <- @rows}
+            row={row}
             throughput_snapshots={@throughput_snapshots}
           />
-          <%!-- USB audio cards + USB Bluetooth radios: claimed automatically
-               by their built-in service, so they appear here but route to
-               the managing tab on click instead of the port drawer. --%>
-          <.peripheral_row :for={p <- @peripherals} p={p} />
         </tbody>
       </table>
     </.card>
+    """
+  end
+
+  # ── Row dispatcher ────────────────────────────────────────────────────
+  # Renders a port row or a peripheral row from a tagged tuple, keeping the
+  # ordering decided by `hardware_rows/2` (which carries no row-type info
+  # into the template otherwise).
+  attr(:row, :any, required: true)
+  attr(:throughput_snapshots, :map, required: true)
+
+  defp hardware_row(%{row: {:port, port}} = assigns) do
+    assigns = assign(assigns, :port, port)
+
+    ~H"""
+    <.port_row port={@port} throughput_snapshots={@throughput_snapshots} />
+    """
+  end
+
+  defp hardware_row(%{row: {:peripheral, p}} = assigns) do
+    assigns = assign(assigns, :p, p)
+
+    ~H"""
+    <.peripheral_row p={@p} />
     """
   end
 
@@ -590,7 +618,7 @@ defmodule UniversalProxyWeb.OverviewLive do
       phx-value-path={@p.tab}
     >
       <td class="px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle">
-        <div class="text-xs font-semibold text-fg-2 tracking-wide">{@p.type_label}</div>
+        <div class="text-xs font-semibold text-fg-2 tracking-wide">{@p.slot}</div>
         <div class="font-mono text-[11px] text-fg-3 mt-0.5">{@p.sub}</div>
       </td>
       <td class="px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle">
@@ -882,6 +910,42 @@ defmodule UniversalProxyWeb.OverviewLive do
     usb_audio_peripherals(audio_outputs) ++ usb_bt_peripherals(bt_radios)
   end
 
+  # Build the ordered hardware-table row list, tagging each as `{:port, _}`
+  # or `{:peripheral, _}`.
+  #
+  # A USB peripheral (today: a Bluetooth dongle) physically occupies one of
+  # the board's declared USB-A slots. Left alone that slot renders as an
+  # empty port row while the device shows as a separate peripheral keyed by
+  # its hci name — the receptacle reads as empty and the dongle reads as
+  # placeless. Fold them together: a peripheral whose `slot_sub` matches an
+  # empty declared slot takes that slot's position *in declared order*
+  # (`list_ports/0` already returns slots ordered), inheriting its "USB N"
+  # label, so the USB rows stay in fixed hardware order regardless of which
+  # device fills them. Peripherals matching no declared empty slot (USB
+  # audio, or a dongle on a dynamic-enumeration target) trail at the end.
+  defp hardware_rows(ports, peripherals) do
+    promotable =
+      for p <- peripherals, is_binary(p.slot_sub), into: %{}, do: {p.slot_sub, p}
+
+    {rows, claimed} =
+      Enum.map_reduce(ports, MapSet.new(), fn port, claimed ->
+        case not port.connected && Map.get(promotable, port.slot_sub) do
+          peripheral when is_map(peripheral) ->
+            {{:peripheral, %{peripheral | slot: port.slot}}, MapSet.put(claimed, port.slot_sub)}
+
+          _ ->
+            {{:port, port}, claimed}
+        end
+      end)
+
+    trailing =
+      for p <- peripherals,
+          not (is_binary(p.slot_sub) and MapSet.member?(claimed, p.slot_sub)),
+          do: {:peripheral, p}
+
+    rows ++ trailing
+  end
+
   defp usb_audio_peripherals(audio_outputs) do
     audio_outputs
     |> Map.values()
@@ -893,6 +957,8 @@ defmodule UniversalProxyWeb.OverviewLive do
       %{
         kind: :audio,
         type_label: "Sound card",
+        slot: "Sound card",
+        slot_sub: nil,
         name: out.friendly_name,
         detail: out.card_name,
         sub: out.alsa_device,
@@ -920,9 +986,14 @@ defmodule UniversalProxyWeb.OverviewLive do
       %{
         kind: :bluetooth,
         type_label: "Bluetooth",
+        # `slot`/`slot_sub` default to the type + hci name; reconcile_slots/2
+        # promotes them to the physical "USB N" / bus-path of the declared
+        # slot the dongle occupies when its port matches one.
+        slot: "Bluetooth",
+        slot_sub: radio[:port] || radio.hci,
         name: bt_radio_name(radio),
         detail: bt_radio_detail(radio),
-        sub: radio.hci,
+        sub: radio[:port] || radio.hci,
         managed_by: "Bluetooth proxy",
         tab: "/bluetooth",
         status:
