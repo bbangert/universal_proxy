@@ -124,6 +124,15 @@ defmodule UniversalProxy.ESPHome.BluetoothProxyTest do
   end
 
   describe "behaviour contract" do
+    setup do
+      # `function_exported?/3` reports false for a not-yet-loaded module. Under
+      # a random test seed nothing may have referenced BluetoothProxy before
+      # these introspection tests run, so load it explicitly first (otherwise
+      # the export checks spuriously fail / pass for the wrong reason).
+      Code.ensure_loaded!(BluetoothProxy)
+      :ok
+    end
+
     test "exports the Phase 2 optional callbacks (PAIRING + CACHE_CLEARING flags)" do
       # Espex requires BOTH pair/1 and unpair/1 for the PAIRING bit (0x08)
       # and clear_cache/1 for CACHE_CLEARING (0x10) — together with Phase 1
