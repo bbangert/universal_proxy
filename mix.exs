@@ -172,11 +172,12 @@ defmodule UniversalProxy.MixProject do
   # Custom Nerves systems (forks of upstream) with BlueZ + D-Bus and USB
   # support: kernel BT serdev/btusb + btbcm/rtl_bt firmware, USB-audio
   # (snd-usb-audio — DAC playback + ADC capture), dbus, bluez5-utils — so the
-  # Bluetooth proxy and USB audio work on every target. Prebuilt artifacts are
-  # pulled from the releases repo; no local buildroot required (host must be
-  # linux/x86_64). rpi/rpi2 have no onboard BT but support USB BT dongles;
-  # x86_64 omits the Pi-only BT firmware package. One pinned tag for all
-  # targets — bump @up_systems_tag to move every target to a new release.
+  # Bluetooth proxy and USB audio work on each custom-system target in
+  # @up_systems_targets (the upstream systems above keep their stock images).
+  # Prebuilt artifacts are pulled from the releases repo; no local buildroot
+  # required (host must be linux/x86_64). rpi/rpi2 have no onboard BT but
+  # support USB BT dongles; x86_64 omits the Pi-only BT firmware package. One
+  # pinned tag for all of them — bump @up_systems_tag to cut a new release.
   @up_systems_tag "v0.1.2"
   @up_systems_targets [:rpi, :rpi0, :rpi0_2, :rpi2, :rpi3, :rpi4, :rpi5, :x86_64]
 
