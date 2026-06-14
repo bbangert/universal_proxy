@@ -46,10 +46,14 @@ defmodule UniversalProxy.Bluetooth do
   so it can be unit-tested on the host against a registry started in the
   test — as are `Settings`, `Manager`, and `Radios`.
 
-  BT scope (`@bluetooth_targets`) = every Pi running a custom
-  BlueZ-enabled system. Only rpi3 is hardware-validated; the others share
-  its design (rpi0/rpi0_2: same miniuart-bt serdev path; rpi4/rpi5:
-  device-tree UNVERIFIED — see the bluetooth-dbus-migration handoff).
+  BT scope (`@bluetooth_targets`) = every target running a custom
+  BlueZ-enabled system. The onboard-BT Pis (rpi0/rpi0_2/rpi3/rpi4/rpi5)
+  carry a SoC radio; rpi/rpi2/x86_64 have none but accept USB BT dongles
+  (btusb is in every custom system). Only rpi3 is hardware-validated; the
+  rest are UNVERIFIED — rpi0/rpi0_2 share rpi3's miniuart-bt serdev path,
+  rpi4/rpi5 device-trees are unverified, and rpi/rpi2/x86_64 are USB-dongle
+  only (no onboard radio → the benign retry loop below until one is
+  plugged). See the bluetooth-dbus-migration handoff.
 
   ## When the controller never appears
 
@@ -64,7 +68,7 @@ defmodule UniversalProxy.Bluetooth do
 
   alias UniversalProxy.Bluetooth.{Manager, RadioMonitor, Settings, Stats}
 
-  @bluetooth_targets [:rpi0, :rpi0_2, :rpi3, :rpi4, :rpi5]
+  @bluetooth_targets [:rpi, :rpi0, :rpi0_2, :rpi2, :rpi3, :rpi4, :rpi5, :x86_64]
 
   # Compile-time constant: `Mix.target/0` is unavailable at runtime in a
   # Nerves release, so bake the predicate in. Single source of truth for
