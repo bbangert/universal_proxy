@@ -10,11 +10,13 @@ defmodule UniversalProxy.Audio.Enumerate do
   Outputs are keyed by a `{slot_sub, vendor_id, product_id}` tuple,
   identical in spirit to `UniversalProxy.UART.Store`'s key shape. For
   built-in SoC cards (Pi 3 / Pi 4 `bcm2835_*`) the VID/PID slots are
-  `nil` and `slot_sub` is the long card name. USB DAC support is
-  out of scope for v1 but the key shape leaves room for it: a
-  hot-plugged USB DAC will surface as
-  `{usb_bus_path, vendor_id, product_id}` once a custom Nerves system
-  enables `CONFIG_SND_USB_AUDIO` in the kernel.
+  `nil` and `slot_sub` is the long card name. A USB DAC keys by its
+  physical bus path — `{usb_port, vendor_id, product_id}` — so two
+  identical adapters (same name + VID/PID) in different ports are distinct
+  outputs instead of colliding on one key. Each output also carries
+  `:usb_port` (the bus path, e.g. `"1-1.3"`; `nil` for SoC cards) so the
+  Overview can render it in its declared slot, and `:card_name` (the raw
+  ALSA name) for display.
 
   ## Filesystem roots
 
@@ -40,7 +42,8 @@ defmodule UniversalProxy.Audio.Enumerate do
   @type output_info :: %{
           card_index: non_neg_integer(),
           alsa_device: String.t(),
-          card_name: String.t()
+          card_name: String.t(),
+          usb_port: String.t() | nil
         }
 
   @doc """
@@ -73,12 +76,18 @@ defmodule UniversalProxy.Audio.Enumerate do
         |> parse_cards()
         |> Enum.into(%{}, fn {index, card_name} ->
           {vid, pid} = read_vid_pid(sys_root, index)
-          key = {card_name, vid, pid}
+          usb_port = read_usb_port(sys_root, index)
+
+          # USB cards key by their physical bus path so two identical adapters
+          # (same name + VID/PID) are distinct outputs rather than colliding on
+          # one key; SoC cards have no port and key by the card name.
+          key = {usb_port || card_name, vid, pid}
 
           info = %{
             card_index: index,
             alsa_device: "plughw:#{index},0",
-            card_name: card_name
+            card_name: card_name,
+            usb_port: usb_port
           }
 
           {key, info}
@@ -157,6 +166,40 @@ defmodule UniversalProxy.Audio.Enumerate do
       _ ->
         {nil, nil}
     end
+  end
+
+  # -- USB bus path lookup --
+
+  # The physical USB-A receptacle a USB sound card occupies, e.g. "1-1.3",
+  # so the Overview can place it in its declared slot instead of a separate
+  # row (mirrors `UniversalProxy.Bluetooth.Radios` for BT dongles). The card's
+  # `device` symlink resolves to the bound USB interface
+  # (".../1-1/1-1.3/1-1.3:1.0"); the bus path is the interface segment
+  # (".../1-1.3:1.0") with the ":interface" suffix stripped. We match only the
+  # interface form — never a bare parent segment like "1-1" — so we can't
+  # mistake the hub for the device. `nil` when no interface segment is present
+  # (SoC cards point at a platform device; tests where `device` is a plain dir
+  # have no symlink), which leaves the card to trail rather than mis-slot it.
+  @usb_iface_re ~r/^(\d+-[\d.]+):\d+\.\d+$/
+
+  defp read_usb_port(sys_root, index) do
+    link = Path.join([sys_root, "card#{index}", "device"])
+
+    case File.read_link(link) do
+      {:ok, target} -> usb_bus_path(target)
+      _ -> nil
+    end
+  end
+
+  defp usb_bus_path(symlink_target) do
+    symlink_target
+    |> String.split("/")
+    |> Enum.find_value(fn seg ->
+      case Regex.run(@usb_iface_re, seg) do
+        [_, bus] -> bus
+        _ -> nil
+      end
+    end)
   end
 
   # -- Filesystem root configuration --

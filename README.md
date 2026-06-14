@@ -36,11 +36,13 @@ range -- without needing a dedicated ESPHome microcontroller for each one.
 - **Bluetooth proxy** -- relays BLE advertisements to Home Assistant over the
   ESPHome Native API (passive scanning plus optional active GATT connections),
   driven by the on-device BlueZ stack. The web UI shows live stats and lets you
-  pick which radio (onboard or USB) is bound. BT-capable Pi targets only.
-- **Sendspin audio playback** -- each ALSA output is exposed as an
-  independently discoverable [Sendspin](https://github.com/Sendspin/sendspin-cpp)
-  player for synchronized multi-room audio. See
-  [docs/plans/10_sendspin_audio.md](docs/plans/10_sendspin_audio.md).
+  pick which radio (onboard or USB) is bound. Works on every custom-system
+  target -- the onboard-BT Pis plus USB BT dongles on `rpi`/`rpi2`/`x86_64`.
+- **Sendspin audio playback** -- each ALSA output (the onboard jack/HDMI plus
+  hot-plugged **USB DACs**) is exposed as an independently discoverable
+  [Sendspin](https://github.com/Sendspin/sendspin-cpp) player for synchronized
+  multi-room audio. USB sound cards appear in their physical USB slot in the web
+  UI. See [docs/plans/10_sendspin_audio.md](docs/plans/10_sendspin_audio.md).
 - Web UI for configuration (accessible at `http://<device-ip>`)
 - USB hotplug detection -- plug/unplug serial adapters at any time
 - DETS-backed persistent device configuration across reboots
@@ -345,11 +347,14 @@ This project supports all standard Nerves targets:
 | `bbb`  | BeagleBone Black |
 | `x86_64` | Generic x86_64 |
 
-**Bluetooth** is available only on the Raspberry Pi targets that ship the
-custom BlueZ-enabled Nerves system -- `rpi0`, `rpi0_2`, `rpi3`, `rpi4`, and
-`rpi5`. Only `rpi3` is hardware-validated so far (`rpi4`/`rpi5` device trees
-are unverified). On every other target the Bluetooth subsystem is compiled out
-and the rest of the proxy runs normally.
+**Bluetooth** is available on every target that ships the custom BlueZ-enabled
+Nerves system: the onboard-BT Pis (`rpi0`, `rpi0_2`, `rpi3`, `rpi4`, `rpi5`)
+and -- via a USB BT dongle -- `rpi`, `rpi2`, and `x86_64`, which have no onboard
+radio. Only `rpi3` is hardware-validated so far; the rest share its design but
+are unverified (`rpi4`/`rpi5` device trees; the USB-dongle-only targets have no
+bench hardware). On a board with no radio yet, the subsystem idles in a benign
+retry loop and binds a USB dongle when one is plugged in. The remaining targets
+(`bbb`, etc.) compile the Bluetooth subsystem out and run the rest normally.
 
 ## Learn more
 

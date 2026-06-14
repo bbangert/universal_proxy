@@ -264,5 +264,16 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
                {:peripheral, %{slot: "Bluetooth", slot_sub: "9-9.9"}}
              ] = OverviewLive.hardware_rows(ports, peripherals)
     end
+
+    test "promotes a USB sound card into its slot; an SoC card still trails" do
+      ports = [slot("1-1.1.2", 1), slot("1-1.3", 2)]
+      usb_card = %{type_label: "Sound card", slot: "Sound card", slot_sub: "1-1.3", name: "DAC"}
+
+      assert [
+               {:port, %{slot_sub: "1-1.1.2"}},
+               {:peripheral, %{slot: "USB 2", slot_sub: "1-1.3", name: "DAC"}},
+               {:peripheral, %{type_label: "Sound card", slot_sub: nil}}
+             ] = OverviewLive.hardware_rows(ports, [audio(), usb_card])
+    end
   end
 end

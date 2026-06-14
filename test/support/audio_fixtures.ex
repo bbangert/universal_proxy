@@ -25,6 +25,7 @@ defmodule UniversalProxy.AudioFixtures do
         card_index: 0,
         alsa_device: "plughw:0,0",
         card_name: "bcm2835 Headphones",
+        usb_port: nil,
         friendly_name: "Headphones",
         enabled: true,
         volume: 50,
