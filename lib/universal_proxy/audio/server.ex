@@ -479,7 +479,7 @@ defmodule UniversalProxy.Audio.Server do
       Enum.reduce(added, {state.outputs, []}, fn key, {acc, broadcasts} ->
         info = Map.fetch!(enumerated, key)
 
-        case Store.save_config(state.store, key, %{}) do
+        case Store.save_config(state.store, key, initial_config_params(state.store, key, info)) do
           :ok ->
             case Store.get_config(state.store, key) do
               {:ok, saved} ->
@@ -553,6 +553,23 @@ defmodule UniversalProxy.Audio.Server do
     |> Map.put(:key, key)
     |> Map.merge(config)
   end
+
+  # On a card's first-ever sighting (no persisted row), seed a readable
+  # `friendly_name` that includes the USB port, so two identical adapters are
+  # distinguishable in Sendspin/HA. Persisted rows are left untouched: `added`
+  # also fires on every boot for already-saved cards, and passing
+  # `friendly_name` as a param would override a user's rename.
+  defp initial_config_params(store, key, info) do
+    case Store.get_config(store, key) do
+      {:ok, _existing} -> %{}
+      :error -> %{friendly_name: default_friendly_name(info)}
+    end
+  end
+
+  defp default_friendly_name(%{card_name: name, usb_port: port}) when is_binary(port),
+    do: "#{name} (#{port})"
+
+  defp default_friendly_name(%{card_name: name}), do: name
 
   @hardware_keys [:card_index, :alsa_device, :card_name, :usb_port]
 

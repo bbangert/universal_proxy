@@ -278,6 +278,50 @@ defmodule UniversalProxy.Audio.ServerTest do
       assert cfg.client_id == output.client_id
     end
 
+    test "USB card's default friendly_name includes the port", %{server: server, store: store} do
+      usb_key = {"1-1.3", 0x0BDA, 0x4E27}
+
+      EnumerateStub.set(%{
+        usb_key => %{
+          card_index: 0,
+          alsa_device: "plughw:0,0",
+          card_name: "USB SPDIF Adapter",
+          usb_port: "1-1.3"
+        }
+      })
+
+      :ok = Server.check_now(server)
+
+      assert_receive {:sendspin_output_added, output}
+      assert output.key == usb_key
+      assert output.friendly_name == "USB SPDIF Adapter (1-1.3)"
+
+      assert {:ok, %{friendly_name: "USB SPDIF Adapter (1-1.3)"}} =
+               Store.get_config(store, usb_key)
+    end
+
+    test "first sighting of a persisted (renamed) card keeps the user's name", %{
+      server: server,
+      store: store
+    } do
+      usb_key = {"1-1.3", 0x0BDA, 0x4E27}
+      :ok = Store.save_config(store, usb_key, %{friendly_name: "Living Room DAC"})
+
+      EnumerateStub.set(%{
+        usb_key => %{
+          card_index: 0,
+          alsa_device: "plughw:0,0",
+          card_name: "USB SPDIF Adapter",
+          usb_port: "1-1.3"
+        }
+      })
+
+      :ok = Server.check_now(server)
+
+      assert_receive {:sendspin_output_added, output}
+      assert output.friendly_name == "Living Room DAC"
+    end
+
     test "does not re-broadcast for outputs already known to the server", %{server: server} do
       EnumerateStub.set(%{
         @hp_key => %{

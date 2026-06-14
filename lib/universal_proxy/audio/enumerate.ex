@@ -10,11 +10,13 @@ defmodule UniversalProxy.Audio.Enumerate do
   Outputs are keyed by a `{slot_sub, vendor_id, product_id}` tuple,
   identical in spirit to `UniversalProxy.UART.Store`'s key shape. For
   built-in SoC cards (Pi 3 / Pi 4 `bcm2835_*`) the VID/PID slots are
-  `nil` and `slot_sub` is the long card name; a USB DAC carries its real
-  `{card_name, vendor_id, product_id}`. USB DACs are supported (the
-  custom Nerves system enables `CONFIG_SND_USB_AUDIO`); each output also
-  carries `:usb_port` — the physical USB-A bus path (e.g. `"1-1.3"`, `nil`
-  for SoC cards) — so the Overview can render it in its declared slot.
+  `nil` and `slot_sub` is the long card name. A USB DAC keys by its
+  physical bus path — `{usb_port, vendor_id, product_id}` — so two
+  identical adapters (same name + VID/PID) in different ports are distinct
+  outputs instead of colliding on one key. Each output also carries
+  `:usb_port` (the bus path, e.g. `"1-1.3"`; `nil` for SoC cards) so the
+  Overview can render it in its declared slot, and `:card_name` (the raw
+  ALSA name) for display.
 
   ## Filesystem roots
 
@@ -74,13 +76,18 @@ defmodule UniversalProxy.Audio.Enumerate do
         |> parse_cards()
         |> Enum.into(%{}, fn {index, card_name} ->
           {vid, pid} = read_vid_pid(sys_root, index)
-          key = {card_name, vid, pid}
+          usb_port = read_usb_port(sys_root, index)
+
+          # USB cards key by their physical bus path so two identical adapters
+          # (same name + VID/PID) are distinct outputs rather than colliding on
+          # one key; SoC cards have no port and key by the card name.
+          key = {usb_port || card_name, vid, pid}
 
           info = %{
             card_index: index,
             alsa_device: "plughw:#{index},0",
             card_name: card_name,
-            usb_port: read_usb_port(sys_root, index)
+            usb_port: usb_port
           }
 
           {key, info}

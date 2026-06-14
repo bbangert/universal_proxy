@@ -128,8 +128,10 @@ defmodule UniversalProxy.Audio.EnumerateTest do
                             USB SPDIF Adapter
       """)
 
+      # USB cards key by their bus path, not the (non-unique) card name, so two
+      # identical adapters don't collide on one key.
       assert Enumerate.list_outputs(proc_root: proc_root, sys_root: sys_root) == %{
-               {"USB SPDIF Adapter", 0x0BDA, 0x4E27} => %{
+               {"1-1.3", 0x0BDA, 0x4E27} => %{
                  card_index: 0,
                  alsa_device: "plughw:0,0",
                  card_name: "USB SPDIF Adapter",
