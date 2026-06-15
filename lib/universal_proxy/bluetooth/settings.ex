@@ -8,8 +8,26 @@ defmodule UniversalProxy.Bluetooth.Settings do
       %{
         enabled: boolean(),            # gate HA-facing proxying (espex wiring)
         active_connections: boolean(), # allow HA to open GATT connections
-        adapter: String.t() | nil      # selected radio MAC, nil = auto
+        adapter: String.t() | nil,     # selected proxy radio MAC, nil = auto
+        roles: %{mac => role}          # explicit per-adapter role
       }
+
+  where `role` is `:proxy | :audio | :off`:
+
+    * `:proxy` — drives the HA-facing BLE scanner/GATT proxy. At most one
+      adapter may be `:proxy` (`set_role/2` enforces this); it's the
+      successor to the single `adapter` selector.
+    * `:audio` — used by `UniversalProxy.Bluetooth.AudioManager` to
+      pair/connect A2DP headsets.
+    * `:off` — neither.
+
+  `roles` keys by **MAC** like `adapter`. A record written before this field
+  existed is migrated on read (see `migrate_roles/1`): a concrete selected
+  `adapter` becomes `:proxy` when `enabled`, else `:off`; an auto (`nil`)
+  adapter yields no role entry and `proxy_adapter/1` falls back to the legacy
+  `adapter` (still `nil` = auto). So existing BT-proxy behavior is unchanged
+  when roles default-derive from a legacy record. `active_connections` stays a
+  **proxy-adapter-only** property (a single flag, unchanged).
 
   `enabled` is NOT a power switch for the radio stack: the BlueZ subtree
   runs whenever the hardware supports it. `enabled` gates only whether the
@@ -42,14 +60,18 @@ defmodule UniversalProxy.Bluetooth.Settings do
   @default_table :bluetooth_config
   @record_key :settings
 
-  @defaults %{enabled: true, active_connections: true, adapter: nil}
+  @defaults %{enabled: true, active_connections: true, adapter: nil, roles: %{}}
 
   @mac_format ~r/^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$/
 
+  @roles [:proxy, :audio, :off]
+
+  @type role :: :proxy | :audio | :off
   @type t :: %{
           enabled: boolean(),
           active_connections: boolean(),
-          adapter: String.t() | nil
+          adapter: String.t() | nil,
+          roles: %{optional(String.t()) => role()}
         }
 
   # -- Client API --
@@ -104,6 +126,52 @@ defmodule UniversalProxy.Bluetooth.Settings do
     end
   end
 
+  @doc """
+  Set an adapter's role (`:proxy | :audio | :off`), keyed by MAC.
+
+  Assigning `:proxy` demotes any other current `:proxy` adapter to `:off` so
+  the single-proxy invariant always holds (only one radio can drive the HA
+  proxy). Setting `:off` removes the entry (the default role). Rejects a
+  malformed MAC (`{:error, :invalid_adapter}`) or unknown role
+  (`{:error, :invalid_role}`).
+  """
+  @spec set_role(GenServer.server(), String.t(), role()) :: :ok | {:error, term()}
+  def set_role(server \\ __MODULE__, mac, role)
+
+  def set_role(server, mac, role) when role in @roles do
+    case normalize_adapter(mac) do
+      {:ok, normalized} when is_binary(normalized) ->
+        GenServer.call(server, {:set_role, normalized, role})
+
+      _ ->
+        {:error, :invalid_adapter}
+    end
+  end
+
+  def set_role(_server, _mac, _role), do: {:error, :invalid_role}
+
+  @doc """
+  The proxy adapter MAC: the `:proxy`-role adapter if one is assigned, else the
+  legacy `adapter` selector (`nil` = auto). Pure; takes a settings map.
+  """
+  @spec proxy_adapter(t()) :: String.t() | nil
+  def proxy_adapter(%{roles: roles, adapter: adapter}) do
+    case Enum.find(roles, fn {_mac, role} -> role == :proxy end) do
+      {mac, _role} -> mac
+      nil -> adapter
+    end
+  end
+
+  @doc "MACs assigned the `:audio` role. Pure; takes a settings map."
+  @spec audio_adapters(t()) :: [String.t()]
+  def audio_adapters(%{roles: roles}) do
+    for {mac, :audio} <- roles, do: mac
+  end
+
+  @doc "Role for a MAC (`:off` if unset). Pure; takes a settings map."
+  @spec role(t(), String.t()) :: role()
+  def role(%{roles: roles}, mac), do: Map.get(roles, mac, :off)
+
   # -- Server Callbacks --
 
   @impl true
@@ -134,27 +202,77 @@ defmodule UniversalProxy.Bluetooth.Settings do
 
   def handle_call({:put, key, value}, _from, state) do
     merged = state.table |> read() |> Map.put(key, value)
+    {:reply, persist(state.table, merged, key), state}
+  end
 
-    with :ok <- :dets.insert(state.table, {@record_key, merged}),
-         :ok <- :dets.sync(state.table) do
-      {:reply, :ok, state}
-    else
-      {:error, reason} ->
-        Logger.error("Bluetooth settings save failed (#{key}): #{inspect(reason)}")
-        {:reply, {:error, reason}, state}
-    end
+  def handle_call({:set_role, mac, role}, _from, state) do
+    current = read(state.table)
+
+    {:reply,
+     persist(state.table, %{current | roles: apply_role(current.roles, mac, role)}, :roles),
+     state}
   end
 
   # -- Private --
+
+  # Insert+sync a complete record; shared by {:put,...} and {:set_role,...}.
+  defp persist(table, record, key) do
+    with :ok <- :dets.insert(table, {@record_key, record}),
+         :ok <- :dets.sync(table) do
+      :ok
+    else
+      {:error, reason} ->
+        Logger.error("Bluetooth settings save failed (#{key}): #{inspect(reason)}")
+        {:error, reason}
+    end
+  end
+
+  # Apply a role with the single-proxy invariant: assigning :proxy clears any
+  # other proxy; :off drops the entry (the default role).
+  defp apply_role(roles, mac, :off), do: Map.delete(roles, mac)
+
+  defp apply_role(roles, mac, :proxy) do
+    roles
+    |> Enum.reject(fn {_mac, role} -> role == :proxy end)
+    |> Map.new()
+    |> Map.put(mac, :proxy)
+  end
+
+  defp apply_role(roles, mac, role), do: Map.put(roles, mac, role)
 
   # Merge over the defaults so records written by an older firmware (fewer
   # fields) read back complete, and a corrupt/foreign record degrades to
   # the defaults instead of crashing every reader.
   defp read(table) do
     case :dets.lookup(table, @record_key) do
-      [{@record_key, stored}] when is_map(stored) -> sanitize(Map.merge(@defaults, stored))
-      _ -> @defaults
+      [{@record_key, stored}] when is_map(stored) ->
+        sanitize(Map.merge(@defaults, migrate_roles(stored)))
+
+      _ ->
+        @defaults
     end
+  end
+
+  # Records written before the `roles` field existed have no `:roles` key.
+  # Synthesize one from the legacy fields so existing proxy behavior is
+  # preserved: a concrete selected `adapter` → :proxy when enabled, else :off;
+  # an auto (nil) adapter yields no entry (proxy_adapter/1 falls back to it).
+  # Records that already carry `:roles` are returned untouched. Done before the
+  # defaults merge so an explicit `roles: %{}` is distinguishable from absence.
+  defp migrate_roles(%{roles: _} = stored), do: stored
+
+  defp migrate_roles(stored) do
+    roles =
+      case normalize_adapter(Map.get(stored, :adapter)) do
+        {:ok, mac} when is_binary(mac) ->
+          enabled = Map.get(stored, :enabled, @defaults.enabled)
+          %{mac => if(enabled == true, do: :proxy, else: :off)}
+
+        _ ->
+          %{}
+      end
+
+    Map.put(stored, :roles, roles)
   end
 
   # The setters validate writes, but the file can outlive them (corrupt
@@ -166,9 +284,32 @@ defmodule UniversalProxy.Bluetooth.Settings do
     %{
       enabled: bool_or(stored.enabled, @defaults.enabled),
       active_connections: bool_or(stored.active_connections, @defaults.active_connections),
-      adapter: stored_adapter(stored.adapter)
+      adapter: stored_adapter(stored.adapter),
+      roles: sanitize_roles(stored.roles)
     }
   end
+
+  # Keep only well-formed `mac => role` pairs (normalized MAC, known role,
+  # never :off — that's the absent default), and enforce the single-proxy
+  # invariant on read too, in case a hand-edited/foreign record carries two.
+  defp sanitize_roles(roles) when is_map(roles) do
+    roles
+    |> Enum.flat_map(fn {mac, role} ->
+      case normalize_adapter(mac) do
+        {:ok, norm} when is_binary(norm) and role in @roles and role != :off -> [{norm, role}]
+        _ -> []
+      end
+    end)
+    |> Enum.reduce({%{}, false}, fn
+      # A second :proxy is dropped (absent = :off), preserving the invariant.
+      {_mac, :proxy}, {acc, true} -> {acc, true}
+      {mac, :proxy}, {acc, false} -> {Map.put(acc, mac, :proxy), true}
+      {mac, role}, {acc, seen?} -> {Map.put(acc, mac, role), seen?}
+    end)
+    |> elem(0)
+  end
+
+  defp sanitize_roles(_), do: %{}
 
   defp bool_or(value, _default) when is_boolean(value), do: value
   defp bool_or(_value, default), do: default

@@ -154,6 +154,13 @@ config :mdns_lite,
 # coexist on one chip, and blue_heron crash-loops at boot without a transport.
 # Hence no `:blue_heron` config here anymore.
 
+# Audio enumerate: on target, union the local ALSA cards with connected A2DP
+# headsets (via bluez-alsa) so a Bluetooth headset surfaces as a Sendspin
+# output through the existing pipeline. Host/test stay on NullEnumerate
+# (config/test.exs); host dev uses the bare ALSA Enumerate (default).
+config :universal_proxy,
+  audio_enumerate_module: UniversalProxy.Audio.Enumerate.Composite
+
 # Import target specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.
 # Uncomment to use target specific configurations

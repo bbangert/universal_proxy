@@ -592,6 +592,50 @@ defmodule UniversalProxy.Audio.ServerTest do
              "expected a :started call on the mDNS port base; got #{inspect(calls)}"
     end
 
+    test "a Bluetooth headset key (nil card_index/usb_port) spawns a player + mDNS port", %{
+      server: server,
+      player_sup: sup
+    } do
+      # Phase 2: a connected A2DP headset enumerates with the same contract as
+      # an ALSA card but with `usb_port: nil` and `card_index: nil` and a MAC
+      # key. Server must spawn a player + allocate an mDNS port for it exactly
+      # like a hardware card — proving the composite-enumerate seam needs no
+      # orchestrator changes and tolerates the nil hardware slots.
+      bt_key = {"AA:BB:CC:DD:EE:FF", nil, nil}
+
+      # Keep the @hp_key ALSA card from setup AND add the headset, so the
+      # count assertion proves a BT output coexists with a hardware card.
+      EnumerateStub.set(%{
+        @hp_key => %{
+          card_index: 0,
+          alsa_device: "plughw:0,0",
+          card_name: "bcm2835 Headphones",
+          usb_port: nil
+        },
+        bt_key => %{
+          card_index: nil,
+          alsa_device: "bluealsa:DEV=AA:BB:CC:DD:EE:FF,PROFILE=a2dp",
+          card_name: "WH-1000XM4",
+          usb_port: nil
+        }
+      })
+
+      :ok = Server.check_now(server)
+      assert_receive {:sendspin_output_added, %{key: ^bt_key, friendly_name: "WH-1000XM4"}}
+
+      # The headset player spawns alongside the @hp_key card on a real mDNS port.
+      assert length(DynamicSupervisor.which_children(sup)) == 2
+
+      assert Enum.any?(PlayerStubCalls.calls(), fn
+               {:started, ^bt_key, port, cfg} when port in 8928..65_535 ->
+                 cfg.alsa_device == "bluealsa:DEV=AA:BB:CC:DD:EE:FF,PROFILE=a2dp"
+
+               _ ->
+                 false
+             end),
+             "expected the BT headset to spawn a player on an mDNS port"
+    end
+
     test "update_config with volume forwards to set_volume", %{server: server} do
       :ok = Server.update_config(server, @hp_key, %{volume: 77})
       assert_receive {:sendspin_state, @hp_key, %{volume: 77}}
