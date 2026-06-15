@@ -257,5 +257,39 @@ defmodule UniversalProxy.Bluetooth.SettingsTest do
       assert {:error, :invalid_adapter} = Settings.set_role(server, "nope", :audio)
       assert {:error, :invalid_role} = Settings.set_role(server, "AA:BB:CC:DD:EE:FF", :bogus)
     end
+
+    test "setting the legacy proxy adapter to :audio frees its proxy fallback", %{server: server} do
+      # Reproduces the hardware bug: the pre-roles `adapter` selector still
+      # named this radio, so giving it :audio left proxy_adapter falling back
+      # to it — masking the :audio role and making the toggle snap to Proxy.
+      :ok = Settings.set_adapter(server, "AA:BB:CC:DD:EE:FF")
+      :ok = Settings.set_role(server, "AA:BB:CC:DD:EE:FF", :audio)
+
+      settings = Settings.get(server)
+      assert Settings.audio_adapters(settings) == ["AA:BB:CC:DD:EE:FF"]
+      assert Settings.proxy_adapter(settings) == nil
+    end
+  end
+
+  describe "proxy_adapter/1 legacy-fallback suppression" do
+    test "falls back to the legacy adapter when it has no role" do
+      assert Settings.proxy_adapter(%{roles: %{}, adapter: "AA:BB:CC:DD:EE:FF"}) ==
+               "AA:BB:CC:DD:EE:FF"
+    end
+
+    test "suppresses the fallback when the legacy adapter was given :audio" do
+      settings = %{roles: %{"AA:BB:CC:DD:EE:FF" => :audio}, adapter: "AA:BB:CC:DD:EE:FF"}
+      assert Settings.proxy_adapter(settings) == nil
+    end
+
+    test "keeps a legacy proxy when a DIFFERENT radio is set to :audio" do
+      settings = %{roles: %{"11:22:33:44:55:66" => :audio}, adapter: "AA:BB:CC:DD:EE:FF"}
+      assert Settings.proxy_adapter(settings) == "AA:BB:CC:DD:EE:FF"
+    end
+
+    test "an explicit :proxy role always wins over the legacy adapter" do
+      settings = %{roles: %{"11:22:33:44:55:66" => :proxy}, adapter: "AA:BB:CC:DD:EE:FF"}
+      assert Settings.proxy_adapter(settings) == "11:22:33:44:55:66"
+    end
   end
 end

@@ -72,7 +72,14 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
     @type conn :: pid() | nil
     # adapters_info entries are `%{path: String, address: String | nil, ...}`.
     @callback adapters_info(conn()) :: [map()]
-    @callback managed_devices(conn()) :: [%{path: String.t(), mac: String.t(), props: map()}]
+    @callback managed_devices(conn()) :: [
+                %{
+                  :path => String.t(),
+                  :mac => String.t(),
+                  :props => map(),
+                  optional(:battery) => non_neg_integer() | nil
+                }
+              ]
     @callback start_discovery(conn(), adapter_path :: String.t()) :: :ok | {:error, term()}
     @callback stop_discovery(conn(), adapter_path :: String.t()) :: :ok | {:error, term()}
     @callback pair(conn(), device_path :: String.t()) :: :ok | {:error, term()}
@@ -276,7 +283,7 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
     do: {:reply, dispatch(state, mac, &connect_and_broadcast(state, &1, mac)), state}
 
   def handle_call({:disconnect, mac}, _from, state),
-    do: {:reply, dispatch(state, mac, &state.ops.disconnect(state.conn, &1)), state}
+    do: {:reply, dispatch(state, mac, &disconnect_and_broadcast(state, &1, mac)), state}
 
   def handle_call({:forget, mac}, _from, state),
     do: {:reply, dispatch(state, mac, &forget_flow(state, mac, &1)), state}
@@ -345,8 +352,14 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
     else
       task = fn ->
         case resolve_device_path(state, mac) do
-          {:ok, device_path} -> fun.(device_path)
-          :no_audio_adapter -> :ok
+          {:ok, device_path} ->
+            fun.(device_path)
+
+          # The audio adapter went away between the guard above and here (e.g.
+          # the dongle was unplugged mid-op). The op can't run, but subscribers
+          # must still refresh — the device is gone — so emit a disconnect.
+          :no_audio_adapter ->
+            broadcast_connection(state, mac, :disconnected)
         end
       end
 
@@ -434,13 +447,30 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
     end
   end
 
-  defp forget_flow(state, _mac, device_path) do
+  # RemoveDevice/Disconnect emit no org.bluez signal we currently subscribe to,
+  # so subscribers (the Bluetooth tab + Audio.Server, which has no kernel uevent
+  # for a BlueALSA PCM) would never learn the device went away. Broadcast a
+  # `:disconnected` after the op — for forget, *after* RemoveDevice so a list
+  # refresh no longer sees the device. (forget_all/0 already does this per
+  # device; the per-device forget/disconnect paths were missing it, which left
+  # the UI card lingering after a confirmed Forget.)
+  defp forget_flow(state, mac, device_path) do
     _ = state.ops.disconnect(state.conn, device_path)
 
-    case adapter_path_for_device(device_path, state) do
-      nil -> {:error, :no_audio_adapter}
-      adapter -> state.ops.remove(state.conn, adapter, device_path)
-    end
+    result =
+      case adapter_path_for_device(device_path, state) do
+        nil -> {:error, :no_audio_adapter}
+        adapter -> state.ops.remove(state.conn, adapter, device_path)
+      end
+
+    broadcast_connection(state, mac, :disconnected)
+    result
+  end
+
+  defp disconnect_and_broadcast(state, device_path, mac) do
+    result = state.ops.disconnect(state.conn, device_path)
+    broadcast_connection(state, mac, :disconnected)
+    result
   end
 
   defp spawn_reconnect(state) do
@@ -552,7 +582,7 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
     adapters = audio_adapters_info(state)
     paths = Enum.map(adapters, & &1.path)
 
-    for %{mac: mac, path: path, props: props} <- managed_devices(state),
+    for %{mac: mac, path: path, props: props} = device <- managed_devices(state),
         on_audio_adapter?(path, paths),
         audio_sink?(props["UUIDs"] || []) do
       %{
@@ -562,7 +592,9 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
         paired: props["Paired"] == true,
         trusted: props["Trusted"] == true,
         # Which audio radio this device is bonded to (bonds are per-adapter).
-        adapter: adapter_mac_for(adapters, path)
+        adapter: adapter_mac_for(adapters, path),
+        # Battery %, when the device reports it (org.bluez.Battery1); else nil.
+        battery: Map.get(device, :battery)
       }
     end
   end

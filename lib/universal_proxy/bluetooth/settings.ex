@@ -153,12 +153,18 @@ defmodule UniversalProxy.Bluetooth.Settings do
   @doc """
   The proxy adapter MAC: the `:proxy`-role adapter if one is assigned, else the
   legacy `adapter` selector (`nil` = auto). Pure; takes a settings map.
+
+  The legacy fallback is suppressed when the `adapter` radio has since been
+  given a non-proxy role: otherwise a radio the user set to `:audio` would still
+  read back as the proxy (its `:proxy` fallback masking its `:audio` role),
+  which forced "assign some other radio to Proxy first" before an audio toggle
+  would stick.
   """
   @spec proxy_adapter(t()) :: String.t() | nil
   def proxy_adapter(%{roles: roles, adapter: adapter}) do
     case Enum.find(roles, fn {_mac, role} -> role == :proxy end) do
       {mac, _role} -> mac
-      nil -> adapter
+      nil -> if Map.has_key?(roles, adapter), do: nil, else: adapter
     end
   end
 

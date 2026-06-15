@@ -15,6 +15,7 @@ defmodule UniversalProxy.Bluetooth.AudioManager.LiveOps do
 
   @adapter_iface "org.bluez.Adapter1"
   @device_iface "org.bluez.Device1"
+  @battery_iface "org.bluez.Battery1"
   @props_iface "org.freedesktop.DBus.Properties"
 
   # Device1.Connect/Pair block until the link is up or BlueZ gives up.
@@ -36,8 +37,18 @@ defmodule UniversalProxy.Bluetooth.AudioManager.LiveOps do
             case List.keyfind(ifaces, @device_iface, 0) do
               {_iface, props} ->
                 case mac_from_path(path) do
-                  {:ok, mac} -> [%{path: path, mac: mac, props: Variant.unwrap_props(props)}]
-                  :error -> []
+                  {:ok, mac} ->
+                    [
+                      %{
+                        path: path,
+                        mac: mac,
+                        props: Variant.unwrap_props(props),
+                        battery: battery_pct(ifaces)
+                      }
+                    ]
+
+                  :error ->
+                    []
                 end
 
               nil ->
@@ -115,6 +126,19 @@ defmodule UniversalProxy.Bluetooth.AudioManager.LiveOps do
 
   defp normalize({:ok, _}), do: :ok
   defp normalize({:error, _} = err), do: err
+
+  # org.bluez exposes a device's battery (via the GATT Battery Service or HFP
+  # indicators, gated by bluetoothd's experimental flag) as a separate
+  # `Battery1` interface on the same object — present only when the device
+  # reports it. `nil` when absent.
+  defp battery_pct(ifaces) do
+    with {_iface, props} <- List.keyfind(ifaces, @battery_iface, 0),
+         pct when is_integer(pct) <- Variant.unwrap_props(props)["Percentage"] do
+      pct
+    else
+      _ -> nil
+    end
+  end
 
   defp mac_from_path(path) do
     case Regex.run(@dev_mac_re, path) do

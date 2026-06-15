@@ -202,6 +202,30 @@ defmodule UniversalProxy.Bluetooth.AudioManagerTest do
     end
   end
 
+  describe "forget/1 + disconnect/1 broadcast :disconnected" do
+    # RemoveDevice/Disconnect emit no org.bluez signal we subscribe to, so the
+    # API must broadcast so the Bluetooth tab + Audio.Server refresh. Without
+    # this the confirmed-Forget card lingered in the UI.
+    test "forget disconnects, removes, and broadcasts :disconnected", %{settings: settings} do
+      with_audio_adapter(settings)
+      mgr = start_manager(settings)
+
+      assert :ok = AudioManager.forget(mgr, @hs)
+      assert_receive {:ops, {:disconnect, @hs_path}}, 500
+      assert_receive {:ops, {:remove, @adapter, @hs_path}}, 500
+      assert_receive {:bt_audio, :connection, @hs, :disconnected}, 500
+    end
+
+    test "disconnect issues Disconnect and broadcasts :disconnected", %{settings: settings} do
+      with_audio_adapter(settings)
+      mgr = start_manager(settings)
+
+      assert :ok = AudioManager.disconnect(mgr, @hs)
+      assert_receive {:ops, {:disconnect, @hs_path}}, 500
+      assert_receive {:bt_audio, :connection, @hs, :disconnected}, 500
+    end
+  end
+
   describe "reconnect on boot" do
     test "issues Connect for each trusted audio headset", %{settings: settings} do
       with_audio_adapter(settings)
@@ -359,6 +383,32 @@ defmodule UniversalProxy.Bluetooth.AudioManagerTest do
 
       assert %{adapter: @audio_mac} = Enum.find(hp, &(&1.mac == @hs))
       assert %{adapter: @audio_mac2} = Enum.find(hp, &(&1.mac == @hs2))
+    end
+
+    test "list_headphones surfaces a reported battery level (nil otherwise)", %{
+      settings: settings
+    } do
+      with_audio_adapter(settings)
+
+      MockOps.configure(%{
+        devices: [
+          Map.put(dev(@hs_path, @hs, %{"Paired" => true, "UUIDs" => [@sink_uuid]}), :battery, 80)
+        ]
+      })
+
+      mgr = start_manager(settings)
+      assert [%{mac: @hs, battery: 80}] = AudioManager.list_headphones(mgr)
+    end
+
+    test "list_headphones battery is nil when the device doesn't report it", %{settings: settings} do
+      with_audio_adapter(settings)
+
+      MockOps.configure(%{
+        devices: [dev(@hs_path, @hs, %{"Paired" => true, "UUIDs" => [@sink_uuid]})]
+      })
+
+      mgr = start_manager(settings)
+      assert [%{mac: @hs, battery: nil}] = AudioManager.list_headphones(mgr)
     end
   end
 
