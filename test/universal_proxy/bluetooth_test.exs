@@ -185,4 +185,40 @@ defmodule UniversalProxy.BluetoothTest do
       assert %{adapter: nil} = Settings.get()
     end
   end
+
+  describe "set_role/2" do
+    # AudioManager isn't started in this harness, so forget_all_on_adapter
+    # no-ops (exit-safe) — these tests cover persistence + proxy re-targeting.
+    test "assigning :proxy persists the role and re-targets the subtree" do
+      %{dynsup: dynsup} = start_subsystem()
+      [{_, pid_before, _, _}] = DynamicSupervisor.which_children(dynsup)
+
+      assert Bluetooth.set_role(@hci1_mac, :proxy) == :ok
+
+      assert Settings.proxy_adapter(Settings.get()) == @hci1_mac
+      assert :persistent_term.get(DevicePath.desired_adapter_key()) == @hci1_mac
+      [{_, pid_after, _, _}] = DynamicSupervisor.which_children(dynsup)
+      assert pid_after != pid_before
+    end
+
+    test "an :audio-only assignment doesn't restart the proxy subtree" do
+      %{dynsup: dynsup} = start_subsystem()
+      [{_, pid_before, _, _}] = DynamicSupervisor.which_children(dynsup)
+
+      assert Bluetooth.set_role(@hci1_mac, :audio) == :ok
+
+      assert Settings.audio_adapters(Settings.get()) == [@hci1_mac]
+      # Proxy target unchanged (still auto) → no restart.
+      [{_, pid_after, _, _}] = DynamicSupervisor.which_children(dynsup)
+      assert pid_after == pid_before
+    end
+
+    test "normalizes case and rejects a bad role" do
+      start_subsystem()
+
+      assert Bluetooth.set_role(String.downcase(@hci1_mac), :audio) == :ok
+      assert Settings.audio_adapters(Settings.get()) == [@hci1_mac]
+      assert {:error, :invalid_role} = Bluetooth.set_role(@hci1_mac, :bogus)
+    end
+  end
 end

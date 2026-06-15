@@ -307,6 +307,43 @@ defmodule UniversalProxy.Bluetooth.AudioManagerTest do
       assert {:error, :not_audio_adapter} = AudioManager.start_scan(mgr, "99:99:99:99:99:99")
     end
 
+    test "forget_all_on_adapter disconnects + removes only that radio's speakers", %{
+      settings: settings
+    } do
+      with_two_audio_adapters(settings)
+
+      MockOps.configure(%{
+        devices: [
+          dev(@hs_path, @hs, %{"UUIDs" => [@sink_uuid]}),
+          dev(@hs2_path, @hs2, %{"UUIDs" => [@sink_uuid]})
+        ]
+      })
+
+      mgr = start_manager(settings)
+
+      assert :ok = AudioManager.forget_all_on_adapter(mgr, @audio_mac)
+      assert_receive {:ops, {:disconnect, @hs_path}}
+      assert_receive {:ops, {:remove, @adapter, @hs_path}}
+      assert_receive {:bt_audio, :connection, @hs, :disconnected}
+
+      # The speaker on the other audio adapter is untouched.
+      refute_receive {:ops, {:remove, @adapter2, _}}, 150
+    end
+
+    test "forget_all_on_adapter resolves even after the role flipped off (raw lookup)", %{
+      settings: settings
+    } do
+      with_two_audio_adapters(settings)
+      MockOps.configure(%{devices: [dev(@hs_path, @hs, %{"UUIDs" => [@sink_uuid]})]})
+      mgr = start_manager(settings)
+
+      # Simulate the public API order: role already off, adapter no longer
+      # :audio, but the raw adapter list still has it → devices still found.
+      :ok = Settings.set_role(settings, @audio_mac, :off)
+      assert :ok = AudioManager.forget_all_on_adapter(mgr, @audio_mac)
+      assert_receive {:ops, {:remove, @adapter, @hs_path}}
+    end
+
     test "list_headphones tags each device with the adapter it's bonded to", %{settings: settings} do
       with_two_audio_adapters(settings)
 

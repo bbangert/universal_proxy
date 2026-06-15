@@ -66,7 +66,7 @@ defmodule UniversalProxy.Bluetooth do
   picked up by the next cycle.
   """
 
-  alias UniversalProxy.Bluetooth.{Manager, RadioMonitor, Settings, Stats}
+  alias UniversalProxy.Bluetooth.{AudioManager, Manager, RadioMonitor, Settings, Stats}
 
   @bluetooth_targets [:rpi, :rpi0, :rpi0_2, :rpi2, :rpi3, :rpi4, :rpi5, :x86_64]
 
@@ -237,6 +237,39 @@ defmodule UniversalProxy.Bluetooth do
       end
     else
       {:error, :unknown_radio}
+    end
+  catch
+    :exit, _ -> {:error, :unavailable}
+  end
+
+  @doc """
+  Assign a radio's role (`:proxy | :audio | :off`) and act on the change.
+
+  Because BlueZ bonds are per-adapter, a radio **leaving** the `:audio` role
+  would orphan its paired speakers — so this disconnects + forgets them
+  (`AudioManager.forget_all_on_adapter/2`). When the change moves the
+  proxy-role radio, the BlueZ subtree is restarted to re-target it; otherwise
+  it just rebroadcasts status. Callers that want a confirm step (the UI's
+  "deactivating forgets N speakers" modal) gather the affected speakers from
+  `AudioManager.list_headphones/0` (filtered by `:adapter`) before calling.
+  """
+  @spec set_role(String.t(), Settings.role()) :: :ok | {:error, term()}
+  def set_role(mac, role) when is_binary(mac) do
+    normalized = String.upcase(mac)
+    before_proxy = Settings.proxy_adapter(Settings.get())
+
+    with :ok <- Settings.set_role(normalized, role) do
+      # Leaving the audio role: clean up its per-adapter bonds.
+      if role != :audio, do: AudioManager.forget_all_on_adapter(normalized)
+
+      if Settings.proxy_adapter(Settings.get()) != before_proxy do
+        :ok = Manager.reconcile(restart: true)
+      else
+        :ok = Manager.reconcile()
+      end
+
+      _ = RadioMonitor.refresh()
+      :ok
     end
   catch
     :exit, _ -> {:error, :unavailable}

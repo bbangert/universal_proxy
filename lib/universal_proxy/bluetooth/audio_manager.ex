@@ -138,6 +138,17 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
   @spec forget(GenServer.server(), mac()) :: :ok | {:error, term()}
   def forget(server \\ __MODULE__, mac), do: call(server, {:forget, mac}, {:error, :not_running})
 
+  @doc """
+  Disconnect + forget every A2DP-sink device bonded to the given adapter MAC.
+  Used when an adapter leaves the `:audio` role: a BlueZ bond is per-adapter, so
+  deactivating a radio orphans its speakers — this removes them cleanly. The
+  adapter is resolved from the raw adapter list (role-independent), so it works
+  even after the role has already flipped off. Returns `:ok` (accepted).
+  """
+  @spec forget_all_on_adapter(GenServer.server(), mac()) :: :ok
+  def forget_all_on_adapter(server \\ __MODULE__, adapter_mac),
+    do: call(server, {:forget_all_on_adapter, adapter_mac}, :ok)
+
   # Exit-safe call: off-target/not-running yields the inert default.
   defp call(server, msg, default) do
     GenServer.call(server, msg)
@@ -270,6 +281,9 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
   def handle_call({:forget, mac}, _from, state),
     do: {:reply, dispatch(state, mac, &forget_flow(state, mac, &1)), state}
 
+  def handle_call({:forget_all_on_adapter, adapter_mac}, _from, state),
+    do: {:reply, forget_all(state, adapter_mac), state}
+
   @impl true
   def handle_info(:scan_timeout, state), do: {:noreply, do_stop_scan(state)}
 
@@ -372,6 +386,51 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
     case state.ops.connect(state.conn, device_path) do
       :ok -> broadcast_connection(state, mac, :connected)
       {:error, reason} -> broadcast_pairing(state, mac, {:error, map_failure(reason)})
+    end
+  end
+
+  # Disconnect + RemoveDevice every A2DP-sink bonded to `adapter_mac`. Resolves
+  # the adapter from the RAW adapter list (not role-filtered) so it works even
+  # once the role has flipped off. Runs in a Task; broadcasts a disconnect per
+  # device so subscribers refresh.
+  defp forget_all(state, adapter_mac) do
+    case raw_adapter_path(state, adapter_mac) do
+      nil ->
+        :ok
+
+      adapter_path ->
+        devices =
+          Enum.filter(managed_devices(state), fn d ->
+            String.starts_with?(d.path, adapter_path <> "/") and
+              audio_sink?(d.props["UUIDs"] || [])
+          end)
+
+        spawn_task(state, fn ->
+          Enum.each(devices, fn d ->
+            _ = state.ops.disconnect(state.conn, d.path)
+            _ = state.ops.remove(state.conn, adapter_path, d.path)
+            broadcast_connection(state, d.mac, :disconnected)
+          end)
+        end)
+
+        :ok
+    end
+  end
+
+  # Object path for an adapter MAC across ALL adapters (any role / none).
+  defp raw_adapter_path(state, adapter_mac) do
+    norm = String.upcase(adapter_mac)
+
+    Enum.find_value(safe_call(fn -> state.ops.adapters_info(state.conn) end, []), fn a ->
+      if is_binary(a[:address]) and String.upcase(a[:address]) == norm, do: a[:path]
+    end)
+  end
+
+  # Run `fun` under the Task.Supervisor; inline fallback if it's unavailable.
+  defp spawn_task(state, fun) do
+    case Task.Supervisor.start_child(state.task_sup, fun) do
+      {:ok, _pid} -> :ok
+      {:error, _} -> fun.()
     end
   end
 
