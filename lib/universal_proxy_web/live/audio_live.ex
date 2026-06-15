@@ -243,8 +243,13 @@ defmodule UniversalProxyWeb.AudioLive do
 
   def handle_info({:bt_audio, _kind, _mac, _payload}, socket), do: {:noreply, socket}
 
-  def handle_info({:drop_reconnecting, mac}, socket) do
-    {:noreply, drop_reconnecting(socket, mac)}
+  def handle_info({:drop_reconnecting, mac, token}, socket) do
+    # Ignore a stale timer: only prune when this is still the current grace
+    # timer for that MAC (a drop→return→drop may have superseded it).
+    case socket.assigns.reconnecting do
+      %{^mac => %{token: ^token}} -> {:noreply, drop_reconnecting(socket, mac)}
+      _ -> {:noreply, socket}
+    end
   end
 
   def handle_info({:sendspin_state, key, partial}, socket) do
@@ -718,14 +723,23 @@ defmodule UniversalProxyWeb.AudioLive do
   # When a connected, enabled BT output's PCM vanishes, hold a brief
   # "Reconnecting" placeholder so a quick drop/return doesn't flicker the
   # card away. Ignores ALSA removals and BT outputs that were disabled.
-  # The grace-timer ref is stored on the entry and cancelled before any
-  # replacement, so a rapid drop→return→drop can't leave a stale timer that
-  # prunes the *fresh* placeholder (or pile timers in the mailbox).
+  #
+  # Each grace timer carries a unique `token` stored on the entry: cancelling
+  # the prior timer reduces mailbox churn, but `cancel_timer/1` can't unsend a
+  # message that already fired, so the handler also drops only when the
+  # message's token still matches the current entry — otherwise a rapid
+  # drop→return→drop could let a stale timer prune the *fresh* placeholder.
   defp maybe_start_reconnecting(socket, _key, %{bt?: true, bt_mac: mac, enabled: true} = removed)
        when is_binary(mac) do
     cancel_reconnect_timer(socket, mac)
-    ref = Process.send_after(self(), {:drop_reconnecting, mac}, @bt_reconnect_grace_ms)
-    update(socket, :reconnecting, &Map.put(&1, mac, %{name: removed.friendly_name, timer: ref}))
+    token = make_ref()
+    ref = Process.send_after(self(), {:drop_reconnecting, mac, token}, @bt_reconnect_grace_ms)
+
+    update(
+      socket,
+      :reconnecting,
+      &Map.put(&1, mac, %{name: removed.friendly_name, timer: ref, token: token})
+    )
   end
 
   defp maybe_start_reconnecting(socket, _key, _removed), do: socket

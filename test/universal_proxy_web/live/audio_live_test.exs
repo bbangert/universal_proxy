@@ -468,6 +468,33 @@ defmodule UniversalProxyWeb.AudioLiveTest do
     refute html =~ "No audio outputs detected"
   end
 
+  test "a stale drop_reconnecting timer (token mismatch) doesn't prune the placeholder",
+       %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/audio")
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:output_added",
+      {:sendspin_output_added, bt_output()}
+    )
+
+    assert render(view) =~ "Sony WH-1000XM5"
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:output_removed",
+      {:sendspin_output_removed, %{key: {"AA:BB:CC:DD:EE:FF", nil, nil}}}
+    )
+
+    assert render(view) =~ "Reconnecting"
+
+    # A grace timer that already fired but was superseded (drop→return→drop)
+    # carries an old token; the handler must ignore it, not prune the fresh
+    # placeholder.
+    send(view.pid, {:drop_reconnecting, "AA:BB:CC:DD:EE:FF", make_ref()})
+    assert render(view) =~ "Reconnecting"
+  end
+
   test "an ALSA removal does not leave a Reconnecting placeholder", %{conn: conn} do
     {:ok, view, _html} = live(conn, "/audio")
 

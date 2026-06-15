@@ -15,15 +15,17 @@ defmodule UniversalProxy.Bluez do
     3. `bluetoothd` (`MuonTrap.Daemon`) — claims `org.bluez`, drives `hci0`
        via the kernel mgmt socket. The `rebus` client + advertisement
        reconstruction (Stage B) attach on top of this.
-    4. `bluealsad` (`MuonTrap.Daemon`, last child) — bluez-alsa's A2DP-source
-       daemon. Claims `org.bluealsa`, and for every connected A2DP headset
-       exposes an ALSA PCM `bluealsa:DEV=MAC,PROFILE=a2dp` that sendspin opens
-       directly. Placed **last** so it comes up after `org.bluez` exists and so
-       a `bluealsad` crash restarts *nothing* — audio is secondary to the BT
-       proxy's scanning, which must survive an audio-daemon fault. (The plan
-       said "before Client"; under `:rest_for_one` that would tear scanning
-       down on a bluealsad crash, contradicting the plan's own rationale — so
-       last placement is the faithful reading of the intent.)
+    4. `bluealsad` (`MuonTrap.Daemon`) — bluez-alsa's A2DP-source daemon.
+       Claims `org.bluealsa`, and for every connected A2DP headset exposes an
+       ALSA PCM `bluealsa:DEV=MAC,PROFILE=a2dp` that sendspin opens directly.
+       Placed **after the proxy scanning/GATT clients** (Client/Agent/Gatt) so
+       it comes up once `org.bluez` exists and so a `bluealsad` crash never
+       restarts the **proxy scanning/GATT stack** — audio is secondary to the
+       BT proxy's scanning, which must survive an audio-daemon fault. The audio
+       children that follow it (`BlueAlsa`, `AudioManager`) *do* restart with it
+       under `:rest_for_one`, which is intended — they're the same audio path.
+       (The plan said "before Client"; that would put it ahead of the scanning
+       stack and tear scanning down on a crash, contradicting the rationale.)
 
   ## Why this can't coexist with `blue_heron`
 
@@ -136,8 +138,10 @@ defmodule UniversalProxy.Bluez do
       # pairing layer (Bluetooth.AudioManager), not here. Runs without
       # `--keep-alive`/codec flags for now — those get tuned during hardware
       # bring-up (1.5) once the exact bluez-alsa version/flag set is confirmed,
-      # so an unrecognized flag can't crash-loop the daemon at boot. Last child:
-      # a crash here restarts nothing else (see @moduledoc).
+      # so an unrecognized flag can't crash-loop the daemon at boot. Placed
+      # after the proxy scanning/GATT clients: a crash here never restarts the
+      # proxy scanning stack (only the audio children that follow — BlueAlsa,
+      # AudioManager — restart with it under :rest_for_one). See @moduledoc.
       Supervisor.child_spec(
         {MuonTrap.Daemon,
          [
@@ -157,8 +161,8 @@ defmodule UniversalProxy.Bluez do
       # org.bluealsa D-Bus client: learns which A2DP-playback PCMs are ready to
       # open (Bluetooth.AudioSink shapes these into Sendspin outputs). Connects
       # to the system bus (dbus-daemon), not to bluealsad, so it tolerates
-      # bluealsad being down. Last child: like bluealsad, a crash here must not
-      # restart the scanning stack — audio is secondary to the BT proxy.
+      # bluealsad being down. After the scanning/GATT clients: a crash here must
+      # not restart the proxy scanning stack — audio is secondary to the BT proxy.
       __MODULE__.BlueAlsa,
 
       # Bluetooth headphone control plane. It's an org.bluez D-Bus client like
@@ -166,8 +170,9 @@ defmodule UniversalProxy.Bluez do
       # connection and adapter lookups are always available), but it drives the
       # *audio*-role adapters rather than the proxy adapter. Its Connect calls
       # (up to ~25 s) run under this Task.Supervisor so the GenServer loop never
-      # blocks. Both are last so a fault here never disturbs the proxy scanning
-      # stack, and a bluetoothd/Client restart re-runs reconnect-on-boot.
+      # blocks. Both sit after the scanning/GATT clients so a fault here never
+      # disturbs the proxy scanning stack, and a bluetoothd/Client restart
+      # re-runs reconnect-on-boot.
       {Task.Supervisor, name: UniversalProxy.Bluetooth.AudioManager.TaskSupervisor},
       UniversalProxy.Bluetooth.AudioManager
     ]
