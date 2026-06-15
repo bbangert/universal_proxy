@@ -20,9 +20,17 @@ defmodule UniversalProxy.Bluez.BlueAlsa do
 
   This client connects to the **system bus** (owned by `dbus-daemon`, the first
   child of `UniversalProxy.Bluez`), not to `bluealsad`. So it comes up whether
-  or not `bluealsad` has claimed `org.bluealsa` yet; `GetPCMs` simply errors
-  (→ `[]`) until the daemon is up, and starts returning PCMs once a headset
-  connects. It survives a `bluealsad` restart without reconnecting.
+  or not `bluealsad` has claimed `org.bluealsa` yet; the `GetManagedObjects`
+  call simply errors (→ `[]`) until the daemon is up, and starts returning PCMs
+  once a headset connects. It survives a `bluealsad` restart without reconnecting.
+
+  ## PCM enumeration (bluez-alsa v4 API)
+
+  PCMs are discovered via the freedesktop `ObjectManager` at `/org/bluealsa`
+  (each connected A2DP playback PCM is an `org.bluealsa.PCM1` object), **not**
+  the v3 `org.bluealsa.Manager1.GetPCMs` method — buildroot ships bluez-alsa
+  4.x, where that method no longer exists (it returns `UnknownMethod`, which the
+  error path would silently swallow into `[]`).
 
   ## Inert off-target / when not started
 
@@ -42,14 +50,28 @@ defmodule UniversalProxy.Bluez.BlueAlsa do
   alias UniversalProxy.Bluez.{DBus, Variant}
 
   @bluealsa "org.bluealsa"
+  # bluez-alsa 4.x has NO `org.bluealsa.Manager1.GetPCMs` (that was the v3 API,
+  # and calling it returns `UnknownMethod`). v4 exposes each PCM as an
+  # `org.bluealsa.PCM1` object under `/org/bluealsa`, enumerated through the
+  # standard freedesktop `ObjectManager` — the same pattern as `org.bluez`.
   @manager_path "/org/bluealsa"
-  @manager_iface "org.bluealsa.Manager1"
+  @object_manager_iface "org.freedesktop.DBus.ObjectManager"
+  @pcm_iface "org.bluealsa.PCM1"
   @bluez_device_iface "org.bluez.Device1"
   @props_iface "org.freedesktop.DBus.Properties"
 
-  # GetPCMs is a local round-trip; keep a tight budget because Audio.Server
-  # calls pcms/0 synchronously inside its 5 s refresh and must not stall if
-  # bluealsad wedges.
+  # PubSub topic announcing that the BlueALSA PCM set changed (a headset
+  # connected/disconnected, so a PCM appeared/vanished). `Audio.Server`
+  # subscribes and re-enumerates — this is the authoritative trigger for the
+  # audio side, because a BlueALSA PCM emits no kernel `sound` uevent and a
+  # device can (re)connect via bluetoothd auto-reconnect *without* going through
+  # `AudioManager` (so no `bluetooth:audio` event fires), and even an
+  # AudioManager-driven `Device1.Connect` returns *before* the PCM exists.
+  @pcms_topic "bluealsa:pcms"
+
+  # GetManagedObjects is a local round-trip; keep a tight budget because
+  # Audio.Server calls pcms/0 synchronously inside its 5 s refresh and must not
+  # stall if bluealsad wedges.
   @call_timeout 2_000
 
   # Device path tail: `.../dev_AA_BB_CC_DD_EE_FF` (under any hciX). We pull the
@@ -74,12 +96,33 @@ defmodule UniversalProxy.Bluez.BlueAlsa do
     :exit, _ -> []
   end
 
+  @doc "PubSub topic broadcast when the BlueALSA PCM set changes."
+  @spec pcms_topic() :: String.t()
+  def pcms_topic, do: @pcms_topic
+
   @impl GenServer
-  def init(_opts) do
+  def init(opts) do
     case Rebus.connect(:system) do
       {:ok, conn} ->
         conn_ref = Process.monitor(conn)
-        {:ok, %{conn: conn, conn_ref: conn_ref}}
+        # Watch org.bluealsa's ObjectManager so we learn the instant a PCM
+        # object is added/removed (headset (dis)connect). The match is on the
+        # bus daemon, so it installs even before bluealsad owns the name;
+        # signals start flowing once it emits them.
+        sig_ref = Rebus.add_signal_handler(conn)
+
+        DBus.add_match(
+          conn,
+          "type='signal',sender='#{@bluealsa}',interface='#{@object_manager_iface}'"
+        )
+
+        {:ok,
+         %{
+           conn: conn,
+           conn_ref: conn_ref,
+           sig_ref: sig_ref,
+           pubsub: Keyword.get(opts, :pubsub, UniversalProxy.PubSub)
+         }}
 
       {:error, reason} ->
         {:stop, {:dbus_connect_failed, reason}}
@@ -98,6 +141,18 @@ defmodule UniversalProxy.Bluez.BlueAlsa do
     {:stop, {:dbus_connection_down, reason}, state}
   end
 
+  # A PCM object appeared/vanished. Don't bother inspecting the body — any
+  # org.bluealsa ObjectManager change means re-checking the PCM set is due;
+  # the downstream re-enumeration is cheap and debounced.
+  def handle_info(
+        {ref, %Rebus.Message{type: :signal, header_fields: %{member: member}}},
+        %{sig_ref: ref} = state
+      )
+      when member in ["InterfacesAdded", "InterfacesRemoved"] do
+    Phoenix.PubSub.broadcast(state.pubsub, @pcms_topic, {:bluealsa_pcms_changed})
+    {:noreply, state}
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
 
   # -- internals --
@@ -107,18 +162,19 @@ defmodule UniversalProxy.Bluez.BlueAlsa do
            conn,
            @bluealsa,
            @manager_path,
-           @manager_iface,
-           "GetPCMs",
+           @object_manager_iface,
+           "GetManagedObjects",
            "",
            [],
            @call_timeout
          ) do
-      {:ok, [pcm_array]} when is_list(pcm_array) ->
-        pcm_array
+      {:ok, [objects]} when is_list(objects) ->
+        objects
+        |> Enum.flat_map(&pcm_entry/1)
         |> Enum.flat_map(&playback_pcm(&1, conn))
 
       {:ok, other} ->
-        Logger.warning("BlueAlsa GetPCMs unexpected reply: #{inspect(other)}")
+        Logger.warning("BlueAlsa GetManagedObjects unexpected reply: #{inspect(other)}")
         []
 
       {:error, _reason} ->
@@ -126,6 +182,19 @@ defmodule UniversalProxy.Bluez.BlueAlsa do
         []
     end
   end
+
+  # A managed object is `{object_path, [{interface, props}]}`. Keep only the
+  # ones carrying the `org.bluealsa.PCM1` interface, projecting to the
+  # `{pcm_path, props_list}` shape `playback_pcm/2` consumes (so the parsing/
+  # filtering below is unchanged from the old GetPCMs reply shape).
+  defp pcm_entry({pcm_path, ifaces}) when is_binary(pcm_path) and is_list(ifaces) do
+    case List.keyfind(ifaces, @pcm_iface, 0) do
+      {_iface, props_list} -> [{pcm_path, props_list}]
+      nil -> []
+    end
+  end
+
+  defp pcm_entry(_other), do: []
 
   # Each entry is `{pcm_path, props_list}` (a{oa{sv}}). Keep only A2DP PCMs the
   # daemon is *sending* to a headset: Transport ~ "A2DP" and Mode == "sink"

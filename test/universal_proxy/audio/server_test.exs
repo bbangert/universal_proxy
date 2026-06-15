@@ -279,6 +279,99 @@ defmodule UniversalProxy.Audio.ServerTest do
       assert cfg.client_id == output.client_id
     end
 
+    test "a Bluetooth connection broadcast triggers re-enumeration (no kernel uevent)",
+         %{server: _server} do
+      bt_key = {"00:42:79:D3:47:12", nil, nil}
+
+      EnumerateStub.set(%{
+        bt_key => %{
+          card_index: nil,
+          alsa_device: "bluealsa:DEV=00:42:79:D3:47:12,PROFILE=a2dp",
+          card_name: "JBL Flip 4",
+          usb_port: nil
+        }
+      })
+
+      # A BlueALSA PCM emits no `sound` uevent, so AudioManager's connection
+      # broadcast is the hotplug trigger. It's debounced (~1 s), hence the
+      # generous receive window.
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "bluetooth:audio",
+        {:bt_audio, :connection, "00:42:79:D3:47:12", :connected}
+      )
+
+      assert_receive {:sendspin_output_added, output}, 2_000
+      assert output.key == bt_key
+      assert output.alsa_device == "bluealsa:DEV=00:42:79:D3:47:12,PROFILE=a2dp"
+      assert output.card_name == "JBL Flip 4"
+    end
+
+    test "a Bluetooth pairing 'connected' step also triggers re-enumeration",
+         %{server: _server} do
+      bt_key = {"00:42:79:D3:47:12", nil, nil}
+
+      EnumerateStub.set(%{
+        bt_key => %{
+          card_index: nil,
+          alsa_device: "bluealsa:DEV=00:42:79:D3:47:12,PROFILE=a2dp",
+          card_name: "JBL Flip 4",
+          usb_port: nil
+        }
+      })
+
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "bluetooth:audio",
+        {:bt_audio, :pairing, "00:42:79:D3:47:12", :connected}
+      )
+
+      assert_receive {:sendspin_output_added, output}, 2_000
+      assert output.key == bt_key
+    end
+
+    test "a BlueALSA PCM-set change triggers re-enumeration", %{server: _server} do
+      bt_key = {"00:42:79:D3:47:12", nil, nil}
+
+      EnumerateStub.set(%{
+        bt_key => %{
+          card_index: nil,
+          alsa_device: "bluealsa:DEV=00:42:79:D3:47:12,PROFILE=a2dp",
+          card_name: "JBL Flip 4",
+          usb_port: nil
+        }
+      })
+
+      # Bluez.BlueAlsa fires this on an org.bluealsa InterfacesAdded/Removed —
+      # the trigger that catches a headset (re)connecting outside AudioManager.
+      Phoenix.PubSub.broadcast(@pubsub, "bluealsa:pcms", {:bluealsa_pcms_changed})
+
+      assert_receive {:sendspin_output_added, output}, 2_000
+      assert output.key == bt_key
+    end
+
+    test "Bluetooth output's default friendly_name appends the MAC tail",
+         %{server: server, store: store} do
+      bt_key = {"00:42:79:D3:47:12", nil, nil}
+
+      EnumerateStub.set(%{
+        bt_key => %{
+          card_index: nil,
+          alsa_device: "bluealsa:DEV=00:42:79:D3:47:12,PROFILE=a2dp",
+          card_name: "JBL Flip 4",
+          usb_port: nil
+        }
+      })
+
+      :ok = Server.check_now(server)
+
+      assert_receive {:sendspin_output_added, output}
+      # MAC tail keeps two identically-named speakers distinct (and their mDNS
+      # instance names unique).
+      assert output.friendly_name == "JBL Flip 4 (D3:47:12)"
+      assert {:ok, %{friendly_name: "JBL Flip 4 (D3:47:12)"}} = Store.get_config(store, bt_key)
+    end
+
     test "USB card's default friendly_name includes the port", %{server: server, store: store} do
       usb_key = {"1-1.3", 0x0BDA, 0x4E27}
 
@@ -621,7 +714,9 @@ defmodule UniversalProxy.Audio.ServerTest do
       })
 
       :ok = Server.check_now(server)
-      assert_receive {:sendspin_output_added, %{key: ^bt_key, friendly_name: "WH-1000XM4"}}
+      # Default name carries the MAC tail so identical models stay distinct.
+      assert_receive {:sendspin_output_added,
+                      %{key: ^bt_key, friendly_name: "WH-1000XM4 (DD:EE:FF)"}}
 
       # The headset player spawns alongside the @hp_key card on a real mDNS port.
       assert length(DynamicSupervisor.which_children(sup)) == 2

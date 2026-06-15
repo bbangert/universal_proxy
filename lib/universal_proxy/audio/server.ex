@@ -72,6 +72,11 @@ defmodule UniversalProxy.Audio.Server do
   @topic_added "sendspin:output_added"
   @topic_removed "sendspin:output_removed"
   @topic_state "sendspin:state"
+  # AudioManager's Bluetooth connection topic — the hotplug trigger for BT
+  # outputs, which produce no kernel `sound` uevent. Kept as a literal (not a
+  # module ref) so Audio.Server carries no compile-time dep on the BT subtree.
+  @bt_audio_topic "bluetooth:audio"
+  @bluealsa_pcms_topic "bluealsa:pcms"
 
   @type key :: Store.output_key()
 
@@ -203,6 +208,17 @@ defmodule UniversalProxy.Audio.Server do
     # topic from `update_config`, but those payloads don't carry an
     # `:event` key, so the handler ignores them.
     Phoenix.PubSub.subscribe(@pubsub, @topic_state)
+
+    # Bluetooth A2DP connect/disconnect is the hotplug trigger for BT outputs
+    # (they emit no kernel `sound` uevent — see the `:bt_audio` handler). Inert
+    # on non-BT targets: nothing broadcasts on these topics there.
+    Phoenix.PubSub.subscribe(@pubsub, @bt_audio_topic)
+    # The authoritative BT trigger: `Bluez.BlueAlsa` broadcasts here the instant
+    # a BlueALSA PCM is added/removed — covering bluetoothd auto-reconnects (no
+    # `AudioManager` event) and the Connect-returns-before-PCM-ready race that a
+    # `:bt_audio` connection event alone would miss. Literal (no compile dep on
+    # the BT subtree): `UniversalProxy.Bluez.BlueAlsa.pcms_topic/0`.
+    Phoenix.PubSub.subscribe(@pubsub, @bluealsa_pcms_topic)
 
     # Restart hygiene: any PlayerSupervisor children left over from a
     # previous Server incarnation (Server crashed but PlayerSupervisor
@@ -352,13 +368,31 @@ defmodule UniversalProxy.Audio.Server do
   # Debounced through `hotplug_pending` so one card's burst of sub-device
   # uevents triggers a single re-enumeration.
   def handle_info(%PropertyTable.Event{property: path}, state) do
-    if "sound" in path and not state.hotplug_pending do
-      Process.send_after(self(), :check_hotplug, @hotplug_debounce_ms)
-      {:noreply, %{state | hotplug_pending: true}}
+    if "sound" in path do
+      {:noreply, schedule_hotplug(state)}
     else
       {:noreply, state}
     end
   end
+
+  # A Bluetooth A2DP device coming or going changes the BlueALSA PCM set (via
+  # the composite enumerate's `Bluetooth.AudioSink`) but emits **no** kernel
+  # `sound` uevent — a BlueALSA PCM is a userspace D-Bus object, not an ALSA
+  # card. So `AudioManager`'s connection broadcasts are the hotplug trigger for
+  # BT outputs: re-enumerate (debounced) on connect/disconnect and when a fresh
+  # pairing reaches the `connected` step. Harmless on non-BT targets (the topic
+  # never fires there).
+  def handle_info({:bt_audio, :connection, _mac, _status}, state),
+    do: {:noreply, schedule_hotplug(state)}
+
+  def handle_info({:bt_audio, :pairing, _mac, :connected}, state),
+    do: {:noreply, schedule_hotplug(state)}
+
+  # The BlueALSA PCM set changed (Bluez.BlueAlsa saw an org.bluealsa
+  # InterfacesAdded/Removed). Re-enumerate so a connected/disconnected headset
+  # surfaces/drops regardless of how it (dis)connected.
+  def handle_info({:bluealsa_pcms_changed}, state),
+    do: {:noreply, schedule_hotplug(state)}
 
   # Binary-emitted volume/mute events flow back through PubSub. Persist
   # them so a respawn (kill -9, reboot) restores the actual last-known
@@ -445,6 +479,17 @@ defmodule UniversalProxy.Audio.Server do
   def handle_info(_msg, state), do: {:noreply, state}
 
   # -- Private --
+
+  # Schedule one debounced re-enumeration. Shared by the kernel-uevent and
+  # Bluetooth-connection triggers: `hotplug_pending` coalesces a burst (a
+  # card's sub-device uevents, or pairing's connect events) into a single
+  # `:check_hotplug`.
+  defp schedule_hotplug(%{hotplug_pending: true} = state), do: state
+
+  defp schedule_hotplug(state) do
+    Process.send_after(self(), :check_hotplug, @hotplug_debounce_ms)
+    %{state | hotplug_pending: true}
+  end
 
   # Subscribe to kernel uevents (all `devices`; `handle_info` filters for
   # the `sound` subsystem). Returns false when `nerves_uevent` isn't
@@ -569,7 +614,25 @@ defmodule UniversalProxy.Audio.Server do
   defp default_friendly_name(%{card_name: name, usb_port: port}) when is_binary(port),
     do: "#{name} (#{port})"
 
+  # Bluetooth A2DP sinks carry no USB port, and two of the same model share a
+  # card_name (the BlueZ alias). Append the device-specific MAC tail so the
+  # default name — which is also the mDNS instance name — is unique; otherwise
+  # identical speakers collide and Music Assistant can't tell them apart.
+  defp default_friendly_name(%{card_name: name, alsa_device: "bluealsa:DEV=" <> rest}),
+    do: "#{name} (#{bt_mac_suffix(rest)})"
+
   defp default_friendly_name(%{card_name: name}), do: name
+
+  # Last three octets of the MAC in `"AA:BB:CC:DD:EE:FF,PROFILE=a2dp"` — the
+  # device-unique half (the first three are the vendor OUI).
+  defp bt_mac_suffix(rest) do
+    rest
+    |> String.split(",", parts: 2)
+    |> hd()
+    |> String.split(":")
+    |> Enum.take(-3)
+    |> Enum.join(":")
+  end
 
   @hardware_keys [:card_index, :alsa_device, :card_name, :usb_port]
 
