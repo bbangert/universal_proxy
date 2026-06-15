@@ -397,8 +397,15 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
   # The body of a connect: issue Device1.Connect and broadcast the outcome.
   defp connect_and_broadcast(state, device_path, mac) do
     case state.ops.connect(state.conn, device_path) do
-      :ok -> broadcast_connection(state, mac, :connected)
-      {:error, reason} -> broadcast_pairing(state, mac, {:error, map_failure(reason)})
+      :ok ->
+        broadcast_connection(state, mac, :connected)
+
+      # This is the connect/reconnect path (not pairing), so report the failure
+      # as a `:connection` event — that's the stream Audio.Server and the
+      # LiveViews watch. (pair_flow/step keeps its own `:pairing` error events.)
+      {:error, reason} ->
+        Logger.warning("Bluetooth connect failed for #{mac}: #{inspect(reason)}")
+        broadcast_connection(state, mac, :disconnected)
     end
   end
 

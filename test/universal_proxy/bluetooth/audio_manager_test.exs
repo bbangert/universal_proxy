@@ -200,6 +200,20 @@ defmodule UniversalProxy.Bluetooth.AudioManagerTest do
       assert_receive {:ops, {:connect, @hs_path}}
       assert_receive {:bt_audio, :connection, @hs, :connected}
     end
+
+    test "broadcasts :connection :disconnected (not a :pairing error) when Connect fails", %{
+      settings: settings
+    } do
+      with_audio_adapter(settings)
+      MockOps.configure(%{connect: {:error, "org.bluez.Error.ConnectionAttemptFailed"}})
+      mgr = start_manager(settings)
+
+      assert :ok = AudioManager.connect(mgr, @hs)
+      # The connect/reconnect path reports failure as a connection event (the
+      # stream Audio.Server + the LiveViews watch), never a pairing event.
+      assert_receive {:bt_audio, :connection, @hs, :disconnected}, 500
+      refute_receive {:bt_audio, :pairing, @hs, _}, 150
+    end
   end
 
   describe "forget/1 + disconnect/1 broadcast :disconnected" do

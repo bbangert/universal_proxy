@@ -274,11 +274,19 @@ defmodule UniversalProxy.Bluetooth do
   @spec set_role(String.t(), Settings.role()) :: :ok | {:error, term()}
   def set_role(mac, role) when is_binary(mac) do
     normalized = String.upcase(mac)
-    before_proxy = Settings.proxy_adapter(Settings.get())
+    settings = Settings.get()
+    before_proxy = Settings.proxy_adapter(settings)
+    before_role = Settings.role(settings, normalized)
 
     with :ok <- Settings.set_role(normalized, role) do
-      # Leaving the audio role: clean up its per-adapter bonds.
-      if role != :audio, do: AudioManager.forget_all_on_adapter(normalized)
+      # Only when a radio actually LEAVES the :audio role do we forget its
+      # per-adapter bonds — matching the UI's deactivate-confirm, which gates on
+      # the same transition. Other transitions (e.g. :off -> :proxy) must not
+      # forget (the radio holds no audio bonds to begin with, and there'd be no
+      # confirmation step).
+      if before_role == :audio and role != :audio do
+        AudioManager.forget_all_on_adapter(normalized)
+      end
 
       if Settings.proxy_adapter(Settings.get()) != before_proxy do
         :ok = Manager.reconcile(restart: true)
