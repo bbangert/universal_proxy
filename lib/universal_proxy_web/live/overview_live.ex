@@ -14,6 +14,7 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   alias UniversalProxy.Audio
   alias UniversalProxy.Bluetooth
+  alias UniversalProxy.Bluetooth.AudioManager
   alias UniversalProxy.Hardware
   alias UniversalProxy.System, as: Sys
   alias UniversalProxy.UART
@@ -38,6 +39,9 @@ defmodule UniversalProxyWeb.OverviewLive do
         # USB Bluetooth radios surface in the hardware list too; the radio
         # list (incl. in_use?) is rebroadcast on enumeration change.
         Phoenix.PubSub.subscribe(UniversalProxy.PubSub, Bluetooth.radios_topic())
+        # Paired-but-disconnected BT speakers show in the audio summary as
+        # Disconnected (their durable surface); refresh on connection events.
+        Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "bluetooth:audio")
         :timer.send_interval(@refresh_interval, self(), :refresh)
         {History.packets_per_minute(), reconcile_throughputs(%{}, ports)}
       else
@@ -54,6 +58,7 @@ defmodule UniversalProxyWeb.OverviewLive do
      |> assign(:pending_kind_change, nil)
      |> assign(:audio_outputs, build_audio_index(Audio.list_outputs()))
      |> assign(:bt_radios, Bluetooth.list_radios())
+     |> assign(:bt_headphones, AudioManager.list_headphones())
      |> set_ports(ports)}
   end
 
@@ -171,6 +176,15 @@ defmodule UniversalProxyWeb.OverviewLive do
   def handle_info({:bluetooth_radios, radios}, socket) do
     {:noreply, assign(socket, :bt_radios, radios)}
   end
+
+  # A BT connect/disconnect moves a speaker between the live audio list and
+  # the durable Disconnected list — re-read the paired set so the summary
+  # surfaces it either way.
+  def handle_info({:bt_audio, :connection, _mac, _status}, socket) do
+    {:noreply, assign(socket, :bt_headphones, AudioManager.list_headphones())}
+  end
+
+  def handle_info({:bt_audio, _kind, _mac, _payload}, socket), do: {:noreply, socket}
 
   def handle_info({:sendspin_output_added, output}, socket) do
     {:noreply, update(socket, :audio_outputs, &Map.put(&1, output.key, output))}
@@ -347,7 +361,10 @@ defmodule UniversalProxyWeb.OverviewLive do
   def render(assigns) do
     rows = hardware_rows(assigns.ports, peripherals(assigns.audio_outputs, assigns.bt_radios))
 
-    assigns = assign(assigns, :hardware_rows, rows)
+    assigns =
+      assigns
+      |> assign(:hardware_rows, rows)
+      |> assign(:bt_disconnected, disconnected_bt(assigns.bt_headphones))
 
     ~H"""
     <div class="max-w-[1120px] mx-auto space-y-4">
@@ -365,7 +382,12 @@ defmodule UniversalProxyWeb.OverviewLive do
         throughput_snapshots={@throughput_snapshots}
       />
 
-      <.audio_outputs_card :if={map_size(@audio_outputs) > 0} outputs={@audio_outputs} />
+      <.audio_outputs_card
+        :if={map_size(@audio_outputs) > 0 or @bt_disconnected != []}
+        outputs={@audio_outputs}
+        bt_disconnected={@bt_disconnected}
+        bt_radios={@bt_radios}
+      />
     </div>
 
     <.maybe_port_drawer
@@ -1041,6 +1063,8 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   # ── Audio outputs summary (links to /audio) ───────────────────────────
   attr(:outputs, :map, required: true)
+  attr(:bt_disconnected, :list, default: [])
+  attr(:bt_radios, :list, default: [])
 
   defp audio_outputs_card(assigns) do
     sorted =
@@ -1048,7 +1072,10 @@ defmodule UniversalProxyWeb.OverviewLive do
       |> Map.values()
       |> Enum.sort_by(& &1.friendly_name)
 
-    assigns = assign(assigns, :sorted, sorted)
+    assigns =
+      assigns
+      |> assign(:sorted, sorted)
+      |> assign(:total, length(sorted) + length(assigns.bt_disconnected))
 
     ~H"""
     <.card padding={:none} class="overflow-hidden">
@@ -1057,7 +1084,7 @@ defmodule UniversalProxyWeb.OverviewLive do
           <.speaker_glyph size={15} />
         </div>
         <div class="text-sm font-semibold text-fg-1">Audio outputs</div>
-        <.badge variant={:neutral}>{length(@sorted)}</.badge>
+        <.badge variant={:neutral}>{@total}</.badge>
         <div class="flex-1"></div>
         <.link
           navigate="/audio"
@@ -1067,9 +1094,58 @@ defmodule UniversalProxyWeb.OverviewLive do
         </.link>
       </div>
       <ul class="m-0 p-0 list-none">
-        <.audio_summary_row :for={{out, last?} <- with_last(@sorted)} out={out} last?={last?} />
+        <.audio_summary_row
+          :for={{out, last?} <- with_last(@sorted)}
+          out={out}
+          last?={last? and @bt_disconnected == []}
+        />
+        <.bt_disconnected_row
+          :for={{device, last?} <- with_last(@bt_disconnected)}
+          device={device}
+          hci={bt_hci_for(@bt_radios, device.adapter)}
+          last?={last?}
+        />
       </ul>
     </.card>
+    """
+  end
+
+  # A paired-but-offline Bluetooth speaker. Distinct from a Disabled ALSA
+  # output: Disconnected (warning) means "should be here but isn't
+  # reachable", not "turned off" (neutral). No live volume/stream — the
+  # device isn't streaming.
+  attr(:device, :map, required: true)
+  attr(:hci, :string, default: nil)
+  attr(:last?, :boolean, required: true)
+
+  defp bt_disconnected_row(assigns) do
+    ~H"""
+    <li class={[
+      "grid grid-cols-[4px_36px_1fr_220px_110px] items-center min-h-[64px]",
+      not @last? && "border-b border-border-2"
+    ]}>
+      <div class="self-stretch opacity-40" style="background: var(--hs-warning);"></div>
+
+      <div class="pl-3 pr-1 flex justify-center">
+        <div class="w-[30px] h-[30px] rounded-md bg-sunken text-fg-4 flex items-center justify-center">
+          <.icon name={:headphones} size={16} />
+        </div>
+      </div>
+
+      <div class="px-3 py-2.5 min-w-0">
+        <div class="text-sm font-medium text-fg-1 truncate">{@device.name}</div>
+        <div class="text-[11px] text-fg-3 mt-0.5">
+          <span class="font-mono">{@device.mac}</span>
+          <span :if={@hci}> · <span class="font-mono">{@hci}</span></span>
+        </div>
+      </div>
+
+      <div class="px-4 text-[11px] text-fg-3">Not connected</div>
+
+      <div class="px-4">
+        <.badge variant={:warning} dot>Disconnected</.badge>
+      </div>
+    </li>
     """
   end
 
@@ -1104,7 +1180,8 @@ defmodule UniversalProxyWeb.OverviewLive do
           "w-[30px] h-[30px] rounded-md flex items-center justify-center",
           if(@out.enabled, do: "bg-audio-soft text-audio", else: "bg-sunken text-fg-4")
         ]}>
-          <.speaker_glyph size={17} muted={@muted} level={speaker_level(@volume)} />
+          <.icon :if={bt_output?(@out)} name={:headphones} size={16} />
+          <.speaker_glyph :if={not bt_output?(@out)} size={17} muted={@muted} level={speaker_level(@volume)} />
         </div>
       </div>
 
@@ -1167,4 +1244,22 @@ defmodule UniversalProxyWeb.OverviewLive do
   defp volume_bar_width(true, true, _vol), do: 0
   defp volume_bar_width(true, false, vol) when is_integer(vol), do: vol
   defp volume_bar_width(_, _, _), do: 0
+
+  # Paired-but-disconnected A2DP speakers for the audio summary's durable
+  # Disconnected rows. A connected device is a live output instead, so we
+  # take only `paired and not connected` to avoid double-listing.
+  defp disconnected_bt(headphones) do
+    headphones
+    |> Enum.filter(&(&1.paired and not &1.connected))
+    |> Enum.sort_by(& &1.name)
+  end
+
+  # "hciN" for a device's bound-radio MAC, or nil if that radio isn't
+  # currently present.
+  defp bt_hci_for(radios, adapter_mac) do
+    case Enum.find(radios, &(&1.address == adapter_mac)) do
+      %{hci: hci} when is_binary(hci) -> hci
+      _ -> nil
+    end
+  end
 end

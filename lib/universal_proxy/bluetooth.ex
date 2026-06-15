@@ -165,6 +165,24 @@ defmodule UniversalProxy.Bluetooth do
   end
 
   @doc """
+  Per-radio role assignment for the web tab, as
+
+      %{proxy: String.t() | nil, audio: [String.t()]}
+
+  `proxy` is the proxy-role radio MAC (or the legacy auto fallback, which may
+  be `nil`); `audio` is the list of audio-role radio MACs. Any radio not in
+  either is `:off`. Safe on non-BT targets / while Settings is down (returns
+  the empty-role shape). Read-only; role changes go through `set_role/2`.
+  """
+  @spec roles() :: %{proxy: String.t() | nil, audio: [String.t()]}
+  def roles do
+    settings = Settings.get()
+    %{proxy: Settings.proxy_adapter(settings), audio: Settings.audio_adapters(settings)}
+  catch
+    :exit, _ -> %{proxy: nil, audio: []}
+  end
+
+  @doc """
   Master Bluetooth switch — purely an espex-wiring gate. The BlueZ stack
   (and its radios) keeps running either way; what changes is whether the
   scanner/GATT adapters are wired into espex, so HA sees bluetooth

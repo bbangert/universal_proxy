@@ -35,6 +35,16 @@ defmodule UniversalProxyWeb.AudioLive do
   import UniversalProxyWeb.Components.Audio
 
   alias UniversalProxy.Audio
+  alias UniversalProxy.Bluetooth
+  alias UniversalProxy.Bluetooth.AudioManager
+
+  # How long a Bluetooth output keeps a "Reconnecting" placeholder card
+  # after its PCM vanishes (a BT disconnect removes the ALSA PCM, like a
+  # USB unplug). If the headset reconnects within this window the real
+  # card replaces the placeholder; otherwise the card disappears and the
+  # device lives on as Disconnected on the Bluetooth tab (its durable
+  # home — see the plan's Open decision #1).
+  @bt_reconnect_grace_ms 20_000
 
   # mDNS TXT record total size cap is 255 bytes; we use ~64 chars to
   # leave headroom for the `name=` prefix and any other TXT attrs the
@@ -50,6 +60,8 @@ defmodule UniversalProxyWeb.AudioLive do
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:output_added")
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:output_removed")
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:state")
+      # Bluetooth connection events drive the brief "Reconnecting" card.
+      Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "bluetooth:audio")
     end
 
     {:ok,
@@ -57,6 +69,13 @@ defmodule UniversalProxyWeb.AudioLive do
      |> assign(:page_title, "Audio")
      |> assign(:friendly_name_max, @friendly_name_max)
      |> assign(:outputs, build_outputs_map(outputs))
+     # mac → "hciN" for Bluetooth outputs (the bound-radio pill). Built by
+     # joining AudioManager.list_headphones (mac→adapter) with the radio
+     # list (adapter→hci); refreshed on output/BT-connection changes.
+     |> assign(:bt_meta, build_bt_meta())
+     # mac → %{name} placeholders shown while a dropped BT device is
+     # reconnecting (keyed by device MAC). Empty on non-BT targets.
+     |> assign(:reconnecting, %{})
      # Rename modal state. `rename_target` holds the DOM-encoded key of
      # the card whose name is being edited; `nil` means the modal is
      # closed. `rename_draft` mirrors the input value live (the modal
@@ -181,21 +200,51 @@ defmodule UniversalProxyWeb.AudioLive do
 
   @impl true
   def handle_info({:sendspin_output_added, output}, socket) do
-    {:noreply, update(socket, :outputs, &Map.put(&1, encode_key(output.key), build_card(output)))}
+    card = build_card(output)
+
+    socket =
+      socket
+      |> update(:outputs, &Map.put(&1, encode_key(output.key), card))
+      |> assign(:bt_meta, build_bt_meta())
+
+    # A reconnected headset replaces its placeholder (and cancels its timer).
+    socket =
+      case card.bt_mac do
+        nil -> socket
+        mac -> drop_reconnecting(socket, mac)
+      end
+
+    {:noreply, socket}
   end
 
   def handle_info({:sendspin_output_removed, %{key: key}}, socket) do
     id = encode_key(key)
+    removed = Map.get(socket.assigns.outputs, id)
 
     socket =
       socket
       |> update(:outputs, &Map.delete(&1, id))
       |> update(:more_open, &MapSet.delete(&1, id))
+      |> maybe_start_reconnecting(key, removed)
+      |> assign(:bt_meta, build_bt_meta())
 
     socket =
       if socket.assigns.rename_target == id, do: close_rename(socket), else: socket
 
     {:noreply, socket}
+  end
+
+  # A BT connection change can move a device in/out of the reconnecting
+  # set and re-binds the hci map. The actual card add/remove arrives via
+  # the sendspin output topics; here we just keep the hci pills fresh.
+  def handle_info({:bt_audio, :connection, _mac, _status}, socket) do
+    {:noreply, assign(socket, :bt_meta, build_bt_meta())}
+  end
+
+  def handle_info({:bt_audio, _kind, _mac, _payload}, socket), do: {:noreply, socket}
+
+  def handle_info({:drop_reconnecting, mac}, socket) do
+    {:noreply, drop_reconnecting(socket, mac)}
   end
 
   def handle_info({:sendspin_state, key, partial}, socket) do
@@ -221,18 +270,21 @@ defmodule UniversalProxyWeb.AudioLive do
     <div class="max-w-[960px] mx-auto">
       <.audio_header count={map_size(@outputs)} />
 
-      <.empty_state :if={map_size(@outputs) == 0} />
+      <.empty_state :if={map_size(@outputs) == 0 and map_size(@reconnecting) == 0} />
 
       <div
-        :if={map_size(@outputs) > 0}
+        :if={map_size(@outputs) > 0 or map_size(@reconnecting) > 0}
         class="grid grid-cols-1 [grid-template-columns:repeat(auto-fit,minmax(420px,1fr))] gap-4"
       >
         <.output_card
           :for={{id, output} <- sorted_outputs(@outputs)}
           id={id}
           output={output}
+          hci={get_in(@bt_meta, [output.bt_mac, :hci])}
+          battery={get_in(@bt_meta, [output.bt_mac, :battery])}
           more_open?={MapSet.member?(@more_open, id)}
         />
+        <.reconnecting_card :for={{mac, info} <- active_reconnecting(@reconnecting, @outputs)} name={info.name} mac={mac} />
       </div>
     </div>
 
@@ -283,6 +335,8 @@ defmodule UniversalProxyWeb.AudioLive do
 
   attr(:id, :string, required: true)
   attr(:output, :map, required: true)
+  attr(:hci, :string, default: nil)
+  attr(:battery, :integer, default: nil)
   attr(:more_open?, :boolean, required: true)
 
   # Single player card. Layout is a vertical flex with three logical
@@ -321,15 +375,18 @@ defmodule UniversalProxyWeb.AudioLive do
       <%!-- Header --%>
       <div class="pt-[18px] pr-5 pb-0 pl-[22px]">
         <div class="flex items-start gap-3.5">
-          <div class={[
-            "w-11 h-11 rounded-md flex items-center justify-center flex-none",
-            if(@output.enabled, do: "bg-audio-soft text-audio", else: "bg-sunken text-fg-4")
-          ]}>
-            <.speaker_glyph
-              size={24}
-              muted={@output.muted}
-              level={speaker_level(@output.volume)}
-            />
+          <div class="relative flex-none w-11 h-11">
+            <div class={[
+              "w-11 h-11 rounded-md flex items-center justify-center",
+              if(@output.enabled, do: "bg-audio-soft text-audio", else: "bg-sunken text-fg-4")
+            ]}>
+              <.speaker_glyph
+                size={24}
+                muted={@output.muted}
+                level={speaker_level(@output.volume)}
+              />
+            </div>
+            <.bt_corner_glyph :if={@output.bt?} class="absolute -right-1 -bottom-1" />
           </div>
           <div class="flex-1 min-w-0">
             <button
@@ -350,6 +407,16 @@ defmodule UniversalProxyWeb.AudioLive do
               <span class="font-mono">{@output.alsa_device}</span>
               <span class="mx-1.5">·</span>
               <span>{@output.card_name}</span>
+            </div>
+            <%!-- Bluetooth pills: codec (when streaming) + bound radio --%>
+            <div :if={@output.bt?} class="flex items-center gap-1.5 mt-2 flex-wrap">
+              <.badge :if={codec_label(@output)} variant={:neutral} class="!text-[10px] !px-1.5 !py-px">
+                {codec_label(@output)}
+              </.badge>
+              <.badge :if={@hci} variant={:neutral} class="!text-[10px] !px-1.5 !py-px !font-mono">
+                {@hci}
+              </.badge>
+              <.battery_pill :if={is_integer(@battery)} level={@battery} />
             </div>
           </div>
           <.badge variant={@status.variant} dot>{@status.label}</.badge>
@@ -452,6 +519,40 @@ defmodule UniversalProxyWeb.AudioLive do
         class="px-[22px] py-2 border-t border-border-2 bg-danger-soft text-danger text-xs"
       >
         {@output.last_error}
+      </div>
+    </.card>
+    """
+  end
+
+  # Transient placeholder shown while a dropped Bluetooth device tries to
+  # reconnect. After the grace window it disappears (the device's durable
+  # surface is the Bluetooth tab). Structurally a slim player card so it
+  # sits in the grid without jarring the layout.
+  attr(:name, :string, required: true)
+  attr(:mac, :string, required: true)
+
+  defp reconnecting_card(assigns) do
+    ~H"""
+    <.card padding={:none} class="relative flex flex-col overflow-hidden opacity-90">
+      <div class="absolute inset-y-0 left-0 w-[3px] bg-accent"></div>
+      <div class="pt-[18px] pr-5 pb-[18px] pl-[22px]">
+        <div class="flex items-start gap-3.5">
+          <div class="relative flex-none w-11 h-11">
+            <div class="w-11 h-11 rounded-md bg-sunken text-fg-4 flex items-center justify-center">
+              <.speaker_glyph size={24} level={0} />
+            </div>
+            <.bt_corner_glyph class="absolute -right-1 -bottom-1" />
+          </div>
+          <div class="flex-1 min-w-0">
+            <div class="text-md font-semibold text-fg-1 truncate">{@name}</div>
+            <div class="text-xs text-fg-3 mt-1 font-mono">{@mac}</div>
+          </div>
+          <.badge variant={:accent} dot>Reconnecting</.badge>
+        </div>
+        <div class="mt-3.5 px-3 py-2.5 rounded-md bg-sunken flex items-center gap-2.5">
+          <span class="w-3.5 h-3.5 rounded-full border-2 border-warning border-t-transparent bt-spin text-warning"></span>
+          <div class="text-xs text-fg-2 font-medium">Reconnecting to {@name}…</div>
+        </div>
       </div>
     </.card>
     """
@@ -596,6 +697,52 @@ defmodule UniversalProxyWeb.AudioLive do
     Map.new(outputs, fn output -> {encode_key(output.key), build_card(output)} end)
   end
 
+  # A Bluetooth output keys by `{mac, nil, nil}`; pull the MAC out. Only
+  # call once the output is known to be Bluetooth (`bt_output?/1`) — the
+  # key shape isn't unique to BT (onboard ALSA cards share it).
+  defp bt_key_mac({mac, nil, nil}) when is_binary(mac), do: mac
+  defp bt_key_mac(_), do: nil
+
+  # mac → "hciN": join the paired-headset list (mac → bound adapter MAC)
+  # with the radio list (adapter MAC → hci). Exit-safe via the public API.
+  defp build_bt_meta do
+    radios = Bluetooth.list_radios()
+    hci_by_mac = Map.new(radios, fn r -> {r.address, Map.get(r, :hci)} end)
+
+    AudioManager.list_headphones()
+    |> Map.new(fn hp ->
+      {hp.mac, %{hci: Map.get(hci_by_mac, hp.adapter), battery: Map.get(hp, :battery)}}
+    end)
+  end
+
+  # When a connected, enabled BT output's PCM vanishes, hold a brief
+  # "Reconnecting" placeholder so a quick drop/return doesn't flicker the
+  # card away. Ignores ALSA removals and BT outputs that were disabled.
+  # The grace-timer ref is stored on the entry and cancelled before any
+  # replacement, so a rapid drop→return→drop can't leave a stale timer that
+  # prunes the *fresh* placeholder (or pile timers in the mailbox).
+  defp maybe_start_reconnecting(socket, _key, %{bt?: true, bt_mac: mac, enabled: true} = removed)
+       when is_binary(mac) do
+    cancel_reconnect_timer(socket, mac)
+    ref = Process.send_after(self(), {:drop_reconnecting, mac}, @bt_reconnect_grace_ms)
+    update(socket, :reconnecting, &Map.put(&1, mac, %{name: removed.friendly_name, timer: ref}))
+  end
+
+  defp maybe_start_reconnecting(socket, _key, _removed), do: socket
+
+  # Remove a reconnecting placeholder, cancelling its grace timer first.
+  defp drop_reconnecting(socket, mac) do
+    cancel_reconnect_timer(socket, mac)
+    update(socket, :reconnecting, &Map.delete(&1, mac))
+  end
+
+  defp cancel_reconnect_timer(socket, mac) do
+    case socket.assigns.reconnecting do
+      %{^mac => %{timer: ref}} when is_reference(ref) -> Process.cancel_timer(ref)
+      _ -> :ok
+    end
+  end
+
   # The card map is the LiveView's per-output view. It merges the
   # persisted/enumerated fields from `Audio.list_outputs/0` with
   # binary-emitted lifecycle data that arrives over PubSub. Connection
@@ -617,7 +764,13 @@ defmodule UniversalProxyWeb.AudioLive do
       connection: Map.get(output, :connection, :unknown),
       stream: Map.get(output, :stream),
       group: nil,
-      last_error: Map.get(output, :last_error)
+      last_error: Map.get(output, :last_error),
+      # Bluetooth (A2DP) outputs render with extra chrome (BT glyph,
+      # codec/radio pills); detected by the `bluealsa:` device prefix
+      # (the `{name, nil, nil}` key shape alone is NOT unique — onboard
+      # ALSA cards key that way too).
+      bt?: bt_output?(output),
+      bt_mac: if(bt_output?(output), do: bt_key_mac(output.key), else: nil)
     }
   end
 
@@ -689,6 +842,17 @@ defmodule UniversalProxyWeb.AudioLive do
     outputs
     |> Map.to_list()
     |> Enum.sort_by(fn {_id, %{friendly_name: name}} -> name end)
+  end
+
+  # Reconnecting placeholders for MACs that don't currently have a live
+  # output card (a reconnected device's real card supersedes its
+  # placeholder until the drop timer prunes the stale entry).
+  defp active_reconnecting(reconnecting, outputs) do
+    live_macs = for {_id, %{bt_mac: mac}} <- outputs, is_binary(mac), into: MapSet.new(), do: mac
+
+    reconnecting
+    |> Enum.reject(fn {mac, _info} -> MapSet.member?(live_macs, mac) end)
+    |> Enum.sort_by(fn {_mac, %{name: name}} -> name end)
   end
 
   defp fetch_output(socket, id) do

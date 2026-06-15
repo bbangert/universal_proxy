@@ -137,6 +137,24 @@ defmodule UniversalProxyWeb.Components.UI do
   defp card_padding(:p), do: "p-4"
   defp card_padding(:lg), do: "p-5"
 
+  # ── Battery pill ──────────────────────────────────────────────────────
+  # A small badge showing a device's battery %, tinted by level (danger ≤15,
+  # warning ≤35, neutral otherwise). Render only when a level is known
+  # (`org.bluez.Battery1` is absent for devices that don't report battery).
+  attr(:level, :integer, required: true)
+
+  def battery_pill(assigns) do
+    ~H"""
+    <.badge variant={battery_variant(@level)} class="!text-[10px] !px-1.5 !py-px !gap-1">
+      <.icon name={:battery} size={11} stroke={1.8} /> {@level}%
+    </.badge>
+    """
+  end
+
+  defp battery_variant(level) when is_integer(level) and level <= 15, do: :danger
+  defp battery_variant(level) when is_integer(level) and level <= 35, do: :warning
+  defp battery_variant(_), do: :neutral
+
   # ── Eyebrow (uppercase 11px label) ────────────────────────────────────
   attr(:class, :string, default: nil)
   slot(:inner_block, required: true)
