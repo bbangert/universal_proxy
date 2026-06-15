@@ -127,16 +127,16 @@ defmodule UniversalProxy.Bluetooth.AudioManagerTest do
   describe "role enforcement (no :audio adapter)" do
     test "pair/connect/start_scan refuse without an audio adapter", %{settings: settings} do
       mgr = start_manager(settings)
-      assert {:error, :no_audio_adapter} = AudioManager.pair(mgr, @hs)
+      assert {:error, :no_audio_adapter} = AudioManager.pair(mgr, @hs, nil)
       assert {:error, :no_audio_adapter} = AudioManager.connect(mgr, @hs)
-      assert {:error, :no_audio_adapter} = AudioManager.start_scan(mgr)
+      assert {:error, :no_audio_adapter} = AudioManager.start_scan(mgr, nil)
     end
 
     test "an adapter with a non-:audio role does not count", %{settings: settings} do
       :ok = Settings.set_role(settings, @audio_mac, :proxy)
       MockOps.configure(%{adapters: [%{path: @adapter, address: @audio_mac}]})
       mgr = start_manager(settings)
-      assert {:error, :no_audio_adapter} = AudioManager.pair(mgr, @hs)
+      assert {:error, :no_audio_adapter} = AudioManager.pair(mgr, @hs, nil)
     end
   end
 
@@ -145,7 +145,7 @@ defmodule UniversalProxy.Bluetooth.AudioManagerTest do
       with_audio_adapter(settings)
       mgr = start_manager(settings)
 
-      assert :ok = AudioManager.pair(mgr, @hs)
+      assert :ok = AudioManager.pair(mgr, @hs, nil)
 
       # D-Bus sequence on the resolved device path.
       assert_receive {:ops, {:pair, @hs_path}}
@@ -165,7 +165,7 @@ defmodule UniversalProxy.Bluetooth.AudioManagerTest do
       mgr = start_manager(settings)
 
       # Accepted synchronously; the failure surfaces over PubSub.
-      assert :ok = AudioManager.pair(mgr, @hs)
+      assert :ok = AudioManager.pair(mgr, @hs, nil)
       assert_receive {:bt_audio, :pairing, @hs, {:error, :rejected}}
       # Never advanced to trust/connect.
       refute_receive {:ops, {:set_trusted, _, _}}, 250
@@ -176,7 +176,7 @@ defmodule UniversalProxy.Bluetooth.AudioManagerTest do
       MockOps.configure(%{connect: {:error, "org.bluez.Error.ConnectionAttemptFailed"}})
       mgr = start_manager(settings)
 
-      assert :ok = AudioManager.pair(mgr, @hs)
+      assert :ok = AudioManager.pair(mgr, @hs, nil)
       assert_receive {:ops, {:set_trusted, @hs_path, true}}
       assert_receive {:bt_audio, :pairing, @hs, {:error, :out_of_range}}
     end
@@ -186,7 +186,7 @@ defmodule UniversalProxy.Bluetooth.AudioManagerTest do
       MockOps.configure(%{pair: {:error, {:exit, :timeout}}})
       mgr = start_manager(settings)
 
-      assert :ok = AudioManager.pair(mgr, @hs)
+      assert :ok = AudioManager.pair(mgr, @hs, nil)
       assert_receive {:bt_audio, :pairing, @hs, {:error, :timeout}}
     end
   end
@@ -238,12 +238,90 @@ defmodule UniversalProxy.Bluetooth.AudioManagerTest do
       with_audio_adapter(settings)
       mgr = start_manager(settings, scan_ms: 30)
 
-      assert :ok = AudioManager.start_scan(mgr)
+      assert :ok = AudioManager.start_scan(mgr, nil)
       assert_receive {:ops, {:start_discovery, @adapter}}
 
       # Auto-stop after scan_ms.
       assert_receive {:bt_scan, :stopped}, 500
       assert_receive {:ops, {:stop_discovery, @adapter}}
+    end
+  end
+
+  describe "multiple :audio adapters (per-adapter bonds)" do
+    @audio_mac2 "CC:DD:EE:FF:00:11"
+    @adapter2 "/org/bluez/hci1"
+    @hs2 "22:33:44:55:66:77"
+    @hs2_path "/org/bluez/hci1/dev_22_33_44_55_66_77"
+
+    defp with_two_audio_adapters(settings) do
+      :ok = Settings.set_role(settings, @audio_mac, :audio)
+      :ok = Settings.set_role(settings, @audio_mac2, :audio)
+
+      MockOps.configure(%{
+        adapters: [
+          %{path: @adapter, address: @audio_mac},
+          %{path: @adapter2, address: @audio_mac2}
+        ]
+      })
+    end
+
+    test "list_audio_adapters/1 enumerates both choices", %{settings: settings} do
+      with_two_audio_adapters(settings)
+      mgr = start_manager(settings)
+
+      adapters = AudioManager.list_audio_adapters(mgr)
+      macs = Enum.map(adapters, & &1.mac) |> Enum.sort()
+      assert macs == Enum.sort([@audio_mac, @audio_mac2])
+    end
+
+    test "pair on a specific adapter bonds the device under THAT adapter", %{settings: settings} do
+      with_two_audio_adapters(settings)
+      mgr = start_manager(settings)
+
+      # Pair hs2 explicitly via the second audio adapter → path under hci1.
+      assert :ok = AudioManager.pair(mgr, @hs2, @audio_mac2)
+      assert_receive {:ops, {:pair, @hs2_path}}
+      assert_receive {:ops, {:set_trusted, @hs2_path, true}}
+
+      # And the first speaker pairs under the first adapter, independently.
+      assert :ok = AudioManager.pair(mgr, @hs, @audio_mac)
+      assert_receive {:ops, {:pair, @hs_path}}
+    end
+
+    test "scan targets the chosen adapter; stop targets the same one", %{settings: settings} do
+      with_two_audio_adapters(settings)
+      mgr = start_manager(settings)
+
+      assert :ok = AudioManager.start_scan(mgr, @audio_mac2)
+      assert_receive {:ops, {:start_discovery, @adapter2}}
+
+      assert :ok = AudioManager.stop_scan(mgr)
+      assert_receive {:ops, {:stop_discovery, @adapter2}}
+    end
+
+    test "pairing on an unknown / non-audio adapter is refused", %{settings: settings} do
+      with_two_audio_adapters(settings)
+      mgr = start_manager(settings)
+
+      assert {:error, :not_audio_adapter} = AudioManager.pair(mgr, @hs, "99:99:99:99:99:99")
+      assert {:error, :not_audio_adapter} = AudioManager.start_scan(mgr, "99:99:99:99:99:99")
+    end
+
+    test "list_headphones tags each device with the adapter it's bonded to", %{settings: settings} do
+      with_two_audio_adapters(settings)
+
+      MockOps.configure(%{
+        devices: [
+          dev(@hs_path, @hs, %{"Paired" => true, "UUIDs" => [@sink_uuid]}),
+          dev(@hs2_path, @hs2, %{"Paired" => true, "UUIDs" => [@sink_uuid]})
+        ]
+      })
+
+      mgr = start_manager(settings)
+      hp = AudioManager.list_headphones(mgr)
+
+      assert %{adapter: @audio_mac} = Enum.find(hp, &(&1.mac == @hs))
+      assert %{adapter: @audio_mac2} = Enum.find(hp, &(&1.mac == @hs2))
     end
   end
 

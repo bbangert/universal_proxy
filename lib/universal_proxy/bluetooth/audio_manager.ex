@@ -8,14 +8,24 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
   Bluetooth tab — including paired-but-disconnected headsets, which the
   enumerate path drops.
 
-  ## Roles
+  ## Roles & multiple audio adapters
 
-  Pairing/connecting only proceeds on an adapter assigned the `:audio` role
-  (`UniversalProxy.Bluetooth.Settings`). With no `:audio` adapter, the
-  mutating calls refuse with `{:error, :no_audio_adapter}`. The audio-role MAC
-  is resolved to its `hciX` object path via `UniversalProxy.Bluez.Client`
-  adapter info — the same MAC→path mechanism the proxy uses (hci indices aren't
-  stable across boots).
+  Pairing/scanning only proceed on an adapter assigned the `:audio` role
+  (`UniversalProxy.Bluetooth.Settings`). With no `:audio` adapter, the mutating
+  calls refuse with `{:error, :no_audio_adapter}`. The audio-role MAC is
+  resolved to its `hciX` object path via `UniversalProxy.Bluez.Client` adapter
+  info — the same MAC→path mechanism the proxy uses (hci indices aren't stable
+  across boots).
+
+  **Several adapters may be `:audio`** (e.g. one BT radio per speaker).
+  Because a BlueZ bond is **per-adapter** — a device paired on hci0 is bonded
+  to hci0 and is not usable via hci1 without re-pairing — `scan/2` and `pair/3`
+  take an explicit adapter MAC (`nil` = the first audio adapter, the common
+  single-adapter case); pass an unknown/non-audio MAC and they refuse with
+  `{:error, :not_audio_adapter}`. `list_audio_adapters/1` enumerates the
+  choices for a UI selector. `connect`/`disconnect`/`forget`/reconnect are
+  adapter-agnostic: they act on the device's existing bond, resolving its real
+  managed-object path (and so the adapter it lives on) automatically.
 
   ## Reconnect
 
@@ -83,17 +93,36 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
   @spec list_headphones(GenServer.server()) :: [map()]
   def list_headphones(server \\ __MODULE__), do: call(server, :list_headphones, [])
 
-  @doc "Begin a (filtered) scan for A2DP headsets; auto-stops after ~30 s."
-  @spec start_scan(GenServer.server()) :: :ok | {:error, term()}
-  def start_scan(server \\ __MODULE__), do: call(server, :start_scan, {:error, :not_running})
+  @doc """
+  The `:audio`-role adapters available to pair/scan on, as `%{mac, path}` —
+  the choices a UI presents when more than one audio radio is configured.
+  """
+  @spec list_audio_adapters(GenServer.server()) :: [%{mac: String.t(), path: String.t()}]
+  def list_audio_adapters(server \\ __MODULE__), do: call(server, :list_audio_adapters, [])
+
+  @doc """
+  Begin a (filtered) scan for A2DP speakers/headsets on a specific `:audio`
+  adapter (MAC); `nil` uses the first audio adapter (the single-adapter case).
+  Auto-stops after ~30 s. Pair on the **same** adapter you scanned (a BlueZ
+  bond is per-adapter).
+  """
+  @spec start_scan(GenServer.server(), mac() | nil) :: :ok | {:error, term()}
+  def start_scan(server \\ __MODULE__, adapter_mac),
+    do: call(server, {:start_scan, adapter_mac}, {:error, :not_running})
 
   @doc "Stop an in-progress scan."
   @spec stop_scan(GenServer.server()) :: :ok
   def stop_scan(server \\ __MODULE__), do: call(server, :stop_scan, :ok)
 
-  @doc "Pair → trust → connect a headset by MAC."
-  @spec pair(GenServer.server(), mac()) :: :ok | {:error, term()}
-  def pair(server \\ __MODULE__, mac), do: call(server, {:pair, mac}, {:error, :not_running})
+  @doc """
+  Pair → trust → connect a speaker/headset by MAC, bonding it to a specific
+  `:audio` adapter (MAC); `nil` uses the first audio adapter. The device must
+  have been discovered on that same adapter (BlueZ pairings are per-adapter, so
+  this choice fixes which radio streams to the device).
+  """
+  @spec pair(GenServer.server(), mac(), mac() | nil) :: :ok | {:error, term()}
+  def pair(server \\ __MODULE__, mac, adapter_mac),
+    do: call(server, {:pair, mac, adapter_mac}, {:error, :not_running})
 
   @doc "Connect an already-paired headset."
   @spec connect(GenServer.server(), mac()) :: :ok | {:error, term()}
@@ -167,7 +196,10 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
       reconnect_ms: Keyword.get(opts, :reconnect_ms, @default_reconnect_ms),
       reconnect?: Keyword.get(opts, :reconnect_on_boot, true),
       scanning?: false,
-      scan_timer: nil
+      scan_timer: nil,
+      # Adapter path the in-flight scan is running on, so stop targets the
+      # right radio when several :audio adapters exist.
+      scan_path: nil
     }
 
     if state.reconnect?, do: {:ok, state, {:continue, :reconnect}}, else: {:ok, state}
@@ -195,31 +227,39 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
   @impl true
   def handle_call(:list_headphones, _from, state), do: {:reply, headphones(state), state}
 
-  def handle_call(:start_scan, _from, state) do
-    case audio_adapter_paths(state) do
-      [] ->
-        {:reply, {:error, :no_audio_adapter}, state}
+  def handle_call(:list_audio_adapters, _from, state),
+    do: {:reply, audio_adapters_info(state), state}
 
-      [adapter | _] ->
+  def handle_call({:start_scan, adapter_mac}, _from, state) do
+    case resolve_audio_adapter(state, adapter_mac) do
+      {:ok, adapter} ->
         case state.ops.start_discovery(state.conn, adapter) do
           :ok ->
             if state.scan_timer, do: Process.cancel_timer(state.scan_timer)
             timer = Process.send_after(self(), :scan_timeout, state.scan_ms)
-            {:reply, :ok, %{state | scanning?: true, scan_timer: timer}}
+            {:reply, :ok, %{state | scanning?: true, scan_timer: timer, scan_path: adapter}}
 
           {:error, _} = err ->
             {:reply, err, state}
         end
+
+      {:error, _} = err ->
+        {:reply, err, state}
     end
   end
 
   def handle_call(:stop_scan, _from, state), do: {:reply, :ok, do_stop_scan(state)}
 
-  # All mutating ops run in a Task (Pair can take ~90 s, Connect ~25 s) so the
-  # loop stays responsive (scans, list_headphones, reconnect). The call returns
+  # Pair bonds to a SPECIFIC audio adapter (per-adapter bonds); the rest are
+  # adapter-agnostic (they act on the device's existing bond). All run in a Task
+  # (Pair ~90 s, Connect ~25 s) so the loop stays responsive. The call returns
   # :ok = "accepted"; progress + the final result fan out on "bluetooth:audio".
-  def handle_call({:pair, mac}, _from, state),
-    do: {:reply, dispatch(state, mac, &pair_flow(state, &1, mac)), state}
+  def handle_call({:pair, mac, adapter_mac}, _from, state) do
+    case resolve_audio_adapter(state, adapter_mac) do
+      {:ok, adapter} -> {:reply, dispatch_pair(state, mac, adapter), state}
+      {:error, _} = err -> {:reply, err, state}
+    end
+  end
 
   def handle_call({:connect, mac}, _from, state),
     do: {:reply, dispatch(state, mac, &connect_and_broadcast(state, &1, mac)), state}
@@ -307,6 +347,26 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
     end
   end
 
+  # Pair on a SPECIFIC adapter: bond `mac` to `adapter_path`. Use the device's
+  # real managed-object path if it was already discovered under that adapter,
+  # else construct it there (a freshly-discovered, not-yet-paired device). Runs
+  # in a Task; returns :ok ("accepted").
+  defp dispatch_pair(state, mac, adapter_path) do
+    task = fn ->
+      device_path =
+        managed_device_path(state, mac, adapter_path) || device_path_under(adapter_path, mac)
+
+      pair_flow(state, device_path, mac)
+    end
+
+    case Task.Supervisor.start_child(state.task_sup, task) do
+      {:ok, _pid} -> :ok
+      {:error, _} -> task.()
+    end
+
+    :ok
+  end
+
   # The body of a connect: issue Device1.Connect and broadcast the outcome.
   defp connect_and_broadcast(state, device_path, mac) do
     case state.ops.connect(state.conn, device_path) do
@@ -374,16 +434,48 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
     end
   end
 
-  # Object paths of adapters whose MAC has the :audio role.
-  defp audio_adapter_paths(state) do
+  # The :audio-role adapters present on the bus, as %{mac, path}. Joins the
+  # Settings role assignment (by MAC) with the live adapter objects (MAC→path),
+  # since hci indices aren't stable.
+  defp audio_adapters_info(state) do
     settings = Settings.get(state.settings)
     audio_macs = MapSet.new(Settings.audio_adapters(settings))
 
     for %{path: path, address: addr} <-
           safe_call(fn -> state.ops.adapters_info(state.conn) end, []),
         is_binary(addr),
-        MapSet.member?(audio_macs, String.upcase(addr)),
-        do: path
+        mac = String.upcase(addr),
+        MapSet.member?(audio_macs, mac),
+        do: %{mac: mac, path: path}
+  end
+
+  # Object paths of the :audio-role adapters.
+  defp audio_adapter_paths(state), do: Enum.map(audio_adapters_info(state), & &1.path)
+
+  # Resolve a requested adapter MAC (nil = first audio adapter) to its object
+  # path, validating it actually has the :audio role.
+  defp resolve_audio_adapter(state, adapter_mac) do
+    case {audio_adapters_info(state), adapter_mac} do
+      {[], _} -> {:error, :no_audio_adapter}
+      {[first | _], nil} -> {:ok, first.path}
+      {adapters, mac} -> find_audio_adapter(adapters, String.upcase(mac))
+    end
+  end
+
+  defp find_audio_adapter(adapters, mac) do
+    case Enum.find(adapters, &(&1.mac == mac)) do
+      %{path: path} -> {:ok, path}
+      nil -> {:error, :not_audio_adapter}
+    end
+  end
+
+  # The real managed-object path for `mac` under a specific adapter, if present.
+  defp managed_device_path(state, mac, adapter_path) do
+    norm = String.upcase(mac)
+
+    Enum.find_value(managed_devices(state), fn d ->
+      if d.mac == norm and String.starts_with?(d.path, adapter_path <> "/"), do: d.path
+    end)
   end
 
   defp managed_devices(state),
@@ -398,7 +490,8 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
   end
 
   defp headphones(state) do
-    paths = audio_adapter_paths(state)
+    adapters = audio_adapters_info(state)
+    paths = Enum.map(adapters, & &1.path)
 
     for %{mac: mac, path: path, props: props} <- managed_devices(state),
         on_audio_adapter?(path, paths),
@@ -408,8 +501,17 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
         name: props["Alias"] || mac,
         connected: props["Connected"] == true,
         paired: props["Paired"] == true,
-        trusted: props["Trusted"] == true
+        trusted: props["Trusted"] == true,
+        # Which audio radio this device is bonded to (bonds are per-adapter).
+        adapter: adapter_mac_for(adapters, path)
       }
+    end
+  end
+
+  defp adapter_mac_for(adapters, device_path) do
+    case Enum.find(adapters, &String.starts_with?(device_path, &1.path <> "/")) do
+      %{mac: mac} -> mac
+      nil -> nil
     end
   end
 
@@ -444,13 +546,15 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
   defp do_stop_scan(state) do
     if state.scan_timer, do: Process.cancel_timer(state.scan_timer)
 
-    case audio_adapter_paths(state) do
+    # Stop on the adapter the scan was started on; fall back to the first audio
+    # adapter if we somehow lost it.
+    case List.wrap(state.scan_path) ++ audio_adapter_paths(state) do
       [adapter | _] -> state.ops.stop_discovery(state.conn, adapter)
       [] -> :ok
     end
 
     Phoenix.PubSub.broadcast(state.pubsub, @scan_topic, {:bt_scan, :stopped})
-    %{state | scanning?: false, scan_timer: nil}
+    %{state | scanning?: false, scan_timer: nil, scan_path: nil}
   end
 
   defp schedule_reconnect(state),
