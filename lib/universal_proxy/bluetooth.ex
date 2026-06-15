@@ -66,7 +66,7 @@ defmodule UniversalProxy.Bluetooth do
   picked up by the next cycle.
   """
 
-  alias UniversalProxy.Bluetooth.{Manager, RadioMonitor, Settings, Stats}
+  alias UniversalProxy.Bluetooth.{AudioManager, Manager, RadioMonitor, Settings, Stats}
 
   @bluetooth_targets [:rpi, :rpi0, :rpi0_2, :rpi2, :rpi3, :rpi4, :rpi5, :x86_64]
 
@@ -165,6 +165,24 @@ defmodule UniversalProxy.Bluetooth do
   end
 
   @doc """
+  Per-radio role assignment for the web tab, as
+
+      %{proxy: String.t() | nil, audio: [String.t()]}
+
+  `proxy` is the proxy-role radio MAC (or the legacy auto fallback, which may
+  be `nil`); `audio` is the list of audio-role radio MACs. Any radio not in
+  either is `:off`. Safe on non-BT targets / while Settings is down (returns
+  the empty-role shape). Read-only; role changes go through `set_role/2`.
+  """
+  @spec roles() :: %{proxy: String.t() | nil, audio: [String.t()]}
+  def roles do
+    settings = Settings.get()
+    %{proxy: Settings.proxy_adapter(settings), audio: Settings.audio_adapters(settings)}
+  catch
+    :exit, _ -> %{proxy: nil, audio: []}
+  end
+
+  @doc """
   Master Bluetooth switch — purely an espex-wiring gate. The BlueZ stack
   (and its radios) keeps running either way; what changes is whether the
   scanner/GATT adapters are wired into espex, so HA sees bluetooth
@@ -237,6 +255,47 @@ defmodule UniversalProxy.Bluetooth do
       end
     else
       {:error, :unknown_radio}
+    end
+  catch
+    :exit, _ -> {:error, :unavailable}
+  end
+
+  @doc """
+  Assign a radio's role (`:proxy | :audio | :off`) and act on the change.
+
+  Because BlueZ bonds are per-adapter, a radio **leaving** the `:audio` role
+  would orphan its paired speakers — so this disconnects + forgets them
+  (`AudioManager.forget_all_on_adapter/2`). When the change moves the
+  proxy-role radio, the BlueZ subtree is restarted to re-target it; otherwise
+  it just rebroadcasts status. Callers that want a confirm step (the UI's
+  "deactivating forgets N speakers" modal) gather the affected speakers from
+  `AudioManager.list_headphones/0` (filtered by `:adapter`) before calling.
+  """
+  @spec set_role(String.t(), Settings.role()) :: :ok | {:error, term()}
+  def set_role(mac, role) when is_binary(mac) do
+    normalized = String.upcase(mac)
+    settings = Settings.get()
+    before_proxy = Settings.proxy_adapter(settings)
+    before_role = Settings.role(settings, normalized)
+
+    with :ok <- Settings.set_role(normalized, role) do
+      # Only when a radio actually LEAVES the :audio role do we forget its
+      # per-adapter bonds — matching the UI's deactivate-confirm, which gates on
+      # the same transition. Other transitions (e.g. :off -> :proxy) must not
+      # forget (the radio holds no audio bonds to begin with, and there'd be no
+      # confirmation step).
+      if before_role == :audio and role != :audio do
+        AudioManager.forget_all_on_adapter(normalized)
+      end
+
+      if Settings.proxy_adapter(Settings.get()) != before_proxy do
+        :ok = Manager.reconcile(restart: true)
+      else
+        :ok = Manager.reconcile()
+      end
+
+      _ = RadioMonitor.refresh()
+      :ok
     end
   catch
     :exit, _ -> {:error, :unavailable}

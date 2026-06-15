@@ -48,6 +48,7 @@ defmodule UniversalProxy.Bluetooth.Radios do
     {0x0B05, 0x190E} => %{chip: "Realtek RTL8761B (ASUS USB-BT500)", bt_version: "5.0"},
     {0x0BDA, 0x8771} => %{chip: "Realtek RTL8761B", bt_version: "5.1"},
     {0x0BDA, 0x2550} => %{chip: "Realtek RTL8761BU", bt_version: "5.1"},
+    {0x2357, 0x0604} => %{chip: "Realtek RTL8761B (TP-Link UB500)", bt_version: "5.0"},
     {0x0A12, 0x0001} => %{chip: "CSR8510 A10", bt_version: "4.0"},
     {0x8087, 0x0029} => %{chip: "Intel AX200", bt_version: "5.2"},
     {0x8087, 0x0026} => %{chip: "Intel Wireless-AC 9260", bt_version: "5.1"}

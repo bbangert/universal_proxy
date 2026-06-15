@@ -134,6 +134,23 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
       assert :persistent_term.get(DevicePath.desired_adapter_key()) == @hci1_mac
     end
 
+    test "the :proxy-role adapter is published, taking precedence over legacy adapter", ctx do
+      # Legacy selector points one way; an explicit :proxy role wins.
+      :ok = Settings.set_adapter(ctx.settings, @hci1_mac)
+      :ok = Settings.set_role(ctx.settings, "00:11:22:33:44:55", :proxy)
+      _manager = start_manager(ctx)
+
+      assert :persistent_term.get(DevicePath.desired_adapter_key()) == "00:11:22:33:44:55"
+    end
+
+    test "an :audio-only role leaves the proxy on auto (legacy fallback)", ctx do
+      # An audio headset adapter must not be picked as the proxy radio.
+      :ok = Settings.set_role(ctx.settings, @hci1_mac, :audio)
+      _manager = start_manager(ctx)
+
+      assert :persistent_term.get(DevicePath.desired_adapter_key(), :unset) == nil
+    end
+
     test "status identifies the claimed adapter via live daemon info while running", ctx do
       # Simulate Bluez.Client having claimed hci1 and the daemon answering.
       :persistent_term.put(DevicePath.adapter_path_key(), "/org/bluez/hci1")

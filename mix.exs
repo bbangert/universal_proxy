@@ -178,7 +178,7 @@ defmodule UniversalProxy.MixProject do
   # required (host must be linux/x86_64). rpi/rpi2 have no onboard BT but
   # support USB BT dongles; x86_64 omits the Pi-only BT firmware package. One
   # pinned tag for all of them — bump @up_systems_tag to cut a new release.
-  @up_systems_tag "v0.1.2"
+  @up_systems_tag "v0.1.3"
   @up_systems_targets [:rpi, :rpi0, :rpi0_2, :rpi2, :rpi3, :rpi4, :rpi5, :x86_64]
 
   defp up_nerves_systems do

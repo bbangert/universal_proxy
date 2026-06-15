@@ -66,6 +66,32 @@ defmodule UniversalProxyWeb.Components.Audio do
   end
 
   @doc """
+  Whether an output is a Bluetooth (A2DP) sink rather than an ALSA card.
+
+  BlueALSA PCMs are opened through the `bluealsa:DEV=…` device string
+  (`UniversalProxy.Bluetooth.AudioSink`), so the `:alsa_device` prefix is the
+  reliable, target-independent marker — the output map is otherwise identical
+  in shape to an ALSA card's.
+  """
+  @spec bt_output?(map()) :: boolean()
+  def bt_output?(%{alsa_device: dev}) when is_binary(dev),
+    do: String.starts_with?(dev, "bluealsa:")
+
+  def bt_output?(_), do: false
+
+  @doc """
+  The codec label (`"SBC"` / `"AAC"`) for a Bluetooth output, taken from the
+  live stream snapshot (the sendspin binary reports the negotiated codec on
+  `stream_start`). Returns `nil` when nothing is streaming — there is no static
+  negotiated-codec field on a connected-but-idle PCM, so callers omit the pill.
+  """
+  @spec codec_label(map()) :: String.t() | nil
+  def codec_label(%{stream: %{codec: codec}}) when is_binary(codec) and codec != "",
+    do: String.upcase(codec)
+
+  def codec_label(_), do: nil
+
+  @doc """
   Map a 0–100 volume to the speaker glyph's "wave count" so the icon
   visually tracks loudness: silence → no waves, normal → one wave,
   loud → two waves.

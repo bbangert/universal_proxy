@@ -145,6 +145,15 @@ defmodule UniversalProxy.Bluetooth.RadiosTest do
              ] = Radios.enumerate(root)
     end
 
+    test "identifies the TP-Link UB500 (Realtek RTL8761B)", %{root: root} do
+      add_usb_radio(root, "hci1", @dongle_mac,
+        modalias: "usb:v2357p0604d0200dcE0dsc01dp01icE0isc01ip01in00"
+      )
+
+      assert [%{chip: "Realtek RTL8761B (TP-Link UB500)", bt_version: "5.0"}] =
+               Radios.enumerate(root)
+    end
+
     test "unknown VID:PID → Unknown chip, bus details still parsed", %{root: root} do
       add_usb_radio(root, "hci1", @dongle_mac,
         modalias: "usb:v1234pABCDd0001dc00dsc00dp00icE0isc01ip01in00",

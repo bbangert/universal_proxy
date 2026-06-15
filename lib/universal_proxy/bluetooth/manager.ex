@@ -211,15 +211,19 @@ defmodule UniversalProxy.Bluetooth.Manager do
   end
 
   defp start_bluez(state, config) do
-    # MUST land before the subtree boots: Bluez.Client resolves this MAC
-    # against bluetoothd's adapters during setup (a crash-restart
+    # The proxy targets the :proxy-role adapter; with none assigned this falls
+    # back to the legacy `adapter` selector (nil = auto), so a default-derived
+    # legacy record points the subtree at exactly the radio it did before roles
+    # existed. MUST land before the subtree boots: Bluez.Client resolves this
+    # MAC against bluetoothd's adapters during setup (a crash-restart
     # re-resolves the same term).
-    :persistent_term.put(DevicePath.desired_adapter_key(), config.adapter)
+    proxy_adapter = Settings.proxy_adapter(config)
+    :persistent_term.put(DevicePath.desired_adapter_key(), proxy_adapter)
 
     case DynamicSupervisor.start_child(state.dynsup, state.bluez_child) do
       {:ok, pid} ->
         Logger.info(
-          "Bluetooth.Manager: Bluez subtree started (radio: #{config.adapter || "auto"})"
+          "Bluetooth.Manager: Bluez subtree started (radio: #{proxy_adapter || "auto"})"
         )
 
         %{state | bluez_pid: pid, monitor: Process.monitor(pid)}

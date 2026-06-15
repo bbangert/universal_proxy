@@ -35,7 +35,43 @@ defmodule UniversalProxy.Bluez.DBus do
   @spec call(pid(), String.t(), String.t(), String.t(), String.t(), list(), timeout()) ::
           {:ok, list()} | {:error, term()}
   def call(conn, path, interface, member, signature, body, timeout \\ @default_timeout) do
-    opts = [destination: @bluez, path: path, interface: interface, member: member, body: body]
+    call_to(conn, @bluez, path, interface, member, signature, body, timeout)
+  end
+
+  @doc """
+  Like `call/7` but to an arbitrary bus name. `call/7` is this with
+  `destination: "org.bluez"`; `UniversalProxy.Bluez.BlueAlsa` uses it to reach
+  `org.bluealsa` over the same kind of connection. Same error normalization.
+  """
+  @spec call_to(
+          pid(),
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          list(),
+          timeout()
+        ) ::
+          {:ok, list()} | {:error, term()}
+  def call_to(
+        conn,
+        destination,
+        path,
+        interface,
+        member,
+        signature,
+        body,
+        timeout \\ @default_timeout
+      ) do
+    opts = [
+      destination: destination,
+      path: path,
+      interface: interface,
+      member: member,
+      body: body
+    ]
+
     opts = if signature == "", do: opts, else: Keyword.put(opts, :signature, signature)
     msg = Rebus.Message.new!(:method_call, opts)
 

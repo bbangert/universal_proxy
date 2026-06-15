@@ -409,4 +409,111 @@ defmodule UniversalProxyWeb.AudioLiveTest do
     hdmi_pos = :binary.match(html, "HDMI") |> elem(0)
     assert aux_pos < hdmi_pos
   end
+
+  # A Bluetooth output keys by {mac, nil, nil} and opens a `bluealsa:` PCM.
+  defp bt_output(overrides \\ %{}) do
+    sample_output(
+      Map.merge(
+        %{
+          key: {"AA:BB:CC:DD:EE:FF", nil, nil},
+          card_index: nil,
+          alsa_device: "bluealsa:DEV=AA:BB:CC:DD:EE:FF,PROFILE=a2dp",
+          card_name: "Bluetooth A2DP",
+          friendly_name: "Sony WH-1000XM5",
+          connection: :connected,
+          stream: %{codec: "sbc", sample_rate: 44_100, bit_depth: 16, channels: 2}
+        },
+        overrides
+      )
+    )
+  end
+
+  test "a Bluetooth output renders the BT card variant (path + codec pill)", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/audio")
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:output_added",
+      {:sendspin_output_added, bt_output()}
+    )
+
+    html = render(view)
+    assert html =~ "Sony WH-1000XM5"
+    assert html =~ "bluealsa:DEV=AA:BB:CC:DD:EE:FF"
+    # Codec pill comes from the live stream snapshot.
+    assert html =~ "SBC"
+  end
+
+  test "a dropped Bluetooth output shows a brief Reconnecting card", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/audio")
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:output_added",
+      {:sendspin_output_added, bt_output()}
+    )
+
+    assert render(view) =~ "Sony WH-1000XM5"
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:output_removed",
+      {:sendspin_output_removed, %{key: {"AA:BB:CC:DD:EE:FF", nil, nil}}}
+    )
+
+    html = render(view)
+    # The card is gone but a transient Reconnecting placeholder remains.
+    assert html =~ "Reconnecting"
+    assert html =~ "Sony WH-1000XM5"
+    refute html =~ "No audio outputs detected"
+  end
+
+  test "a stale drop_reconnecting timer (token mismatch) doesn't prune the placeholder",
+       %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/audio")
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:output_added",
+      {:sendspin_output_added, bt_output()}
+    )
+
+    assert render(view) =~ "Sony WH-1000XM5"
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:output_removed",
+      {:sendspin_output_removed, %{key: {"AA:BB:CC:DD:EE:FF", nil, nil}}}
+    )
+
+    assert render(view) =~ "Reconnecting"
+
+    # A grace timer that already fired but was superseded (drop→return→drop)
+    # carries an old token; the handler must ignore it, not prune the fresh
+    # placeholder.
+    send(view.pid, {:drop_reconnecting, "AA:BB:CC:DD:EE:FF", make_ref()})
+    assert render(view) =~ "Reconnecting"
+  end
+
+  test "an ALSA removal does not leave a Reconnecting placeholder", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/audio")
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:output_added",
+      {:sendspin_output_added, sample_output()}
+    )
+
+    assert render(view) =~ "Headphones"
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:output_removed",
+      {:sendspin_output_removed, %{key: @hp_key}}
+    )
+
+    html = render(view)
+    refute html =~ "Reconnecting"
+    assert html =~ "No audio outputs detected"
+  end
 end

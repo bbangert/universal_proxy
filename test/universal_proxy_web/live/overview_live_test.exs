@@ -82,6 +82,30 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
     assert html =~ "Searching"
   end
 
+  test "a connected Bluetooth output renders in the audio summary", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/")
+
+    bt =
+      sample_output(%{
+        key: {"AA:BB:CC:DD:EE:FF", nil, nil},
+        card_index: nil,
+        alsa_device: "bluealsa:DEV=AA:BB:CC:DD:EE:FF,PROFILE=a2dp",
+        card_name: "Bluetooth A2DP",
+        friendly_name: "Kitchen Speaker"
+      })
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:output_added",
+      {:sendspin_output_added, bt}
+    )
+
+    html = render(view)
+    assert html =~ "Audio outputs"
+    assert html =~ "Kitchen Speaker"
+    assert html =~ "bluealsa:DEV=AA:BB:CC:DD:EE:FF"
+  end
+
   test "binary events progress the badge through Searching → Connected → Streaming",
        %{conn: conn} do
     {:ok, view, _html} = live(conn, "/")

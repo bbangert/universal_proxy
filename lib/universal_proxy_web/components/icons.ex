@@ -199,6 +199,42 @@ defmodule UniversalProxyWeb.Components.Icons do
     """
   end
 
+  defp paths(:headphones) do
+    assigns = %{}
+
+    ~H"""
+    <path d="M4 14v-2a8 8 0 0 1 16 0v2" />
+    <rect x="2" y="14" width="5" height="7" rx="1.5" />
+    <rect x="17" y="14" width="5" height="7" rx="1.5" />
+    """
+  end
+
+  defp paths(:plus) do
+    assigns = %{}
+
+    ~H"""
+    <path d="M12 5v14M5 12h14" />
+    """
+  end
+
+  defp paths(:search) do
+    assigns = %{}
+
+    ~H"""
+    <circle cx="11" cy="11" r="7" />
+    <path d="M21 21l-4.3-4.3" />
+    """
+  end
+
+  defp paths(:battery) do
+    assigns = %{}
+
+    ~H"""
+    <rect x="2" y="8" width="16" height="9" rx="2" />
+    <path d="M21 11v3" />
+    """
+  end
+
   defp paths(:chip) do
     assigns = %{}
 
@@ -247,6 +283,25 @@ defmodule UniversalProxyWeb.Components.Icons do
       <path :if={not @muted and @level >= 2} d="M18 6a8 8 0 0 1 0 12" />
       <path :if={@muted} d="M16 9l5 6M21 9l-5 6" />
     </svg>
+    """
+  end
+
+  # Small Bluetooth "corner" badge overlaid on an audio-output tile to
+  # mark it as a Bluetooth (A2DP) output. Positioned by the caller
+  # (absolute, bottom-right); this renders just the accent disc + rune.
+  attr(:class, :string, default: nil)
+
+  def bt_corner_glyph(assigns) do
+    ~H"""
+    <span class={[
+      "w-4 h-4 rounded-full bg-accent text-white border-2 border-surface",
+      "flex items-center justify-center",
+      @class
+    ]}>
+      <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M7 7l10 10-5 5V2l5 5L7 17" />
+      </svg>
+    </span>
     """
   end
 
