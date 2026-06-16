@@ -66,6 +66,36 @@ defmodule SendspinPlayerContractTest do
     assert event["alsa_device"] == "default"
   end
 
+  test "started event advertises the baseline format floor", %{started: event} do
+    formats = event["formats"]
+    assert is_list(formats) and formats != [], "formats should be a non-empty list"
+
+    # Every entry carries the full {codec, channels, rate, bit_depth} shape.
+    for f <- formats do
+      assert is_binary(f["codec"])
+      assert f["channels"] == 2
+      assert is_integer(f["rate"])
+      assert f["bit_depth"] in [16, 24, 32]
+    end
+
+    # `--alsa-device default` is a non-card device, so the probe is skipped
+    # and exactly the unconditional baseline floor is advertised — the same
+    # list the player offered before per-device probing existed. This is the
+    # safety net: a probe regression degrades to this, never to silence.
+    floor = [
+      %{"codec" => "flac", "channels" => 2, "rate" => 44100, "bit_depth" => 16},
+      %{"codec" => "flac", "channels" => 2, "rate" => 48000, "bit_depth" => 16},
+      %{"codec" => "opus", "channels" => 2, "rate" => 48000, "bit_depth" => 16},
+      %{"codec" => "pcm", "channels" => 2, "rate" => 44100, "bit_depth" => 16},
+      %{"codec" => "pcm", "channels" => 2, "rate" => 48000, "bit_depth" => 16}
+    ]
+
+    for entry <- floor do
+      assert entry in formats,
+             "baseline floor entry #{inspect(entry)} missing from advertised formats"
+    end
+  end
+
   test "emits initial `volume` event matching --initial-volume", %{volume_event: event} do
     assert event == %{"event" => "volume", "value" => 42}
   end

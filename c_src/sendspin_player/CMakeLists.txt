@@ -83,6 +83,7 @@ unset(_bind_marker)
 add_executable(sendspin_player
     src/main.cpp
     src/alsa_pipe_sink.cpp
+    src/alsa_caps.cpp
 )
 
 target_link_libraries(sendspin_player

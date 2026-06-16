@@ -20,6 +20,7 @@
 #include "sendspin/player_role.h"
 
 #include "alsa_pipe_sink.h"
+#include "alsa_caps.h"
 
 #include <algorithm>
 #include <atomic>
@@ -140,6 +141,68 @@ static const char* codec_name(SendspinCodecFormat c) {
         case SendspinCodecFormat::UNSUPPORTED: return "unsupported";
     }
     return "unknown";
+}
+
+// ---------------------------------------------------------------------------
+// Advertised audio formats
+// ---------------------------------------------------------------------------
+
+// Build the list of formats advertised to the Sendspin server. Negotiation
+// is 100% server-driven (the server picks from this menu and encodes to the
+// chosen format before streaming), so this list is the only lever for
+// enabling hi-res output.
+//
+// The first five entries are the unconditional baseline floor — exactly what
+// was advertised before per-device probing existed. Keeping them present
+// always means a probe failure (or a non-card device) silently degrades to
+// today's behaviour rather than going silent. Hi-res entries are layered on
+// top only when the probe succeeds.
+static std::vector<AudioSupportedFormatObject> build_audio_formats(const ProbedCaps& caps) {
+    std::vector<AudioSupportedFormatObject> formats = {
+        {SendspinCodecFormat::FLAC, 2, 44100, 16},
+        {SendspinCodecFormat::FLAC, 2, 48000, 16},
+        {SendspinCodecFormat::OPUS, 2, 48000, 16},
+        {SendspinCodecFormat::PCM,  2, 44100, 16},
+        {SendspinCodecFormat::PCM,  2, 48000, 16},
+    };
+
+    if (!caps.ok) return formats;
+
+    // Cross-product of probed rates × probed depths, for FLAC + PCM only.
+    // Opus is hard-locked to 16-bit in the decoder (decoder.cpp:174), so it
+    // never receives hi-res entries. Skip the {44100,48000} × 16-bit corner
+    // the floor already covers to keep the advertised list dupe-free.
+    // Channels stay stereo — channel-count probing is out of scope.
+    for (uint8_t depth : caps.bit_depths) {
+        for (uint32_t rate : caps.rates) {
+            bool in_floor = (depth == 16 && (rate == 44100 || rate == 48000));
+            if (in_floor) continue;
+            formats.push_back({SendspinCodecFormat::FLAC, 2, rate, depth});
+            formats.push_back({SendspinCodecFormat::PCM,  2, rate, depth});
+        }
+    }
+
+    return formats;
+}
+
+// Serialize the advertised formats as a JSON array for the `started` event.
+// This makes the advertised menu — otherwise visible only in the WS
+// client/hello — observable on stdout for the contract test, the LiveView
+// UI, and hardware validation.
+static std::string formats_to_json(const std::vector<AudioSupportedFormatObject>& formats) {
+    std::ostringstream os;
+    os << '[';
+    bool first = true;
+    for (const auto& f : formats) {
+        if (!first) os << ',';
+        first = false;
+        os << "{\"codec\":\"" << codec_name(f.codec) << "\","
+           << "\"channels\":" << static_cast<unsigned>(f.channels) << ","
+           << "\"rate\":" << f.sample_rate << ","
+           << "\"bit_depth\":" << static_cast<unsigned>(f.bit_depth) << "}";
+    }
+    os << ']';
+    return os.str();
 }
 
 // ---------------------------------------------------------------------------
@@ -595,14 +658,28 @@ int main(int argc, char* argv[]) {
     client_config.software_version = VERSION;
     SendspinClient client(std::move(client_config));
 
+    // Probe the attached DAC once at startup, before add_player, so the
+    // advertised format list reflects what the hardware can actually play.
+    // The probe opens `hw:` transiently and closes it before the playback
+    // path ever opens `plughw:`, so there is no device contention; any
+    // failure degrades to the baseline floor (build_audio_formats handles
+    // the !ok case). Non-card devices ("default", empty) skip the probe.
+    ProbedCaps probed = probe_caps(hw_device_for_probe(opts.alsa_device));
+    if (probed.ok) {
+        std::fprintf(stderr,
+                     "alsa_caps: probed '%s' — %zu rate(s), %zu depth(s)\n",
+                     opts.alsa_device.c_str(), probed.rates.size(),
+                     probed.bit_depths.size());
+    } else {
+        std::fprintf(stderr,
+                     "alsa_caps: no probe for '%s' — advertising baseline floor\n",
+                     opts.alsa_device.c_str());
+    }
+    std::vector<AudioSupportedFormatObject> audio_formats = build_audio_formats(probed);
+
     PlayerRoleConfig player_config;
-    player_config.audio_formats = {
-        {SendspinCodecFormat::FLAC, 2, 44100, 16},
-        {SendspinCodecFormat::FLAC, 2, 48000, 16},
-        {SendspinCodecFormat::OPUS, 2, 48000, 16},
-        {SendspinCodecFormat::PCM,  2, 44100, 16},
-        {SendspinCodecFormat::PCM,  2, 48000, 16},
-    };
+    // Copy (not move): `audio_formats` is reused below for the started event.
+    player_config.audio_formats = audio_formats;
     player_config.audio_buffer_capacity = 2'000'000;
     player_config.fixed_delay_us = AlsaPipeSink::PIPELINE_DELAY_US;
     auto& player = client.add_player(std::move(player_config));
@@ -629,7 +706,8 @@ int main(int argc, char* argv[]) {
            << "\"version\":\"" << VERSION << "\","
            << "\"port\":" << opts.mdns_port << ","
            << "\"name\":\"" << json_escape(opts.name) << "\","
-           << "\"alsa_device\":\"" << json_escape(opts.alsa_device) << "\"}";
+           << "\"alsa_device\":\"" << json_escape(opts.alsa_device) << "\","
+           << "\"formats\":" << formats_to_json(audio_formats) << "}";
         emit_json(os.str());
     }
 
