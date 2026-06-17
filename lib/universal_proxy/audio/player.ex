@@ -31,7 +31,7 @@ defmodule UniversalProxy.Audio.Player do
   ("Stdout events" section) — keep this list in sync with that
   README and with `main.cpp`'s `emit_json` call sites.
 
-      {"event":"started","version":"0.1.0","port":8928,"name":"Out 1","alsa_device":"plughw:0,0"}
+      {"event":"started","version":"0.1.0","port":8928,"name":"Out 1","alsa_device":"plughw:0,0","formats":[{"codec":"flac","channels":2,"rate":48000,"bit_depth":16}]}
       {"event":"connected","server":"ws://music.local:8927/sendspin"}
       {"event":"disconnected"}
       {"event":"stream_start","sample_rate":48000,"channels":2,"bit_depth":16,"codec":"opus"}

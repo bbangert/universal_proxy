@@ -133,7 +133,7 @@ connection state changes, on stream lifecycle changes, on volume/mute
 changes, and on errors.
 
 ```jsonc
-{"event":"started","version":"0.1.0","port":8928,"name":"Out 1","alsa_device":"plughw:0,0"}
+{"event":"started","version":"0.1.0","port":8928,"name":"Out 1","alsa_device":"plughw:0,0","formats":[{"codec":"flac","channels":2,"rate":48000,"bit_depth":16}]}
 {"event":"connected","server":"ws://music.local:8927/sendspin"}
 {"event":"disconnected"}
 {"event":"stream_start","sample_rate":48000,"channels":2,"bit_depth":16,"codec":"opus"}
@@ -144,6 +144,14 @@ changes, and on errors.
 {"event":"error","kind":"alsa_configure","msg":"..."}
 {"event":"shutdown"}
 ```
+
+The `started` event's `formats` array is the menu of audio formats advertised
+to the Sendspin server (the server picks one and encodes to it). It always
+includes the baseline floor (FLAC/OPUS/PCM at 44.1/48 kHz, 16-bit). When the
+`--alsa-device` is a hardware card (`plughw:N,0`/`hw:N,0`), the device is
+probed at startup for the rates and bit depths it actually accepts, and the
+matching hi-res FLAC + PCM entries (24/32-bit, up to 384 kHz) are added. A
+probe failure or a non-card device (`default`) advertises the floor only.
 
 ## Stdin commands
 
