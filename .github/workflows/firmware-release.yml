@@ -36,6 +36,15 @@ jobs:
 
     env:
       MIX_TARGET: ${{ matrix.target }}
+      # The 8 custom-forked targets (rpi*, x86_64) pull prebuilt Nerves system
+      # artifacts from the public bbangert/nerves_systems_universal_proxy
+      # releases via the `:github_releases` resolver, which calls the GitHub
+      # API. Unauthenticated, that API is rate-limited (60/hr per IP) and the
+      # shared runner IP gets blocked, so the download silently fails and Mix
+      # falls through to "Nerves packages need to be built" — there is no local
+      # Buildroot, so the job dies. A token lifts the limit to 5000/hr; the
+      # repo-scoped default works since the releases repo is public.
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
       - name: Checkout code
