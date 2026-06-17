@@ -2,7 +2,7 @@ defmodule UniversalProxy.MixProject do
   use Mix.Project
 
   @app :universal_proxy
-  @version "0.4.0"
+  @version "0.5.0"
   @all_targets [
     :bbb,
     :grisp2,
