@@ -49,6 +49,7 @@ def main():
     p.add_argument("--client-id", required=True)
     p.add_argument("--mdns-port", type=int, default=0)
     p.add_argument("--initial-volume", type=int, default=50)
+    p.add_argument("--initial-static-delay-ms", type=int, default=0)
     p.add_argument("--log-level", default="info")
     args = p.parse_args()
 
@@ -73,6 +74,10 @@ def main():
     # Real binary emits a separate `volume` event after `started` to
     # publish the initial volume (main.cpp:642-649).
     emit({"event": "volume", "value": args.initial_volume})
+
+    # ...and a `static_delay` event publishing the server-adjustable static
+    # output delay (the real binary reports get_static_delay_ms()).
+    emit({"event": "static_delay", "value": args.initial_static_delay_ms})
 
     for line in sys.stdin:
         line = line.strip()

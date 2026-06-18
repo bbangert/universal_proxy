@@ -34,9 +34,24 @@ defmodule UniversalProxy.Audio.StoreTest do
       assert cfg.enabled == true
       assert cfg.volume == 50
       assert cfg.muted == false
+      assert cfg.static_delay_ms == 0
       # client_id is a hex-encoded 16-byte random — 32 lowercase hex chars
       assert is_binary(cfg.client_id)
       assert String.match?(cfg.client_id, ~r/^[0-9a-f]{32}$/)
+    end
+
+    test "round-trips and clamps static_delay_ms (0..5000)", %{server: server} do
+      :ok = Store.save_config(server, @key, %{static_delay_ms: 250})
+      assert {:ok, %{static_delay_ms: 250}} = Store.get_config(server, @key)
+
+      :ok = Store.save_config(server, @key, %{static_delay_ms: 9999})
+      assert {:ok, %{static_delay_ms: 5000}} = Store.get_config(server, @key)
+
+      :ok = Store.save_config(server, @key, %{static_delay_ms: -5})
+      assert {:ok, %{static_delay_ms: 0}} = Store.get_config(server, @key)
+
+      :ok = Store.save_config(server, @key, %{static_delay_ms: "nope"})
+      assert {:ok, %{static_delay_ms: 0}} = Store.get_config(server, @key)
     end
 
     test "preserves a caller-supplied friendly_name + volume + muted", %{server: server} do

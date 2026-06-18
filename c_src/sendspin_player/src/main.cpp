@@ -229,6 +229,7 @@ struct Options {
     std::string client_id;
     int mdns_port = DEFAULT_WS_PORT;
     int initial_volume = 50;
+    int initial_static_delay_ms = 0;
     std::string log_level = "info";
 };
 
@@ -245,6 +246,11 @@ static void print_usage(const char* prog) {
         "  --alsa-device STR     ALSA device name (e.g. plughw:0,0). Empty = default.\n"
         "  --mdns-port INT       Local WebSocket listener port (default: %d).\n"
         "  --initial-volume N    Startup volume 0-100 (default: 50).\n"
+        "  --initial-static-delay-ms N\n"
+        "                        Startup static output delay 0-5000 ms (default: 0).\n"
+        "                        The server (e.g. Music Assistant) can adjust this at\n"
+        "                        runtime for multi-room sync; report changes back via\n"
+        "                        the `static_delay` stdout event to persist them.\n"
         "  --log-level STR       none|error|warn|info|debug|verbose (default: info).\n"
         "  -h, --help            Show this help.\n"
         "  -V, --version         Show version.\n",
@@ -265,6 +271,7 @@ static bool parse_args(int argc, char** argv, Options& opts) {
         {"client-id",      required_argument, nullptr, 'i'},
         {"mdns-port",      required_argument, nullptr, 'p'},
         {"initial-volume", required_argument, nullptr, 'v'},
+        {"initial-static-delay-ms", required_argument, nullptr, 'D'},
         {"log-level",      required_argument, nullptr, 'l'},
         {"help",           no_argument,       nullptr, 'h'},
         {"version",        no_argument,       nullptr, 'V'},
@@ -290,6 +297,12 @@ static bool parse_args(int argc, char** argv, Options& opts) {
                     return false;
                 }
                 break;
+            case 'D':
+                if (!parse_int(optarg, opts.initial_static_delay_ms)) {
+                    std::fprintf(stderr, "Error: --initial-static-delay-ms must be an integer\n");
+                    return false;
+                }
+                break;
             case 'l': opts.log_level = optarg; break;
             case 'h': print_usage(argv[0]); std::exit(0);
             case 'V': std::fprintf(stdout, "sendspin_player %s\n", VERSION); std::exit(0);
@@ -310,6 +323,10 @@ static bool parse_args(int argc, char** argv, Options& opts) {
     }
     if (opts.initial_volume < 0 || opts.initial_volume > 100) {
         std::fprintf(stderr, "Error: --initial-volume must be 0-100\n");
+        return false;
+    }
+    if (opts.initial_static_delay_ms < 0 || opts.initial_static_delay_ms > 5000) {
+        std::fprintf(stderr, "Error: --initial-static-delay-ms must be 0-5000\n");
         return false;
     }
     // UTF-8 gate before any field flows into a stdout JSON event.
@@ -597,6 +614,15 @@ struct PlayerListener : PlayerRoleListener {
         os << "{\"event\":\"mute\",\"value\":" << (muted ? "true" : "false") << "}";
         emit_json(os.str());
     }
+
+    // The server (e.g. Music Assistant) changed the static output delay. The
+    // library already applies it to playout timing in the sync task; we just
+    // report it so the Elixir side can persist it and re-apply on respawn.
+    void on_static_delay_changed(uint16_t delay_ms) override {
+        std::ostringstream os;
+        os << "{\"event\":\"static_delay\",\"value\":" << static_cast<int>(delay_ms) << "}";
+        emit_json(os.str());
+    }
 };
 
 struct ClientListener : SendspinClientListener {
@@ -682,6 +708,11 @@ int main(int argc, char* argv[]) {
     player_config.audio_formats = audio_formats;
     player_config.audio_buffer_capacity = 2'000'000;
     player_config.fixed_delay_us = AlsaPipeSink::PIPELINE_DELAY_US;
+    // Seed the server-adjustable static output delay (persisted across
+    // respawns by the Elixir side via the `static_delay` stdout event +
+    // `--initial-static-delay-ms`). The library applies it to playout timing
+    // inside the sync task; we only enable + report it.
+    player_config.initial_static_delay_ms = static_cast<uint16_t>(opts.initial_static_delay_ms);
     auto& player = client.add_player(std::move(player_config));
 
     AlsaPipeSink audio_sink;
@@ -697,6 +728,9 @@ int main(int argc, char* argv[]) {
     ClientListener client_listener;
     NetworkProvider network_provider;
     player.set_listener(&player_listener);
+    // Advertise the static delay as server-adjustable; without this the
+    // player reports it as 0 and Music Assistant exposes no delay control.
+    player.set_static_delay_adjustable(true);
     client.set_listener(&client_listener);
     client.set_network_provider(&network_provider);
 
@@ -723,6 +757,15 @@ int main(int argc, char* argv[]) {
         player.update_volume(v);
         std::ostringstream os;
         os << "{\"event\":\"volume\",\"value\":" << opts.initial_volume << "}";
+        emit_json(os.str());
+    }
+
+    {
+        // Report the effective startup delay so the Elixir side's cache and
+        // any UI reflect it without waiting for a server change.
+        std::ostringstream os;
+        os << "{\"event\":\"static_delay\",\"value\":"
+           << static_cast<int>(player.get_static_delay_ms()) << "}";
         emit_json(os.str());
     }
 

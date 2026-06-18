@@ -111,6 +111,14 @@ defmodule UniversalProxy.Audio.PlayerTest do
       assert Process.alive?(pid)
     end
 
+    test "forwards the persisted static delay via --initial-static-delay-ms" do
+      _pid = start_player!(config: Map.put(config(), :static_delay_ms, 250))
+      assert_receive {:sendspin_state, @key, _started}, 2_000
+      # The binary echoes the static delay it was launched with — proving the
+      # CLI arg flowed through and round-trips back for persistence.
+      assert_receive {:sendspin_state, @key, %{event: "static_delay", value: 250}}, 1_000
+    end
+
     test "registers an mDNS service on launch" do
       _pid = start_player!()
       assert_receive {:sendspin_state, @key, _started}, 2_000

@@ -409,6 +409,13 @@ defmodule UniversalProxy.Audio.Server do
     {:noreply, persist_binary_state(state, key, %{muted: m})}
   end
 
+  # Server (e.g. Music Assistant) adjusted the static output delay. Persist it
+  # so it's re-applied via `--initial-static-delay-ms` on the next respawn.
+  def handle_info({:sendspin_state, key, %{event: "static_delay", value: v}}, state)
+      when is_integer(v) do
+    {:noreply, persist_binary_state(state, key, %{static_delay_ms: clamp_static_delay(v)})}
+  end
+
   # Track derived connection / stream state for late LiveView subscribers.
   # Without this, switching between Overview and /audio resets the badge
   # to "Stopped" / "Idle" until the binary's next event lands — even when
@@ -706,9 +713,20 @@ defmodule UniversalProxy.Audio.Server do
         if changed?(existing, update) do
           case Store.save_config(state.store, key, update) do
             :ok ->
-              {:ok, saved} = Store.get_config(state.store, key)
-              merged = merge(key, hardware_fields(existing), saved)
-              put_in(state.outputs[key], merged)
+              # Read-back can fail (corrupt/race) even after a clean write;
+              # don't crash the Server — keep the prior in-memory output.
+              case Store.get_config(state.store, key) do
+                {:ok, saved} ->
+                  merged = merge(key, hardware_fields(existing), saved)
+                  put_in(state.outputs[key], merged)
+
+                :error ->
+                  Logger.warning(
+                    "Audio.Server: read-back missing after save for #{inspect(key)}; keeping cached"
+                  )
+
+                  state
+              end
 
             {:error, reason} ->
               Logger.warning(
@@ -735,6 +753,12 @@ defmodule UniversalProxy.Audio.Server do
   defp clamp_volume(v) when is_integer(v) and v < 0, do: 0
   defp clamp_volume(v) when is_integer(v) and v > 100, do: 100
   defp clamp_volume(_), do: 50
+
+  # Mirrors the sendspin library cap (MAX_STATIC_DELAY_MS = 5000).
+  defp clamp_static_delay(v) when is_integer(v) and v >= 0 and v <= 5000, do: v
+  defp clamp_static_delay(v) when is_integer(v) and v < 0, do: 0
+  defp clamp_static_delay(v) when is_integer(v) and v > 5000, do: 5000
+  defp clamp_static_delay(_), do: 0
 
   # Convergence pass: ensure every enabled, currently-tracked output
   # has a live player. Called at the end of each `refresh_outputs/1`
