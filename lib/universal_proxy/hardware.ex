@@ -84,6 +84,19 @@ defmodule UniversalProxy.Hardware do
        vendor: "Hardware Group",
        locked: true
      }},
+    # FlooGoo FMA120 USB Bluetooth-audio dongle. The audio half enumerates
+    # as a snd-usb-audio card; the control channel is FlooCast ASCII-over-
+    # serial on its CDC-ACM node (`ttyACM*`). Locked so the ESPHome
+    # `UART.Server` proxy never auto-opens the port — `FMA120.DeviceWorker`
+    # is its sole owner.
+    {0x0A12, 0x4007,
+     %{
+       kind: :bt_audio,
+       name: "FlooGoo FMA120",
+       vendor: "Flairmesh Technologies",
+       chip: "Qualcomm/CSR",
+       locked: true
+     }},
 
     # ── Generic USB-to-serial chipsets (kind is editable) ─────────
     # The same chip is sold in both TTL pigtails and DB9 RS-232 cables;
@@ -115,7 +128,8 @@ defmodule UniversalProxy.Hardware do
     rs485: "RS-485",
     zwave: "Z-Wave",
     ir: "IR",
-    infrared: "IR"
+    infrared: "IR",
+    bt_audio: "BT Audio"
   }
 
   @doc "List of all VID/PID entries the module recognises (for introspection)."
@@ -194,6 +208,103 @@ defmodule UniversalProxy.Hardware do
       end
     end)
     |> Map.new()
+  end
+
+  @usb_devices_dir "/sys/bus/usb/devices"
+  # A device-level USB path under /sys/bus/usb/devices (e.g. "1-1.1.3"),
+  # as opposed to a root hub ("usb1") or an interface ("1-1.3:1.0").
+  @usb_device_path ~r/^\d+-[\d.]+$/
+
+  @doc """
+  Map of `bus_path => hub_info` for every USB **hub** currently enumerated
+  under `/sys/bus/usb/devices` (devices whose `bDeviceClass` is `"09"`).
+
+  A hub sits at the bus path of the receptacle it's plugged into, with the
+  devices behind it enumerating one level deeper (`<hub_path>.<n>`). The
+  Overview uses this to render a hub at its physical USB slot and indent the
+  devices behind it as a tree — e.g. the FlooGoo FMA120 contains its own hub
+  (`0a12:4010`), so it plugs into one receptacle but its functions enumerate
+  at `<slot>.1`. Root hubs (`usbN`) are skipped.
+
+  `hub_info` is `%{vendor_id, product_id, name}`.
+
+  ## Options
+
+    * `:usb_devices_dir` — sysfs root (default `"/sys/bus/usb/devices"`)
+  """
+  @spec usb_hubs(keyword()) :: %{
+          String.t() => %{
+            vendor_id: non_neg_integer() | nil,
+            product_id: non_neg_integer() | nil,
+            name: String.t()
+          }
+        }
+  def usb_hubs(opts \\ []) do
+    dir = Keyword.get(opts, :usb_devices_dir, @usb_devices_dir)
+
+    case File.ls(dir) do
+      {:ok, names} ->
+        names
+        |> Enum.filter(&Regex.match?(@usb_device_path, &1))
+        |> Enum.flat_map(fn name ->
+          base = Path.join(dir, name)
+
+          if read_sysfs_attr(base, "bDeviceClass") == "09" do
+            vid = parse_hex_id(read_sysfs_attr(base, "idVendor"))
+            pid = parse_hex_id(read_sysfs_attr(base, "idProduct"))
+
+            [
+              {name,
+               %{
+                 vendor_id: vid,
+                 product_id: pid,
+                 name:
+                   hub_name(
+                     read_sysfs_attr(base, "product"),
+                     read_sysfs_attr(base, "manufacturer"),
+                     vid,
+                     pid
+                   )
+               }}
+            ]
+          else
+            []
+          end
+        end)
+        |> Map.new()
+
+      _ ->
+        %{}
+    end
+  end
+
+  defp read_sysfs_attr(base, file) do
+    case File.read(Path.join(base, file)) do
+      {:ok, value} -> String.trim(value)
+      _ -> nil
+    end
+  end
+
+  defp parse_hex_id(nil), do: nil
+
+  defp parse_hex_id(str) do
+    case Integer.parse(str, 16) do
+      {n, _} -> n
+      _ -> nil
+    end
+  end
+
+  # Prefer a USB product string; fall back to a known device-table name, then
+  # manufacturer, then a generic label. Many cheap hubs report no product.
+  defp hub_name(product, manufacturer, vid, pid) do
+    table_name = (Map.get(@usb_device_table, {vid, pid}) || %{})[:name]
+
+    cond do
+      is_binary(product) and product != "" -> product
+      is_binary(table_name) -> table_name
+      is_binary(manufacturer) and manufacturer != "" -> "#{manufacturer} USB hub"
+      true -> "USB hub"
+    end
   end
 
   defp target_slots, do: Map.get(@external_slots, @target)

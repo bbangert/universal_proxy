@@ -300,4 +300,84 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
              ] = OverviewLive.hardware_rows(ports, [audio(), usb_card])
     end
   end
+
+  describe "hardware_rows/3 (USB hub tree)" do
+    defp card(sub, name) do
+      %{type_label: "Sound card", slot: "Sound card", slot_sub: sub, name: name}
+    end
+
+    @hub %{vendor_id: 0x0A12, product_id: 0x4010, name: "USB hub"}
+
+    test "renders a hub at its slot with devices behind it indented (depth 1)" do
+      ports = [slot("1-1.1.2", 1), slot("1-1.1.3", 2), slot("1-1.2", 3), slot("1-1.3", 4)]
+      peripherals = [card("1-1.1.3.1", "FlooGoo FMA120")]
+      hubs = %{"1-1.1.3" => @hub}
+
+      assert [
+               {:port, %{slot_sub: "1-1.1.2"}},
+               {:hub,
+                %{slot: "USB 2", slot_sub: "1-1.1.3", name: "USB hub", vidpid: "0A12:4010"}},
+               {:peripheral, %{slot_sub: "1-1.1.3.1", depth: 1}},
+               {:port, %{slot_sub: "1-1.2"}},
+               {:port, %{slot_sub: "1-1.3"}}
+             ] = OverviewLive.hardware_rows(ports, peripherals, hubs)
+    end
+
+    test "collapses a child that has both a serial port and a peripheral into the peripheral" do
+      # The FMA120's ttyACM (a bonus port) and its sound card share 1-1.1.3.1.
+      child_port = slot("1-1.1.3.1", 5, connected: true)
+      ports = [slot("1-1.1.3", 2), child_port]
+      peripherals = [card("1-1.1.3.1", "FlooGoo FMA120")]
+      hubs = %{"1-1.1.3" => @hub}
+
+      rows = OverviewLive.hardware_rows(ports, peripherals, hubs)
+
+      # One hub + exactly one child row (the peripheral), no stray child port.
+      assert [
+               {:hub, %{slot_sub: "1-1.1.3"}},
+               {:peripheral, %{slot_sub: "1-1.1.3.1", depth: 1}}
+             ] = rows
+
+      refute Enum.any?(rows, &match?({:port, %{slot_sub: "1-1.1.3.1"}}, &1))
+    end
+
+    test "a child port with no peripheral renders as an indented port row" do
+      child_port = slot("1-1.1.3.1", 5, connected: true)
+      ports = [slot("1-1.1.3", 2), child_port]
+      hubs = %{"1-1.1.3" => @hub}
+
+      assert [
+               {:hub, %{slot_sub: "1-1.1.3"}},
+               {:port, %{slot_sub: "1-1.1.3.1", depth: 1}}
+             ] = OverviewLive.hardware_rows(ports, [], hubs)
+    end
+
+    test "ignores hubs that aren't a rendered slot (board-internal ancestor hubs)" do
+      # The board's internal hubs (1-1, 1-1.1) are ancestors of the declared
+      # slots and class-09, so usb_hubs/0 reports them — but they must NOT be
+      # treated as tree-roots or they'd swallow every slot as a child.
+      ports = [slot("1-1.1.2", 1), slot("1-1.1.3", 2), slot("1-1.2", 3), slot("1-1.3", 4)]
+
+      hubs = %{
+        "1-1" => @hub,
+        "1-1.1" => @hub,
+        "1-1.1.3" => @hub
+      }
+
+      assert [
+               {:port, %{slot_sub: "1-1.1.2"}},
+               {:hub, %{slot_sub: "1-1.1.3"}},
+               {:port, %{slot_sub: "1-1.2"}},
+               {:port, %{slot_sub: "1-1.3"}}
+             ] = OverviewLive.hardware_rows(ports, [], hubs)
+    end
+
+    test "with no hubs the output is identical to hardware_rows/2" do
+      ports = [slot("1-1.1.2", 1), slot("1-1.1.3", 2)]
+      peripherals = [card("1-1.1.2", "DAC")]
+
+      assert OverviewLive.hardware_rows(ports, peripherals, %{}) ==
+               OverviewLive.hardware_rows(ports, peripherals)
+    end
+  end
 end

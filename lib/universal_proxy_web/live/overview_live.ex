@@ -15,6 +15,7 @@ defmodule UniversalProxyWeb.OverviewLive do
   alias UniversalProxy.Audio
   alias UniversalProxy.Bluetooth
   alias UniversalProxy.Bluetooth.AudioManager
+  alias UniversalProxy.FMA120
   alias UniversalProxy.Hardware
   alias UniversalProxy.System, as: Sys
   alias UniversalProxy.UART
@@ -36,6 +37,8 @@ defmodule UniversalProxyWeb.OverviewLive do
         Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:output_added")
         Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:output_removed")
         Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:state")
+        # FlooGoo FMA120 control-channel state (firmware, codec, mode, devices).
+        Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "fma120:state")
         # USB Bluetooth radios surface in the hardware list too; the radio
         # list (incl. in_use?) is rebroadcast on enumeration change.
         Phoenix.PubSub.subscribe(UniversalProxy.PubSub, Bluetooth.radios_topic())
@@ -53,9 +56,12 @@ defmodule UniversalProxyWeb.OverviewLive do
      |> assign(:page_title, "Overview")
      |> assign(:target, Sys.device_summary())
      |> assign(:selected_port, nil)
+     |> assign(:selected_fma120, nil)
+     |> assign(:fma120_states, if(connected?(socket), do: seed_fma120_states(), else: %{}))
      |> assign(:throughput_snapshots, snapshots)
      |> assign(:packet_rate, packet_rate)
      |> assign(:pending_kind_change, nil)
+     |> assign(:usb_hubs, Hardware.usb_hubs())
      |> assign(:audio_outputs, build_audio_index(Audio.list_outputs()))
      |> assign(:bt_radios, Bluetooth.list_radios())
      |> assign(:bt_headphones, AudioManager.list_headphones())
@@ -72,6 +78,76 @@ defmodule UniversalProxyWeb.OverviewLive do
   end
 
   def handle_event("ignore", _params, socket), do: {:noreply, socket}
+
+  # ── FMA120 control drawer ─────────────────────────────────────────────
+
+  def handle_event("select_fma120", %{"key" => b64}, socket) do
+    case decode_key(b64) do
+      {:ok, key} -> {:noreply, assign(socket, :selected_fma120, key)}
+      {:error, _} -> {:noreply, socket}
+    end
+  end
+
+  def handle_event("close_fma120_drawer", _params, socket) do
+    {:noreply, assign(socket, :selected_fma120, nil)}
+  end
+
+  def handle_event("fma120_set_mode", %{"key" => b64, "mode" => mode}, socket) do
+    with_fma120(socket, b64, fn key ->
+      FMA120.set_audio_mode(key, fma120_mode_atom(mode))
+    end)
+  end
+
+  def handle_event("fma120_scan", %{"key" => b64}, socket) do
+    with_fma120(socket, b64, &FMA120.inquiry/1)
+  end
+
+  def handle_event("fma120_connect", %{"key" => b64, "index" => idx}, socket) do
+    with_fma120(socket, b64, fn key -> FMA120.connect(key, parse_index(idx)) end)
+  end
+
+  def handle_event("fma120_disconnect", %{"key" => b64}, socket) do
+    with_fma120(socket, b64, &FMA120.disconnect/1)
+  end
+
+  def handle_event("fma120_forget", %{"key" => b64, "index" => idx}, socket) do
+    with_fma120(socket, b64, fn key -> FMA120.clear_paired(key, parse_index(idx)) end)
+  end
+
+  def handle_event("fma120_set_le_pref", %{"key" => b64, "pref" => pref}, socket) do
+    pref_atom = if pref == "lea", do: :lea, else: :a2dp
+    with_fma120(socket, b64, fn key -> FMA120.set_le_preference(key, pref_atom) end)
+  end
+
+  def handle_event("fma120_set_discoverable", %{"key" => b64} = params, socket) do
+    on? = params["on"] in ["true", "on", true]
+    with_fma120(socket, b64, fn key -> FMA120.set_discoverable(key, on?) end)
+  end
+
+  def handle_event("fma120_toggle_led", %{"key" => b64}, socket) do
+    with_fma120(socket, b64, fn key ->
+      features = get_in(socket.assigns.fma120_states, [key, :features]) || %{}
+      FMA120.set_features(key, toggle_led_bitmask(features))
+    end)
+  end
+
+  def handle_event("fma120_set_bcast_name", %{"key" => b64, "name" => name}, socket) do
+    with_fma120(socket, b64, fn key -> FMA120.set_broadcast_name(key, name) end)
+  end
+
+  def handle_event("fma120_set_bcast_enc", %{"key" => b64} = params, socket) do
+    with_fma120(socket, b64, fn key ->
+      FMA120.set_broadcast_encryption(key, params["pass"] || "")
+    end)
+  end
+
+  # Flip one broadcast-mode bit (quality / usb-volume) and re-send the byte.
+  def handle_event("fma120_toggle_bcast_bit", %{"key" => b64, "bit" => bit}, socket) do
+    with_fma120(socket, b64, fn key ->
+      current = bcast_mode_byte(socket.assigns.fma120_states[key])
+      FMA120.set_broadcast_mode(key, Bitwise.bxor(current, bit_value(bit)))
+    end)
+  end
 
   # Peripheral rows (USB audio / USB Bluetooth) are claimed automatically
   # by their built-in service, so clicking routes to the managing tab
@@ -244,6 +320,26 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   def handle_info({:sendspin_state, _key, _partial}, socket), do: {:noreply, socket}
 
+  # Merge an FMA120 control-state partial into the cached per-device state.
+  # The `:devices` map is merged (not replaced) so individual FD-row updates
+  # accumulate rather than clobber the list.
+  def handle_info({:fma120_state, key, partial}, socket) do
+    states = socket.assigns.fma120_states
+    existing = Map.get(states, key, %{})
+
+    merged =
+      case partial do
+        %{devices: new_devices} ->
+          devices = Map.merge(Map.get(existing, :devices, %{}), new_devices)
+          existing |> Map.merge(partial) |> Map.put(:devices, devices)
+
+        _ ->
+          Map.merge(existing, partial)
+      end
+
+    {:noreply, assign(socket, :fma120_states, Map.put(states, key, merged))}
+  end
+
   def handle_info(_msg, socket), do: {:noreply, socket}
 
   # Refresh the port list AND reconcile throughput subscriptions so new
@@ -253,18 +349,29 @@ defmodule UniversalProxyWeb.OverviewLive do
   # same ports, and re-assigning would force a full table re-render.
   defp refresh_ports(socket) do
     ports = Hardware.list_ports()
+    hubs = Hardware.usb_hubs()
 
-    if ports == socket.assigns.ports do
-      assign(socket, :target, Sys.device_summary())
-    else
+    socket =
       socket
       |> assign(:target, Sys.device_summary())
+      |> maybe_assign(:usb_hubs, hubs)
+
+    if ports == socket.assigns.ports do
+      socket
+    else
+      socket
       |> assign(
         :throughput_snapshots,
         reconcile_throughputs(socket.assigns.throughput_snapshots, ports)
       )
       |> set_ports(ports)
     end
+  end
+
+  # Assign only when the value actually changed, so an unchanged sysfs scan
+  # on the 10 s refresh tick doesn't churn the assign / re-render.
+  defp maybe_assign(socket, key, value) do
+    if Map.get(socket.assigns, key) == value, do: socket, else: assign(socket, key, value)
   end
 
   # Memoize derived counts so the device-summary card doesn't recompute
@@ -359,7 +466,12 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   @impl true
   def render(assigns) do
-    rows = hardware_rows(assigns.ports, peripherals(assigns.audio_outputs, assigns.bt_radios))
+    rows =
+      hardware_rows(
+        assigns.ports,
+        peripherals(assigns.audio_outputs, assigns.bt_radios),
+        assigns.usb_hubs
+      )
 
     assigns =
       assigns
@@ -395,6 +507,13 @@ defmodule UniversalProxyWeb.OverviewLive do
       throughput_snapshots={@throughput_snapshots}
     />
 
+    <.fma120_drawer
+      :if={@selected_fma120}
+      key={@selected_fma120}
+      encoded_key={encode_key(@selected_fma120)}
+      state={Map.get(@fma120_states, @selected_fma120, %{})}
+    />
+
     <.modal
       open={@pending_kind_change != nil}
       on_close="cancel_kind_change"
@@ -418,6 +537,126 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   defp find_port(_ports, nil), do: nil
   defp find_port(ports, id), do: Enum.find(ports, &(&1.id == id))
+
+  # ── FMA120 helpers ────────────────────────────────────────────────────
+
+  # FlooGoo FMA120 USB BT-audio dongle (Flairmesh / Qualcomm-CSR).
+  @fma120_vid 0x0A12
+  @fma120_pid 0x4007
+
+  defp fma120_key?({_slot, @fma120_vid, @fma120_pid}), do: true
+  defp fma120_key?(_), do: false
+
+  # Seed the per-device control-state cache from the running context, so a
+  # fresh mount renders current status without waiting for a broadcast.
+  defp seed_fma120_states do
+    FMA120.list_devices()
+    |> Enum.reduce(%{}, fn %{key: key}, acc ->
+      case FMA120.get_state(key) do
+        {:ok, state} -> Map.put(acc, key, state)
+        _ -> acc
+      end
+    end)
+  rescue
+    _ -> %{}
+  end
+
+  # Run an FMA120 control action by decoded key; result is fire-and-forget
+  # (the device echoes state back over "fma120:state").
+  defp with_fma120(socket, b64, fun) do
+    case decode_key(b64) do
+      {:ok, key} ->
+        _ = fun.(key)
+        {:noreply, socket}
+
+      {:error, _} ->
+        {:noreply, socket}
+    end
+  end
+
+  defp fma120_mode_atom("gaming"), do: :gaming
+  defp fma120_mode_atom("broadcast"), do: :broadcast
+  defp fma120_mode_atom(_), do: :high_quality
+
+  defp parse_index(idx) when is_integer(idx), do: idx
+
+  defp parse_index(idx) when is_binary(idx) do
+    case Integer.parse(idx) do
+      {n, ""} when n in 0..255 -> n
+      _ -> 0
+    end
+  end
+
+  defp toggle_led_bitmask(features) do
+    base = features_to_bitmask(features)
+    Bitwise.bxor(base, 0x01)
+  end
+
+  defp features_to_bitmask(features) when is_map(features) do
+    [{:led, 0x01}, {:aptx_lossless, 0x02}, {:gatt_client, 0x04}, {:usb_audio_source, 0x08}]
+    |> Enum.reduce(0, fn {flag, bit}, acc ->
+      if Map.get(features, flag), do: Bitwise.bor(acc, bit), else: acc
+    end)
+  end
+
+  defp features_to_bitmask(_), do: 0
+
+  # Re-pack the cached decoded broadcast-mode map into its byte so a single
+  # bit can be flipped (inverse of Protocol's BM decode).
+  defp bcast_mode_byte(%{broadcast_mode: bm}) when is_map(bm), do: pack_bm(bm)
+  defp bcast_mode_byte(_), do: 0
+
+  defp pack_bm(bm) do
+    0
+    |> Bitwise.bor(profile_enc_bits(bm))
+    |> set_bit(0x04, bm[:quality] == :high)
+    |> set_bit(0x08, bm[:usb_playback] == :stop_immediately)
+    |> Bitwise.bor(latency_bits(bm[:latency]))
+    |> set_bit(0x40, bm[:quality_range] == :both)
+    |> set_bit(0x80, bm[:usb_volume] == :follow)
+  end
+
+  defp profile_enc_bits(%{profile: :tmap, encryption: :unencrypted}), do: 0
+  defp profile_enc_bits(%{profile: :tmap, encryption: :encrypted}), do: 1
+  defp profile_enc_bits(%{profile: :pbp, encryption: :unencrypted}), do: 2
+  defp profile_enc_bits(%{profile: :pbp, encryption: :encrypted}), do: 3
+  defp profile_enc_bits(_), do: 0
+
+  defp latency_bits(:lowest), do: 0x10
+  defp latency_bits(:lower), do: 0x20
+  defp latency_bits(:default), do: 0x30
+  defp latency_bits(_), do: 0x00
+
+  defp set_bit(byte, mask, true), do: Bitwise.bor(byte, mask)
+  defp set_bit(byte, _mask, _), do: byte
+
+  defp bit_value("quality"), do: 0x04
+  defp bit_value("usb_volume"), do: 0x80
+  defp bit_value(_), do: 0x00
+
+  # URL-safe base64 of `:erlang.term_to_binary/1`, matching AudioLive's
+  # opaque-key encoding. Decoded with `[:safe]` + a shape assertion so a
+  # tampered param can't inject arbitrary atoms.
+  defp encode_key(key), do: key |> :erlang.term_to_binary() |> Base.url_encode64(padding: false)
+
+  defp decode_key(b64) when is_binary(b64) do
+    with {:ok, bin} <- Base.url_decode64(b64, padding: false),
+         true <- byte_size(bin) <= 256,
+         {:ok, term} <- safe_binary_to_term(bin),
+         true <- fma120_key?(term) do
+      {:ok, term}
+    else
+      _ -> {:error, :invalid_key}
+    end
+  end
+
+  defp decode_key(_), do: {:error, :invalid_key}
+
+  defp safe_binary_to_term(bin) do
+    {:ok, :erlang.binary_to_term(bin, [:safe])}
+  rescue
+    _ -> :error
+  end
 
   attr(:port, :map, default: nil)
   attr(:throughput_snapshots, :map, required: true)
@@ -570,7 +809,15 @@ defmodule UniversalProxyWeb.OverviewLive do
     """
   end
 
-  # Defensive: `hardware_rows/2` only ever emits the two tags above, so an
+  defp hardware_row(%{row: {:hub, hub}} = assigns) do
+    assigns = assign(assigns, :hub, hub)
+
+    ~H"""
+    <.hub_row hub={@hub} />
+    """
+  end
+
+  # Defensive: `hardware_rows/3` only ever emits the tags above, so an
   # unknown shape means that contract changed — drop the row rather than
   # crash the whole table render.
   defp hardware_row(assigns) do
@@ -583,7 +830,10 @@ defmodule UniversalProxyWeb.OverviewLive do
   attr(:throughput_snapshots, :map, required: true)
 
   defp port_row(assigns) do
-    assigns = assign(assigns, :status, MockData.port_status(assigns.port))
+    assigns =
+      assigns
+      |> assign(:status, MockData.port_status(assigns.port))
+      |> assign(:depth, Map.get(assigns.port, :depth, 0))
 
     ~H"""
     <tr
@@ -591,8 +841,10 @@ defmodule UniversalProxyWeb.OverviewLive do
       phx-click="select_port"
       phx-value-id={@port.id}
     >
-      <td class="px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle">
-        <div class="text-xs font-semibold text-fg-2 tracking-wide">{@port.slot}</div>
+      <td class={["px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle", @depth > 0 && "pl-10"]}>
+        <div class="text-xs font-semibold text-fg-2 tracking-wide">
+          <span :if={@depth > 0} class="text-fg-4 mr-1">└</span>{@port.slot}
+        </div>
         <div class="font-mono text-[11px] text-fg-3 mt-0.5">{@port.slot_sub}</div>
       </td>
       <td class="px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle">
@@ -642,6 +894,20 @@ defmodule UniversalProxyWeb.OverviewLive do
   # per-device byte rate.
   attr(:p, :map, required: true)
 
+  # FMA120 rows open the control drawer (select_fma120); every other
+  # peripheral routes to its managing tab (goto_tab). Same six-column body.
+  defp peripheral_row(%{p: %{fma120?: true}} = assigns) do
+    ~H"""
+    <tr
+      class="cursor-pointer hover:bg-sunken last:[&_td]:border-b-0"
+      phx-click="select_fma120"
+      phx-value-key={@p.fma120_key}
+    >
+      <.peripheral_cells p={@p} />
+    </tr>
+    """
+  end
+
   defp peripheral_row(assigns) do
     ~H"""
     <tr
@@ -649,45 +915,359 @@ defmodule UniversalProxyWeb.OverviewLive do
       phx-click="goto_tab"
       phx-value-path={@p.tab}
     >
+      <.peripheral_cells p={@p} />
+    </tr>
+    """
+  end
+
+  attr(:p, :map, required: true)
+
+  defp peripheral_cells(assigns) do
+    assigns = assign(assigns, :depth, Map.get(assigns.p, :depth, 0))
+
+    ~H"""
+    <td class={["px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle", @depth > 0 && "pl-10"]}>
+      <div class="text-xs font-semibold text-fg-2 tracking-wide">
+        <span :if={@depth > 0} class="text-fg-4 mr-1">└</span>{@p.slot}
+      </div>
+      <div class="font-mono text-[11px] text-fg-3 mt-0.5">{@p.sub}</div>
+    </td>
+    <td class="px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle">
+      <div class="flex items-center gap-3">
+        <div class={["w-8 h-8 rounded-sm flex items-center justify-center flex-none", @p.soft_class]}>
+          <.port_glyph kind={@p.kind} size={18} />
+        </div>
+        <div class="min-w-0">
+          <div class="text-base font-medium text-fg-1 truncate">{@p.name}</div>
+          <div class="text-sm text-fg-3 mt-px">{@p.detail}</div>
+        </div>
+      </div>
+    </td>
+    <td class="px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle">
+      <div class="flex items-center gap-2">
+        <span class={["w-1.5 h-1.5 rounded-full flex-none", @p.dot_class]}></span>
+        <span class="text-sm text-fg-1">{@p.type_label}</span>
+      </div>
+    </td>
+    <td class="px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle">
+      <.link
+        navigate={@p.tab}
+        phx-click="ignore"
+        onclick="event.stopPropagation()"
+        class="text-accent text-base no-underline"
+      >
+        {@p.managed_by}
+      </.link>
+    </td>
+    <td class="px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle">
+      <span class="text-fg-4 text-base">—</span>
+    </td>
+    <td class="px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle">
+      <.badge variant={@p.status.variant} dot>{@p.status.label}</.badge>
+    </td>
+    """
+  end
+
+  # ── USB hub row (a hub occupying a physical slot; children indent below) ──
+  attr(:hub, :map, required: true)
+
+  defp hub_row(assigns) do
+    ~H"""
+    <tr class="last:[&_td]:border-b-0 bg-sunken/30">
       <td class="px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle">
-        <div class="text-xs font-semibold text-fg-2 tracking-wide">{@p.slot}</div>
-        <div class="font-mono text-[11px] text-fg-3 mt-0.5">{@p.sub}</div>
+        <div class="text-xs font-semibold text-fg-2 tracking-wide">{@hub.slot}</div>
+        <div class="font-mono text-[11px] text-fg-3 mt-0.5">{@hub.slot_sub}</div>
       </td>
       <td class="px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle">
         <div class="flex items-center gap-3">
-          <div class={["w-8 h-8 rounded-sm flex items-center justify-center flex-none", @p.soft_class]}>
-            <.port_glyph kind={@p.kind} size={18} />
+          <div class="w-8 h-8 rounded-sm bg-sunken flex items-center justify-center flex-none text-fg-3">
+            <.icon name={:plug} size={18} />
           </div>
           <div class="min-w-0">
-            <div class="text-base font-medium text-fg-1 truncate">{@p.name}</div>
-            <div class="text-sm text-fg-3 mt-px">{@p.detail}</div>
+            <div class="text-base font-medium text-fg-1 truncate">{@hub.name}</div>
+            <div class="text-sm text-fg-3 mt-px font-mono">{@hub.vidpid}</div>
           </div>
         </div>
       </td>
       <td class="px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle">
-        <div class="flex items-center gap-2">
-          <span class={["w-1.5 h-1.5 rounded-full flex-none", @p.dot_class]}></span>
-          <span class="text-sm text-fg-1">{@p.type_label}</span>
-        </div>
+        <span class="text-sm text-fg-1">USB hub</span>
       </td>
       <td class="px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle">
-        <.link
-          navigate={@p.tab}
-          phx-click="ignore"
-          onclick="event.stopPropagation()"
-          class="text-accent text-base no-underline"
-        >
-          {@p.managed_by}
-        </.link>
+        <span class="text-fg-3 text-base">—</span>
       </td>
       <td class="px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle">
         <span class="text-fg-4 text-base">—</span>
       </td>
       <td class="px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle">
-        <.badge variant={@p.status.variant} dot>{@p.status.label}</.badge>
+        <.badge variant={:neutral} dot>Hub</.badge>
       </td>
     </tr>
     """
+  end
+
+  # ── FMA120 control drawer ─────────────────────────────────────────────
+  # Mode-driven: the AM audio-mode is the 1:1-vs-Auracast switch, so the
+  # drawer renders ONE body at a time (high-quality/gaming → unicast,
+  # broadcast → Auracast).
+  attr(:key, :any, required: true)
+  attr(:encoded_key, :string, required: true)
+  attr(:state, :map, required: true)
+
+  defp fma120_drawer(assigns) do
+    mode = get_in(assigns.state, [:audio_mode, :quality]) || :high_quality
+    devices = assigns.state |> Map.get(:devices, %{}) |> Map.values() |> Enum.sort_by(& &1.index)
+
+    assigns = assigns |> assign(:mode, mode) |> assign(:devices, devices)
+
+    ~H"""
+    <div class="fixed inset-0 z-[90] flex justify-end animate-fade">
+      <div phx-click="close_fma120_drawer" class="absolute inset-0 bg-overlay"></div>
+      <div class="relative w-[440px] bg-raised h-full shadow-lg overflow-auto animate-slide-in flex flex-col">
+        <%!-- Header --%>
+        <div class="px-6 py-5 border-b border-border-1 flex items-start gap-3">
+          <div class="w-10 h-10 rounded-md bg-audio-soft text-audio flex items-center justify-center">
+            <.speaker_glyph size={20} />
+          </div>
+          <div class="flex-1 min-w-0">
+            <div class="text-xs font-bold text-fg-3 tracking-caps">FlooGoo FMA120</div>
+            <div class="text-lg font-semibold tracking-tight mt-0.5">
+              {@state[:version] && "Firmware #{@state[:version]}" || "Bluetooth audio dongle"}
+            </div>
+            <div class="mt-2 text-sm text-fg-2">{fma120_status_line(@mode, @state)}</div>
+          </div>
+          <.button variant={:ghost} size={:sm} phx-click="close_fma120_drawer">
+            <.icon name={:x} size={16} />
+          </.button>
+        </div>
+
+        <%!-- Mode selector (segmented) --%>
+        <div class="px-6 py-4 border-b border-border-1">
+          <div class="text-xs font-semibold text-fg-3 uppercase tracking-caps mb-2">Audio mode</div>
+          <div class="flex gap-1.5">
+            <.fma120_mode_button key={@encoded_key} mode="high_quality" current={@mode} label="High Quality" />
+            <.fma120_mode_button key={@encoded_key} mode="gaming" current={@mode} label="Gaming" />
+            <.fma120_mode_button key={@encoded_key} mode="broadcast" current={@mode} label="Broadcast" />
+          </div>
+        </div>
+
+        <%!-- Mode-driven body --%>
+        <.fma120_broadcast_body :if={@mode == :broadcast} key={@encoded_key} state={@state} />
+        <.fma120_unicast_body :if={@mode != :broadcast} key={@encoded_key} state={@state} devices={@devices} />
+
+        <%!-- Footer --%>
+        <div class="mt-auto px-6 py-4 border-t border-border-1 flex items-center gap-2 flex-wrap">
+          <.button variant={:secondary} size={:sm} phx-click="fma120_toggle_led" phx-value-key={@encoded_key}>
+            <.icon name={:plug} size={14} /> LED {if get_in(@state, [:features, :led]), do: "on", else: "off"}
+          </.button>
+          <div class="flex-1"></div>
+          <.link navigate="/audio" class="text-sm text-accent font-medium hover:underline">
+            Audio settings →
+          </.link>
+        </div>
+      </div>
+    </div>
+    """
+  end
+
+  attr(:key, :string, required: true)
+  attr(:mode, :string, required: true)
+  attr(:current, :atom, required: true)
+  attr(:label, :string, required: true)
+
+  defp fma120_mode_button(assigns) do
+    ~H"""
+    <.button
+      variant={if to_string(@current) == @mode, do: :primary, else: :secondary}
+      size={:sm}
+      phx-click="fma120_set_mode"
+      phx-value-key={@key}
+      phx-value-mode={@mode}
+    >
+      {@label}
+    </.button>
+    """
+  end
+
+  # 1:1 (unicast) body: LE-audio preference, scan, paired list, codec status.
+  attr(:key, :string, required: true)
+  attr(:state, :map, required: true)
+  attr(:devices, :list, required: true)
+
+  defp fma120_unicast_body(assigns) do
+    ~H"""
+    <div class="px-6 py-4 space-y-4">
+      <%!-- Active codec --%>
+      <div class="flex items-center gap-2">
+        <span class="text-xs font-semibold text-fg-3 uppercase tracking-caps">Codec</span>
+        <.badge variant={:neutral}>{fma120_codec_label(get_in(@state, [:active_codec, :codec]))}</.badge>
+        <span :if={get_in(@state, [:active_codec, :rssi])} class="text-sm text-fg-3">
+          {get_in(@state, [:active_codec, :rssi])} dBm
+        </span>
+      </div>
+
+      <%!-- LE-audio preference --%>
+      <div>
+        <div class="text-xs font-semibold text-fg-3 uppercase tracking-caps mb-2">Profile preference</div>
+        <div class="flex gap-1.5">
+          <.button
+            variant={if @state[:le_preference] == :a2dp, do: :primary, else: :secondary}
+            size={:sm}
+            phx-click="fma120_set_le_pref"
+            phx-value-key={@key}
+            phx-value-pref="a2dp"
+          >
+            A2DP
+          </.button>
+          <.button
+            variant={if @state[:le_preference] == :lea, do: :primary, else: :secondary}
+            size={:sm}
+            phx-click="fma120_set_le_pref"
+            phx-value-key={@key}
+            phx-value-pref="lea"
+          >
+            LE Audio
+          </.button>
+        </div>
+      </div>
+
+      <%!-- Discover / scan --%>
+      <div class="flex gap-2">
+        <.button variant={:secondary} size={:sm} phx-click="fma120_scan" phx-value-key={@key}>
+          <.icon name={:refresh} size={14} /> Scan
+        </.button>
+        <.button variant={:secondary} size={:sm} phx-click="fma120_set_discoverable" phx-value-key={@key} phx-value-on="true">
+          Make discoverable
+        </.button>
+      </div>
+
+      <%!-- Paired / recent devices --%>
+      <div>
+        <div class="text-xs font-semibold text-fg-3 uppercase tracking-caps mb-2">Devices</div>
+        <div :if={@devices == []} class="text-sm text-fg-3">No paired devices yet.</div>
+        <ul class="m-0 p-0 list-none space-y-2">
+          <li :for={dev <- @devices} class="flex items-center gap-2">
+            <div class="min-w-0 flex-1">
+              <div class="text-base text-fg-1 truncate">{dev[:name] || dev[:mac]}</div>
+              <div class="text-[11px] text-fg-3">{fma120_device_state(dev[:connection_state])}</div>
+            </div>
+            <.button variant={:secondary} size={:sm} phx-click="fma120_connect" phx-value-key={@key} phx-value-index={dev.index}>
+              {if dev[:connection_state] == :connected, do: "Disconnect", else: "Connect"}
+            </.button>
+            <.button variant={:ghost} size={:sm} phx-click="fma120_forget" phx-value-key={@key} phx-value-index={dev.index}>
+              Forget
+            </.button>
+          </li>
+        </ul>
+      </div>
+    </div>
+    """
+  end
+
+  # Broadcast (Auracast) body: name, encryption, quality / usb-volume.
+  attr(:key, :string, required: true)
+  attr(:state, :map, required: true)
+
+  defp fma120_broadcast_body(assigns) do
+    ~H"""
+    <div class="px-6 py-4 space-y-4">
+      <form phx-submit="fma120_set_bcast_name">
+        <input type="hidden" name="key" value={@key} />
+        <label class="text-xs font-semibold text-fg-3 uppercase tracking-caps">Broadcast name</label>
+        <div class="flex gap-2 mt-1">
+          <input
+            type="text"
+            name="name"
+            value={@state[:broadcast_name]}
+            class="flex-1 bg-sunken border border-border-2 rounded-sm px-2 py-1 text-base text-fg-1"
+            placeholder="Auracast name"
+          />
+          <.button variant={:primary} size={:sm} type="submit">Save</.button>
+        </div>
+      </form>
+
+      <form phx-submit="fma120_set_bcast_enc">
+        <input type="hidden" name="key" value={@key} />
+        <label class="text-xs font-semibold text-fg-3 uppercase tracking-caps">
+          Encryption {if @state[:broadcast_encryption] == :set, do: "(on)", else: "(off)"}
+        </label>
+        <div class="flex gap-2 mt-1">
+          <input
+            type="password"
+            name="pass"
+            maxlength="16"
+            class="flex-1 bg-sunken border border-border-2 rounded-sm px-2 py-1 text-base text-fg-1"
+            placeholder="Passphrase (blank = off)"
+          />
+          <.button variant={:primary} size={:sm} type="submit">Set</.button>
+        </div>
+      </form>
+
+      <div>
+        <div class="text-xs font-semibold text-fg-3 uppercase tracking-caps mb-2">Quality &amp; volume</div>
+        <div class="flex gap-1.5 flex-wrap">
+          <.button
+            variant={if get_in(@state, [:broadcast_mode, :quality]) == :high, do: :primary, else: :secondary}
+            size={:sm}
+            phx-click="fma120_toggle_bcast_bit"
+            phx-value-key={@key}
+            phx-value-bit="quality"
+          >
+            High quality
+          </.button>
+          <.button
+            variant={if get_in(@state, [:broadcast_mode, :usb_volume]) == :follow, do: :primary, else: :secondary}
+            size={:sm}
+            phx-click="fma120_toggle_bcast_bit"
+            phx-value-key={@key}
+            phx-value-bit="usb_volume"
+          >
+            Follow USB volume
+          </.button>
+        </div>
+        <div class="text-[11px] text-fg-3 mt-2">
+          Latency: {get_in(@state, [:broadcast_mode, :latency]) || "default"}
+        </div>
+      </div>
+    </div>
+    """
+  end
+
+  defp fma120_status_line(:broadcast, state) do
+    case state[:le_audio_state] do
+      s when s in [:broadcast_streaming, :broadcast_stream_starting] ->
+        "Broadcasting '#{state[:broadcast_name] || "Auracast"}'"
+
+      _ ->
+        "Auracast idle"
+    end
+  end
+
+  defp fma120_status_line(_mode, state) do
+    case connected_device(state) do
+      nil ->
+        "Not connected"
+
+      dev ->
+        "Connected to #{dev[:name] || dev[:mac]} · #{fma120_codec_label(get_in(state, [:active_codec, :codec]))}"
+    end
+  end
+
+  defp connected_device(state) do
+    state
+    |> Map.get(:devices, %{})
+    |> Map.values()
+    |> Enum.find(&(&1[:connection_state] == :connected))
+  end
+
+  defp fma120_device_state(:connected), do: "Connected"
+  defp fma120_device_state(:disconnected), do: "Disconnected"
+  defp fma120_device_state(:idle), do: "Paired"
+  defp fma120_device_state(_), do: "Unknown"
+
+  defp fma120_codec_label(nil), do: "—"
+
+  defp fma120_codec_label(codec) do
+    codec |> to_string() |> String.upcase() |> String.replace("_", " ")
   end
 
   # ── Adapter cell (icon tile + name + sub-line + HA picker hint) ───────
@@ -956,35 +1536,119 @@ defmodule UniversalProxyWeb.OverviewLive do
   # device fills them. Peripherals matching no declared empty slot (USB
   # audio, or a dongle on a dynamic-enumeration target) trail at the end.
   #
+  # `hubs` (optional) is `%{bus_path => hub_info}` from `Hardware.usb_hubs/0`.
+  # When a hub occupies a declared slot, that slot renders as a `{:hub, _}`
+  # row and the devices behind it (bus paths `<slot>.<n>`) render **indented**
+  # beneath it (depth 1) as a tree, rather than as placeless trailing rows. A
+  # child that has both a port and a peripheral at the same bus path (e.g. the
+  # FMA120's serial control port + its sound card) collapses to its peripheral
+  # row, so it shows once and opens the control drawer. With no hubs the output
+  # is identical to the prior slot-promotion behavior.
+  #
   # Public only so it can be unit-tested directly (the host test env has no
   # declared slots, so the promotion path is unreachable via a live mount).
   @doc false
-  def hardware_rows(ports, peripherals) do
+  def hardware_rows(ports, peripherals, hubs \\ %{}) do
+    # Only hubs that actually occupy a slot we render are tree-roots. This
+    # excludes the board's internal infrastructure hubs (ancestors of the
+    # declared receptacle slots) — `usb_hubs/0` reports every class-09 device,
+    # and without this filter those ancestors would swallow every declared
+    # slot as a "child" and collapse the USB 1–4 ordering.
+    port_slots = MapSet.new(ports, & &1.slot_sub)
+    hub_paths = hubs |> Map.keys() |> Enum.filter(&MapSet.member?(port_slots, &1))
+
     promotable =
       for p <- peripherals, is_binary(p.slot_sub), into: %{}, do: {p.slot_sub, p}
 
-    {rows, claimed} =
-      Enum.map_reduce(ports, MapSet.new(), fn port, claimed ->
-        # The peripheral occupying this slot, or nil: only empty (unconnected)
-        # declared slots can be claimed; `promotable` holds maps only.
-        claimer = if port.connected, do: nil, else: Map.get(promotable, port.slot_sub)
+    {rows, claimed, consumed} =
+      Enum.reduce(ports, {[], MapSet.new(), MapSet.new()}, fn port, {acc, claimed, consumed} ->
+        cond do
+          # A hub sits at this declared slot: emit the hub row + its children.
+          Map.has_key?(hubs, port.slot_sub) ->
+            {child_rows, child_paths} = hub_children(port, ports, peripherals)
+            row = {:hub, hub_row_map(port, Map.fetch!(hubs, port.slot_sub))}
+            {acc ++ [row | child_rows], claimed, MapSet.union(consumed, child_paths)}
 
-        case claimer do
-          nil ->
-            {{:port, port}, claimed}
+          # A device behind a hub: already emitted (or collapsed) under it.
+          under_hub?(port.slot_sub, hub_paths) ->
+            {acc, claimed, consumed}
 
-          peripheral ->
-            {{:peripheral, %{peripheral | slot: port.slot}}, MapSet.put(claimed, port.slot_sub)}
+          # Connected non-hub port: render as-is (never claimed by a peripheral).
+          port.connected ->
+            {acc ++ [{:port, port}], claimed, consumed}
+
+          # Empty declared slot: a peripheral may be promoted into it.
+          true ->
+            case Map.get(promotable, port.slot_sub) do
+              nil ->
+                {acc ++ [{:port, port}], claimed, consumed}
+
+              peripheral ->
+                {acc ++ [{:peripheral, %{peripheral | slot: port.slot}}],
+                 MapSet.put(claimed, port.slot_sub), consumed}
+            end
         end
       end)
 
     trailing =
       for p <- peripherals,
-          not (is_binary(p.slot_sub) and MapSet.member?(claimed, p.slot_sub)),
+          not (is_binary(p.slot_sub) and
+                 (MapSet.member?(claimed, p.slot_sub) or MapSet.member?(consumed, p.slot_sub))),
           do: {:peripheral, p}
 
     rows ++ trailing
   end
+
+  defp under_hub?(slot_sub, hub_paths) when is_binary(slot_sub) do
+    Enum.any?(hub_paths, &String.starts_with?(slot_sub, &1 <> "."))
+  end
+
+  defp under_hub?(_slot_sub, _hub_paths), do: false
+
+  # Devices enumerated behind the hub at `hub_port.slot_sub`, as indented
+  # (depth-1) rows. A child bus path covered by a peripheral renders only its
+  # peripheral row (collapsing a co-located serial port into it).
+  defp hub_children(hub_port, ports, peripherals) do
+    prefix = hub_port.slot_sub <> "."
+
+    child_peripherals =
+      peripherals
+      |> Enum.filter(&(is_binary(&1.slot_sub) and String.starts_with?(&1.slot_sub, prefix)))
+      |> Enum.sort_by(& &1.slot_sub)
+
+    peripheral_paths = MapSet.new(child_peripherals, & &1.slot_sub)
+
+    child_ports =
+      ports
+      |> Enum.filter(fn pt ->
+        is_binary(pt.slot_sub) and String.starts_with?(pt.slot_sub, prefix) and
+          not MapSet.member?(peripheral_paths, pt.slot_sub)
+      end)
+      |> Enum.sort_by(& &1.slot_sub)
+
+    rows =
+      Enum.map(child_peripherals, &{:peripheral, Map.put(&1, :depth, 1)}) ++
+        Enum.map(child_ports, &{:port, Map.put(&1, :depth, 1)})
+
+    paths = MapSet.union(peripheral_paths, MapSet.new(child_ports, & &1.slot_sub))
+    {rows, paths}
+  end
+
+  defp hub_row_map(hub_port, hub_info) do
+    %{
+      slot: hub_port.slot,
+      slot_sub: hub_port.slot_sub,
+      name: hub_info.name,
+      vidpid: format_vidpid_pair(hub_info.vendor_id, hub_info.product_id)
+    }
+  end
+
+  defp format_vidpid_pair(vid, pid) when is_integer(vid) and is_integer(pid) do
+    hex = fn v -> v |> Integer.to_string(16) |> String.upcase() |> String.pad_leading(4, "0") end
+    "#{hex.(vid)}:#{hex.(pid)}"
+  end
+
+  defp format_vidpid_pair(_, _), do: "—"
 
   defp usb_audio_peripherals(audio_outputs) do
     audio_outputs
@@ -1009,7 +1673,11 @@ defmodule UniversalProxyWeb.OverviewLive do
         tab: "/audio",
         status: status,
         soft_class: "bg-audio-soft text-audio",
-        dot_class: "bg-audio"
+        dot_class: "bg-audio",
+        # FlooGoo FMA120 rows open the control drawer instead of routing to
+        # the Audio tab; other sound cards keep their goto_tab behavior.
+        fma120?: fma120_key?(out.key),
+        fma120_key: encode_key(out.key)
       }
     end)
   end
@@ -1045,7 +1713,9 @@ defmodule UniversalProxyWeb.OverviewLive do
             else: %{label: "Idle", variant: :warning}
           ),
         soft_class: "bg-accent-soft text-accent",
-        dot_class: "bg-accent"
+        dot_class: "bg-accent",
+        fma120?: false,
+        fma120_key: nil
       }
     end)
   end
