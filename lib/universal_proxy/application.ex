@@ -23,6 +23,12 @@ defmodule UniversalProxy.Application do
         # per-output config, broadcasts lifecycle events. Phase 1 holds
         # an empty PlayerSupervisor; Phase 3 adds player children.
         UniversalProxy.Audio.Supervisor,
+        # FlooGoo FMA120 control channel (DETS prefs store + supervised
+        # worker subtree). AFTER Audio.Supervisor so its hotplug events
+        # (`sendspin:output_added`) flow. No-op when no FMA120 is attached
+        # (empty inventory); works on host.
+        UniversalProxy.FMA120.Store,
+        UniversalProxy.FMA120.Supervisor,
         # ESPHome device identity store (DETS)
         UniversalProxy.ESPHome.ConfigStore,
         # Firmware update flow (ConfigStore + library Supervisor, wired

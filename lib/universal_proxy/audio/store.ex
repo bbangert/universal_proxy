@@ -14,7 +14,8 @@ defmodule UniversalProxy.Audio.Store do
         enabled: boolean(),
         client_id: String.t(),
         volume: 0..100,
-        muted: boolean()
+        muted: boolean(),
+        static_delay_ms: 0..5000
       }
 
   `client_id` is generated once per output the first time it is sighted
@@ -47,7 +48,8 @@ defmodule UniversalProxy.Audio.Store do
           enabled: boolean(),
           client_id: String.t(),
           volume: 0..100,
-          muted: boolean()
+          muted: boolean(),
+          static_delay_ms: 0..5000
         }
 
   # -- Client API --
@@ -191,7 +193,8 @@ defmodule UniversalProxy.Audio.Store do
       enabled: pick(params, existing, :enabled, true),
       client_id: pick(params, existing, :client_id, &generate_client_id/0),
       volume: clamp_volume(pick(params, existing, :volume, 50)),
-      muted: !!pick(params, existing, :muted, false)
+      muted: !!pick(params, existing, :muted, false),
+      static_delay_ms: clamp_static_delay(pick(params, existing, :static_delay_ms, 0))
     }
   end
 
@@ -221,6 +224,13 @@ defmodule UniversalProxy.Audio.Store do
   defp clamp_volume(v) when is_integer(v) and v < 0, do: 0
   defp clamp_volume(v) when is_integer(v) and v > 100, do: 100
   defp clamp_volume(_), do: 50
+
+  # Server-adjustable static output delay (multi-room sync). The sendspin
+  # library caps this at 5000 ms (`MAX_STATIC_DELAY_MS`); mirror that here.
+  defp clamp_static_delay(v) when is_integer(v) and v >= 0 and v <= 5000, do: v
+  defp clamp_static_delay(v) when is_integer(v) and v < 0, do: 0
+  defp clamp_static_delay(v) when is_integer(v) and v > 5000, do: 5000
+  defp clamp_static_delay(_), do: 0
 
   # 16 random bytes is 128 bits of entropy, more than enough to identify
   # a player to a Sendspin server. Hex-encoded for human-greppable logs.

@@ -891,6 +891,25 @@ defmodule UniversalProxy.Audio.ServerTest do
       assert :sys.get_state(server).outputs[@hp_key].muted == true
     end
 
+    test "persists binary-emitted static_delay events to DETS (MA sync delay)",
+         %{server: server, store: store} do
+      # Music Assistant adjusts the player's static output delay for
+      # multi-room sync; the binary emits `{"event":"static_delay","value":N}`.
+      # Server must persist it so the next respawn re-applies it via
+      # `--initial-static-delay-ms`.
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "sendspin:state",
+        {:sendspin_state, @hp_key, %{event: "static_delay", value: 9999}}
+      )
+
+      :sys.get_state(server)
+
+      # Clamped to the library cap (5000 ms).
+      assert {:ok, %{static_delay_ms: 5000}} = Store.get_config(store, @hp_key)
+      assert :sys.get_state(server).outputs[@hp_key].static_delay_ms == 5000
+    end
+
     test "caps binary-emitted error msg length to keep state and socket diffs bounded",
          %{server: server} do
       # A misbehaving Sendspin server could forward a multi-MB error

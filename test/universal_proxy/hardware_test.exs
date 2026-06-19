@@ -458,4 +458,43 @@ defmodule UniversalProxy.HardwareTest do
       assert Enum.map(ports, & &1.slot_sub) == ["1-1.1.2", "1-1.2", "1-1.3"]
     end
   end
+
+  describe "usb_hubs/1" do
+    # Build a fake /sys/bus/usb/devices tree with a hub, a non-hub device,
+    # and a root hub, then assert only the real hub is detected.
+    test "detects hub-class devices and parses their descriptors" do
+      dir = Path.join(System.tmp_dir!(), "uhub-#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf!(dir) end)
+
+      # The FMA120's internal hub at the USB 2 receptacle.
+      hub = Path.join(dir, "1-1.1.3")
+      File.mkdir_p!(hub)
+      File.write!(Path.join(hub, "bDeviceClass"), "09\n")
+      File.write!(Path.join(hub, "idVendor"), "0a12\n")
+      File.write!(Path.join(hub, "idProduct"), "4010\n")
+      # (no product/manufacturer file — many hubs report none)
+
+      # The FMA120 functions one level below the hub — NOT a hub.
+      dev = Path.join(dir, "1-1.1.3.1")
+      File.mkdir_p!(dev)
+      File.write!(Path.join(dev, "bDeviceClass"), "ef\n")
+      File.write!(Path.join(dev, "idVendor"), "0a12\n")
+      File.write!(Path.join(dev, "idProduct"), "4007\n")
+      File.write!(Path.join(dev, "product"), "FlooGoo FMA120\n")
+
+      # A root hub, which must be skipped (name doesn't match a bus path).
+      root = Path.join(dir, "usb1")
+      File.mkdir_p!(root)
+      File.write!(Path.join(root, "bDeviceClass"), "09\n")
+
+      hubs = Hardware.usb_hubs(usb_devices_dir: dir)
+
+      assert Map.keys(hubs) == ["1-1.1.3"]
+      assert hubs["1-1.1.3"] == %{vendor_id: 0x0A12, product_id: 0x4010, name: "USB hub"}
+    end
+
+    test "returns an empty map when the sysfs root is absent" do
+      assert Hardware.usb_hubs(usb_devices_dir: "/nonexistent-#{System.unique_integer()}") == %{}
+    end
+  end
 end

@@ -39,6 +39,7 @@ defmodule UniversalProxy.Audio.Player do
       {"event":"time_sync","error_us":42.3}
       {"event":"volume","value":80}
       {"event":"mute","value":false}
+      {"event":"static_delay","value":200}
       {"event":"error","kind":"alsa_configure","msg":"..."}
       {"event":"shutdown"}
 
@@ -392,6 +393,8 @@ defmodule UniversalProxy.Audio.Player do
       Integer.to_string(state.mdns_port),
       "--initial-volume",
       Integer.to_string(Map.get(cfg, :volume, 50)),
+      "--initial-static-delay-ms",
+      Integer.to_string(Map.get(cfg, :static_delay_ms, 0)),
       "--log-level",
       "info"
     ]

@@ -52,7 +52,10 @@ defmodule SendspinPlayerContractTest do
     on_exit(fn -> shutdown_os_process(os_pid) end)
 
     {:ok,
-     port: port, started: assert_started_event(port), volume_event: assert_volume_event(port)}
+     port: port,
+     started: assert_started_event(port),
+     volume_event: assert_volume_event(port),
+     static_delay_event: assert_static_delay_event(port)}
   end
 
   test "emits a `started` JSON event with documented fields on launch", %{started: event} do
@@ -98,6 +101,28 @@ defmodule SendspinPlayerContractTest do
 
   test "emits initial `volume` event matching --initial-volume", %{volume_event: event} do
     assert event == %{"event" => "volume", "value" => 42}
+  end
+
+  test "emits initial `static_delay` event (server-adjustable, default 0)",
+       %{static_delay_event: event} do
+    assert event == %{"event" => "static_delay", "value" => 0}
+  end
+
+  test "real binary honors a non-zero --initial-static-delay-ms" do
+    # Own port so it doesn't collide with the setup-spawned player on @ws_port.
+    port = spawn_player(ws_port: @ws_port + 1, extra: ["--initial-static-delay-ms", "200"])
+
+    os_pid =
+      case Port.info(port, :os_pid) do
+        {:os_pid, pid} -> pid
+        _ -> nil
+      end
+
+    on_exit(fn -> shutdown_os_process(os_pid) end)
+
+    assert_started_event(port)
+    assert_volume_event(port)
+    assert next_event(port) == %{"event" => "static_delay", "value" => 200}
   end
 
   test "set_volume command echoes back as a clamped volume event", %{port: port} do
@@ -147,33 +172,38 @@ defmodule SendspinPlayerContractTest do
   # Helpers
   # ----------------------------------------------------------------------
 
-  defp spawn_player do
+  defp spawn_player(opts \\ []) do
+    ws_port = Keyword.get(opts, :ws_port, @ws_port)
+    extra = Keyword.get(opts, :extra, [])
+
     Port.open(
       {:spawn_executable, String.to_charlist(@binary_path)},
       [
         :binary,
         :exit_status,
         {:line, 1024},
-        args: [
-          "--name",
-          "contract-test",
-          "--client-id",
-          "contract-uuid-0001",
-          "--mdns-port",
-          Integer.to_string(@ws_port),
-          "--alsa-device",
-          "default",
-          "--initial-volume",
-          "42",
-          "--log-level",
-          "error"
-        ]
+        args:
+          [
+            "--name",
+            "contract-test",
+            "--client-id",
+            "contract-uuid-0001",
+            "--mdns-port",
+            Integer.to_string(ws_port),
+            "--alsa-device",
+            "default",
+            "--initial-volume",
+            "42",
+            "--log-level",
+            "error"
+          ] ++ extra
       ]
     )
   end
 
   defp assert_started_event(port), do: receive_event(port, "started")
   defp assert_volume_event(port), do: receive_event(port, "volume")
+  defp assert_static_delay_event(port), do: receive_event(port, "static_delay")
 
   defp receive_event(port, expected_event_kind) do
     event = next_event(port)
