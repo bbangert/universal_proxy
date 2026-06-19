@@ -103,7 +103,10 @@ defmodule UniversalProxyWeb.OverviewLive do
   end
 
   def handle_event("fma120_connect", %{"key" => b64, "index" => idx}, socket) do
-    with_fma120(socket, b64, fn key -> FMA120.connect(key, parse_index(idx)) end)
+    case parse_index(idx) do
+      {:ok, index} -> with_fma120(socket, b64, &FMA120.connect(&1, index))
+      :error -> {:noreply, socket}
+    end
   end
 
   def handle_event("fma120_disconnect", %{"key" => b64}, socket) do
@@ -111,7 +114,10 @@ defmodule UniversalProxyWeb.OverviewLive do
   end
 
   def handle_event("fma120_forget", %{"key" => b64, "index" => idx}, socket) do
-    with_fma120(socket, b64, fn key -> FMA120.clear_paired(key, parse_index(idx)) end)
+    case parse_index(idx) do
+      {:ok, index} -> with_fma120(socket, b64, &FMA120.clear_paired(&1, index))
+      :error -> {:noreply, socket}
+    end
   end
 
   def handle_event("fma120_set_le_pref", %{"key" => b64, "pref" => pref}, socket) do
@@ -578,14 +584,18 @@ defmodule UniversalProxyWeb.OverviewLive do
   defp fma120_mode_atom("broadcast"), do: :broadcast
   defp fma120_mode_atom(_), do: :high_quality
 
-  defp parse_index(idx) when is_integer(idx), do: idx
+  # Returns `{:ok, index}` only for a clean 0..255 value; `:error` otherwise so
+  # callers no-op rather than acting on device 0 for malformed/tampered input.
+  defp parse_index(idx) when is_integer(idx) and idx in 0..255, do: {:ok, idx}
 
   defp parse_index(idx) when is_binary(idx) do
     case Integer.parse(idx) do
-      {n, ""} when n in 0..255 -> n
-      _ -> 0
+      {n, ""} when n in 0..255 -> {:ok, n}
+      _ -> :error
     end
   end
+
+  defp parse_index(_), do: :error
 
   defp toggle_led_bitmask(features) do
     base = features_to_bitmask(features)
@@ -1612,23 +1622,26 @@ defmodule UniversalProxyWeb.OverviewLive do
     prefix = hub_port.slot_sub <> "."
 
     child_peripherals =
-      peripherals
-      |> Enum.filter(&(is_binary(&1.slot_sub) and String.starts_with?(&1.slot_sub, prefix)))
-      |> Enum.sort_by(& &1.slot_sub)
+      Enum.filter(
+        peripherals,
+        &(is_binary(&1.slot_sub) and String.starts_with?(&1.slot_sub, prefix))
+      )
 
     peripheral_paths = MapSet.new(child_peripherals, & &1.slot_sub)
 
     child_ports =
-      ports
-      |> Enum.filter(fn pt ->
+      Enum.filter(ports, fn pt ->
         is_binary(pt.slot_sub) and String.starts_with?(pt.slot_sub, prefix) and
           not MapSet.member?(peripheral_paths, pt.slot_sub)
       end)
-      |> Enum.sort_by(& &1.slot_sub)
 
+    # Order all children by bus path together (not peripherals-then-ports), so
+    # a hub with devices on multiple downstream ports reads in physical order.
     rows =
-      Enum.map(child_peripherals, &{:peripheral, Map.put(&1, :depth, 1)}) ++
-        Enum.map(child_ports, &{:port, Map.put(&1, :depth, 1)})
+      (Enum.map(child_peripherals, &{&1.slot_sub, {:peripheral, Map.put(&1, :depth, 1)}}) ++
+         Enum.map(child_ports, &{&1.slot_sub, {:port, Map.put(&1, :depth, 1)}}))
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.map(&elem(&1, 1))
 
     paths = MapSet.union(peripheral_paths, MapSet.new(child_ports, & &1.slot_sub))
     {rows, paths}

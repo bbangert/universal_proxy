@@ -99,6 +99,27 @@ defmodule UniversalProxyWeb.OverviewFMA120Test do
     assert Process.alive?(view.pid)
   end
 
+  test "a malformed device index is ignored (no-op), not coerced to 0", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/")
+    add_fma120_output(view)
+
+    send(
+      view.pid,
+      {:fma120_state, @key, %{audio_mode: %{quality: :high_quality, variant: :fma120}}}
+    )
+
+    render_click(view, "select_fma120", %{"key" => enc(@key)})
+
+    # A tampered/garbage index must not crash and must not act on device 0.
+    html = render_click(view, "fma120_connect", %{"key" => enc(@key), "index" => "garbage"})
+    assert html =~ "Audio mode"
+    assert Process.alive?(view.pid)
+
+    html = render_click(view, "fma120_forget", %{"key" => enc(@key), "index" => "99x"})
+    assert html =~ "Audio mode"
+    assert Process.alive?(view.pid)
+  end
+
   test "the drawer closes on close_fma120_drawer", %{conn: conn} do
     {:ok, view, _html} = live(conn, "/")
     add_fma120_output(view)

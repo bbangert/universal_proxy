@@ -341,6 +341,21 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
       refute Enum.any?(rows, &match?({:port, %{slot_sub: "1-1.1.3.1"}}, &1))
     end
 
+    test "orders children by bus path, interleaving ports and peripherals" do
+      # Hub with a serial port at .1 and a sound card at .2 — must render in
+      # bus-path order (.1 then .2), not peripherals-then-ports.
+      child_port = slot("1-1.1.3.1", 5, connected: true)
+      ports = [slot("1-1.1.3", 2), child_port]
+      peripherals = [card("1-1.1.3.2", "Card")]
+      hubs = %{"1-1.1.3" => @hub}
+
+      assert [
+               {:hub, %{slot_sub: "1-1.1.3"}},
+               {:port, %{slot_sub: "1-1.1.3.1", depth: 1}},
+               {:peripheral, %{slot_sub: "1-1.1.3.2", depth: 1}}
+             ] = OverviewLive.hardware_rows(ports, peripherals, hubs)
+    end
+
     test "a child port with no peripheral renders as an indented port row" do
       child_port = slot("1-1.1.3.1", 5, connected: true)
       ports = [slot("1-1.1.3", 2), child_port]
