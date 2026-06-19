@@ -40,7 +40,6 @@ defmodule UniversalProxy.FMA120.DeviceWorker do
   alias UniversalProxy.FMA120.Store
 
   @cmd_timeout 2_000
-  @call_timeout @cmd_timeout + 3_000
 
   # Wedge watchdog: VR always answers on a healthy channel, so consecutive VR
   # timeouts are the canary for a wedged control channel. Other commands time
@@ -106,16 +105,20 @@ defmodule UniversalProxy.FMA120.DeviceWorker do
     GenServer.start_link(__MODULE__, opts)
   end
 
+  # `:infinity` (not a fixed bound): the worker always completes an in-flight
+  # command — via its reply or its own per-command timer — and a command queued
+  # behind others (e.g. the 10-step init handshake) can legitimately wait longer
+  # than any fixed caller timeout. A worker crash still surfaces as a call exit.
   @doc "Query a bare header (e.g. `\"VR\"`). Routed through the serialized queue."
   @spec query(GenServer.server(), String.t()) :: {:ok, term()} | {:error, term()}
   def query(pid, header) when is_binary(header) do
-    GenServer.call(pid, {:enqueue, header, nil}, @call_timeout)
+    GenServer.call(pid, {:enqueue, header, nil}, :infinity)
   end
 
   @doc "Send a set-command with a payload (integer hex-byte or string). Returns `:ok`/`{:error, _}`."
   @spec command(GenServer.server(), String.t(), 0..255 | binary()) :: :ok | {:error, term()}
   def command(pid, header, payload) when is_binary(header) do
-    GenServer.call(pid, {:enqueue, header, payload}, @call_timeout)
+    GenServer.call(pid, {:enqueue, header, payload}, :infinity)
   end
 
   @doc "Fetch the worker's current cached protocol state."
@@ -345,7 +348,21 @@ defmodule UniversalProxy.FMA120.DeviceWorker do
     case File.write(path, "0") do
       :ok ->
         Process.sleep(state.reauthorize_pause)
-        File.write(path, "1")
+
+        case File.write(path, "1") do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            # Worse than the wedge: the device is now de-authorized and we
+            # failed to re-enable it. Surface it loudly.
+            Logger.error(
+              "FMA120 USB re-enable failed at #{path}: #{inspect(reason)} — " <>
+                "device may be left de-authorized"
+            )
+
+            :error
+        end
 
       {:error, reason} ->
         Logger.error("FMA120 USB re-authorize failed at #{path}: #{inspect(reason)}")
