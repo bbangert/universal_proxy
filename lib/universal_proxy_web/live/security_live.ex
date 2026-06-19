@@ -9,9 +9,14 @@ defmodule UniversalProxyWeb.SecurityLive do
 
   use UniversalProxyWeb, :live_view
 
+  # Filename suggested to the browser for the downloaded private key, and the
+  # `-i` identity referenced in the login command shown on the card.
+  @private_key_filename "universal_proxy"
+
   import UniversalProxyWeb.Components.UI
   import UniversalProxyWeb.Components.Icons
 
+  alias UniversalProxy.SSHAccess
   alias UniversalProxyWeb.MockData
 
   @impl true
@@ -24,7 +29,26 @@ defmodule UniversalProxyWeb.SecurityLive do
      |> assign(:sec, initial)
      |> assign(:original, initial)
      |> assign(:show_key, false)
-     |> assign(:copied, nil)}
+     |> assign(:copied, nil)
+     |> assign(:ssh_fingerprint, ssh_fingerprint())
+     |> assign(:ssh_key_type, SSHAccess.key_type())
+     |> assign(:ssh_command, ssh_command())
+     |> assign(:ssh_copied, false)}
+  end
+
+  # The login command an operator runs after downloading the private key.
+  # `:inet.gethostname/0` is spec'd to always return `{:ok, hostname}`.
+  defp ssh_command do
+    {:ok, hostname} = :inet.gethostname()
+    "ssh -i #{@private_key_filename} root@#{hostname}.local"
+  end
+
+  # Tolerate the SSHAccess server being momentarily down (e.g. restarting) so
+  # the page renders instead of crashing the LiveView.
+  defp ssh_fingerprint do
+    SSHAccess.fingerprint()
+  catch
+    :exit, _ -> "unavailable — key service restarting"
   end
 
   @impl true
@@ -65,6 +89,32 @@ defmodule UniversalProxyWeb.SecurityLive do
      |> push_event("copy", %{text: socket.assigns.sec.api_key})}
   end
 
+  def handle_event("copy_fingerprint", _params, socket) do
+    # Recompute on click: the mount-time value may have been the
+    # "unavailable" placeholder if SSHAccess was momentarily down. Refresh
+    # the assign too so the on-screen readout self-corrects.
+    fingerprint = ssh_fingerprint()
+    Process.send_after(self(), :reset_ssh_copied, 1_600)
+
+    {:noreply,
+     socket
+     |> assign(:ssh_fingerprint, fingerprint)
+     |> assign(:ssh_copied, true)
+     |> push_event("copy", %{text: fingerprint})}
+  end
+
+  def handle_event("download_ssh_key", _params, socket) do
+    {:noreply,
+     push_event(socket, "download", %{
+       content: SSHAccess.private_key(),
+       filename: @private_key_filename
+     })}
+  catch
+    :exit, _ ->
+      {:noreply,
+       put_flash(socket, :error, "SSH key service is unavailable — try again in a moment.")}
+  end
+
   def handle_event("save", _params, socket) do
     {:noreply,
      socket
@@ -79,6 +129,10 @@ defmodule UniversalProxyWeb.SecurityLive do
   @impl true
   def handle_info(:reset_copied, socket) do
     {:noreply, assign(socket, :copied, false)}
+  end
+
+  def handle_info(:reset_ssh_copied, socket) do
+    {:noreply, assign(socket, :ssh_copied, false)}
   end
 
   def handle_info(_msg, socket), do: {:noreply, socket}
@@ -185,6 +239,44 @@ defmodule UniversalProxyWeb.SecurityLive do
             Fine for trusted home networks and first-run setup. Turn it on before exposing the
             proxy beyond your LAN.
           </span>
+        </div>
+      </.card>
+
+      <.card padding={:lg} class="mt-4">
+        <div class="flex items-start gap-4">
+          <div class="w-9 h-9 rounded-sm flex items-center justify-center flex-none bg-sunken text-fg-2">
+            <.icon name={:lock} size={18} />
+          </div>
+          <div class="flex-1">
+            <div class="text-base font-semibold">SSH access</div>
+            <div class="text-sm text-fg-3 mt-0.5">
+              Download the proxy's private key, add it to your SSH client, and open a shell on the
+              device.
+            </div>
+          </div>
+          <.badge variant={:neutral} dot>{@ssh_key_type}</.badge>
+        </div>
+
+        <div class="mt-3.5 text-sm font-semibold text-fg-2">Access key fingerprint</div>
+        <div class="text-sm text-fg-3 mt-0.5 mb-2">
+          Verify this matches the key you download before you trust the connection.
+        </div>
+        <div class="flex gap-2">
+          <input
+            type="text"
+            readonly
+            value={@ssh_fingerprint}
+            class="flex-1 h-9 px-3 rounded-md text-xs font-mono outline-none bg-sunken text-fg-2 border border-border-strong"
+          />
+          <.button variant={:secondary} size={:sm} phx-click="copy_fingerprint">
+            <.icon name={:check} size={14} /> {if @ssh_copied, do: "Copied", else: "Copy"}
+          </.button>
+          <.button variant={:primary} size={:sm} phx-click="download_ssh_key">
+            <.icon name={:download} size={14} /> Download key
+          </.button>
+        </div>
+        <div class="mt-3 px-3 py-2.5 bg-sunken rounded-sm font-mono text-sm text-fg-2 overflow-x-auto">
+          {@ssh_command}
         </div>
       </.card>
 
