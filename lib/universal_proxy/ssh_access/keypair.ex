@@ -21,7 +21,13 @@ defmodule UniversalProxy.SSHAccess.Keypair do
     import Inspect.Algebra
 
     def inspect(keypair, _opts) do
-      concat(["#SSHAccess.Keypair<", to_string(keypair.fingerprint), " private_key=[REDACTED]>"])
+      concat([
+        "#",
+        inspect(keypair.__struct__),
+        "<",
+        to_string(keypair.fingerprint),
+        " private_key=[REDACTED]>"
+      ])
     end
   end
 end

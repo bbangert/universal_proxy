@@ -90,12 +90,17 @@ defmodule UniversalProxyWeb.SecurityLive do
   end
 
   def handle_event("copy_fingerprint", _params, socket) do
+    # Recompute on click: the mount-time value may have been the
+    # "unavailable" placeholder if SSHAccess was momentarily down. Refresh
+    # the assign too so the on-screen readout self-corrects.
+    fingerprint = ssh_fingerprint()
     Process.send_after(self(), :reset_ssh_copied, 1_600)
 
     {:noreply,
      socket
+     |> assign(:ssh_fingerprint, fingerprint)
      |> assign(:ssh_copied, true)
-     |> push_event("copy", %{text: socket.assigns.ssh_fingerprint})}
+     |> push_event("copy", %{text: fingerprint})}
   end
 
   def handle_event("download_ssh_key", _params, socket) do
