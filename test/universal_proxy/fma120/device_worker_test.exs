@@ -100,6 +100,24 @@ defmodule UniversalProxy.FMA120.DeviceWorkerTest do
       reply(pid, "VR=1.1.7G")
       assert Task.await(t2) == {:ok, {:version, "1.1.7G"}}
     end
+
+    test "queries use the short timeout; set-commands get the longer one" do
+      pid = start_worker(query_timeout: 60, set_timeout: 3_000)
+
+      # An idle, silent query times out quickly (don't block the queue on it).
+      t1 = Task.async(fn -> DeviceWorker.query(pid, "ST") end)
+      assert_receive {:uart_write, "BC:ST\r\n"}, 500
+      assert Task.await(t1, 1_000) == {:error, :timeout}
+
+      # A set-command stays in flight well past the query timeout, giving a
+      # slow dongle time to answer (no false timeout, no late-reply desync).
+      t2 = Task.async(fn -> DeviceWorker.command(pid, "AM", 0x02) end)
+      assert_receive {:uart_write, "BC:AM=02\r\n"}, 500
+      # Still awaiting at 400ms (set_timeout is 3000) — hasn't false-timed-out.
+      assert Task.yield(t2, 400) == nil
+      reply(pid, "OK")
+      assert Task.await(t2, 1_000) == :ok
+    end
   end
 
   describe "async state broadcast" do
