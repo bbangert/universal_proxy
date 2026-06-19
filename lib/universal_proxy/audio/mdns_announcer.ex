@@ -39,7 +39,15 @@ defmodule UniversalProxy.Audio.MdnsAnnouncer do
   @reannounce_delays_ms [500, 1_500]
 
   def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
+    # `name: nil` → start unnamed (omit the option), matching the sibling
+    # Audio.Store/FMA120.Store convention.
+    gen_opts =
+      case Keyword.get(opts, :name, __MODULE__) do
+        nil -> []
+        name -> [name: name]
+      end
+
+    GenServer.start_link(__MODULE__, opts, gen_opts)
   end
 
   @impl true
