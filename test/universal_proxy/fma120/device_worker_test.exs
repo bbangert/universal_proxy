@@ -1,4 +1,7 @@
 defmodule UniversalProxy.FMA120.DeviceWorkerTest do
+  # async: false — shares the global `:fma120_test_controller` Application env
+  # key with commands_test.exs (both serialize the FakeUART write controller).
+  # Keep both files async: false or they'll cross-talk.
   use ExUnit.Case, async: false
 
   alias UniversalProxy.FMA120.DeviceWorker
@@ -100,6 +103,25 @@ defmodule UniversalProxy.FMA120.DeviceWorkerTest do
       reply(pid, "VR=1.1.7G")
       assert Task.await(t2) == {:ok, {:version, "1.1.7G"}}
     end
+
+    test "queries use the short timeout; set-commands get the longer one" do
+      pid = start_worker(query_timeout: 60, set_timeout: 3_000)
+
+      # An idle, silent query times out quickly (don't block the queue on it).
+      t1 = Task.async(fn -> DeviceWorker.query(pid, "ST") end)
+      assert_receive {:uart_write, "BC:ST\r\n"}, 500
+      assert Task.await(t1, 1_000) == {:error, :timeout}
+
+      # A set-command must survive past the (short) query timeout. Wait well
+      # beyond query_timeout (60ms) but far below set_timeout (3000ms), THEN
+      # reply: if the set had wrongly used the short timeout it would already
+      # have completed as {:error, :timeout}, so awaiting :ok proves it didn't.
+      t2 = Task.async(fn -> DeviceWorker.command(pid, "AM", 0x02) end)
+      assert_receive {:uart_write, "BC:AM=02\r\n"}, 500
+      Process.sleep(400)
+      reply(pid, "OK")
+      assert Task.await(t2, 1_000) == :ok
+    end
   end
 
   describe "async state broadcast" do
@@ -109,12 +131,37 @@ defmodule UniversalProxy.FMA120.DeviceWorkerTest do
 
       reply(pid, "FD=00,905682D5F226,C5,00240404,Office BT")
 
+      # Devices are keyed by MAC, not index.
       assert_receive {:fma120_state, @key, %{devices: devices}}, 500
-      assert devices[0].name == "Office BT"
-      assert devices[0].state_byte == 0xC5
+      assert devices["905682D5F226"].name == "Office BT"
+      assert devices["905682D5F226"].state_byte == 0xC5
 
       cache = DeviceWorker.get_state(pid)
-      assert cache.devices[0].mac == "905682D5F226"
+      assert cache.devices["905682D5F226"].index == 0
+    end
+
+    test "rows with the same index but different MACs both survive (no collision)" do
+      pid = start_worker()
+      reply(pid, "FD=00,AAAAAAAAAAAA,C5,00240404,Speaker A")
+      reply(pid, "FD=00,BBBBBBBBBBBB,C5,00240404,Speaker B")
+
+      # get_state (a GenServer.call) is queued after the two UART messages, so
+      # both are processed by the time it returns — no polling needed.
+      cache = DeviceWorker.get_state(pid)
+      assert map_size(cache.devices) == 2
+      assert cache.devices["AAAAAAAAAAAA"].name == "Speaker A"
+      assert cache.devices["BBBBBBBBBBBB"].name == "Speaker B"
+    end
+
+    test "a MAC-less FN list reply does not clobber a real device" do
+      pid = start_worker()
+      reply(pid, "FD=00,905682D5F226,C5,00240404,Office BT")
+      # A bare FN reply (index only, no MAC/name) must be ignored, not cached.
+      reply(pid, "FN=00")
+
+      cache = DeviceWorker.get_state(pid)
+      assert map_size(cache.devices) == 1
+      assert cache.devices["905682D5F226"].name == "Office BT"
     end
 
     test "version reply caches and broadcasts" do

@@ -197,6 +197,35 @@ defmodule UniversalProxy.FMA120.ProtocolTest do
     end
   end
 
+  describe "decode/1 — FN paired/recent device" do
+    test "bare index reply (no MAC)" do
+      assert Protocol.decode("FN=00") == {:paired_device, %{index: 0}}
+    end
+
+    test "index + MAC normalizes the MAC to FD's uppercase-hex format" do
+      # idx 00 + MAC 90:56:82:D5:F2:26 → mac must match the FD hex-string form.
+      assert Protocol.decode("FN=00905682D5F226") ==
+               {:paired_device, %{index: 0, mac: "905682D5F226"}}
+
+      # Same device via FD and FN ends up under the same MAC string (one key).
+      {:found_device, fd} = Protocol.decode("FD=00,905682D5F226,C5,00240404,Office BT")
+      {:paired_device, fn_dev} = Protocol.decode("FN=00905682D5F226")
+      assert fd.mac == fn_dev.mac
+    end
+
+    test "index + MAC + name" do
+      assert {:paired_device, %{index: 1, mac: "905682D5F226", name: name}} =
+               Protocol.decode("FN=01905682D5F226" <> Base.encode16("Hub"))
+
+      assert name == "Hub"
+    end
+
+    test "a truncated payload (neither bare idx, idx+MAC, nor longer) is unknown" do
+      # 2 bytes: an index plus one stray byte — matches no FN shape.
+      assert Protocol.decode("FN=0190") == {:unknown, "FN=0190"}
+    end
+  end
+
   describe "decode/1 — unknown / malformed" do
     test "unknown header → {:unknown, line}" do
       assert Protocol.decode("ZZ=01") == {:unknown, "ZZ=01"}

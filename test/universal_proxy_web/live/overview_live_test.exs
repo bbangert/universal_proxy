@@ -395,4 +395,66 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
                OverviewLive.hardware_rows(ports, peripherals)
     end
   end
+
+  describe "slot_summary/5 (physical-slot occupancy across device types)" do
+    @slots ["1-1.1.2", "1-1.1.3", "1-1.2", "1-1.3"]
+
+    # All four receptacles full, by different device types: USB1 BT dongle,
+    # USB2 FMA120 (audio+serial behind its hub), USB3 streaming audio, USB4 idle
+    # audio. The serial-only count used to read "1/5"; this must read 4/4.
+    defp full_board do
+      ports = [
+        %{connected: false, slot_sub: "1-1.1.2", in_use: false},
+        %{connected: false, slot_sub: "1-1.1.3", in_use: false},
+        %{connected: false, slot_sub: "1-1.2", in_use: false},
+        %{connected: false, slot_sub: "1-1.3", in_use: false},
+        %{connected: true, slot_sub: "1-1.1.3.1", in_use: false}
+      ]
+
+      audio = %{
+        a: %{key: {"1-1.1.3.1", 0x0A12, 0x4007}, usb_port: "1-1.1.3.1", stream: nil},
+        b: %{key: {"1-1.2", 1, 1}, usb_port: "1-1.2", stream: %{codec: "flac"}},
+        c: %{key: {"1-1.3", 2, 2}, usb_port: "1-1.3", stream: nil}
+      }
+
+      bt = [%{bus: :usb, port: "1-1.1.2", hci: "hci1", in_use?: true}]
+      hubs = %{"1-1" => %{}, "1-1.1" => %{}, "1-1.1.3" => %{}}
+      {ports, audio, bt, hubs}
+    end
+
+    test "counts every occupied receptacle, not just serial ports" do
+      {ports, audio, bt, hubs} = full_board()
+      s = OverviewLive.slot_summary(ports, audio, bt, hubs, @slots)
+      assert s.total == 4
+      assert s.in_use == 4
+      # Active: USB1 (BT in use) + USB3 (audio streaming).
+      assert s.active == 2
+      assert s.idle == 2
+    end
+
+    test "an empty board reads 0 in use" do
+      s = OverviewLive.slot_summary([], %{}, [], %{}, @slots)
+      assert s == %{in_use: 0, total: 4, active: 0, idle: 0}
+    end
+
+    test "two devices on the same child bus path count their slot once" do
+      # The FMA120's serial port and its sound card share 1-1.1.3.1 (under USB 2).
+      ports = [%{connected: true, slot_sub: "1-1.1.3.1", in_use: false}]
+      audio = %{a: %{key: {"1-1.1.3.1", 0x0A12, 0x4007}, usb_port: "1-1.1.3.1", stream: nil}}
+      s = OverviewLive.slot_summary(ports, audio, [], %{}, @slots)
+      assert s == %{in_use: 1, total: 4, active: 0, idle: 1}
+    end
+
+    test "a BT radio without a :port (hci-only) is not counted" do
+      bt = [%{bus: :usb, hci: "hci0", in_use?: true}]
+      assert OverviewLive.slot_summary([], %{}, bt, %{}, @slots).in_use == 0
+    end
+
+    test "dynamic target (no slot map) reports devices as N/N" do
+      {ports, audio, bt, hubs} = full_board()
+      s = OverviewLive.slot_summary(ports, audio, bt, hubs, nil)
+      # Distinct device paths: 1-1.1.3.1 (serial+audio), 1-1.2, 1-1.3, 1-1.1.2.
+      assert s == %{in_use: 4, total: 4, active: 2, idle: 2}
+    end
+  end
 end

@@ -327,8 +327,8 @@ defmodule UniversalProxyWeb.OverviewLive do
   def handle_info({:sendspin_state, _key, _partial}, socket), do: {:noreply, socket}
 
   # Merge an FMA120 control-state partial into the cached per-device state.
-  # The `:devices` map is merged (not replaced) so individual FD-row updates
-  # accumulate rather than clobber the list.
+  # The `:devices` map (keyed by MAC) is merged, not replaced, so individual
+  # device-row updates accumulate rather than clobber the list.
   def handle_info({:fma120_state, key, partial}, socket) do
     states = socket.assigns.fma120_states
     existing = Map.get(states, key, %{})
@@ -380,15 +380,68 @@ defmodule UniversalProxyWeb.OverviewLive do
     if Map.get(socket.assigns, key) == value, do: socket, else: assign(socket, key, value)
   end
 
-  # Memoize derived counts so the device-summary card doesn't recompute
-  # them on every render — only when `:ports` actually changes.
-  defp set_ports(socket, ports) do
-    socket
-    |> assign(:ports, ports)
-    |> assign(:connected_count, Enum.count(ports, & &1.connected))
-    |> assign(:active_count, Enum.count(ports, & &1.in_use))
-    |> assign(:idle_count, Enum.count(ports, &(&1.connected and not &1.in_use)))
-    |> assign(:total_count, length(ports))
+  defp set_ports(socket, ports), do: assign(socket, :ports, ports)
+
+  # Physical-slot summary for the device-summary card. Counts occupancy across
+  # ALL device types (serial, USB audio, USB Bluetooth, and hubs) mapped to the
+  # board's declared USB-A receptacles — not just serial ports, which made a
+  # board full of audio/BT devices read "1/5". A slot is *active* when its
+  # device is actually in use (serial proxied, audio streaming, or BT in use);
+  # *idle* is occupied-but-not-active.
+  defp slot_summary(ports, audio_outputs, bt_radios, hubs),
+    do: slot_summary(ports, audio_outputs, bt_radios, hubs, Hardware.physical_slots())
+
+  # Public (arity-5, slots injected) only so it can be unit-tested directly —
+  # the host test env has no declared slots, so the slot-mode path is otherwise
+  # unreachable via a live mount.
+  @doc false
+  def slot_summary(ports, audio_outputs, bt_radios, hubs, slots) do
+    # {bus_path, active?} for every USB device the Overview knows about.
+    # Only the physical bus path maps to a receptacle; an hci name never
+    # does, so don't fall back to it (would inflate the dynamic-mode count).
+    devices =
+      for(p <- ports, p.connected, is_binary(p.slot_sub), do: {p.slot_sub, p.in_use}) ++
+        for(
+          o <- Map.values(audio_outputs),
+          usb_audio?(o),
+          is_binary(o.usb_port),
+          do: {o.usb_port, not is_nil(o[:stream])}
+        ) ++
+        for(
+          r <- bt_radios,
+          r.bus == :usb,
+          is_binary(r[:port]),
+          do: {r[:port], r.in_use? == true}
+        )
+
+    case slots do
+      nil ->
+        # Dynamic target: no fixed receptacle map — report devices as N/N.
+        occupied = devices |> Enum.map(&elem(&1, 0)) |> MapSet.new()
+        active = for {p, true} <- devices, into: MapSet.new(), do: p
+        n = MapSet.size(occupied)
+        a = MapSet.size(active)
+        %{in_use: n, total: n, active: a, idle: n - a}
+
+      slots ->
+        # A hub occupies its receptacle even though its function devices sit
+        # one level below it.
+        all = devices ++ for({path, _} <- hubs, do: {path, false})
+
+        slot_of = fn path ->
+          Enum.find(slots, &(path == &1 or String.starts_with?(path, &1 <> ".")))
+        end
+
+        to_slots = fn list ->
+          list |> Enum.map(fn {p, _} -> slot_of.(p) end) |> Enum.reject(&is_nil/1) |> MapSet.new()
+        end
+
+        occupied = to_slots.(all)
+        active = to_slots.(Enum.filter(all, &elem(&1, 1)))
+        in_use = MapSet.size(occupied)
+        a = MapSet.size(active)
+        %{in_use: in_use, total: length(slots), active: a, idle: in_use - a}
+    end
   end
 
   # Subscribe to History throughput for every port the table will draw
@@ -479,19 +532,23 @@ defmodule UniversalProxyWeb.OverviewLive do
         assigns.usb_hubs
       )
 
+    summary =
+      slot_summary(assigns.ports, assigns.audio_outputs, assigns.bt_radios, assigns.usb_hubs)
+
     assigns =
       assigns
       |> assign(:hardware_rows, rows)
+      |> assign(:slot_summary, summary)
       |> assign(:bt_disconnected, disconnected_bt(assigns.bt_headphones))
 
     ~H"""
     <div class="max-w-[1120px] mx-auto space-y-4">
       <.device_summary
         target={@target}
-        connected={@connected_count}
-        active={@active_count}
-        idle={@idle_count}
-        total={@total_count}
+        connected={@slot_summary.in_use}
+        active={@slot_summary.active}
+        idle={@slot_summary.idle}
+        total={@slot_summary.total}
         packet_rate={@packet_rate}
       />
 
@@ -1025,7 +1082,12 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   defp fma120_drawer(assigns) do
     mode = get_in(assigns.state, [:audio_mode, :quality]) || :high_quality
-    devices = assigns.state |> Map.get(:devices, %{}) |> Map.values() |> Enum.sort_by(& &1.index)
+    # Keyed by MAC; sort by index (nil-safe) then MAC for a stable order.
+    devices =
+      assigns.state
+      |> Map.get(:devices, %{})
+      |> Map.values()
+      |> Enum.sort_by(&{&1[:index] || 0, &1[:mac]})
 
     assigns = assigns |> assign(:mode, mode) |> assign(:devices, devices)
 

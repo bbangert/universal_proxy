@@ -36,6 +36,11 @@ defmodule UniversalProxy.Hardware do
   # SMSC2514 sub-hub provides `1-1.1.2` and `1-1.1.3`. The other empty
   # leaf in the topology (`1-1.4`) is advertised by the hub controller
   # but not wired to a physical connector.
+  #
+  # INVARIANT: no slot path may be a prefix of another (a device behind a hub
+  # enumerates as `<slot>.<n>`, and consumers map it back to its slot by a
+  # `<slot>.`-prefix match — so e.g. listing both `1-1.1` and `1-1.1.2` would
+  # make the former wrongly claim the latter's devices).
   @external_slots %{
     rpi3: ["1-1.1.2", "1-1.1.3", "1-1.2", "1-1.3"]
   }
@@ -306,6 +311,14 @@ defmodule UniversalProxy.Hardware do
       true -> "USB hub"
     end
   end
+
+  @doc """
+  Declared physical USB-A slot bus paths for the running target, in order, or
+  `nil` when the target has no slot map (dynamic enumeration). Consumers use
+  this to map any USB device's bus path back to the receptacle it occupies.
+  """
+  @spec physical_slots() :: [String.t()] | nil
+  def physical_slots, do: target_slots()
 
   defp target_slots, do: Map.get(@external_slots, @target)
 

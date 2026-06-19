@@ -243,11 +243,15 @@ defmodule UniversalProxy.FMA120.Protocol do
       {:ok, <<idx>>} ->
         {:paired_device, %{index: idx}}
 
+      # Normalize the MAC to an uppercase hex string so it matches FD's format
+      # (FD carries the MAC as hex text). Without this, the same device keyed by
+      # MAC would land under two keys, and a raw-binary MAC could crash UTF-8
+      # rendering in the drawer.
       {:ok, <<idx, mac::binary-size(6)>>} ->
-        {:paired_device, %{index: idx, mac: mac}}
+        {:paired_device, %{index: idx, mac: Base.encode16(mac)}}
 
       {:ok, <<idx, mac::binary-size(6), name::binary>>} ->
-        {:paired_device, %{index: idx, mac: mac, name: name}}
+        {:paired_device, %{index: idx, mac: Base.encode16(mac), name: name}}
 
       _ ->
         {:unknown, line}

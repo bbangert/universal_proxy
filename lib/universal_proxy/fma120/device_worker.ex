@@ -39,7 +39,15 @@ defmodule UniversalProxy.FMA120.DeviceWorker do
   alias UniversalProxy.FMA120.Protocol
   alias UniversalProxy.FMA120.Store
 
-  @cmd_timeout 2_000
+  # Two timeouts, picked per command in `maybe_send_next/1`:
+  #   * queries (no payload) — short: idle state queries are legitimately
+  #     silent (constraint #2), so don't block the queue waiting on them.
+  #   * set-commands (payload) — longer: the dongle's first reply after an idle
+  #     period can land past a couple seconds; a too-tight bound declares a
+  #     false timeout (so the UI never sees the change) and lets the late reply
+  #     desync the next command. Matches the vendor app's serial read timeout.
+  @query_timeout 2_000
+  @set_timeout 5_000
 
   # Wedge watchdog: VR always answers on a healthy channel, so consecutive VR
   # timeouts are the canary for a wedged control channel. Other commands time
@@ -84,7 +92,8 @@ defmodule UniversalProxy.FMA120.DeviceWorker do
     :key,
     :server_pid,
     store: Store,
-    cmd_timeout: @cmd_timeout,
+    query_timeout: @query_timeout,
+    set_timeout: @set_timeout,
     skip_handshake: false,
     watchdog_interval: @default_watchdog_interval,
     sysfs_root: @default_sysfs_root,
@@ -144,7 +153,10 @@ defmodule UniversalProxy.FMA120.DeviceWorker do
       server_pid: Keyword.get(opts, :server_pid),
       uart_module: Keyword.get(opts, :uart_module, Circuits.UART),
       store: Keyword.get(opts, :store, Store),
-      cmd_timeout: Keyword.get(opts, :cmd_timeout, @cmd_timeout),
+      # `:cmd_timeout` is a legacy single-knob (tests) that sets both; otherwise
+      # queries and set-commands get their own defaults.
+      query_timeout: Keyword.get(opts, :query_timeout, opts[:cmd_timeout] || @query_timeout),
+      set_timeout: Keyword.get(opts, :set_timeout, opts[:cmd_timeout] || @set_timeout),
       skip_handshake: Keyword.get(opts, :skip_handshake, false),
       watchdog_interval: Keyword.get(opts, :watchdog_interval, @default_watchdog_interval),
       sysfs_root: Keyword.get(opts, :sysfs_root, @default_sysfs_root),
@@ -285,7 +297,11 @@ defmodule UniversalProxy.FMA120.DeviceWorker do
 
         case state.uart_module.write(state.uart_pid, frame) do
           :ok ->
-            timer = Process.send_after(self(), {:cmd_timeout, seq}, state.cmd_timeout)
+            # Queries (no payload) may be legitimately silent → short timeout.
+            # Set-commands should reply → longer timeout (avoids false timeout +
+            # late-reply desync when the dongle is slow to answer).
+            timeout = if is_nil(payload), do: state.query_timeout, else: state.set_timeout
+            timer = Process.send_after(self(), {:cmd_timeout, seq}, timeout)
 
             %{
               state
@@ -466,10 +482,17 @@ defmodule UniversalProxy.FMA120.DeviceWorker do
   defp cache_partial({:features, f}, _cache), do: %{features: f}
   defp cache_partial({:active_codec, c}, _cache), do: %{active_codec: c}
 
-  defp cache_partial({tag, device}, cache) when tag in [:found_device, :paired_device] do
+  # Key the device map by MAC (stable + unique), NOT by `index`: the dongle
+  # reuses index 0 across rows (and a bare `FN` list reply carries only an
+  # index, no MAC), so keying by index made rows clobber each other. A row with
+  # no MAC isn't a renderable device — ignore it so it can't wipe a real entry.
+  defp cache_partial({tag, %{mac: mac} = device}, cache)
+       when tag in [:found_device, :paired_device] and is_binary(mac) and mac != "" do
     devices = Map.get(cache, :devices, %{})
-    %{devices: Map.put(devices, device.index, device)}
+    %{devices: Map.put(devices, mac, device)}
   end
+
+  defp cache_partial({tag, _device}, _cache) when tag in [:found_device, :paired_device], do: nil
 
   defp cache_partial(_other, _cache), do: nil
 
