@@ -17,6 +17,10 @@ defmodule UniversalProxy.Application do
         UniversalProxyWeb.Endpoint,
         # Task supervisor for fire-and-forget work (e.g. async ESPHome restarts)
         {Task.Supervisor, name: UniversalProxy.TaskSupervisor},
+        # SSH access key: generates the device's ed25519 keypair on first boot,
+        # authorizes the public half for ssh login, and serves the private half
+        # to the Security tab for download. No-op authorize on host.
+        UniversalProxy.SSHAccess,
         # Start the UART subsystem (DynamicSupervisor + registry server)
         UniversalProxy.UART.Supervisor,
         # Audio (Sendspin) subsystem — enumerates ALSA outputs, persists

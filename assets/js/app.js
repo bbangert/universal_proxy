@@ -109,6 +109,24 @@ window.addEventListener("phx:traffic-export", event => {
   URL.revokeObjectURL(url)
 })
 
+// Server-side `push_event("download", %{content, filename})` triggers a
+// same-page file download. Used by the Security tab's "Download key" button
+// to save the device's SSH private key.
+window.addEventListener("phx:download", event => {
+  const detail = event.detail || {}
+  const content = detail.content || ""
+  const filename = detail.filename || "download"
+  const blob = new Blob([content], {type: "application/octet-stream"})
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement("a")
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+})
+
 let csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")
 let liveSocket = new LiveSocket("/live", Socket, {
   longPollFallbackMs: false,
