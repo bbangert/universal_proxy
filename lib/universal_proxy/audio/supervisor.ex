@@ -20,6 +20,9 @@ defmodule UniversalProxy.Audio.Supervisor do
     4. `UniversalProxy.Audio.Server` — the registry/orchestrator
        that polls enumeration, manages player lifecycle via the
        DynamicSupervisor above, and brokers PubSub events.
+    5. `UniversalProxy.Audio.MdnsAnnouncer` — re-announces mDNS on
+       network-up so players advertised during the boot race (before
+       `eth0` had an address) become discoverable.
   """
 
   use Supervisor
@@ -39,7 +42,12 @@ defmodule UniversalProxy.Audio.Supervisor do
       {DynamicSupervisor, name: UniversalProxy.Audio.PlayerSupervisor, strategy: :one_for_one},
       UniversalProxy.Audio.Store,
       UniversalProxy.Audio.MdnsDiscovery,
-      UniversalProxy.Audio.Server
+      UniversalProxy.Audio.Server,
+      # Last child: re-announces mDNS when an interface gains an IPv4 so
+      # players advertised before the network was ready (boot race) become
+      # discoverable. Independent of the others; placed last so its crash
+      # or restart never cascades to Server/players under :rest_for_one.
+      UniversalProxy.Audio.MdnsAnnouncer
     ]
 
     Supervisor.init(children, strategy: :rest_for_one)
