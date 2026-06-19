@@ -327,8 +327,8 @@ defmodule UniversalProxyWeb.OverviewLive do
   def handle_info({:sendspin_state, _key, _partial}, socket), do: {:noreply, socket}
 
   # Merge an FMA120 control-state partial into the cached per-device state.
-  # The `:devices` map is merged (not replaced) so individual FD-row updates
-  # accumulate rather than clobber the list.
+  # The `:devices` map (keyed by MAC) is merged, not replaced, so individual
+  # device-row updates accumulate rather than clobber the list.
   def handle_info({:fma120_state, key, partial}, socket) do
     states = socket.assigns.fma120_states
     existing = Map.get(states, key, %{})
@@ -1025,7 +1025,12 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   defp fma120_drawer(assigns) do
     mode = get_in(assigns.state, [:audio_mode, :quality]) || :high_quality
-    devices = assigns.state |> Map.get(:devices, %{}) |> Map.values() |> Enum.sort_by(& &1.index)
+    # Keyed by MAC; sort by index (nil-safe) then MAC for a stable order.
+    devices =
+      assigns.state
+      |> Map.get(:devices, %{})
+      |> Map.values()
+      |> Enum.sort_by(&{&1[:index] || 0, &1[:mac]})
 
     assigns = assigns |> assign(:mode, mode) |> assign(:devices, devices)
 

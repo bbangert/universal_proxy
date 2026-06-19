@@ -466,10 +466,17 @@ defmodule UniversalProxy.FMA120.DeviceWorker do
   defp cache_partial({:features, f}, _cache), do: %{features: f}
   defp cache_partial({:active_codec, c}, _cache), do: %{active_codec: c}
 
-  defp cache_partial({tag, device}, cache) when tag in [:found_device, :paired_device] do
+  # Key the device map by MAC (stable + unique), NOT by `index`: the dongle
+  # reuses index 0 across rows (and a bare `FN` list reply carries only an
+  # index, no MAC), so keying by index made rows clobber each other. A row with
+  # no MAC isn't a renderable device — ignore it so it can't wipe a real entry.
+  defp cache_partial({tag, %{mac: mac} = device}, cache)
+       when tag in [:found_device, :paired_device] and is_binary(mac) and mac != "" do
     devices = Map.get(cache, :devices, %{})
-    %{devices: Map.put(devices, device.index, device)}
+    %{devices: Map.put(devices, mac, device)}
   end
+
+  defp cache_partial({tag, _device}, _cache) when tag in [:found_device, :paired_device], do: nil
 
   defp cache_partial(_other, _cache), do: nil
 
