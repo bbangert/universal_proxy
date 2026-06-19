@@ -307,6 +307,14 @@ defmodule UniversalProxy.Hardware do
     end
   end
 
+  @doc """
+  Declared physical USB-A slot bus paths for the running target, in order, or
+  `nil` when the target has no slot map (dynamic enumeration). Consumers use
+  this to map any USB device's bus path back to the receptacle it occupies.
+  """
+  @spec physical_slots() :: [String.t()] | nil
+  def physical_slots, do: target_slots()
+
   defp target_slots, do: Map.get(@external_slots, @target)
 
   # -- Slot mode (per-target, every port shows) ------------------------
