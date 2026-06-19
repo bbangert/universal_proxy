@@ -219,6 +219,11 @@ defmodule UniversalProxy.FMA120.ProtocolTest do
 
       assert name == "Hub"
     end
+
+    test "a truncated payload (neither bare idx, idx+MAC, nor longer) is unknown" do
+      # 2 bytes: an index plus one stray byte — matches no FN shape.
+      assert Protocol.decode("FN=0190") == {:unknown, "FN=0190"}
+    end
   end
 
   describe "decode/1 — unknown / malformed" do

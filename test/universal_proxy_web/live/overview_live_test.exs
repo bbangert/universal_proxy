@@ -437,6 +437,19 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
       assert s == %{in_use: 0, total: 4, active: 0, idle: 0}
     end
 
+    test "two devices on the same child bus path count their slot once" do
+      # The FMA120's serial port and its sound card share 1-1.1.3.1 (under USB 2).
+      ports = [%{connected: true, slot_sub: "1-1.1.3.1", in_use: false}]
+      audio = %{a: %{key: {"1-1.1.3.1", 0x0A12, 0x4007}, usb_port: "1-1.1.3.1", stream: nil}}
+      s = OverviewLive.slot_summary(ports, audio, [], %{}, @slots)
+      assert s == %{in_use: 1, total: 4, active: 0, idle: 1}
+    end
+
+    test "a BT radio without a :port (hci-only) is not counted" do
+      bt = [%{bus: :usb, hci: "hci0", in_use?: true}]
+      assert OverviewLive.slot_summary([], %{}, bt, %{}, @slots).in_use == 0
+    end
+
     test "dynamic target (no slot map) reports devices as N/N" do
       {ports, audio, bt, hubs} = full_board()
       s = OverviewLive.slot_summary(ports, audio, bt, hubs, nil)

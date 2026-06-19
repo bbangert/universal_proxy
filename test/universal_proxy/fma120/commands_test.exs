@@ -1,5 +1,7 @@
 defmodule UniversalProxy.FMA120.CommandsTest do
   @moduledoc "Phases 5–7: write/command API, refresh, and persisted-pref re-apply."
+  # async: false — shares the global `:fma120_test_controller` Application env
+  # key with device_worker_test.exs; keep both async: false to avoid cross-talk.
   use ExUnit.Case, async: false
 
   alias UniversalProxy.FMA120

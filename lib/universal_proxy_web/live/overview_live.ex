@@ -397,6 +397,8 @@ defmodule UniversalProxyWeb.OverviewLive do
   @doc false
   def slot_summary(ports, audio_outputs, bt_radios, hubs, slots) do
     # {bus_path, active?} for every USB device the Overview knows about.
+    # Only the physical bus path maps to a receptacle; an hci name never
+    # does, so don't fall back to it (would inflate the dynamic-mode count).
     devices =
       for(p <- ports, p.connected, is_binary(p.slot_sub), do: {p.slot_sub, p.in_use}) ++
         for(
@@ -408,8 +410,8 @@ defmodule UniversalProxyWeb.OverviewLive do
         for(
           r <- bt_radios,
           r.bus == :usb,
-          is_binary(r[:port] || r.hci),
-          do: {r[:port] || r.hci, r.in_use? == true}
+          is_binary(r[:port]),
+          do: {r[:port], r.in_use? == true}
         )
 
     case slots do

@@ -1,4 +1,7 @@
 defmodule UniversalProxy.FMA120.DeviceWorkerTest do
+  # async: false — shares the global `:fma120_test_controller` Application env
+  # key with commands_test.exs (both serialize the FakeUART write controller).
+  # Keep both files async: false or they'll cross-talk.
   use ExUnit.Case, async: false
 
   alias UniversalProxy.FMA120.DeviceWorker
@@ -109,12 +112,13 @@ defmodule UniversalProxy.FMA120.DeviceWorkerTest do
       assert_receive {:uart_write, "BC:ST\r\n"}, 500
       assert Task.await(t1, 1_000) == {:error, :timeout}
 
-      # A set-command stays in flight well past the query timeout, giving a
-      # slow dongle time to answer (no false timeout, no late-reply desync).
+      # A set-command must survive past the (short) query timeout. Wait well
+      # beyond query_timeout (60ms) but far below set_timeout (3000ms), THEN
+      # reply: if the set had wrongly used the short timeout it would already
+      # have completed as {:error, :timeout}, so awaiting :ok proves it didn't.
       t2 = Task.async(fn -> DeviceWorker.command(pid, "AM", 0x02) end)
       assert_receive {:uart_write, "BC:AM=02\r\n"}, 500
-      # Still awaiting at 400ms (set_timeout is 3000) — hasn't false-timed-out.
-      assert Task.yield(t2, 400) == nil
+      Process.sleep(400)
       reply(pid, "OK")
       assert Task.await(t2, 1_000) == :ok
     end
