@@ -315,9 +315,10 @@ defmodule UniversalProxy.FMA120.DeviceWorker do
     {consecutive, vr_timeouts} =
       case result do
         {:error, :timeout} -> {state.consecutive_timeouts, state.vr_timeouts}
-        # Any successful completion proves the channel responded; a VR reply
-        # in particular clears the wedge canary.
-        _ -> {0, if(in_flight.header == "VR", do: 0, else: state.vr_timeouts)}
+        # Any successful reply proves the channel is alive, so it clears the
+        # wedge canary — `vr_timeouts` counts VR timeouts with no successful
+        # command in between (i.e. genuinely consecutive), not a running tally.
+        _ -> {0, 0}
       end
 
     %{state | in_flight: nil, consecutive_timeouts: consecutive, vr_timeouts: vr_timeouts}

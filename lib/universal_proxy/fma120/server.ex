@@ -136,11 +136,21 @@ defmodule UniversalProxy.FMA120.Server do
 
   @impl true
   def handle_info({:sendspin_output_added, %{key: key} = output}, state) do
-    if fma120_key?(key) and not has_entry?(state, key) do
-      usb_port = elem(key, 0) || Map.get(output, :usb_port)
-      {:noreply, add_device(state, key, usb_port)}
-    else
-      {:noreply, state}
+    cond do
+      not fma120_key?(key) ->
+        {:noreply, state}
+
+      # A worker is already running for this device — nothing to do.
+      live_entry?(state, key) ->
+        {:noreply, state}
+
+      # Either no entry, or a stale failed entry (`worker_pid: nil` from a
+      # start failure). Drop any stale entry and (re)start, so a transient
+      # boot-time failure can recover on the next output event.
+      true ->
+        usb_port = elem(key, 0) || Map.get(output, :usb_port)
+        state = %{state | inventory: Enum.reject(state.inventory, &(&1.key == key))}
+        {:noreply, add_device(state, key, usb_port)}
     end
   end
 
@@ -260,7 +270,8 @@ defmodule UniversalProxy.FMA120.Server do
   defp fma120_port?(%{vendor_id: vid, product_id: pid}),
     do: vid == @vendor_id and pid == @product_id
 
-  defp has_entry?(state, key), do: Enum.any?(state.inventory, &(&1.key == key))
+  defp live_entry?(state, key),
+    do: Enum.any?(state.inventory, &(&1.key == key and &1.worker_pid))
 
   # Find the ttyACM basename at the same USB bus path as the audio output.
   defp resolve_tty(state, usb_port) do

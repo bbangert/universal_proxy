@@ -17,6 +17,23 @@ defmodule UniversalProxy.FMA120.ServerTest do
     def handle_call(:get_state, _from, s), do: {:reply, s.cache, s}
   end
 
+  # Fails its first start_link (simulating UART-busy at boot), succeeds after.
+  defmodule FlakyWorker do
+    use GenServer
+
+    def start_link(opts) do
+      n = Application.get_env(:universal_proxy, :fma_flaky_attempts, 0) + 1
+      Application.put_env(:universal_proxy, :fma_flaky_attempts, n)
+      if n == 1, do: {:error, :busy}, else: GenServer.start_link(__MODULE__, opts)
+    end
+
+    def get_state(pid), do: GenServer.call(pid, :get_state)
+    @impl true
+    def init(opts), do: {:ok, %{opts: opts}}
+    @impl true
+    def handle_call(:get_state, _from, s), do: {:reply, %{}, s}
+  end
+
   # Hardware stand-in driven by Application env per test.
   defmodule StubHW do
     def list_ports, do: Application.get_env(:universal_proxy, :fma_test_ports, [])
@@ -38,6 +55,7 @@ defmodule UniversalProxy.FMA120.ServerTest do
     on_exit(fn ->
       Application.delete_env(:universal_proxy, :fma_test_ports)
       Application.delete_env(:universal_proxy, :fma_test_keys)
+      Application.delete_env(:universal_proxy, :fma_flaky_attempts)
     end)
 
     sup_name = :"wsup_#{System.unique_integer([:positive])}"
@@ -45,7 +63,7 @@ defmodule UniversalProxy.FMA120.ServerTest do
     {:ok, sup: sup_name}
   end
 
-  defp start_server(sup) do
+  defp start_server(sup, worker_module \\ StubWorker) do
     name = :"fma_srv_#{System.unique_integer([:positive])}"
 
     pid =
@@ -53,7 +71,7 @@ defmodule UniversalProxy.FMA120.ServerTest do
         {Server,
          name: name,
          subscribe: false,
-         worker_module: StubWorker,
+         worker_module: worker_module,
          worker_supervisor: sup,
          hardware: StubHW},
         id: name
@@ -107,6 +125,21 @@ defmodule UniversalProxy.FMA120.ServerTest do
       srv = start_server(sup)
       send(srv, {:sendspin_output_added, %{key: {"1-1.2", 0x1234, 0x5678}, usb_port: "1-1.2"}})
       assert Server.list_devices(srv) == []
+    end
+
+    test "retries a device whose worker failed to start, on the next output_added",
+         %{sup: sup} do
+      Application.put_env(:universal_proxy, :fma_test_keys, %{@key => "ttyACM0"})
+      srv = start_server(sup, FlakyWorker)
+
+      # First attempt: FlakyWorker.start_link returns {:error, :busy} → the
+      # entry is kept but with no live worker.
+      send(srv, {:sendspin_output_added, %{key: @key, usb_port: "1-1.3"}})
+      assert [%{key: @key, connected: false}] = Server.list_devices(srv)
+
+      # A later output event must retry rather than be ignored as "present".
+      send(srv, {:sendspin_output_added, %{key: @key, usb_port: "1-1.3"}})
+      assert [%{key: @key, connected: true}] = Server.list_devices(srv)
     end
 
     test "output_removed stops the matching worker", %{sup: sup} do
