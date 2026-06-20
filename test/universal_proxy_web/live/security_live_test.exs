@@ -17,7 +17,7 @@ defmodule UniversalProxyWeb.SecurityLiveTest do
 
   setup do
     # Start every test from a plaintext baseline on the global store.
-    PskStore.clear()
+    :ok = PskStore.clear()
     on_exit(fn -> PskStore.clear() end)
     {:ok, conn: Phoenix.ConnTest.build_conn()}
   end

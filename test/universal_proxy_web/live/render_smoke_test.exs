@@ -15,7 +15,7 @@ defmodule UniversalProxyWeb.RenderSmokeTest do
     # The Security tab reads the global ESPHome PSK store; ensure a plaintext
     # baseline so the smoke assertions don't see a key left in the on-disk
     # DETS by a prior run.
-    UniversalProxy.ESPHome.PskStore.clear()
+    :ok = UniversalProxy.ESPHome.PskStore.clear()
     {:ok, conn: Phoenix.ConnTest.build_conn()}
   end
 

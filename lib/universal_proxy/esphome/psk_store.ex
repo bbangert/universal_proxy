@@ -105,7 +105,7 @@ defmodule UniversalProxy.ESPHome.PskStore do
   end
 
   @impl GenServer
-  def handle_call({:store, psk}, _from, state) do
+  def handle_call({:store, <<_::256>> = psk}, _from, state) do
     with :ok <- :dets.insert(state.table, {@psk_key, psk}),
          :ok <- :dets.sync(state.table) do
       broadcast(psk)
@@ -115,6 +115,13 @@ defmodule UniversalProxy.ESPHome.PskStore do
         Logger.error("ESPHome PSK store write failed: #{inspect(reason)}")
         {:reply, {:error, reason}, state}
     end
+  end
+
+  # Enforce the 32-byte contract at the server boundary too, so a malformed PSK
+  # can never be persisted (and later read back / treated as encrypted) even if
+  # something bypasses store_psk/1 and calls this message directly.
+  def handle_call({:store, _bad}, _from, state) do
+    {:reply, {:error, :invalid_psk}, state}
   end
 
   def handle_call(:load, _from, state) do

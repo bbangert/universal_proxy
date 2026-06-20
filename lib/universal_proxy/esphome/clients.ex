@@ -117,25 +117,25 @@ defmodule UniversalProxy.ESPHome.Clients do
   defp parse_client_info(""), do: {"Native API client", "Native API client", nil}
 
   defp parse_client_info(info) when is_binary(info) do
-    # client_info is conventionally "<name> <version>" so take the LAST
-    # version-like token, not the first.
-    version =
-      case Regex.scan(~r/\b\d+\.\d+(?:\.\d+)?\S*/, info) do
-        [] -> nil
-        matches -> matches |> List.last() |> hd()
-      end
+    # Parse the trailing "<name> <version>" form directly: if the last
+    # whitespace-separated token looks like a version, split it off as the
+    # version and keep the rest as the name. Splitting (vs. String.replace)
+    # avoids mangling a name that happens to repeat the version substring.
+    case String.split(String.trim(info), ~r/\s+/) do
+      [_ | _] = words ->
+        {last, rest} = List.pop_at(words, -1)
 
-    name =
-      info
-      |> then(fn s -> if version, do: String.replace(s, version, ""), else: s end)
-      |> String.trim()
-      |> case do
-        "" -> info
-        trimmed -> trimmed
-      end
-
-    {name, classify(name), version}
+        if rest != [] and version_token?(last) do
+          name = Enum.join(rest, " ")
+          {name, classify(name), last}
+        else
+          name = Enum.join(words, " ")
+          {name, classify(name), nil}
+        end
+    end
   end
+
+  defp version_token?(token), do: token =~ ~r/^\d+\.\d+(?:\.\d+)?\S*$/
 
   defp classify(name) do
     cond do

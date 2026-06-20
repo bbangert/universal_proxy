@@ -12,9 +12,12 @@ defmodule UniversalProxy.ESPHome.PskStoreTest do
   # server) is exercised against the global store in security_live_test's
   # auto-upgrade flip test; here we drive the underlying {:store, psk} server
   # path directly.
-  setup context do
+  setup do
     table = :esphome_psk_unit_test
-    path = Path.join(System.tmp_dir!(), "esphome_psk_test_#{:erlang.phash2(context.test)}.dets")
+
+    path =
+      Path.join(System.tmp_dir!(), "esphome_psk_test_#{System.unique_integer([:positive])}.dets")
+
     File.rm(path)
 
     store = start_supervised!({PskStore, name: nil, table: table, dets_path: path})
