@@ -53,6 +53,11 @@ defmodule UniversalProxy.ESPHome.PskStore do
     GenServer.call(__MODULE__, {:store, psk})
   end
 
+  # Defensive: the behaviour types the arg as a 32-byte binary, but return an
+  # error tuple (per the callback contract) rather than raising FunctionClauseError
+  # if a malformed value ever reaches us — a raise would crash espex's caller path.
+  def store_psk(_other), do: {:error, :invalid_psk}
+
   @doc """
   Return the persisted raw 32-byte PSK, or `nil` when plaintext. Used by the
   supervisor boot seed and by `SecurityLive`.

@@ -1,17 +1,20 @@
 defmodule UniversalProxy.ESPHome.PskStoreTest do
-  use ExUnit.Case, async: true
+  # async: false — these tests subscribe to the global "esphome:psk" PubSub
+  # topic and touch the app-started store, so they must not run concurrently
+  # with other global-state tests. Serialized, a fixed table atom is safe
+  # (no per-test dynamic atoms to leak); isolation comes from the unique file.
+  use ExUnit.Case, async: false
 
   alias UniversalProxy.ESPHome.PskStore
 
-  # Each test gets its own unnamed store backed by a unique temp DETS file and
-  # a unique table atom, so they don't collide with each other or the
-  # app-started global PskStore. The behaviour callback store_psk/1 (which is
-  # hardwired to the named __MODULE__ server) is exercised against the global
-  # store in security_live_test's auto-upgrade flip test; here we drive the
-  # underlying {:store, psk} server path directly.
+  # Each test gets its own unnamed store backed by a unique temp DETS file.
+  # The behaviour callback store_psk/1 (hardwired to the named __MODULE__
+  # server) is exercised against the global store in security_live_test's
+  # auto-upgrade flip test; here we drive the underlying {:store, psk} server
+  # path directly.
   setup context do
-    table = :erlang.binary_to_atom("esphome_psk_test_#{:erlang.phash2(context.test)}", :utf8)
-    path = Path.join(System.tmp_dir!(), "#{table}.dets")
+    table = :esphome_psk_unit_test
+    path = Path.join(System.tmp_dir!(), "esphome_psk_test_#{:erlang.phash2(context.test)}.dets")
     File.rm(path)
 
     store = start_supervised!({PskStore, name: nil, table: table, dets_path: path})
@@ -59,7 +62,7 @@ defmodule UniversalProxy.ESPHome.PskStoreTest do
       )
 
     File.rm(path)
-    tbl = :erlang.binary_to_atom("persist_#{System.unique_integer([:positive])}", :utf8)
+    tbl = :esphome_psk_persist_test
 
     {:ok, store1} = PskStore.start_link(name: nil, table: tbl, dets_path: path)
     key = :crypto.strong_rand_bytes(32)

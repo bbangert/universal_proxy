@@ -3,7 +3,9 @@ defmodule UniversalProxyWeb.RenderSmokeTest do
   Smoke test that each LiveView mounts and renders without raising.
   Catches HEEx and assign errors that compile-time validation misses.
   """
-  use ExUnit.Case, async: true
+  # async: false — setup clears the app-started global PskStore, so this
+  # module must be serialized against other tests touching that shared state.
+  use ExUnit.Case, async: false
   import Phoenix.LiveViewTest
   import Phoenix.ConnTest
 

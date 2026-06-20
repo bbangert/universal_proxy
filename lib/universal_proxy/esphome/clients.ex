@@ -113,8 +113,8 @@ defmodule UniversalProxy.ESPHome.Clients do
   # The ESPHome HelloRequest client_info is a free-form string, conventionally
   # "<client name> <version>" (e.g. "Home Assistant 2026.1.0"). Pull a trailing
   # version token off the end and classify the remainder.
-  defp parse_client_info(nil), do: {"Native API client", "ESPHome client", nil}
-  defp parse_client_info(""), do: {"Native API client", "ESPHome client", nil}
+  defp parse_client_info(nil), do: {"Native API client", "Native API client", nil}
+  defp parse_client_info(""), do: {"Native API client", "Native API client", nil}
 
   defp parse_client_info(info) when is_binary(info) do
     # client_info is conventionally "<name> <version>" so take the LAST
