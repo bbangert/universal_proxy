@@ -296,4 +296,105 @@ defmodule UniversalProxyWeb.Components.UI do
     </div>
     """
   end
+
+  # ── Connected-clients pill + popover ──────────────────────────────────
+  # Header pill showing how many ESPHome native-API clients are connected.
+  # Click toggles a popover listing them. Wired to the centralized
+  # `toggle_ha_clients` / `close_ha_clients` events in NavHooks, so it works
+  # from the shared layout on every tab.
+  attr(:clients, :list, required: true)
+  attr(:open, :boolean, default: false)
+
+  def clients_pill(assigns) do
+    count = length(assigns.clients)
+    connected = count > 0
+
+    label =
+      case assigns.clients do
+        [] -> "No clients"
+        [one] -> one.name
+        _ -> "#{count} clients"
+      end
+
+    assigns =
+      assign(assigns,
+        count: count,
+        connected: connected,
+        label: label,
+        chevron_class:
+          "opacity-60 transition-transform" <> if(assigns.open, do: " rotate-180", else: "")
+      )
+
+    ~H"""
+    <div class="relative">
+      <button
+        type="button"
+        phx-click="toggle_ha_clients"
+        aria-expanded={@open}
+        title={
+          if @connected,
+            do: "Click to see connected clients",
+            else: "No ESPHome clients connected"
+        }
+        class={[
+          "flex items-center gap-2 pl-2 pr-2.5 py-1 rounded-full border transition-colors",
+          if(@connected,
+            do: "bg-success-soft border-transparent text-success",
+            else: "bg-sunken border-border-1 text-fg-3"
+          )
+        ]}
+      >
+        <span class={[
+          "w-2 h-2 rounded-full",
+          if(@connected, do: "bg-success ring-2 ring-success-soft", else: "bg-fg-4")
+        ]} />
+        <span class="text-xs font-medium">{@label}</span>
+        <.icon name={:chevron} size={10} stroke={2.4} class={@chevron_class} />
+      </button>
+
+      <div :if={@open}>
+        <div phx-click="close_ha_clients" class="fixed inset-0 z-[90]"></div>
+        <div class="absolute right-0 top-full mt-2 w-[360px] max-h-[70vh] overflow-auto bg-raised border border-border-1 rounded-xl shadow-lg z-[100] animate-pop">
+          <div class="flex items-center gap-2.5 px-3.5 py-3 border-b border-border-2">
+            <div class="text-[13px] font-semibold text-fg-1">ESPHome API clients</div>
+            <div class="flex-1"></div>
+            <div class="text-[11px] text-fg-3">{@count} connected</div>
+          </div>
+
+          <div
+            :if={@clients == []}
+            class="px-4 py-5 text-[13px] text-fg-3 leading-relaxed"
+          >
+            Nothing is talking to the proxy over the native API yet. Add this device to Home
+            Assistant or another ESPHome client to start streaming.
+          </div>
+
+          <div :if={@clients != []} class="flex flex-col">
+            <div
+              :for={{c, i} <- Enum.with_index(@clients)}
+              class={["flex flex-col gap-2 px-3.5 py-3", i > 0 && "border-t border-border-2"]}
+            >
+              <div class="flex items-baseline gap-2">
+                <div class="text-[13px] font-semibold text-fg-1">{c.name}</div>
+                <div class="text-[11px] text-fg-3">
+                  {c.kind}{if c.version, do: " · v#{c.version}"}
+                </div>
+                <div class="flex-1"></div>
+                <.badge variant={if c.encrypted?, do: :success, else: :neutral} class="text-[10px]">
+                  {if c.encrypted?, do: "Encrypted", else: "Plaintext"}
+                </.badge>
+              </div>
+              <div class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[11px] text-fg-2">
+                <span class="text-fg-3">Address</span>
+                <span class="font-mono">{c.peer}</span>
+                <span class="text-fg-3">Connected</span>
+                <span>{c.since} · last packet {c.last_seen}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    """
+  end
 end

@@ -1,13 +1,26 @@
 defmodule UniversalProxyWeb.SecurityLive do
   @moduledoc """
-  Security tab — ESPHome native API encryption.
+  Security tab — ESPHome Native API encryption and SSH access.
 
-  Encryption is opt-in, off by default. Flipping the toggle on generates
-  a fresh 32-byte base64 key (kept in socket assigns for now — real
-  storage will land with the encryption-key backend).
+  Encryption is connection-driven, not a manual toggle. The native API
+  starts in **plaintext**; the first time Home Assistant connects it
+  provisions a 32-byte Noise pre-shared key, which `ESPHome.PskStore`
+  persists. From then on the session is encrypted and the key is retained
+  (it survives reboots via DETS). The page reads the current key from
+  `PskStore` and subscribes to its PubSub topic, so it flips to "Enforced"
+  live the moment HA provisions.
+
+  The only manual control is **Reset**: it clears the persisted key and
+  restarts the ESPHome subtree, returning the proxy to plaintext so the next
+  client re-negotiates a fresh encrypted session. The device never mints a
+  key; encrypted ⇔ a key is present.
+
+  The SSH access card (private-key download + fingerprint) is independent.
   """
 
   use UniversalProxyWeb, :live_view
+
+  require Logger
 
   # Filename suggested to the browser for the downloaded private key, and the
   # `-i` identity referenced in the login command shown on the card.
@@ -16,24 +29,33 @@ defmodule UniversalProxyWeb.SecurityLive do
   import UniversalProxyWeb.Components.UI
   import UniversalProxyWeb.Components.Icons
 
+  alias UniversalProxy.ESPHome.PskStore
   alias UniversalProxy.SSHAccess
-  alias UniversalProxyWeb.MockData
 
   @impl true
   def mount(_params, _session, socket) do
-    initial = %{enc_enabled: false, api_key: ""}
+    if connected?(socket),
+      do: Phoenix.PubSub.subscribe(UniversalProxy.PubSub, PskStore.topic())
 
     {:ok,
      socket
      |> assign(:page_title, "Security")
-     |> assign(:sec, initial)
-     |> assign(:original, initial)
+     |> assign(:psk, current_psk())
      |> assign(:show_key, false)
      |> assign(:copied, nil)
+     |> assign(:pending_reset, false)
      |> assign(:ssh_fingerprint, ssh_fingerprint())
      |> assign(:ssh_key_type, SSHAccess.key_type())
      |> assign(:ssh_command, ssh_command())
      |> assign(:ssh_copied, false)}
+  end
+
+  # Tolerate the PSK store being momentarily down (e.g. restarting after a
+  # Reset) so the page renders as plaintext instead of crashing the LiveView.
+  defp current_psk do
+    PskStore.load_psk()
+  catch
+    :exit, _ -> nil
   end
 
   # The login command an operator runs after downloading the private key.
@@ -52,32 +74,14 @@ defmodule UniversalProxyWeb.SecurityLive do
   end
 
   @impl true
-  def handle_event("toggle_enc", _params, socket) do
-    sec =
-      if socket.assigns.sec.enc_enabled do
-        %{socket.assigns.sec | enc_enabled: false}
-      else
-        %{
-          socket.assigns.sec
-          | enc_enabled: true,
-            api_key:
-              if(socket.assigns.sec.api_key == "",
-                do: MockData.generate_api_key(),
-                else: socket.assigns.sec.api_key
-              )
-        }
-      end
-
-    {:noreply, assign(socket, :sec, sec)}
-  end
-
-  def handle_event("regenerate_key", _params, socket) do
-    sec = %{socket.assigns.sec | api_key: MockData.generate_api_key()}
-    {:noreply, assign(socket, :sec, sec)}
-  end
-
   def handle_event("toggle_show_key", _params, socket) do
     {:noreply, assign(socket, :show_key, !socket.assigns.show_key)}
+  end
+
+  # Guard against a stale client event arriving after the key was cleared
+  # server-side: Base.encode64(nil) would crash the LiveView.
+  def handle_event("copy_key", _params, %{assigns: %{psk: nil}} = socket) do
+    {:noreply, socket}
   end
 
   def handle_event("copy_key", _params, socket) do
@@ -86,7 +90,41 @@ defmodule UniversalProxyWeb.SecurityLive do
     {:noreply,
      socket
      |> assign(:copied, true)
-     |> push_event("copy", %{text: socket.assigns.sec.api_key})}
+     |> push_event("copy", %{text: Base.encode64(socket.assigns.psk)})}
+  end
+
+  def handle_event("reset_request", _params, socket) do
+    {:noreply, assign(socket, :pending_reset, true)}
+  end
+
+  def handle_event("cancel_reset", _params, socket) do
+    {:noreply, assign(socket, :pending_reset, false)}
+  end
+
+  def handle_event("confirm_reset", _params, socket) do
+    # Clear the persisted key, then restart the ESPHome subtree so it
+    # re-reads device_config with no PSK (plaintext, awaiting a fresh
+    # provision). A tagged {:error, _} from either step (e.g. a DETS write
+    # failure or a failed child restart) must surface as an error flash, not
+    # the success path.
+    with :ok <- PskStore.clear(),
+         {:ok, _pid} <- UniversalProxy.ESPHome.Supervisor.restart() do
+      {:noreply,
+       socket
+       |> assign(:pending_reset, false)
+       |> assign(:psk, nil)
+       |> assign(:show_key, false)
+       |> put_flash(
+         :info,
+         "Encryption reset. The next client to connect starts a fresh encrypted session."
+       )}
+    else
+      other ->
+        Logger.error("ESPHome encryption reset failed: #{inspect(other)}")
+        {:noreply, reset_failed(socket)}
+    end
+  catch
+    :exit, _ -> {:noreply, reset_failed(socket)}
   end
 
   def handle_event("copy_fingerprint", _params, socket) do
@@ -115,18 +153,17 @@ defmodule UniversalProxyWeb.SecurityLive do
        put_flash(socket, :error, "SSH key service is unavailable — try again in a moment.")}
   end
 
-  def handle_event("save", _params, socket) do
-    {:noreply,
-     socket
-     |> assign(:original, socket.assigns.sec)
-     |> put_flash(:info, "Saved. Encryption settings are live.")}
-  end
-
-  def handle_event("discard", _params, socket) do
-    {:noreply, assign(socket, :sec, socket.assigns.original)}
+  defp reset_failed(socket) do
+    socket
+    |> assign(:pending_reset, false)
+    |> put_flash(:error, "Couldn't reset encryption — try again in a moment.")
   end
 
   @impl true
+  def handle_info({:esphome_psk, psk}, socket) do
+    {:noreply, assign(socket, :psk, psk)}
+  end
+
   def handle_info(:reset_copied, socket) do
     {:noreply, assign(socket, :copied, false)}
   end
@@ -139,19 +176,7 @@ defmodule UniversalProxyWeb.SecurityLive do
 
   @impl true
   def render(assigns) do
-    enabled = assigns.sec.enc_enabled
-    dirty = assigns.sec != assigns.original
-
-    save_msg =
-      if enabled,
-        do: "Connected clients will be disconnected on save.",
-        else: "Encryption will be turned off on save — clients can connect without a key."
-
-    assigns =
-      assigns
-      |> assign(:enabled, enabled)
-      |> assign(:dirty, dirty)
-      |> assign(:save_msg, save_msg)
+    assigns = assign(assigns, :encrypted, assigns.psk != nil)
 
     ~H"""
     <div class="max-w-[720px] mx-auto">
@@ -159,8 +184,8 @@ defmodule UniversalProxyWeb.SecurityLive do
         <.eyebrow>Security</.eyebrow>
         <h2 class="text-xl font-semibold mt-1 mb-1.5 text-fg-1">Keep the proxy locked down</h2>
         <p class="text-base text-fg-2 m-0">
-          The native API can run encrypted or in the clear. We recommend turning encryption on
-          for any network you don't fully trust.
+          The native API encrypts itself automatically once Home Assistant connects. Below you can
+          copy the active key or reset back to plaintext for a fresh negotiation.
         </p>
       </div>
 
@@ -168,38 +193,24 @@ defmodule UniversalProxyWeb.SecurityLive do
         <div class="flex items-start gap-4">
           <div class={[
             "w-9 h-9 rounded-sm flex items-center justify-center flex-none",
-            if(@enabled, do: "bg-accent-soft text-accent", else: "bg-sunken text-fg-3")
+            if(@encrypted, do: "bg-accent-soft text-accent", else: "bg-sunken text-fg-3")
           ]}>
             <.icon name={:lock} size={18} />
           </div>
           <div class="flex-1">
             <div class="text-base font-semibold">API encryption</div>
             <div class="text-sm text-fg-3 mt-0.5">
-              {if @enabled,
+              {if @encrypted,
                 do: "Native API traffic is encrypted with a 32-byte pre-shared key.",
                 else: "Off by default. Native API traffic is sent in the clear on your LAN."}
             </div>
           </div>
-          <.badge :if={@enabled} variant={:success} dot>Enforced</.badge>
-          <.badge :if={!@enabled} variant={:neutral} dot>Off</.badge>
+          <.badge :if={@encrypted} variant={:success} dot>Enforced</.badge>
+          <.badge :if={!@encrypted} variant={:neutral} dot>Off</.badge>
         </div>
 
-        <div class="mt-4 flex items-center gap-3 px-3.5 py-3 border border-border-1 rounded-md">
-          <.toggle checked={@enabled} phx-click="toggle_enc" />
-          <div class="flex-1 min-w-0">
-            <div class="text-sm font-semibold">
-              {if @enabled, do: "Encryption is on", else: "Enable encryption"}
-            </div>
-            <div class="text-sm text-fg-3 mt-0.5">
-              {if @enabled,
-                do: "Clients must present the key below to connect.",
-                else: "We'll generate a fresh 32-byte key for you to paste into Home Assistant."}
-            </div>
-          </div>
-        </div>
-
-        <div :if={@enabled}>
-          <div class="mt-3.5 text-sm font-semibold text-fg-2">Pre-shared key</div>
+        <div :if={@encrypted}>
+          <div class="mt-4 text-sm font-semibold text-fg-2">Pre-shared key</div>
           <div class="text-sm text-fg-3 mt-0.5 mb-2">
             Paste into <span class="font-mono">api: encryption: key:</span>
             in your Home Assistant config.
@@ -208,7 +219,7 @@ defmodule UniversalProxyWeb.SecurityLive do
             <input
               type={if @show_key, do: "text", else: "password"}
               readonly
-              value={@sec.api_key}
+              value={Base.encode64(@psk)}
               class="flex-1 h-9 px-3 rounded-md text-xs font-mono outline-none bg-sunken text-fg-2 border border-border-strong"
             />
             <.button variant={:secondary} size={:sm} phx-click="toggle_show_key">
@@ -217,27 +228,29 @@ defmodule UniversalProxyWeb.SecurityLive do
             <.button variant={:secondary} size={:sm} phx-click="copy_key">
               <.icon name={:check} size={14} /> {if @copied, do: "Copied", else: "Copy"}
             </.button>
-            <.button variant={:ghost} size={:sm} phx-click="regenerate_key">
-              <.icon name={:refresh} size={14} /> Regenerate
-            </.button>
           </div>
-          <div class="mt-2.5 px-3 py-2.5 bg-warning-soft text-warning rounded-sm text-sm flex gap-2 items-start">
-            <.icon name={:alert} size={14} stroke={2.0} />
-            <span class="text-fg-1">
-              Regenerating this key will disconnect Home Assistant. You'll need to paste the new
-              value into your ESPHome config and reload.
-            </span>
+
+          <div class="mt-4 pt-4 border-t border-border-2 flex items-start gap-3">
+            <div class="flex-1">
+              <div class="text-[13px] font-semibold text-fg-1">Reset encryption</div>
+              <div class="text-sm text-fg-3 mt-0.5">
+                Clears the key and returns the proxy to plaintext, ready for a fresh connection.
+              </div>
+            </div>
+            <.button variant={:danger} size={:sm} phx-click="reset_request">
+              <.icon name={:refresh} size={14} /> Reset
+            </.button>
           </div>
         </div>
 
         <div
-          :if={!@enabled}
-          class="mt-3.5 px-3 py-2.5 bg-sunken rounded-sm text-sm flex gap-2 items-start text-fg-2"
+          :if={!@encrypted}
+          class="mt-4 px-3 py-2.5 bg-sunken rounded-sm text-sm flex gap-2 items-start text-fg-2"
         >
           <.icon name={:info} size={14} stroke={2.0} />
           <span>
-            Fine for trusted home networks and first-run setup. Turn it on before exposing the
-            proxy beyond your LAN.
+            Native API traffic is in the clear on your LAN until the first client connects.
+            Encryption turns on automatically as soon as Home Assistant connects — no key to paste.
           </span>
         </div>
       </.card>
@@ -280,7 +293,24 @@ defmodule UniversalProxyWeb.SecurityLive do
         </div>
       </.card>
 
-      <.save_bar dirty={@dirty} msg={@save_msg} />
+      <.modal
+        open={@pending_reset}
+        on_close="cancel_reset"
+        title="Reset API encryption?"
+        subtitle="Home Assistant will disconnect, then re-negotiate."
+      >
+        <p class="text-sm text-fg-2 m-0">
+          This deletes the current pre-shared key and drops the native API back to plaintext. Home
+          Assistant will disconnect, then re-negotiate a brand-new encrypted session the next time
+          it connects.
+        </p>
+        <:footer>
+          <.button variant={:ghost} size={:sm} phx-click="cancel_reset">Cancel</.button>
+          <.button variant={:danger} size={:sm} phx-click="confirm_reset">
+            Reset encryption
+          </.button>
+        </:footer>
+      </.modal>
     </div>
     """
   end

@@ -211,11 +211,6 @@ defmodule UniversalProxyWeb.MockData do
   def port_status(%{in_use: true}), do: %{label: "Active", variant: :success}
   def port_status(_), do: %{label: "Idle", variant: :warning}
 
-  @doc "Generate a fake but believable 32-byte API key in base64."
-  def generate_api_key do
-    32 |> :crypto.strong_rand_bytes() |> Base.encode64()
-  end
-
   @doc "Seed a few sample traffic frames for the Traffic tab."
   def seed_traffic do
     Enum.map(0..17, &sample_frame(&1))
