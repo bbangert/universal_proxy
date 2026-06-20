@@ -1,6 +1,8 @@
 defmodule UniversalProxyWeb.Layouts do
   use UniversalProxyWeb, :html
 
+  import UniversalProxyWeb.Components.UI
+
   embed_templates("layouts/*")
 
   @doc "A single tab link in the top tab strip."

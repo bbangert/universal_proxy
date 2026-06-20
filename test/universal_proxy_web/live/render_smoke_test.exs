@@ -10,6 +10,10 @@ defmodule UniversalProxyWeb.RenderSmokeTest do
   @endpoint UniversalProxyWeb.Endpoint
 
   setup do
+    # The Security tab reads the global ESPHome PSK store; ensure a plaintext
+    # baseline so the smoke assertions don't see a key left in the on-disk
+    # DETS by a prior run.
+    UniversalProxy.ESPHome.PskStore.clear()
     {:ok, conn: Phoenix.ConnTest.build_conn()}
   end
 
@@ -77,11 +81,11 @@ defmodule UniversalProxyWeb.RenderSmokeTest do
     end
   end
 
-  test "Security toggle generates a key when turned on", %{conn: conn} do
-    {:ok, view, _html} = live(conn, "/security")
+  test "Security tab shows the connection-driven plaintext info panel", %{conn: conn} do
+    {:ok, _view, html} = live(conn, "/security")
 
-    html = view |> element("button[role=switch]") |> render_click()
-    assert html =~ "Encryption is on"
-    assert html =~ "Pre-shared key"
+    # No manual toggle anymore: plaintext until a client provisions a key.
+    assert html =~ "turns on automatically"
+    refute html =~ "role=\"switch\""
   end
 end

@@ -21,8 +21,10 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   alias UniversalProxy.ESPHome.{
     BluetoothProxy,
     BluetoothScanner,
+    Clients,
     ConfigStore,
     Infrared,
+    PskStore,
     SerialProxy,
     ZWaveProxy
   }
@@ -57,7 +59,16 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   @impl true
   def init(_init_arg) do
     zwave_port_path = resolve_zwave_port()
-    device_config = ConfigStore.device_config_opts()
+
+    # Seed the persisted PSK into device_config so a previously
+    # HA-provisioned key survives restart/reboot. accepts_key_provisioning
+    # is opened only while keyless: once a key exists, no LAN client can
+    # re-provision (espex's own documented idiom).
+    psk = PskStore.load_psk()
+
+    device_config =
+      ConfigStore.device_config_opts()
+      |> Keyword.merge(psk: psk, accepts_key_provisioning: psk == nil)
 
     espex_opts =
       [
@@ -65,7 +76,9 @@ defmodule UniversalProxy.ESPHome.Supervisor do
         serial_proxy: SerialProxy,
         zwave_proxy: ZWaveProxy,
         infrared_proxy: Infrared.Server,
-        mdns: Espex.Mdns.MdnsLite
+        mdns: Espex.Mdns.MdnsLite,
+        psk_store: PskStore,
+        connection_listener: Clients
       ] ++ bluetooth_opts()
 
     children = [

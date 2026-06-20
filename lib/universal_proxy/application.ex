@@ -35,6 +35,10 @@ defmodule UniversalProxy.Application do
         UniversalProxy.FMA120.Supervisor,
         # ESPHome device identity store (DETS)
         UniversalProxy.ESPHome.ConfigStore,
+        # ESPHome Noise PSK store (DETS). Sits beside ConfigStore at the
+        # top level so a restart/0 of the ESPHome subtree never closes its
+        # DETS file. Holds the HA-provisioned API encryption key.
+        UniversalProxy.ESPHome.PskStore,
         # Firmware update flow (ConfigStore + library Supervisor, wired
         # together so the snapshot lands before the library starts).
         UniversalProxy.FirmwareUpdate,
