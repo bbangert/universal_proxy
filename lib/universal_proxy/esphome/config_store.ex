@@ -32,7 +32,11 @@ defmodule UniversalProxy.ESPHome.ConfigStore do
     # project" value.
     project_name: "bbangert.universal_proxy",
     project_version: "0.1.0",
-    port: @default_port
+    port: @default_port,
+    # Web UI port advertised to Home Assistant so it shows the "Visit
+    # device" link (configuration_url = http://<host>:<webserver_port>).
+    # The device serves its LiveView UI on port 80; 0 would hide the link.
+    webserver_port: 80
   }
 
   @config_fields Map.keys(@defaults) ++ [:mac_address, :compilation_time]
@@ -126,7 +130,7 @@ defmodule UniversalProxy.ESPHome.ConfigStore do
 
   def handle_call(:current, _from, state) do
     overrides = read_overrides(state.table)
-    {:reply, Map.merge(@defaults, overrides), state}
+    {:reply, Map.merge(runtime_defaults(), overrides), state}
   end
 
   def handle_call({:put, updates}, _from, state) do
@@ -162,9 +166,25 @@ defmodule UniversalProxy.ESPHome.ConfigStore do
   defp build_opts(state) do
     overrides = read_overrides(state.table)
 
-    @defaults
+    runtime_defaults()
     |> Map.merge(overrides)
     |> Map.to_list()
+  end
+
+  # Defaults with `project_version` resolved at runtime to the actual
+  # firmware version, so Home Assistant's device-card firmware matches the
+  # `firmware_version` diagnostic sensor. The static `@defaults` value is
+  # kept only as a fallback when the firmware version can't be read. A user
+  # override (from the config form) still wins via the later `Map.merge`.
+  defp runtime_defaults do
+    %{@defaults | project_version: firmware_version()}
+  end
+
+  defp firmware_version do
+    case UniversalProxy.System.firmware_info() do
+      %{version: v} when is_binary(v) and v != "" and v != "—" -> v
+      _ -> @defaults.project_version
+    end
   end
 
   defp read_overrides(table) do

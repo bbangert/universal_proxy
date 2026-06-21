@@ -161,4 +161,19 @@ defmodule UniversalProxy.ESPHome.ConfigStoreTest do
       assert Keyword.fetch!(opts, :port) == 6053
     end
   end
+
+  describe "project_version tracks the firmware version" do
+    test "default project_version equals System.firmware_info().version", %{server: server} do
+      # So HA's device-card firmware matches the `firmware_version`
+      # diagnostic sensor instead of a stale hardcoded value.
+      fw = UniversalProxy.System.firmware_info().version
+      assert ConfigStore.current(server).project_version == fw
+      assert Keyword.fetch!(ConfigStore.device_config_opts(server), :project_version) == fw
+    end
+
+    test "an explicit override still wins over the firmware default", %{server: server} do
+      :ok = ConfigStore.put(server, project_version: "9.9.9")
+      assert ConfigStore.current(server).project_version == "9.9.9"
+    end
+  end
 end

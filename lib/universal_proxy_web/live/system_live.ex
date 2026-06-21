@@ -41,6 +41,7 @@ defmodule UniversalProxyWeb.SystemLive do
      |> assign(:log_since, since)
      |> assign(:rebooting, false)
      |> assign(:confirm_reboot, false)
+     |> assign(:confirm_factory_reset, false)
      |> assign(:fw_update, FirmwareUpdate.state())
      |> assign(:show_fw_actions, @show_fw_actions)
      |> assign(:show_release_notes, false)}
@@ -98,15 +99,24 @@ defmodule UniversalProxyWeb.SystemLive do
     {:noreply, assign(socket, :show_release_notes, false)}
   end
 
-  def handle_event("factory_reset", _params, socket) do
-    # No factory-reset path implemented yet; surface that explicitly
-    # rather than pretending the button works.
+  def handle_event("factory_reset_clicked", _params, socket) do
+    {:noreply, assign(socket, :confirm_factory_reset, true)}
+  end
+
+  def handle_event("cancel_factory_reset", _params, socket) do
+    {:noreply, assign(socket, :confirm_factory_reset, false)}
+  end
+
+  def handle_event("confirm_factory_reset", _params, socket) do
+    # Schedule a beat later so the flash + UI state render before the
+    # wipe + reboot take the BEAM down.
+    Process.send_after(self(), :do_factory_reset, 400)
+
     {:noreply,
-     put_flash(
-       socket,
-       :error,
-       "Factory reset isn't wired up yet. SSH in and clear /data manually if you really need it."
-     )}
+     socket
+     |> assign(:confirm_factory_reset, false)
+     |> assign(:rebooting, true)
+     |> put_flash(:info, "Factory reset in progress — wiping data and rebooting.")}
   end
 
   @impl true
@@ -130,6 +140,11 @@ defmodule UniversalProxyWeb.SystemLive do
 
   def handle_info(:do_reboot, socket) do
     Sys.reboot()
+    {:noreply, socket}
+  end
+
+  def handle_info(:do_factory_reset, socket) do
+    Sys.factory_reset()
     {:noreply, socket}
   end
 
@@ -340,7 +355,9 @@ defmodule UniversalProxyWeb.SystemLive do
                 Wipes settings, keys, and paired Z-Wave network. Can't be undone.
               </div>
             </div>
-            <.button variant={:danger} size={:sm} phx-click="factory_reset">Reset…</.button>
+            <.button variant={:danger} size={:sm} phx-click="factory_reset_clicked" disabled={@rebooting}>
+              Reset…
+            </.button>
           </div>
         </div>
       </.card>
@@ -355,6 +372,20 @@ defmodule UniversalProxyWeb.SystemLive do
       <:footer>
         <.button variant={:ghost} size={:sm} phx-click="cancel_reboot">Cancel</.button>
         <.button variant={:primary} size={:sm} phx-click="confirm_reboot">Reboot now</.button>
+      </:footer>
+    </.modal>
+
+    <.modal
+      open={@confirm_factory_reset}
+      on_close="cancel_factory_reset"
+      title="Factory reset the proxy?"
+      subtitle="Wipes ALL settings, encryption keys, SSH identity, and paired networks, then reboots. Home Assistant will have to re-adopt the device. This can't be undone."
+    >
+      <:footer>
+        <.button variant={:ghost} size={:sm} phx-click="cancel_factory_reset">Cancel</.button>
+        <.button variant={:danger} size={:sm} phx-click="confirm_factory_reset">
+          Erase everything
+        </.button>
       </:footer>
     </.modal>
 

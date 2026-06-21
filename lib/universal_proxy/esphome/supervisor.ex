@@ -23,6 +23,7 @@ defmodule UniversalProxy.ESPHome.Supervisor do
     BluetoothScanner,
     Clients,
     ConfigStore,
+    EntityProvider,
     Infrared,
     PskStore,
     SerialProxy,
@@ -78,12 +79,19 @@ defmodule UniversalProxy.ESPHome.Supervisor do
         infrared_proxy: Infrared.Server,
         mdns: Espex.Mdns.MdnsLite,
         psk_store: PskStore,
-        connection_listener: Clients
+        connection_listener: Clients,
+        entity_provider: EntityProvider
       ] ++ bluetooth_opts()
 
     children = [
       {ZWaveProxy, port_path: zwave_port_path},
       Infrared.Supervisor,
+      # Must start BEFORE Espex (rest_for_one): Espex calls
+      # EntityProvider.list_entities/0 at connection-accept time, and a
+      # provider crash should restart Espex so clients re-read entities.
+      # Pushes go to the default Espex.Server name (espex_opts sets no
+      # :server_name).
+      {EntityProvider, server: Espex.Server},
       {Espex, espex_opts}
     ]
 
