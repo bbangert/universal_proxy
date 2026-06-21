@@ -9,6 +9,8 @@ defmodule UniversalProxy.System do
   sysfs file, optional dep absent).
   """
 
+  require Logger
+
   # These modules only exist on Nerves targets / when their apps are
   # running. Reference them at compile time without warning; runtime
   # `Code.ensure_loaded?` checks gate every call.
@@ -143,7 +145,11 @@ defmodule UniversalProxy.System do
 
   # -- Uptime ---------------------------------------------------------
 
-  defp uptime_seconds do
+  @doc """
+  Seconds since the BEAM started (a proxy for device uptime).
+  """
+  @spec uptime_seconds() :: non_neg_integer()
+  def uptime_seconds do
     {ms, _} = :erlang.statistics(:wall_clock)
     div(ms, 1000)
   end
@@ -311,6 +317,210 @@ defmodule UniversalProxy.System do
     end
   end
 
+  # ── Wi-Fi / network type ───────────────────────────────────────────
+  #
+  # ⚠ SPIKE (confirmed against deps/vintage_net_wifi 0.12.8): the current
+  # association is published at `["interface", ifname, "wifi", "current_ap"]`
+  # as a `%VintageNetWiFi.AccessPoint{}` (fields `:ssid`, `:signal_dbm`)
+  # when associated, and `nil` when not. Cannot be HW-validated on the
+  # Ethernet-only rpi3 testbed — verify on a real Wi-Fi unit.
+
+  @wifi_ifname "wlan0"
+
+  @doc """
+  Current Wi-Fi association as `%{ssid, rssi_dbm}`, or `nil` when the
+  device is not associated (Ethernet/disconnected, or no Wi-Fi support).
+
+  ## Options (for tests)
+
+    * `:vintage_get` — 1-arity fun replacing the VintageNet property read
+    * `:wifi_ifname` — interface name (default `"wlan0"`)
+  """
+  @spec wifi_info(keyword()) :: %{ssid: String.t(), rssi_dbm: integer()} | nil
+  def wifi_info(opts \\ []) do
+    get = Keyword.get(opts, :vintage_get, &vintage_get/1)
+    ifname = Keyword.get(opts, :wifi_ifname, @wifi_ifname)
+
+    case get.(["interface", ifname, "wifi", "current_ap"]) do
+      %{ssid: ssid, signal_dbm: dbm} when is_binary(ssid) and ssid != "" and is_integer(dbm) ->
+        %{ssid: ssid, rssi_dbm: dbm}
+
+      _ ->
+        nil
+    end
+  end
+
+  @doc """
+  Active network medium: `:ethernet`, `:wifi`, or `:disconnected`.
+
+  Picks the first interface that VintageNet reports as connected
+  (`:internet` preferred, else `:lan`) and classifies it by name.
+
+  ## Options (for tests)
+
+    * `:vintage_get` — 1-arity fun replacing the VintageNet property read
+    * `:interfaces` — list of interface names (default `VintageNet.all_interfaces/0`)
+  """
+  @spec network_type(keyword()) :: :ethernet | :wifi | :disconnected
+  def network_type(opts \\ []) do
+    get = Keyword.get(opts, :vintage_get, &vintage_get/1)
+    interfaces = Keyword.get_lazy(opts, :interfaces, &vintage_interfaces/0)
+
+    active =
+      Enum.find(interfaces, fn iface ->
+        get.(["interface", iface, "connection"]) in [:internet, :lan]
+      end)
+
+    cond do
+      is_nil(active) -> :disconnected
+      String.starts_with?(active, "wlan") -> :wifi
+      true -> :ethernet
+    end
+  end
+
+  defp vintage_get(path) do
+    if Code.ensure_loaded?(VintageNet), do: VintageNet.get(path), else: nil
+  end
+
+  defp vintage_interfaces do
+    if Code.ensure_loaded?(VintageNet), do: VintageNet.all_interfaces(), else: []
+  end
+
+  # ── Raw metrics (numeric, for the ESPHome EntityProvider) ──────────
+  #
+  # `health/1` above returns DISPLAY STRINGS ("47.2 °C", "812 / 1024 MB",
+  # "—"). Home Assistant sensors need raw numbers, so these accessors
+  # parse the same sources into numerics (or `nil` when unavailable).
+  # The display path is left untouched to avoid web-UI regressions; the
+  # small amount of parse duplication is deliberate.
+
+  @thermal_path "/sys/class/thermal/thermal_zone0/temp"
+  @meminfo_path "/proc/meminfo"
+  @loadavg_path "/proc/loadavg"
+  @data_path "/data"
+
+  @doc """
+  Numeric system metrics for the ESPHome diagnostic sensors. Each value
+  is a number or `nil` (not `"—"`) when its source is unavailable.
+
+  Memory and data-storage are reported as **percent used** (0–100).
+  `boot_time_unix` is the Unix epoch (seconds) the device booted,
+  recomputed each call so it self-corrects after the Nerves NTP
+  clock-step.
+
+  ## Options (for tests — inject fixture paths)
+
+    * `:thermal_path`, `:meminfo_path`, `:loadavg_path` — sysfs/proc files
+    * `:data_path` — partition passed to `df` for storage usage
+  """
+  @spec metrics(keyword()) :: %{
+          cpu_temp_c: float() | nil,
+          mem_used_pct: non_neg_integer() | nil,
+          load1: float() | nil,
+          data_used_pct: non_neg_integer() | nil,
+          boot_time_unix: integer()
+        }
+  def metrics(opts \\ []) do
+    %{
+      cpu_temp_c: read_cpu_temp_c(Keyword.get(opts, :thermal_path, @thermal_path)),
+      mem_used_pct: read_mem_used_pct(Keyword.get(opts, :meminfo_path, @meminfo_path)),
+      load1: read_load1(Keyword.get(opts, :loadavg_path, @loadavg_path)),
+      data_used_pct: read_data_used_pct(Keyword.get(opts, :data_path, @data_path)),
+      boot_time_unix: boot_time_unix()
+    }
+  end
+
+  @doc """
+  Unix epoch (seconds) at which the device booted: now minus uptime.
+  """
+  @spec boot_time_unix() :: integer()
+  def boot_time_unix do
+    System.system_time(:second) - uptime_seconds()
+  end
+
+  defp read_cpu_temp_c(path) do
+    case File.read(path) do
+      {:ok, s} -> cpu_temp_c_from(s)
+      _ -> nil
+    end
+  end
+
+  @doc false
+  @spec cpu_temp_c_from(String.t()) :: float() | nil
+  def cpu_temp_c_from(s) do
+    case Integer.parse(String.trim(s)) do
+      {millic, _} -> Float.round(millic / 1000, 1)
+      _ -> nil
+    end
+  end
+
+  defp read_mem_used_pct(path) do
+    case File.read(path) do
+      {:ok, s} -> mem_used_pct_from(parse_meminfo(s))
+      _ -> nil
+    end
+  end
+
+  @doc false
+  @spec mem_used_pct_from(map()) :: non_neg_integer() | nil
+  def mem_used_pct_from(fields) do
+    total_kb = Map.get(fields, "MemTotal")
+    avail_kb = Map.get(fields, "MemAvailable") || Map.get(fields, "MemFree")
+
+    if is_integer(total_kb) and is_integer(avail_kb) and total_kb > 0 do
+      round((total_kb - avail_kb) / total_kb * 100)
+    end
+  end
+
+  defp read_load1(path) do
+    case File.read(path) do
+      {:ok, s} -> load1_from(s)
+      _ -> nil
+    end
+  end
+
+  @doc false
+  @spec load1_from(String.t()) :: float() | nil
+  def load1_from(s) do
+    with [a | _] <- s |> String.trim() |> String.split(" "),
+         {f, _} <- Float.parse(a) do
+      f
+    else
+      _ -> nil
+    end
+  end
+
+  defp read_data_used_pct(path) do
+    case System.cmd("df", ["-B1", path], stderr_to_stdout: true) do
+      {out, 0} -> data_used_pct_from(out)
+      _ -> nil
+    end
+  rescue
+    _ -> nil
+  end
+
+  @doc false
+  @spec data_used_pct_from(String.t()) :: non_neg_integer() | nil
+  def data_used_pct_from(out) do
+    out
+    |> String.split("\n", trim: true)
+    |> Enum.at(1, "")
+    |> String.split(~r/\s+/, trim: true)
+    |> case do
+      [_fs, total, used, _avail, _pct, _mount] ->
+        with {t, _} <- Integer.parse(total),
+             {u, _} <- Integer.parse(used),
+             true <- t > 0 do
+          round(u / t * 100)
+        else
+          _ -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
   # ── System log ─────────────────────────────────────────────────────
 
   @doc """
@@ -413,6 +623,60 @@ defmodule UniversalProxy.System do
       :ok
     else
       :unavailable
+    end
+  end
+
+  @doc """
+  Factory reset: wipe all persisted state on the writable data
+  partition, then reboot.
+
+  Removes everything under the data root (every DETS store plus the
+  BlueZ runtime dir) so the device returns as if freshly flashed — the
+  API PSK, SSH identity, and audio/bluetooth/UART config are all dropped,
+  forcing Home Assistant to re-adopt. Wiping the whole directory (rather
+  than an enumerated file list) ensures future stores aren't missed.
+
+  **Destructive and irreversible.** Logs a warning and pauses briefly so
+  the log line flushes before the reboot. On host (no data partition)
+  this is a no-op returning `:unavailable`.
+
+  ## Options (for tests)
+
+    * `:data_root` — directory to wipe (default `"/data"`)
+    * `:reboot` — set `false` to skip the reboot (default `true`)
+    * `:sleep_ms` — pre-wipe delay (default `500`)
+  """
+  @spec factory_reset(keyword()) :: :ok | :unavailable
+  def factory_reset(opts \\ []) do
+    data_root = Keyword.get(opts, :data_root, "/data")
+
+    cond do
+      not File.dir?(data_root) ->
+        :unavailable
+
+      # Never wipe a real "/data" mount on a dev host that happens to have
+      # one — the default path is only honoured on a Nerves target. Tests
+      # pass an explicit `:data_root` (a temp dir) and bypass this guard.
+      data_root == "/data" and not function_exported?(Nerves.Runtime, :reboot, 0) ->
+        :unavailable
+
+      true ->
+        Logger.warning("FACTORY RESET requested — wiping #{data_root} and rebooting")
+        Process.sleep(Keyword.get(opts, :sleep_ms, 500))
+        wipe_dir_contents(data_root)
+
+        if Keyword.get(opts, :reboot, true), do: reboot(), else: :ok
+    end
+  end
+
+  # Remove the contents of a directory while keeping the mountpoint.
+  defp wipe_dir_contents(root) do
+    case File.ls(root) do
+      {:ok, entries} ->
+        Enum.each(entries, fn entry -> File.rm_rf(Path.join(root, entry)) end)
+
+      _ ->
+        :ok
     end
   end
 end
