@@ -650,14 +650,22 @@ defmodule UniversalProxy.System do
   def factory_reset(opts \\ []) do
     data_root = Keyword.get(opts, :data_root, "/data")
 
-    if File.dir?(data_root) do
-      Logger.warning("FACTORY RESET requested — wiping #{data_root} and rebooting")
-      Process.sleep(Keyword.get(opts, :sleep_ms, 500))
-      wipe_dir_contents(data_root)
+    cond do
+      not File.dir?(data_root) ->
+        :unavailable
 
-      if Keyword.get(opts, :reboot, true), do: reboot(), else: :ok
-    else
-      :unavailable
+      # Never wipe a real "/data" mount on a dev host that happens to have
+      # one — the default path is only honoured on a Nerves target. Tests
+      # pass an explicit `:data_root` (a temp dir) and bypass this guard.
+      data_root == "/data" and not function_exported?(Nerves.Runtime, :reboot, 0) ->
+        :unavailable
+
+      true ->
+        Logger.warning("FACTORY RESET requested — wiping #{data_root} and rebooting")
+        Process.sleep(Keyword.get(opts, :sleep_ms, 500))
+        wipe_dir_contents(data_root)
+
+        if Keyword.get(opts, :reboot, true), do: reboot(), else: :ok
     end
   end
 

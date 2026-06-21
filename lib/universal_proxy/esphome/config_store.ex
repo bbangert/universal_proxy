@@ -39,7 +39,10 @@ defmodule UniversalProxy.ESPHome.ConfigStore do
     webserver_port: 80
   }
 
-  @config_fields Map.keys(@defaults) ++ [:mac_address, :compilation_time]
+  # `webserver_port` is a fixed system default (the device's web UI port),
+  # not a user-editable field — exclude it so `put/2` can't persist a bogus
+  # (e.g. string) value that would later reach Espex's integer port.
+  @config_fields (Map.keys(@defaults) -- [:webserver_port]) ++ [:mac_address, :compilation_time]
 
   # -- Client API --
 

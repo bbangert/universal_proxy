@@ -176,4 +176,12 @@ defmodule UniversalProxy.ESPHome.ConfigStoreTest do
       assert ConfigStore.current(server).project_version == "9.9.9"
     end
   end
+
+  describe "webserver_port is a fixed default, not persistable" do
+    test "put/2 ignores webserver_port; the default still reaches the opts", %{server: server} do
+      :ok = ConfigStore.put(server, webserver_port: "not-a-port")
+      assert ConfigStore.current(server).webserver_port == 80
+      assert Keyword.fetch!(ConfigStore.device_config_opts(server), :webserver_port) == 80
+    end
+  end
 end
