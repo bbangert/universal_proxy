@@ -147,15 +147,18 @@ jobs:
       - uses: actions/cache@v5
         with:
           path: priv/plts
-          # Include the vendored rebus submodule source in the key: it's a path
-          # dep, so mix.lock doesn't change when it does, and dialyxir won't
-          # refresh a restored PLT for a same-version path dep — a stale PLT then
-          # reports its new exports as a "missing function". The rebus hash is
-          # also in the restore-keys prefix so a rebus change can't fall back to a
-          # stale PLT (forces a fresh build); a mix.lock-only change still reuses it.
-          key: ${{ runner.os }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('deps_local/**/*.ex') }}-${{ hashFiles('mix.lock') }}
+          # Include the vendored path-dep sources (deps_local, e.g. the rebus
+          # submodule) in the key: a path dep doesn't change mix.lock when it
+          # changes, and dialyxir won't refresh a restored PLT for a same-version
+          # path dep — a stale PLT then reports its new exports as a "missing
+          # function". Hash .ex plus mix.exs (dep list / compiler opts) and
+          # .erl/.hrl so a behavior/type change in any vendored source busts it.
+          # The same hash is in the restore-keys prefix so a vendored-dep change
+          # can't fall back to a stale PLT (forces a fresh build); a mix.lock-only
+          # change still reuses the PLT.
+          key: ${{ runner.os }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('deps_local/**/*.ex', 'deps_local/**/mix.exs', 'deps_local/**/*.erl', 'deps_local/**/*.hrl') }}-${{ hashFiles('mix.lock') }}
           restore-keys: |
-            ${{ runner.os }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('deps_local/**/*.ex') }}-
+            ${{ runner.os }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('deps_local/**/*.ex', 'deps_local/**/mix.exs', 'deps_local/**/*.erl', 'deps_local/**/*.hrl') }}-
       - run: mix deps.get
       - run: mix dialyzer --format github
 
