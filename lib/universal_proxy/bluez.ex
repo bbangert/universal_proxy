@@ -174,7 +174,16 @@ defmodule UniversalProxy.Bluez do
       # disturbs the proxy scanning stack, and a bluetoothd/Client restart
       # re-runs reconnect-on-boot.
       {Task.Supervisor, name: UniversalProxy.Bluetooth.AudioManager.TaskSupervisor},
-      UniversalProxy.Bluetooth.AudioManager
+      UniversalProxy.Bluetooth.AudioManager,
+
+      # Improv-over-BLE Wi-Fi provisioning. Its own :one_for_all sub-supervisor
+      # (GattServer + Advert + manager + Task.Supervisor) so the mutually-dependent
+      # processes restart as a unit — a manager crash can't leave the cleartext
+      # GATT app/advert exported without the session timers/disarm logic (see
+      # Improv.Supervisor). Placed LAST here so an Improv fault never disturbs the
+      # proxy scanning/GATT or audio stacks, while a bluetoothd/Client restart
+      # (earlier, :rest_for_one) still rebuilds the whole group.
+      UniversalProxy.Bluez.Improv.Supervisor
     ]
 
     Supervisor.init(children, strategy: :rest_for_one)

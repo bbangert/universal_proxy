@@ -98,4 +98,48 @@ defmodule UniversalProxyWeb.BluetoothLiveTest do
     html = view |> element("button", "Rescan") |> render_click()
     assert html =~ "No Bluetooth radios found"
   end
+
+  describe "Improv Wi-Fi provisioning status row" do
+    defp push_improv(view, status) do
+      Phoenix.PubSub.broadcast(@pubsub, "bluetooth:improv", {:improv_status, status})
+      render(view)
+    end
+
+    test "hidden while disarmed (the default)", %{conn: conn} do
+      {:ok, _view, html} = live(conn, "/bluetooth")
+      refute html =~ "Wi-Fi setup over Bluetooth"
+    end
+
+    test "renders the status across states", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/bluetooth")
+
+      html = push_improv(view, %{state: :advertising, error: nil})
+      assert html =~ "Wi-Fi setup over Bluetooth"
+      assert html =~ "Ready"
+      assert html =~ "improv-wifi.com"
+
+      html = push_improv(view, %{state: :provisioning, error: nil})
+      assert html =~ "Connecting"
+      assert html =~ "Joining the Wi-Fi network"
+
+      html = push_improv(view, %{state: :provisioned, error: nil})
+      assert html =~ "Done"
+      assert html =~ "now online"
+    end
+
+    test "shows the error line on a failed connect", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/bluetooth")
+
+      html = push_improv(view, %{state: :connected, error: :unable_to_connect})
+      assert html =~ "Wi-Fi setup over Bluetooth"
+      assert html =~ "check the password"
+    end
+
+    test "returns to hidden when disarmed again", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/bluetooth")
+
+      assert push_improv(view, %{state: :advertising, error: nil}) =~ "Wi-Fi setup over Bluetooth"
+      refute push_improv(view, %{state: :disarmed, error: nil}) =~ "Wi-Fi setup over Bluetooth"
+    end
+  end
 end

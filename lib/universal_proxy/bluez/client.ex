@@ -131,6 +131,23 @@ defmodule UniversalProxy.Bluez.Client do
   end
 
   @doc """
+  Suspend scanning entirely (disengage the monitor/discovery), preserving the
+  HA-configured mode so `resume_scan/0` restores it. Used by Improv Wi-Fi
+  provisioning: it only runs on a no-connectivity boot, when there is no HA
+  client to consume proxied advertisements anyway — so scanning is pointless
+  (and may degrade the active BLE peripheral connection on a single radio).
+
+  Fire-and-forget cast (the transition runs off-loop); safe to call when the
+  Client isn't running (no-op).
+  """
+  @spec suspend_scan() :: :ok
+  def suspend_scan, do: GenServer.cast(__MODULE__, :suspend_scan)
+
+  @doc "Re-engage the HA-configured scanner mode after `suspend_scan/0`."
+  @spec resume_scan() :: :ok
+  def resume_scan, do: GenServer.cast(__MODULE__, :resume_scan)
+
+  @doc """
   The HA-configured scanner mode (`:passive` default). Pure
   `:persistent_term` read — safe on any target, with or without the Client
   running (host tests, early boot).
@@ -230,34 +247,59 @@ defmodule UniversalProxy.Bluez.Client do
   end
 
   def handle_call({:set_mode, target}, from, state) do
+    {:noreply, transition_to(target, [from], state)}
+  end
+
+  @impl GenServer
+  # Improv provisioning suspends scanning while armed (see suspend_scan/0). `:off`
+  # disengages without overwriting the persisted HA mode, so resume restores it.
+  def handle_cast(:suspend_scan, state) do
+    {:noreply, transition_to(:off, [], state)}
+  end
+
+  def handle_cast(:resume_scan, state) do
+    {:noreply, transition_to(configured_mode(), [], state)}
+  end
+
+  # Shared by set_mode (call, froms = [from]) and suspend/resume (cast, froms = []).
+  defp transition_to(target, froms, state) do
     cond do
       # A transition is running: park behind it. Same-target callers pile
       # into one pending slot and all succeed together; a different target
       # displaces them (latest target wins).
       state.transition != nil ->
-        pending =
-          case state.pending do
-            {^target, froms} ->
-              {target, [from | froms]}
-
-            {_other_target, froms} ->
-              Enum.each(froms, &GenServer.reply(&1, {:error, :superseded}))
-              {target, [from]}
-
-            nil ->
-              {target, [from]}
-          end
-
-        {:noreply, %{state | pending: pending}}
+        merge_pending(state, target, froms)
 
       # Already there (and actually engaged — a failed initial setup leaves
-      # engaged: :none, which falls through and retries).
-      state.mode == target and state.engaged != :none ->
-        {:reply, :ok, state}
+      # engaged: :none, which falls through and retries). `:off` is "there"
+      # when nothing is engaged.
+      state.mode == target and engaged_ok?(target, state.engaged) ->
+        Enum.each(froms, &GenServer.reply(&1, :ok))
+        state
 
       true ->
-        {:noreply, start_transition(state, target, [from])}
+        start_transition(state, target, froms)
     end
+  end
+
+  defp engaged_ok?(:off, engaged), do: engaged == :none
+  defp engaged_ok?(_mode, engaged), do: engaged != :none
+
+  defp merge_pending(state, target, froms) do
+    pending =
+      case state.pending do
+        {^target, existing} ->
+          {target, froms ++ existing}
+
+        {_other_target, existing} ->
+          Enum.each(existing, &GenServer.reply(&1, {:error, :superseded}))
+          {target, froms}
+
+        nil ->
+          {target, froms}
+      end
+
+    %{state | pending: pending}
   end
 
   @impl GenServer
@@ -290,7 +332,9 @@ defmodule UniversalProxy.Bluez.Client do
     state =
       case result do
         {:ok, engaged} ->
-          :persistent_term.put(@mode_key, target)
+          # `:off` (suspend) must NOT overwrite the HA-configured mode — resume
+          # reads it back from here.
+          if target != :off, do: :persistent_term.put(@mode_key, target)
           Enum.each(froms, &GenServer.reply(&1, :ok))
           Logger.info("Bluez.Client: scanner mode #{target} engaged (#{engaged})")
           %{state | mode: target, engaged: engaged}
@@ -394,7 +438,7 @@ defmodule UniversalProxy.Bluez.Client do
   defp run_pending(%{pending: {target, froms}} = state) do
     state = %{state | pending: nil}
 
-    if state.mode == target and state.engaged != :none do
+    if state.mode == target and engaged_ok?(target, state.engaged) do
       Enum.each(froms, &GenServer.reply(&1, :ok))
       state
     else
@@ -423,6 +467,7 @@ defmodule UniversalProxy.Bluez.Client do
 
   defp engaged_for(:passive), do: :monitor
   defp engaged_for(:active), do: :discovery
+  defp engaged_for(:off), do: :none
 
   defp disengage(_conn, :none), do: :ok
 
@@ -441,6 +486,9 @@ defmodule UniversalProxy.Bluez.Client do
       {:error, reason} -> Logger.warning("Bluez.Client: StopDiscovery: #{inspect(reason)}")
     end
   end
+
+  # Suspend: nothing to engage; apply_mode then disengages whatever was running.
+  defp engage(_conn, :off), do: :ok
 
   defp engage(conn, :passive) do
     case register_monitor(conn) do
