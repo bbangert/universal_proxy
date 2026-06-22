@@ -174,7 +174,26 @@ defmodule UniversalProxy.Bluez do
       # disturbs the proxy scanning stack, and a bluetoothd/Client restart
       # re-runs reconnect-on-boot.
       {Task.Supervisor, name: UniversalProxy.Bluetooth.AudioManager.TaskSupervisor},
-      UniversalProxy.Bluetooth.AudioManager
+      UniversalProxy.Bluetooth.AudioManager,
+
+      # Improv-over-BLE Wi-Fi provisioning (own rebus connections per child).
+      # Placed LAST so an Improv fault never restarts the proxy scanning/GATT or
+      # audio stacks, while a bluetoothd/Client restart (earlier) rebuilds it —
+      # the GATT app + advertisement die with bluetoothd. The Task.Supervisor
+      # runs the re-entrant Register{Application,Advertisement} calls (which call
+      # back into our own handlers) off the GenServer loops. GattServer/Advert
+      # come before the manager: it registers and drives them on arm.
+      #
+      # ⚠ These four MUST stay adjacent and last. Registration state lives
+      # per-process (GattServer/Advert hold `registered?`); the manager assumes
+      # all three restart together under :rest_for_one. A child inserted between
+      # GattServer and the manager could crash-restart the manager WITHOUT
+      # restarting GattServer — the manager would re-arm while GattServer still
+      # believes it's registered (but BlueZ may have dropped the GATT app).
+      {Task.Supervisor, name: UniversalProxy.Bluez.Improv.TaskSupervisor},
+      UniversalProxy.Bluez.Improv.GattServer,
+      UniversalProxy.Bluez.Improv.Advert,
+      UniversalProxy.Bluez.Improv
     ]
 
     Supervisor.init(children, strategy: :rest_for_one)

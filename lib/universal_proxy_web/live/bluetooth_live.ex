@@ -45,6 +45,7 @@ defmodule UniversalProxyWeb.BluetoothLive do
 
   alias UniversalProxy.Bluetooth
   alias UniversalProxy.Bluetooth.AudioManager
+  alias UniversalProxy.Bluez.Improv
 
   # Discovered-device list refresh cadence while a pairing scan runs.
   # AudioManager pushes only `{:bt_scan, :stopped}`, but `list_headphones/0`
@@ -63,12 +64,14 @@ defmodule UniversalProxyWeb.BluetoothLive do
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, Bluetooth.radios_topic())
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, @scan_topic)
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, @audio_topic)
+      Phoenix.PubSub.subscribe(UniversalProxy.PubSub, Improv.status_topic())
     end
 
     {:ok,
      socket
      |> assign(:page_title, "Bluetooth")
      |> assign(:status, Bluetooth.status())
+     |> assign(:improv, Improv.status())
      |> assign(:stats, Bluetooth.stats())
      |> assign(:radios, Bluetooth.list_radios())
      |> assign(:roles, Bluetooth.roles())
@@ -322,6 +325,10 @@ defmodule UniversalProxyWeb.BluetoothLive do
     {:noreply, assign(socket, :radios, radios)}
   end
 
+  def handle_info({:improv_status, improv}, socket) do
+    {:noreply, assign(socket, :improv, improv)}
+  end
+
   # A connection change (incl. forget-on-deactivate) refreshes the list.
   def handle_info({:bt_audio, :connection, _mac, _status}, socket) do
     {:noreply, assign(socket, :headphones, AudioManager.list_headphones())}
@@ -472,6 +479,8 @@ defmodule UniversalProxyWeb.BluetoothLive do
 
       <.proxy_card status={@status} stats={@stats} proxy_status={@proxy_status} busy={@busy} />
 
+      <.improv_card :if={@improv.state != :disarmed} improv={@improv} />
+
       <.radios_section
         radios={@radios}
         radio_count={@radio_count}
@@ -591,6 +600,70 @@ defmodule UniversalProxyWeb.BluetoothLive do
     </.card>
     """
   end
+
+  # ── Improv Wi-Fi provisioning status (read-only) ────────────────────────
+  attr(:improv, :map, required: true)
+
+  defp improv_card(assigns) do
+    assigns = assign(assigns, :view, improv_view(assigns.improv))
+
+    ~H"""
+    <.card padding={:none} class="overflow-hidden mb-5">
+      <div class="flex items-start gap-4 p-[20px_22px]">
+        <div class="flex-none w-11 h-11 rounded-[10px] flex items-center justify-center bg-accent-soft text-accent">
+          <.icon name={:bluetooth} size={24} stroke={1.7} />
+        </div>
+
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center gap-2.5">
+            <span class="text-md font-semibold">Wi-Fi setup over Bluetooth</span>
+            <.badge variant={@view.variant} dot>{@view.label}</.badge>
+          </div>
+          <div class="text-xs text-fg-3 mt-1">{@view.hint}</div>
+
+          <div
+            :if={@view.error}
+            class="mt-2 p-[10px_12px] rounded-md bg-warning-soft text-warning text-xs font-medium flex items-center gap-2"
+          >
+            <.icon name={:alert} size={14} stroke={2.0} />
+            {@view.error}
+          </div>
+        </div>
+      </div>
+    </.card>
+    """
+  end
+
+  # Map the Improv status to display label/variant/hint + an optional error line.
+  defp improv_view(%{state: state} = improv) do
+    {label, variant, hint} = improv_state_view(state)
+    %{label: label, variant: variant, hint: hint, error: improv_error(improv[:error])}
+  end
+
+  defp improv_state_view(:advertising),
+    do:
+      {"Ready", :accent,
+       "Discoverable for Wi-Fi setup. Open improv-wifi.com or the Home Assistant app on a nearby phone to add a network."}
+
+  defp improv_state_view(:connected),
+    do: {"Connected", :accent, "A device is connected — choose a Wi-Fi network to continue."}
+
+  defp improv_state_view(:provisioning),
+    do: {"Connecting", :warning, "Joining the Wi-Fi network…"}
+
+  defp improv_state_view(:provisioned),
+    do: {"Done", :success, "Wi-Fi configured — this device is now online."}
+
+  defp improv_state_view(_other),
+    do: {"Setup", :neutral, "Bluetooth Wi-Fi setup is active."}
+
+  defp improv_error(:unable_to_connect),
+    do: "Couldn't connect to that network — check the password and try again."
+
+  defp improv_error(:invalid_rpc), do: "The setup request was invalid."
+  defp improv_error(:unknown_command), do: "Unsupported setup command."
+  defp improv_error(:not_authorized), do: "Setup isn't authorized."
+  defp improv_error(_), do: nil
 
   # ── Radios section ────────────────────────────────────────────────────
   attr(:radios, :list, required: true)
