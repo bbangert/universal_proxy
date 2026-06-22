@@ -245,6 +245,9 @@ defmodule UniversalProxy.Bluez.Improv.Advert do
 
       {:error, reason} = err ->
         Logger.error("Improv.Advert: RegisterAdvertisement failed: #{inspect(reason)}")
+        # The advert never went up, so undo the Pairable=false we set above —
+        # otherwise the adapter is stuck non-pairable for the rest of the boot.
+        set_adapter_prop(conn, "Pairable", {"b", true})
         err
     end
   end

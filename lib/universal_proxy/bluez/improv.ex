@@ -11,7 +11,10 @@ defmodule UniversalProxy.Bluez.Improv do
   ## State machine
 
       :disarmed → :advertising → :connected → :provisioning → :provisioned
-                                                    ↘ :error ↗ (revert to authorized for retry)
+
+  A failed/timed-out connect reverts `:provisioning → :connected` and surfaces the
+  reason via `state.error` (an error byte to the client) — there is no distinct
+  `:error` FSM state.
 
   We always advertise current-state AUTHORIZED until a submit moves us to
   PROVISIONING; security comes from the no-connectivity arm gate + the session
@@ -63,7 +66,7 @@ defmodule UniversalProxy.Bluez.Improv do
 
   @connection_topic ["interface", :_, "connection"]
 
-  @type fsm :: :disarmed | :advertising | :connected | :provisioning | :provisioned | :error
+  @type fsm :: :disarmed | :advertising | :connected | :provisioning | :provisioned
 
   # ── public API ──────────────────────────────────────────────────────────
 
@@ -92,7 +95,7 @@ defmodule UniversalProxy.Bluez.Improv do
   @spec current_state_atom(fsm()) :: atom()
   def current_state_atom(:provisioning), do: :provisioning
   def current_state_atom(:provisioned), do: :provisioned
-  # advertising / connected / error / disarmed all present as AUTHORIZED.
+  # advertising / connected / disarmed all present as AUTHORIZED.
   def current_state_atom(_), do: :authorized
 
   @doc "Improv SSID length rule: 1..32 bytes. Pure."

@@ -5,12 +5,14 @@ defmodule UniversalProxy.Bluez.Improv.Wifi do
   `UniversalProxy.Bluez.Improv` manager calls into.
 
   All VintageNet access is guarded (`Code.ensure_loaded?`) so the module loads on
-  host, and is injectable (`:scan_fn` / `:configure_fn` / `:vintage_get`) so the
-  pure shaping — the configure map, the AP→network mapping, the secured? rule —
+  host, and is injectable (`:scan_trigger` / `:vintage_get` / `:configure_fn`) so
+  the pure shaping — the configure map, the AP→network mapping, the secured? rule —
   is host-tested without a radio.
 
-  `scan_networks/1` wraps `VintageNetWiFi.quick_scan/1`, which **sleeps ~2 s**;
-  the manager calls it from a `Task`, never its own loop.
+  `scan_networks/1` reads the live `access_points` property (kept fresh by
+  `wpa_supplicant`) rather than `VintageNetWiFi.quick_scan/1`, whose fresh-scan +
+  2 s sleep read an empty list mid-scan on hardware. It also kicks an async
+  `VintageNet.scan/1` to refresh the property for the next call.
   """
 
   require Logger
