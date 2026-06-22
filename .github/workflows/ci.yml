@@ -147,9 +147,15 @@ jobs:
       - uses: actions/cache@v5
         with:
           path: priv/plts
-          key: ${{ runner.os }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
+          # Include the vendored rebus submodule source in the key: it's a path
+          # dep, so mix.lock doesn't change when it does, and dialyxir won't
+          # refresh a restored PLT for a same-version path dep — a stale PLT then
+          # reports its new exports as a "missing function". The rebus hash is
+          # also in the restore-keys prefix so a rebus change can't fall back to a
+          # stale PLT (forces a fresh build); a mix.lock-only change still reuses it.
+          key: ${{ runner.os }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('deps_local/**/*.ex') }}-${{ hashFiles('mix.lock') }}
           restore-keys: |
-            ${{ runner.os }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+            ${{ runner.os }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('deps_local/**/*.ex') }}-
       - run: mix deps.get
       - run: mix dialyzer --format github
 
