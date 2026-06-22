@@ -197,7 +197,7 @@ defmodule UniversalProxy.Bluez.Improv.Advert do
     {:stop, {:dbus_connection_down, reason}, state}
   end
 
-  def handle_info({:register_result, :ok}, state), do: {:noreply, state}
+  def handle_info({:register_result, {:ok, _}}, state), do: {:noreply, state}
 
   def handle_info({:register_result, {:error, _reason}}, state) do
     {:noreply, %{state | registered?: false}}
@@ -311,8 +311,12 @@ defmodule UniversalProxy.Bluez.Improv.Advert do
 
     case {hf[:interface], hf[:member]} do
       {@adv_iface, "Release"} ->
-        # BlueZ dropped our advert (adapter reset, etc.). Ack and mark unregistered.
+        # BlueZ dropped our advert (adapter reset, etc.). Ack, restore the adapter
+        # props we changed on register (a later unregister no-ops once
+        # registered? is false, so it can't restore Pairable for us), and mark
+        # unregistered.
         Logger.info("Improv.Advert: BlueZ released the advertisement")
+        set_adapter_prop(conn, "Pairable", {"b", true})
         Rebus.reply(conn, msg)
         %{state | registered?: false}
 

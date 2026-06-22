@@ -308,7 +308,7 @@ defmodule UniversalProxy.Bluez.Improv.GattServer do
 
   # W1: heal the optimistic registered? flag if RegisterApplication actually failed,
   # so a later register/1 retries instead of being skipped by the guard.
-  def handle_info({:register_result, :ok}, state), do: {:noreply, state}
+  def handle_info({:register_result, {:ok, _}}, state), do: {:noreply, state}
 
   def handle_info({:register_result, {:error, _reason}}, state) do
     {:noreply, %{state | registered?: false}}

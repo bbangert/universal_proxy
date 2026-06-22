@@ -176,24 +176,14 @@ defmodule UniversalProxy.Bluez do
       {Task.Supervisor, name: UniversalProxy.Bluetooth.AudioManager.TaskSupervisor},
       UniversalProxy.Bluetooth.AudioManager,
 
-      # Improv-over-BLE Wi-Fi provisioning (own rebus connections per child).
-      # Placed LAST so an Improv fault never restarts the proxy scanning/GATT or
-      # audio stacks, while a bluetoothd/Client restart (earlier) rebuilds it —
-      # the GATT app + advertisement die with bluetoothd. The Task.Supervisor
-      # runs the re-entrant Register{Application,Advertisement} calls (which call
-      # back into our own handlers) off the GenServer loops. GattServer/Advert
-      # come before the manager: it registers and drives them on arm.
-      #
-      # ⚠ These four MUST stay adjacent and last. Registration state lives
-      # per-process (GattServer/Advert hold `registered?`); the manager assumes
-      # all three restart together under :rest_for_one. A child inserted between
-      # GattServer and the manager could crash-restart the manager WITHOUT
-      # restarting GattServer — the manager would re-arm while GattServer still
-      # believes it's registered (but BlueZ may have dropped the GATT app).
-      {Task.Supervisor, name: UniversalProxy.Bluez.Improv.TaskSupervisor},
-      UniversalProxy.Bluez.Improv.GattServer,
-      UniversalProxy.Bluez.Improv.Advert,
-      UniversalProxy.Bluez.Improv
+      # Improv-over-BLE Wi-Fi provisioning. Its own :one_for_all sub-supervisor
+      # (GattServer + Advert + manager + Task.Supervisor) so the mutually-dependent
+      # processes restart as a unit — a manager crash can't leave the cleartext
+      # GATT app/advert exported without the session timers/disarm logic (see
+      # Improv.Supervisor). Placed LAST here so an Improv fault never disturbs the
+      # proxy scanning/GATT or audio stacks, while a bluetoothd/Client restart
+      # (earlier, :rest_for_one) still rebuilds the whole group.
+      UniversalProxy.Bluez.Improv.Supervisor
     ]
 
     Supervisor.init(children, strategy: :rest_for_one)
