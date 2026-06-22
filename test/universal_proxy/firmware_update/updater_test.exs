@@ -203,6 +203,21 @@ defmodule UniversalProxy.FirmwareUpdate.UpdaterTest do
       refute_receive {:fw_update_progress, %{phase: :verifying}}, 50
     end
 
+    test "forwards req_options as a list (never nil) to the client" do
+      # Regression: opts had no :req_options key, so Map.get/2 returned nil and
+      # download_asset received `req_options: nil`, crashing Keyword.merge/2.
+      set_latest({:ok, build_release()})
+      pid = start_updater(verification_required: false)
+
+      :ok = Updater.check(pid)
+      assert_receive {:fw_update_progress, %{phase: :idle}}, 500
+
+      :ok = Updater.install_latest(pid)
+
+      assert_receive {:client_download, _url, _dest, opts}, 500
+      assert is_list(Keyword.get(opts, :req_options))
+    end
+
     test "no signature asset still flashes when verification is disabled" do
       release =
         build_release(
