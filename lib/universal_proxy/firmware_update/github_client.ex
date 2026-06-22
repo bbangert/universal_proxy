@@ -65,7 +65,7 @@ defmodule UniversalProxy.FirmwareUpdate.GithubClient do
 
     req_opts =
       [url: url, headers: headers]
-      |> Keyword.merge(Keyword.get(opts, :req_options, []))
+      |> Keyword.merge(Keyword.get(opts, :req_options) || [])
 
     case Req.request(req_opts) do
       {:ok, %Req.Response{status: 200, body: body, headers: resp_headers}} ->
@@ -125,7 +125,7 @@ defmodule UniversalProxy.FirmwareUpdate.GithubClient do
 
       req_opts =
         [url: asset_url, headers: headers, into: stream_collector(acc)]
-        |> Keyword.merge(Keyword.get(opts, :req_options, []))
+        |> Keyword.merge(Keyword.get(opts, :req_options) || [])
 
       case Req.request(req_opts) do
         {:ok, %Req.Response{status: status}} when status in 200..299 ->
