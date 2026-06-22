@@ -229,9 +229,12 @@ defmodule UniversalProxy.FirmwareUpdate do
   def devpath do
     cond do
       Code.ensure_loaded?(Nerves.Runtime.KV) and
-          function_exported?(Nerves.Runtime.KV, :get_active, 1) ->
-        Nerves.Runtime.KV.get_active("nerves_fw_devpath") ||
-          Nerves.Runtime.KV.get_active("nerves_fw_destination")
+          function_exported?(Nerves.Runtime.KV, :get, 1) ->
+        # nerves_fw_devpath is a global (non-prefixed) U-Boot variable, so it
+        # must be read with get/1 — get_active/1 prepends the active partition
+        # ("a."/"b.") and finds nothing, yielding :missing_devpath at flash time.
+        Nerves.Runtime.KV.get("nerves_fw_devpath") ||
+          Nerves.Runtime.KV.get("nerves_fw_destination")
 
       true ->
         nil
