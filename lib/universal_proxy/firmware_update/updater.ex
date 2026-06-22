@@ -256,7 +256,7 @@ defmodule UniversalProxy.FirmwareUpdate.Updater do
         # need (and shouldn't see) the operator bearer.
         expected_size: Map.get(fw_asset, :size, 0),
         progress: &broadcast_progress(state, &1),
-        req_options: Map.get(opts, :req_options, [])
+        req_options: Map.get(opts, :req_options) || []
       )
 
     with :ok <- fw_dl,
@@ -291,7 +291,7 @@ defmodule UniversalProxy.FirmwareUpdate.Updater do
       # See do_download_install/3 — no bearer on browser_download_url.
       expected_size: Map.get(sig_asset, :size, 64),
       progress: fn _ -> :ok end,
-      req_options: Map.get(opts, :req_options, [])
+      req_options: Map.get(opts, :req_options) || []
     )
   end
 
