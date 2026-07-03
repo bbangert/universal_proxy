@@ -78,7 +78,11 @@ defmodule UniversalProxy.Audio.PlayerTest do
           # Default to no re-announces in existing tests; the dedicated
           # describe block opts back in. Otherwise every test would
           # schedule timers that fire after the test process exits.
-          reannounce_delays_ms: []
+          reannounce_delays_ms: [],
+          # Default to no device suffix so instance-name assertions are
+          # deterministic regardless of whether ConfigStore is running;
+          # the dedicated test opts a real node name back in.
+          device_name_fun: fn -> nil end
         ],
         overrides
       )
@@ -184,6 +188,45 @@ defmodule UniversalProxy.Audio.PlayerTest do
 
       [{:add, service}] = MdnsStub.calls()
       assert service.instance_name == "sendspin"
+    end
+
+    test "mDNS instance_name carries the device node name so devices are distinguishable" do
+      _pid = start_player!(device_name_fun: fn -> "universal-proxy-45099b" end, mdns_port: 18_902)
+
+      assert_receive {:sendspin_state, @key, _started}, 2_000
+
+      [{:add, service}] = MdnsStub.calls()
+      assert service.instance_name == "Headphones (universal-proxy-45099b)"
+      # TXT `name` matches the instance so MA shows the same identifier.
+      assert "name=Headphones (universal-proxy-45099b)" in service.txt_payload
+    end
+  end
+
+  describe "sendspin_instance_name/2" do
+    test "appends the node name as a suffix" do
+      assert Player.sendspin_instance_name("bcm2835 Headphones", "universal-proxy-45099b") ==
+               "bcm2835 Headphones (universal-proxy-45099b)"
+    end
+
+    test "no node name → bare sanitized output name" do
+      assert Player.sendspin_instance_name("bcm2835 Headphones", nil) == "bcm2835 Headphones"
+      assert Player.sendspin_instance_name("bcm2835 Headphones", "") == "bcm2835 Headphones"
+    end
+
+    test "preserves the device suffix within the 63-byte budget by truncating the output" do
+      node = "universal-proxy-45099b"
+      long = String.duplicate("漢", 40)
+
+      name = Player.sendspin_instance_name(long, node)
+
+      assert byte_size(name) <= 63
+      assert String.valid?(name)
+      # The identifying suffix always survives — that's the whole point.
+      assert String.ends_with?(name, " (#{node})")
+    end
+
+    test "blank output name with a node still yields a valid label" do
+      assert Player.sendspin_instance_name("  \t ", "node-x") == "sendspin (node-x)"
     end
 
     test "refuses to start when the binary is missing" do

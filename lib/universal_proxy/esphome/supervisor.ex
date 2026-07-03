@@ -77,7 +77,7 @@ defmodule UniversalProxy.ESPHome.Supervisor do
         serial_proxy: SerialProxy,
         zwave_proxy: ZWaveProxy,
         infrared_proxy: Infrared.Server,
-        mdns: Espex.Mdns.MdnsLite,
+        mdns: UniversalProxy.ESPHome.MdnsAdapter,
         psk_store: PskStore,
         connection_listener: Clients,
         entity_provider: EntityProvider

@@ -85,6 +85,7 @@ defmodule UniversalProxy.Audio.Player do
     :server_url,
     :pubsub,
     :mdns_module,
+    :device_name_fun,
     port: nil,
     mdns_id: nil,
     last_event: %{},
@@ -99,6 +100,7 @@ defmodule UniversalProxy.Audio.Player do
           server_url: String.t() | nil,
           pubsub: module(),
           mdns_module: module(),
+          device_name_fun: (-> String.t() | nil),
           port: port() | nil,
           mdns_id: term(),
           last_event: map(),
@@ -167,6 +169,7 @@ defmodule UniversalProxy.Audio.Player do
     server_url = Keyword.get(opts, :server_url)
     pubsub = Keyword.get(opts, :pubsub, @pubsub)
     mdns_module = Keyword.get(opts, :mdns_module, MdnsLite)
+    device_name_fun = Keyword.get(opts, :device_name_fun, &default_device_name/0)
 
     state = %__MODULE__{
       key: key,
@@ -175,7 +178,8 @@ defmodule UniversalProxy.Audio.Player do
       mdns_port: mdns_port,
       server_url: server_url,
       pubsub: pubsub,
-      mdns_module: mdns_module
+      mdns_module: mdns_module,
+      device_name_fun: device_name_fun
     }
 
     cond do
@@ -443,36 +447,42 @@ defmodule UniversalProxy.Audio.Player do
       :ok
   end
 
-  defp register_mdns(%__MODULE__{key: key, config: cfg, mdns_port: port, mdns_module: mod}) do
+  defp register_mdns(%__MODULE__{
+         key: key,
+         config: cfg,
+         mdns_port: port,
+         mdns_module: mod,
+         device_name_fun: device_name_fun
+       }) do
     friendly_name = Map.fetch!(cfg, :friendly_name)
     client_id = Map.fetch!(cfg, :client_id)
 
-    # Set the mDNS *instance name* to the user-facing friendly name.
-    # Without this, all our `_sendspin._tcp` services share the host's
-    # default instance name (e.g. `nerves-507f._sendspin._tcp.local`),
-    # which means:
+    # Set the mDNS *instance name* to the user-facing output name, suffixed
+    # with the device node name (e.g. `bcm2835 Headphones
+    # (universal-proxy-45099b)`). Two reasons the name carries identity:
     #   1. Music Assistant's python-zeroconf can't distinguish two
-    #      ALSA outputs on the same Pi — they collide on the instance
-    #      name.
-    #   2. Renaming an output doesn't change the instance name, so
-    #      MA's `_handle_service_added` sees no service-instance
-    #      change and its UI keeps showing the old name forever.
-    # By setting instance_name = friendly_name we get a clean
-    # Removed/Added cycle on rename, and the new name lands in MA's
-    # display the next time it processes the Added event.
+    #      ALSA outputs on the same Pi if they share an instance name —
+    #      and identically-named outputs on *different* Pis (the common
+    #      `bcm2835 Headphones`) are indistinguishable without the device
+    #      suffix. The node name disambiguates both.
+    #   2. Renaming an output changes the instance name, giving MA a clean
+    #      Removed/Added cycle so the new name lands in its UI.
     #
-    # `sanitize_instance_name/1` strips control chars and trims; the
-    # mDNS wire format allows arbitrary UTF-8 in instance names, so
+    # `sendspin_instance_name/2` composes the two, preserving the device
+    # suffix within the 63-byte mDNS label budget (the output portion is
+    # truncated first). mDNS allows arbitrary UTF-8 in instance names, so
     # spaces, accents, etc. are fine and don't need escaping.
+    display_name = sendspin_instance_name(friendly_name, safe_device_name(device_name_fun))
+
     service = %{
       id: mdns_service_id(key),
-      instance_name: sanitize_instance_name(friendly_name),
+      instance_name: display_name,
       protocol: "sendspin",
       transport: "tcp",
       port: port,
       txt_payload: [
         "path=/sendspin",
-        "name=#{friendly_name}",
+        "name=#{display_name}",
         "client_id=#{client_id}"
       ]
     }
@@ -528,6 +538,67 @@ defmodule UniversalProxy.Audio.Player do
   end
 
   defp sanitize_instance_name(_), do: "sendspin"
+
+  @doc false
+  # Compose the sendspin mDNS instance name as "<output> (<node>)",
+  # preserving the device suffix within the 63-byte mDNS label budget:
+  # the output portion is truncated first so the identifier always
+  # survives. With no node name it degrades to the bare output name.
+  @spec sendspin_instance_name(String.t(), String.t() | nil) :: String.t()
+  def sendspin_instance_name(friendly_name, node) when is_binary(node) and node != "" do
+    suffix = " (#{node})"
+
+    case 63 - byte_size(suffix) do
+      budget when budget > 0 ->
+        # A blank output name falls back to the plain placeholder so we
+        # never emit a leading-space " (node)" label.
+        base =
+          friendly_name
+          |> clean_instance_string()
+          |> truncate_to_byte_limit(budget)
+          |> String.trim_trailing()
+
+        if base == "", do: "sendspin" <> suffix, else: base <> suffix
+
+      # Pathologically long node name — can't fit a suffix, keep the
+      # output name so the player is at least still discoverable.
+      _ ->
+        sanitize_instance_name(friendly_name)
+    end
+  end
+
+  def sendspin_instance_name(friendly_name, _), do: sanitize_instance_name(friendly_name)
+
+  # Strip control chars and trim — shared by the plain and suffixed
+  # instance-name paths.
+  defp clean_instance_string(raw) when is_binary(raw) do
+    raw
+    |> String.replace(~r/[[:cntrl:]]/u, "")
+    |> String.trim()
+  end
+
+  defp clean_instance_string(_), do: ""
+
+  # The device node name (ESPHome identity), read defensively: ConfigStore
+  # starts before Audio, but a lookup failure degrades to an unsuffixed
+  # name rather than blocking mDNS registration.
+  defp default_device_name do
+    UniversalProxy.ESPHome.ConfigStore.current().name
+  rescue
+    _ -> nil
+  catch
+    :exit, _ -> nil
+  end
+
+  defp safe_device_name(fun) when is_function(fun, 0) do
+    fun.()
+  rescue
+    _ -> nil
+  catch
+    :exit, _ -> nil
+  end
+
+  defp safe_device_name(_), do: nil
 
   defp truncate_to_byte_limit(s, max) when byte_size(s) <= max, do: s
 

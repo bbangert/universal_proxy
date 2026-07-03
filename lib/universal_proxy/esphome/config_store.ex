@@ -179,8 +179,42 @@ defmodule UniversalProxy.ESPHome.ConfigStore do
   # `firmware_version` diagnostic sensor. The static `@defaults` value is
   # kept only as a fallback when the firmware version can't be read. A user
   # override (from the config form) still wins via the later `Map.merge`.
+  #
+  # `name`/`friendly_name` get a per-device MAC suffix so every unit is
+  # unique out of the box. Home Assistant's ESPHome integration keys each
+  # device on `name` (the mDNS/Native-API hostname), so a shared static
+  # default made a second device collide with "The name ... is already being
+  # used by another device". The suffix mirrors ESPHome's own convention
+  # (e.g. `esphome-web-a1b2c3`) and is derived from the same MAC that Espex
+  # reports to Home Assistant, so it always matches the device's MAC address.
   defp runtime_defaults do
-    %{@defaults | project_version: firmware_version()}
+    base = %{@defaults | project_version: firmware_version()}
+
+    case device_suffix() do
+      nil ->
+        base
+
+      suffix ->
+        %{
+          base
+          | name: "#{@defaults.name}-#{suffix}",
+            friendly_name: "#{@defaults.friendly_name} #{String.upcase(suffix)}"
+        }
+    end
+  end
+
+  # Last three octets of the device MAC as lowercase hex (e.g. "07507f"),
+  # or nil when no real MAC is available (Espex returns the all-zero
+  # placeholder) — in which case we keep the bare defaults rather than emit
+  # a shared "-000000" suffix that would collide all over again.
+  defp device_suffix do
+    case Espex.DeviceConfig.detect_mac_address()
+         |> String.replace(":", "")
+         |> String.downcase() do
+      "000000000000" -> nil
+      hex when byte_size(hex) == 12 -> binary_part(hex, 6, 6)
+      _ -> nil
+    end
   end
 
   defp firmware_version do
