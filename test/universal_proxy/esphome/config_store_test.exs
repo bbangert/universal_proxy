@@ -28,8 +28,15 @@ defmodule UniversalProxy.ESPHome.ConfigStoreTest do
     test "returns defaults when nothing has been persisted", %{server: server} do
       config = ConfigStore.current(server)
 
-      assert config.name == "universal-proxy"
-      assert config.friendly_name == "Universal Proxy"
+      # Default name/friendly_name carry a per-device MAC suffix so each unit
+      # is unique in Home Assistant (see ConfigStore.runtime_defaults/0). On a
+      # host with no real MAC the bare base name is used.
+      assert config.name == "universal-proxy" or
+               config.name =~ ~r/^universal-proxy-[0-9a-f]{6}$/
+
+      assert config.friendly_name == "Universal Proxy" or
+               config.friendly_name =~ ~r/^Universal Proxy [0-9A-F]{6}$/
+
       assert config.port == 6053
       assert config.project_name == "bbangert.universal_proxy"
     end
@@ -98,7 +105,7 @@ defmodule UniversalProxy.ESPHome.ConfigStoreTest do
   describe "non-binary value handling" do
     test "nil values are silently dropped (default preserved)", %{server: server} do
       :ok = ConfigStore.put(server, name: nil)
-      assert ConfigStore.current(server).name == "universal-proxy"
+      assert ConfigStore.current(server).name |> String.starts_with?("universal-proxy")
     end
 
     test "atom values are coerced to strings", %{server: server} do
@@ -112,8 +119,8 @@ defmodule UniversalProxy.ESPHome.ConfigStoreTest do
       :ok = ConfigStore.put(server, model: [1, 2, 3])
 
       config = ConfigStore.current(server)
-      assert config.name == "universal-proxy"
-      assert config.friendly_name == "Universal Proxy"
+      assert config.name |> String.starts_with?("universal-proxy")
+      assert config.friendly_name |> String.starts_with?("Universal Proxy")
       assert config.model == "Universal Proxy"
     end
   end
