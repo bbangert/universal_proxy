@@ -26,8 +26,6 @@ defmodule MdnsLite do
   alias MdnsLite.Options
   alias MdnsLite.TableServer
 
-  require Logger
-
   @typedoc """
   A user-specified ID for referring to a service
 

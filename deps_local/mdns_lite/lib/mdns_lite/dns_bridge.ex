@@ -28,7 +28,6 @@ defmodule MdnsLite.DNSBridge do
   import MdnsLite.DNS
   alias MdnsLite.DNS
   alias MdnsLite.Options
-  require Logger
 
   @doc false
   @spec start_link(MdnsLite.Options.t()) :: GenServer.on_start()

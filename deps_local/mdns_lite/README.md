@@ -1,3 +1,8 @@
+<!--
+  SPDX-FileCopyrightText: 2019 Frank Hunleth
+  SPDX-License-Identifier: CC-BY-4.0
+-->
+
 # MdnsLite
 
 [![Hex version](https://img.shields.io/hexpm/v/mdns_lite.svg "Hex version")](https://hex.pm/packages/mdns_lite)
