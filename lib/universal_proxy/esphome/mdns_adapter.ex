@@ -34,14 +34,45 @@ defmodule UniversalProxy.ESPHome.MdnsAdapter do
   @doc """
   Resolve the mDNS service instance name from the ESPHome node name.
 
-  A non-blank binary is used verbatim (so the service advertises as
-  `<name>._esphomelib._tcp.local`); anything else falls back to
-  `:unspecified`, which makes `mdns_lite` use the Nerves hostname — mDNS is
-  never lost just because the name couldn't be read.
+  The node name (`ConfigStore` accepts any binary for `:name`) becomes the
+  leftmost DNS label, so it is stripped of control chars, trimmed, and
+  clamped to the 63-byte label limit (RFC 1035 §2.3.4). A binary that
+  survives sanitizing advertises as `<name>._esphomelib._tcp.local`;
+  anything that cleans to empty — blank, whitespace/control-only, or
+  unreadable — falls back to `:unspecified`, which makes `mdns_lite` use
+  the Nerves hostname so mDNS advertising is never lost.
   """
   @spec instance_name(term()) :: String.t() | :unspecified
-  def instance_name(name) when is_binary(name) and name != "", do: name
+  def instance_name(name) when is_binary(name) do
+    case sanitize(name) do
+      "" -> :unspecified
+      cleaned -> cleaned
+    end
+  end
+
   def instance_name(_), do: :unspecified
+
+  # Strip control chars, trim, and clamp to the 63-byte DNS label limit at
+  # codepoint boundaries so the result is always valid UTF-8 and never a
+  # malformed mDNS RR.
+  defp sanitize(name) do
+    name
+    |> String.replace(~r/[[:cntrl:]]/u, "")
+    |> String.trim()
+    |> truncate_to_byte_limit(63)
+  end
+
+  defp truncate_to_byte_limit(s, max) when byte_size(s) <= max, do: s
+
+  defp truncate_to_byte_limit(s, max) do
+    s
+    |> String.codepoints()
+    |> Enum.reduce_while({"", 0}, fn cp, {acc, sz} ->
+      new_sz = sz + byte_size(cp)
+      if new_sz > max, do: {:halt, {acc, sz}}, else: {:cont, {acc <> cp, new_sz}}
+    end)
+    |> elem(0)
+  end
 
   # ConfigStore is started before the ESPHome supervisor, but stay
   # defensive so a lookup failure degrades to hostname-based advertising.

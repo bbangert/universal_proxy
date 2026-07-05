@@ -100,7 +100,10 @@ defmodule UniversalProxy.Audio.Player do
           server_url: String.t() | nil,
           pubsub: module(),
           mdns_module: module(),
-          device_name_fun: (-> String.t() | nil),
+          # `init/1` passes this through untouched and `safe_device_name/1`
+          # tolerates a non-function (returns nil), so the type is widened
+          # past the expected 0-arity function to match the runtime.
+          device_name_fun: (-> String.t() | nil) | term(),
           port: port() | nil,
           mdns_id: term(),
           last_event: map(),
@@ -546,6 +549,18 @@ defmodule UniversalProxy.Audio.Player do
   # survives. With no node name it degrades to the bare output name.
   @spec sendspin_instance_name(String.t(), String.t() | nil) :: String.t()
   def sendspin_instance_name(friendly_name, node) when is_binary(node) and node != "" do
+    # The node name (ConfigStore accepts any binary for `:name`) is
+    # interpolated into the label and the TXT `name=` value, so strip
+    # control chars/trim first. If nothing survives, degrade to the bare
+    # output name rather than emit a `" ()"`-style suffix.
+    do_sendspin_instance_name(friendly_name, clean_instance_string(node))
+  end
+
+  def sendspin_instance_name(friendly_name, _), do: sanitize_instance_name(friendly_name)
+
+  defp do_sendspin_instance_name(friendly_name, ""), do: sanitize_instance_name(friendly_name)
+
+  defp do_sendspin_instance_name(friendly_name, node) do
     suffix = " (#{node})"
 
     case 63 - byte_size(suffix) do
@@ -566,8 +581,6 @@ defmodule UniversalProxy.Audio.Player do
         sanitize_instance_name(friendly_name)
     end
   end
-
-  def sendspin_instance_name(friendly_name, _), do: sanitize_instance_name(friendly_name)
 
   # Strip control chars and trim — shared by the plain and suffixed
   # instance-name paths.
