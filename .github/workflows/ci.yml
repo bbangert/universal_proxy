@@ -191,7 +191,7 @@ jobs:
       - name: Hex audit (cowlib 2.18.0 advisories allow-listed — no upstream fix)
         run: |
           ALLOWED='EEF-CVE-2026-43966|EEF-CVE-2026-43969'
-          audit=$(mix hex.audit) && exit 0
+          audit=$(mix hex.audit 2>&1) && exit 0
           echo "$audit"
           unexpected=$(echo "$audit" | grep -E '^  [^ ]+ [0-9]' | grep -Ev " - (${ALLOWED}) " || true)
           if [ -n "$unexpected" ]; then
