@@ -40,11 +40,12 @@ FetchContent_Declare(
     # that masks real failures (e.g. a partial hunk apply on upstream
     # context drift) — silent breakage would slip past CI and only
     # surface when the second player instance failed to bind. Instead,
-    # gate the apply on a marker grep: if the env-var hook is already
-    # present, the patch has run; otherwise apply with default semantics
+    # gate each apply on a marker grep: if the patch's marker is already
+    # present, that patch has run; otherwise apply with default semantics
     # so any failure (missing context, conflicting edit) is loud and
-    # fatal at configure time.
-    PATCH_COMMAND  sh -c "grep -q SENDSPIN_WS_PORT src/host/ws_server.cpp || patch -p1 -i ${CMAKE_CURRENT_LIST_DIR}/patches/0001-configurable-ws-port.patch"
+    # fatal at configure time. Order matters: 0002's context includes
+    # 0001's changes.
+    PATCH_COMMAND  sh -c "(grep -q SENDSPIN_WS_PORT src/host/ws_server.cpp || patch -p1 -i ${CMAKE_CURRENT_LIST_DIR}/patches/0001-configurable-ws-port.patch) && (grep -q 'register only on Open' src/host/ws_server.cpp || patch -p1 -i ${CMAKE_CURRENT_LIST_DIR}/patches/0002-defer-registration-until-open.patch)"
 )
 
 # Manual populate + add_subdirectory(EXCLUDE_FROM_ALL) for compatibility with
@@ -59,15 +60,22 @@ if(NOT sendspin-cpp_POPULATED)
                      EXCLUDE_FROM_ALL)
 endif()
 
-# Defence in depth: verify the port-config patch landed both halves.
-# Marker #1 (env_marker): the SENDSPIN_WS_PORT-reading block exists.
-# Marker #2 (bind_marker): the WebSocketServer constructor was actually
-# rewritten to use the runtime `port` variable. Without #2, a partial
+# Defence in depth: verify both patches landed completely.
+# Marker #1 (env_marker): 0001's SENDSPIN_WS_PORT-reading block exists.
+# Marker #2 (bind_marker): 0001 actually rewrote the WebSocketServer
+# constructor to use the runtime `port` variable. Without #2, a partial
 # apply could leave the env-read block in place while the constructor
 # still passes DEFAULT_SERVER_PORT — silently honouring 8928 only.
+# Marker #3 (defer_marker): 0002's comment sentinel exists.
+# Marker #4 (open_marker): 0002 actually moved connection registration
+# into the Open branch. Without #4, a partial apply could leave the
+# comment while connections still register on TCP accept — silently
+# reintroducing the phantom-connection wedge.
 file(READ "${sendspin-cpp_SOURCE_DIR}/src/host/ws_server.cpp" _ws_server_src)
 string(FIND "${_ws_server_src}" "SENDSPIN_WS_PORT" _env_marker)
 string(FIND "${_ws_server_src}" "WebSocketServer>(port," _bind_marker)
+string(FIND "${_ws_server_src}" "register only on Open" _defer_marker)
+string(FIND "${_ws_server_src}" "new_connection_callback_(std::make_unique<SendspinServerConnection>" _open_marker)
 if(_env_marker EQUAL -1 OR _bind_marker EQUAL -1)
     message(FATAL_ERROR
         "sendspin-cpp port-config patch did not apply cleanly: "
@@ -76,9 +84,19 @@ if(_env_marker EQUAL -1 OR _bind_marker EQUAL -1)
         "Re-validate patches/0001-configurable-ws-port.patch against the "
         "current SENDSPIN_CPP_REF (${SENDSPIN_CPP_REF}).")
 endif()
+if(_defer_marker EQUAL -1 OR _open_marker EQUAL -1)
+    message(FATAL_ERROR
+        "sendspin-cpp defer-registration patch did not apply cleanly: "
+        "defer_marker=${_defer_marker} open_marker=${_open_marker} in "
+        "${sendspin-cpp_SOURCE_DIR}/src/host/ws_server.cpp. "
+        "Re-validate patches/0002-defer-registration-until-open.patch "
+        "against the current SENDSPIN_CPP_REF (${SENDSPIN_CPP_REF}).")
+endif()
 unset(_ws_server_src)
 unset(_env_marker)
 unset(_bind_marker)
+unset(_defer_marker)
+unset(_open_marker)
 
 add_executable(sendspin_player
     src/main.cpp

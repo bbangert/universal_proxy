@@ -1,0 +1,67 @@
+--- a/src/host/ws_server.cpp	2026-07-06 22:28:49.810515903 +0000
++++ b/src/host/ws_server.cpp	2026-07-06 22:29:40.252579780 +0000
+@@ -70,11 +70,17 @@
+ 
+             SS_LOGD(TAG, "New client connection (synthetic sockfd %d)", synthetic_sockfd);
+ 
+-            // Create the server connection
+-            auto connection = std::make_unique<SendspinServerConnection>(ws, synthetic_sockfd);
+-
+-            // Set up the message callback on the websocket to route data through the connection
+-            ws->setOnMessageCallback([this, synthetic_sockfd](const ix::WebSocketMessagePtr& msg) {
++            // universal_proxy patch: register only on Open. This accept callback
++            // runs before the WebSocket handshake; a socket that never completes
++            // the handshake (port scan, reachability probe, half-open connection)
++            // gets no Close event, so a connection registered here would occupy
++            // a current/pending slot forever — two such phantoms silently wedge
++            // the player until restart. Creating and registering the connection
++            // from the Open message instead means only established sessions ever
++            // reach the connection manager, matching the ESP httpd path (whose
++            // open callback runs post-upgrade).
++            ws->setOnMessageCallback([this, synthetic_sockfd,
++                                      weak_ws](const ix::WebSocketMessagePtr& msg) {
+                 int64_t receive_time = platform_time_us();
+ 
+                 // Find the connection by sockfd; hold shared_ptr to keep it alive during dispatch
+@@ -96,6 +102,27 @@
+                     conn->handle_message(msg->str, msg->binary, receive_time);
+ 
+                 } else if (msg->type == ix::WebSocketMessageType::Open) {
++                    auto open_ws = weak_ws.lock();
++                    if (open_ws == nullptr) {
++                        return;
++                    }
++
++                    // Handshake complete: create the connection and hand it to
++                    // the manager, then look it up again so on_connected_cb
++                    // (installed during registration) can fire. A connection
++                    // the manager rejected (both slots busy) is absent from the
++                    // lookup and its goodbye has already been sent.
++                    if (this->new_connection_callback_) {
++                        this->new_connection_callback_(std::make_unique<SendspinServerConnection>(
++                            open_ws, synthetic_sockfd));
++                    } else {
++                        SS_LOGW(TAG, "No new connection callback set, connection will be dropped");
++                    }
++
++                    if (this->find_connection_callback_) {
++                        conn_holder = this->find_connection_callback_(synthetic_sockfd);
++                        conn = static_cast<SendspinServerConnection*>(conn_holder.get());
++                    }
+                     if (conn != nullptr && conn->on_connected_cb) {
+                         conn->on_connected_cb(conn);
+                     }
+@@ -109,13 +136,6 @@
+                     SS_LOGE(TAG, "WebSocket error: %s", msg->errorInfo.reason.c_str());
+                 }
+             });
+-
+-            // Notify the client of the new connection
+-            if (this->new_connection_callback_) {
+-                this->new_connection_callback_(std::move(connection));
+-            } else {
+-                SS_LOGW(TAG, "No new connection callback set, connection will be dropped");
+-            }
+         });
+ 
+     SS_LOGI(TAG, "Starting server on port: %d (max connections: %d)", port,

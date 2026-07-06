@@ -36,7 +36,9 @@
 #include <getopt.h>
 #include <iostream>
 #include <mutex>
+#include <netinet/in.h>
 #include <poll.h>
+#include <sys/socket.h>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -635,6 +637,32 @@ struct ClientListener : SendspinClientListener {
     }
 };
 
+// sendspin-cpp binds its WebSocket listener lazily — on the first
+// client.loop() tick after the network provider reports ready — so
+// start_server() returning does NOT mean the port accepts connections
+// yet. The Elixir side must not advertise the player over mDNS before
+// the listener is up: Music Assistant's discovery connect is one-shot
+// (aiosendspin `retry_initial_connection=False`), so a connection
+// refused in that gap orphans the player until the mDNS record flaps.
+// Probe by trying to bind the same wildcard address ourselves:
+// EADDRINUSE means a listener holds the port. A connect() probe would
+// also work but would exercise the server's accept path; a failed
+// bind is entirely passive. Caveat: a *foreign* process holding the
+// port also reports bound — but in that state the server can never
+// bind at all and logs its own error; advertising is moot either way.
+static bool ws_listener_bound(uint16_t port) {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    bool in_use = ::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 &&
+                  errno == EADDRINUSE;
+    ::close(fd);
+    return in_use;
+}
+
 struct NetworkProvider : SendspinNetworkProvider {
     bool is_network_ready() override { return true; }
 };
@@ -775,9 +803,20 @@ int main(int argc, char* argv[]) {
     static constexpr auto RECONNECT_INTERVAL = std::chrono::seconds(5);
     auto last_connect_attempt = clock::now() - RECONNECT_INTERVAL;
     bool was_connected = false;
+    bool listening_emitted = false;
 
     while (g_running.load()) {
         client.loop();
+
+        // `listening` gates the Elixir side's mDNS advertisement (see
+        // ws_listener_bound above) — emitted once, as soon as the
+        // listener is observably bound.
+        if (!listening_emitted && ws_listener_bound(static_cast<uint16_t>(opts.mdns_port))) {
+            listening_emitted = true;
+            std::ostringstream os;
+            os << "{\"event\":\"listening\",\"port\":" << opts.mdns_port << "}";
+            emit_json(os.str());
+        }
 
         bool stdin_eof = false;
         for (auto& line : stdin_poller.poll_lines(stdin_eof)) {

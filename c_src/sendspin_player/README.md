@@ -19,7 +19,8 @@ c_src/sendspin_player/
 ├── LICENSE-sendspin-armv6   Apache-2.0 attribution copy for vendored files
 ├── README.md                this file
 ├── patches/
-│   └── 0001-configurable-ws-port.patch
+│   ├── 0001-configurable-ws-port.patch
+│   └── 0002-defer-registration-until-open.patch
 └── src/
     ├── alsa_pipe_sink.h     vendored from LeoLTM/sendspin-armv6
     ├── alsa_pipe_sink.cpp   vendored from LeoLTM/sendspin-armv6
@@ -68,7 +69,7 @@ would otherwise silently flow into firmware. The friendly tag name lives in
 a comment beside the SHA for traceability.
 
 The protocol is Experimental upstream — treat every minor bump as a
-release-blocking review and re-validate the patch listed below.
+release-blocking review and re-validate the patches listed below.
 
 ### Patch: configurable WebSocket port
 
@@ -79,6 +80,23 @@ default (8928). Without this, every binary instance would try to bind 8928
 and the second one would fail — universal_proxy spawns one binary per ALSA
 output so it needs distinct ports.
 
+### Patch: defer connection registration until Open
+
+`patches/0002-defer-registration-until-open.patch` (applies on top of 0001,
+same file) moves the `new_connection_callback_` invocation from IXWebSocket's
+accept callback — which runs **before** the WebSocket handshake — into the
+`WebSocketMessageType::Open` branch. Upstream registers the connection on TCP
+accept; a socket that never completes the handshake (port scanner, TCP
+reachability probe, half-open Wi-Fi connection) never produces a Close event,
+so the registered "phantom" occupies one of the manager's two connection
+slots (current + pending) forever. Two phantoms silently wedge the player:
+every real client (i.e. Music Assistant) gets `101 Switching Protocols` and
+then nothing — no `client/hello`, no goodbye — until the binary restarts.
+Reproduced on upstream v0.5.0 through main (`bf9e085`); the fix mirrors the
+ESP httpd path, whose open callback runs post-upgrade. Drop this patch once
+fixed upstream (issue draft + repro live in the session scratchpad; see
+`.claude` memory `sendspin-phantom-connection-wedge`).
+
 When bumping `SENDSPIN_CPP_REF`:
 
 1. Resolve the tag to a SHA:
@@ -87,10 +105,11 @@ When bumping `SENDSPIN_CPP_REF`:
    tag in the inline comment for traceability)
 3. `rm -rf _build/*/sendspin_player/_deps/sendspin-cpp-*` so FetchContent
    re-populates and re-runs `PATCH_COMMAND`
-4. Run `mix compile` — if the patch no longer applies cleanly, regenerate
-   it against the new tree (`diff -u <old> <new> > 0001-...patch`) and
-   commit. The post-populate marker check in `CMakeLists.txt` will
-   `FATAL_ERROR` if the patch silently no-applies.
+4. Run `mix compile` — if a patch no longer applies cleanly, regenerate
+   it against the new tree (`diff -u <old> <new> > 000N-...patch`) and
+   commit. The post-populate marker checks in `CMakeLists.txt` will
+   `FATAL_ERROR` if either patch silently no-applies. 0002 is generated
+   against the 0001-patched tree, so regenerate them in order.
 5. Verify the binary runs with `--mdns-port 18928` and binds correctly
    (e.g. `ss -tlnp | grep 18928`)
 6. Run `mix test test/sendspin_player_contract_test.exs --include contract`
@@ -134,6 +153,7 @@ changes, and on errors.
 
 ```jsonc
 {"event":"started","version":"0.1.0","port":8928,"name":"Out 1","alsa_device":"plughw:0,0","formats":[{"codec":"flac","channels":2,"rate":48000,"bit_depth":16}]}
+{"event":"listening","port":8928}          // WebSocket listener confirmed bound
 {"event":"connected","server":"ws://music.local:8927/sendspin"}
 {"event":"disconnected"}
 {"event":"stream_start","sample_rate":48000,"channels":2,"bit_depth":16,"codec":"opus"}
@@ -152,6 +172,15 @@ includes the baseline floor (FLAC/OPUS/PCM at 44.1/48 kHz, 16-bit). When the
 probed at startup for the rates and bit depths it actually accepts, and the
 matching hi-res FLAC + PCM entries (24/32-bit, up to 384 kHz) are added. A
 probe failure or a non-card device (`default`) advertises the floor only.
+
+The `listening` event fires once, when the WebSocket listener is confirmed
+bound (checked with a passive EADDRINUSE bind-probe from the main loop —
+sendspin-cpp binds lazily on its first `loop()` tick, so `started` does NOT
+imply the port accepts connections yet). `Audio.Player` gates its mDNS
+advertisement on this event: Music Assistant's discovery connect is one-shot
+(aiosendspin `retry_initial_connection=False`), so advertising before the
+listener is up hands MA a connection-refused that orphans the player until
+the mDNS record next flaps.
 
 ## Stdin commands
 

@@ -12,7 +12,13 @@ defmodule UniversalProxy.Audio.Player do
     * Stdin commands (`set_volume`, `set_muted`, `shutdown`) written
       via `Port.command/2` as line-delimited JSON.
     * The `MdnsLite` service advertisement for `_sendspin._tcp` so
-      Sendspin servers can discover this player.
+      Sendspin servers can discover this player. Registered only once
+      the binary reports `listening` (WebSocket listener bound), NOT
+      at init: Music Assistant's discovery connect is one-shot
+      (aiosendspin `retry_initial_connection=False`), so advertising
+      into the spawn-to-bind gap makes MA burn its single attempt on
+      a connection refused and orphan the player until the mDNS
+      record next flaps.
 
   ## Why raw Port (no MuonTrap)
 
@@ -32,6 +38,7 @@ defmodule UniversalProxy.Audio.Player do
   README and with `main.cpp`'s `emit_json` call sites.
 
       {"event":"started","version":"0.1.0","port":8928,"name":"Out 1","alsa_device":"plughw:0,0","formats":[{"codec":"flac","channels":2,"rate":48000,"bit_depth":16}]}
+      {"event":"listening","port":8928}
       {"event":"connected","server":"ws://music.local:8927/sendspin"}
       {"event":"disconnected"}
       {"event":"stream_start","sample_rate":48000,"channels":2,"bit_depth":16,"codec":"opus"}
@@ -88,6 +95,8 @@ defmodule UniversalProxy.Audio.Player do
     :device_name_fun,
     port: nil,
     mdns_id: nil,
+    mdns_registered: false,
+    reannounce_delays_ms: [],
     last_event: %{},
     os_pid: nil
   ]
@@ -106,6 +115,8 @@ defmodule UniversalProxy.Audio.Player do
           device_name_fun: (-> String.t() | nil) | term(),
           port: port() | nil,
           mdns_id: term(),
+          mdns_registered: boolean(),
+          reannounce_delays_ms: [non_neg_integer()],
           last_event: map(),
           os_pid: pos_integer() | nil
         }
@@ -206,8 +217,17 @@ defmodule UniversalProxy.Audio.Player do
             nil -> nil
           end
 
-        register_mdns(state)
-        new_state = %{state | port: port, mdns_id: mdns_service_id(key), os_pid: os_pid}
+        # mDNS registration is deferred until the binary's `listening`
+        # event (WebSocket listener bound) — see the moduledoc. Only
+        # `mdns_id` is set here so `terminate/2` can best-effort
+        # remove/goodbye even if the binary never got that far.
+        new_state = %{
+          state
+          | port: port,
+            mdns_id: mdns_service_id(key),
+            os_pid: os_pid,
+            reannounce_delays_ms: Keyword.get(opts, :reannounce_delays_ms, @reannounce_delays_ms)
+        }
 
         # `--initial-volume` is the only startup config the binary
         # accepts on its CLI; there's no `--initial-muted`. If DETS
@@ -218,8 +238,6 @@ defmodule UniversalProxy.Audio.Player do
         if Map.get(config, :muted, false) do
           send_command(new_state, {:set_muted, true})
         end
-
-        schedule_reannounces(opts)
 
         {:ok, new_state}
     end
@@ -255,6 +273,25 @@ defmodule UniversalProxy.Audio.Player do
     # network-derived (codec strings, error messages from the Sendspin
     # server) but values aren't atomised by `:atoms`, only keys.
     case Jason.decode(line, keys: :atoms) do
+      {:ok, %{event: "listening"} = event} ->
+        # The binary's WebSocket listener is confirmed bound — NOW it
+        # is safe to advertise. Registering earlier (init) races MA's
+        # one-shot discovery connect against the spawn-to-bind gap.
+        # The RFC 6762 §8.3 re-announce burst is anchored here too so
+        # its cache-priming fires after the record actually exists.
+        # Guarded for idempotency; the binary emits `listening` once.
+        state =
+          if state.mdns_registered do
+            state
+          else
+            register_mdns(state)
+            schedule_reannounces(state.reannounce_delays_ms)
+            %{state | mdns_registered: true}
+          end
+
+        broadcast_state(state, event)
+        {:noreply, %{state | last_event: event}}
+
       {:ok, %{event: _} = event} ->
         broadcast_state(state, event)
         {:noreply, %{state | last_event: event}}
@@ -369,11 +406,11 @@ defmodule UniversalProxy.Audio.Player do
 
   # RFC 6762 §8.3 calls for at least two unsolicited announcements ~1 s
   # apart when a service comes up. mdns_lite 0.9.1 sends zero, so we
-  # synthesize them via `Audio.MdnsAnnouncer.announce/1`. Tests can
-  # override `reannounce_delays_ms:` to skip the schedule.
-  defp schedule_reannounces(opts) do
-    delays = Keyword.get(opts, :reannounce_delays_ms, @reannounce_delays_ms)
-
+  # synthesize them via `Audio.MdnsAnnouncer.announce/1`. Scheduled
+  # from the `listening` event (not init) so the burst fires after the
+  # service is actually registered. Tests can override
+  # `reannounce_delays_ms:` to skip the schedule.
+  defp schedule_reannounces(delays) when is_list(delays) do
     Enum.each(delays, fn ms when is_integer(ms) and ms >= 0 ->
       Process.send_after(self(), :reannounce, ms)
     end)

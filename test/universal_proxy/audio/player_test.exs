@@ -123,13 +123,17 @@ defmodule UniversalProxy.Audio.PlayerTest do
       assert_receive {:sendspin_state, @key, %{event: "static_delay", value: 250}}, 1_000
     end
 
-    test "registers an mDNS service on launch" do
+    test "registers an mDNS service once the binary reports `listening`" do
       _pid = start_player!()
-      assert_receive {:sendspin_state, @key, _started}, 2_000
 
-      # `register_mdns/1` runs synchronously inside `init/1` before
-      # `start_supervised!` returns, so the Agent has already recorded
-      # the add by the time the started event arrives. No sleep needed.
+      # Registration is gated on the binary's `listening` event (the
+      # WebSocket listener is bound) — advertising earlier would race
+      # Music Assistant's one-shot discovery connect against the
+      # spawn-to-bind gap. `register_mdns/1` runs in the same
+      # handle_info before the event is broadcast, so once we receive
+      # `listening` the Agent has recorded the add. No sleep needed.
+      assert_receive {:sendspin_state, @key, %{event: "listening"}}, 2_000
+
       [{kind, service}] = MdnsStub.calls()
       assert kind == :add
       assert service.id == {:sendspin_player, "bcm2835 Headphones", nil, nil}
@@ -143,6 +147,26 @@ defmodule UniversalProxy.Audio.PlayerTest do
       # default. Renames produce a clean Removed/Added cycle on peer
       # caches like avahi.
       assert service.instance_name == "Headphones"
+    end
+
+    test "does NOT register mDNS while `listening` has not arrived" do
+      # Simulates a binary whose WebSocket listener never comes up
+      # (bind failure, wedged startup). Advertising such a player
+      # would hand Music Assistant a guaranteed connection-refused —
+      # and MA's discovery connect is one-shot, so that orphans the
+      # player. The fake suppresses `listening` via env.
+      System.put_env("FAKE_SKIP_LISTENING", "1")
+      on_exit(fn -> System.delete_env("FAKE_SKIP_LISTENING") end)
+
+      _pid = start_player!()
+
+      # All startup events through static_delay arrive...
+      assert_receive {:sendspin_state, @key, %{event: "started"}}, 2_000
+      assert_receive {:sendspin_state, @key, %{event: "static_delay"}}, 1_000
+
+      # ...but with no `listening`, no advertisement may happen.
+      Process.sleep(50)
+      refute Enum.any?(MdnsStub.calls(), &match?({:add, _}, &1))
     end
 
     test "mDNS instance_name truncates by BYTES, not graphemes" do
@@ -164,7 +188,7 @@ defmodule UniversalProxy.Audio.PlayerTest do
           mdns_port: 18_900
         )
 
-      assert_receive {:sendspin_state, @key, _started}, 2_000
+      assert_receive {:sendspin_state, @key, %{event: "listening"}}, 2_000
 
       [{:add, service}] = MdnsStub.calls()
       assert byte_size(service.instance_name) <= 63
@@ -184,7 +208,7 @@ defmodule UniversalProxy.Audio.PlayerTest do
           mdns_port: 18_901
         )
 
-      assert_receive {:sendspin_state, @key, _started}, 2_000
+      assert_receive {:sendspin_state, @key, %{event: "listening"}}, 2_000
 
       [{:add, service}] = MdnsStub.calls()
       assert service.instance_name == "sendspin"
@@ -193,7 +217,7 @@ defmodule UniversalProxy.Audio.PlayerTest do
     test "mDNS instance_name carries the device node name so devices are distinguishable" do
       _pid = start_player!(device_name_fun: fn -> "universal-proxy-45099b" end, mdns_port: 18_902)
 
-      assert_receive {:sendspin_state, @key, _started}, 2_000
+      assert_receive {:sendspin_state, @key, %{event: "listening"}}, 2_000
 
       [{:add, service}] = MdnsStub.calls()
       assert service.instance_name == "Headphones (universal-proxy-45099b)"
