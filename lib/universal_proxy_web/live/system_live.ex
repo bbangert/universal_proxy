@@ -414,7 +414,7 @@ defmodule UniversalProxyWeb.SystemLive do
     """
   end
 
-  defp short_uuid(nil), do: ""
+  # Only rendered inside `:if={@firmware.uuid}`, so uuid is always a binary here.
   defp short_uuid(uuid) when is_binary(uuid), do: uuid |> String.slice(0, 8)
 
   defp log_level_class("WARN"), do: "text-warning"

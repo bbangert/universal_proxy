@@ -320,7 +320,12 @@ defmodule UniversalProxy.Hardware do
   @spec physical_slots() :: [String.t()] | nil
   def physical_slots, do: target_slots()
 
-  defp target_slots, do: Map.get(@external_slots, @target)
+  # `@target` is a compile-time literal; on :host it's not a key in
+  # `@external_slots` (host has no static slots — the caller's `nil ->` branch
+  # then falls back to dynamic listing). Route through `Map.new/1` so the type
+  # checker treats this as an open `map()` lookup rather than proving the
+  # literal map lacks the `:host` key (which trips --warnings-as-errors).
+  defp target_slots, do: @external_slots |> Map.new() |> Map.get(@target)
 
   # -- Slot mode (per-target, every port shows) ------------------------
 

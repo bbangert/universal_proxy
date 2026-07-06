@@ -86,7 +86,7 @@ defmodule UniversalProxy.System do
     %{
       hostname: hostname(),
       ip: primary_ipv4(),
-      hardware: fw.hardware || "—",
+      hardware: fw.hardware,
       firmware: fw.version || "—"
     }
   end

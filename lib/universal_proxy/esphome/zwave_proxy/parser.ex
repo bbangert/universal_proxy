@@ -218,7 +218,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy.Parser do
   # -- Buffer helpers --
 
   defp put_byte(%{buffer_index: idx} = parser, byte) when idx < @max_frame_size do
-    <<prefix::binary-size(idx), _old, suffix::binary>> = parser.buffer
+    <<prefix::binary-size(^idx), _old, suffix::binary>> = parser.buffer
     buffer = <<prefix::binary, byte, suffix::binary>>
     %{parser | buffer: buffer, buffer_index: idx + 1}
   end

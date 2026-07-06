@@ -7,8 +7,8 @@ on:
 
 env:
   MIX_TARGET: host
-  ELIXIR_VERSION: "1.19.5"
-  OTP_VERSION: "28.3"
+  ELIXIR_VERSION: "1.20.2-otp-29"
+  OTP_VERSION: "29.0.3"
   # System packages required to compile NIFs that mix deps.get pulls in
   # (libmnl-dev for vintage_net, libssl-dev for crypto-using NIFs).
   # libasound2-dev is needed by the sendspin_player Mix compiler, which

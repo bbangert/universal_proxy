@@ -5,8 +5,6 @@ defmodule UniversalProxy.MixProject do
   @version "0.6.2"
   @all_targets [
     :bbb,
-    :grisp2,
-    :osd32mp1,
     :mangopi_mq_pro,
     :qemu_aarch64,
     :rpi,
@@ -23,7 +21,7 @@ defmodule UniversalProxy.MixProject do
     [
       app: @app,
       version: @version,
-      elixir: "~> 1.19",
+      elixir: "~> 1.20",
       elixirc_paths: elixirc_paths(Mix.env()),
       archives: [nerves_bootstrap: "~> 1.14"],
       # :sendspin_player runs BEFORE :app so the freshly built C++ binary
@@ -164,11 +162,9 @@ defmodule UniversalProxy.MixProject do
       # bumps to Nerves systems. Since these include Linux kernel and Erlang
       # version updates, please review their release notes in case
       # changes to your application are needed.
-      {:nerves_system_bbb, "~> 2.19", runtime: false, targets: :bbb},
-      {:nerves_system_grisp2, "~> 0.17", runtime: false, targets: :grisp2},
-      {:nerves_system_osd32mp1, "~> 0.24", runtime: false, targets: :osd32mp1},
-      {:nerves_system_mangopi_mq_pro, "~> 0.15", runtime: false, targets: :mangopi_mq_pro},
-      {:nerves_system_qemu_aarch64, "~> 0.3", runtime: false, targets: :qemu_aarch64}
+      {:nerves_system_bbb, "~> 2.30", runtime: false, targets: :bbb},
+      {:nerves_system_mangopi_mq_pro, "~> 0.16", runtime: false, targets: :mangopi_mq_pro},
+      {:nerves_system_qemu_aarch64, "~> 0.4", runtime: false, targets: :qemu_aarch64}
     ] ++ up_nerves_systems()
   end
 
@@ -181,7 +177,7 @@ defmodule UniversalProxy.MixProject do
   # required (host must be linux/x86_64). rpi/rpi2 have no onboard BT but
   # support USB BT dongles; x86_64 omits the Pi-only BT firmware package. One
   # pinned tag for all of them — bump @up_systems_tag to cut a new release.
-  @up_systems_tag "v0.1.3"
+  @up_systems_tag "v0.1.4"
   @up_systems_targets [:rpi, :rpi0, :rpi0_2, :rpi2, :rpi3, :rpi4, :rpi5, :x86_64]
 
   defp up_nerves_systems do

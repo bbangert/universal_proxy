@@ -368,7 +368,7 @@ defmodule UniversalProxy.FMA120.Protocol do
 
   defp take_uint(bin, n) do
     case bin do
-      <<chunk::binary-size(n), rest::binary>> -> {:binary.decode_unsigned(chunk, :big), rest}
+      <<chunk::binary-size(^n), rest::binary>> -> {:binary.decode_unsigned(chunk, :big), rest}
       _ -> {0, <<>>}
     end
   end
