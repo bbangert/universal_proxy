@@ -67,7 +67,8 @@ defmodule UniversalProxy.Bluez.Improv.ProtocolTest do
     test "bad checksum" do
       good = framed(0x01, submit_data("MyNet", "pw"))
       # Flip the trailing checksum byte.
-      <<rest::binary-size(byte_size(good) - 1), cs>> = good
+      head_len = byte_size(good) - 1
+      <<rest::binary-size(^head_len), cs>> = good
       corrupt = <<rest::binary, band(cs + 1, 0xFF)>>
       assert Protocol.decode_command(corrupt) == {:error, :bad_checksum}
     end

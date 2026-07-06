@@ -61,7 +61,8 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.ProtocolTest do
 
       # Should end with 0xFF, 0xFF terminator
       total_len = byte_size(rest)
-      <<_timing_data::binary-size(total_len - 2), 0xFF, 0xFF>> = rest
+      body_len = total_len - 2
+      <<_timing_data::binary-size(^body_len), 0xFF, 0xFF>> = rest
 
       # Each timing is 2 bytes, so 4 timings = 8 bytes of timing data
       assert total_len == 8 + 2
@@ -242,7 +243,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.ProtocolTest do
 
       # Strip terminator
       data_len = byte_size(encoded_data) - 2
-      <<timing_data::binary-size(data_len), 0xFF, 0xFF>> = encoded_data
+      <<timing_data::binary-size(^data_len), 0xFF, 0xFF>> = encoded_data
 
       # Decode: device counts -> us (simulating what feed/2 does)
       counts_per_us = 48_000_000 / 4 / 256 / 1_000_000

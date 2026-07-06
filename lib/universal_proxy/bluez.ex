@@ -48,7 +48,6 @@ defmodule UniversalProxy.Bluez do
   """
 
   use Supervisor
-  require Logger
 
   @dbus_daemon "/usr/bin/dbus-daemon"
   @bluetoothd "/usr/libexec/bluetooth/bluetoothd"

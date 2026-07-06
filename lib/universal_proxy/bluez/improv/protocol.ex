@@ -120,7 +120,7 @@ defmodule UniversalProxy.Bluez.Improv.Protocol do
   @spec decode_command(binary()) :: command() | decode_error()
   def decode_command(<<cmd, data_len, rest::binary>>)
       when byte_size(rest) == data_len + 1 do
-    <<data::binary-size(data_len), checksum>> = rest
+    <<data::binary-size(^data_len), checksum>> = rest
 
     if checksum == frame_checksum(cmd, data_len, data) do
       decode_payload(cmd, data)

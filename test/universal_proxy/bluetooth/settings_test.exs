@@ -74,7 +74,10 @@ defmodule UniversalProxy.Bluetooth.SettingsTest do
     end
 
     test "set_enabled rejects non-booleans by guard" do
-      assert_raise FunctionClauseError, fn -> Settings.set_enabled(self(), "true") end
+      # `apply/3` keeps the intentional bad-type call out of the compile-time
+      # type checker (it would flag the String vs boolean guard); the runtime
+      # FunctionClauseError from the guard is what we're asserting.
+      assert_raise FunctionClauseError, fn -> apply(Settings, :set_enabled, [self(), "true"]) end
     end
   end
 
