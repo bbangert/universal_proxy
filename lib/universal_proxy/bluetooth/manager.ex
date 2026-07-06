@@ -45,12 +45,20 @@ defmodule UniversalProxy.Bluetooth.Manager do
   rebroadcasts status on `{:bluetooth_adapters_changed}` (claim landed,
   hotplug add/remove), settling subscribers on the final claim.
 
+  ## Espex bounce on pausedness flips
+
+  Reconciles also track `Settings.proxy_paused?/1` across calls: when a
+  role change flips it, espex is restarted (via `:esphome_restart_fun`)
+  so the HA-facing Bluetooth feature flags follow the pause — see
+  `ESPHome.Supervisor.bluetooth_opts/2`, which gates on the same predicate.
+
   ## Options (host-testability)
 
   `start_link/1` accepts `:name`, `:settings` (Settings server ref),
   `:dynamic_supervisor`, `:bluez_child` (child spec started under it),
-  `:sysfs_root`, and `:pubsub` — production defaults wire the real
-  modules; tests substitute fixtures and stubs.
+  `:sysfs_root`, `:pubsub`, and `:esphome_restart_fun` (the pausedness-flip
+  reaction) — production defaults wire the real modules; tests substitute
+  fixtures and stubs.
   """
 
   use GenServer
@@ -130,8 +138,11 @@ defmodule UniversalProxy.Bluetooth.Manager do
         Keyword.get(opts, :adapters_info_fun, &UniversalProxy.Bluez.Client.adapters_info/0),
       start_retry_ms: Keyword.get(opts, :start_retry_ms, @start_retry_ms),
       restart_settle_ms: Keyword.get(opts, :restart_settle_ms, @restart_settle_ms),
+      esphome_restart_fun: Keyword.get(opts, :esphome_restart_fun, &restart_esphome/0),
       bluez_pid: nil,
-      monitor: nil
+      monitor: nil,
+      # Seeded on the boot reconcile; a nil→boolean transition never bounces.
+      last_paused?: nil
     }
 
     # See "Broadcasts" in the moduledoc: the adapter claim lands after a
@@ -143,7 +154,7 @@ defmodule UniversalProxy.Bluetooth.Manager do
 
   @impl GenServer
   def handle_continue(:reconcile, state) do
-    state = do_reconcile(state, [])
+    state = state |> do_reconcile([]) |> sync_paused()
     broadcast(state)
     {:noreply, state}
   end
@@ -154,7 +165,7 @@ defmodule UniversalProxy.Bluetooth.Manager do
   end
 
   def handle_call({:reconcile, opts}, _from, state) do
-    state = do_reconcile(state, opts)
+    state = state |> do_reconcile(opts) |> sync_paused()
     broadcast(state)
     {:reply, :ok, state}
   end
@@ -190,7 +201,7 @@ defmodule UniversalProxy.Bluetooth.Manager do
 
   # A start_child failure scheduled this.
   def handle_info(:retry_start, %{bluez_pid: nil} = state) do
-    state = do_reconcile(state, [])
+    state = state |> do_reconcile([]) |> sync_paused()
     broadcast(state)
     {:noreply, state}
   end
@@ -286,14 +297,20 @@ defmodule UniversalProxy.Bluetooth.Manager do
   defp build_status(state) do
     config = settings(state)
     running? = running?(state)
+    paused? = Settings.proxy_paused?(config)
     {used, limit} = connection_usage()
 
     %{
       enabled: config.enabled,
       # The stack itself is always on — "proxying" means HA-facing: data
       # only reaches espex (and the flags are only advertised) when the
-      # user has Bluetooth enabled.
-      proxying?: config.enabled and running?,
+      # user has Bluetooth enabled AND a radio holds the proxy duty. When
+      # role-paused the subtree keeps running on an auto-claimed radio
+      # (the radio list needs the daemon for MACs) but nothing is relayed
+      # — see ESPHome.Supervisor.bluetooth_opts/2, which gates on the
+      # same predicate.
+      proxying?: config.enabled and running? and not paused?,
+      paused?: paused?,
       adapter: adapter_status(state, running?),
       active_connections: %{allowed?: config.active_connections, used: used, limit: limit}
     }
@@ -327,6 +344,36 @@ defmodule UniversalProxy.Bluetooth.Manager do
   catch
     # Gatt not running (subtree down, host) — nothing in use.
     :exit, _ -> {0, UniversalProxy.Bluez.Gatt.max_connections()}
+  end
+
+  # Track the role-paused state across reconciles and bounce espex when it
+  # flips: pausedness gates the espex adapter wiring (see
+  # `ESPHome.Supervisor.bluetooth_opts/2`), so the HA-facing feature flags
+  # must follow — the same exposure as the enabled toggle. Owned here (not
+  # in the `Bluetooth.set_role/2` caller) so the before/after comparison is
+  # serialized in one process: concurrent setters each reconcile, and
+  # whichever lands second sees the settled state instead of misattributing
+  # the other's transition. The boot reconcile seeds `last_paused?` without
+  # bouncing (espex boots after Bluetooth and reads settings fresh).
+  defp sync_paused(state) do
+    paused? = Settings.proxy_paused?(settings(state))
+
+    if is_boolean(state.last_paused?) and paused? != state.last_paused? do
+      state.esphome_restart_fun.()
+    end
+
+    %{state | last_paused?: paused?}
+  end
+
+  # Async fire-and-forget under the app's Task.Supervisor (crash
+  # visibility) — bouncing espex drops HA connections for a few seconds,
+  # the same accepted behavior as the enabled/active_connections setters.
+  defp restart_esphome do
+    Task.Supervisor.start_child(UniversalProxy.TaskSupervisor, fn ->
+      UniversalProxy.ESPHome.Supervisor.restart()
+    end)
+
+    :ok
   end
 
   defp running?(state), do: state.bluez_pid != nil and Process.alive?(state.bluez_pid)

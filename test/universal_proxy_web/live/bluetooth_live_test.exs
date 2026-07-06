@@ -88,6 +88,7 @@ defmodule UniversalProxyWeb.BluetoothLiveTest do
     status = %{
       enabled: true,
       proxying?: true,
+      paused?: false,
       adapter: %{name: "BlueZ 5.79", address: "11:22:33:44:55:66", hci: "hci1"},
       active_connections: %{allowed?: true, used: 0, limit: 3}
     }
@@ -96,6 +97,55 @@ defmodule UniversalProxyWeb.BluetoothLiveTest do
     html = render(view)
 
     refute html =~ "In use"
+  end
+
+  test "role-paused status renders Paused with the assign-a-radio hint", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/bluetooth")
+
+    # The first radio keeps a stale/transient in_use? mark (the subtree
+    # still auto-claims one for the radio list while paused) — it must NOT
+    # render as the effective proxy: effective_role/3 requires proxying?.
+    inject_radios(view, [
+      radio(%{in_use?: true}),
+      radio(%{hci: "hci1", address: "11:22:33:44:55:66", bus: :usb})
+    ])
+
+    status = %{
+      enabled: true,
+      proxying?: false,
+      paused?: true,
+      adapter: %{name: "BlueZ 5.79", address: "AA:BB:CC:DD:EE:FF", hci: "hci0"},
+      active_connections: %{allowed?: true, used: 0, limit: 3}
+    }
+
+    Phoenix.PubSub.broadcast(@pubsub, "bluetooth:state", {:bluetooth_state, status})
+    html = render(view)
+
+    assert html =~ "Paused"
+    assert html =~ "Assign a radio to the Proxy role below to start relaying."
+    refute html =~ "Relaying on"
+    refute html =~ "In use"
+  end
+
+  test "an auto-claimed radio displays as the effective proxy", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/bluetooth")
+
+    # No roles assigned anywhere (host roles read back empty-shaped); the
+    # stack auto-claimed this radio, so its row must say so.
+    inject_radios(view, [radio(%{in_use?: true})])
+
+    status = %{
+      enabled: true,
+      proxying?: true,
+      paused?: false,
+      adapter: %{name: "BlueZ 5.79", address: "AA:BB:CC:DD:EE:FF", hci: "hci0"},
+      active_connections: %{allowed?: true, used: 0, limit: 3}
+    }
+
+    Phoenix.PubSub.broadcast(@pubsub, "bluetooth:state", {:bluetooth_state, status})
+    html = render(view)
+
+    assert html =~ "In use"
   end
 
   test "choosing a role surfaces the unavailable error off-target", %{conn: conn} do
