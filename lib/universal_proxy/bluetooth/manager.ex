@@ -37,6 +37,14 @@ defmodule UniversalProxy.Bluetooth.Manager do
   (crash-restarts are performed by the DynamicSupervisor; this Manager
   only re-binds its monitor and tells subscribers).
 
+  A reconcile's broadcast can predate the subtree's actual adapter claim:
+  `start_child` returns when the subtree *starts*, while `Bluez.Client`
+  resolves and claims the adapter asynchronously during its setup — so the
+  reconcile-time status may still identify the previous adapter. The
+  Manager therefore also subscribes to `Bluez.Client.adapters_topic/0` and
+  rebroadcasts status on `{:bluetooth_adapters_changed}` (claim landed,
+  hotplug add/remove), settling subscribers on the final claim.
+
   ## Options (host-testability)
 
   `start_link/1` accepts `:name`, `:settings` (Settings server ref),
@@ -126,6 +134,10 @@ defmodule UniversalProxy.Bluetooth.Manager do
       monitor: nil
     }
 
+    # See "Broadcasts" in the moduledoc: the adapter claim lands after a
+    # reconcile's broadcast, so rebroadcast when the Client announces it.
+    Phoenix.PubSub.subscribe(state.pubsub, UniversalProxy.Bluez.Client.adapters_topic())
+
     {:ok, state, {:continue, :reconcile}}
   end
 
@@ -184,6 +196,13 @@ defmodule UniversalProxy.Bluetooth.Manager do
   end
 
   def handle_info(:retry_start, state), do: {:noreply, state}
+
+  # Bluez.Client (re)claimed an adapter, or one was hot-plugged/removed.
+  # The claim is what makes adapter_status/2 identify the new radio.
+  def handle_info({:bluetooth_adapters_changed}, state) do
+    broadcast(state)
+    {:noreply, state}
+  end
 
   def handle_info(_other, state), do: {:noreply, state}
 

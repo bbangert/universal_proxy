@@ -264,4 +264,33 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
       assert new_pid != pid
     end
   end
+
+  describe "adapter claim settling" do
+    test "rebroadcasts status when the Client announces an adapter change", ctx do
+      # Stands in for Bluez.Client's live Adapter1 view, which is empty
+      # until the (asynchronous) claim lands.
+      {:ok, info} = Agent.start_link(fn -> [] end)
+
+      _manager = start_manager(ctx, adapters_info_fun: fn -> Agent.get(info, & &1) end)
+
+      # The reconcile-time broadcast predates the claim: no adapter identity.
+      assert_receive {:bluetooth_state, %{adapter: %{address: nil}}}
+
+      # The Client resolves + claims hci1 after its setup, then announces it
+      # on adapters_topic. The Manager must rebroadcast the settled identity.
+      :persistent_term.put(DevicePath.adapter_path_key(), "/org/bluez/hci1")
+
+      Agent.update(info, fn _ ->
+        [%{path: "/org/bluez/hci1", address: @hci1_mac, name: "BlueZ 5.79"}]
+      end)
+
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        UniversalProxy.Bluez.Client.adapters_topic(),
+        {:bluetooth_adapters_changed}
+      )
+
+      assert_receive {:bluetooth_state, %{adapter: %{hci: "hci1", address: @hci1_mac}}}
+    end
+  end
 end
