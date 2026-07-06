@@ -129,6 +129,7 @@ defmodule UniversalProxy.ESPHome.Supervisor do
           required(:enabled) => boolean(),
           required(:active_connections) => boolean(),
           required(:roles) => %{optional(String.t()) => atom()},
+          required(:adapter) => String.t() | nil,
           optional(atom()) => term()
         }) :: keyword()
   def bluetooth_opts(false, _settings), do: []

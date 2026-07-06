@@ -23,11 +23,13 @@ defmodule UniversalProxy.Bluetooth.Settings do
 
   `roles` keys by **MAC** like `adapter`. A record written before this field
   existed is migrated on read (see `migrate_roles/1`): a concrete selected
-  `adapter` becomes `:proxy` when `enabled`, else `:off`; an auto (`nil`)
-  adapter yields no role entry and `proxy_adapter/1` falls back to the legacy
-  `adapter` (still `nil` = auto). So existing BT-proxy behavior is unchanged
-  when roles default-derive from a legacy record. `active_connections` stays a
-  **proxy-adapter-only** property (a single flag, unchanged).
+  `adapter` becomes `:proxy` when `enabled`; when disabled (or auto/`nil`
+  adapter) NO entry is synthesized — never `:off`, which marks "explicitly
+  turned off" and would read as role-paused — and `proxy_adapter/1` falls
+  back to the legacy `adapter` (still `nil` = auto). So existing BT-proxy
+  behavior is unchanged when roles default-derive from a legacy record.
+  `active_connections` stays a **proxy-adapter-only** property (a single
+  flag, unchanged).
 
   `enabled` is NOT a power switch for the radio stack: the BlueZ subtree
   runs whenever the hardware supports it. `enabled` gates only whether the
@@ -256,7 +258,7 @@ defmodule UniversalProxy.Bluetooth.Settings do
   end
 
   # Apply a role with the single-proxy invariant: assigning :proxy clears any
-  # other proxy; :off drops the entry (the default role).
+  # other proxy.
   # :off is STORED, not deleted: an explicitly-off radio must be
   # distinguishable from a never-assigned one, or proxy_paused?/1 couldn't
   # tell "user turned their only radio off" (pause) from a fresh install
