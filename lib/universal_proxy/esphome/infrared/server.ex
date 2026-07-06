@@ -39,6 +39,16 @@ defmodule UniversalProxy.ESPHome.Infrared.Server do
 
   @worker_supervisor UniversalProxy.ESPHome.Infrared.WorkerSupervisor
 
+  # A worker that dies within this window of starting is fast-crashing.
+  # Workers are `:temporary`, so they don't count toward any supervisor's
+  # restart intensity — an immediate inline respawn would be a tight
+  # crash loop nothing ever escalates. Park the entry and retry with
+  # exponential backoff instead; a crash after a healthy run resets the
+  # counter. Same constants as `UniversalProxy.FMA120.Server`.
+  @fast_crash_window_ms 5_000
+  @retry_backoff_base_ms 1_000
+  @retry_backoff_cap_ms 30_000
+
   defstruct inventory: [],
             subscribers: MapSet.new(),
             monitors: %{}
@@ -149,6 +159,16 @@ defmodule UniversalProxy.ESPHome.Infrared.Server do
     end
   end
 
+  # Delayed respawn of a fast-crashing worker. The entry may have been
+  # rebuilt or already restarted since the timer was armed — only act on
+  # a parked entry.
+  def handle_info({:retry_worker, key}, state) do
+    case Enum.find(state.inventory, &(&1.entity.key == key and is_nil(&1.worker_pid))) do
+      nil -> {:noreply, state}
+      entry -> {:noreply, update_entry(state, key, start_worker_for(entry))}
+    end
+  end
+
   def handle_info(_msg, state) do
     {:noreply, state}
   end
@@ -165,30 +185,64 @@ defmodule UniversalProxy.ESPHome.Infrared.Server do
         state
 
       entry ->
-        case start_worker(entry) do
-          {:ok, new_pid} ->
-            Logger.info("Infrared worker for key #{key} restarted")
+        now = System.monotonic_time(:millisecond)
 
-            inventory =
-              Enum.map(state.inventory, fn
-                %{entity: %{key: ^key}} = e -> %{e | worker_pid: new_pid}
-                e -> e
-              end)
+        if entry.last_start != nil and now - entry.last_start < @fast_crash_window_ms do
+          crash_count = entry.crash_count + 1
+          backoff = backoff_ms(crash_count)
 
-            %{state | inventory: inventory}
+          Logger.warning(
+            "Infrared worker for key #{key} fast-crashed (##{crash_count}); " <>
+              "retrying in #{backoff} ms"
+          )
 
-          {:error, reason} ->
-            Logger.error("Failed to restart infrared worker for key #{key}: #{inspect(reason)}")
+          timer = Process.send_after(self(), {:retry_worker, key}, backoff)
 
-            inventory =
-              Enum.map(state.inventory, fn
-                %{entity: %{key: ^key}} = e -> %{e | worker_pid: nil}
-                e -> e
-              end)
-
-            %{state | inventory: inventory}
+          update_entry(state, key, %{
+            entry
+            | worker_pid: nil,
+              crash_count: crash_count,
+              retry_timer: timer
+          })
+        else
+          # Healthy run before dying — restart inline, counter reset.
+          update_entry(state, key, start_worker_for(%{entry | crash_count: 0}))
         end
     end
+  end
+
+  # Start (or restart) the worker for an entry, stamping `last_start` and
+  # preserving `crash_count` so a delayed retry keeps growing its backoff
+  # until a healthy run resets it.
+  defp start_worker_for(entry) do
+    entry = %{entry | last_start: System.monotonic_time(:millisecond), retry_timer: nil}
+
+    case start_worker(entry) do
+      {:ok, pid} ->
+        Logger.info("Infrared worker for key #{entry.entity.key} restarted")
+        %{entry | worker_pid: pid}
+
+      {:error, reason} ->
+        Logger.error(
+          "Failed to restart infrared worker for key #{entry.entity.key}: #{inspect(reason)}"
+        )
+
+        %{entry | worker_pid: nil}
+    end
+  end
+
+  defp update_entry(state, key, new_entry) do
+    inventory =
+      Enum.map(state.inventory, fn
+        %{entity: %{key: ^key}} -> new_entry
+        e -> e
+      end)
+
+    %{state | inventory: inventory}
+  end
+
+  defp backoff_ms(crash_count) do
+    min(@retry_backoff_cap_ms, @retry_backoff_base_ms * Integer.pow(2, crash_count - 1))
   end
 
   defp remove_subscriber(state, pid) do
@@ -264,7 +318,10 @@ defmodule UniversalProxy.ESPHome.Infrared.Server do
           device_module: mod,
           serial_number: serial,
           port_path: path,
-          worker_pid: nil
+          worker_pid: nil,
+          crash_count: 0,
+          last_start: System.monotonic_time(:millisecond),
+          retry_timer: nil
         }
 
         case start_worker(entry) do

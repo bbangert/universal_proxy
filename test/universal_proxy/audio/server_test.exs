@@ -685,6 +685,35 @@ defmodule UniversalProxy.Audio.ServerTest do
              "expected a :started call on the mDNS port base; got #{inspect(calls)}"
     end
 
+    test "a crashed player is rescheduled for respawn without an external hotplug event", %{
+      server: server,
+      player_sup: sup
+    } do
+      [{_, pid, _, _}] = DynamicSupervisor.which_children(sup)
+      ref = Process.monitor(pid)
+      Process.exit(pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
+
+      # The `:DOWN` handler must arm the debounced re-enumeration
+      # itself: on Nerves targets enumeration is uevent-driven and a
+      # player crash emits no uevent, so nothing else would respawn it.
+      eventually(fn -> :sys.get_state(server).hotplug_pending end, 1_000)
+
+      # Drive the debounced message directly instead of sleeping
+      # through @hotplug_debounce_ms.
+      send(server, :check_hotplug)
+
+      eventually(
+        fn ->
+          case DynamicSupervisor.which_children(sup) do
+            [{_, new_pid, _, _}] -> is_pid(new_pid) and new_pid != pid
+            _ -> false
+          end
+        end,
+        1_000
+      )
+    end
+
     test "a Bluetooth headset key (nil card_index/usb_port) spawns a player + mDNS port", %{
       server: server,
       player_sup: sup

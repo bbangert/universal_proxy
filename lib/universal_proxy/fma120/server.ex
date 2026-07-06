@@ -40,17 +40,33 @@ defmodule UniversalProxy.FMA120.Server do
 
   @default_worker_supervisor UniversalProxy.FMA120.WorkerSupervisor
 
+  # A worker that dies within this window of starting is fast-crashing.
+  # Workers are `:temporary`, so they don't count toward any supervisor's
+  # restart intensity — an immediate inline respawn would be a tight
+  # crash loop nothing ever escalates. Park the entry and retry with
+  # exponential backoff instead; a crash after a healthy run resets the
+  # counter (a flaky-but-usable device must not ratchet up permanently).
+  @fast_crash_window_ms 5_000
+  @retry_backoff_base_ms 1_000
+  @retry_backoff_cap_ms 30_000
+
   defstruct inventory: [],
             worker_module: DeviceWorker,
             worker_supervisor: @default_worker_supervisor,
-            hardware: Hardware
+            hardware: Hardware,
+            # Both overridable via start opts (tests shorten them).
+            fast_crash_window_ms: @fast_crash_window_ms,
+            retry_backoff_base_ms: @retry_backoff_base_ms
 
   @type entry :: %{
           key: tuple(),
           usb_port: String.t(),
           port_path: String.t(),
           worker_pid: pid() | nil,
-          monitor: reference() | nil
+          monitor: reference() | nil,
+          crash_count: non_neg_integer(),
+          last_start: integer() | nil,
+          retry_timer: reference() | nil
         }
 
   # -- Client API --
@@ -82,7 +98,9 @@ defmodule UniversalProxy.FMA120.Server do
     state = %__MODULE__{
       worker_module: Keyword.get(opts, :worker_module, DeviceWorker),
       worker_supervisor: Keyword.get(opts, :worker_supervisor, @default_worker_supervisor),
-      hardware: Keyword.get(opts, :hardware, Hardware)
+      hardware: Keyword.get(opts, :hardware, Hardware),
+      fast_crash_window_ms: Keyword.get(opts, :fast_crash_window_ms, @fast_crash_window_ms),
+      retry_backoff_base_ms: Keyword.get(opts, :retry_backoff_base_ms, @retry_backoff_base_ms)
     }
 
     if Keyword.get(opts, :subscribe, true) do
@@ -169,6 +187,29 @@ defmodule UniversalProxy.FMA120.Server do
     end
   end
 
+  # Delayed respawn of a fast-crashing worker. The entry may have been
+  # removed (unplug) or already restarted (hotplug add) since the timer
+  # was armed — only act on a parked entry.
+  def handle_info({:retry_worker, key}, state) do
+    case Enum.find(state.inventory, &(&1.key == key and is_nil(&1.worker_pid))) do
+      nil ->
+        {:noreply, state}
+
+      entry ->
+        inventory = Enum.reject(state.inventory, &(&1.key == key))
+
+        # Re-resolve the tty — the device may be gone by now.
+        case resolve_tty(state, entry.usb_port) do
+          nil ->
+            {:noreply, %{state | inventory: inventory}}
+
+          tty ->
+            new_entry = start_entry(state, key, entry.usb_port, tty, entry.crash_count)
+            {:noreply, %{state | inventory: [new_entry | inventory]}}
+        end
+    end
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
 
   # -- Private: inventory construction --
@@ -207,29 +248,75 @@ defmodule UniversalProxy.FMA120.Server do
         state
 
       entry ->
+        if entry.retry_timer, do: Process.cancel_timer(entry.retry_timer)
         stop_worker(state, entry)
         %{state | inventory: Enum.reject(state.inventory, &(&1.key == key))}
     end
   end
 
   defp restart_or_drop(state, entry) do
+    now = System.monotonic_time(:millisecond)
+
+    fast_crash? =
+      entry.last_start != nil and now - entry.last_start < state.fast_crash_window_ms
+
     inventory = Enum.reject(state.inventory, &(&1.key == entry.key))
 
-    case resolve_tty(state, entry.usb_port) do
-      nil ->
-        # Device is gone; the removal event (or next add) handles it.
-        %{state | inventory: inventory}
+    cond do
+      fast_crash? ->
+        crash_count = entry.crash_count + 1
+        backoff = backoff_ms(state, crash_count)
 
-      tty ->
-        new_entry = start_entry(state, entry.key, entry.usb_port, tty)
-        %{state | inventory: [new_entry | inventory]}
+        Logger.warning(
+          "FMA120 worker for #{inspect(entry.key)} fast-crashed " <>
+            "(##{crash_count}); retrying in #{backoff} ms"
+        )
+
+        timer = Process.send_after(self(), {:retry_worker, entry.key}, backoff)
+
+        parked = %{
+          entry
+          | worker_pid: nil,
+            monitor: nil,
+            crash_count: crash_count,
+            retry_timer: timer
+        }
+
+        %{state | inventory: [parked | inventory]}
+
+      true ->
+        # Healthy run before dying — restart inline, counter reset.
+        case resolve_tty(state, entry.usb_port) do
+          nil ->
+            # Device is gone; the removal event (or next add) handles it.
+            %{state | inventory: inventory}
+
+          tty ->
+            new_entry = start_entry(state, entry.key, entry.usb_port, tty)
+            %{state | inventory: [new_entry | inventory]}
+        end
     end
+  end
+
+  defp backoff_ms(state, crash_count) do
+    min(@retry_backoff_cap_ms, state.retry_backoff_base_ms * Integer.pow(2, crash_count - 1))
   end
 
   # Build an entry and start+monitor its worker. On start failure the entry
   # is kept with `worker_pid: nil` so a later hotplug/DOWN can retry.
-  defp start_entry(state, key, usb_port, tty) do
-    base = %{key: key, usb_port: usb_port, port_path: tty, worker_pid: nil, monitor: nil}
+  # `crash_count` carries the fast-crash tally across a delayed retry so
+  # the backoff keeps growing until a healthy run resets it.
+  defp start_entry(state, key, usb_port, tty, crash_count \\ 0) do
+    base = %{
+      key: key,
+      usb_port: usb_port,
+      port_path: tty,
+      worker_pid: nil,
+      monitor: nil,
+      crash_count: crash_count,
+      last_start: System.monotonic_time(:millisecond),
+      retry_timer: nil
+    }
 
     spec = %{
       id: key,

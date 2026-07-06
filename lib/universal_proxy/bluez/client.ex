@@ -97,6 +97,13 @@ defmodule UniversalProxy.Bluez.Client do
   # disengage 5 s) plus margin; normal transitions complete in milliseconds.
   @set_mode_timeout_ms 32_000
 
+  # Watchdog for a mode-transition Task that neither completes nor dies —
+  # e.g. a D-Bus call wedged past its own timeouts. Must exceed the 32 s
+  # set_mode budget so it only fires when the transition machinery itself
+  # is stuck; then we stop and let the supervisor rebuild us with fresh
+  # D-Bus state (a wedged connection is suspect — don't patch state).
+  @transition_watchdog_ms 45_000
+
   # :persistent_term key for the HA-configured scanner mode. Survives Client
   # restarts (within a boot) so re-init re-engages what HA chose.
   @mode_key {__MODULE__, :configured_mode}
@@ -193,17 +200,23 @@ defmodule UniversalProxy.Bluez.Client do
   end
 
   @impl GenServer
-  def init(_opts) do
-    case Rebus.connect(:system) do
+  def init(opts) do
+    # `connect_fun` / `apply_mode_fun` / `watchdog_ms` / `setup` are
+    # test-only injection seams (host has no system D-Bus); production
+    # callers pass no opts.
+    connect_fun = Keyword.get(opts, :connect_fun, fn -> Rebus.connect(:system) end)
+
+    case connect_fun.() do
       {:ok, conn} ->
         ref = Rebus.add_signal_handler(conn)
         # Receive inbound method calls (BlueZ → our monitor object) too.
         Rebus.set_method_handler(conn, self())
         # Restart (and reconnect) if the connection dies.
         conn_ref = Process.monitor(conn)
+
         # rebus installs no bus-side match rules, so org.bluez's device signals
         # wouldn't reach us; ask the daemon to route them.
-        add_signal_matches(conn)
+        if Keyword.get(opts, :setup, true), do: add_signal_matches(conn)
 
         state = %{
           conn: conn,
@@ -214,11 +227,15 @@ defmodule UniversalProxy.Bluez.Client do
           # actually doing for us right now (:none until setup engages).
           mode: nil,
           engaged: :none,
-          # transition = generation ref of the in-flight Task (nil = idle);
-          # pending = one-slot queue parked behind it: {target, [from]} —
-          # same-target callers coalesce, a new target displaces them.
+          # transition = nil (idle) or the in-flight Task's bookkeeping:
+          # %{ref: generation ref, task_ref: monitor, watchdog: timer,
+          #   target:, froms:}. pending = one-slot queue parked behind
+          # it: {target, [from]} — same-target callers coalesce, a new
+          # target displaces them.
           transition: nil,
           pending: nil,
+          apply_mode_fun: Keyword.get(opts, :apply_mode_fun),
+          watchdog_ms: Keyword.get(opts, :watchdog_ms, @transition_watchdog_ms),
           # Set of org.bluez adapter object paths ("/org/bluez/hciN"),
           # seeded at setup and maintained from InterfacesAdded/Removed.
           # `adapters_info/0` does a cheap per-path GetAll over this set
@@ -226,7 +243,11 @@ defmodule UniversalProxy.Bluez.Client do
           adapters: MapSet.new()
         }
 
-        {:ok, state, {:continue, {:setup, @setup_retries}}}
+        if Keyword.get(opts, :setup, true) do
+          {:ok, state, {:continue, {:setup, @setup_retries}}}
+        else
+          {:ok, state}
+        end
 
       {:error, reason} ->
         {:stop, {:dbus_connect_failed, reason}}
@@ -324,9 +345,66 @@ defmodule UniversalProxy.Bluez.Client do
     {:noreply, state}
   end
 
+  # The transition Task died without sending its completion message
+  # (brutal kill, or a bug in the task body's own error handling). Clear
+  # `transition` so the state machine can't wedge, fail the callers, and
+  # serve whatever parked behind it.
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{transition: %{task_ref: ref}} = state) do
+    %{watchdog: watchdog, target: target, froms: froms} = state.transition
+    Process.cancel_timer(watchdog)
+
+    Logger.error(
+      "Bluez.Client: mode transition to #{inspect(target)} task died " <>
+        "without completing: #{inspect(reason)}"
+    )
+
+    Enum.each(froms, &GenServer.reply(&1, {:error, :transition_task_died}))
+    {:noreply, run_pending(%{state | transition: nil})}
+  end
+
+  # The transition neither completed nor died within the watchdog budget —
+  # a D-Bus call is stuck past its own timeouts, so the connection state
+  # is suspect. Stop and let the supervisor rebuild us fresh rather than
+  # patching state around a wedged connection.
+  def handle_info({:transition_watchdog, ref}, %{transition: %{ref: ref}} = state) do
+    %{target: target, froms: froms, task_pid: task_pid, task_ref: task_ref} = state.transition
+
+    Logger.error(
+      "Bluez.Client: scanner mode transition to #{inspect(target)} stuck " <>
+        "beyond #{state.watchdog_ms} ms — stopping for a fresh D-Bus connection"
+    )
+
+    # Reap the wedged Task — it's unsupervised, and the blocked D-Bus
+    # call it sits in is exactly the "stuck indefinitely" case this
+    # watchdog exists for; nothing else would ever kill it.
+    Process.demonitor(task_ref, [:flush])
+    Process.exit(task_pid, :kill)
+
+    # Fail the current callers AND anyone parked behind them — a plain
+    # {:error, _} tuple beats riding the raw process exit (mirrors the
+    # task-died path, which serves pending via run_pending).
+    Enum.each(froms, &GenServer.reply(&1, {:error, :transition_stuck}))
+
+    case state.pending do
+      {_target, pending_froms} ->
+        Enum.each(pending_froms, &GenServer.reply(&1, {:error, :transition_stuck}))
+
+      nil ->
+        :ok
+    end
+
+    {:stop, {:transition_stuck, target}, %{state | pending: nil}}
+  end
+
   # Current transition finished — commit the outcome, answer the callers,
   # then run whatever parked behind it.
-  def handle_info({:mode_transition, ref, target, froms, result}, %{transition: ref} = state) do
+  def handle_info(
+        {:mode_transition, ref, target, froms, result},
+        %{transition: %{ref: ref}} = state
+      ) do
+    %{task_ref: task_ref, watchdog: watchdog} = state.transition
+    Process.demonitor(task_ref, [:flush])
+    Process.cancel_timer(watchdog)
     state = %{state | transition: nil}
 
     state =
@@ -411,25 +489,42 @@ defmodule UniversalProxy.Bluez.Client do
     conn = state.conn
     engaged = state.engaged
     ref = make_ref()
+    apply_mode_fun = state.apply_mode_fun || (&apply_mode/3)
 
-    Task.start(fn ->
-      # The completion message must ALWAYS arrive — a Task that dies without
-      # sending it leaves `transition` stuck non-nil and every future
-      # set_mode/1 parking until timeout. apply_mode/3 shouldn't raise
-      # (DBus.call normalizes errors), but don't bet the state machine on it.
-      result =
-        try do
-          apply_mode(conn, engaged, target)
-        rescue
-          e -> {:error, e, engaged}
-        catch
-          kind, reason -> {:error, {kind, reason}, engaged}
-        end
+    {:ok, task_pid} =
+      Task.start(fn ->
+        # The completion message must ALWAYS arrive — a Task that dies without
+        # sending it leaves `transition` stuck non-nil and every future
+        # set_mode/1 parking until timeout. apply_mode/3 shouldn't raise
+        # (DBus.call normalizes errors), but don't bet the state machine on it.
+        result =
+          try do
+            apply_mode_fun.(conn, engaged, target)
+          rescue
+            e -> {:error, e, engaged}
+          catch
+            kind, reason -> {:error, {kind, reason}, engaged}
+          end
 
-      send(me, {:mode_transition, ref, target, froms, result})
-    end)
+        send(me, {:mode_transition, ref, target, froms, result})
+      end)
 
-    %{state | transition: ref}
+    # Belt (monitor) and braces (watchdog) for the guarantee above: the
+    # monitor catches a task killed before it can send; the watchdog
+    # catches a task alive but stuck in a wedged D-Bus call.
+    task_ref = Process.monitor(task_pid)
+    watchdog = Process.send_after(me, {:transition_watchdog, ref}, state.watchdog_ms)
+
+    transition = %{
+      ref: ref,
+      task_pid: task_pid,
+      task_ref: task_ref,
+      watchdog: watchdog,
+      target: target,
+      froms: froms
+    }
+
+    %{state | transition: transition}
   end
 
   # After a transition: serve the parked set_mode callers, if any.

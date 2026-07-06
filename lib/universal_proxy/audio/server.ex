@@ -465,8 +465,13 @@ defmodule UniversalProxy.Audio.Server do
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
     # A player crashed (we use `:temporary` so the DynamicSupervisor
-    # doesn't auto-restart). Drop it from `state.players`; the next
-    # hotplug poll will respawn if the output is still enabled.
+    # doesn't auto-restart). Drop it from `state.players` and schedule a
+    # debounced re-enumeration to respawn it if still enabled. The
+    # explicit schedule matters: on Nerves targets enumeration is
+    # uevent-driven and a player crash emits no uevent, so without it a
+    # crashed player would never respawn on hardware. A player marked
+    # `binary_missing` by `maybe_mark_port_unusable` is still skipped by
+    # `respawn_missing_players/1`.
     case Enum.find(state.players, fn {_k, %{monitor: m}} -> m == ref end) do
       {key, %{mdns_port: port}} ->
         Logger.warning("Audio.Player for #{inspect(key)} went down: #{inspect(reason)}")
@@ -475,6 +480,7 @@ defmodule UniversalProxy.Audio.Server do
           %{state | players: Map.delete(state.players, key)}
           |> maybe_mark_port_unusable(port, reason)
           |> reset_connection_state(key)
+          |> schedule_hotplug()
 
         {:noreply, state}
 
@@ -1005,9 +1011,17 @@ defmodule UniversalProxy.Audio.Server do
             _ -> nil
           end
         rescue
-          _ -> nil
+          e ->
+            Logger.warning(
+              "Audio mDNS discovery (#{inspect(mod)}) raised: " <>
+                Exception.format(:error, e, __STACKTRACE__)
+            )
+
+            nil
         catch
-          :exit, _ -> nil
+          :exit, reason ->
+            Logger.warning("Audio mDNS discovery (#{inspect(mod)}) exited: #{inspect(reason)}")
+            nil
         end
     end
   end

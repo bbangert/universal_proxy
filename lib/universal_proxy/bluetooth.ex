@@ -32,6 +32,13 @@ defmodule UniversalProxy.Bluetooth do
   readers return a disabled-shaped status and the setters return clean
   errors instead of raising — same defensive posture as the espex adapters.
 
+  Tradeoff to know: the `catch :exit, _` wrappers convert BOTH the
+  process-not-running exit AND a call **timeout** into the same
+  "subsystem off" default, so a wedged server renders as a disabled
+  subsystem rather than raising. Deliberate (benign UI degradation over
+  crash cascades) and project-wide — see CLAUDE.md "Public-API
+  `catch :exit` idiom". New wrappers must follow the idiom knowingly.
+
   State changes are broadcast on `Phoenix.PubSub` (`UniversalProxy.PubSub`):
 
     * `state_topic()` (`"bluetooth:state"`) — `{:bluetooth_state, status}`
@@ -59,11 +66,14 @@ defmodule UniversalProxy.Bluetooth do
 
   On a board whose BT bring-up fails (broken DT, no onboard radio, no USB
   dongle yet), `UniversalProxy.Bluez.Client` gives up after ~10 s
-  (`:no_adapter`) and the `Bluez` subtree restarts. Each cycle takes
-  longer than the DynamicSupervisor's intensity window, so this is a benign
-  endless retry loop, not an escalating crash: the app stays healthy, and
-  a USB BT dongle (btusb is in the custom systems) hot-plugged later is
-  picked up by the next cycle.
+  (`:no_adapter`) and the `Bluez` subtree restarts. The loop is benign by
+  configuration: both the `Bluez` supervisor and the DynamicSupervisor it
+  runs under carry explicit `max_restarts: 10, max_seconds: 60` budgets,
+  sized so the ~10 s `:no_adapter` cycle AND a faster-failing variant
+  (e.g. `:dbus_connect_failed` from init) stay below the intensity
+  threshold — while a genuinely hot crash loop still escalates within a
+  minute. The app stays healthy, and a USB BT dongle (btusb is in the
+  custom systems) hot-plugged later is picked up by the next cycle.
   """
 
   alias UniversalProxy.Bluetooth.{AudioManager, Manager, RadioMonitor, Settings, Stats}
@@ -338,7 +348,15 @@ defmodule UniversalProxy.Bluetooth do
 
         # The BlueZ subtree (dbus-daemon + bluetoothd + scanner/GATT
         # clients) runs under here, started/stopped by the Manager.
-        {DynamicSupervisor, name: __MODULE__.DynamicSupervisor, strategy: :one_for_one},
+        # Restart budget matches the Bluez supervisor's own 10/60 s: the
+        # default 3-in-5 s is exactly what a fast-failing Bluez subtree
+        # (e.g. :dbus_connect_failed on every init) would trip, walking
+        # the escalation chain toward a BEAM exit + Nerves reboot loop.
+        {DynamicSupervisor,
+         name: __MODULE__.DynamicSupervisor,
+         strategy: :one_for_one,
+         max_restarts: 10,
+         max_seconds: 60},
 
         # Runtime lifecycle gate (see its @moduledoc).
         Manager,

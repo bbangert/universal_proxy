@@ -176,11 +176,28 @@ defmodule UniversalProxy.FMA120 do
   # between resolution and the call, a blocking `command/3` surfaces the exit
   # and a fire-and-forget `refresh/2` cast is silently dropped — both tolerated
   # (the device re-broadcasts its state on the next handshake / reconnect).
+  # A call *timeout* (worker wedged past DeviceWorker's own command budget)
+  # comes back as `{:error, :timeout}` so LiveView callers render an error
+  # instead of crashing or hanging.
   defp with_worker(key, fun) do
     case Server.worker_for(key) do
-      {:ok, pid} -> fun.(pid)
+      {:ok, pid} -> call_worker(pid, fun)
       {:error, :not_found} -> {:error, :not_found}
     end
+  end
+
+  # Public (`@doc false`) so the timeout conversion is unit-testable.
+  # The second clause covers a worker that stops (or is already dead)
+  # while the call is pending — e.g. the wedge-recovery
+  # `{:stop, :wedged_recovered, _}` — which re-raises in the caller with
+  # the stop reason, not `:timeout`. Only call-shaped exits are caught;
+  # anything else propagates.
+  @doc false
+  def call_worker(pid, fun) do
+    fun.(pid)
+  catch
+    :exit, {:timeout, {GenServer, :call, _}} -> {:error, :timeout}
+    :exit, {_reason, {GenServer, :call, _}} -> {:error, :unavailable}
   end
 
   # Persist the preference first (so it survives a reconnect even if the live

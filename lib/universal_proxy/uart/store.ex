@@ -181,7 +181,7 @@ defmodule UniversalProxy.UART.Store do
   defp to_atom(_, default), do: default
 
   defp restart_esphome do
-    Task.start(fn ->
+    Task.Supervisor.start_child(UniversalProxy.TaskSupervisor, fn ->
       UniversalProxy.ESPHome.Supervisor.restart()
     end)
   end

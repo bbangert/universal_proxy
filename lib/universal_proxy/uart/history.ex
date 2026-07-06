@@ -137,23 +137,40 @@ defmodule UniversalProxy.UART.History do
     Phoenix.PubSub.subscribe(@pubsub, "uart:port_opened")
     Phoenix.PubSub.subscribe(@pubsub, "uart:port_closed")
 
-    open_names = open_friendly_names()
-    Enum.each(open_names, &Phoenix.PubSub.subscribe(@pubsub, "uart:#{&1}"))
-
     if Map.get(opts, :auto_tick?, true) do
       :timer.send_interval(@throughput_tick_ms, self(), :throughput_tick)
     end
 
+    # The already-open-port snapshot needs a cross-process call into
+    # UART.Server, which must not happen in init: it would couple this
+    # process's startup to the Server being up already (a fragile
+    # supervisor-ordering dependency). The port_opened/port_closed
+    # subscriptions above are live before the continue runs, so no
+    # open/close event can slip between snapshot and subscription.
     {:ok,
      %{
        buffers: %{},
-       subscribed_topics: MapSet.new(open_names),
+       subscribed_topics: MapSet.new(),
        subscribers: %{},
        throughput: %{},
        throughput_subscribers: %{},
        packet_buckets: List.duplicate(0, @packet_rate_window),
        next_id: 1
-     }}
+     }, {:continue, :subscribe_open_ports}}
+  end
+
+  @impl true
+  def handle_continue(:subscribe_open_ports, state) do
+    open_names = open_friendly_names()
+
+    new_names =
+      open_names
+      |> Enum.reject(&MapSet.member?(state.subscribed_topics, &1))
+      |> MapSet.new()
+
+    Enum.each(new_names, &Phoenix.PubSub.subscribe(@pubsub, "uart:#{&1}"))
+
+    {:noreply, %{state | subscribed_topics: MapSet.union(state.subscribed_topics, new_names)}}
   end
 
   @impl true

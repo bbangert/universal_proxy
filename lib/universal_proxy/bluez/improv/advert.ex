@@ -209,12 +209,28 @@ defmodule UniversalProxy.Bluez.Improv.Advert do
 
   defp run_task(%{task_sup: sup}, fun) do
     # Fall back to a bare Task when the supervisor is absent (host tests) or
-    # refuses (e.g. max_restarts) so the {:register_result, _} heal still fires (W1f).
-    with true <- is_pid(Process.whereis(sup)),
-         {:ok, _} <- Task.Supervisor.start_child(sup, fun) do
-      :ok
-    else
-      _ -> Task.start(fun)
+    # refuses (e.g. max_restarts) so the {:register_result, _} heal still fires
+    # (W1f). The refused case is logged — a restart-throttled supervisor
+    # spawning unsupervised work is when crash visibility matters most.
+    case Process.whereis(sup) do
+      nil ->
+        Task.start(fun)
+        :ok
+
+      _pid ->
+        case Task.Supervisor.start_child(sup, fun) do
+          {:ok, _} ->
+            :ok
+
+          error ->
+            Logger.warning(
+              "Improv.Advert Task.Supervisor #{inspect(sup)} refused " <>
+                "(#{inspect(error)}); running unsupervised"
+            )
+
+            Task.start(fun)
+            :ok
+        end
     end
   end
 

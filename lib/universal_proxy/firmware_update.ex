@@ -130,7 +130,37 @@ defmodule UniversalProxy.FirmwareUpdate do
         verification_required: ConfigStore.verification_required?()
       }
     else
-      Updater.state(Updater)
+      # Flash-safe: the Updater deliberately blocks its whole loop while
+      # fwup writes the firmware (documented design), so a LiveView
+      # mounting mid-flash would exit at the 5 s default call timeout —
+      # render a busy-shaped snapshot for that case. Only the timeout
+      # means "flash in progress"; any other exit (e.g. :noproc while
+      # the Updater restarts) must not masquerade as installing.
+      try do
+        Updater.state(Updater)
+      catch
+        :exit, {:timeout, {GenServer, :call, _}} ->
+          %{
+            phase: :installing,
+            pct: nil,
+            message: "Installing firmware…",
+            last_error: nil,
+            last_release: nil,
+            verification_required: ConfigStore.verification_required?()
+          }
+
+        :exit, reason ->
+          Logger.warning("FirmwareUpdate.state: Updater unavailable: #{inspect(reason)}")
+
+          %{
+            phase: :idle,
+            pct: nil,
+            message: nil,
+            last_error: nil,
+            last_release: nil,
+            verification_required: ConfigStore.verification_required?()
+          }
+      end
     end
   end
 
@@ -162,9 +192,31 @@ defmodule UniversalProxy.FirmwareUpdate do
         verification_required: snap.verification_required
       ]
 
-      case Updater.update_config(Updater, propagated) do
+      # Flash-safe like `state/0`: a flash in progress blocks the
+      # Updater's loop past the call timeout — report `{:error, :busy}`
+      # for that case only. Any other exit (e.g. :noproc during an
+      # Updater restart) is a best-effort propagation failure like the
+      # `{:error, reason}` branch below: logged, but `:ok` — the DETS
+      # write above already landed and survives restart.
+      result =
+        try do
+          Updater.update_config(Updater, propagated)
+        catch
+          :exit, {:timeout, {GenServer, :call, _}} -> {:error, :busy}
+          :exit, reason -> {:error, {:updater_unavailable, reason}}
+        end
+
+      case result do
         :ok ->
           :ok
+
+        {:error, :busy} ->
+          Logger.warning(
+            "FirmwareUpdate.update_config: live Updater busy (flash in progress); " <>
+              "DETS persist applied, restart picks it up"
+          )
+
+          {:error, :busy}
 
         {:error, reason} ->
           Logger.warning(

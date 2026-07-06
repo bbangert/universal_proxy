@@ -324,12 +324,28 @@ defmodule UniversalProxy.Bluez.Improv.GattServer do
   defp run_task(%{task_sup: sup}, fun) do
     # Fall back to a bare Task when the supervisor is absent (host tests) or
     # refuses (e.g. max_restarts) — otherwise the {:register_result, _} heal
-    # would never arrive and registered? would stick at true (W1f).
-    with true <- is_pid(Process.whereis(sup)),
-         {:ok, _} <- Task.Supervisor.start_child(sup, fun) do
-      :ok
-    else
-      _ -> Task.start(fun)
+    # would never arrive and registered? would stick at true (W1f). The
+    # refused case is logged — a restart-throttled supervisor spawning
+    # unsupervised work is when crash visibility matters most.
+    case Process.whereis(sup) do
+      nil ->
+        Task.start(fun)
+        :ok
+
+      _pid ->
+        case Task.Supervisor.start_child(sup, fun) do
+          {:ok, _} ->
+            :ok
+
+          error ->
+            Logger.warning(
+              "Improv.GattServer Task.Supervisor #{inspect(sup)} refused " <>
+                "(#{inspect(error)}); running unsupervised"
+            )
+
+            Task.start(fun)
+            :ok
+        end
     end
   end
 

@@ -117,20 +117,30 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
     }
 
     if port_path do
-      case open_port(port_path) do
-        {:ok, uart_pid} ->
-          state = %{state | uart_pid: uart_pid}
-          request_home_id(state)
-          Logger.info("Z-Wave proxy started on #{port_path}")
-          {:ok, state}
-
-        {:error, reason} ->
-          Logger.warning("Z-Wave proxy failed to open #{port_path}: #{inspect(reason)}")
-          {:ok, state}
-      end
+      # Port open is deferred out of init: `Circuits.UART.open` can block
+      # on a slow/misbehaving tty, and nothing here may hold up the
+      # ESPHome supervisor's boot. Same tolerate-failure semantics as
+      # before (a failed open leaves uart_pid nil); matches the
+      # FMA120/irdroid worker pattern.
+      {:ok, state, {:continue, :open_port}}
     else
       Logger.info("Z-Wave proxy started (no device configured)")
       {:ok, state}
+    end
+  end
+
+  @impl GenServer
+  def handle_continue(:open_port, %{port_path: port_path} = state) do
+    case open_port(port_path) do
+      {:ok, uart_pid} ->
+        state = %{state | uart_pid: uart_pid}
+        request_home_id(state)
+        Logger.info("Z-Wave proxy started on #{port_path}")
+        {:noreply, state}
+
+      {:error, reason} ->
+        Logger.warning("Z-Wave proxy failed to open #{port_path}: #{inspect(reason)}")
+        {:noreply, state}
     end
   end
 
