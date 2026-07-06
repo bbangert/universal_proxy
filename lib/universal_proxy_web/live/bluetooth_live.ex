@@ -705,7 +705,7 @@ defmodule UniversalProxyWeb.BluetoothLive do
         <.bt_radio_row
           :for={radio <- @radios}
           radio={radio}
-          role={role_of(@roles, radio.address)}
+          role={effective_role(@roles, radio, @status)}
           proxying?={@status.proxying?}
           paired_count={length(paired_on(@headphones, radio.address))}
           busy={@busy}
@@ -1365,10 +1365,11 @@ defmodule UniversalProxyWeb.BluetoothLive do
   defp proxy_status(%{proxying?: true}, _roles, _radios),
     do: %{label: "Proxying", variant: :success, paused?: false, paused_hint: nil}
 
-  defp proxy_status(%{enabled: true, adapter: nil}, roles, radios) do
+  defp proxy_status(%{enabled: true} = status, roles, radios) do
     cond do
-      # A radio is present but none holds the :proxy role → paused, not "no adapter".
-      radios != [] and is_nil(roles.proxy) ->
+      # Role-paused (per the Manager, which gates proxying? on it) with a
+      # radio present to assign — the pause is the story, not the adapter.
+      Map.get(status, :paused?, false) and radios != [] ->
         %{
           label: "Paused",
           variant: :neutral,
@@ -1376,10 +1377,12 @@ defmodule UniversalProxyWeb.BluetoothLive do
           paused_hint: paused_hint(radios, roles)
         }
 
-      true ->
+      is_nil(status.adapter) ->
         %{label: "No adapter", variant: :warning, paused?: false, paused_hint: nil}
+
+      true ->
+        %{label: "Off", variant: :neutral, paused?: false, paused_hint: nil}
     end
-    |> Map.put_new(:paused?, false)
   end
 
   defp proxy_status(_status, _roles, _radios),
@@ -1433,6 +1436,23 @@ defmodule UniversalProxyWeb.BluetoothLive do
   end
 
   defp role_of(_roles, _mac), do: :off
+
+  # The role a radio row displays. Explicit assignment wins; the one
+  # exception is the auto-claimed proxy: with NO roles assigned anywhere
+  # (fresh install / pre-roles settings) the stack falls back to a radio
+  # on its own, and showing that radio as "Off" while the header says
+  # Proxying would be a lie. Clicking Off on it then genuinely pauses
+  # (the :off is stored, ending the auto fallback).
+  defp effective_role(roles, radio, status) do
+    role = role_of(roles, radio.address)
+
+    if role == :off and is_nil(roles.proxy) and roles.audio == [] and
+         status.proxying? and radio.in_use? do
+      :proxy
+    else
+      role
+    end
+  end
 
   defp role_tile_classes(:proxy), do: "bg-accent-soft text-accent"
   defp role_tile_classes(:audio), do: "bg-audio-soft text-audio"

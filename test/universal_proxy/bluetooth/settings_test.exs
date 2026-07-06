@@ -250,10 +250,23 @@ defmodule UniversalProxy.Bluetooth.SettingsTest do
       assert Enum.count(settings.roles, fn {_m, r} -> r == :proxy end) == 1
     end
 
-    test ":off removes the entry", %{server: server} do
+    test ":off is stored, distinguishing it from never-assigned", %{server: server} do
       :ok = Settings.set_role(server, "AA:BB:CC:DD:EE:FF", :audio)
       :ok = Settings.set_role(server, "AA:BB:CC:DD:EE:FF", :off)
-      assert Settings.get(server).roles == %{}
+
+      settings = Settings.get(server)
+      assert settings.roles == %{"AA:BB:CC:DD:EE:FF" => :off}
+      assert Settings.role(settings, "AA:BB:CC:DD:EE:FF") == :off
+      assert Settings.audio_adapters(settings) == []
+    end
+
+    test "setting the legacy adapter radio :off keeps its fallback suppressed", %{server: server} do
+      # A deleted entry would resurrect the legacy fallback for the very
+      # radio the user just turned off.
+      :ok = Settings.set_adapter(server, "AA:BB:CC:DD:EE:FF")
+      :ok = Settings.set_role(server, "AA:BB:CC:DD:EE:FF", :off)
+
+      assert Settings.proxy_adapter(Settings.get(server)) == nil
     end
 
     test "rejects a malformed MAC and an unknown role", %{server: server} do
@@ -293,6 +306,43 @@ defmodule UniversalProxy.Bluetooth.SettingsTest do
     test "an explicit :proxy role always wins over the legacy adapter" do
       settings = %{roles: %{"11:22:33:44:55:66" => :proxy}, adapter: "AA:BB:CC:DD:EE:FF"}
       assert Settings.proxy_adapter(settings) == "11:22:33:44:55:66"
+    end
+  end
+
+  describe "proxy_paused?/1" do
+    test "fresh install (no roles, auto adapter) is not paused" do
+      refute Settings.proxy_paused?(%{roles: %{}, adapter: nil})
+    end
+
+    test "legacy-only config (no roles, adapter selected) is not paused" do
+      refute Settings.proxy_paused?(%{roles: %{}, adapter: "AA:BB:CC:DD:EE:FF"})
+    end
+
+    test "an explicit :proxy role is not paused" do
+      refute Settings.proxy_paused?(%{roles: %{"AA:BB:CC:DD:EE:FF" => :proxy}, adapter: nil})
+    end
+
+    test "roles engaged with no :proxy and no surviving fallback is paused" do
+      # The user's radio holds :audio — nothing left to proxy on.
+      assert Settings.proxy_paused?(%{roles: %{"AA:BB:CC:DD:EE:FF" => :audio}, adapter: nil})
+
+      # Same when the role holder IS the legacy adapter (fallback suppressed).
+      assert Settings.proxy_paused?(%{
+               roles: %{"AA:BB:CC:DD:EE:FF" => :audio},
+               adapter: "AA:BB:CC:DD:EE:FF"
+             })
+    end
+
+    test "the only radio explicitly :off is paused" do
+      assert Settings.proxy_paused?(%{roles: %{"AA:BB:CC:DD:EE:FF" => :off}, adapter: nil})
+    end
+
+    test "a surviving legacy fallback is not paused" do
+      # A different radio got a role; the legacy adapter still proxies.
+      refute Settings.proxy_paused?(%{
+               roles: %{"11:22:33:44:55:66" => :audio},
+               adapter: "AA:BB:CC:DD:EE:FF"
+             })
     end
   end
 end

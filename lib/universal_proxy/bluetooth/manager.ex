@@ -286,14 +286,20 @@ defmodule UniversalProxy.Bluetooth.Manager do
   defp build_status(state) do
     config = settings(state)
     running? = running?(state)
+    paused? = Settings.proxy_paused?(config)
     {used, limit} = connection_usage()
 
     %{
       enabled: config.enabled,
       # The stack itself is always on — "proxying" means HA-facing: data
       # only reaches espex (and the flags are only advertised) when the
-      # user has Bluetooth enabled.
-      proxying?: config.enabled and running?,
+      # user has Bluetooth enabled AND a radio holds the proxy duty. When
+      # role-paused the subtree keeps running on an auto-claimed radio
+      # (the radio list needs the daemon for MACs) but nothing is relayed
+      # — see ESPHome.Supervisor.bluetooth_opts/2, which gates on the
+      # same predicate.
+      proxying?: config.enabled and running? and not paused?,
+      paused?: paused?,
       adapter: adapter_status(state, running?),
       active_connections: %{allowed?: config.active_connections, used: used, limit: limit}
     }

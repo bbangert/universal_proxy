@@ -265,6 +265,31 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
     end
   end
 
+  describe "role-paused status" do
+    test "roles engaged with no :proxy: subtree runs, but proxying? is false", ctx do
+      # The only radio the user touched holds :audio — nothing may proxy.
+      :ok = Settings.set_role(ctx.settings, @hci1_mac, :audio)
+      manager = start_manager(ctx)
+
+      # The subtree still runs (the radio list needs the daemon for MACs).
+      assert child_count(ctx.dynsup) == 1
+
+      assert %{enabled: true, proxying?: false, paused?: true} = Manager.status(manager)
+      assert_receive {:bluetooth_state, %{proxying?: false, paused?: true}}
+    end
+
+    test "assigning :proxy resumes: reconcile broadcasts proxying? true", ctx do
+      :ok = Settings.set_role(ctx.settings, @hci1_mac, :audio)
+      manager = start_manager(ctx)
+      assert_receive {:bluetooth_state, %{paused?: true}}
+
+      :ok = Settings.set_role(ctx.settings, @hci0_mac, :proxy)
+      :ok = Manager.reconcile(manager)
+
+      assert_receive {:bluetooth_state, %{proxying?: true, paused?: false}}
+    end
+  end
+
   describe "adapter claim settling" do
     test "rebroadcasts status when the Client announces an adapter change", ctx do
       # Stands in for Bluez.Client's live Adapter1 view, which is empty

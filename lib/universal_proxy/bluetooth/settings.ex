@@ -168,6 +168,24 @@ defmodule UniversalProxy.Bluetooth.Settings do
     end
   end
 
+  @doc """
+  Whether the proxy is role-paused: the user has engaged the role model
+  (any explicit role assignment, including `:off`) and `proxy_adapter/1`
+  resolves to no radio. Pure; takes a settings map.
+
+  An empty roles map is NOT paused — that's a fresh install or pre-roles
+  settings, where the legacy adapter/auto fallback keeps the zero-config
+  proxy working. A surviving legacy fallback (roles assigned, but the
+  legacy `adapter` radio itself is role-free) also isn't paused — that
+  config was proxying before roles existed and must keep doing so. Once
+  no fallback remains, an unassigned proxy role means exactly what the
+  UI promises: paused until a radio is set to Proxy.
+  """
+  @spec proxy_paused?(t()) :: boolean()
+  def proxy_paused?(%{roles: roles} = settings) do
+    roles != %{} and is_nil(proxy_adapter(settings))
+  end
+
   @doc "MACs assigned the `:audio` role. Pure; takes a settings map."
   @spec audio_adapters(t()) :: [String.t()]
   def audio_adapters(%{roles: roles}) do
@@ -235,7 +253,13 @@ defmodule UniversalProxy.Bluetooth.Settings do
 
   # Apply a role with the single-proxy invariant: assigning :proxy clears any
   # other proxy; :off drops the entry (the default role).
-  defp apply_role(roles, mac, :off), do: Map.delete(roles, mac)
+  # :off is STORED, not deleted: an explicitly-off radio must be
+  # distinguishable from a never-assigned one, or proxy_paused?/1 couldn't
+  # tell "user turned their only radio off" (pause) from a fresh install
+  # (auto-proxy). It also pins the legacy-adapter suppression in
+  # proxy_adapter/1: deleting would resurrect the legacy fallback for the
+  # very radio the user just turned off.
+  defp apply_role(roles, mac, :off), do: Map.put(roles, mac, :off)
 
   defp apply_role(roles, mac, :proxy) do
     roles
@@ -261,21 +285,22 @@ defmodule UniversalProxy.Bluetooth.Settings do
 
   # Records written before the `roles` field existed have no `:roles` key.
   # Synthesize one from the legacy fields so existing proxy behavior is
-  # preserved: a concrete selected `adapter` → :proxy when enabled, else :off;
-  # an auto (nil) adapter yields no entry (proxy_adapter/1 falls back to it).
-  # Records that already carry `:roles` are returned untouched. Done before the
+  # preserved: a concrete selected `adapter` → :proxy when enabled. When
+  # disabled (or auto/nil adapter) synthesize NO entry — never :off, which
+  # now means "explicitly turned off" and would both suppress the legacy
+  # fallback and read as role-paused (proxy_paused?/1); the legacy master
+  # toggle gates espex wiring, not the radio selection. Records that
+  # already carry `:roles` are returned untouched. Done before the
   # defaults merge so an explicit `roles: %{}` is distinguishable from absence.
   defp migrate_roles(%{roles: _} = stored), do: stored
 
   defp migrate_roles(stored) do
     roles =
-      case normalize_adapter(Map.get(stored, :adapter)) do
-        {:ok, mac} when is_binary(mac) ->
-          enabled = Map.get(stored, :enabled, @defaults.enabled)
-          %{mac => if(enabled == true, do: :proxy, else: :off)}
-
-        _ ->
-          %{}
+      with {:ok, mac} when is_binary(mac) <- normalize_adapter(Map.get(stored, :adapter)),
+           true <- Map.get(stored, :enabled, @defaults.enabled) == true do
+        %{mac => :proxy}
+      else
+        _ -> %{}
       end
 
     Map.put(stored, :roles, roles)
@@ -295,14 +320,16 @@ defmodule UniversalProxy.Bluetooth.Settings do
     }
   end
 
-  # Keep only well-formed `mac => role` pairs (normalized MAC, known role,
-  # never :off — that's the absent default), and enforce the single-proxy
-  # invariant on read too, in case a hand-edited/foreign record carries two.
+  # Keep only well-formed `mac => role` pairs (normalized MAC, known role —
+  # a stored :off included: it marks "explicitly turned off", which
+  # proxy_paused?/1 must distinguish from never-assigned), and enforce the
+  # single-proxy invariant on read too, in case a hand-edited/foreign
+  # record carries two.
   defp sanitize_roles(roles) when is_map(roles) do
     roles
     |> Enum.flat_map(fn {mac, role} ->
       case normalize_adapter(mac) do
-        {:ok, norm} when is_binary(norm) and role in @roles and role != :off -> [{norm, role}]
+        {:ok, norm} when is_binary(norm) and role in @roles -> [{norm, role}]
         _ -> []
       end
     end)

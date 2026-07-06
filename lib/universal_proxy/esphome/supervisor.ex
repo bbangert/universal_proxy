@@ -115,9 +115,12 @@ defmodule UniversalProxy.ESPHome.Supervisor do
 
   @doc """
   The espex adapter wiring for a given BT support level + settings — pure,
-  so the enabled × active_connections matrix is host-testable.
+  so the enabled × paused × active_connections matrix is host-testable.
 
     * unsupported target or `enabled: false` → no adapters (flags 0)
+    * role-paused (`Settings.proxy_paused?/1` — roles assigned, none
+      `:proxy`) → no adapters: "Off" on every radio must mean HA gets
+      nothing, not a silent auto-fallback
     * `active_connections: false` → scanner only (HA sees a passive-only
       proxy: no ACTIVE_CONNECTIONS / REMOTE_CACHING / PAIRING flags)
     * both on → scanner + GATT proxy (full flag set, 0x7F)
@@ -125,16 +128,24 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   @spec bluetooth_opts(boolean(), %{
           required(:enabled) => boolean(),
           required(:active_connections) => boolean(),
+          required(:roles) => %{optional(String.t()) => atom()},
           optional(atom()) => term()
         }) :: keyword()
   def bluetooth_opts(false, _settings), do: []
   def bluetooth_opts(true, %{enabled: false}), do: []
 
-  def bluetooth_opts(true, %{active_connections: false}),
-    do: [bluetooth_scanner: BluetoothScanner]
+  def bluetooth_opts(true, settings) do
+    cond do
+      UniversalProxy.Bluetooth.Settings.proxy_paused?(settings) ->
+        []
 
-  def bluetooth_opts(true, _settings),
-    do: [bluetooth_scanner: BluetoothScanner, bluetooth_proxy: BluetoothProxy]
+      settings.active_connections == false ->
+        [bluetooth_scanner: BluetoothScanner]
+
+      true ->
+        [bluetooth_scanner: BluetoothScanner, bluetooth_proxy: BluetoothProxy]
+    end
+  end
 
   # Defensive read: if the settings store isn't up (it always is on BT
   # targets by boot order, but stay safe), fall back to the defaults.
