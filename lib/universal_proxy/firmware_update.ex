@@ -132,17 +132,30 @@ defmodule UniversalProxy.FirmwareUpdate do
     else
       # Flash-safe: the Updater deliberately blocks its whole loop while
       # fwup writes the firmware (documented design), so a LiveView
-      # mounting mid-flash would exit at the 5 s default call timeout.
-      # Render a busy-shaped snapshot instead — the standard public-API
-      # `catch :exit` idiom (see UniversalProxy.Bluetooth @moduledoc).
+      # mounting mid-flash would exit at the 5 s default call timeout —
+      # render a busy-shaped snapshot for that case. Only the timeout
+      # means "flash in progress"; any other exit (e.g. :noproc while
+      # the Updater restarts) must not masquerade as installing.
       try do
         Updater.state(Updater)
       catch
-        :exit, _ ->
+        :exit, {:timeout, {GenServer, :call, _}} ->
           %{
             phase: :installing,
             pct: nil,
             message: "Installing firmware…",
+            last_error: nil,
+            last_release: nil,
+            verification_required: ConfigStore.verification_required?()
+          }
+
+        :exit, reason ->
+          Logger.warning("FirmwareUpdate.state: Updater unavailable: #{inspect(reason)}")
+
+          %{
+            phase: :idle,
+            pct: nil,
+            message: nil,
             last_error: nil,
             last_release: nil,
             verification_required: ConfigStore.verification_required?()
@@ -180,14 +193,17 @@ defmodule UniversalProxy.FirmwareUpdate do
       ]
 
       # Flash-safe like `state/0`: a flash in progress blocks the
-      # Updater's loop past the call timeout. The DETS write above
-      # already landed and survives restart, so report `{:error, :busy}`
-      # rather than exiting the caller.
+      # Updater's loop past the call timeout — report `{:error, :busy}`
+      # for that case only. Any other exit (e.g. :noproc during an
+      # Updater restart) is a best-effort propagation failure like the
+      # `{:error, reason}` branch below: logged, but `:ok` — the DETS
+      # write above already landed and survives restart.
       result =
         try do
           Updater.update_config(Updater, propagated)
         catch
-          :exit, _ -> {:error, :busy}
+          :exit, {:timeout, {GenServer, :call, _}} -> {:error, :busy}
+          :exit, reason -> {:error, {:updater_unavailable, reason}}
         end
 
       case result do

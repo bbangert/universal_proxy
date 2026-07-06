@@ -14,18 +14,24 @@ defmodule UniversalProxy.UART.ServerLifecycleTest do
 
   defp wait_until(fun, timeout \\ 2_000) do
     deadline = System.monotonic_time(:millisecond) + timeout
+    do_wait_until(fun, deadline)
+  end
 
-    Stream.repeatedly(fn ->
-      if fun.() do
+  # Returns the condition's last evaluation — no extra fun.() after the
+  # loop (which could double-run side effects or flip a transient
+  # success back to failure).
+  defp do_wait_until(fun, deadline) do
+    cond do
+      fun.() ->
         true
-      else
-        Process.sleep(20)
-        System.monotonic_time(:millisecond) >= deadline
-      end
-    end)
-    |> Enum.find(& &1)
 
-    fun.()
+      System.monotonic_time(:millisecond) >= deadline ->
+        false
+
+      true ->
+        Process.sleep(20)
+        do_wait_until(fun, deadline)
+    end
   end
 
   describe "port child restart semantics" do
