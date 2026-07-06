@@ -130,13 +130,16 @@ defmodule UniversalProxy.MixProject do
       # Dependencies for all targets except :host
       {:nerves_pack, "~> 0.7.1", targets: @all_targets},
 
-      # Vendored fork of mdns_lite — adds `MdnsLite.announce_all/0` so
-      # services we publish via `add_mdns_service/1` actually trigger
-      # unsolicited multicast announces per RFC 6762 §8.3. Upstream
-      # 0.9.1 only emits records in reply to queries, which means peers
-      # like Music Assistant's python-zeroconf don't notice newly
-      # registered services until their next poll (60+ s). Track upstream
-      # `nerves-networking/mdns_lite#213` for the eventual fix.
+      # Vendored fork of mdns_lite (upstream 0.9.2 + our patch) — adds
+      # `MdnsLite.announce_all/0` + `goodbye_service/1` so services we
+      # publish via `add_mdns_service/1` trigger unsolicited multicast
+      # announces (RFC 6762 §8.3) and goodbyes (§10.1). Upstream 0.9.2
+      # added an announce loop on *responder startup*, but that only
+      # covers services present at boot — it doesn't announce services
+      # registered dynamically afterward (our case: sendspin outputs
+      # appearing at runtime), so the patch is still needed. Track
+      # upstream `nerves-networking/mdns_lite#213` for a dynamic
+      # announce-on-add API that would let us drop this fork.
       {:mdns_lite, path: "deps_local/mdns_lite", override: true},
 
       # blue_heron (the vendored raw-HCI fork) has been retired on rpi3 in

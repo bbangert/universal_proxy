@@ -1,7 +1,9 @@
+# SPDX-FileCopyrightText: None
+# SPDX-License-Identifier: CC0-1.0
 defmodule MdnsLite.MixProject do
   use Mix.Project
 
-  @version "0.9.1"
+  @version "0.9.2"
   @source_url "https://github.com/nerves-networking/mdns_lite"
 
   # Check that OTP has an mDNS-supporting DNS record parser
@@ -17,7 +19,7 @@ defmodule MdnsLite.MixProject do
     [
       app: :mdns_lite,
       version: @version,
-      elixir: "~> 1.14",
+      elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
       consolidate_protocols: Mix.env() != :dev,
       docs: docs(),
@@ -52,7 +54,7 @@ defmodule MdnsLite.MixProject do
         "GitHub" => @source_url,
         "Changelog" => "#{@source_url}/blob/main/CHANGELOG.md",
         "REUSE Compliance" =>
-          "https://api.reuse.software/info/github.com/elixir-circuits/circuits_gpio"
+          "https://api.reuse.software/info/github.com/nerves-networking/mdns_lite"
       }
     }
   end
