@@ -1420,8 +1420,11 @@ defmodule UniversalProxyWeb.BluetoothLive do
     end
   end
 
-  # Role of a MAC from the {proxy, audio} role map.
-  defp role_of(%{proxy: proxy, audio: audio}, mac) do
+  # Role of a MAC from the {proxy, audio} role map. A radio without an
+  # address (BlueZ not answering for it — radio dead or subtree down) holds
+  # no role: without the guard, nil == nil matches an unassigned proxy role
+  # and the dead radio renders as :proxy with an "In use" badge.
+  defp role_of(%{proxy: proxy, audio: audio}, mac) when is_binary(mac) do
     cond do
       mac == proxy -> :proxy
       mac in audio -> :audio

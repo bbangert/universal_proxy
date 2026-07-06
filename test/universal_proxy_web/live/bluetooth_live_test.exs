@@ -72,6 +72,32 @@ defmodule UniversalProxyWeb.BluetoothLiveTest do
     assert html =~ "AA:BB:CC:DD:EE:FF"
   end
 
+  test "a dead radio (no address) never renders as the in-use proxy", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/bluetooth")
+
+    # A dead onboard radio (BlueZ not answering for it → nil address)
+    # alongside a live USB one.
+    inject_radios(view, [
+      radio(%{address: nil}),
+      radio(%{hci: "hci1", bus: :usb, name: "BlueZ 5.79", address: "11:22:33:44:55:66"})
+    ])
+
+    # Proxying is up (on the USB radio) while the proxy *role* is
+    # unassigned — roles stay empty-shaped (proxy: nil) on host. The dead
+    # radio's nil address must not match the nil proxy role.
+    status = %{
+      enabled: true,
+      proxying?: true,
+      adapter: %{name: "BlueZ 5.79", address: "11:22:33:44:55:66", hci: "hci1"},
+      active_connections: %{allowed?: true, used: 0, limit: 3}
+    }
+
+    Phoenix.PubSub.broadcast(@pubsub, "bluetooth:state", {:bluetooth_state, status})
+    html = render(view)
+
+    refute html =~ "In use"
+  end
+
   test "choosing a role surfaces the unavailable error off-target", %{conn: conn} do
     {:ok, view, _html} = live(conn, "/bluetooth")
     inject_radios(view, [radio()])
