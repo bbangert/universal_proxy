@@ -577,12 +577,21 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
   defp managed_devices(state),
     do: safe_call(fn -> state.ops.managed_devices(state.conn) end, [])
 
+  # Logged, not silent: the injected ops module is expected to fail only
+  # for "subsystem down" reasons, but a bug in it must not be invisible.
   defp safe_call(fun, default) do
     fun.()
   rescue
-    _ -> default
+    e ->
+      Logger.warning(
+        "AudioManager ops call raised: #{Exception.format(:error, e, __STACKTRACE__)}"
+      )
+
+      default
   catch
-    :exit, _ -> default
+    :exit, reason ->
+      Logger.warning("AudioManager ops call exited: #{inspect(reason)}")
+      default
   end
 
   defp headphones(state) do

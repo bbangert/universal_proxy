@@ -113,6 +113,15 @@ defmodule UniversalProxy.UART.Server do
 
   @impl true
   def init(_opts) do
+    # Restart hygiene: a Server-only crash leaves PortSupervisor children
+    # running (`:rest_for_one` restarts the Server but never touches the
+    # PortSupervisor started before it), and the fresh Server has no
+    # record of them — orphaned Circuits.UART processes holding ttys
+    # open. Terminate any leftovers; ESPHome clients reopen ports via
+    # the serial-proxy protocol. Mirrors `Audio.Server.init`'s
+    # `terminate_all_players` sweep.
+    sweep_orphaned_ports()
+
     :timer.send_interval(@hotplug_interval, self(), :check_hotplug)
     known = current_serial_set()
     Logger.info("UART server started, #{MapSet.size(known)} serial devices detected")
@@ -242,7 +251,7 @@ defmodule UniversalProxy.UART.Server do
         Logger.info("UART hotplug: devices removed: #{Enum.join(removed, ", ")}")
       end
 
-      Task.start(fn ->
+      Task.Supervisor.start_child(UniversalProxy.TaskSupervisor, fn ->
         UniversalProxy.ESPHome.Supervisor.restart()
       end)
 
@@ -273,7 +282,7 @@ defmodule UniversalProxy.UART.Server do
         new_state = %{state | ports: Map.delete(state.ports, port_name)}
         broadcast_lifecycle("uart:port_closed", port_name, config)
 
-        Task.start(fn ->
+        Task.Supervisor.start_child(UniversalProxy.TaskSupervisor, fn ->
           UniversalProxy.ESPHome.Supervisor.restart()
         end)
 
@@ -317,15 +326,37 @@ defmodule UniversalProxy.UART.Server do
 
   # -- Private Helpers --
 
+  # `:temporary` so the DynamicSupervisor never respawns a port process
+  # on its own — Circuits.UART children default to `:permanent`, and a
+  # permanent child restarts even on the normal exit from `stop/1`,
+  # leaving an untracked replacement (plus its C port program) leaked
+  # on every close. This Server's monitor + `:DOWN` bookkeeping is the
+  # single owner of port lifecycle. Public (`@doc false`) so tests can
+  # exercise the exact production spec.
+  @doc false
+  def port_child_spec do
+    Supervisor.child_spec({Circuits.UART, []}, restart: :temporary)
+  end
+
+  defp sweep_orphaned_ports do
+    UniversalProxy.UART.PortSupervisor
+    |> DynamicSupervisor.which_children()
+    |> Enum.each(fn {_id, pid, _type, _modules} when is_pid(pid) ->
+      Logger.warning("UART sweeping orphaned port process #{inspect(pid)} from previous Server")
+      _ = DynamicSupervisor.terminate_child(UniversalProxy.UART.PortSupervisor, pid)
+    end)
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
+  end
+
   defp start_and_open(port_name, opts) do
     config = PortConfig.new(port_name, opts)
     uart_opts = PortConfig.to_uart_opts(config)
 
     with {:ok, pid} <-
-           DynamicSupervisor.start_child(
-             UniversalProxy.UART.PortSupervisor,
-             {Circuits.UART, []}
-           ),
+           DynamicSupervisor.start_child(UniversalProxy.UART.PortSupervisor, port_child_spec()),
          :ok <- Circuits.UART.open(pid, port_name, uart_opts) do
       {:ok, pid, config}
     else
@@ -342,7 +373,10 @@ defmodule UniversalProxy.UART.Server do
         |> Enum.filter(fn {_path, info} -> present?(info[:serial_number]) end)
         |> Enum.map(fn {_path, info} -> info[:serial_number] end)
       rescue
-        _ -> []
+        e ->
+          Logger.warning("UART enumerate failed: #{Exception.format(:error, e, __STACKTRACE__)}")
+
+          []
       end
 
     MapSet.new(serials)

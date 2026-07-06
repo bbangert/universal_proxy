@@ -84,7 +84,14 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
 
   @impl true
   def close({relay, path}) do
-    if Process.alive?(relay), do: GenServer.stop(relay, :normal, 1_000)
+    # No alive?-guard: it was a TOCTOU (the relay can die between the
+    # check and the stop). Stopping an already-dead process exits with
+    # :noproc — catch it and move on; close is idempotent.
+    try do
+      GenServer.stop(relay, :normal, 1_000)
+    catch
+      :exit, _ -> :ok
+    end
 
     case UART.close(path) do
       :ok -> :ok

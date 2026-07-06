@@ -63,17 +63,26 @@ defmodule UniversalProxy.FMA120.ServerTest do
     {:ok, sup: sup_name}
   end
 
-  defp start_server(sup, worker_module \\ StubWorker) do
+  # `fast_crash_window_ms: 0` disables the fast-crash backoff so the
+  # legacy lifecycle tests keep exercising the inline-restart path; the
+  # "fast-crash backoff" describe block overrides it.
+  defp start_server(sup, worker_module \\ StubWorker, opts \\ []) do
     name = :"fma_srv_#{System.unique_integer([:positive])}"
 
     pid =
       start_supervised!(
         {Server,
-         name: name,
-         subscribe: false,
-         worker_module: worker_module,
-         worker_supervisor: sup,
-         hardware: StubHW},
+         Keyword.merge(
+           [
+             name: name,
+             subscribe: false,
+             worker_module: worker_module,
+             worker_supervisor: sup,
+             hardware: StubHW,
+             fast_crash_window_ms: 0
+           ],
+           opts
+         )},
         id: name
       )
 
@@ -184,6 +193,107 @@ defmodule UniversalProxy.FMA120.ServerTest do
       Process.exit(pid, :kill)
 
       wait_until(fn -> Server.list_devices(srv) == [] end)
+    end
+  end
+
+  # Starts fine, then crashes immediately (a broken device would do this
+  # on every respawn — the tight loop F5 the backoff exists for).
+  defmodule CrashingWorker do
+    use GenServer
+    def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
+    def get_state(pid), do: GenServer.call(pid, :get_state)
+    @impl true
+    def init(_opts), do: {:ok, nil, {:continue, :die}}
+    @impl true
+    def handle_continue(:die, state), do: {:stop, :simulated_device_fault, state}
+  end
+
+  describe "fast-crash backoff" do
+    test "a fast-crashing worker is parked with a delayed retry, not hot-looped",
+         %{sup: sup} do
+      Application.put_env(:universal_proxy, :fma_test_ports, [port([])])
+      Application.put_env(:universal_proxy, :fma_test_keys, %{@key => "ttyACM0"})
+
+      srv =
+        start_server(sup, CrashingWorker,
+          fast_crash_window_ms: 5_000,
+          retry_backoff_base_ms: 100
+        )
+
+      # After the first crash the entry parks (no live pid) with a retry
+      # timer, instead of respawning inline in a tight loop.
+      wait_until(fn ->
+        case :sys.get_state(srv).inventory do
+          [entry] ->
+            entry.worker_pid == nil and is_reference(entry.retry_timer) and
+              entry.crash_count >= 1
+
+          _ ->
+            false
+        end
+      end)
+
+      [%{crash_count: first_count}] = :sys.get_state(srv).inventory
+
+      # The retry timer (not a hot loop) drives the next attempt, which
+      # crashes again and grows the tally/backoff.
+      wait_until(fn ->
+        case :sys.get_state(srv).inventory do
+          [entry] -> entry.crash_count > first_count
+          _ -> false
+        end
+      end)
+    end
+
+    test "unplug while parked cancels the retry", %{sup: sup} do
+      Application.put_env(:universal_proxy, :fma_test_ports, [port([])])
+      Application.put_env(:universal_proxy, :fma_test_keys, %{@key => "ttyACM0"})
+
+      srv =
+        start_server(sup, CrashingWorker,
+          fast_crash_window_ms: 5_000,
+          retry_backoff_base_ms: 60_000
+        )
+
+      wait_until(fn ->
+        case :sys.get_state(srv).inventory do
+          [entry] -> entry.worker_pid == nil and is_reference(entry.retry_timer)
+          _ -> false
+        end
+      end)
+
+      [%{retry_timer: timer}] = :sys.get_state(srv).inventory
+
+      send(srv, {:sendspin_output_removed, %{key: @key}})
+      assert Server.list_devices(srv) == []
+
+      # Prove the timer was actually cancelled, not merely unfired (the
+      # 60 s base above guarantees it couldn't have fired on its own).
+      assert Process.read_timer(timer) == false
+    end
+  end
+
+  describe "call_worker/2 timeout conversion" do
+    test "a wedged worker call returns {:error, :timeout} instead of exiting" do
+      # A process that never replies — the shape of a wedged DeviceWorker.
+      # Killed in on_exit: a linked process survives the test process's
+      # :normal exit and would otherwise leak for the whole BEAM run.
+      wedged = spawn_link(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(wedged, :kill) end)
+
+      assert UniversalProxy.FMA120.call_worker(wedged, fn pid ->
+               GenServer.call(pid, :anything, 100)
+             end) == {:error, :timeout}
+    end
+
+    test "a worker that stops mid-call returns {:error, :unavailable} instead of exiting" do
+      # The wedge-recovery path stops the worker with a non-normal
+      # reason while callers may still be blocked in GenServer.call.
+      dying = spawn(fn -> receive(do: (_ -> exit(:wedged_recovered))) end)
+
+      assert UniversalProxy.FMA120.call_worker(dying, fn pid ->
+               GenServer.call(pid, :anything, 1_000)
+             end) == {:error, :unavailable}
     end
   end
 

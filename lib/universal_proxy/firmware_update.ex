@@ -130,7 +130,24 @@ defmodule UniversalProxy.FirmwareUpdate do
         verification_required: ConfigStore.verification_required?()
       }
     else
-      Updater.state(Updater)
+      # Flash-safe: the Updater deliberately blocks its whole loop while
+      # fwup writes the firmware (documented design), so a LiveView
+      # mounting mid-flash would exit at the 5 s default call timeout.
+      # Render a busy-shaped snapshot instead — the standard public-API
+      # `catch :exit` idiom (see UniversalProxy.Bluetooth @moduledoc).
+      try do
+        Updater.state(Updater)
+      catch
+        :exit, _ ->
+          %{
+            phase: :installing,
+            pct: nil,
+            message: "Installing firmware…",
+            last_error: nil,
+            last_release: nil,
+            verification_required: ConfigStore.verification_required?()
+          }
+      end
     end
   end
 
@@ -162,9 +179,28 @@ defmodule UniversalProxy.FirmwareUpdate do
         verification_required: snap.verification_required
       ]
 
-      case Updater.update_config(Updater, propagated) do
+      # Flash-safe like `state/0`: a flash in progress blocks the
+      # Updater's loop past the call timeout. The DETS write above
+      # already landed and survives restart, so report `{:error, :busy}`
+      # rather than exiting the caller.
+      result =
+        try do
+          Updater.update_config(Updater, propagated)
+        catch
+          :exit, _ -> {:error, :busy}
+        end
+
+      case result do
         :ok ->
           :ok
+
+        {:error, :busy} ->
+          Logger.warning(
+            "FirmwareUpdate.update_config: live Updater busy (flash in progress); " <>
+              "DETS persist applied, restart picks it up"
+          )
+
+          {:error, :busy}
 
         {:error, reason} ->
           Logger.warning(

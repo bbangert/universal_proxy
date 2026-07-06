@@ -185,7 +185,14 @@ defmodule UniversalProxy.Bluez do
       UniversalProxy.Bluez.Improv.Supervisor
     ]
 
-    Supervisor.init(children, strategy: :rest_for_one)
+    # Explicit restart budget so the documented "benign endless retry
+    # loop" (Client `{:stop, :no_adapter}` while the controller is absent
+    # — see UniversalProxy.Bluetooth @moduledoc) is benign by
+    # configuration, not by cycle timing: the observed ~10 s :no_adapter
+    # cycle (6/min) and a faster :dbus_connect_failed cycle both fit in
+    # 10-per-60 s, while a genuinely hot crash loop still escalates to
+    # the Bluetooth DynamicSupervisor within a minute.
+    Supervisor.init(children, strategy: :rest_for_one, max_restarts: 10, max_seconds: 60)
   end
 
   @doc """

@@ -441,13 +441,30 @@ defmodule UniversalProxy.Bluez.Improv do
 
   # Run off the GenServer loop, under the Improv Task.Supervisor when it's alive
   # (production), else a bare Task (host tests). Falls back to Task.start if the
-  # supervisor refuses (e.g. max_restarts) so work is never silently dropped.
+  # supervisor refuses (e.g. max_restarts) so work is never silently dropped —
+  # but that production case is logged: a restart-throttled supervisor spawning
+  # unsupervised work is exactly when crash visibility matters most. No log when
+  # the supervisor simply isn't registered (host tests).
   defp run_task(%{task_sup: sup}, fun) do
-    with true <- is_pid(Process.whereis(sup)),
-         {:ok, _} <- Task.Supervisor.start_child(sup, fun) do
-      :ok
-    else
-      _ -> Task.start(fun)
+    case Process.whereis(sup) do
+      nil ->
+        Task.start(fun)
+        :ok
+
+      _pid ->
+        case Task.Supervisor.start_child(sup, fun) do
+          {:ok, _} ->
+            :ok
+
+          error ->
+            Logger.warning(
+              "Improv Task.Supervisor #{inspect(sup)} refused (#{inspect(error)}); " <>
+                "running unsupervised"
+            )
+
+            Task.start(fun)
+            :ok
+        end
     end
   end
 
@@ -460,11 +477,9 @@ defmodule UniversalProxy.Bluez.Improv do
   defp suspend_proxy_scan(state), do: scanner_cast(state.scanner, :suspend_scan)
   defp resume_proxy_scan(state), do: scanner_cast(state.scanner, :resume_scan)
 
-  defp scanner_cast(scanner, msg) do
-    pid = if is_pid(scanner), do: scanner, else: Process.whereis(scanner)
-    if is_pid(pid), do: GenServer.cast(pid, msg)
-    :ok
-  end
+  # `GenServer.cast` to an unregistered name already returns `:ok`, so no
+  # whereis-guard is needed (it was a TOCTOU no-op anyway).
+  defp scanner_cast(scanner, msg), do: GenServer.cast(scanner, msg)
 
   defp maybe_subscribe_connectivity(%{subscribe?: false}), do: :ok
 

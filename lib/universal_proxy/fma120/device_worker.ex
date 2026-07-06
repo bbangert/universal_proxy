@@ -114,20 +114,25 @@ defmodule UniversalProxy.FMA120.DeviceWorker do
     GenServer.start_link(__MODULE__, opts)
   end
 
-  # `:infinity` (not a fixed bound): the worker always completes an in-flight
-  # command — via its reply or its own per-command timer — and a command queued
-  # behind others (e.g. the 10-step init handshake) can legitimately wait longer
-  # than any fixed caller timeout. A worker crash still surfaces as a call exit.
+  # Finite bound derived from the worker's own command budget: every queued
+  # command completes via its reply or its per-command timer (query 2 s /
+  # set 5 s, plus the 1 s wedge-recovery pause), so even a command parked
+  # behind the 10-step init handshake resolves well inside this. A caller
+  # timeout therefore means the worker itself is wedged — better to surface
+  # `{:error, :timeout}` (see `FMA120.with_worker/2`) than hang the caller's
+  # LiveView indefinitely, which is what `:infinity` did.
+  @call_timeout_ms 15_000
+
   @doc "Query a bare header (e.g. `\"VR\"`). Routed through the serialized queue."
   @spec query(GenServer.server(), String.t()) :: {:ok, term()} | {:error, term()}
   def query(pid, header) when is_binary(header) do
-    GenServer.call(pid, {:enqueue, header, nil}, :infinity)
+    GenServer.call(pid, {:enqueue, header, nil}, @call_timeout_ms)
   end
 
   @doc "Send a set-command with a payload (integer hex-byte or string). Returns `:ok`/`{:error, _}`."
   @spec command(GenServer.server(), String.t(), 0..255 | binary()) :: :ok | {:error, term()}
   def command(pid, header, payload) when is_binary(header) do
-    GenServer.call(pid, {:enqueue, header, payload}, :infinity)
+    GenServer.call(pid, {:enqueue, header, payload}, @call_timeout_ms)
   end
 
   @doc "Fetch the worker's current cached protocol state."
@@ -232,6 +237,12 @@ defmodule UniversalProxy.FMA120.DeviceWorker do
           "attempting USB re-authorize recovery"
       )
 
+      # Callers parked in the queue would otherwise ride this abnormal
+      # stop as exit({:wedged_recovered, {GenServer, :call, _}}) — fail
+      # them with a clean tuple first (the in-flight caller already got
+      # {:error, :timeout} via complete_in_flight above).
+      state = drain_queue(state, {:error, :device_wedged})
+
       recover_wedged(state)
       {:stop, :wedged_recovered, state}
     else
@@ -286,6 +297,19 @@ defmodule UniversalProxy.FMA120.DeviceWorker do
 
   defp enqueue(state, header, payload, from) do
     %{state | queue: :queue.in({header, payload, from}, state.queue)}
+  end
+
+  # Reply `result` to every queued caller (refresh casts have from: nil)
+  # and empty the queue. Used before an abnormal stop so blocked callers
+  # get a clean error tuple instead of the raw stop reason.
+  defp drain_queue(state, result) do
+    state.queue
+    |> :queue.to_list()
+    |> Enum.each(fn {_header, _payload, from} ->
+      if from, do: GenServer.reply(from, result)
+    end)
+
+    %{state | queue: :queue.new()}
   end
 
   # Write the next queued command only when nothing is in flight.
@@ -497,12 +521,16 @@ defmodule UniversalProxy.FMA120.DeviceWorker do
   defp cache_partial(_other, _cache), do: nil
 
   # Broadcast a state partial keyed by the device key. Guarded so an
-  # isolated worker (no PubSub running) doesn't crash on broadcast.
+  # isolated worker (no PubSub running — host tests) doesn't crash on
+  # broadcast: an unstarted PubSub registry raises ArgumentError. Only
+  # that; a real broadcast failure must propagate, not vanish.
   defp broadcast(%{key: nil}, _partial), do: :ok
 
   defp broadcast(%{key: key}, partial) do
     Phoenix.PubSub.broadcast(@pubsub, @topic, {:fma120_state, key, partial})
   rescue
-    _ -> :ok
+    e in ArgumentError ->
+      Logger.debug("FMA120 broadcast skipped (PubSub not running): #{Exception.message(e)}")
+      :ok
   end
 end
