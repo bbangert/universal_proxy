@@ -265,28 +265,74 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
     end
   end
 
+  # Timeouts are explicit (not the 100 ms default): these assertions run
+  # right after start_manager/2, whose boot reconcile does real sysfs I/O —
+  # same loaded-CI reasoning as the crash/retry tests below.
   describe "role-paused status" do
+    defp bounce_fun do
+      test_pid = self()
+      fn -> send(test_pid, :esphome_bounced) end
+    end
+
     test "roles engaged with no :proxy: subtree runs, but proxying? is false", ctx do
       # The only radio the user touched holds :audio — nothing may proxy.
       :ok = Settings.set_role(ctx.settings, @hci1_mac, :audio)
-      manager = start_manager(ctx)
+      manager = start_manager(ctx, esphome_restart_fun: bounce_fun())
 
       # The subtree still runs (the radio list needs the daemon for MACs).
       assert child_count(ctx.dynsup) == 1
 
       assert %{enabled: true, proxying?: false, paused?: true} = Manager.status(manager)
-      assert_receive {:bluetooth_state, %{proxying?: false, paused?: true}}
+      assert_receive {:bluetooth_state, %{proxying?: false, paused?: true}}, 1_000
+
+      # Booting INTO paused seeds the tracker without bouncing espex —
+      # espex starts after Bluetooth and reads the same settings fresh.
+      refute_receive :esphome_bounced, 100
     end
 
-    test "assigning :proxy resumes: reconcile broadcasts proxying? true", ctx do
-      :ok = Settings.set_role(ctx.settings, @hci1_mac, :audio)
+    test "an explicitly :off-only roles map is paused too", ctx do
+      # Single radio turned Off — must NOT fall back to auto-claiming it.
+      :ok = Settings.set_role(ctx.settings, @hci0_mac, :off)
       manager = start_manager(ctx)
-      assert_receive {:bluetooth_state, %{paused?: true}}
+
+      assert %{proxying?: false, paused?: true} = Manager.status(manager)
+    end
+
+    test "assigning :proxy resumes: reconcile broadcasts and bounces espex", ctx do
+      :ok = Settings.set_role(ctx.settings, @hci1_mac, :audio)
+      manager = start_manager(ctx, esphome_restart_fun: bounce_fun())
+      assert_receive {:bluetooth_state, %{paused?: true}}, 1_000
 
       :ok = Settings.set_role(ctx.settings, @hci0_mac, :proxy)
       :ok = Manager.reconcile(manager)
 
-      assert_receive {:bluetooth_state, %{proxying?: true, paused?: false}}
+      assert_receive {:bluetooth_state, %{proxying?: true, paused?: false}}, 1_000
+      assert_receive :esphome_bounced
+    end
+
+    test "un-assigning the running :proxy pauses: reconcile broadcasts and bounces espex", ctx do
+      :ok = Settings.set_role(ctx.settings, @hci0_mac, :proxy)
+      manager = start_manager(ctx, esphome_restart_fun: bounce_fun())
+      assert_receive {:bluetooth_state, %{proxying?: true, paused?: false}}, 1_000
+
+      :ok = Settings.set_role(ctx.settings, @hci0_mac, :off)
+      :ok = Manager.reconcile(manager)
+
+      assert_receive {:bluetooth_state, %{proxying?: false, paused?: true}}, 1_000
+      assert_receive :esphome_bounced
+    end
+
+    test "a role change that doesn't flip pausedness never bounces espex", ctx do
+      :ok = Settings.set_role(ctx.settings, @hci0_mac, :proxy)
+      manager = start_manager(ctx, esphome_restart_fun: bounce_fun())
+      assert_receive {:bluetooth_state, %{paused?: false}}, 1_000
+
+      # A different radio takes :audio — still un-paused throughout.
+      :ok = Settings.set_role(ctx.settings, @hci1_mac, :audio)
+      :ok = Manager.reconcile(manager)
+
+      assert_receive {:bluetooth_state, %{proxying?: true, paused?: false}}, 1_000
+      refute_receive :esphome_bounced, 100
     end
   end
 
@@ -299,7 +345,7 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
       _manager = start_manager(ctx, adapters_info_fun: fn -> Agent.get(info, & &1) end)
 
       # The reconcile-time broadcast predates the claim: no adapter identity.
-      assert_receive {:bluetooth_state, %{adapter: %{address: nil}}}
+      assert_receive {:bluetooth_state, %{adapter: %{address: nil}}}, 1_000
 
       # The Client resolves + claims hci1 after its setup, then announces it
       # on adapters_topic. The Manager must rebroadcast the settled identity.

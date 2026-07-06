@@ -101,7 +101,14 @@ defmodule UniversalProxyWeb.BluetoothLiveTest do
 
   test "role-paused status renders Paused with the assign-a-radio hint", %{conn: conn} do
     {:ok, view, _html} = live(conn, "/bluetooth")
-    inject_radios(view, [radio(), radio(%{hci: "hci1", address: "11:22:33:44:55:66", bus: :usb})])
+
+    # The first radio keeps a stale/transient in_use? mark (the subtree
+    # still auto-claims one for the radio list while paused) — it must NOT
+    # render as the effective proxy: effective_role/3 requires proxying?.
+    inject_radios(view, [
+      radio(%{in_use?: true}),
+      radio(%{hci: "hci1", address: "11:22:33:44:55:66", bus: :usb})
+    ])
 
     status = %{
       enabled: true,

@@ -131,9 +131,10 @@ defmodule UniversalProxy.Bluetooth.Settings do
 
   Assigning `:proxy` demotes any other current `:proxy` adapter to `:off` so
   the single-proxy invariant always holds (only one radio can drive the HA
-  proxy). Setting `:off` removes the entry (the default role). Rejects a
-  malformed MAC (`{:error, :invalid_adapter}`) or unknown role
-  (`{:error, :invalid_role}`).
+  proxy). Setting `:off` STORES the entry — an explicitly-off radio is
+  distinguishable from a never-assigned one (see `proxy_paused?/1`) and
+  keeps the legacy-adapter fallback suppressed. Rejects a malformed MAC
+  (`{:error, :invalid_adapter}`) or unknown role (`{:error, :invalid_role}`).
   """
   @spec set_role(GenServer.server(), String.t(), role()) :: :ok | {:error, term()}
   def set_role(server \\ __MODULE__, mac, role)
@@ -164,6 +165,9 @@ defmodule UniversalProxy.Bluetooth.Settings do
   def proxy_adapter(%{roles: roles, adapter: adapter}) do
     case Enum.find(roles, fn {_mac, role} -> role == :proxy end) do
       {mac, _role} -> mac
+      # With an auto (nil) legacy adapter, Map.has_key?(roles, nil) is always
+      # false (sanitize_roles/1 never admits a nil key) and this returns nil
+      # — intentional: auto has no MAC to suppress, so it stays auto.
       nil -> if Map.has_key?(roles, adapter), do: nil, else: adapter
     end
   end
@@ -335,6 +339,9 @@ defmodule UniversalProxy.Bluetooth.Settings do
     end)
     |> Enum.reduce({%{}, false}, fn
       # A second :proxy is dropped (absent = :off), preserving the invariant.
+      # Which of the two survives follows map enumeration order — arbitrary
+      # but stable for a given map. Defensive path only (setters can't write
+      # two); not worth imposing an ordering rule.
       {_mac, :proxy}, {acc, true} -> {acc, true}
       {mac, :proxy}, {acc, false} -> {Map.put(acc, mac, :proxy), true}
       {mac, role}, {acc, seen?} -> {Map.put(acc, mac, role), seen?}

@@ -337,6 +337,28 @@ defmodule UniversalProxy.Bluetooth.SettingsTest do
       assert Settings.proxy_paused?(%{roles: %{"AA:BB:CC:DD:EE:FF" => :off}, adapter: nil})
     end
 
+    test "enabled and paused? are orthogonal: a disabled legacy migration is not paused", %{
+      dets_path: path
+    } do
+      # enabled gates the espex wiring; paused? is purely about roles. A
+      # legacy record with a selected adapter but Bluetooth disabled
+      # migrates to NO role entries — so re-enabling later resumes proxying
+      # on the remembered radio instead of landing role-paused.
+      stop_supervised!(Settings)
+
+      pid =
+        seed_legacy(path, %{
+          enabled: false,
+          active_connections: true,
+          adapter: "AA:BB:CC:DD:EE:FF"
+        })
+
+      settings = Settings.get(pid)
+      refute settings.enabled
+      refute Settings.proxy_paused?(settings)
+      assert Settings.proxy_adapter(settings) == "AA:BB:CC:DD:EE:FF"
+    end
+
     test "a surviving legacy fallback is not paused" do
       # A different radio got a role; the legacy adapter still proxies.
       refute Settings.proxy_paused?(%{

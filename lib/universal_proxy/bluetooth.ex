@@ -281,9 +281,17 @@ defmodule UniversalProxy.Bluetooth do
   would orphan its paired speakers — so this disconnects + forgets them
   (`AudioManager.forget_all_on_adapter/2`). When the change moves the
   proxy-role radio, the BlueZ subtree is restarted to re-target it; otherwise
-  it just rebroadcasts status. When it flips the role-paused state
-  (`Settings.proxy_paused?/1`), espex is bounced so the HA-facing feature
-  flags follow — pausing really stops the proxy, resuming re-advertises it. Callers that want a confirm step (the UI's
+  it just rebroadcasts status. When the change flips the role-paused state
+  (`Settings.proxy_paused?/1`), the Manager's reconcile bounces espex so the
+  HA-facing feature flags follow — pausing really stops the proxy, resuming
+  re-advertises it.
+
+  Note the sequence here is multi-step under one `catch :exit` (see
+  CLAUDE.md's documented tradeoff): if the Manager wedges *after* the
+  settings write and bond-forget committed, the caller sees
+  `{:error, :unavailable}` for a change that partially happened. Accepted
+  for the same reason as the base idiom — single-admin usage, benign UI
+  degradation over crash cascades. Callers that want a confirm step (the UI's
   "deactivating forgets N speakers" modal) gather the affected speakers from
   `AudioManager.list_headphones/0` (filtered by `:adapter`) before calling.
   """
@@ -292,7 +300,6 @@ defmodule UniversalProxy.Bluetooth do
     normalized = String.upcase(mac)
     settings = Settings.get()
     before_proxy = Settings.proxy_adapter(settings)
-    before_paused = Settings.proxy_paused?(settings)
     before_role = Settings.role(settings, normalized)
 
     with :ok <- Settings.set_role(normalized, role) do
@@ -305,20 +312,13 @@ defmodule UniversalProxy.Bluetooth do
         AudioManager.forget_all_on_adapter(normalized)
       end
 
-      after_settings = Settings.get()
-
-      if Settings.proxy_adapter(after_settings) != before_proxy do
+      # The Manager owns the pausedness→espex reaction: its reconcile
+      # detects a proxy_paused?/1 flip and bounces espex itself, serialized
+      # in one process so concurrent setters can't misattribute the flip.
+      if Settings.proxy_adapter(Settings.get()) != before_proxy do
         :ok = Manager.reconcile(restart: true)
       else
         :ok = Manager.reconcile()
-      end
-
-      # Pausedness gates the espex wiring (bluetooth_opts/2), so a flip
-      # must bounce espex — same exposure as the enabled toggle. It can
-      # flip without proxy_adapter changing (nil = both auto and paused),
-      # so this check is independent of the restart decision above.
-      if Settings.proxy_paused?(after_settings) != before_paused do
-        restart_esphome()
       end
 
       _ = RadioMonitor.refresh()
