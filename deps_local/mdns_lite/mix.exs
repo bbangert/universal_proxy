@@ -72,7 +72,7 @@ defmodule MdnsLite.MixProject do
       {:dialyxir, "~> 1.1", only: :dev, runtime: false},
       {:credo, "~> 1.2", only: :test, runtime: false},
       {:ex_doc, "~> 0.22", only: :docs, runtime: false},
-      {:vintage_net, "~> 0.7", optional: true}
+      {:vintage_net, "~> 0.13", optional: true}
     ]
   end
 
