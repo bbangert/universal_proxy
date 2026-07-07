@@ -21,6 +21,11 @@ defmodule UniversalProxy.Application do
         # authorizes the public half for ssh login, and serves the private half
         # to the Security tab for download. No-op authorize on host.
         UniversalProxy.SSHAccess,
+        # Ethernet-preferred Wi-Fi: while any Ethernet interface has
+        # connectivity, suspends (runtime-only) every Wi-Fi interface that
+        # has a persisted config, and restores from disk when Ethernet
+        # drops. No-op on host (VintageNet absent).
+        UniversalProxy.WifiPolicy,
         # Start the UART subsystem (DynamicSupervisor + registry server)
         UniversalProxy.UART.Supervisor,
         # Audio (Sendspin) subsystem — enumerates ALSA outputs, persists

@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - run: sudo apt-get update && sudo apt-get install -y ${{ env.APT_PACKAGES }}
+      - run: sudo apt-get update || true; sudo apt-get install -y ${{ env.APT_PACKAGES }}
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
@@ -42,7 +42,7 @@ jobs:
       MIX_ENV: dev
     steps:
       - uses: actions/checkout@v7
-      - run: sudo apt-get update && sudo apt-get install -y ${{ env.APT_PACKAGES }}
+      - run: sudo apt-get update || true; sudo apt-get install -y ${{ env.APT_PACKAGES }}
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
@@ -65,7 +65,7 @@ jobs:
       MIX_ENV: dev
     steps:
       - uses: actions/checkout@v7
-      - run: sudo apt-get update && sudo apt-get install -y ${{ env.APT_PACKAGES }}
+      - run: sudo apt-get update || true; sudo apt-get install -y ${{ env.APT_PACKAGES }}
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
@@ -88,7 +88,7 @@ jobs:
       MIX_ENV: test
     steps:
       - uses: actions/checkout@v7
-      - run: sudo apt-get update && sudo apt-get install -y ${{ env.APT_PACKAGES }}
+      - run: sudo apt-get update || true; sudo apt-get install -y ${{ env.APT_PACKAGES }}
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
@@ -111,7 +111,7 @@ jobs:
       MIX_ENV: dev
     steps:
       - uses: actions/checkout@v7
-      - run: sudo apt-get update && sudo apt-get install -y ${{ env.APT_PACKAGES }}
+      - run: sudo apt-get update || true; sudo apt-get install -y ${{ env.APT_PACKAGES }}
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
@@ -147,7 +147,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - run: sudo apt-get update && sudo apt-get install -y ${{ env.APT_PACKAGES }}
+      - run: sudo apt-get update || true; sudo apt-get install -y ${{ env.APT_PACKAGES }}
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
