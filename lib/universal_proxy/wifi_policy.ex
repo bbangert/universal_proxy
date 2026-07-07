@@ -3,7 +3,7 @@ defmodule UniversalProxy.WifiPolicy do
   Ethernet-preferred Wi-Fi policy: while any Ethernet interface has
   connectivity, Wi-Fi interfaces are kept deconfigured so the device is
   reachable at exactly one address; when Ethernet loses connectivity the
-  stashed Wi-Fi config is re-applied.
+  persisted Wi-Fi config is re-applied from disk.
 
   Why: with both `eth0` and `wlan0` joined to the same LAN the device answers
   on two IPs, and mDNS can hand either to HA / Music Assistant. Clients that
@@ -12,17 +12,26 @@ defmodule UniversalProxy.WifiPolicy do
   SoC radio). Wired wins; Wi-Fi is the fallback.
 
   Mechanics: subscribes to `["interface", :_, "connection"]` and re-evaluates
-  after a short settle delay. Suspending an interface stashes its runtime
-  config and calls `VintageNet.deconfigure(ifname, persist: false)` — the
-  persisted config on disk is untouched, so a reboot (or this policy) can
-  bring Wi-Fi back. Restoring re-applies the stash with `persist: false`.
-  Interfaces are classified by their `"type"` property (`VintageNetEthernet` /
+  after a short settle delay. Suspending an interface calls
+  `VintageNet.deconfigure(ifname, persist: false)` — the persisted config on
+  disk is untouched and is the restore source (`VintageNet.Persistence`), so
+  the policy holds no state that a process restart could lose. Restoring
+  re-applies the persisted config with `persist: false`. Interfaces are
+  classified by their `"type"` property (`VintageNetEthernet` /
   `VintageNetWiFi`), never by name.
 
+  Deliberate limits: a Wi-Fi interface with **no persisted config** (runtime-
+  only, e.g. configured by hand with `persist: false`) is never suspended —
+  we couldn't restore it, and availability beats strictness. And because the
+  policy is reactive (VintageNet applies persisted configs before this app
+  starts), `wlan0` may associate for a few seconds at boot before the first
+  evaluation suspends it.
+
   Improv provisioning is unaffected: it only arms on a no-connectivity boot,
-  where this policy leaves Wi-Fi alone. All VintageNet access is guarded
-  (`Code.ensure_loaded?`) and injectable, so the module loads and the decision
-  logic is tested on host without a radio.
+  where this policy leaves Wi-Fi alone, and it persists the credentials it
+  writes. All VintageNet access is guarded (`Code.ensure_loaded?`) and
+  injectable, so the module loads and the decision logic is tested on host
+  without a radio.
   """
 
   use GenServer
@@ -48,35 +57,53 @@ defmodule UniversalProxy.WifiPolicy do
 
   @doc """
   Which interfaces to suspend or restore. `ifaces` is
-  `[%{ifname: _, type: _, connection: _}]`; `stashed` the suspended ifnames.
+  `[%{ifname: _, type: _, connection: _, persisted: config | nil}]`.
 
-  With Ethernet up every Wi-Fi-typed (i.e. currently configured) interface is
-  suspended; with Ethernet down every stashed interface is restored. Pure.
+  With Ethernet up, every Wi-Fi-typed interface whose config is persisted is
+  suspended (no persisted copy ⇒ nothing to restore from ⇒ left alone). With
+  Ethernet down, every Null-typed interface with a persisted Wi-Fi config is
+  restored — stateless, so a policy restart while suspended changes nothing.
+  Pure.
   """
-  @spec decide([map()], [String.t()]) :: %{suspend: [String.t()], restore: [String.t()]}
-  def decide(ifaces, stashed) do
-    ethernet_up? =
-      Enum.any?(ifaces, &(&1.type == VintageNetEthernet and &1.connection in @up_states))
-
-    if ethernet_up? do
-      %{suspend: for(i <- ifaces, i.type == VintageNetWiFi, do: i.ifname), restore: []}
+  @spec decide([map()]) :: %{suspend: [String.t()], restore: [String.t()]}
+  def decide(ifaces) do
+    if ethernet_up?(ifaces) do
+      %{
+        suspend: for(i <- ifaces, i.type == VintageNetWiFi and persisted_wifi?(i), do: i.ifname),
+        restore: []
+      }
     else
-      %{suspend: [], restore: stashed}
+      %{
+        suspend: [],
+        restore:
+          for(
+            i <- ifaces,
+            i.type == VintageNet.Technology.Null and persisted_wifi?(i),
+            do: i.ifname
+          )
+      }
     end
   end
+
+  @doc "Whether any Ethernet-typed interface has `:lan`/`:internet`. Pure."
+  @spec ethernet_up?([map()]) :: boolean()
+  def ethernet_up?(ifaces) do
+    Enum.any?(ifaces, &(&1.type == VintageNetEthernet and &1.connection in @up_states))
+  end
+
+  defp persisted_wifi?(iface), do: match?(%{type: VintageNetWiFi}, iface.persisted)
 
   # ── GenServer ───────────────────────────────────────────────────────────────
 
   @impl true
   def init(opts) do
     state = %{
-      stash: %{},
       timer: nil,
       settle_ms: Keyword.get(opts, :settle_ms, @default_settle_ms),
       subscribe?: Keyword.get(opts, :subscribe?, true),
       match_fn: Keyword.get(opts, :match_fn, &vintage_match/1),
       get_fn: Keyword.get(opts, :get_fn, &vintage_get/1),
-      get_config_fn: Keyword.get(opts, :get_config_fn, &vintage_get_configuration/1),
+      load_persisted_fn: Keyword.get(opts, :load_persisted_fn, &vintage_load_persisted/1),
       configure_fn: Keyword.get(opts, :configure_fn, &vintage_configure/3),
       deconfigure_fn: Keyword.get(opts, :deconfigure_fn, &vintage_deconfigure/2)
     }
@@ -90,7 +117,12 @@ defmodule UniversalProxy.WifiPolicy do
 
   @impl true
   def handle_call(:status, _from, state) do
-    {:reply, %{ethernet_up?: ethernet_up?(state), suspended: Map.keys(state.stash)}, state}
+    ifaces = interfaces(state)
+
+    suspended =
+      for i <- ifaces, i.type == VintageNet.Technology.Null and persisted_wifi?(i), do: i.ifname
+
+    {:reply, %{ethernet_up?: ethernet_up?(ifaces), suspended: suspended}, state}
   end
 
   @impl true
@@ -105,51 +137,42 @@ defmodule UniversalProxy.WifiPolicy do
   # ── evaluation ──────────────────────────────────────────────────────────────
 
   defp evaluate(state) do
-    %{suspend: suspend, restore: restore} =
-      state |> interfaces() |> decide(Map.keys(state.stash))
+    ifaces = interfaces(state)
+    %{suspend: suspend, restore: restore} = decide(ifaces)
+    persisted = Map.new(ifaces, &{&1.ifname, &1.persisted})
 
-    state = Enum.reduce(suspend, state, &suspend_iface/2)
-    Enum.reduce(restore, state, &restore_iface/2)
+    Enum.each(suspend, fn ifname ->
+      Logger.info("WifiPolicy: Ethernet up — suspending #{ifname} (config kept on disk)")
+      log_result(state.deconfigure_fn.(ifname, persist: false), ifname, "deconfigure")
+    end)
+
+    Enum.each(restore, fn ifname ->
+      Logger.info("WifiPolicy: Ethernet down — restoring Wi-Fi on #{ifname}")
+
+      state.configure_fn.(ifname, Map.fetch!(persisted, ifname), persist: false)
+      |> log_result(ifname, "configure")
+    end)
+
+    state
   end
 
-  # Every interface that has a "type" property, with its connection state.
+  # Every interface that has a "type" property, with its connection state and
+  # persisted (on-disk) config.
   defp interfaces(state) do
     for {["interface", ifname, "type"], type} <- state.match_fn.(["interface", :_, "type"]) do
       %{
         ifname: ifname,
         type: type,
-        connection: state.get_fn.(["interface", ifname, "connection"])
+        connection: state.get_fn.(["interface", ifname, "connection"]),
+        persisted: state.load_persisted_fn.(ifname)
       }
     end
   end
 
-  defp suspend_iface(ifname, state) do
-    config = state.get_config_fn.(ifname)
+  defp log_result(:ok, _ifname, _op), do: :ok
 
-    case config do
-      %{type: VintageNetWiFi} ->
-        Logger.info("WifiPolicy: Ethernet up — suspending #{ifname} (config kept on disk)")
-        state.deconfigure_fn.(ifname, persist: false)
-        %{state | stash: Map.put(state.stash, ifname, config)}
-
-      _ ->
-        # Already Null (a previous pass suspended it) or unreadable — keep any
-        # existing stash entry rather than clobbering it with Null.
-        state
-    end
-  end
-
-  defp restore_iface(ifname, state) do
-    {config, stash} = Map.pop(state.stash, ifname)
-    Logger.info("WifiPolicy: Ethernet down — restoring Wi-Fi on #{ifname}")
-    state.configure_fn.(ifname, config, persist: false)
-    %{state | stash: stash}
-  end
-
-  defp ethernet_up?(state) do
-    state
-    |> interfaces()
-    |> Enum.any?(&(&1.type == VintageNetEthernet and &1.connection in @up_states))
+  defp log_result(other, ifname, op) do
+    Logger.warning("WifiPolicy: #{op} #{ifname} failed: #{inspect(other)}")
   end
 
   # ── VintageNet wrappers (target-only) ───────────────────────────────────────
@@ -166,10 +189,19 @@ defmodule UniversalProxy.WifiPolicy do
     if Code.ensure_loaded?(VintageNet), do: apply(VintageNet, :get, [path]), else: nil
   end
 
-  defp vintage_get_configuration(ifname) do
-    if Code.ensure_loaded?(VintageNet),
-      do: apply(VintageNet, :get_configuration, [ifname]),
-      else: nil
+  # The persisted (on-disk) config, or nil. A corrupt/undecryptable file must
+  # degrade to "nothing to restore", never crash a top-level child.
+  defp vintage_load_persisted(ifname) do
+    if Code.ensure_loaded?(VintageNet.Persistence) do
+      case apply(VintageNet.Persistence, :call, [:load, [ifname]]) do
+        {:ok, config} -> config
+        _ -> nil
+      end
+    else
+      nil
+    end
+  rescue
+    _ -> nil
   end
 
   defp vintage_configure(ifname, config, opts) do
