@@ -127,11 +127,11 @@ When bumping `SENDSPIN_CPP_REF`:
    `git ls-remote https://github.com/Sendspin/sendspin-cpp.git refs/tags/vX.Y.Z`
 2. Update `CMakeLists.txt`'s `SENDSPIN_CPP_REF` cache var (keep the friendly
    tag in the inline comment for traceability)
-3. `rm -rf _build/*/sendspin_player` — the WHOLE build dir per target, not
-   just `_deps`: `SENDSPIN_CPP_REF` is a CMake `CACHE` variable, so a
-   surviving `CMakeCache.txt` silently keeps the OLD pin and FetchContent
-   re-populates the previous version (the patch chain then fails against
-   the wrong tree)
+3. `rm -rf _build/*/sendspin_player` — the WHOLE build dir per target.
+   The pin itself now propagates into existing caches (`SENDSPIN_CPP_REF`
+   is set with `FORCE`), but a clean dir guarantees FetchContent
+   re-populates and the patch chain applies to a pristine tree rather
+   than one carrying the previous version's patched state
 4. Run `mix compile` — if a patch no longer applies cleanly, regenerate
    it against the new tree (`diff -u <old> <new> > 000N-...patch`) and
    commit. The post-populate marker checks in `CMakeLists.txt` will

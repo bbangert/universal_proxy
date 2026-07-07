@@ -15,8 +15,14 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "" FORCE)
 # side: a retag would silently flow into firmware. The friendly tag is kept
 # in a comment for traceability. Resolve with `git ls-remote URL TAG` when
 # bumping.
+#
+# FORCE so the repo pin always wins over a stale CMakeCache.txt — without
+# it, a pin bump silently keeps building the previous SHA in existing
+# build dirs. This also means `-DSENDSPIN_CPP_REF=...` cannot override;
+# for scratch experiments against another ref use
+# `-DFETCHCONTENT_SOURCE_DIR_SENDSPIN-CPP=<local-checkout>` instead.
 set(SENDSPIN_CPP_REF "ef1157f0525d2107320736efc0909d78832cc270" # v0.6.1
-    CACHE STRING "sendspin-cpp commit SHA to pin")
+    CACHE STRING "sendspin-cpp commit SHA to pin" FORCE)
 
 # Trim sendspin-cpp to just the player role. Other roles ship dead code on a
 # device that only plays audio and cost compile time on slower cross-targets.
