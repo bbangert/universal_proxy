@@ -236,7 +236,8 @@ defmodule UniversalProxy.Audio.Server do
     # Pre-emptive mDNS goodbye for every service type we publish. After
     # an ungraceful shutdown we never sent a TTL=0 record, so peers may
     # still have cached PTR entries pointing at us. Clearing those
-    # caches now means the announces from `Audio.Player.init/1` produce
+    # caches now means the registration + §8.3 announce burst each
+    # `Audio.Player` fires on its binary's `listening` event produces
     # a fresh `Added` event on peers instead of a silent refresh.
     send_preemptive_goodbyes(state)
 

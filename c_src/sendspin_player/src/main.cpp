@@ -36,9 +36,7 @@
 #include <getopt.h>
 #include <iostream>
 #include <mutex>
-#include <netinet/in.h>
 #include <poll.h>
-#include <sys/socket.h>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -644,23 +642,19 @@ struct ClientListener : SendspinClientListener {
 // the listener is up: Music Assistant's discovery connect is one-shot
 // (aiosendspin `retry_initial_connection=False`), so a connection
 // refused in that gap orphans the player until the mDNS record flaps.
-// Probe by trying to bind the same wildcard address ourselves:
-// EADDRINUSE means a listener holds the port. A connect() probe would
-// also work but would exercise the server's accept path; a failed
-// bind is entirely passive. Caveat: a *foreign* process holding the
-// port also reports bound — but in that state the server can never
-// bind at all and logs its own error; advertising is moot either way.
-static bool ws_listener_bound(uint16_t port) {
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return false;
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    bool in_use = ::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 &&
-                  errno == EADDRINUSE;
-    ::close(fd);
-    return in_use;
+// Our 0003 patch has the library call this hook from inside
+// SendspinWsServer::start() the moment its listen() succeeds — an
+// authoritative signal, unlike a port probe, which cannot tell OUR
+// listener from a foreign or dying-predecessor socket on the same
+// port. The hook runs on the main-loop thread (start() is driven by
+// client.loop()), but the flags are atomics so the loop's read is
+// well-defined regardless of future library threading changes.
+static std::atomic<bool> g_listener_bound{false};
+static std::atomic<int> g_listener_port{0};
+
+extern "C" void sendspin_host_listener_bound(uint16_t port) {
+    g_listener_port.store(port);
+    g_listener_bound.store(true);
 }
 
 struct NetworkProvider : SendspinNetworkProvider {
@@ -809,12 +803,15 @@ int main(int argc, char* argv[]) {
         client.loop();
 
         // `listening` gates the Elixir side's mDNS advertisement (see
-        // ws_listener_bound above) — emitted once, as soon as the
-        // listener is observably bound.
-        if (!listening_emitted && ws_listener_bound(static_cast<uint16_t>(opts.mdns_port))) {
+        // sendspin_host_listener_bound above) — emitted once, as soon
+        // as the library reports its listener bound. If the bind fails
+        // (foreign process on the port), the library retries every tick
+        // and this fires on eventual success; until then the player is
+        // deliberately not advertised.
+        if (!listening_emitted && g_listener_bound.load()) {
             listening_emitted = true;
             std::ostringstream os;
-            os << "{\"event\":\"listening\",\"port\":" << opts.mdns_port << "}";
+            os << "{\"event\":\"listening\",\"port\":" << g_listener_port.load() << "}";
             emit_json(os.str());
         }
 

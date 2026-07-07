@@ -21,12 +21,26 @@ defmodule UniversalProxy.Audio.PlayerTest do
     use Agent
 
     def start_link(_initial \\ []) do
-      Agent.start_link(fn -> %{calls: []} end, name: __MODULE__)
+      Agent.start_link(fn -> %{calls: [], fail_adds: 0} end, name: __MODULE__)
+    end
+
+    @doc """
+    Make the next `n` add_mdns_service calls fail with `{:error, :noproc}`,
+    mimicking MdnsLite's TableServer being down/mid-restart. Recorded as
+    `{:add_failed, service}` so tests can assert the failed attempt.
+    """
+    def fail_next_adds(n) do
+      Agent.update(__MODULE__, fn s -> %{s | fail_adds: n} end)
     end
 
     def add_mdns_service(service) do
-      Agent.update(__MODULE__, fn s -> %{s | calls: [{:add, service} | s.calls]} end)
-      :ok
+      Agent.get_and_update(__MODULE__, fn
+        %{fail_adds: n} = s when n > 0 ->
+          {{:error, :noproc}, %{s | fail_adds: n - 1, calls: [{:add_failed, service} | s.calls]}}
+
+        s ->
+          {:ok, %{s | calls: [{:add, service} | s.calls]}}
+      end)
     end
 
     def remove_mdns_service(id) do
@@ -167,6 +181,51 @@ defmodule UniversalProxy.Audio.PlayerTest do
       # ...but with no `listening`, no advertisement may happen.
       Process.sleep(50)
       refute Enum.any?(MdnsStub.calls(), &match?({:add, _}, &1))
+    end
+
+    test "retries mDNS registration when MdnsLite is unavailable at `listening`" do
+      # `listening` is a one-shot signal from the binary; if MdnsLite's
+      # TableServer happens to be down at that instant, registration
+      # must be retried or the player stays unadvertised for the
+      # binary's whole lifetime.
+      MdnsStub.fail_next_adds(1)
+      _pid = start_player!(mdns_retry_ms: 25, reannounce_delays_ms: [1])
+
+      assert_receive {:sendspin_state, @key, %{event: "listening"}}, 2_000
+
+      # First attempt fails, the scheduled retry succeeds, and the
+      # reannounce burst fires only after the successful registration.
+      eventually(
+        fn ->
+          calls = MdnsStub.calls()
+
+          Enum.any?(calls, &match?({:add_failed, _}, &1)) and
+            Enum.any?(calls, &match?({:add, _}, &1)) and
+            :announce_all in calls
+        end,
+        1_000
+      )
+
+      calls = MdnsStub.calls()
+      add_idx = Enum.find_index(calls, &match?({:add, _}, &1))
+      announce_idx = Enum.find_index(calls, &(&1 == :announce_all))
+      assert add_idx < announce_idx, "reannounce burst must follow successful registration"
+    end
+
+    test "warns when the binary never reports `listening`" do
+      # A player in this state runs fine but is invisible to Sendspin
+      # servers; the watchdog is the only breadcrumb saying why.
+      System.put_env("FAKE_SKIP_LISTENING", "1")
+      on_exit(fn -> System.delete_env("FAKE_SKIP_LISTENING") end)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          _pid = start_player!(mdns_watchdog_ms: 50)
+          assert_receive {:sendspin_state, @key, %{event: "static_delay"}}, 2_000
+          Process.sleep(120)
+        end)
+
+      assert log =~ "never reported `listening`"
     end
 
     test "mDNS instance_name truncates by BYTES, not graphemes" do
@@ -361,7 +420,11 @@ defmodule UniversalProxy.Audio.PlayerTest do
   describe "termination" do
     test "sends shutdown command and removes the mDNS service" do
       pid = start_player!()
-      assert_receive {:sendspin_state, @key, %{event: "started"}}, 2_000
+      # Sync on `listening` (not just `started`) so the teardown under
+      # test is deterministically the registered-record path — port
+      # messages and the stop request come from different senders, so
+      # BEAM gives no cross-sender ordering guarantee.
+      assert_receive {:sendspin_state, @key, %{event: "listening"}}, 2_000
 
       :ok = GenServer.stop(pid, :normal, 2_000)
       refute Process.alive?(pid)
@@ -378,7 +441,11 @@ defmodule UniversalProxy.Audio.PlayerTest do
       # Caught when Music Assistant refused to reconnect on re-enable
       # because its python-zeroconf hadn't seen a Removed event.
       pid = start_player!()
-      assert_receive {:sendspin_state, @key, %{event: "started"}}, 2_000
+      # Sync on `listening` (not just `started`) so the teardown under
+      # test is deterministically the registered-record path — port
+      # messages and the stop request come from different senders, so
+      # BEAM gives no cross-sender ordering guarantee.
+      assert_receive {:sendspin_state, @key, %{event: "listening"}}, 2_000
 
       :ok = GenServer.stop(pid, :normal, 2_000)
 
