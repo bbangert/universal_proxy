@@ -112,12 +112,20 @@ defmodule UniversalProxy.Bluetooth do
 
   @doc """
   Whether BlueZ radios may take the `:audio` role on this hardware
-  (compile-time constant; see `@audio_role_targets`). Overridable via the
-  `:bt_audio_role_override` app env — tests only.
+  (compile-time constant; see `@audio_role_targets`). In test builds only,
+  the `:bt_audio_role_override` app env (boolean) overrides it — the env
+  read is compiled out everywhere else.
   """
   @spec audio_role_supported?() :: boolean()
-  def audio_role_supported? do
-    Application.get_env(:universal_proxy, :bt_audio_role_override, @audio_role_supported)
+  if Mix.env() == :test do
+    def audio_role_supported? do
+      case Application.get_env(:universal_proxy, :bt_audio_role_override) do
+        override when is_boolean(override) -> override
+        _ -> @audio_role_supported
+      end
+    end
+  else
+    def audio_role_supported?, do: @audio_role_supported
   end
 
   @doc "PubSub topic carrying `{:bluetooth_state, status}` broadcasts."
