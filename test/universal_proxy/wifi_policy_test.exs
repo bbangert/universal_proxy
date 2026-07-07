@@ -162,19 +162,27 @@ defmodule UniversalProxy.WifiPolicyTest do
       assert %{ethernet_up?: true, suspended: ["wlan0"]} = WifiPolicy.status(ctx.policy)
     end
 
-    test "a flap that settles back within the debounce window never suspends" do
-      ctx = start_policy([@eth_down, @wifi], settle_ms: 80)
+    test "connection events defer evaluation to the settle timer" do
+      # Timer parked far out so CI scheduling jitter can't fire it mid-test:
+      # a flap that settles back never evaluates with the mid-flap state.
+      ctx = start_policy([@eth_down, @wifi], settle_ms: 60_000)
 
-      # Ethernet comes up... and drops again before the settle timer fires.
       set_ifaces(ctx, [@eth, @wifi])
       set_ifaces(ctx, [@eth_down, @wifi])
 
-      # If debouncing were broken (first timer not cancelled / evaluated
-      # immediately), the eth-up table snapshot would have produced a
-      # deconfigure. Wait past the settle window to be sure.
-      refute_receive {:deconfigure, _, _}, 300
+      refute_receive {:deconfigure, _, _}, 150
+    end
 
-      # And the timer still works: a flap that persists does suspend.
+    test "a stale :evaluate from a cancelled timer is ignored" do
+      ctx = start_policy([@eth_down, @wifi])
+
+      # cancel_timer/1 doesn't flush an already-delivered message — simulate
+      # one whose token is no longer current while the table says eth-up.
+      Agent.update(ctx.table, fn _ -> [@eth, @wifi] end)
+      send(ctx.policy, {:evaluate, make_ref()})
+      refute_receive {:deconfigure, _, _}, 100
+
+      # The real event path still evaluates.
       set_ifaces(ctx, [@eth, @wifi])
       assert_receive {:deconfigure, "wlan0", persist: false}, 500
     end
