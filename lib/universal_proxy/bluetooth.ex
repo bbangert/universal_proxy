@@ -120,11 +120,14 @@ defmodule UniversalProxy.Bluetooth do
     * GATT events are translated to espex messages by
       `BluetoothProxy.gatt_event/2`;
     * connection-slot changes tick `Stats`;
-    * the AudioManager pair (BT-headphone control plane) mounts in the
-      `extra_children:` audio slot — after `BlueAlsa`, before
-      `Improv.Supervisor` — preserving the restart-ordering semantics it
-      had as a hardcoded child;
-    * Improv gets the app's PubSub + connectivity probe.
+    * the app's own children mount in the `extra_children:` slot (after
+      `BlueAlsa`): the AudioManager pair (BT-headphone control plane)
+      first — preserving the restart-ordering semantics it had as a
+      hardcoded child — then `UniversalProxy.Improv.Supervisor` LAST, so
+      an Improv fault never disturbs the proxy scanning/GATT or audio
+      stacks while a bluetoothd/Client restart (`:rest_for_one`) still
+      rebuilds the whole group. Improv gets the app's PubSub +
+      connectivity probe here.
   """
   @spec bluez_spec() :: Supervisor.child_spec() | {module(), keyword()}
   def bluez_spec do
@@ -138,13 +141,14 @@ defmodule UniversalProxy.Bluetooth do
        on_connections_changed: &Stats.connections_changed/0
      ],
      blue_alsa: [pubsub: UniversalProxy.PubSub],
-     improv: [
-       pubsub: UniversalProxy.PubSub,
-       network_type: &UniversalProxy.System.network_type/0
-     ],
      extra_children: [
        {Task.Supervisor, name: AudioManager.TaskSupervisor},
-       AudioManager
+       AudioManager,
+       {UniversalProxy.Improv.Supervisor,
+        [
+          pubsub: UniversalProxy.PubSub,
+          network_type: &UniversalProxy.System.network_type/0
+        ]}
      ]}
   end
 

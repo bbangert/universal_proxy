@@ -1,4 +1,4 @@
-defmodule UniversalProxy.Bluez.Improv do
+defmodule UniversalProxy.Improv do
   @moduledoc """
   Improv-over-BLE Wi-Fi provisioning manager — the GenServer that ties the
   protocol codec, GATT server and advertisement into a working subsystem.
@@ -42,7 +42,7 @@ defmodule UniversalProxy.Bluez.Improv do
   use GenServer
   require Logger
 
-  alias UniversalProxy.Bluez.Improv.{Advert, GattServer, Protocol}
+  alias UniversalProxy.Improv.{Advert, GattServer, Protocol}
 
   @topic "bluetooth:improv"
 
@@ -127,7 +127,7 @@ defmodule UniversalProxy.Bluez.Improv do
     state = %{
       gatt: Keyword.get(opts, :gatt, GattServer),
       advert: Keyword.get(opts, :advert, Advert),
-      wifi: Keyword.get(opts, :wifi, UniversalProxy.Bluez.Improv.Wifi),
+      wifi: Keyword.get(opts, :wifi, UniversalProxy.Improv.Wifi),
       # Connectivity probe for the arm gate; nil (the default) reads as
       # online, so Improv NEVER arms unless the host explicitly opts into
       # offline-driven arming by wiring a real probe (the app passes
@@ -137,7 +137,7 @@ defmodule UniversalProxy.Bluez.Improv do
       # Phoenix.PubSub for {:improv_status, _} broadcasts; nil = no-op.
       pubsub: Keyword.get(opts, :pubsub),
       scanner: Keyword.get(opts, :scanner, UniversalProxy.Bluez.Client),
-      task_sup: Keyword.get(opts, :task_supervisor, UniversalProxy.Bluez.Improv.TaskSupervisor),
+      task_sup: Keyword.get(opts, :task_supervisor, UniversalProxy.Improv.TaskSupervisor),
       timeout_ms: Keyword.get(opts, :timeout_ms, @session_timeout_ms),
       session_cap_ms: Keyword.get(opts, :session_cap_ms, @session_cap_ms),
       connect_timeout_ms: Keyword.get(opts, :connect_timeout_ms, @connect_timeout_ms),

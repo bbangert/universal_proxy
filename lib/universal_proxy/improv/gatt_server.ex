@@ -1,4 +1,4 @@
-defmodule UniversalProxy.Bluez.Improv.GattServer do
+defmodule UniversalProxy.Improv.GattServer do
   @moduledoc """
   Exports the Improv GATT application over D-Bus and serves the inbound method
   calls BlueZ makes against it.
@@ -30,7 +30,7 @@ defmodule UniversalProxy.Bluez.Improv.GattServer do
   require Logger
 
   alias UniversalProxy.Bluez.{DBus, DevicePath}
-  alias UniversalProxy.Bluez.Improv.Protocol
+  alias UniversalProxy.Improv.Protocol
 
   @om_iface "org.freedesktop.DBus.ObjectManager"
   @props_iface "org.freedesktop.DBus.Properties"
@@ -231,9 +231,8 @@ defmodule UniversalProxy.Bluez.Improv.GattServer do
         state = %{
           conn: conn,
           conn_ref: conn_ref,
-          manager: Keyword.get(opts, :manager, UniversalProxy.Bluez.Improv),
-          task_sup:
-            Keyword.get(opts, :task_supervisor, UniversalProxy.Bluez.Improv.TaskSupervisor),
+          manager: Keyword.get(opts, :manager, UniversalProxy.Improv),
+          task_sup: Keyword.get(opts, :task_supervisor, UniversalProxy.Improv.TaskSupervisor),
           values: initial_values(),
           notifying: MapSet.new(),
           registered?: false

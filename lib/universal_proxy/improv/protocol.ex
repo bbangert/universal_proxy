@@ -1,10 +1,10 @@
-defmodule UniversalProxy.Bluez.Improv.Protocol do
+defmodule UniversalProxy.Improv.Protocol do
   @moduledoc """
   Pure wire codec for the [Improv Wi-Fi BLE protocol](https://www.improv-wifi.com/ble/).
 
   No D-Bus, no processes — every byte the GATT server reads or notifies is built
   and parsed here, so the protocol is 100% host-testable. Higher layers
-  (`UniversalProxy.Bluez.Improv` and its GATT server) only move opaque binaries.
+  (`UniversalProxy.Improv` and its GATT server) only move opaque binaries.
 
   ## Wire format (locked against improv-wifi.com/ble + improv-wifi/sdk-js)
 

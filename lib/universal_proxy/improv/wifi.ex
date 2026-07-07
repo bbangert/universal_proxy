@@ -1,8 +1,8 @@
-defmodule UniversalProxy.Bluez.Improv.Wifi do
+defmodule UniversalProxy.Improv.Wifi do
   @moduledoc """
   Wi-Fi operations for Improv provisioning: scan for networks, apply submitted
   credentials, and derive the post-provisioning redirect URL. The seam the
-  `UniversalProxy.Bluez.Improv` manager calls into.
+  `UniversalProxy.Improv` manager calls into.
 
   All VintageNet access is guarded (`Code.ensure_loaded?`) so the module loads on
   host, and is injectable (`:scan_trigger` / `:vintage_get` / `:configure_fn`) so

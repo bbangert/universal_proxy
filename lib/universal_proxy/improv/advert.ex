@@ -1,4 +1,4 @@
-defmodule UniversalProxy.Bluez.Improv.Advert do
+defmodule UniversalProxy.Improv.Advert do
   @moduledoc """
   Exports an `org.bluez.LEAdvertisement1` object and registers it with the
   adapter's `org.bluez.LEAdvertisingManager1`, so the device advertises the
@@ -33,7 +33,7 @@ defmodule UniversalProxy.Bluez.Improv.Advert do
   @compile {:no_warn_undefined, VintageNet}
 
   alias UniversalProxy.Bluez.{DBus, DevicePath}
-  alias UniversalProxy.Bluez.Improv.Protocol
+  alias UniversalProxy.Improv.Protocol
 
   @props_iface "org.freedesktop.DBus.Properties"
   @introspect_iface "org.freedesktop.DBus.Introspectable"
@@ -113,8 +113,7 @@ defmodule UniversalProxy.Bluez.Improv.Advert do
           conn: conn,
           conn_ref: conn_ref,
           local_name: Keyword.get(opts, :local_name, default_local_name()),
-          task_sup:
-            Keyword.get(opts, :task_supervisor, UniversalProxy.Bluez.Improv.TaskSupervisor),
+          task_sup: Keyword.get(opts, :task_supervisor, UniversalProxy.Improv.TaskSupervisor),
           registered?: false
         }
 
