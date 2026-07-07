@@ -12,6 +12,7 @@ defmodule UniversalProxyWeb.DiscoveryLive do
   import UniversalProxyWeb.Components.Icons
 
   alias UniversalProxy.ESPHome
+  alias UniversalProxy.ESPHome.MdnsAdapter
   alias UniversalProxyWeb.MockData
 
   @areas ["Living room", "Office", "Garage", "Basement", "Server rack"]
@@ -87,9 +88,23 @@ defmodule UniversalProxyWeb.DiscoveryLive do
 
   # The device's unique hostname IS the ESPHome node name (which carries
   # the per-device MAC suffix) — `MdnsAdapter` advertises it as
-  # `<name>.local`. Derived, never free-typed: a hostname that diverges
-  # from what mDNS actually answers would just be a lie in the UI.
-  defp hostname_for(esphome_id), do: "#{esphome_id}.local"
+  # `<name>.local`. Derived, never free-typed, and gated through the SAME
+  # `host_alias/1` check the adapter uses: a name it would refuse to
+  # advertise (spaces, underscores, empty) must not render as a hostname
+  # mDNS never answers. In that case fall back to the OS hostname
+  # (`nerves-XXXX.local`), which is always advertised — also making the
+  # live preview honest while an invalid name is being typed.
+  defp hostname_for(esphome_id) do
+    case MdnsAdapter.host_alias(esphome_id) do
+      nil -> os_hostname()
+      alias_name -> "#{alias_name}.local"
+    end
+  end
+
+  defp os_hostname do
+    {:ok, name} = :inet.gethostname()
+    "#{name}.local"
+  end
 
   defp dirty?(form, original), do: form != original
 
