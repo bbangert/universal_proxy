@@ -130,11 +130,18 @@ defmodule UniversalProxy.WifiPolicy do
 
   @impl true
   def handle_info({VintageNet, ["interface", _if, "connection"], _old, _new, _meta}, state) do
-    if state.timer, do: Process.cancel_timer(state.timer)
-    {:noreply, %{state | timer: Process.send_after(self(), :evaluate, state.settle_ms)}}
+    # Tokenized so a cancelled-but-already-delivered :evaluate can't fire
+    # early with mid-flap state (cancel_timer doesn't flush the mailbox).
+    with {timer, _token} <- state.timer, do: Process.cancel_timer(timer)
+    token = make_ref()
+    timer = Process.send_after(self(), {:evaluate, token}, state.settle_ms)
+    {:noreply, %{state | timer: {timer, token}}}
   end
 
-  def handle_info(:evaluate, state), do: {:noreply, evaluate(%{state | timer: nil})}
+  def handle_info({:evaluate, token}, %{timer: {_timer, token}} = state),
+    do: {:noreply, evaluate(%{state | timer: nil})}
+
+  def handle_info({:evaluate, _stale_token}, state), do: {:noreply, state}
   def handle_info(_msg, state), do: {:noreply, state}
 
   # ── evaluation ──────────────────────────────────────────────────────────────
@@ -205,6 +212,8 @@ defmodule UniversalProxy.WifiPolicy do
     end
   rescue
     _ -> nil
+  catch
+    :exit, _ -> nil
   end
 
   defp vintage_configure(ifname, config, opts) do
