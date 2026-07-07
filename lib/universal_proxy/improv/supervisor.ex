@@ -5,7 +5,7 @@ defmodule UniversalProxy.Improv.Supervisor do
   The children are mutually dependent — the `Improv` manager registers and drives
   the `GattServer` + `Advert` D-Bus exporters (off-loop via the `Task.Supervisor`)
   — so a crash of any one must restart all of them together. Under the parent
-  `UniversalProxy.Bluez` supervisor's `:rest_for_one`, the manager (started last)
+  `Bluez` supervisor's `:rest_for_one`, the manager (started last)
   crashing would otherwise leave `GattServer`/`Advert` running: the cleartext GATT
   app + advertisement would stay exported with no session timers or disarm logic.
 

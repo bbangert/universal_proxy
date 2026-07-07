@@ -42,7 +42,6 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
 
   alias UniversalProxy.{Audio, Bluetooth, System}
   alias UniversalProxy.Bluetooth.{RadioMonitor, Stats}
-  alias UniversalProxy.Bluez
   alias UniversalProxy.ESPHome.Clients
 
   @default_tick_ms 30_000

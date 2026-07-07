@@ -14,12 +14,12 @@ defmodule UniversalProxy.Bluetooth do
     2. `UniversalProxy.Bluetooth.Settings` — DETS-persisted user settings
        (enabled / active-connections / selected radio MAC).
     3. a `DynamicSupervisor` the BlueZ subtree runs under.
-    4. `UniversalProxy.Bluetooth.Manager` — keeps `UniversalProxy.Bluez`
+    4. `UniversalProxy.Bluetooth.Manager` — keeps `Bluez`
        running (always — the `enabled` setting gates espex wiring, not the
        stack) and performs radio switches, publishing the selected radio
        MAC (`:persistent_term`) **before** each subtree (re)start.
 
-  `UniversalProxy.Bluez` brings up `dbus-daemon` + `bluetoothd` so the
+  `Bluez` brings up `dbus-daemon` + `bluetoothd` so the
   kernel-attached controller is managed by BlueZ over D-Bus; the `rebus`
   client + advertisement reconstruction that call
   `UniversalProxy.ESPHome.BluetoothScanner.on_advertisement/1` attach
@@ -65,7 +65,7 @@ defmodule UniversalProxy.Bluetooth do
   ## When the controller never appears
 
   On a board whose BT bring-up fails (broken DT, no onboard radio, no USB
-  dongle yet), `UniversalProxy.Bluez.Client` gives up after ~10 s
+  dongle yet), `Bluez.Client` gives up after ~10 s
   (`:no_adapter`) and the `Bluez` subtree restarts. The loop is benign by
   configuration: both the `Bluez` supervisor and the DynamicSupervisor it
   runs under carry explicit `max_restarts: 10, max_seconds: 60` budgets,
@@ -112,7 +112,7 @@ defmodule UniversalProxy.Bluetooth do
   def stats_topic, do: @stats_topic
 
   @doc """
-  The `UniversalProxy.Bluez` child spec with every app-side callback wired
+  The `Bluez` child spec with every app-side callback wired
   in — the single place the app plugs itself into the (espex-agnostic)
   Bluez subtree. `Manager`'s `bluez_child:` default starts exactly this.
 
@@ -131,7 +131,7 @@ defmodule UniversalProxy.Bluetooth do
   """
   @spec bluez_spec() :: Supervisor.child_spec() | {module(), keyword()}
   def bluez_spec do
-    {UniversalProxy.Bluez,
+    {Bluez,
      client: [
        on_advertisement: &UniversalProxy.ESPHome.BluetoothScanner.on_advertisement/1,
        pubsub: UniversalProxy.PubSub

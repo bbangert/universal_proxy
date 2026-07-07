@@ -4,7 +4,7 @@ defmodule UniversalProxy.Improv.Advert do
   adapter's `org.bluez.LEAdvertisingManager1`, so the device advertises the
   Improv service while provisioning is armed.
 
-  Same export+dispatch shape as `UniversalProxy.Bluez.Agent` (own `rebus`
+  Same export+dispatch shape as `Bluez.Agent` (own `rebus`
   connection, `set_method_handler`, reply to inbound calls, register off-loop in
   a `Task`). The advertisement is a *single* read-only object with a `Release()`
   method BlueZ calls when it drops the advert.
@@ -32,7 +32,7 @@ defmodule UniversalProxy.Improv.Advert do
   # VintageNet is target-only; device_suffix/0 reads a MAC through it defensively.
   @compile {:no_warn_undefined, VintageNet}
 
-  alias UniversalProxy.Bluez.{DBus, DevicePath}
+  alias Bluez.{DBus, DevicePath}
   alias UniversalProxy.Improv.Protocol
 
   @props_iface "org.freedesktop.DBus.Properties"

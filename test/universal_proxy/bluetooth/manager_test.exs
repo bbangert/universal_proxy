@@ -4,7 +4,7 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
   use ExUnit.Case, async: false
 
   alias UniversalProxy.Bluetooth.{Manager, Settings}
-  alias UniversalProxy.Bluez.DevicePath
+  alias Bluez.DevicePath
 
   @pubsub UniversalProxy.PubSub
   @table :bluetooth_manager_test_settings
@@ -13,7 +13,7 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
   @hci1_mac "AA:BB:CC:DD:EE:FF"
 
   defmodule StubBluez do
-    @moduledoc "Stands in for the UniversalProxy.Bluez subtree in host tests."
+    @moduledoc "Stands in for the Bluez subtree in host tests."
     use Agent
 
     def start_link(_opts), do: Agent.start_link(fn -> :ok end)
@@ -357,7 +357,7 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
 
       Phoenix.PubSub.broadcast(
         @pubsub,
-        UniversalProxy.Bluez.Client.adapters_topic(),
+        Bluez.Client.adapters_topic(),
         {:bluetooth_adapters_changed}
       )
 

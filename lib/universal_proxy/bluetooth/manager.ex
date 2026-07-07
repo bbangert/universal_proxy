@@ -21,9 +21,9 @@ defmodule UniversalProxy.Bluetooth.Manager do
 
   Before every (re)start of the Bluez subtree the Manager publishes the
   persisted radio MAC (or `nil` = auto) as `:persistent_term`
-  (`UniversalProxy.Bluez.DevicePath.desired_adapter_key/0`). The kernel
+  (`Bluez.DevicePath.desired_adapter_key/0`). The kernel
   exposes no BT MAC in sysfs, so the MAC → hciX resolution happens
-  inside the subtree: `UniversalProxy.Bluez.Client` matches the desired
+  inside the subtree: `Bluez.Client` matches the desired
   MAC against bluetoothd's `Adapter1` objects during setup and writes
   the resolved adapter path (`adapter_path_key/0`) itself, falling back
   to the lowest-index adapter when the MAC is absent. A crash-restart
@@ -65,7 +65,7 @@ defmodule UniversalProxy.Bluetooth.Manager do
   require Logger
 
   alias UniversalProxy.Bluetooth.{Radios, Settings}
-  alias UniversalProxy.Bluez.DevicePath
+  alias Bluez.DevicePath
 
   # Delay before re-binding the monitor after the subtree dies — the
   # DynamicSupervisor restarts a :permanent child immediately, so one tick
@@ -134,8 +134,7 @@ defmodule UniversalProxy.Bluetooth.Manager do
       bluez_child: Keyword.get_lazy(opts, :bluez_child, &UniversalProxy.Bluetooth.bluez_spec/0),
       sysfs_root: Keyword.get(opts, :sysfs_root, "/sys/class/bluetooth"),
       pubsub: Keyword.get(opts, :pubsub, UniversalProxy.PubSub),
-      adapters_info_fun:
-        Keyword.get(opts, :adapters_info_fun, &UniversalProxy.Bluez.Client.adapters_info/0),
+      adapters_info_fun: Keyword.get(opts, :adapters_info_fun, &Bluez.Client.adapters_info/0),
       start_retry_ms: Keyword.get(opts, :start_retry_ms, @start_retry_ms),
       restart_settle_ms: Keyword.get(opts, :restart_settle_ms, @restart_settle_ms),
       esphome_restart_fun: Keyword.get(opts, :esphome_restart_fun, &restart_esphome/0),
@@ -147,7 +146,7 @@ defmodule UniversalProxy.Bluetooth.Manager do
 
     # See "Broadcasts" in the moduledoc: the adapter claim lands after a
     # reconcile's broadcast, so rebroadcast when the Client announces it.
-    Phoenix.PubSub.subscribe(state.pubsub, UniversalProxy.Bluez.Client.adapters_topic())
+    Phoenix.PubSub.subscribe(state.pubsub, Bluez.Client.adapters_topic())
 
     {:ok, state, {:continue, :reconcile}}
   end
@@ -339,11 +338,11 @@ defmodule UniversalProxy.Bluetooth.Manager do
   end
 
   defp connection_usage do
-    {free, total} = UniversalProxy.Bluez.Gatt.connections_free()
+    {free, total} = Bluez.Gatt.connections_free()
     {total - free, total}
   catch
     # Gatt not running (subtree down, host) — nothing in use.
-    :exit, _ -> {0, UniversalProxy.Bluez.Gatt.max_connections()}
+    :exit, _ -> {0, Bluez.Gatt.max_connections()}
   end
 
   # Track the role-paused state across reconciles and bounce espex when it

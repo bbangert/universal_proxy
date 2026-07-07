@@ -22,13 +22,13 @@ defmodule UniversalProxy.Bluetooth.AudioSink do
 
   `safe/0` mirrors `Enumerate.safe/0`: it rescues *any* failure and returns
   `%{}`, so it is inert when `bluealsad`/`org.bluealsa` is down or the
-  `UniversalProxy.Bluez.BlueAlsa` client isn't running (off-target/CI). The
+  `Bluez.BlueAlsa` client isn't running (off-target/CI). The
   composite enumerate then degrades to just the ALSA cards.
   """
 
   require Logger
 
-  alias UniversalProxy.Bluez.BlueAlsa
+  alias Bluez.BlueAlsa
 
   @type output_key :: {String.t(), nil, nil}
   @type output_info :: %{
@@ -55,7 +55,7 @@ defmodule UniversalProxy.Bluetooth.AudioSink do
   end
 
   @doc """
-  Pure shaper: turn a list of `UniversalProxy.Bluez.BlueAlsa.pcms/0` maps into
+  Pure shaper: turn a list of `Bluez.BlueAlsa.pcms/0` maps into
   the enumerate contract. Separated from `safe/0` so it's unit-testable from a
   fixture PCM list. Last-write-wins if a MAC appears twice (it shouldn't —
   one A2DP-playback PCM per connected headset).

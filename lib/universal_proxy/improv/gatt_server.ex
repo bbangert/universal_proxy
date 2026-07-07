@@ -3,7 +3,7 @@ defmodule UniversalProxy.Improv.GattServer do
   Exports the Improv GATT application over D-Bus and serves the inbound method
   calls BlueZ makes against it.
 
-  Same export+dispatch shape as `UniversalProxy.Bluez.Agent`/`Client`, scaled to
+  Same export+dispatch shape as `Bluez.Agent`/`Client`, scaled to
   a small object tree: an app-root `ObjectManager`, one `org.bluez.GattService1`,
   and five `org.bluez.GattCharacteristic1` objects (the Improv
   capabilities/current-state/error-state/rpc-command/rpc-result characteristics —
@@ -29,7 +29,7 @@ defmodule UniversalProxy.Improv.GattServer do
   use GenServer
   require Logger
 
-  alias UniversalProxy.Bluez.{DBus, DevicePath}
+  alias Bluez.{DBus, DevicePath}
   alias UniversalProxy.Improv.Protocol
 
   @om_iface "org.freedesktop.DBus.ObjectManager"

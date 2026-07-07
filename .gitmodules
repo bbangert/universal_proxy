@@ -2,3 +2,6 @@
 	path = deps_local/rebus
 	url = https://github.com/bbangert/rebus.git
 	branch = dbus-service
+[submodule "deps_local/bluez"]
+	path = deps_local/bluez
+	url = https://github.com/bbangert/bluez.git

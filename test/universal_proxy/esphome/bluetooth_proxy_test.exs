@@ -1,9 +1,9 @@
 defmodule UniversalProxy.ESPHome.BluetoothProxyTest do
   # async: false — tests register a stub process under the global
-  # UniversalProxy.Bluez.Gatt name.
+  # Bluez.Gatt name.
   use ExUnit.Case, async: false
 
-  alias UniversalProxy.Bluez.Gatt
+  alias Bluez.Gatt
   alias UniversalProxy.ESPHome.BluetoothProxy
 
   @address 0xAABBCCDDEEFF
@@ -140,15 +140,15 @@ defmodule UniversalProxy.ESPHome.BluetoothProxyTest do
     end
 
     test "gatt_service rebuilds the espex struct tree from the neutral one" do
-      service = %UniversalProxy.Bluez.Gatt.Service{
+      service = %Bluez.Gatt.Service{
         uuid: 0x180F,
         handle: 0x0A,
         characteristics: [
-          %UniversalProxy.Bluez.Gatt.Characteristic{
+          %Bluez.Gatt.Characteristic{
             uuid: 0x2A19,
             handle: 0x0C,
             properties: 0x12,
-            descriptors: [%UniversalProxy.Bluez.Gatt.Descriptor{uuid: 0x2902, handle: 0x0D}]
+            descriptors: [%Bluez.Gatt.Descriptor{uuid: 0x2902, handle: 0x0D}]
           }
         ]
       }
