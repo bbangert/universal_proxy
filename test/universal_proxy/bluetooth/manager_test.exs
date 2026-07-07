@@ -134,6 +134,22 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
       assert :persistent_term.get(DevicePath.desired_adapter_key()) == @hci1_mac
     end
 
+    test "coerces persisted :audio roles to :off when the target lacks audio support", ctx do
+      :ok = Settings.set_role(ctx.settings, @hci1_mac, :audio)
+
+      _manager = start_manager(ctx, audio_role_supported_fun: fn -> false end)
+
+      assert Settings.role(Settings.get(ctx.settings), @hci1_mac) == :off
+    end
+
+    test "leaves persisted :audio roles alone when the target supports audio", ctx do
+      :ok = Settings.set_role(ctx.settings, @hci1_mac, :audio)
+
+      _manager = start_manager(ctx)
+
+      assert Settings.role(Settings.get(ctx.settings), @hci1_mac) == :audio
+    end
+
     test "the :proxy-role adapter is published, taking precedence over legacy adapter", ctx do
       # Legacy selector points one way; an explicit :proxy role wins.
       :ok = Settings.set_adapter(ctx.settings, @hci1_mac)

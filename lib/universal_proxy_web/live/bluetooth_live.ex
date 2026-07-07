@@ -70,6 +70,7 @@ defmodule UniversalProxyWeb.BluetoothLive do
     {:ok,
      socket
      |> assign(:page_title, "Bluetooth")
+     |> assign(:audio_role_supported, Bluetooth.audio_role_supported?())
      |> assign(:status, Bluetooth.status())
      |> assign(:improv, Improv.status())
      |> assign(:stats, Bluetooth.stats())
@@ -472,8 +473,9 @@ defmodule UniversalProxyWeb.BluetoothLive do
         <p class="text-base text-fg-2 m-0 max-w-[640px]">
           Relays nearby Bluetooth traffic to Home&nbsp;Assistant over the native API —
           a remote antenna for trackers, sensors, and smart locks that are out of
-          range of your server. Dedicate a radio to <span class="text-audio font-medium">Audio</span>
-          to stream to Bluetooth speakers and headphones.
+          range of your server.<span :if={@audio_role_supported}>
+            Dedicate a radio to <span class="text-audio font-medium">Audio</span>
+            to stream to Bluetooth speakers and headphones.</span>
         </p>
       </div>
 
@@ -488,14 +490,33 @@ defmodule UniversalProxyWeb.BluetoothLive do
         headphones={@headphones}
         status={@status}
         busy={@busy}
+        audio_role_supported={@audio_role_supported}
       />
 
       <.audio_devices_section
+        :if={@audio_role_supported}
         paired={@paired}
         audio_radios={@audio_radios}
         radios={@radios}
         menu_open={@menu_open}
       />
+
+      <%!-- rpi3-and-below: BlueZ radios can't sustain glitch-free A2DP, so
+            point at the dedicated-dongle path instead of offering the role. --%>
+      <div :if={not @audio_role_supported} class="mt-7">
+        <.eyebrow>Bluetooth audio</.eyebrow>
+        <.card padding={:lg} class="!p-6 mt-2.5">
+          <p class="text-sm text-fg-2 m-0 leading-normal">
+            This board's Bluetooth radios can't stream audio reliably, so the
+            <strong>Audio</strong> role is unavailable here. To play to Bluetooth
+            speakers or headphones, use a dedicated USB Bluetooth-audio
+            transmitter (e.g. Creative BTD&nbsp;700, FlooGoo FMA120) — it shows
+            up under
+            <.link navigate="/audio" class="text-accent hover:underline">Audio</.link>
+            outputs automatically.
+          </p>
+        </.card>
+      </div>
     </div>
 
     <.deactivate_modal :if={@deactivate} deactivate={@deactivate} />
@@ -672,6 +693,7 @@ defmodule UniversalProxyWeb.BluetoothLive do
   attr(:headphones, :list, required: true)
   attr(:status, :map, required: true)
   attr(:busy, :boolean, required: true)
+  attr(:audio_role_supported, :boolean, required: true)
 
   defp radios_section(assigns) do
     assigns = assign(assigns, :single_audio?, single_radio_audio?(assigns.radios, assigns.roles))
@@ -709,6 +731,7 @@ defmodule UniversalProxyWeb.BluetoothLive do
           proxying?={@status.proxying?}
           paired_count={length(paired_on(@headphones, radio.address))}
           busy={@busy}
+          audio_role_supported={@audio_role_supported}
         />
       </.card>
 
@@ -752,6 +775,7 @@ defmodule UniversalProxyWeb.BluetoothLive do
   attr(:proxying?, :boolean, required: true)
   attr(:paired_count, :integer, required: true)
   attr(:busy, :boolean, required: true)
+  attr(:audio_role_supported, :boolean, required: true)
 
   defp bt_radio_row(assigns) do
     ~H"""
@@ -785,7 +809,13 @@ defmodule UniversalProxyWeb.BluetoothLive do
       </div>
 
       <%!-- Role selector --%>
-      <.role_seg :if={@radio.address} mac={@radio.address} role={@role} busy={@busy} />
+      <.role_seg
+        :if={@radio.address}
+        mac={@radio.address}
+        role={@role}
+        busy={@busy}
+        audio_role_supported={@audio_role_supported}
+      />
     </div>
     """
   end
@@ -794,6 +824,7 @@ defmodule UniversalProxyWeb.BluetoothLive do
   attr(:mac, :string, required: true)
   attr(:role, :atom, required: true)
   attr(:busy, :boolean, required: true)
+  attr(:audio_role_supported, :boolean, required: true)
 
   defp role_seg(assigns) do
     ~H"""
@@ -802,7 +833,14 @@ defmodule UniversalProxyWeb.BluetoothLive do
       @busy && "opacity-55 pointer-events-none"
     ]}>
       <.role_seg_btn mac={@mac} value="proxy" label="Proxy" active={@role == :proxy} active_class="bg-surface shadow-xs text-accent" />
-      <.role_seg_btn mac={@mac} value="audio" label="Audio" active={@role == :audio} active_class="bg-surface shadow-xs text-audio" />
+      <.role_seg_btn
+        :if={@audio_role_supported}
+        mac={@mac}
+        value="audio"
+        label="Audio"
+        active={@role == :audio}
+        active_class="bg-surface shadow-xs text-audio"
+      />
       <.role_seg_btn mac={@mac} value="off" label="Off" active={@role == :off} active_class="bg-surface shadow-xs text-fg-1" />
     </div>
     """
