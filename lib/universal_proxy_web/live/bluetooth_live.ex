@@ -877,8 +877,12 @@ defmodule UniversalProxyWeb.BluetoothLive do
         </p>
       </.card>
 
-      <%!-- Single audio radio: flat list --%>
-      <.card :if={@paired != [] and not @multi?} padding={:none} class="overflow-hidden">
+      <%!-- Single audio radio: flat list. NO overflow-hidden here: the
+           per-row "more" menu is absolutely positioned below its row, and
+           a clipping card exactly one row tall (single paired device)
+           would swallow the menu entirely. Rows are transparent, so
+           nothing needs corner-clipping. --%>
+      <.card :if={@paired != [] and not @multi?} padding={:none}>
         <.bt_headset_row
           :for={device <- @paired}
           device={device}
@@ -895,7 +899,9 @@ defmodule UniversalProxyWeb.BluetoothLive do
             <span class="text-xs font-semibold text-fg-2">{radio_name(radio)}</span>
             <span class="text-[11px] text-fg-3 font-mono">{radio.hci}</span>
           </div>
-          <.card padding={:none} class="overflow-hidden">
+          <%!-- Same as the flat list above: no overflow-hidden, or a
+               single-device group clips its row menu. --%>
+          <.card padding={:none}>
             <.bt_headset_row
               :for={device <- paired_on(@paired, radio.address)}
               device={device}
