@@ -31,7 +31,7 @@ jobs:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
       - run: mix archive.install hex nerves_bootstrap --force
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: deps
           key: ${{ runner.os }}-host-deps-${{ hashFiles('mix.lock') }}
@@ -56,7 +56,7 @@ jobs:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
       - run: mix archive.install hex nerves_bootstrap --force
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: |
             deps
@@ -83,7 +83,7 @@ jobs:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
       - run: mix archive.install hex nerves_bootstrap --force
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: |
             deps
@@ -110,7 +110,7 @@ jobs:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
       - run: mix archive.install hex nerves_bootstrap --force
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: |
             deps
@@ -137,14 +137,14 @@ jobs:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
       - run: mix archive.install hex nerves_bootstrap --force
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: |
             deps
             _build/host_dev
           key: ${{ runner.os }}-host-dev-${{ hashFiles('mix.lock') }}
           restore-keys: ${{ runner.os }}-host-dev-
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: priv/plts
           # Include the vendored path-dep sources (deps_local, e.g. the rebus
@@ -177,7 +177,7 @@ jobs:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
       - run: mix archive.install hex nerves_bootstrap --force
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: deps
           key: ${{ runner.os }}-host-deps-${{ hashFiles('mix.lock') }}
