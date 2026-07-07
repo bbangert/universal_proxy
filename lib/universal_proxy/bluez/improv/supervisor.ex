@@ -24,7 +24,9 @@ defmodule UniversalProxy.Bluez.Improv.Supervisor do
   end
 
   @impl Supervisor
-  def init(_opts) do
+  # `opts` are the Improv manager's opts (`pubsub:`, `network_type:`, …),
+  # threaded through from the parent's `improv:` opt.
+  def init(opts) do
     children = [
       # Runs the re-entrant Register{Application,Advertisement} calls off the
       # GenServer loops (they call back into our own handlers).
@@ -32,7 +34,7 @@ defmodule UniversalProxy.Bluez.Improv.Supervisor do
       # Exporters first — the manager registers and drives them on arm.
       UniversalProxy.Bluez.Improv.GattServer,
       UniversalProxy.Bluez.Improv.Advert,
-      UniversalProxy.Bluez.Improv
+      {UniversalProxy.Bluez.Improv, opts}
     ]
 
     Supervisor.init(children, strategy: :one_for_all)

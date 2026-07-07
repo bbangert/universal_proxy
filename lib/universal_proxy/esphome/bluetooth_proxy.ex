@@ -4,10 +4,20 @@ defmodule UniversalProxy.ESPHome.BluetoothProxy do
   connection + GATT requests to BlueZ via `UniversalProxy.Bluez.Gatt`.
 
   All required callbacks are cast-style facades over the Gatt GenServer —
-  results flow asynchronously from `Bluez.Gatt` straight to the espex
-  connection-handler pid (`subscriber`) captured at `connect/3`. Espex owns
-  cross-client address locking and calls `disconnect/1` for every owned
-  address when a client's socket closes, so this module holds no state.
+  results flow asynchronously from `Bluez.Gatt` through `gatt_event/2`
+  (wired as the Gatt `on_gatt_event:` opt in
+  `UniversalProxy.Bluetooth.bluez_spec/0`) to the espex connection-handler
+  pid (`subscriber`) captured at `connect/3`. Espex owns cross-client
+  address locking and calls `disconnect/1` for every owned address when a
+  client's socket closes, so this module holds no state.
+
+  `gatt_event/2` is the espex boundary: it translates the lib-native Gatt
+  events (see the `UniversalProxy.Bluez.Gatt` moduledoc for the contract)
+  into `:espex_ble_*` messages, rebuilding `Espex.BluetoothProxy.*` structs
+  from the neutral `UniversalProxy.Bluez.Gatt.*` ones. The match is
+  deliberately exhaustive with NO catch-all: an unknown event is a contract
+  violation and must crash loudly (in the Gatt server, whose supervisor
+  restarts it), never be dropped silently.
 
   Wiring this module into `Espex.start_link/1` (see
   `UniversalProxy.ESPHome.Supervisor`) is what makes espex advertise
@@ -39,6 +49,69 @@ defmodule UniversalProxy.ESPHome.BluetoothProxy do
 
   # Mirrors Espex.BluetoothProxy.ErrorCodes.generic_error/0 (@moduledoc false).
   @err_generic -1
+
+  @doc """
+  Translate a lib-native `UniversalProxy.Bluez.Gatt` event to its espex
+  message and deliver it to the subscriber. Passed to Gatt as the
+  `on_gatt_event:` opt (see the moduledoc); runs in the Gatt server.
+  """
+  @spec gatt_event(pid(), tuple()) :: :ok
+  def gatt_event(subscriber, event) do
+    send(subscriber, translate(event))
+    :ok
+  end
+
+  # One clause per Gatt event tag — exhaustive, no catch-all (see moduledoc).
+  defp translate({:gatt_connection, address, result}),
+    do: {:espex_ble_connection, address, result}
+
+  defp translate({:gatt_service, address, service}),
+    do: {:espex_ble_gatt_service, address, espex_service(service)}
+
+  defp translate({:gatt_services_done, address}),
+    do: {:espex_ble_gatt_services_done, address}
+
+  defp translate({:gatt_read, address, handle, result}),
+    do: {:espex_ble_gatt_read, address, handle, result}
+
+  defp translate({:gatt_write, address, handle, result}),
+    do: {:espex_ble_gatt_write, address, handle, result}
+
+  defp translate({:gatt_notify, address, handle, result}),
+    do: {:espex_ble_gatt_notify, address, handle, result}
+
+  defp translate({:gatt_notify_data, address, handle, data}),
+    do: {:espex_ble_gatt_notify_data, address, handle, data}
+
+  defp translate({:gatt_pair, address, success?, code}),
+    do: {:espex_ble_pair, address, success?, code}
+
+  defp translate({:gatt_unpair, address, success?, code}),
+    do: {:espex_ble_unpair, address, success?, code}
+
+  defp translate({:gatt_clear_cache, address, success?, code}),
+    do: {:espex_ble_clear_cache, address, success?, code}
+
+  defp espex_service(%Gatt.Service{uuid: uuid, handle: handle, characteristics: chars}) do
+    %Espex.BluetoothProxy.Service{
+      uuid: uuid,
+      handle: handle,
+      characteristics: Enum.map(chars, &espex_characteristic/1)
+    }
+  end
+
+  defp espex_characteristic(%Gatt.Characteristic{} = char) do
+    %Espex.BluetoothProxy.Characteristic{
+      uuid: char.uuid,
+      handle: char.handle,
+      properties: char.properties,
+      descriptors: Enum.map(char.descriptors, &espex_descriptor/1)
+    }
+  end
+
+  defp espex_descriptor(%Gatt.Descriptor{uuid: uuid, handle: handle}) do
+    %Espex.BluetoothProxy.Descriptor{uuid: uuid, handle: handle}
+  end
 
   @impl Espex.BluetoothProxy
   def connect(address, opts, subscriber) do

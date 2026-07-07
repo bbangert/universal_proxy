@@ -112,6 +112,43 @@ defmodule UniversalProxy.Bluetooth do
   def stats_topic, do: @stats_topic
 
   @doc """
+  The `UniversalProxy.Bluez` child spec with every app-side callback wired
+  in — the single place the app plugs itself into the (espex-agnostic)
+  Bluez subtree. `Manager`'s `bluez_child:` default starts exactly this.
+
+    * adverts fan out to HA via `BluetoothScanner.on_advertisement/1`;
+    * GATT events are translated to espex messages by
+      `BluetoothProxy.gatt_event/2`;
+    * connection-slot changes tick `Stats`;
+    * the AudioManager pair (BT-headphone control plane) mounts in the
+      `extra_children:` audio slot — after `BlueAlsa`, before
+      `Improv.Supervisor` — preserving the restart-ordering semantics it
+      had as a hardcoded child;
+    * Improv gets the app's PubSub + connectivity probe.
+  """
+  @spec bluez_spec() :: Supervisor.child_spec() | {module(), keyword()}
+  def bluez_spec do
+    {UniversalProxy.Bluez,
+     client: [
+       on_advertisement: &UniversalProxy.ESPHome.BluetoothScanner.on_advertisement/1,
+       pubsub: UniversalProxy.PubSub
+     ],
+     gatt: [
+       on_gatt_event: &UniversalProxy.ESPHome.BluetoothProxy.gatt_event/2,
+       on_connections_changed: &Stats.connections_changed/0
+     ],
+     blue_alsa: [pubsub: UniversalProxy.PubSub],
+     improv: [
+       pubsub: UniversalProxy.PubSub,
+       network_type: &UniversalProxy.System.network_type/0
+     ],
+     extra_children: [
+       {Task.Supervisor, name: AudioManager.TaskSupervisor},
+       AudioManager
+     ]}
+  end
+
+  @doc """
   Current Bluetooth status for the web tab:
 
       %{enabled: boolean(), proxying?: boolean(), paused?: boolean(),

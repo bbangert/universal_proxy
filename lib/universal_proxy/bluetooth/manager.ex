@@ -131,7 +131,7 @@ defmodule UniversalProxy.Bluetooth.Manager do
     state = %{
       settings: Keyword.get(opts, :settings, Settings),
       dynsup: Keyword.get(opts, :dynamic_supervisor, UniversalProxy.Bluetooth.DynamicSupervisor),
-      bluez_child: Keyword.get(opts, :bluez_child, UniversalProxy.Bluez),
+      bluez_child: Keyword.get_lazy(opts, :bluez_child, &UniversalProxy.Bluetooth.bluez_spec/0),
       sysfs_root: Keyword.get(opts, :sysfs_root, "/sys/class/bluetooth"),
       pubsub: Keyword.get(opts, :pubsub, UniversalProxy.PubSub),
       adapters_info_fun:

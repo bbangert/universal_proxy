@@ -44,7 +44,6 @@ defmodule UniversalProxy.Bluez.Improv do
 
   alias UniversalProxy.Bluez.Improv.{Advert, GattServer, Protocol}
 
-  @pubsub UniversalProxy.PubSub
   @topic "bluetooth:improv"
 
   @session_timeout_ms 5 * 60 * 1000
@@ -129,7 +128,13 @@ defmodule UniversalProxy.Bluez.Improv do
       gatt: Keyword.get(opts, :gatt, GattServer),
       advert: Keyword.get(opts, :advert, Advert),
       wifi: Keyword.get(opts, :wifi, UniversalProxy.Bluez.Improv.Wifi),
-      network_type: Keyword.get(opts, :network_type, &UniversalProxy.System.network_type/0),
+      # Connectivity probe for the arm gate. The default treats the device
+      # as offline, so hosts MUST pass their real probe (the app wires
+      # UniversalProxy.System.network_type/0 via bluez_spec/0) or every
+      # boot arms provisioning after the grace period.
+      network_type: Keyword.get(opts, :network_type, fn -> :disconnected end),
+      # Phoenix.PubSub for {:improv_status, _} broadcasts; nil = no-op.
+      pubsub: Keyword.get(opts, :pubsub),
       scanner: Keyword.get(opts, :scanner, UniversalProxy.Bluez.Client),
       task_sup: Keyword.get(opts, :task_supervisor, UniversalProxy.Bluez.Improv.TaskSupervisor),
       timeout_ms: Keyword.get(opts, :timeout_ms, @session_timeout_ms),
@@ -399,9 +404,11 @@ defmodule UniversalProxy.Bluez.Improv do
       {:error, :wifi_unavailable}
   end
 
+  defp broadcast(%{pubsub: nil} = state), do: state
+
   defp broadcast(state) do
     Phoenix.PubSub.broadcast(
-      @pubsub,
+      state.pubsub,
       @topic,
       {:improv_status, %{state: state.fsm, error: state.error}}
     )

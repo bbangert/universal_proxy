@@ -52,6 +52,9 @@ defmodule UniversalProxy.Bluez.ImprovTest do
       advert: advert,
       scanner: scanner,
       wifi: StubWifi,
+      # The pubsub default is nil (no-op) since the extraction seams landed;
+      # these tests assert the status broadcasts, so wire the real one.
+      pubsub: UniversalProxy.PubSub,
       subscribe?: false,
       # No boot grace by default so arm-on-offline tests fire immediately.
       boot_grace_ms: 0,

@@ -69,7 +69,6 @@ defmodule UniversalProxy.Bluez.Client do
   require Logger
 
   alias UniversalProxy.Bluez.{DBus, DeviceCache, DevicePath, Variant}
-  alias UniversalProxy.ESPHome.BluetoothScanner
 
   @adapter_iface "org.bluez.Adapter1"
   @device_iface "org.bluez.Device1"
@@ -111,8 +110,9 @@ defmodule UniversalProxy.Bluez.Client do
   # PubSub topic carrying `{:bluetooth_adapters_changed}` whenever the set
   # of org.bluez adapters changes (claim at setup, hotplug add/remove).
   # `UniversalProxy.Bluetooth.RadioMonitor` subscribes and re-enumerates —
-  # this is the event source that replaced its periodic poll. Owned here
-  # (the broadcaster) so the Bluez layer carries no upward dependency.
+  # this is the event source that replaced its periodic poll. Broadcast on
+  # the Phoenix.PubSub passed as the `pubsub:` opt (no-op when absent), so
+  # the Bluez layer carries no upward dependency.
   @adapters_topic "bluetooth:adapters"
 
   def start_link(opts \\ []) do
@@ -202,8 +202,10 @@ defmodule UniversalProxy.Bluez.Client do
   @impl GenServer
   def init(opts) do
     # `connect_fun` / `apply_mode_fun` / `watchdog_ms` / `setup` are
-    # test-only injection seams (host has no system D-Bus); production
-    # callers pass no opts.
+    # test-only injection seams (host has no system D-Bus). Production
+    # callers pass `on_advertisement:` (per-advert fan-out fun) and
+    # `pubsub:` (adapter-change broadcasts) — see bluez_spec/0 in
+    # UniversalProxy.Bluetooth.
     connect_fun = Keyword.get(opts, :connect_fun, fn -> Rebus.connect(:system) end)
 
     case connect_fun.() do
@@ -234,6 +236,10 @@ defmodule UniversalProxy.Bluez.Client do
           # target displaces them.
           transition: nil,
           pending: nil,
+          # Advert fan-out seam: called once per reconstructed advert map.
+          on_advertisement: Keyword.get(opts, :on_advertisement, fn _advert -> :ok end),
+          # Phoenix.PubSub instance for adapter-change broadcasts; nil = no-op.
+          pubsub: Keyword.get(opts, :pubsub),
           apply_mode_fun: Keyword.get(opts, :apply_mode_fun),
           watchdog_ms: Keyword.get(opts, :watchdog_ms, @transition_watchdog_ms),
           # Set of org.bluez adapter object paths ("/org/bluez/hciN"),
@@ -463,7 +469,7 @@ defmodule UniversalProxy.Bluez.Client do
         # Tell RadioMonitor the adapter set is live (its identity is now
         # readable). This is the boot/claim edge of the event stream that
         # replaced its poll; hotplug edges come from InterfacesAdded/Removed.
-        broadcast_adapters_changed()
+        broadcast_adapters_changed(state)
 
         # An early set_mode/1 may already have a transition in flight (its
         # D-Bus calls work as soon as the adapter answers) — don't race it;
@@ -736,7 +742,7 @@ defmodule UniversalProxy.Bluez.Client do
           state
         else
           state = %{state | adapters: MapSet.put(state.adapters, path)}
-          broadcast_adapters_changed()
+          broadcast_adapters_changed(state)
           state
         end
 
@@ -783,7 +789,7 @@ defmodule UniversalProxy.Bluez.Client do
           # (set committed before the broadcast, as in InterfacesAdded).
           @adapter_iface in ifaces and MapSet.member?(state.adapters, path) ->
             state = %{state | adapters: MapSet.delete(state.adapters, path)}
-            broadcast_adapters_changed()
+            broadcast_adapters_changed(state)
             state
 
           String.starts_with?(path, adapter_path() <> "/dev_") ->
@@ -810,12 +816,16 @@ defmodule UniversalProxy.Bluez.Client do
     {cache, adverts} =
       DeviceCache.upsert(state.cache, path, props, System.monotonic_time(:millisecond))
 
-    Enum.each(adverts, &emit/1)
+    Enum.each(adverts, &emit(state, &1))
     %{state | cache: cache}
   end
 
-  defp emit(%{address: address, rss: rss, address_type: address_type, raw_data: raw_data}) do
-    BluetoothScanner.on_advertisement(%{
+  # Fan each advert out through the injected seam (the app passes
+  # UniversalProxy.ESPHome.BluetoothScanner.on_advertisement/1). The map is
+  # rebuilt to exactly these four keys so the fun's contract is stable
+  # regardless of what the cache carries internally.
+  defp emit(state, %{address: address, rss: rss, address_type: address_type, raw_data: raw_data}) do
+    state.on_advertisement.(%{
       address: address,
       rss: rss,
       address_type: address_type,
@@ -914,12 +924,10 @@ defmodule UniversalProxy.Bluez.Client do
     call(conn, path, @props_iface, "GetAll", "s", [@adapter_iface])
   end
 
-  defp broadcast_adapters_changed do
-    Phoenix.PubSub.broadcast(
-      UniversalProxy.PubSub,
-      @adapters_topic,
-      {:bluetooth_adapters_changed}
-    )
+  defp broadcast_adapters_changed(%{pubsub: nil}), do: :ok
+
+  defp broadcast_adapters_changed(%{pubsub: pubsub}) do
+    Phoenix.PubSub.broadcast(pubsub, @adapters_topic, {:bluetooth_adapters_changed})
   end
 
   # Power the claimed adapter on — required to scan through it. Other
