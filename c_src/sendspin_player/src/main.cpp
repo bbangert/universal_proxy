@@ -653,8 +653,13 @@ static std::atomic<bool> g_listener_bound{false};
 static std::atomic<int> g_listener_port{0};
 
 extern "C" void sendspin_host_listener_bound(uint16_t port) {
-    g_listener_port.store(port);
-    g_listener_bound.store(true);
+    // Release/acquire pairing with the main-loop read: the relaxed port
+    // store is published by the release store of the flag, so a reader
+    // that acquires `bound == true` is guaranteed to see the port.
+    // (Plain defaults would be seq_cst — also correct — but the explicit
+    // orderings document the intent.)
+    g_listener_port.store(port, std::memory_order_relaxed);
+    g_listener_bound.store(true, std::memory_order_release);
 }
 
 struct NetworkProvider : SendspinNetworkProvider {
@@ -808,10 +813,13 @@ int main(int argc, char* argv[]) {
         // (foreign process on the port), the library retries every tick
         // and this fires on eventual success; until then the player is
         // deliberately not advertised.
-        if (!listening_emitted && g_listener_bound.load()) {
+        if (!listening_emitted && g_listener_bound.load(std::memory_order_acquire)) {
             listening_emitted = true;
             std::ostringstream os;
-            os << "{\"event\":\"listening\",\"port\":" << g_listener_port.load() << "}";
+            // The acquire above pairs with the hook's release store, so
+            // this relaxed port load cannot observe a stale/zero value.
+            os << "{\"event\":\"listening\",\"port\":"
+               << g_listener_port.load(std::memory_order_relaxed) << "}";
             emit_json(os.str());
         }
 

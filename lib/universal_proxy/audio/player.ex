@@ -605,7 +605,7 @@ defmodule UniversalProxy.Audio.Player do
       other ->
         Logger.log(
           log_level,
-          "MdnsLite.add_mdns_service returned #{inspect(other)} for #{inspect(key)}"
+          "#{inspect(mod)}.add_mdns_service returned #{inspect(other)} for #{inspect(key)}"
         )
 
         :error
@@ -618,7 +618,7 @@ defmodule UniversalProxy.Audio.Player do
       # until a retry succeeds.
       Logger.log(
         log_level,
-        "MdnsLite advertise failed for #{inspect(key)}: #{Exception.message(e)}"
+        "#{inspect(mod)} advertise failed for #{inspect(key)}: #{Exception.message(e)}"
       )
 
       :error
@@ -629,7 +629,11 @@ defmodule UniversalProxy.Audio.Player do
     # these; we want best-effort registration regardless of the
     # signal shape.
     :exit, reason ->
-      Logger.log(log_level, "MdnsLite advertise exited for #{inspect(key)}: #{inspect(reason)}")
+      Logger.log(
+        log_level,
+        "#{inspect(mod)} advertise exited for #{inspect(key)}: #{inspect(reason)}"
+      )
+
       :error
   end
 
