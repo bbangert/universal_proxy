@@ -128,11 +128,12 @@ defmodule UniversalProxy.Bluez.Improv do
       gatt: Keyword.get(opts, :gatt, GattServer),
       advert: Keyword.get(opts, :advert, Advert),
       wifi: Keyword.get(opts, :wifi, UniversalProxy.Bluez.Improv.Wifi),
-      # Connectivity probe for the arm gate. The default treats the device
-      # as offline, so hosts MUST pass their real probe (the app wires
-      # UniversalProxy.System.network_type/0 via bluez_spec/0) or every
-      # boot arms provisioning after the grace period.
-      network_type: Keyword.get(opts, :network_type, fn -> :disconnected end),
+      # Connectivity probe for the arm gate; nil (the default) reads as
+      # online, so Improv NEVER arms unless the host explicitly opts into
+      # offline-driven arming by wiring a real probe (the app passes
+      # UniversalProxy.System.network_type/0 via bluez_spec/0). Fail-closed:
+      # an unconfigured host must not expose the provisioning surface.
+      network_type: Keyword.get(opts, :network_type),
       # Phoenix.PubSub for {:improv_status, _} broadcasts; nil = no-op.
       pubsub: Keyword.get(opts, :pubsub),
       scanner: Keyword.get(opts, :scanner, UniversalProxy.Bluez.Client),
@@ -477,6 +478,8 @@ defmodule UniversalProxy.Bluez.Improv do
 
   # ── connectivity ─────────────────────────────────────────────────────────
 
+  # No probe configured → treated as online → never arms (see init/1).
+  defp online?(%{network_type: nil}), do: true
   defp online?(state), do: state.network_type.() != :disconnected
 
   # Best-effort: only cast when the scanner is actually running (no-op off-target
