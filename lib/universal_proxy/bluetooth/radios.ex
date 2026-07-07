@@ -11,7 +11,7 @@ defmodule UniversalProxy.Bluetooth.Radios do
   `hciX/` exposes only device/subsystem/rfkill/power/uevent) — addresses
   exist only via `org.bluez` `Adapter1.Address`, merged on top by
   `UniversalProxy.Bluetooth.RadioMonitor` when the daemon is up. That's
-  also why MAC → hciX resolution lives in `UniversalProxy.Bluez.Client`.
+  also why MAC → hciX resolution lives in `Bluez.Client`.
 
   Chip name / BT version / BLE+BR-EDR capability badges come from a small
   static lookup over the device modalias (DT compatible strings for SoC

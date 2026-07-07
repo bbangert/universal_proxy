@@ -7,7 +7,7 @@ defmodule UniversalProxy.BluetoothTest do
 
   alias UniversalProxy.Bluetooth
   alias UniversalProxy.Bluetooth.{Manager, RadioMonitor, Settings}
-  alias UniversalProxy.Bluez.DevicePath
+  alias Bluez.DevicePath
 
   @pubsub UniversalProxy.PubSub
   @table :bluetooth_public_api_test

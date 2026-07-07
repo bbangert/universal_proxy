@@ -2,15 +2,15 @@ defmodule UniversalProxy.Bluetooth.AudioManager.LiveOps do
   @moduledoc """
   Live `org.bluez` implementation of the
   `UniversalProxy.Bluetooth.AudioManager.Ops` behaviour. Thin wrappers over
-  `UniversalProxy.Bluez.DBus` on the AudioManager's rebus connection, mirroring
-  the call shapes in `UniversalProxy.Bluez.Client`/`Gatt`. Tests use a mock
+  `Bluez.DBus` on the AudioManager's rebus connection, mirroring
+  the call shapes in `Bluez.Client`/`Gatt`. Tests use a mock
   instead, so this module carries no logic worth unit-testing — only D-Bus
   marshalling validated on hardware (plan 1.5).
   """
 
   @behaviour UniversalProxy.Bluetooth.AudioManager.Ops
 
-  alias UniversalProxy.Bluez.{DBus, Variant}
+  alias Bluez.{DBus, Variant}
   alias UniversalProxy.Bluetooth.AudioManager
 
   @adapter_iface "org.bluez.Adapter1"
@@ -26,7 +26,7 @@ defmodule UniversalProxy.Bluetooth.AudioManager.LiveOps do
   @dev_mac_re ~r"/dev_([0-9A-Fa-f_]{17})$"
 
   @impl true
-  def adapters_info(_conn), do: UniversalProxy.Bluez.Client.adapters_info()
+  def adapters_info(_conn), do: Bluez.Client.adapters_info()
 
   @impl true
   def managed_devices(conn) do

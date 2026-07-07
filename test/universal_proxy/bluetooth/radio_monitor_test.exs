@@ -3,7 +3,7 @@ defmodule UniversalProxy.Bluetooth.RadioMonitorTest do
   use ExUnit.Case, async: false
 
   alias UniversalProxy.Bluetooth.RadioMonitor
-  alias UniversalProxy.Bluez.{Client, DevicePath}
+  alias Bluez.{Client, DevicePath}
 
   @pubsub UniversalProxy.PubSub
 

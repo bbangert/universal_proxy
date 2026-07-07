@@ -146,15 +146,24 @@ defmodule UniversalProxy.MixProject do
       # a transport. It's fully removed — no dependency, and the
       # deps_local/blue_heron submodule + .gitmodules entry have been dropped.
 
+      # The BlueZ-over-D-Bus stack (daemons + scanning/GATT/pairing/audio
+      # clients), extracted from this app into bbangert/bluez and consumed as
+      # a git submodule at deps_local/bluez. All app wiring flows through
+      # `UniversalProxy.Bluetooth.bluez_spec/0`. Available on all targets so
+      # the adapters compile on host; only *started* on BT targets. Run
+      # `git submodule update --init` after cloning (bluez vendors its own
+      # rebus submodule, but the app's rebus below overrides it — keep both
+      # submodule pointers on the same fork commit).
+      {:bluez, path: "deps_local/bluez"},
+
       # Pure-Elixir D-Bus client for talking to org.bluez on the system bus.
       # Forked (bbangert/rebus, branch dbus-service, off the 0.2.0 release) and
       # consumed as a git submodule at deps_local/rebus: upstream rebus is
       # client-only and crashes on inbound method calls, so the fork adds
       # service-side handling (reply to method calls) needed to export an
-      # org.bluez AdvertisementMonitor for passive scanning. Available on all
-      # targets so UniversalProxy.Bluez.Client compiles on host (CI builds host
-      # with --warnings-as-errors); only *started* on rpi3 via UniversalProxy.Bluez.
-      # Run `git submodule update --init` after cloning.
+      # org.bluez AdvertisementMonitor for passive scanning. `override: true`
+      # wins over bluez's vendored copy at app-compile time. Run
+      # `git submodule update --init` after cloning.
       {:rebus, path: "deps_local/rebus", override: true},
 
       # Dependencies for specific targets

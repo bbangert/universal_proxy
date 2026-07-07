@@ -217,7 +217,7 @@ defmodule UniversalProxy.Audio.Server do
     # a BlueALSA PCM is added/removed — covering bluetoothd auto-reconnects (no
     # `AudioManager` event) and the Connect-returns-before-PCM-ready race that a
     # `:bt_audio` connection event alone would miss. Literal (no compile dep on
-    # the BT subtree): `UniversalProxy.Bluez.BlueAlsa.pcms_topic/0`.
+    # the BT subtree): `Bluez.BlueAlsa.pcms_topic/0`.
     Phoenix.PubSub.subscribe(@pubsub, @bluealsa_pcms_topic)
 
     # Restart hygiene: any PlayerSupervisor children left over from a

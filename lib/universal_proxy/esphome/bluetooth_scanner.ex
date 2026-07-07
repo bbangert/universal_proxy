@@ -1,7 +1,7 @@
 defmodule UniversalProxy.ESPHome.BluetoothScanner do
   @moduledoc """
   `Espex.BluetoothScanner` adapter: bridges the rpi3's passive BLE scan
-  (BlueZ via `UniversalProxy.Bluez.Client`) to Home Assistant through the
+  (BlueZ via `Bluez.Client`) to Home Assistant through the
   ESPHome Native API.
 
   ## Shape — pure module functions over a Registry (no GenServer)
@@ -16,7 +16,7 @@ defmodule UniversalProxy.ESPHome.BluetoothScanner do
   plus N non-blocking `send/2`, no extra mailbox hop on the advert hot path.
 
   The `Registry` is owned by the `UniversalProxy.Bluetooth` subtree (rpi3-only,
-  which also starts `UniversalProxy.Bluez`). This module is just the behaviour
+  which also starts `Bluez`). This module is just the behaviour
   implementation that reads/writes that registry, so it compiles and
   unit-tests on the host with a registry started in the test. It is
   source-agnostic: `on_advertisement/1` takes a plain map, so the same code
@@ -24,7 +24,7 @@ defmodule UniversalProxy.ESPHome.BluetoothScanner do
 
   ## Scanner mode — runtime passive/active switching
 
-  `set_scanner_mode/1` delegates to `UniversalProxy.Bluez.Client.set_mode/1`,
+  `set_scanner_mode/1` delegates to `Bluez.Client.set_mode/1`,
   which swaps the BlueZ scan strategy at runtime: `:passive` uses an
   AdvertisementMonitor (no scan requests sent), `:active` uses
   `StartDiscovery` (SCAN_RSP data collected — ESP32-proxy parity). On
@@ -45,14 +45,12 @@ defmodule UniversalProxy.ESPHome.BluetoothScanner do
 
   `address` is forwarded as-is: an MSB-first MAC integer (`0xAABBCCDDEEFF`),
   which is what HA expects and espex passes straight through.
-  `UniversalProxy.Bluez.Advert` parses BlueZ's `"AA:BB:CC:DD:EE:FF"` string
+  `Bluez.Advert` parses BlueZ's `"AA:BB:CC:DD:EE:FF"` string
   into that form (it matches what blue_heron produced, validated on rpi3
   against HA — no byte-swap needed).
   """
 
   @behaviour Espex.BluetoothScanner
-
-  alias UniversalProxy.Bluez
 
   # Duplicate-key registry: every subscribed connection-handler pid is one
   # entry under the `:subscribers` key. Owned by `UniversalProxy.Bluetooth`.
@@ -143,12 +141,12 @@ defmodule UniversalProxy.ESPHome.BluetoothScanner do
 
   @doc """
   Maps one advertised device to the espex advertisement tuple and fans it out
-  to every subscribed connection. Invoked by `UniversalProxy.Bluez.Client` per
+  to every subscribed connection. Invoked by `Bluez.Client` per
   reconstructed advert.
 
   Accepts a plain map (`%{address:, rss:, address_type:, raw_data:}`). Skips
   entries whose `:raw_data` is `nil`. `raw_data` is the AD byte structure
-  `UniversalProxy.Bluez.Advert` reconstructs from BlueZ's parsed properties —
+  `Bluez.Advert` reconstructs from BlueZ's parsed properties —
   faithful for the manufacturer/service-data elements HA decoders use (e.g.
   BTHome's `0xFCD2`).
   """

@@ -44,7 +44,7 @@ defmodule UniversalProxy.Bluetooth.AudioSinkTest do
 
   describe "safe/0" do
     test "returns %{} when the BlueAlsa client isn't running (off-target/CI)" do
-      # UniversalProxy.Bluez.BlueAlsa isn't started in the test app, so pcms/0
+      # Bluez.BlueAlsa isn't started in the test app, so pcms/0
       # catches the :exit and returns []; safe/0 must stay inert.
       assert AudioSink.safe() == %{}
     end

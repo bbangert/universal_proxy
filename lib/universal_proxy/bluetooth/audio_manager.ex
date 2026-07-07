@@ -13,7 +13,7 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
   Pairing/scanning only proceed on an adapter assigned the `:audio` role
   (`UniversalProxy.Bluetooth.Settings`). With no `:audio` adapter, the mutating
   calls refuse with `{:error, :no_audio_adapter}`. The audio-role MAC is
-  resolved to its `hciX` object path via `UniversalProxy.Bluez.Client` adapter
+  resolved to its `hciX` object path via `Bluez.Client` adapter
   info — the same MAC→path mechanism the proxy uses (hci indices aren't stable
   across boots).
 
@@ -33,7 +33,7 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
   timer) this issues `Device1.Connect` for every trusted A2DP-sink headset on
   an `:audio` adapter. `Connect` can take ~25 s, so it runs under a
   `Task.Supervisor` and never blocks the GenServer loop (mirrors
-  `UniversalProxy.Bluez.Gatt`).
+  `Bluez.Gatt`).
 
   ## D-Bus injection / testability
 
@@ -668,7 +668,7 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
     do: Process.send_after(self(), :reconnect_tick, state.reconnect_ms)
 
   defp expect_pairing(device_path) do
-    UniversalProxy.Bluez.Agent.expect_pairing(device_path)
+    Bluez.Agent.expect_pairing(device_path)
   rescue
     _ -> :ok
   catch
@@ -676,7 +676,7 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
   end
 
   defp pairing_done(device_path) do
-    UniversalProxy.Bluez.Agent.pairing_done(device_path)
+    Bluez.Agent.pairing_done(device_path)
   rescue
     _ -> :ok
   catch

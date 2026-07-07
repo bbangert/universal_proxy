@@ -1,7 +1,7 @@
 defmodule UniversalProxy.ESPHome.BluetoothProxy do
   @moduledoc """
   `Espex.BluetoothProxy` adapter: bridges Home Assistant's active BLE
-  connection + GATT requests to BlueZ via `UniversalProxy.Bluez.Gatt`.
+  connection + GATT requests to BlueZ via `Bluez.Gatt`.
 
   All required callbacks are cast-style facades over the Gatt GenServer —
   results flow asynchronously from `Bluez.Gatt` through `gatt_event/2`
@@ -12,9 +12,9 @@ defmodule UniversalProxy.ESPHome.BluetoothProxy do
   client's socket closes, so this module holds no state.
 
   `gatt_event/2` is the espex boundary: it translates the lib-native Gatt
-  events (see the `UniversalProxy.Bluez.Gatt` moduledoc for the contract)
+  events (see the `Bluez.Gatt` moduledoc for the contract)
   into `:espex_ble_*` messages, rebuilding `Espex.BluetoothProxy.*` structs
-  from the neutral `UniversalProxy.Bluez.Gatt.*` ones. The match is
+  from the neutral `Bluez.Gatt.*` ones. The match is
   deliberately exhaustive with NO catch-all: an unknown event is a contract
   violation and must crash loudly (in the Gatt server, whose supervisor
   restarts it), never be dropped silently.
@@ -45,13 +45,13 @@ defmodule UniversalProxy.ESPHome.BluetoothProxy do
 
   @behaviour Espex.BluetoothProxy
 
-  alias UniversalProxy.Bluez.{DevicePath, Gatt}
+  alias Bluez.{DevicePath, Gatt}
 
   # Mirrors Espex.BluetoothProxy.ErrorCodes.generic_error/0 (@moduledoc false).
   @err_generic -1
 
   @doc """
-  Translate a lib-native `UniversalProxy.Bluez.Gatt` event to its espex
+  Translate a lib-native `Bluez.Gatt` event to its espex
   message and deliver it to the subscriber. Passed to Gatt as the
   `on_gatt_event:` opt (see the moduledoc); runs in the Gatt server.
   """

@@ -12,10 +12,10 @@ defmodule UniversalProxy.Bluetooth.Stats do
       advert hot path pays nanoseconds and never blocks on this server
       (and no-ops entirely when Stats isn't running — host, non-BT).
     * `devices_15min` — distinct devices seen in the last 15 minutes,
-      a windowed count over `UniversalProxy.Bluez.DeviceCache`'s last-seen
-      timestamps (via `UniversalProxy.Bluez.Client.devices_seen/1`).
+      a windowed count over `Bluez.DeviceCache`'s last-seen
+      timestamps (via `Bluez.Client.devices_seen/1`).
     * `connections` — `%{used:, limit:}` GATT slots. Re-read each tick,
-      plus `connections_changed/0` lets `UniversalProxy.Bluez.Gatt` push
+      plus `connections_changed/0` lets `Bluez.Gatt` push
       an off-tick update the moment a connection comes or goes.
 
   Every source is read defensively, so ticks keep flowing (with zeros)
@@ -24,7 +24,7 @@ defmodule UniversalProxy.Bluetooth.Stats do
 
   use GenServer
 
-  alias UniversalProxy.Bluez.{Client, Gatt}
+  alias Bluez.{Client, Gatt}
 
   @counter_key {__MODULE__, :ad_counter}
   @tick_ms 1_000
@@ -63,7 +63,7 @@ defmodule UniversalProxy.Bluetooth.Stats do
 
   @doc """
   Tell Stats the GATT connection count changed (fire-and-forget, from
-  `UniversalProxy.Bluez.Gatt`): re-reads the slots and broadcasts
+  `Bluez.Gatt`): re-reads the slots and broadcasts
   immediately instead of waiting for the next tick.
   """
   @spec connections_changed(GenServer.server()) :: :ok

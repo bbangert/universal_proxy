@@ -136,7 +136,7 @@ defmodule UniversalProxy.Improv do
       network_type: Keyword.get(opts, :network_type),
       # Phoenix.PubSub for {:improv_status, _} broadcasts; nil = no-op.
       pubsub: Keyword.get(opts, :pubsub),
-      scanner: Keyword.get(opts, :scanner, UniversalProxy.Bluez.Client),
+      scanner: Keyword.get(opts, :scanner, Bluez.Client),
       task_sup: Keyword.get(opts, :task_supervisor, UniversalProxy.Improv.TaskSupervisor),
       timeout_ms: Keyword.get(opts, :timeout_ms, @session_timeout_ms),
       session_cap_ms: Keyword.get(opts, :session_cap_ms, @session_cap_ms),

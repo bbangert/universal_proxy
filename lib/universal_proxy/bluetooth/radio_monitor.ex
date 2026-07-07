@@ -11,7 +11,7 @@ defmodule UniversalProxy.Bluetooth.RadioMonitor do
   The radio set only changes on discrete events, so this re-enumerates on
   those rather than on a timer (an SoC radio is soldered in; USB dongles
   announce themselves). The trigger is
-  `UniversalProxy.Bluez.Client.adapters_topic/0`, on which the Client
+  `Bluez.Client.adapters_topic/0`, on which the Client
   broadcasts `{:bluetooth_adapters_changed}` when it claims an adapter at
   setup (boot, and after a radio-switch restart) and on every adapter
   `InterfacesAdded`/`InterfacesRemoved` (hotplug). Subscribing before the
@@ -31,15 +31,15 @@ defmodule UniversalProxy.Bluetooth.RadioMonitor do
 
   `:name`, `:sysfs_root`, `:pubsub`, plus the `:adapters_info_fun`
   injection point (defaults to
-  `UniversalProxy.Bluez.Client.adapters_info/0`). Tests drive a
+  `Bluez.Client.adapters_info/0`). Tests drive a
   re-enumeration by broadcasting `{:bluetooth_adapters_changed}` on
-  `UniversalProxy.Bluez.Client.adapters_topic/0`.
+  `Bluez.Client.adapters_topic/0`.
   """
 
   use GenServer
 
   alias UniversalProxy.Bluetooth.Radios
-  alias UniversalProxy.Bluez.{Client, DevicePath}
+  alias Bluez.{Client, DevicePath}
 
   def start_link(opts \\ []) do
     gen_opts =
@@ -73,8 +73,7 @@ defmodule UniversalProxy.Bluetooth.RadioMonitor do
     state = %{
       sysfs_root: Keyword.get(opts, :sysfs_root, "/sys/class/bluetooth"),
       pubsub: Keyword.get(opts, :pubsub, UniversalProxy.PubSub),
-      adapters_info_fun:
-        Keyword.get(opts, :adapters_info_fun, &UniversalProxy.Bluez.Client.adapters_info/0),
+      adapters_info_fun: Keyword.get(opts, :adapters_info_fun, &Bluez.Client.adapters_info/0),
       radios: []
     }
 

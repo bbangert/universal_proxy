@@ -9,25 +9,25 @@ defmodule UniversalProxy.ESPHome.BluetoothScannerTest do
   alias UniversalProxy.ESPHome.BluetoothScanner
 
   # The Client's :persistent_term key for the HA-configured scanner mode
-  # (private @mode_key in UniversalProxy.Bluez.Client).
+  # (private @mode_key in Bluez.Client).
   #
   # GLOBAL-STATE CAVEAT: this key and the FakeClient name below are VM-global.
   # That is safe under async: true only because (a) ExUnit runs the tests
   # within one module sequentially — async: true parallelizes across test
   # MODULES (a file may define several) — and (b) no other test module, in
-  # this file or any other, registers UniversalProxy.Bluez.Client or touches
+  # this file or any other, registers Bluez.Client or touches
   # this key. If another module ever needs either, it must coordinate with
   # this one (or both go async: false).
-  @mode_key {UniversalProxy.Bluez.Client, :configured_mode}
+  @mode_key {Bluez.Client, :configured_mode}
 
-  # Stands in for UniversalProxy.Bluez.Client on the host: registers under
+  # Stands in for Bluez.Client on the host: registers under
   # the real module name (never started outside the rpi3 target) and answers
   # {:set_mode, mode} with a canned reply.
   defmodule FakeClient do
     use GenServer
 
     def start_link(reply),
-      do: GenServer.start_link(__MODULE__, reply, name: UniversalProxy.Bluez.Client)
+      do: GenServer.start_link(__MODULE__, reply, name: Bluez.Client)
 
     @impl GenServer
     def init(reply), do: {:ok, reply}
