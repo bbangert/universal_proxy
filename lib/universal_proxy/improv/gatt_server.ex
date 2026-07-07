@@ -14,7 +14,7 @@ defmodule UniversalProxy.Improv.GattServer do
 
   Notifications (current-state, error-state, rpc-result progress) are pushed by
   emitting `org.freedesktop.DBus.Properties.PropertiesChanged` on the
-  characteristic's object path (`Rebus.emit_signal/2`, the Phase 0 helper) — but
+  characteristic's object path (`Bluez.Rebus.emit_signal/2`, the Phase 0 helper) — but
   only after a client has subscribed via `StartNotify`.
 
   Owns its own `rebus` connection (separate failure domain, like `Gatt`).
@@ -225,7 +225,7 @@ defmodule UniversalProxy.Improv.GattServer do
   def init(opts) do
     case get_conn(opts) do
       {:ok, conn} ->
-        Rebus.set_method_handler(conn, self())
+        Bluez.Rebus.set_method_handler(conn, self())
         conn_ref = Process.monitor(conn)
 
         state = %{
@@ -248,7 +248,7 @@ defmodule UniversalProxy.Improv.GattServer do
   # Tests inject a stub connection via `:conn`; production connects to the system bus.
   defp get_conn(opts) do
     case Keyword.get(opts, :conn) do
-      nil -> Rebus.connect(:system)
+      nil -> Bluez.Rebus.connect(:system)
       conn when is_pid(conn) -> {:ok, conn}
     end
   end
@@ -297,7 +297,7 @@ defmodule UniversalProxy.Improv.GattServer do
   end
 
   @impl GenServer
-  def handle_info({:dbus_call, %Rebus.Message{} = msg}, state) do
+  def handle_info({:dbus_call, %Bluez.Rebus.Message{} = msg}, state) do
     {:noreply, dispatch_method_call(msg, state)}
   end
 
@@ -389,7 +389,7 @@ defmodule UniversalProxy.Improv.GattServer do
 
   # ── inbound method-call dispatch ──────────────────────────────────────────
 
-  defp dispatch_method_call(%Rebus.Message{header_fields: hf} = msg, state) do
+  defp dispatch_method_call(%Bluez.Rebus.Message{header_fields: hf} = msg, state) do
     conn = state.conn
 
     case {hf[:interface], hf[:member]} do
@@ -516,7 +516,7 @@ defmodule UniversalProxy.Improv.GattServer do
   end
 
   defp emit_notification(conn, key, bytes) do
-    Rebus.emit_signal(conn,
+    Bluez.Rebus.emit_signal(conn,
       path: char_path(key),
       interface: @props_iface,
       member: "PropertiesChanged",
@@ -548,7 +548,7 @@ defmodule UniversalProxy.Improv.GattServer do
   defp to_binary(_), do: <<>>
 
   # Thin wrappers so the dispatch reads cleanly and tests can stub the conn.
-  defp reply(conn, msg), do: Rebus.reply(conn, msg)
-  defp reply(conn, msg, body, sig), do: Rebus.reply(conn, msg, body, sig)
-  defp reply_error(conn, msg, name, text), do: Rebus.reply_error(conn, msg, name, text)
+  defp reply(conn, msg), do: Bluez.Rebus.reply(conn, msg)
+  defp reply(conn, msg, body, sig), do: Bluez.Rebus.reply(conn, msg, body, sig)
+  defp reply_error(conn, msg, name, text), do: Bluez.Rebus.reply_error(conn, msg, name, text)
 end
