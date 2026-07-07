@@ -235,10 +235,10 @@ defmodule UniversalProxy.Audio.Server do
 
     # Pre-emptive mDNS goodbye for every service type we publish. After
     # an ungraceful shutdown we never sent a TTL=0 record, so peers may
-    # still have cached PTR entries pointing at us. Clearing those
-    # caches now means the registration + §8.3 announce burst each
-    # `Audio.Player` fires on its binary's `listening` event produces
-    # a fresh `Added` event on peers instead of a silent refresh.
+    # still have cached PTR entries pointing at us. Clear those caches
+    # now, so that when each `Audio.Player` registers and fires its §8.3
+    # announce burst (on the binary's `listening` event), peers see a
+    # fresh `Added` event instead of a silent cache refresh.
     send_preemptive_goodbyes(state)
 
     # Hotplug detection. ALSA cards change only on discrete events, so

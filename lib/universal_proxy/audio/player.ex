@@ -84,9 +84,13 @@ defmodule UniversalProxy.Audio.Player do
   # seconds to cover initial peer-discovery jitter.
   @reannounce_delays_ms [500, 1_500, 3_500]
 
-  # Retry cadence when mDNS registration fails on the `listening` event
-  # (MdnsLite down or mid-restart at that one instant).
+  # Base retry cadence when mDNS registration fails on the `listening`
+  # event (MdnsLite down or mid-restart at that one instant). Backs off
+  # exponentially per consecutive failure, capped at @mdns_retry_max_ms —
+  # on hosts where MdnsLite intentionally isn't running the retry loop
+  # would otherwise tick (and log) every base interval forever.
   @mdns_retry_ms 5_000
+  @mdns_retry_max_ms 60_000
 
   # One warning if the binary never reports `listening` — a player in
   # that state runs fine but is invisible to Sendspin servers, and
@@ -107,6 +111,7 @@ defmodule UniversalProxy.Audio.Player do
     mdns_registered: false,
     reannounce_delays_ms: [],
     mdns_retry_ms: @mdns_retry_ms,
+    mdns_failures: 0,
     last_event: %{},
     os_pid: nil
   ]
@@ -128,6 +133,7 @@ defmodule UniversalProxy.Audio.Player do
           mdns_registered: boolean(),
           reannounce_delays_ms: [non_neg_integer()],
           mdns_retry_ms: pos_integer(),
+          mdns_failures: non_neg_integer(),
           last_event: map(),
           os_pid: pos_integer() | nil
         }
@@ -442,16 +448,25 @@ defmodule UniversalProxy.Audio.Player do
   # (MdnsLite down or mid-restart) schedule a retry: `listening` is a
   # one-shot signal, so without the retry a transient outage at that
   # instant would leave the player unadvertised for the binary's whole
-  # lifetime.
+  # lifetime. Retries are deliberately unbounded (a cap would reintroduce
+  # exactly that permanent state), but the delay backs off exponentially
+  # and only the FIRST failure logs at warning — later attempts log at
+  # debug, so a host where MdnsLite intentionally isn't running doesn't
+  # emit a warning per player per interval forever.
   defp attempt_mdns_registration(state) do
-    case register_mdns(state) do
+    log_level = if state.mdns_failures == 0, do: :warning, else: :debug
+
+    case register_mdns(state, log_level) do
       :ok ->
         schedule_reannounces(state.reannounce_delays_ms)
-        %{state | mdns_registered: true}
+        %{state | mdns_registered: true, mdns_failures: 0}
 
       :error ->
-        Process.send_after(self(), :retry_mdns_register, state.mdns_retry_ms)
-        state
+        delay =
+          min(state.mdns_retry_ms * Integer.pow(2, state.mdns_failures), @mdns_retry_max_ms)
+
+        Process.send_after(self(), :retry_mdns_register, delay)
+        %{state | mdns_failures: state.mdns_failures + 1}
     end
   end
 
@@ -538,13 +553,18 @@ defmodule UniversalProxy.Audio.Player do
       :ok
   end
 
-  defp register_mdns(%__MODULE__{
-         key: key,
-         config: cfg,
-         mdns_port: port,
-         mdns_module: mod,
-         device_name_fun: device_name_fun
-       }) do
+  # `log_level` throttles the failure logging across the retry loop:
+  # :warning for the first attempt, :debug for retries.
+  defp register_mdns(
+         %__MODULE__{
+           key: key,
+           config: cfg,
+           mdns_port: port,
+           mdns_module: mod,
+           device_name_fun: device_name_fun
+         },
+         log_level
+       ) do
     friendly_name = Map.fetch!(cfg, :friendly_name)
     client_id = Map.fetch!(cfg, :client_id)
 
@@ -583,7 +603,10 @@ defmodule UniversalProxy.Audio.Player do
         :ok
 
       other ->
-        Logger.warning("MdnsLite.add_mdns_service returned #{inspect(other)} for #{inspect(key)}")
+        Logger.log(
+          log_level,
+          "MdnsLite.add_mdns_service returned #{inspect(other)} for #{inspect(key)}"
+        )
 
         :error
     end
@@ -593,7 +616,10 @@ defmodule UniversalProxy.Audio.Player do
       # network — log, report failure so the caller can retry.
       # Player still functions either way; just not LAN-discoverable
       # until a retry succeeds.
-      Logger.warning("MdnsLite advertise failed for #{inspect(key)}: #{Exception.message(e)}")
+      Logger.log(
+        log_level,
+        "MdnsLite advertise failed for #{inspect(key)}: #{Exception.message(e)}"
+      )
 
       :error
   catch
@@ -603,7 +629,7 @@ defmodule UniversalProxy.Audio.Player do
     # these; we want best-effort registration regardless of the
     # signal shape.
     :exit, reason ->
-      Logger.warning("MdnsLite advertise exited for #{inspect(key)}: #{inspect(reason)}")
+      Logger.log(log_level, "MdnsLite advertise exited for #{inspect(key)}: #{inspect(reason)}")
       :error
   end
 
