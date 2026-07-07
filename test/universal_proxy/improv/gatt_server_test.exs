@@ -3,7 +3,7 @@ defmodule UniversalProxy.Improv.GattServerTest do
 
   alias UniversalProxy.Improv.GattServer
   alias UniversalProxy.Improv.Protocol
-  alias Rebus.Message
+  alias Bluez.Rebus.Message
 
   @service_iface "org.bluez.GattService1"
   @char_iface "org.bluez.GattCharacteristic1"
@@ -12,7 +12,7 @@ defmodule UniversalProxy.Improv.GattServerTest do
   @introspect_iface "org.freedesktop.DBus.Introspectable"
 
   # Minimal stand-in for a rebus connection: answers the GenServer.call shapes
-  # `Rebus.reply`/`emit_signal`/`set_method_handler` make, forwarding every sent
+  # `Bluez.Rebus.reply`/`emit_signal`/`set_method_handler` make, forwarding every sent
   # message to the test process as `{:sent, %Message{}}`.
   defmodule StubConn do
     use GenServer

@@ -3,7 +3,7 @@ defmodule UniversalProxy.Improv.AdvertTest do
 
   alias UniversalProxy.Improv.Advert
   alias UniversalProxy.Improv.Protocol
-  alias Rebus.Message
+  alias Bluez.Rebus.Message
 
   @adv_iface "org.bluez.LEAdvertisement1"
   @props_iface "org.freedesktop.DBus.Properties"

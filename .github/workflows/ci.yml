@@ -21,10 +21,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-        with:
-          # rebus is an all-target path dep vendored as a git submodule
-          # (deps_local/rebus); without it `mix deps.get`/compile fail.
-          submodules: recursive
       - run: sudo apt-get update && sudo apt-get install -y ${{ env.APT_PACKAGES }}
       - uses: erlef/setup-beam@v1
         with:
@@ -46,10 +42,6 @@ jobs:
       MIX_ENV: dev
     steps:
       - uses: actions/checkout@v7
-        with:
-          # rebus is an all-target path dep vendored as a git submodule
-          # (deps_local/rebus); without it `mix deps.get`/compile fail.
-          submodules: recursive
       - run: sudo apt-get update && sudo apt-get install -y ${{ env.APT_PACKAGES }}
       - uses: erlef/setup-beam@v1
         with:
@@ -73,10 +65,6 @@ jobs:
       MIX_ENV: dev
     steps:
       - uses: actions/checkout@v7
-        with:
-          # rebus is an all-target path dep vendored as a git submodule
-          # (deps_local/rebus); without it `mix deps.get`/compile fail.
-          submodules: recursive
       - run: sudo apt-get update && sudo apt-get install -y ${{ env.APT_PACKAGES }}
       - uses: erlef/setup-beam@v1
         with:
@@ -100,10 +88,6 @@ jobs:
       MIX_ENV: test
     steps:
       - uses: actions/checkout@v7
-        with:
-          # rebus is an all-target path dep vendored as a git submodule
-          # (deps_local/rebus); without it `mix deps.get`/compile fail.
-          submodules: recursive
       - run: sudo apt-get update && sudo apt-get install -y ${{ env.APT_PACKAGES }}
       - uses: erlef/setup-beam@v1
         with:
@@ -127,10 +111,6 @@ jobs:
       MIX_ENV: dev
     steps:
       - uses: actions/checkout@v7
-        with:
-          # rebus is an all-target path dep vendored as a git submodule
-          # (deps_local/rebus); without it `mix deps.get`/compile fail.
-          submodules: recursive
       - run: sudo apt-get update && sudo apt-get install -y ${{ env.APT_PACKAGES }}
       - uses: erlef/setup-beam@v1
         with:
@@ -147,8 +127,8 @@ jobs:
       - uses: actions/cache@v6
         with:
           path: priv/plts
-          # Include the vendored path-dep sources (deps_local, e.g. the rebus
-          # submodule) in the key: a path dep doesn't change mix.lock when it
+          # Include the vendored path-dep sources (deps_local, e.g. the
+          # mdns_lite fork) in the key: a path dep doesn't change mix.lock when it
           # changes, and dialyxir won't refresh a restored PLT for a same-version
           # path dep — a stale PLT then reports its new exports as a "missing
           # function". Hash .ex plus mix.exs (dep list / compiler opts) and
@@ -167,10 +147,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-        with:
-          # rebus is an all-target path dep vendored as a git submodule
-          # (deps_local/rebus); without it `mix deps.get`/compile fail.
-          submodules: recursive
       - run: sudo apt-get update && sudo apt-get install -y ${{ env.APT_PACKAGES }}
       - uses: erlef/setup-beam@v1
         with:

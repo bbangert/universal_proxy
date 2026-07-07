@@ -227,7 +227,7 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
   # one. A failed connect is non-fatal — the module stays inert (LiveOps calls
   # would error → mapped failures) rather than crash-looping the BT subtree.
   defp connect_bus(:connect) do
-    case Rebus.connect(:system) do
+    case Bluez.Rebus.connect(:system) do
       {:ok, conn} -> conn
       {:error, _} -> nil
     end

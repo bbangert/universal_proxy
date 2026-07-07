@@ -106,7 +106,7 @@ defmodule UniversalProxy.Improv.Advert do
   def init(opts) do
     case get_conn(opts) do
       {:ok, conn} ->
-        Rebus.set_method_handler(conn, self())
+        Bluez.Rebus.set_method_handler(conn, self())
         conn_ref = Process.monitor(conn)
 
         state = %{
@@ -126,7 +126,7 @@ defmodule UniversalProxy.Improv.Advert do
 
   defp get_conn(opts) do
     case Keyword.get(opts, :conn) do
-      nil -> Rebus.connect(:system)
+      nil -> Bluez.Rebus.connect(:system)
       conn when is_pid(conn) -> {:ok, conn}
     end
   end
@@ -188,7 +188,7 @@ defmodule UniversalProxy.Improv.Advert do
   def handle_cast({:set_state, _state_atom}, state), do: {:noreply, state}
 
   @impl GenServer
-  def handle_info({:dbus_call, %Rebus.Message{} = msg}, state) do
+  def handle_info({:dbus_call, %Bluez.Rebus.Message{} = msg}, state) do
     {:noreply, dispatch_method_call(msg, state)}
   end
 
@@ -321,7 +321,7 @@ defmodule UniversalProxy.Improv.Advert do
 
   # ── inbound method-call dispatch ──────────────────────────────────────────
 
-  defp dispatch_method_call(%Rebus.Message{header_fields: hf} = msg, state) do
+  defp dispatch_method_call(%Bluez.Rebus.Message{header_fields: hf} = msg, state) do
     conn = state.conn
 
     case {hf[:interface], hf[:member]} do
@@ -332,11 +332,11 @@ defmodule UniversalProxy.Improv.Advert do
         # unregistered.
         Logger.info("Improv.Advert: BlueZ released the advertisement")
         set_adapter_prop(conn, "Pairable", {"b", true})
-        Rebus.reply(conn, msg)
+        Bluez.Rebus.reply(conn, msg)
         %{state | registered?: false}
 
       {@props_iface, "GetAll"} ->
-        Rebus.reply(conn, msg, [props(state)], "a{sv}")
+        Bluez.Rebus.reply(conn, msg, [props(state)], "a{sv}")
         state
 
       {@props_iface, "Get"} ->
@@ -344,15 +344,21 @@ defmodule UniversalProxy.Improv.Advert do
         state
 
       {@props_iface, "Set"} ->
-        Rebus.reply_error(conn, msg, "org.freedesktop.DBus.Error.PropertyReadOnly", "read-only")
+        Bluez.Rebus.reply_error(
+          conn,
+          msg,
+          "org.freedesktop.DBus.Error.PropertyReadOnly",
+          "read-only"
+        )
+
         state
 
       {@introspect_iface, "Introspect"} ->
-        Rebus.reply(conn, msg, [introspect_xml(hf[:path])], "s")
+        Bluez.Rebus.reply(conn, msg, [introspect_xml(hf[:path])], "s")
         state
 
       {iface, member} ->
-        Rebus.reply_error(
+        Bluez.Rebus.reply_error(
           conn,
           msg,
           "org.freedesktop.DBus.Error.UnknownMethod",
@@ -368,7 +374,12 @@ defmodule UniversalProxy.Improv.Advert do
           inspect(e, limit: 5, printable_limit: 200)
       )
 
-      Rebus.reply_error(state.conn, msg, "org.freedesktop.DBus.Error.Failed", "internal error")
+      Bluez.Rebus.reply_error(
+        state.conn,
+        msg,
+        "org.freedesktop.DBus.Error.Failed",
+        "internal error"
+      )
 
       state
   end
@@ -378,14 +389,19 @@ defmodule UniversalProxy.Improv.Advert do
       [_iface, name | _] ->
         case List.keyfind(props, name, 0) do
           {^name, variant} ->
-            Rebus.reply(conn, msg, [variant], "v")
+            Bluez.Rebus.reply(conn, msg, [variant], "v")
 
           _ ->
-            Rebus.reply_error(conn, msg, "org.freedesktop.DBus.Error.UnknownProperty", "#{name}")
+            Bluez.Rebus.reply_error(
+              conn,
+              msg,
+              "org.freedesktop.DBus.Error.UnknownProperty",
+              "#{name}"
+            )
         end
 
       _ ->
-        Rebus.reply_error(
+        Bluez.Rebus.reply_error(
           conn,
           msg,
           "org.freedesktop.DBus.Error.InvalidArgs",
