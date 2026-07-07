@@ -15,7 +15,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "" FORCE)
 # side: a retag would silently flow into firmware. The friendly tag is kept
 # in a comment for traceability. Resolve with `git ls-remote URL TAG` when
 # bumping.
-set(SENDSPIN_CPP_REF "573efd520d8a4918a310addc99ce77f6ff9a4e09" # v0.5.0
+set(SENDSPIN_CPP_REF "ef1157f0525d2107320736efc0909d78832cc270" # v0.6.1
     CACHE STRING "sendspin-cpp commit SHA to pin")
 
 # Trim sendspin-cpp to just the player role. Other roles ship dead code on a
@@ -87,7 +87,7 @@ assert_patch_markers(0001-configurable-ws-port
     "WebSocketServer>(port,")
 assert_patch_markers(0002-defer-registration-until-open
     "register only on Open"
-    "new_connection_callback_(std::make_unique<SendspinServerConnection>")
+    "new_connection_callback_(std::make_shared<SendspinServerConnection>")
 assert_patch_markers(0003-listener-bound-hook
     "sendspin_host_listener_bound(uint16_t port) __attribute__((weak))"
     "sendspin_host_listener_bound(port)")

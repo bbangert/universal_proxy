@@ -1,11 +1,11 @@
---- a/src/host/ws_server.cpp	2026-07-06 22:28:49.810515903 +0000
-+++ b/src/host/ws_server.cpp	2026-07-06 22:29:40.252579780 +0000
+--- a/src/host/ws_server.cpp	2026-07-07 01:57:12.637079855 +0000
++++ b/src/host/ws_server.cpp	2026-07-07 01:57:12.640079913 +0000
 @@ -70,11 +70,17 @@
  
              SS_LOGD(TAG, "New client connection (synthetic sockfd %d)", synthetic_sockfd);
  
 -            // Create the server connection
--            auto connection = std::make_unique<SendspinServerConnection>(ws, synthetic_sockfd);
+-            auto connection = std::make_shared<SendspinServerConnection>(ws, synthetic_sockfd);
 -
 -            // Set up the message callback on the websocket to route data through the connection
 -            ws->setOnMessageCallback([this, synthetic_sockfd](const ix::WebSocketMessagePtr& msg) {
@@ -38,7 +38,7 @@
 +                    // the manager rejected (both slots busy) is absent from the
 +                    // lookup and its goodbye has already been sent.
 +                    if (this->new_connection_callback_) {
-+                        this->new_connection_callback_(std::make_unique<SendspinServerConnection>(
++                        this->new_connection_callback_(std::make_shared<SendspinServerConnection>(
 +                            open_ws, synthetic_sockfd));
 +                    } else {
 +                        SS_LOGW(TAG, "No new connection callback set, connection will be dropped");
