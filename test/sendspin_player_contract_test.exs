@@ -55,7 +55,8 @@ defmodule SendspinPlayerContractTest do
      port: port,
      started: assert_started_event(port),
      volume_event: assert_volume_event(port),
-     static_delay_event: assert_static_delay_event(port)}
+     static_delay_event: assert_static_delay_event(port),
+     listening_event: assert_listening_event(port)}
   end
 
   test "emits a `started` JSON event with documented fields on launch", %{started: event} do
@@ -106,6 +107,14 @@ defmodule SendspinPlayerContractTest do
   test "emits initial `static_delay` event (server-adjustable, default 0)",
        %{static_delay_event: event} do
     assert event == %{"event" => "static_delay", "value" => 0}
+  end
+
+  test "emits `listening` once the WebSocket listener is bound", %{listening_event: event} do
+    # `listening` gates the Elixir side's mDNS advertisement: it must
+    # only be emitted when the port actually accepts connections, so
+    # Music Assistant's one-shot discovery connect can't land in the
+    # spawn-to-bind gap.
+    assert event == %{"event" => "listening", "port" => @ws_port}
   end
 
   test "real binary honors a non-zero --initial-static-delay-ms" do
@@ -204,6 +213,7 @@ defmodule SendspinPlayerContractTest do
   defp assert_started_event(port), do: receive_event(port, "started")
   defp assert_volume_event(port), do: receive_event(port, "volume")
   defp assert_static_delay_event(port), do: receive_event(port, "static_delay")
+  defp assert_listening_event(port), do: receive_event(port, "listening")
 
   defp receive_event(port, expected_event_kind) do
     event = next_event(port)

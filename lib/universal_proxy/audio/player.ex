@@ -12,7 +12,13 @@ defmodule UniversalProxy.Audio.Player do
     * Stdin commands (`set_volume`, `set_muted`, `shutdown`) written
       via `Port.command/2` as line-delimited JSON.
     * The `MdnsLite` service advertisement for `_sendspin._tcp` so
-      Sendspin servers can discover this player.
+      Sendspin servers can discover this player. Registered only once
+      the binary reports `listening` (WebSocket listener bound), NOT
+      at init: Music Assistant's discovery connect is one-shot
+      (aiosendspin `retry_initial_connection=False`), so advertising
+      into the spawn-to-bind gap makes MA burn its single attempt on
+      a connection refused and orphan the player until the mDNS
+      record next flaps.
 
   ## Why raw Port (no MuonTrap)
 
@@ -32,6 +38,7 @@ defmodule UniversalProxy.Audio.Player do
   README and with `main.cpp`'s `emit_json` call sites.
 
       {"event":"started","version":"0.1.0","port":8928,"name":"Out 1","alsa_device":"plughw:0,0","formats":[{"codec":"flac","channels":2,"rate":48000,"bit_depth":16}]}
+      {"event":"listening","port":8928}
       {"event":"connected","server":"ws://music.local:8927/sendspin"}
       {"event":"disconnected"}
       {"event":"stream_start","sample_rate":48000,"channels":2,"bit_depth":16,"codec":"opus"}
@@ -77,6 +84,19 @@ defmodule UniversalProxy.Audio.Player do
   # seconds to cover initial peer-discovery jitter.
   @reannounce_delays_ms [500, 1_500, 3_500]
 
+  # Base retry cadence when mDNS registration fails on the `listening`
+  # event (MdnsLite down or mid-restart at that one instant). Backs off
+  # exponentially per consecutive failure, capped at @mdns_retry_max_ms —
+  # on hosts where MdnsLite intentionally isn't running the retry loop
+  # would otherwise tick (and log) every base interval forever.
+  @mdns_retry_ms 5_000
+  @mdns_retry_max_ms 60_000
+
+  # One warning if the binary never reports `listening` — a player in
+  # that state runs fine but is invisible to Sendspin servers, and
+  # nothing else would say why.
+  @mdns_watchdog_ms 15_000
+
   defstruct [
     :key,
     :config,
@@ -88,6 +108,10 @@ defmodule UniversalProxy.Audio.Player do
     :device_name_fun,
     port: nil,
     mdns_id: nil,
+    mdns_registered: false,
+    reannounce_delays_ms: [],
+    mdns_retry_ms: @mdns_retry_ms,
+    mdns_failures: 0,
     last_event: %{},
     os_pid: nil
   ]
@@ -106,6 +130,10 @@ defmodule UniversalProxy.Audio.Player do
           device_name_fun: (-> String.t() | nil) | term(),
           port: port() | nil,
           mdns_id: term(),
+          mdns_registered: boolean(),
+          reannounce_delays_ms: [non_neg_integer()],
+          mdns_retry_ms: pos_integer(),
+          mdns_failures: non_neg_integer(),
           last_event: map(),
           os_pid: pos_integer() | nil
         }
@@ -206,8 +234,27 @@ defmodule UniversalProxy.Audio.Player do
             nil -> nil
           end
 
-        register_mdns(state)
-        new_state = %{state | port: port, mdns_id: mdns_service_id(key), os_pid: os_pid}
+        # mDNS registration is deferred until the binary's `listening`
+        # event (WebSocket listener bound) — see the moduledoc. Only
+        # `mdns_id` is set here so `terminate/2` can best-effort
+        # remove/goodbye even if the binary never got that far.
+        new_state = %{
+          state
+          | port: port,
+            mdns_id: mdns_service_id(key),
+            os_pid: os_pid,
+            reannounce_delays_ms: Keyword.get(opts, :reannounce_delays_ms, @reannounce_delays_ms),
+            mdns_retry_ms: Keyword.get(opts, :mdns_retry_ms, @mdns_retry_ms)
+        }
+
+        # One-shot diagnostic: if the binary never reports `listening`
+        # (listener can't bind, wedged startup), the player would run
+        # healthy but undiscoverable with no trace anywhere — surface it.
+        Process.send_after(
+          self(),
+          :mdns_watchdog,
+          Keyword.get(opts, :mdns_watchdog_ms, @mdns_watchdog_ms)
+        )
 
         # `--initial-volume` is the only startup config the binary
         # accepts on its CLI; there's no `--initial-muted`. If DETS
@@ -218,8 +265,6 @@ defmodule UniversalProxy.Audio.Player do
         if Map.get(config, :muted, false) do
           send_command(new_state, {:set_muted, true})
         end
-
-        schedule_reannounces(opts)
 
         {:ok, new_state}
     end
@@ -256,6 +301,7 @@ defmodule UniversalProxy.Audio.Player do
     # server) but values aren't atomised by `:atoms`, only keys.
     case Jason.decode(line, keys: :atoms) do
       {:ok, %{event: _} = event} ->
+        state = maybe_register_mdns(state, event)
         broadcast_state(state, event)
         {:noreply, %{state | last_event: event}}
 
@@ -295,6 +341,25 @@ defmodule UniversalProxy.Audio.Player do
     _ = state.mdns_module.announce_all()
     {:noreply, state}
   end
+
+  def handle_info(:retry_mdns_register, %{mdns_registered: false} = state) do
+    {:noreply, attempt_mdns_registration(state)}
+  end
+
+  # Registration succeeded before the retry fired — nothing to do.
+  def handle_info(:retry_mdns_register, state), do: {:noreply, state}
+
+  def handle_info(:mdns_watchdog, %{mdns_registered: false} = state) do
+    Logger.warning(
+      "Audio.Player #{inspect(state.key)} never reported `listening` — " <>
+        "WebSocket listener not bound (port conflict? wedged startup?); " <>
+        "output is running but NOT advertised via mDNS"
+    )
+
+    {:noreply, state}
+  end
+
+  def handle_info(:mdns_watchdog, state), do: {:noreply, state}
 
   def handle_info(_msg, state), do: {:noreply, state}
 
@@ -367,13 +432,51 @@ defmodule UniversalProxy.Audio.Player do
 
   # -- Private --
 
+  # The binary's WebSocket listener is confirmed bound on `listening` —
+  # only then is it safe to advertise. Registering earlier (init) races
+  # MA's one-shot discovery connect against the spawn-to-bind gap.
+  # Guarded on `mdns_registered` for idempotency; the binary emits
+  # `listening` once per lifetime.
+  defp maybe_register_mdns(%__MODULE__{mdns_registered: false} = state, %{event: "listening"}) do
+    attempt_mdns_registration(state)
+  end
+
+  defp maybe_register_mdns(state, _event), do: state
+
+  # On success, anchor the §8.3 reannounce burst here so its
+  # cache-priming fires after the record actually exists. On failure
+  # (MdnsLite down or mid-restart) schedule a retry: `listening` is a
+  # one-shot signal, so without the retry a transient outage at that
+  # instant would leave the player unadvertised for the binary's whole
+  # lifetime. Retries are deliberately unbounded (a cap would reintroduce
+  # exactly that permanent state), but the delay backs off exponentially
+  # and only the FIRST failure logs at warning — later attempts log at
+  # debug, so a host where MdnsLite intentionally isn't running doesn't
+  # emit a warning per player per interval forever.
+  defp attempt_mdns_registration(state) do
+    log_level = if state.mdns_failures == 0, do: :warning, else: :debug
+
+    case register_mdns(state, log_level) do
+      :ok ->
+        schedule_reannounces(state.reannounce_delays_ms)
+        %{state | mdns_registered: true, mdns_failures: 0}
+
+      :error ->
+        delay =
+          min(state.mdns_retry_ms * Integer.pow(2, state.mdns_failures), @mdns_retry_max_ms)
+
+        Process.send_after(self(), :retry_mdns_register, delay)
+        %{state | mdns_failures: state.mdns_failures + 1}
+    end
+  end
+
   # RFC 6762 §8.3 calls for at least two unsolicited announcements ~1 s
   # apart when a service comes up. mdns_lite 0.9.1 sends zero, so we
-  # synthesize them via `Audio.MdnsAnnouncer.announce/1`. Tests can
-  # override `reannounce_delays_ms:` to skip the schedule.
-  defp schedule_reannounces(opts) do
-    delays = Keyword.get(opts, :reannounce_delays_ms, @reannounce_delays_ms)
-
+  # synthesize them via `Audio.MdnsAnnouncer.announce/1`. Scheduled
+  # from the `listening` event (not init) so the burst fires after the
+  # service is actually registered. Tests can override
+  # `reannounce_delays_ms:` to skip the schedule.
+  defp schedule_reannounces(delays) when is_list(delays) do
     Enum.each(delays, fn ms when is_integer(ms) and ms >= 0 ->
       Process.send_after(self(), :reannounce, ms)
     end)
@@ -450,13 +553,18 @@ defmodule UniversalProxy.Audio.Player do
       :ok
   end
 
-  defp register_mdns(%__MODULE__{
-         key: key,
-         config: cfg,
-         mdns_port: port,
-         mdns_module: mod,
-         device_name_fun: device_name_fun
-       }) do
+  # `log_level` throttles the failure logging across the retry loop:
+  # :warning for the first attempt, :debug for retries.
+  defp register_mdns(
+         %__MODULE__{
+           key: key,
+           config: cfg,
+           mdns_port: port,
+           mdns_module: mod,
+           device_name_fun: device_name_fun
+         },
+         log_level
+       ) do
     friendly_name = Map.fetch!(cfg, :friendly_name)
     client_id = Map.fetch!(cfg, :client_id)
 
@@ -495,18 +603,25 @@ defmodule UniversalProxy.Audio.Player do
         :ok
 
       other ->
-        Logger.warning("MdnsLite.add_mdns_service returned #{inspect(other)} for #{inspect(key)}")
+        Logger.log(
+          log_level,
+          "#{inspect(mod)}.add_mdns_service returned #{inspect(other)} for #{inspect(key)}"
+        )
 
-        :ok
+        :error
     end
   rescue
     e ->
       # mdns_lite may not be running in dev / on host with no
-      # network — log and continue. Player still functions; just
-      # not LAN-discoverable.
-      Logger.warning("MdnsLite advertise failed for #{inspect(key)}: #{Exception.message(e)}")
+      # network — log, report failure so the caller can retry.
+      # Player still functions either way; just not LAN-discoverable
+      # until a retry succeeds.
+      Logger.log(
+        log_level,
+        "#{inspect(mod)} advertise failed for #{inspect(key)}: #{Exception.message(e)}"
+      )
 
-      :ok
+      :error
   catch
     # MdnsLite.add_mdns_service/1 is a GenServer.call. If the
     # MdnsLite TableServer is stopped or mid-restart it exits with
@@ -514,8 +629,12 @@ defmodule UniversalProxy.Audio.Player do
     # these; we want best-effort registration regardless of the
     # signal shape.
     :exit, reason ->
-      Logger.warning("MdnsLite advertise exited for #{inspect(key)}: #{inspect(reason)}")
-      :ok
+      Logger.log(
+        log_level,
+        "#{inspect(mod)} advertise exited for #{inspect(key)}: #{inspect(reason)}"
+      )
+
+      :error
   end
 
   defp mdns_service_id({slot_sub, vid, pid}) do

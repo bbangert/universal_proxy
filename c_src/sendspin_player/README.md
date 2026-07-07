@@ -19,7 +19,9 @@ c_src/sendspin_player/
 ├── LICENSE-sendspin-armv6   Apache-2.0 attribution copy for vendored files
 ├── README.md                this file
 ├── patches/
-│   └── 0001-configurable-ws-port.patch
+│   ├── 0001-configurable-ws-port.patch
+│   ├── 0002-defer-registration-until-open.patch
+│   └── 0003-listener-bound-hook.patch
 └── src/
     ├── alsa_pipe_sink.h     vendored from LeoLTM/sendspin-armv6
     ├── alsa_pipe_sink.cpp   vendored from LeoLTM/sendspin-armv6
@@ -68,7 +70,7 @@ would otherwise silently flow into firmware. The friendly tag name lives in
 a comment beside the SHA for traceability.
 
 The protocol is Experimental upstream — treat every minor bump as a
-release-blocking review and re-validate the patch listed below.
+release-blocking review and re-validate the patches listed below.
 
 ### Patch: configurable WebSocket port
 
@@ -79,6 +81,45 @@ default (8928). Without this, every binary instance would try to bind 8928
 and the second one would fail — universal_proxy spawns one binary per ALSA
 output so it needs distinct ports.
 
+### Patch: defer connection registration until Open
+
+`patches/0002-defer-registration-until-open.patch` (applies on top of 0001,
+same file) moves the `new_connection_callback_` invocation from IXWebSocket's
+accept callback — which runs **before** the WebSocket handshake — into the
+`WebSocketMessageType::Open` branch. Upstream registers the connection on TCP
+accept; a socket that never completes the handshake (port scanner, TCP
+reachability probe, half-open Wi-Fi connection) never produces a Close event,
+so the registered "phantom" occupies one of the manager's two connection
+slots (current + pending) forever. Two phantoms silently wedge the player:
+every real client (i.e. Music Assistant) gets `101 Switching Protocols` and
+then nothing — no `client/hello`, no goodbye — until the binary restarts.
+Reproduced on upstream v0.5.0 through main (`bf9e085`); the fix mirrors the
+ESP httpd path, whose open callback runs post-upgrade. Drop this patch once
+fixed upstream (issue draft + repro live in the session scratchpad; see
+`.claude` memory `sendspin-phantom-connection-wedge`).
+
+**Known residual**: this only covers *pre-handshake* phantoms. A peer that
+completes the WebSocket upgrade and then never speaks (a health checker
+doing full WS checks, a half-open connection that died post-upgrade) is
+registered and occupies a slot indefinitely — v0.5.0's ConnectionManager
+has no handshake deadline and the host build configures no WS ping/TCP
+keepalive, so two such peers still wedge the player. That fix (a
+registered-but-no-hello timeout) belongs upstream in ConnectionManager,
+not in this patch.
+
+### Patch: listener-bound hook
+
+`patches/0003-listener-bound-hook.patch` (same file, applies after 0002)
+declares a weak `extern "C" sendspin_host_listener_bound(uint16_t)` and
+calls it from `SendspinWsServer::start()` the moment `listen()` succeeds.
+`main.cpp` defines the strong symbol and uses it to drive the `listening`
+stdout event. The hook is authoritative where an external port probe is
+not: a probe cannot tell OUR listener from a foreign or dying-predecessor
+socket on the same port (which would advertise a player whose own listener
+is still failing to bind — recreating the announce-before-bind race).
+Weak linkage keeps the library linkable without a definition (upstream
+examples, tests).
+
 When bumping `SENDSPIN_CPP_REF`:
 
 1. Resolve the tag to a SHA:
@@ -87,10 +128,12 @@ When bumping `SENDSPIN_CPP_REF`:
    tag in the inline comment for traceability)
 3. `rm -rf _build/*/sendspin_player/_deps/sendspin-cpp-*` so FetchContent
    re-populates and re-runs `PATCH_COMMAND`
-4. Run `mix compile` — if the patch no longer applies cleanly, regenerate
-   it against the new tree (`diff -u <old> <new> > 0001-...patch`) and
-   commit. The post-populate marker check in `CMakeLists.txt` will
-   `FATAL_ERROR` if the patch silently no-applies.
+4. Run `mix compile` — if a patch no longer applies cleanly, regenerate
+   it against the new tree (`diff -u <old> <new> > 000N-...patch`) and
+   commit. The post-populate marker checks in `CMakeLists.txt` will
+   `FATAL_ERROR` if any patch silently no-applies. Each patch is
+   generated against the tree with the previous patches applied, so
+   regenerate them in order.
 5. Verify the binary runs with `--mdns-port 18928` and binds correctly
    (e.g. `ss -tlnp | grep 18928`)
 6. Run `mix test test/sendspin_player_contract_test.exs --include contract`
@@ -134,6 +177,7 @@ changes, and on errors.
 
 ```jsonc
 {"event":"started","version":"0.1.0","port":8928,"name":"Out 1","alsa_device":"plughw:0,0","formats":[{"codec":"flac","channels":2,"rate":48000,"bit_depth":16}]}
+{"event":"listening","port":8928}          // WebSocket listener confirmed bound
 {"event":"connected","server":"ws://music.local:8927/sendspin"}
 {"event":"disconnected"}
 {"event":"stream_start","sample_rate":48000,"channels":2,"bit_depth":16,"codec":"opus"}
@@ -152,6 +196,15 @@ includes the baseline floor (FLAC/OPUS/PCM at 44.1/48 kHz, 16-bit). When the
 probed at startup for the rates and bit depths it actually accepts, and the
 matching hi-res FLAC + PCM entries (24/32-bit, up to 384 kHz) are added. A
 probe failure or a non-card device (`default`) advertises the floor only.
+
+The `listening` event fires once, when the WebSocket listener is confirmed
+bound (signalled by the library itself via the patch-0003 hook —
+sendspin-cpp binds lazily on its first `loop()` tick, so `started` does NOT
+imply the port accepts connections yet). `Audio.Player` gates its mDNS
+advertisement on this event: Music Assistant's discovery connect is one-shot
+(aiosendspin `retry_initial_connection=False`), so advertising before the
+listener is up hands MA a connection-refused that orphans the player until
+the mDNS record next flaps.
 
 ## Stdin commands
 

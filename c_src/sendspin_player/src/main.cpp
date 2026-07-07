@@ -635,6 +635,33 @@ struct ClientListener : SendspinClientListener {
     }
 };
 
+// sendspin-cpp binds its WebSocket listener lazily — on the first
+// client.loop() tick after the network provider reports ready — so
+// start_server() returning does NOT mean the port accepts connections
+// yet. The Elixir side must not advertise the player over mDNS before
+// the listener is up: Music Assistant's discovery connect is one-shot
+// (aiosendspin `retry_initial_connection=False`), so a connection
+// refused in that gap orphans the player until the mDNS record flaps.
+// Our 0003 patch has the library call this hook from inside
+// SendspinWsServer::start() the moment its listen() succeeds — an
+// authoritative signal, unlike a port probe, which cannot tell OUR
+// listener from a foreign or dying-predecessor socket on the same
+// port. The hook runs on the main-loop thread (start() is driven by
+// client.loop()), but the flags are atomics so the loop's read is
+// well-defined regardless of future library threading changes.
+static std::atomic<bool> g_listener_bound{false};
+static std::atomic<int> g_listener_port{0};
+
+extern "C" void sendspin_host_listener_bound(uint16_t port) {
+    // Release/acquire pairing with the main-loop read: the relaxed port
+    // store is published by the release store of the flag, so a reader
+    // that acquires `bound == true` is guaranteed to see the port.
+    // (Plain defaults would be seq_cst — also correct — but the explicit
+    // orderings document the intent.)
+    g_listener_port.store(port, std::memory_order_relaxed);
+    g_listener_bound.store(true, std::memory_order_release);
+}
+
 struct NetworkProvider : SendspinNetworkProvider {
     bool is_network_ready() override { return true; }
 };
@@ -775,9 +802,26 @@ int main(int argc, char* argv[]) {
     static constexpr auto RECONNECT_INTERVAL = std::chrono::seconds(5);
     auto last_connect_attempt = clock::now() - RECONNECT_INTERVAL;
     bool was_connected = false;
+    bool listening_emitted = false;
 
     while (g_running.load()) {
         client.loop();
+
+        // `listening` gates the Elixir side's mDNS advertisement (see
+        // sendspin_host_listener_bound above) — emitted once, as soon
+        // as the library reports its listener bound. If the bind fails
+        // (foreign process on the port), the library retries every tick
+        // and this fires on eventual success; until then the player is
+        // deliberately not advertised.
+        if (!listening_emitted && g_listener_bound.load(std::memory_order_acquire)) {
+            listening_emitted = true;
+            std::ostringstream os;
+            // The acquire above pairs with the hook's release store, so
+            // this relaxed port load cannot observe a stale/zero value.
+            os << "{\"event\":\"listening\",\"port\":"
+               << g_listener_port.load(std::memory_order_relaxed) << "}";
+            emit_json(os.str());
+        }
 
         bool stdin_eof = false;
         for (auto& line : stdin_poller.poll_lines(stdin_eof)) {

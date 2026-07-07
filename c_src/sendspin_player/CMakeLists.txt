@@ -40,11 +40,12 @@ FetchContent_Declare(
     # that masks real failures (e.g. a partial hunk apply on upstream
     # context drift) — silent breakage would slip past CI and only
     # surface when the second player instance failed to bind. Instead,
-    # gate the apply on a marker grep: if the env-var hook is already
-    # present, the patch has run; otherwise apply with default semantics
+    # gate each apply on a marker grep: if the patch's marker is already
+    # present, that patch has run; otherwise apply with default semantics
     # so any failure (missing context, conflicting edit) is loud and
-    # fatal at configure time.
-    PATCH_COMMAND  sh -c "grep -q SENDSPIN_WS_PORT src/host/ws_server.cpp || patch -p1 -i ${CMAKE_CURRENT_LIST_DIR}/patches/0001-configurable-ws-port.patch"
+    # fatal at configure time. Order matters: 0002's context includes
+    # 0001's changes.
+    PATCH_COMMAND  sh -c "(grep -q SENDSPIN_WS_PORT src/host/ws_server.cpp || patch -p1 -i ${CMAKE_CURRENT_LIST_DIR}/patches/0001-configurable-ws-port.patch) && (grep -q 'register only on Open' src/host/ws_server.cpp || patch -p1 -i ${CMAKE_CURRENT_LIST_DIR}/patches/0002-defer-registration-until-open.patch) && (grep -q sendspin_host_listener_bound src/host/ws_server.cpp || patch -p1 -i ${CMAKE_CURRENT_LIST_DIR}/patches/0003-listener-bound-hook.patch)"
 )
 
 # Manual populate + add_subdirectory(EXCLUDE_FROM_ALL) for compatibility with
@@ -59,26 +60,37 @@ if(NOT sendspin-cpp_POPULATED)
                      EXCLUDE_FROM_ALL)
 endif()
 
-# Defence in depth: verify the port-config patch landed both halves.
-# Marker #1 (env_marker): the SENDSPIN_WS_PORT-reading block exists.
-# Marker #2 (bind_marker): the WebSocketServer constructor was actually
-# rewritten to use the runtime `port` variable. Without #2, a partial
-# apply could leave the env-read block in place while the constructor
-# still passes DEFAULT_SERVER_PORT — silently honouring 8928 only.
-file(READ "${sendspin-cpp_SOURCE_DIR}/src/host/ws_server.cpp" _ws_server_src)
-string(FIND "${_ws_server_src}" "SENDSPIN_WS_PORT" _env_marker)
-string(FIND "${_ws_server_src}" "WebSocketServer>(port," _bind_marker)
-if(_env_marker EQUAL -1 OR _bind_marker EQUAL -1)
-    message(FATAL_ERROR
-        "sendspin-cpp port-config patch did not apply cleanly: "
-        "env_marker=${_env_marker} bind_marker=${_bind_marker} in "
-        "${sendspin-cpp_SOURCE_DIR}/src/host/ws_server.cpp. "
-        "Re-validate patches/0001-configurable-ws-port.patch against the "
-        "current SENDSPIN_CPP_REF (${SENDSPIN_CPP_REF}).")
-endif()
-unset(_ws_server_src)
-unset(_env_marker)
-unset(_bind_marker)
+# Defence in depth: verify every patch landed completely. Each patch
+# names TWO markers: a comment/declaration sentinel proving the patch
+# ran at all, and a functional marker proving the load-bearing hunk
+# landed (a partial apply could leave the sentinel while the behavior
+# hunk silently no-applied — e.g. 0001's env-read block present but the
+# constructor still passing DEFAULT_SERVER_PORT, or 0002's comment
+# present while connections still register on TCP accept).
+function(assert_patch_markers patch_label)
+    file(READ "${sendspin-cpp_SOURCE_DIR}/src/host/ws_server.cpp" _src)
+    foreach(_marker IN LISTS ARGN)
+        string(FIND "${_src}" "${_marker}" _pos)
+        if(_pos EQUAL -1)
+            message(FATAL_ERROR
+                "sendspin-cpp patch ${patch_label} did not apply cleanly: "
+                "marker '${_marker}' missing from "
+                "${sendspin-cpp_SOURCE_DIR}/src/host/ws_server.cpp. "
+                "Re-validate patches/${patch_label}.patch against the "
+                "current SENDSPIN_CPP_REF (${SENDSPIN_CPP_REF}).")
+        endif()
+    endforeach()
+endfunction()
+
+assert_patch_markers(0001-configurable-ws-port
+    "SENDSPIN_WS_PORT"
+    "WebSocketServer>(port,")
+assert_patch_markers(0002-defer-registration-until-open
+    "register only on Open"
+    "new_connection_callback_(std::make_unique<SendspinServerConnection>")
+assert_patch_markers(0003-listener-bound-hook
+    "sendspin_host_listener_bound(uint16_t port) __attribute__((weak))"
+    "sendspin_host_listener_bound(port)")
 
 add_executable(sendspin_player
     src/main.cpp

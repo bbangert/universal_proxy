@@ -8,6 +8,8 @@ Player tests need to drive.
 
   startup       → {"event":"started","version":...,"port":...,"name":...,"alsa_device":...}
                   {"event":"volume","value":<initial_volume>}
+                  {"event":"static_delay","value":<initial_static_delay_ms>}
+                  {"event":"listening","port":...}
   stdin commands → stdout events
     {"cmd":"set_volume","value":N} → {"event":"volume","value":N}
     {"cmd":"set_muted","value":B}  → {"event":"mute","value":B}
@@ -22,6 +24,7 @@ write so the BEAM port sees events line-by-line.
 """
 import argparse
 import json
+import os
 import sys
 
 # Hard-coded version string so the `started` event has a stable shape
@@ -78,6 +81,14 @@ def main():
     # ...and a `static_delay` event publishing the server-adjustable static
     # output delay (the real binary reports get_static_delay_ms()).
     emit({"event": "static_delay", "value": args.initial_static_delay_ms})
+
+    # ...and finally `listening`, once the WebSocket listener is bound
+    # (the real binary probes the port from its main loop). This is
+    # what gates Audio.Player's mDNS registration. Tests set
+    # FAKE_SKIP_LISTENING=1 to simulate a binary whose listener never
+    # comes up and assert that no mDNS advertisement happens.
+    if os.environ.get("FAKE_SKIP_LISTENING") != "1":
+        emit({"event": "listening", "port": args.mdns_port})
 
     for line in sys.stdin:
         line = line.strip()
