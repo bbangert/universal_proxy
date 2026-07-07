@@ -216,8 +216,14 @@ defmodule UniversalProxy.ESPHome.BluetoothProxyTest do
     end
 
     test "an unknown event crashes loudly instead of being dropped" do
+      # apply/3 with a variable function name keeps the deliberately-invalid
+      # event opaque to the compiler's type checker, which would otherwise
+      # (correctly!) flag that no translate/1 clause matches — that being
+      # the point — and fail --warnings-as-errors in CI.
+      fun = :gatt_event
+
       assert_raise FunctionClauseError, fn ->
-        BluetoothProxy.gatt_event(self(), {:gatt_bogus, @address})
+        apply(BluetoothProxy, fun, [self(), {:gatt_bogus, @address}])
       end
     end
   end
