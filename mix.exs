@@ -2,7 +2,7 @@ defmodule UniversalProxy.MixProject do
   use Mix.Project
 
   @app :universal_proxy
-  @version "0.7.1"
+  @version "0.8.0"
   @all_targets [
     :bbb,
     :mangopi_mq_pro,
