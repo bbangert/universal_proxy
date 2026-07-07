@@ -1,7 +1,8 @@
 defmodule UniversalProxy.Bluez.Gatt do
   @moduledoc """
-  Active BLE connections + GATT client over BlueZ D-Bus — the engine behind
-  the `Espex.BluetoothProxy` adapter (`UniversalProxy.ESPHome.BluetoothProxy`).
+  Active BLE connections + GATT client over BlueZ D-Bus — in this app, the
+  engine behind the `Espex.BluetoothProxy` adapter
+  (`UniversalProxy.ESPHome.BluetoothProxy`).
 
   Owns its own `rebus` connection, separate from `UniversalProxy.Bluez.Client`
   (the passive scanner): independent match rules, independent failure domain,
@@ -11,6 +12,42 @@ defmodule UniversalProxy.Bluez.Gatt do
   calls here run in `Task`s under `#{inspect(__MODULE__)}.Tasks`, never in
   this GenServer's own loop. `Device1.Connect` alone can take ~25 s.
 
+  ## Event contract
+
+  Results flow asynchronously to the `subscriber` pid captured at
+  `connect/3`, through the `on_gatt_event:` fun (`fn subscriber, event`;
+  default: `send(subscriber, event)`). Hosts inject a translator to reshape
+  events for their own wire protocol (see
+  `UniversalProxy.ESPHome.BluetoothProxy.gatt_event/2`). The full event set:
+
+    * `{:gatt_connection, address, {:ok, mtu} | {:error, code}}` — connect
+      result, post-remove teardown, or an unexpected disconnect.
+    * `{:gatt_service, address, %UniversalProxy.Bluez.Gatt.Service{}}` — one
+      per service, streamed on `get_services/1`.
+    * `{:gatt_services_done, address}` — service stream terminator.
+    * `{:gatt_read, address, handle, {:ok, binary} | {:error, code}}` —
+      characteristic *and* descriptor reads (a failed `get_services/1` on a
+      not-ready link also answers here with handle 0, the ESPHome
+      convention).
+    * `{:gatt_write, address, handle, {:ok, :done} | {:error, code}}` —
+      characteristic and descriptor writes.
+    * `{:gatt_notify, address, handle, {:ok, :done} | {:error, code}}` —
+      Start/StopNotify result.
+    * `{:gatt_notify_data, address, handle, binary}` — a notification value.
+    * `{:gatt_pair, address, success? :: boolean(), code :: integer()}`
+    * `{:gatt_unpair, address, success?, code}`
+    * `{:gatt_clear_cache, address, success?, code}`
+
+  Error `code`s follow the ESPHome BLE convention this stack was built
+  against: `-1` generic, `-2` not connected.
+
+  ## Options
+
+    * `on_gatt_event:` — see above.
+    * `on_connections_changed:` — zero-arity fun invoked whenever a
+      connection slot is taken or freed (default: no-op). The app wires
+      `UniversalProxy.Bluetooth.Stats.connections_changed/0`.
+
   ## Connection lifecycle
 
       connect cast ─→ Device1.Connect (Task) ─→ ServicesResolved? ──true──┐
@@ -19,18 +56,18 @@ defmodule UniversalProxy.Bluez.Gatt do
                                                       (resolve timeout)   ▼
                                        GetManagedObjects ─→ GattTree.build
                                                    │
-                          {:espex_ble_connection, addr, {:ok, mtu}} ──→ HA
+                            {:gatt_connection, addr, {:ok, mtu}} ──→ host
 
-  The espex connection reply is deliberately deferred until BlueZ has
-  resolved services: every subsequent GATT request is handle-keyed, and the
+  The connection reply is deliberately deferred until BlueZ has resolved
+  services: every subsequent GATT request is handle-keyed, and the
   handle ↔ object-path map only exists once the GATT objects are visible.
   MTU comes from the experimental `MTU` characteristic property
   (`bluetoothd -E`), falling back to the BLE minimum (23).
 
   Unexpected disconnects surface as `Device1.PropertiesChanged
-  Connected=false`; espex is told via the same connection envelope with an
-  error code. Requested disconnects remove state immediately and need no
-  follow-up message.
+  Connected=false`; the subscriber is told via the same connection envelope
+  with an error code. Requested disconnects remove state immediately and
+  need no follow-up message.
 
   ## Notifications
 
@@ -40,9 +77,10 @@ defmodule UniversalProxy.Bluez.Gatt do
   StartNotify call returns (and rolled back on error) so no early value
   can race past us.
 
-  Espex owns cross-client address locking; this module trusts that
-  `connect` arrives at most once per address per ownership cycle, but stays
-  defensive (a stale entry is torn down and replaced).
+  The host owns cross-client address locking (espex does, here); this
+  module trusts that `connect` arrives at most once per address per
+  ownership cycle, but stays defensive (a stale entry is torn down and
+  replaced).
 
   ## Pairing and cache clearing (Phase 2)
 
@@ -52,7 +90,7 @@ defmodule UniversalProxy.Bluez.Gatt do
   the agent only authorizes pairings we initiated. `unpair/1` and
   `clear_cache/1` both map to `Adapter1.RemoveDevice` — BlueZ's only
   bond-removal API, and the only D-Bus way to drop a device's cached GATT
-  database (they differ only in the espex reply envelope; the bond, if any,
+  database (they differ only in the reply envelope; the bond, if any,
   goes too — same observable semantics as ESP32's
   `esp_ble_remove_bond_device`). RemoveDevice destroys the device object —
   and the live link with it.
@@ -65,8 +103,8 @@ defmodule UniversalProxy.Bluez.Gatt do
   the op reply is always delivered, and entry teardown happens via
   whichever of the two paths (signal or result) still finds the entry.
 
-  All three require a live connection entry: espex routes their replies to
-  the subscriber captured at `connect/3`, so for an unknown address there
+  All three require a live connection entry: replies route to the
+  subscriber captured at `connect/3`, so for an unknown address there
   is no one to answer — those requests are logged and dropped (HA only
   issues them on connected devices).
   """
@@ -107,12 +145,11 @@ defmodule UniversalProxy.Bluez.Gatt do
   # expanding them into byte lists for marshalling.
   @max_attr_len 512
 
-  # espex BluetoothProxy error codes (Espex.BluetoothProxy.ErrorCodes is
-  # @moduledoc false, so mirror the two we use).
+  # ESPHome-convention BLE error codes (see the moduledoc event contract).
   @err_generic -1
   @err_not_connected -2
 
-  @typedoc "Packed 48-bit MAC, MSB-first — the espex address form."
+  @typedoc "Packed 48-bit MAC, MSB-first."
   @type address :: non_neg_integer()
 
   def child_spec(opts) do
@@ -171,14 +208,14 @@ defmodule UniversalProxy.Bluez.Gatt do
   @spec clear_cache(address()) :: :ok
   def clear_cache(address), do: GenServer.cast(__MODULE__, {:clear_cache, address})
 
-  @doc "Free / total connection slots, for `c:Espex.BluetoothProxy.connections_free/0`."
+  @doc "Free / total connection slots (the host's connections_free callback)."
   @spec connections_free() :: {non_neg_integer(), non_neg_integer()}
   def connections_free, do: GenServer.call(__MODULE__, :connections_free)
 
   # ── GenServer ─────────────────────────────────────────────────────────────
 
   @impl GenServer
-  def init(_opts) do
+  def init(opts) do
     case Rebus.connect(:system) do
       {:ok, conn} ->
         sig_ref = Rebus.add_signal_handler(conn)
@@ -200,6 +237,15 @@ defmodule UniversalProxy.Bluez.Gatt do
            conn: conn,
            conn_ref: conn_ref,
            sig_ref: sig_ref,
+           # Event seam (see the moduledoc): every subscriber-bound event
+           # goes through this fun so a host can translate the lib-native
+           # shapes to its own wire protocol.
+           on_gatt_event:
+             Keyword.get(opts, :on_gatt_event, fn subscriber, event ->
+               send(subscriber, event)
+             end),
+           # Slot-usage seam: invoked on every entry create/drop.
+           on_connections_changed: Keyword.get(opts, :on_connections_changed, fn -> :ok end),
            # address => connection entry (see new_entry/3)
            conns: %{},
            # char object path => {address, reported handle}, for routing
@@ -224,7 +270,7 @@ defmodule UniversalProxy.Bluez.Gatt do
       # Refuse cleanly — a crafted address must not crash this server.
       not DevicePath.valid?(address) ->
         Logger.warning("Bluez.Gatt: connect refused — invalid address #{inspect(address)}")
-        send(subscriber, {:espex_ble_connection, address, {:error, @err_generic}})
+        emit(state, subscriber, {:gatt_connection, address, {:error, @err_generic}})
         {:noreply, state}
 
       true ->
@@ -232,13 +278,13 @@ defmodule UniversalProxy.Bluez.Gatt do
 
         if map_size(state.conns) >= @max_connections do
           Logger.warning("Bluez.Gatt: connect #{fmt(address)} refused — no free slots")
-          send(subscriber, {:espex_ble_connection, address, {:error, @err_generic}})
+          emit(state, subscriber, {:gatt_connection, address, {:error, @err_generic}})
           {:noreply, state}
         else
           gen = state.gen_seq + 1
           path = DevicePath.from_address(address)
           run_connect(state.conn, address, gen, path)
-          notify_connections_changed()
+          notify_connections_changed(state)
 
           {:noreply,
            %{state | gen_seq: gen}
@@ -264,12 +310,12 @@ defmodule UniversalProxy.Bluez.Gatt do
   def handle_cast({:get_services, address}, state) do
     # On a not-ready link, ESPHome's convention for a get-services failure
     # is a GATT error with handle 0 (what the C++ proxy sends).
-    with_ready_entry(state, address, {:espex_ble_gatt_read, address, 0}, fn entry ->
+    with_ready_entry(state, address, {:gatt_read, address, 0}, fn entry ->
       Enum.each(entry.tree.services, fn service ->
-        send(entry.subscriber, {:espex_ble_gatt_service, address, service})
+        emit(state, entry.subscriber, {:gatt_service, address, service})
       end)
 
-      send(entry.subscriber, {:espex_ble_gatt_services_done, address})
+      emit(state, entry.subscriber, {:gatt_services_done, address})
       {:noreply, state}
     end)
   end
@@ -320,7 +366,7 @@ defmodule UniversalProxy.Bluez.Gatt do
   end
 
   def handle_cast({:notify, address, handle, enable?}, state) do
-    with_ready_entry(state, address, {:espex_ble_gatt_notify, address, handle}, fn entry ->
+    with_ready_entry(state, address, {:gatt_notify, address, handle}, fn entry ->
       case entry.tree.by_handle[handle] do
         {:characteristic, path} ->
           member = if enable?, do: "StartNotify", else: "StopNotify"
@@ -344,11 +390,7 @@ defmodule UniversalProxy.Bluez.Gatt do
           {:noreply, state}
 
         _other ->
-          send(
-            entry.subscriber,
-            {:espex_ble_gatt_notify, address, handle, {:error, @err_generic}}
-          )
-
+          emit(state, entry.subscriber, {:gatt_notify, address, handle, {:error, @err_generic}})
           {:noreply, state}
       end
     end)
@@ -369,10 +411,10 @@ defmodule UniversalProxy.Bluez.Gatt do
   end
 
   def handle_cast({:unpair, address}, state),
-    do: remove_device(state, address, :espex_ble_unpair)
+    do: remove_device(state, address, :gatt_unpair)
 
   def handle_cast({:clear_cache, address}, state),
-    do: remove_device(state, address, :espex_ble_clear_cache)
+    do: remove_device(state, address, :gatt_clear_cache)
 
   @impl GenServer
   def handle_call(:connections_free, _from, state) do
@@ -413,7 +455,13 @@ defmodule UniversalProxy.Bluez.Gatt do
       {%{gen: ^gen, status: :fetching} = entry, {:ok, objects}} ->
         tree = GattTree.build(objects, entry.path)
         entry = %{entry | status: :ready, tree: tree, resolve_timer: nil}
-        send(entry.subscriber, {:espex_ble_connection, address, {:ok, tree.mtu || @default_mtu}})
+
+        emit(
+          state,
+          entry.subscriber,
+          {:gatt_connection, address, {:ok, tree.mtu || @default_mtu}}
+        )
+
         {:noreply, put_in(state.conns[address], entry)}
 
       {%{gen: ^gen}, {:error, reason}} ->
@@ -447,8 +495,8 @@ defmodule UniversalProxy.Bluez.Gatt do
   # would time the request out). Hardware-observed on the H60B0.
   def handle_info({:pair_result, address, _gen, subscriber, result}, state) do
     case result do
-      :ok -> send(subscriber, {:espex_ble_pair, address, true, 0})
-      {:error, code} -> send(subscriber, {:espex_ble_pair, address, false, code})
+      :ok -> emit(state, subscriber, {:gatt_pair, address, true, 0})
+      {:error, code} -> emit(state, subscriber, {:gatt_pair, address, false, code})
     end
 
     {:noreply, state}
@@ -457,7 +505,7 @@ defmodule UniversalProxy.Bluez.Gatt do
   def handle_info({:remove_result, address, gen, tag, subscriber, result}, state) do
     case result do
       :ok ->
-        send(subscriber, {tag, address, true, 0})
+        emit(state, subscriber, {tag, address, true, 0})
 
         # The device object is gone. If the Connected=false signal raced us,
         # the entry (and its teardown envelope) is already handled; otherwise
@@ -465,7 +513,7 @@ defmodule UniversalProxy.Bluez.Gatt do
         case state.conns[address] do
           %{gen: ^gen} = entry ->
             cancel_resolve_timer(entry)
-            send(subscriber, {:espex_ble_connection, address, {:error, @err_not_connected}})
+            emit(state, subscriber, {:gatt_connection, address, {:error, @err_not_connected}})
             {:noreply, drop_entry(state, address)}
 
           _gone_or_replaced ->
@@ -473,7 +521,7 @@ defmodule UniversalProxy.Bluez.Gatt do
         end
 
       {:error, code} ->
-        send(subscriber, {tag, address, false, code})
+        emit(state, subscriber, {tag, address, false, code})
         {:noreply, state}
     end
   end
@@ -495,7 +543,7 @@ defmodule UniversalProxy.Bluez.Gatt do
               state
           end
 
-        forward_op_result(entry, envelope, result)
+        forward_op_result(state, entry, envelope, result)
         {:noreply, state}
 
       _stale ->
@@ -550,11 +598,11 @@ defmodule UniversalProxy.Bluez.Gatt do
 
           props["Connected"] == false ->
             # Unexpected drop (requested disconnects clear the entry before
-            # BlueZ emits this). Same envelope as a failed connect — espex
+            # BlueZ emits this). Same envelope as a failed connect — the host
             # forwards it as a connected=false response either way.
             Logger.info("Bluez.Gatt: #{fmt(address)} disconnected unexpectedly")
             cancel_resolve_timer(entry)
-            send(entry.subscriber, {:espex_ble_connection, address, {:error, @err_generic}})
+            emit(state, entry.subscriber, {:gatt_connection, address, {:error, @err_generic}})
             drop_entry(state, address)
 
           props["ServicesResolved"] == true and entry.status == :resolving ->
@@ -578,7 +626,7 @@ defmodule UniversalProxy.Bluez.Gatt do
     with {address, handle} <- state.notify_paths[path],
          %{} = entry <- state.conns[address],
          value when not is_nil(value) <- props["Value"] do
-      send(entry.subscriber, {:espex_ble_gatt_notify_data, address, handle, to_bin(value)})
+      emit(state, entry.subscriber, {:gatt_notify_data, address, handle, to_bin(value)})
       state
     else
       _ -> state
@@ -601,16 +649,16 @@ defmodule UniversalProxy.Bluez.Gatt do
     }
   end
 
-  defp forward_op_result(entry, envelope, result) do
+  defp forward_op_result(state, entry, envelope, result) do
     case envelope do
       {:gatt_read, address, handle} ->
-        send(entry.subscriber, {:espex_ble_gatt_read, address, handle, result})
+        emit(state, entry.subscriber, {:gatt_read, address, handle, result})
 
       {:gatt_write, address, handle} ->
-        send(entry.subscriber, {:espex_ble_gatt_write, address, handle, result})
+        emit(state, entry.subscriber, {:gatt_write, address, handle, result})
 
       {:gatt_notify, address, handle, _enable?, _path} ->
-        send(entry.subscriber, {:espex_ble_gatt_notify, address, handle, result})
+        emit(state, entry.subscriber, {:gatt_notify, address, handle, result})
 
       other ->
         Logger.warning("Bluez.Gatt: unhandled op_result envelope #{inspect(other)}")
@@ -623,7 +671,7 @@ defmodule UniversalProxy.Bluez.Gatt do
     case state.conns[address] do
       %{subscriber: subscriber} ->
         Logger.warning("Bluez.Gatt: write to #{fmt(address)} handle #{handle} exceeds ATT limit")
-        send(subscriber, {:espex_ble_gatt_write, address, handle, {:error, @err_generic}})
+        emit(state, subscriber, {:gatt_write, address, handle, {:error, @err_generic}})
 
       nil ->
         :ok
@@ -654,7 +702,7 @@ defmodule UniversalProxy.Bluez.Gatt do
 
       entry ->
         cancel_resolve_timer(entry)
-        send(entry.subscriber, {:espex_ble_connection, address, {:error, code}})
+        emit(state, entry.subscriber, {:gatt_connection, address, {:error, code}})
         # Best-effort cleanup: a half-open link would otherwise hold the slot
         # on the controller until BlueZ notices.
         run_disconnect(state.conn, entry.path)
@@ -664,19 +712,20 @@ defmodule UniversalProxy.Bluez.Gatt do
 
   defp drop_entry(state, address) do
     {_entry, state} = pop_in(state.conns[address])
-    notify_connections_changed()
+    notify_connections_changed(state)
 
     update_in(state.notify_paths, fn paths ->
       paths |> Enum.reject(fn {_path, {addr, _h}} -> addr == address end) |> Map.new()
     end)
   end
 
-  # Slot usage changed (entry created or dropped) — let the stats server
-  # push an off-tick update to the web tab. Cast: fire-and-forget, no-op
-  # when Stats isn't running.
-  defp notify_connections_changed do
-    UniversalProxy.Bluetooth.Stats.connections_changed()
-  end
+  # Slot usage changed (entry created or dropped) — the injected fun lets
+  # the host push an off-tick update (the app wires Bluetooth.Stats, whose
+  # cast is fire-and-forget and a no-op when Stats isn't running).
+  defp notify_connections_changed(state), do: state.on_connections_changed.()
+
+  # Every subscriber-bound event flows through the injected seam.
+  defp emit(state, subscriber, event), do: state.on_gatt_event.(subscriber, event)
 
   defp cancel_resolve_timer(%{resolve_timer: nil}), do: :ok
   defp cancel_resolve_timer(%{resolve_timer: timer}), do: Process.cancel_timer(timer)
@@ -684,15 +733,15 @@ defmodule UniversalProxy.Bluez.Gatt do
   # Look up a :ready entry; on a known-but-not-ready link, answer with the
   # op's own error envelope (`error_envelope` is the `{tag, address, handle}`
   # prefix the result tuple is built from). An *unknown* address has no
-  # subscriber to tell — espex gates ops on ownership, so that's a stale op
-  # and gets dropped (per the espex contract).
+  # subscriber to tell — the host gates ops on ownership (espex does), so
+  # that's a stale op and gets dropped.
   defp with_ready_entry(state, address, error_envelope, fun) do
     case state.conns[address] do
       %{status: :ready} = entry ->
         fun.(entry)
 
       %{subscriber: subscriber} ->
-        send(subscriber, error_msg(error_envelope, @err_not_connected))
+        emit(state, subscriber, error_msg(error_envelope, @err_not_connected))
         {:noreply, state}
 
       nil ->
@@ -702,24 +751,23 @@ defmodule UniversalProxy.Bluez.Gatt do
   end
 
   # Common shape of read/write ops: resolve handle → path, kind-check, run.
-  defp gatt_op(state, address, {tag, _addr, handle}, allowed_kinds, run) do
-    error_envelope = {espex_envelope(tag), address, handle}
-
-    with_ready_entry(state, address, error_envelope, fn entry ->
+  # The internal envelope doubles as the event-tag prefix (see the moduledoc).
+  defp gatt_op(state, address, {_tag, _addr, handle} = envelope, allowed_kinds, run) do
+    with_ready_entry(state, address, envelope, fn entry ->
       with {kind, path} <- entry.tree.by_handle[handle],
            true <- kind in allowed_kinds do
         run.(path, kind, entry.gen)
         {:noreply, state}
       else
         _other ->
-          send(entry.subscriber, error_msg(error_envelope, @err_generic))
+          emit(state, entry.subscriber, error_msg(envelope, @err_generic))
           {:noreply, state}
       end
     end)
   end
 
   # unpair and clear_cache are the same BlueZ operation (RemoveDevice);
-  # only the espex reply envelope (`tag`) differs.
+  # only the reply envelope (`tag`) differs.
   defp remove_device(state, address, tag) do
     case state.conns[address] do
       nil ->
@@ -731,9 +779,6 @@ defmodule UniversalProxy.Bluez.Gatt do
         {:noreply, state}
     end
   end
-
-  defp espex_envelope(:gatt_read), do: :espex_ble_gatt_read
-  defp espex_envelope(:gatt_write), do: :espex_ble_gatt_write
 
   defp error_msg({tag, address, handle}, code), do: {tag, address, handle, {:error, code}}
 

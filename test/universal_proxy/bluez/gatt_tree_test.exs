@@ -1,7 +1,7 @@
 defmodule UniversalProxy.Bluez.GattTreeTest do
   use ExUnit.Case, async: true
 
-  alias Espex.BluetoothProxy.{Characteristic, Descriptor, Service}
+  alias UniversalProxy.Bluez.Gatt.{Characteristic, Descriptor, Service}
   alias UniversalProxy.Bluez.GattTree
 
   doctest GattTree
@@ -80,7 +80,7 @@ defmodule UniversalProxy.Bluez.GattTreeTest do
   end
 
   describe "build/2" do
-    test "builds espex Service structs sorted by handle" do
+    test "builds neutral Service structs sorted by handle" do
       tree = GattTree.build(objects(), @dev)
 
       assert [

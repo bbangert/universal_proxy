@@ -22,8 +22,9 @@ defmodule UniversalProxy.Bluez do
        it comes up once `org.bluez` exists and so a `bluealsad` crash never
        restarts the **proxy scanning/GATT stack** — audio is secondary to the
        BT proxy's scanning, which must survive an audio-daemon fault. The audio
-       children that follow it (`BlueAlsa`, `AudioManager`) *do* restart with it
-       under `:rest_for_one`, which is intended — they're the same audio path.
+       children that follow it (`BlueAlsa`, then the host's `extra_children:` —
+       the app mounts its AudioManager pair there) *do* restart with it under
+       `:rest_for_one`, which is intended — they're the same audio path.
        (The plan said "before Client"; that would put it ahead of the scanning
        stack and tear scanning down on a crash, contradicting the rationale.)
 
@@ -69,10 +70,47 @@ defmodule UniversalProxy.Bluez do
   end
 
   @impl Supervisor
-  def init(_opts) do
+  def init(opts) do
     prepare_runtime()
 
-    children = [
+    # Explicit restart budget so the documented "benign endless retry
+    # loop" (Client `{:stop, :no_adapter}` while the controller is absent
+    # — see UniversalProxy.Bluetooth @moduledoc) is benign by
+    # configuration, not by cycle timing: the observed ~10 s :no_adapter
+    # cycle (6/min) and a faster :dbus_connect_failed cycle both fit in
+    # 10-per-60 s, while a genuinely hot crash loop still escalates to
+    # the Bluetooth DynamicSupervisor within a minute.
+    Supervisor.init(children(opts), strategy: :rest_for_one, max_restarts: 10, max_seconds: 60)
+  end
+
+  @doc """
+  The child list `init/1` supervises, exposed for the child-order test.
+
+  Supported opts (all optional; see `UniversalProxy.Bluetooth.bluez_spec/0`
+  for how the app fills them):
+
+    * `client:` — keyword opts for `#{inspect(__MODULE__)}.Client`
+      (`on_advertisement:`, `pubsub:`).
+    * `gatt:` — keyword opts for `#{inspect(__MODULE__)}.Gatt`
+      (`on_gatt_event:`, `on_connections_changed:`).
+    * `blue_alsa:` — keyword opts for `#{inspect(__MODULE__)}.BlueAlsa`
+      (`pubsub:`).
+    * `improv:` — keyword opts threaded through
+      `#{inspect(__MODULE__)}.Improv.Supervisor` to the Improv manager
+      (`pubsub:`, `network_type:`).
+    * `extra_children:` — host-supplied child specs, inserted after
+      `BlueAlsa` and before `Improv.Supervisor` (the audio-consumer slot:
+      they restart with the audio path under `:rest_for_one`, and a fault
+      there never disturbs the proxy scanning/GATT stack above them).
+  """
+  @spec children(keyword()) :: [Supervisor.child_spec() | {module(), term()} | module()]
+  def children(opts) do
+    # Host-supplied children (the app mounts its AudioManager pair here —
+    # see UniversalProxy.Bluetooth.bluez_spec/0). This slot sits after the
+    # proxy scanning/GATT clients so a fault here never disturbs them, and
+    # a bluetoothd/Client restart (earlier, :rest_for_one) still rebuilds
+    # everything downstream.
+    [
       # System bus. --nofork so MuonTrap's port owns the process; --nopidfile
       # because /var/run is read-only and we don't read a pidfile anyway.
       # Both daemons are MuonTrap.Daemon, so each needs a distinct child :id
@@ -111,10 +149,10 @@ defmodule UniversalProxy.Bluez do
       ),
 
       # Persistent rebus client: owns the discovery session and turns BlueZ
-      # device signals into advertisements for the ESPHome scanner. After
-      # bluetoothd in rest_for_one order so it (re)connects only once
-      # bluetoothd is up.
-      __MODULE__.Client,
+      # device signals into advertisements, fanned out via its
+      # `on_advertisement:` opt. After bluetoothd in rest_for_one order so
+      # it (re)connects only once bluetoothd is up.
+      {__MODULE__.Client, Keyword.get(opts, :client, [])},
 
       # Default org.bluez pairing agent (Phase 2): bluetoothd routes the IO
       # for Gatt's Device1.Pair() calls here. Before Gatt in rest_for_one
@@ -130,7 +168,7 @@ defmodule UniversalProxy.Bluez do
       # The GATT client itself (its own rebus connection, separate from
       # Client). Last so a bluetoothd/Client restart also rebuilds it —
       # its device objects and connection state die with bluetoothd.
-      __MODULE__.Gatt,
+      {__MODULE__.Gatt, Keyword.get(opts, :gatt, [])},
 
       # bluez-alsa A2DP-source daemon. No `-i`: manages all controllers; role
       # separation (which adapter may pair/connect headsets) is enforced at the
@@ -162,37 +200,19 @@ defmodule UniversalProxy.Bluez do
       # to the system bus (dbus-daemon), not to bluealsad, so it tolerates
       # bluealsad being down. After the scanning/GATT clients: a crash here must
       # not restart the proxy scanning stack — audio is secondary to the BT proxy.
-      __MODULE__.BlueAlsa,
-
-      # Bluetooth headphone control plane. It's an org.bluez D-Bus client like
-      # Client/Gatt (hence it lives in this subtree, after them, so its bus
-      # connection and adapter lookups are always available), but it drives the
-      # *audio*-role adapters rather than the proxy adapter. Its Connect calls
-      # (up to ~25 s) run under this Task.Supervisor so the GenServer loop never
-      # blocks. Both sit after the scanning/GATT clients so a fault here never
-      # disturbs the proxy scanning stack, and a bluetoothd/Client restart
-      # re-runs reconnect-on-boot.
-      {Task.Supervisor, name: UniversalProxy.Bluetooth.AudioManager.TaskSupervisor},
-      UniversalProxy.Bluetooth.AudioManager,
-
-      # Improv-over-BLE Wi-Fi provisioning. Its own :one_for_all sub-supervisor
-      # (GattServer + Advert + manager + Task.Supervisor) so the mutually-dependent
-      # processes restart as a unit — a manager crash can't leave the cleartext
-      # GATT app/advert exported without the session timers/disarm logic (see
-      # Improv.Supervisor). Placed LAST here so an Improv fault never disturbs the
-      # proxy scanning/GATT or audio stacks, while a bluetoothd/Client restart
-      # (earlier, :rest_for_one) still rebuilds the whole group.
-      UniversalProxy.Bluez.Improv.Supervisor
-    ]
-
-    # Explicit restart budget so the documented "benign endless retry
-    # loop" (Client `{:stop, :no_adapter}` while the controller is absent
-    # — see UniversalProxy.Bluetooth @moduledoc) is benign by
-    # configuration, not by cycle timing: the observed ~10 s :no_adapter
-    # cycle (6/min) and a faster :dbus_connect_failed cycle both fit in
-    # 10-per-60 s, while a genuinely hot crash loop still escalates to
-    # the Bluetooth DynamicSupervisor within a minute.
-    Supervisor.init(children, strategy: :rest_for_one, max_restarts: 10, max_seconds: 60)
+      {__MODULE__.BlueAlsa, Keyword.get(opts, :blue_alsa, [])}
+    ] ++
+      Keyword.get(opts, :extra_children, []) ++
+      [
+        # Improv-over-BLE Wi-Fi provisioning. Its own :one_for_all sub-supervisor
+        # (GattServer + Advert + manager + Task.Supervisor) so the mutually-dependent
+        # processes restart as a unit — a manager crash can't leave the cleartext
+        # GATT app/advert exported without the session timers/disarm logic (see
+        # Improv.Supervisor). Placed LAST here so an Improv fault never disturbs the
+        # proxy scanning/GATT or audio stacks, while a bluetoothd/Client restart
+        # (earlier, :rest_for_one) still rebuilds the whole group.
+        {UniversalProxy.Bluez.Improv.Supervisor, Keyword.get(opts, :improv, [])}
+      ]
   end
 
   @doc """

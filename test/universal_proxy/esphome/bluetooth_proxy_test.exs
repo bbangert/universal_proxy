@@ -123,6 +123,111 @@ defmodule UniversalProxy.ESPHome.BluetoothProxyTest do
     end
   end
 
+  describe "gatt_event/2 translator" do
+    # One assertion per lib-native event tag — this exhaustive set is the
+    # regression net for HA GATT behavior: a Gatt event the translator
+    # doesn't cover would crash the Gatt server (no catch-all, by design),
+    # and a missing tag here would let that regress silently.
+
+    @handle 0x0C
+
+    test "gatt_connection" do
+      assert BluetoothProxy.gatt_event(self(), {:gatt_connection, @address, {:ok, 247}}) == :ok
+      assert_receive {:espex_ble_connection, @address, {:ok, 247}}
+
+      BluetoothProxy.gatt_event(self(), {:gatt_connection, @address, {:error, -2}})
+      assert_receive {:espex_ble_connection, @address, {:error, -2}}
+    end
+
+    test "gatt_service rebuilds the espex struct tree from the neutral one" do
+      service = %UniversalProxy.Bluez.Gatt.Service{
+        uuid: 0x180F,
+        handle: 0x0A,
+        characteristics: [
+          %UniversalProxy.Bluez.Gatt.Characteristic{
+            uuid: 0x2A19,
+            handle: 0x0C,
+            properties: 0x12,
+            descriptors: [%UniversalProxy.Bluez.Gatt.Descriptor{uuid: 0x2902, handle: 0x0D}]
+          }
+        ]
+      }
+
+      BluetoothProxy.gatt_event(self(), {:gatt_service, @address, service})
+
+      assert_receive {:espex_ble_gatt_service, @address,
+                      %Espex.BluetoothProxy.Service{
+                        uuid: 0x180F,
+                        handle: 0x0A,
+                        characteristics: [
+                          %Espex.BluetoothProxy.Characteristic{
+                            uuid: 0x2A19,
+                            handle: 0x0C,
+                            properties: 0x12,
+                            descriptors: [
+                              %Espex.BluetoothProxy.Descriptor{uuid: 0x2902, handle: 0x0D}
+                            ]
+                          }
+                        ]
+                      }}
+    end
+
+    test "gatt_services_done" do
+      BluetoothProxy.gatt_event(self(), {:gatt_services_done, @address})
+      assert_receive {:espex_ble_gatt_services_done, @address}
+    end
+
+    test "gatt_read" do
+      BluetoothProxy.gatt_event(self(), {:gatt_read, @address, @handle, {:ok, <<0x64>>}})
+      assert_receive {:espex_ble_gatt_read, @address, @handle, {:ok, <<0x64>>}}
+
+      BluetoothProxy.gatt_event(self(), {:gatt_read, @address, 0, {:error, -2}})
+      assert_receive {:espex_ble_gatt_read, @address, 0, {:error, -2}}
+    end
+
+    test "gatt_write" do
+      BluetoothProxy.gatt_event(self(), {:gatt_write, @address, @handle, {:ok, :done}})
+      assert_receive {:espex_ble_gatt_write, @address, @handle, {:ok, :done}}
+    end
+
+    test "gatt_notify" do
+      BluetoothProxy.gatt_event(self(), {:gatt_notify, @address, @handle, {:error, -1}})
+      assert_receive {:espex_ble_gatt_notify, @address, @handle, {:error, -1}}
+    end
+
+    test "gatt_notify_data" do
+      BluetoothProxy.gatt_event(self(), {:gatt_notify_data, @address, @handle, <<1, 2>>})
+      assert_receive {:espex_ble_gatt_notify_data, @address, @handle, <<1, 2>>}
+    end
+
+    test "gatt_pair" do
+      BluetoothProxy.gatt_event(self(), {:gatt_pair, @address, true, 0})
+      assert_receive {:espex_ble_pair, @address, true, 0}
+    end
+
+    test "gatt_unpair" do
+      BluetoothProxy.gatt_event(self(), {:gatt_unpair, @address, false, -1})
+      assert_receive {:espex_ble_unpair, @address, false, -1}
+    end
+
+    test "gatt_clear_cache" do
+      BluetoothProxy.gatt_event(self(), {:gatt_clear_cache, @address, true, 0})
+      assert_receive {:espex_ble_clear_cache, @address, true, 0}
+    end
+
+    test "an unknown event crashes loudly instead of being dropped" do
+      # apply/3 with a variable function name keeps the deliberately-invalid
+      # event opaque to the compiler's type checker, which would otherwise
+      # (correctly!) flag that no translate/1 clause matches — that being
+      # the point — and fail --warnings-as-errors in CI.
+      fun = :gatt_event
+
+      assert_raise FunctionClauseError, fn ->
+        apply(BluetoothProxy, fun, [self(), {:gatt_bogus, @address}])
+      end
+    end
+  end
+
   describe "behaviour contract" do
     setup do
       # `function_exported?/3` reports false for a not-yet-loaded module. Under

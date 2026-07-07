@@ -44,7 +44,6 @@ defmodule UniversalProxy.Bluez.Improv do
 
   alias UniversalProxy.Bluez.Improv.{Advert, GattServer, Protocol}
 
-  @pubsub UniversalProxy.PubSub
   @topic "bluetooth:improv"
 
   @session_timeout_ms 5 * 60 * 1000
@@ -129,7 +128,14 @@ defmodule UniversalProxy.Bluez.Improv do
       gatt: Keyword.get(opts, :gatt, GattServer),
       advert: Keyword.get(opts, :advert, Advert),
       wifi: Keyword.get(opts, :wifi, UniversalProxy.Bluez.Improv.Wifi),
-      network_type: Keyword.get(opts, :network_type, &UniversalProxy.System.network_type/0),
+      # Connectivity probe for the arm gate; nil (the default) reads as
+      # online, so Improv NEVER arms unless the host explicitly opts into
+      # offline-driven arming by wiring a real probe (the app passes
+      # UniversalProxy.System.network_type/0 via bluez_spec/0). Fail-closed:
+      # an unconfigured host must not expose the provisioning surface.
+      network_type: Keyword.get(opts, :network_type),
+      # Phoenix.PubSub for {:improv_status, _} broadcasts; nil = no-op.
+      pubsub: Keyword.get(opts, :pubsub),
       scanner: Keyword.get(opts, :scanner, UniversalProxy.Bluez.Client),
       task_sup: Keyword.get(opts, :task_supervisor, UniversalProxy.Bluez.Improv.TaskSupervisor),
       timeout_ms: Keyword.get(opts, :timeout_ms, @session_timeout_ms),
@@ -399,9 +405,11 @@ defmodule UniversalProxy.Bluez.Improv do
       {:error, :wifi_unavailable}
   end
 
+  defp broadcast(%{pubsub: nil} = state), do: state
+
   defp broadcast(state) do
     Phoenix.PubSub.broadcast(
-      @pubsub,
+      state.pubsub,
       @topic,
       {:improv_status, %{state: state.fsm, error: state.error}}
     )
@@ -470,6 +478,8 @@ defmodule UniversalProxy.Bluez.Improv do
 
   # ── connectivity ─────────────────────────────────────────────────────────
 
+  # No probe configured → treated as online → never arms (see init/1).
+  defp online?(%{network_type: nil}), do: true
   defp online?(state), do: state.network_type.() != :disconnected
 
   # Best-effort: only cast when the scanner is actually running (no-op off-target

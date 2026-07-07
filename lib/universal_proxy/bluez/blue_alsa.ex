@@ -121,7 +121,9 @@ defmodule UniversalProxy.Bluez.BlueAlsa do
            conn: conn,
            conn_ref: conn_ref,
            sig_ref: sig_ref,
-           pubsub: Keyword.get(opts, :pubsub, UniversalProxy.PubSub)
+           # Phoenix.PubSub for {:bluealsa_pcms_changed} broadcasts; nil =
+           # no-op (the app passes UniversalProxy.PubSub via bluez_spec/0).
+           pubsub: Keyword.get(opts, :pubsub)
          }}
 
       {:error, reason} ->
@@ -149,7 +151,10 @@ defmodule UniversalProxy.Bluez.BlueAlsa do
         %{sig_ref: ref} = state
       )
       when member in ["InterfacesAdded", "InterfacesRemoved"] do
-    Phoenix.PubSub.broadcast(state.pubsub, @pcms_topic, {:bluealsa_pcms_changed})
+    if state.pubsub do
+      Phoenix.PubSub.broadcast(state.pubsub, @pcms_topic, {:bluealsa_pcms_changed})
+    end
+
     {:noreply, state}
   end
 

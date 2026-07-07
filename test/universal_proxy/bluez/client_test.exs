@@ -11,18 +11,23 @@ defmodule UniversalProxy.Bluez.ClientTest do
     Minimal stand-in for a `Rebus.Connection` pid: answers the handler
     registrations `Client.init/1` performs and any other call with `:ok`.
     No D-Bus traffic ever flows in these tests (`setup: false` and an
-    injected `apply_mode_fun` keep the Client away from the bus).
+    injected `apply_mode_fun` keep the Client away from the bus). The
+    signal-handler ref is reported to the test pid (`{:sig_ref, ref}`) so
+    tests can inject fake org.bluez signals into the Client.
     """
     use GenServer
 
-    def start_link(_opts \\ []), do: GenServer.start_link(__MODULE__, nil)
+    def start_link(test_pid \\ nil), do: GenServer.start_link(__MODULE__, test_pid)
 
     @impl true
-    def init(nil), do: {:ok, nil}
+    def init(test_pid), do: {:ok, test_pid}
 
     @impl true
-    def handle_call({:add_signal_handler, _pid}, _from, state),
-      do: {:reply, make_ref(), state}
+    def handle_call({:add_signal_handler, _pid}, _from, test_pid) do
+      ref = make_ref()
+      if test_pid, do: send(test_pid, {:sig_ref, ref})
+      {:reply, ref, test_pid}
+    end
 
     def handle_call(_other, _from, state), do: {:reply, :ok, state}
   end
@@ -31,7 +36,7 @@ defmodule UniversalProxy.Bluez.ClientTest do
   # test process, and links don't propagate a :normal exit — without
   # this they'd outlive the test for the rest of the suite run.
   defp start_client(opts) do
-    {:ok, conn} = ConnStub.start_link()
+    {:ok, conn} = ConnStub.start_link(self())
 
     {:ok, client} =
       Client.start_link(
@@ -93,5 +98,42 @@ defmodule UniversalProxy.Bluez.ClientTest do
     # call would park behind it until the watchdog/call timeout. The
     # short timeout proves the :DOWN handler cleared the wedge.
     assert :ok = GenServer.call(client, {:set_mode, :passive}, 2_000)
+  end
+
+  test "adverts fan out through the injected on_advertisement fun" do
+    test_pid = self()
+
+    {:ok, client} =
+      start_client(on_advertisement: fn advert -> send(test_pid, {:advert, advert}) end)
+
+    assert_receive {:sig_ref, sig_ref}
+
+    # A Device1 InterfacesAdded under the (default) hci0 adapter path, in
+    # rebus wire shape — drives the real signal → DeviceCache → emit path.
+    msg = %Rebus.Message{
+      type: :signal,
+      flags: [],
+      version: 1,
+      body_length: 0,
+      serial: 1,
+      header_fields: %{member: "InterfacesAdded"},
+      body: [
+        "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF",
+        [
+          {"org.bluez.Device1",
+           [
+             {"Address", {"s", "AA:BB:CC:DD:EE:FF"}},
+             {"AddressType", {"s", "public"}},
+             {"RSSI", {"n", -50}}
+           ]}
+        ]
+      ]
+    }
+
+    send(client, {sig_ref, msg})
+
+    assert_receive {:advert, %{address: 0xAABBCCDDEEFF, rss: -50} = advert}
+    assert Map.has_key?(advert, :address_type)
+    assert Map.has_key?(advert, :raw_data)
   end
 end

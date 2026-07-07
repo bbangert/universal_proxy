@@ -52,6 +52,9 @@ defmodule UniversalProxy.Bluez.ImprovTest do
       advert: advert,
       scanner: scanner,
       wifi: StubWifi,
+      # The pubsub default is nil (no-op) since the extraction seams landed;
+      # these tests assert the status broadcasts, so wire the real one.
+      pubsub: UniversalProxy.PubSub,
       subscribe?: false,
       # No boot grace by default so arm-on-offline tests fire immediately.
       boot_grace_ms: 0,
@@ -97,6 +100,15 @@ defmodule UniversalProxy.Bluez.ImprovTest do
   end
 
   describe "arm policy" do
+    test "never arms when no network_type probe is configured (fail-closed)" do
+      # nil probe reads as online: an unconfigured host must not expose the
+      # provisioning surface just because it forgot to wire connectivity.
+      %{mgr: mgr} = start_manager([])
+
+      refute_receive {:gatt, :register}, 150
+      assert %{state: :disarmed} = Improv.status(mgr)
+    end
+
     test "arms on a no-connectivity boot" do
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, Improv.status_topic())
       %{mgr: mgr} = start_manager(network_type: offline())

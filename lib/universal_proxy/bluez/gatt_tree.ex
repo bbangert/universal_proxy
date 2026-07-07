@@ -1,13 +1,15 @@
 defmodule UniversalProxy.Bluez.GattTree do
   @moduledoc """
-  Build an espex-shaped GATT tree from BlueZ's `GetManagedObjects` reply.
+  Build a GATT tree from BlueZ's `GetManagedObjects` reply.
 
   Once a device's `ServicesResolved` flips true, its GATT database appears
   as `org.bluez.GattService1` / `GattCharacteristic1` / `GattDescriptor1`
   objects under the device path. This module turns those (rebus-decoded)
   objects into:
 
-    * `Espex.BluetoothProxy.Service` structs to stream to Home Assistant, and
+    * `UniversalProxy.Bluez.Gatt.Service` structs, emitted to the host via
+      `{:gatt_service, address, service}` events (the app-side translator
+      reshapes them for Home Assistant), and
     * handle ↔ object-path maps for executing handle-keyed GATT requests.
 
   Pure and host-testable — the D-Bus I/O stays in `UniversalProxy.Bluez.Gatt`.
@@ -32,7 +34,7 @@ defmodule UniversalProxy.Bluez.GattTree do
   dangling parent references are dropped.
   """
 
-  alias Espex.BluetoothProxy.{Characteristic, Descriptor, Service}
+  alias UniversalProxy.Bluez.Gatt.{Characteristic, Descriptor, Service}
   alias UniversalProxy.Bluez.Variant
 
   @service_iface "org.bluez.GattService1"
@@ -140,12 +142,12 @@ defmodule UniversalProxy.Bluez.GattTree do
   def properties_mask(_other), do: 0
 
   @doc """
-  Convert a BlueZ UUID string to the espex `t:Espex.BluetoothProxy.uuid/0`
+  Convert a BlueZ UUID string to the `t:UniversalProxy.Bluez.Gatt.Service.uuid/0`
   shape: a 16-bit integer when it's a SIG base UUID (smaller on the wire,
   matches what ESP32 proxies send), else the full 16-byte binary. Invalid
   strings map to the all-zero UUID rather than crashing the tree build.
   """
-  @spec to_uuid(String.t() | term()) :: Espex.BluetoothProxy.uuid()
+  @spec to_uuid(String.t() | term()) :: Service.uuid()
   def to_uuid(uuid) when is_binary(uuid) do
     normalized = String.downcase(uuid)
 
