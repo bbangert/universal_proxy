@@ -119,6 +119,12 @@ config :mdns_lite,
   # because otherwise any of the devices may respond to nerves.local leading to
   # unpredictable behavior.
 
+  # NOTE: at runtime `UniversalProxy.ESPHome.MdnsAdapter` re-sets this list
+  # to also advertise the device's unique node name (e.g.
+  # `universal-proxy-07507f.local`) — the MAC suffix isn't known at compile
+  # time. `universal_proxy.local` stays as the documented single-device
+  # convenience URL; with several proxies on one LAN any of them may answer
+  # it, so the unique alias is the one to rely on.
   hosts: [:hostname, "universal_proxy"],
   ttl: 120,
 

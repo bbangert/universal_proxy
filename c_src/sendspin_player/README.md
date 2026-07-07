@@ -166,6 +166,7 @@ The flags must match what `UniversalProxy.Audio.Player` passes — see the
 | `--name STR`               | yes      | Friendly display name                        |
 | `--client-id STR`          | yes      | Stable unique client identifier (UUID)       |
 | `--server URL`             | no       | Outbound Sendspin server WebSocket URL       |
+| `--product STR`            | no       | Product id in `device_info` (node name, e.g. `universal-proxy-07507f`); vendor is fixed to `Universal Proxy`. Default `sendspin_player` |
 | `--alsa-device STR`        | no       | ALSA device, e.g. `plughw:0,0` (default = system default) |
 | `--mdns-port INT`          | no       | Local WebSocket listener port (default 8928) |
 | `--initial-volume 0..100`  | no       | Startup volume (default 50)                  |
@@ -180,7 +181,7 @@ connection state changes, on stream lifecycle changes, on volume/mute
 changes, and on errors.
 
 ```jsonc
-{"event":"started","version":"0.1.0","port":8928,"name":"Out 1","alsa_device":"plughw:0,0","formats":[{"codec":"flac","channels":2,"rate":48000,"bit_depth":16}]}
+{"event":"started","version":"0.1.0","port":8928,"name":"Out 1","product":"universal-proxy-07507f","alsa_device":"plughw:0,0","formats":[{"codec":"flac","channels":2,"rate":48000,"bit_depth":16}]}
 {"event":"listening","port":8928}          // WebSocket listener confirmed bound
 {"event":"connected","server":"ws://music.local:8927/sendspin"}
 {"event":"disconnected"}

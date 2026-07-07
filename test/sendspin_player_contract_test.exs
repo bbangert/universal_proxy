@@ -67,6 +67,9 @@ defmodule SendspinPlayerContractTest do
 
     assert event["port"] == @ws_port
     assert event["name"] == "contract-test"
+    # Vendor/Product identity shown by Sendspin servers; without --product
+    # the binary falls back to its generic id.
+    assert event["product"] == "sendspin_player"
     assert event["alsa_device"] == "default"
   end
 

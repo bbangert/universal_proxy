@@ -38,7 +38,9 @@ defmodule UniversalProxy.ESPHome.ConfigStoreTest do
                config.friendly_name =~ ~r/^Universal Proxy [0-9A-F]{6}$/
 
       assert config.port == 6053
-      assert config.project_name == "bbangert.universal_proxy"
+      # The segment after the dot is what Home Assistant displays as the
+      # device model — a display string, not a snake_case id.
+      assert config.project_name == "bbangert.Universal Proxy"
     end
   end
 

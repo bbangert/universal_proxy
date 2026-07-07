@@ -27,10 +27,14 @@ defmodule UniversalProxy.ESPHome.ConfigStore do
     manufacturer: "UniversalProxy",
     suggested_area: "",
     # ESPHome's "author.project" convention — Home Assistant splits on
-    # the dot to derive the model. A bare token (no dot) makes HA's
-    # discovery task crash silently. Empty string is the safe "no
-    # project" value.
-    project_name: "bbangert.universal_proxy",
+    # the dot: the first segment displays as the device's manufacturer,
+    # the second as its MODEL (our separate `model` field is ignored
+    # whenever a project is present). The model segment is therefore the
+    # display string "Universal Proxy", not a snake_case id — HA renders
+    # it verbatim under the device name on the integration card. A bare
+    # token (no dot) makes HA's discovery task crash silently. Empty
+    # string is the safe "no project" value.
+    project_name: "bbangert.Universal Proxy",
     project_version: "0.1.0",
     port: @default_port,
     # Web UI port advertised to Home Assistant so it shows the "Visit

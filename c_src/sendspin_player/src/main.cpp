@@ -227,6 +227,7 @@ struct Options {
     std::string alsa_device;
     std::string name;
     std::string client_id;
+    std::string product;
     int mdns_port = DEFAULT_WS_PORT;
     int initial_volume = 50;
     int initial_static_delay_ms = 0;
@@ -244,6 +245,10 @@ static void print_usage(const char* prog) {
         "                        (e.g. ws://music.local:8927/sendspin).\n"
         "                        If empty, only inbound server connections are accepted.\n"
         "  --alsa-device STR     ALSA device name (e.g. plughw:0,0). Empty = default.\n"
+        "  --product STR         Device product identifier reported to Sendspin\n"
+        "                        servers (e.g. universal-proxy-07507f). Shown as\n"
+        "                        'Universal Proxy / <product>' in Music Assistant.\n"
+        "                        Default: sendspin_player.\n"
         "  --mdns-port INT       Local WebSocket listener port (default: %d).\n"
         "  --initial-volume N    Startup volume 0-100 (default: 50).\n"
         "  --initial-static-delay-ms N\n"
@@ -269,6 +274,7 @@ static bool parse_args(int argc, char** argv, Options& opts) {
         {"alsa-device",    required_argument, nullptr, 'd'},
         {"name",           required_argument, nullptr, 'n'},
         {"client-id",      required_argument, nullptr, 'i'},
+        {"product",        required_argument, nullptr, 'P'},
         {"mdns-port",      required_argument, nullptr, 'p'},
         {"initial-volume", required_argument, nullptr, 'v'},
         {"initial-static-delay-ms", required_argument, nullptr, 'D'},
@@ -285,6 +291,7 @@ static bool parse_args(int argc, char** argv, Options& opts) {
             case 'd': opts.alsa_device = optarg; break;
             case 'n': opts.name = optarg; break;
             case 'i': opts.client_id = optarg; break;
+            case 'P': opts.product = optarg; break;
             case 'p':
                 if (!parse_int(optarg, opts.mdns_port)) {
                     std::fprintf(stderr, "Error: --mdns-port must be an integer\n");
@@ -332,6 +339,7 @@ static bool parse_args(int argc, char** argv, Options& opts) {
     // UTF-8 gate before any field flows into a stdout JSON event.
     if (!require_utf8("--name", opts.name)) return false;
     if (!require_utf8("--client-id", opts.client_id)) return false;
+    if (!require_utf8("--product", opts.product)) return false;
     if (!require_utf8("--alsa-device", opts.alsa_device)) return false;
     if (!require_utf8("--server", opts.server)) return false;
     return true;
@@ -706,8 +714,12 @@ int main(int argc, char* argv[]) {
     SendspinClientConfig client_config;
     client_config.client_id = opts.client_id;
     client_config.name = opts.name;
-    client_config.product_name = "sendspin_player";
-    client_config.manufacturer = "universal_proxy";
+    // Shown by Sendspin servers as "Vendor / Product" (Music Assistant's
+    // player list). Mirrors the Home Assistant Voice PE scheme: a human
+    // display string for the vendor and the per-device node name (e.g.
+    // "universal-proxy-07507f") as the product, passed via --product.
+    client_config.product_name = opts.product.empty() ? "sendspin_player" : opts.product;
+    client_config.manufacturer = "Universal Proxy";
     client_config.software_version = VERSION;
     SendspinClient client(std::move(client_config));
 
@@ -767,6 +779,8 @@ int main(int argc, char* argv[]) {
            << "\"version\":\"" << VERSION << "\","
            << "\"port\":" << opts.mdns_port << ","
            << "\"name\":\"" << json_escape(opts.name) << "\","
+           << "\"product\":\""
+           << json_escape(opts.product.empty() ? "sendspin_player" : opts.product) << "\","
            << "\"alsa_device\":\"" << json_escape(opts.alsa_device) << "\","
            << "\"formats\":" << formats_to_json(audio_formats) << "}";
         emit_json(os.str());

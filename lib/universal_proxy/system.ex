@@ -91,9 +91,28 @@ defmodule UniversalProxy.System do
     }
   end
 
+  # Prefer the device's unique advertised alias — the ESPHome node name
+  # (`universal-proxy-07507f`) that `ESPHome.MdnsAdapter` publishes as
+  # `<name>.local` — so the Overview shows the hostname users should
+  # actually reach for, not the OS-level `nerves-XXXX`. Reuses the
+  # adapter's host-label gate so we never display a hostname that isn't
+  # really advertised; falls back to the OS hostname when the name is
+  # unusable or config is unavailable.
   defp hostname do
+    "#{advertised_host() || os_hostname()}.local"
+  end
+
+  defp advertised_host do
+    UniversalProxy.ESPHome.MdnsAdapter.host_alias(UniversalProxy.ESPHome.config().name)
+  rescue
+    _ -> nil
+  catch
+    :exit, _ -> nil
+  end
+
+  defp os_hostname do
     {:ok, name} = :inet.gethostname()
-    "#{name}.local"
+    name
   end
 
   defp primary_ipv4 do

@@ -173,9 +173,11 @@ defmodule UniversalProxyWeb.MockData do
     network: "Ethernet, 1 Gbps"
   }
 
+  # No `hostname` key: the Discovery tab derives the hostname from the
+  # (real) ESPHome device name — a mocked static hostname made every
+  # proxy claim to be `universal-proxy-a1.local`.
   @discovery_defaults %{
     friendly: "Universal Proxy (Rack)",
-    hostname: "universal-proxy-a1.local",
     service: "_hassever-proxy._tcp",
     esphome_id: "universal_proxy_a1",
     area: "Server rack",

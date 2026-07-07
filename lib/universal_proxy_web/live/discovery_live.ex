@@ -12,6 +12,7 @@ defmodule UniversalProxyWeb.DiscoveryLive do
   import UniversalProxyWeb.Components.Icons
 
   alias UniversalProxy.ESPHome
+  alias UniversalProxy.ESPHome.MdnsAdapter
   alias UniversalProxyWeb.MockData
 
   @areas ["Living room", "Office", "Garage", "Basement", "Server rack"]
@@ -32,11 +33,13 @@ defmodule UniversalProxyWeb.DiscoveryLive do
   def handle_event("change", %{"discovery" => params}, socket) do
     advertise = Map.get(params, "advertise") in ["true", true, "on"]
 
+    esphome_id = params["esphome_id"] || socket.assigns.form.esphome_id
+
     form = %{
       friendly: params["friendly"] || socket.assigns.form.friendly,
-      hostname: params["hostname"] || socket.assigns.form.hostname,
+      hostname: hostname_for(esphome_id),
       service: socket.assigns.form.service,
-      esphome_id: params["esphome_id"] || socket.assigns.form.esphome_id,
+      esphome_id: esphome_id,
       area: params["area"] || socket.assigns.form.area,
       advertise: advertise
     }
@@ -71,15 +74,36 @@ defmodule UniversalProxyWeb.DiscoveryLive do
   defp build_form do
     cfg = ESPHome.config()
     defaults = MockData.discovery_defaults()
+    esphome_id = Map.get(cfg, :name) || defaults.esphome_id
 
     %{
       friendly: Map.get(cfg, :friendly_name) || defaults.friendly,
-      hostname: defaults.hostname,
+      hostname: hostname_for(esphome_id),
       service: defaults.service,
-      esphome_id: Map.get(cfg, :name) || defaults.esphome_id,
+      esphome_id: esphome_id,
       area: defaults.area,
       advertise: defaults.advertise
     }
+  end
+
+  # The device's unique hostname IS the ESPHome node name (which carries
+  # the per-device MAC suffix) — `MdnsAdapter` advertises it as
+  # `<name>.local`. Derived, never free-typed, and gated through the SAME
+  # `host_alias/1` check the adapter uses: a name it would refuse to
+  # advertise (spaces, underscores, empty) must not render as a hostname
+  # mDNS never answers. In that case fall back to the OS hostname
+  # (`nerves-XXXX.local`), which is always advertised — also making the
+  # live preview honest while an invalid name is being typed.
+  defp hostname_for(esphome_id) do
+    case MdnsAdapter.host_alias(esphome_id) do
+      nil -> os_hostname()
+      alias_name -> "#{alias_name}.local"
+    end
+  end
+
+  defp os_hostname do
+    {:ok, name} = :inet.gethostname()
+    "#{name}.local"
   end
 
   defp dirty?(form, original), do: form != original
@@ -108,8 +132,8 @@ defmodule UniversalProxyWeb.DiscoveryLive do
           </.field>
 
           <div class="grid grid-cols-2 gap-4">
-            <.field label="Hostname" help="Must end in .local">
-              <.text_input name="discovery[hostname]" value={@form.hostname} />
+            <.field label="Hostname" help="Follows the ESPHome device name.">
+              <.text_input name="discovery[hostname]" value={@form.hostname} readonly mono />
             </.field>
             <.field label="mDNS service">
               <.text_input

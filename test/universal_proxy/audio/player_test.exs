@@ -129,6 +129,24 @@ defmodule UniversalProxy.Audio.PlayerTest do
       assert Process.alive?(pid)
     end
 
+    test "passes the node name as --product for the Vendor / Product identity" do
+      # Sendspin servers (Music Assistant) show device_info as
+      # "Vendor / Product"; the vendor is fixed to "Universal Proxy" in
+      # the binary and the product carries the per-device node name.
+      _pid = start_player!(device_name_fun: fn -> "universal-proxy-45099b" end, mdns_port: 18_903)
+
+      assert_receive {:sendspin_state, @key,
+                      %{event: "started", product: "universal-proxy-45099b"}},
+                     2_000
+    end
+
+    test "omits --product without a node name so the binary default applies" do
+      _pid = start_player!()
+
+      assert_receive {:sendspin_state, @key, %{event: "started", product: "sendspin_player"}},
+                     2_000
+    end
+
     test "forwards the persisted static delay via --initial-static-delay-ms" do
       _pid = start_player!(config: Map.put(config(), :static_delay_ms, 250))
       assert_receive {:sendspin_state, @key, _started}, 2_000

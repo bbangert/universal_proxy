@@ -50,6 +50,7 @@ def main():
     # reports as `{:binary_exited, _}` and tests fail.
     p.add_argument("--name", required=True)
     p.add_argument("--client-id", required=True)
+    p.add_argument("--product", default="sendspin_player")
     p.add_argument("--mdns-port", type=int, default=0)
     p.add_argument("--initial-volume", type=int, default=50)
     p.add_argument("--initial-static-delay-ms", type=int, default=0)
@@ -71,6 +72,7 @@ def main():
         "version": FAKE_VERSION,
         "port": args.mdns_port,
         "name": args.name,
+        "product": args.product,
         "alsa_device": args.alsa_device,
     })
 

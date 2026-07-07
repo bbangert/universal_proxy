@@ -37,7 +37,7 @@ defmodule UniversalProxy.Audio.Player do
   ("Stdout events" section) — keep this list in sync with that
   README and with `main.cpp`'s `emit_json` call sites.
 
-      {"event":"started","version":"0.1.0","port":8928,"name":"Out 1","alsa_device":"plughw:0,0","formats":[{"codec":"flac","channels":2,"rate":48000,"bit_depth":16}]}
+      {"event":"started","version":"0.1.0","port":8928,"name":"Out 1","product":"universal-proxy-07507f","alsa_device":"plughw:0,0","formats":[{"codec":"flac","channels":2,"rate":48000,"bit_depth":16}]}
       {"event":"listening","port":8928}
       {"event":"connected","server":"ws://music.local:8927/sendspin"}
       {"event":"disconnected"}
@@ -508,6 +508,18 @@ defmodule UniversalProxy.Audio.Player do
       "--log-level",
       "info"
     ]
+
+    # Sendspin servers display device_info as "Vendor / Product" (Music
+    # Assistant's player list). Pass the node name (which carries the
+    # per-device MAC suffix) as the product so entries read
+    # "Universal Proxy / universal-proxy-07507f" — mirroring the HA Voice
+    # PE scheme ("ESPHome / home-assistant-voice-09010e"). No node name
+    # (host dev) falls back to the binary's default product.
+    base =
+      case safe_device_name(state.device_name_fun) do
+        product when is_binary(product) and product != "" -> base ++ ["--product", product]
+        _ -> base
+      end
 
     case state.server_url do
       nil -> base
