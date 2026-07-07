@@ -20,7 +20,7 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # rebus is an all-target path dep vendored as a git submodule
           # (deps_local/rebus); without it `mix deps.get`/compile fail.
@@ -45,7 +45,7 @@ jobs:
     env:
       MIX_ENV: dev
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # rebus is an all-target path dep vendored as a git submodule
           # (deps_local/rebus); without it `mix deps.get`/compile fail.
@@ -72,7 +72,7 @@ jobs:
     env:
       MIX_ENV: dev
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # rebus is an all-target path dep vendored as a git submodule
           # (deps_local/rebus); without it `mix deps.get`/compile fail.
@@ -99,7 +99,7 @@ jobs:
     env:
       MIX_ENV: test
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # rebus is an all-target path dep vendored as a git submodule
           # (deps_local/rebus); without it `mix deps.get`/compile fail.
@@ -126,7 +126,7 @@ jobs:
     env:
       MIX_ENV: dev
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # rebus is an all-target path dep vendored as a git submodule
           # (deps_local/rebus); without it `mix deps.get`/compile fail.
@@ -166,7 +166,7 @@ jobs:
     name: Hex audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # rebus is an all-target path dep vendored as a git submodule
           # (deps_local/rebus); without it `mix deps.get`/compile fail.
