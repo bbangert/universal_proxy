@@ -344,7 +344,13 @@ defmodule UniversalProxy.Improv.Advert do
         state
 
       {@props_iface, "Set"} ->
-        Bluez.Rebus.reply_error(conn, msg, "org.freedesktop.DBus.Error.PropertyReadOnly", "read-only")
+        Bluez.Rebus.reply_error(
+          conn,
+          msg,
+          "org.freedesktop.DBus.Error.PropertyReadOnly",
+          "read-only"
+        )
+
         state
 
       {@introspect_iface, "Introspect"} ->
@@ -368,7 +374,12 @@ defmodule UniversalProxy.Improv.Advert do
           inspect(e, limit: 5, printable_limit: 200)
       )
 
-      Bluez.Rebus.reply_error(state.conn, msg, "org.freedesktop.DBus.Error.Failed", "internal error")
+      Bluez.Rebus.reply_error(
+        state.conn,
+        msg,
+        "org.freedesktop.DBus.Error.Failed",
+        "internal error"
+      )
 
       state
   end
@@ -381,7 +392,12 @@ defmodule UniversalProxy.Improv.Advert do
             Bluez.Rebus.reply(conn, msg, [variant], "v")
 
           _ ->
-            Bluez.Rebus.reply_error(conn, msg, "org.freedesktop.DBus.Error.UnknownProperty", "#{name}")
+            Bluez.Rebus.reply_error(
+              conn,
+              msg,
+              "org.freedesktop.DBus.Error.UnknownProperty",
+              "#{name}"
+            )
         end
 
       _ ->
