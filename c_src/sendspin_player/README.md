@@ -63,8 +63,8 @@ Differences:
 ## sendspin-cpp pin
 
 Pinned via `FetchContent` to a **commit SHA** in `CMakeLists.txt`
-(`SENDSPIN_CPP_REF` cache var). Currently `573efd520...` which is the SHA
-that `v0.5.0` resolved to at the time of authorship. We pin to a SHA rather
+(`SENDSPIN_CPP_REF` cache var). Currently `ef1157f05...` which is the SHA
+that `v0.6.1` resolved to at the time of the bump. We pin to a SHA rather
 than a tag because git tags are mutable server-side; a retagged upstream
 would otherwise silently flow into firmware. The friendly tag name lives in
 a comment beside the SHA for traceability.
@@ -101,9 +101,10 @@ fixed upstream (issue draft + repro live in the session scratchpad; see
 **Known residual**: this only covers *pre-handshake* phantoms. A peer that
 completes the WebSocket upgrade and then never speaks (a health checker
 doing full WS checks, a half-open connection that died post-upgrade) is
-registered and occupies a slot indefinitely — v0.5.0's ConnectionManager
-has no handshake deadline and the host build configures no WS ping/TCP
-keepalive, so two such peers still wedge the player. That fix (a
+registered and occupies a slot indefinitely — the pinned ConnectionManager
+(still true through v0.6.1 and upstream main) has no handshake deadline and
+the host build configures no WS ping/TCP keepalive, so two such peers still
+wedge the player. That fix (a
 registered-but-no-hello timeout) belongs upstream in ConnectionManager,
 not in this patch.
 
@@ -126,8 +127,11 @@ When bumping `SENDSPIN_CPP_REF`:
    `git ls-remote https://github.com/Sendspin/sendspin-cpp.git refs/tags/vX.Y.Z`
 2. Update `CMakeLists.txt`'s `SENDSPIN_CPP_REF` cache var (keep the friendly
    tag in the inline comment for traceability)
-3. `rm -rf _build/*/sendspin_player/_deps/sendspin-cpp-*` so FetchContent
-   re-populates and re-runs `PATCH_COMMAND`
+3. `rm -rf _build/*/sendspin_player` — the WHOLE build dir per target.
+   The pin itself now propagates into existing caches (`SENDSPIN_CPP_REF`
+   is set with `FORCE`), but a clean dir guarantees FetchContent
+   re-populates and the patch chain applies to a pristine tree rather
+   than one carrying the previous version's patched state
 4. Run `mix compile` — if a patch no longer applies cleanly, regenerate
    it against the new tree (`diff -u <old> <new> > 000N-...patch`) and
    commit. The post-populate marker checks in `CMakeLists.txt` will
