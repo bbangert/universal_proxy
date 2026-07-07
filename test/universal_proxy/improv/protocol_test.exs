@@ -1,7 +1,7 @@
-defmodule UniversalProxy.Bluez.Improv.ProtocolTest do
+defmodule UniversalProxy.Improv.ProtocolTest do
   use ExUnit.Case, async: true
 
-  alias UniversalProxy.Bluez.Improv.Protocol
+  alias UniversalProxy.Improv.Protocol
 
   import Bitwise, only: [band: 2]
 

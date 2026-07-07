@@ -1,8 +1,8 @@
-defmodule UniversalProxy.Bluez.Improv.AdvertTest do
+defmodule UniversalProxy.Improv.AdvertTest do
   use ExUnit.Case, async: true
 
-  alias UniversalProxy.Bluez.Improv.Advert
-  alias UniversalProxy.Bluez.Improv.Protocol
+  alias UniversalProxy.Improv.Advert
+  alias UniversalProxy.Improv.Protocol
   alias Rebus.Message
 
   @adv_iface "org.bluez.LEAdvertisement1"

@@ -10,14 +10,16 @@ defmodule UniversalProxy.BluezTest do
   defp id_of(mod) when is_atom(mod), do: mod
 
   describe "children/1" do
-    test "extra_children slot sits between BlueAlsa and Improv.Supervisor" do
+    test "extra_children append after BlueAlsa, in caller order" do
       # Restart-ordering contract under :rest_for_one — extra children (the
-      # app's audio consumers) restart with the audio path but a fault there
-      # never disturbs the proxy scanning/GATT stack, and Improv always
-      # rebuilds last. A regression here silently changes crash semantics.
+      # app's audio consumers + Improv, appended last by the caller) restart
+      # with the audio path but a fault there never disturbs the proxy
+      # scanning/GATT stack. A regression here silently changes crash
+      # semantics. Mirrors bluez_spec/0's real slot content.
       extra = [
         {Task.Supervisor, name: __MODULE__.ExtraTaskSup},
-        __MODULE__.ExtraChild
+        __MODULE__.ExtraChild,
+        {UniversalProxy.Improv.Supervisor, [pubsub: __MODULE__.PubSub]}
       ]
 
       ids = Bluez.children(extra_children: extra) |> Enum.map(&id_of/1)
@@ -35,19 +37,18 @@ defmodule UniversalProxy.BluezTest do
                # extra_children, in caller order
                Task.Supervisor,
                __MODULE__.ExtraChild,
-               Bluez.Improv.Supervisor
+               UniversalProxy.Improv.Supervisor
              ]
     end
 
-    test "opts thread through to the Client/Gatt/BlueAlsa/Improv children" do
+    test "opts thread through to the Client/Gatt/BlueAlsa children" do
       fan_out = fn _advert -> :ok end
 
       children =
         Bluez.children(
           client: [on_advertisement: fan_out],
           gatt: [on_connections_changed: fan_out],
-          blue_alsa: [pubsub: __MODULE__.PubSub],
-          improv: [pubsub: __MODULE__.PubSub]
+          blue_alsa: [pubsub: __MODULE__.PubSub]
         )
 
       assert {Bluez.Client, [on_advertisement: ^fan_out]} =
@@ -58,9 +59,18 @@ defmodule UniversalProxy.BluezTest do
 
       assert {Bluez.BlueAlsa, [pubsub: __MODULE__.PubSub]} =
                Enum.find(children, &match?({Bluez.BlueAlsa, _}, &1))
+    end
 
-      assert {Bluez.Improv.Supervisor, [pubsub: __MODULE__.PubSub]} =
-               Enum.find(children, &match?({Bluez.Improv.Supervisor, _}, &1))
+    test "bluez_spec/0 mounts the AudioManager pair then Improv LAST in the slot" do
+      assert {UniversalProxy.Bluez, opts} = UniversalProxy.Bluetooth.bluez_spec()
+
+      extra_ids = opts |> Keyword.fetch!(:extra_children) |> Enum.map(&id_of/1)
+
+      assert extra_ids == [
+               Task.Supervisor,
+               UniversalProxy.Bluetooth.AudioManager,
+               UniversalProxy.Improv.Supervisor
+             ]
     end
 
     test "no opts yields the default children with an empty extra slot" do
@@ -75,8 +85,7 @@ defmodule UniversalProxy.BluezTest do
                Task.Supervisor,
                Bluez.Gatt,
                :bluealsad,
-               Bluez.BlueAlsa,
-               Bluez.Improv.Supervisor
+               Bluez.BlueAlsa
              ]
     end
   end

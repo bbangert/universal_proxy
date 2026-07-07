@@ -1,4 +1,4 @@
-defmodule UniversalProxy.Bluez.Improv.Supervisor do
+defmodule UniversalProxy.Improv.Supervisor do
   @moduledoc """
   Supervises the Improv provisioning processes as a `:one_for_all` group.
 
@@ -13,8 +13,11 @@ defmodule UniversalProxy.Bluez.Improv.Supervisor do
   which makes `bluetoothd` auto-unregister the GATT application + advertisement,
   and the manager re-evaluates connectivity from a clean slate.
 
-  Mounted as a single child of `UniversalProxy.Bluez` (last, in `:rest_for_one`
-  order) so a `bluetoothd`/`Client` restart still rebuilds the whole group.
+  Improv is a *consumer* of the Bluez subtree, not part of it: the app mounts
+  this supervisor via the `extra_children:` slot of
+  `UniversalProxy.Bluetooth.bluez_spec/0`, appended LAST so an Improv fault
+  never disturbs the proxy scanning/GATT or audio stacks, while a
+  `bluetoothd`/`Client` restart (`:rest_for_one`) still rebuilds the whole group.
   """
 
   use Supervisor
@@ -25,16 +28,16 @@ defmodule UniversalProxy.Bluez.Improv.Supervisor do
 
   @impl Supervisor
   # `opts` are the Improv manager's opts (`pubsub:`, `network_type:`, …),
-  # threaded through from the parent's `improv:` opt.
+  # passed in this supervisor's child spec (see bluez_spec/0).
   def init(opts) do
     children = [
       # Runs the re-entrant Register{Application,Advertisement} calls off the
       # GenServer loops (they call back into our own handlers).
-      {Task.Supervisor, name: UniversalProxy.Bluez.Improv.TaskSupervisor},
+      {Task.Supervisor, name: UniversalProxy.Improv.TaskSupervisor},
       # Exporters first — the manager registers and drives them on arm.
-      UniversalProxy.Bluez.Improv.GattServer,
-      UniversalProxy.Bluez.Improv.Advert,
-      {UniversalProxy.Bluez.Improv, opts}
+      UniversalProxy.Improv.GattServer,
+      UniversalProxy.Improv.Advert,
+      {UniversalProxy.Improv, opts}
     ]
 
     Supervisor.init(children, strategy: :one_for_all)

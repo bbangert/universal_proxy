@@ -45,7 +45,7 @@ defmodule UniversalProxyWeb.BluetoothLive do
 
   alias UniversalProxy.Bluetooth
   alias UniversalProxy.Bluetooth.AudioManager
-  alias UniversalProxy.Bluez.Improv
+  alias UniversalProxy.Improv
 
   # Discovered-device list refresh cadence while a pairing scan runs.
   # AudioManager pushes only `{:bt_scan, :stopped}`, but `list_headphones/0`

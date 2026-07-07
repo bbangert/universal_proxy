@@ -1,11 +1,11 @@
-defmodule UniversalProxy.Bluez.ImprovTest do
+defmodule UniversalProxy.ImprovTest do
   # async: false — these tests subscribe to and broadcast on the global
   # "bluetooth:improv" PubSub topic (every manager transition broadcasts), so
   # concurrent modules would risk cross-test {:improv_status, _} interference.
   use ExUnit.Case, async: false
 
-  alias UniversalProxy.Bluez.Improv
-  alias UniversalProxy.Bluez.Improv.Protocol
+  alias UniversalProxy.Improv
+  alias UniversalProxy.Improv.Protocol
 
   # Records every cast it receives and forwards it to the test pid tagged, so we
   # can assert the manager's effects on GattServer / Advert.

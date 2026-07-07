@@ -1,7 +1,7 @@
-defmodule UniversalProxy.Bluez.Improv.WifiTest do
+defmodule UniversalProxy.Improv.WifiTest do
   use ExUnit.Case, async: true
 
-  alias UniversalProxy.Bluez.Improv.Wifi
+  alias UniversalProxy.Improv.Wifi
 
   describe "configure_map/2" do
     test "WPA-PSK network when a password is given" do

@@ -1,8 +1,8 @@
-defmodule UniversalProxy.Bluez.Improv.GattServerTest do
+defmodule UniversalProxy.Improv.GattServerTest do
   use ExUnit.Case, async: true
 
-  alias UniversalProxy.Bluez.Improv.GattServer
-  alias UniversalProxy.Bluez.Improv.Protocol
+  alias UniversalProxy.Improv.GattServer
+  alias UniversalProxy.Improv.Protocol
   alias Rebus.Message
 
   @service_iface "org.bluez.GattService1"

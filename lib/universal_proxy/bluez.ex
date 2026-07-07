@@ -95,13 +95,13 @@ defmodule UniversalProxy.Bluez do
       (`on_gatt_event:`, `on_connections_changed:`).
     * `blue_alsa:` — keyword opts for `#{inspect(__MODULE__)}.BlueAlsa`
       (`pubsub:`).
-    * `improv:` — keyword opts threaded through
-      `#{inspect(__MODULE__)}.Improv.Supervisor` to the Improv manager
-      (`pubsub:`, `network_type:`).
-    * `extra_children:` — host-supplied child specs, inserted after
-      `BlueAlsa` and before `Improv.Supervisor` (the audio-consumer slot:
-      they restart with the audio path under `:rest_for_one`, and a fault
-      there never disturbs the proxy scanning/GATT stack above them).
+    * `extra_children:` — host-supplied child specs, appended after
+      `BlueAlsa` at the end of the tree. Under `:rest_for_one` they restart
+      with the audio path, and a fault there never disturbs the proxy
+      scanning/GATT stack above them. Ordering within the slot is the
+      caller's contract (the app mounts its AudioManager pair first, then
+      `UniversalProxy.Improv.Supervisor` last — see
+      `UniversalProxy.Bluetooth.bluez_spec/0`).
   """
   @spec children(keyword()) :: [Supervisor.child_spec() | {module(), term()} | module()]
   def children(opts) do
@@ -201,18 +201,7 @@ defmodule UniversalProxy.Bluez do
       # bluealsad being down. After the scanning/GATT clients: a crash here must
       # not restart the proxy scanning stack — audio is secondary to the BT proxy.
       {__MODULE__.BlueAlsa, Keyword.get(opts, :blue_alsa, [])}
-    ] ++
-      Keyword.get(opts, :extra_children, []) ++
-      [
-        # Improv-over-BLE Wi-Fi provisioning. Its own :one_for_all sub-supervisor
-        # (GattServer + Advert + manager + Task.Supervisor) so the mutually-dependent
-        # processes restart as a unit — a manager crash can't leave the cleartext
-        # GATT app/advert exported without the session timers/disarm logic (see
-        # Improv.Supervisor). Placed LAST here so an Improv fault never disturbs the
-        # proxy scanning/GATT or audio stacks, while a bluetoothd/Client restart
-        # (earlier, :rest_for_one) still rebuilds the whole group.
-        {UniversalProxy.Bluez.Improv.Supervisor, Keyword.get(opts, :improv, [])}
-      ]
+    ] ++ Keyword.get(opts, :extra_children, [])
   end
 
   @doc """
