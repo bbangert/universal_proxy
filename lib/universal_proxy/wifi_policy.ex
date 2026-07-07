@@ -108,6 +108,9 @@ defmodule UniversalProxy.WifiPolicy do
       deconfigure_fn: Keyword.get(opts, :deconfigure_fn, &vintage_deconfigure/2)
     }
 
+    # VintageNet is target-only and (being optional) may not be started in
+    # order — mirror Audio.MdnsAnnouncer and ensure it's up before first use.
+    if Code.ensure_loaded?(VintageNet), do: Application.ensure_all_started(:vintage_net)
     if state.subscribe?, do: vintage_subscribe(@connection_topic)
     {:ok, state, {:continue, :evaluate}}
   end
