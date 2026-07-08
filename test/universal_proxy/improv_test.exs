@@ -270,6 +270,75 @@ defmodule UniversalProxy.ImprovTest do
       assert %{state: :provisioning} = Improv.status(mgr)
     end
 
+    test "identify runs the identify_fun off-loop with no RPC result" do
+      test = self()
+
+      %{mgr: mgr} =
+        start_manager(
+          network_type: offline(),
+          identify_fun: fn -> send(test, :identified) end
+        )
+
+      assert_receive {:gatt, :register}
+
+      frame = <<0x02, 0x00, Protocol.checksum(<<0x02, 0x00>>)>>
+      send(mgr, {:improv_rpc_command, frame})
+
+      assert_receive :identified
+      # No RPC result and no error (per spec identify has no reply).
+      refute_receive {:gatt, {:notify, :rpc_result, _}}, 100
+      refute_receive {:gatt, {:notify, :error_state, _}}, 10
+      assert %{state: :advertising, error: nil} = Improv.status(mgr)
+    end
+
+    test "identify without an identify_fun rejects as unknown command" do
+      %{mgr: mgr} = start_manager(network_type: offline())
+      assert_receive {:gatt, :register}
+
+      frame = <<0x02, 0x00, Protocol.checksum(<<0x02, 0x00>>)>>
+      send(mgr, {:improv_rpc_command, frame})
+
+      assert_receive {:gatt, {:notify, :error_state, <<0x02>>}}
+    end
+
+    test "device-info notifies one RPC result with the four configured strings" do
+      %{mgr: mgr} =
+        start_manager(
+          network_type: offline(),
+          device_info: [
+            firmware_name: "Universal Proxy",
+            firmware_version: "1.2.3",
+            hardware: "Raspberry Pi 3 Model B Plus",
+            device_name: "Universal Proxy 507f"
+          ]
+        )
+
+      assert_receive {:gatt, :register}
+
+      frame = <<0x03, 0x00, Protocol.checksum(<<0x03, 0x00>>)>>
+      send(mgr, {:improv_rpc_command, frame})
+
+      expected =
+        Protocol.encode_rpc_result(0x03, [
+          "Universal Proxy",
+          "1.2.3",
+          "Raspberry Pi 3 Model B Plus",
+          "Universal Proxy 507f"
+        ])
+
+      assert_receive {:gatt, {:notify, :rpc_result, ^expected}}
+    end
+
+    test "device-info without configured strings rejects as unknown command" do
+      %{mgr: mgr} = start_manager(network_type: offline())
+      assert_receive {:gatt, :register}
+
+      frame = <<0x03, 0x00, Protocol.checksum(<<0x03, 0x00>>)>>
+      send(mgr, {:improv_rpc_command, frame})
+
+      assert_receive {:gatt, {:notify, :error_state, <<0x02>>}}
+    end
+
     test "a custom ifname: drives the connectivity match and every wifi call" do
       Process.register(self(), :improv_echo_test)
       %{mgr: mgr} = start_manager(network_type: offline(), wifi: EchoWifi, ifname: "wlan1")

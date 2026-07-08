@@ -233,7 +233,7 @@ defmodule UniversalProxy.Improv.GattServer do
           conn_ref: conn_ref,
           manager: Keyword.get(opts, :manager, UniversalProxy.Improv),
           task_sup: Keyword.get(opts, :task_supervisor, UniversalProxy.Improv.TaskSupervisor),
-          values: initial_values(),
+          values: initial_values(Keyword.get(opts, :capabilities, Protocol.capabilities())),
           notifying: MapSet.new(),
           registered?: false
         }
@@ -253,13 +253,16 @@ defmodule UniversalProxy.Improv.GattServer do
     end
   end
 
-  defp initial_values do
-    # Always advertise AUTHORIZED, no error, scan-capable — the manager updates
-    # current-state/error via notify/3 as it progresses.
+  defp initial_values(capabilities) do
+    # Always advertise AUTHORIZED, no error — the manager updates
+    # current-state/error via notify/3 as it progresses. The capabilities
+    # byte is derived once by the supervisor (`:capabilities` opt) so it
+    # matches the advertisement's ServiceData; the bare default is
+    # scan-only (identify/device-info unconfigured).
     %{
       current_state: Protocol.encode_state(:authorized),
       error_state: Protocol.encode_error(:none),
-      capabilities: Protocol.capabilities()
+      capabilities: capabilities
     }
   end
 

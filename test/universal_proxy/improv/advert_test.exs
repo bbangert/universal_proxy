@@ -45,8 +45,8 @@ defmodule UniversalProxy.Improv.AdvertTest do
     send(server, {:dbus_call, %{msg | serial: 1}})
   end
 
-  describe "advertisement_props/1 (pure)" do
-    test "carries Type, ServiceUUIDs, LocalName, Discoverable — and NO ServiceData" do
+  describe "advertisement_props/2 (pure)" do
+    test "carries Type, ServiceUUIDs, ServiceData, LocalName, Discoverable" do
       props = Advert.advertisement_props("Living Room")
 
       assert {"Type", {"s", "peripheral"}} in props
@@ -54,8 +54,18 @@ defmodule UniversalProxy.Improv.AdvertTest do
       assert {"LocalName", {"s", "Living Room"}} in props
       assert {"Discoverable", {"b", true}} in props
 
-      # ServiceData is intentionally omitted (31-byte legacy-AD limit on BT 4.x).
-      assert List.keyfind(props, "ServiceData", 0) == nil
+      # The spec's 6-byte payload keyed by the 16-bit UUID: state frozen at
+      # AUTHORIZED (0x02), default capabilities scan-only (0x04), 4 reserved.
+      assert List.keyfind(props, "ServiceData", 0) ==
+               {"ServiceData", {"a{sv}", [{"4677", {"ay", [0x02, 0x04, 0, 0, 0, 0]}}]}}
+    end
+
+    test "ServiceData carries the derived capabilities byte" do
+      caps = Protocol.capabilities(identify?: true, device_info?: true)
+      props = Advert.advertisement_props("Living Room", caps)
+
+      assert {"ServiceData", {"a{sv}", [{"4677", {"ay", [0x02, 0x07, 0, 0, 0, 0]}}]}} =
+               List.keyfind(props, "ServiceData", 0)
     end
   end
 
@@ -140,7 +150,7 @@ defmodule UniversalProxy.Improv.AdvertTest do
       assert xml =~ @adv_iface
     end
 
-    test "set_state is a no-op (state isn't advertised) and never emits or crashes" do
+    test "set_state is a no-op (ServiceData is static) and never emits or crashes" do
       %{server: server} = start_advert()
       Advert.set_state(server, :provisioning)
       Advert.set_state(server, :bogus)
@@ -148,10 +158,14 @@ defmodule UniversalProxy.Improv.AdvertTest do
       # No PropertiesChanged signal is emitted...
       refute_receive {:sent, %Message{type: :signal}}, 100
 
-      # ...and the server is still alive and answering, with no ServiceData.
+      # ...and the server is still alive and answering, ServiceData still
+      # frozen at AUTHORIZED (0x02) — registration-time static.
       call_in(server, @props_iface, "GetAll", [@adv_iface], "s")
       assert_receive {:sent, %Message{type: :method_return, body: [props]}}
-      assert List.keyfind(props, "ServiceData", 0) == nil
+
+      assert {"ServiceData", {"a{sv}", [{"4677", {"ay", [0x02 | _]}}]}} =
+               List.keyfind(props, "ServiceData", 0)
+
       assert {"Type", {"s", "peripheral"}} in props
     end
 

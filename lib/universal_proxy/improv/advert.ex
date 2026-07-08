@@ -13,17 +13,27 @@ defmodule UniversalProxy.Improv.Advert do
 
     * `Type` = `"peripheral"` (connectable),
     * `ServiceUUIDs` = `[improv service uuid]` (128-bit),
+    * `ServiceData` = the spec's 6-byte payload keyed by the 16-bit `"4677"`
+      UUID (see below),
     * `LocalName` = the device name (falls to the scan-response packet),
     * `Discoverable` = true.
 
-  We deliberately do NOT advertise `ServiceData` (current-state + capabilities).
-  The 128-bit service UUID already consumes 18 of the 31-byte legacy-advertising
-  budget, and the rpi3 controller (BCM4345C0, BT 4.x) has no LE Extended
-  Advertising — including the ~24-byte service-data made `bluetoothd` reject the
-  advert with "Invalid Parameters" (HW-found on rpi3). The provisioner reads
-  current-state and capabilities from the GATT characteristics after connecting
-  (improv-wifi.com and the HA app both do this), so nothing is lost. `set_state/2`
-  is therefore a no-op, kept only so the manager's transitions stay uniform.
+  ## ServiceData and the 31-byte legacy-advertising budget
+
+  The 128-bit service UUID consumes 18 of the 31-byte legacy budget, and the
+  rpi3 controller (BCM4345C0, BT 4.x) has no LE Extended Advertising. A June
+  2026 attempt keyed ServiceData by the **128-bit** UUID (~24-byte AD) made
+  `bluetoothd` reject the advert with "Invalid Parameters" (HW-found on rpi3).
+  The spec's form — 6-byte payload `[state, capabilities, 0 ×4]` keyed by the
+  **16-bit** `"4677"` UUID — totals exactly 31 bytes alongside Flags + the
+  128-bit ServiceUUIDs, so it fits. It is **static at registration** (state
+  frozen at `:authorized`): BlueZ reads LEAdvertisement1 properties once at
+  RegisterAdvertisement, dynamic updates would need re-registration churn,
+  and legacy controllers stop advertising while a client is connected — which
+  is when all post-`:authorized` states occur. Clients read live state and
+  capabilities from the GATT characteristics after connecting (improv-wifi.com
+  and the HA app both do), so nothing is lost. `set_state/2` is therefore a
+  no-op, kept only so the manager's transitions stay uniform.
   """
 
   use GenServer
@@ -73,23 +83,30 @@ defmodule UniversalProxy.Improv.Advert do
   @doc """
   Build the `LEAdvertisement1` property list. Pure.
 
-  We advertise ONLY the 128-bit Improv service UUID (+ peripheral/discoverable);
-  `LocalName` falls to the scan-response packet. We do NOT advertise `ServiceData`
-  (current-state/capabilities): the 128-bit UUID is already 18 bytes of the
-  31-byte legacy-advertising budget, and the rpi3's BCM4345C0 is BT 4.x with no
-  LE Extended Advertising — adding 24+ bytes of service-data made bluetoothd
-  reject the advert ("Invalid Parameters", HW-found). Clients read current-state
-  and capabilities from the characteristics after connecting (improv-wifi.com and
-  the HA app both do this), so nothing is lost.
+  `ServiceData` carries the spec's 6-byte payload `[current_state,
+  capabilities, 0 ×4]` keyed by the 16-bit `"4677"` UUID — the only form that
+  fits the 31-byte legacy budget next to the 128-bit ServiceUUIDs (see the
+  moduledoc for the June 128-bit-keyed rejection). The state byte is frozen
+  at `:authorized`; `capabilities` MUST be the same derived byte the GATT
+  capabilities characteristic serves (the supervisor derives it once).
+  `LocalName` falls to the scan-response packet.
   """
-  @spec advertisement_props(String.t()) :: list()
-  def advertisement_props(local_name) do
+  @spec advertisement_props(String.t(), binary()) :: list()
+  def advertisement_props(local_name, capabilities \\ Protocol.capabilities()) do
     [
       {"Type", {"s", "peripheral"}},
       {"ServiceUUIDs", {"as", [Protocol.service_uuid()]}},
+      {"ServiceData", {"a{sv}", [{"4677", {"ay", service_data(capabilities)}}]}},
       {"LocalName", {"s", local_name}},
       {"Discoverable", {"b", true}}
     ]
+  end
+
+  # The spec's 6-byte ServiceData payload: [state, capabilities, reserved ×4],
+  # static at registration (we always advertise AUTHORIZED — see set_state/2).
+  defp service_data(<<caps>>) do
+    <<state>> = Protocol.encode_state(:authorized)
+    [state, caps, 0, 0, 0, 0]
   end
 
   @doc "Introspection XML for the advertisement object. Pure."
@@ -116,6 +133,9 @@ defmodule UniversalProxy.Improv.Advert do
             Keyword.get_lazy(opts, :local_name, fn ->
               default_local_name(Keyword.get(opts, :name_prefix, "Improv"))
             end),
+          # Derived once by the supervisor so it matches the GATT
+          # capabilities characteristic.
+          capabilities: Keyword.get(opts, :capabilities, Protocol.capabilities()),
           task_sup: Keyword.get(opts, :task_supervisor, UniversalProxy.Improv.TaskSupervisor),
           registered?: false
         }
@@ -145,7 +165,14 @@ defmodule UniversalProxy.Improv.Advert do
   # calling it in the host test VM triggers an uncatchable reboot/shutdown.)
   defp default_local_name(prefix), do: "#{prefix} #{device_suffix()}"
 
-  defp device_suffix, do: mac_suffix() || hostname_suffix()
+  @doc """
+  The short device-unique suffix used in the default local name: last 4 hex
+  of the device MAC, falling back to the hostname tail. Public so hosts can
+  build other device-facing strings (e.g. Device Info's device name) that
+  match the advertised BLE name.
+  """
+  @spec device_suffix() :: String.t()
+  def device_suffix, do: mac_suffix() || hostname_suffix()
 
   defp mac_suffix do
     if Code.ensure_loaded?(VintageNet) do
@@ -415,5 +442,5 @@ defmodule UniversalProxy.Improv.Advert do
     end
   end
 
-  defp props(state), do: advertisement_props(state.local_name)
+  defp props(state), do: advertisement_props(state.local_name, state.capabilities)
 end

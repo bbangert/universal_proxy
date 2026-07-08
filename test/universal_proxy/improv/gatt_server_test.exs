@@ -30,9 +30,9 @@ defmodule UniversalProxy.Improv.GattServerTest do
     def handle_call({:set_method_handler, _h}, _from, test_pid), do: {:reply, :ok, test_pid}
   end
 
-  defp start_server do
+  defp start_server(opts \\ []) do
     {:ok, conn} = StubConn.start_link(self())
-    {:ok, server} = GattServer.start_link(name: nil, conn: conn, manager: self())
+    {:ok, server} = GattServer.start_link([name: nil, conn: conn, manager: self()] ++ opts)
     %{conn: conn, server: server}
   end
 
@@ -163,12 +163,34 @@ defmodule UniversalProxy.Improv.GattServerTest do
                       }}
     end
 
-    test "ReadValue on capabilities returns 0x04" do
+    test "ReadValue on capabilities returns scan-only 0x04 by default" do
       %{server: server} = start_server()
       cap = char(:capabilities)
       call_in(server, cap.path, @char_iface, "ReadValue", [[]], "a{sv}")
 
       assert_receive {:sent, %Message{type: :method_return, body: [[0x04]]}}
+    end
+
+    test "ReadValue on capabilities returns the injected derived byte (0x07 full config)" do
+      caps = Protocol.capabilities(identify?: true, device_info?: true)
+      %{server: server} = start_server(capabilities: caps)
+      cap = char(:capabilities)
+      call_in(server, cap.path, @char_iface, "ReadValue", [[]], "a{sv}")
+
+      assert_receive {:sent, %Message{type: :method_return, body: [[0x07]]}}
+    end
+
+    test "WriteValue forwards identify (0x02) and device-info (0x03) frames" do
+      %{server: server} = start_server()
+      cmd = char(:rpc_command)
+
+      call_in(server, cmd.path, @char_iface, "WriteValue", [[0x02, 0x00, 0x02], []], "aya{sv}")
+      assert_receive {:improv_rpc_command, <<0x02, 0x00, 0x02>>}
+      assert_receive {:sent, %Message{type: :method_return}}
+
+      call_in(server, cmd.path, @char_iface, "WriteValue", [[0x03, 0x00, 0x03], []], "aya{sv}")
+      assert_receive {:improv_rpc_command, <<0x03, 0x00, 0x03>>}
+      assert_receive {:sent, %Message{type: :method_return}}
     end
 
     test "WriteValue on rpc-command forwards bytes + activity to the manager and acks" do

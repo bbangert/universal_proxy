@@ -34,18 +34,27 @@ defmodule UniversalProxy.Improv.Supervisor do
 
   @impl Supervisor
   # `opts` are the Improv manager's opts (`pubsub:`, `network_type:`,
-  # `ifname:`, …) plus the advert branding (`name_prefix:` / `local_name:`),
-  # passed in this supervisor's child spec (see bluez_spec/0).
+  # `ifname:`, `identify_fun:`, `device_info:`, …) plus the advert branding
+  # (`name_prefix:` / `local_name:`), passed in this supervisor's child spec
+  # (see bluez_spec/0).
   def init(opts) do
     {advert_opts, manager_opts} = Keyword.split(opts, [:local_name, :name_prefix])
+
+    # Derived ONCE so the GATT capabilities characteristic and the
+    # advertisement's ServiceData byte can never disagree.
+    capabilities =
+      UniversalProxy.Improv.Protocol.capabilities(
+        identify?: Keyword.get(opts, :identify_fun) != nil,
+        device_info?: Keyword.get(opts, :device_info) != nil
+      )
 
     children = [
       # Runs the re-entrant Register{Application,Advertisement} calls off the
       # GenServer loops (they call back into our own handlers).
       {Task.Supervisor, name: UniversalProxy.Improv.TaskSupervisor},
       # Exporters first — the manager registers and drives them on arm.
-      UniversalProxy.Improv.GattServer,
-      {UniversalProxy.Improv.Advert, advert_opts},
+      {UniversalProxy.Improv.GattServer, capabilities: capabilities},
+      {UniversalProxy.Improv.Advert, [capabilities: capabilities] ++ advert_opts},
       {UniversalProxy.Improv, manager_opts}
     ]
 

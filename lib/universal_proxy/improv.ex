@@ -111,12 +111,14 @@ defmodule UniversalProxy.Improv do
     * `{:reject, error_atom}` for an invalid submit / decode failure.
   """
   @spec command_action(Protocol.command() | Protocol.decode_error()) ::
-          {:submit, binary(), binary()} | :scan | {:reject, atom()}
+          {:submit, binary(), binary()} | :scan | :identify | :device_info | {:reject, atom()}
   def command_action({:submit_wifi, ssid, pwd}) do
     if valid_ssid?(ssid), do: {:submit, ssid, pwd}, else: {:reject, :invalid_rpc}
   end
 
   def command_action({:request_wifi_networks}), do: :scan
+  def command_action({:identify}), do: :identify
+  def command_action({:device_info}), do: :device_info
   def command_action({:error, :unknown_command}), do: {:reject, :unknown_command}
   def command_action({:error, _}), do: {:reject, :invalid_rpc}
 
@@ -139,6 +141,13 @@ defmodule UniversalProxy.Improv do
       network_type: Keyword.get(opts, :network_type),
       # Phoenix.PubSub for {:improv_status, _} broadcasts; nil = no-op.
       pubsub: Keyword.get(opts, :pubsub),
+      # Identify (0x02) callback — something physically observable (blink an
+      # LED, …), run fire-and-forget off the loop. nil (default) = the command
+      # is unsupported and its capability bit stays off.
+      identify_fun: Keyword.get(opts, :identify_fun),
+      # Device Info (0x03) static strings, normalized to wire order at init.
+      # nil (default) = unsupported, capability bit off.
+      device_info: device_info_strings(Keyword.get(opts, :device_info)),
       scanner: Keyword.get(opts, :scanner, Bluez.Client),
       task_sup: Keyword.get(opts, :task_supervisor, UniversalProxy.Improv.TaskSupervisor),
       timeout_ms: Keyword.get(opts, :timeout_ms, @session_timeout_ms),
@@ -261,8 +270,44 @@ defmodule UniversalProxy.Improv do
     case command_action(Protocol.decode_command(bytes)) do
       {:submit, ssid, pwd} -> submit_wifi(ssid, pwd, state)
       :scan -> request_networks(state)
+      :identify -> run_identify(state)
+      :device_info -> send_device_info(state)
       {:reject, error} -> push_error(state, error)
     end
+  end
+
+  # Identify: fire-and-forget via the Task.Supervisor, NO RPC result (per
+  # spec). Unconfigured hosts advertise the capability bit off, so a compliant
+  # client never sends it — reject like an unknown command if one does anyway.
+  defp run_identify(%{identify_fun: nil} = state), do: push_error(state, :unknown_command)
+
+  defp run_identify(%{identify_fun: fun} = state) do
+    run_task(state, fun)
+    state
+  end
+
+  defp send_device_info(%{device_info: nil} = state), do: push_error(state, :unknown_command)
+
+  defp send_device_info(state) do
+    notify_result(
+      state,
+      Protocol.encode_rpc_result(Protocol.device_info_command(), state.device_info)
+    )
+
+    state
+  end
+
+  # Wire order per the Improv spec: firmware name, firmware version, hardware
+  # variant, device name.
+  defp device_info_strings(nil), do: nil
+
+  defp device_info_strings(info) do
+    [
+      Keyword.fetch!(info, :firmware_name),
+      Keyword.fetch!(info, :firmware_version),
+      Keyword.fetch!(info, :hardware),
+      Keyword.fetch!(info, :device_name)
+    ]
   end
 
   defp submit_wifi(ssid, pwd, state) do
