@@ -128,13 +128,69 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
     test "claimed_port reports the open tty and subscription state", %{server: server} do
       attach_fake_uart(server)
 
-      assert ZWaveProxy.claimed_port(server) == %{tty_name: "ttyFake", subscribed: false}
+      base = %{tty_name: "ttyFake", display_name: "ttyFake", subscribed: false}
+      assert ZWaveProxy.claimed_port(server) == base
 
       {:ok, _} = ZWaveProxy.subscribe(server, self())
-      assert ZWaveProxy.claimed_port(server) == %{tty_name: "ttyFake", subscribed: true}
+      assert ZWaveProxy.claimed_port(server) == %{base | subscribed: true}
 
       :ok = ZWaveProxy.unsubscribe(server, self())
-      assert ZWaveProxy.claimed_port(server) == %{tty_name: "ttyFake", subscribed: false}
+      assert ZWaveProxy.claimed_port(server) == base
+    end
+
+    test "claimed_port prefers the resolver-supplied display name", %{server: server} do
+      attach_fake_uart(server, %{display_name: "ZWA-2 (1-1.1)"})
+
+      assert ZWaveProxy.claimed_port(server) == %{
+               tty_name: "ttyFake",
+               display_name: "ZWA-2 (1-1.1)",
+               subscribed: false
+             }
+    end
+  end
+
+  describe "History pipeline broadcasts (fake UART)" do
+    test "rx chunks, local ACKs, and client writes broadcast as :uart_data", %{server: server} do
+      display = "zw-hist-#{System.unique_integer([:positive])}"
+      attach_fake_uart(server, %{display_name: display})
+      Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "uart:#{display}")
+
+      frame = network_ids_response()
+      send(server, {:circuits_uart, "ttyFake", frame})
+
+      assert_receive {:uart_data, %{name: ^display, dir: :rx, data: ^frame}}
+      # The locally written ACK is mirrored as TX.
+      assert_receive {:uart_data, %{name: ^display, dir: :tx, data: <<0x06>>}}
+
+      # A client-originated frame write is mirrored too (0x15 is not the
+      # last local response, so it is not dedup-suppressed).
+      assert :ok = ZWaveProxy.send_frame(server, <<0x15>>)
+      assert_receive {:uart_data, %{name: ^display, dir: :tx, data: <<0x15>>}}
+    end
+
+    test "dedup-suppressed client frames are not broadcast", %{server: server} do
+      display = "zw-hist-#{System.unique_integer([:positive])}"
+
+      attach_fake_uart(server, %{
+        display_name: display,
+        parser: %{Parser.new() | last_response: 0x06}
+      })
+
+      Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "uart:#{display}")
+
+      assert :ok = ZWaveProxy.send_frame(server, <<0x06>>)
+      refute_receive {:uart_data, _}, 50
+    end
+
+    test "UART error broadcasts :uart_port_closed", %{server: server} do
+      display = "zw-hist-#{System.unique_integer([:positive])}"
+      attach_fake_uart(server, %{display_name: display})
+      Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "uart:port_closed")
+
+      send(server, {:circuits_uart, "ttyFake", {:error, :eio}})
+
+      assert_receive {:uart_port_closed, %{friendly_name: ^display}}
+      refute ZWaveProxy.available?(server)
     end
   end
 

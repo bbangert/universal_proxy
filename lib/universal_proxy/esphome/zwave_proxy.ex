@@ -27,6 +27,13 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
   - Only one connection may subscribe at a time (Z-Wave Serial API is
     single-master). The subscriber is monitored and auto-unsubscribed
     on crash.
+  - All UART traffic is re-broadcast on the same PubSub topics
+    `UART.Server` uses (`uart:port_opened`/`uart:port_closed` and
+    `uart:<display_name>` `:uart_data` messages), so `UART.History`
+    feeds the Overview throughput sparkline, the packets/min pill, and
+    the Traffic tab for this port exactly like any proxied serial port.
+    The display name comes from the resolver (the port's `ha_name`) so
+    it matches the key the Overview subscribes with.
   """
 
   use GenServer
@@ -56,9 +63,12 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
 
   @zero_home_id <<0, 0, 0, 0>>
 
+  @pubsub UniversalProxy.PubSub
+
   defstruct [
     :uart_pid,
     :port_path,
+    :display_name,
     :resolver,
     :subscriber,
     :monitor_ref,
@@ -158,6 +168,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
     state = %__MODULE__{
       parser: Parser.new(),
       port_path: Keyword.get(opts, :port_path),
+      display_name: Keyword.get(opts, :display_name),
       resolver: Keyword.get(opts, :resolver)
     }
 
@@ -219,7 +230,11 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
   def handle_call(:claimed_port, _from, state) do
     reply =
       if state.uart_pid && state.port_path do
-        %{tty_name: Path.basename(state.port_path), subscribed: state.subscriber != nil}
+        %{
+          tty_name: Path.basename(state.port_path),
+          display_name: state.display_name || Path.basename(state.port_path),
+          subscribed: state.subscriber != nil
+        }
       end
 
     {:reply, reply, state}
@@ -240,7 +255,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
       # misattribute to the next frame in flight (ESPHome parity).
       {:reply, :ok, state}
     else
-      {:reply, Circuits.UART.write(state.uart_pid, data), state}
+      {:reply, uart_write(state, data), state}
     end
   end
 
@@ -248,6 +263,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
   def handle_info({:circuits_uart, _port, {:error, reason}}, state) do
     Logger.warning("Z-Wave UART error: #{inspect(reason)}")
     cleanup_uart(state.uart_pid)
+    broadcast_lifecycle(state, "uart:port_closed", :uart_port_closed)
 
     state =
       %{state | uart_pid: nil, parser: Parser.new(), home_id_ready: false, query_retries: 0}
@@ -258,6 +274,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
   end
 
   def handle_info({:circuits_uart, _port, data}, state) when is_binary(data) do
+    broadcast_data(state, data, :rx)
     {parser, actions} = Parser.feed(state.parser, data)
     state = %{state | parser: parser}
     state = execute_actions(state, actions)
@@ -304,6 +321,10 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
 
   @impl GenServer
   def terminate(_reason, state) do
+    if state.uart_pid do
+      broadcast_lifecycle(state, "uart:port_closed", :uart_port_closed)
+    end
+
     cleanup_uart(state.uart_pid)
     :ok
   end
@@ -327,30 +348,33 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
   # back on a different tty) and open the port. On any failure, arm the
   # reopen timer so the next attempt happens without external prodding.
   defp attempt_open(state) do
-    case resolve_path(state) do
+    case resolve_port(state) do
       nil ->
         schedule_reopen(state)
 
-      port_path ->
+      {port_path, display_name} ->
         case open_port(port_path) do
           {:ok, uart_pid} ->
             Logger.info("Z-Wave proxy started on #{port_path}")
 
-            # port_path is updated to the path that actually opened — a
-            # resolver-discovered stick would otherwise leave it nil (or
-            # stale after a replug onto a different tty), and
-            # claimed_port/1 reports it to the Overview.
-            %{
+            # port_path/display_name update to what actually opened — a
+            # resolver-discovered stick would otherwise leave them nil
+            # (or stale after a replug onto a different tty), and
+            # claimed_port/1 reports them to the Overview and History.
+            state = %{
               state
               | uart_pid: uart_pid,
                 port_path: port_path,
+                display_name: display_name,
                 parser: Parser.new(),
                 home_id_ready: false,
                 query_retries: 0,
                 last_open_error: nil
             }
-            |> tap(&request_home_id/1)
-            |> schedule_home_id_retry()
+
+            broadcast_lifecycle(state, "uart:port_opened", :uart_port_opened)
+            request_home_id(state)
+            schedule_home_id_retry(state)
 
           {:error, reason} ->
             # First (or changed) failure logs at warning; identical
@@ -362,8 +386,24 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
     end
   end
 
-  defp resolve_path(%{resolver: resolver, port_path: port_path}) do
-    (resolver && resolver.()) || port_path
+  # Returns `{open_target, display_name}` or nil. The resolver hands back
+  # `%{path: ..., display_name: ...}` (the port's Overview `ha_name`, so
+  # History throughput lands under the key the UI subscribes with); a
+  # bare-string `port_path` (tests, manual wiring) falls back to its
+  # basename as the display name.
+  defp resolve_port(state) do
+    case state.resolver && state.resolver.() do
+      %{path: path, display_name: display} ->
+        {path, display}
+
+      path when is_binary(path) ->
+        {path, Path.basename(path)}
+
+      nil ->
+        if state.port_path do
+          {state.port_path, state.display_name || Path.basename(state.port_path)}
+        end
+    end
   end
 
   # Nothing to reopen when no port was ever configured and there's no
@@ -407,11 +447,41 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
     end
   end
 
-  defp request_home_id(%{uart_pid: pid}) when pid != nil do
-    Circuits.UART.write(pid, Frame.get_network_ids_command())
+  defp request_home_id(%{uart_pid: pid} = state) when pid != nil do
+    uart_write(state, Frame.get_network_ids_command())
   end
 
   defp request_home_id(_state), do: :ok
+
+  # All outbound bytes flow through here so every write is mirrored as a
+  # `:tx` broadcast for the History throughput/traffic pipeline.
+  defp uart_write(state, data) do
+    result = Circuits.UART.write(state.uart_pid, data)
+    if result == :ok, do: broadcast_data(state, data, :tx)
+    result
+  end
+
+  # Mirror UART.Server's PubSub message shapes exactly — History and the
+  # LiveViews consume both sources through one code path.
+  defp broadcast_data(%{display_name: nil}, _data, _dir), do: :ok
+
+  defp broadcast_data(%{display_name: name}, data, dir) do
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "uart:#{name}",
+      {:uart_data, %{name: name, data: data, timestamp: DateTime.utc_now(), dir: dir}}
+    )
+  end
+
+  defp broadcast_lifecycle(%{display_name: nil}, _topic, _event), do: :ok
+
+  defp broadcast_lifecycle(state, topic, event) do
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      topic,
+      {event, %{path: state.port_path, friendly_name: state.display_name}}
+    )
+  end
 
   defp execute_actions(state, actions) do
     Enum.reduce(actions, state, &execute_action(&2, &1))
@@ -419,7 +489,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
 
   defp execute_action(state, {:send_response, byte}) do
     if state.uart_pid do
-      Circuits.UART.write(state.uart_pid, <<byte>>)
+      uart_write(state, <<byte>>)
     end
 
     state

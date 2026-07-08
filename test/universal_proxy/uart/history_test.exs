@@ -148,6 +148,55 @@ defmodule UniversalProxy.UART.HistoryTest do
     assert [%{data: "before-close"}] = History.subscribe_and_snapshot(server)
   end
 
+  test "eviction spares a port claimed by the Z-Wave proxy" do
+    name = :"history_#{System.unique_integer([:positive])}"
+    claimed = "ZWA-2 (1-1.1) #{System.unique_integer([:positive])}"
+
+    {:ok, _pid} =
+      History.start_link(
+        name: name,
+        auto_tick: false,
+        zwave_claim: fn -> %{tty_name: "ttyACM0", display_name: claimed, subscribed: true} end
+      )
+
+    publish_open(claimed)
+    drain(name)
+    publish(claimed, "zw-frame", :rx)
+    drain(name)
+
+    # Fire the delayed eviction directly (the 5-minute grace timer is
+    # not test-friendly). The claim must veto it: the Z-Wave port never
+    # appears in UART.named_ports/0, so without the claim check this
+    # would evict — and unsubscribe — a live port.
+    send(name, {:evict_port, claimed})
+    drain(name)
+
+    assert [%{data: "zw-frame"}] = History.subscribe_and_snapshot(name)
+
+    # Frames published after the attempted eviction still arrive (the
+    # PubSub subscription survived).
+    publish(claimed, "still-alive", :rx)
+    drain(name)
+    assert [_a, %{data: "still-alive"}] = History.subscribe_and_snapshot(name)
+  end
+
+  test "eviction proceeds when the Z-Wave proxy holds no (or another) port" do
+    name = :"history_#{System.unique_integer([:positive])}"
+    port = "gone-port #{System.unique_integer([:positive])}"
+
+    {:ok, _pid} = History.start_link(name: name, auto_tick: false, zwave_claim: fn -> nil end)
+
+    publish_open(port)
+    drain(name)
+    publish(port, "old-frame", :rx)
+    drain(name)
+
+    send(name, {:evict_port, port})
+    drain(name)
+
+    assert [] == History.subscribe_and_snapshot(name)
+  end
+
   test "subscriber is dropped when its process dies", %{server: server, pid: history_pid} do
     name = "port-#{System.unique_integer([:positive])}"
     publish_open(name)

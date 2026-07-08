@@ -65,7 +65,18 @@ defmodule UniversalProxy.UART.History do
   def start_link(opts \\ []) do
     name = Keyword.get(opts, :name, __MODULE__)
     auto_tick? = Keyword.get(opts, :auto_tick, true)
-    GenServer.start_link(__MODULE__, %{auto_tick?: auto_tick?}, name: name)
+
+    # The Z-Wave proxy broadcasts on the same topics as UART.Server but
+    # its port never appears in `UART.named_ports/0` — the eviction
+    # check consults this claim so a live Z-Wave port isn't evicted
+    # (and unsubscribed!) five minutes after a close/reopen cycle.
+    # Injectable for tests.
+    zwave_claim =
+      Keyword.get(opts, :zwave_claim, &UniversalProxy.ESPHome.ZWaveProxy.claimed_port/0)
+
+    GenServer.start_link(__MODULE__, %{auto_tick?: auto_tick?, zwave_claim: zwave_claim},
+      name: name
+    )
   end
 
   @doc """
@@ -155,7 +166,8 @@ defmodule UniversalProxy.UART.History do
        throughput: %{},
        throughput_subscribers: %{},
        packet_buckets: List.duplicate(0, @packet_rate_window),
-       next_id: 1
+       next_id: 1,
+       zwave_claim: Map.fetch!(opts, :zwave_claim)
      }, {:continue, :subscribe_open_ports}}
   end
 
@@ -231,7 +243,7 @@ defmodule UniversalProxy.UART.History do
   def handle_info({:uart_port_closed, _info}, state), do: {:noreply, state}
 
   def handle_info({:evict_port, name}, state) do
-    if port_still_absent?(name) do
+    if port_still_absent?(state, name) do
       {:noreply, evict_port(state, name)}
     else
       {:noreply, state}
@@ -377,8 +389,16 @@ defmodule UniversalProxy.UART.History do
     end
   end
 
-  defp port_still_absent?(name) do
-    not Enum.any?(UART.named_ports(), &(&1.friendly_name == name))
+  defp port_still_absent?(state, name) do
+    not (Enum.any?(UART.named_ports(), &(&1.friendly_name == name)) or
+           zwave_port_name(state) == name)
+  end
+
+  defp zwave_port_name(%{zwave_claim: claim_fun}) do
+    case claim_fun.() do
+      %{display_name: name} -> name
+      _ -> nil
+    end
   end
 
   # Drop every trace of `name` from state and the PubSub topic. Any
