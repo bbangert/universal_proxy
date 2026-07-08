@@ -10,10 +10,10 @@ defmodule UniversalProxy.HardwareTest do
           slots: nil,
           enumerated: %{
             "ttyACM0" => %{
-              vendor_id: 0x10C4,
-              product_id: 0xEA60,
-              manufacturer: "Silicon Labs",
-              description: "CP2102N USB to UART Bridge Controller",
+              vendor_id: 0x303A,
+              product_id: 0x4001,
+              manufacturer: "Nabu Casa",
+              description: "Home Assistant Connect ZWA-2",
               serial_number: "DH001K8R"
             }
           },
@@ -29,7 +29,7 @@ defmodule UniversalProxy.HardwareTest do
       assert port.vendor == "Nabu Casa"
       assert port.chip == "Silicon Labs EFR32ZG23"
       assert port.serial == "DH001K8R"
-      assert port.vidpid == "10C4:EA60"
+      assert port.vidpid == "303A:4001"
       assert port.configured == true
       assert port.locked == true
       assert port.connected == true
@@ -136,8 +136,8 @@ defmodule UniversalProxy.HardwareTest do
           slots: nil,
           enumerated: %{
             "ttyACM0" => %{
-              vendor_id: 0x10C4,
-              product_id: 0xEA60,
+              vendor_id: 0x303A,
+              product_id: 0x4001,
               serial_number: "DH001K8R"
             }
           },
@@ -145,10 +145,10 @@ defmodule UniversalProxy.HardwareTest do
           # Even if a saved config somehow exists for this port + chip,
           # we must not let it override the hardware-fixed Z-Wave kind.
           saved_configs: %{
-            {"1-1.1", 0x10C4, 0xEA60} => %{
+            {"1-1.1", 0x303A, 0x4001} => %{
               slot_sub: "1-1.1",
-              vendor_id: 0x10C4,
-              product_id: 0xEA60,
+              vendor_id: 0x303A,
+              product_id: 0x4001,
               serial_number: "DH001K8R",
               port_type: :rs485
             }
@@ -159,6 +159,35 @@ defmodule UniversalProxy.HardwareTest do
       assert port.kind == :zwave
       assert port.detection == :auto
       assert port.locked == true
+    end
+
+    # Regression guard for the ZWA-2 VID/PID mixup: 10C4:EA60 is the
+    # generic CP2102/CP2102N bridge (used by SONOFF Z-Wave dongles and
+    # countless TTL adapters) — it must classify as editable TTL, never
+    # as a locked ZWA-2.
+    test "auto-detects a CP2102 (10C4:EA60) as generic TTL, not a ZWA-2" do
+      [port] =
+        Hardware.list_ports(
+          slots: nil,
+          enumerated: %{
+            "ttyUSB0" => %{
+              vendor_id: 0x10C4,
+              product_id: 0xEA60,
+              manufacturer: "Silicon Labs",
+              description: "CP2102N USB to UART Bridge Controller",
+              serial_number: "DH001K8R"
+            }
+          },
+          bus_paths: %{"ttyUSB0" => "1-1.2"},
+          saved_configs: %{},
+          in_use_ports: MapSet.new()
+        )
+
+      assert port.detection == :auto
+      assert port.kind == :ttl
+      assert port.name == "USB Serial Adapter"
+      assert port.chip == "CP2102/CP2102N"
+      assert port.locked == false
     end
 
     test "auto-detects branded IRdroid IR Toy as locked IR" do
@@ -266,6 +295,51 @@ defmodule UniversalProxy.HardwareTest do
       assert port.configured == true
       assert port.locked == false
       assert port.name == "Bus A"
+    end
+
+    test "zwave-claimed port shows in_use with the Z-Wave JS user label" do
+      base = [
+        slots: nil,
+        enumerated: %{
+          "ttyACM0" => %{vendor_id: 0x303A, product_id: 0x4001, serial_number: "DH001K8R"}
+        },
+        bus_paths: %{"ttyACM0" => "1-1.1"},
+        saved_configs: %{},
+        in_use_ports: MapSet.new()
+      ]
+
+      [subscribed] =
+        Hardware.list_ports(base ++ [zwave_claim: %{tty_name: "ttyACM0", subscribed: true}])
+
+      assert subscribed.in_use == true
+      assert subscribed.user == "Z-Wave JS · Home Assistant"
+
+      [idle] =
+        Hardware.list_ports(base ++ [zwave_claim: %{tty_name: "ttyACM0", subscribed: false}])
+
+      assert idle.in_use == true
+      assert idle.user == "Z-Wave proxy"
+
+      [unclaimed] = Hardware.list_ports(base ++ [zwave_claim: nil])
+      assert unclaimed.in_use == false
+      assert unclaimed.user == nil
+    end
+
+    test "zwave claim on a different tty does not mark this port in_use" do
+      [port] =
+        Hardware.list_ports(
+          slots: nil,
+          enumerated: %{
+            "ttyUSB0" => %{vendor_id: 0x0403, product_id: 0x6001, serial_number: "X"}
+          },
+          bus_paths: %{"ttyUSB0" => "1-1.2"},
+          saved_configs: %{},
+          in_use_ports: MapSet.new(),
+          zwave_claim: %{tty_name: "ttyACM0", subscribed: true}
+        )
+
+      assert port.in_use == false
+      assert port.user == nil
     end
 
     test "marks port as in_use when its tty name is currently opened" do

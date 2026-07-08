@@ -29,7 +29,13 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy.Frame do
 
   @command_get_network_ids 0x20
   @command_type_response 0x01
-  @min_get_network_ids_length 9
+  # TYPE(1) + CMD(1) + HOME_ID(4) + NODE_ID(1) + CHECKSUM(1). DELIBERATE
+  # divergence from the C++ (audit F8): upstream requires >= 9, which
+  # contradicts its own comment and rejects the LENGTH=8 responses a
+  # stick sends while in 8-bit node-ID mode — i.e. any freshly powered
+  # controller before Z-Wave JS switches it to 16-bit node IDs
+  # (HW-confirmed on the ZWA-2). The home ID sits at offset 4 either way.
+  @min_get_network_ids_length 8
   @home_id_size 4
 
   defguard is_single_byte_frame(byte) when byte in [@ack, @nak, @can]

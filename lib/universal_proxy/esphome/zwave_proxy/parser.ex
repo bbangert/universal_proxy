@@ -100,6 +100,20 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy.Parser do
     end)
   end
 
+  @doc """
+  Should a client-originated frame be suppressed as a duplicate of the
+  response this parser already sent locally?
+
+  Mirrors the C++ `send_frame` guard exactly: the proxy pre-ACKs every
+  valid frame on the UART for latency, and the API client (Z-Wave JS)
+  then sends its own ACK — forwarding that duplicate would hand the
+  module a second ACK it may misattribute to the next frame in flight.
+  Like the C++, `last_response` is not reset after a suppressed frame.
+  """
+  @spec duplicate_response?(t(), binary()) :: boolean()
+  def duplicate_response?(%__MODULE__{last_response: last}, <<byte>>), do: byte == last
+  def duplicate_response?(%__MODULE__{}, _data), do: false
+
   # -- Internal byte-level state machine --
 
   defp parse_byte(%{state: :wait_start} = parser, byte) do
@@ -122,6 +136,12 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy.Parser do
     {%{parser | state: :wait_command_id}, []}
   end
 
+  # DELIBERATE divergence from the C++ (see audit F5): upstream moves to
+  # WAIT_PAYLOAD unconditionally here, so a zero-payload frame (LENGTH =
+  # 3: TYPE + CMD + CHECKSUM) has its checksum consumed as payload and
+  # the parser then eats one extra byte. We check `end_frame_after` so
+  # L=3 frames parse correctly. Unreachable in practice (module→host
+  # frames carry payload) — do not "fix" this back to match upstream.
   defp parse_byte(%{state: :wait_command_id} = parser, byte) do
     parser = put_byte(parser, byte)
 
@@ -155,6 +175,14 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy.Parser do
       parser = %{parser | state: :send_nak}
       handle_response(parser, [])
     end
+  end
+
+  # Overflow check mirrors the C++: a menu that fills the buffer without
+  # a terminating 0x00 is discarded (reset to :wait_start, byte dropped),
+  # never emitted truncated.
+  defp parse_byte(%{state: :read_bl_menu, buffer_index: idx} = parser, _byte)
+       when idx >= @max_frame_size do
+    {%{parser | state: :wait_start}, []}
   end
 
   defp parse_byte(%{state: :read_bl_menu} = parser, byte) do
