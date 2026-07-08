@@ -148,6 +148,91 @@ defmodule UniversalProxy.UART.HistoryTest do
     assert [%{data: "before-close"}] = History.subscribe_and_snapshot(server)
   end
 
+  # Lifecycle events from a direct port owner (the Z-Wave proxy) carry
+  # an `owner:` key — that is what marks the name as externally held.
+  defp publish_open_owned(friendly_name) do
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "uart:port_opened",
+      {:uart_port_opened, %{path: "/dev/null", friendly_name: friendly_name, owner: :zwave_proxy}}
+    )
+  end
+
+  defp publish_closed_owned(friendly_name) do
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "uart:port_closed",
+      {:uart_port_closed, %{path: "/dev/null", friendly_name: friendly_name, owner: :zwave_proxy}}
+    )
+  end
+
+  test "eviction spares an externally-owned port that is still open", %{server: server} do
+    claimed = "ZWA-2 (1-1.1) #{System.unique_integer([:positive])}"
+
+    publish_open_owned(claimed)
+    drain(server)
+    publish(claimed, "zw-frame", :rx)
+    drain(server)
+
+    # Fire the delayed eviction directly (the 5-minute grace timer is
+    # not test-friendly). The open `owner:` port must veto it: it never
+    # appears in UART.named_ports/0, so without the external-ports set
+    # this would evict — and unsubscribe — a live port.
+    send(server, {:evict_port, claimed})
+    drain(server)
+
+    assert [%{data: "zw-frame"}] = History.subscribe_and_snapshot(server)
+
+    # Frames published after the attempted eviction still arrive (the
+    # PubSub subscription survived).
+    publish(claimed, "still-alive", :rx)
+    drain(server)
+    assert [_a, %{data: "still-alive"}] = History.subscribe_and_snapshot(server)
+  end
+
+  test "eviction proceeds once an externally-owned port closes for good", %{server: server} do
+    port = "gone-zw-port #{System.unique_integer([:positive])}"
+
+    publish_open_owned(port)
+    drain(server)
+    publish(port, "old-frame", :rx)
+    drain(server)
+
+    publish_closed_owned(port)
+    drain(server)
+
+    send(server, {:evict_port, port})
+    drain(server)
+
+    assert [] == History.subscribe_and_snapshot(server)
+
+    # And the data subscription is really gone: a late frame under the
+    # evicted name no longer lands in the buffer.
+    publish(port, "too-late", :rx)
+    drain(server)
+    assert [] == History.subscribe_and_snapshot(server)
+  end
+
+  test "reopen inside the grace window re-arms eviction protection", %{server: server} do
+    port = "zw-replug #{System.unique_integer([:positive])}"
+
+    publish_open_owned(port)
+    drain(server)
+    publish(port, "before", :rx)
+    drain(server)
+
+    # Close (schedules the real eviction) then reopen — mirrors a
+    # replugged stick. The pending eviction must find the port present.
+    publish_closed_owned(port)
+    publish_open_owned(port)
+    drain(server)
+
+    send(server, {:evict_port, port})
+    drain(server)
+
+    assert [%{data: "before"}] = History.subscribe_and_snapshot(server)
+  end
+
   test "subscriber is dropped when its process dies", %{server: server, pid: history_pid} do
     name = "port-#{System.unique_integer([:positive])}"
     publish_open(name)

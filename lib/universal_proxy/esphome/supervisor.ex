@@ -59,8 +59,6 @@ defmodule UniversalProxy.ESPHome.Supervisor do
 
   @impl true
   def init(_init_arg) do
-    zwave_port_path = resolve_zwave_port()
-
     # Seed the persisted PSK into device_config so a previously
     # HA-provisioned key survives restart/reboot. accepts_key_provisioning
     # is opened only while keyless: once a key exists, no LAN client can
@@ -84,10 +82,10 @@ defmodule UniversalProxy.ESPHome.Supervisor do
       ] ++ bluetooth_opts()
 
     children = [
-      # The resolver lets the proxy re-resolve the port on its reopen
-      # loop, so a stick plugged in (or replugged) after boot attaches
-      # without restarting this tree.
-      {ZWaveProxy, port_path: zwave_port_path, resolver: &__MODULE__.resolve_zwave_port/0},
+      # No port is resolved here — the proxy resolves (and re-resolves)
+      # through the resolver on its open/rescan loop, so boot, hotplug,
+      # and replug all take the same path.
+      {ZWaveProxy, resolver: &__MODULE__.resolve_zwave_port/0},
       Infrared.Supervisor,
       # Must start BEFORE Espex (rest_for_one): Espex calls
       # EntityProvider.list_entities/0 at connection-accept time, and a
@@ -159,8 +157,8 @@ defmodule UniversalProxy.ESPHome.Supervisor do
     :exit, _ -> UniversalProxy.Bluetooth.Settings.defaults()
   end
 
-  # Resolve the tty path of the Z-Wave-classified port. Two sources
-  # cooperate:
+  # Resolve the Z-Wave-classified port as `%{path: tty, display_name:
+  # ha_name}` (or nil). Two sources cooperate:
   #
   #   1. `Hardware.list_ports/0` already auto-classifies the Nabu Casa
   #      Connect ZWA-2 by VID/PID (`0x303A:0x4001`), so the common case
@@ -168,10 +166,15 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   #   2. A user-saved `:zwave` override on a generic port still wins
   #      (e.g. a SONOFF Z-Wave 800 dongle on a CP2102, `0x10C4:0xEA60`).
   #
-  # Public because `ZWaveProxy` re-invokes it from its reopen loop.
+  # `display_name` is the row's `ha_name` — the key the Overview
+  # subscribes to `UART.History` throughput with, so the proxy's
+  # broadcasts land on the sparkline. Public because `ZWaveProxy`
+  # invokes it from its open/rescan loop.
   @doc false
   def resolve_zwave_port do
-    case Enum.find(Hardware.list_ports(), &(&1.connected and &1.kind == :zwave)) do
+    ports = Hardware.list_ports()
+
+    case Enum.find(ports, &(&1.connected and &1.kind == :zwave)) do
       nil ->
         # Fallback for pre-existing saved configs that target a port
         # whose adapter isn't currently classified as Z-Wave by
@@ -182,12 +185,23 @@ defmodule UniversalProxy.ESPHome.Supervisor do
                cfg[:port_type] == :zwave and
                  Map.has_key?(key_to_tty, {cfg[:slot_sub], cfg[:vendor_id], cfg[:product_id]})
              end) do
-          nil -> nil
-          cfg -> Map.get(key_to_tty, {cfg[:slot_sub], cfg[:vendor_id], cfg[:product_id]})
+          nil ->
+            nil
+
+          cfg ->
+            tty = Map.get(key_to_tty, {cfg[:slot_sub], cfg[:vendor_id], cfg[:product_id]})
+            %{path: tty, display_name: display_name_for(ports, tty)}
         end
 
       port ->
-        port.tty_name
+        %{path: port.tty_name, display_name: port.ha_name}
+    end
+  end
+
+  defp display_name_for(ports, tty) do
+    case Enum.find(ports, &(&1.tty_name == tty)) do
+      %{ha_name: name} when is_binary(name) -> name
+      _ -> tty
     end
   end
 end
