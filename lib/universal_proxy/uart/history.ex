@@ -65,18 +65,7 @@ defmodule UniversalProxy.UART.History do
   def start_link(opts \\ []) do
     name = Keyword.get(opts, :name, __MODULE__)
     auto_tick? = Keyword.get(opts, :auto_tick, true)
-
-    # The Z-Wave proxy broadcasts on the same topics as UART.Server but
-    # its port never appears in `UART.named_ports/0` — the eviction
-    # check consults this claim so a live Z-Wave port isn't evicted
-    # (and unsubscribed!) five minutes after a close/reopen cycle.
-    # Injectable for tests.
-    zwave_claim =
-      Keyword.get(opts, :zwave_claim, &UniversalProxy.ESPHome.ZWaveProxy.claimed_port/0)
-
-    GenServer.start_link(__MODULE__, %{auto_tick?: auto_tick?, zwave_claim: zwave_claim},
-      name: name
-    )
+    GenServer.start_link(__MODULE__, %{auto_tick?: auto_tick?}, name: name)
   end
 
   @doc """
@@ -167,13 +156,20 @@ defmodule UniversalProxy.UART.History do
        throughput_subscribers: %{},
        packet_buckets: List.duplicate(0, @packet_rate_window),
        next_id: 1,
-       zwave_claim: Map.fetch!(opts, :zwave_claim)
+       # Names currently open by direct port owners (e.g. the Z-Wave
+       # proxy — lifecycle payloads carrying an `owner:` key). They
+       # never appear in `UART.named_ports/0`, so the grace eviction
+       # consults this set instead of making a synchronous call into
+       # the owning process (which would let one wedged subsystem
+       # stall History for every port's eviction).
+       external_ports: MapSet.new()
      }, {:continue, :subscribe_open_ports}}
   end
 
   @impl true
   def handle_continue(:subscribe_open_ports, state) do
-    open_names = open_friendly_names()
+    external = external_claims()
+    open_names = open_friendly_names() ++ external
 
     new_names =
       open_names
@@ -182,7 +178,12 @@ defmodule UniversalProxy.UART.History do
 
     Enum.each(new_names, &Phoenix.PubSub.subscribe(@pubsub, "uart:#{&1}"))
 
-    {:noreply, %{state | subscribed_topics: MapSet.union(state.subscribed_topics, new_names)}}
+    {:noreply,
+     %{
+       state
+       | subscribed_topics: MapSet.union(state.subscribed_topics, new_names),
+         external_ports: MapSet.union(state.external_ports, MapSet.new(external))
+     }}
   end
 
   @impl true
@@ -217,7 +218,9 @@ defmodule UniversalProxy.UART.History do
   end
 
   @impl true
-  def handle_info({:uart_port_opened, %{friendly_name: name}}, state) do
+  def handle_info({:uart_port_opened, %{friendly_name: name} = info}, state) do
+    state = track_external_port(state, info, :opened)
+
     state =
       if MapSet.member?(state.subscribed_topics, name) do
         state
@@ -235,7 +238,8 @@ defmodule UniversalProxy.UART.History do
   # leak its buffer + PubSub subscription forever. If the port comes
   # back inside the grace window the `:evict` message will find it
   # in `UART.named_ports/0` and bail.
-  def handle_info({:uart_port_closed, %{friendly_name: name}}, state) do
+  def handle_info({:uart_port_closed, %{friendly_name: name} = info}, state) do
+    state = track_external_port(state, info, :closed)
     Process.send_after(self(), {:evict_port, name}, @port_eviction_grace_ms)
     {:noreply, state}
   end
@@ -366,6 +370,22 @@ defmodule UniversalProxy.UART.History do
     UART.named_ports() |> Enum.map(& &1.friendly_name)
   end
 
+  # One-shot restart recovery for ports owned outside UART.Server: a
+  # History restart replays no lifecycle events, so without this a
+  # Z-Wave port open at that moment would lose its data subscription
+  # (and eviction protection) until its next reopen. Runs only from
+  # handle_continue — steady-state tracking is event-driven via the
+  # `owner:` lifecycle payloads, never a per-eviction call.
+  # `claimed_port/1` absorbs `:noproc` (at app boot the ESPHome tree —
+  # and thus the Z-Wave proxy — starts after this one) via its
+  # documented `catch :exit`.
+  defp external_claims do
+    case UniversalProxy.ESPHome.ZWaveProxy.claimed_port() do
+      %{display_name: name} -> [name]
+      _ -> []
+    end
+  end
+
   # Send only when the receiver's mailbox is short enough to keep up.
   # A backgrounded LV tab whose websocket is congested can otherwise
   # accumulate per-frame messages indefinitely under sustained
@@ -391,15 +411,24 @@ defmodule UniversalProxy.UART.History do
 
   defp port_still_absent?(state, name) do
     not (Enum.any?(UART.named_ports(), &(&1.friendly_name == name)) or
-           zwave_port_name(state) == name)
+           MapSet.member?(state.external_ports, name))
   end
 
-  defp zwave_port_name(%{zwave_claim: claim_fun}) do
-    case claim_fun.() do
-      %{display_name: name} -> name
-      _ -> nil
-    end
+  # Maintain the set of names held open by direct port owners. Only
+  # lifecycle payloads carrying an `owner:` key participate —
+  # UART.Server's own ports are covered by `UART.named_ports/0`. A
+  # reopen inside the eviction grace window re-adds the name, so the
+  # pending `:evict_port` finds it present and bails, exactly like a
+  # returning UART.Server port.
+  defp track_external_port(state, %{friendly_name: name, owner: _owner}, :opened) do
+    %{state | external_ports: MapSet.put(state.external_ports, name)}
   end
+
+  defp track_external_port(state, %{friendly_name: name, owner: _owner}, :closed) do
+    %{state | external_ports: MapSet.delete(state.external_ports, name)}
+  end
+
+  defp track_external_port(state, _info, _transition), do: state
 
   # Drop every trace of `name` from state and the PubSub topic. Any
   # throughput subscribers still holding a monitor for this port get

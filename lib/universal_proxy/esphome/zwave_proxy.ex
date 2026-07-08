@@ -154,7 +154,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
   simply sees "no claim" for its own row.
   """
   @spec claimed_port(GenServer.server()) ::
-          %{tty_name: String.t(), subscribed: boolean()} | nil
+          %{tty_name: String.t(), display_name: String.t(), subscribed: boolean()} | nil
   def claimed_port(server \\ __MODULE__) do
     GenServer.call(server, :claimed_port, @short_call_timeout)
   catch
@@ -475,11 +475,15 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
 
   defp broadcast_lifecycle(%{display_name: nil}, _topic, _event), do: :ok
 
+  # `owner:` extends UART.Server's payload shape (safe — every consumer
+  # pattern-matches on a subset of keys). It tells `UART.History` this
+  # port is held open outside `UART.Server`, so its grace eviction won't
+  # unsubscribe a live port that `UART.named_ports/0` can never list.
   defp broadcast_lifecycle(state, topic, event) do
     Phoenix.PubSub.broadcast(
       @pubsub,
       topic,
-      {event, %{path: state.port_path, friendly_name: state.display_name}}
+      {event, %{path: state.port_path, friendly_name: state.display_name, owner: :zwave_proxy}}
     )
   end
 

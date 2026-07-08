@@ -189,7 +189,9 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
 
       send(server, {:circuits_uart, "ttyFake", {:error, :eio}})
 
-      assert_receive {:uart_port_closed, %{friendly_name: ^display}}
+      # `owner:` is the contract History's external-port tracking keys
+      # off — assert it explicitly.
+      assert_receive {:uart_port_closed, %{friendly_name: ^display, owner: :zwave_proxy}}
       refute ZWaveProxy.available?(server)
     end
   end
