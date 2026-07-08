@@ -220,5 +220,16 @@ defmodule UniversalProxy.BluetoothTest do
       assert Settings.audio_adapters(Settings.get()) == [@hci1_mac]
       assert {:error, :invalid_role} = Bluetooth.set_role(@hci1_mac, :bogus)
     end
+
+    test "rejects :audio on hardware without audio-role support" do
+      start_subsystem()
+      Application.put_env(:universal_proxy, :bt_audio_role_override, false)
+      on_exit(fn -> Application.delete_env(:universal_proxy, :bt_audio_role_override) end)
+
+      assert {:error, :audio_role_unsupported} = Bluetooth.set_role(@hci1_mac, :audio)
+      assert Settings.audio_adapters(Settings.get()) == []
+      # Non-audio roles pass the gate untouched.
+      assert Bluetooth.set_role(@hci1_mac, :off) == :ok
+    end
   end
 end

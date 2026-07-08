@@ -51,6 +51,24 @@ defmodule UniversalProxyWeb.BluetoothLiveTest do
     refute html =~ "Advertisements / s"
   end
 
+  test "audio role gated off: no Audio role button, dongle guidance instead", %{conn: conn} do
+    Application.put_env(:universal_proxy, :bt_audio_role_override, false)
+    on_exit(fn -> Application.delete_env(:universal_proxy, :bt_audio_role_override) end)
+
+    {:ok, view, html} = live(conn, "/bluetooth")
+
+    # Audio-devices section replaced by the dedicated-dongle guidance.
+    refute html =~ "Pair device"
+    assert html =~ "can&#39;t stream audio reliably"
+    assert html =~ "FMA120"
+
+    # A present radio renders Proxy/Off but no Audio segment.
+    html = inject_radios(view, [radio()])
+    assert html =~ "phx-value-role=\"proxy\""
+    assert html =~ "phx-value-role=\"off\""
+    refute html =~ "phx-value-role=\"audio\""
+  end
+
   test "no audio radio: audio-devices empty state + disabled Pair button", %{conn: conn} do
     {:ok, view, html} = live(conn, "/bluetooth")
 

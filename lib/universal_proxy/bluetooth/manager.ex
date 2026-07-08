@@ -138,6 +138,12 @@ defmodule UniversalProxy.Bluetooth.Manager do
       start_retry_ms: Keyword.get(opts, :start_retry_ms, @start_retry_ms),
       restart_settle_ms: Keyword.get(opts, :restart_settle_ms, @restart_settle_ms),
       esphome_restart_fun: Keyword.get(opts, :esphome_restart_fun, &restart_esphome/0),
+      audio_role_supported_fun:
+        Keyword.get(
+          opts,
+          :audio_role_supported_fun,
+          &UniversalProxy.Bluetooth.audio_role_supported?/0
+        ),
       bluez_pid: nil,
       monitor: nil,
       # Seeded on the boot reconcile; a nil→boolean transition never bounces.
@@ -153,9 +159,25 @@ defmodule UniversalProxy.Bluetooth.Manager do
 
   @impl GenServer
   def handle_continue(:reconcile, state) do
+    coerce_audio_roles(state)
     state = state |> do_reconcile([]) |> sync_paused()
     broadcast(state)
     {:noreply, state}
+  end
+
+  # One-time boot migration: persisted `:audio` roles written before the
+  # audio-role hardware gate existed (or by an older build on hardware that
+  # can't stream A2DP cleanly) fall back to `:off`, so no radio silently
+  # claims a role the target no longer offers.
+  defp coerce_audio_roles(state) do
+    unless state.audio_role_supported_fun.() do
+      for {mac, :audio} <- settings(state).roles do
+        Logger.info("Bluetooth.Manager: audio role unsupported on this target — #{mac} -> :off")
+        :ok = Settings.set_role(state.settings, mac, :off)
+      end
+    end
+
+    :ok
   end
 
   @impl GenServer

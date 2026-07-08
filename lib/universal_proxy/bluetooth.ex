@@ -99,6 +99,34 @@ defmodule UniversalProxy.Bluetooth do
   @spec supported?() :: boolean()
   def supported?, do: @bluetooth_supported
 
+  # Targets whose BlueZ radios can stream glitch-free A2DP. rpi3-and-below
+  # cannot: built-in chips sit on a 230400-baud mini-UART (less than half an
+  # SBC stream), and generic USB HCI adapters stutter behind the dwc_otg USB
+  # controller (HW-tested 2026-07-07: periodic 3–15 s dropouts on an
+  # RTL8761BU that plays flawlessly on rpi4's xHCI). Dedicated BT-audio
+  # dongles (Creative BTD 700, FlooGoo FMA120) are NOT affected — they
+  # enumerate as USB sound cards, so they bypass the audio role entirely.
+  # :host keeps the role available for UI dev and host tests.
+  @audio_role_targets [:rpi4, :rpi5, :x86_64, :host]
+  @audio_role_supported Mix.target() in @audio_role_targets
+
+  @doc """
+  Whether BlueZ radios may take the `:audio` role on this hardware
+  (defaults to the compile-time `@audio_role_targets` predicate). A boolean
+  `:bt_audio_role_override` app env overrides it — meant for host tests;
+  non-boolean values are ignored. Deliberately a runtime read even though
+  the default is a constant: a `Mix.env`-gated constant function lets the
+  Elixir type checker prove callers' `if audio_role_supported?()` branches
+  always-true/false and fail --warnings-as-errors builds.
+  """
+  @spec audio_role_supported?() :: boolean()
+  def audio_role_supported? do
+    case Application.get_env(:universal_proxy, :bt_audio_role_override) do
+      override when is_boolean(override) -> override
+      _ -> @audio_role_supported
+    end
+  end
+
   @doc "PubSub topic carrying `{:bluetooth_state, status}` broadcasts."
   @spec state_topic() :: String.t()
   def state_topic, do: @state_topic
@@ -337,7 +365,17 @@ defmodule UniversalProxy.Bluetooth do
   `AudioManager.list_headphones/0` (filtered by `:adapter`) before calling.
   """
   @spec set_role(String.t(), Settings.role()) :: :ok | {:error, term()}
-  def set_role(mac, role) when is_binary(mac) do
+  def set_role(mac, :audio) when is_binary(mac) do
+    if audio_role_supported?() do
+      do_set_role(mac, :audio)
+    else
+      {:error, :audio_role_unsupported}
+    end
+  end
+
+  def set_role(mac, role) when is_binary(mac), do: do_set_role(mac, role)
+
+  defp do_set_role(mac, role) do
     normalized = String.upcase(mac)
     settings = Settings.get()
     before_proxy = Settings.proxy_adapter(settings)
