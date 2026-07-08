@@ -87,8 +87,25 @@ defmodule UniversalProxy.Improv.ProtocolTest do
     end
 
     test "unknown but well-formed command" do
-      # 0x02 = identify, which we don't implement; checksum is valid.
-      assert Protocol.decode_command(framed(0x02, <<>>)) == {:error, :unknown_command}
+      # 0x08 is unassigned; checksum is valid.
+      assert Protocol.decode_command(framed(0x08, <<>>)) == {:error, :unknown_command}
+    end
+  end
+
+  describe "decode_command/1 — identify (0x02) / device-info (0x03)" do
+    test "decodes the no-data commands" do
+      assert Protocol.decode_command(framed(0x02, <<>>)) == {:identify}
+      assert Protocol.decode_command(framed(0x03, <<>>)) == {:device_info}
+    end
+
+    test "rejects frames that carry data" do
+      assert Protocol.decode_command(framed(0x02, <<1>>)) == {:error, :invalid}
+      assert Protocol.decode_command(framed(0x03, <<1, 2>>)) == {:error, :invalid}
+    end
+
+    test "command id accessors match the wire ids" do
+      assert Protocol.identify_command() == 0x02
+      assert Protocol.device_info_command() == 0x03
     end
   end
 
@@ -109,8 +126,16 @@ defmodule UniversalProxy.Improv.ProtocolTest do
       assert Protocol.encode_error(:unknown) == <<0xFF>>
     end
 
-    test "capabilities advertises scan-wifi (bit 2)" do
+    test "capabilities always advertises scan-wifi (bit 2)" do
       assert Protocol.capabilities() == <<0x04>>
+      assert Protocol.capabilities([]) == <<0x04>>
+    end
+
+    test "capabilities derives identify (bit 0) and device-info (bit 1)" do
+      assert Protocol.capabilities(identify?: true) == <<0x05>>
+      assert Protocol.capabilities(device_info?: true) == <<0x06>>
+      assert Protocol.capabilities(identify?: true, device_info?: true) == <<0x07>>
+      assert Protocol.capabilities(identify?: false, device_info?: false) == <<0x04>>
     end
   end
 

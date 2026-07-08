@@ -178,9 +178,29 @@ defmodule UniversalProxy.Bluetooth do
           network_type: &UniversalProxy.System.network_type/0,
           # Advert branding: keeps the BLE-visible name "Universal Proxy <mac4>"
           # while the suffix derivation stays inside Improv.
-          name_prefix: "Universal Proxy"
+          name_prefix: "Universal Proxy",
+          # Identify (0x02): blink the board ACT LED so the provisioner can
+          # spot the device. Device Info (0x03): static identity strings.
+          # Both configured → Improv capabilities derive to 0x07.
+          identify_fun: &UniversalProxy.Identify.blink_act_led/0,
+          device_info: improv_device_info()
         ]}
      ]}
+  end
+
+  # Static Improv Device Info strings (spec command 0x03), resolved when the
+  # Bluez child spec is built — KV/device-tree/hostname reads only, no
+  # GenServer dependencies. The device name mirrors the advertised BLE local
+  # name ("Universal Proxy <suffix>", same derivation).
+  defp improv_device_info do
+    fw = UniversalProxy.System.firmware_info()
+
+    [
+      firmware_name: "Universal Proxy",
+      firmware_version: fw.version,
+      hardware: fw.hardware,
+      device_name: "Universal Proxy #{UniversalProxy.Improv.Advert.device_suffix()}"
+    ]
   end
 
   @doc """

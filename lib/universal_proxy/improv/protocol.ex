@@ -22,6 +22,13 @@ defmodule UniversalProxy.Improv.Protocol do
 
   Open networks send `pwd_len = 0`.
 
+  ### Identify (`0x02`) / Device Info (`0x03`)
+
+  Both carry no data (`[cmd][0x00][cs]`). Identify has **no RPC result** — the
+  device just does something physically observable. Device Info replies with one
+  RPC result carrying four length-prefixed strings: firmware name, firmware
+  version, hardware variant, device name.
+
   ### Request scanned networks (`0x04`)
 
   Command has no data (`[0x04][0x00][cs]`). The reply is sent as **one RPC-result
@@ -30,12 +37,14 @@ defmodule UniversalProxy.Improv.Protocol do
 
   ## Capabilities
 
-  We advertise `0x04` — bit 2, "supports the scan-wifi command". (bit0=identify,
-  bit1=device-info, bit3=hostname are all unsupported.) This bit is what makes
-  improv-wifi.com show the network dropdown; `0x00` would hide it.
+  The capabilities byte is derived from what the host configures (see
+  `capabilities/1`): bit2 (`0x04`, scan-wifi) is always set — the command is
+  built in, and it's what makes improv-wifi.com show the network dropdown.
+  bit0 (`0x01`) is set iff an identify callback is configured, bit1 (`0x02`)
+  iff device-info strings are provided. bit3 (hostname) is unsupported.
   """
 
-  import Bitwise, only: [band: 2]
+  import Bitwise, only: [band: 2, bor: 2]
 
   # --- Service / characteristic UUIDs (full 128-bit) --------------------------
 
@@ -46,9 +55,11 @@ defmodule UniversalProxy.Improv.Protocol do
   @uuid_rpc_result "00467768-6228-2272-4663-277478268004"
   @uuid_capabilities "00467768-6228-2272-4663-277478268005"
 
-  # --- Command IDs (only the two we implement) --------------------------------
+  # --- Command IDs -------------------------------------------------------------
 
   @cmd_submit_wifi 0x01
+  @cmd_identify 0x02
+  @cmd_device_info 0x03
   @cmd_request_networks 0x04
 
   # --- Current-state enum -----------------------------------------------------
@@ -73,11 +84,15 @@ defmodule UniversalProxy.Improv.Protocol do
 
   # --- Capabilities bitfield --------------------------------------------------
 
-  @capabilities 0x04
+  @cap_identify 0x01
+  @cap_device_info 0x02
+  @cap_scan 0x04
 
   @typedoc "Decoded inbound RPC command."
   @type command ::
           {:submit_wifi, ssid :: binary(), password :: binary()}
+          | {:identify}
+          | {:device_info}
           | {:request_wifi_networks}
 
   @typedoc "Reasons a command frame is rejected."
@@ -102,9 +117,26 @@ defmodule UniversalProxy.Improv.Protocol do
     }
   end
 
-  @doc "Capabilities characteristic value (`0x04` — scan-wifi supported)."
-  @spec capabilities() :: binary()
-  def capabilities, do: <<@capabilities>>
+  @doc """
+  Capabilities characteristic value (single byte), derived from what the host
+  configures: bit2 (scan-wifi) is always set — the command is built in;
+  bit0 iff `identify?: true`; bit1 iff `device_info?: true`. Pure.
+
+  The advertisement's ServiceData capabilities byte MUST carry this same
+  derived value — derive once and share (the supervisor does this).
+  """
+  @spec capabilities(keyword()) :: binary()
+  def capabilities(opts \\ []) do
+    caps =
+      @cap_scan
+      |> add_cap(@cap_identify, Keyword.get(opts, :identify?, false))
+      |> add_cap(@cap_device_info, Keyword.get(opts, :device_info?, false))
+
+    <<caps>>
+  end
+
+  defp add_cap(byte, bit, true), do: bor(byte, bit)
+  defp add_cap(byte, _bit, false), do: byte
 
   @doc """
   Decode an inbound RPC-command frame written to the rpc-command characteristic.
@@ -132,8 +164,13 @@ defmodule UniversalProxy.Improv.Protocol do
   def decode_command(_), do: {:error, :invalid}
 
   defp decode_payload(@cmd_submit_wifi, data), do: decode_submit_wifi(data)
+  # identify / device-info / request-networks must carry no data; anything
+  # else is malformed.
+  defp decode_payload(@cmd_identify, <<>>), do: {:identify}
+  defp decode_payload(@cmd_identify, _), do: {:error, :invalid}
+  defp decode_payload(@cmd_device_info, <<>>), do: {:device_info}
+  defp decode_payload(@cmd_device_info, _), do: {:error, :invalid}
   defp decode_payload(@cmd_request_networks, <<>>), do: {:request_wifi_networks}
-  # request-networks must carry no data; anything else is malformed.
   defp decode_payload(@cmd_request_networks, _), do: {:error, :invalid}
   defp decode_payload(_cmd, _data), do: {:error, :unknown_command}
 
@@ -186,6 +223,14 @@ defmodule UniversalProxy.Improv.Protocol do
   @doc "Command id for a submit-wifi result frame."
   @spec submit_wifi_command() :: byte()
   def submit_wifi_command, do: @cmd_submit_wifi
+
+  @doc "Command id of the identify command."
+  @spec identify_command() :: byte()
+  def identify_command, do: @cmd_identify
+
+  @doc "Command id for a device-info result frame."
+  @spec device_info_command() :: byte()
+  def device_info_command, do: @cmd_device_info
 
   @doc """
   Checksum of a complete frame *without* its trailing checksum byte:
