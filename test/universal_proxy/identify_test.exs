@@ -2,9 +2,14 @@ defmodule UniversalProxy.IdentifyTest do
   # Exercises the whole park/blink/restore cycle against a tmp-dir fake
   # /sys/class/leds tree; ms-scale timing via the half_period_ms:/toggles: opts.
   #
-  # async: false — Identify's "which LED / none found" messages are info-level,
-  # below the test env's :warning primary level, so the setup temporarily
-  # lowers the GLOBAL Logger level to let capture_log see them.
+  # async: false + a GLOBAL Logger level change: Identify's "which LED / none
+  # found" messages are info-level, below the test env's :warning primary
+  # level, and `Logger.info/1` gates on `:logger.allow/2` (primary/module
+  # config only) BEFORE Elixir's per-process level is consulted — so
+  # `Logger.put_process_level/2` cannot open up logging below the primary
+  # level; only `Logger.configure/1` can. The mutation cannot leak into
+  # async tests: ExUnit runs async: false modules only after every async
+  # module has finished, and on_exit restores the previous level.
   use ExUnit.Case, async: false
 
   import ExUnit.CaptureLog
