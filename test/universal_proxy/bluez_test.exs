@@ -15,7 +15,7 @@ defmodule UniversalProxy.BluezSpecTest do
     assert extra_ids == [
              Task.Supervisor,
              UniversalProxy.Bluetooth.AudioManager,
-             UniversalProxy.Improv.Supervisor
+             Improv.Supervisor
            ]
   end
 end
