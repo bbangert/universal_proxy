@@ -113,33 +113,35 @@ defmodule UniversalProxy.WifiPolicyTest do
       test = self()
 
       policy =
-        start_supervised!(
-          {WifiPolicy,
-           name: nil,
-           subscribe?: false,
-           settle_ms: Keyword.get(opts, :settle_ms, 0),
-           boot_grace_ms: Keyword.get(opts, :boot_grace_ms, 60_000),
-           match_fn: fn ["interface", :_, "type"] ->
-             Agent.get(table, & &1) |> Enum.map(&{["interface", &1.ifname, "type"], &1.type})
-           end,
-           get_fn: fn ["interface", ifname, prop] when prop in ["connection", "lower_up"] ->
-             key = String.to_existing_atom(prop)
+        start_supervised!({WifiPolicy,
+         name: nil,
+         subscribe?: false,
+         settle_ms: Keyword.get(opts, :settle_ms, 0),
+         boot_grace_ms: Keyword.get(opts, :boot_grace_ms, 60_000),
+         match_fn: fn ["interface", :_, "type"] ->
+           Agent.get(table, & &1) |> Enum.map(&{["interface", &1.ifname, "type"], &1.type})
+         end,
+         get_fn: fn ["interface", ifname, prop] when prop in ["connection", "lower_up"] ->
+           # Enum.find + Map.get so a stored `false` (lower_up) survives —
+           # find_value would swallow it and misreport the iface as absent.
+           key = %{"connection" => :connection, "lower_up" => :lower_up}[prop]
 
-             Agent.get(table, & &1)
-             |> Enum.find_value(&(&1.ifname == ifname && Map.get(&1, key)))
-           end,
-           load_persisted_fn: fn ifname ->
-             Agent.get(table, & &1) |> Enum.find_value(&(&1.ifname == ifname && &1.persisted))
-           end,
-           configure_fn: fn ifname, config, opts ->
-             send(test, {:configure, ifname, config, opts})
-             :ok
-           end,
-           deconfigure_fn: fn ifname, opts ->
-             send(test, {:deconfigure, ifname, opts})
-             :ok
-           end}
-        )
+           case Enum.find(Agent.get(table, & &1), &(&1.ifname == ifname)) do
+             nil -> nil
+             iface -> Map.get(iface, key)
+           end
+         end,
+         load_persisted_fn: fn ifname ->
+           Agent.get(table, & &1) |> Enum.find_value(&(&1.ifname == ifname && &1.persisted))
+         end,
+         configure_fn: fn ifname, config, opts ->
+           send(test, {:configure, ifname, config, opts})
+           :ok
+         end,
+         deconfigure_fn: fn ifname, opts ->
+           send(test, {:deconfigure, ifname, opts})
+           :ok
+         end})
 
       %{policy: policy, table: table}
     end
