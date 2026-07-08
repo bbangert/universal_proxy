@@ -76,6 +76,24 @@ defmodule UniversalProxy.Improv.AdvertTest do
       assert {"Type", {"s", "peripheral"}} in props
     end
 
+    test "defaults to the neutral \"Improv <suffix>\" local name" do
+      %{server: server} = start_advert()
+      call_in(server, @props_iface, "Get", [@adv_iface, "LocalName"], "ss")
+
+      assert_receive {:sent, %Message{type: :method_return, body: [{"s", name}]}}
+      assert ["Improv", suffix] = String.split(name, " ", parts: 2)
+      assert suffix != ""
+    end
+
+    test "name_prefix: rebrands the local name while keeping the device suffix" do
+      %{server: server} = start_advert(name_prefix: "Universal Proxy")
+      call_in(server, @props_iface, "Get", [@adv_iface, "LocalName"], "ss")
+
+      assert_receive {:sent, %Message{type: :method_return, body: [{"s", name}]}}
+      assert "Universal Proxy " <> suffix = name
+      assert suffix != ""
+    end
+
     test "Get returns a single property variant" do
       %{server: server} = start_advert()
       call_in(server, @props_iface, "Get", [@adv_iface, "Type"], "ss")

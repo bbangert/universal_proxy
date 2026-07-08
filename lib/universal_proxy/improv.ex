@@ -53,8 +53,8 @@ defmodule UniversalProxy.Improv do
   @session_cap_ms 15 * 60 * 1000
   # Brief hold after PROVISIONED so the client can read the result before teardown.
   @provisioned_hold_ms 10_000
-  # Bound on how long we wait for wlan0 to join after a submit before declaring
-  # the credentials bad and reverting to AUTHORIZED for a retry.
+  # Bound on how long we wait for the Wi-Fi interface to join after a submit
+  # before declaring the credentials bad and reverting to AUTHORIZED for a retry.
   @connect_timeout_ms 30_000
   # Grace period before arming on a seemingly-offline boot: the boot connectivity
   # read races interface bring-up (DHCP/link), so an Ethernet device looks offline
@@ -128,6 +128,9 @@ defmodule UniversalProxy.Improv do
       gatt: Keyword.get(opts, :gatt, GattServer),
       advert: Keyword.get(opts, :advert, Advert),
       wifi: Keyword.get(opts, :wifi, UniversalProxy.Improv.Wifi),
+      # Wi-Fi interface being provisioned; threaded into every :wifi call and
+      # matched against VintageNet connectivity events.
+      ifname: Keyword.get(opts, :ifname, "wlan0"),
       # Connectivity probe for the arm gate; nil (the default) reads as
       # online, so Improv NEVER arms unless the host explicitly opts into
       # offline-driven arming by wiring a real probe (the app passes
@@ -201,14 +204,14 @@ defmodule UniversalProxy.Improv do
 
   def handle_info({:improv_client_activity, _key}, state), do: {:noreply, state}
 
-  # Provisioned only when WLAN0 reaches full :internet connectivity. NOT :lan
-  # (a wrong password flaps associate→handshake-fail→drop, blipping :lan
-  # transiently — that would falsely report success), and NOT eth0/other ifaces
-  # (their connectivity says nothing about the submitted Wi-Fi). If wlan0 never
-  # reaches :internet, the connect timer fires → unable_to_connect.
+  # Provisioned only when the provisioning interface reaches full :internet
+  # connectivity. NOT :lan (a wrong password flaps associate→handshake-fail→drop,
+  # blipping :lan transiently — that would falsely report success), and NOT
+  # other ifaces (their connectivity says nothing about the submitted Wi-Fi).
+  # If it never reaches :internet, the connect timer fires → unable_to_connect.
   def handle_info(
-        {VintageNet, ["interface", "wlan0", "connection"], _old, :internet, _meta},
-        %{fsm: :provisioning} = state
+        {VintageNet, ["interface", ifname, "connection"], _old, :internet, _meta},
+        %{fsm: :provisioning, ifname: ifname} = state
       ) do
     {:noreply, mark_provisioned(state)}
   end
@@ -264,9 +267,9 @@ defmodule UniversalProxy.Improv do
 
   defp submit_wifi(ssid, pwd, state) do
     state = %{state | error: nil} |> transition(:provisioning) |> arm_provision_timer()
-    # Improv.Wifi applies the credentials; PROVISIONED is detected via the wlan0
-    # connectivity event above. configure/2 returns quickly (best-effort).
-    safe_apply(state.wifi, :configure, [ssid, pwd])
+    # Improv.Wifi applies the credentials; PROVISIONED is detected via the
+    # interface connectivity event above. configure/3 returns quickly (best-effort).
+    safe_apply(state.wifi, :configure, [ssid, pwd, wifi_opts(state)])
     state
   end
 
@@ -289,13 +292,14 @@ defmodule UniversalProxy.Improv do
 
   defp request_networks(state) do
     %{gatt: gatt, wifi: wifi} = state
+    wifi_opts = wifi_opts(state)
 
     # quick_scan sleeps ~2s — run off the GenServer loop, under the Improv
     # Task.Supervisor (crash visibility). The Task pushes the per-network results
     # then the empty terminator so the client's list completes.
     run_task(state, fn ->
       networks =
-        case safe_apply(wifi, :scan_networks, []) do
+        case safe_apply(wifi, :scan_networks, [wifi_opts]) do
           {:ok, ns} when is_list(ns) -> ns
           _ -> []
         end
@@ -373,7 +377,7 @@ defmodule UniversalProxy.Improv do
   # On success the Improv RPC-result carries the device's web-UI URL on the new
   # network, so the provisioner can redirect there. Skipped if no IPv4 yet.
   defp push_redirect_result(state) do
-    case safe_apply(state.wifi, :redirect_url, []) do
+    case safe_apply(state.wifi, :redirect_url, [wifi_opts(state)]) do
       url when is_binary(url) ->
         notify_result(state, Protocol.encode_rpc_result(Protocol.submit_wifi_command(), [url]))
 
@@ -394,6 +398,9 @@ defmodule UniversalProxy.Improv do
 
   defp notify_result(state, bytes), do: notify(state, :rpc_result, bytes)
   defp notify(state, key, bytes), do: GattServer.notify(state.gatt, key, bytes)
+
+  # Opts threaded into every :wifi call (each takes a trailing keyword list).
+  defp wifi_opts(state), do: [ifname: state.ifname]
 
   # Call the Wi-Fi module through a variable, rescued so a raising impl can't
   # crash the manager (or the scan Task). Used from both the loop and the Task.

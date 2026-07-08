@@ -112,7 +112,10 @@ defmodule UniversalProxy.Improv.Advert do
         state = %{
           conn: conn,
           conn_ref: conn_ref,
-          local_name: Keyword.get(opts, :local_name, default_local_name()),
+          local_name:
+            Keyword.get_lazy(opts, :local_name, fn ->
+              default_local_name(Keyword.get(opts, :name_prefix, "Improv"))
+            end),
           task_sup: Keyword.get(opts, :task_supervisor, UniversalProxy.Improv.TaskSupervisor),
           registered?: false
         }
@@ -131,14 +134,16 @@ defmodule UniversalProxy.Improv.Advert do
     end
   end
 
-  # Friendly name "Universal Proxy <suffix>". The suffix is the last 4 hex of the
-  # device's MAC (eth0 preferred, else wlan0) — stable, device-unique, and what
-  # the Nerves hostname is itself derived from (eth0 b8:27:eb:07:50:7f → "507f").
-  # Read directly from the MAC (not parsed from the hostname, which a rename could
-  # change). VintageNet is host-guarded; falls back to the hostname tail off-target
-  # / in tests. (Do NOT use Nerves.Runtime.serial_number here — calling it in the
-  # host test VM triggers an uncatchable reboot/shutdown.)
-  defp default_local_name, do: "Universal Proxy #{device_suffix()}"
+  # Friendly name "<prefix> <suffix>" — the prefix comes from the `name_prefix:`
+  # opt (host brand, e.g. "Universal Proxy"; defaults to "Improv"), or pass a
+  # full `local_name:` to skip suffixing entirely. The suffix is the last 4 hex
+  # of the device's MAC (eth0 preferred, else wlan0) — stable, device-unique, and
+  # what the Nerves hostname is itself derived from (eth0 b8:27:eb:07:50:7f →
+  # "507f"). Read directly from the MAC (not parsed from the hostname, which a
+  # rename could change). VintageNet is host-guarded; falls back to the hostname
+  # tail off-target / in tests. (Do NOT use Nerves.Runtime.serial_number here —
+  # calling it in the host test VM triggers an uncatchable reboot/shutdown.)
+  defp default_local_name(prefix), do: "#{prefix} #{device_suffix()}"
 
   defp device_suffix, do: mac_suffix() || hostname_suffix()
 
