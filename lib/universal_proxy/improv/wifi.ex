@@ -7,7 +7,8 @@ defmodule UniversalProxy.Improv.Wifi do
   All VintageNet access is guarded (`Code.ensure_loaded?`) so the module loads on
   host, and is injectable (`:scan_trigger` / `:vintage_get` / `:configure_fn`) so
   the pure shaping — the configure map, the AP→network mapping, the secured? rule —
-  is host-tested without a radio.
+  is host-tested without a radio. The Wi-Fi interface defaults to `"wlan0"`;
+  pass `ifname:` in each call's opts to target another interface.
 
   `scan_networks/1` reads the live `access_points` property (kept fresh by
   `wpa_supplicant`) rather than `VintageNetWiFi.quick_scan/1`, whose fresh-scan +
@@ -17,7 +18,7 @@ defmodule UniversalProxy.Improv.Wifi do
 
   require Logger
 
-  @ifname "wlan0"
+  @default_ifname "wlan0"
 
   # AP `:flags` that indicate a secured network (new-style; old-style wpa_* flags
   # are matched by prefix). Anything else (e.g. `[:ess]`) is open.
@@ -29,7 +30,7 @@ defmodule UniversalProxy.Improv.Wifi do
   Nearby networks → `{:ok, [network]}` (empty SSIDs dropped, deduped by SSID
   keeping the strongest signal), or `{:error, reason}`.
 
-  Reads the live `["interface", "wlan0", "wifi", "access_points"]` property that
+  Reads the live `["interface", ifname, "wifi", "access_points"]` property that
   `wpa_supplicant` keeps refreshed via periodic background scans — NOT
   `VintageNetWiFi.quick_scan/1`, which triggers a fresh ioctl scan and only waits
   2s, so it lands in the empty window mid-scan (HW-found: returned 0 while the
@@ -38,14 +39,15 @@ defmodule UniversalProxy.Improv.Wifi do
   """
   @spec scan_networks(keyword()) :: {:ok, [network()]} | {:error, term()}
   def scan_networks(opts \\ []) do
+    ifname = Keyword.get(opts, :ifname, @default_ifname)
     get = Keyword.get(opts, :vintage_get, &vintage_get/1)
-    trigger = Keyword.get(opts, :scan_trigger, &default_scan_trigger/0)
+    trigger = Keyword.get(opts, :scan_trigger, fn -> default_scan_trigger(ifname) end)
 
     # Async refresh for subsequent requests; return what's cached now.
     trigger.()
 
     networks =
-      ["interface", @ifname, "wifi", "access_points"]
+      ["interface", ifname, "wifi", "access_points"]
       |> get.()
       |> ap_list()
       |> Enum.map(&network_from_ap/1)
@@ -65,13 +67,14 @@ defmodule UniversalProxy.Improv.Wifi do
   defp ap_list(_), do: []
 
   @doc """
-  Apply submitted credentials to `wlan0`. `:configure_fn` (2-arity `(ifname,
-  config) -> term`) is injectable for tests.
+  Apply submitted credentials to the Wi-Fi interface. `:configure_fn` (2-arity
+  `(ifname, config) -> term`) is injectable for tests.
   """
   @spec configure(binary(), binary(), keyword()) :: term()
   def configure(ssid, password, opts \\ []) do
+    ifname = Keyword.get(opts, :ifname, @default_ifname)
     cfg = Keyword.get(opts, :configure_fn, &default_configure/2)
-    cfg.(@ifname, configure_map(ssid, password))
+    cfg.(ifname, configure_map(ssid, password))
   end
 
   @doc """
@@ -80,8 +83,9 @@ defmodule UniversalProxy.Improv.Wifi do
   """
   @spec redirect_url(keyword()) :: String.t() | nil
   def redirect_url(opts \\ []) do
+    ifname = Keyword.get(opts, :ifname, @default_ifname)
     get = Keyword.get(opts, :vintage_get, &vintage_get/1)
-    addrs = get.(["interface", @ifname, "addresses"]) || []
+    addrs = get.(["interface", ifname, "addresses"]) || []
 
     case first_ipv4(addrs) do
       nil -> nil
@@ -143,8 +147,8 @@ defmodule UniversalProxy.Improv.Wifi do
   # ── VintageNet wrappers (target-only) ──────────────────────────────────────
 
   # Best-effort async refresh of the access_points property; results land later.
-  defp default_scan_trigger do
-    if Code.ensure_loaded?(VintageNet), do: apply(VintageNet, :scan, [@ifname]), else: :ok
+  defp default_scan_trigger(ifname) do
+    if Code.ensure_loaded?(VintageNet), do: apply(VintageNet, :scan, [ifname]), else: :ok
   rescue
     _ -> :ok
   end

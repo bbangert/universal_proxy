@@ -175,7 +175,10 @@ defmodule UniversalProxy.Bluetooth do
        {UniversalProxy.Improv.Supervisor,
         [
           pubsub: UniversalProxy.PubSub,
-          network_type: &UniversalProxy.System.network_type/0
+          network_type: &UniversalProxy.System.network_type/0,
+          # Advert branding: keeps the BLE-visible name "Universal Proxy <mac4>"
+          # while the suffix derivation stays inside Improv.
+          name_prefix: "Universal Proxy"
         ]}
      ]}
   end

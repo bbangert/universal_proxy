@@ -22,7 +22,7 @@ defmodule UniversalProxy.ImprovTest do
   end
 
   defmodule StubWifi do
-    def scan_networks do
+    def scan_networks(_opts \\ []) do
       {:ok,
        [
          %{ssid: "Net1", rssi: -50, secured: true},
@@ -30,15 +30,34 @@ defmodule UniversalProxy.ImprovTest do
        ]}
     end
 
-    def configure(_ssid, _pwd), do: :ok
-    def redirect_url, do: "http://192.168.1.50/"
+    def configure(_ssid, _pwd, _opts \\ []), do: :ok
+    def redirect_url(_opts \\ []), do: "http://192.168.1.50/"
   end
 
   # Like StubWifi but with no bound IPv4 yet (redirect_url → nil).
   defmodule StubWifiNoIp do
-    def scan_networks, do: {:ok, []}
-    def configure(_ssid, _pwd), do: :ok
-    def redirect_url, do: nil
+    def scan_networks(_opts \\ []), do: {:ok, []}
+    def configure(_ssid, _pwd, _opts \\ []), do: :ok
+    def redirect_url(_opts \\ []), do: nil
+  end
+
+  # Echoes each call's opts to the process registered as :improv_echo_test, so
+  # tests can assert the manager threads ifname: into every wifi call.
+  defmodule EchoWifi do
+    def scan_networks(opts \\ []) do
+      send(:improv_echo_test, {:scan_opts, opts})
+      {:ok, []}
+    end
+
+    def configure(_ssid, _pwd, opts \\ []) do
+      send(:improv_echo_test, {:configure_opts, opts})
+      :ok
+    end
+
+    def redirect_url(opts \\ []) do
+      send(:improv_echo_test, {:redirect_opts, opts})
+      "http://192.168.1.50/"
+    end
   end
 
   defp start_manager(opts) do
@@ -249,6 +268,25 @@ defmodule UniversalProxy.ImprovTest do
       send(mgr, {VintageNet, ["interface", "eth0", "connection"], :lan, :internet, %{}})
       refute_receive {:gatt, {:notify, :current_state, <<0x04>>}}, 150
       assert %{state: :provisioning} = Improv.status(mgr)
+    end
+
+    test "a custom ifname: drives the connectivity match and every wifi call" do
+      Process.register(self(), :improv_echo_test)
+      %{mgr: mgr} = start_manager(network_type: offline(), wifi: EchoWifi, ifname: "wlan1")
+      assert_receive {:gatt, :register}
+
+      send(mgr, {:improv_rpc_command, submit_frame("MyNet", "pw")})
+      assert_receive {:configure_opts, [ifname: "wlan1"]}
+      assert_receive {:gatt, {:notify, :current_state, <<0x03>>}}
+
+      # The default interface joining is NOT the one being provisioned.
+      send(mgr, {VintageNet, ["interface", "wlan0", "connection"], :configuring, :internet, %{}})
+      refute_receive {:gatt, {:notify, :current_state, <<0x04>>}}, 150
+
+      # The configured interface joining completes provisioning.
+      send(mgr, {VintageNet, ["interface", "wlan1", "connection"], :configuring, :internet, %{}})
+      assert_receive {:gatt, {:notify, :current_state, <<0x04>>}}
+      assert_receive {:redirect_opts, [ifname: "wlan1"]}
     end
 
     test "wlan0 only reaching :lan (flapping) does NOT mark provisioned" do

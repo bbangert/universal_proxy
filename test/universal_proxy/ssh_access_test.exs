@@ -13,7 +13,16 @@ defmodule UniversalProxy.SSHAccessTest do
     {:ok, pid} = SSHAccess.start_link(name: name, table: table, dets_path: path)
 
     on_exit(fn ->
-      if Process.alive?(pid), do: GenServer.stop(pid)
+      # The server is linked to the (already-dead) test process, so it may be
+      # shutting down concurrently — alive?-then-stop is a TOCTOU race that
+      # exits with :shutdown under CI load. Stop unconditionally and swallow
+      # the already-dead exit.
+      try do
+        GenServer.stop(pid)
+      catch
+        :exit, _ -> :ok
+      end
+
       File.rm_rf!(dir)
     end)
 

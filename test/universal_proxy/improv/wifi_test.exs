@@ -73,6 +73,14 @@ defmodule UniversalProxy.Improv.WifiTest do
                Wifi.scan_networks(vintage_get: fn _ -> nil end, scan_trigger: fn -> :ok end)
     end
 
+    test "ifname: overrides the interface whose property is read" do
+      aps = %{"aa" => %{ssid: "Net1", signal_dbm: -50, flags: [:wpa2, :psk]}}
+      get = fn ["interface", "wlan1", "wifi", "access_points"] -> aps end
+
+      assert {:ok, [%{ssid: "Net1"}]} =
+               Wifi.scan_networks(ifname: "wlan1", vintage_get: get, scan_trigger: fn -> :ok end)
+    end
+
     test "returns {:error, :scan_failed} when the read raises" do
       assert Wifi.scan_networks(
                vintage_get: fn _ -> raise "boom" end,
@@ -92,6 +100,15 @@ defmodule UniversalProxy.Improv.WifiTest do
       assert_receive {:configured, "wlan0", %{vintage_net_wifi: %{networks: [net]}}}
       assert net == %{key_mgmt: :wpa_psk, ssid: "MyNet", psk: "pw"}
     end
+
+    test "ifname: overrides the configured interface" do
+      test = self()
+      cfg = fn ifname, config -> send(test, {:configured, ifname, config}) end
+
+      Wifi.configure("MyNet", "pw", configure_fn: cfg, ifname: "wlan1")
+
+      assert_receive {:configured, "wlan1", _config}
+    end
   end
 
   describe "redirect_url/1" do
@@ -101,6 +118,14 @@ defmodule UniversalProxy.Improv.WifiTest do
       end
 
       assert Wifi.redirect_url(vintage_get: get) == "http://192.168.1.50/"
+    end
+
+    test "ifname: overrides the interface whose addresses are read" do
+      get = fn ["interface", "wlan1", "addresses"] ->
+        [%{family: :inet, scope: :universe, address: {10, 0, 0, 7}}]
+      end
+
+      assert Wifi.redirect_url(ifname: "wlan1", vintage_get: get) == "http://10.0.0.7/"
     end
 
     test "nil when no IPv4 address is bound" do
