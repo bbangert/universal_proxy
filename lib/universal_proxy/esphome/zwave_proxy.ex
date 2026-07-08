@@ -9,12 +9,21 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
 
   ## Lifecycle
 
-  - On init, if a Z-Wave port path is provided, opens `Circuits.UART`
-    at 115200/8N1 and sends a GET_NETWORK_IDS command to discover the
-    home ID.
-  - Incoming UART bytes are fed through `Espex.ZWaveProxy.Parser`, which
-    returns local ACK/NAK/CAN responses to write back to the UART, and
-    complete frames to forward to the subscribed espex connection.
+  - On init, if a Z-Wave port path (or a `:resolver`) is provided, opens
+    `Circuits.UART` at 115200/8N1 and sends GET_NETWORK_IDS to discover
+    the home ID, retrying up to 5 times at 500 ms intervals (mirrors
+    the ESPHome component's reconnect retry).
+  - Incoming UART bytes are fed through the `Parser`, which returns local
+    ACK/NAK/CAN responses to write back to the UART, and complete frames
+    to forward to the subscribed espex connection.
+  - Client frames that duplicate the response the proxy already sent
+    locally (single-byte ACK/NAK/CAN) are suppressed, matching the
+    ESPHome `last_response_` guard.
+  - On UART error the port is closed, the home ID is cleared (and the
+    subscriber notified with a zeroed ID, mirroring ESPHome's
+    `clear_home_id_`), and a reopen loop re-resolves the port every 5 s
+    via the `:resolver` — so a stick replugged (or first plugged after
+    boot) attaches without restarting the supervision tree.
   - Only one connection may subscribe at a time (Z-Wave Serial API is
     single-master). The subscriber is monitored and auto-unsubscribed
     on crash.
@@ -37,13 +46,29 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
   @short_call_timeout 1_000
   @send_frame_timeout 3_000
 
+  # Home-ID query retry cadence — mirrors the ESPHome component's
+  # RECONNECT_DELAY_MS / MAX_QUERY_RETRIES.
+  @home_id_retry_interval 500
+  @max_home_id_retries 5
+
+  # Port (re)open / hotplug rescan cadence.
+  @reopen_interval 5_000
+
+  @zero_home_id <<0, 0, 0, 0>>
+
   defstruct [
     :uart_pid,
     :port_path,
+    :resolver,
     :subscriber,
     :monitor_ref,
+    :reopen_timer,
+    :home_id_timer,
+    :last_open_error,
     parser: nil,
-    home_id: <<0, 0, 0, 0>>
+    home_id: @zero_home_id,
+    home_id_ready: false,
+    query_retries: 0
   ]
 
   # -- Adapter wiring --
@@ -105,23 +130,42 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
     :exit, _ -> {:error, :unavailable}
   end
 
+  @doc """
+  The tty this proxy currently holds open, or `nil`.
+
+  `UniversalProxy.Hardware` uses this to mark the port as in-use on the
+  Overview (the Z-Wave port is opened directly, not through the shared
+  `UART.Server`, so it is invisible to `UART.ports/0`). `subscribed`
+  says whether an API client (Z-Wave JS) is attached right now.
+
+  Note: `Hardware.list_ports/0` calls this by default, and this server's
+  own port resolver calls `Hardware.list_ports/0` — that self-call exits
+  with `:calling_self` immediately and is caught here, so the resolver
+  simply sees "no claim" for its own row.
+  """
+  @spec claimed_port(GenServer.server()) ::
+          %{tty_name: String.t(), subscribed: boolean()} | nil
+  def claimed_port(server \\ __MODULE__) do
+    GenServer.call(server, :claimed_port, @short_call_timeout)
+  catch
+    :exit, _ -> nil
+  end
+
   # -- Server Callbacks --
 
   @impl GenServer
   def init(opts) do
-    port_path = Keyword.get(opts, :port_path)
-
     state = %__MODULE__{
       parser: Parser.new(),
-      port_path: port_path
+      port_path: Keyword.get(opts, :port_path),
+      resolver: Keyword.get(opts, :resolver)
     }
 
-    if port_path do
+    if state.port_path || state.resolver do
       # Port open is deferred out of init: `Circuits.UART.open` can block
       # on a slow/misbehaving tty, and nothing here may hold up the
-      # ESPHome supervisor's boot. Same tolerate-failure semantics as
-      # before (a failed open leaves uart_pid nil); matches the
-      # FMA120/irdroid worker pattern.
+      # ESPHome supervisor's boot. A failed open schedules a retry rather
+      # than crashing; matches the FMA120/irdroid worker pattern.
       {:ok, state, {:continue, :open_port}}
     else
       Logger.info("Z-Wave proxy started (no device configured)")
@@ -130,18 +174,8 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
   end
 
   @impl GenServer
-  def handle_continue(:open_port, %{port_path: port_path} = state) do
-    case open_port(port_path) do
-      {:ok, uart_pid} ->
-        state = %{state | uart_pid: uart_pid}
-        request_home_id(state)
-        Logger.info("Z-Wave proxy started on #{port_path}")
-        {:noreply, state}
-
-      {:error, reason} ->
-        Logger.warning("Z-Wave proxy failed to open #{port_path}: #{inspect(reason)}")
-        {:noreply, state}
-    end
+  def handle_continue(:open_port, state) do
+    {:noreply, attempt_open(state)}
   end
 
   @impl GenServer
@@ -182,15 +216,45 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
     end
   end
 
+  def handle_call(:claimed_port, _from, state) do
+    reply =
+      if state.uart_pid && state.port_path do
+        %{tty_name: Path.basename(state.port_path), subscribed: state.subscriber != nil}
+      end
+
+    {:reply, reply, state}
+  end
+
+  def handle_call({:send_frame, _data}, _from, %{uart_pid: nil} = state) do
+    {:reply, {:error, :unavailable}, state}
+  end
+
+  def handle_call({:send_frame, <<>>}, _from, state) do
+    {:reply, {:error, :empty_frame}, state}
+  end
+
   def handle_call({:send_frame, data}, _from, state) do
-    {:reply, write_frame(state, data), state}
+    if Parser.duplicate_response?(state.parser, data) do
+      # The proxy already ACK/NAKed this frame locally; forwarding the
+      # client's copy would hand the module a duplicate it may
+      # misattribute to the next frame in flight (ESPHome parity).
+      {:reply, :ok, state}
+    else
+      {:reply, Circuits.UART.write(state.uart_pid, data), state}
+    end
   end
 
   @impl GenServer
   def handle_info({:circuits_uart, _port, {:error, reason}}, state) do
     Logger.warning("Z-Wave UART error: #{inspect(reason)}")
     cleanup_uart(state.uart_pid)
-    {:noreply, %{state | uart_pid: nil, parser: Parser.new()}}
+
+    state =
+      %{state | uart_pid: nil, parser: Parser.new(), home_id_ready: false, query_retries: 0}
+      |> clear_home_id()
+      |> schedule_reopen()
+
+    {:noreply, state}
   end
 
   def handle_info({:circuits_uart, _port, data}, state) when is_binary(data) do
@@ -198,6 +262,35 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
     state = %{state | parser: parser}
     state = execute_actions(state, actions)
     {:noreply, state}
+  end
+
+  def handle_info(:zwave_reopen, state) do
+    state = %{state | reopen_timer: nil}
+
+    if state.uart_pid do
+      {:noreply, state}
+    else
+      {:noreply, attempt_open(state)}
+    end
+  end
+
+  def handle_info(:zwave_home_id_retry, state) do
+    state = %{state | home_id_timer: nil}
+
+    cond do
+      state.uart_pid == nil or state.home_id_ready ->
+        {:noreply, state}
+
+      state.query_retries < @max_home_id_retries ->
+        Logger.debug("Z-Wave querying home ID (retry #{state.query_retries + 1})")
+        request_home_id(state)
+
+        {:noreply, schedule_home_id_retry(%{state | query_retries: state.query_retries + 1})}
+
+      true ->
+        Logger.warning("Z-Wave failed to read home ID after #{@max_home_id_retries} retries")
+        {:noreply, state}
+    end
   end
 
   def handle_info({:DOWN, ref, :process, pid, _reason}, %{monitor_ref: ref} = state) do
@@ -230,10 +323,71 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
     :ok
   end
 
+  # Resolve (preferring the dynamic resolver — a replugged stick can come
+  # back on a different tty) and open the port. On any failure, arm the
+  # reopen timer so the next attempt happens without external prodding.
+  defp attempt_open(state) do
+    case resolve_path(state) do
+      nil ->
+        schedule_reopen(state)
+
+      port_path ->
+        case open_port(port_path) do
+          {:ok, uart_pid} ->
+            Logger.info("Z-Wave proxy started on #{port_path}")
+
+            # port_path is updated to the path that actually opened — a
+            # resolver-discovered stick would otherwise leave it nil (or
+            # stale after a replug onto a different tty), and
+            # claimed_port/1 reports it to the Overview.
+            %{
+              state
+              | uart_pid: uart_pid,
+                port_path: port_path,
+                parser: Parser.new(),
+                home_id_ready: false,
+                query_retries: 0,
+                last_open_error: nil
+            }
+            |> tap(&request_home_id/1)
+            |> schedule_home_id_retry()
+
+          {:error, reason} ->
+            # First (or changed) failure logs at warning; identical
+            # repeats every @reopen_interval drop to debug to avoid spam.
+            level = if reason == state.last_open_error, do: :debug, else: :warning
+            Logger.log(level, "Z-Wave proxy failed to open #{port_path}: #{inspect(reason)}")
+            schedule_reopen(%{state | last_open_error: reason})
+        end
+    end
+  end
+
+  defp resolve_path(%{resolver: resolver, port_path: port_path}) do
+    (resolver && resolver.()) || port_path
+  end
+
+  # Nothing to reopen when no port was ever configured and there's no
+  # resolver to discover one.
+  defp schedule_reopen(%{port_path: nil, resolver: nil} = state), do: state
+
+  defp schedule_reopen(%{reopen_timer: nil} = state) do
+    %{state | reopen_timer: Process.send_after(self(), :zwave_reopen, @reopen_interval)}
+  end
+
+  defp schedule_reopen(state), do: state
+
+  defp schedule_home_id_retry(%{home_id_timer: nil} = state) do
+    %{
+      state
+      | home_id_timer: Process.send_after(self(), :zwave_home_id_retry, @home_id_retry_interval)
+    }
+  end
+
+  defp schedule_home_id_retry(state), do: state
+
   defp open_port(port_path) do
-    with {:ok, pid} <- Circuits.UART.start_link(),
-         :ok <-
-           Circuits.UART.open(pid, port_path,
+    with {:ok, pid} <- Circuits.UART.start_link() do
+      case Circuits.UART.open(pid, port_path,
              speed: @uart_speed,
              data_bits: 8,
              stop_bits: 1,
@@ -241,7 +395,15 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
              flow_control: :none,
              active: true
            ) do
-      {:ok, pid}
+        :ok ->
+          {:ok, pid}
+
+        {:error, reason} ->
+          # Don't leak the UART process — the reopen loop would stack one
+          # per failed attempt otherwise.
+          cleanup_uart(pid)
+          {:error, reason}
+      end
     end
   end
 
@@ -275,24 +437,30 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
 
   defp maybe_update_home_id(state, frame_data) do
     case Frame.extract_home_id(frame_data) do
-      {:ok, new_home_id} when new_home_id != state.home_id ->
-        Logger.info("Z-Wave home ID changed: #{inspect(new_home_id)}")
+      {:ok, new_home_id} ->
+        # Any valid GET_NETWORK_IDS response settles the retry loop, even
+        # when the ID is unchanged.
+        state = %{state | home_id_ready: true}
+        put_home_id(state, new_home_id)
 
-        if state.subscriber do
-          send(state.subscriber, {:espex_zwave_home_id_changed, new_home_id})
-        end
-
-        %{state | home_id: new_home_id}
-
-      _ ->
+      :error ->
         state
     end
   end
 
-  defp write_frame(%{uart_pid: nil}, _data), do: {:error, :unavailable}
-  defp write_frame(_state, <<>>), do: {:error, :empty_frame}
+  # Mirrors ESPHome's clear_home_id_: on device loss, zero the ID and
+  # tell the subscriber so the client's stored network identity resets.
+  defp clear_home_id(state), do: put_home_id(state, @zero_home_id)
 
-  defp write_frame(%{uart_pid: pid}, data) when is_binary(data) do
-    Circuits.UART.write(pid, data)
+  defp put_home_id(%{home_id: home_id} = state, home_id), do: state
+
+  defp put_home_id(state, new_home_id) do
+    Logger.info("Z-Wave home ID changed: #{inspect(new_home_id)}")
+
+    if state.subscriber do
+      send(state.subscriber, {:espex_zwave_home_id_changed, new_home_id})
+    end
+
+    %{state | home_id: new_home_id}
   end
 end

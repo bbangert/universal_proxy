@@ -66,7 +66,10 @@ defmodule UniversalProxy.Hardware do
   # in the wild are TTL) go in the second.
   @usb_devices [
     # ── Branded products (kind locked by hardware) ────────────────
-    {0x10C4, 0xEA60,
+    # VID/PID from Home Assistant's zwave_js manifest (vid 303A =
+    # Espressif — the ZWA-2's USB interface is its ESP32 bridge; the
+    # Z-Wave radio itself is the EFR32ZG23).
+    {0x303A, 0x4001,
      %{
        kind: :zwave,
        name: "Home Assistant Connect ZWA-2",
@@ -119,6 +122,10 @@ defmodule UniversalProxy.Hardware do
     {0x0403, 0x6010, %{kind: :ttl, name: "USB Serial Adapter", chip: "FT2232H"}},
     {0x0403, 0x6014, %{kind: :ttl, name: "USB Serial Adapter", chip: "FT232H"}},
     {0x0403, 0x6015, %{kind: :ttl, name: "USB Serial Adapter", chip: "FT231X"}},
+    # NOTE: SONOFF Z-Wave 800 dongles also enumerate as 10C4:EA60 — HA
+    # disambiguates by USB descriptor strings; here they take the manual
+    # `:zwave` type selection, which `resolve_zwave_port/0` honors.
+    {0x10C4, 0xEA60, %{kind: :ttl, name: "USB Serial Adapter", chip: "CP2102/CP2102N"}},
     {0x10C4, 0xEA70, %{kind: :ttl, name: "USB Serial Adapter", chip: "CP2105"}},
     {0x1A86, 0x7523, %{kind: :ttl, name: "USB Serial Adapter", chip: "CH340"}},
     {0x1A86, 0x55D4, %{kind: :ttl, name: "USB Serial Adapter", chip: "CH9102"}},
@@ -159,6 +166,10 @@ defmodule UniversalProxy.Hardware do
     * `:saved_configs` — pre-built `%{serial_number => config}` map
     * `:in_use_ports` — pre-built `MapSet` of currently-opened tty
       basenames
+    * `:zwave_claim` — the Z-Wave proxy's port claim
+      (`%{tty_name: ..., subscribed: ...}` or `nil`); the proxy opens
+      its tty directly rather than through `UART.Server`, so it never
+      appears in `:in_use_ports`
 
   All defaults are wired to live system sources; tests inject fixtures.
   """
@@ -175,16 +186,22 @@ defmodule UniversalProxy.Hardware do
         end)
       end)
 
-    in_use_ports =
-      Keyword.get_lazy(opts, :in_use_ports, fn ->
-        MapSet.new(UART.ports(), fn {name, _cfg} -> name end)
-      end)
+    usage = %{
+      in_use_ports:
+        Keyword.get_lazy(opts, :in_use_ports, fn ->
+          MapSet.new(UART.ports(), fn {name, _cfg} -> name end)
+        end),
+      zwave_claim:
+        Keyword.get_lazy(opts, :zwave_claim, fn ->
+          UniversalProxy.ESPHome.ZWaveProxy.claimed_port()
+        end)
+    }
 
     slots = Keyword.get(opts, :slots, target_slots())
 
     case slots do
-      nil -> dynamic_listing(enumerated, bus_paths, saved, in_use_ports)
-      slots -> slot_listing(slots, enumerated, bus_paths, saved, in_use_ports)
+      nil -> dynamic_listing(enumerated, bus_paths, saved, usage)
+      slots -> slot_listing(slots, enumerated, bus_paths, saved, usage)
     end
   end
 
@@ -329,7 +346,7 @@ defmodule UniversalProxy.Hardware do
 
   # -- Slot mode (per-target, every port shows) ------------------------
 
-  defp slot_listing(slots, enumerated, bus_paths, saved, in_use_ports) do
+  defp slot_listing(slots, enumerated, bus_paths, saved, usage) do
     tty_by_bus_path = Map.new(bus_paths, fn {tty, bus} -> {bus, tty} end)
     known_slots = MapSet.new(slots)
 
@@ -343,7 +360,7 @@ defmodule UniversalProxy.Hardware do
 
           tty_name ->
             info = Map.get(enumerated, tty_name, %{})
-            build_port(tty_name, info, slot_sub, saved, in_use_ports, idx)
+            build_port(tty_name, info, slot_sub, saved, usage, idx)
         end
       end)
 
@@ -356,7 +373,7 @@ defmodule UniversalProxy.Hardware do
       |> Enum.with_index(length(slots) + 1)
       |> Enum.map(fn {{tty_name, bus_path}, idx} ->
         info = Map.get(enumerated, tty_name, %{})
-        build_port(tty_name, info, bus_path, saved, in_use_ports, idx)
+        build_port(tty_name, info, bus_path, saved, usage, idx)
       end)
 
     declared ++ bonus
@@ -364,7 +381,7 @@ defmodule UniversalProxy.Hardware do
 
   # -- Dynamic mode (host / unknown target) ----------------------------
 
-  defp dynamic_listing(enumerated, bus_paths, saved, in_use_ports) do
+  defp dynamic_listing(enumerated, bus_paths, saved, usage) do
     enumerated
     |> Enum.filter(fn {name, _} -> usb_serial?(name) end)
     |> Enum.map(fn {name, info} -> {name, info, Map.get(bus_paths, name)} end)
@@ -372,7 +389,7 @@ defmodule UniversalProxy.Hardware do
     |> Enum.with_index(1)
     |> Enum.map(fn {{name, info, bus_path}, idx} ->
       slot_sub = bus_path || name
-      build_port(name, info, slot_sub, saved, in_use_ports, idx)
+      build_port(name, info, slot_sub, saved, usage, idx)
     end)
   end
 
@@ -430,11 +447,11 @@ defmodule UniversalProxy.Hardware do
 
   # -- Port shape ------------------------------------------------------
 
-  defp build_port(tty_name, info, slot_sub, saved, in_use_ports, idx) do
+  defp build_port(tty_name, info, slot_sub, saved, usage, idx) do
     vid = info[:vendor_id]
     pid = info[:product_id]
     serial = info[:serial_number]
-    in_use? = MapSet.member?(in_use_ports, tty_name)
+    {in_use?, user} = port_usage(tty_name, usage)
     device_info = Map.get(@usb_device_table, {vid, pid})
     saved_cfg = Map.get(saved, {slot_sub, vid, pid})
 
@@ -464,7 +481,7 @@ defmodule UniversalProxy.Hardware do
       in_use: in_use?,
       configured: classification.configured,
       locked: classification.locked,
-      user: if(in_use?, do: "ESPHome serial proxy", else: nil),
+      user: user,
       user_href: nil,
       baud: nil,
       throughput: %{in: 0, out: 0, unit: "B/s"},
@@ -472,6 +489,22 @@ defmodule UniversalProxy.Hardware do
       since: nil,
       notes: classification.notes
     }
+  end
+
+  # Who holds this tty open, if anyone. The Z-Wave proxy owns its port
+  # directly (never via UART.Server), so it gets its own label; the
+  # subscribed flag distinguishes an attached Z-Wave JS client from the
+  # proxy merely holding the port open.
+  defp port_usage(tty_name, %{zwave_claim: %{tty_name: tty_name} = claim}) do
+    {true, if(claim.subscribed, do: "Z-Wave JS · Home Assistant", else: "Z-Wave proxy")}
+  end
+
+  defp port_usage(tty_name, %{in_use_ports: in_use_ports}) do
+    if MapSet.member?(in_use_ports, tty_name) do
+      {true, "ESPHome serial proxy"}
+    else
+      {false, nil}
+    end
   end
 
   # Format a port for display in Home Assistant's serial port picker.

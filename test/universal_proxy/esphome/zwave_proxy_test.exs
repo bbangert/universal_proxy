@@ -4,10 +4,48 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
   use ExUnit.Case, async: true
 
   alias UniversalProxy.ESPHome.ZWaveProxy
+  alias UniversalProxy.ESPHome.ZWaveProxy.{Frame, Parser}
+
+  # Stands in for the Circuits.UART GenServer: replies :ok to every call
+  # and forwards writes to the test process, so tests can assert exactly
+  # what reaches the "wire".
+  defmodule FakeUART do
+    use GenServer
+
+    def start_link(test_pid), do: GenServer.start_link(__MODULE__, test_pid)
+
+    @impl true
+    def init(test_pid), do: {:ok, test_pid}
+
+    @impl true
+    def handle_call({:write, data, _timeout}, _from, test_pid) do
+      send(test_pid, {:uart_write, data})
+      {:reply, :ok, test_pid}
+    end
+
+    def handle_call(_msg, _from, test_pid), do: {:reply, :ok, test_pid}
+  end
 
   setup do
     pid = start_supervised!({ZWaveProxy, name: nil, port_path: nil})
     {:ok, server: pid}
+  end
+
+  # GET_NETWORK_IDS response with home ID DE:AD:BE:EF (LENGTH = 9).
+  defp network_ids_response do
+    body = <<0x01, 0x09, 0x01, 0x20, 0xDE, 0xAD, 0xBE, 0xEF, 0x05, 0x00>>
+    body <> <<Frame.calculate_checksum(body <> <<0x00>>)>>
+  end
+
+  # Wire a FakeUART into the server's state (there is no real tty in CI).
+  defp attach_fake_uart(server, overrides \\ %{}) do
+    {:ok, fake} = FakeUART.start_link(self())
+
+    :sys.replace_state(server, fn state ->
+      struct!(state, Map.merge(%{uart_pid: fake, port_path: "/dev/ttyFake"}, overrides))
+    end)
+
+    fake
   end
 
   describe "without hardware" do
@@ -29,6 +67,109 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
 
     test "unsubscribe is idempotent for an unknown pid", %{server: server} do
       assert :ok = ZWaveProxy.unsubscribe(server, self())
+    end
+
+    test "claimed_port is nil without an open port", %{server: server} do
+      assert ZWaveProxy.claimed_port(server) == nil
+    end
+
+    test "an unopenable port path leaves the proxy unavailable, not crashed" do
+      server =
+        start_supervised!(
+          {ZWaveProxy, name: nil, port_path: "/dev/nonexistent-zwave-test"},
+          id: :zwave_bad_port
+        )
+
+      refute ZWaveProxy.available?(server)
+      assert Process.alive?(server)
+    end
+  end
+
+  describe "frame pipeline (fake UART)" do
+    test "UART bytes are ACKed locally, forwarded, and update the home ID", %{server: server} do
+      attach_fake_uart(server)
+      assert {:ok, <<0, 0, 0, 0>>} = ZWaveProxy.subscribe(server, self())
+
+      frame = network_ids_response()
+      send(server, {:circuits_uart, "ttyFake", frame})
+
+      # Local ACK reaches the wire before the frame reaches the client.
+      assert_receive {:uart_write, <<0x06>>}
+      assert_receive {:espex_zwave_home_id_changed, <<0xDE, 0xAD, 0xBE, 0xEF>>}
+      assert_receive {:espex_zwave_frame, ^frame}
+
+      assert ZWaveProxy.home_id(server) == 0xDEADBEEF
+      assert ZWaveProxy.available?(server)
+    end
+
+    test "duplicate single-byte client responses are suppressed (ESPHome parity)",
+         %{server: server} do
+      attach_fake_uart(server, %{parser: %{Parser.new() | last_response: 0x06}})
+
+      # The proxy already ACKed locally — the client's copy is dropped.
+      assert :ok = ZWaveProxy.send_frame(server, <<0x06>>)
+      refute_receive {:uart_write, <<0x06>>}, 50
+
+      # A different single-byte response passes through.
+      assert :ok = ZWaveProxy.send_frame(server, <<0x15>>)
+      assert_receive {:uart_write, <<0x15>>}
+
+      # Multi-byte frames are never suppressed.
+      frame = network_ids_response()
+      assert :ok = ZWaveProxy.send_frame(server, frame)
+      assert_receive {:uart_write, ^frame}
+    end
+
+    test "empty frames are rejected", %{server: server} do
+      attach_fake_uart(server)
+      assert {:error, :empty_frame} = ZWaveProxy.send_frame(server, <<>>)
+    end
+
+    test "claimed_port reports the open tty and subscription state", %{server: server} do
+      attach_fake_uart(server)
+
+      assert ZWaveProxy.claimed_port(server) == %{tty_name: "ttyFake", subscribed: false}
+
+      {:ok, _} = ZWaveProxy.subscribe(server, self())
+      assert ZWaveProxy.claimed_port(server) == %{tty_name: "ttyFake", subscribed: true}
+
+      :ok = ZWaveProxy.unsubscribe(server, self())
+      assert ZWaveProxy.claimed_port(server) == %{tty_name: "ttyFake", subscribed: false}
+    end
+  end
+
+  describe "home-ID lifecycle (fake UART)" do
+    test "UART error clears the home ID and notifies the subscriber", %{server: server} do
+      attach_fake_uart(server, %{home_id: <<0xDE, 0xAD, 0xBE, 0xEF>>, home_id_ready: true})
+      assert {:ok, <<0xDE, 0xAD, 0xBE, 0xEF>>} = ZWaveProxy.subscribe(server, self())
+
+      send(server, {:circuits_uart, "ttyFake", {:error, :eio}})
+
+      assert_receive {:espex_zwave_home_id_changed, <<0, 0, 0, 0>>}
+      refute ZWaveProxy.available?(server)
+      assert ZWaveProxy.home_id(server) == 0
+    end
+
+    test "retry tick re-sends GET_NETWORK_IDS while the home ID is unknown", %{server: server} do
+      attach_fake_uart(server, %{home_id_ready: false, query_retries: 0})
+
+      send(server, :zwave_home_id_retry)
+      assert_receive {:uart_write, cmd}
+      assert cmd == Frame.get_network_ids_command()
+    end
+
+    test "retry tick gives up after the retry budget", %{server: server} do
+      attach_fake_uart(server, %{home_id_ready: false, query_retries: 5})
+
+      send(server, :zwave_home_id_retry)
+      refute_receive {:uart_write, _}, 50
+    end
+
+    test "retry tick is a no-op once the home ID is known", %{server: server} do
+      attach_fake_uart(server, %{home_id_ready: true, query_retries: 1})
+
+      send(server, :zwave_home_id_retry)
+      refute_receive {:uart_write, _}, 50
     end
   end
 

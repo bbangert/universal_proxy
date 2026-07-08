@@ -21,7 +21,7 @@ defmodule UniversalProxyWeb.MockData do
       device: "/dev/ttyACM0",
       chip: "Silicon Labs EFR32ZG23",
       serial: "DH001K8R",
-      vidpid: "10C4:EA60",
+      vidpid: "303A:4001",
       connected: true,
       in_use: true,
       configured: true,

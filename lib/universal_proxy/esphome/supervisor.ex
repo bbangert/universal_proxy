@@ -84,7 +84,10 @@ defmodule UniversalProxy.ESPHome.Supervisor do
       ] ++ bluetooth_opts()
 
     children = [
-      {ZWaveProxy, port_path: zwave_port_path},
+      # The resolver lets the proxy re-resolve the port on its reopen
+      # loop, so a stick plugged in (or replugged) after boot attaches
+      # without restarting this tree.
+      {ZWaveProxy, port_path: zwave_port_path, resolver: &__MODULE__.resolve_zwave_port/0},
       Infrared.Supervisor,
       # Must start BEFORE Espex (rest_for_one): Espex calls
       # EntityProvider.list_entities/0 at connection-accept time, and a
@@ -160,10 +163,14 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   # cooperate:
   #
   #   1. `Hardware.list_ports/0` already auto-classifies the Nabu Casa
-  #      Connect ZWA-2 by VID/PID (`0x10C4:0xEA60`), so the common case
+  #      Connect ZWA-2 by VID/PID (`0x303A:0x4001`), so the common case
   #      needs no saved config.
-  #   2. A user-saved `:zwave` override on a generic port still wins.
-  defp resolve_zwave_port do
+  #   2. A user-saved `:zwave` override on a generic port still wins
+  #      (e.g. a SONOFF Z-Wave 800 dongle on a CP2102, `0x10C4:0xEA60`).
+  #
+  # Public because `ZWaveProxy` re-invokes it from its reopen loop.
+  @doc false
+  def resolve_zwave_port do
     case Enum.find(Hardware.list_ports(), &(&1.connected and &1.kind == :zwave)) do
       nil ->
         # Fallback for pre-existing saved configs that target a port
