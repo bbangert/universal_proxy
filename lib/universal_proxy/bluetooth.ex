@@ -151,7 +151,7 @@ defmodule UniversalProxy.Bluetooth do
     * the app's own children mount in the `extra_children:` slot (after
       `BlueAlsa`): the AudioManager pair (BT-headphone control plane)
       first — preserving the restart-ordering semantics it had as a
-      hardcoded child — then `UniversalProxy.Improv.Supervisor` LAST, so
+      hardcoded child — then `Improv.Supervisor` LAST, so
       an Improv fault never disturbs the proxy scanning/GATT or audio
       stacks while a bluetoothd/Client restart (`:rest_for_one`) still
       rebuilds the whole group. Improv gets the app's PubSub +
@@ -172,7 +172,7 @@ defmodule UniversalProxy.Bluetooth do
      extra_children: [
        {Task.Supervisor, name: AudioManager.TaskSupervisor},
        AudioManager,
-       {UniversalProxy.Improv.Supervisor,
+       {Improv.Supervisor,
         [
           pubsub: UniversalProxy.PubSub,
           network_type: &UniversalProxy.System.network_type/0,
@@ -199,7 +199,7 @@ defmodule UniversalProxy.Bluetooth do
       firmware_name: "Universal Proxy",
       firmware_version: fw.version,
       hardware: fw.hardware,
-      device_name: "Universal Proxy #{UniversalProxy.Improv.Advert.device_suffix()}"
+      device_name: "Universal Proxy #{Improv.Advert.device_suffix()}"
     ]
   end
 

@@ -156,6 +156,12 @@ defmodule UniversalProxy.MixProject do
       # no rebus dependency of its own anymore.
       {:bluez, "~> 0.1"},
 
+      # Improv-over-BLE Wi-Fi provisioning, extracted from this app into
+      # bbangert/improv (same lineage as bluez above). Git-pinned until
+      # 0.1.0 ships on hex — the pin lets the firmware/HW validation run
+      # before the irreversible publish.
+      {:improv, github: "bbangert/improv", ref: "70a24f428f6e68eb8f23237efc952e75488afb6c"},
+
       # Dependencies for specific targets
       # NOTE: It's generally low risk and recommended to follow minor version
       # bumps to Nerves systems. Since these include Linux kernel and Erlang
