@@ -48,6 +48,19 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
     fake
   end
 
+  # Stand up an espex-convention connection registry with self() registered
+  # as a subscriber, so `Espex.push_zwave_home_id/2` broadcasts land here.
+  # Returns the server name to feed the adapter as `:espex_server`. Using
+  # `Espex.Supervisor.registry_name/1` guarantees the name matches what the
+  # broadcast dispatches to.
+  defp start_espex_registry! do
+    server = Module.concat(__MODULE__, "Server#{System.unique_integer([:positive])}")
+    registry = Espex.Supervisor.registry_name(server)
+    start_supervised!({Registry, keys: :duplicate, name: registry})
+    {:ok, _} = Registry.register(registry, :subscribers, nil)
+    server
+  end
+
   describe "without hardware" do
     test "available? returns false", %{server: server} do
       refute ZWaveProxy.available?(server)
@@ -87,7 +100,8 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
 
   describe "frame pipeline (fake UART)" do
     test "UART bytes are ACKed locally, forwarded, and update the home ID", %{server: server} do
-      attach_fake_uart(server)
+      espex = start_espex_registry!()
+      attach_fake_uart(server, %{espex_server: espex})
       assert {:ok, <<0, 0, 0, 0>>} = ZWaveProxy.subscribe(server, self())
 
       frame = network_ids_response()
@@ -95,7 +109,9 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
 
       # Local ACK reaches the wire before the frame reaches the client.
       assert_receive {:uart_write, <<0x06>>}
+      # Home-ID change is broadcast to every espex connection (we are one).
       assert_receive {:espex_zwave_home_id_changed, <<0xDE, 0xAD, 0xBE, 0xEF>>}
+      # The frame itself still goes only to the subscriber.
       assert_receive {:espex_zwave_frame, ^frame}
 
       assert ZWaveProxy.home_id(server) == 0xDEADBEEF
@@ -197,8 +213,15 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
   end
 
   describe "home-ID lifecycle (fake UART)" do
-    test "UART error clears the home ID and notifies the subscriber", %{server: server} do
-      attach_fake_uart(server, %{home_id: <<0xDE, 0xAD, 0xBE, 0xEF>>, home_id_ready: true})
+    test "UART error clears the home ID and broadcasts the zeroed ID", %{server: server} do
+      espex = start_espex_registry!()
+
+      attach_fake_uart(server, %{
+        home_id: <<0xDE, 0xAD, 0xBE, 0xEF>>,
+        home_id_ready: true,
+        espex_server: espex
+      })
+
       assert {:ok, <<0xDE, 0xAD, 0xBE, 0xEF>>} = ZWaveProxy.subscribe(server, self())
 
       send(server, {:circuits_uart, "ttyFake", {:error, :eio}})
@@ -206,6 +229,19 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
       assert_receive {:espex_zwave_home_id_changed, <<0, 0, 0, 0>>}
       refute ZWaveProxy.available?(server)
       assert ZWaveProxy.home_id(server) == 0
+    end
+
+    test "home-ID broadcast is dropped (not crashed) when espex registry is down",
+         %{server: server} do
+      # Default espex_server (Espex.Server) has no registry in the test
+      # env; the boot-ordering rescue must swallow it and keep the server
+      # alive with the home ID stored.
+      attach_fake_uart(server)
+      frame = network_ids_response()
+      send(server, {:circuits_uart, "ttyFake", frame})
+
+      assert ZWaveProxy.home_id(server) == 0xDEADBEEF
+      assert Process.alive?(server)
     end
 
     test "retry tick re-sends GET_NETWORK_IDS while the home ID is unknown", %{server: server} do

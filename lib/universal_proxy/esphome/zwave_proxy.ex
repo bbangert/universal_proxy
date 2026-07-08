@@ -78,7 +78,8 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
     parser: nil,
     home_id: @zero_home_id,
     home_id_ready: false,
-    query_retries: 0
+    query_retries: 0,
+    espex_server: Espex.Server
   ]
 
   # -- Adapter wiring --
@@ -169,7 +170,8 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
       parser: Parser.new(),
       port_path: Keyword.get(opts, :port_path),
       display_name: Keyword.get(opts, :display_name),
-      resolver: Keyword.get(opts, :resolver)
+      resolver: Keyword.get(opts, :resolver),
+      espex_server: Keyword.get(opts, :espex_server, Espex.Server)
     }
 
     if state.port_path || state.resolver do
@@ -523,7 +525,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
   end
 
   # Mirrors ESPHome's clear_home_id_: on device loss, zero the ID and
-  # tell the subscriber so the client's stored network identity resets.
+  # broadcast so every client's stored network identity resets.
   defp clear_home_id(state), do: put_home_id(state, @zero_home_id)
 
   defp put_home_id(%{home_id: home_id} = state, home_id), do: state
@@ -531,10 +533,26 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
   defp put_home_id(state, new_home_id) do
     Logger.info("Z-Wave home ID changed: #{inspect(new_home_id)}")
 
-    if state.subscriber do
-      send(state.subscriber, {:espex_zwave_home_id_changed, new_home_id})
-    end
+    # Broadcast to ALL espex connections, not just the frame subscriber.
+    # HA's zwave_js discovery runs on a connection that never subscribes,
+    # and a stick hot-plugged after HA connected must still be seen — the
+    # subscriber-only send missed both (espex F4). Espex fans this out
+    # via its connection registry.
+    broadcast_home_id(state, new_home_id)
 
     %{state | home_id: new_home_id}
+  end
+
+  # `Registry.dispatch` raises ArgumentError when espex's registry isn't
+  # started — which happens at boot: ZWaveProxy is the FIRST child of the
+  # rest_for_one ESPHome tree, so the very first home-ID read can precede
+  # Espex's registry. Rescue it (per the project's registry convention,
+  # NOT catch :exit) and drop the broadcast: the auth-time push in espex
+  # (`:client_connected`) re-delivers the current home ID to every client
+  # once they connect, so nothing is permanently lost.
+  defp broadcast_home_id(state, home_id) do
+    Espex.push_zwave_home_id(state.espex_server, home_id)
+  rescue
+    ArgumentError -> :ok
   end
 end

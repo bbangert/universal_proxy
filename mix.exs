@@ -2,7 +2,7 @@ defmodule UniversalProxy.MixProject do
   use Mix.Project
 
   @app :universal_proxy
-  @version "0.8.2"
+  @version "0.8.3"
   @all_targets [
     :bbb,
     :mangopi_mq_pro,
@@ -113,7 +113,7 @@ defmodule UniversalProxy.MixProject do
       {:muontrap, "~> 1.8"},
 
       # ESPHome Native API server library
-      {:espex, "~> 0.6.0"},
+      {:espex, "~> 0.7"},
 
       # Dependencies for all targets
       {:nerves, "~> 1.10", runtime: false},
