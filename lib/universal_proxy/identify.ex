@@ -22,16 +22,21 @@ defmodule UniversalProxy.Identify do
   @blink_half_period_ms 125
   @blink_toggles 80
 
-  @doc "Blink the activity LED for ~10 s (blocking; run it in a Task)."
-  @spec blink_act_led() :: :ok
-  def blink_act_led(root \\ @leds_root) do
+  @doc """
+  Blink the activity LED (~10 s at the defaults; blocking — run it in a Task).
+
+  `opts` override the blink timing (`half_period_ms:`, `toggles:`) so host
+  tests can run the full park/blink/restore cycle in milliseconds.
+  """
+  @spec blink_act_led(Path.t(), keyword()) :: :ok
+  def blink_act_led(root \\ @leds_root, opts \\ []) do
     case find_led(root) do
       nil ->
         Logger.info("Identify requested — no activity LED on this board")
 
       led ->
         Logger.info("Identify requested — blinking #{led}")
-        blink(led)
+        blink(led, opts)
     end
 
     :ok
@@ -44,20 +49,37 @@ defmodule UniversalProxy.Identify do
     end)
   end
 
-  defp blink(led) do
+  defp blink(led, opts) do
+    half_period_ms = Keyword.get(opts, :half_period_ms, @blink_half_period_ms)
+    toggles = Keyword.get(opts, :toggles, @blink_toggles)
+
     original_trigger = current_trigger(led)
     write(led, "trigger", "none")
 
     try do
       max = max_brightness(led)
 
-      for n <- 1..@blink_toggles do
+      for n <- 1..toggles do
         write(led, "brightness", if(rem(n, 2) == 1, do: max, else: "0"))
-        Process.sleep(@blink_half_period_ms)
+        Process.sleep(half_period_ms)
       end
     after
       write(led, "brightness", "0")
-      if original_trigger, do: write(led, "trigger", original_trigger)
+      if original_trigger, do: restore_trigger(led, original_trigger)
+    end
+  end
+
+  # A failed restore leaves the LED dark on trigger "none" — invisible unless
+  # logged (the blink itself already "worked" from the caller's perspective).
+  defp restore_trigger(led, trigger) do
+    case write(led, "trigger", trigger) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "Identify: failed to restore #{led} trigger #{trigger}: #{inspect(reason)}"
+        )
     end
   end
 
