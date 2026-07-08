@@ -157,10 +157,9 @@ defmodule UniversalProxy.MixProject do
       {:bluez, "~> 0.1"},
 
       # Improv-over-BLE Wi-Fi provisioning, extracted from this app into
-      # bbangert/improv (same lineage as bluez above). Git-pinned until
-      # 0.1.0 ships on hex — the pin lets the firmware/HW validation run
-      # before the irreversible publish.
-      {:improv, github: "bbangert/improv", ref: "70a24f428f6e68eb8f23237efc952e75488afb6c"},
+      # bbangert/improv (same lineage as bluez above) and published as
+      # hex improv 0.1.0 after HW validation on the interim git pin.
+      {:improv, "~> 0.1"},
 
       # Dependencies for specific targets
       # NOTE: It's generally low risk and recommended to follow minor version
