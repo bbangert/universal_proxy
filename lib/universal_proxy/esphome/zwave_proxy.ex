@@ -79,7 +79,8 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
     home_id: @zero_home_id,
     home_id_ready: false,
     query_retries: 0,
-    espex_server: Espex.Server
+    espex_server: Espex.Server,
+    open_fun: nil
   ]
 
   # -- Adapter wiring --
@@ -112,7 +113,17 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
 
   @impl Espex.ZWaveProxy
   def feature_flags do
-    if available?(), do: 0x01, else: 0
+    # Always advertise the Z-Wave proxy capability (matches ESPHome's
+    # compile-time constant). The flag means "this device can proxy
+    # Z-Wave"; whether a controller is actually attached is conveyed by
+    # `home_id/0` (0 = no network). Reporting 0 when no stick was
+    # present broke cold-hotplug discovery: HA arms its HOME_ID_CHANGE
+    # listener only if the flag is set AT CONNECT (esphome/manager.py),
+    # so a stick plugged in later never surfaced without a reconnect.
+    # With the flag always on, the home-ID broadcast (F4) reaches HA and
+    # discovery fires live; HA still won't create a flow until a nonzero
+    # home ID arrives, so advertising with no stick is inert.
+    0x01
   end
 
   @impl Espex.ZWaveProxy
@@ -171,7 +182,11 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
       port_path: Keyword.get(opts, :port_path),
       display_name: Keyword.get(opts, :display_name),
       resolver: Keyword.get(opts, :resolver),
-      espex_server: Keyword.get(opts, :espex_server, Espex.Server)
+      espex_server: Keyword.get(opts, :espex_server, Espex.Server),
+      # Seam for tests: the real opener needs a live tty. Production
+      # always uses open_port/1; tests inject a fake to exercise the
+      # open-success path (resolve_port, :uart_port_opened broadcast).
+      open_fun: Keyword.get(opts, :open_fun, &open_port/1)
     }
 
     if state.port_path || state.resolver do
@@ -355,7 +370,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
         schedule_reopen(state)
 
       {port_path, display_name} ->
-        case open_port(port_path) do
+        case state.open_fun.(port_path) do
           {:ok, uart_pid} ->
             Logger.info("Z-Wave proxy started on #{port_path}")
 

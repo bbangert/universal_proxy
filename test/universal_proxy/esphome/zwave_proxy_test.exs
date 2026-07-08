@@ -267,6 +267,58 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
     end
   end
 
+  describe "feature_flags/0" do
+    test "always advertises the Z-Wave capability, even with no hardware" do
+      # Cold-hotplug discovery depends on this: HA arms its HOME_ID_CHANGE
+      # listener only if the flag is set at connect.
+      assert ZWaveProxy.feature_flags() == 0x01
+    end
+  end
+
+  describe "open path (injected opener)" do
+    # Exercises attempt_open/resolve_port/:uart_port_opened without a real
+    # tty by injecting an opener that hands back a FakeUART. Subscribe to
+    # the lifecycle topic BEFORE the server starts so the open broadcast
+    # (fired from handle_continue) isn't missed.
+    defp start_opening_proxy!(resolver_or_opts) do
+      {:ok, fake} = FakeUART.start_link(self())
+      Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "uart:port_opened")
+
+      opts =
+        [name: nil, open_fun: fn _path -> {:ok, fake} end] ++
+          List.wrap(resolver_or_opts)
+
+      server = start_supervised!({ZWaveProxy, opts}, id: {:zw_open, System.unique_integer()})
+      {server, fake}
+    end
+
+    test "resolver map: broadcasts port_opened with the display name and queries home ID" do
+      {server, _fake} =
+        start_opening_proxy!(
+          resolver: fn -> %{path: "/dev/ttyZW", display_name: "ZWA-2 (1-1.1)"} end
+        )
+
+      assert_receive {:uart_port_opened, %{friendly_name: "ZWA-2 (1-1.1)", owner: :zwave_proxy}}
+      assert_receive {:uart_write, cmd}
+      assert cmd == Frame.get_network_ids_command()
+
+      assert ZWaveProxy.claimed_port(server) ==
+               %{tty_name: "ttyZW", display_name: "ZWA-2 (1-1.1)", subscribed: false}
+    end
+
+    test "resolver bare string: display name falls back to the tty basename" do
+      {_server, _fake} = start_opening_proxy!(resolver: fn -> "/dev/ttyBare" end)
+
+      assert_receive {:uart_port_opened, %{friendly_name: "ttyBare", owner: :zwave_proxy}}
+    end
+
+    test "no resolver: opens the static port_path, basename as display name" do
+      {_server, _fake} = start_opening_proxy!(port_path: "/dev/ttyStatic")
+
+      assert_receive {:uart_port_opened, %{friendly_name: "ttyStatic", owner: :zwave_proxy}}
+    end
+  end
+
   describe "callbacks tolerate a dead/missing server" do
     setup do
       {:ok, pid} = ZWaveProxy.start_link(name: nil, port_path: nil)
