@@ -61,6 +61,9 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
   # Port (re)open / hotplug rescan cadence.
   @reopen_interval 5_000
 
+  # Abandon a partial frame after this much inter-byte silence.
+  @frame_timeout 1_500
+
   @zero_home_id <<0, 0, 0, 0>>
 
   @pubsub UniversalProxy.PubSub
@@ -74,6 +77,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
     :monitor_ref,
     :reopen_timer,
     :home_id_timer,
+    :frame_timer,
     :last_open_error,
     parser: nil,
     home_id: @zero_home_id,
@@ -297,7 +301,21 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
     {parser, actions} = Parser.feed(state.parser, data)
     state = %{state | parser: parser}
     state = execute_actions(state, actions)
-    {:noreply, state}
+    {:noreply, refresh_frame_timer(state)}
+  end
+
+  # A byte lost to UART noise can strand the parser mid-frame; the stale
+  # bytes would then corrupt the next real frame. Abandon a partial frame
+  # after @frame_timeout of inter-byte silence (mirrors ESPHome #17461).
+  def handle_info(:zwave_frame_timeout, state) do
+    state = %{state | frame_timer: nil}
+
+    if Parser.mid_frame?(state.parser) do
+      Logger.warning("Z-Wave frame timeout; resetting parser")
+      {:noreply, %{state | parser: Parser.new()}}
+    else
+      {:noreply, state}
+    end
   end
 
   def handle_info(:zwave_reopen, state) do
@@ -443,6 +461,21 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
   end
 
   defp schedule_home_id_retry(state), do: state
+
+  # (Re)arm the inter-byte frame timer after each UART chunk: cancel any
+  # pending timer, then arm a fresh one only while the parser is mid-frame.
+  # Progress cancels-and-rearms; a completed frame (back at :wait_start)
+  # leaves no timer, so it fires only on genuine mid-frame silence.
+  defp refresh_frame_timer(state) do
+    if state.frame_timer, do: Process.cancel_timer(state.frame_timer)
+
+    timer =
+      if Parser.mid_frame?(state.parser) do
+        Process.send_after(self(), :zwave_frame_timeout, @frame_timeout)
+      end
+
+    %{state | frame_timer: timer}
+  end
 
   defp open_port(port_path) do
     with {:ok, pid} <- Circuits.UART.start_link() do

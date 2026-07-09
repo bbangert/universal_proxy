@@ -272,6 +272,35 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
     end
   end
 
+  describe "frame inter-byte timeout (fake UART)" do
+    test "a stalled partial frame is abandoned and the parser recovers", %{server: server} do
+      attach_fake_uart(server)
+
+      # Partial frame (SOF + LENGTH), then silence — parser is mid-frame.
+      send(server, {:circuits_uart, "ttyFake", <<0x01, 0x09>>})
+      assert Parser.mid_frame?(:sys.get_state(server).parser)
+
+      # Fire the timeout directly (the 1.5 s wall-clock timer isn't
+      # test-friendly); the stale bytes must be dropped.
+      send(server, :zwave_frame_timeout)
+      refute Parser.mid_frame?(:sys.get_state(server).parser)
+
+      # A fresh full frame now parses cleanly — no corruption from the
+      # abandoned partial.
+      send(server, {:circuits_uart, "ttyFake", network_ids_response()})
+      assert_receive {:uart_write, <<0x06>>}
+    end
+
+    test "timeout is a no-op when the parser is idle", %{server: server} do
+      attach_fake_uart(server)
+      refute Parser.mid_frame?(:sys.get_state(server).parser)
+
+      send(server, :zwave_frame_timeout)
+      assert Process.alive?(server)
+      refute Parser.mid_frame?(:sys.get_state(server).parser)
+    end
+  end
+
   describe "feature_flags/0" do
     test "always advertises the Z-Wave capability, even with no hardware" do
       # Cold-hotplug discovery depends on this: HA arms its HOME_ID_CHANGE
