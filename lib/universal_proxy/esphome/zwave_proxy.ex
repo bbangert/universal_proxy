@@ -61,7 +61,8 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
   # Port (re)open / hotplug rescan cadence.
   @reopen_interval 5_000
 
-  # Abandon a partial frame after this much inter-byte silence.
+  # Abandon a partial frame this long after its start (SOF) byte, per the
+  # Z-Wave API spec's data-frame reception timeout.
   @frame_timeout 1_500
 
   @zero_home_id <<0, 0, 0, 0>>
@@ -297,16 +298,17 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
   end
 
   def handle_info({:circuits_uart, _port, data}, state) when is_binary(data) do
+    was_mid_frame = Parser.mid_frame?(state.parser)
     broadcast_data(state, data, :rx)
     {parser, actions} = Parser.feed(state.parser, data)
     state = %{state | parser: parser}
     state = execute_actions(state, actions)
-    {:noreply, refresh_frame_timer(state)}
+    {:noreply, refresh_frame_timer(state, was_mid_frame)}
   end
 
   # A byte lost to UART noise can strand the parser mid-frame; the stale
-  # bytes would then corrupt the next real frame. Abandon a partial frame
-  # after @frame_timeout of inter-byte silence (mirrors ESPHome #17461).
+  # bytes would then corrupt the next real frame. Abandon the frame
+  # @frame_timeout after its start byte (mirrors ESPHome #17461).
   def handle_info(:zwave_frame_timeout, state) do
     state = %{state | frame_timer: nil}
 
@@ -462,19 +464,30 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
 
   defp schedule_home_id_retry(state), do: state
 
-  # (Re)arm the inter-byte frame timer after each UART chunk: cancel any
-  # pending timer, then arm a fresh one only while the parser is mid-frame.
-  # Progress cancels-and-rearms; a completed frame (back at :wait_start)
-  # leaves no timer, so it fires only on genuine mid-frame silence.
-  defp refresh_frame_timer(state) do
-    if state.frame_timer, do: Process.cancel_timer(state.frame_timer)
+  # Frame reception timeout, timed from the frame's start byte (the
+  # Z-Wave API spec aborts a data frame that takes >1500 ms from its SOF,
+  # per ESPHome #17461) — NOT reset per byte, or a slow trickle would
+  # never time out. So arm the timer only on the idle→mid-frame edge (a
+  # frame just started), leave it running while the same frame continues,
+  # and cancel it once the parser returns to idle. `was_mid_frame` is the
+  # parser's state before this chunk was fed.
+  defp refresh_frame_timer(state, was_mid_frame) do
+    now_mid_frame = Parser.mid_frame?(state.parser)
 
-    timer =
-      if Parser.mid_frame?(state.parser) do
-        Process.send_after(self(), :zwave_frame_timeout, @frame_timeout)
-      end
+    cond do
+      now_mid_frame and not was_mid_frame ->
+        if state.frame_timer, do: Process.cancel_timer(state.frame_timer)
+        %{state | frame_timer: Process.send_after(self(), :zwave_frame_timeout, @frame_timeout)}
 
-    %{state | frame_timer: timer}
+      not now_mid_frame ->
+        if state.frame_timer, do: Process.cancel_timer(state.frame_timer)
+        %{state | frame_timer: nil}
+
+      # Still receiving the same frame — leave the timer running so it
+      # measures from the start byte.
+      true ->
+        state
+    end
   end
 
   defp open_port(port_path) do

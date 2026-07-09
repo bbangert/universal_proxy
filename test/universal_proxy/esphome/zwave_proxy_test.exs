@@ -272,7 +272,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
     end
   end
 
-  describe "frame inter-byte timeout (fake UART)" do
+  describe "frame reception timeout (fake UART)" do
     test "a stalled partial frame is abandoned and the parser recovers", %{server: server} do
       attach_fake_uart(server)
 
@@ -289,6 +289,24 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
       # abandoned partial.
       send(server, {:circuits_uart, "ttyFake", network_ids_response()})
       assert_receive {:uart_write, <<0x06>>}
+    end
+
+    test "the timer is timed from the start byte, not reset per chunk", %{server: server} do
+      attach_fake_uart(server)
+
+      # First chunk starts the frame → a timer is armed.
+      send(server, {:circuits_uart, "ttyFake", <<0x01, 0x09>>})
+      timer1 = :sys.get_state(server).frame_timer
+      assert timer1 != nil
+
+      # More bytes of the SAME frame must NOT rearm the timer — it keeps
+      # measuring from the SOF, so a slow trickle still times out.
+      send(server, {:circuits_uart, "ttyFake", <<0x01, 0x20>>})
+      assert :sys.get_state(server).frame_timer == timer1
+
+      # Completing the frame cancels the timer.
+      send(server, {:circuits_uart, "ttyFake", <<0xDE, 0xAD, 0xBE, 0xEF, 0x05, 0x00, 0xF0>>})
+      assert :sys.get_state(server).frame_timer == nil
     end
 
     test "timeout is a no-op when the parser is idle", %{server: server} do
