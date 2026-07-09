@@ -61,6 +61,10 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
   # Port (re)open / hotplug rescan cadence.
   @reopen_interval 5_000
 
+  # Abandon a partial frame this long after its start (SOF) byte, per the
+  # Z-Wave API spec's data-frame reception timeout.
+  @frame_timeout 1_500
+
   @zero_home_id <<0, 0, 0, 0>>
 
   @pubsub UniversalProxy.PubSub
@@ -74,11 +78,15 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
     :monitor_ref,
     :reopen_timer,
     :home_id_timer,
+    :frame_timer,
+    :frame_timer_ref,
     :last_open_error,
     parser: nil,
     home_id: @zero_home_id,
     home_id_ready: false,
-    query_retries: 0
+    query_retries: 0,
+    espex_server: Espex.Server,
+    open_fun: nil
   ]
 
   # -- Adapter wiring --
@@ -111,7 +119,17 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
 
   @impl Espex.ZWaveProxy
   def feature_flags do
-    if available?(), do: 0x01, else: 0
+    # Always advertise the Z-Wave proxy capability (matches ESPHome's
+    # compile-time constant). The flag means "this device can proxy
+    # Z-Wave"; whether a controller is actually attached is conveyed by
+    # `home_id/0` (0 = no network). Reporting 0 when no stick was
+    # present broke cold-hotplug discovery: HA arms its HOME_ID_CHANGE
+    # listener only if the flag is set AT CONNECT (esphome/manager.py),
+    # so a stick plugged in later never surfaced without a reconnect.
+    # With the flag always on, the home-ID broadcast (F4) reaches HA and
+    # discovery fires live; HA still won't create a flow until a nonzero
+    # home ID arrives, so advertising with no stick is inert.
+    0x01
   end
 
   @impl Espex.ZWaveProxy
@@ -169,7 +187,14 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
       parser: Parser.new(),
       port_path: Keyword.get(opts, :port_path),
       display_name: Keyword.get(opts, :display_name),
-      resolver: Keyword.get(opts, :resolver)
+      resolver: Keyword.get(opts, :resolver),
+      espex_server: Keyword.get(opts, :espex_server, Espex.Server),
+      # Seam for tests: the real opener needs a live tty. Production
+      # always uses open_port/1; tests inject a fake to exercise the
+      # open-success path (resolve_port, :uart_port_opened broadcast).
+      # nil (explicit or absent) falls back to the real opener so
+      # state.open_fun is always callable.
+      open_fun: Keyword.get(opts, :open_fun) || (&open_port/1)
     }
 
     if state.port_path || state.resolver do
@@ -267,6 +292,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
 
     state =
       %{state | uart_pid: nil, parser: Parser.new(), home_id_ready: false, query_retries: 0}
+      |> cancel_frame_timer()
       |> clear_home_id()
       |> schedule_reopen()
 
@@ -274,10 +300,33 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
   end
 
   def handle_info({:circuits_uart, _port, data}, state) when is_binary(data) do
+    was_mid_frame = Parser.mid_frame?(state.parser)
     broadcast_data(state, data, :rx)
     {parser, actions} = Parser.feed(state.parser, data)
     state = %{state | parser: parser}
     state = execute_actions(state, actions)
+    {:noreply, refresh_frame_timer(state, was_mid_frame)}
+  end
+
+  # A byte lost to UART noise can strand the parser mid-frame; the stale
+  # bytes would then corrupt the next real frame. Abandon the frame
+  # @frame_timeout after its start byte (mirrors ESPHome #17461). Each
+  # armed timer carries a unique ref: only the currently-armed one may
+  # reset the parser, so a timer that fired just before it was cancelled
+  # (or before a reopen) can't reset a newer frame when its late message
+  # is finally delivered.
+  def handle_info({:zwave_frame_timeout, ref}, %{frame_timer_ref: ref} = state) do
+    state = %{state | frame_timer: nil, frame_timer_ref: nil}
+
+    if Parser.mid_frame?(state.parser) do
+      Logger.warning("Z-Wave frame timeout; resetting parser")
+      {:noreply, %{state | parser: Parser.new()}}
+    else
+      {:noreply, state}
+    end
+  end
+
+  def handle_info({:zwave_frame_timeout, _stale_ref}, state) do
     {:noreply, state}
   end
 
@@ -353,7 +402,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
         schedule_reopen(state)
 
       {port_path, display_name} ->
-        case open_port(port_path) do
+        case state.open_fun.(port_path) do
           {:ok, uart_pid} ->
             Logger.info("Z-Wave proxy started on #{port_path}")
 
@@ -424,6 +473,39 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
   end
 
   defp schedule_home_id_retry(state), do: state
+
+  # Frame reception timeout, timed from the frame's start byte (the
+  # Z-Wave API spec aborts a data frame that takes >1500 ms from its SOF,
+  # per ESPHome #17461) — NOT reset per byte, or a slow trickle would
+  # never time out. So arm the timer only on the idle→mid-frame edge (a
+  # frame just started), leave it running while the same frame continues,
+  # and cancel it once the parser returns to idle. `was_mid_frame` is the
+  # parser's state before this chunk was fed.
+  defp refresh_frame_timer(state, was_mid_frame) do
+    now_mid_frame = Parser.mid_frame?(state.parser)
+
+    cond do
+      now_mid_frame and not was_mid_frame -> arm_frame_timer(state)
+      not now_mid_frame -> cancel_frame_timer(state)
+      # Still receiving the same frame — leave the timer running so it
+      # measures from the start byte.
+      true -> state
+    end
+  end
+
+  defp arm_frame_timer(state) do
+    state = cancel_frame_timer(state)
+    ref = make_ref()
+    timer = Process.send_after(self(), {:zwave_frame_timeout, ref}, @frame_timeout)
+    %{state | frame_timer: timer, frame_timer_ref: ref}
+  end
+
+  defp cancel_frame_timer(%{frame_timer: nil} = state), do: state
+
+  defp cancel_frame_timer(state) do
+    Process.cancel_timer(state.frame_timer)
+    %{state | frame_timer: nil, frame_timer_ref: nil}
+  end
 
   defp open_port(port_path) do
     with {:ok, pid} <- Circuits.UART.start_link() do
@@ -523,7 +605,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
   end
 
   # Mirrors ESPHome's clear_home_id_: on device loss, zero the ID and
-  # tell the subscriber so the client's stored network identity resets.
+  # broadcast so every client's stored network identity resets.
   defp clear_home_id(state), do: put_home_id(state, @zero_home_id)
 
   defp put_home_id(%{home_id: home_id} = state, home_id), do: state
@@ -531,10 +613,26 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
   defp put_home_id(state, new_home_id) do
     Logger.info("Z-Wave home ID changed: #{inspect(new_home_id)}")
 
-    if state.subscriber do
-      send(state.subscriber, {:espex_zwave_home_id_changed, new_home_id})
-    end
+    # Broadcast to ALL espex connections, not just the frame subscriber.
+    # HA's zwave_js discovery runs on a connection that never subscribes,
+    # and a stick hot-plugged after HA connected must still be seen — the
+    # subscriber-only send missed both (espex F4). Espex fans this out
+    # via its connection registry.
+    broadcast_home_id(state, new_home_id)
 
     %{state | home_id: new_home_id}
+  end
+
+  # `Registry.dispatch` raises ArgumentError when espex's registry isn't
+  # started — which happens at boot: ZWaveProxy is the FIRST child of the
+  # rest_for_one ESPHome tree, so the very first home-ID read can precede
+  # Espex's registry. Rescue it (per the project's registry convention,
+  # NOT catch :exit) and drop the broadcast: the auth-time push in espex
+  # (`:client_connected`) re-delivers the current home ID to every client
+  # once they connect, so nothing is permanently lost.
+  defp broadcast_home_id(state, home_id) do
+    Espex.push_zwave_home_id(state.espex_server, home_id)
+  rescue
+    ArgumentError -> :ok
   end
 end

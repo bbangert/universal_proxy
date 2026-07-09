@@ -1,7 +1,12 @@
 defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
   # Each test gets its own unnamed GenServer (pid only — no atom leakage)
   # and no UART hardware (port_path: nil).
-  use ExUnit.Case, async: true
+  #
+  # async: false — the broadcast tests share a fixed-name espex registry
+  # (torn down per test by start_supervised) and several tests assert on
+  # the global uart:port_opened/uart:port_closed PubSub topics; running
+  # serially avoids both dynamic-atom growth and cross-test delivery.
+  use ExUnit.Case, async: false
 
   alias UniversalProxy.ESPHome.ZWaveProxy
   alias UniversalProxy.ESPHome.ZWaveProxy.{Frame, Parser}
@@ -48,6 +53,19 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
     fake
   end
 
+  # Stand up an espex-convention connection registry with self() registered
+  # as a subscriber, so `Espex.push_zwave_home_id/2` broadcasts land here.
+  # Returns the server name to feed the adapter as `:espex_server`. Using
+  # `Espex.Supervisor.registry_name/1` guarantees the name matches what the
+  # broadcast dispatches to.
+  defp start_espex_registry! do
+    server = __MODULE__.EspexServer
+    registry = Espex.Supervisor.registry_name(server)
+    start_supervised!({Registry, keys: :duplicate, name: registry})
+    {:ok, _} = Registry.register(registry, :subscribers, nil)
+    server
+  end
+
   describe "without hardware" do
     test "available? returns false", %{server: server} do
       refute ZWaveProxy.available?(server)
@@ -87,7 +105,8 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
 
   describe "frame pipeline (fake UART)" do
     test "UART bytes are ACKed locally, forwarded, and update the home ID", %{server: server} do
-      attach_fake_uart(server)
+      espex = start_espex_registry!()
+      attach_fake_uart(server, %{espex_server: espex})
       assert {:ok, <<0, 0, 0, 0>>} = ZWaveProxy.subscribe(server, self())
 
       frame = network_ids_response()
@@ -95,7 +114,9 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
 
       # Local ACK reaches the wire before the frame reaches the client.
       assert_receive {:uart_write, <<0x06>>}
+      # Home-ID change is broadcast to every espex connection (we are one).
       assert_receive {:espex_zwave_home_id_changed, <<0xDE, 0xAD, 0xBE, 0xEF>>}
+      # The frame itself still goes only to the subscriber.
       assert_receive {:espex_zwave_frame, ^frame}
 
       assert ZWaveProxy.home_id(server) == 0xDEADBEEF
@@ -197,8 +218,15 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
   end
 
   describe "home-ID lifecycle (fake UART)" do
-    test "UART error clears the home ID and notifies the subscriber", %{server: server} do
-      attach_fake_uart(server, %{home_id: <<0xDE, 0xAD, 0xBE, 0xEF>>, home_id_ready: true})
+    test "UART error clears the home ID and broadcasts the zeroed ID", %{server: server} do
+      espex = start_espex_registry!()
+
+      attach_fake_uart(server, %{
+        home_id: <<0xDE, 0xAD, 0xBE, 0xEF>>,
+        home_id_ready: true,
+        espex_server: espex
+      })
+
       assert {:ok, <<0xDE, 0xAD, 0xBE, 0xEF>>} = ZWaveProxy.subscribe(server, self())
 
       send(server, {:circuits_uart, "ttyFake", {:error, :eio}})
@@ -206,6 +234,19 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
       assert_receive {:espex_zwave_home_id_changed, <<0, 0, 0, 0>>}
       refute ZWaveProxy.available?(server)
       assert ZWaveProxy.home_id(server) == 0
+    end
+
+    test "home-ID broadcast is dropped (not crashed) when espex registry is down",
+         %{server: server} do
+      # Default espex_server (Espex.Server) has no registry in the test
+      # env; the boot-ordering rescue must swallow it and keep the server
+      # alive with the home ID stored.
+      attach_fake_uart(server)
+      frame = network_ids_response()
+      send(server, {:circuits_uart, "ttyFake", frame})
+
+      assert ZWaveProxy.home_id(server) == 0xDEADBEEF
+      assert Process.alive?(server)
     end
 
     test "retry tick re-sends GET_NETWORK_IDS while the home ID is unknown", %{server: server} do
@@ -228,6 +269,130 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
 
       send(server, :zwave_home_id_retry)
       refute_receive {:uart_write, _}, 50
+    end
+  end
+
+  describe "frame reception timeout (fake UART)" do
+    test "a stalled partial frame is abandoned and the parser recovers", %{server: server} do
+      attach_fake_uart(server)
+
+      # Partial frame (SOF + LENGTH), then silence — parser is mid-frame.
+      send(server, {:circuits_uart, "ttyFake", <<0x01, 0x09>>})
+      ref = :sys.get_state(server).frame_timer_ref
+      assert Parser.mid_frame?(:sys.get_state(server).parser)
+
+      # Fire the armed timeout directly (the 1.5 s wall-clock timer isn't
+      # test-friendly); the stale bytes must be dropped.
+      send(server, {:zwave_frame_timeout, ref})
+      refute Parser.mid_frame?(:sys.get_state(server).parser)
+
+      # A fresh full frame now parses cleanly — no corruption from the
+      # abandoned partial.
+      send(server, {:circuits_uart, "ttyFake", network_ids_response()})
+      assert_receive {:uart_write, <<0x06>>}
+    end
+
+    test "the timer is timed from the start byte, not reset per chunk", %{server: server} do
+      attach_fake_uart(server)
+
+      # First chunk starts the frame → a timer is armed.
+      send(server, {:circuits_uart, "ttyFake", <<0x01, 0x09>>})
+      timer1 = :sys.get_state(server).frame_timer
+      assert timer1 != nil
+
+      # More bytes of the SAME frame must NOT rearm the timer — it keeps
+      # measuring from the SOF, so a slow trickle still times out.
+      send(server, {:circuits_uart, "ttyFake", <<0x01, 0x20>>})
+      assert :sys.get_state(server).frame_timer == timer1
+
+      # Completing the frame cancels the timer.
+      send(server, {:circuits_uart, "ttyFake", <<0xDE, 0xAD, 0xBE, 0xEF, 0x05, 0x00, 0xF0>>})
+      assert :sys.get_state(server).frame_timer == nil
+    end
+
+    test "timeout is a no-op when the parser is idle", %{server: server} do
+      attach_fake_uart(server)
+      refute Parser.mid_frame?(:sys.get_state(server).parser)
+
+      send(server, {:zwave_frame_timeout, make_ref()})
+      assert Process.alive?(server)
+      refute Parser.mid_frame?(:sys.get_state(server).parser)
+    end
+
+    test "a stale timeout ref does not reset a newer frame", %{server: server} do
+      attach_fake_uart(server)
+
+      # Frame A starts and arms a timer (capture its ref), then completes —
+      # this is the "timer fired just before cancel" shape.
+      send(server, {:circuits_uart, "ttyFake", <<0x01, 0x09>>})
+      stale_ref = :sys.get_state(server).frame_timer_ref
+
+      send(
+        server,
+        {:circuits_uart, "ttyFake", <<0x01, 0x20, 0xDE, 0xAD, 0xBE, 0xEF, 0x05, 0x00, 0xF0>>}
+      )
+
+      refute Parser.mid_frame?(:sys.get_state(server).parser)
+
+      # Frame B is now mid-flight when frame A's late timeout is delivered.
+      send(server, {:circuits_uart, "ttyFake", <<0x01, 0x09>>})
+      assert Parser.mid_frame?(:sys.get_state(server).parser)
+
+      send(server, {:zwave_frame_timeout, stale_ref})
+      # Frame B must survive — the stale ref is ignored.
+      assert Parser.mid_frame?(:sys.get_state(server).parser)
+    end
+  end
+
+  describe "feature_flags/0" do
+    test "always advertises the Z-Wave capability, even with no hardware" do
+      # Cold-hotplug discovery depends on this: HA arms its HOME_ID_CHANGE
+      # listener only if the flag is set at connect.
+      assert ZWaveProxy.feature_flags() == 0x01
+    end
+  end
+
+  describe "open path (injected opener)" do
+    # Exercises attempt_open/resolve_port/:uart_port_opened without a real
+    # tty by injecting an opener that hands back a FakeUART. Subscribe to
+    # the lifecycle topic BEFORE the server starts so the open broadcast
+    # (fired from handle_continue) isn't missed.
+    defp start_opening_proxy!(resolver_or_opts) do
+      {:ok, fake} = FakeUART.start_link(self())
+      Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "uart:port_opened")
+
+      opts =
+        [name: nil, open_fun: fn _path -> {:ok, fake} end] ++
+          List.wrap(resolver_or_opts)
+
+      server = start_supervised!({ZWaveProxy, opts}, id: {:zw_open, System.unique_integer()})
+      {server, fake}
+    end
+
+    test "resolver map: broadcasts port_opened with the display name and queries home ID" do
+      {server, _fake} =
+        start_opening_proxy!(
+          resolver: fn -> %{path: "/dev/ttyZW", display_name: "ZWA-2 (1-1.1)"} end
+        )
+
+      assert_receive {:uart_port_opened, %{friendly_name: "ZWA-2 (1-1.1)", owner: :zwave_proxy}}
+      assert_receive {:uart_write, cmd}
+      assert cmd == Frame.get_network_ids_command()
+
+      assert ZWaveProxy.claimed_port(server) ==
+               %{tty_name: "ttyZW", display_name: "ZWA-2 (1-1.1)", subscribed: false}
+    end
+
+    test "resolver bare string: display name falls back to the tty basename" do
+      {_server, _fake} = start_opening_proxy!(resolver: fn -> "/dev/ttyBare" end)
+
+      assert_receive {:uart_port_opened, %{friendly_name: "ttyBare", owner: :zwave_proxy}}
+    end
+
+    test "no resolver: opens the static port_path, basename as display name" do
+      {_server, _fake} = start_opening_proxy!(port_path: "/dev/ttyStatic")
+
+      assert_receive {:uart_port_opened, %{friendly_name: "ttyStatic", owner: :zwave_proxy}}
     end
   end
 

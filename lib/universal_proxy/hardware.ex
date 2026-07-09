@@ -77,6 +77,17 @@ defmodule UniversalProxy.Hardware do
        chip: "Silicon Labs EFR32ZG23",
        locked: true
      }},
+    # Aeotec Z-Stick Gen5+ — unambiguous VID/PID (HA zwave_js manifest).
+    # Other Z-Wave sticks share the generic Silicon Labs CP210x VID/PID
+    # (10C4:EA60/8A2A) and are disambiguated by USB descriptor strings in
+    # `zwave_by_descriptor/1` rather than a fixed table entry.
+    {0x0658, 0x0200,
+     %{
+       kind: :zwave,
+       name: "Aeotec Z-Stick Gen5+",
+       vendor: "Aeotec",
+       locked: true
+     }},
     {0x04D8, 0xFD08,
      %{
        kind: :ir,
@@ -452,7 +463,7 @@ defmodule UniversalProxy.Hardware do
     pid = info[:product_id]
     serial = info[:serial_number]
     {in_use?, user} = port_usage(tty_name, usage)
-    device_info = Map.get(@usb_device_table, {vid, pid})
+    device_info = zwave_by_descriptor(info) || Map.get(@usb_device_table, {vid, pid})
     saved_cfg = Map.get(saved, {slot_sub, vid, pid})
 
     classification = classify(device_info, saved_cfg)
@@ -597,6 +608,33 @@ defmodule UniversalProxy.Hardware do
       since: nil,
       notes: nil
     }
+  end
+
+  # Several Z-Wave 800 sticks (SONOFF ZBDongle-Z, Nortek HUSBZB-1, …)
+  # ship the generic Silicon Labs CP210x bridge (VID 0x10C4), so VID/PID
+  # alone can't tell them from a plain USB-serial cable. HA's zwave_js
+  # manifest disambiguates by USB descriptor string; mirror that. Gated
+  # to VID 0x10C4 + a "z-wave"/"zwave" token in the descriptor so a bare
+  # CP2102 cable (e.g. the ZWA-2's own bridge reports "CP2102N USB to
+  # UART Bridge") never false-positives. Returns a synthetic locked
+  # device-info map so the normal branded-lock classify path applies, or
+  # nil to fall through to the VID/PID table.
+  defp zwave_by_descriptor(info) do
+    if info[:vendor_id] == 0x10C4 and zwave_descriptor?(info) do
+      name = descriptor_name(info) || "Z-Wave Controller"
+      %{kind: :zwave, name: name, vendor: info[:manufacturer], locked: true}
+    end
+  end
+
+  @zwave_descriptor ~r/z-?wave/i
+
+  defp zwave_descriptor?(info) do
+    [info[:product], info[:description], info[:manufacturer]]
+    |> Enum.any?(fn s -> is_binary(s) and Regex.match?(@zwave_descriptor, s) end)
+  end
+
+  defp descriptor_name(info) do
+    Enum.find([info[:product], info[:description]], fn s -> is_binary(s) and s != "" end)
   end
 
   # Branded device: hardware-locked, ignore any saved override.

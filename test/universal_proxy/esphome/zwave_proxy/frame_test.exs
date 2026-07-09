@@ -61,9 +61,13 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy.FrameTest do
       assert Frame.extract_home_id(<<sof, len, type, 0x02, rest::binary>>) == :error
     end
 
+    # Minimum is 7 (TYPE + CMD + HOME_ID(4) + CHECKSUM); LENGTH 6 can't
+    # carry the full home ID, so it's rejected. 7 and 8 are accepted
+    # (see the 8-bit-node-ID case above).
     test "rejects frames shorter than the minimum LENGTH" do
       <<sof, _len, rest::binary>> = @response
-      assert Frame.extract_home_id(<<sof, 0x07, rest::binary>>) == :error
+      assert Frame.extract_home_id(<<sof, 0x06, rest::binary>>) == :error
+      assert {:ok, _} = Frame.extract_home_id(<<sof, 0x07, rest::binary>>)
     end
 
     test "rejects single-byte and bootloader frames" do

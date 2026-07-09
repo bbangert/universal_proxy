@@ -68,15 +68,18 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy.ParserTest do
       assert parser.last_response == @ack
     end
 
-    test "LENGTH of zero: immediate NAK, following frame still parses" do
+    test "LENGTH below the minimum frame (0, 1, 2): immediate NAK, following frame still parses" do
       good = network_ids_response()
-      {_parser, actions} = feed_all(<<0x01, 0x00>> <> good)
 
-      assert actions == [
-               {:send_response, @nak},
-               {:send_response, @ack},
-               {:frame_complete, good}
-             ]
+      for bad_len <- [0x00, 0x01, 0x02] do
+        {_parser, actions} = feed_all(<<0x01, bad_len>> <> good)
+
+        assert actions == [
+                 {:send_response, @nak},
+                 {:send_response, @ack},
+                 {:frame_complete, good}
+               ]
+      end
     end
 
     # Documents the deliberate divergence from the C++ (audit F5): a
@@ -123,16 +126,49 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy.ParserTest do
       refute parser.in_bootloader
     end
 
-    test "menu overflowing the 257-byte buffer is discarded, not truncated" do
-      overflowing = <<Frame.bl_menu()>> <> :binary.copy(<<0xAA>>, 300) <> <<0x00>>
+    test "a non-menu byte abandons the tentative menu and reparses as a frame start" do
+      # A stray 0x0D followed immediately by a real SOF frame: the 0x0D is
+      # NOT a bootloader menu; the frame after it must still parse, and we
+      # must never enter bootloader mode.
+      good = network_ids_response()
+      {parser, actions} = feed_all(<<Frame.bl_menu()>> <> good)
+
+      assert actions == [{:send_response, @ack}, {:frame_complete, good}]
+      refute parser.in_bootloader
+    end
+
+    test "a lone ACK after a stray 0x0D is recovered, not swallowed" do
+      # 0x06 (ACK) is not menu text, so the tentative menu bails and the
+      # ACK is reparsed as a single-byte frame.
+      {parser, actions} = feed_all(<<Frame.bl_menu(), @ack>>)
+      assert actions == [{:frame_complete, <<@ack>>}]
+      refute parser.in_bootloader
+    end
+
+    test "committing bootloader mode resets response deduplication" do
+      # Prime last_response as if a prior ACK was sent, then complete a
+      # real menu — the commit must clear it so a client's XMODEM
+      # ACK/NAK/CAN during a firmware update isn't dropped as a duplicate.
+      primed = %{Parser.new() | last_response: @ack}
+      menu = <<Frame.bl_menu(), "Gecko Bootloader", 0x00>>
+      {parser, _actions} = Parser.feed(primed, menu)
+
+      assert parser.in_bootloader
+      assert parser.last_response == 0
+    end
+
+    test "a menu overflowing the buffer without a terminator recovers on the next frame" do
+      # All printable, so it stays a tentative menu until the 257-byte
+      # buffer fills; then it bails and reparses. A following good frame
+      # must still be ACKed and forwarded (no truncated menu emitted).
+      overflowing = <<Frame.bl_menu()>> <> :binary.copy("A", 300)
       good = network_ids_response()
 
-      {_parser, actions} = feed_all(overflowing <> good)
+      {parser, actions} = feed_all(overflowing <> good)
 
-      assert actions == [
-               {:send_response, @ack},
-               {:frame_complete, good}
-             ]
+      assert {:frame_complete, good} in actions
+      refute Enum.any?(actions, fn a -> match?({:frame_complete, <<0x0D, _::binary>>}, a) end)
+      refute parser.in_bootloader
     end
   end
 

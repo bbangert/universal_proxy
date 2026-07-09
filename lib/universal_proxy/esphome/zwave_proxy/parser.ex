@@ -71,6 +71,16 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy.Parser do
 
   @max_frame_size 257
 
+  # Smallest valid LENGTH byte: TYPE + CMD + CHECKSUM (a zero-payload
+  # frame). Anything shorter can't carry a command, so it's rejected.
+  @min_frame_length 3
+
+  # A byte that can appear in bootloader-menu output: printable ASCII
+  # plus CR/LF and the NUL terminator. Used to read the menu tentatively
+  # (see `parse_start/2` for BL_MENU and the `:read_bl_menu` handler).
+  defguardp is_bl_menu_byte(byte)
+            when byte == 0 or byte == 0x0D or byte == 0x0A or (byte >= 0x20 and byte <= 0x7E)
+
   @doc """
   Create a new parser in the initial waiting state.
   """
@@ -114,6 +124,17 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy.Parser do
   def duplicate_response?(%__MODULE__{last_response: last}, <<byte>>), do: byte == last
   def duplicate_response?(%__MODULE__{}, _data), do: false
 
+  @doc """
+  Is the parser partway through a frame (i.e. not idle at `:wait_start`)?
+
+  The owning server uses this to abandon a stalled partial frame after an
+  inter-byte timeout — a byte lost to UART noise would otherwise leave
+  stale bytes that corrupt the next frame.
+  """
+  @spec mid_frame?(t()) :: boolean()
+  def mid_frame?(%__MODULE__{state: :wait_start}), do: false
+  def mid_frame?(%__MODULE__{}), do: true
+
   # -- Internal byte-level state machine --
 
   defp parse_byte(%{state: :wait_start} = parser, byte) do
@@ -121,7 +142,11 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy.Parser do
   end
 
   defp parse_byte(%{state: :wait_length} = parser, byte) do
-    if byte == 0 do
+    # Reject any LENGTH below a minimal frame (was: only 0). A 1- or
+    # 2-byte length can't hold TYPE + CMD + CHECKSUM. NAK immediately —
+    # our handle_response runs inline, so bytes already buffered behind
+    # this one are reparsed rather than dropped.
+    if byte < @min_frame_length do
       {%{parser | state: :send_nak}, []}
       |> then(fn {p, a} -> handle_response(p, a) end)
     else
@@ -177,20 +202,28 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy.Parser do
     end
   end
 
-  # Overflow check mirrors the C++: a menu that fills the buffer without
-  # a terminating 0x00 is discarded (reset to :wait_start, byte dropped),
-  # never emitted truncated.
-  defp parse_byte(%{state: :read_bl_menu, buffer_index: idx} = parser, _byte)
-       when idx >= @max_frame_size do
-    {%{parser | state: :wait_start}, []}
+  # The menu is read tentatively (see `parse_start/2` for BL_MENU): a
+  # byte that can't be menu text — or a buffer that fills without a NUL
+  # terminator — means the 0x0D that started this state wasn't really a
+  # bootloader menu (e.g. garbled data after the parser lost frame
+  # alignment). Abandon the tentative menu and re-parse this byte as a
+  # fresh frame start; it may be the SOF/ACK/NAK of real traffic.
+  defp parse_byte(%{state: :read_bl_menu, buffer_index: idx} = parser, byte)
+       when idx >= @max_frame_size or not is_bl_menu_byte(byte) do
+    parse_start(%{parser | state: :wait_start}, byte)
   end
 
   defp parse_byte(%{state: :read_bl_menu} = parser, byte) do
     parser = put_byte(parser, byte)
 
     if byte == 0 do
+      # A plausible menu completed with its NUL terminator — commit
+      # bootloader mode now. Reset response dedup: in bootloader mode a
+      # client's single-byte XMODEM writes (ACK/NAK/CAN) are raw data
+      # and must never be suppressed as duplicate proxy responses.
       frame_data = binary_part(parser.buffer, 0, parser.buffer_index)
-      {%{parser | state: :wait_start}, [{:frame_complete, frame_data}]}
+      parser = %{parser | state: :wait_start, in_bootloader: true, last_response: 0}
+      {parser, [{:frame_complete, frame_data}]}
     else
       {parser, []}
     end
@@ -209,7 +242,10 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy.Parser do
   end
 
   defp parse_start(parser, @bl_menu) do
-    parser = %{parser | buffer_index: 0, in_bootloader: true}
+    # Tentative — do NOT commit bootloader mode yet. A stray 0x0D also
+    # appears in garbled data after a lost frame boundary; `in_bootloader`
+    # flips only once a plausible menu completes (see `:read_bl_menu`).
+    parser = %{parser | buffer_index: 0}
     parser = put_byte(parser, @bl_menu)
     {%{parser | state: :read_bl_menu}, []}
   end
