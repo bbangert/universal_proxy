@@ -190,6 +190,71 @@ defmodule UniversalProxy.HardwareTest do
       assert port.locked == false
     end
 
+    # A SONOFF Z-Wave dongle shares the CP210x VID/PID with plain serial
+    # cables; the USB descriptor string is what distinguishes it (HA does
+    # the same). NOT HW-validated — no SONOFF stick on the testbed.
+    test "auto-detects a SONOFF Z-Wave dongle (10C4:EA60) by descriptor" do
+      [port] =
+        Hardware.list_ports(
+          slots: nil,
+          enumerated: %{
+            "ttyUSB0" => %{
+              vendor_id: 0x10C4,
+              product_id: 0xEA60,
+              manufacturer: "ITEAD",
+              description: "SONOFF Zwave 800 Dongle Plus",
+              serial_number: "SZW800"
+            }
+          },
+          bus_paths: %{"ttyUSB0" => "1-1.2"},
+          saved_configs: %{},
+          in_use_ports: MapSet.new()
+        )
+
+      assert port.detection == :auto
+      assert port.kind == :zwave
+      assert port.locked == true
+      assert port.name == "SONOFF Zwave 800 Dongle Plus"
+    end
+
+    test "auto-detects a Nortek-style CP210x by '*z-wave*' descriptor" do
+      [port] =
+        Hardware.list_ports(
+          slots: nil,
+          enumerated: %{
+            "ttyUSB0" => %{
+              vendor_id: 0x10C4,
+              product_id: 0x8A2A,
+              description: "HubZ Smart Home Controller — Z-Wave",
+              serial_number: "N1"
+            }
+          },
+          bus_paths: %{"ttyUSB0" => "1-1.2"},
+          saved_configs: %{},
+          in_use_ports: MapSet.new()
+        )
+
+      assert port.kind == :zwave
+      assert port.locked == true
+    end
+
+    test "auto-detects an Aeotec Z-Stick (0658:0200) as locked Z-Wave" do
+      [port] =
+        Hardware.list_ports(
+          slots: nil,
+          enumerated: %{
+            "ttyACM0" => %{vendor_id: 0x0658, product_id: 0x0200, serial_number: "AE1"}
+          },
+          bus_paths: %{"ttyACM0" => "1-1.2"},
+          saved_configs: %{},
+          in_use_ports: MapSet.new()
+        )
+
+      assert port.kind == :zwave
+      assert port.locked == true
+      assert port.name == "Aeotec Z-Stick Gen5+"
+    end
+
     test "auto-detects branded IRdroid IR Toy as locked IR" do
       [port] =
         Hardware.list_ports(
