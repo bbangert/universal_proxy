@@ -79,6 +79,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
     :reopen_timer,
     :home_id_timer,
     :frame_timer,
+    :frame_timer_ref,
     :last_open_error,
     parser: nil,
     home_id: @zero_home_id,
@@ -291,6 +292,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
 
     state =
       %{state | uart_pid: nil, parser: Parser.new(), home_id_ready: false, query_retries: 0}
+      |> cancel_frame_timer()
       |> clear_home_id()
       |> schedule_reopen()
 
@@ -308,9 +310,13 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
 
   # A byte lost to UART noise can strand the parser mid-frame; the stale
   # bytes would then corrupt the next real frame. Abandon the frame
-  # @frame_timeout after its start byte (mirrors ESPHome #17461).
-  def handle_info(:zwave_frame_timeout, state) do
-    state = %{state | frame_timer: nil}
+  # @frame_timeout after its start byte (mirrors ESPHome #17461). Each
+  # armed timer carries a unique ref: only the currently-armed one may
+  # reset the parser, so a timer that fired just before it was cancelled
+  # (or before a reopen) can't reset a newer frame when its late message
+  # is finally delivered.
+  def handle_info({:zwave_frame_timeout, ref}, %{frame_timer_ref: ref} = state) do
+    state = %{state | frame_timer: nil, frame_timer_ref: nil}
 
     if Parser.mid_frame?(state.parser) do
       Logger.warning("Z-Wave frame timeout; resetting parser")
@@ -318,6 +324,10 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
     else
       {:noreply, state}
     end
+  end
+
+  def handle_info({:zwave_frame_timeout, _stale_ref}, state) do
+    {:noreply, state}
   end
 
   def handle_info(:zwave_reopen, state) do
@@ -475,19 +485,26 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
     now_mid_frame = Parser.mid_frame?(state.parser)
 
     cond do
-      now_mid_frame and not was_mid_frame ->
-        if state.frame_timer, do: Process.cancel_timer(state.frame_timer)
-        %{state | frame_timer: Process.send_after(self(), :zwave_frame_timeout, @frame_timeout)}
-
-      not now_mid_frame ->
-        if state.frame_timer, do: Process.cancel_timer(state.frame_timer)
-        %{state | frame_timer: nil}
-
+      now_mid_frame and not was_mid_frame -> arm_frame_timer(state)
+      not now_mid_frame -> cancel_frame_timer(state)
       # Still receiving the same frame — leave the timer running so it
       # measures from the start byte.
-      true ->
-        state
+      true -> state
     end
+  end
+
+  defp arm_frame_timer(state) do
+    state = cancel_frame_timer(state)
+    ref = make_ref()
+    timer = Process.send_after(self(), {:zwave_frame_timeout, ref}, @frame_timeout)
+    %{state | frame_timer: timer, frame_timer_ref: ref}
+  end
+
+  defp cancel_frame_timer(%{frame_timer: nil} = state), do: state
+
+  defp cancel_frame_timer(state) do
+    Process.cancel_timer(state.frame_timer)
+    %{state | frame_timer: nil, frame_timer_ref: nil}
   end
 
   defp open_port(port_path) do

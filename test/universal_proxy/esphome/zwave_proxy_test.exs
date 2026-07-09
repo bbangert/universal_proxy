@@ -278,11 +278,12 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
 
       # Partial frame (SOF + LENGTH), then silence — parser is mid-frame.
       send(server, {:circuits_uart, "ttyFake", <<0x01, 0x09>>})
+      ref = :sys.get_state(server).frame_timer_ref
       assert Parser.mid_frame?(:sys.get_state(server).parser)
 
-      # Fire the timeout directly (the 1.5 s wall-clock timer isn't
+      # Fire the armed timeout directly (the 1.5 s wall-clock timer isn't
       # test-friendly); the stale bytes must be dropped.
-      send(server, :zwave_frame_timeout)
+      send(server, {:zwave_frame_timeout, ref})
       refute Parser.mid_frame?(:sys.get_state(server).parser)
 
       # A fresh full frame now parses cleanly — no corruption from the
@@ -313,9 +314,33 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
       attach_fake_uart(server)
       refute Parser.mid_frame?(:sys.get_state(server).parser)
 
-      send(server, :zwave_frame_timeout)
+      send(server, {:zwave_frame_timeout, make_ref()})
       assert Process.alive?(server)
       refute Parser.mid_frame?(:sys.get_state(server).parser)
+    end
+
+    test "a stale timeout ref does not reset a newer frame", %{server: server} do
+      attach_fake_uart(server)
+
+      # Frame A starts and arms a timer (capture its ref), then completes —
+      # this is the "timer fired just before cancel" shape.
+      send(server, {:circuits_uart, "ttyFake", <<0x01, 0x09>>})
+      stale_ref = :sys.get_state(server).frame_timer_ref
+
+      send(
+        server,
+        {:circuits_uart, "ttyFake", <<0x01, 0x20, 0xDE, 0xAD, 0xBE, 0xEF, 0x05, 0x00, 0xF0>>}
+      )
+
+      refute Parser.mid_frame?(:sys.get_state(server).parser)
+
+      # Frame B is now mid-flight when frame A's late timeout is delivered.
+      send(server, {:circuits_uart, "ttyFake", <<0x01, 0x09>>})
+      assert Parser.mid_frame?(:sys.get_state(server).parser)
+
+      send(server, {:zwave_frame_timeout, stale_ref})
+      # Frame B must survive — the stale ref is ignored.
+      assert Parser.mid_frame?(:sys.get_state(server).parser)
     end
   end
 
