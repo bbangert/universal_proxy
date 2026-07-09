@@ -186,7 +186,9 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
       # Seam for tests: the real opener needs a live tty. Production
       # always uses open_port/1; tests inject a fake to exercise the
       # open-success path (resolve_port, :uart_port_opened broadcast).
-      open_fun: Keyword.get(opts, :open_fun, &open_port/1)
+      # nil (explicit or absent) falls back to the real opener so
+      # state.open_fun is always callable.
+      open_fun: Keyword.get(opts, :open_fun) || (&open_port/1)
     }
 
     if state.port_path || state.resolver do

@@ -1,7 +1,12 @@
 defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
   # Each test gets its own unnamed GenServer (pid only — no atom leakage)
   # and no UART hardware (port_path: nil).
-  use ExUnit.Case, async: true
+  #
+  # async: false — the broadcast tests share a fixed-name espex registry
+  # (torn down per test by start_supervised) and several tests assert on
+  # the global uart:port_opened/uart:port_closed PubSub topics; running
+  # serially avoids both dynamic-atom growth and cross-test delivery.
+  use ExUnit.Case, async: false
 
   alias UniversalProxy.ESPHome.ZWaveProxy
   alias UniversalProxy.ESPHome.ZWaveProxy.{Frame, Parser}
@@ -54,7 +59,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
   # `Espex.Supervisor.registry_name/1` guarantees the name matches what the
   # broadcast dispatches to.
   defp start_espex_registry! do
-    server = Module.concat(__MODULE__, "Server#{System.unique_integer([:positive])}")
+    server = __MODULE__.EspexServer
     registry = Espex.Supervisor.registry_name(server)
     start_supervised!({Registry, keys: :duplicate, name: registry})
     {:ok, _} = Registry.register(registry, :subscribers, nil)
