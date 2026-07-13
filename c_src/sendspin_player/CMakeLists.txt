@@ -10,7 +10,7 @@ set(CMAKE_C_FLAGS_RELEASE   "-O3 -DNDEBUG" CACHE STRING "" FORCE)
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "" FORCE)
 
 # Pin sendspin-cpp tightly — the protocol is Experimental upstream and our
-# patch (configurable WebSocket port) must be re-validated on every bump.
+# patch (listener-bound hook) must be re-validated on every bump.
 # We pin to a commit SHA, not a tag, because git tags are mutable server-
 # side: a retag would silently flow into firmware. The friendly tag is kept
 # in a comment for traceability. Resolve with `git ls-remote URL TAG` when
@@ -21,7 +21,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "" FORCE)
 # build dirs. This also means `-DSENDSPIN_CPP_REF=...` cannot override;
 # for scratch experiments against another ref use
 # `-DFETCHCONTENT_SOURCE_DIR_SENDSPIN-CPP=<local-checkout>` instead.
-set(SENDSPIN_CPP_REF "ef1157f0525d2107320736efc0909d78832cc270" # v0.6.1
+set(SENDSPIN_CPP_REF "0c2b4585f41889a8ddac4dabaea503d6d851715a" # post-v0.6.1, PR #81 (no tag yet)
     CACHE STRING "sendspin-cpp commit SHA to pin" FORCE)
 
 # Trim sendspin-cpp to just the player role. Other roles ship dead code on a
@@ -45,13 +45,11 @@ FetchContent_Declare(
     # CMake configure. We can't use `patch -N --forward || true` because
     # that masks real failures (e.g. a partial hunk apply on upstream
     # context drift) — silent breakage would slip past CI and only
-    # surface when the second player instance failed to bind. Instead,
-    # gate each apply on a marker grep: if the patch's marker is already
-    # present, that patch has run; otherwise apply with default semantics
-    # so any failure (missing context, conflicting edit) is loud and
-    # fatal at configure time. Order matters: 0002's context includes
-    # 0001's changes.
-    PATCH_COMMAND  sh -c "(grep -q SENDSPIN_WS_PORT src/host/ws_server.cpp || patch -p1 -i ${CMAKE_CURRENT_LIST_DIR}/patches/0001-configurable-ws-port.patch) && (grep -q 'register only on Open' src/host/ws_server.cpp || patch -p1 -i ${CMAKE_CURRENT_LIST_DIR}/patches/0002-defer-registration-until-open.patch) && (grep -q sendspin_host_listener_bound src/host/ws_server.cpp || patch -p1 -i ${CMAKE_CURRENT_LIST_DIR}/patches/0003-listener-bound-hook.patch)"
+    # surface at runtime. Instead, gate the apply on a marker grep: if
+    # the patch's marker is already present, the patch has run;
+    # otherwise apply with default semantics so any failure (missing
+    # context, conflicting edit) is loud and fatal at configure time.
+    PATCH_COMMAND  sh -c "grep -q sendspin_host_listener_bound src/host/ws_server.cpp || patch -p1 -i ${CMAKE_CURRENT_LIST_DIR}/patches/0003-listener-bound-hook.patch"
 )
 
 # Manual populate + add_subdirectory(EXCLUDE_FROM_ALL) for compatibility with
@@ -66,13 +64,12 @@ if(NOT sendspin-cpp_POPULATED)
                      EXCLUDE_FROM_ALL)
 endif()
 
-# Defence in depth: verify every patch landed completely. Each patch
-# names TWO markers: a comment/declaration sentinel proving the patch
-# ran at all, and a functional marker proving the load-bearing hunk
-# landed (a partial apply could leave the sentinel while the behavior
-# hunk silently no-applied — e.g. 0001's env-read block present but the
-# constructor still passing DEFAULT_SERVER_PORT, or 0002's comment
-# present while connections still register on TCP accept).
+# Defence in depth: verify the patch landed completely. It names TWO
+# markers: a comment/declaration sentinel proving the patch ran at all,
+# and a functional marker proving the load-bearing hunk landed (a
+# partial apply could leave the sentinel while the behavior hunk
+# silently no-applied — the weak declaration present but the hook call
+# after server start missing).
 function(assert_patch_markers patch_label)
     file(READ "${sendspin-cpp_SOURCE_DIR}/src/host/ws_server.cpp" _src)
     foreach(_marker IN LISTS ARGN)
@@ -88,12 +85,6 @@ function(assert_patch_markers patch_label)
     endforeach()
 endfunction()
 
-assert_patch_markers(0001-configurable-ws-port
-    "SENDSPIN_WS_PORT"
-    "WebSocketServer>(port,")
-assert_patch_markers(0002-defer-registration-until-open
-    "register only on Open"
-    "new_connection_callback_(std::make_shared<SendspinServerConnection>")
 assert_patch_markers(0003-listener-bound-hook
     "sendspin_host_listener_bound(uint16_t port) __attribute__((weak))"
     "sendspin_host_listener_bound(port)")
