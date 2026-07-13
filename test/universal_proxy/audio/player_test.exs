@@ -212,15 +212,20 @@ defmodule UniversalProxy.Audio.PlayerTest do
 
       log =
         ExUnit.CaptureLog.capture_log(fn ->
-          _pid = start_player!()
+          # Short watchdog so we can also assert it stays SILENT after a
+          # refusal — `listening` did arrive, so its "never reported"
+          # warning would be false.
+          _pid = start_player!(mdns_watchdog_ms: 50)
 
           # `maybe_register_mdns` runs in the same handle_info before
           # the event is broadcast, so receiving `listening` proves the
           # refusal path already executed.
           assert_receive {:sendspin_state, @key, %{event: "listening", port: 8928}}, 2_000
+          Process.sleep(120)
         end)
 
       assert log =~ "refusing mDNS registration"
+      refute log =~ "never reported `listening`"
       refute Enum.any?(MdnsStub.calls(), &match?({:add, _}, &1))
     end
 

@@ -109,6 +109,7 @@ defmodule UniversalProxy.Audio.Player do
     port: nil,
     mdns_id: nil,
     mdns_registered: false,
+    mdns_refused: false,
     reannounce_delays_ms: [],
     mdns_retry_ms: @mdns_retry_ms,
     mdns_failures: 0,
@@ -131,6 +132,7 @@ defmodule UniversalProxy.Audio.Player do
           port: port() | nil,
           mdns_id: term(),
           mdns_registered: boolean(),
+          mdns_refused: boolean(),
           reannounce_delays_ms: [non_neg_integer()],
           mdns_retry_ms: pos_integer(),
           mdns_failures: non_neg_integer(),
@@ -349,6 +351,11 @@ defmodule UniversalProxy.Audio.Player do
   # Registration succeeded before the retry fired — nothing to do.
   def handle_info(:retry_mdns_register, state), do: {:noreply, state}
 
+  # A wrong-port refusal already logged an error explaining exactly why
+  # this player is unadvertised — a "never reported `listening`" warning
+  # on top would be false (the event DID arrive) and misleading.
+  def handle_info(:mdns_watchdog, %{mdns_refused: true} = state), do: {:noreply, state}
+
   def handle_info(:mdns_watchdog, %{mdns_registered: false} = state) do
     Logger.warning(
       "Audio.Player #{inspect(state.key)} never reported `listening` — " <>
@@ -458,7 +465,11 @@ defmodule UniversalProxy.Audio.Player do
         "(advertising the wrong port would hand MA a dead one-shot connect)"
     )
 
-    state
+    # `mdns_refused` (not `mdns_registered: true` — no service exists)
+    # tells the watchdog this player's missing advertisement is already
+    # explained, so it doesn't pile on a misleading "never reported
+    # `listening`" warning.
+    %{state | mdns_refused: true}
   end
 
   defp maybe_register_mdns(state, _event), do: state
