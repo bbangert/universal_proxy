@@ -156,9 +156,11 @@ The flags must match what `UniversalProxy.Audio.Player` passes — see the
 | `--client-id STR`          | yes      | Stable unique client identifier (UUID)       |
 | `--server URL`             | no       | Outbound Sendspin server WebSocket URL       |
 | `--product STR`            | no       | Product id in `device_info` (node name, e.g. `universal-proxy-07507f`); vendor is fixed to `Universal Proxy`. Default `sendspin_player` |
+| `--mac STR`                | no       | MAC for `device_info`, lowercase colon-separated. Pre-normalized by the Elixir side; empty/absent = library auto-detects from the active interface |
 | `--alsa-device STR`        | no       | ALSA device, e.g. `plughw:0,0` (default = system default) |
 | `--mdns-port INT`          | no       | Local WebSocket listener port (default 8928) |
 | `--initial-volume 0..100`  | no       | Startup volume (default 50)                  |
+| `--initial-static-delay-ms 0..5000` | no | Startup static output delay for multi-room sync; the server can adjust it at runtime (`static_delay` event reports changes for persistence). Default 0 |
 | `--log-level STR`          | no       | `none\|error\|warn\|info\|debug\|verbose`    |
 | `--help` / `-h`            | no       | Print usage and exit                         |
 | `--version` / `-V`         | no       | Print version and exit                       |

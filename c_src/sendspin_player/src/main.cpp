@@ -228,6 +228,7 @@ struct Options {
     std::string name;
     std::string client_id;
     std::string product;
+    std::string mac;
     int mdns_port = DEFAULT_WS_PORT;
     int initial_volume = 50;
     int initial_static_delay_ms = 0;
@@ -249,6 +250,10 @@ static void print_usage(const char* prog) {
         "                        servers (e.g. universal-proxy-07507f). Shown as\n"
         "                        'Universal Proxy / <product>' in Music Assistant.\n"
         "                        Default: sendspin_player.\n"
+        "  --mac STR             MAC address for device_info, lowercase\n"
+        "                        colon-separated (e.g. b8:27:eb:07:50:7f).\n"
+        "                        Empty/absent = library auto-detects from the\n"
+        "                        active interface.\n"
         "  --mdns-port INT       Local WebSocket listener port (default: %d).\n"
         "  --initial-volume N    Startup volume 0-100 (default: 50).\n"
         "  --initial-static-delay-ms N\n"
@@ -275,6 +280,7 @@ static bool parse_args(int argc, char** argv, Options& opts) {
         {"name",           required_argument, nullptr, 'n'},
         {"client-id",      required_argument, nullptr, 'i'},
         {"product",        required_argument, nullptr, 'P'},
+        {"mac",            required_argument, nullptr, 'm'},
         {"mdns-port",      required_argument, nullptr, 'p'},
         {"initial-volume", required_argument, nullptr, 'v'},
         {"initial-static-delay-ms", required_argument, nullptr, 'D'},
@@ -292,6 +298,7 @@ static bool parse_args(int argc, char** argv, Options& opts) {
             case 'n': opts.name = optarg; break;
             case 'i': opts.client_id = optarg; break;
             case 'P': opts.product = optarg; break;
+            case 'm': opts.mac = optarg; break;
             case 'p':
                 if (!parse_int(optarg, opts.mdns_port)) {
                     std::fprintf(stderr, "Error: --mdns-port must be an integer\n");
@@ -340,6 +347,7 @@ static bool parse_args(int argc, char** argv, Options& opts) {
     if (!require_utf8("--name", opts.name)) return false;
     if (!require_utf8("--client-id", opts.client_id)) return false;
     if (!require_utf8("--product", opts.product)) return false;
+    if (!require_utf8("--mac", opts.mac)) return false;
     if (!require_utf8("--alsa-device", opts.alsa_device)) return false;
     if (!require_utf8("--server", opts.server)) return false;
     return true;
@@ -706,6 +714,12 @@ int main(int argc, char* argv[]) {
     // opts.mdns_port is validated 1–65535 in parse_args, so the narrowing
     // cast cannot truncate.
     client_config.server_port = static_cast<uint16_t>(opts.mdns_port);
+    // --mac is pre-normalized (lowercase, format-checked) by the Elixir
+    // side; empty/absent leaves the optional unset so the library
+    // auto-detects from the active interface, as before.
+    if (!opts.mac.empty()) {
+        client_config.mac_address = opts.mac;
+    }
     // Shown by Sendspin servers as "Vendor / Product" (Music Assistant's
     // player list). Mirrors the Home Assistant Voice PE scheme: a human
     // display string for the vendor and the per-device node name (e.g.

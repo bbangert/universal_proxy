@@ -96,12 +96,38 @@ defmodule UniversalProxy.Audio.PlayerTest do
           # Default to no device suffix so instance-name assertions are
           # deterministic regardless of whether ConfigStore is running;
           # the dedicated test opts a real node name back in.
-          device_name_fun: fn -> nil end
+          device_name_fun: fn -> nil end,
+          # Same determinism story for the device_info MAC.
+          mac_address_fun: fn -> nil end
         ],
         overrides
       )
 
     start_supervised!({Player, opts})
+  end
+
+  # Minimal state for `Player.__cli_args__/1` arg-level assertions —
+  # flags like --mac never appear in stdout events, so they can't be
+  # asserted through the fake's echo.
+  defp cli_state(overrides) do
+    struct!(
+      %Player{
+        key: @key,
+        config: config(),
+        binary_path: @fake_binary,
+        mdns_port: 18_928,
+        device_name_fun: fn -> nil end,
+        mac_address_fun: fn -> nil end
+      },
+      overrides
+    )
+  end
+
+  defp mac_pair(args) do
+    case Enum.drop_while(args, &(&1 != "--mac")) do
+      ["--mac", mac | _] -> ["--mac", mac]
+      [] -> nil
+    end
   end
 
   describe "startup" do
@@ -145,6 +171,34 @@ defmodule UniversalProxy.Audio.PlayerTest do
 
       assert_receive {:sendspin_state, @key, %{event: "started", product: "sendspin_player"}},
                      2_000
+    end
+
+    test "passes --mac downcased and starts normally with a MAC configured" do
+      # Process-level: the real binary accepts --mac (fake mirrors the
+      # arg surface), and args carry the normalized persisted MAC.
+      _pid = start_player!(mac_address_fun: fn -> "B8:27:EB:07:50:7F" end, mdns_port: 18_904)
+      assert_receive {:sendspin_state, @key, %{event: "started"}}, 2_000
+
+      args = Player.__cli_args__(cli_state(mac_address_fun: fn -> "B8:27:EB:07:50:7F" end))
+      assert ["--mac", "b8:27:eb:07:50:7f"] = mac_pair(args)
+    end
+
+    test "omits --mac on zeros sentinel, malformed value, or a crashing fun" do
+      # Degraded path (decision: quiet omit, binary auto-detects — never
+      # block audio on cosmetic metadata). Zeros = espex "no interface";
+      # malformed = user-edited Settings value; raise/exit = ConfigStore
+      # down (the catch :exit optional-subsystem idiom).
+      for fun <- [
+            fn -> "00:00:00:00:00:00" end,
+            fn -> "not-a-mac" end,
+            fn -> "b8:27:eb:07:50" end,
+            fn -> nil end,
+            fn -> raise "boom" end,
+            fn -> exit(:noproc) end
+          ] do
+        args = Player.__cli_args__(cli_state(mac_address_fun: fun))
+        assert mac_pair(args) == nil
+      end
     end
 
     test "forwards the persisted static delay via --initial-static-delay-ms" do
