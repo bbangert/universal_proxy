@@ -201,6 +201,34 @@ defmodule UniversalProxy.Audio.PlayerTest do
       refute Enum.any?(MdnsStub.calls(), &match?({:add, _}, &1))
     end
 
+    test "refuses mDNS registration when the bound port differs from the requested one" do
+      # The `listening` event reports the port the binary ACTUALLY
+      # bound. If it ever diverges from the one we were going to
+      # advertise, registering would hand MA's one-shot discovery
+      # connect a dead port — refuse loudly instead. The fake reports
+      # a foreign port via env.
+      System.put_env("FAKE_LISTENING_PORT", "8928")
+      on_exit(fn -> System.delete_env("FAKE_LISTENING_PORT") end)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          # Short watchdog so we can also assert it stays SILENT after a
+          # refusal — `listening` did arrive, so its "never reported"
+          # warning would be false.
+          _pid = start_player!(mdns_watchdog_ms: 50)
+
+          # `maybe_register_mdns` runs in the same handle_info before
+          # the event is broadcast, so receiving `listening` proves the
+          # refusal path already executed.
+          assert_receive {:sendspin_state, @key, %{event: "listening", port: 8928}}, 2_000
+          Process.sleep(120)
+        end)
+
+      assert log =~ "refusing mDNS registration"
+      refute log =~ "never reported `listening`"
+      refute Enum.any?(MdnsStub.calls(), &match?({:add, _}, &1))
+    end
+
     test "retries mDNS registration when MdnsLite is unavailable at `listening`" do
       # `listening` is a one-shot signal from the binary; if MdnsLite's
       # TableServer happens to be down at that instant, registration

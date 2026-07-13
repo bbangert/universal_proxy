@@ -19,8 +19,6 @@ c_src/sendspin_player/
 ├── LICENSE-sendspin-armv6   Apache-2.0 attribution copy for vendored files
 ├── README.md                this file
 ├── patches/
-│   ├── 0001-configurable-ws-port.patch
-│   ├── 0002-defer-registration-until-open.patch
 │   └── 0003-listener-bound-hook.patch
 └── src/
     ├── alsa_pipe_sink.h     vendored from LeoLTM/sendspin-armv6
@@ -40,7 +38,7 @@ Do not add per-file headers locally.
 
 ### Local divergence
 
-The vendored files carry one local fix vs. upstream:
+The vendored files carry two local fixes vs. upstream:
 
 - `alsa_pipe_sink.cpp::stop()` — join the playback thread unconditionally
   so a self-clearing `running_` (after an ALSA write error inside the
@@ -49,6 +47,13 @@ The vendored files carry one local fix vs. upstream:
   flagged inline with a comment in `alsa_pipe_sink.cpp` and is intended
   to be sent upstream — once it merges, we can re-vendor verbatim and
   drop the divergence.
+- `alsa_pipe_sink.cpp::write()` — commit only whole PCM frames to the
+  ring per call, so partial return counts are always frame-aligned.
+  sendspin-cpp made this an explicit contract in #78 (a mid-frame
+  count drifts its playtime estimate); upstream's byte-oriented write
+  can return a mid-frame count when the ring fills exactly (the 2 MiB
+  power-of-two capacity is not a multiple of 6-byte 24-bit-stereo
+  frames). Also a candidate to send upstream.
 
 `main.cpp` is our own adaptation of upstream `src/main.cpp`. The shape stayed
 close to upstream so future patches there can land here with minimal effort.
@@ -57,60 +62,44 @@ Differences:
 - CLI args (`getopt_long`) replace the INI config file
 - JSON status events on **stdout** replace upstream's stderr free-form logs
 - JSON command lines on **stdin** for runtime volume / mute / shutdown
-- Sets `SENDSPIN_WS_PORT` env (consumed by our sendspin-cpp patch) so multiple
-  binary instances can bind distinct ports
+- Sets `SendspinClientConfig::server_port` from `--mdns-port` so multiple
+  binary instances can bind distinct ports (first-class upstream since
+  sendspin-cpp #61)
 
 ## sendspin-cpp pin
 
 Pinned via `FetchContent` to a **commit SHA** in `CMakeLists.txt`
-(`SENDSPIN_CPP_REF` cache var). Currently `ef1157f05...` which is the SHA
-that `v0.6.1` resolved to at the time of the bump. We pin to a SHA rather
+(`SENDSPIN_CPP_REF` cache var). Currently `0c2b4585...`, upstream main
+post-PR #81 (after v0.6.1, no release tag yet). We pin to a SHA rather
 than a tag because git tags are mutable server-side; a retagged upstream
-would otherwise silently flow into firmware. The friendly tag name lives in
-a comment beside the SHA for traceability.
+would otherwise silently flow into firmware. The friendly tag name (or
+nearest-release note) lives in a comment beside the SHA for traceability.
 
 The protocol is Experimental upstream — treat every minor bump as a
-release-blocking review and re-validate the patches listed below.
+release-blocking review and re-validate the patch listed below.
 
-### Patch: configurable WebSocket port
+### Retired patches (upstreamed)
 
-`patches/0001-configurable-ws-port.patch` modifies
-`sendspin-cpp/src/host/ws_server.cpp` so the WebSocket listener reads
-`SENDSPIN_WS_PORT` from the environment with a fallback to the upstream
-default (8928). Without this, every binary instance would try to bind 8928
-and the second one would fail — universal_proxy spawns one binary per ALSA
-output so it needs distinct ports.
+Two patches were dropped at the `0c2b4585` bump because upstream now
+provides the behavior first-class:
 
-### Patch: defer connection registration until Open
-
-`patches/0002-defer-registration-until-open.patch` (applies on top of 0001,
-same file) moves the `new_connection_callback_` invocation from IXWebSocket's
-accept callback — which runs **before** the WebSocket handshake — into the
-`WebSocketMessageType::Open` branch. Upstream registers the connection on TCP
-accept; a socket that never completes the handshake (port scanner, TCP
-reachability probe, half-open Wi-Fi connection) never produces a Close event,
-so the registered "phantom" occupies one of the manager's two connection
-slots (current + pending) forever. Two phantoms silently wedge the player:
-every real client (i.e. Music Assistant) gets `101 Switching Protocols` and
-then nothing — no `client/hello`, no goodbye — until the binary restarts.
-Reproduced on upstream v0.5.0 through main (`bf9e085`); the fix mirrors the
-ESP httpd path, whose open callback runs post-upgrade. Drop this patch once
-fixed upstream (issue draft + repro live in the session scratchpad; see
-`.claude` memory `sendspin-phantom-connection-wedge`).
-
-**Known residual**: this only covers *pre-handshake* phantoms. A peer that
-completes the WebSocket upgrade and then never speaks (a health checker
-doing full WS checks, a half-open connection that died post-upgrade) is
-registered and occupies a slot indefinitely — the pinned ConnectionManager
-(still true through v0.6.1 and upstream main) has no handshake deadline and
-the host build configures no WS ping/TCP keepalive, so two such peers still
-wedge the player. That fix (a
-registered-but-no-hello timeout) belongs upstream in ConnectionManager,
-not in this patch.
+- **0001-configurable-ws-port** — superseded by upstream #61:
+  `SendspinClientConfig::server_port` configures the listener port
+  directly; `main.cpp` sets it from `--mdns-port` (the old patch read a
+  `SENDSPIN_WS_PORT` env var). Needed because universal_proxy spawns one
+  binary per ALSA output, so each instance must bind a distinct port.
+- **0002-defer-registration-until-open** — superseded by upstream
+  #80/#81 (fixing Ben's issue #75, the phantom-connection wedge):
+  connections now enter a handshake "nursery" and are only admitted to
+  the ConnectionManager once the WebSocket upgrade completes and
+  `client/hello` arrives (prove-then-admit). This also covers the
+  residual our patch could not: a post-upgrade-but-silent peer now
+  times out in the nursery instead of occupying a slot forever, and a
+  surplus peer gets a graceful `client/goodbye`.
 
 ### Patch: listener-bound hook
 
-`patches/0003-listener-bound-hook.patch` (same file, applies after 0002)
+`patches/0003-listener-bound-hook.patch` (our sole remaining patch)
 declares a weak `extern "C" sendspin_host_listener_bound(uint16_t)` and
 calls it from `SendspinWsServer::start()` the moment `listen()` succeeds.
 `main.cpp` defines the strong symbol and uses it to drive the `listening`
@@ -130,20 +119,20 @@ When bumping `SENDSPIN_CPP_REF`:
 3. `rm -rf _build/*/sendspin_player` — the WHOLE build dir per target.
    The pin itself now propagates into existing caches (`SENDSPIN_CPP_REF`
    is set with `FORCE`), but a clean dir guarantees FetchContent
-   re-populates and the patch chain applies to a pristine tree rather
+   re-populates and the patch applies to a pristine tree rather
    than one carrying the previous version's patched state
-4. Run `mix compile` — if a patch no longer applies cleanly, regenerate
-   it against the new tree (`diff -u <old> <new> > 000N-...patch`) and
-   commit. The post-populate marker checks in `CMakeLists.txt` will
-   `FATAL_ERROR` if any patch silently no-applies. Each patch is
-   generated against the tree with the previous patches applied, so
-   regenerate them in order.
+4. Run `mix compile` — if the patch no longer applies cleanly, regenerate
+   it from a real checkout at the new SHA (apply the edits, then
+   `git diff > 0003-...patch`) and commit. The post-populate marker
+   checks in `CMakeLists.txt` will `FATAL_ERROR` if the patch silently
+   no-applies. Keep the two marker strings byte-identical to the
+   `assert_patch_markers` arguments.
 5. Verify the binary runs with `--mdns-port 18928` and binds correctly
    (e.g. `ss -tlnp | grep 18928`)
 6. Run `mix test test/sendspin_player_contract_test.exs --include contract`
    to confirm the JSON event contract still holds
-7. If upstream adds first-class port configuration, drop the patch and use
-   their API directly
+7. If upstream adds a first-class listener-bound callback, drop the patch
+   and use their API directly
 
 ## Manual hacking
 

@@ -11,7 +11,7 @@
 //   • CLI args via getopt_long instead of INI config file
 //   • JSON status events on stdout instead of stderr free-form logs
 //   • JSON commands on stdin for runtime volume/mute/shutdown
-//   • Honors SENDSPIN_WS_PORT (via our sendspin-cpp patch) to bind a
+//   • Sets SendspinClientConfig::server_port from --mdns-port to bind a
 //     non-default WebSocket port so multiple players can coexist
 //
 // Licensed under the Apache License, Version 2.0.
@@ -698,22 +698,14 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Invariant: SENDSPIN_WS_PORT must be set BEFORE SendspinClient is
-    // constructed and BEFORE any thread is spawned, because (a) the patched
-    // sendspin-cpp reads it inside start_server(), and (b) POSIX setenv/
-    // getenv are not MT-safe — a future refactor that moves thread spawn
-    // earlier would race.
-    {
-        char buf[16];
-        std::snprintf(buf, sizeof(buf), "%d", opts.mdns_port);
-        ::setenv("SENDSPIN_WS_PORT", buf, 1);
-    }
-
     SendspinClient::set_log_level(log_level);
 
     SendspinClientConfig client_config;
     client_config.client_id = opts.client_id;
     client_config.name = opts.name;
+    // opts.mdns_port is validated 1–65535 in parse_args, so the narrowing
+    // cast cannot truncate.
+    client_config.server_port = static_cast<uint16_t>(opts.mdns_port);
     // Shown by Sendspin servers as "Vendor / Product" (Music Assistant's
     // player list). Mirrors the Home Assistant Voice PE scheme: a human
     // display string for the vendor and the per-device node name (e.g.
@@ -824,9 +816,10 @@ int main(int argc, char* argv[]) {
         // `listening` gates the Elixir side's mDNS advertisement (see
         // sendspin_host_listener_bound above) — emitted once, as soon
         // as the library reports its listener bound. If the bind fails
-        // (foreign process on the port), the library retries every tick
-        // and this fires on eventual success; until then the player is
-        // deliberately not advertised.
+        // (foreign process on the port), the library retries with
+        // backoff (WS_SERVER_START_RETRY_US) and this fires on
+        // eventual success; until then the player is deliberately not
+        // advertised.
         if (!listening_emitted && g_listener_bound.load(std::memory_order_acquire)) {
             listening_emitted = true;
             std::ostringstream os;

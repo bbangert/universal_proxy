@@ -24,9 +24,9 @@ defmodule Mix.Tasks.Compile.SendspinPlayer do
   ## Patch lifecycle
 
   The CMakeLists.txt applies a small patch to `sendspin-cpp` via
-  `FetchContent` PATCH_COMMAND so the WebSocket port can be set via the
-  `SENDSPIN_WS_PORT` environment variable. See
-  `c_src/sendspin_player/patches/0001-configurable-ws-port.patch`.
+  `FetchContent` PATCH_COMMAND that adds a listener-bound hook, letting
+  the binary report exactly when its WebSocket listener is up. See
+  `c_src/sendspin_player/patches/0003-listener-bound-hook.patch`.
 
   ## Failure modes
 
