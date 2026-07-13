@@ -106,6 +106,7 @@ defmodule UniversalProxy.Audio.Player do
     :pubsub,
     :mdns_module,
     :device_name_fun,
+    :mac_address_fun,
     port: nil,
     mdns_id: nil,
     mdns_registered: false,
@@ -125,10 +126,11 @@ defmodule UniversalProxy.Audio.Player do
           server_url: String.t() | nil,
           pubsub: module(),
           mdns_module: module(),
-          # `init/1` passes this through untouched and `safe_device_name/1`
+          # `init/1` passes this through untouched and `safe_call/1`
           # tolerates a non-function (returns nil), so the type is widened
           # past the expected 0-arity function to match the runtime.
           device_name_fun: (-> String.t() | nil) | term(),
+          mac_address_fun: (-> String.t() | nil) | term(),
           port: port() | nil,
           mdns_id: term(),
           mdns_registered: boolean(),
@@ -184,6 +186,14 @@ defmodule UniversalProxy.Audio.Player do
     GenServer.cast(server, {:__send_command__, cmd})
   end
 
+  @doc false
+  # Test seam: the computed CLI argv for a state. Flags like `--mac`
+  # are deliberately NOT echoed back in any stdout event (they only
+  # shape client/hello device_info), so arg-level tests assert here
+  # instead of teaching the fake binary to leak them.
+  @spec __cli_args__(t()) :: [String.t()]
+  def __cli_args__(%__MODULE__{} = state), do: build_cli_args(state)
+
   # -- Server Callbacks --
 
   @impl true
@@ -203,6 +213,7 @@ defmodule UniversalProxy.Audio.Player do
     pubsub = Keyword.get(opts, :pubsub, @pubsub)
     mdns_module = Keyword.get(opts, :mdns_module, MdnsLite)
     device_name_fun = Keyword.get(opts, :device_name_fun, &default_device_name/0)
+    mac_address_fun = Keyword.get(opts, :mac_address_fun, &default_mac_address/0)
 
     state = %__MODULE__{
       key: key,
@@ -212,7 +223,8 @@ defmodule UniversalProxy.Audio.Player do
       server_url: server_url,
       pubsub: pubsub,
       mdns_module: mdns_module,
-      device_name_fun: device_name_fun
+      device_name_fun: device_name_fun,
+      mac_address_fun: mac_address_fun
     }
 
     cond do
@@ -547,9 +559,30 @@ defmodule UniversalProxy.Audio.Player do
     # PE scheme ("ESPHome / home-assistant-voice-09010e"). No node name
     # (host dev) falls back to the binary's default product.
     base =
-      case safe_device_name(state.device_name_fun) do
+      case safe_call(state.device_name_fun) do
         product when is_binary(product) and product != "" -> base ++ ["--product", product]
         _ -> base
+      end
+
+    # device_info MAC: pass the persisted ESPHome identity (the MAC HA
+    # already sees, user-overridable in Settings) so the reported value
+    # is deterministic — the library's auto-detect follows the *active*
+    # interface, which flips eth0/wlan0 across boots under the
+    # boot-locked ethernet-preferred policy. No usable MAC (host dev,
+    # ConfigStore down, zeros sentinel) → omit the flag and let the
+    # binary auto-detect: degraded metadata, never blocked audio.
+    base =
+      case normalize_mac(safe_call(state.mac_address_fun)) do
+        mac when is_binary(mac) ->
+          base ++ ["--mac", mac]
+
+        nil ->
+          Logger.debug(
+            "Audio.Player #{inspect(state.key)} has no usable device MAC — " <>
+              "binary will auto-detect device_info.mac_address"
+          )
+
+          base
       end
 
     case state.server_url do
@@ -557,6 +590,26 @@ defmodule UniversalProxy.Audio.Player do
       url when is_binary(url) -> base ++ ["--server", url]
     end
   end
+
+  # sendspin-cpp requires lowercase colon-separated; espex detection
+  # reports uppercase, and the ConfigStore field is user-editable, so
+  # normalize + validate here and treat anything else as absent. The
+  # zeros sentinel is espex's "no interface found" — auto-detect in the
+  # binary can do no worse, and a real (if nondeterministic) MAC beats
+  # advertising zeros.
+  @mac_re ~r/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/
+  defp normalize_mac(mac) when is_binary(mac) do
+    # Trim too: the Settings field persists verbatim (ConfigStore only
+    # trims :project_name), so stray whitespace from a hand-entered
+    # override must not silently disable the flag.
+    mac = mac |> String.trim() |> String.downcase()
+
+    if mac != "00:00:00:00:00:00" and Regex.match?(@mac_re, mac) do
+      mac
+    end
+  end
+
+  defp normalize_mac(_), do: nil
 
   # The C++ binary's stdin parser is a strict left-to-right scanner that
   # requires the literal field order `{"cmd":...[,"value":...]}` (see
@@ -626,7 +679,7 @@ defmodule UniversalProxy.Audio.Player do
     # suffix within the 63-byte mDNS label budget (the output portion is
     # truncated first). mDNS allows arbitrary UTF-8 in instance names, so
     # spaces, accents, etc. are fine and don't need escaping.
-    display_name = sendspin_instance_name(friendly_name, safe_device_name(device_name_fun))
+    display_name = sendspin_instance_name(friendly_name, safe_call(device_name_fun))
 
     service = %{
       id: mdns_service_id(key),
@@ -765,7 +818,30 @@ defmodule UniversalProxy.Audio.Player do
     :exit, _ -> nil
   end
 
-  defp safe_device_name(fun) when is_function(fun, 0) do
+  # The device MAC as the ESPHome side reports it to HA: a Settings
+  # override when present, else the same eth0-first detection espex
+  # runs at startup (`Keyword.put_new_lazy(:mac_address, ...)` in
+  # Espex.DeviceConfig.new/1). NOTE `ConfigStore.current/0` only
+  # carries :mac_address when overridden — it is NOT in the defaults
+  # map, so this must be Map.get + fallback, not a bare field access.
+  # Detection is interface-ORDER stable (eth0 → end0 → wlan0), unlike
+  # the C++ library's active-interface probe — that stability is the
+  # whole point of passing --mac.
+  defp default_mac_address do
+    stored_mac_address() || Espex.DeviceConfig.detect_mac_address()
+  end
+
+  # ConfigStore is a GenServer: a down/wedged store degrades to
+  # detection rather than blocking the player spawn.
+  defp stored_mac_address do
+    Map.get(UniversalProxy.ESPHome.ConfigStore.current(), :mac_address)
+  rescue
+    _ -> nil
+  catch
+    :exit, _ -> nil
+  end
+
+  defp safe_call(fun) when is_function(fun, 0) do
     fun.()
   rescue
     _ -> nil
@@ -773,7 +849,7 @@ defmodule UniversalProxy.Audio.Player do
     :exit, _ -> nil
   end
 
-  defp safe_device_name(_), do: nil
+  defp safe_call(_), do: nil
 
   defp truncate_to_byte_limit(s, max) when byte_size(s) <= max, do: s
 

@@ -51,6 +51,9 @@ def main():
     p.add_argument("--name", required=True)
     p.add_argument("--client-id", required=True)
     p.add_argument("--product", default="sendspin_player")
+    # Accepted like the real binary; NOT echoed in any event (it only
+    # affects the client/hello device_info, which never hits stdout).
+    p.add_argument("--mac", default="")
     p.add_argument("--mdns-port", type=int, default=0)
     p.add_argument("--initial-volume", type=int, default=50)
     p.add_argument("--initial-static-delay-ms", type=int, default=0)
