@@ -181,6 +181,11 @@ defmodule UniversalProxy.Audio.PlayerTest do
 
       args = Player.__cli_args__(cli_state(mac_address_fun: fn -> "B8:27:EB:07:50:7F" end))
       assert ["--mac", "b8:27:eb:07:50:7f"] = mac_pair(args)
+
+      # Hand-entered Settings overrides persist verbatim — stray
+      # whitespace must normalize away, not silently disable the flag.
+      args = Player.__cli_args__(cli_state(mac_address_fun: fn -> " B8:27:EB:07:50:7F\n" end))
+      assert ["--mac", "b8:27:eb:07:50:7f"] = mac_pair(args)
     end
 
     test "omits --mac on zeros sentinel, malformed value, or a crashing fun" do

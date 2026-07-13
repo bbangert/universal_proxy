@@ -599,7 +599,10 @@ defmodule UniversalProxy.Audio.Player do
   # advertising zeros.
   @mac_re ~r/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/
   defp normalize_mac(mac) when is_binary(mac) do
-    mac = String.downcase(mac)
+    # Trim too: the Settings field persists verbatim (ConfigStore only
+    # trims :project_name), so stray whitespace from a hand-entered
+    # override must not silently disable the flag.
+    mac = mac |> String.trim() |> String.downcase()
 
     if mac != "00:00:00:00:00:00" and Regex.match?(@mac_re, mac) do
       mac
