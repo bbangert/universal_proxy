@@ -88,9 +88,12 @@ def main():
     # (the real binary probes the port from its main loop). This is
     # what gates Audio.Player's mDNS registration. Tests set
     # FAKE_SKIP_LISTENING=1 to simulate a binary whose listener never
-    # comes up and assert that no mDNS advertisement happens.
+    # comes up and assert that no mDNS advertisement happens, or
+    # FAKE_LISTENING_PORT=N to report a bound port different from the
+    # requested one (drives the wrong-port refusal path).
     if os.environ.get("FAKE_SKIP_LISTENING") != "1":
-        emit({"event": "listening", "port": args.mdns_port})
+        bound_port = int(os.environ.get("FAKE_LISTENING_PORT", args.mdns_port))
+        emit({"event": "listening", "port": bound_port})
 
     for line in sys.stdin:
         line = line.strip()

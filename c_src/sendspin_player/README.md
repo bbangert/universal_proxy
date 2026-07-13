@@ -38,7 +38,7 @@ Do not add per-file headers locally.
 
 ### Local divergence
 
-The vendored files carry one local fix vs. upstream:
+The vendored files carry two local fixes vs. upstream:
 
 - `alsa_pipe_sink.cpp::stop()` — join the playback thread unconditionally
   so a self-clearing `running_` (after an ALSA write error inside the
@@ -47,6 +47,13 @@ The vendored files carry one local fix vs. upstream:
   flagged inline with a comment in `alsa_pipe_sink.cpp` and is intended
   to be sent upstream — once it merges, we can re-vendor verbatim and
   drop the divergence.
+- `alsa_pipe_sink.cpp::write()` — commit only whole PCM frames to the
+  ring per call, so partial return counts are always frame-aligned.
+  sendspin-cpp made this an explicit contract in #78 (a mid-frame
+  count drifts its playtime estimate); upstream's byte-oriented write
+  can return a mid-frame count when the ring fills exactly (the 2 MiB
+  power-of-two capacity is not a multiple of 6-byte 24-bit-stereo
+  frames). Also a candidate to send upstream.
 
 `main.cpp` is our own adaptation of upstream `src/main.cpp`. The shape stayed
 close to upstream so future patches there can land here with minimal effort.

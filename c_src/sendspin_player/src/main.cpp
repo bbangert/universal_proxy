@@ -816,9 +816,10 @@ int main(int argc, char* argv[]) {
         // `listening` gates the Elixir side's mDNS advertisement (see
         // sendspin_host_listener_bound above) — emitted once, as soon
         // as the library reports its listener bound. If the bind fails
-        // (foreign process on the port), the library retries every tick
-        // and this fires on eventual success; until then the player is
-        // deliberately not advertised.
+        // (foreign process on the port), the library retries with
+        // backoff (WS_SERVER_START_RETRY_US) and this fires on
+        // eventual success; until then the player is deliberately not
+        // advertised.
         if (!listening_emitted && g_listener_bound.load(std::memory_order_acquire)) {
             listening_emitted = true;
             std::ostringstream os;

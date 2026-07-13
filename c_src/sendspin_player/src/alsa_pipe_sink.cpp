@@ -271,16 +271,31 @@ size_t AlsaPipeSink::write(uint8_t* data, size_t length,
 
     std::unique_lock<std::mutex> lk(ring_mtx_);
     while (written < length && running_.load()) {
+        // sendspin-cpp's player role requires partial write returns to
+        // be a whole number of PCM frames (player_role.h, upstream #78)
+        // — a mid-frame count drifts its playtime estimate. Commit
+        // whole frames only: RING_CAPACITY (a power of two) is not a
+        // multiple of e.g. the 6-byte frames of 24-bit stereo, so the
+        // exact-fill chunk must be rounded down, and a sub-frame tail
+        // in the input is refused rather than half-buffered (the
+        // caller re-offers it; returning bytes not in the ring would
+        // make it skip them — that WOULD corrupt audio).
+        size_t remaining = length - written;
+        remaining -= remaining % bytes_per_frame_;
+        if (remaining == 0) break;
+
         size_t space = RING_CAPACITY - ring_used_;
-        if (space == 0) {
+        size_t chunk = std::min(remaining, space);
+        chunk -= chunk % bytes_per_frame_;
+        if (chunk == 0) {
             if (std::chrono::steady_clock::now() >= deadline) break;
             ring_cv_.wait_until(lk, deadline, [&] {
-                return (RING_CAPACITY - ring_used_) > 0 || !running_.load();
+                return (RING_CAPACITY - ring_used_) >= bytes_per_frame_ ||
+                       !running_.load();
             });
             continue;
         }
 
-        size_t chunk = std::min(length - written, space);
         // Copy into the ring, handling wrap-around.
         size_t head_room = RING_CAPACITY - ring_head_;
         size_t first = std::min(chunk, head_room);
