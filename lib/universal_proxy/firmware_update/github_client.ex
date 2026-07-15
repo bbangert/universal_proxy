@@ -36,10 +36,18 @@ defmodule UniversalProxy.FirmwareUpdate.GithubClient do
         }
 
   @doc """
-  Fetches the latest non-prerelease for `owner_repo` (e.g. `"bbangert/universal_proxy"`).
+  Fetches the latest release for `owner_repo` (e.g. `"bbangert/universal_proxy"`).
 
   ## Options
 
+    * `:channel` — `:stable` (default) or `:prerelease`.
+      `:stable` hits the `/releases/latest` endpoint — GitHub's "latest"
+      excludes prereleases and drafts by definition, so the existing
+      prerelease guard is just belt-and-suspenders.
+      `:prerelease` hits `/releases?per_page=30` and picks the release
+      with the highest semver tag (drafts excluded, prereleases
+      eligible — ties are broken by `Version.compare/2`'s native
+      prerelease ordering, so e.g. `v1.3.0-rc.1` beats `v1.2.9`).
     * `:github_token` — optional bearer token for higher rate limits and
       private-repo access.
     * `:etag` — value from a prior call's response. A matching server
@@ -49,14 +57,16 @@ defmodule UniversalProxy.FirmwareUpdate.GithubClient do
       tests to inject `plug:` for stubbing).
 
   Returns `{:ok, release}` on a current release, `{:ok, :not_modified}`
-  on 304, `{:error, :rate_limited}` on quota exhaustion,
-  `{:error, :not_found}` on 404, or `{:error, term()}` on transport
-  errors.
+  on 304, `{:error, :no_release}` when `:channel` is `:prerelease` and
+  no release has a parseable semver tag, `{:error, :rate_limited}` on
+  quota exhaustion, `{:error, :not_found}` on 404, or `{:error, term()}`
+  on transport errors.
   """
   @spec latest_release(String.t(), keyword()) ::
           {:ok, release()} | {:ok, :not_modified} | {:error, term()}
   def latest_release(owner_repo, opts \\ []) when is_binary(owner_repo) do
-    url = "#{@api_base}/repos/#{owner_repo}/releases/latest"
+    channel = Keyword.get(opts, :channel, :stable)
+    url = release_url(owner_repo, channel)
 
     headers =
       [{"accept", "application/vnd.github+json"}, {"x-github-api-version", "2022-11-28"}]
@@ -69,7 +79,7 @@ defmodule UniversalProxy.FirmwareUpdate.GithubClient do
 
     case Req.request(req_opts) do
       {:ok, %Req.Response{status: 200, body: body, headers: resp_headers}} ->
-        decode_release(body, resp_headers)
+        decode_latest(channel, body, resp_headers)
 
       {:ok, %Req.Response{status: 304}} ->
         {:ok, :not_modified}
@@ -98,6 +108,15 @@ defmodule UniversalProxy.FirmwareUpdate.GithubClient do
   Reports progress through `opts[:progress]` as `{:downloading, percent}`
   every ≥ #{@progress_chunk_bytes} bytes and once on completion.
 
+  ## Options
+
+    * `:expected_sha256` — optional hex digest (either case) checked
+      against a SHA-256 computed incrementally while streaming. Verified
+      before the `.part` → dest rename; on mismatch the `.part` file is
+      deleted and `{:error, {:sha256_mismatch, expected: ..., actual:
+      ...}}` is returned (both hex strings lowercase). Omit to skip
+      hashing entirely.
+
   Returns `:ok` on success; on failure deletes the partial file and
   returns `{:error, term()}`.
   """
@@ -106,6 +125,7 @@ defmodule UniversalProxy.FirmwareUpdate.GithubClient do
     part_path = dest_path <> ".part"
     total_size = Keyword.get(opts, :expected_size, 0)
     progress_fn = Keyword.get(opts, :progress, fn _ -> :ok end)
+    expected_sha256 = opts[:expected_sha256]
 
     headers =
       [{"accept", "application/octet-stream"}]
@@ -120,7 +140,8 @@ defmodule UniversalProxy.FirmwareUpdate.GithubClient do
         written: 0,
         last_reported: 0,
         total: total_size,
-        progress_fn: progress_fn
+        progress_fn: progress_fn,
+        hash: hash_init(expected_sha256)
       }
 
       req_opts =
@@ -128,17 +149,25 @@ defmodule UniversalProxy.FirmwareUpdate.GithubClient do
         |> Keyword.merge(Keyword.get(opts, :req_options) || [])
 
       case Req.request(req_opts) do
-        {:ok, %Req.Response{status: status}} when status in 200..299 ->
+        {:ok, %Req.Response{status: status} = resp} when status in 200..299 ->
           File.close(fd)
           progress_fn.({:downloading, 100})
+          final_acc = Map.get(resp.private, :gh_acc, acc)
 
-          case File.rename(part_path, dest_path) do
+          case verify_sha256(final_acc.hash, expected_sha256) do
             :ok ->
-              :ok
+              case File.rename(part_path, dest_path) do
+                :ok ->
+                  :ok
 
-            {:error, reason} ->
+                {:error, reason} ->
+                  File.rm(part_path)
+                  {:error, reason}
+              end
+
+            {:error, _reason} = error ->
               File.rm(part_path)
-              {:error, reason}
+              error
           end
 
         {:ok, %Req.Response{status: status}} ->
@@ -161,6 +190,8 @@ defmodule UniversalProxy.FirmwareUpdate.GithubClient do
       acc = Map.get(private, :gh_acc, initial_acc)
       :ok = IO.binwrite(acc.fd, chunk)
 
+      hash = acc.hash && :crypto.hash_update(acc.hash, chunk)
+
       new_written = acc.written + byte_size(chunk)
       delta = new_written - acc.last_reported
 
@@ -168,44 +199,104 @@ defmodule UniversalProxy.FirmwareUpdate.GithubClient do
         if delta >= @progress_chunk_bytes and acc.total > 0 do
           pct = min(round(new_written * 100 / acc.total), 99)
           acc.progress_fn.({:downloading, pct})
-          %{acc | written: new_written, last_reported: new_written}
+          %{acc | written: new_written, last_reported: new_written, hash: hash}
         else
-          %{acc | written: new_written}
+          %{acc | written: new_written, hash: hash}
         end
 
       {:cont, {request, %{response | private: Map.put(private, :gh_acc, acc)}}}
     end
   end
 
+  defp hash_init(nil), do: nil
+  defp hash_init(_expected_sha256), do: :crypto.hash_init(:sha256)
+
+  defp verify_sha256(_hash, nil), do: :ok
+
+  defp verify_sha256(hash, expected) do
+    actual = hash |> :crypto.hash_final() |> Base.encode16(case: :lower)
+    expected_lower = String.downcase(expected)
+
+    if actual == expected_lower do
+      :ok
+    else
+      {:error, {:sha256_mismatch, expected: expected_lower, actual: actual}}
+    end
+  end
+
+  defp release_url(owner_repo, :stable), do: "#{@api_base}/repos/#{owner_repo}/releases/latest"
+
+  defp release_url(owner_repo, :prerelease),
+    do: "#{@api_base}/repos/#{owner_repo}/releases?per_page=30"
+
+  defp decode_latest(:stable, body, resp_headers), do: decode_release(body, resp_headers)
+
+  defp decode_latest(:prerelease, body, resp_headers) when is_list(body) do
+    case pick_max_semver(body) do
+      nil -> {:error, :no_release}
+      release -> {:ok, build_release(release, resp_headers)}
+    end
+  end
+
+  defp decode_latest(:prerelease, _body, _resp_headers), do: {:error, :invalid_response}
+
+  defp pick_max_semver(releases) do
+    releases
+    |> Enum.reject(&(&1["draft"] == true))
+    |> Enum.flat_map(fn release ->
+      case parse_semver_tag(release["tag_name"]) do
+        {:ok, version} -> [{version, release}]
+        :error -> []
+      end
+    end)
+    |> Enum.max_by(fn {version, _release} -> version end, Version, fn -> nil end)
+    |> case do
+      nil -> nil
+      {_version, release} -> release
+    end
+  end
+
+  defp parse_semver_tag(tag) when is_binary(tag) do
+    case Version.parse(String.replace_prefix(tag, "v", "")) do
+      {:ok, version} -> {:ok, version}
+      :error -> :error
+    end
+  end
+
+  defp parse_semver_tag(_tag), do: :error
+
   defp decode_release(body, resp_headers) when is_map(body) do
     if body["prerelease"] == true do
       {:error, :no_stable_release}
     else
-      assets =
-        body
-        |> Map.get("assets", [])
-        |> Enum.map(fn a ->
-          %{
-            name: a["name"],
-            url: a["url"],
-            browser_download_url: a["browser_download_url"],
-            size: a["size"] || 0
-          }
-        end)
-
-      {:ok,
-       %{
-         tag_name: body["tag_name"],
-         name: body["name"],
-         body: body["body"] || "",
-         published_at: body["published_at"],
-         assets: assets,
-         etag: header_value(resp_headers, "etag")
-       }}
+      {:ok, build_release(body, resp_headers)}
     end
   end
 
   defp decode_release(_body, _headers), do: {:error, :invalid_response}
+
+  defp build_release(body, resp_headers) do
+    assets =
+      body
+      |> Map.get("assets", [])
+      |> Enum.map(fn a ->
+        %{
+          name: a["name"],
+          url: a["url"],
+          browser_download_url: a["browser_download_url"],
+          size: a["size"] || 0
+        }
+      end)
+
+    %{
+      tag_name: body["tag_name"],
+      name: body["name"],
+      body: body["body"] || "",
+      published_at: body["published_at"],
+      assets: assets,
+      etag: header_value(resp_headers, "etag")
+    }
+  end
 
   defp add_auth(headers, nil), do: headers
   defp add_auth(headers, ""), do: headers
