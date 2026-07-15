@@ -114,11 +114,19 @@ jobs:
   #   gcp-kms — needs GCP_WORKLOAD_IDENTITY_PROVIDER, GCP_SERVICE_ACCOUNT,
   #     GCP_KMS_LOCATION, GCP_KMS_KEYRING, GCP_KMS_KEY, GCP_KMS_KEY_VERSION
   #     (EC_SIGN_ED25519 key)
+  #   local-key — signs in-CI with an Ed25519 PEM private key supplied
+  #     as the FW_SIGNING_KEY_PEM_B64 secret (base64 of the PEM). No
+  #     cloud KMS; lower security than KMS (the key exists in the runner)
+  #     — intended for test/pre-KMS releases. Generate with:
+  #       openssl genpkey -algorithm ed25519 -out fw_signing.pem
+  #       openssl pkey -in fw_signing.pem -pubout -outform DER | tail -c 32 \
+  #         > rootfs_overlay/etc/firmware_signing.pub   # commit this
+  #       base64 -w0 fw_signing.pem                      # store as the secret
   #   manual — no cloud creds; uploads the unsigned manifest and prints
   #     instructions for signing offline (workstation HSM / openssl) and
   #     attaching release-manifest.sig by hand
   #
-  # The job fails until the chosen backend's variables exist.
+  # The job fails until the chosen backend's variables/secrets exist.
   sign_manifest:
     name: Sign release manifest
     needs: build
@@ -214,6 +222,20 @@ jobs:
             --input-file digest.bin \
             --signature-file release-manifest.sig.b64
           base64 -d release-manifest.sig.b64 > release-manifest.sig
+
+      - name: Sign manifest (local key)
+        if: env.FW_SIGNING_BACKEND == 'local-key'
+        env:
+          FW_SIGNING_KEY_PEM_B64: ${{ secrets.FW_SIGNING_KEY_PEM_B64 }}
+        run: |
+          # Ed25519 in openssl is PureEdDSA: -rawin signs digest.bin as
+          # the message, matching the device's verify construction.
+          test -n "$FW_SIGNING_KEY_PEM_B64" || { echo "FW_SIGNING_KEY_PEM_B64 secret is not set"; exit 1; }
+          umask 077
+          printf '%s' "$FW_SIGNING_KEY_PEM_B64" | base64 -d > signing_key.pem
+          openssl pkeyutl -sign -rawin -inkey signing_key.pem \
+            -in digest.bin -out release-manifest.sig
+          rm -f signing_key.pem
 
       - name: Assert raw Ed25519 signature
         if: env.FW_SIGNING_BACKEND != 'manual'

@@ -128,10 +128,25 @@ openssl pkeyutl -sign -rawin -inkey ed25519_private.pem \
 # YubiHSM 2: yubihsm-shell -a sign-eddsa -A ed25519 ... < digest.bin
 ```
 
+**Local Ed25519 key** (CI `local-key` backend — signs in-CI from an
+Ed25519 PEM stored as the `FW_SIGNING_KEY_PEM_B64` secret; lower
+security than KMS since the key touches the runner, intended for
+test/pre-KMS releases):
+
+```sh
+openssl genpkey -algorithm ed25519 -out fw_signing.pem       # private
+openssl pkey -in fw_signing.pem -pubout -outform DER \
+  | tail -c 32 > rootfs_overlay/etc/firmware_signing.pub      # commit
+openssl pkeyutl -sign -rawin -inkey fw_signing.pem \
+  -in digest.bin -out release-manifest.sig                    # sign
+```
+
 CI selects the backend via the `FW_SIGNING_BACKEND` repo variable
-(`aws-kms` default, `gcp-kms`, or `manual` — which uploads the
-unsigned manifest and prints the offline-signing steps). In every
-case, sanity-check `release-manifest.sig` is exactly 64 bytes.
+(`aws-kms` default, `gcp-kms`, `local-key`, or `manual` — which uploads
+the unsigned manifest and prints the offline-signing steps). In every
+case, sanity-check `release-manifest.sig` is exactly 64 bytes. The raw
+32-byte public key committed at `rootfs_overlay/etc/firmware_signing.pub`
+is what the device trusts, independent of which backend signs.
 
 ## Device-side pipeline
 
