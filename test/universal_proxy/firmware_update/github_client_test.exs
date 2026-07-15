@@ -327,5 +327,28 @@ defmodule UniversalProxy.FirmwareUpdate.GithubClientTest do
       refute File.exists?(dest)
       refute File.exists?(dest <> ".part")
     end
+
+    test "a response body over the size ceiling aborts the stream and leaves no files", %{
+      dest: dest
+    } do
+      # No :expected_size given ⇒ the ceiling is the bare @min_size_ceiling
+      # floor (256 MiB). One byte over it must abort the download before
+      # it can fill the download dir. Zero-filled (not random) so building
+      # the oversized payload is cheap.
+      oversized = 256 * 1024 * 1024 + 1
+      payload = :binary.copy(<<0>>, oversized)
+
+      handler = fn conn -> respond(conn, 200, payload) end
+
+      assert {:error, {:download_too_large, _limit}} =
+               GithubClient.download_asset(
+                 "https://api.example/assets/1",
+                 dest,
+                 req_options: stub_plug(handler)
+               )
+
+      refute File.exists?(dest)
+      refute File.exists?(dest <> ".part")
+    end
   end
 end

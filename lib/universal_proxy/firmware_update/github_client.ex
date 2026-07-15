@@ -18,6 +18,10 @@ defmodule UniversalProxy.FirmwareUpdate.GithubClient do
   # Stream download chunks in 256 KiB units, reporting progress to the
   # callback when the cumulative delta crosses this threshold.
   @progress_chunk_bytes 256 * 1024
+  # Hard floor for the download size ceiling (see download_asset/3):
+  # comfortably above any real firmware image, so it only bites on a
+  # runaway/malicious response, not normal size variance.
+  @min_size_ceiling 256 * 1024 * 1024
 
   @type asset :: %{
           required(:name) => String.t(),
@@ -91,7 +95,7 @@ defmodule UniversalProxy.FirmwareUpdate.GithubClient do
         if rate_limited?(resp_headers) do
           {:error, :rate_limited}
         else
-          {:error, {:forbidden, resp_headers}}
+          {:error, :forbidden}
         end
 
       {:ok, %Req.Response{status: status}} ->
@@ -117,6 +121,12 @@ defmodule UniversalProxy.FirmwareUpdate.GithubClient do
       ...}}` is returned (both hex strings lowercase). Omit to skip
       hashing entirely.
 
+  A hard size ceiling always applies — `max(expected_size * 2,
+  #{@min_size_ceiling})` bytes — so a runaway or malicious response
+  can't fill the download dir even when `:expected_size` is
+  0/absent. Exceeding it aborts the stream and returns
+  `{:error, {:download_too_large, limit}}`.
+
   Returns `:ok` on success; on failure deletes the partial file and
   returns `{:error, term()}`.
   """
@@ -126,6 +136,9 @@ defmodule UniversalProxy.FirmwareUpdate.GithubClient do
     total_size = Keyword.get(opts, :expected_size, 0)
     progress_fn = Keyword.get(opts, :progress, fn _ -> :ok end)
     expected_sha256 = opts[:expected_sha256]
+    # Always positive (floor is @min_size_ceiling) — a 0/absent
+    # expected_size still gets a cap, never an unbounded write.
+    limit = max(total_size * 2, @min_size_ceiling)
 
     headers =
       [{"accept", "application/octet-stream"}]
@@ -140,6 +153,7 @@ defmodule UniversalProxy.FirmwareUpdate.GithubClient do
         written: 0,
         last_reported: 0,
         total: total_size,
+        limit: limit,
         progress_fn: progress_fn,
         hash: hash_init(expected_sha256)
       }
@@ -151,23 +165,29 @@ defmodule UniversalProxy.FirmwareUpdate.GithubClient do
       case Req.request(req_opts) do
         {:ok, %Req.Response{status: status} = resp} when status in 200..299 ->
           File.close(fd)
-          progress_fn.({:downloading, 100})
           final_acc = Map.get(resp.private, :gh_acc, acc)
 
-          case verify_sha256(final_acc.hash, expected_sha256) do
-            :ok ->
-              case File.rename(part_path, dest_path) do
-                :ok ->
-                  :ok
+          if final_acc.written > final_acc.limit do
+            File.rm(part_path)
+            {:error, {:download_too_large, final_acc.limit}}
+          else
+            progress_fn.({:downloading, 100})
 
-                {:error, reason} ->
-                  File.rm(part_path)
-                  {:error, reason}
-              end
+            case verify_sha256(final_acc.hash, expected_sha256) do
+              :ok ->
+                case File.rename(part_path, dest_path) do
+                  :ok ->
+                    :ok
 
-            {:error, _reason} = error ->
-              File.rm(part_path)
-              error
+                  {:error, reason} ->
+                    File.rm(part_path)
+                    {:error, reason}
+                end
+
+              {:error, _reason} = error ->
+                File.rm(part_path)
+                error
+            end
           end
 
         {:ok, %Req.Response{status: status}} ->
@@ -204,7 +224,17 @@ defmodule UniversalProxy.FirmwareUpdate.GithubClient do
           %{acc | written: new_written, hash: hash}
         end
 
-      {:cont, {request, %{response | private: Map.put(private, :gh_acc, acc)}}}
+      response = %{response | private: Map.put(private, :gh_acc, acc)}
+
+      # Abort the stream once the hard ceiling is crossed rather than
+      # keep buffering an oversized/malicious response — the caller
+      # checks acc.written vs acc.limit after Req.request/1 returns
+      # and turns this into {:error, {:download_too_large, _}}.
+      if new_written > acc.limit do
+        {:halt, {request, response}}
+      else
+        {:cont, {request, response}}
+      end
     end
   end
 

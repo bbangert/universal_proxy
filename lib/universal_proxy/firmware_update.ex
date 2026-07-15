@@ -314,6 +314,7 @@ defmodule UniversalProxy.FirmwareUpdate do
     if Code.ensure_loaded?(Nerves.Runtime.KV) and
          function_exported?(Nerves.Runtime.KV, :put, 2) do
       Nerves.Runtime.KV.put(key, value)
+      :ok
     else
       :ok
     end

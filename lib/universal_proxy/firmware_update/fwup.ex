@@ -147,14 +147,30 @@ defmodule UniversalProxy.FirmwareUpdate.Fwup do
         {:error, {:firmware_read_failed, reason}}
 
       data when is_binary(data) ->
-        true = Port.command(port, <<byte_size(data)::32-big, data::binary>>)
-        stream_loop(port, fd, chunk_size)
+        case port_command(port, <<byte_size(data)::32-big, data::binary>>) do
+          :ok -> stream_loop(port, fd, chunk_size)
+          {:error, _} = err -> err
+        end
     end
   end
 
   defp send_terminator(port) do
-    true = Port.command(port, <<0::32-big>>)
-    :ok
+    port_command(port, <<0::32-big>>)
+  end
+
+  # Port.command/2 raises ArgumentError (badarg) if the port's OS
+  # process already died mid-stream. Convert that into the documented
+  # {:error, term()} contract instead of crashing the caller (mirrors
+  # the safe_close/1 rescue+catch style below).
+  defp port_command(port, data) do
+    try do
+      true = Port.command(port, data)
+      :ok
+    rescue
+      ArgumentError -> {:error, :fwup_port_closed}
+    catch
+      :error, :badarg -> {:error, :fwup_port_closed}
+    end
   end
 
   defp await_exit(port, progress, buffer) do
@@ -194,6 +210,10 @@ defmodule UniversalProxy.FirmwareUpdate.Fwup do
         await_exit(port, progress, new_buffer, new_error || last_error)
 
       {^port, {:exit_status, 0}} ->
+        if last_error do
+          Logger.warning("fwup exited 0 but reported: #{inspect(last_error)}")
+        end
+
         :ok
 
       {^port, {:exit_status, n}} ->

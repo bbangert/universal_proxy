@@ -26,9 +26,9 @@ defmodule UniversalProxy.FirmwareUpdate.Updater do
   not mutate the GenServer state — the install runs inside a
   single `handle_info/2` that blocks the GenServer, so routing
   progress through self-messages would just buffer them all until
-  the install completes. A LiveView that reconnects mid-install
-  therefore sees a stale `pct` for the brief window until the next
-  PubSub event lands and corrects it.
+  the install completes. A subscriber that reads a fresh `state/1`
+  snapshot mid-install therefore sees a stale `pct` for the brief
+  window until the next PubSub event lands and corrects it.
 
   ## Conditional verification
 
@@ -189,7 +189,7 @@ defmodule UniversalProxy.FirmwareUpdate.Updater do
     GenServer.call(server, :install_latest)
   end
 
-  @doc "Synchronous snapshot used by LiveView mount."
+  @doc "Synchronous snapshot for a subscriber's initial render."
   @spec state(GenServer.server()) :: map()
   def state(server \\ __MODULE__) do
     GenServer.call(server, :state)
@@ -428,8 +428,20 @@ defmodule UniversalProxy.FirmwareUpdate.Updater do
              {:ok, flashed_state} <- do_flash(downloading_state, opts, fw_path) do
           # The counter anchor only advances once the new firmware is
           # actually flashed — a failed flash must not move the
-          # rollback floor.
-          kv_put.(@counter_key, Integer.to_string(manifest.counter))
+          # rollback floor. The flash already succeeded and reboot
+          # must proceed either way, so a KV write failure here is
+          # log-only, not install-failing.
+          case kv_put.(@counter_key, Integer.to_string(manifest.counter)) do
+            :ok ->
+              :ok
+
+            other ->
+              Logger.error(
+                "Failed to persist firmware rollback counter (#{inspect(other)}); " <>
+                  "rollback protection may be stale until next successful install"
+              )
+          end
+
           {:ok, flashed_state}
         end
       end

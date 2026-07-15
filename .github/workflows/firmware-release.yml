@@ -132,11 +132,16 @@ jobs:
     steps:
       - name: Download firmware assets
         env:
+          # Bind release/repo context to env vars rather than interpolating
+          # ${{ github.* }} into the shell: a tag_name containing shell
+          # metacharacters (git ref names permit `` $ ( ) ; | ``) would
+          # otherwise execute inside this KMS-privileged job.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
         run: |
           mkdir -p fw
-          gh release download "${{ github.event.release.tag_name }}" \
-            --repo "${{ github.repository }}" \
+          gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
             --pattern 'universal_proxy_*.fw' \
             --dir fw
 
@@ -232,14 +237,17 @@ jobs:
 
       - name: Print manual signing instructions
         if: env.FW_SIGNING_BACKEND == 'manual'
+        # TAG via env, not ${{ }} interpolation — see the download step.
+        env:
+          TAG: ${{ github.event.release.tag_name }}
         run: |
           echo "Manifest uploaded UNSIGNED. Sign it offline (see"
           echo "docs/manifest-format.md) and attach the signature:"
           echo
-          echo "  gh release download ${{ github.event.release.tag_name }} -p release-manifest.json"
+          echo "  gh release download $TAG -p release-manifest.json"
           echo "  sha512sum release-manifest.json | cut -d' ' -f1 | xxd -r -p > digest.bin"
           echo "  # sign digest.bin with your HSM/key -> release-manifest.sig (raw 64 bytes)"
-          echo "  gh release upload ${{ github.event.release.tag_name }} release-manifest.sig"
+          echo "  gh release upload $TAG release-manifest.sig"
           echo
           echo "Devices with verification_required=true will refuse this"
           echo "release until release-manifest.sig is attached."
