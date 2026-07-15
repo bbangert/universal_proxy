@@ -331,19 +331,20 @@ defmodule UniversalProxy.FirmwareUpdate.GithubClientTest do
     test "a response body over the size ceiling aborts the stream and leaves no files", %{
       dest: dest
     } do
-      # No :expected_size given ⇒ the ceiling is the bare @min_size_ceiling
-      # floor (256 MiB). One byte over it must abort the download before
-      # it can fill the download dir. Zero-filled (not random) so building
-      # the oversized payload is cheap.
-      oversized = 256 * 1024 * 1024 + 1
-      payload = :binary.copy(<<0>>, oversized)
+      # Exercise the ceiling at KiB scale via the :max_bytes override so
+      # the test doesn't have to push the 256 MiB production floor through
+      # the transport. One byte over the cap must abort before it fills
+      # the download dir.
+      limit = 8 * 1024
+      payload = :binary.copy(<<0>>, limit + 1)
 
       handler = fn conn -> respond(conn, 200, payload) end
 
-      assert {:error, {:download_too_large, _limit}} =
+      assert {:error, {:download_too_large, ^limit}} =
                GithubClient.download_asset(
                  "https://api.example/assets/1",
                  dest,
+                 max_bytes: limit,
                  req_options: stub_plug(handler)
                )
 

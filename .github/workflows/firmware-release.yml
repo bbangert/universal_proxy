@@ -232,10 +232,12 @@ jobs:
           # the message, matching the device's verify construction.
           test -n "$FW_SIGNING_KEY_PEM_B64" || { echo "FW_SIGNING_KEY_PEM_B64 secret is not set"; exit 1; }
           umask 077
+          # Remove the key on ANY exit — `set -e` would otherwise skip a
+          # trailing rm if openssl fails, leaving the PEM on the runner.
+          trap 'rm -f signing_key.pem' EXIT
           printf '%s' "$FW_SIGNING_KEY_PEM_B64" | base64 -d > signing_key.pem
           openssl pkeyutl -sign -rawin -inkey signing_key.pem \
             -in digest.bin -out release-manifest.sig
-          rm -f signing_key.pem
 
       - name: Assert raw Ed25519 signature
         if: env.FW_SIGNING_BACKEND != 'manual'

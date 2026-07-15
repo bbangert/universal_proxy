@@ -136,9 +136,11 @@ defmodule UniversalProxy.FirmwareUpdate.GithubClient do
     total_size = Keyword.get(opts, :expected_size, 0)
     progress_fn = Keyword.get(opts, :progress, fn _ -> :ok end)
     expected_sha256 = opts[:expected_sha256]
-    # Always positive (floor is @min_size_ceiling) — a 0/absent
-    # expected_size still gets a cap, never an unbounded write.
-    limit = max(total_size * 2, @min_size_ceiling)
+    # Always positive — a 0/absent expected_size still gets a cap, never
+    # an unbounded write. `:max_bytes` is an undocumented override so the
+    # ceiling can be exercised at KiB scale in tests without pushing the
+    # 256 MiB floor through the transport.
+    limit = Keyword.get(opts, :max_bytes) || max(total_size * 2, @min_size_ceiling)
 
     headers =
       [{"accept", "application/octet-stream"}]

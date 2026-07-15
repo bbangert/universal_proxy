@@ -313,8 +313,10 @@ defmodule UniversalProxy.FirmwareUpdate do
   def kv_put(key, value) do
     if Code.ensure_loaded?(Nerves.Runtime.KV) and
          function_exported?(Nerves.Runtime.KV, :put, 2) do
+      # Return KV.put's real result (`:ok | {:error, any()}`) — the
+      # Updater logs a failed rollback-counter write, so swallowing the
+      # error here would make that log dead code on device.
       Nerves.Runtime.KV.put(key, value)
-      :ok
     else
       :ok
     end

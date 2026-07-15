@@ -94,8 +94,10 @@ defmodule UniversalProxy.FirmwareUpdate.Updater do
     * `:kv_get` — `(String.t() -> String.t() | nil)`, reads the
       persisted counter anchor. Missing ⇒ `fn _ -> nil end` (no
       anchor, first-contact trust).
-    * `:kv_put` — `(String.t(), String.t() -> :ok)`, persists the new
-      counter anchor after a successful flash. Missing ⇒
+    * `:kv_put` — `(String.t(), String.t() -> :ok | {:error, term()})`,
+      persists the new counter anchor after a successful flash. A
+      non-`:ok` return is logged (rollback protection may be stale) but
+      does not fail the already-completed install. Missing ⇒
       `fn _, _ -> :ok end` (no-op — degrades gracefully rather than
       crashing the install on a host/test without Nerves.Runtime.KV).
     * `:target_fn` — `(-> String.t())`, resolves the device's Nerves
