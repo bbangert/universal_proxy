@@ -8,9 +8,10 @@ defmodule UniversalProxy.FirmwareUpdate.Updater do
 
   ## State machine
 
-      :idle ─→ :checking ─→ :downloading ─→ :verifying ─→ :flashing ─→ :idle
-                                          ↘ (verification disabled) ↗
-                                          ↘     :error                 ↗
+      :idle ─→ :checking ─→ :idle
+      :idle ─→ :downloading ─→ :flashing ─→ :idle                    (legacy, unverified)
+      :idle ─→ :verifying ─→ :downloading ─→ :flashing ─→ :idle      (manifest, verified)
+                    any phase above ↘ :error ↗ (next check/1 clears to :idle)
 
   Every phase transition broadcasts `{:fw_update_progress, payload}`
   on the configured PubSub topic. `:error` clears to `:idle` on the
@@ -25,16 +26,91 @@ defmodule UniversalProxy.FirmwareUpdate.Updater do
   not mutate the GenServer state — the install runs inside a
   single `handle_info/2` that blocks the GenServer, so routing
   progress through self-messages would just buffer them all until
-  the install completes. A LiveView that reconnects mid-install
-  therefore sees a stale `pct` for the brief window until the next
-  PubSub event lands and corrects it.
+  the install completes. A subscriber that reads a fresh `state/1`
+  snapshot mid-install therefore sees a stale `pct` for the brief
+  window until the next PubSub event lands and corrects it.
 
   ## Conditional verification
 
   When opts `:verification_required` is `false` (v1 default), the
-  flow skips `:verifying` entirely and goes `:downloading → :flashing`.
-  A `Logger.warning` fires on every such install so the unverified
+  install flow is the legacy path: `asset_matcher.(tag, assets)`
+  resolves a single firmware asset, which is downloaded unverified and
+  flashed (`:downloading → :flashing`, no `:verifying` phase). A
+  `Logger.warning` fires on every such install so the unverified
   state is auditable in `RingLogger`.
+
+  When `:verification_required` is `true`, the flow is the manifest
+  path (`:verifying → :downloading → :flashing`) — see "## Manifest
+  verification" below.
+
+  ## Downgrade gate
+
+  Before either path runs, `release.tag_name` is compared against
+  `:current_version_fn.()` via `VersionCompare.compare/2`. A `:lt`
+  result (release older than the running firmware) is refused unless
+  `:allow_downgrade` is `true`. This is belt-and-braces: the manifest
+  counter (see below) is the primary rollback control and is the only
+  check that applies on the manifest path; this semver check also
+  guards the legacy (unverified) path, which has no counter at all.
+  `:gt`, `:eq`, `:missing`, and `:incomparable` all proceed.
+
+  ## Manifest verification
+
+  Wire contract: `docs/manifest-format.md`. Summary of the device-side
+  pipeline (entered when `:verification_required` is `true`):
+
+    1. Transition to `:verifying`.
+    2. Download `release-manifest.json` + `release-manifest.sig` from
+       the release assets (missing either ⇒ `:missing_manifest` /
+       `:missing_manifest_signature`).
+    3. `sig_mod.verify_manifest(manifest_bytes, sig_bytes, pubkey)` —
+       signed message is `sha512(manifest_bytes)`, not the raw bytes.
+    4. `Manifest.parse/1` — schema + version validation.
+    5. `Manifest.check_expiry/2` — policy-gated, default off
+       (`:enforce_expiry`).
+    6. `Manifest.check_counter/2` against `:kv_get.("fw_manifest_counter")`
+       — rejects a lower counter (rollback), accepts equal or absent.
+    7. `:target_fn.()` resolves the device's Nerves target;
+       `Manifest.target/2` looks up its `%{asset, sha256, size}` entry.
+    8. Transition to `:downloading`; download the named release asset
+       with `expected_sha256` / `expected_size` — the client verifies
+       the streamed hash before the atomic rename.
+    9. Flash (`:flashing`). On success, `:kv_put.("fw_manifest_counter",
+       counter)` **before** reboot — the counter anchor only advances
+       once the new firmware is actually on disk.
+
+  Any failure at any step broadcasts `{:fw_update_progress, %{phase:
+  :error, ...}}` and resets to `:idle` on the next `check/1`.
+
+  ## Opts
+
+    * `:owner_repo`, `:github_token`, `:public_key` — as before.
+    * `:verification_required` (default `false`) — selects legacy vs
+      manifest install path (see above).
+    * `:channel` (default `:stable`) — forwarded to
+      `client.latest_release/2`; `:stable` or `:prerelease`.
+    * `:allow_downgrade` (default `false`) — see "Downgrade gate".
+    * `:enforce_expiry` (default `false`) — see "Manifest verification".
+    * `:kv_get` — `(String.t() -> String.t() | nil)`, reads the
+      persisted counter anchor. Missing ⇒ `fn _ -> nil end` (no
+      anchor, first-contact trust).
+    * `:kv_put` — `(String.t(), String.t() -> :ok | {:error, term()})`,
+      persists the new counter anchor after a successful flash. A
+      non-`:ok` return is logged (rollback protection may be stale) but
+      does not fail the already-completed install. Missing ⇒
+      `fn _, _ -> :ok end` (no-op — degrades gracefully rather than
+      crashing the install on a host/test without Nerves.Runtime.KV).
+    * `:target_fn` — `(-> String.t())`, resolves the device's Nerves
+      target for the manifest path. Missing ⇒
+      `{:error, :missing_target_fn}` (fails the install via the normal
+      `fail/3` path; the legacy path never calls it).
+    * `:current_version_fn` — `(-> String.t() | nil)`, the device's
+      current firmware version for the downgrade gate. Missing ⇒
+      `fn -> nil end` (comparison against `nil` is `:missing`, which
+      proceeds).
+    * `:asset_matcher` — legacy-path only. Contract is `(tag, assets)
+      -> {:ok, fw_asset} | {:error, reason}` (no more sig asset — the
+      manifest path replaces per-asset signatures entirely).
 
   ## Test seams
 
@@ -42,13 +118,19 @@ defmodule UniversalProxy.FirmwareUpdate.Updater do
       `download_asset/3` (default `UniversalProxy.FirmwareUpdate.GithubClient`).
     * `:fwup` — module implementing `apply/2` (default
       `UniversalProxy.FirmwareUpdate.Fwup`).
-    * `:signature` — module implementing `verify/3` (default
+    * `:signature` — module implementing `verify_manifest/3` (default
       `UniversalProxy.FirmwareUpdate.Signature`).
   """
 
   use GenServer
 
   require Logger
+
+  alias UniversalProxy.FirmwareUpdate.{Manifest, VersionCompare}
+
+  @manifest_asset "release-manifest.json"
+  @manifest_sig_asset "release-manifest.sig"
+  @counter_key "fw_manifest_counter"
 
   @mutable_keys [
     :owner_repo,
@@ -60,7 +142,14 @@ defmodule UniversalProxy.FirmwareUpdate.Updater do
     :fwup,
     :signature,
     :reboot_fn,
-    :devpath_fn
+    :devpath_fn,
+    :channel,
+    :allow_downgrade,
+    :enforce_expiry,
+    :kv_get,
+    :kv_put,
+    :target_fn,
+    :current_version_fn
   ]
 
   @immutable_keys [
@@ -102,7 +191,7 @@ defmodule UniversalProxy.FirmwareUpdate.Updater do
     GenServer.call(server, :install_latest)
   end
 
-  @doc "Synchronous snapshot used by LiveView mount."
+  @doc "Synchronous snapshot for a subscriber's initial render."
   @spec state(GenServer.server()) :: map()
   def state(server \\ __MODULE__) do
     GenServer.call(server, :state)
@@ -158,12 +247,14 @@ defmodule UniversalProxy.FirmwareUpdate.Updater do
         # :busy branch above instead of enqueuing a duplicate install
         # (and a duplicate reboot). Snapshot opts + release at call
         # time for the same reason — see @moduledoc on the in-flight
-        # opts contract.
+        # opts contract. The message is neutral because the next
+        # phase differs by path (legacy skips :verifying); the UI
+        # treats :downloading/:verifying/:flashing identically anyway.
         new_state =
           transition(
             %{state | last_error: nil},
             :downloading,
-            "Downloading firmware…",
+            "Starting install…",
             0
           )
 
@@ -202,11 +293,15 @@ defmodule UniversalProxy.FirmwareUpdate.Updater do
 
   @impl true
   def handle_info({:do_check, opts}, state) do
-    client = Map.get(opts, :client, UniversalProxy.FirmwareUpdate.GithubClient)
+    client = client_mod(opts)
     repo = Map.fetch!(opts, :owner_repo)
 
     client_opts =
-      [github_token: Map.get(opts, :github_token), etag: state.etag]
+      [
+        github_token: Map.get(opts, :github_token),
+        etag: state.etag,
+        channel: Map.get(opts, :channel, :stable)
+      ]
       |> maybe_put(:req_options, Map.get(opts, :req_options))
 
     case client.latest_release(repo, client_opts) do
@@ -225,93 +320,186 @@ defmodule UniversalProxy.FirmwareUpdate.Updater do
   def handle_info({:do_install, _opts, nil}, state), do: {:noreply, state}
 
   def handle_info({:do_install, opts, release}, state) do
+    current = current_version_fn(opts).()
+    allow_downgrade = Map.get(opts, :allow_downgrade, false)
+
+    case VersionCompare.compare(release.tag_name, current) do
+      :lt when not allow_downgrade ->
+        reason = {:downgrade_refused, release.tag_name, current}
+        {:noreply, fail(state, "Install failed: #{format_error(reason)}", reason)}
+
+      _ ->
+        if Map.get(opts, :verification_required, false) do
+          do_manifest_install(state, opts, release)
+        else
+          do_legacy_install(state, opts, release)
+        end
+    end
+  end
+
+  # -- Private --
+
+  defp do_legacy_install(state, opts, release) do
     matcher = Map.fetch!(opts, :asset_matcher)
 
     case matcher.(release.tag_name, release.assets) do
-      {:ok, fw_asset, sig_asset} ->
-        do_download_install(state, opts, fw_asset, sig_asset)
+      {:ok, fw_asset} ->
+        Logger.warning(
+          "Firmware install proceeding without signature verification (verification_required=false)"
+        )
+
+        client = client_mod(opts)
+        download_dir = Map.fetch!(opts, :download_dir)
+        fw_path = Path.join(download_dir, "firmware_pending.fw")
+
+        fw_dl =
+          client.download_asset(fw_asset.url, fw_path,
+            # Intentionally no github_token here: asset URLs from
+            # `browser_download_url` are public S3 redirects that
+            # don't need (and shouldn't see) the operator bearer.
+            expected_size: Map.get(fw_asset, :size, 0),
+            progress: &broadcast_progress(state, &1),
+            req_options: Map.get(opts, :req_options) || []
+          )
+
+        with :ok <- fw_dl,
+             {:ok, flashed_state} <- do_flash(state, opts, fw_path) do
+          cleanup_partials([fw_path])
+          new_state = transition(flashed_state, :idle, "Install complete; rebooting.", 100)
+          run_reboot(opts)
+          {:noreply, new_state}
+        else
+          {:error, reason} ->
+            cleanup_partials([fw_path])
+            {:noreply, fail(state, "Install failed: #{format_error(reason)}", reason)}
+        end
 
       {:error, reason} ->
         {:noreply, fail(state, "No matching firmware asset: #{format_error(reason)}", reason)}
     end
   end
 
-  # -- Private --
+  defp do_manifest_install(state, opts, release) do
+    state = transition(state, :verifying, "Verifying release manifest…")
 
-  defp do_download_install(state, opts, fw_asset, sig_asset) do
-    client = Map.get(opts, :client, UniversalProxy.FirmwareUpdate.GithubClient)
     download_dir = Map.fetch!(opts, :download_dir)
-    verify_required = Map.get(opts, :verification_required, false)
+    client = client_mod(opts)
+    sig_mod = Map.get(opts, :signature, UniversalProxy.FirmwareUpdate.Signature)
+    pubkey = Map.get(opts, :public_key)
+    enforce_expiry = Map.get(opts, :enforce_expiry, false)
+    kv_get = kv_get_fn(opts)
+    kv_put = kv_put_fn(opts)
 
+    manifest_path = Path.join(download_dir, @manifest_asset)
+    sig_path = Path.join(download_dir, @manifest_sig_asset)
     fw_path = Path.join(download_dir, "firmware_pending.fw")
-    sig_path = Path.join(download_dir, "firmware_pending.fw.sig")
 
-    # Phase was set to :downloading synchronously in handle_call(:install_latest, ...)
-    # so the busy-check rejects concurrent installs. No need to re-transition here.
+    result =
+      with {:ok, manifest_asset} <-
+             find_release_asset(release.assets, @manifest_asset, :missing_manifest),
+           {:ok, sig_asset} <-
+             find_release_asset(release.assets, @manifest_sig_asset, :missing_manifest_signature),
+           :ok <- download_support_asset(client, manifest_asset, manifest_path, opts),
+           :ok <- download_support_asset(client, sig_asset, sig_path, opts),
+           {:ok, manifest_bytes} <- File.read(manifest_path),
+           {:ok, sig_bytes} <- File.read(sig_path),
+           :ok <- sig_mod.verify_manifest(manifest_bytes, sig_bytes, pubkey),
+           {:ok, manifest} <- Manifest.parse(manifest_bytes),
+           :ok <- Manifest.check_expiry(manifest, enforce_expiry),
+           :ok <- Manifest.check_counter(manifest, kv_get.(@counter_key)),
+           {:ok, target_fn} <- fetch_target_fn(opts),
+           target_name = target_fn.(),
+           {:ok, target} <- Manifest.target(manifest, target_name),
+           {:ok, fw_asset} <-
+             find_release_asset(
+               release.assets,
+               target.asset,
+               {:target_asset_missing, target.asset}
+             ) do
+        downloading_state = transition(state, :downloading, "Downloading firmware…", 0)
 
-    fw_dl =
-      client.download_asset(fw_asset.url, fw_path,
-        # Intentionally no github_token here: asset URLs from
-        # `browser_download_url` are public S3 redirects that don't
-        # need (and shouldn't see) the operator bearer.
-        expected_size: Map.get(fw_asset, :size, 0),
-        progress: &broadcast_progress(state, &1),
-        req_options: Map.get(opts, :req_options) || []
-      )
+        fw_dl =
+          client.download_asset(asset_url(fw_asset), fw_path,
+            expected_sha256: target.sha256,
+            expected_size: target.size,
+            progress: &broadcast_progress(downloading_state, &1),
+            req_options: Map.get(opts, :req_options) || []
+          )
 
-    with :ok <- fw_dl,
-         :ok <- maybe_download_sig(client, sig_asset, sig_path, opts, verify_required),
-         {:ok, state} <- maybe_verify(state, fw_path, sig_path, opts, verify_required),
-         {:ok, state} <- do_flash(state, opts, fw_path) do
-      cleanup_partials([fw_path, sig_path])
-      new_state = transition(state, :idle, "Install complete; rebooting.", 100)
-      run_reboot(opts)
-      {:noreply, new_state}
-    else
+        with :ok <- fw_dl,
+             {:ok, flashed_state} <- do_flash(downloading_state, opts, fw_path) do
+          # The counter anchor only advances once the new firmware is
+          # actually flashed — a failed flash must not move the
+          # rollback floor. The flash already succeeded and reboot
+          # must proceed either way, so a KV write failure here is
+          # log-only, not install-failing.
+          case kv_put.(@counter_key, Integer.to_string(manifest.counter)) do
+            :ok ->
+              :ok
+
+            other ->
+              Logger.error(
+                "Failed to persist firmware rollback counter (#{inspect(other)}); " <>
+                  "rollback protection may be stale until next successful install"
+              )
+          end
+
+          {:ok, flashed_state}
+        end
+      end
+
+    case result do
+      {:ok, flashed_state} ->
+        cleanup_partials([manifest_path, sig_path, fw_path])
+        new_state = transition(flashed_state, :idle, "Install complete; rebooting.", 100)
+        run_reboot(opts)
+        {:noreply, new_state}
+
       {:error, reason} ->
-        cleanup_partials([fw_path, sig_path])
+        cleanup_partials([manifest_path, sig_path, fw_path])
         {:noreply, fail(state, "Install failed: #{format_error(reason)}", reason)}
     end
   end
 
-  defp run_reboot(opts) do
-    case Map.get(opts, :reboot_fn) do
-      fun when is_function(fun, 0) -> fun.()
-      _ -> :ok
+  defp find_release_asset(assets, name, error_reason) do
+    case Enum.find(assets, fn a -> a.name == name end) do
+      nil -> {:error, error_reason}
+      asset -> {:ok, asset}
     end
   end
 
-  defp maybe_download_sig(_client, _asset, _path, _opts, false), do: :ok
-
-  defp maybe_download_sig(_client, nil, _path, _opts, true),
-    do: {:error, :missing_signature_asset}
-
-  defp maybe_download_sig(client, sig_asset, sig_path, opts, true) do
-    client.download_asset(sig_asset.url, sig_path,
-      # See do_download_install/3 — no bearer on browser_download_url.
-      expected_size: Map.get(sig_asset, :size, 64),
+  defp download_support_asset(client, asset, path, opts) do
+    client.download_asset(asset_url(asset), path,
+      # See asset_url/1 — no bearer on the public download URL.
+      expected_size: Map.get(asset, :size, 0),
       progress: fn _ -> :ok end,
       req_options: Map.get(opts, :req_options) || []
     )
   end
 
-  defp maybe_verify(state, _fw_path, _sig_path, _opts, false) do
-    Logger.warning(
-      "Firmware install proceeding without signature verification (verification_required=false)"
-    )
+  # Direct public download, no auth — v0.1 is public-repos-only. The
+  # GitHub API asset `:url` route would work too, but needs an
+  # `accept: application/octet-stream` + Bearer flow only needed for
+  # private repos.
+  defp asset_url(asset), do: Map.get(asset, :browser_download_url) || asset.url
 
-    {:ok, state}
+  defp fetch_target_fn(opts) do
+    case Map.get(opts, :target_fn) do
+      fun when is_function(fun, 0) -> {:ok, fun}
+      _ -> {:error, :missing_target_fn}
+    end
   end
 
-  defp maybe_verify(state, fw_path, sig_path, opts, true) do
-    sig_mod = Map.get(opts, :signature, UniversalProxy.FirmwareUpdate.Signature)
-    pubkey = Map.get(opts, :public_key)
+  defp client_mod(opts), do: Map.get(opts, :client, UniversalProxy.FirmwareUpdate.GithubClient)
 
-    new_state = transition(state, :verifying, "Verifying signature…")
+  defp kv_get_fn(opts), do: Map.get(opts, :kv_get, fn _ -> nil end)
+  defp kv_put_fn(opts), do: Map.get(opts, :kv_put, fn _, _ -> :ok end)
+  defp current_version_fn(opts), do: Map.get(opts, :current_version_fn, fn -> nil end)
 
-    case sig_mod.verify(fw_path, sig_path, pubkey) do
-      :ok -> {:ok, new_state}
-      {:error, _} = err -> err
+  defp run_reboot(opts) do
+    case Map.get(opts, :reboot_fn) do
+      fun when is_function(fun, 0) -> fun.()
+      _ -> :ok
     end
   end
 
@@ -388,7 +576,11 @@ defmodule UniversalProxy.FirmwareUpdate.Updater do
       Path.join(download_dir, "firmware_pending.fw"),
       Path.join(download_dir, "firmware_pending.fw.sig"),
       Path.join(download_dir, "firmware_pending.fw.part"),
-      Path.join(download_dir, "firmware_pending.fw.sig.part")
+      Path.join(download_dir, "firmware_pending.fw.sig.part"),
+      Path.join(download_dir, @manifest_asset),
+      Path.join(download_dir, @manifest_asset <> ".part"),
+      Path.join(download_dir, @manifest_sig_asset),
+      Path.join(download_dir, @manifest_sig_asset <> ".part")
     ])
   end
 

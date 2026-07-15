@@ -29,7 +29,25 @@ defmodule UniversalProxy.FirmwareUpdate.Fwup do
   `ssh_subsystem_fwup` use the same parser. We rely on
   `Port.command/2`'s blocking semantics for back-pressure: when fwup's
   stdin buffer is full, the write blocks until fwup drains.
+
+  ## Caller contract
+
+  Callers MUST serialize `apply/2` invocations. Each call spawns one
+  fwup process against `devpath`; concurrent applies to the same
+  device are undefined.
+
+  ## Accepted risks
+
+  - No `--exit-handshake` (see above) — the final `ER` text can race
+    behind `:exit_status`, so an error exit may report a nil/stale
+    message.
+  - `:stderr_to_stdout` merges stderr into the framed stream. A chatty
+    stderr line could theoretically desynchronize frame parsing or
+    stall it. Accepted because fwup in framing mode keeps stderr quiet
+    in practice.
   """
+
+  require Logger
 
   @default_chunk_size 64 * 1024
 
@@ -39,6 +57,7 @@ defmodule UniversalProxy.FirmwareUpdate.Fwup do
           | {:progress, (term() -> any())}
           | {:chunk_size, pos_integer()}
           | {:fwup_path, String.t() | nil}
+          | {:extra_args, [String.t()]}
 
   @doc """
   Applies `fw_path` via `fwup`, blocking until fwup exits.
@@ -55,6 +74,9 @@ defmodule UniversalProxy.FirmwareUpdate.Fwup do
       #{@default_chunk_size}).
     * `:fwup_path` — explicit path to the fwup executable. Defaults to
       `System.find_executable("fwup")`.
+    * `:extra_args` — extra fwup CLI args appended after the fixed
+      args (default `[]`). Hook for future delta-update fwup flags
+      like `--unsafe`.
 
   Returns `:ok` on exit status 0; `{:error, term()}` otherwise.
   """
@@ -65,6 +87,7 @@ defmodule UniversalProxy.FirmwareUpdate.Fwup do
     task = Keyword.get(opts, :task, "upgrade")
     progress = Keyword.get(opts, :progress, fn _ -> :ok end)
     chunk_size = Keyword.get(opts, :chunk_size, @default_chunk_size)
+    extra_args = Keyword.get(opts, :extra_args, [])
 
     cond do
       is_nil(fwup) ->
@@ -77,17 +100,17 @@ defmodule UniversalProxy.FirmwareUpdate.Fwup do
         {:error, {:firmware_not_found, fw_path}}
 
       true ->
-        open_and_apply(fwup, fw_path, devpath, task, progress, chunk_size)
+        open_and_apply(fwup, fw_path, devpath, task, progress, chunk_size, extra_args)
     end
   end
 
-  defp open_and_apply(fwup, fw_path, devpath, task, progress, chunk_size) do
+  defp open_and_apply(fwup, fw_path, devpath, task, progress, chunk_size, extra_args) do
     port =
       Port.open({:spawn_executable, fwup}, [
         :binary,
         :exit_status,
         :stderr_to_stdout,
-        args: ["--apply", "--task", task, "--framing", "-d", devpath]
+        args: ["--apply", "--task", task, "--framing", "-d", devpath] ++ extra_args
       ])
 
     try do
@@ -124,14 +147,30 @@ defmodule UniversalProxy.FirmwareUpdate.Fwup do
         {:error, {:firmware_read_failed, reason}}
 
       data when is_binary(data) ->
-        true = Port.command(port, <<byte_size(data)::32-big, data::binary>>)
-        stream_loop(port, fd, chunk_size)
+        case port_command(port, <<byte_size(data)::32-big, data::binary>>) do
+          :ok -> stream_loop(port, fd, chunk_size)
+          {:error, _} = err -> err
+        end
     end
   end
 
   defp send_terminator(port) do
-    true = Port.command(port, <<0::32-big>>)
-    :ok
+    port_command(port, <<0::32-big>>)
+  end
+
+  # Port.command/2 raises ArgumentError (badarg) if the port's OS
+  # process already died mid-stream. Convert that into the documented
+  # {:error, term()} contract instead of crashing the caller (mirrors
+  # the safe_close/1 rescue+catch style below).
+  defp port_command(port, data) do
+    try do
+      true = Port.command(port, data)
+      :ok
+    rescue
+      ArgumentError -> {:error, :fwup_port_closed}
+    catch
+      :error, :badarg -> {:error, :fwup_port_closed}
+    end
   end
 
   defp await_exit(port, progress, buffer) do
@@ -171,6 +210,10 @@ defmodule UniversalProxy.FirmwareUpdate.Fwup do
         await_exit(port, progress, new_buffer, new_error || last_error)
 
       {^port, {:exit_status, 0}} ->
+        if last_error do
+          Logger.warning("fwup exited 0 but reported: #{inspect(last_error)}")
+        end
+
         :ok
 
       {^port, {:exit_status, n}} ->
@@ -195,7 +238,18 @@ defmodule UniversalProxy.FirmwareUpdate.Fwup do
   end
 
   defp decode_payload(<<"PR", pct::16-big>>, err) when pct in 0..100, do: {{:progress, pct}, err}
-  defp decode_payload(<<"OK", _rest::binary>>, err), do: {:ok, err}
+
+  defp decode_payload(<<"PR", pct::16-big>>, err) do
+    Logger.warning("fwup reported out-of-range progress: #{pct}")
+    {:unknown, err}
+  end
+
+  defp decode_payload(<<"OK", 0::16-big>>, err), do: {:ok, err}
+
+  defp decode_payload(<<"OK", code::16-big>>, _err) do
+    {:ok, "fwup OK frame with non-zero result #{code}"}
+  end
+
   defp decode_payload(<<"ER", msg::binary>>, _err), do: {{:error_msg, msg}, msg}
   defp decode_payload(<<"WN", msg::binary>>, err), do: {{:warning, msg}, err}
   defp decode_payload(_other, err), do: {:unknown, err}

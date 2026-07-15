@@ -83,7 +83,11 @@ defmodule UniversalProxy.FirmwareUpdate do
       pubsub_topic: @topic,
       download_dir: download_dir(),
       reboot_fn: &__MODULE__.reboot/0,
-      devpath_fn: &__MODULE__.devpath/0
+      devpath_fn: &__MODULE__.devpath/0,
+      kv_get: &__MODULE__.kv_get/1,
+      kv_put: &__MODULE__.kv_put/2,
+      target_fn: &__MODULE__.current_target/0,
+      current_version_fn: &__MODULE__.current_version/0
     )
   end
 
@@ -230,37 +234,31 @@ defmodule UniversalProxy.FirmwareUpdate do
   end
 
   @doc """
-  Resolves the `(fw_asset, sig_asset)` from a release's asset list.
+  Resolves the firmware asset from a release's asset list.
 
-  The matcher contract is `(tag, assets) -> {:ok, fw, sig} | {:error, reason}`.
-  Filename pattern: `universal_proxy_<target>.fw` + `.fw.sig`. Target
-  comes from `Nerves.Runtime.KV[\"nerves_fw_platform\"]`, falling back
-  to the compile-time `Mix.target/0`.
+  The matcher contract is `(tag, assets) -> {:ok, fw_asset} | {:error, reason}`
+  (legacy/unverified path only — the manifest path resolves its target
+  asset itself). Filename pattern: `universal_proxy_<target>.fw`.
+  Target comes from `Nerves.Runtime.KV["nerves_fw_platform"]`, falling
+  back to the compile-time `Mix.target/0`.
   """
-  @spec match_asset(String.t(), [map()]) ::
-          {:ok, map(), map() | nil} | {:error, :no_fw_asset}
+  @spec match_asset(String.t(), [map()]) :: {:ok, map()} | {:error, :no_fw_asset}
   def match_asset(_tag_name, assets) when is_list(assets) do
     target = current_target()
     fw_name = "universal_proxy_#{target}.fw"
-    sig_name = fw_name <> ".sig"
 
-    fw_asset = Enum.find(assets, fn a -> a.name == fw_name end)
-    sig_asset = Enum.find(assets, fn a -> a.name == sig_name end)
-
-    case fw_asset do
+    case Enum.find(assets, fn a -> a.name == fw_name end) do
       nil -> {:error, :no_fw_asset}
-      asset -> {:ok, with_download_url(asset), with_download_url(sig_asset)}
+      asset -> {:ok, with_download_url(asset)}
     end
   end
 
-  # Use the public browser_download_url for the actual fetch. The
-  # GitHub API `:url` 302-redirects to a signed S3 URL; Req forwards
-  # the Authorization: Bearer header across redirects by default,
-  # which would leak the operator token to GitHub's S3 host. The
-  # browser URL is a direct S3 download that doesn't need (or want)
-  # the bearer.
-  defp with_download_url(nil), do: nil
-
+  # Use the public browser_download_url for the actual fetch: it's a
+  # direct public download that needs no auth at all, the simplest
+  # correct choice given v0.1 is public-repos-only. The GitHub API
+  # asset `:url` route would work too, but needs an
+  # `accept: application/octet-stream` + Bearer flow and is only
+  # needed for private repos.
   defp with_download_url(%{browser_download_url: url} = asset) when is_binary(url) do
     %{asset | url: url}
   end
@@ -302,11 +300,40 @@ defmodule UniversalProxy.FirmwareUpdate do
     end
   end
 
-  # -- Private --
+  @doc false
+  def kv_get(key) do
+    if Code.ensure_loaded?(Nerves.Runtime.KV) and function_exported?(Nerves.Runtime.KV, :get, 1) do
+      Nerves.Runtime.KV.get(key)
+    else
+      nil
+    end
+  end
 
-  defp host_mode?, do: @target == "host"
+  @doc false
+  def kv_put(key, value) do
+    if Code.ensure_loaded?(Nerves.Runtime.KV) and
+         function_exported?(Nerves.Runtime.KV, :put, 2) do
+      # Return KV.put's real result (`:ok | {:error, any()}`) — the
+      # Updater logs a failed rollback-counter write, so swallowing the
+      # error here would make that log dead code on device.
+      Nerves.Runtime.KV.put(key, value)
+    else
+      :ok
+    end
+  end
 
-  defp current_target do
+  @doc false
+  def current_version do
+    if Code.ensure_loaded?(Nerves.Runtime.KV) and
+         function_exported?(Nerves.Runtime.KV, :get_active, 1) do
+      Nerves.Runtime.KV.get_active("nerves_fw_version")
+    else
+      nil
+    end
+  end
+
+  @doc false
+  def current_target do
     if Code.ensure_loaded?(Nerves.Runtime.KV) and
          function_exported?(Nerves.Runtime.KV, :get_active, 1) do
       Nerves.Runtime.KV.get_active("nerves_fw_platform") || @target
@@ -314,4 +341,8 @@ defmodule UniversalProxy.FirmwareUpdate do
       @target
     end
   end
+
+  # -- Private --
+
+  defp host_mode?, do: @target == "host"
 end

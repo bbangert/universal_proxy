@@ -119,6 +119,106 @@ defmodule UniversalProxy.FirmwareUpdate.GithubClientTest do
                  req_options: stub_plug(handler)
                )
     end
+
+    test "channel: :prerelease hits the list endpoint and picks the max semver tag, prereleases eligible" do
+      handler = fn conn ->
+        assert conn.request_path == "/repos/owner/repo/releases"
+        assert conn.query_string == "per_page=30"
+
+        respond(
+          conn,
+          200,
+          [
+            %{
+              "tag_name" => "v1.2.9",
+              "name" => "v1.2.9",
+              "body" => "old stable",
+              "published_at" => "2026-04-01T00:00:00Z",
+              "draft" => false,
+              "prerelease" => false,
+              "assets" => []
+            },
+            %{
+              "tag_name" => "v1.3.0-rc.1",
+              "name" => "v1.3.0-rc.1",
+              "body" => "release candidate",
+              "published_at" => "2026-05-01T00:00:00Z",
+              "draft" => false,
+              "prerelease" => true,
+              "assets" => [
+                %{
+                  "name" => "universal_proxy_rpi3.fw",
+                  "url" => "https://api.example/assets/2",
+                  "browser_download_url" => "https://dl.example/2.fw",
+                  "size" => 2048
+                }
+              ]
+            },
+            %{
+              "tag_name" => "v9.9.9",
+              "name" => "draft",
+              "body" => "should be ignored",
+              "published_at" => "2026-06-01T00:00:00Z",
+              "draft" => true,
+              "prerelease" => false,
+              "assets" => []
+            },
+            %{
+              "tag_name" => "not-a-semver",
+              "name" => "junk",
+              "body" => "should be ignored",
+              "published_at" => "2026-06-01T00:00:00Z",
+              "draft" => false,
+              "prerelease" => false,
+              "assets" => []
+            }
+          ],
+          [{"etag", "W/\"list-etag\""}]
+        )
+      end
+
+      assert {:ok, release} =
+               GithubClient.latest_release("owner/repo",
+                 channel: :prerelease,
+                 req_options: stub_plug(handler)
+               )
+
+      assert release.tag_name == "v1.3.0-rc.1"
+      assert release.body == "release candidate"
+      assert release.etag == "W/\"list-etag\""
+      assert [%{name: "universal_proxy_rpi3.fw", size: 2048}] = release.assets
+    end
+
+    test "channel: :prerelease with no parseable releases returns {:error, :no_release}" do
+      handler = fn conn ->
+        respond(conn, 200, [
+          %{
+            "tag_name" => "not-a-semver",
+            "name" => "junk",
+            "body" => "",
+            "published_at" => "2026-06-01T00:00:00Z",
+            "draft" => false,
+            "prerelease" => false,
+            "assets" => []
+          },
+          %{
+            "tag_name" => "v1.0.0",
+            "name" => "draft-only",
+            "body" => "",
+            "published_at" => "2026-06-01T00:00:00Z",
+            "draft" => true,
+            "prerelease" => false,
+            "assets" => []
+          }
+        ])
+      end
+
+      assert {:error, :no_release} =
+               GithubClient.latest_release("owner/repo",
+                 channel: :prerelease,
+                 req_options: stub_plug(handler)
+               )
+    end
   end
 
   describe "download_asset/3" do
@@ -182,6 +282,70 @@ defmodule UniversalProxy.FirmwareUpdate.GithubClientTest do
                  "https://api.example/assets/1",
                  dest,
                  req_options: stub_plug(handler) ++ [retry: false]
+               )
+
+      refute File.exists?(dest)
+      refute File.exists?(dest <> ".part")
+    end
+
+    test "matching expected_sha256 succeeds and renames into place", %{dest: dest} do
+      payload = :crypto.strong_rand_bytes(4096)
+      digest = :sha256 |> :crypto.hash(payload) |> Base.encode16(case: :upper)
+
+      handler = fn conn -> respond(conn, 200, payload) end
+
+      assert :ok =
+               GithubClient.download_asset(
+                 "https://api.example/assets/1",
+                 dest,
+                 expected_sha256: digest,
+                 req_options: stub_plug(handler)
+               )
+
+      assert File.read!(dest) == payload
+      refute File.exists?(dest <> ".part")
+    end
+
+    test "wrong expected_sha256 returns {:error, {:sha256_mismatch, ...}} and leaves no files", %{
+      dest: dest
+    } do
+      payload = :crypto.strong_rand_bytes(4096)
+      wrong_digest = String.duplicate("0", 64)
+
+      handler = fn conn -> respond(conn, 200, payload) end
+
+      assert {:error, {:sha256_mismatch, expected: expected, actual: actual}} =
+               GithubClient.download_asset(
+                 "https://api.example/assets/1",
+                 dest,
+                 expected_sha256: wrong_digest,
+                 req_options: stub_plug(handler)
+               )
+
+      assert expected == wrong_digest
+      assert actual == :sha256 |> :crypto.hash(payload) |> Base.encode16(case: :lower)
+      refute File.exists?(dest)
+      refute File.exists?(dest <> ".part")
+    end
+
+    test "a response body over the size ceiling aborts the stream and leaves no files", %{
+      dest: dest
+    } do
+      # Exercise the ceiling at KiB scale via the :max_bytes override so
+      # the test doesn't have to push the 256 MiB production floor through
+      # the transport. One byte over the cap must abort before it fills
+      # the download dir.
+      limit = 8 * 1024
+      payload = :binary.copy(<<0>>, limit + 1)
+
+      handler = fn conn -> respond(conn, 200, payload) end
+
+      assert {:error, {:download_too_large, ^limit}} =
+               GithubClient.download_asset(
+                 "https://api.example/assets/1",
+                 dest,
+                 max_bytes: limit,
+                 req_options: stub_plug(handler)
                )
 
       refute File.exists?(dest)
