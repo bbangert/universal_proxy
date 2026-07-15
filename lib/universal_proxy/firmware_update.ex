@@ -253,12 +253,12 @@ defmodule UniversalProxy.FirmwareUpdate do
     end
   end
 
-  # Use the public browser_download_url for the actual fetch. The
-  # GitHub API `:url` 302-redirects to a signed S3 URL; Req forwards
-  # the Authorization: Bearer header across redirects by default,
-  # which would leak the operator token to GitHub's S3 host. The
-  # browser URL is a direct S3 download that doesn't need (or want)
-  # the bearer.
+  # Use the public browser_download_url for the actual fetch: it's a
+  # direct public download that needs no auth at all, the simplest
+  # correct choice given v0.1 is public-repos-only. The GitHub API
+  # asset `:url` route would work too, but needs an
+  # `accept: application/octet-stream` + Bearer flow and is only
+  # needed for private repos.
   defp with_download_url(nil), do: nil
 
   defp with_download_url(%{browser_download_url: url} = asset) when is_binary(url) do
