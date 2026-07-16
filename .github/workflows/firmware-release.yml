@@ -120,7 +120,7 @@ jobs:
     permissions:
       id-token: write
       contents: write
-    uses: bbangert/nerves_github_updater/.github/workflows/sign-firmware.yml@0.1.0
+    uses: bbangert/nerves_github_updater/.github/workflows/sign-firmware.yml@0.1.1
     with:
       tag: ${{ github.event.release.tag_name }}
       asset-glob: universal_proxy_*.fw
