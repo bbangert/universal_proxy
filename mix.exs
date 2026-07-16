@@ -161,6 +161,14 @@ defmodule UniversalProxy.MixProject do
       # hex improv 0.1.0 after HW validation on the interim git pin.
       {:improv, "~> 0.1"},
 
+      # Firmware-update pipeline (GitHub-releases checker/installer,
+      # fwup wrapper, Ed25519 signature verification), extracted from
+      # this app into bbangert/nerves_github_updater (same lineage as
+      # bluez/improv above) and published as hex nerves_github_updater
+      # 0.1.0. The host wires it via the `UniversalProxy.FirmwareUpdate`
+      # facade, which stays in-app.
+      {:nerves_github_updater, "~> 0.1"},
+
       # Dependencies for specific targets
       # NOTE: It's generally low risk and recommended to follow minor version
       # bumps to Nerves systems. Since these include Linux kernel and Erlang

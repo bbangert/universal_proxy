@@ -105,173 +105,36 @@ jobs:
           tag_name: ${{ github.event.release.tag_name }}
           files: universal_proxy_${{ matrix.target }}.fw
 
-  # Builds and signs release-manifest.json per docs/manifest-format.md.
-  # The signature scheme is signer-agnostic (raw Ed25519 over the
-  # manifest's sha512 digest); FW_SIGNING_BACKEND selects who signs:
-  #
-  #   aws-kms (default) — needs repo vars AWS_ROLE_ARN, AWS_REGION,
-  #     KMS_SIGNING_KEY_ID (Ed25519 key, OIDC role with kms:Sign)
-  #   gcp-kms — needs GCP_WORKLOAD_IDENTITY_PROVIDER, GCP_SERVICE_ACCOUNT,
-  #     GCP_KMS_LOCATION, GCP_KMS_KEYRING, GCP_KMS_KEY, GCP_KMS_KEY_VERSION
-  #     (EC_SIGN_ED25519 key)
-  #   local-key — signs in-CI with an Ed25519 PEM private key supplied
-  #     as the FW_SIGNING_KEY_PEM_B64 secret (base64 of the PEM). No
-  #     cloud KMS; lower security than KMS (the key exists in the runner)
-  #     — intended for test/pre-KMS releases. Generate with:
-  #       openssl genpkey -algorithm ed25519 -out fw_signing.pem
-  #       openssl pkey -in fw_signing.pem -pubout -outform DER | tail -c 32 \
-  #         > rootfs_overlay/etc/firmware_signing.pub   # commit this
-  #       base64 -w0 fw_signing.pem                      # store as the secret
-  #   manual — no cloud creds; uploads the unsigned manifest and prints
-  #     instructions for signing offline (workstation HSM / openssl) and
-  #     attaching release-manifest.sig by hand
-  #
-  # The job fails until the chosen backend's variables/secrets exist.
+  # Sign the release manifest via the reusable workflow published by the
+  # extracted nerves_github_updater library (bbangert/nerves_github_updater,
+  # pinned to the hex-released tag). Signer-agnostic: raw Ed25519 over
+  # sha512(manifest). The FW_SIGNING_BACKEND repo variable selects the
+  # backend (aws-kms default | gcp-kms | local-key | manual); each needs its
+  # own vars/secrets — see the reusable workflow's inputs. Note aws-role-arn
+  # is now a SECRET (was the AWS_ROLE_ARN repo var in the old inline job).
+  # target-strip-prefix maps `universal_proxy_<target>.fw` asset names to the
+  # bare target key the device's target_fn returns (e.g. "rpi3").
   sign_manifest:
     name: Sign release manifest
     needs: build
-    runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: write
-    env:
-      FW_SIGNING_BACKEND: ${{ vars.FW_SIGNING_BACKEND || 'aws-kms' }}
-
-    steps:
-      - name: Download firmware assets
-        env:
-          # Bind release/repo context to env vars rather than interpolating
-          # ${{ github.* }} into the shell: a tag_name containing shell
-          # metacharacters (git ref names permit `` $ ( ) ; | ``) would
-          # otherwise execute inside this KMS-privileged job.
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.event.release.tag_name }}
-        run: |
-          mkdir -p fw
-          gh release download "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --pattern 'universal_proxy_*.fw' \
-            --dir fw
-
-      - name: Generate release manifest
-        run: |
-          signed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          counter="$(date +%s)"
-          targets="{}"
-          for f in fw/universal_proxy_*.fw; do
-            name="$(basename "$f")"
-            target="${name#universal_proxy_}"
-            target="${target%.fw}"
-            sha256="$(sha256sum "$f" | cut -d' ' -f1)"
-            size="$(stat -c%s "$f")"
-            entry="$(jq -n --arg asset "$name" --arg sha256 "$sha256" --argjson size "$size" \
-              '{asset: $asset, sha256: $sha256, size: $size}')"
-            targets="$(jq --argjson entry "$entry" --arg target "$target" \
-              '. + {($target): $entry}' <<<"$targets")"
-          done
-          jq -n \
-            --argjson version 1 \
-            --argjson counter "$counter" \
-            --arg signed_at "$signed_at" \
-            --argjson targets "$targets" \
-            '{version: $version, counter: $counter, signed_at: $signed_at,
-              expires_at: null, targets: $targets, deltas: {}}' \
-            > release-manifest.json
-
-      - name: Compute manifest digest
-        run: |
-          # The signed message is always sha512(manifest_bytes), never the
-          # manifest itself — keeps the message a constant 64 bytes (inside
-          # AWS KMS's 4096-byte RAW cap, trivial for any HSM). See
-          # docs/manifest-format.md "Signature construction".
-          sha512sum release-manifest.json | cut -d' ' -f1 | xxd -r -p > digest.bin
-
-      - name: Configure AWS credentials
-        if: env.FW_SIGNING_BACKEND == 'aws-kms'
-        uses: aws-actions/configure-aws-credentials@v5
-        with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
-
-      - name: Sign manifest (AWS KMS)
-        if: env.FW_SIGNING_BACKEND == 'aws-kms'
-        run: |
-          aws kms sign --key-id "${{ vars.KMS_SIGNING_KEY_ID }}" \
-            --message fileb://digest.bin --message-type RAW \
-            --signing-algorithm ED25519_SHA_512 \
-            --output text --query Signature | base64 -d > release-manifest.sig
-
-      - name: Authenticate to Google Cloud
-        if: env.FW_SIGNING_BACKEND == 'gcp-kms'
-        uses: google-github-actions/auth@v3
-        with:
-          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
-
-      - name: Sign manifest (GCP KMS)
-        if: env.FW_SIGNING_BACKEND == 'gcp-kms'
-        run: |
-          # EC_SIGN_ED25519 is PureEdDSA over raw input: pass the digest as
-          # the input file and omit --digest-algorithm. gcloud writes the
-          # signature base64-encoded.
-          gcloud kms asymmetric-sign \
-            --location "${{ vars.GCP_KMS_LOCATION }}" \
-            --keyring "${{ vars.GCP_KMS_KEYRING }}" \
-            --key "${{ vars.GCP_KMS_KEY }}" \
-            --version "${{ vars.GCP_KMS_KEY_VERSION }}" \
-            --input-file digest.bin \
-            --signature-file release-manifest.sig.b64
-          base64 -d release-manifest.sig.b64 > release-manifest.sig
-
-      - name: Sign manifest (local key)
-        if: env.FW_SIGNING_BACKEND == 'local-key'
-        env:
-          FW_SIGNING_KEY_PEM_B64: ${{ secrets.FW_SIGNING_KEY_PEM_B64 }}
-        run: |
-          # Ed25519 in openssl is PureEdDSA: -rawin signs digest.bin as
-          # the message, matching the device's verify construction.
-          test -n "$FW_SIGNING_KEY_PEM_B64" || { echo "FW_SIGNING_KEY_PEM_B64 secret is not set"; exit 1; }
-          umask 077
-          # Remove the key on ANY exit — `set -e` would otherwise skip a
-          # trailing rm if openssl fails, leaving the PEM on the runner.
-          trap 'rm -f signing_key.pem' EXIT
-          printf '%s' "$FW_SIGNING_KEY_PEM_B64" | base64 -d > signing_key.pem
-          openssl pkeyutl -sign -rawin -inkey signing_key.pem \
-            -in digest.bin -out release-manifest.sig
-
-      - name: Assert raw Ed25519 signature
-        if: env.FW_SIGNING_BACKEND != 'manual'
-        run: test "$(stat -c%s release-manifest.sig)" = 64
-
-      - name: Upload manifest and signature to release
-        if: env.FW_SIGNING_BACKEND != 'manual'
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ github.event.release.tag_name }}
-          files: |
-            release-manifest.json
-            release-manifest.sig
-
-      - name: Upload unsigned manifest (manual signing)
-        if: env.FW_SIGNING_BACKEND == 'manual'
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ github.event.release.tag_name }}
-          files: release-manifest.json
-
-      - name: Print manual signing instructions
-        if: env.FW_SIGNING_BACKEND == 'manual'
-        # TAG via env, not ${{ }} interpolation — see the download step.
-        env:
-          TAG: ${{ github.event.release.tag_name }}
-        run: |
-          echo "Manifest uploaded UNSIGNED. Sign it offline (see"
-          echo "docs/manifest-format.md) and attach the signature:"
-          echo
-          echo "  gh release download $TAG -p release-manifest.json"
-          echo "  sha512sum release-manifest.json | cut -d' ' -f1 | xxd -r -p > digest.bin"
-          echo "  # sign digest.bin with your HSM/key -> release-manifest.sig (raw 64 bytes)"
-          echo "  gh release upload $TAG release-manifest.sig"
-          echo
-          echo "Devices with verification_required=true will refuse this"
-          echo "release until release-manifest.sig is attached."
+    uses: bbangert/nerves_github_updater/.github/workflows/sign-firmware.yml@0.1.0
+    with:
+      tag: ${{ github.event.release.tag_name }}
+      asset-glob: universal_proxy_*.fw
+      target-strip-prefix: universal_proxy_
+      signing-backend: ${{ vars.FW_SIGNING_BACKEND || 'aws-kms' }}
+      aws-region: ${{ vars.AWS_REGION }}
+      kms-key-id: ${{ vars.KMS_SIGNING_KEY_ID }}
+      gcp-kms-location: ${{ vars.GCP_KMS_LOCATION }}
+      gcp-kms-keyring: ${{ vars.GCP_KMS_KEYRING }}
+      gcp-kms-key: ${{ vars.GCP_KMS_KEY }}
+      gcp-kms-key-version: ${{ vars.GCP_KMS_KEY_VERSION }}
+    secrets:
+      github-token: ${{ secrets.GITHUB_TOKEN }}
+      aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
+      gcp-workload-identity-provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      gcp-service-account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      fw-signing-key-pem-b64: ${{ secrets.FW_SIGNING_KEY_PEM_B64 }}

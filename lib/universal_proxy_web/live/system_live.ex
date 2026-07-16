@@ -431,12 +431,12 @@ defmodule UniversalProxyWeb.SystemLive do
 
   defp update_available?(%{last_release: last_release}, %{version: current}) do
     tag = last_release && last_release.tag_name
-    UniversalProxy.FirmwareUpdate.VersionCompare.update_available?(tag, current)
+    NervesGithubUpdater.VersionCompare.update_available?(tag, current)
   end
 
   defp fw_up_to_date?(%{last_release: last_release}, %{version: current}) do
     tag = last_release && last_release.tag_name
-    UniversalProxy.FirmwareUpdate.VersionCompare.up_to_date?(tag, current)
+    NervesGithubUpdater.VersionCompare.up_to_date?(tag, current)
   end
 
   defp format_date(nil), do: ""

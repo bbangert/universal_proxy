@@ -2,9 +2,11 @@ defmodule UniversalProxy.FirmwareUpdate do
   @moduledoc """
   Host-side façade and wiring for the firmware update flow.
 
-  The library (`UniversalProxy.FirmwareUpdate.{GithubClient, Signature,
-  Updater, Fwup, Supervisor}`) is intentionally host-agnostic. This
-  module is the seam where host-specific glue lives:
+  The update pipeline itself lives in the external `nerves_github_updater`
+  hex library (`NervesGithubUpdater.{GithubClient, Signature, Updater,
+  Fwup, Supervisor}`), which is intentionally host-agnostic. This
+  module is the host facade wiring it into the app — the seam where
+  host-specific glue lives:
 
     * Wiring config from `ConfigStore` into the library `Supervisor`.
     * Mapping target firmware to GitHub assets
@@ -31,11 +33,12 @@ defmodule UniversalProxy.FirmwareUpdate do
 
   require Logger
 
-  alias UniversalProxy.FirmwareUpdate.{ConfigStore, Updater}
+  alias UniversalProxy.FirmwareUpdate.ConfigStore
+  alias NervesGithubUpdater.Updater
 
   # Aliased separately because the unaliased `Supervisor` below refers
   # to the stdlib supervisor (used by start_link/1).
-  alias UniversalProxy.FirmwareUpdate.Supervisor, as: LibSupervisor
+  alias NervesGithubUpdater.Supervisor, as: LibSupervisor
 
   @compile {:no_warn_undefined, [Nerves.Runtime, Nerves.Runtime.KV]}
 
