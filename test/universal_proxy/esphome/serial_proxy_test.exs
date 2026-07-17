@@ -1,21 +1,24 @@
 defmodule UniversalProxy.ESPHome.SerialProxyTest do
   # Locks in the wire-level contract between this repo's adapter and
-  # espex's dispatcher for SerialProxyRequest ordering. Two cases:
+  # espex's dispatcher for SerialProxyRequest/SerialProxyConfigureRequest/
+  # SerialProxyWriteRequest ordering, under the espex 0.8 lazy-open +
+  # persistent-subscribe-intent semantics (the old espex 0.7 contract —
+  # `{:replay_pending_subscribe, _}` actions, one-shot pending-subscribe
+  # stash — is gone; see `Espex.SerialProxy`'s moduledoc after the bump).
   #
-  #   1. SUBSCRIBE before CONFIGURE — serialx >= the puddly/serialx#91
-  #      fix sends this order. Espex must stash the intent and OK the
-  #      request; CONFIGURE then emits the {:serial_open, ...} +
-  #      {:replay_pending_subscribe, ...} action pair.
-  #
-  #   2. CONFIGURE then SUBSCRIBE — the original aioesphomeapi order.
-  #      SUBSCRIBE on an opened port routes to {:serial_request, ...}
-  #      with no pending stash.
+  #   * SUBSCRIBE / UNSUBSCRIBE / WRITE against an advertised-but-unopened
+  #     instance lazily open it via `{:serial_open, instance, :default_opts}`
+  #     and are otherwise handled inline (no stash, no replay action).
+  #   * CONFIGURE always attempts an open (closing first if already open)
+  #     and never emits a replay action.
+  #   * SUBSCRIBE/UNSUBSCRIBE against an already-open instance route
+  #     straight through `{:serial_request, instance, type}`.
   #
   # These tests drive `Espex.Dispatch.handle_request/2` directly. They
   # do NOT call our adapter's `request/2` — that path is covered by
   # `UniversalProxy.ESPHome.SerialProxy.RelayTest`. The value here is
   # protecting against an espex regression that would silently revert
-  # to the pre-fix gate.
+  # to the pre-0.8 gate.
   use ExUnit.Case, async: true
 
   alias Espex.{ConnectionState, DeviceConfig, Dispatch, Proto, SerialProxy}
@@ -55,78 +58,79 @@ defmodule UniversalProxy.ESPHome.SerialProxyTest do
   defp configure_req,
     do: %Proto.SerialProxyConfigureRequest{instance: @instance, baudrate: 9600}
 
-  describe "SUBSCRIBE before CONFIGURE (serialx >= puddly/serialx#91)" do
-    test "stashes pending intent and replies OK without calling the adapter" do
+  defp write_req,
+    do: %Proto.SerialProxyWriteRequest{instance: @instance, data: "hi"}
+
+  describe "SUBSCRIBE on an advertised-but-unopened instance (lazy open)" do
+    test "lazily opens, replies OK, and records subscribe intent" do
       {new_state, actions} = Dispatch.handle_request(state(), subscribe_req())
 
-      assert ConnectionState.pending_subscription?(new_state, @instance)
-      refute ConnectionState.port_open?(new_state, @instance)
+      assert [
+               {:log, :debug, _},
+               {:serial_open, @instance, :default_opts},
+               {:send, %Proto.SerialProxyRequestResponse{} = resp}
+             ] = actions
 
-      assert [{:send, %Proto.SerialProxyRequestResponse{} = resp}] = actions
       assert resp.instance == @instance
       assert resp.status == :SERIAL_PROXY_STATUS_OK
       assert resp.type == :SERIAL_PROXY_REQUEST_TYPE_SUBSCRIBE
       assert resp.error_message == ""
 
-      # No adapter-bound actions until CONFIGURE arrives.
-      refute Enum.any?(actions, &match?({:serial_open, _, _}, &1))
-      refute Enum.any?(actions, &match?({:serial_request, _, _}, &1))
-    end
-
-    test "CONFIGURE after pending SUBSCRIBE emits :serial_open then :replay_pending_subscribe" do
-      {state, _} = Dispatch.handle_request(state(), subscribe_req())
-      {_state, actions} = Dispatch.handle_request(state, configure_req())
-
-      assert [
-               {:serial_open, @instance, opts},
-               {:replay_pending_subscribe, @instance}
-             ] = actions
-
-      assert opts[:speed] == 9600
-    end
-
-    test "UNSUBSCRIBE while pending drops the intent and replies OK" do
-      {state, _} = Dispatch.handle_request(state(), subscribe_req())
-      assert ConnectionState.pending_subscription?(state, @instance)
-
-      {state, actions} = Dispatch.handle_request(state, unsubscribe_req())
-
-      refute ConnectionState.pending_subscription?(state, @instance)
-
-      assert [{:send, %Proto.SerialProxyRequestResponse{status: :SERIAL_PROXY_STATUS_OK}}] =
-               actions
+      assert ConnectionState.serial_subscribed?(new_state, @instance)
     end
   end
 
-  describe "CONFIGURE then SUBSCRIBE (legacy / aioesphomeapi order)" do
-    test "CONFIGURE alone emits :serial_open + (no-op) :replay_pending_subscribe with no pending intent" do
-      {state, actions} = Dispatch.handle_request(state(), configure_req())
+  describe "UNSUBSCRIBE on an advertised-but-unopened instance" do
+    test "replies OK and clears subscribe intent without opening" do
+      {state, actions} = Dispatch.handle_request(state(), unsubscribe_req())
 
-      refute ConnectionState.pending_subscription?(state, @instance)
+      refute ConnectionState.serial_subscribed?(state, @instance)
 
-      # Replay action is always emitted; interpreter no-ops when there's no
-      # pending intent. We assert the action shape here, not the runtime
-      # effect — those belong in espex's own tests.
-      assert [
-               {:serial_open, @instance, _opts},
-               {:replay_pending_subscribe, @instance}
-             ] = actions
+      assert [{:send, %Proto.SerialProxyRequestResponse{status: :SERIAL_PROXY_STATUS_OK} = resp}] =
+               actions
+
+      assert resp.type == :SERIAL_PROXY_REQUEST_TYPE_UNSUBSCRIBE
+    end
+  end
+
+  describe "CONFIGURE" do
+    test "on an unopened instance emits :serial_open with translated opts and no replay action" do
+      {_state, actions} = Dispatch.handle_request(state(), configure_req())
+
+      assert [{:serial_open, @instance, opts}] = actions
+      assert opts[:speed] == 9600
+      refute Enum.any?(actions, &match?({:replay_pending_subscribe, _}, &1))
     end
 
-    test "SUBSCRIBE on an open port routes through :serial_request (not stashed)" do
-      # Drive CONFIGURE through Dispatch so we catch a regression that would
-      # incorrectly stash pending during CONFIGURE. Then simulate "open
-      # succeeded" by storing a fake handle so port_open? returns true for
-      # the subsequent SUBSCRIBE.
-      {state, _configure_actions} = Dispatch.handle_request(state(), configure_req())
-      opened = ConnectionState.put_port(state, @instance, {self(), "/dev/null"})
+    test "on an already-open instance closes then re-opens" do
+      opened = ConnectionState.put_port(state(), @instance, {self(), "/dev/null"})
 
-      refute ConnectionState.pending_subscription?(opened, @instance)
+      {_state, actions} = Dispatch.handle_request(opened, configure_req())
+
+      assert [{:serial_close, @instance}, {:serial_open, @instance, _opts}] = actions
+    end
+  end
+
+  describe "WRITE on an advertised-but-unopened instance (restart-resume guard)" do
+    test "lazily opens then writes, with no CONFIGURE required" do
+      {_state, actions} = Dispatch.handle_request(state(), write_req())
+
+      assert [
+               {:log, :debug, _},
+               {:serial_open, @instance, :default_opts},
+               {:serial_write, @instance, "hi"}
+             ] = actions
+    end
+  end
+
+  describe "SUBSCRIBE on an already-open instance" do
+    test "routes straight through :serial_request and records intent" do
+      opened = ConnectionState.put_port(state(), @instance, {self(), "/dev/null"})
 
       {new_state, actions} = Dispatch.handle_request(opened, subscribe_req())
 
-      refute ConnectionState.pending_subscription?(new_state, @instance)
       assert [{:serial_request, @instance, :subscribe}] = actions
+      assert ConnectionState.serial_subscribed?(new_state, @instance)
     end
   end
 
@@ -134,7 +138,7 @@ defmodule UniversalProxy.ESPHome.SerialProxyTest do
     test "SUBSCRIBE for an instance not in list_instances rejects with 'unknown instance'" do
       {state, actions} = Dispatch.handle_request(state(), %{subscribe_req() | instance: 99})
 
-      refute ConnectionState.pending_subscription?(state, 99)
+      refute ConnectionState.serial_subscribed?(state, 99)
 
       assert [
                {:log, :warning, _},
@@ -143,6 +147,47 @@ defmodule UniversalProxy.ESPHome.SerialProxyTest do
              ] = actions
 
       assert resp.error_message == "unknown instance"
+    end
+  end
+
+  describe "default_open_opts/1" do
+    test "falls back to espex defaults when the instance has no matching hardware" do
+      assert UniversalProxy.ESPHome.SerialProxy.default_open_opts(99) ==
+               Espex.SerialProxy.default_open_opts()
+    end
+
+    test "round-trips settings persisted through a real port, if hardware is present" do
+      case UniversalProxy.Hardware.list_ports() do
+        [] ->
+          :ok
+
+        ports ->
+          case Enum.find(
+                 ports,
+                 &(&1.connected and &1.configured and &1.kind in [:ttl, :rs232, :rs485])
+               ) do
+            nil ->
+              :ok
+
+            port ->
+              opts = [
+                speed: 19_200,
+                data_bits: 8,
+                stop_bits: 1,
+                parity: :none,
+                flow_control: :none
+              ]
+
+              :ok = UniversalProxy.ESPHome.SerialProxy.SettingsStore.put_opts(port.id, opts)
+
+              instance =
+                UniversalProxy.ESPHome.SerialProxy.list_instances()
+                |> Enum.find_index(&(&1.name == port.ha_name))
+
+              assert instance != nil
+              assert UniversalProxy.ESPHome.SerialProxy.default_open_opts(instance) == opts
+          end
+      end
     end
   end
 end
