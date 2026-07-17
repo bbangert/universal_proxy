@@ -47,9 +47,9 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
 
   alias Espex.SerialProxy.Info
   alias UniversalProxy.ESPHome.SerialProxy.Relay
-  alias UniversalProxy.ESPHome.SerialProxy.SettingsStore
   alias UniversalProxy.Hardware
   alias UniversalProxy.UART
+  alias UniversalProxy.UART.SettingsStore
 
   @impl true
   def list_instances do

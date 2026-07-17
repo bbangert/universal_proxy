@@ -178,7 +178,7 @@ defmodule UniversalProxy.ESPHome.SerialProxyTest do
                 flow_control: :none
               ]
 
-              :ok = UniversalProxy.ESPHome.SerialProxy.SettingsStore.put_opts(port.id, opts)
+              :ok = UniversalProxy.UART.SettingsStore.put_opts(port.id, opts)
 
               instance =
                 UniversalProxy.ESPHome.SerialProxy.list_instances()

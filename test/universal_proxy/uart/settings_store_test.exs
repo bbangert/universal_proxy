@@ -1,18 +1,18 @@
-defmodule UniversalProxy.ESPHome.SerialProxy.SettingsStoreTest do
+defmodule UniversalProxy.UART.SettingsStoreTest do
   # Each test gets its own unnamed store backed by a unique temp DETS file
   # (mirrors PskStoreTest's isolation pattern), so this module is safe to
   # run async.
   use ExUnit.Case, async: true
 
-  alias UniversalProxy.ESPHome.SerialProxy.SettingsStore
+  alias UniversalProxy.UART.SettingsStore
 
   setup do
-    table = :"esphome_serial_settings_unit_test_#{System.unique_integer([:positive])}"
+    table = :"uart_settings_unit_test_#{System.unique_integer([:positive])}"
 
     path =
       Path.join(
         System.tmp_dir!(),
-        "esphome_serial_settings_test_#{System.unique_integer([:positive])}.dets"
+        "uart_settings_test_#{System.unique_integer([:positive])}.dets"
       )
 
     File.rm(path)
@@ -54,11 +54,11 @@ defmodule UniversalProxy.ESPHome.SerialProxy.SettingsStoreTest do
     path =
       Path.join(
         System.tmp_dir!(),
-        "esphome_serial_settings_persist_#{System.unique_integer([:positive])}.dets"
+        "uart_settings_persist_#{System.unique_integer([:positive])}.dets"
       )
 
     File.rm(path)
-    tbl = :"esphome_serial_settings_persist_test_#{System.unique_integer([:positive])}"
+    tbl = :"uart_settings_persist_test_#{System.unique_integer([:positive])}"
     opts = [speed: 57_600, data_bits: 8, stop_bits: 1, parity: :even, flow_control: :hardware]
 
     {:ok, store1} = SettingsStore.start_link(name: nil, table: tbl, dets_path: path)
@@ -69,5 +69,21 @@ defmodule UniversalProxy.ESPHome.SerialProxy.SettingsStoreTest do
     assert SettingsStore.get_opts(store2, "p_2_1") == opts
     :ok = GenServer.stop(store2)
     File.rm(path)
+  end
+
+  describe "all_opts/1" do
+    test "returns an empty map when the store has no records", %{store: store} do
+      assert SettingsStore.all_opts(store) == %{}
+    end
+
+    test "returns every persisted port's settings keyed by port id", %{store: store} do
+      opts_1 = [speed: 115_200, data_bits: 8, stop_bits: 1, parity: :none, flow_control: :none]
+      opts_2 = [speed: 9600, data_bits: 7, stop_bits: 2, parity: :even, flow_control: :hardware]
+
+      :ok = SettingsStore.put_opts(store, "p_1_1", opts_1)
+      :ok = SettingsStore.put_opts(store, "p_1_2", opts_2)
+
+      assert SettingsStore.all_opts(store) == %{"p_1_1" => opts_1, "p_1_2" => opts_2}
+    end
   end
 end

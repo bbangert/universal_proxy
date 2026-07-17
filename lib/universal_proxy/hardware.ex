@@ -175,6 +175,9 @@ defmodule UniversalProxy.Hardware do
     * `:slots` — explicit list of slot bus paths (overrides the
       target-based mapping; pass `nil` for dynamic mode)
     * `:saved_configs` — pre-built `%{serial_number => config}` map
+    * `:line_settings` — pre-built `%{port_id => keyword()}` map of
+      persisted UART line settings (see `UniversalProxy.UART.SettingsStore.
+      all_opts/1`)
     * `:in_use_ports` — pre-built `MapSet` of currently-opened tty
       basenames
     * `:zwave_claim` — the Z-Wave proxy's port claim
@@ -197,6 +200,8 @@ defmodule UniversalProxy.Hardware do
         end)
       end)
 
+    line_settings = Keyword.get_lazy(opts, :line_settings, &safe_line_settings/0)
+
     usage = %{
       in_use_ports:
         Keyword.get_lazy(opts, :in_use_ports, fn ->
@@ -211,9 +216,17 @@ defmodule UniversalProxy.Hardware do
     slots = Keyword.get(opts, :slots, target_slots())
 
     case slots do
-      nil -> dynamic_listing(enumerated, bus_paths, saved, usage)
-      slots -> slot_listing(slots, enumerated, bus_paths, saved, usage)
+      nil -> dynamic_listing(enumerated, bus_paths, saved, usage, line_settings)
+      slots -> slot_listing(slots, enumerated, bus_paths, saved, usage, line_settings)
     end
+  end
+
+  # A wedged/absent SettingsStore must degrade to "no settings shown", not
+  # take down the caller (public-API catch :exit idiom, CLAUDE.md).
+  defp safe_line_settings do
+    UART.SettingsStore.all_opts()
+  catch
+    :exit, _ -> %{}
   end
 
   @doc """
@@ -357,7 +370,7 @@ defmodule UniversalProxy.Hardware do
 
   # -- Slot mode (per-target, every port shows) ------------------------
 
-  defp slot_listing(slots, enumerated, bus_paths, saved, usage) do
+  defp slot_listing(slots, enumerated, bus_paths, saved, usage, line_settings) do
     tty_by_bus_path = Map.new(bus_paths, fn {tty, bus} -> {bus, tty} end)
     known_slots = MapSet.new(slots)
 
@@ -371,7 +384,7 @@ defmodule UniversalProxy.Hardware do
 
           tty_name ->
             info = Map.get(enumerated, tty_name, %{})
-            build_port(tty_name, info, slot_sub, saved, usage, idx)
+            build_port(tty_name, info, slot_sub, saved, usage, line_settings, idx)
         end
       end)
 
@@ -384,7 +397,7 @@ defmodule UniversalProxy.Hardware do
       |> Enum.with_index(length(slots) + 1)
       |> Enum.map(fn {{tty_name, bus_path}, idx} ->
         info = Map.get(enumerated, tty_name, %{})
-        build_port(tty_name, info, bus_path, saved, usage, idx)
+        build_port(tty_name, info, bus_path, saved, usage, line_settings, idx)
       end)
 
     declared ++ bonus
@@ -392,7 +405,7 @@ defmodule UniversalProxy.Hardware do
 
   # -- Dynamic mode (host / unknown target) ----------------------------
 
-  defp dynamic_listing(enumerated, bus_paths, saved, usage) do
+  defp dynamic_listing(enumerated, bus_paths, saved, usage, line_settings) do
     enumerated
     |> Enum.filter(fn {name, _} -> usb_serial?(name) end)
     |> Enum.map(fn {name, info} -> {name, info, Map.get(bus_paths, name)} end)
@@ -400,7 +413,7 @@ defmodule UniversalProxy.Hardware do
     |> Enum.with_index(1)
     |> Enum.map(fn {{name, info, bus_path}, idx} ->
       slot_sub = bus_path || name
-      build_port(name, info, slot_sub, saved, usage, idx)
+      build_port(name, info, slot_sub, saved, usage, line_settings, idx)
     end)
   end
 
@@ -458,7 +471,7 @@ defmodule UniversalProxy.Hardware do
 
   # -- Port shape ------------------------------------------------------
 
-  defp build_port(tty_name, info, slot_sub, saved, usage, idx) do
+  defp build_port(tty_name, info, slot_sub, saved, usage, line_settings, idx) do
     vid = info[:vendor_id]
     pid = info[:product_id]
     serial = info[:serial_number]
@@ -470,6 +483,7 @@ defmodule UniversalProxy.Hardware do
     name = pick_name(saved_cfg, device_info, info)
     vendor = pick_vendor(device_info, info)
     chip = pick_chip(device_info, info)
+    line = Map.get(line_settings, port_id(slot_sub))
 
     %{
       id: port_id(slot_sub),
@@ -494,11 +508,26 @@ defmodule UniversalProxy.Hardware do
       locked: classification.locked,
       user: user,
       user_href: nil,
-      baud: nil,
       throughput: %{in: 0, out: 0, unit: "B/s"},
       errors: 0,
       since: nil,
       notes: classification.notes
+    }
+    |> Map.merge(line_setting_fields(line))
+  end
+
+  # No persisted entry (never opened, or store unavailable) → `baud: nil`,
+  # which `fact_rows/1` in the Overview LiveView treats as "hide the Serial
+  # settings row". `parity` MUST be a string, never an atom — the LiveView
+  # calls `String.first/1` on it.
+  defp line_setting_fields(nil), do: %{baud: nil, data_bits: nil, stop_bits: nil, parity: nil}
+
+  defp line_setting_fields(opts) do
+    %{
+      baud: opts[:speed],
+      data_bits: opts[:data_bits],
+      stop_bits: opts[:stop_bits],
+      parity: to_string(opts[:parity] || :none)
     }
   end
 

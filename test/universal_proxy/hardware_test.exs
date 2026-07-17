@@ -19,6 +19,7 @@ defmodule UniversalProxy.HardwareTest do
           },
           bus_paths: %{"ttyACM0" => "1-1.1"},
           saved_configs: %{},
+          line_settings: %{},
           in_use_ports: MapSet.new()
         )
 
@@ -55,6 +56,7 @@ defmodule UniversalProxy.HardwareTest do
           },
           bus_paths: %{"ttyUSB0" => "1-1.3"},
           saved_configs: %{},
+          line_settings: %{},
           in_use_ports: MapSet.new()
         )
 
@@ -83,6 +85,7 @@ defmodule UniversalProxy.HardwareTest do
           },
           bus_paths: %{"ttyUSB0" => "1-1.4"},
           saved_configs: %{},
+          line_settings: %{},
           in_use_ports: MapSet.new()
         )
 
@@ -117,6 +120,7 @@ defmodule UniversalProxy.HardwareTest do
               friendly_name: "Modbus bus"
             }
           },
+          line_settings: %{},
           in_use_ports: MapSet.new()
         )
 
@@ -153,6 +157,7 @@ defmodule UniversalProxy.HardwareTest do
               port_type: :rs485
             }
           },
+          line_settings: %{},
           in_use_ports: MapSet.new()
         )
 
@@ -180,6 +185,7 @@ defmodule UniversalProxy.HardwareTest do
           },
           bus_paths: %{"ttyUSB0" => "1-1.2"},
           saved_configs: %{},
+          line_settings: %{},
           in_use_ports: MapSet.new()
         )
 
@@ -208,6 +214,7 @@ defmodule UniversalProxy.HardwareTest do
           },
           bus_paths: %{"ttyUSB0" => "1-1.2"},
           saved_configs: %{},
+          line_settings: %{},
           in_use_ports: MapSet.new()
         )
 
@@ -231,6 +238,7 @@ defmodule UniversalProxy.HardwareTest do
           },
           bus_paths: %{"ttyUSB0" => "1-1.2"},
           saved_configs: %{},
+          line_settings: %{},
           in_use_ports: MapSet.new()
         )
 
@@ -247,6 +255,7 @@ defmodule UniversalProxy.HardwareTest do
           },
           bus_paths: %{"ttyACM0" => "1-1.2"},
           saved_configs: %{},
+          line_settings: %{},
           in_use_ports: MapSet.new()
         )
 
@@ -268,6 +277,7 @@ defmodule UniversalProxy.HardwareTest do
           },
           bus_paths: %{"ttyACM1" => "1-1.2"},
           saved_configs: %{},
+          line_settings: %{},
           in_use_ports: MapSet.new()
         )
 
@@ -292,6 +302,7 @@ defmodule UniversalProxy.HardwareTest do
           },
           bus_paths: %{"ttyACM0" => "1-1.2"},
           saved_configs: %{},
+          line_settings: %{},
           in_use_ports: MapSet.new()
         )
 
@@ -316,6 +327,7 @@ defmodule UniversalProxy.HardwareTest do
           },
           bus_paths: %{"ttyUSB0" => "1-1.4"},
           saved_configs: %{},
+          line_settings: %{},
           in_use_ports: MapSet.new()
         )
 
@@ -351,6 +363,7 @@ defmodule UniversalProxy.HardwareTest do
               friendly_name: "Bus A"
             }
           },
+          line_settings: %{},
           in_use_ports: MapSet.new()
         )
 
@@ -370,6 +383,7 @@ defmodule UniversalProxy.HardwareTest do
         },
         bus_paths: %{"ttyACM0" => "1-1.1"},
         saved_configs: %{},
+        line_settings: %{},
         in_use_ports: MapSet.new()
       ]
 
@@ -399,6 +413,7 @@ defmodule UniversalProxy.HardwareTest do
           },
           bus_paths: %{"ttyUSB0" => "1-1.2"},
           saved_configs: %{},
+          line_settings: %{},
           in_use_ports: MapSet.new(),
           zwave_claim: %{tty_name: "ttyACM0", subscribed: true}
         )
@@ -416,6 +431,7 @@ defmodule UniversalProxy.HardwareTest do
           },
           bus_paths: %{"ttyACM0" => "1-1.1"},
           saved_configs: %{},
+          line_settings: %{},
           in_use_ports: MapSet.new(["ttyACM0"])
         )
 
@@ -434,6 +450,7 @@ defmodule UniversalProxy.HardwareTest do
           },
           bus_paths: %{"ttyUSB0" => "1-1.2"},
           saved_configs: %{},
+          line_settings: %{},
           in_use_ports: MapSet.new()
         )
 
@@ -451,11 +468,70 @@ defmodule UniversalProxy.HardwareTest do
           },
           bus_paths: %{"ttyUSB1" => "1-1.4", "ttyUSB0" => "1-1.3", "ttyACM0" => "1-1.2"},
           saved_configs: %{},
+          line_settings: %{},
           in_use_ports: MapSet.new()
         )
 
       assert Enum.map(ports, & &1.slot_sub) == ["1-1.2", "1-1.3", "1-1.4"]
       assert Enum.map(ports, & &1.slot) == ["USB 1", "USB 2", "USB 3"]
+    end
+  end
+
+  describe "list_ports/1 persisted line settings" do
+    test "a matching :line_settings entry decorates the port with real values" do
+      [port] =
+        Hardware.list_ports(
+          slots: nil,
+          enumerated: %{
+            "ttyUSB0" => %{
+              vendor_id: 0x0403,
+              product_id: 0x6001,
+              manufacturer: "FTDI",
+              description: "FT232R USB UART",
+              serial_number: "BG018NOP"
+            }
+          },
+          bus_paths: %{"ttyUSB0" => "1-1.3"},
+          saved_configs: %{},
+          line_settings: %{
+            "p_1_1_3" => [
+              speed: 115_200,
+              data_bits: 8,
+              stop_bits: 1,
+              parity: :none,
+              flow_control: :none
+            ]
+          },
+          in_use_ports: MapSet.new()
+        )
+
+      assert port.id == "p_1_1_3"
+      assert port.baud == 115_200
+      assert port.data_bits == 8
+      assert port.stop_bits == 1
+      assert port.parity == "none"
+    end
+
+    test "no matching :line_settings entry leaves baud nil (unchanged shape)" do
+      [port] =
+        Hardware.list_ports(
+          slots: nil,
+          enumerated: %{
+            "ttyUSB0" => %{
+              vendor_id: 0x0403,
+              product_id: 0x6001,
+              manufacturer: "FTDI",
+              description: "FT232R USB UART",
+              serial_number: "BG018NOP"
+            }
+          },
+          bus_paths: %{"ttyUSB0" => "1-1.3"},
+          saved_configs: %{},
+          line_settings: %{},
+          in_use_ports: MapSet.new()
+        )
+
+      assert port.baud == nil
     end
   end
 
@@ -475,6 +551,7 @@ defmodule UniversalProxy.HardwareTest do
             "ttyUSB0" => "1-1.3"
           },
           saved_configs: %{},
+          line_settings: %{},
           in_use_ports: MapSet.new()
         )
 
@@ -500,6 +577,7 @@ defmodule UniversalProxy.HardwareTest do
           enumerated: %{},
           bus_paths: %{},
           saved_configs: %{},
+          line_settings: %{},
           in_use_ports: MapSet.new()
         )
 
@@ -520,6 +598,7 @@ defmodule UniversalProxy.HardwareTest do
             "ttyUSB9" => "1-1.99"
           },
           saved_configs: %{},
+          line_settings: %{},
           in_use_ports: MapSet.new()
         )
 
@@ -535,6 +614,7 @@ defmodule UniversalProxy.HardwareTest do
                enumerated: %{},
                bus_paths: %{},
                saved_configs: %{},
+               line_settings: %{},
                in_use_ports: MapSet.new()
              ) == []
     end
@@ -546,6 +626,7 @@ defmodule UniversalProxy.HardwareTest do
           enumerated: %{"ttyUSB0" => %{vendor_id: 0x0403, product_id: 0x6001}},
           bus_paths: %{"ttyUSB0" => "1-1.2.3"},
           saved_configs: %{},
+          line_settings: %{},
           in_use_ports: MapSet.new()
         )
 
@@ -591,6 +672,7 @@ defmodule UniversalProxy.HardwareTest do
           },
           tty_class_dir: dir,
           saved_configs: %{},
+          line_settings: %{},
           in_use_ports: MapSet.new()
         )
 

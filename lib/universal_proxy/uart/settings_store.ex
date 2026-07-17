@@ -1,21 +1,24 @@
-defmodule UniversalProxy.ESPHome.SerialProxy.SettingsStore do
+defmodule UniversalProxy.UART.SettingsStore do
   @moduledoc """
-  DETS-backed persistence for per-port ESPHome serial-proxy line settings.
+  DETS-backed persistence for per-port UART line settings (last successful
+  open).
 
   Remembers, per physical port, the line settings (`:speed`, `:data_bits`,
   `:stop_bits`, `:parity`, `:flow_control`) the port was last successfully
-  opened with by an ESPHome serial-proxy client. Served back through
-  `UniversalProxy.ESPHome.SerialProxy.default_open_opts/1` when espex 0.8
+  opened with. This is UART-domain data; the writer today is the ESPHome
+  serial-proxy adapter (`UniversalProxy.ESPHome.SerialProxy.open/3`), and
+  there are two readers: the adapter's `default_open_opts/1` (espex 0.8
   lazily opens an instance for a client that resumed after a proxy restart
-  without re-sending a `SerialProxyConfigureRequest` (real ESPHome hardware
-  retains its UART settings across a reconnect, so clients legitimately
-  assume the proxy does too).
+  without re-sending a `SerialProxyConfigureRequest` — real ESPHome
+  hardware retains its UART settings across a reconnect, so clients
+  legitimately assume the proxy does too) and `UniversalProxy.Hardware.
+  list_ports/0` (decorates the Overview drawer's "Serial settings" row).
 
   Keyed by `UniversalProxy.Hardware`'s stable port id (`"p_" <> slot`),
   which survives replug on the same physical port.
 
   The DETS file lives on the writable data partition on Nerves
-  (`/data/esphome_serial_settings.dets`) and in `_build/` on the host for
+  (`/data/uart_settings.dets`) and in `_build/` on the host for
   development. It is owned at the top-level application supervisor (a peer
   to `ConfigStore`/`PskStore`, not inside `ESPHome.Supervisor`) so a
   `restart/0` of the ESPHome subtree never closes the DETS file.
@@ -58,20 +61,30 @@ defmodule UniversalProxy.ESPHome.SerialProxy.SettingsStore do
     GenServer.call(server, {:get, port_id})
   end
 
+  @doc """
+  Snapshot of every persisted port's line settings, keyed by port id.
+  Used by `Hardware.list_ports/0` to decorate port maps in one call
+  instead of N lookups.
+  """
+  @spec all_opts(GenServer.server()) :: %{String.t() => keyword()}
+  def all_opts(server \\ __MODULE__) do
+    GenServer.call(server, :all)
+  end
+
   # -- Server Callbacks --
 
   @impl GenServer
   def init(opts) do
-    table_name = Keyword.get(opts, :table, :esphome_serial_settings)
+    table_name = Keyword.get(opts, :table, :uart_settings)
     path = Keyword.get(opts, :dets_path) || dets_path()
 
     case :dets.open_file(table_name, file: to_charlist(path), type: :set) do
       {:ok, table} ->
-        Logger.info("ESPHome serial settings store opened at #{path}")
+        Logger.info("UART settings store opened at #{path}")
         {:ok, %{table: table}}
 
       {:error, reason} ->
-        Logger.error("ESPHome serial settings store failed to open #{path}: #{inspect(reason)}")
+        Logger.error("UART settings store failed to open #{path}: #{inspect(reason)}")
         {:stop, reason}
     end
   end
@@ -88,13 +101,18 @@ defmodule UniversalProxy.ESPHome.SerialProxy.SettingsStore do
       {:reply, :ok, state}
     else
       {:error, reason} ->
-        Logger.error("ESPHome serial settings store write failed: #{inspect(reason)}")
+        Logger.error("UART settings store write failed: #{inspect(reason)}")
         {:reply, {:error, reason}, state}
     end
   end
 
   def handle_call({:get, port_id}, _from, state) do
     {:reply, read_opts(state.table, port_id), state}
+  end
+
+  def handle_call(:all, _from, state) do
+    all = :dets.foldl(fn {id, opts}, acc -> Map.put(acc, id, opts) end, %{}, state.table)
+    {:reply, all, state}
   end
 
   # -- Private --
@@ -108,9 +126,9 @@ defmodule UniversalProxy.ESPHome.SerialProxy.SettingsStore do
 
   defp dets_path do
     if File.dir?("/data") do
-      "/data/esphome_serial_settings.dets"
+      "/data/uart_settings.dets"
     else
-      Path.join([File.cwd!(), "_build", "esphome_serial_settings.dets"])
+      Path.join([File.cwd!(), "_build", "uart_settings.dets"])
     end
   end
 end
