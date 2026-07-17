@@ -44,6 +44,16 @@ defmodule UniversalProxy.Application do
         # top level so a restart/0 of the ESPHome subtree never closes its
         # DETS file. Holds the HA-provisioned API encryption key.
         UniversalProxy.ESPHome.PskStore,
+        # UART per-port line-settings store (DETS). Sits beside
+        # ConfigStore/PskStore at the top level so a restart/0 of the
+        # ESPHome subtree never closes its DETS file, since the writer
+        # (the ESPHome serial-proxy adapter) lives there. Remembers the
+        # last settings each port was successfully opened with, served
+        # back through the serial-proxy adapter's default_open_opts/1 so a
+        # client resuming after a restart without CONFIGURE gets the
+        # right baud rate instead of the espex 9600-8-N-1 fallback, and
+        # through Hardware.list_ports/0 for the Overview drawer display.
+        UniversalProxy.UART.SettingsStore,
         # Firmware update flow (ConfigStore + library Supervisor, wired
         # together so the snapshot lands before the library starts).
         UniversalProxy.FirmwareUpdate,

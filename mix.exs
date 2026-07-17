@@ -113,7 +113,7 @@ defmodule UniversalProxy.MixProject do
       {:muontrap, "~> 1.8"},
 
       # ESPHome Native API server library
-      {:espex, "~> 0.7"},
+      {:espex, "~> 0.8"},
 
       # Dependencies for all targets
       {:nerves, "~> 1.10", runtime: false},

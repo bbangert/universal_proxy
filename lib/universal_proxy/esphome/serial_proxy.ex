@@ -20,6 +20,25 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
   `SERIAL_PROXY_REQUEST_TYPE_SUBSCRIBE`. `UNSUBSCRIBE` halts forwarding
   again. Both are handled through `c:Espex.SerialProxy.request/2` and
   routed to the per-instance `Relay`.
+
+  espex 0.8 tracks subscribe *intent* per connection rather than a
+  one-shot stash: the client's first operation of any kind (write,
+  subscribe, modem pins, flush) against an advertised-but-unopened
+  instance lazily opens it via `open/3`, and a previously-set subscribe
+  intent is reattached (another `request/2` call) after *every*
+  successful open — whether that open was triggered by CONFIGURE or by
+  the lazy path. This lets a client resume traffic (e.g. Home Assistant
+  writing to a Zigbee coordinator, or re-subscribing) after a proxy
+  restart without re-sending CONFIGURE first.
+
+  ## Persisted line settings
+
+  A lazily-opened instance has no CONFIGURE to draw options from, so
+  `default_open_opts/1` below serves the settings the port was last
+  successfully opened with (persisted in `SettingsStore`) instead of
+  espex's 9600-8-N-1 fallback. Real ESPHome hardware retains its UART
+  settings across a client reconnect, so this keeps a resumed connection
+  talking at the baud rate the attached device actually expects.
   """
 
   @behaviour Espex.SerialProxy
@@ -30,6 +49,7 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
   alias UniversalProxy.ESPHome.SerialProxy.Relay
   alias UniversalProxy.Hardware
   alias UniversalProxy.UART
+  alias UniversalProxy.UART.SettingsStore
 
   @impl true
   def list_instances do
@@ -43,12 +63,14 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
   @impl true
   def open(instance, opts, subscriber) do
     case Enum.at(inventory(), instance) do
-      %{path: path, friendly_name: friendly_name} ->
+      %{id: id, path: path, friendly_name: friendly_name} ->
         with {:ok, _pid} <- UART.open(path, Keyword.put(opts, :friendly_name, friendly_name)),
              {:ok, relay} <- start_relay_or_close(path, friendly_name, subscriber) do
           Logger.info(
             "ESPHome serial proxy opened instance #{instance} (#{friendly_name} @ #{path}, #{opts[:speed]} baud)"
           )
+
+          persist_opts(id, opts)
 
           {:ok, {relay, path}}
         else
@@ -62,6 +84,20 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
 
       nil ->
         {:error, :no_such_instance}
+    end
+  end
+
+  @impl true
+  def default_open_opts(instance) do
+    # espex 0.8 calls this when a client operates on an advertised
+    # instance without a prior CONFIGURE on this connection (e.g. HA
+    # resuming after a proxy restart). Serve the settings the port was
+    # last successfully opened with; fall back to espex's 9600-8-N-1.
+    with %{id: id} <- Enum.at(inventory(), instance),
+         opts when is_list(opts) <- get_stored_opts(id) do
+      opts
+    else
+      _ -> Espex.SerialProxy.default_open_opts()
     end
   end
 
@@ -99,9 +135,11 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
     end
   end
 
-  # Espex.Connection calls set_modem_pins/3 and get_modem_pins/1 unguarded
-  # (no `function_exported?` check), so we provide stubs even though both
-  # are declared `@optional_callbacks` in `Espex.SerialProxy`.
+  # espex 0.8 guards both set_modem_pins/3 and get_modem_pins/1 with
+  # function_exported? and would otherwise fall back to its own
+  # omitted-callback default (all lines low / no-op). We keep these stubs
+  # anyway to answer NOT_SUPPORTED explicitly rather than relying on that
+  # fallback.
   @impl true
   def set_modem_pins(_handle, _rts, _dtr), do: {:error, :not_supported}
 
@@ -143,11 +181,37 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
     end)
     |> Enum.map(fn port ->
       %{
+        id: port.id,
         path: port.tty_name,
         friendly_name: port.ha_name,
         port_type: port.kind
       }
     end)
     |> Enum.sort_by(& &1.friendly_name)
+  end
+
+  # Best-effort: a `SettingsStore` hiccup (down, wedged, or DETS write
+  # failure) must not fail an otherwise-good open. Follows this project's
+  # public-API `catch :exit` idiom (CLAUDE.md) — a wedged store degrades
+  # to "settings not persisted" rather than failing the connection.
+  defp persist_opts(id, opts) do
+    case SettingsStore.put_opts(id, opts) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("ESPHome serial settings store write failed for #{id}: #{inspect(reason)}")
+    end
+  catch
+    :exit, reason ->
+      Logger.warning("ESPHome serial settings store unavailable for #{id}: #{inspect(reason)}")
+  end
+
+  # Same idiom as persist_opts/2: a down/wedged store must degrade to the
+  # espex default, not crash the espex connection process.
+  defp get_stored_opts(id) do
+    SettingsStore.get_opts(id)
+  catch
+    :exit, _ -> nil
   end
 end
