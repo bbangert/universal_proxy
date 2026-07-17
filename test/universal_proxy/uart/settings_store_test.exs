@@ -1,14 +1,19 @@
 defmodule UniversalProxy.UART.SettingsStoreTest do
-  # Each test gets its own unnamed store backed by a unique temp DETS file
-  # (mirrors PskStoreTest's isolation pattern), so this module is safe to
-  # run async.
-  use ExUnit.Case, async: true
+  # async: false because DETS table names must be atoms; serialized, the
+  # fixed table atoms below are safe to reuse without minting a new atom
+  # per test run (mirrors PskStoreTest/ConfigStoreTest). Each test still
+  # gets its own unnamed store on a unique temp DETS file.
+  use ExUnit.Case, async: false
 
   alias UniversalProxy.UART.SettingsStore
 
-  setup do
-    table = :"uart_settings_unit_test_#{System.unique_integer([:positive])}"
+  @table :uart_settings_unit_test
+  # The top-level setup also runs for the persistence test, which opens
+  # its own stores — a second table under the same atom would collide, so
+  # it gets a distinct fixed atom.
+  @persist_table :uart_settings_persist_test
 
+  setup do
     path =
       Path.join(
         System.tmp_dir!(),
@@ -17,10 +22,10 @@ defmodule UniversalProxy.UART.SettingsStoreTest do
 
     File.rm(path)
 
-    store = start_supervised!({SettingsStore, name: nil, table: table, dets_path: path})
+    store = start_supervised!({SettingsStore, name: nil, table: @table, dets_path: path})
     on_exit(fn -> File.rm(path) end)
 
-    %{store: store, path: path, table: table}
+    %{store: store, path: path}
   end
 
   test "get_opts/2 is nil for an unknown port id", %{store: store} do
@@ -58,14 +63,13 @@ defmodule UniversalProxy.UART.SettingsStoreTest do
       )
 
     File.rm(path)
-    tbl = :"uart_settings_persist_test_#{System.unique_integer([:positive])}"
     opts = [speed: 57_600, data_bits: 8, stop_bits: 1, parity: :even, flow_control: :hardware]
 
-    {:ok, store1} = SettingsStore.start_link(name: nil, table: tbl, dets_path: path)
+    {:ok, store1} = SettingsStore.start_link(name: nil, table: @persist_table, dets_path: path)
     :ok = SettingsStore.put_opts(store1, "p_2_1", opts)
     :ok = GenServer.stop(store1)
 
-    {:ok, store2} = SettingsStore.start_link(name: nil, table: tbl, dets_path: path)
+    {:ok, store2} = SettingsStore.start_link(name: nil, table: @persist_table, dets_path: path)
     assert SettingsStore.get_opts(store2, "p_2_1") == opts
     :ok = GenServer.stop(store2)
     File.rm(path)

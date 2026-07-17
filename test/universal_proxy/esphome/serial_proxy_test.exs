@@ -156,6 +156,10 @@ defmodule UniversalProxy.ESPHome.SerialProxyTest do
                Espex.SerialProxy.default_open_opts()
     end
 
+    # Writes to the app-started SettingsStore (real persisted DETS state),
+    # so it must never run in a default `mix test` — opt in with
+    # `--include hardware` on a machine where mutating that state is fine.
+    @tag :hardware
     test "round-trips settings persisted through a real port, if hardware is present" do
       case UniversalProxy.Hardware.list_ports() do
         [] ->
