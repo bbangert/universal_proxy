@@ -176,8 +176,8 @@ defmodule UniversalProxy.Hardware do
       target-based mapping; pass `nil` for dynamic mode)
     * `:saved_configs` — pre-built `%{serial_number => config}` map
     * `:line_settings` — pre-built `%{port_id => keyword()}` map of
-      persisted UART line settings (see `UniversalProxy.UART.SettingsStore.
-      all_opts/1`)
+      persisted UART line settings (see
+      `UniversalProxy.UART.SettingsStore.all_opts/1`)
     * `:in_use_ports` — pre-built `MapSet` of currently-opened tty
       basenames
     * `:zwave_claim` — the Z-Wave proxy's port claim
