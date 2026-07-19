@@ -104,7 +104,7 @@ defmodule UniversalProxy.Bluetooth do
   # SBC stream), and generic USB HCI adapters stutter behind the dwc_otg USB
   # controller (HW-tested 2026-07-07: periodic 3–15 s dropouts on an
   # RTL8761BU that plays flawlessly on rpi4's xHCI). Dedicated BT-audio
-  # dongles (Creative BTD 700, FlooGoo FMA120) are NOT affected — they
+  # dongles (Sennheiser BTD 700, FlooGoo FMA120) are NOT affected — they
   # enumerate as USB sound cards, so they bypass the audio role entirely.
   # :host keeps the role available for UI dev and host tests.
   @audio_role_targets [:rpi4, :rpi5, :x86_64, :host]

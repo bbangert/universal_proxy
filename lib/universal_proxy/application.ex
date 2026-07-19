@@ -37,7 +37,17 @@ defmodule UniversalProxy.Application do
         # (`sendspin:output_added`) flow. No-op when no FMA120 is attached
         # (empty inventory); works on host.
         UniversalProxy.FMA120.Store,
+        # Sennheiser BTD 700 control channel (DETS prefs store). Same
+        # rationale as FMA120.Store above: sits at the top level, outside
+        # the future BTD700 `:one_for_all` subtree, so a subtree crash
+        # never closes the DETS file.
+        UniversalProxy.BTD700.Store,
         UniversalProxy.FMA120.Supervisor,
+        # Sennheiser BTD 700 control channel (:one_for_all WorkerSupervisor +
+        # Server). AFTER Audio.Supervisor so its hotplug events flow, same
+        # rationale as FMA120.Supervisor above. No-op when no BTD 700 is
+        # attached (empty inventory); works on host.
+        UniversalProxy.BTD700.Supervisor,
         # ESPHome device identity store (DETS)
         UniversalProxy.ESPHome.ConfigStore,
         # ESPHome Noise PSK store (DETS). Sits beside ConfigStore at the

@@ -116,6 +116,19 @@ defmodule UniversalProxy.Hardware do
        chip: "Qualcomm/CSR",
        locked: true
      }},
+    # Sennheiser BTD 700 USB Bluetooth-audio dongle. The audio half enumerates
+    # as a snd-usb-audio card; the control channel is HID-only (report ID
+    # 0x34 on a vendor usage-page collection) — there is no CDC-ACM tty, so
+    # `UART.Server` can never collide with `BTD700.DeviceWorker`. This entry
+    # exists for the device table / hub-name fallback / introspection.
+    {0x3542, 0x3001,
+     %{
+       kind: :bt_audio,
+       name: "Sennheiser BTD 700",
+       vendor: "Sennheiser",
+       chip: "Qualcomm",
+       locked: true
+     }},
 
     # ── Generic USB-to-serial chipsets (kind is editable) ─────────
     # The same chip is sold in both TTL pigtails and DB9 RS-232 cables;
