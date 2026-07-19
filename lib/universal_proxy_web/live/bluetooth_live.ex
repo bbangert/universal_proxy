@@ -509,7 +509,7 @@ defmodule UniversalProxyWeb.BluetoothLive do
             This board's Bluetooth radios can't stream audio reliably, so the
             <strong>Audio</strong> role is unavailable here. To play to Bluetooth
             speakers or headphones, use a dedicated USB Bluetooth-audio
-            transmitter (e.g. Creative BTD&nbsp;700, FlooGoo FMA120) — it shows
+            transmitter (e.g. Sennheiser BTD&nbsp;700, FlooGoo FMA120) — it shows
             up under
             <.link navigate="/audio" class="text-accent hover:underline">Audio</.link>
             outputs automatically.

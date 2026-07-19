@@ -3,6 +3,19 @@ defmodule UniversalProxy.HardwareTest do
 
   alias UniversalProxy.Hardware
 
+  describe "known_devices/0" do
+    test "includes the Sennheiser BTD 700 as a locked bt_audio device" do
+      assert {0x3542, 0x3001, info} =
+               Enum.find(Hardware.known_devices(), fn {vid, pid, _} ->
+                 {vid, pid} == {0x3542, 0x3001}
+               end)
+
+      assert info.kind == :bt_audio
+      assert info.name == "Sennheiser BTD 700"
+      assert info.locked == true
+    end
+  end
+
   describe "list_ports/1 in dynamic mode (no slot mapping)" do
     test "auto-detects a Z-Wave ZWA-2 by VID/PID and locks the kind" do
       [port] =

@@ -15,6 +15,7 @@ defmodule UniversalProxyWeb.OverviewLive do
   alias UniversalProxy.Audio
   alias UniversalProxy.Bluetooth
   alias UniversalProxy.Bluetooth.AudioManager
+  alias UniversalProxy.BTD700
   alias UniversalProxy.FMA120
   alias UniversalProxy.Hardware
   alias UniversalProxy.System, as: Sys
@@ -39,6 +40,9 @@ defmodule UniversalProxyWeb.OverviewLive do
         Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:state")
         # FlooGoo FMA120 control-channel state (firmware, codec, mode, devices).
         Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "fma120:state")
+        # Sennheiser BTD 700 control-channel state (firmware, mode, codecs,
+        # dongle/LE/sink status, Auracast broadcast info).
+        Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "btd700:state")
         # USB Bluetooth radios surface in the hardware list too; the radio
         # list (incl. in_use?) is rebroadcast on enumeration change.
         Phoenix.PubSub.subscribe(UniversalProxy.PubSub, Bluetooth.radios_topic())
@@ -58,6 +62,8 @@ defmodule UniversalProxyWeb.OverviewLive do
      |> assign(:selected_port, nil)
      |> assign(:selected_fma120, nil)
      |> assign(:fma120_states, if(connected?(socket), do: seed_fma120_states(), else: %{}))
+     |> assign(:selected_btd700, nil)
+     |> assign(:btd700_states, if(connected?(socket), do: seed_btd700_states(), else: %{}))
      |> assign(:throughput_snapshots, snapshots)
      |> assign(:packet_rate, packet_rate)
      |> assign(:pending_kind_change, nil)
@@ -153,6 +159,92 @@ defmodule UniversalProxyWeb.OverviewLive do
       current = bcast_mode_byte(socket.assigns.fma120_states[key])
       FMA120.set_broadcast_mode(key, Bitwise.bxor(current, bit_value(bit)))
     end)
+  end
+
+  # ── BTD 700 control drawer ────────────────────────────────────────────
+
+  def handle_event("select_btd700", %{"key" => b64}, socket) do
+    case decode_btd700_key(b64) do
+      {:ok, key} -> {:noreply, assign(socket, :selected_btd700, key)}
+      {:error, _} -> {:noreply, socket}
+    end
+  end
+
+  def handle_event("close_btd700_drawer", _params, socket) do
+    {:noreply, assign(socket, :selected_btd700, nil)}
+  end
+
+  def handle_event("btd700_set_mode", %{"key" => b64, "mode" => mode}, socket) do
+    with_btd700(socket, b64, fn key -> BTD700.set_audio_mode(key, btd700_mode_atom(mode)) end)
+  end
+
+  # Toggle one codec bit against the SAVED/current `codec_in_use` mask and
+  # send the full resulting atom list — the wire has no single-codec
+  # selector (`BTD700.set_codec_mask/2` always writes the whole mask).
+  def handle_event("btd700_toggle_codec", %{"key" => b64, "codec" => codec}, socket) do
+    case btd700_codec_atom(codec) do
+      nil ->
+        {:noreply, socket}
+
+      codec_atom ->
+        with_btd700(socket, b64, fn key ->
+          current = btd700_codec_list(get_in(socket.assigns.btd700_states, [key, :codec_in_use]))
+
+          updated =
+            if codec_atom in current,
+              do: List.delete(current, codec_atom),
+              else: [codec_atom | current]
+
+          BTD700.set_codec_mask(key, updated)
+        end)
+    end
+  end
+
+  def handle_event("btd700_connect", %{"key" => b64}, socket) do
+    with_btd700(socket, b64, &BTD700.connect/1)
+  end
+
+  def handle_event("btd700_disconnect", %{"key" => b64}, socket) do
+    with_btd700(socket, b64, &BTD700.disconnect/1)
+  end
+
+  # Broadcast on/off is a toggle: read the current tri-field broadcast info,
+  # flip just `state`, and resend the whole map (the wire command bundles
+  # state/encryption/quality in one write).
+  def handle_event("btd700_set_bcast_state", %{"key" => b64}, socket) do
+    with_btd700(socket, b64, fn key ->
+      info = btd700_broadcast_info(btd700_state_for(socket, key))
+      new_state = if info.state == :on_public, do: :off_private, else: :on_public
+      BTD700.set_broadcast_info(key, %{info | state: new_state})
+    end)
+  end
+
+  def handle_event("btd700_set_bcast_quality", %{"key" => b64, "quality" => quality}, socket) do
+    with_btd700(socket, b64, fn key ->
+      info = btd700_broadcast_info(btd700_state_for(socket, key))
+      BTD700.set_broadcast_info(key, %{info | quality: btd700_quality_atom(quality)})
+    end)
+  end
+
+  def handle_event("btd700_set_bcast_enc", %{"key" => b64}, socket) do
+    with_btd700(socket, b64, fn key ->
+      info = btd700_broadcast_info(btd700_state_for(socket, key))
+      BTD700.set_broadcast_info(key, %{info | encryption: not info.encryption})
+    end)
+  end
+
+  def handle_event("btd700_set_bcast_name", %{"key" => b64, "name" => name}, socket) do
+    with_btd700(socket, b64, fn key -> BTD700.set_broadcast_name(key, name) end)
+  end
+
+  # The passphrase is fire-and-forget and never assigned to socket state, so
+  # it can never be echoed back into the rendered key-form input.
+  def handle_event("btd700_set_bcast_key", %{"key" => b64, "secret" => secret}, socket) do
+    with_btd700(socket, b64, fn key -> BTD700.set_broadcast_key(key, secret) end)
+  end
+
+  def handle_event("btd700_factory_reset", %{"key" => b64}, socket) do
+    with_btd700(socket, b64, &BTD700.factory_reset/1)
   end
 
   # Peripheral rows (USB audio / USB Bluetooth) are claimed automatically
@@ -344,6 +436,17 @@ defmodule UniversalProxyWeb.OverviewLive do
       end
 
     {:noreply, assign(socket, :fma120_states, Map.put(states, key, merged))}
+  end
+
+  # Merge a BTD 700 control-state partial (always `%{one_field => value}`,
+  # per `DeviceWorker.cache_and_broadcast/3`) into the cached per-device
+  # state. No nested collection to merge here (unlike FMA120's `:devices`
+  # map), so a plain shallow merge suffices.
+  def handle_info({:btd700_state, key, partial}, socket) do
+    states = socket.assigns.btd700_states
+    existing = Map.get(states, key, %{})
+    merged = Map.merge(existing, scrub_btd700_partial(partial))
+    {:noreply, assign(socket, :btd700_states, Map.put(states, key, merged))}
   end
 
   def handle_info(_msg, socket), do: {:noreply, socket}
@@ -577,6 +680,13 @@ defmodule UniversalProxyWeb.OverviewLive do
       state={Map.get(@fma120_states, @selected_fma120, %{})}
     />
 
+    <.btd700_drawer
+      :if={@selected_btd700}
+      key={@selected_btd700}
+      encoded_key={encode_key(@selected_btd700)}
+      state={Map.get(@btd700_states, @selected_btd700, %{})}
+    />
+
     <.modal
       open={@pending_kind_change != nil}
       on_close="cancel_kind_change"
@@ -610,6 +720,14 @@ defmodule UniversalProxyWeb.OverviewLive do
   defp fma120_key?({_slot, @fma120_vid, @fma120_pid}), do: true
   defp fma120_key?(_), do: false
 
+  # Sennheiser BTD 700 USB BT-audio dongle (BTD 600, PID 0x3000, is a
+  # different unsupported device — never widen this match).
+  @btd700_vid 0x3542
+  @btd700_pid 0x3001
+
+  defp btd700_key?({_slot, @btd700_vid, @btd700_pid}), do: true
+  defp btd700_key?(_), do: false
+
   # Seed the per-device control-state cache from the running context, so a
   # fresh mount renders current status without waiting for a broadcast.
   defp seed_fma120_states do
@@ -634,6 +752,85 @@ defmodule UniversalProxyWeb.OverviewLive do
 
       {:error, _} ->
         {:noreply, socket}
+    end
+  end
+
+  # ── BTD700 helpers ────────────────────────────────────────────────────
+
+  # Seed the per-device control-state cache from the running context, so a
+  # fresh mount renders current status without waiting for a broadcast.
+  defp seed_btd700_states do
+    BTD700.list_devices()
+    |> Enum.reduce(%{}, fn %{key: key}, acc ->
+      case BTD700.get_state(key) do
+        {:ok, state} -> Map.put(acc, key, scrub_btd700_partial(state))
+        _ -> acc
+      end
+    end)
+  rescue
+    _ -> %{}
+  end
+
+  # Protocol.decode/1 hands the broadcast name back as raw wire bytes
+  # (deliberately never UTF-8-validated at the protocol layer). Rendered
+  # HTML would survive invalid bytes, but the connected render's diff is
+  # JSON-encoded and Jason raises on invalid UTF-8 — a buggy dongle name
+  # would crash the LiveView. Scrub at the assign boundary; nil renders as
+  # the usual empty/placeholder value.
+  defp scrub_btd700_partial(%{broadcast_name: name} = partial) when is_binary(name) do
+    if String.valid?(name), do: partial, else: %{partial | broadcast_name: nil}
+  end
+
+  defp scrub_btd700_partial(partial), do: partial
+
+  # Run a BTD700 control action by decoded key; result is fire-and-forget
+  # (the device echoes state back over "btd700:state").
+  defp with_btd700(socket, b64, fun) do
+    case decode_btd700_key(b64) do
+      {:ok, key} ->
+        _ = fun.(key)
+        {:noreply, socket}
+
+      {:error, _} ->
+        {:noreply, socket}
+    end
+  end
+
+  defp btd700_state_for(socket, key), do: Map.get(socket.assigns.btd700_states, key, %{})
+
+  defp btd700_mode_atom("gaming"), do: :gaming
+  defp btd700_mode_atom("broadcast"), do: :broadcast
+  defp btd700_mode_atom(_), do: :high_quality
+
+  defp btd700_quality_atom("standard_24k"), do: :standard_24k
+  defp btd700_quality_atom("high"), do: :high
+  defp btd700_quality_atom(_), do: :standard_16k
+
+  defp btd700_codec_atom("sbc"), do: :sbc
+  defp btd700_codec_atom("aptx"), do: :aptx
+  defp btd700_codec_atom("aptx_adaptive"), do: :aptx_adaptive
+  defp btd700_codec_atom("aptx_lossless"), do: :aptx_lossless
+  defp btd700_codec_atom("aptx_lite"), do: :aptx_lite
+  defp btd700_codec_atom("lc3"), do: :lc3
+  defp btd700_codec_atom(_), do: nil
+
+  defp btd700_codec_list(list) when is_list(list), do: list
+  defp btd700_codec_list(_), do: []
+
+  # `broadcast_info` decodes to `%{state, encryption, quality}` with
+  # `encryption` as the wire atom `:on`/`:off` — normalized here to a
+  # boolean so callers (both the drawer render and the event handlers that
+  # resend the full tri-field map) share one shape. Any other cache value
+  # (nil before the handshake completes, or a length-guarded `%{raw: _}`)
+  # falls back to the device's power-on defaults rather than crashing.
+  defp btd700_broadcast_info(state) do
+    case Map.get(state, :broadcast_info) do
+      %{state: s, encryption: e, quality: q} = info
+      when s in [:off_private, :on_public] and q in [:standard_16k, :standard_24k, :high] ->
+        %{info | encryption: e == :on}
+
+      _ ->
+        %{state: :off_private, encryption: false, quality: :standard_16k}
     end
   end
 
@@ -718,6 +915,19 @@ defmodule UniversalProxyWeb.OverviewLive do
   end
 
   defp decode_key(_), do: {:error, :invalid_key}
+
+  defp decode_btd700_key(b64) when is_binary(b64) do
+    with {:ok, bin} <- Base.url_decode64(b64, padding: false),
+         true <- byte_size(bin) <= 256,
+         {:ok, term} <- safe_binary_to_term(bin),
+         true <- btd700_key?(term) do
+      {:ok, term}
+    else
+      _ -> {:error, :invalid_key}
+    end
+  end
+
+  defp decode_btd700_key(_), do: {:error, :invalid_key}
 
   defp safe_binary_to_term(bin) do
     {:ok, :erlang.binary_to_term(bin, [:safe])}
@@ -969,6 +1179,21 @@ defmodule UniversalProxyWeb.OverviewLive do
       class="cursor-pointer hover:bg-sunken last:[&_td]:border-b-0"
       phx-click="select_fma120"
       phx-value-key={@p.fma120_key}
+    >
+      <.peripheral_cells p={@p} />
+    </tr>
+    """
+  end
+
+  # BTD 700 rows open their own control drawer (select_btd700). Distinct
+  # VID:PID from FMA120, so this clause can never shadow (or be shadowed
+  # by) the fma120? clause above.
+  defp peripheral_row(%{p: %{btd700?: true}} = assigns) do
+    ~H"""
+    <tr
+      class="cursor-pointer hover:bg-sunken last:[&_td]:border-b-0"
+      phx-click="select_btd700"
+      phx-value-key={@p.btd700_key}
     >
       <.peripheral_cells p={@p} />
     </tr>
@@ -1341,6 +1566,339 @@ defmodule UniversalProxyWeb.OverviewLive do
   defp fma120_codec_label(codec) do
     codec |> to_string() |> String.upcase() |> String.replace("_", " ")
   end
+
+  # ── BTD 700 control drawer ─────────────────────────────────────────────
+  # Mode-driven, same shape as the FMA120 drawer above: the `audio_mode` is
+  # the 1:1-vs-Auracast switch, so exactly one body renders at a time.
+  attr(:key, :any, required: true)
+  attr(:encoded_key, :string, required: true)
+  attr(:state, :map, required: true)
+
+  defp btd700_drawer(assigns) do
+    mode = get_in(assigns.state, [:audio_mode, :mode]) || :high_quality
+    assigns = assign(assigns, :mode, mode)
+
+    ~H"""
+    <div class="fixed inset-0 z-[90] flex justify-end animate-fade">
+      <div phx-click="close_btd700_drawer" class="absolute inset-0 bg-overlay"></div>
+      <div class="relative w-[440px] bg-raised h-full shadow-lg overflow-auto animate-slide-in flex flex-col">
+        <%!-- Header --%>
+        <div class="px-6 py-5 border-b border-border-1 flex items-start gap-3">
+          <div class="w-10 h-10 rounded-md bg-accent-soft text-accent flex items-center justify-center">
+            <.icon name={:bluetooth} size={20} />
+          </div>
+          <div class="flex-1 min-w-0">
+            <div class="text-xs font-bold text-fg-3 tracking-caps">Sennheiser BTD 700</div>
+            <div class="text-lg font-semibold tracking-tight mt-0.5">
+              {btd700_fw_label(@state)}
+            </div>
+            <div class="mt-2 text-sm text-fg-2">{btd700_status_line(@state)}</div>
+          </div>
+          <.button variant={:ghost} size={:sm} phx-click="close_btd700_drawer">
+            <.icon name={:x} size={16} />
+          </.button>
+        </div>
+
+        <%!-- Mode selector (segmented) --%>
+        <div class="px-6 py-4 border-b border-border-1">
+          <div class="text-xs font-semibold text-fg-3 uppercase tracking-caps mb-2">Audio mode</div>
+          <div class="flex gap-1.5">
+            <.btd700_mode_button key={@encoded_key} mode="high_quality" current={@mode} label="High Quality" />
+            <.btd700_mode_button key={@encoded_key} mode="gaming" current={@mode} label="Gaming" />
+            <.btd700_mode_button key={@encoded_key} mode="broadcast" current={@mode} label="Broadcast" />
+          </div>
+        </div>
+
+        <%!-- Mode-driven body --%>
+        <.btd700_broadcast_body :if={@mode == :broadcast} key={@encoded_key} state={@state} />
+        <.btd700_unicast_body :if={@mode != :broadcast} key={@encoded_key} state={@state} />
+
+        <%!-- Footer --%>
+        <div class="mt-auto px-6 py-4 border-t border-border-1 flex items-center gap-2 flex-wrap">
+          <.button
+            variant={:danger}
+            size={:sm}
+            phx-click="btd700_factory_reset"
+            phx-value-key={@encoded_key}
+            data-confirm="Factory reset this BTD 700? This clears all paired devices and Auracast settings."
+          >
+            <.icon name={:alert} size={14} /> Factory reset
+          </.button>
+          <div class="flex-1"></div>
+          <.link navigate="/audio" class="text-sm text-accent font-medium hover:underline">
+            Audio settings →
+          </.link>
+        </div>
+      </div>
+    </div>
+    """
+  end
+
+  attr(:key, :string, required: true)
+  attr(:mode, :string, required: true)
+  attr(:current, :atom, required: true)
+  attr(:label, :string, required: true)
+
+  defp btd700_mode_button(assigns) do
+    ~H"""
+    <.button
+      variant={if to_string(@current) == @mode, do: :primary, else: :secondary}
+      size={:sm}
+      phx-click="btd700_set_mode"
+      phx-value-key={@key}
+      phx-value-mode={@mode}
+    >
+      {@label}
+    </.button>
+    """
+  end
+
+  # Unicast body (mode != broadcast): dongle/LE/sink status, audio-quality
+  # readout (read-only), codec-in-use + supported-codec toggle chips,
+  # connect/disconnect triggers.
+  attr(:key, :string, required: true)
+  attr(:state, :map, required: true)
+
+  defp btd700_unicast_body(assigns) do
+    supported = btd700_codec_list(assigns.state[:supported_codecs])
+    in_use = btd700_codec_list(assigns.state[:codec_in_use])
+
+    assigns =
+      assigns
+      |> assign(:supported, supported)
+      |> assign(:in_use, in_use)
+
+    ~H"""
+    <div class="px-6 py-4 space-y-4">
+      <div class="grid grid-cols-2 gap-3 text-sm">
+        <div>
+          <div class="text-xs font-semibold text-fg-3 uppercase tracking-caps">Dongle</div>
+          <div class="text-fg-1 mt-0.5">{btd700_enum_label(@state[:dongle_state])}</div>
+        </div>
+        <div>
+          <div class="text-xs font-semibold text-fg-3 uppercase tracking-caps">LE audio</div>
+          <div class="text-fg-1 mt-0.5">{btd700_enum_label(@state[:le_audio_state])}</div>
+        </div>
+        <div>
+          <div class="text-xs font-semibold text-fg-3 uppercase tracking-caps">Sink transport</div>
+          <div class="text-fg-1 mt-0.5">{btd700_enum_label(@state[:sink_transport])}</div>
+        </div>
+        <div>
+          <div class="text-xs font-semibold text-fg-3 uppercase tracking-caps">Audio quality</div>
+          <div class="text-fg-1 mt-0.5">{btd700_quality_label(@state[:audio_quality])}</div>
+        </div>
+      </div>
+
+      <div class="flex items-center gap-2">
+        <span class="text-xs font-semibold text-fg-3 uppercase tracking-caps">In use</span>
+        <.badge variant={:neutral}>{btd700_codec_join_label(@in_use)}</.badge>
+      </div>
+
+      <div>
+        <div class="text-xs font-semibold text-fg-3 uppercase tracking-caps mb-2">Codecs</div>
+        <div :if={@supported == []} class="text-sm text-fg-3">—</div>
+        <div class="flex gap-1.5 flex-wrap">
+          <.button
+            :for={codec <- @supported}
+            variant={if codec in @in_use, do: :primary, else: :secondary}
+            size={:sm}
+            phx-click="btd700_toggle_codec"
+            phx-value-key={@key}
+            phx-value-codec={codec}
+          >
+            {btd700_codec_label(codec)}
+          </.button>
+        </div>
+      </div>
+
+      <div class="flex gap-2">
+        <.button variant={:secondary} size={:sm} phx-click="btd700_connect" phx-value-key={@key}>
+          Connect
+        </.button>
+        <.button variant={:secondary} size={:sm} phx-click="btd700_disconnect" phx-value-key={@key}>
+          Disconnect
+        </.button>
+      </div>
+    </div>
+    """
+  end
+
+  # Broadcast (Auracast) body (mode == broadcast): on/off, name, quality,
+  # encryption toggle + key form.
+  attr(:key, :string, required: true)
+  attr(:state, :map, required: true)
+
+  defp btd700_broadcast_body(assigns) do
+    info = btd700_broadcast_info(assigns.state)
+    assigns = assign(assigns, :info, info)
+
+    ~H"""
+    <div class="px-6 py-4 space-y-4">
+      <div class="flex items-center justify-between">
+        <div>
+          <div class="text-xs font-semibold text-fg-3 uppercase tracking-caps">Broadcast</div>
+          <div class="text-sm text-fg-2 mt-0.5">
+            {if @info.state == :on_public, do: "On (public)", else: "Off"}
+          </div>
+        </div>
+        <.button
+          variant={if @info.state == :on_public, do: :primary, else: :secondary}
+          size={:sm}
+          phx-click="btd700_set_bcast_state"
+          phx-value-key={@key}
+        >
+          {if @info.state == :on_public, do: "Turn off", else: "Turn on"}
+        </.button>
+      </div>
+
+      <form phx-submit="btd700_set_bcast_name">
+        <input type="hidden" name="key" value={@key} />
+        <label class="text-xs font-semibold text-fg-3 uppercase tracking-caps">Broadcast name</label>
+        <div class="flex gap-2 mt-1">
+          <input
+            type="text"
+            name="name"
+            value={@state[:broadcast_name]}
+            class="flex-1 bg-sunken border border-border-2 rounded-sm px-2 py-1 text-base text-fg-1"
+            placeholder="Auracast name"
+          />
+          <.button variant={:primary} size={:sm} type="submit">Save</.button>
+        </div>
+      </form>
+
+      <%!-- Auracast/PBP tiers: Standard Quality has 16 kHz and 24 kHz
+           variants; High Quality is 48 kHz LC3. --%>
+      <div>
+        <div class="text-xs font-semibold text-fg-3 uppercase tracking-caps mb-2">Quality</div>
+        <div class="flex gap-1.5 flex-wrap">
+          <.button
+            variant={if @info.quality == :standard_16k, do: :primary, else: :secondary}
+            size={:sm}
+            title="Standard quality, 16 kHz"
+            phx-click="btd700_set_bcast_quality"
+            phx-value-key={@key}
+            phx-value-quality="standard_16k"
+          >
+            16k
+          </.button>
+          <.button
+            variant={if @info.quality == :standard_24k, do: :primary, else: :secondary}
+            size={:sm}
+            title="Standard quality, 24 kHz"
+            phx-click="btd700_set_bcast_quality"
+            phx-value-key={@key}
+            phx-value-quality="standard_24k"
+          >
+            24k
+          </.button>
+          <.button
+            variant={if @info.quality == :high, do: :primary, else: :secondary}
+            size={:sm}
+            title="High quality, 48 kHz"
+            phx-click="btd700_set_bcast_quality"
+            phx-value-key={@key}
+            phx-value-quality="high"
+          >
+            High
+          </.button>
+        </div>
+      </div>
+
+      <div class="flex items-center justify-between">
+        <div>
+          <div class="text-xs font-semibold text-fg-3 uppercase tracking-caps">Encryption</div>
+          <div class="text-sm text-fg-2 mt-0.5">{if @info.encryption, do: "On", else: "Off"}</div>
+        </div>
+        <.button
+          variant={if @info.encryption, do: :primary, else: :secondary}
+          size={:sm}
+          phx-click="btd700_set_bcast_enc"
+          phx-value-key={@key}
+        >
+          {if @info.encryption, do: "Turn off", else: "Turn on"}
+        </.button>
+      </div>
+
+      <%!-- Key input is intentionally never bound to any assign/cached
+           state — the passphrase is send-only (never persisted, never
+           echoed back from the device or the LiveView). --%>
+      <form phx-submit="btd700_set_bcast_key">
+        <input type="hidden" name="key" value={@key} />
+        <label class="text-xs font-semibold text-fg-3 uppercase tracking-caps">Broadcast key</label>
+        <div class="flex gap-2 mt-1">
+          <input
+            type="password"
+            name="secret"
+            class="flex-1 bg-sunken border border-border-2 rounded-sm px-2 py-1 text-base text-fg-1"
+            placeholder="Passphrase"
+          />
+          <.button variant={:primary} size={:sm} type="submit">Set</.button>
+        </div>
+      </form>
+    </div>
+    """
+  end
+
+  defp btd700_fw_label(%{firmware_version: %{version: v}}) when is_binary(v), do: "Firmware #{v}"
+  defp btd700_fw_label(_), do: "Bluetooth audio dongle"
+
+  # In broadcast mode the unicast headset-link state is meaningless noise
+  # (Auracast is connectionless) — show the broadcast status instead.
+  defp btd700_status_line(state) do
+    if get_in(state, [:audio_mode, :mode]) == :broadcast do
+      case get_in(state, [:broadcast_info, :state]) do
+        :on_public -> "Broadcasting '#{state[:broadcast_name] || "Auracast"}'"
+        :off_private -> "Broadcast off"
+        _ -> "Broadcast mode"
+      end
+    else
+      case Map.get(state, :dongle_state) do
+        :connected -> "Connected"
+        s when s in [:streaming_audio, :streaming_voice] -> "Connected · #{btd700_enum_label(s)}"
+        :disconnected -> "Not connected"
+        _ -> "Status unknown"
+      end
+    end
+  end
+
+  # Generic label for the plain-atom enums (`dongle_state`, `le_audio_state`,
+  # `sink_transport`, …) — `:unknown`/nil/a length-guarded `%{raw: _}` all
+  # render as an em-dash placeholder rather than crashing the drawer.
+  defp btd700_enum_label(nil), do: "—"
+  defp btd700_enum_label(:unknown), do: "—"
+  defp btd700_enum_label(%{raw: _}), do: "—"
+
+  defp btd700_enum_label(atom) when is_atom(atom) do
+    atom |> to_string() |> String.replace("_", " ") |> String.capitalize()
+  end
+
+  defp btd700_enum_label(_), do: "—"
+
+  defp btd700_quality_label(%{resolution: res, frequency: freq}) do
+    "#{btd700_resolution_label(res)} / #{btd700_frequency_label(freq)}"
+  end
+
+  defp btd700_quality_label(_), do: "—"
+
+  defp btd700_resolution_label(:res_16bit), do: "16-bit"
+  defp btd700_resolution_label(:res_24bit), do: "24-bit"
+  defp btd700_resolution_label(_), do: "—"
+
+  defp btd700_frequency_label(:freq_44100), do: "44.1 kHz"
+  defp btd700_frequency_label(:freq_48000), do: "48 kHz"
+  defp btd700_frequency_label(:freq_96000), do: "96 kHz"
+  defp btd700_frequency_label(_), do: "—"
+
+  defp btd700_codec_join_label([]), do: "—"
+  defp btd700_codec_join_label(codecs), do: Enum.map_join(codecs, ", ", &btd700_codec_label/1)
+
+  defp btd700_codec_label(:aptx_adaptive), do: "aptX Adaptive"
+  defp btd700_codec_label(:aptx_lossless), do: "aptX Lossless"
+  defp btd700_codec_label(:aptx_lite), do: "aptX Lite"
+  defp btd700_codec_label(:aptx), do: "aptX"
+  defp btd700_codec_label(:sbc), do: "SBC"
+  defp btd700_codec_label(:lc3), do: "LC3"
+  defp btd700_codec_label(codec), do: codec |> to_string() |> String.upcase()
 
   # ── Adapter cell (icon tile + name + sub-line + HA picker hint) ───────
   attr(:port, :map, required: true)
@@ -1749,10 +2307,13 @@ defmodule UniversalProxyWeb.OverviewLive do
         status: status,
         soft_class: "bg-audio-soft text-audio",
         dot_class: "bg-audio",
-        # FlooGoo FMA120 rows open the control drawer instead of routing to
-        # the Audio tab; other sound cards keep their goto_tab behavior.
+        # FlooGoo FMA120 and Sennheiser BTD 700 rows open their control
+        # drawer instead of routing to the Audio tab; other sound cards
+        # keep their goto_tab behavior.
         fma120?: fma120_key?(out.key),
-        fma120_key: encode_key(out.key)
+        fma120_key: encode_key(out.key),
+        btd700?: btd700_key?(out.key),
+        btd700_key: encode_key(out.key)
       }
     end)
   end
@@ -1790,7 +2351,9 @@ defmodule UniversalProxyWeb.OverviewLive do
         soft_class: "bg-accent-soft text-accent",
         dot_class: "bg-accent",
         fma120?: false,
-        fma120_key: nil
+        fma120_key: nil,
+        btd700?: false,
+        btd700_key: nil
       }
     end)
   end
