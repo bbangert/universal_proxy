@@ -17,11 +17,14 @@ defmodule UniversalProxy.UART.SettingsStore do
   Keyed by `UniversalProxy.Hardware`'s stable port id (`"p_" <> slot`),
   which survives replug on the same physical port.
 
-  Entries are never overwritten by a different device's settings — a
-  port id only changes hands when `UniversalProxy.UART.Server` sees the
+  A port id changes hands when `UniversalProxy.UART.Server` sees the
   slot's USB serial number disappear from a hotplug poll and calls
   `delete_opts/2` to clear it, so a different adapter plugged into the
-  same physical port can never inherit the previous device's baud.
+  same physical port won't normally inherit the previous device's baud.
+  One accepted corner (documented at the call site in `UART.Server`): a
+  swap that lands entirely between two hotplug polls can leave the stale
+  entry in place briefly, until the next set-change poll or the new
+  adapter's first explicit open re-learns the settings.
 
   The DETS file lives on the writable data partition on Nerves
   (`/data/uart_settings.dets`) and in `_build/` on the host for

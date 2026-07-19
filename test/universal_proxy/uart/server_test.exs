@@ -1,5 +1,9 @@
 defmodule UniversalProxy.UART.ServerTest do
-  use ExUnit.Case, async: true
+  # async: false because the settings-clearing tests open a DETS-backed
+  # SettingsStore on a fixed table atom — DETS table names must be atoms,
+  # so serialization keeps the fixed atom safe to reuse (same rationale as
+  # SettingsStoreTest/PskStoreTest/ConfigStoreTest).
+  use ExUnit.Case, async: false
 
   alias UniversalProxy.UART.Server
   alias UniversalProxy.UART.SettingsStore
