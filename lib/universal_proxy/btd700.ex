@@ -193,7 +193,8 @@ defmodule UniversalProxy.BTD700 do
 
   @doc """
   Set the Auracast broadcast state/encryption/quality in one call (the wire
-  command bundles all three: `<<state, encryption, quality>>`). Persisted +
+  command bundles all three: `<<state, quality, encryption>>` — note the
+  reference driver's field order is wrong, see `Protocol`). Persisted +
   re-applied.
 
       set_broadcast_info(key, %{state: :on_public, encryption: true, quality: :high})
@@ -216,7 +217,7 @@ defmodule UniversalProxy.BTD700 do
           broadcast_encryption: encryption?
         },
         :set_broadcast_info,
-        <<state_byte, encryption_byte, quality_byte>>,
+        <<state_byte, quality_byte, encryption_byte>>,
         :get_broadcast_info
       )
     else

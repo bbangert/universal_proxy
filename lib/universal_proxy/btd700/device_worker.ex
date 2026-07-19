@@ -669,7 +669,7 @@ defmodule UniversalProxy.BTD700.DeviceWorker do
          {:ok, quality_byte} <-
            Map.fetch(@broadcast_quality_wire, cfg.broadcast_quality || :standard_16k) do
       encryption_byte = if cfg.broadcast_encryption, do: 1, else: 0
-      {:set_broadcast_info, <<state_byte, encryption_byte, quality_byte>>}
+      {:set_broadcast_info, <<state_byte, quality_byte, encryption_byte>>}
     else
       :error -> nil
     end

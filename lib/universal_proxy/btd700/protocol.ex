@@ -97,6 +97,7 @@ defmodule UniversalProxy.BTD700.Protocol do
   @sink_transports %{0 => :not_available, 1 => :classic, 2 => :le_audio, 3 => :dual}
 
   @broadcast_states %{0 => :off_private, 1 => :on_public}
+  @broadcast_encryptions %{0 => :off, 1 => :on}
   @broadcast_qualities %{0 => :standard_16k, 1 => :standard_24k, 2 => :high}
 
   # Codec bitmask -> atom, in ascending bit order (bit 0 first). Used for
@@ -306,11 +307,18 @@ defmodule UniversalProxy.BTD700.Protocol do
 
   defp decode_response(:audio_quality, payload), do: %{raw: payload}
 
-  # Broadcast info: [0]=state, [1]=encryption, [2]=quality.
-  defp decode_response(:broadcast_info, <<state, encryption, quality, _rest::binary>>) do
+  # Broadcast info: [0]=state, [1]=QUALITY, [2]=ENCRYPTION — the reference
+  # driver has quality/encryption REVERSED (same class of bug as its
+  # audio-quality byte order). Established on live HW 2026-07-19: a
+  # factory-reset dongle that Sennheiser's own app reports as "High
+  # quality, no encryption" reads [1, 2, 0] on the wire — only the
+  # [state, quality, encryption] layout matches, and quality writes to
+  # slot [1] round-trip while slot [2] (encryption) refuses values
+  # without a key. SET payloads use the same corrected order.
+  defp decode_response(:broadcast_info, <<state, quality, encryption, _rest::binary>>) do
     %{
       state: Map.get(@broadcast_states, state, :unknown),
-      encryption: decode_broadcast_encryption(encryption),
+      encryption: Map.get(@broadcast_encryptions, encryption, :unknown),
       quality: Map.get(@broadcast_qualities, quality, :unknown)
     }
   end
@@ -414,15 +422,6 @@ defmodule UniversalProxy.BTD700.Protocol do
   defp decode_event(:gaming, data), do: %{raw: data}
 
   # ── Private shared decode helpers ────────────────────────────────────
-
-  # The reference C header enumerates encryption as 0/1 only, but a real
-  # dongle previously configured by Sennheiser's own app reports 2 (observed
-  # live 2026-07-19; the firmware round-trips whatever raw byte is written).
-  # 0 is the only "off" in any convention, so treat every nonzero byte as
-  # :on rather than :unknown — otherwise the drawer's resend-the-full-map
-  # broadcast setters would coerce an app-set value to "off".
-  defp decode_broadcast_encryption(0), do: :off
-  defp decode_broadcast_encryption(_), do: :on
 
   defp decode_audio_mode(mode, transport) do
     %{

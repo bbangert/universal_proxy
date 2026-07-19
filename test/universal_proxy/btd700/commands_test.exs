@@ -234,7 +234,8 @@ defmodule UniversalProxy.BTD700.CommandsTest do
           BTD700.set_broadcast_info(key, %{state: :on_public, encryption: true, quality: :high})
         end)
 
-      assert_receive {:hid_write, <<0x34, 0xFE, 0x0A, 3, 1, 1, 2, _::binary>>}, 500
+      # Corrected wire order: [state=on, quality=high, encryption=on].
+      assert_receive {:hid_write, <<0x34, 0xFE, 0x0A, 3, 1, 2, 1, _::binary>>}, 500
 
       assert {:ok,
               %{broadcast_state: :on_public, broadcast_quality: :high, broadcast_encryption: true}} =

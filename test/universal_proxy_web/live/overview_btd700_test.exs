@@ -144,9 +144,10 @@ defmodule UniversalProxyWeb.OverviewBTD700Test do
     refute html =~ "Not connected"
   end
 
-  # Dongle fw 3.11.0 rejects quality writes (raw-HID-verified) — the
-  # buttons render disabled so the UI doesn't offer a dead affordance.
-  test "broadcast quality buttons are disabled with an explanatory hint", %{conn: conn} do
+  # Quality writes work once the corrected [state, quality, encryption]
+  # field order is used (the "fw rejects quality" episode was a field-order
+  # misread) — the three tier buttons must be live, not disabled.
+  test "broadcast quality buttons are enabled", %{conn: conn} do
     {:ok, view, _html} = live(conn, "/")
     add_btd700_output(view)
 
@@ -161,15 +162,15 @@ defmodule UniversalProxyWeb.OverviewBTD700Test do
 
     html = render_click(view, "select_btd700", %{"key" => enc(@key)})
 
-    assert html =~ "Fixed by the dongle firmware"
-
     quality_buttons =
       html
       |> String.split("<button")
       |> Enum.filter(&(&1 =~ "btd700_set_bcast_quality"))
 
     assert length(quality_buttons) == 3
-    for btn <- quality_buttons, do: assert(btn =~ "disabled")
+    # The disabled ATTRIBUTE (` disabled ` / `disabled="..."`), not the
+    # `disabled:` Tailwind variant prefix in the class list.
+    for btn <- quality_buttons, do: refute(btn =~ ~r/ disabled(="[^"]*")?[ >]/)
   end
 
   # Protocol hands broadcast names back as raw wire bytes. Invalid UTF-8

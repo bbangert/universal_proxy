@@ -141,25 +141,26 @@ defmodule UniversalProxy.BTD700.ProtocolTest do
       assert Protocol.decode(frame) == {:response, :broadcast_name, "BTD700_3008"}
     end
 
-    # Real-hardware fixture (live dongle, 2026-07-19): a dongle configured
-    # by Sennheiser's own app reports encryption byte 2 — outside the
-    # reference C header's 0/1 enum. Any nonzero byte must decode :on, not
-    # :unknown, so the drawer's full-map broadcast resends can't coerce an
-    # app-set value to "off".
-    test "broadcast info with out-of-enum encryption byte decodes as :on" do
+    # Real-hardware fixture (live dongle fw 3.11.0, 2026-07-19): a
+    # factory-reset dongle that Sennheiser's own app reports as "High
+    # quality, no encryption" reads [1, 2, 0] on the wire. The reference
+    # driver's [state, encryption, quality] layout misreads this as
+    # "encryption on(!), quality 16k" — the real layout is
+    # [state, QUALITY, ENCRYPTION].
+    test "broadcast info field order is [state, quality, encryption], not the C header's" do
       frame = fake_frame(0xFF, 0x09, <<1, 2, 0>>)
 
       assert Protocol.decode(frame) ==
                {:response, :broadcast_info,
-                %{state: :on_public, encryption: :on, quality: :standard_16k}}
+                %{state: :on_public, quality: :high, encryption: :off}}
     end
 
-    test "broadcast info encryption 0 decodes as :off" do
-      frame = fake_frame(0xFF, 0x09, <<0, 0, 2>>)
+    test "broadcast info encryption on decodes from byte [2]" do
+      frame = fake_frame(0xFF, 0x09, <<0, 0, 1>>)
 
       assert Protocol.decode(frame) ==
                {:response, :broadcast_info,
-                %{state: :off_private, encryption: :off, quality: :high}}
+                %{state: :off_private, quality: :standard_16k, encryption: :on}}
     end
   end
 

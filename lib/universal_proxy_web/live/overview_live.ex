@@ -1766,21 +1766,15 @@ defmodule UniversalProxyWeb.OverviewLive do
         </div>
       </form>
 
-      <%!-- Quality buttons are disabled: dongle fw 3.11.0 rejects every
-           quality write through SET_BROADCAST_INFO (verified at the raw
-           HID level, 2026-07-19 — state/encryption in the same command
-           apply). The `btd700_set_bcast_quality` handler stays wired so
-           re-enabling is a one-attribute change if a future firmware
-           honors it. Auracast/PBP tiers: Standard Quality has 16 kHz and
-           24 kHz variants; High Quality is 48 kHz LC3. --%>
+      <%!-- Auracast/PBP tiers: Standard Quality has 16 kHz and 24 kHz
+           variants; High Quality is 48 kHz LC3. --%>
       <div>
         <div class="text-xs font-semibold text-fg-3 uppercase tracking-caps mb-2">Quality</div>
         <div class="flex gap-1.5 flex-wrap">
           <.button
             variant={if @info.quality == :standard_16k, do: :primary, else: :secondary}
             size={:sm}
-            disabled
-            title="Standard quality, 16 kHz — fixed by the dongle firmware"
+            title="Standard quality, 16 kHz"
             phx-click="btd700_set_bcast_quality"
             phx-value-key={@key}
             phx-value-quality="standard_16k"
@@ -1790,8 +1784,7 @@ defmodule UniversalProxyWeb.OverviewLive do
           <.button
             variant={if @info.quality == :standard_24k, do: :primary, else: :secondary}
             size={:sm}
-            disabled
-            title="Standard quality, 24 kHz — fixed by the dongle firmware"
+            title="Standard quality, 24 kHz"
             phx-click="btd700_set_bcast_quality"
             phx-value-key={@key}
             phx-value-quality="standard_24k"
@@ -1801,17 +1794,13 @@ defmodule UniversalProxyWeb.OverviewLive do
           <.button
             variant={if @info.quality == :high, do: :primary, else: :secondary}
             size={:sm}
-            disabled
-            title="High quality, 48 kHz — fixed by the dongle firmware"
+            title="High quality, 48 kHz"
             phx-click="btd700_set_bcast_quality"
             phx-value-key={@key}
             phx-value-quality="high"
           >
             High
           </.button>
-        </div>
-        <div class="text-xs text-fg-3 mt-1.5">
-          Fixed by the dongle firmware — changing it isn't supported on firmware 3.11.
         </div>
       </div>
 

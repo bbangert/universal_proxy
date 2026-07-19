@@ -306,7 +306,8 @@ defmodule UniversalProxy.BTD700.DeviceWorkerTest do
       assert_receive {:hid_write, <<0x34, 0xFE, 0x04, 2, 0x03, 0x00, _::binary>>}, 500
       send_report(reader, response_frame(0x04, <<>>))
 
-      assert_receive {:hid_write, <<0x34, 0xFE, 0x0A, 3, 1, 1, 2, _::binary>>}, 500
+      # Corrected wire order: [state=on, quality=high, encryption=on].
+      assert_receive {:hid_write, <<0x34, 0xFE, 0x0A, 3, 1, 2, 1, _::binary>>}, 500
       send_report(reader, response_frame(0x0A, <<>>))
 
       assert_receive {:hid_write, <<0x34, 0xFE, 0x0E, len, rest::binary>>}, 500
