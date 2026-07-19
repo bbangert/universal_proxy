@@ -693,6 +693,58 @@ defmodule UniversalProxy.HardwareTest do
     end
   end
 
+  describe "port_ids_by_serial/1" do
+    test "maps serial_number to port_id for every connected adapter with both" do
+      result =
+        Hardware.port_ids_by_serial(
+          enumerated: %{
+            "ttyUSB0" => %{vendor_id: 0x0403, product_id: 0x6001, serial_number: "BG018NOP"},
+            "ttyACM0" => %{vendor_id: 0x303A, product_id: 0x4001, serial_number: "DH001K8R"}
+          },
+          bus_paths: %{"ttyUSB0" => "1-1.3", "ttyACM0" => "1-1.1"}
+        )
+
+      assert result == %{"BG018NOP" => "p_1_1_3", "DH001K8R" => "p_1_1_1"}
+    end
+
+    test "omits adapters without a serial number" do
+      result =
+        Hardware.port_ids_by_serial(
+          enumerated: %{
+            "ttyUSB0" => %{vendor_id: 0x1A86, product_id: 0x7523, serial_number: nil}
+          },
+          bus_paths: %{"ttyUSB0" => "1-1.4"}
+        )
+
+      assert result == %{}
+    end
+
+    test "omits a tty with no matching bus path" do
+      result =
+        Hardware.port_ids_by_serial(
+          enumerated: %{
+            "ttyUSB0" => %{vendor_id: 0x0403, product_id: 0x6001, serial_number: "BG018NOP"}
+          },
+          bus_paths: %{}
+        )
+
+      assert result == %{}
+    end
+
+    test "skips built-in SoC UARTs (ttyAMA, ttyS)" do
+      result =
+        Hardware.port_ids_by_serial(
+          enumerated: %{
+            "ttyAMA0" => %{serial_number: "should-not-appear"},
+            "ttyUSB0" => %{vendor_id: 0x0403, product_id: 0x6001, serial_number: "BG018NOP"}
+          },
+          bus_paths: %{"ttyUSB0" => "1-1.3"}
+        )
+
+      assert result == %{"BG018NOP" => "p_1_1_3"}
+    end
+  end
+
   describe "usb_hubs/1" do
     # Build a fake /sys/bus/usb/devices tree with a hub, a non-hub device,
     # and a root hub, then assert only the real hub is detected.

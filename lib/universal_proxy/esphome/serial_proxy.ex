@@ -63,14 +63,14 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
   @impl true
   def open(instance, opts, subscriber) do
     case Enum.at(inventory(), instance) do
-      %{id: id, path: path, friendly_name: friendly_name} ->
+      %{id: id, path: path, friendly_name: friendly_name, serial: serial} ->
         with {:ok, _pid} <- UART.open(path, Keyword.put(opts, :friendly_name, friendly_name)),
              {:ok, relay} <- start_relay_or_close(path, friendly_name, subscriber) do
           Logger.info(
             "ESPHome serial proxy opened instance #{instance} (#{friendly_name} @ #{path}, #{opts[:speed]} baud)"
           )
 
-          persist_opts(id, opts)
+          persist_opts(id, opts, serial)
 
           {:ok, {relay, path}}
         else
@@ -184,7 +184,11 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
         id: port.id,
         path: port.tty_name,
         friendly_name: port.ha_name,
-        port_type: port.kind
+        port_type: port.kind,
+        # The device's USB serial, tagging persisted line settings so a
+        # delayed unplug-clear can never wipe a different adapter's write
+        # (list_ports renders missing serials as an em-dash placeholder).
+        serial: if(port.serial == "—", do: nil, else: port.serial)
       }
     end)
     |> Enum.sort_by(& &1.friendly_name)
@@ -194,8 +198,10 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
   # failure) must not fail an otherwise-good open. Follows this project's
   # public-API `catch :exit` idiom (CLAUDE.md) — a wedged store degrades
   # to "settings not persisted" rather than failing the connection.
-  defp persist_opts(id, opts) do
-    case SettingsStore.put_opts(id, opts) do
+  defp persist_opts(id, opts, serial) do
+    # Explicit server arg: put_opts/4 defaults BOTH its first and last
+    # params, so a 3-arg call binds `id` as the server (dialyzer-caught).
+    case SettingsStore.put_opts(SettingsStore, id, opts, serial) do
       :ok ->
         :ok
 

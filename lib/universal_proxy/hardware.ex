@@ -269,6 +269,32 @@ defmodule UniversalProxy.Hardware do
     |> Map.new()
   end
 
+  @doc """
+  Map of USB `serial_number => port_id` for every currently-connected USB
+  serial adapter (adapters without a serial number are omitted — the UART
+  server's hotplug tracking skips those too). `UniversalProxy.UART.Server`
+  snapshots this while devices are present so it can clear each device's
+  persisted line settings at unplug time, when the sysfs path needed to
+  derive the port id is already gone.
+  """
+  @spec port_ids_by_serial(keyword()) :: %{String.t() => String.t()}
+  def port_ids_by_serial(opts \\ []) do
+    enumerated = Keyword.get_lazy(opts, :enumerated, &Enumerate.safe/0)
+    bus_paths = Keyword.get_lazy(opts, :bus_paths, fn -> bus_paths_from_sysfs(opts) end)
+
+    enumerated
+    |> Enum.filter(fn {name, info} ->
+      usb_serial?(name) and Enumerate.present?(info[:serial_number])
+    end)
+    |> Enum.flat_map(fn {tty_name, info} ->
+      case Map.get(bus_paths, tty_name) do
+        nil -> []
+        slot_sub -> [{info[:serial_number], port_id(slot_sub)}]
+      end
+    end)
+    |> Map.new()
+  end
+
   @usb_devices_dir "/sys/bus/usb/devices"
   # A device-level USB path under /sys/bus/usb/devices (e.g. "1-1.1.3"),
   # as opposed to a root hub ("usb1") or an interface ("1-1.3:1.0").

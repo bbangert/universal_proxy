@@ -1,7 +1,12 @@
 defmodule UniversalProxy.UART.ServerTest do
-  use ExUnit.Case, async: true
+  # async: false because the settings-clearing tests open a DETS-backed
+  # SettingsStore on a fixed table atom — DETS table names must be atoms,
+  # so serialization keeps the fixed atom safe to reuse (same rationale as
+  # SettingsStoreTest/PskStoreTest/ConfigStoreTest).
+  use ExUnit.Case, async: false
 
   alias UniversalProxy.UART.Server
+  alias UniversalProxy.UART.SettingsStore
 
   describe "zwa2_device?/1" do
     test "matches ZWA-2 by VID/PID" do
@@ -59,6 +64,115 @@ defmodule UniversalProxy.UART.ServerTest do
 
     test "rejects missing keys" do
       refute Server.irdroid_device?(%{serial_number: "abc123"})
+    end
+  end
+
+  # Exercises the unplug-clear logic directly against a test-local
+  # SettingsStore instead of via `handle_info(:check_hotplug, _)` — that
+  # handler always fires a real `ESPHome.Supervisor.restart/0` on a
+  # serial-set change, which must not run against the app-global
+  # supervision tree from a test.
+  describe "clear_removed_settings/3" do
+    setup do
+      path =
+        Path.join(
+          System.tmp_dir!(),
+          "uart_server_settings_test_#{System.unique_integer([:positive])}.dets"
+        )
+
+      File.rm(path)
+
+      store =
+        start_supervised!(
+          {SettingsStore, name: nil, table: :uart_server_test_settings, dets_path: path}
+        )
+
+      on_exit(fn -> File.rm(path) end)
+
+      %{store: store}
+    end
+
+    @opts [speed: 9600, data_bits: 8, stop_bits: 1, parity: :none, flow_control: :none]
+
+    test "deletes the persisted entry for a removed device's port id", %{store: store} do
+      :ok = SettingsStore.put_opts(store, "p_1_1", @opts)
+
+      assert Server.clear_removed_settings(
+               MapSet.new(["SERIAL1"]),
+               %{"SERIAL1" => "p_1_1"},
+               store
+             ) == :ok
+
+      assert SettingsStore.get_opts(store, "p_1_1") == nil
+    end
+
+    test "a removed serial with no known port id is a no-op", %{store: store} do
+      :ok = SettingsStore.put_opts(store, "p_1_1", @opts)
+
+      Server.clear_removed_settings(MapSet.new(["UNKNOWN"]), %{}, store)
+
+      assert SettingsStore.get_opts(store, "p_1_1") == @opts
+    end
+
+    test "leaves other ports' settings untouched", %{store: store} do
+      :ok = SettingsStore.put_opts(store, "p_1_1", @opts)
+      :ok = SettingsStore.put_opts(store, "p_1_2", @opts)
+
+      Server.clear_removed_settings(MapSet.new(["SERIAL1"]), %{"SERIAL1" => "p_1_1"}, store)
+
+      assert SettingsStore.get_opts(store, "p_1_1") == nil
+      assert SettingsStore.get_opts(store, "p_1_2") == @opts
+    end
+
+    test "a dead/unavailable settings store does not crash the caller" do
+      dead = spawn(fn -> :ok end)
+      ref = Process.monitor(dead)
+      assert_receive {:DOWN, ^ref, :process, ^dead, _reason}
+
+      assert Server.clear_removed_settings(
+               MapSet.new(["SERIAL1"]),
+               %{"SERIAL1" => "p_1_1"},
+               dead
+             ) == :ok
+    end
+
+    test "clears every removed serial's entry, not just the first", %{store: store} do
+      :ok = SettingsStore.put_opts(store, "p_1_1", @opts, "SERIAL1")
+      :ok = SettingsStore.put_opts(store, "p_1_2", @opts, "SERIAL2")
+      :ok = SettingsStore.put_opts(store, "p_1_3", @opts, "SERIAL3")
+
+      Server.clear_removed_settings(
+        MapSet.new(["SERIAL1", "SERIAL2"]),
+        %{"SERIAL1" => "p_1_1", "SERIAL2" => "p_1_2", "SERIAL3" => "p_1_3"},
+        store
+      )
+
+      assert SettingsStore.get_opts(store, "p_1_1") == nil
+      assert SettingsStore.get_opts(store, "p_1_2") == nil
+      assert SettingsStore.get_opts(store, "p_1_3") == @opts
+    end
+
+    test "an empty removed set is a no-op", %{store: store} do
+      :ok = SettingsStore.put_opts(store, "p_1_1", @opts)
+
+      assert Server.clear_removed_settings(MapSet.new(), %{"S" => "p_1_1"}, store) == :ok
+      assert SettingsStore.get_opts(store, "p_1_1") == @opts
+    end
+
+    # End-to-end delete-after-replug race: device B re-persists into the
+    # slot (tagged with B's serial) before A's delayed clear runs — the
+    # clear must no-op on the tag mismatch and keep B's fresh write.
+    test "a delayed clear never wipes a different device's fresher write", %{store: store} do
+      fresh = [speed: 115_200, data_bits: 8, stop_bits: 1, parity: :none, flow_control: :none]
+      :ok = SettingsStore.put_opts(store, "p_1_1", fresh, "SERIAL_B")
+
+      Server.clear_removed_settings(
+        MapSet.new(["SERIAL_A"]),
+        %{"SERIAL_A" => "p_1_1"},
+        store
+      )
+
+      assert SettingsStore.get_opts(store, "p_1_1") == fresh
     end
   end
 end
