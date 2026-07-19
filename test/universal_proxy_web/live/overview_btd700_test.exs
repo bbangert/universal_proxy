@@ -112,6 +112,66 @@ defmodule UniversalProxyWeb.OverviewBTD700Test do
     refute html =~ "Not connected"
   end
 
+  test "in broadcast mode the header shows broadcast status, not the unicast link state",
+       %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/")
+    add_btd700_output(view)
+
+    send(
+      view.pid,
+      {:btd700_state, @key,
+       %{
+         audio_mode: %{mode: :broadcast, transport: :le_audio},
+         dongle_state: :disconnected,
+         broadcast_info: %{state: :on_public, encryption: :off, quality: :standard_16k},
+         broadcast_name: "Kitchen"
+       }}
+    )
+
+    html = render_click(view, "select_btd700", %{"key" => enc(@key)})
+    assert html =~ "Broadcasting"
+    assert html =~ "Kitchen"
+    refute html =~ "Not connected"
+
+    send(
+      view.pid,
+      {:btd700_state, @key,
+       %{broadcast_info: %{state: :off_private, encryption: :off, quality: :standard_16k}}}
+    )
+
+    html = render(view)
+    assert html =~ "Broadcast off"
+    refute html =~ "Not connected"
+  end
+
+  # Dongle fw 3.11.0 rejects quality writes (raw-HID-verified) — the
+  # buttons render disabled so the UI doesn't offer a dead affordance.
+  test "broadcast quality buttons are disabled with an explanatory hint", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/")
+    add_btd700_output(view)
+
+    send(
+      view.pid,
+      {:btd700_state, @key,
+       %{
+         audio_mode: %{mode: :broadcast, transport: :le_audio},
+         broadcast_info: %{state: :on_public, encryption: :off, quality: :standard_16k}
+       }}
+    )
+
+    html = render_click(view, "select_btd700", %{"key" => enc(@key)})
+
+    assert html =~ "Fixed by the dongle firmware"
+
+    quality_buttons =
+      html
+      |> String.split("<button")
+      |> Enum.filter(&(&1 =~ "btd700_set_bcast_quality"))
+
+    assert length(quality_buttons) == 3
+    for btn <- quality_buttons, do: assert(btn =~ "disabled")
+  end
+
   # Protocol hands broadcast names back as raw wire bytes. Invalid UTF-8
   # survives HTML escaping but crashes the connected render's JSON diff
   # (Jason raises) — the assign boundary must scrub it (verified in review,
