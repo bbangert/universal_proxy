@@ -223,6 +223,29 @@ defmodule UniversalProxy.BTD700.DeviceWorkerTest do
       refute_receive {:btd700_state, _, _}, 200
       assert DeviceWorker.get_state(pid) == %{}
     end
+
+    # The Auracast key must never land in the state cache or on the PubSub
+    # topic (LiveView merges broadcasts into socket assigns) — whether the
+    # response was solicited through the public command/3 or arrived
+    # unsolicited. The transient caller reply is the only place it may appear.
+    test "a broadcast_key response is never cached or broadcast" do
+      Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "btd700:state")
+      pid = start_worker()
+      reader = await_reader(pid)
+
+      # Solicited: caller gets the key in the reply, nothing else keeps it.
+      t = Task.async(fn -> DeviceWorker.command(pid, :get_broadcast_key) end)
+      assert_receive {:hid_write, <<0x34, 0xFE, 0x0B, 0, _::binary>>}, 500
+      send_report(reader, response_frame(0x0B, <<0xDE, 0xAD>>))
+      assert {:ok, key_bytes} = Task.await(t)
+      assert binary_part(key_bytes, 0, 2) == <<0xDE, 0xAD>>
+
+      # Unsolicited (no in-flight): dropped from cache/broadcast too.
+      send_report(reader, response_frame(0x0B, <<0xBE, 0xEF>>))
+
+      refute_receive {:btd700_state, _, %{broadcast_key: _}}, 200
+      refute Map.has_key?(DeviceWorker.get_state(pid), :broadcast_key)
+    end
   end
 
   describe "timeout handling" do

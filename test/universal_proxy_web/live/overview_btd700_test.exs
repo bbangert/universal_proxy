@@ -112,6 +112,30 @@ defmodule UniversalProxyWeb.OverviewBTD700Test do
     refute html =~ "Not connected"
   end
 
+  # Protocol hands broadcast names back as raw wire bytes. Invalid UTF-8
+  # survives HTML escaping but crashes the connected render's JSON diff
+  # (Jason raises) — the assign boundary must scrub it (verified in review,
+  # 2026-07-19).
+  test "an invalid-UTF-8 broadcast name from the wire cannot crash the connected render",
+       %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/")
+    add_btd700_output(view)
+
+    send(
+      view.pid,
+      {:btd700_state, @key,
+       %{
+         audio_mode: %{mode: :broadcast, transport: :le_audio},
+         broadcast_info: %{state: :on_public, encryption: :off, quality: :standard_16k},
+         broadcast_name: <<0xFF, 0xFE, "garbage">>
+       }}
+    )
+
+    html = render_click(view, "select_btd700", %{"key" => enc(@key)})
+    assert html =~ "Auracast" or html =~ "Broadcast"
+    assert Process.alive?(view.pid)
+  end
+
   test "mode/codec/connect/factory-reset events are handled without crashing the view",
        %{conn: conn} do
     {:ok, view, _html} = live(conn, "/")

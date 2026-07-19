@@ -445,7 +445,8 @@ defmodule UniversalProxyWeb.OverviewLive do
   def handle_info({:btd700_state, key, partial}, socket) do
     states = socket.assigns.btd700_states
     existing = Map.get(states, key, %{})
-    {:noreply, assign(socket, :btd700_states, Map.put(states, key, Map.merge(existing, partial)))}
+    merged = Map.merge(existing, scrub_btd700_partial(partial))
+    {:noreply, assign(socket, :btd700_states, Map.put(states, key, merged))}
   end
 
   def handle_info(_msg, socket), do: {:noreply, socket}
@@ -762,13 +763,25 @@ defmodule UniversalProxyWeb.OverviewLive do
     BTD700.list_devices()
     |> Enum.reduce(%{}, fn %{key: key}, acc ->
       case BTD700.get_state(key) do
-        {:ok, state} -> Map.put(acc, key, state)
+        {:ok, state} -> Map.put(acc, key, scrub_btd700_partial(state))
         _ -> acc
       end
     end)
   rescue
     _ -> %{}
   end
+
+  # Protocol.decode/1 hands the broadcast name back as raw wire bytes
+  # (deliberately never UTF-8-validated at the protocol layer). Rendered
+  # HTML would survive invalid bytes, but the connected render's diff is
+  # JSON-encoded and Jason raises on invalid UTF-8 — a buggy dongle name
+  # would crash the LiveView. Scrub at the assign boundary; nil renders as
+  # the usual empty/placeholder value.
+  defp scrub_btd700_partial(%{broadcast_name: name} = partial) when is_binary(name) do
+    if String.valid?(name), do: partial, else: %{partial | broadcast_name: nil}
+  end
+
+  defp scrub_btd700_partial(partial), do: partial
 
   # Run a BTD700 control action by decoded key; result is fire-and-forget
   # (the device echoes state back over "btd700:state").

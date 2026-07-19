@@ -500,6 +500,14 @@ defmodule UniversalProxy.BTD700.DeviceWorker do
     end
   end
 
+  # The Auracast key must never reach the state cache or the PubSub topic
+  # (LiveView merges broadcasts straight into socket assigns). Nothing in
+  # the app queries it today — this guard keeps the invariant even if a
+  # future caller sends :get_broadcast_key through the public command/3
+  # (the caller still gets the key in its transient reply; it just never
+  # lands anywhere persistent).
+  defp cache_and_broadcast(state, :broadcast_key, _payload), do: state
+
   defp cache_and_broadcast(state, field, payload) do
     partial = %{field => payload}
     broadcast(state, partial)

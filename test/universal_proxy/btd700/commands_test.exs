@@ -28,9 +28,13 @@ defmodule UniversalProxy.BTD700.CommandsTest do
   # singleton DETS table with no delete — see its moduledoc — so reusing a
   # fixed literal here would leak state across `mix test` invocations that
   # don't recompile this file). Harmless accumulation in the dev `_build`
-  # dets file; never queried by any other test.
+  # dets file; never queried by any other test. The suffix is random, NOT
+  # `System.unique_integer` — the DETS file outlives the VM while the
+  # counter restarts with it, so counter-suffixed keys can collide with a
+  # record persisted by a previous run and fail this run's "nothing saved"
+  # assertions (witnessed in review, 2026-07-19).
   setup do
-    key = {"1-1.9-#{System.unique_integer([:positive])}", 0x3542, 0x3001}
+    key = {"1-1.9-#{Base.encode16(:crypto.strong_rand_bytes(4))}", 0x3542, 0x3001}
     {:ok, key: key}
   end
 
