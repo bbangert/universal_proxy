@@ -230,6 +230,19 @@ defmodule UniversalProxy.BTD700.ProtocolTest do
       assert Protocol.decode(frame) == {:event, :dongle_state, :streaming_audio}
     end
 
+    # Real-hardware fixture (live dongle fw 3.11.0, 2026-07-19): codec-mask
+    # events arrive with a 1-byte payload, not the reference driver's
+    # assumed 2-byte u16.
+    test "codec_in_use event with a 1-byte payload decodes the mask" do
+      frame = <<0x34, 0xFC, 0x04, 1, 1>> <> :binary.copy(<<0>>, 59)
+      assert Protocol.decode(frame) == {:event, :codec_in_use, [:sbc]}
+    end
+
+    test "supported_codecs event with a 1-byte payload decodes the mask" do
+      frame = <<0x34, 0xFC, 0x03, 1, 0x07>> <> :binary.copy(<<0>>, 59)
+      assert Protocol.decode(frame) == {:event, :supported_codecs, [:sbc, :aptx, :aptx_adaptive]}
+    end
+
     test "audio_mode event with a normal-length payload decodes fully" do
       frame = fake_frame(0xFC, 0x02, <<1, 2>>)
 

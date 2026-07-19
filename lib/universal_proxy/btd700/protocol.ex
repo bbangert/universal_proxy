@@ -358,15 +358,25 @@ defmodule UniversalProxy.BTD700.Protocol do
 
   defp decode_event(:audio_mode, data), do: %{raw: data}
 
+  # Codec-mask events: live fw 3.11.0 declares a 1-byte payload (observed
+  # 2026-07-19 on real hardware), not the 2-byte u16 LE the reference
+  # driver assumed — all six codec bits fit in the low byte, so a single
+  # byte is unambiguous. Accept both widths; responses are unaffected
+  # (a response payload is never sliced below 2 bytes — full 64-byte
+  # frames — so their u16 clause always matches).
   defp decode_event(:supported_codecs, <<mask::16-little, _rest::binary>>) do
     decode_codec_mask(mask)
   end
+
+  defp decode_event(:supported_codecs, <<mask>>), do: decode_codec_mask(mask)
 
   defp decode_event(:supported_codecs, data), do: %{raw: data}
 
   defp decode_event(:codec_in_use, <<mask::16-little, _rest::binary>>) do
     decode_codec_mask(mask)
   end
+
+  defp decode_event(:codec_in_use, <<mask>>), do: decode_codec_mask(mask)
 
   defp decode_event(:codec_in_use, data), do: %{raw: data}
 
