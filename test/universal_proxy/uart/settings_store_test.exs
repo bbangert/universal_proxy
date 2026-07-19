@@ -88,6 +88,51 @@ defmodule UniversalProxy.UART.SettingsStoreTest do
     test "deleting an unknown port id is a no-op :ok", %{store: store} do
       assert SettingsStore.delete_opts(store, "p_unknown") == :ok
     end
+
+    # Regression for the delete-after-replug race: a delayed unplug-clear
+    # for device A must not wipe an entry device B re-wrote in the same
+    # slot after the caller snapshotted A's serial.
+    test "with an expected serial, only deletes when the stored tag matches", %{store: store} do
+      opts = [speed: 115_200, data_bits: 8, stop_bits: 1, parity: :none, flow_control: :none]
+      :ok = SettingsStore.put_opts(store, "p_1_1", opts, "SERIAL_B")
+
+      # Late clear for the departed device A: tag mismatch, entry survives.
+      assert SettingsStore.delete_opts(store, "p_1_1", "SERIAL_A") == :ok
+      assert SettingsStore.get_opts(store, "p_1_1") == opts
+
+      # Clear for the actual writer: tag matches, entry goes.
+      assert SettingsStore.delete_opts(store, "p_1_1", "SERIAL_B") == :ok
+      assert SettingsStore.get_opts(store, "p_1_1") == nil
+    end
+
+    test "a nil-tagged entry (serial-less adapter) matches any expected serial", %{store: store} do
+      opts = [speed: 9600, data_bits: 8, stop_bits: 1, parity: :none, flow_control: :none]
+      :ok = SettingsStore.put_opts(store, "p_1_2", opts, nil)
+
+      assert SettingsStore.delete_opts(store, "p_1_2", "WHATEVER") == :ok
+      assert SettingsStore.get_opts(store, "p_1_2") == nil
+    end
+
+    test ":any (the default) deletes regardless of the stored tag", %{store: store} do
+      opts = [speed: 57_600, data_bits: 8, stop_bits: 1, parity: :none, flow_control: :none]
+      :ok = SettingsStore.put_opts(store, "p_1_3", opts, "SERIAL_C")
+
+      assert SettingsStore.delete_opts(store, "p_1_3") == :ok
+      assert SettingsStore.get_opts(store, "p_1_3") == nil
+    end
+
+    # Records written before serial tagging existed are 2-tuples. They
+    # must read normally and match any serial on delete (clearing them is
+    # exactly the pre-tagging behavior).
+    test "legacy untagged 2-tuple records read and delete compatibly", %{store: store} do
+      opts = [speed: 19_200, data_bits: 8, stop_bits: 1, parity: :none, flow_control: :none]
+      :ok = :dets.insert(@table, {"p_legacy", opts})
+
+      assert SettingsStore.get_opts(store, "p_legacy") == opts
+      assert SettingsStore.all_opts(store) == %{"p_legacy" => opts}
+      assert SettingsStore.delete_opts(store, "p_legacy", "ANY_SERIAL") == :ok
+      assert SettingsStore.get_opts(store, "p_legacy") == nil
+    end
   end
 
   describe "all_opts/1" do

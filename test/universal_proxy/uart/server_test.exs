@@ -135,5 +135,44 @@ defmodule UniversalProxy.UART.ServerTest do
                dead
              ) == :ok
     end
+
+    test "clears every removed serial's entry, not just the first", %{store: store} do
+      :ok = SettingsStore.put_opts(store, "p_1_1", @opts, "SERIAL1")
+      :ok = SettingsStore.put_opts(store, "p_1_2", @opts, "SERIAL2")
+      :ok = SettingsStore.put_opts(store, "p_1_3", @opts, "SERIAL3")
+
+      Server.clear_removed_settings(
+        MapSet.new(["SERIAL1", "SERIAL2"]),
+        %{"SERIAL1" => "p_1_1", "SERIAL2" => "p_1_2", "SERIAL3" => "p_1_3"},
+        store
+      )
+
+      assert SettingsStore.get_opts(store, "p_1_1") == nil
+      assert SettingsStore.get_opts(store, "p_1_2") == nil
+      assert SettingsStore.get_opts(store, "p_1_3") == @opts
+    end
+
+    test "an empty removed set is a no-op", %{store: store} do
+      :ok = SettingsStore.put_opts(store, "p_1_1", @opts)
+
+      assert Server.clear_removed_settings(MapSet.new(), %{"S" => "p_1_1"}, store) == :ok
+      assert SettingsStore.get_opts(store, "p_1_1") == @opts
+    end
+
+    # End-to-end delete-after-replug race: device B re-persists into the
+    # slot (tagged with B's serial) before A's delayed clear runs — the
+    # clear must no-op on the tag mismatch and keep B's fresh write.
+    test "a delayed clear never wipes a different device's fresher write", %{store: store} do
+      fresh = [speed: 115_200, data_bits: 8, stop_bits: 1, parity: :none, flow_control: :none]
+      :ok = SettingsStore.put_opts(store, "p_1_1", fresh, "SERIAL_B")
+
+      Server.clear_removed_settings(
+        MapSet.new(["SERIAL_A"]),
+        %{"SERIAL_A" => "p_1_1"},
+        store
+      )
+
+      assert SettingsStore.get_opts(store, "p_1_1") == fresh
+    end
   end
 end
