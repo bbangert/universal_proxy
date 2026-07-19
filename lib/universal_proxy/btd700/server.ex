@@ -185,9 +185,20 @@ defmodule UniversalProxy.BTD700.Server do
       # (cancelling its retry timer) and (re)start, so a transient boot-time
       # failure can recover on the next output event.
       true ->
-        usb_port = elem(key, 0) || Map.get(output, :usb_port)
-        state = drop_entry(state, key)
-        {:noreply, add_device(state, key, usb_port)}
+        case hotplug_usb_port(output, key) do
+          nil ->
+            # Same gate as the boot inventory (`btd700_output?/1`): without
+            # a sysfs bus path there is nothing to hand Hidraw discovery.
+            Logger.warning(
+              "BTD700 output added without a usable usb_port, ignoring: #{inspect(key)}"
+            )
+
+            {:noreply, state}
+
+          usb_port ->
+            state = drop_entry(state, key)
+            {:noreply, add_device(state, key, usb_port)}
+        end
     end
   end
 
@@ -397,6 +408,13 @@ defmodule UniversalProxy.BTD700.Server do
 
   defp btd700_key?({_usb, vid, pid}), do: vid == @vendor_id and pid == @product_id
   defp btd700_key?(_), do: false
+
+  # Prefer the output's own :usb_port (authoritative sysfs bus path), fall
+  # back to the key's first element only when it is a binary — for onboard
+  # cards it is an ALSA card label, never a bus path.
+  defp hotplug_usb_port(%{usb_port: p}, _key) when is_binary(p), do: p
+  defp hotplug_usb_port(_output, {p, _vid, _pid}) when is_binary(p), do: p
+  defp hotplug_usb_port(_output, _key), do: nil
 
   defp btd700_output?(%{key: key, usb_port: usb_port}),
     do: btd700_key?(key) and is_binary(usb_port)

@@ -160,6 +160,26 @@ defmodule UniversalProxy.BTD700.ServerTest do
       assert Server.list_devices(srv) == []
     end
 
+    # Same gate as the boot inventory: a vid/pid-matching output without a
+    # binary usb_port anywhere (output field or key head) has no bus path
+    # to hand hidraw discovery — must be ignored, never crash or start a
+    # worker on a garbage port.
+    test "output_added without a usable usb_port is ignored", %{sup: sup} do
+      srv = start_server(sup)
+      bad = output(key: {nil, 0x3542, 0x3001}, usb_port: nil)
+      send(srv, {:sendspin_output_added, bad})
+      assert Server.list_devices(srv) == []
+    end
+
+    test "output_added falls back to the key head when the output lacks usb_port", %{sup: sup} do
+      Application.put_env(:universal_proxy, :btd700_test_hidraw, %{"1-1.3.1" => "/dev/hidraw3"})
+      srv = start_server(sup)
+      send(srv, {:sendspin_output_added, output(usb_port: nil)})
+
+      assert [%{key: @key, connected: true, device_path: "/dev/hidraw3"}] =
+               Server.list_devices(srv)
+    end
+
     test "output_removed stops the matching worker", %{sup: sup} do
       Application.put_env(:universal_proxy, :btd700_test_hidraw, %{"1-1.3.1" => "/dev/hidraw3"})
       srv = start_server(sup)
