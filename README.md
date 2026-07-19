@@ -43,10 +43,48 @@ range -- without needing a dedicated ESPHome microcontroller for each one.
   [Sendspin](https://github.com/Sendspin/sendspin-cpp) player for synchronized
   multi-room audio. USB sound cards appear in their physical USB slot in the web
   UI. See [docs/plans/10_sendspin_audio.md](docs/plans/10_sendspin_audio.md).
+- **Bluetooth-audio transmitter control** -- FlooGoo FMA120 and Sennheiser
+  BTD 700 dongles get full control drawers in the web UI (see
+  [Supported USB devices](#supported-usb-devices))
 - Web UI for configuration (accessible at `http://<device-ip>`)
 - USB hotplug detection -- plug/unplug serial adapters at any time
 - DETS-backed persistent device configuration across reboots
 - Graceful handling of unexpected USB disconnects during active sessions
+
+## Supported USB devices
+
+Everything below is hot-pluggable: devices are detected on insert, appear
+on the web UI's Overview at their physical USB slot (devices behind a hub
+render as a tree under it), and clean up on removal. Per-device settings
+persist across reboots and replugs.
+
+| Device / class | Examples | Capabilities |
+|---|---|---|
+| **Serial adapters** (TTL, RS-232, RS-485) | FTDI FT232R/FT232H/FT2232H/FT231X, Silicon Labs CP2102/CP2105, WCH CH340/CH9102, Prolific PL2303 | Exposed to Home Assistant as ESPHome **serial proxies**. Line settings (baud/framing) are remembered per port and served back to reconnecting clients; adapter kind (TTL vs RS-232) is editable in the Overview drawer. |
+| **Z-Wave controllers** | Home Assistant Connect ZWA-2, Aeotec Z-Stick Gen5+ | **Z-Wave proxy**: the latency-sensitive Serial API ACK/NAK/CAN handshake runs locally on the device while complete frames stream to Home Assistant. |
+| **Infrared transceivers** | IRdroid IR Toy | Auto-detected and exposed as serial proxies for IR send/receive. |
+| **Bluetooth (HCI) adapters** | Any `btusb`-supported dongle | Selectable radio for the **Bluetooth proxy** (BLE advertisement relay + active GATT connections) -- adds Bluetooth to boards without a usable onboard radio (`rpi`, `rpi2`, `x86_64`) or replaces a weak onboard one. |
+| **USB DACs / sound cards** | Any class-compliant (`snd-usb-audio`) device, including hi-res DACs (up to 24-bit/96 kHz where supported) | Each output becomes an independently discoverable **Sendspin** player for synchronized multi-room audio. |
+| **Bluetooth-audio transmitters** | FlooGoo FMA120, Sennheiser BTD 700 | Sendspin players (via their sound-card half) **plus a device control drawer** on the Overview -- details below. |
+| **USB hubs** | -- | Devices behind a hub render as an indented tree at the hub's slot; branded hubs are named. |
+
+### Bluetooth-audio transmitter control drawers
+
+Both supported dongles pair the audio output with a vendor-protocol control
+channel, surfaced as a drawer on the dongle's Overview row. Preferences are
+persisted and re-applied automatically when the dongle is replugged.
+
+- **FlooGoo FMA120**: audio mode (High Quality / Gaming / Broadcast),
+  headphone pairing (scan, discoverable, connect/forget from the paired
+  list), A2DP vs LE Audio profile preference, active-codec + RSSI readout,
+  Auracast broadcast settings (name, encryption, quality, USB volume), and
+  status-LED toggle.
+- **Sennheiser BTD 700**: audio mode (High Quality / Gaming / Broadcast),
+  per-codec enable toggles (SBC, aptX, aptX Adaptive, aptX Lossless, aptX
+  Lite, LC3 -- as supported by the dongle), connect/disconnect, live
+  dongle / LE-audio / codec-in-use status, and the full Auracast surface:
+  broadcast on/off, name, quality (16 kHz / 24 kHz / High), encryption +
+  key, plus factory reset.
 
 ---
 
