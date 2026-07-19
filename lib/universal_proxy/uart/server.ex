@@ -271,7 +271,7 @@ defmodule UniversalProxy.UART.Server do
         UniversalProxy.ESPHome.Supervisor.restart()
       end)
 
-      {:noreply, refresh_and_clear_stale(state, current, removed)}
+      {:noreply, refresh_and_clear_stale(state, current, Enum.to_list(removed))}
     else
       # Same-set tick: still refresh + reconcile, so a device that moved
       # between slots without the serial SET changing (unplug+replug
@@ -279,7 +279,7 @@ defmodule UniversalProxy.UART.Server do
       # AND gets its vacated slot's persisted entry cleared.
       # current_serial_set/0 above already paid for the enumerate; this
       # adds one sysfs walk per quiet tick.
-      {:noreply, refresh_and_clear_stale(state, current, MapSet.new())}
+      {:noreply, refresh_and_clear_stale(state, current, [])}
     end
   end
 
@@ -442,7 +442,7 @@ defmodule UniversalProxy.UART.Server do
           is_binary(new_port) and new_port != old_port,
           do: serial
 
-    stale = Enum.uniq(MapSet.to_list(removed) ++ moved)
+    stale = Enum.uniq(removed ++ moved)
 
     if stale != [] do
       store = state.settings_store

@@ -199,7 +199,9 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
   # public-API `catch :exit` idiom (CLAUDE.md) — a wedged store degrades
   # to "settings not persisted" rather than failing the connection.
   defp persist_opts(id, opts, serial) do
-    case SettingsStore.put_opts(id, opts, serial) do
+    # Explicit server arg: put_opts/4 defaults BOTH its first and last
+    # params, so a 3-arg call binds `id` as the server (dialyzer-caught).
+    case SettingsStore.put_opts(SettingsStore, id, opts, serial) do
       :ok ->
         :ok
 
