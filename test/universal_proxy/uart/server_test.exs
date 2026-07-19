@@ -2,6 +2,7 @@ defmodule UniversalProxy.UART.ServerTest do
   use ExUnit.Case, async: true
 
   alias UniversalProxy.UART.Server
+  alias UniversalProxy.UART.SettingsStore
 
   describe "zwa2_device?/1" do
     test "matches ZWA-2 by VID/PID" do
@@ -59,6 +60,76 @@ defmodule UniversalProxy.UART.ServerTest do
 
     test "rejects missing keys" do
       refute Server.irdroid_device?(%{serial_number: "abc123"})
+    end
+  end
+
+  # Exercises the unplug-clear logic directly against a test-local
+  # SettingsStore instead of via `handle_info(:check_hotplug, _)` — that
+  # handler always fires a real `ESPHome.Supervisor.restart/0` on a
+  # serial-set change, which must not run against the app-global
+  # supervision tree from a test.
+  describe "clear_removed_settings/3" do
+    setup do
+      path =
+        Path.join(
+          System.tmp_dir!(),
+          "uart_server_settings_test_#{System.unique_integer([:positive])}.dets"
+        )
+
+      File.rm(path)
+
+      store =
+        start_supervised!(
+          {SettingsStore, name: nil, table: :uart_server_test_settings, dets_path: path}
+        )
+
+      on_exit(fn -> File.rm(path) end)
+
+      %{store: store}
+    end
+
+    @opts [speed: 9600, data_bits: 8, stop_bits: 1, parity: :none, flow_control: :none]
+
+    test "deletes the persisted entry for a removed device's port id", %{store: store} do
+      :ok = SettingsStore.put_opts(store, "p_1_1", @opts)
+
+      assert Server.clear_removed_settings(
+               MapSet.new(["SERIAL1"]),
+               %{"SERIAL1" => "p_1_1"},
+               store
+             ) == :ok
+
+      assert SettingsStore.get_opts(store, "p_1_1") == nil
+    end
+
+    test "a removed serial with no known port id is a no-op", %{store: store} do
+      :ok = SettingsStore.put_opts(store, "p_1_1", @opts)
+
+      Server.clear_removed_settings(MapSet.new(["UNKNOWN"]), %{}, store)
+
+      assert SettingsStore.get_opts(store, "p_1_1") == @opts
+    end
+
+    test "leaves other ports' settings untouched", %{store: store} do
+      :ok = SettingsStore.put_opts(store, "p_1_1", @opts)
+      :ok = SettingsStore.put_opts(store, "p_1_2", @opts)
+
+      Server.clear_removed_settings(MapSet.new(["SERIAL1"]), %{"SERIAL1" => "p_1_1"}, store)
+
+      assert SettingsStore.get_opts(store, "p_1_1") == nil
+      assert SettingsStore.get_opts(store, "p_1_2") == @opts
+    end
+
+    test "a dead/unavailable settings store does not crash the caller" do
+      dead = spawn(fn -> :ok end)
+      ref = Process.monitor(dead)
+      assert_receive {:DOWN, ^ref, :process, ^dead, _reason}
+
+      assert Server.clear_removed_settings(
+               MapSet.new(["SERIAL1"]),
+               %{"SERIAL1" => "p_1_1"},
+               dead
+             ) == :ok
     end
   end
 end

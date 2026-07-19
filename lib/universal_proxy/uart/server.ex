@@ -13,6 +13,9 @@ defmodule UniversalProxy.UART.Server do
   Periodically polls `Circuits.UART.enumerate()` to detect USB hotplug
   events. When the set of connected serial numbers changes, the ESPHome
   supervisor is restarted so clients reconnect with the updated device list.
+  A removed device's persisted line settings are also cleared from
+  `UniversalProxy.UART.SettingsStore`, so a different adapter later
+  plugged into the same physical port never inherits a stale baud rate.
 
   Incoming UART data is broadcast to PubSub topic `"uart:<friendly_name>"`.
   """
@@ -21,7 +24,9 @@ defmodule UniversalProxy.UART.Server do
 
   require Logger
 
+  alias UniversalProxy.Hardware
   alias UniversalProxy.UART.PortConfig
+  alias UniversalProxy.UART.SettingsStore
 
   @pubsub UniversalProxy.PubSub
   @hotplug_interval 5_000
@@ -112,7 +117,7 @@ defmodule UniversalProxy.UART.Server do
   # -- Server Callbacks --
 
   @impl true
-  def init(_opts) do
+  def init(opts) do
     # Restart hygiene: a Server-only crash leaves PortSupervisor children
     # running (`:rest_for_one` restarts the Server but never touches the
     # PortSupervisor started before it), and the fresh Server has no
@@ -125,7 +130,14 @@ defmodule UniversalProxy.UART.Server do
     :timer.send_interval(@hotplug_interval, self(), :check_hotplug)
     known = current_serial_set()
     Logger.info("UART server started, #{MapSet.size(known)} serial devices detected")
-    {:ok, %{ports: %{}, known_serials: known}}
+
+    {:ok,
+     %{
+       ports: %{},
+       known_serials: known,
+       port_ids_by_serial: safe_port_ids_by_serial(),
+       settings_store: Keyword.get(opts, :settings_store, SettingsStore)
+     }}
   end
 
   @impl true
@@ -249,13 +261,21 @@ defmodule UniversalProxy.UART.Server do
 
       if MapSet.size(removed) > 0 do
         Logger.info("UART hotplug: devices removed: #{Enum.join(removed, ", ")}")
+        clear_removed_settings(removed, state.port_ids_by_serial, state.settings_store)
       end
 
       Task.Supervisor.start_child(UniversalProxy.TaskSupervisor, fn ->
         UniversalProxy.ESPHome.Supervisor.restart()
       end)
 
-      {:noreply, %{state | known_serials: current}}
+      # Refreshed only here, in the changed branch — a same-set poll
+      # can't move a device between slots without its serial
+      # appearing/disappearing in some tick, EXCEPT an unplug+replug of
+      # the same device into a DIFFERENT slot within one
+      # @hotplug_interval window. That corner keeps the old entry keyed
+      # to the old slot, which the next open in the new slot re-learns
+      # anyway, so it's left unhandled.
+      {:noreply, %{state | known_serials: current, port_ids_by_serial: safe_port_ids_by_serial()}}
     else
       {:noreply, state}
     end
@@ -380,6 +400,62 @@ defmodule UniversalProxy.UART.Server do
       end
 
     MapSet.new(serials)
+  end
+
+  # `Hardware.port_ids_by_serial/1` only walks sysfs and reads
+  # `Circuits.UART.enumerate/0` today — no GenServer call involved — but
+  # this runs on every hotplug poll, so keep it defensive and cheap
+  # rather than assume that stays true forever.
+  @spec safe_port_ids_by_serial() :: %{String.t() => String.t()}
+  defp safe_port_ids_by_serial do
+    Hardware.port_ids_by_serial()
+  rescue
+    e ->
+      Logger.warning(
+        "UART port_ids_by_serial failed: #{Exception.format(:error, e, __STACKTRACE__)}"
+      )
+
+      %{}
+  catch
+    :exit, _ -> %{}
+  end
+
+  # Public (`@doc false`) so tests can exercise the settings-clearing
+  # logic directly against a test-local SettingsStore, without going
+  # through `handle_info(:check_hotplug, _)` — that handler always fires
+  # a real `ESPHome.Supervisor.restart/0` on a serial-set change, which
+  # must not run against the app-global supervision tree from a test.
+  @doc false
+  def clear_removed_settings(removed, port_ids_by_serial, settings_store) do
+    Enum.each(removed, fn serial ->
+      case Map.fetch(port_ids_by_serial, serial) do
+        {:ok, port_id} -> clear_settings(port_id, serial, settings_store)
+        :error -> :ok
+      end
+    end)
+  end
+
+  # Best-effort: a wedged or absent SettingsStore must not crash the
+  # UART server over a hotplug event it can't fully act on (public-API
+  # `catch :exit` idiom, CLAUDE.md) — worst case a stale baud lingers
+  # until a later unplug succeeds in clearing it.
+  defp clear_settings(port_id, serial, settings_store) do
+    case SettingsStore.delete_opts(settings_store, port_id) do
+      :ok ->
+        Logger.info(
+          "UART hotplug: cleared persisted line settings for #{port_id} (#{serial} unplugged)"
+        )
+
+      {:error, reason} ->
+        Logger.warning(
+          "UART hotplug: failed to clear persisted line settings for #{port_id}: #{inspect(reason)}"
+        )
+    end
+  catch
+    :exit, reason ->
+      Logger.warning(
+        "UART hotplug: settings store unavailable while clearing #{port_id}: #{inspect(reason)}"
+      )
   end
 
   defp present?(nil), do: false

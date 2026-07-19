@@ -17,6 +17,12 @@ defmodule UniversalProxy.UART.SettingsStore do
   Keyed by `UniversalProxy.Hardware`'s stable port id (`"p_" <> slot`),
   which survives replug on the same physical port.
 
+  Entries are never overwritten by a different device's settings — a
+  port id only changes hands when `UniversalProxy.UART.Server` sees the
+  slot's USB serial number disappear from a hotplug poll and calls
+  `delete_opts/2` to clear it, so a different adapter plugged into the
+  same physical port can never inherit the previous device's baud.
+
   The DETS file lives on the writable data partition on Nerves
   (`/data/uart_settings.dets`) and in `_build/` on the host for
   development. It is owned at the top-level application supervisor (a peer
@@ -59,6 +65,17 @@ defmodule UniversalProxy.UART.SettingsStore do
   @spec get_opts(GenServer.server(), String.t()) :: keyword() | nil
   def get_opts(server \\ __MODULE__, port_id) when is_binary(port_id) do
     GenServer.call(server, {:get, port_id})
+  end
+
+  @doc """
+  Forget the persisted line settings for `port_id`. Called by
+  `UniversalProxy.UART.Server` when the adapter in that slot is unplugged,
+  so a different device plugged into the same port can never inherit a
+  stale baud rate. Deleting an absent id is a no-op `:ok`.
+  """
+  @spec delete_opts(GenServer.server(), String.t()) :: :ok | {:error, term()}
+  def delete_opts(server \\ __MODULE__, port_id) when is_binary(port_id) do
+    GenServer.call(server, {:delete, port_id})
   end
 
   @doc """
@@ -108,6 +125,17 @@ defmodule UniversalProxy.UART.SettingsStore do
 
   def handle_call({:get, port_id}, _from, state) do
     {:reply, read_opts(state.table, port_id), state}
+  end
+
+  def handle_call({:delete, port_id}, _from, state) do
+    with :ok <- :dets.delete(state.table, port_id),
+         :ok <- :dets.sync(state.table) do
+      {:reply, :ok, state}
+    else
+      {:error, reason} ->
+        Logger.error("UART settings store delete failed: #{inspect(reason)}")
+        {:reply, {:error, reason}, state}
+    end
   end
 
   def handle_call(:all, _from, state) do

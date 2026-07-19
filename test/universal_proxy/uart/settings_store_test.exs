@@ -75,6 +75,21 @@ defmodule UniversalProxy.UART.SettingsStoreTest do
     File.rm(path)
   end
 
+  describe "delete_opts/2" do
+    test "removes a persisted entry", %{store: store} do
+      opts = [speed: 115_200, data_bits: 8, stop_bits: 1, parity: :none, flow_control: :none]
+      :ok = SettingsStore.put_opts(store, "p_1_1", opts)
+
+      assert SettingsStore.delete_opts(store, "p_1_1") == :ok
+      assert SettingsStore.get_opts(store, "p_1_1") == nil
+      assert SettingsStore.all_opts(store) == %{}
+    end
+
+    test "deleting an unknown port id is a no-op :ok", %{store: store} do
+      assert SettingsStore.delete_opts(store, "p_unknown") == :ok
+    end
+  end
+
   describe "all_opts/1" do
     test "returns an empty map when the store has no records", %{store: store} do
       assert SettingsStore.all_opts(store) == %{}
