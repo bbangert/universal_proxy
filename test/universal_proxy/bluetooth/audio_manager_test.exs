@@ -37,19 +37,46 @@ defmodule UniversalProxy.Bluetooth.AudioManagerTest do
     @impl true
     def managed_devices(_c), do: cfg(:devices, [])
     @impl true
-    def start_discovery(_c, a), do: record({:start_discovery, a}) && cfg(:start_discovery, :ok)
+    def start_discovery(_c, a) do
+      record({:start_discovery, a})
+      cfg(:start_discovery, :ok)
+    end
+
     @impl true
-    def stop_discovery(_c, a), do: record({:stop_discovery, a}) && :ok
+    def stop_discovery(_c, a) do
+      record({:stop_discovery, a})
+      :ok
+    end
+
     @impl true
-    def pair(_c, p), do: record({:pair, p}) && cfg(:pair, :ok)
+    def pair(_c, p) do
+      record({:pair, p})
+      cfg(:pair, :ok)
+    end
+
     @impl true
-    def set_trusted(_c, p, v), do: record({:set_trusted, p, v}) && cfg(:set_trusted, :ok)
+    def set_trusted(_c, p, v) do
+      record({:set_trusted, p, v})
+      cfg(:set_trusted, :ok)
+    end
+
     @impl true
-    def connect(_c, p), do: record({:connect, p}) && cfg(:connect, :ok)
+    def connect(_c, p) do
+      record({:connect, p})
+      cfg(:connect, :ok)
+    end
+
     @impl true
-    def disconnect(_c, p), do: record({:disconnect, p}) && :ok
+    def disconnect(_c, p) do
+      record({:disconnect, p})
+      :ok
+    end
+
     @impl true
-    def remove(_c, a, p), do: record({:remove, a, p}) && :ok
+    def remove(_c, a, p) do
+      record({:remove, a, p})
+      :ok
+    end
   end
 
   setup do
