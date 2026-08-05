@@ -175,7 +175,7 @@ defmodule UniversalProxy.MixProject do
       # version updates, please review their release notes in case
       # changes to your application are needed.
       {:nerves_system_bbb, "~> 2.30", runtime: false, targets: :bbb},
-      {:nerves_system_mangopi_mq_pro, "~> 0.16", runtime: false, targets: :mangopi_mq_pro},
+      {:nerves_system_mangopi_mq_pro, "~> 0.17", runtime: false, targets: :mangopi_mq_pro},
       {:nerves_system_qemu_aarch64, "~> 0.4", runtime: false, targets: :qemu_aarch64}
     ] ++ up_nerves_systems()
   end
