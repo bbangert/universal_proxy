@@ -110,7 +110,7 @@ defmodule UniversalProxy.MixProject do
       {:circuits_uart, "~> 1.5"},
 
       # Supervised OS process management for the sendspin_player C++ binary
-      {:muontrap, "~> 1.8"},
+      {:muontrap, "~> 2.0"},
 
       # ESPHome Native API server library
       {:espex, "~> 0.8"},
