@@ -33,7 +33,7 @@ defmodule UniversalProxy.FirmwareUpdate do
 
   require Logger
 
-  alias UniversalProxy.FirmwareUpdate.ConfigStore
+  alias UniversalProxy.FirmwareUpdate.{ConfigStore, Poller}
   alias NervesGithubUpdater.Updater
 
   # Aliased separately because the unaliased `Supervisor` below refers
@@ -65,7 +65,11 @@ defmodule UniversalProxy.FirmwareUpdate do
           id: LibSupervisor,
           start: {__MODULE__, :start_library, []},
           type: :supervisor
-        }
+        },
+        # Last in rest_for_one: the Updater must exist before the poller
+        # can ask it to check. Nothing else schedules checks — the library
+        # arms no timers and does none at boot.
+        Poller
       ],
       strategy: :rest_for_one,
       name: __MODULE__
