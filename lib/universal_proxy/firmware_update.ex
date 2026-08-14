@@ -155,18 +155,42 @@ defmodule UniversalProxy.FirmwareUpdate do
     end
   end
 
+  @doc """
+  Like `state/0`, but distinguishes "the Updater is gone" from "the
+  Updater is idle".
+
+  `state/0` flattens both into an idle-shaped map, which is right for the
+  LiveView (it renders the same either way) but wrong for anything that
+  needs to report availability — the ESPHome `update` entity sends
+  `missing_state` so Home Assistant shows the entity as unavailable
+  rather than claiming the device is up to date.
+
+  A call timeout still returns `{:ok, installing_snapshot}`: mid-flash the
+  Updater is deliberately blocked, which means busy, not absent.
+  """
+  @spec updater_state() :: {:ok, map()} | {:error, :unavailable}
+  def updater_state do
+    if host_mode?() do
+      {:ok, state()}
+    else
+      try do
+        {:ok, Updater.state(Updater)}
+      catch
+        :exit, {:timeout, {GenServer, :call, _}} ->
+          {:ok, flashing_snapshot()}
+
+        :exit, reason ->
+          Logger.warning("FirmwareUpdate.updater_state: Updater unavailable: #{inspect(reason)}")
+          {:error, :unavailable}
+      end
+    end
+  end
+
   @doc "Returns the live Updater snapshot for LiveView mount."
   @spec state() :: map()
   def state do
     if host_mode?() do
-      %{
-        phase: :idle,
-        pct: nil,
-        message: nil,
-        last_error: nil,
-        last_release: nil,
-        verification_required: ConfigStore.verification_required?()
-      }
+      idle_snapshot()
     else
       # Flash-safe: the Updater deliberately blocks its whole loop while
       # fwup writes the firmware (documented design), so a LiveView
@@ -174,32 +198,33 @@ defmodule UniversalProxy.FirmwareUpdate do
       # render a busy-shaped snapshot for that case. Only the timeout
       # means "flash in progress"; any other exit (e.g. :noproc while
       # the Updater restarts) must not masquerade as installing.
-      try do
-        Updater.state(Updater)
-      catch
-        :exit, {:timeout, {GenServer, :call, _}} ->
-          %{
-            phase: :installing,
-            pct: nil,
-            message: "Installing firmware…",
-            last_error: nil,
-            last_release: nil,
-            verification_required: ConfigStore.verification_required?()
-          }
-
-        :exit, reason ->
-          Logger.warning("FirmwareUpdate.state: Updater unavailable: #{inspect(reason)}")
-
-          %{
-            phase: :idle,
-            pct: nil,
-            message: nil,
-            last_error: nil,
-            last_release: nil,
-            verification_required: ConfigStore.verification_required?()
-          }
+      case updater_state() do
+        {:ok, snapshot} -> snapshot
+        {:error, :unavailable} -> idle_snapshot()
       end
     end
+  end
+
+  defp idle_snapshot do
+    %{
+      phase: :idle,
+      pct: nil,
+      message: nil,
+      last_error: nil,
+      last_release: nil,
+      verification_required: ConfigStore.verification_required?()
+    }
+  end
+
+  defp flashing_snapshot do
+    %{
+      phase: :installing,
+      pct: nil,
+      message: "Installing firmware…",
+      last_error: nil,
+      last_release: nil,
+      verification_required: ConfigStore.verification_required?()
+    }
   end
 
   @doc """

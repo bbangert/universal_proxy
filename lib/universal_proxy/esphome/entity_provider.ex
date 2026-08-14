@@ -258,8 +258,20 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
   # Live install progress. Re-read only the update entity (not every source)
   # and push when it actually changed, so HA's progress bar tracks the flash
   # instead of waiting for the next 30 s tick.
-  def handle_info({:fw_update_progress, _payload}, state) do
-    value = read_update_value(state.sources)
+  def handle_info({:fw_update_progress, payload}, state) do
+    # Mid-flash the Updater blocks its entire loop, so re-reading here would
+    # park this provider for the full call timeout AND come back with
+    # `pct: nil` — discarding the very percentage the event carries, which
+    # is the whole reason we subscribe. Merge the payload instead, and only
+    # re-read once it reports idle (where a freshly fetched release, and so
+    # a new latest_version/notes, becomes visible). Same shape as the
+    # LiveView handler in UniversalProxyWeb.SystemLive.
+    value =
+      if Map.get(payload, :phase) == :idle do
+        read_update_value(state.sources)
+      else
+        apply_progress(Map.get(state.last, "firmware_update"), payload)
+      end
 
     if Map.get(state.last, "firmware_update", :__unset__) == value do
       {:noreply, state}
@@ -313,8 +325,8 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
   # return {:error, :host_mode} off-device; log rather than crash the provider.
   def handle_cast({:command, %Proto.UpdateCommandRequest{key: key, command: cmd}}, state) do
     case {Map.get(state.keys, key), cmd} do
-      {"firmware_update", :UPDATE_COMMAND_UPDATE} -> log_fw(FirmwareUpdate.install_latest())
-      {"firmware_update", :UPDATE_COMMAND_CHECK} -> log_fw(FirmwareUpdate.check())
+      {"firmware_update", :UPDATE_COMMAND_UPDATE} -> run_fw(state, :fw_install, "install")
+      {"firmware_update", :UPDATE_COMMAND_CHECK} -> run_fw(state, :fw_check, "check")
       other -> Logger.info("EntityProvider: ignoring update command #{inspect(other)}")
     end
 
@@ -326,10 +338,29 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
     {:noreply, state}
   end
 
-  defp log_fw(:ok), do: :ok
+  # Run the firmware command off this process. `install_latest/0` is a call
+  # into a loop that deliberately blocks for the whole flash, so running it
+  # inline would park the provider (and every other entity's state pushes)
+  # for the full call timeout. Task.Supervisor per the project convention —
+  # never bare Task.start — so a failure is supervised and visible.
+  defp run_fw(state, source_key, label) do
+    fun = Map.fetch!(state.sources, source_key)
+    runner = Map.get(state.sources, :task_runner, &default_task_runner/1)
 
-  defp log_fw({:error, reason}),
-    do: Logger.info("EntityProvider: firmware update command rejected: #{inspect(reason)}")
+    runner.(fn ->
+      case fun.() do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          Logger.info("EntityProvider: firmware #{label} rejected: #{inspect(reason)}")
+      end
+    end)
+  end
+
+  defp default_task_runner(fun) do
+    Task.Supervisor.start_child(UniversalProxy.TaskSupervisor, fun)
+  end
 
   # ── Pure: advertisements ────────────────────────────────────────────
 
@@ -509,11 +540,37 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
   @doc false
   @spec read_update_value(map()) :: map() | nil
   def read_update_value(sources) do
-    update_value(
-      safe(sources.fw_update, nil),
-      safe(sources.fw_version, nil),
-      safe(sources.fw_repo, nil)
-    )
+    case safe(sources.fw_update, {:error, :unavailable}) do
+      {:ok, fw_state} ->
+        update_value(fw_state, safe(sources.fw_version, nil), safe(sources.fw_repo, nil))
+
+      {:error, :unavailable} ->
+        nil
+    end
+  end
+
+  @doc """
+  Fold a `{:fw_update_progress, payload}` event into the cached update
+  value without touching the Updater.
+
+  Only the progress-bar fields move; versions and release notes are
+  carried over from the last full read, since the payload doesn't carry
+  them. With no cached value there is nothing to merge into, so the
+  entity stays `missing_state` until the next full read.
+  """
+  @spec apply_progress(map() | nil, map()) :: map() | nil
+  def apply_progress(nil, _payload), do: nil
+
+  def apply_progress(value, payload) when is_map(value) do
+    pct = Map.get(payload, :pct)
+    in_progress? = Map.get(payload, :phase) in @in_progress_phases
+
+    %{
+      value
+      | in_progress: in_progress?,
+        has_progress: in_progress? and is_number(pct),
+        progress: (is_number(pct) && pct * 1.0) || 0.0
+    }
   end
 
   @doc """
@@ -646,9 +703,14 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
       audio: &Audio.Server.list_outputs/0,
       bt_stats: &Stats.current/0,
       adapters: &bt_adapters/0,
-      fw_update: &FirmwareUpdate.state/0,
+      # updater_state/0, not state/0: the entity needs to tell "Updater is
+      # gone" (missing_state) apart from "Updater is idle", which state/0
+      # deliberately flattens together for the LiveView.
+      fw_update: &FirmwareUpdate.updater_state/0,
       fw_version: &FirmwareUpdate.current_version/0,
-      fw_repo: &ConfigStore.get_repo/0
+      fw_repo: &ConfigStore.get_repo/0,
+      fw_check: &FirmwareUpdate.check/0,
+      fw_install: &FirmwareUpdate.install_latest/0
     }
 
     Map.merge(defaults, Map.new(Keyword.get(opts, :sources, [])))
