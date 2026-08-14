@@ -40,11 +40,20 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
 
   alias Espex.Proto
 
-  alias UniversalProxy.{Audio, Bluetooth, System}
+  alias UniversalProxy.{Audio, Bluetooth, FirmwareUpdate, System}
   alias UniversalProxy.Bluetooth.{RadioMonitor, Stats}
   alias UniversalProxy.ESPHome.Clients
+  alias UniversalProxy.FirmwareUpdate.ConfigStore
 
   @default_tick_ms 30_000
+
+  # Updater phases that mean "an install is running" for HA's progress bar.
+  @in_progress_phases [:downloading, :installing]
+
+  # `release_summary` is free-form in the proto, but the release body is
+  # unbounded (GitHub auto-generated notes run to several KB) and it rides
+  # every progress push. Cap it so a chatty install doesn't spam large frames.
+  @summary_limit 1_500
 
   # ── Entity specifications ───────────────────────────────────────────
   # `key` (fixed32) is derived from `object_id` via crc32 so it is stable
@@ -148,6 +157,16 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
       type: :button,
       name: "Reboot",
       category: :ENTITY_CATEGORY_CONFIG
+    },
+    # firmware update — renders in HA as a native `update.` entity with an
+    # Install button, release notes and a progress bar, and feeds the
+    # Settings → Updates panel.
+    %{
+      object_id: "firmware_update",
+      type: :update,
+      name: "Firmware Update",
+      device_class: "firmware",
+      category: :ENTITY_CATEGORY_CONFIG
     }
   ]
 
@@ -184,6 +203,12 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
       keys: key_lookup(),
       last: %{}
     }
+
+    # Firmware-update progress is event-driven, not poll-driven: a 30 s tick
+    # would render HA's progress bar useless during an install. Subscribing is
+    # best-effort — PubSub may not be up yet during a supervised restart, and
+    # the poll tick still backstops the entity either way.
+    if Keyword.get(opts, :subscribe, true), do: subscribe_fw_progress()
 
     # Seed `last` once at startup (before any client can connect) so
     # `initial_states/0` answers instantly off the connection-accept path
@@ -230,6 +255,26 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
     {:noreply, new_state}
   end
 
+  # Live install progress. Re-read only the update entity (not every source)
+  # and push when it actually changed, so HA's progress bar tracks the flash
+  # instead of waiting for the next 30 s tick.
+  def handle_info({:fw_update_progress, _payload}, state) do
+    value = read_update_value(state.sources)
+
+    if Map.get(state.last, "firmware_update", :__unset__) == value do
+      {:noreply, state}
+    else
+      case state_response_for(spec_for("firmware_update"), value) do
+        nil -> :ok
+        struct -> push(state.server, struct)
+      end
+
+      {:noreply, %{state | last: Map.put(state.last, "firmware_update", value)}}
+    end
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
+
   # Read every source, push only changed values, and return the new state.
   defp do_poll(state) do
     values = read_values(state.sources, state.supported?)
@@ -264,10 +309,27 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
     {:noreply, state}
   end
 
+  # HA's update card maps Install -> UPDATE and its refresh -> CHECK. Both
+  # return {:error, :host_mode} off-device; log rather than crash the provider.
+  def handle_cast({:command, %Proto.UpdateCommandRequest{key: key, command: cmd}}, state) do
+    case {Map.get(state.keys, key), cmd} do
+      {"firmware_update", :UPDATE_COMMAND_UPDATE} -> log_fw(FirmwareUpdate.install_latest())
+      {"firmware_update", :UPDATE_COMMAND_CHECK} -> log_fw(FirmwareUpdate.check())
+      other -> Logger.info("EntityProvider: ignoring update command #{inspect(other)}")
+    end
+
+    {:noreply, state}
+  end
+
   def handle_cast({:command, other}, state) do
     Logger.debug("EntityProvider: ignoring unknown command #{inspect(other)}")
     {:noreply, state}
   end
+
+  defp log_fw(:ok), do: :ok
+
+  defp log_fw({:error, reason}),
+    do: Logger.info("EntityProvider: firmware update command rejected: #{inspect(reason)}")
 
   # ── Pure: advertisements ────────────────────────────────────────────
 
@@ -327,6 +389,17 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
     }
   end
 
+  defp advertisement(%{type: :update} = s) do
+    %Proto.ListEntitiesUpdateResponse{
+      object_id: s.object_id,
+      key: key_for(s.object_id),
+      name: s.name,
+      device_class: Map.get(s, :device_class, ""),
+      entity_category: Map.get(s, :category, :ENTITY_CATEGORY_CONFIG),
+      disabled_by_default: Map.get(s, :disabled_by_default, false)
+    }
+  end
+
   # ── Pure: state responses ───────────────────────────────────────────
 
   @doc """
@@ -366,6 +439,23 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
     }
   end
 
+  defp state_response_for(%{type: :update} = s, value) do
+    v = value || %{}
+
+    %Proto.UpdateStateResponse{
+      key: key_for(s.object_id),
+      missing_state: is_nil(value),
+      in_progress: Map.get(v, :in_progress, false),
+      has_progress: Map.get(v, :has_progress, false),
+      progress: Map.get(v, :progress, 0.0),
+      current_version: Map.get(v, :current_version, ""),
+      latest_version: Map.get(v, :latest_version, ""),
+      title: Map.get(v, :title, ""),
+      release_summary: Map.get(v, :release_summary, ""),
+      release_url: Map.get(v, :release_url, "")
+    }
+  end
+
   defp state_response_for(_other, _value), do: nil
 
   # ── Pure: read all sources into a value map ─────────────────────────
@@ -397,7 +487,8 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
       "firmware_version" => Map.get(firmware, :version),
       "board_target" => Map.get(firmware, :target),
       "network_type" => network_type_label(safe(sources.network_type, :disconnected)),
-      "ip_address" => safe(sources.ip, nil)
+      "ip_address" => safe(sources.ip, nil),
+      "firmware_update" => read_update_value(sources)
     }
 
     if supported? do
@@ -414,6 +505,66 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
       base
     end
   end
+
+  @doc false
+  @spec read_update_value(map()) :: map() | nil
+  def read_update_value(sources) do
+    update_value(
+      safe(sources.fw_update, nil),
+      safe(sources.fw_version, nil),
+      safe(sources.fw_repo, nil)
+    )
+  end
+
+  @doc """
+  Normalise an `UniversalProxy.FirmwareUpdate.state/0` snapshot into the
+  flat value map backing the HA `update.` entity.
+
+  `nil` (updater unavailable) yields `nil`, which renders as
+  `missing_state` rather than a bogus "no update available".
+
+  `latest_version` falls back to the current version when no release has
+  been fetched yet — reporting an empty latest would make HA show a
+  permanently-pending update before the first check runs.
+  """
+  @spec update_value(map() | nil, String.t() | nil, String.t() | nil) :: map() | nil
+  def update_value(nil, _current_version, _repo), do: nil
+
+  def update_value(fw_state, current_version, repo) when is_map(fw_state) do
+    release = Map.get(fw_state, :last_release)
+    pct = Map.get(fw_state, :pct)
+    in_progress? = Map.get(fw_state, :phase) in @in_progress_phases
+    tag = release && Map.get(release, :tag_name)
+    current = current_version || ""
+
+    %{
+      current_version: current,
+      latest_version: tag || current,
+      title: (release && Map.get(release, :name)) || "",
+      release_summary: summary(release),
+      release_url: release_url(repo, tag),
+      in_progress: in_progress?,
+      has_progress: in_progress? and is_number(pct),
+      progress: (is_number(pct) && pct * 1.0) || 0.0
+    }
+  end
+
+  defp summary(nil), do: ""
+
+  defp summary(release) do
+    case Map.get(release, :body) do
+      body when is_binary(body) -> String.slice(body, 0, @summary_limit)
+      _ -> ""
+    end
+  end
+
+  # The updater's cached release carries no html_url, so reconstruct the
+  # canonical GitHub URL from the configured owner/repo + tag.
+  defp release_url(repo, tag)
+       when is_binary(repo) and is_binary(tag) and repo != "" and tag != "",
+       do: "https://github.com/#{repo}/releases/tag/#{tag}"
+
+  defp release_url(_repo, _tag), do: ""
 
   @doc """
   Return `{object_id, value}` pairs whose value differs from `last`.
@@ -467,6 +618,22 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
 
   defp schedule(tick_ms), do: Process.send_after(self(), :poll, tick_ms)
 
+  # Best-effort: Phoenix.PubSub.subscribe/2 raises when the PubSub isn't
+  # started (host tests, or a supervised restart racing this provider).
+  # Losing the subscription only costs live progress, not correctness — the
+  # poll tick still refreshes the entity.
+  defp subscribe_fw_progress do
+    Phoenix.PubSub.subscribe(FirmwareUpdate.pubsub(), FirmwareUpdate.topic())
+  rescue
+    e ->
+      Logger.debug("EntityProvider: firmware-progress subscribe failed: #{Exception.message(e)}")
+      :ok
+  catch
+    :exit, reason ->
+      Logger.debug("EntityProvider: firmware-progress subscribe exited: #{inspect(reason)}")
+      :ok
+  end
+
   defp default_supported?, do: Bluetooth.supported?()
 
   # Default source funs. Overridable per-key via opts for tests.
@@ -480,7 +647,10 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
       clients_count: &client_count/0,
       audio: &Audio.Server.list_outputs/0,
       bt_stats: &Stats.current/0,
-      adapters: &bt_adapters/0
+      adapters: &bt_adapters/0,
+      fw_update: &FirmwareUpdate.state/0,
+      fw_version: &FirmwareUpdate.current_version/0,
+      fw_repo: &ConfigStore.get_repo/0
     }
 
     Map.merge(defaults, Map.new(Keyword.get(opts, :sources, [])))
