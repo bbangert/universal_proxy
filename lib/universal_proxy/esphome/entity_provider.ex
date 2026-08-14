@@ -618,19 +618,17 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
 
   defp schedule(tick_ms), do: Process.send_after(self(), :poll, tick_ms)
 
-  # Best-effort: Phoenix.PubSub.subscribe/2 raises when the PubSub isn't
-  # started (host tests, or a supervised restart racing this provider).
-  # Losing the subscription only costs live progress, not correctness — the
-  # poll tick still refreshes the entity.
+  # Best-effort: Phoenix.PubSub.subscribe/2 delegates to Registry.register/3,
+  # which RAISES ArgumentError when the registry isn't started (host tests, or
+  # a supervised restart racing this provider) rather than exiting — so rescue
+  # that specifically, per the project convention. Losing the subscription only
+  # costs live progress, not correctness: the poll tick still refreshes the
+  # entity. Anything else is a real bug and must not be swallowed here.
   defp subscribe_fw_progress do
     Phoenix.PubSub.subscribe(FirmwareUpdate.pubsub(), FirmwareUpdate.topic())
   rescue
-    e ->
+    e in ArgumentError ->
       Logger.debug("EntityProvider: firmware-progress subscribe failed: #{Exception.message(e)}")
-      :ok
-  catch
-    :exit, reason ->
-      Logger.debug("EntityProvider: firmware-progress subscribe exited: #{inspect(reason)}")
       :ok
   end
 

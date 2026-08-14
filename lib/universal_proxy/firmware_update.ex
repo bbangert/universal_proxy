@@ -119,12 +119,39 @@ defmodule UniversalProxy.FirmwareUpdate do
     end
   end
 
-  @spec install_latest() :: :ok | {:error, :host_mode | :no_release_cached | :busy}
+  @doc """
+  Start installing the cached release.
+
+  Flash-safe, for the same reason `state/0` is: the Updater deliberately
+  blocks its whole loop while fwup writes the firmware, so a second call
+  arriving mid-flash never reaches the server's own `:busy` guard — it
+  just sits until the 5 s call timeout. Left unguarded that exit
+  propagates into the caller, which matters because callers include the
+  ESPHome `EntityProvider` (a Home Assistant "Install" press, or simply a
+  double-click). Killing it would take the whole Espex subtree down with
+  it via `:rest_for_one`, dropping every HA client mid-flash.
+
+  A timeout therefore means "an install is already running" and maps to
+  `{:error, :busy}` — the same answer the server gives when it can
+  answer. Any other exit means the Updater is down or restarting, which
+  is reported separately rather than masquerading as busy.
+  """
+  @spec install_latest() ::
+          :ok | {:error, :host_mode | :no_release_cached | :busy | :unavailable}
   def install_latest do
     if host_mode?() do
       {:error, :host_mode}
     else
-      Updater.install_latest(Updater)
+      try do
+        Updater.install_latest(Updater)
+      catch
+        :exit, {:timeout, {GenServer, :call, _}} ->
+          {:error, :busy}
+
+        :exit, reason ->
+          Logger.warning("FirmwareUpdate.install_latest: Updater unavailable: #{inspect(reason)}")
+          {:error, :unavailable}
+      end
     end
   end
 

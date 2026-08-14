@@ -68,8 +68,13 @@ defmodule UniversalProxy.FirmwareUpdate.PollerTest do
           end
         })
 
-      # Startup delay is jitter-floored to 1 min, so drive the first tick
-      # directly rather than waiting on wall-clock time.
+      # init/1 must have armed the startup timer. Asserted explicitly because
+      # the tick below is driven by hand — without this, deleting the
+      # schedule/2 call from init/1's enabled branch would still pass.
+      assert :sys.get_state(pid).timer != nil
+
+      # The startup delay is floored at 1 min by design, so drive the first
+      # tick directly rather than waiting on wall-clock time.
       send(pid, :check)
       assert_receive :checked, 500
 
