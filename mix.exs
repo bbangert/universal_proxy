@@ -164,7 +164,7 @@ defmodule UniversalProxy.MixProject do
       # bluez/improv above) and published as hex nerves_github_updater
       # 0.1.0. The host wires it via the `UniversalProxy.FirmwareUpdate`
       # facade, which stays in-app.
-      {:nerves_github_updater, "~> 0.1"},
+      {:nerves_github_updater, "~> 0.2"},
 
       # Dependencies for specific targets
       # NOTE: It's generally low risk and recommended to follow minor version
