@@ -226,7 +226,7 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
     # because this provider starts before Espex (rest_for_one), the Espex
     # registry may not exist — pushing would raise. The first scheduled tick
     # does the first real diff-push once Espex is up.
-    new_state = %{state | last: read_values(state.sources, state.supported?)}
+    new_state = %{state | last: read_values(state.sources, state.supported?, state.last)}
     schedule(new_state.tick_ms)
     {:noreply, new_state}
   end
@@ -289,7 +289,7 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
 
   # Read every source, push only changed values, and return the new state.
   defp do_poll(state) do
-    values = read_values(state.sources, state.supported?)
+    values = read_values(state.sources, state.supported?, state.last)
 
     for {object_id, value} <- changed(state.last, values) do
       case state_response_for(spec_for(object_id), value) do
@@ -498,7 +498,14 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
   than crashing the poll loop.
   """
   @spec read_values(map(), boolean()) :: map()
-  def read_values(sources, supported?) do
+  def read_values(sources, supported?), do: read_values(sources, supported?, %{})
+
+  @doc """
+  As `read_values/2`, but given the previous tick's values so the firmware
+  entity can be carried over instead of re-read while an install runs.
+  """
+  @spec read_values(map(), boolean(), map()) :: map()
+  def read_values(sources, supported?, previous) do
     metrics = safe(sources.metrics, %{})
     wifi = safe(sources.wifi, nil)
     firmware = safe(sources.firmware, %{})
@@ -519,7 +526,7 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
       "board_target" => Map.get(firmware, :target),
       "network_type" => network_type_label(safe(sources.network_type, :disconnected)),
       "ip_address" => safe(sources.ip, nil),
-      "firmware_update" => read_update_value(sources)
+      "firmware_update" => poll_update_value(sources, Map.get(previous, "firmware_update"))
     }
 
     if supported? do
@@ -536,6 +543,21 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
       base
     end
   end
+
+  # While an install runs, the Updater blocks its entire loop, so the 30 s
+  # tick would wait out the full call timeout and get back a synthetic
+  # snapshot with `pct: nil` and no release — clobbering the live values
+  # the progress events maintain, and stalling every other entity's push
+  # for 5 s each tick. Carry the cached value instead; the terminal `:idle`
+  # progress event does the authoritative re-read.
+  #
+  # Gated on liveness (a registry lookup, never a call) so a crashed
+  # Updater can't leave the entity pinned to a stale in-progress value.
+  defp poll_update_value(sources, %{in_progress: true} = cached) do
+    if safe(sources.fw_alive, false), do: cached, else: read_update_value(sources)
+  end
+
+  defp poll_update_value(sources, _cached), do: read_update_value(sources)
 
   @doc false
   @spec read_update_value(map()) :: map() | nil
@@ -707,6 +729,7 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
       # gone" (missing_state) apart from "Updater is idle", which state/0
       # deliberately flattens together for the LiveView.
       fw_update: &FirmwareUpdate.updater_state/0,
+      fw_alive: &FirmwareUpdate.updater_alive?/0,
       fw_version: &FirmwareUpdate.current_version/0,
       fw_repo: &ConfigStore.get_repo/0,
       fw_check: &FirmwareUpdate.check/0,

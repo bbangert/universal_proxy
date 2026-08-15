@@ -32,6 +32,7 @@ defmodule UniversalProxy.ESPHome.EntityProviderTest do
         fw_repo: fn -> "bbangert/universal_proxy" end,
         fw_check: fn -> :ok end,
         fw_install: fn -> :ok end,
+        fw_alive: fn -> true end,
         # Run supervised work inline so tests observe it deterministically.
         task_runner: fn fun -> fun.() end
       },
@@ -292,6 +293,70 @@ defmodule UniversalProxy.ESPHome.EntityProviderTest do
       assert state.current_version == "1.2.3"
       assert state.latest_version == "0.9.1"
       assert state.release_url =~ "releases/tag/0.9.1"
+    end
+  end
+
+  describe "poll during an install" do
+    test "carries the cached value instead of re-reading the blocked updater" do
+      reads = start_supervised!(Supervisor.child_spec({Agent, fn -> 0 end}, id: :poll_reads))
+
+      sources =
+        sample_sources(%{
+          fw_update: fn ->
+            Agent.update(reads, &(&1 + 1))
+            {:ok, idle_fw_state()}
+          end,
+          fw_alive: fn -> true end
+        })
+
+      installing = %{
+        current_version: "0.9.0",
+        latest_version: "0.9.1",
+        title: "0.9.1",
+        release_summary: "notes",
+        release_url: "https://example/releases/tag/0.9.1",
+        in_progress: true,
+        has_progress: true,
+        progress: 42.0
+      }
+
+      v = EP.read_values(sources, false, %{"firmware_update" => installing})
+
+      # Untouched: the 30 s tick must not clobber live progress or the
+      # release metadata the progress events maintain.
+      assert v["firmware_update"] == installing
+      assert Agent.get(reads, & &1) == 0
+    end
+
+    test "resumes reading once the install is no longer in progress" do
+      reads = start_supervised!(Supervisor.child_spec({Agent, fn -> 0 end}, id: :poll_reads2))
+
+      sources =
+        sample_sources(%{
+          fw_update: fn ->
+            Agent.update(reads, &(&1 + 1))
+            {:ok, idle_fw_state()}
+          end
+        })
+
+      idle = %{in_progress: false, progress: 0.0}
+      v = EP.read_values(sources, false, %{"firmware_update" => idle})
+
+      assert Agent.get(reads, & &1) == 1
+      refute v["firmware_update"] == idle
+    end
+
+    test "a dead updater is not pinned to a stale in-progress value" do
+      sources =
+        sample_sources(%{
+          fw_update: fn -> {:error, :unavailable} end,
+          fw_alive: fn -> false end
+        })
+
+      stale = %{in_progress: true, progress: 42.0}
+      v = EP.read_values(sources, false, %{"firmware_update" => stale})
+
+      assert v["firmware_update"] == nil
     end
   end
 

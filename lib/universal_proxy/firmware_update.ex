@@ -156,6 +156,16 @@ defmodule UniversalProxy.FirmwareUpdate do
   end
 
   @doc """
+  Cheap, non-blocking liveness check for the Updater.
+
+  Safe to call from a hot path: it's a registry lookup, so unlike
+  `state/0` it never waits on the Updater's loop — which matters because
+  that loop is blocked for the whole flash.
+  """
+  @spec updater_alive?() :: boolean()
+  def updater_alive?, do: host_mode?() or GenServer.whereis(Updater) != nil
+
+  @doc """
   Like `state/0`, but distinguishes "the Updater is gone" from "the
   Updater is idle".
 
@@ -165,8 +175,8 @@ defmodule UniversalProxy.FirmwareUpdate do
   `missing_state` so Home Assistant shows the entity as unavailable
   rather than claiming the device is up to date.
 
-  A call timeout still returns `{:ok, installing_snapshot}`: mid-flash the
-  Updater is deliberately blocked, which means busy, not absent.
+  Mid-flash still reports `{:ok, busy_snapshot}` — the Updater is
+  deliberately blocked then, which means busy, not absent.
   """
   @spec updater_state() :: {:ok, map()} | {:error, :unavailable}
   def updater_state do
@@ -185,9 +195,10 @@ defmodule UniversalProxy.FirmwareUpdate do
       # Updater dies between the lookup and the call, `state/1` absorbs it
       # and we report idle — degrading to the old behaviour rather than
       # crashing, which is the right direction to fail in.
-      case GenServer.whereis(Updater) do
-        nil -> {:error, :unavailable}
-        _pid -> {:ok, Updater.state(Updater)}
+      if updater_alive?() do
+        {:ok, Updater.state(Updater)}
+      else
+        {:error, :unavailable}
       end
     end
   end
