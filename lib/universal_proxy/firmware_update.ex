@@ -33,7 +33,7 @@ defmodule UniversalProxy.FirmwareUpdate do
 
   require Logger
 
-  alias UniversalProxy.FirmwareUpdate.ConfigStore
+  alias UniversalProxy.FirmwareUpdate.{ConfigStore, Poller}
   alias NervesGithubUpdater.Updater
 
   # Aliased separately because the unaliased `Supervisor` below refers
@@ -65,7 +65,11 @@ defmodule UniversalProxy.FirmwareUpdate do
           id: LibSupervisor,
           start: {__MODULE__, :start_library, []},
           type: :supervisor
-        }
+        },
+        # Last in rest_for_one: the Updater must exist before the poller
+        # can ask it to check. Nothing else schedules checks — the library
+        # arms no timers and does none at boot.
+        Poller
       ],
       strategy: :rest_for_one,
       name: __MODULE__
@@ -115,12 +119,87 @@ defmodule UniversalProxy.FirmwareUpdate do
     end
   end
 
-  @spec install_latest() :: :ok | {:error, :host_mode | :no_release_cached | :busy}
+  @doc """
+  Start installing the cached release.
+
+  Flash-safe, for the same reason `state/0` is: the Updater deliberately
+  blocks its whole loop while fwup writes the firmware, so a second call
+  arriving mid-flash never reaches the server's own `:busy` guard — it
+  just sits until the 5 s call timeout. Left unguarded that exit
+  propagates into the caller, which matters because callers include the
+  ESPHome `EntityProvider` (a Home Assistant "Install" press, or simply a
+  double-click). Killing it would take the whole Espex subtree down with
+  it via `:rest_for_one`, dropping every HA client mid-flash.
+
+  A timeout therefore means "an install is already running" and maps to
+  `{:error, :busy}` — the same answer the server gives when it can
+  answer. Any other exit means the Updater is down or restarting, which
+  is reported separately rather than masquerading as busy.
+  """
+  @spec install_latest() ::
+          :ok | {:error, :host_mode | :no_release_cached | :busy | :unavailable}
   def install_latest do
     if host_mode?() do
       {:error, :host_mode}
     else
-      Updater.install_latest(Updater)
+      try do
+        Updater.install_latest(Updater)
+      catch
+        :exit, {:timeout, {GenServer, :call, _}} ->
+          {:error, :busy}
+
+        :exit, reason ->
+          Logger.warning("FirmwareUpdate.install_latest: Updater unavailable: #{inspect(reason)}")
+          {:error, :unavailable}
+      end
+    end
+  end
+
+  @doc """
+  Cheap, non-blocking liveness check for the Updater.
+
+  Safe to call from a hot path: it's a registry lookup, so unlike
+  `state/0` it never waits on the Updater's loop — which matters because
+  that loop is blocked for the whole flash.
+  """
+  @spec updater_alive?() :: boolean()
+  def updater_alive?, do: host_mode?() or GenServer.whereis(Updater) != nil
+
+  @doc """
+  Like `state/0`, but distinguishes "the Updater is gone" from "the
+  Updater is idle".
+
+  `state/0` flattens both into an idle-shaped map, which is right for the
+  LiveView (it renders the same either way) but wrong for anything that
+  needs to report availability — the ESPHome `update` entity sends
+  `missing_state` so Home Assistant shows the entity as unavailable
+  rather than claiming the device is up to date.
+
+  Mid-flash still reports `{:ok, busy_snapshot}` — the Updater is
+  deliberately blocked then, which means busy, not absent.
+  """
+  @spec updater_state() :: {:ok, map()} | {:error, :unavailable}
+  def updater_state do
+    if host_mode?() do
+      {:ok, state()}
+    else
+      # `Updater.state/1` swallows every exit itself — a call timeout
+      # becomes a busy snapshot, anything else becomes an idle snapshot —
+      # so wrapping it in try/catch is dead code, and a stopped Updater
+      # would come back looking like a healthy idle one. HA would then show
+      # "up to date" for a subsystem that isn't running.
+      #
+      # Check registration instead. That's the case that actually happens
+      # (the subtree is down or crash-looping) and it needs no coupling to
+      # the server's private call protocol. It is racy by nature: if the
+      # Updater dies between the lookup and the call, `state/1` absorbs it
+      # and we report idle — degrading to the old behaviour rather than
+      # crashing, which is the right direction to fail in.
+      if updater_alive?() do
+        {:ok, Updater.state(Updater)}
+      else
+        {:error, :unavailable}
+      end
     end
   end
 
@@ -128,47 +207,30 @@ defmodule UniversalProxy.FirmwareUpdate do
   @spec state() :: map()
   def state do
     if host_mode?() do
-      %{
-        phase: :idle,
-        pct: nil,
-        message: nil,
-        last_error: nil,
-        last_release: nil,
-        verification_required: ConfigStore.verification_required?()
-      }
+      idle_snapshot()
     else
       # Flash-safe: the Updater deliberately blocks its whole loop while
-      # fwup writes the firmware (documented design), so a LiveView
-      # mounting mid-flash would exit at the 5 s default call timeout —
-      # render a busy-shaped snapshot for that case. Only the timeout
-      # means "flash in progress"; any other exit (e.g. :noproc while
-      # the Updater restarts) must not masquerade as installing.
-      try do
-        Updater.state(Updater)
-      catch
-        :exit, {:timeout, {GenServer, :call, _}} ->
-          %{
-            phase: :installing,
-            pct: nil,
-            message: "Installing firmware…",
-            last_error: nil,
-            last_release: nil,
-            verification_required: ConfigStore.verification_required?()
-          }
-
-        :exit, reason ->
-          Logger.warning("FirmwareUpdate.state: Updater unavailable: #{inspect(reason)}")
-
-          %{
-            phase: :idle,
-            pct: nil,
-            message: nil,
-            last_error: nil,
-            last_release: nil,
-            verification_required: ConfigStore.verification_required?()
-          }
+      # fwup writes the firmware, so a LiveView mounting mid-flash would
+      # otherwise exit at the 5 s call timeout. `Updater.state/1` absorbs
+      # that itself and hands back a busy-shaped snapshot, so nothing is
+      # needed here beyond flattening an absent Updater to idle — the
+      # LiveView renders both the same way.
+      case updater_state() do
+        {:ok, snapshot} -> snapshot
+        {:error, :unavailable} -> idle_snapshot()
       end
     end
+  end
+
+  defp idle_snapshot do
+    %{
+      phase: :idle,
+      pct: nil,
+      message: nil,
+      last_error: nil,
+      last_release: nil,
+      verification_required: ConfigStore.verification_required?()
+    }
   end
 
   @doc """

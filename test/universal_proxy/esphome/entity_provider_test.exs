@@ -26,7 +26,36 @@ defmodule UniversalProxy.ESPHome.EntityProviderTest do
         clients_count: fn -> 2 end,
         audio: fn -> [] end,
         bt_stats: fn -> %{devices_15min: 7, ads_per_s: 5, connections: %{used: 1, limit: 4}} end,
-        adapters: fn -> [%{powered: true}] end
+        adapters: fn -> [%{powered: true}] end,
+        fw_update: fn -> {:ok, idle_fw_state()} end,
+        fw_version: fn -> "1.2.3" end,
+        fw_repo: fn -> "bbangert/universal_proxy" end,
+        fw_check: fn -> :ok end,
+        fw_install: fn -> :ok end,
+        fw_alive: fn -> true end,
+        # Run supervised work inline so tests observe it deterministically.
+        task_runner: fn fun -> fun.() end
+      },
+      overrides
+    )
+  end
+
+  defp idle_fw_state(overrides \\ %{}) do
+    Map.merge(
+      %{phase: :idle, pct: nil, message: nil, last_error: nil, last_release: nil},
+      overrides
+    )
+  end
+
+  defp release(overrides \\ %{}) do
+    Map.merge(
+      %{
+        name: "0.9.1",
+        tag_name: "0.9.1",
+        body: "notes",
+        assets: [],
+        etag: nil,
+        published_at: nil
       },
       overrides
     )
@@ -37,14 +66,14 @@ defmodule UniversalProxy.ESPHome.EntityProviderTest do
       ads = EP.advertisements(all_specs(), true)
       object_ids = Enum.map(ads, & &1.object_id)
       assert Enum.all?(@bt_object_ids, &(&1 in object_ids))
-      assert length(ads) == 20
+      assert length(ads) == 21
     end
 
     test "excludes BT entities when unsupported" do
       ads = EP.advertisements(all_specs(), false)
       object_ids = Enum.map(ads, & &1.object_id)
       refute Enum.any?(@bt_object_ids, &(&1 in object_ids))
-      assert length(ads) == 16
+      assert length(ads) == 17
     end
   end
 
@@ -181,6 +210,156 @@ defmodule UniversalProxy.ESPHome.EntityProviderTest do
     end
   end
 
+  describe "firmware update entity" do
+    test "advertises as an update entity with the firmware device class" do
+      ad = find_ad("firmware_update")
+      assert %Proto.ListEntitiesUpdateResponse{} = ad
+      assert ad.device_class == "firmware"
+      assert ad.entity_category == :ENTITY_CATEGORY_CONFIG
+      assert ad.key == EP.key_for("firmware_update")
+    end
+
+    test "latest_version falls back to current so no update shows before a check" do
+      v = EP.update_value(idle_fw_state(), "1.2.3", "o/r")
+      assert v.current_version == "1.2.3"
+      assert v.latest_version == "1.2.3"
+      assert v.release_url == ""
+      refute v.in_progress
+    end
+
+    test "a cached release surfaces version, notes and a constructed URL" do
+      v =
+        EP.update_value(
+          idle_fw_state(%{last_release: release()}),
+          "0.9.0",
+          "bbangert/universal_proxy"
+        )
+
+      assert v.current_version == "0.9.0"
+      assert v.latest_version == "0.9.1"
+      assert v.title == "0.9.1"
+      assert v.release_summary == "notes"
+      assert v.release_url == "https://github.com/bbangert/universal_proxy/releases/tag/0.9.1"
+    end
+
+    test "install phases drive in_progress and the progress bar" do
+      v = EP.update_value(idle_fw_state(%{phase: :installing, pct: 42}), "0.9.0", "o/r")
+      assert v.in_progress
+      assert v.has_progress
+      assert v.progress == 42.0
+
+      # downloading counts too, but a nil pct means "no determinate progress"
+      v2 = EP.update_value(idle_fw_state(%{phase: :downloading, pct: nil}), "0.9.0", "o/r")
+      assert v2.in_progress
+      refute v2.has_progress
+    end
+
+    test "release notes are capped so progress pushes stay small" do
+      body = String.duplicate("x", 5_000)
+      v = EP.update_value(idle_fw_state(%{last_release: release(%{body: body})}), "0.9.0", "o/r")
+      assert String.length(v.release_summary) == 1_500
+    end
+
+    test "an unavailable updater renders as missing_state, not a bogus version" do
+      assert EP.update_value(nil, "1.2.3", "o/r") == nil
+
+      responses =
+        EP.state_responses(all_specs(), %{"firmware_update" => nil}, false)
+
+      state = find_state(responses, "firmware_update")
+      assert %Proto.UpdateStateResponse{} = state
+      assert state.missing_state == true
+    end
+
+    test "an unavailable updater reports missing, not a phantom up-to-date" do
+      sources = sample_sources(%{fw_update: fn -> {:error, :unavailable} end})
+      assert EP.read_values(sources, false)["firmware_update"] == nil
+    end
+
+    test "state response carries the update fields" do
+      values =
+        EP.read_values(
+          sample_sources(%{
+            fw_update: fn -> {:ok, idle_fw_state(%{last_release: release()})} end
+          }),
+          false
+        )
+
+      responses = EP.state_responses(all_specs(), values, false)
+      state = find_state(responses, "firmware_update")
+
+      assert %Proto.UpdateStateResponse{} = state
+      assert state.missing_state == false
+      assert state.current_version == "1.2.3"
+      assert state.latest_version == "0.9.1"
+      assert state.release_url =~ "releases/tag/0.9.1"
+    end
+  end
+
+  describe "poll during an install" do
+    test "carries the cached value instead of re-reading the blocked updater" do
+      reads = start_supervised!(Supervisor.child_spec({Agent, fn -> 0 end}, id: :poll_reads))
+
+      sources =
+        sample_sources(%{
+          fw_update: fn ->
+            Agent.update(reads, &(&1 + 1))
+            {:ok, idle_fw_state()}
+          end,
+          fw_alive: fn -> true end
+        })
+
+      installing = %{
+        current_version: "0.9.0",
+        latest_version: "0.9.1",
+        title: "0.9.1",
+        release_summary: "notes",
+        release_url: "https://example/releases/tag/0.9.1",
+        in_progress: true,
+        has_progress: true,
+        progress: 42.0
+      }
+
+      v = EP.read_values(sources, false, %{"firmware_update" => installing})
+
+      # Untouched: the 30 s tick must not clobber live progress or the
+      # release metadata the progress events maintain.
+      assert v["firmware_update"] == installing
+      assert Agent.get(reads, & &1) == 0
+    end
+
+    test "resumes reading once the install is no longer in progress" do
+      reads = start_supervised!(Supervisor.child_spec({Agent, fn -> 0 end}, id: :poll_reads2))
+
+      sources =
+        sample_sources(%{
+          fw_update: fn ->
+            Agent.update(reads, &(&1 + 1))
+            {:ok, idle_fw_state()}
+          end
+        })
+
+      idle = %{in_progress: false, progress: 0.0}
+      v = EP.read_values(sources, false, %{"firmware_update" => idle})
+
+      assert Agent.get(reads, & &1) == 1
+      refute v["firmware_update"] == idle
+    end
+
+    test "a dead updater is not pinned to a stale in-progress value" do
+      sources =
+        sample_sources(%{
+          fw_update: fn -> {:error, :unavailable} end,
+          fw_alive: fn -> false end
+        })
+
+      stale = %{in_progress: true, progress: 42.0}
+      v = EP.read_values(sources, false, %{"firmware_update" => stale})
+
+      assert v["firmware_update"] == nil
+    end
+  end
+
   describe "changed/2 (diff)" do
     test "returns only keys whose value differs" do
       last = %{"a" => 1, "b" => 2, "c" => nil}
@@ -217,6 +396,53 @@ defmodule UniversalProxy.ESPHome.EntityProviderTest do
       state = %{keys: key_lookup(), server: nil}
       assert {:noreply, ^state} = EP.handle_cast({:command, %{some: :thing}}, state)
     end
+
+    # Asserting a branch-specific effect, not just {:noreply, state} — the
+    # catch-all returns that too, so a shape-only assertion would still pass
+    # with either mapping deleted.
+    test "UPDATE routes to install and CHECK routes to check" do
+      state = command_state(self())
+      key = EP.key_for("firmware_update")
+
+      assert {:noreply, ^state} =
+               EP.handle_cast(
+                 {:command,
+                  %Proto.UpdateCommandRequest{key: key, command: :UPDATE_COMMAND_UPDATE}},
+                 state
+               )
+
+      assert_receive :install_called
+      refute_receive :check_called, 50
+
+      assert {:noreply, ^state} =
+               EP.handle_cast(
+                 {:command,
+                  %Proto.UpdateCommandRequest{key: key, command: :UPDATE_COMMAND_CHECK}},
+                 state
+               )
+
+      assert_receive :check_called
+      refute_receive :install_called, 50
+    end
+
+    test "an update command for an unknown key runs neither" do
+      state = command_state(self())
+      req = %Proto.UpdateCommandRequest{key: 999_999, command: :UPDATE_COMMAND_UPDATE}
+
+      assert {:noreply, ^state} = EP.handle_cast({:command, req}, state)
+      refute_receive :install_called, 50
+      refute_receive :check_called, 50
+    end
+
+    test "an unknown update command value runs neither" do
+      state = command_state(self())
+      key = EP.key_for("firmware_update")
+      req = %Proto.UpdateCommandRequest{key: key, command: :UPDATE_COMMAND_NONE}
+
+      assert {:noreply, ^state} = EP.handle_cast({:command, req}, state)
+      refute_receive :install_called, 50
+      refute_receive :check_called, 50
+    end
   end
 
   describe "poll loop diff-push (integration)" do
@@ -240,7 +466,7 @@ defmodule UniversalProxy.ESPHome.EntityProviderTest do
 
       # First poll: empty `last` → every stateful (non-button) value pushed.
       GenServer.call(pid, :poll_now)
-      assert drain_pushes() == 14
+      assert drain_pushes() == 15
 
       # Identical second poll: nothing changed → no pushes.
       GenServer.call(pid, :poll_now)
@@ -326,6 +552,71 @@ defmodule UniversalProxy.ESPHome.EntityProviderTest do
   # Counting pushes is safe with a 50 ms timeout because GenServer.call(:poll_now)
   # is synchronous: it returns only after do_poll/1 has sent every push_state
   # message, so the mailbox is already populated by the time we drain.
+  describe "firmware progress push (integration)" do
+    test "a progress event pushes only the update entity, and only when it changed" do
+      server = :"ep_test_#{System.unique_integer([:positive])}"
+      registry = Module.concat(server, "Registry")
+      start_supervised!({Registry, keys: :duplicate, name: registry})
+      {:ok, _} = Registry.register(registry, :subscribers, nil)
+
+      # Counts reads of the updater so we can prove the mid-flash path
+      # never touches it (it blocks its whole loop during a real flash).
+      reads = start_supervised!(Supervisor.child_spec({Agent, fn -> 0 end}, id: :reads))
+
+      fw_update = fn ->
+        Agent.update(reads, &(&1 + 1))
+        {:ok, idle_fw_state(%{last_release: release()})}
+      end
+
+      # A source that DOES change per tick, so a regression back to a full
+      # re-poll would push extra entities instead of the update alone.
+      counter = start_supervised!(Supervisor.child_spec({Agent, fn -> 0 end}, id: :counter))
+      clients = fn -> Agent.get_and_update(counter, &{&1, &1 + 1}) end
+
+      pid =
+        start_supervised!(
+          {EP,
+           name: :"ep_proc_#{System.unique_integer([:positive])}",
+           server: server,
+           poll: false,
+           subscribe: false,
+           supported?: false,
+           sources: Map.to_list(sample_sources(%{fw_update: fw_update, clients_count: clients}))}
+        )
+
+      # Seed `last` so the first progress event diffs against a real value.
+      GenServer.call(pid, :poll_now)
+      _ = drain_pushes()
+      seeded_reads = Agent.get(reads, & &1)
+
+      # Install starts → exactly one push, and it is the update entity only.
+      send(pid, {:fw_update_progress, %{phase: :installing, pct: 10}})
+      _ = :sys.get_state(pid)
+
+      assert_receive {:espex_state_update, %Proto.UpdateStateResponse{} = pushed}
+      assert pushed.key == EP.key_for("firmware_update")
+      assert pushed.in_progress
+      assert pushed.progress == 10.0
+      # api_clients changes every read, so any full re-poll would show up here.
+      assert drain_pushes() == 0
+
+      # The whole point: mid-flash we merge the payload rather than calling
+      # into the blocked updater.
+      assert Agent.get(reads, & &1) == seeded_reads
+
+      # Progress advances from the payload alone.
+      send(pid, {:fw_update_progress, %{phase: :installing, pct: 55}})
+      _ = :sys.get_state(pid)
+      assert_receive {:espex_state_update, %Proto.UpdateStateResponse{progress: 55.0}}
+      assert Agent.get(reads, & &1) == seeded_reads
+
+      # Returning to idle DOES re-read, so a freshly fetched release shows up.
+      send(pid, {:fw_update_progress, %{phase: :idle}})
+      _ = :sys.get_state(pid)
+      assert Agent.get(reads, & &1) > seeded_reads
+    end
+  end
+
   defp drain_pushes(count \\ 0) do
     receive do
       {:espex_state_update, _struct} -> drain_pushes(count + 1)
@@ -346,5 +637,24 @@ defmodule UniversalProxy.ESPHome.EntityProviderTest do
 
   defp find_state(responses, object_id) do
     Enum.find(responses, &(&1.key == EP.key_for(object_id)))
+  end
+
+  # Minimal handle_cast state whose command funs report which branch ran.
+  defp command_state(test_pid) do
+    %{
+      keys: key_lookup(),
+      server: nil,
+      sources: %{
+        fw_check: fn ->
+          send(test_pid, :check_called)
+          :ok
+        end,
+        fw_install: fn ->
+          send(test_pid, :install_called)
+          :ok
+        end,
+        task_runner: fn fun -> fun.() end
+      }
+    }
   end
 end
