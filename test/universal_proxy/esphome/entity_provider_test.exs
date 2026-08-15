@@ -296,6 +296,64 @@ defmodule UniversalProxy.ESPHome.EntityProviderTest do
     end
   end
 
+  describe "privileged commands on an unencrypted connection" do
+    setup do
+      start_supervised!({Registry, keys: :duplicate, name: :"ep_reg_#{System.unique_integer()}"})
+      :ok
+    end
+
+    test "firmware_update, factory_reset and reboot are identified as privileged" do
+      for object_id <- ~w(firmware_update factory_reset reboot) do
+        cmd = %Proto.ButtonCommandRequest{key: EP.key_for(object_id)}
+        assert EP.privileged_object_id(cmd) == object_id
+      end
+    end
+
+    test "diagnostic entities are not privileged" do
+      # A sensor key isn't a command target, but the guard must not
+      # over-reach onto anything that merely shares the message shape.
+      cmd = %Proto.ButtonCommandRequest{key: EP.key_for("cpu_temperature")}
+      assert EP.privileged_object_id(cmd) == nil
+      assert EP.privileged_object_id(%{no_key: true}) == nil
+    end
+
+    test "a privileged command from an unencrypted client is refused, not run" do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          cmd = %Proto.UpdateCommandRequest{
+            key: EP.key_for("firmware_update"),
+            command: :UPDATE_COMMAND_UPDATE
+          }
+
+          assert EP.handle_command(cmd, %{encrypted?: false}) == :ok
+        end)
+
+      assert log =~ "refusing firmware_update command from an unencrypted client"
+    end
+
+    test "an encrypted client is not refused" do
+      # Routed through to the GenServer (unregistered here, so the cast is
+      # a no-op) — the point is that it is NOT short-circuited or logged.
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          cmd = %Proto.ButtonCommandRequest{key: EP.key_for("reboot")}
+          EP.handle_command(cmd, %{encrypted?: true})
+        end)
+
+      refute log =~ "refusing"
+    end
+
+    test "a non-privileged command is allowed even unencrypted" do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          cmd = %Proto.ButtonCommandRequest{key: EP.key_for("cpu_temperature")}
+          EP.handle_command(cmd, %{encrypted?: false})
+        end)
+
+      refute log =~ "refusing"
+    end
+  end
+
   describe "poll during an install" do
     test "carries the cached value instead of re-reading the blocked updater" do
       reads = start_supervised!(Supervisor.child_spec({Agent, fn -> 0 end}, id: :poll_reads))

@@ -191,6 +191,55 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
   @impl Espex.EntityProvider
   def handle_command(command), do: GenServer.cast(__MODULE__, {:command, command})
 
+  # Entities whose commands can reboot, wipe or reflash the device.
+  @privileged_object_ids ~w(firmware_update factory_reset reboot)
+
+  @doc """
+  Command entry point that also gets the connection's security context.
+
+  Espex prefers this over `handle_command/1` when exported. On a keyless
+  server every connection is anonymous — the ESPHome protocol answers
+  `AuthenticationRequest` unconditionally, so a Noise session is the only
+  real credential — which means anything on the LAN can drive entity
+  commands until Home Assistant provisions a PSK.
+
+  That's tolerable for the diagnostic entities, which is why the whole
+  surface isn't simply closed: the keyless window is how HA adopts the
+  device in the first place. It isn't tolerable for Factory Reset, Reboot
+  or Firmware Update, so those are refused unless the connection is
+  encrypted.
+
+  Refusals return `:ok`: the protocol has no "denied" reply for a command,
+  and reporting an error would only surface as an adapter failure in the
+  server's logs. The warning is the audit trail.
+  """
+  @impl Espex.EntityProvider
+  def handle_command(command, %{encrypted?: false} = _context) do
+    case privileged_object_id(command) do
+      nil ->
+        handle_command(command)
+
+      object_id ->
+        Logger.warning(
+          "EntityProvider: refusing #{object_id} command from an unencrypted client — " <>
+            "provision API encryption in Home Assistant to enable it"
+        )
+
+        :ok
+    end
+  end
+
+  def handle_command(command, _context), do: handle_command(command)
+
+  @doc false
+  @spec privileged_object_id(struct()) :: String.t() | nil
+  def privileged_object_id(%{key: key}) do
+    object_id = Map.get(key_lookup(), key)
+    if object_id in @privileged_object_ids, do: object_id
+  end
+
+  def privileged_object_id(_command), do: nil
+
   # ── GenServer callbacks ─────────────────────────────────────────────
 
   @impl GenServer
