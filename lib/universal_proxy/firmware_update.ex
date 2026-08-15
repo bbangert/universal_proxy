@@ -173,15 +173,21 @@ defmodule UniversalProxy.FirmwareUpdate do
     if host_mode?() do
       {:ok, state()}
     else
-      try do
-        {:ok, Updater.state(Updater)}
-      catch
-        :exit, {:timeout, {GenServer, :call, _}} ->
-          {:ok, flashing_snapshot()}
-
-        :exit, reason ->
-          Logger.warning("FirmwareUpdate.updater_state: Updater unavailable: #{inspect(reason)}")
-          {:error, :unavailable}
+      # `Updater.state/1` swallows every exit itself — a call timeout
+      # becomes a busy snapshot, anything else becomes an idle snapshot —
+      # so wrapping it in try/catch is dead code, and a stopped Updater
+      # would come back looking like a healthy idle one. HA would then show
+      # "up to date" for a subsystem that isn't running.
+      #
+      # Check registration instead. That's the case that actually happens
+      # (the subtree is down or crash-looping) and it needs no coupling to
+      # the server's private call protocol. It is racy by nature: if the
+      # Updater dies between the lookup and the call, `state/1` absorbs it
+      # and we report idle — degrading to the old behaviour rather than
+      # crashing, which is the right direction to fail in.
+      case GenServer.whereis(Updater) do
+        nil -> {:error, :unavailable}
+        _pid -> {:ok, Updater.state(Updater)}
       end
     end
   end
@@ -193,11 +199,11 @@ defmodule UniversalProxy.FirmwareUpdate do
       idle_snapshot()
     else
       # Flash-safe: the Updater deliberately blocks its whole loop while
-      # fwup writes the firmware (documented design), so a LiveView
-      # mounting mid-flash would exit at the 5 s default call timeout —
-      # render a busy-shaped snapshot for that case. Only the timeout
-      # means "flash in progress"; any other exit (e.g. :noproc while
-      # the Updater restarts) must not masquerade as installing.
+      # fwup writes the firmware, so a LiveView mounting mid-flash would
+      # otherwise exit at the 5 s call timeout. `Updater.state/1` absorbs
+      # that itself and hands back a busy-shaped snapshot, so nothing is
+      # needed here beyond flattening an absent Updater to idle — the
+      # LiveView renders both the same way.
       case updater_state() do
         {:ok, snapshot} -> snapshot
         {:error, :unavailable} -> idle_snapshot()
@@ -210,17 +216,6 @@ defmodule UniversalProxy.FirmwareUpdate do
       phase: :idle,
       pct: nil,
       message: nil,
-      last_error: nil,
-      last_release: nil,
-      verification_required: ConfigStore.verification_required?()
-    }
-  end
-
-  defp flashing_snapshot do
-    %{
-      phase: :installing,
-      pct: nil,
-      message: "Installing firmware…",
       last_error: nil,
       last_release: nil,
       verification_required: ConfigStore.verification_required?()
