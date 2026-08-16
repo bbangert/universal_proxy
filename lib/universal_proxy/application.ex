@@ -32,6 +32,19 @@ defmodule UniversalProxy.Application do
         # per-output config, broadcasts lifecycle events. Phase 1 holds
         # an empty PlayerSupervisor; Phase 3 adds player children.
         UniversalProxy.Audio.Supervisor,
+        # Audio input (Sendspin `source@v1`) subsystem — enumerates ALSA
+        # capture cards, runs one websocket listener per card for Music
+        # Assistant to dial into, persists pairing state. A sibling of
+        # Audio.Supervisor, not a branch of it, so a crash on one side can't
+        # take the other down. Ungated for the same reason the output side
+        # is: it works on host (empty enumeration) and a target without
+        # `arecord` degrades at runtime — the source stays discoverable and
+        # pairable, it just can't capture.
+        #
+        # AFTER Audio.Supervisor: Audio.Server's boot-time pre-emptive
+        # `goodbye_for_type("_sendspin._tcp")` is type-wide, so it has to run
+        # before any source service is registered.
+        UniversalProxy.Audio.Input.Supervisor,
         # FlooGoo FMA120 control channel (DETS prefs store + supervised
         # worker subtree). AFTER Audio.Supervisor so its hotplug events
         # (`sendspin:output_added`) flow. No-op when no FMA120 is attached
