@@ -343,6 +343,23 @@ defmodule UniversalProxy.ESPHome.EntityProviderTest do
       refute log =~ "refusing"
     end
 
+    # Deliberate, not an oversight: the gate is per-entity, so the update
+    # entity's CHECK is refused along with UPDATE. CHECK reaches
+    # FirmwareUpdate.check/0, which hits GitHub with no debounce — leaving
+    # it open would let an unauthenticated client drive the API into its
+    # secondary rate limits. Pinned here so it isn't "fixed" by accident.
+    test "update CHECK is refused too, not just UPDATE" do
+      for cmd <- [:UPDATE_COMMAND_UPDATE, :UPDATE_COMMAND_CHECK] do
+        log =
+          ExUnit.CaptureLog.capture_log(fn ->
+            req = %Proto.UpdateCommandRequest{key: EP.key_for("firmware_update"), command: cmd}
+            assert EP.handle_command(req, %{encrypted?: false}) == :ok
+          end)
+
+        assert log =~ "refusing firmware_update command from an unencrypted client"
+      end
+    end
+
     test "a non-privileged command is allowed even unencrypted" do
       log =
         ExUnit.CaptureLog.capture_log(fn ->

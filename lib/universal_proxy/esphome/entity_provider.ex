@@ -206,8 +206,17 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
   That's tolerable for the diagnostic entities, which is why the whole
   surface isn't simply closed: the keyless window is how HA adopts the
   device in the first place. It isn't tolerable for Factory Reset, Reboot
-  or Firmware Update, so those are refused unless the connection is
-  encrypted.
+  or Firmware Update, so **every** command on those three entities is
+  refused unless the connection is encrypted.
+
+  Note that includes the update entity's Check, not just Install — the
+  gate is per-entity, not per-command. That is deliberate: Check reaches
+  `FirmwareUpdate.check/0`, which makes an outbound GitHub request with no
+  debounce, so leaving it open would let an unauthenticated client drive
+  the API into its secondary rate limits. Nothing legitimate is lost:
+  the keyless window is pre-adoption, HA refreshes over an encrypted
+  connection once it has provisioned a PSK, and the 24 h poller checks
+  regardless.
 
   Refusals return `:ok`: the protocol has no "denied" reply for a command,
   and reporting an error would only surface as an adapter failure in the
