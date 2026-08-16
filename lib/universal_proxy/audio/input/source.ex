@@ -98,11 +98,11 @@ defmodule UniversalProxy.Audio.Input.Source do
   down again with a `client_stream/end`. Both directions are idempotent.
 
   Audio frames are stamped in the **server's** clock domain:
-  `ClockFilter.server_time/2` maps our local capture time forward. Capture
-  timestamps come from `System.os_time/1` while the `client/time` exchange
-  uses `System.monotonic_time/1`, so a per-capture-session offset between the
-  two clocks is measured once and added — the filter must see one consistent
-  local basis or its drift term becomes meaningless.
+  `ClockFilter.server_time/2` maps our local capture time forward. Both the
+  `client/time` exchange and `Capture`'s frame stamps use
+  `System.monotonic_time/1`, so the filter sees one consistent local basis
+  with no clock conversion — monotonic never jumps or slews on an NTP sync,
+  which a `System.os_time/1` capture stamp could.
 
   ## Owner notifications
 
@@ -197,6 +197,16 @@ defmodule UniversalProxy.Audio.Input.Source do
   # answering.
   @ws_timeout_ms 60_000
 
+  # Cap the accepted inbound websocket frame size. Each inbound binary frame
+  # carries exactly one Noise transport message (its AEAD ciphertext), which
+  # the Noise spec bounds at 65535 bytes — larger Sendspin app messages
+  # fragment at the Sendspin layer (types 2/3) into separate ≤64 KiB Noise
+  # messages, each its own WS frame. So no legitimate frame exceeds this, and
+  # WebSockAdapter's 10 MB default would otherwise let a sentinel-PSK LAN peer
+  # force repeated multi-MB allocations + crypto (the reassembler's 1 MB cap
+  # only kicks in *after* a full frame is received and decrypted).
+  @max_ws_frame_bytes 65_535
+
   # Noise message 2's inner plaintext is the literal two bytes `{}` — an empty
   # payload is rejected by aiosendspin's `_validate_msg2_payload`.
   @noise_msg2_payload "{}"
@@ -280,6 +290,7 @@ defmodule UniversalProxy.Audio.Input.Source do
     :handshake_hash,
     :psk_category,
     :capture,
+    :stopping_capture,
     :time_timer,
     :pairing,
     :pairing_timer,
@@ -297,7 +308,6 @@ defmodule UniversalProxy.Audio.Input.Source do
     filter: nil,
     outstanding: [],
     start_requested: false,
-    os_offset: 0,
     pairing_index: 0,
     pairing_allowed: false,
     accepts: [],
@@ -549,7 +559,7 @@ defmodule UniversalProxy.Audio.Input.Source do
     if outbound_congested?(state) do
       {:noreply, drop_frame(state)}
     else
-      server_us = ClockFilter.server_time(state.filter, ts_us + state.os_offset)
+      server_us = ClockFilter.server_time(state.filter, ts_us)
 
       case Noise.encrypt(state.noise, Wire.encode_audio_frame(server_us, frame)) do
         {:ok, ciphertext} ->
@@ -581,6 +591,17 @@ defmodule UniversalProxy.Audio.Input.Source do
     {:noreply, end_stream(%{state | capture: nil})}
   end
 
+  # The capture we asked to stop (asynchronously, see `stop_capture/1`) has
+  # finally terminated, so the ALSA device is only now released. Any deferred
+  # `start` is safe to open here — `start_requested` is the pending-start
+  # intent (a `stop`/teardown clears it, cancelling the deferral).
+  def handle_info({:EXIT, pid, _reason}, %{stopping_capture: pid} = state) do
+    case maybe_start_streaming(%{state | stopping_capture: nil}) do
+      {:ok, state} -> {:noreply, state}
+      {:error, reason, state} -> {:noreply, fail(state, reason)}
+    end
+  end
+
   def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
 
   def handle_info(message, state) do
@@ -608,7 +629,7 @@ defmodule UniversalProxy.Audio.Input.Source do
     plug_opts = [
       path: state.path,
       source: self(),
-      websock_opts: [timeout: @ws_timeout_ms]
+      websock_opts: [timeout: @ws_timeout_ms, max_frame_size: @max_ws_frame_bytes]
     ]
 
     # `:listen_ip` defaults to `:any` (the listener has to be reachable on
@@ -1487,8 +1508,7 @@ defmodule UniversalProxy.Audio.Input.Source do
         fsm: :awaiting_server_hello,
         filter: ClockFilter.reset(state.filter),
         outstanding: [],
-        start_requested: false,
-        os_offset: 0
+        start_requested: false
     }
   end
 
@@ -1577,6 +1597,14 @@ defmodule UniversalProxy.Audio.Input.Source do
 
   defp handle_source_command(state, nil), do: {:ok, state}
 
+  # A previous capture is still shutting down (async stop). Opening `arecord`
+  # now would race it on the same ALSA device (EBUSY). Defer: the
+  # `{:EXIT, stopping_capture}` handler re-runs this once the old process is
+  # gone, and `start_requested` carries the pending intent across the wait.
+  defp maybe_start_streaming(%{stopping_capture: pid} = state) when is_pid(pid) do
+    {:ok, state}
+  end
+
   # `start` is idempotent and may legitimately arrive before we are available
   # — remember it and open the stream as soon as the filter converges.
   defp maybe_start_streaming(%{fsm: :ready, start_requested: true} = state) do
@@ -1630,11 +1658,10 @@ defmodule UniversalProxy.Audio.Input.Source do
 
     case Capture.start_link(opts) do
       {:ok, pid} ->
-        # `Capture` stamps frames with `System.os_time/1` while the clock
-        # filter's local basis is `System.monotonic_time/1`; measure the gap
-        # once per capture session and translate every frame through it.
-        offset = now_us() - System.os_time(:microsecond)
-        {:ok, %{state | capture: pid, os_offset: offset}}
+        # `Capture` stamps frames on the same monotonic basis the clock filter
+        # uses (`System.monotonic_time/1`), so frames feed `server_time/2`
+        # directly — no realtime→monotonic conversion.
+        {:ok, %{state | capture: pid}}
 
       {:error, {:binary_missing, path}} ->
         notify(state, {:capture_missing, path})
@@ -1667,13 +1694,22 @@ defmodule UniversalProxy.Audio.Input.Source do
   # here would block the FSM inside a `handle_info` for up to the shutdown
   # timeout, stalling a racing new handshake or `stop`/`start`. `Capture` is
   # linked and we trap exits, so its eventual normal exit arrives as an
-  # `{:EXIT, pid, _}` message we already ignore once `capture` is `nil`.
+  # `{:EXIT, pid, _}` message.
+  #
+  # We remember it as `stopping_capture` so a following `start` does NOT open a
+  # second `arecord` on the still-held device (real ALSA rejects that as
+  # EBUSY, and late frames from the old capture would bleed into the new
+  # stream). A deferred start waits for this pid's `{:EXIT, _}` — see the
+  # `maybe_start_streaming/1` guard and the matching `handle_info`. The
+  # invariant `capture` is nil while `stopping_capture` is set keeps a new
+  # capture from ever starting before the old one is gone, so there is exactly
+  # one to track.
   defp stop_capture(%__MODULE__{capture: pid} = state) do
     Task.Supervisor.start_child(UniversalProxy.TaskSupervisor, fn ->
       if Process.alive?(pid), do: GenServer.stop(pid, :normal, 2_000)
     end)
 
-    %{state | capture: nil}
+    %{state | capture: nil, stopping_capture: pid}
   end
 
   # -- Connection teardown --
@@ -1727,8 +1763,7 @@ defmodule UniversalProxy.Audio.Input.Source do
         # basis; the filter must not carry an offset across it.
         filter: ClockFilter.reset(state.filter),
         outstanding: [],
-        start_requested: false,
-        os_offset: 0
+        start_requested: false
     }
   end
 

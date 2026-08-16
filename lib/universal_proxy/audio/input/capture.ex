@@ -42,16 +42,20 @@ defmodule UniversalProxy.Audio.Input.Capture do
       {:capture_frame, ts_us, frame_binary}
       {:capture_exit, exit_status}
 
-  `ts_us` is `System.os_time(:microsecond)` captured once per *port
-  message arrival*, not once per emitted frame. A single port message
-  routinely contains several `frame_bytes` chunks (arecord's period
-  writes coalesce up to the pipe buffer); all frames sliced from one
-  arrival share that arrival's timestamp rather than each getting its
-  own read time. Downstream (`Sendspin.ClockFilter` and friends)
-  tolerates this — the resulting jitter is bounded by one arrival's
-  worth of frames (a handful of ms), well inside the filter's
-  convergence tolerance — and it avoids a `System.os_time/1` call per
-  20 ms frame for no measurable accuracy gain.
+  `ts_us` is `System.monotonic_time(:microsecond)` captured once per
+  *port message arrival*, not once per emitted frame. Monotonic (not
+  `System.os_time/1`) so the stamp can never jump or slew on an NTP
+  sync mid-capture — the downstream `Sendspin.ClockFilter` basis is
+  monotonic, so frames feed it directly with no clock conversion. Note
+  BEAM monotonic time legitimately starts negative; downstream must not
+  assume a positive value. A single port message routinely contains
+  several `frame_bytes` chunks (arecord's period writes coalesce up to
+  the pipe buffer); all frames sliced from one arrival share that
+  arrival's timestamp rather than each getting its own read time.
+  Downstream tolerates this — the resulting jitter is bounded by one
+  arrival's worth of frames (a handful of ms), well inside the filter's
+  convergence tolerance — and it avoids a clock read per 20 ms frame
+  for no measurable accuracy gain.
 
   ## Framing / alignment
 
@@ -199,8 +203,9 @@ defmodule UniversalProxy.Audio.Input.Capture do
   @impl true
   def handle_info({port, {:data, data}}, %{port: port} = state) do
     # Stamped once per arrival, not per emitted frame — see moduledoc
-    # "Subscriber messages".
-    ts_us = System.os_time(:microsecond)
+    # "Subscriber messages". Monotonic so the stamp matches the clock
+    # filter's basis and never jumps/slews on an NTP sync.
+    ts_us = System.monotonic_time(:microsecond)
     buffer = state.buffer <> data
     {frames, remainder} = slice_frames(buffer, state.frame_bytes)
 

@@ -392,6 +392,12 @@ defmodule UniversalProxy.Audio.Input.Server do
 
     added = MapSet.difference(new_keys, current_keys)
     removed = MapSet.difference(current_keys, new_keys)
+    # Keys present in BOTH the cache and the fresh enumeration whose hardware
+    # fields changed. A card that keeps its stable `{slot_sub, vid, pid}` key
+    # but re-enumerates at a new ALSA index (a remove/re-add collapsed by the
+    # hotplug debounce) is neither added nor removed, yet the running Source
+    # holds a now-stale `plughw` path — reconcile it below.
+    changed = changed_keys(state, enumerated, MapSet.intersection(current_keys, new_keys))
 
     {with_adds, merged_adds} =
       Enum.reduce(added, {state.inputs, []}, fn key, {acc, broadcasts} ->
@@ -403,7 +409,13 @@ defmodule UniversalProxy.Audio.Input.Server do
         end
       end)
 
-    final_inputs = Enum.reduce(removed, with_adds, &Map.delete(&2, &1))
+    {with_changes, merged_changes} =
+      Enum.reduce(changed, {with_adds, []}, fn key, {acc, broadcasts} ->
+        merged = remerge_config(state, key, Map.fetch!(enumerated, key))
+        {Map.put(acc, key, merged), [merged | broadcasts]}
+      end)
+
+    final_inputs = Enum.reduce(removed, with_changes, &Map.delete(&2, &1))
 
     # A gone card must not keep painting "Streaming" from cached live state,
     # and a re-add later deserves a fresh spawn attempt — so drop both its
@@ -427,9 +439,15 @@ defmodule UniversalProxy.Audio.Input.Server do
       %{state | inputs: final_inputs}
       |> stop_sources(removed)
       |> start_sources(merged_adds)
+      |> restart_sources(merged_changes)
       |> respawn_missing_sources()
 
     Enum.each(merged_adds, &broadcast_added/1)
+    # A hardware change is an upsert of the existing row, not a new card — the
+    # add/remove events would confuse a subscriber keyed by `key`, so it rides
+    # the same `input_added` upsert with the fresh hardware fields. The Source
+    # restart drives the usual `input_state` lifecycle on top of it.
+    Enum.each(merged_changes, &broadcast_added/1)
     Enum.each(removed, &broadcast_removed/1)
 
     new_state
@@ -486,10 +504,43 @@ defmodule UniversalProxy.Audio.Input.Server do
     |> Map.put(:paired, not is_nil(Map.get(config, :paired_at)))
   end
 
+  # Keys present in both cache and enumeration whose enumerated hardware fields
+  # differ. Only hardware moves (a new ALSA index, a renamed card) count — the
+  # persisted config half is reconciled elsewhere.
+  defp changed_keys(state, enumerated, both_keys) do
+    Enum.filter(both_keys, fn key ->
+      cached = Map.take(Map.fetch!(state.inputs, key), @hardware_keys)
+      fresh = Map.take(Map.fetch!(enumerated, key), @hardware_keys)
+      cached != fresh
+    end)
+  end
+
+  # Re-merge fresh hardware into the row while preserving the persisted config
+  # (friendly_name, pairing). Prefer the authoritative DETS config; fall back
+  # to the cached row's public fields if the Store can't answer.
+  defp remerge_config(state, key, info) do
+    case Store.get_config(state.store, key) do
+      {:ok, saved} -> merge(key, info, saved)
+      :error -> merge(key, info, Map.fetch!(state.inputs, key))
+    end
+  end
+
   # -- Source lifecycle --
 
   defp start_sources(state, merged_adds) do
     Enum.reduce(merged_adds, state, fn merged, acc -> start_source(acc, merged) end)
+  end
+
+  # A card whose hardware changed under a stable key: tear down the Source
+  # holding the stale `plughw` path and start a fresh one on the new device.
+  # Pairing survives — it is persisted in DETS keyed by the unchanged
+  # `{slot_sub, vid, pid}`, so the restarted Source reloads the stored PSK and
+  # reconnects at trust `user` with no re-pairing. Reuses the same stop/start
+  # paths as remove/add.
+  defp restart_sources(state, merged_changes) do
+    Enum.reduce(merged_changes, state, fn merged, acc ->
+      acc |> stop_source(merged.key) |> start_source(merged)
+    end)
   end
 
   # Convergence pass: every tracked input that has no live source gets one.

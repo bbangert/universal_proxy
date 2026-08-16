@@ -343,6 +343,60 @@ defmodule UniversalProxy.Audio.Input.ServerTest do
     end
   end
 
+  describe "convergence: hardware change" do
+    test "an alsa_device change on a stable key restarts the source with the new device", %{
+      server: server,
+      source_sup: sup
+    } do
+      _input = add_usb_card!(server)
+      assert_receive {:input_state, @usb_key, %{status: :waiting}}
+      old_pid = source_pid(sup)
+
+      # Same {slot_sub, vid, pid} key, but the card re-enumerated at a new ALSA
+      # index — a remove/re-add collapsed by the hotplug debounce. It is
+      # neither an add nor a remove, so only the `changed` branch reconciles it.
+      moved = %{@usb_info | alsa_device: "plughw:2,0", card_index: 2}
+      EnumerateStub.set(%{@usb_key => moved})
+      :ok = Server.check_now(server)
+
+      # The stale-plughw source is torn down and a fresh one started on the new
+      # device (pairing survives — it's keyed by the unchanged key).
+      assert {:terminated, @usb_key} in SourceStubCalls.calls()
+      new_pid = source_pid(sup)
+      assert new_pid != old_pid
+
+      assert Enum.any?(SourceStubCalls.calls(), fn
+               {:started, @usb_key, _port, opts} ->
+                 Keyword.fetch!(opts, :alsa_device) == "plughw:2,0"
+
+               _ ->
+                 false
+             end),
+             "expected a restart on plughw:2,0; got #{inspect(SourceStubCalls.calls())}"
+
+      # The row is upserted with the new hardware (same card, no add/remove
+      # churn to the UI).
+      assert_receive {:sendspin_input_added, %{key: @usb_key, alsa_device: "plughw:2,0"}}
+      refute_received {:sendspin_input_removed, _}
+      assert [%{alsa_device: "plughw:2,0", card_index: 2}] = Server.list_inputs(server)
+    end
+
+    test "an unchanged re-enumeration does not restart the source", %{
+      server: server,
+      source_sup: sup
+    } do
+      _input = add_usb_card!(server)
+      assert_receive {:input_state, @usb_key, %{status: :waiting}}
+      pid = source_pid(sup)
+
+      EnumerateStub.set(%{@usb_key => @usb_info})
+      :ok = Server.check_now(server)
+
+      refute {:terminated, @usb_key} in SourceStubCalls.calls()
+      assert source_pid(sup) == pid
+    end
+  end
+
   describe "mDNS" do
     test "registers only on listener_bound, with a leading-slash path TXT", %{server: server} do
       _input = add_usb_card!(server)

@@ -166,6 +166,11 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
   end
 
   describe "happy path" do
+    # Streaming tests drive the write_fake_arecord!/1 Python fixture standing
+    # in for `arecord`; :python3 is excluded in test_helper.exs when python3
+    # isn't on PATH (matches capture_test.exs).
+    @describetag :python3
+
     test "handshakes, syncs, and streams 20 ms frames in the server clock domain", ctx do
       arecord = write_fake_arecord!()
       psk = pair!(ctx)
@@ -225,6 +230,10 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
   end
 
   describe "server/command" do
+    # Only the streaming tests below shell to Python; the ":degraded" test uses
+    # a missing binary path and never spawns it, so tag per-test rather than
+    # the whole describe.
+    @tag :python3
     test "stop ends the stream and start resumes it", ctx do
       arecord = write_fake_arecord!()
       psk = pair!(ctx)
@@ -246,6 +255,46 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
       {_stream, peer} = Peer.await_json!(peer, "client_stream/start")
       assert_receive {:source_event, @key, :streaming}, 2_000
 
+      {_ts, payload, _peer} = Peer.await_audio!(peer)
+      assert byte_size(payload) == @frame_bytes
+      assert Source.status(source) == :streaming
+    end
+
+    @tag :python3
+    test "a stop immediately followed by start never opens a second arecord", ctx do
+      arecord = write_fake_arecord!()
+      psk = pair!(ctx)
+      {source, port} = start_source!(ctx, capture_opts: [arecord_path: arecord])
+      assert_receive {:source_event, @key, {:listener_bound, ^port}}, 2_000
+
+      peer = connect_available!(port, psk: psk)
+      peer = Peer.command!(peer, "start")
+      {_stream, peer} = Peer.await_json!(peer, "client_stream/start")
+      assert_receive {:source_event, @key, :streaming}, 2_000
+      {_ts, _payload, peer} = Peer.await_audio!(peer)
+
+      cap1 = :sys.get_state(source).capture
+      assert is_pid(cap1)
+      mon = Process.monitor(cap1)
+
+      # Race a stop and an immediate start. The W-elixir-2 async stop must not
+      # let the restart open a second arecord while the first still holds the
+      # ALSA device — the new capture is deferred until the old one's EXIT.
+      peer = Peer.command!(peer, "stop")
+      {_end, peer} = Peer.await_json!(peer, "client_stream/end")
+      peer = Peer.command!(peer, "start")
+      {_stream, peer} = Peer.await_json!(peer, "client_stream/start")
+
+      # The restart's client_stream/start is only sent after the old capture's
+      # EXIT is processed, so by the time it reaches the peer the old arecord is
+      # already gone — proving the two never overlap.
+      assert_received {:DOWN, ^mon, :process, ^cap1, _}
+
+      cap2 = :sys.get_state(source).capture
+      assert is_pid(cap2) and cap2 != cap1
+      refute Process.alive?(cap1)
+
+      assert_receive {:source_event, @key, :streaming}, 2_000
       {_ts, payload, _peer} = Peer.await_audio!(peer)
       assert byte_size(payload) == @frame_bytes
       assert Source.status(source) == :streaming
@@ -337,6 +386,7 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
       assert Peer.closed?(first, 2_000)
     end
 
+    @tag :python3
     test "a streaming trust-user session is not evicted by an un-handshaked peer", ctx do
       arecord = write_fake_arecord!()
       psk = pair!(ctx)
@@ -398,6 +448,25 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
       assert Source.status(source) == :listening
     end
 
+    test "an oversized websocket frame is rejected at the listener before decrypt", ctx do
+      {source, port} = start_source!(ctx)
+      assert_receive {:source_event, @key, {:listener_bound, ^port}}, 2_000
+
+      peer = Peer.connect!(port)
+      peer = Peer.handshake!(peer)
+
+      # One WS binary frame carries exactly one Noise transport message
+      # (≤ 65_535 bytes), so a larger frame can never be legitimate. Cowboy
+      # rejects it at the WS layer via `max_frame_size` BEFORE any reassembly
+      # or decrypt work, so the connection drops with no protocol `{:error}`
+      # reaching the FSM (an uncapped default would let it through to Noise).
+      _peer = Peer.send_raw_binary!(peer, :crypto.strong_rand_bytes(70_000))
+
+      assert_receive {:source_event, @key, :disconnected}, 2_000
+      refute_received {:source_event, @key, {:error, _}}
+      assert Source.status(source) == :listening
+    end
+
     test "an out-of-order server/hello before the handshake is a protocol error", ctx do
       {source, port} = start_source!(ctx)
       assert_receive {:source_event, @key, {:listener_bound, ^port}}, 2_000
@@ -414,6 +483,8 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
   end
 
   describe "capture crash" do
+    @describetag :python3
+
     test "a capture crash mid-stream ends the stream but keeps the connection", ctx do
       arecord = write_fake_arecord!()
       psk = pair!(ctx)
