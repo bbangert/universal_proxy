@@ -18,6 +18,7 @@ defmodule UniversalProxyWeb.AudioLiveTest do
   @pubsub UniversalProxy.PubSub
 
   @hp_key UniversalProxy.AudioFixtures.hp_key()
+  @input_key UniversalProxy.AudioFixtures.input_key()
 
   setup do
     {:ok, conn: Phoenix.ConnTest.build_conn()}
@@ -29,6 +30,241 @@ defmodule UniversalProxyWeb.AudioLiveTest do
     {:ok, _view, html} = live(conn, "/audio")
     assert html =~ "Sendspin players"
     assert html =~ "No audio outputs detected"
+  end
+
+  test "renders the empty state when no inputs are present", %{conn: conn} do
+    {:ok, _view, html} = live(conn, "/audio")
+    assert html =~ "Audio inputs"
+    assert html =~ "No audio inputs detected"
+  end
+
+  test "renders an input row when a :sendspin_input_added event arrives", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/audio")
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:input_added",
+      {:sendspin_input_added, sample_input()}
+    )
+
+    html = render(view)
+    assert html =~ "USB Capture Card (1-1.3)"
+    assert html =~ "plughw:1,0"
+    assert html =~ "Detected"
+    refute html =~ "No audio inputs detected"
+  end
+
+  test "removes the input row when :sendspin_input_removed arrives", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/audio")
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:input_added",
+      {:sendspin_input_added, sample_input()}
+    )
+
+    assert render(view) =~ "USB Capture Card (1-1.3)"
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:input_removed",
+      {:sendspin_input_removed, %{key: @input_key}}
+    )
+
+    html = render(view)
+    refute html =~ "USB Capture Card (1-1.3)"
+    assert html =~ "No audio inputs detected"
+  end
+
+  test "an :input_state event flips the input status badge through its states", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/audio")
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:input_added",
+      {:sendspin_input_added, sample_input()}
+    )
+
+    assert render(view) =~ "Detected"
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:input_state",
+      {:input_state, @input_key,
+       %{status: :waiting, connection: :disconnected, pin: nil, port: 9_928, last_error: nil}}
+    )
+
+    html = render(view)
+    assert html =~ "Waiting for Music Assistant"
+    refute html =~ ">Detected<"
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:input_state",
+      {:input_state, @input_key,
+       %{status: :streaming, connection: :connected, pin: nil, port: 9_928, last_error: nil}}
+    )
+
+    assert render(view) =~ "Streaming"
+  end
+
+  test "a :degraded input_state renders the no-capture badge and last_error", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/audio")
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:input_added",
+      {:sendspin_input_added, sample_input()}
+    )
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:input_state",
+      {:input_state, @input_key,
+       %{
+         status: :degraded,
+         connection: :connected,
+         pin: nil,
+         port: 9_928,
+         last_error: "capture binary missing"
+       }}
+    )
+
+    html = render(view)
+    assert html =~ "No capture (arecord missing)"
+    # The banner shows a FIXED message, never the peer-influenced `last_error`
+    # string (social-engineering surface).
+    assert html =~ "No capture device available"
+    refute html =~ "capture binary missing"
+  end
+
+  test "the PIN block renders only while pairing with a pin present", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/audio")
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:input_added",
+      {:sendspin_input_added, sample_input()}
+    )
+
+    # Pairing offered, no PIN derived yet: badge shows "Pairing" but no PIN
+    # block — matches `Audio.Input.Server`'s `{:pairing_required, _}` →
+    # `{:pairing_pin, pin}` sequencing (PIN lands a beat later).
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:input_state",
+      {:input_state, @input_key,
+       %{status: :pairing, connection: :connected, pin: nil, port: 9_928, last_error: nil}}
+    )
+
+    html = render(view)
+    assert html =~ "Pairing"
+    refute html =~ "Enter this PIN in Music Assistant"
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:input_state",
+      {:input_state, @input_key,
+       %{status: :pairing, connection: :connected, pin: "482915", port: 9_928, last_error: nil}}
+    )
+
+    html = render(view)
+    assert html =~ "Enter this PIN in Music Assistant"
+    # Each digit renders in its own segmented `<span>` (whitespace around
+    # the HEEx interpolation, hence the regex rather than a literal match).
+    for digit <- ~w(4 8 2 9 1 5) do
+      assert Regex.match?(~r/>\s*#{digit}\s*<\/span>/, html), "expected digit #{digit} in #{html}"
+    end
+
+    # Once paired the PIN block disappears even if a stale pin lingered in
+    # the assign (the Server itself always clears `pin` on `:paired`, but
+    # the LiveView's own guard — `status == :pairing` — is what's under
+    # test here).
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:input_state",
+      {:input_state, @input_key,
+       %{status: :paired, connection: :connected, pin: nil, port: 9_928, last_error: nil}}
+    )
+
+    html = render(view)
+    assert html =~ "Paired"
+    refute html =~ "Enter this PIN in Music Assistant"
+  end
+
+  test "the allow-pairing button shows without a window and yields to the active state", %{
+    conn: conn
+  } do
+    {:ok, view, _html} = live(conn, "/audio")
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:input_added",
+      {:sendspin_input_added, sample_input()}
+    )
+
+    # Pairing offered, no PIN and no consent window yet: offer the button.
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:input_state",
+      {:input_state, @input_key,
+       %{
+         status: :pairing,
+         connection: :connected,
+         pin: nil,
+         port: 9_928,
+         last_error: nil,
+         pairing_window: nil
+       }}
+    )
+
+    html = render(view)
+    assert html =~ "Allow pairing"
+    refute html =~ "waiting for Music Assistant"
+
+    # Consent window open (expiry in the future): active waiting state, no button.
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:input_state",
+      {:input_state, @input_key,
+       %{
+         status: :pairing,
+         connection: :connected,
+         pin: nil,
+         port: 9_928,
+         last_error: nil,
+         pairing_window: System.system_time(:second) + 120
+       }}
+    )
+
+    html = render(view)
+    refute html =~ "Allow pairing"
+    assert html =~ "Pairing allowed"
+  end
+
+  test "a paired input row never renders secret fields", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/audio")
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:input_added",
+      {:sendspin_input_added, sample_input(%{paired: true})}
+    )
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:input_state",
+      {:input_state, @input_key,
+       %{status: :paired, connection: :connected, pin: nil, port: 9_928, last_error: nil}}
+    )
+
+    html = render(view)
+    assert html =~ "Paired"
+    # The merged row this LiveView ever sees has no `psk`/`psk_id`/
+    # `client_keypair` fields (`Audio.Input.Server` never includes them —
+    # see its moduledoc), and the rendered markup mustn't invent them.
+    refute html =~ "psk"
+    refute html =~ "client_keypair"
   end
 
   test "renders a card when a :sendspin_output_added event arrives", %{conn: conn} do

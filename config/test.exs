@@ -27,3 +27,10 @@ config :vintage_net, resolvconf: "/tmp/universal_proxy_test_resolv.conf"
 # tests still supply their own `enumerate_module:` opt for
 # deterministic test enumeration.
 config :universal_proxy, :audio_enumerate_module, UniversalProxy.Audio.NullEnumerate
+
+# Same hazard on the input side, and worse: the application-tree
+# `Audio.Input.Server` would start a real `Audio.Input.Source` per capture
+# card, each binding a listener port and registering an mDNS service for the
+# duration of the suite. Focused input tests supply their own
+# `enumerate_module:` opt.
+config :universal_proxy, :audio_input_enumerate_module, UniversalProxy.Audio.NullEnumerate

@@ -85,6 +85,7 @@ defmodule UniversalProxy.MixProject do
       {:phoenix_live_view, "~> 1.0"},
       {:floki, ">= 0.30.0", only: :test},
       {:lazy_html, ">= 0.1.0", only: :test},
+      {:mint_web_socket, "~> 1.0", only: :test},
       {:phoenix_live_dashboard, "~> 0.8"},
       {:esbuild, "~> 0.7", runtime: Mix.env() == :dev},
       {:tailwind, "~> 0.4", runtime: Mix.env() == :dev},
@@ -101,6 +102,7 @@ defmodule UniversalProxy.MixProject do
       {:jason, "~> 1.2"},
       {:plug_cowboy, "~> 2.5"},
       {:req, "~> 0.7"},
+      {:decibel, "~> 0.2"},
 
       # Static analysis
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},

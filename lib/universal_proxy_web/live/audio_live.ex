@@ -24,6 +24,23 @@ defmodule UniversalProxyWeb.AudioLive do
   mDNS, which momentarily disconnects any paired Sendspin server. The
   earlier inline-blur rename pattern made accidental clicks user-
   hostile; the modal forces an explicit commit step.
+
+  ## Audio inputs
+
+  Below the outputs grid, a read-only "Audio inputs" section lists
+  every USB capture card surfaced by `UniversalProxy.Audio.Input.list_inputs/0`
+  (the `source@v1` mirror of the outputs above). It subscribes to the
+  three `"sendspin:input_*"` topics `Audio.Input.Server` owns, keyed by
+  the same `{slot_sub, vid, pid}` tuple and the same base64 encode/decode
+  helpers as the outputs above.
+
+  Pairing requires an explicit local consent gesture: an "Allow pairing"
+  button opens a time-boxed window on the source (`Audio.Input.allow_pairing/1`)
+  before it will answer Music Assistant's pairing offer. Once pairing runs, the
+  device DISPLAYS the derived PIN and the operator types it into Music
+  Assistant — never the other way around. `:pairing` status therefore renders
+  one of: the "Allow pairing" button (offer pending, no window), an active
+  "waiting" state (window open), or the PIN (once derived).
   """
 
   use UniversalProxyWeb, :live_view
@@ -35,6 +52,7 @@ defmodule UniversalProxyWeb.AudioLive do
   import UniversalProxyWeb.Components.Audio
 
   alias UniversalProxy.Audio
+  alias UniversalProxy.Audio.Input
   alias UniversalProxy.Bluetooth
   alias UniversalProxy.Bluetooth.AudioManager
 
@@ -55,6 +73,11 @@ defmodule UniversalProxyWeb.AudioLive do
   @impl true
   def mount(_params, _session, socket) do
     outputs = Audio.list_outputs()
+    # Synchronous GenServer read, same reasoning as `Audio.list_outputs/0`
+    # above: this is a cheap in-memory lookup, not a DB query, so it needs
+    # no `assign_async` — and `Audio.Input.list_inputs/0` already degrades
+    # to `[]` (via `catch :exit`) when the input subtree is down.
+    inputs = Input.list_inputs()
 
     if connected?(socket) do
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:output_added")
@@ -62,6 +85,9 @@ defmodule UniversalProxyWeb.AudioLive do
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:state")
       # Bluetooth connection events drive the brief "Reconnecting" card.
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "bluetooth:audio")
+      Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:input_added")
+      Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:input_removed")
+      Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:input_state")
     end
 
     {:ok,
@@ -88,7 +114,10 @@ defmodule UniversalProxyWeb.AudioLive do
      # Per-card "more" disclosure (footer chevron expands to show card
      # index + client_id). Tracking as a MapSet keyed on the same
      # encoded ids the cards use.
-     |> assign(:more_open, MapSet.new())}
+     |> assign(:more_open, MapSet.new())
+     # Audio inputs (capture cards), keyed by the same base64-encoded
+     # `{slot_sub, vid, pid}` id the outputs map above uses.
+     |> assign(:inputs, build_inputs_map(inputs))}
   end
 
   @impl true
@@ -198,6 +227,18 @@ defmodule UniversalProxyWeb.AudioLive do
      end)}
   end
 
+  # Operator consent gesture for pairing a capture card. Opens the source's
+  # time-boxed "allow pairing" window; the source stays authoritative over what
+  # happens next (it still requires MA to type the derived PIN).
+  def handle_event("allow_pairing", %{"id" => id}, socket) do
+    case decode_key(id) do
+      {:ok, key} -> Input.allow_pairing(key)
+      {:error, _} -> :ok
+    end
+
+    {:noreply, socket}
+  end
+
   @impl true
   def handle_info({:sendspin_output_added, output}, socket) do
     card = build_card(output)
@@ -267,6 +308,34 @@ defmodule UniversalProxyWeb.AudioLive do
     end
   end
 
+  def handle_info({:sendspin_input_added, input}, socket) do
+    {:noreply,
+     update(socket, :inputs, &Map.put(&1, encode_key(input.key), build_input_card(input)))}
+  end
+
+  def handle_info({:sendspin_input_removed, %{key: key}}, socket) do
+    {:noreply, update(socket, :inputs, &Map.delete(&1, encode_key(key)))}
+  end
+
+  # `state_map` from `Audio.Input.Server` is always the FULL derived live
+  # state (`status`/`connection`/`pin`/`port`/`last_error`), not a partial
+  # patch — a straight `Map.merge/2` is correct here, unlike `merge_card/2`
+  # above which has to interpret an `:event`-tagged partial.
+  def handle_info({:input_state, key, state_map}, socket) do
+    id = encode_key(key)
+
+    case Map.fetch(socket.assigns.inputs, id) do
+      {:ok, input} ->
+        merged = Map.merge(input, state_map)
+        {:noreply, assign(socket, :inputs, Map.put(socket.assigns.inputs, id, merged))}
+
+      :error ->
+        # State for a key we don't know about — ignore, same posture as
+        # the output-side `:sendspin_state` handler.
+        {:noreply, socket}
+    end
+  end
+
   def handle_info(_msg, socket), do: {:noreply, socket}
 
   @impl true
@@ -291,6 +360,19 @@ defmodule UniversalProxyWeb.AudioLive do
         />
         <.reconnecting_card :for={{mac, info} <- active_reconnecting(@reconnecting, @outputs)} name={info.name} mac={mac} />
       </div>
+
+      <section aria-label="Audio inputs" class="mt-10">
+        <.input_header count={map_size(@inputs)} />
+
+        <.input_empty_state :if={map_size(@inputs) == 0} />
+
+        <div
+          :if={map_size(@inputs) > 0}
+          class="grid grid-cols-1 [grid-template-columns:repeat(auto-fit,minmax(360px,1fr))] gap-4"
+        >
+          <.input_card :for={{id, input} <- sorted_inputs(@inputs)} id={id} input={input} />
+        </div>
+      </section>
     </div>
 
     <.rename_modal
@@ -335,6 +417,160 @@ defmodule UniversalProxyWeb.AudioLive do
         is set in the boot config. The list refreshes automatically.
       </p>
     </.card>
+    """
+  end
+
+  attr(:count, :integer, required: true)
+
+  defp input_header(assigns) do
+    ~H"""
+    <div class="mb-5">
+      <.eyebrow>Inputs</.eyebrow>
+      <h2 class="text-xl font-semibold mt-1 mb-1.5 text-fg-1 flex items-center gap-2.5">
+        Audio inputs
+        <span :if={@count > 0} class="text-sm font-medium text-fg-3">
+          · {@count} {if @count == 1, do: "input", else: "inputs"}
+        </span>
+      </h2>
+      <p class="text-base text-fg-2 m-0 max-w-[640px]">
+        Each USB capture card is advertised as a Sendspin source. Add it as a
+        Live Input in Music Assistant, then pair it using the PIN shown here.
+      </p>
+    </div>
+    """
+  end
+
+  defp input_empty_state(assigns) do
+    ~H"""
+    <.card padding={:lg} class="text-center !p-9">
+      <div class="w-12 h-12 rounded-md bg-audio-soft text-audio mx-auto mb-3 flex items-center justify-center">
+        <.icon name={:mic} size={26} />
+      </div>
+      <div class="text-md font-semibold text-fg-1">No audio inputs detected</div>
+      <p class="text-sm text-fg-2 mt-1.5 m-0">
+        Connect a USB capture card to advertise it as a Sendspin source for Music Assistant.
+      </p>
+    </.card>
+    """
+  end
+
+  attr(:id, :string, required: true)
+  attr(:input, :map, required: true)
+
+  # Single input row/card. Read-only: no volume, mute, or enable control —
+  # unlike an output, a present capture card always gets a source (see
+  # `Audio.Input.Server`'s moduledoc). The only interactive-looking content
+  # is the PIN block, and even that isn't a form: the device DISPLAYS the
+  # PIN, the operator types it into Music Assistant.
+  defp input_card(assigns) do
+    assigns =
+      assigns
+      |> assign(:status, input_status(assigns.input.status))
+      |> assign(:pairing_window_active?, pairing_window_active?(assigns.input))
+      |> assign(:error_message, input_error_message(assigns.input))
+
+    ~H"""
+    <.card id={"input-#{@id}"} padding={:none} class="relative flex flex-col overflow-hidden">
+      <div
+        class="absolute inset-y-0 left-0 w-[3px]"
+        style={"background: #{@status.tint_var};"}
+      >
+      </div>
+
+      <div class="pt-[18px] pr-5 pb-[18px] pl-[22px]">
+        <div class="flex items-start gap-3.5">
+          <div class="flex-none w-11 h-11 rounded-md bg-audio-soft text-audio flex items-center justify-center">
+            <.icon name={:mic} size={22} />
+          </div>
+          <div class="flex-1 min-w-0">
+            <div class="text-md font-semibold text-fg-1">
+              {@input.friendly_name || @input.name}
+            </div>
+            <div class="text-xs text-fg-3 mt-1">
+              <span class="font-mono">{@input.alsa_device}</span>
+              <span class="mx-1.5">·</span>
+              <span>{@input.name}</span>
+            </div>
+          </div>
+          <.badge variant={@status.variant} dot>{@status.label}</.badge>
+        </div>
+
+        <div
+          :if={@input.status == :pairing and @input.pin}
+          class="mt-4 px-3.5 py-3 rounded-md bg-accent-soft text-accent"
+        >
+          <div class="text-xs font-semibold mb-2">Enter this PIN in Music Assistant</div>
+          <.pin_display pin={@input.pin} />
+        </div>
+
+        <%!-- Consent gesture: no PIN yet and no open window → offer the button;
+             window open → show the active waiting state. --%>
+        <button
+          :if={@input.status == :pairing and is_nil(@input.pin) and not @pairing_window_active?}
+          type="button"
+          phx-click="allow_pairing"
+          phx-value-id={@id}
+          class="mt-4 w-full px-3.5 py-2.5 rounded-md bg-accent text-white text-sm font-semibold
+                 cursor-pointer border-none hover:opacity-90 transition-opacity"
+        >
+          Allow pairing
+        </button>
+
+        <div
+          :if={@input.status == :pairing and is_nil(@input.pin) and @pairing_window_active?}
+          class="mt-4 px-3.5 py-3 rounded-md bg-accent-soft text-accent flex items-center gap-2.5"
+        >
+          <span class="w-3.5 h-3.5 rounded-full border-2 border-accent border-t-transparent bt-spin">
+          </span>
+          <div class="text-xs font-semibold">
+            Pairing allowed — waiting for Music Assistant…
+          </div>
+        </div>
+      </div>
+
+      <div
+        :if={@error_message}
+        class="px-[22px] py-2 border-t border-border-2 bg-danger-soft text-danger text-xs"
+      >
+        {@error_message}
+      </div>
+    </.card>
+    """
+  end
+
+  # An open "allow pairing" window (Unix-second expiry still in the future).
+  defp pairing_window_active?(%{pairing_window: expires}) when is_integer(expires),
+    do: expires > System.system_time(:second)
+
+  defp pairing_window_active?(_input), do: false
+
+  # Map an input's error state to a FIXED display string. `last_error` can carry
+  # peer-influenced text; HEEx escapes it (no XSS) but echoing it verbatim in a
+  # trusted-looking banner is a social-engineering surface, so the UI shows a
+  # curated message instead.
+  defp input_error_message(%{status: :degraded}),
+    do: "No capture device available (arecord missing)."
+
+  defp input_error_message(%{last_error: err}) when is_binary(err),
+    do: "The last connection attempt failed. Music Assistant will retry."
+
+  defp input_error_message(_input), do: nil
+
+  attr(:pin, :string, required: true)
+
+  # Large, segmented digit display — the whole pairing UX on our side is
+  # showing this clearly enough to type into another device's UI.
+  defp pin_display(assigns) do
+    ~H"""
+    <div class="flex items-center gap-1.5" role="text" aria-label={"Pairing PIN #{@pin}"}>
+      <span
+        :for={digit <- String.graphemes(@pin)}
+        class="w-8 h-10 rounded-md bg-surface border border-border-1 flex items-center
+               justify-center text-xl font-mono font-semibold tabular-nums text-fg-1"
+      >
+        {digit}
+      </span>
+    </div>
     """
   end
 
@@ -702,6 +938,31 @@ defmodule UniversalProxyWeb.AudioLive do
     Map.new(outputs, fn output -> {encode_key(output.key), build_card(output)} end)
   end
 
+  defp build_inputs_map(inputs) do
+    Map.new(inputs, fn input -> {encode_key(input.key), build_input_card(input)} end)
+  end
+
+  # The card map is the LiveView's per-input view — see `build_card/1`
+  # above for the output-side counterpart. `Audio.Input.list_inputs/0`
+  # always carries the live-state fields (merged in server-side), but the
+  # `:sendspin_input_added` broadcast payload does NOT (see
+  # `Audio.Input.Server.refresh_inputs/1`'s `merged_adds`) — so every
+  # live-state field defaults here to the same "just detected" values
+  # `Audio.Input.Server`'s `@default_input_state` uses.
+  defp build_input_card(input) do
+    %{
+      key: input.key,
+      name: Map.get(input, :name),
+      alsa_device: Map.get(input, :alsa_device),
+      friendly_name: Map.get(input, :friendly_name) || Map.get(input, :name),
+      status: Map.get(input, :status, :detected),
+      connection: Map.get(input, :connection, :disconnected),
+      pin: Map.get(input, :pin),
+      pairing_window: Map.get(input, :pairing_window),
+      last_error: Map.get(input, :last_error)
+    }
+  end
+
   # A Bluetooth output keys by `{mac, nil, nil}`; pull the MAC out. Only
   # call once the output is known to be Bluetooth (`bt_output?/1`) — the
   # key shape isn't unique to BT (onboard ALSA cards share it).
@@ -857,6 +1118,40 @@ defmodule UniversalProxyWeb.AudioLive do
     |> Map.to_list()
     |> Enum.sort_by(fn {_id, %{friendly_name: name}} -> name end)
   end
+
+  defp sorted_inputs(inputs) do
+    inputs
+    |> Map.to_list()
+    |> Enum.sort_by(fn {_id, %{friendly_name: name}} -> name end)
+  end
+
+  # Badge copy + tint for an input's `:status`. Mirrors `audio_status/1`
+  # in `Components.Audio` (same badge/tint-var contract) but keyed off the
+  # input state machine's richer status set — `:detected` through
+  # `:degraded` — rather than the output side's enabled/connection/stream
+  # trio.
+  @spec input_status(atom()) :: %{label: String.t(), variant: atom(), tint_var: String.t()}
+  defp input_status(:detected),
+    do: %{label: "Detected", variant: :neutral, tint_var: "var(--hs-fg-4)"}
+
+  defp input_status(:waiting),
+    do: %{label: "Waiting for Music Assistant", variant: :warning, tint_var: "var(--hs-warning)"}
+
+  defp input_status(:pairing),
+    do: %{label: "Pairing", variant: :accent, tint_var: "var(--hs-accent)"}
+
+  defp input_status(:paired),
+    do: %{label: "Paired", variant: :accent, tint_var: "var(--hs-accent)"}
+
+  defp input_status(:streaming),
+    do: %{label: "Streaming", variant: :success, tint_var: "var(--hs-success)"}
+
+  defp input_status(:degraded),
+    do: %{
+      label: "No capture (arecord missing)",
+      variant: :danger,
+      tint_var: "var(--hs-danger)"
+    }
 
   # Reconnecting placeholders for MACs that don't currently have a live
   # output card (a reconnected device's real card supersedes its
