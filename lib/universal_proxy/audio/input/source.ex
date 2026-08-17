@@ -238,11 +238,14 @@ defmodule UniversalProxy.Audio.Input.Source do
   @pairing_backoff_ms 300
   @pairing_window_ms 120_000
 
-  # A simple per-source accept rate limit: a peer that loops connect/disconnect
-  # can neither exhaust resources nor (with the eviction rules below) flap the
-  # live session.
-  @max_accepts 5
-  @accept_window_ms 10_000
+  # A per-source accept rate limit, sized only to catch pathological churn (a
+  # peer wedged in a tight connect/disconnect loop). It is a secondary backstop:
+  # the real protection against a live session being flapped lives in the
+  # eviction rules below (a trust-`user` incumbent is never evicted for an
+  # un-authenticated challenger). Kept generous so MA's normal reconnect and
+  # operator-initiated pairing-dial cadence is never refused.
+  @max_accepts 30
+  @accept_window_ms 60_000
 
   # How long the incumbent has to prove liveness before a parked challenger is
   # promoted. A live trust-`user` session answers a `client/time` inside this.
@@ -1136,8 +1139,18 @@ defmodule UniversalProxy.Audio.Input.Source do
         state = %{discard_pairing(state) | fsm: :pairing_required, last_pairing_params: pairing}
         maybe_start_pairing(state, pairing)
 
+      # An idle `server/activate`: neither a `source@v1` role nor a pairing
+      # activity. This is MA's steady state before the operator initiates
+      # pairing (it dials every discovered source and holds it). Stay connected
+      # and idle in `:awaiting_activate` so MA keeps a stable connection and can
+      # later send a pairing or `source@v1` activate; closing here made the
+      # source flap "unavailable" and never present a device to pair.
       true ->
-        {:error, {:source_not_activated, roles}, state}
+        Logger.debug(
+          "Audio.Input.Source #{inspect(state.key)} idle activate (roles=#{inspect(roles)}); staying idle"
+        )
+
+        {:ok, state}
     end
   end
 

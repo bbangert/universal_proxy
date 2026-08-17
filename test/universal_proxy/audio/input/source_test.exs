@@ -398,6 +398,38 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
   end
 
   describe "connection lifecycle" do
+    test "an idle activate (no role, no pairing) holds the connection open and idle", ctx do
+      {source, port} = start_source!(ctx)
+      assert_receive {:source_event, @key, {:listener_bound, ^port}}, 2_000
+
+      peer = Peer.connect!(port)
+      peer = Peer.handshake!(peer)
+      peer = Peer.hello!(peer)
+      {_hello, peer} = Peer.await_json!(peer, "client/hello")
+
+      # MA's steady state before the operator initiates pairing: it dials every
+      # discovered source and sends an activate with neither a source@v1 role
+      # nor a pairing activity. We must stay connected and idle (not close), so
+      # MA keeps a stable connection and can later escalate to pairing.
+      peer = Peer.activate!(peer, roles: [], activities: ["playback"])
+
+      refute_receive {:source_event, @key, {:error, _}}, 500
+      refute_received {:source_event, @key, :disconnected}
+      refute_received {:source_event, @key, :activated}
+      assert Source.status(source) == :awaiting_activate
+
+      # A later pairing activate on the SAME connection still works.
+      _peer =
+        Peer.activate!(peer,
+          roles: [],
+          activities: ["pairing"],
+          pairing: %{"method" => "dynamic_pin", "pin_length" => 6}
+        )
+
+      assert_receive {:source_event, @key, {:pairing_required, _params}}, 2_000
+      assert Source.status(source) == :pairing_required
+    end
+
     test "a dropped connection is reported and the listener keeps accepting", ctx do
       psk = pair!(ctx)
       {source, port} = start_source!(ctx)
