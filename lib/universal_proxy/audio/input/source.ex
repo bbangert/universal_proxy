@@ -38,9 +38,9 @@ defmodule UniversalProxy.Audio.Input.Source do
       :awaiting_activate    sent client/hello; the `client/time` clock-sync
                             loop runs from here for the rest of the connection
       :pairing_required     activate withheld source@v1 and granted the
-                            pairing activity while we are unpaired; a PIN
-                            attempt is either running or waiting to be
-                            re-offered
+                            pairing activity while we are unpaired; we are
+                            holding the offer for operator consent, or a PIN
+                            attempt is running or waiting to be re-offered
       :awaiting_rehandshake pairing completed; waiting for the server to
                             re-run the Noise handshake in band
       :syncing              source@v1 active; reports available once the
@@ -61,10 +61,16 @@ defmodule UniversalProxy.Audio.Input.Source do
 
   Pairing is gated on an explicit **local operator gesture**
   (`allow_pairing/1`, a button on the Audio tab). A peer-sent pairing
-  `server/activate` on its own is refused with `pair/abort` (`user_cancelled`)
-  and held in `:pairing_required`; only once the operator opens a time-boxed
+  `server/activate` on its own does **not** open an attempt — but it is not
+  instantly aborted either. We **hold** it in `:pairing_required` (surfacing the
+  "Allow pairing" affordance) and wait, mirroring MA's `start_pin_pairing`,
+  which sends the offer and then waits for `client/pair-init` rather than
+  demanding an immediate reply. Only once the operator opens a time-boxed
   (120 s) window do we send `client/pair-init` and drive
-  `UniversalProxy.Sendspin.Pairing` through the CPace exchange. Attempts are
+  `UniversalProxy.Sendspin.Pairing` through the CPace exchange. If the operator
+  never consents, a consent-wait timeout (also 120 s, matching MA's window)
+  sends `pair/abort` and returns the connection to idle — an un-consented offer
+  never pairs, so an attacker gains nothing. Attempts are
   capped at 3 per connection with a backoff between
   retries (bounding an online PIN brute force), and an attempt is refused
   outright while a long-term PSK already exists (an operator must unpair first)
@@ -123,6 +129,9 @@ defmodule UniversalProxy.Audio.Input.Source do
       {:pairing_pin, pin}         show this PIN; the user types it into MA
       :paired                     PSK minted and persisted; awaiting the
                                   post-pairing re-handshake
+      :pairing_declined           a held offer expired without the operator's
+                                  consent; we sent `pair/abort` and are back
+                                  connected-and-idle
       {:pairing_failed, reason}   attempt abandoned; MA may offer another
       :streaming                  capture up, client_stream/start sent
       :stopped                    streaming ended (server stop or capture exit)
@@ -310,6 +319,8 @@ defmodule UniversalProxy.Audio.Input.Source do
     :last_pairing_params,
     :pairing_window_timer,
     :pairing_attempt_timer,
+    :consent_wait_timer,
+    :pairing_window_ms,
     fsm: :listening,
     trust: :none,
     reassembler: nil,
@@ -333,6 +344,7 @@ defmodule UniversalProxy.Audio.Input.Source do
           | {:pairing_pin, String.t()}
           | :paired
           | {:pairing_failed, term()}
+          | :pairing_declined
           | :streaming
           | :stopped
           | :disconnected
@@ -373,6 +385,9 @@ defmodule UniversalProxy.Audio.Input.Source do
     * `:pairing_timeout_ms` — how long one PIN attempt may take before we
       send `pair/abort` with `attempt_timeout` (default
       `Sendspin.Pairing.attempt_timeout_ms/0`, 120 s).
+    * `:pairing_window_ms` — the consent window: both how long a held pairing
+      offer waits for the operator's `allow_pairing/1` gesture and how long an
+      opened window stays open (default #{@pairing_window_ms}, 120 s).
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -390,9 +405,9 @@ defmodule UniversalProxy.Audio.Input.Source do
   @doc """
   Open a time-boxed local "allow pairing" window (the operator consent
   gesture). Until this is called, a peer-sent pairing `server/activate` is
-  refused with `pair/abort` rather than opening an attempt. If an offer is
-  already pending on the live connection, opening the window proceeds straight
-  to `client/pair-init`.
+  **held** (not aborted) until the consent-wait timeout. If an offer is already
+  pending on the live connection, opening the window proceeds straight to
+  `client/pair-init`; otherwise it pre-authorizes the next offer.
   """
   @spec allow_pairing(GenServer.server()) :: :ok
   def allow_pairing(server), do: GenServer.cast(server, :allow_pairing)
@@ -422,6 +437,7 @@ defmodule UniversalProxy.Audio.Input.Source do
       pair_methods: Keyword.get(opts, :supported_pair_methods, default_pair_methods()),
       time_burst_ms: Keyword.get(opts, :time_burst_ms, @time_burst_ms),
       pairing_timeout_ms: Keyword.get(opts, :pairing_timeout_ms, Pairing.attempt_timeout_ms()),
+      pairing_window_ms: Keyword.get(opts, :pairing_window_ms, @pairing_window_ms),
       listen_ip: Keyword.get(opts, :listen_ip, :any),
       reassembler: Wire.Reassembler.new(),
       filter: ClockFilter.new()
@@ -539,6 +555,21 @@ defmodule UniversalProxy.Audio.Input.Source do
 
   def handle_info(:pairing_window_timeout, state) do
     {:noreply, close_pairing_window(state)}
+  end
+
+  # The held pairing offer expired without an `allow_pairing/1` gesture. Only
+  # act while still genuinely holding (no attempt opened, socket up); a stray
+  # timeout that raced a consent or a teardown just clears its field.
+  def handle_info(
+        :consent_wait_timeout,
+        %{fsm: :pairing_required, pairing: nil, socket: socket} = state
+      )
+      when not is_nil(socket) do
+    {:noreply, decline_held_offer(state, :user_cancelled)}
+  end
+
+  def handle_info(:consent_wait_timeout, state) do
+    {:noreply, cancel_consent_wait_timer(state)}
   end
 
   def handle_info({:open_pairing_attempt, params}, state) do
@@ -1191,14 +1222,54 @@ defmodule UniversalProxy.Audio.Input.Source do
   # The consent gate. A pairing `server/activate` only opens an attempt when
   # (a) no long-term PSK already exists — refusing to let a Sentinel-keyed
   # attacker overwrite MA's stored PSK (`Store.save_pairing` clobbers) — and
-  # (b) the operator has opened a local "allow pairing" window. Otherwise we
-  # send `pair/abort` and hold in `:pairing_required` until the operator acts.
+  # (b) the operator has opened a local "allow pairing" window. Absent consent
+  # we do NOT abort: we HOLD the offer in `:pairing_required` (surfacing the
+  # "Allow pairing" affordance) and wait, mirroring how MA's `start_pin_pairing`
+  # sends the offer and then waits for `client/pair-init` rather than demanding
+  # an immediate reply. Pairing still requires the explicit operator gesture —
+  # an un-consented offer just waits, then times out with no pairing.
   defp maybe_start_pairing(state, params) do
     cond do
-      already_paired?(state) -> refuse_pairing(state, :already_paired)
-      not state.pairing_allowed -> refuse_pairing(state, :awaiting_consent)
-      true -> start_pairing(state, params)
+      already_paired?(state) -> refuse_pairing(state)
+      state.pairing_allowed -> start_pairing(state, params)
+      true -> hold_for_consent(state)
     end
+  end
+
+  # No operator consent yet. Send neither `pair/abort` nor `client/pair-init`;
+  # just hold in `:pairing_required` (already set by the caller, along with the
+  # `{:pairing_required, params}` notification and `last_pairing_params`) and
+  # arm a consent-wait timeout sized to MA's own pairing window. The `client/time`
+  # keepalive holds the connection open in the meantime.
+  defp hold_for_consent(state) do
+    {:ok, arm_consent_wait(state)}
+  end
+
+  defp arm_consent_wait(state) do
+    state = cancel_consent_wait_timer(state)
+    timer = Process.send_after(self(), :consent_wait_timeout, state.pairing_window_ms)
+    %{state | consent_wait_timer: timer}
+  end
+
+  defp cancel_consent_wait_timer(%__MODULE__{consent_wait_timer: nil} = state), do: state
+
+  defp cancel_consent_wait_timer(%__MODULE__{consent_wait_timer: timer} = state) do
+    _ = Process.cancel_timer(timer)
+    %{state | consent_wait_timer: nil}
+  end
+
+  # The consent-wait timeout fired with no `allow_pairing/1` gesture: MA's own
+  # pairing window has (about) elapsed too. Decline the held offer with
+  # `pair/abort` and return to connected-idle, holding the connection for a
+  # later offer. No pairing happened, so an un-consented attacker gains nothing.
+  defp decline_held_offer(state, reason) do
+    Logger.info("Audio.Input.Source #{inspect(state.key)} pairing offer expired without consent")
+
+    state = cancel_consent_wait_timer(state)
+    _ = send_json(state, Wire.encode_pair_abort(reason))
+    state = %{state | fsm: :awaiting_activate, last_pairing_params: nil}
+    notify(state, :pairing_declined)
+    state
   end
 
   defp already_paired?(state) do
@@ -1208,12 +1279,15 @@ defmodule UniversalProxy.Audio.Input.Source do
     end
   end
 
-  # Politely decline until the operator consents (or unpairs). The peer stays
-  # connected; the server retries by offering the pairing activity again.
-  defp refuse_pairing(state, reason) do
-    Logger.info("Audio.Input.Source #{inspect(state.key)} declining pairing offer (#{reason})")
+  # A long-term PSK already exists: an operator must unpair first, so we refuse
+  # outright rather than let a Sentinel-keyed peer overwrite the stored PSK. The
+  # peer stays connected; only this offer is declined.
+  defp refuse_pairing(state) do
+    Logger.info(
+      "Audio.Input.Source #{inspect(state.key)} declining pairing offer (already_paired)"
+    )
 
-    if reason == :already_paired, do: notify(state, {:pairing_failed, :already_paired})
+    notify(state, {:pairing_failed, :already_paired})
 
     case send_json(state, Wire.encode_pair_abort(:user_cancelled)) do
       :ok -> {:ok, state}
@@ -1225,6 +1299,8 @@ defmodule UniversalProxy.Audio.Input.Source do
   # first being 1 (ground truth §3). Capped at `@max_pairing_attempts` per
   # connection to bound an online PIN brute force; retries back off.
   defp start_pairing(state, params) do
+    # Opening an attempt supersedes any held-offer wait.
+    state = cancel_consent_wait_timer(state)
     index = state.pairing_index + 1
 
     cond do
@@ -1283,8 +1359,8 @@ defmodule UniversalProxy.Audio.Input.Source do
 
   defp arm_pairing_window(state) do
     state = cancel_pairing_window_timer(state)
-    timer = Process.send_after(self(), :pairing_window_timeout, @pairing_window_ms)
-    expires_at = System.system_time(:second) + div(@pairing_window_ms, 1_000)
+    timer = Process.send_after(self(), :pairing_window_timeout, state.pairing_window_ms)
+    expires_at = System.system_time(:second) + div(state.pairing_window_ms, 1_000)
     state = %{state | pairing_allowed: true, pairing_window_timer: timer}
     notify(state, {:pairing_window, expires_at})
     state
@@ -1818,6 +1894,7 @@ defmodule UniversalProxy.Audio.Input.Source do
       |> stop_capture()
       |> cancel_time_timer()
       |> discard_pairing()
+      |> cancel_consent_wait_timer()
       |> cancel_liveness_timer()
       |> drop_parked()
 

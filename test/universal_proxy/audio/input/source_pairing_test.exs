@@ -96,7 +96,7 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
   end
 
   describe "pairing consent gate" do
-    test "a pairing offer without consent is declined and never opens an attempt", ctx do
+    test "a pairing offer without consent HOLDS the offer instead of aborting", ctx do
       {source, port} = start_source!(ctx)
       {_hello, peer} = connect_hello!(port)
 
@@ -106,15 +106,18 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
       assert_receive {:source_event, @key, {:pairing_required, _params}}, 2_000
       refute_receive {:source_event, @key, :pairing_started}, 300
 
-      # The client declines with `pair/abort user_cancelled` and holds, waiting
-      # for the operator to open the window.
-      {reason, _peer} = Peer.await_pair_abort!(peer)
-      assert reason == "user_cancelled"
+      # We neither open an attempt nor send `pair/abort`: the offer is held for
+      # the operator, and the `client/time` keepalive keeps the connection up.
+      # Serving a couple of exchanges pumps everything the source has sent — no
+      # `pair/abort` is among it.
+      peer = Peer.serve_time!(peer, 2)
+      refute Enum.any?(peer.messages, &match?({:json, "pair/abort", _}, &1))
+
       assert Source.status(source) == :pairing_required
       refute_paired!(ctx.store)
     end
 
-    test "opening the consent window proceeds with a pending offer", ctx do
+    test "opening the consent window drives the held offer straight to pairing", ctx do
       {source, port} = start_source!(ctx)
       {_hello, peer} = connect_hello!(port)
 
@@ -122,14 +125,35 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
         Peer.activate!(peer, roles: [], activities: ["pairing"], pairing: @pairing_params)
 
       assert_receive {:source_event, @key, {:pairing_required, _params}}, 2_000
-      {reason, peer} = Peer.await_pair_abort!(peer)
-      assert reason == "user_cancelled"
 
-      # Operator consent: the source acts on the offer it is already holding.
+      # No abort was sent while holding; operator consent now acts on the offer
+      # the source is already holding.
+      peer = Peer.serve_time!(peer, 1)
+      refute Enum.any?(peer.messages, &match?({:json, "pair/abort", _}, &1))
+
       :ok = Source.allow_pairing(source)
       assert_receive {:source_event, @key, :pairing_started}, 2_000
       {index, _peer} = Peer.await_pair_init!(peer, pin_length: @pin_length)
       assert index == 1
+    end
+
+    test "a held offer that never gets consent aborts on the consent-wait timeout", ctx do
+      # Tiny consent window so the wait elapses in the test.
+      {source, port} = start_source!(ctx, pairing_window_ms: 40)
+      {_hello, peer} = connect_hello!(port)
+
+      peer =
+        Peer.activate!(peer, roles: [], activities: ["pairing"], pairing: @pairing_params)
+
+      assert_receive {:source_event, @key, {:pairing_required, _params}}, 2_000
+
+      # The operator never consents: the consent-wait timeout fires, we abort the
+      # held offer and fall back to connected-idle.
+      {reason, _peer} = Peer.await_pair_abort!(peer)
+      assert reason == "user_cancelled"
+      assert_receive {:source_event, @key, :pairing_declined}, 2_000
+      assert Source.status(source) == :awaiting_activate
+      refute_paired!(ctx.store)
     end
 
     test "refuses to open an attempt while a long-term PSK already exists", ctx do
