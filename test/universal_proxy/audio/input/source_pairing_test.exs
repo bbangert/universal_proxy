@@ -266,6 +266,32 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
       assert Source.status(source) == :ready
     end
 
+    test "no client/time is emitted during the active pairing exchange", ctx do
+      # A fast keepalive cadence, so a tick would certainly fire mid-exchange if
+      # it were not suppressed. `serve_pair_auth!`/`serve_pair_finalize!` are
+      # strict: they flunk on any frame interleaved with the exchange, so a
+      # completed pairing is proof that only pairing frames flowed.
+      {source, port} = start_source!(ctx, time_burst_ms: 10)
+
+      {_hello, peer} = connect_hello!(port)
+      :ok = Source.allow_pairing(source)
+      {1, peer} = offer_pairing!(peer)
+      pin = await_pin!()
+
+      # Let several keepalive intervals elapse while the attempt is live. Without
+      # the fix a `client/time` would land between `client/pair-init` and
+      # `client/pair-auth` — the exact interleave that made real MA raise
+      # "malformed message awaiting ClientPairAuthMessage".
+      Process.sleep(60)
+
+      peer = peer |> Peer.submit_pin!(pin) |> Peer.serve_pair_auth!()
+      {psk, peer} = Peer.serve_pair_finalize!(peer)
+
+      assert_receive {:source_event, @key, :paired}, 2_000
+      assert {:ok, %{psk: ^psk}} = Store.get_config(ctx.store, @key)
+      assert Source.status(source) == :awaiting_rehandshake
+    end
+
     test "a mistyped PIN aborts the attempt and the retry pairs at index 2", ctx do
       {source, port} = start_source!(ctx)
 

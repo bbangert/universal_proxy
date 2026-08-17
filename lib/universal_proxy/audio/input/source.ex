@@ -598,6 +598,18 @@ defmodule UniversalProxy.Audio.Input.Source do
     end
   end
 
+  # While a pairing attempt is actively exchanging (`pairing != nil`, i.e. from
+  # `client/pair-init` until the attempt resolves), MA drives a strict sequential
+  # `_receive_pairing`: any interleaved non-pairing frame — a `client/time`
+  # keepalive included — is treated as a malformed message and aborts pairing.
+  # So keep the loop armed (preserving the ClockFilter, which must not re-converge
+  # afterwards) but skip the send until the exchange ends. The consent HOLD
+  # (`pairing == nil` in `:pairing_required`) is unaffected, so a held offer still
+  # keeps the connection alive.
+  def handle_info(:time_tick, %{pairing: %Pairing{}} = state) do
+    {:noreply, schedule_time_tick(state, time_interval(state))}
+  end
+
   def handle_info(:time_tick, state), do: {:noreply, send_time_request(state)}
 
   def handle_info(:pairing_timeout, %{pairing: %Pairing{}} = state) do
@@ -1685,6 +1697,14 @@ defmodule UniversalProxy.Audio.Input.Source do
   end
 
   # -- Time sync --
+
+  # No `client/time` may leave while a pairing exchange is live: MA's strict
+  # `_receive_pairing` aborts on any interleaved non-pairing frame. This also
+  # silences the incumbent-liveness probe for the duration of an exchange — a
+  # parked challenger still proves the incumbent alive via the pairing frames the
+  # exchange itself carries inbound, and the `:time_tick` loop re-arms without
+  # sending, so keepalive resumes automatically once `pairing` clears.
+  defp send_time_request(%__MODULE__{pairing: %Pairing{}} = state), do: state
 
   defp send_time_request(%__MODULE__{noise: nil} = state), do: state
 
