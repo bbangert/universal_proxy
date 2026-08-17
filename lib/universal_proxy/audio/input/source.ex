@@ -1031,10 +1031,36 @@ defmodule UniversalProxy.Audio.Input.Source do
   end
 
   # A second (third, …) pairing `server/activate` is how the server retries
-  # after a failed attempt, so `:pairing_required` accepts activate too.
+  # after a failed attempt, so `:pairing_required` accepts activate too. This
+  # is the *initial* activation / pairing-retry path; a role change once
+  # `source@v1` is already active is handled by the clause below.
   defp handle_message(%{fsm: fsm} = state, :server_activate, payload)
        when fsm in [:awaiting_activate, :pairing_required] do
     handle_activate(state, payload)
+  end
+
+  # `source@v1` is already active (`:syncing`/`:ready`/`:streaming`, or
+  # `:degraded` where capture couldn't open) and the server re-sends
+  # `server/activate`. Two cases, and neither may be silently ignored — doing so
+  # would keep us capturing after the role was revoked:
+  #
+  #   * `source@v1` still present — a benign re-affirmation. We are already
+  #     active, so this is a no-op: don't tear down a healthy stream or reset
+  #     the converged clock filter (the source@v1 contract carries no "re-assert
+  #     `client/state`" obligation, so nothing needs re-sending).
+  #   * `source@v1` absent — MA revoked the role (another source took the
+  #     target, an admin disabled it, …). Stop capture and, if streaming, send
+  #     `client_stream/end`; rewind to `:awaiting_activate` holding the
+  #     connection so a later `server/activate` re-activates without a
+  #     reconnect. Disjoint from the pairing-retry path above (those states are
+  #     not active), so the two never conflict.
+  defp handle_message(%{fsm: fsm} = state, :server_activate, %{active_roles: roles})
+       when fsm in [:syncing, :ready, :streaming, :degraded] do
+    if is_list(roles) and @source_role in roles do
+      {:ok, state}
+    else
+      {:ok, deactivate_source(state)}
+    end
   end
 
   defp handle_message(state, :server_time, payload), do: handle_server_time(state, payload)
@@ -1675,6 +1701,28 @@ defmodule UniversalProxy.Audio.Input.Source do
         notify(state, {:error, {:capture_failed, reason}})
         {:degraded, %{state | fsm: :degraded}}
     end
+  end
+
+  # `source@v1` was removed from `active_roles` mid-session. End any open stream
+  # (reusing the async `stop_capture` path — never a synchronous stop from a
+  # handler), stop the `client/time` loop, and rewind to `:awaiting_activate`
+  # while holding the connection, so a later `server/activate` re-activates
+  # without a reconnect. `end_stream/1` emits `client_stream/end` + `:stopped`
+  # only when a stream was actually open. Trust and the Noise session are kept.
+  defp deactivate_source(state) do
+    Logger.info(
+      "Audio.Input.Source #{inspect(state.key)} source@v1 role removed mid-session; deactivating"
+    )
+
+    state = state |> end_stream() |> cancel_time_timer()
+
+    %{
+      state
+      | fsm: :awaiting_activate,
+        start_requested: false,
+        outstanding: [],
+        filter: ClockFilter.reset(state.filter)
+    }
   end
 
   # Closes an open stream if there is one; a no-op otherwise, so both a

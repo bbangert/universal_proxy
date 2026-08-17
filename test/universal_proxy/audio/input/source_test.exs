@@ -318,6 +318,59 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
     end
   end
 
+  describe "role removal" do
+    @tag :python3
+    test "server/activate dropping source@v1 mid-stream stops capture and can re-activate", ctx do
+      arecord = write_fake_arecord!()
+      psk = pair!(ctx)
+      {source, port} = start_source!(ctx, capture_opts: [arecord_path: arecord])
+      assert_receive {:source_event, @key, {:listener_bound, ^port}}, 2_000
+
+      peer = connect_available!(port, psk: psk)
+      peer = Peer.command!(peer, "start")
+      {_stream, peer} = Peer.await_json!(peer, "client_stream/start")
+      assert_receive {:source_event, @key, :streaming}, 2_000
+      {_ts, _payload, peer} = Peer.await_audio!(peer)
+
+      capture = :sys.get_state(source).capture
+      assert is_pid(capture)
+      mon = Process.monitor(capture)
+
+      # MA revokes source@v1 mid-stream (another source took the target, an
+      # admin disabled it, …). We must stop capturing and sending audio, send
+      # client_stream/end, and hold the connection so MA can re-activate later.
+      peer = Peer.activate!(peer, roles: [])
+      {_end, peer} = Peer.await_json!(peer, "client_stream/end")
+      assert_receive {:source_event, @key, :stopped}, 2_000
+
+      # Capture is torn down (async), the connection stays up, and the FSM has
+      # left :streaming for a re-activatable state.
+      assert_receive {:DOWN, ^mon, :process, ^capture, _}, 2_000
+      refute Process.alive?(capture)
+      refute_received {:source_event, @key, :disconnected}
+      assert Source.status(source) == :awaiting_activate
+
+      # A later server/activate WITH source@v1 re-activates without a reconnect;
+      # re-converge the clock, then a fresh start resumes streaming.
+      peer = Peer.activate!(peer, roles: ["source@v1"])
+      assert_receive {:source_event, @key, :activated}, 2_000
+
+      {initial, peer} = Peer.await_json!(peer, "client/state")
+      assert initial["available"] == false
+      peer = Peer.serve_time!(peer, 2)
+      {available, peer} = Peer.await_json!(peer, "client/state")
+      assert available["available"] == true
+
+      peer = Peer.command!(peer, "start")
+      {_stream, peer} = Peer.await_json!(peer, "client_stream/start")
+      assert_receive {:source_event, @key, :streaming}, 2_000
+
+      {_ts, payload, _peer} = Peer.await_audio!(peer)
+      assert byte_size(payload) == @frame_bytes
+      assert Source.status(source) == :streaming
+    end
+  end
+
   describe "pairing" do
     test "activate without source@v1 plus a pairing activity holds in :pairing_required", ctx do
       {source, port} = start_source!(ctx)

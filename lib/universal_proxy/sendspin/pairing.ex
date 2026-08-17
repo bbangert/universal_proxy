@@ -153,8 +153,11 @@ defmodule UniversalProxy.Sendspin.Pairing do
 
   # Redact the secret fields from any crash report / RingLogger dump / observer
   # inspection: the minted long-term PSK, the derived PIN, the CPace
-  # intermediate/MAC keys and the (test-only) CPace scalar.
-  @derive {Inspect, except: [:psk, :pin, :isk, :mac_key, :cpace_scalar]}
+  # intermediate/MAC keys, the commit/reveal nonce (secret until revealed in
+  # `client/pair-confirm`) and the (test-only) CPace scalar. The live CPace
+  # scalar lives inside the `:cpace` field's `%CPace{}`, which self-redacts it
+  # via its own `@derive {Inspect, except: [:scalar]}`.
+  @derive {Inspect, except: [:psk, :pin, :isk, :mac_key, :nonce_b, :cpace_scalar]}
   @enforce_keys [:method, :stage, :handshake_hash, :pairing_index, :sid, :suite, :psk]
   defstruct [
     :method,

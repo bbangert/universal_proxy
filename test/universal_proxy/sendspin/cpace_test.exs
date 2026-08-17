@@ -282,4 +282,23 @@ defmodule UniversalProxy.Sendspin.CPaceTest do
       refute isk_1 == isk_2
     end
   end
+
+  describe "inspect redaction" do
+    test "does not leak the secret scalar" do
+      scalar = :crypto.strong_rand_bytes(32)
+      {:ok, cpace} = CPace.start(:a, prs: "483106", sid: "sid-1", ad: "server", scalar: scalar)
+
+      rendered = inspect(cpace)
+
+      # Neither the raw bytes nor their hex/base64 renderings may appear.
+      refute rendered =~ inspect(scalar)
+      refute rendered =~ Base.encode16(scalar)
+      refute rendered =~ Base.encode16(scalar, case: :lower)
+      refute rendered =~ Base.url_encode64(scalar, padding: false)
+      # The `except:` derivation collapses the omitted field into an ellipsis.
+      assert rendered =~ "..."
+      # Public fields are still visible.
+      assert rendered =~ "role: :a"
+    end
+  end
 end

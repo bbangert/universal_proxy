@@ -68,6 +68,11 @@ defmodule UniversalProxy.Sendspin.CPace do
           transcript: transcript_mode()
         }
 
+  # Self-redact the secret random scalar wherever this struct is inspected
+  # (crash report / RingLogger / observer). It is the private CPace key; leaking
+  # it lets an eavesdropper who also saw the shares recover the ISK. `share`,
+  # `sid` and `ad` are all sent on the wire, so they need no redaction.
+  @derive {Inspect, except: [:scalar]}
   @enforce_keys [:role, :sid, :ad, :scalar, :share, :transcript]
   defstruct [:role, :sid, :ad, :scalar, :share, :transcript]
 

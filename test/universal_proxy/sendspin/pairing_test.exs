@@ -497,6 +497,40 @@ defmodule UniversalProxy.Sendspin.PairingTest do
     end
   end
 
+  describe "inspect redaction" do
+    test "a mid-attempt struct leaks neither the CPace scalar nor nonce_b" do
+      # Drive to `:awaiting_pair_auth`, where the live `%CPace{}` (with its
+      # secret scalar) and `nonce_b` (still secret — revealed only later in
+      # `client/pair-confirm`) both sit in the struct.
+      {:ok, [{"client/pair-init", _init}], client} =
+        Pairing.start(
+          client_opts(
+            handshake_hash: @kat_hash,
+            pairing_index: @kat_index,
+            pin_length: @kat_pin_length,
+            nonce_b: @kat_nonce_b,
+            cpace_scalar: @kat_scalar_b
+          )
+        )
+
+      {:pin, _pin, client} =
+        Pairing.handle(client, "server/pair-init", %{"nonce_A" => b64(@kat_nonce_a)})
+
+      # Sanity: the secrets really are in the struct (the CPace nested one too).
+      assert client.nonce_b == @kat_nonce_b
+      assert client.cpace.scalar == @kat_scalar_b
+
+      rendered = inspect(client)
+
+      for secret <- [@kat_scalar_b, @kat_nonce_b] do
+        refute rendered =~ inspect(secret)
+        refute rendered =~ Base.encode16(secret)
+        refute rendered =~ Base.encode16(secret, case: :lower)
+        refute rendered =~ b64(secret)
+      end
+    end
+  end
+
   # Same drive as `pair/2` but with the server deliberately bound to a
   # different sid input than the client.
   defp pair_with_server_override(override) do
