@@ -6,6 +6,7 @@ defmodule UniversalProxy.Audio.Input.StoreTest do
   use ExUnit.Case, async: false
 
   alias UniversalProxy.Audio.Input.Store
+  alias UniversalProxy.Sendspin.Noise
 
   @table :audio_input_store_test
   @key {"USB Capture Card", nil, nil}
@@ -165,6 +166,24 @@ defmodule UniversalProxy.Audio.Input.StoreTest do
 
       {:ok, cfg} = Store.get_config(server, @key)
       assert cfg.friendly_name == "Keep Me"
+    end
+
+    test "a persisted keypair with a wrong-length priv is discarded and regenerated",
+         %{server: server} do
+      {pub, _valid_priv} = Noise.generate_static_keypair()
+      bad_keypair = {pub, <<1, 2, 3>>}
+
+      :ok = Store.save_config(server, @key, %{client_keypair: bad_keypair})
+      {:ok, %{client_keypair: ^bad_keypair}} = Store.get_config(server, @key)
+
+      {:ok, {new_pub, new_priv}} = Store.ensure_client_keypair(server, @key)
+
+      assert byte_size(new_pub) == 32
+      assert byte_size(new_priv) == 32
+      assert {new_pub, new_priv} != bad_keypair
+
+      {:ok, cfg} = Store.get_config(server, @key)
+      assert cfg.client_keypair == {new_pub, new_priv}
     end
   end
 

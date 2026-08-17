@@ -244,7 +244,13 @@ defmodule UniversalProxy.Audio.Input.Store do
     existing = lookup(state.table, key)
 
     case existing[:client_keypair] do
-      {<<_::256>>, priv} = keypair when is_binary(priv) ->
+      # Both halves must be exactly 32 bytes (X25519). A malformed row
+      # (e.g. a truncated priv from some earlier bug) falls through to
+      # the regenerate-and-persist branch below instead of being
+      # returned forever — otherwise ensure_client_keypair/2 could
+      # never heal a bad record and every later Noise setup using it
+      # would fail.
+      {<<_::256>>, <<_::256>>} = keypair ->
         {:reply, {:ok, keypair}, state}
 
       _ ->

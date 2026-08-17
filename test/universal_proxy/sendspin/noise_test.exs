@@ -116,6 +116,21 @@ defmodule UniversalProxy.Sendspin.NoiseTest do
 
       assert {:error, {:invalid_key, :psk}} = Noise.start(Keyword.put(base, :psk, nil))
     end
+
+    test "rejects a keypair with a valid 32-byte pub but a wrong-length priv", ctx do
+      {server_pub, _} = ctx.server
+      {client_pub, _valid_priv} = ctx.client
+
+      base = [
+        suite: "25519_ChaChaPoly_SHA256",
+        static_keypair: {client_pub, <<1, 2, 3>>},
+        remote_static_key: server_pub,
+        psk: ctx.psk,
+        prologue: @prologue
+      ]
+
+      assert {:error, {:invalid_key, :static_keypair}} = Noise.start(base)
+    end
   end
 
   for suite <- ["25519_ChaChaPoly_SHA256", "25519_AESGCM_SHA256"] do

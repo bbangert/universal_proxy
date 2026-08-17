@@ -239,7 +239,10 @@ defmodule UniversalProxy.Sendspin.Noise do
             "#{inspect(self())}; decibel keeps session state in the process dictionary"
   end
 
-  defp validate_keypair({<<_::256>> = pub, priv}) when is_binary(priv), do: {:ok, {pub, priv}}
+  # X25519 keys are exactly 32 bytes both halves; a malformed priv must
+  # fail here with the tagged error rather than deferring to a raw
+  # Decibel/:crypto failure further into the handshake.
+  defp validate_keypair({<<_::256>> = pub, <<_::256>> = priv}), do: {:ok, {pub, priv}}
   defp validate_keypair(_other), do: {:error, {:invalid_key, :static_keypair}}
 
   defp validate_key(<<_::256>> = key, _name), do: {:ok, key}

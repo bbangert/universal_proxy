@@ -7,6 +7,9 @@ defmodule UniversalProxy.Audio.Input.CaptureTest do
   alias UniversalProxy.Audio.Input.Capture
 
   @default_frame_bytes 3_840
+  # 20 ms @ 48 kHz/S16/stereo: matches Capture's private frame_duration_us/1
+  # for @default_frame_bytes (3_840 * 1_000_000 / (48_000 * 2 * 2)).
+  @frame_duration_us 20_000
 
   # Writes a tiny Python script standing in for `arecord`: it emits
   # `chunks` (a list of byte counts) as successive stdout writes —
@@ -116,16 +119,40 @@ defmodule UniversalProxy.Audio.Input.CaptureTest do
       assert [{_, ^expected_1}, {_, ^expected_2}] = frames
     end
 
-    test "frames sliced from a single arrival share one arrival timestamp" do
+    test "frames sliced from a single arrival are back-dated one frame_duration_us apart" do
       # No inter-write sleep — both frames come from the same write(2),
-      # which lands as one Port {:data, _} message.
+      # which lands as one Port {:data, _} message. The newest (last)
+      # frame gets the arrival read verbatim; the older one is
+      # back-dated by one frame_duration_us (20_000 for the default
+      # frame_bytes) rather than sharing the same stamp.
       path = write_fake_capture!([@default_frame_bytes * 2])
       _pid = start_capture!(arecord_path: path)
 
       {frames, _status} = drain_until_exit()
 
       assert [{ts_1, _}, {ts_2, _}] = frames
-      assert ts_1 == ts_2
+      assert ts_2 - ts_1 == @frame_duration_us
+    end
+
+    test "a single delivery carrying 3 frames stamps them frame_duration_us apart, last == arrival" do
+      # Custom (smaller) frame_bytes so 3 frames (720 bytes total) stay
+      # well under the port's internal read-buffer size and are
+      # guaranteed to land as one Port {:data, _} arrival -> one
+      # monotonic read. (At the default frame_bytes, 3 frames = 11,520
+      # bytes reliably split across two arrivals on this system, which
+      # would defeat the point of this test.) Each earlier frame must
+      # be exactly one frame_duration_us further back than the next.
+      frame_bytes = 240
+      frame_duration_us = 1_250
+
+      path = write_fake_capture!([frame_bytes * 3])
+      _pid = start_capture!(arecord_path: path, frame_bytes: frame_bytes)
+
+      {frames, _status} = drain_until_exit()
+
+      assert [{ts_1, _}, {ts_2, _}, {ts_3, _}] = frames
+      assert ts_2 - ts_1 == frame_duration_us
+      assert ts_3 - ts_2 == frame_duration_us
     end
 
     test "produces non-decreasing timestamps across separate port arrivals" do
@@ -209,6 +236,38 @@ defmodule UniversalProxy.Audio.Input.CaptureTest do
 
       assert length(frames) == 1
       assert status == 9
+    end
+  end
+
+  describe "terminate/2 force_kill guard" do
+    test "does not signal a retained os_pid once state.port is already nil" do
+      # Simulates the post-exit_status state: the OS process already
+      # exited on its own and handle_info cleared `port` (and, since
+      # the fix, `os_pid` too) — but even if `os_pid` were somehow
+      # still set, force_kill/1 must not fire once `port` is nil. Prove
+      # it against a REAL, still-running OS process: if the guard were
+      # broken, terminate/2 would `kill -9` it and it would die.
+      port = Port.open({:spawn_executable, ~c"/bin/sleep"}, [:binary, :exit_status, args: ["5"]])
+      {:os_pid, os_pid} = Port.info(port, :os_pid)
+
+      state = %Capture{
+        alsa_device: "plughw:1,0",
+        subscriber: self(),
+        arecord_path: "/bin/true",
+        frame_bytes: @default_frame_bytes,
+        args: nil,
+        port: nil,
+        os_pid: os_pid
+      }
+
+      assert :ok = Capture.terminate(:shutdown, state)
+
+      # `kill -0` only checks liveness/permission, sending no signal —
+      # confirms the sleep process is still alive, i.e. force_kill/1
+      # never sent it a real signal.
+      assert {_, 0} = System.cmd("kill", ["-0", Integer.to_string(os_pid)])
+
+      Port.close(port)
     end
   end
 

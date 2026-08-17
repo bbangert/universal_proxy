@@ -42,20 +42,22 @@ defmodule UniversalProxy.Audio.Input.Capture do
       {:capture_frame, ts_us, frame_binary}
       {:capture_exit, exit_status}
 
-  `ts_us` is `System.monotonic_time(:microsecond)` captured once per
-  *port message arrival*, not once per emitted frame. Monotonic (not
-  `System.os_time/1`) so the stamp can never jump or slew on an NTP
-  sync mid-capture — the downstream `Sendspin.ClockFilter` basis is
-  monotonic, so frames feed it directly with no clock conversion. Note
-  BEAM monotonic time legitimately starts negative; downstream must not
-  assume a positive value. A single port message routinely contains
-  several `frame_bytes` chunks (arecord's period writes coalesce up to
-  the pipe buffer); all frames sliced from one arrival share that
-  arrival's timestamp rather than each getting its own read time.
-  Downstream tolerates this — the resulting jitter is bounded by one
-  arrival's worth of frames (a handful of ms), well inside the filter's
-  convergence tolerance — and it avoids a clock read per 20 ms frame
-  for no measurable accuracy gain.
+  `ts_us` is derived from a single `System.monotonic_time(:microsecond)`
+  read per *port message arrival*, not one clock read per emitted
+  frame. Monotonic (not `System.os_time/1`) so the stamp can never jump
+  or slew on an NTP sync mid-capture — the downstream
+  `Sendspin.ClockFilter` basis is monotonic, so frames feed it directly
+  with no clock conversion. Note BEAM monotonic time legitimately
+  starts negative; downstream must not assume a positive value. A
+  single port message routinely contains several `frame_bytes` chunks
+  (arecord's period writes coalesce up to the pipe buffer); that one
+  read corresponds to roughly when the *last* buffered sample arrived,
+  so instead of every frame sharing it verbatim, each frame is
+  back-dated by one `frame_duration_us` per position from the end — the
+  newest (last) frame in the delivery gets the arrival read verbatim
+  and earlier frames get progressively earlier stamps. This is still
+  exactly one clock read no matter how many frames the arrival
+  contains; only the arithmetic changed, not the read count.
 
   ## Framing / alignment
 
@@ -202,15 +204,26 @@ defmodule UniversalProxy.Audio.Input.Capture do
 
   @impl true
   def handle_info({port, {:data, data}}, %{port: port} = state) do
-    # Stamped once per arrival, not per emitted frame — see moduledoc
-    # "Subscriber messages". Monotonic so the stamp matches the clock
-    # filter's basis and never jumps/slews on an NTP sync.
+    # One monotonic read per arrival, then back-dated per frame — see
+    # moduledoc "Subscriber messages". Monotonic so the stamp matches
+    # the clock filter's basis and never jumps/slews on an NTP sync.
     ts_us = System.monotonic_time(:microsecond)
     buffer = state.buffer <> data
     {frames, remainder} = slice_frames(buffer, state.frame_bytes)
 
-    Enum.each(frames, fn frame ->
-      send(state.subscriber, {:capture_frame, ts_us, frame})
+    frame_count = length(frames)
+    frame_duration_us = frame_duration_us(state.frame_bytes)
+
+    frames
+    |> Enum.with_index()
+    |> Enum.each(fn {frame, index} ->
+      # `index` counts up from the oldest frame in this delivery; the
+      # last (newest) frame gets the arrival read verbatim, and each
+      # frame before it is back-dated by one more frame_duration_us —
+      # the arrival read corresponds to roughly when the last buffered
+      # sample arrived, not the first.
+      frame_ts_us = ts_us - (frame_count - 1 - index) * frame_duration_us
+      send(state.subscriber, {:capture_frame, frame_ts_us, frame})
     end)
 
     {:noreply, %{state | buffer: remainder}}
@@ -221,8 +234,12 @@ defmodule UniversalProxy.Audio.Input.Capture do
     # Owner decides respawn policy (mirrors Audio.Player's
     # {:binary_exited, status} stop reason / Audio.Server convergence
     # pattern) — stop normally here since the exit was already
-    # reported via the message, not the supervision tree.
-    {:stop, :normal, %{state | port: nil}}
+    # reported via the message, not the supervision tree. Clear
+    # os_pid alongside port: the OS process has already exited (this
+    # message only arrives after it does), so retaining a stale os_pid
+    # would let terminate/2's SIGKILL backstop later signal a PID the
+    # kernel may have since reused for an unrelated process.
+    {:stop, :normal, %{state | port: nil, os_pid: nil}}
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
@@ -287,6 +304,20 @@ defmodule UniversalProxy.Audio.Input.Capture do
     {frames, remainder}
   end
 
+  # Microseconds per frame_bytes-sized chunk at 48 kHz/S16/stereo (4
+  # bytes per sample-pair): e.g. 3,840 bytes -> 20,000 µs. Derived from
+  # frame_bytes rather than hardcoded so a custom :frame_bytes (the
+  # test seam) still back-dates frames by the correct amount.
+  defp frame_duration_us(frame_bytes), do: div(frame_bytes * 1_000_000, 48_000 * 2 * 2)
+
+  # No-op once the port is gone — whether because the OS process
+  # already exited normally (handle_info's exit_status path clears
+  # both port and os_pid together) or because init/1 never got one.
+  # Guarding on `port: nil` here too (not just `os_pid: nil`) means a
+  # stale os_pid alone can never trigger a signal: only a genuine
+  # terminate/2 while the port is still open (crash/shutdown
+  # mid-capture) reaches the kill -9 below.
+  defp force_kill(%__MODULE__{port: nil}), do: :ok
   defp force_kill(%__MODULE__{os_pid: nil}), do: :ok
 
   defp force_kill(%__MODULE__{os_pid: pid}) do
