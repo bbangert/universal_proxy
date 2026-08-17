@@ -38,6 +38,12 @@ defmodule UniversalProxyWeb.OverviewLive do
         Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:output_added")
         Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:output_removed")
         Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:state")
+        # Capture-only inputs (USB line-in) never surface as outputs, so the
+        # Connected-hardware index needs the input topics too or a line-in
+        # would vanish from the topology on add/remove/status change.
+        Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:input_added")
+        Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:input_removed")
+        Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:input_state")
         # FlooGoo FMA120 control-channel state (firmware, codec, mode, devices).
         Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "fma120:state")
         # Sennheiser BTD 700 control-channel state (firmware, mode, codecs,
@@ -69,6 +75,7 @@ defmodule UniversalProxyWeb.OverviewLive do
      |> assign(:pending_kind_change, nil)
      |> assign(:usb_hubs, Hardware.usb_hubs())
      |> assign(:audio_outputs, build_audio_index(Audio.list_outputs()))
+     |> assign(:audio_inputs, build_audio_index(Audio.Input.list_inputs()))
      |> assign(:bt_radios, Bluetooth.list_radios())
      |> assign(:bt_headphones, AudioManager.list_headphones())
      |> set_ports(ports)}
@@ -368,6 +375,23 @@ defmodule UniversalProxyWeb.OverviewLive do
     {:noreply, update(socket, :audio_outputs, &Map.delete(&1, key))}
   end
 
+  # Capture inputs feed the Connected-hardware index only (never the
+  # outputs-only "Audio outputs" card). A capture-only device shows up here
+  # and nowhere else, so these three keep its hardware row live.
+  def handle_info({:sendspin_input_added, input}, socket) do
+    {:noreply, update(socket, :audio_inputs, &Map.put(&1, input.key, input))}
+  end
+
+  def handle_info({:sendspin_input_removed, %{key: key}}, socket) do
+    {:noreply, update(socket, :audio_inputs, &Map.delete(&1, key))}
+  end
+
+  # A live status/connection change patches the cached input row so the slot
+  # in-use indicator and the row badge track capture state without re-fetching.
+  def handle_info({:input_state, key, state}, socket) do
+    {:noreply, update_audio_input(socket, key, state)}
+  end
+
   # Track binary-emitted connection events per key so the "Streaming" /
   # "Connected" / "Stopped" badge on the Overview row can flip without
   # re-fetching the output list. Server-originated `:sendspin_state`
@@ -508,7 +532,7 @@ defmodule UniversalProxyWeb.OverviewLive do
           o <- Map.values(audio_outputs),
           usb_audio?(o),
           is_binary(o.usb_port),
-          do: {o.usb_port, not is_nil(o[:stream])}
+          do: {o.usb_port, audio_device_active?(o)}
         ) ++
         for(
           r <- bt_radios,
@@ -575,6 +599,15 @@ defmodule UniversalProxyWeb.OverviewLive do
     Map.new(outputs, fn output -> {output.key, output} end)
   end
 
+  # Union of the output and input indexes for the Connected-hardware view.
+  # Both are keyed by `{slot_sub, vid, pid}`; a duplex device (e.g. BTD 700)
+  # is present in both, and the OUTPUT entry wins so the row keeps its output
+  # semantics (stream/volume/connection). Input-only devices (a capture-only
+  # line-in) are contributed by the inputs map.
+  defp merge_audio_devices(outputs, inputs) do
+    Map.merge(inputs, outputs)
+  end
+
   # Cheap projection of the binary's stream_start payload to a non-nil
   # term — the Overview row's badge only branches on `is_nil(stream)`,
   # so we don't need the full codec/rate/bit-depth breakdown that
@@ -588,6 +621,15 @@ defmodule UniversalProxyWeb.OverviewLive do
       case Map.fetch(outputs, key) do
         {:ok, existing} -> Map.put(outputs, key, Map.merge(existing, patch))
         :error -> outputs
+      end
+    end)
+  end
+
+  defp update_audio_input(socket, key, patch) do
+    update(socket, :audio_inputs, fn inputs ->
+      case Map.fetch(inputs, key) do
+        {:ok, existing} -> Map.put(inputs, key, Map.merge(existing, patch))
+        :error -> inputs
       end
     end)
   end
@@ -628,15 +670,20 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   @impl true
   def render(assigns) do
+    # Connected hardware must show ALL audio devices, so the slot map and the
+    # table draw from outputs ∪ inputs. The "Audio outputs" card below stays
+    # bound to @audio_outputs alone (outputs-only).
+    audio_devices = merge_audio_devices(assigns.audio_outputs, assigns.audio_inputs)
+
     rows =
       hardware_rows(
         assigns.ports,
-        peripherals(assigns.audio_outputs, assigns.bt_radios),
+        peripherals(audio_devices, assigns.bt_radios),
         assigns.usb_hubs
       )
 
     summary =
-      slot_summary(assigns.ports, assigns.audio_outputs, assigns.bt_radios, assigns.usb_hubs)
+      slot_summary(assigns.ports, audio_devices, assigns.bt_radios, assigns.usb_hubs)
 
     assigns =
       assigns
@@ -2283,40 +2330,71 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   defp format_vidpid_pair(_, _), do: "—"
 
-  defp usb_audio_peripherals(audio_outputs) do
-    audio_outputs
+  defp usb_audio_peripherals(audio_devices) do
+    audio_devices
     |> Map.values()
     |> Enum.filter(&usb_audio?/1)
     |> Enum.sort_by(& &1.friendly_name)
-    |> Enum.map(fn out ->
-      status = audio_status(out)
-
-      %{
-        kind: :audio,
-        type_label: "Sound card",
-        # `slot`/`slot_sub` default to the type + USB bus path; reconcile in
-        # hardware_rows/2 promotes a USB card into the declared "USB N" slot it
-        # occupies (SoC cards carry usb_port: nil → no slot_sub → they trail).
-        slot: "Sound card",
-        slot_sub: out.usb_port,
-        name: out.friendly_name,
-        detail: out.card_name,
-        sub: out.usb_port || out.alsa_device,
-        managed_by: "Sendspin",
-        tab: "/audio",
-        status: status,
-        soft_class: "bg-audio-soft text-audio",
-        dot_class: "bg-audio",
-        # FlooGoo FMA120 and Sennheiser BTD 700 rows open their control
-        # drawer instead of routing to the Audio tab; other sound cards
-        # keep their goto_tab behavior.
-        fma120?: fma120_key?(out.key),
-        fma120_key: encode_key(out.key),
-        btd700?: btd700_key?(out.key),
-        btd700_key: encode_key(out.key)
-      }
-    end)
+    |> Enum.map(&audio_peripheral_row/1)
   end
+
+  # A capture-only input (`:status` is unique to input rows). Renders as a
+  # plain audio-hardware row — name + card + an In use/Idle indicator from its
+  # live capture state — with none of the output-only controls (no
+  # volume/stream badge) and no control drawer (those dongles are outputs), so
+  # it routes to the Audio tab like any other sound card.
+  defp audio_peripheral_row(%{status: _} = input) do
+    %{
+      kind: :audio,
+      type_label: "Audio input",
+      slot: "Sound card",
+      slot_sub: input.usb_port,
+      name: input.friendly_name,
+      detail: input.name,
+      sub: input.usb_port || input.alsa_device,
+      managed_by: "Sendspin",
+      tab: "/audio",
+      status: input_status(input),
+      soft_class: "bg-audio-soft text-audio",
+      dot_class: "bg-audio",
+      fma120?: false,
+      fma120_key: nil,
+      btd700?: false,
+      btd700_key: nil
+    }
+  end
+
+  defp audio_peripheral_row(out) do
+    %{
+      kind: :audio,
+      type_label: "Sound card",
+      # `slot`/`slot_sub` default to the type + USB bus path; reconcile in
+      # hardware_rows/2 promotes a USB card into the declared "USB N" slot it
+      # occupies (SoC cards carry usb_port: nil → no slot_sub → they trail).
+      slot: "Sound card",
+      slot_sub: out.usb_port,
+      name: out.friendly_name,
+      detail: out.card_name,
+      sub: out.usb_port || out.alsa_device,
+      managed_by: "Sendspin",
+      tab: "/audio",
+      status: audio_status(out),
+      soft_class: "bg-audio-soft text-audio",
+      dot_class: "bg-audio",
+      # FlooGoo FMA120 and Sennheiser BTD 700 rows open their control
+      # drawer instead of routing to the Audio tab; other sound cards
+      # keep their goto_tab behavior.
+      fma120?: fma120_key?(out.key),
+      fma120_key: encode_key(out.key),
+      btd700?: btd700_key?(out.key),
+      btd700_key: encode_key(out.key)
+    }
+  end
+
+  # In use while capturing (`:streaming`); otherwise idle. Mirrors the USB
+  # Bluetooth radio's In use/Idle vocabulary since neither exposes a byte rate.
+  defp input_status(%{status: :streaming}), do: %{label: "In use", variant: :success}
+  defp input_status(_), do: %{label: "Idle", variant: :warning}
 
   # USB audio outputs carry a real {vid, pid} in their key; onboard SoC
   # cards key as {card_name, nil, nil}.
@@ -2324,6 +2402,13 @@ defmodule UniversalProxyWeb.OverviewLive do
     do: true
 
   defp usb_audio?(_), do: false
+
+  # A slot is *active* when its audio device is actually moving audio. An
+  # output carries a live `:stream` snapshot; a capture input reports
+  # `status: :streaming`. The `:status` key is unique to input rows (outputs
+  # never carry it), so it also serves as the input/output discriminator here.
+  defp audio_device_active?(%{status: status}), do: status == :streaming
+  defp audio_device_active?(o), do: not is_nil(o[:stream])
 
   defp usb_bt_peripherals(bt_radios) do
     bt_radios

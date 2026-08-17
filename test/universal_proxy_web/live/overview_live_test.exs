@@ -230,6 +230,86 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
     assert render(view) =~ ~s|href="/audio"|
   end
 
+  describe "capture inputs in Connected hardware" do
+    test "a capture-only input appears in Connected hardware but not the outputs card",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "sendspin:input_added",
+        {:sendspin_input_added, sample_input(%{friendly_name: "CUBILUX Line-in"})}
+      )
+
+      html = render(view)
+      # It's a hardware device, so it must show in the topology table…
+      assert html =~ "CUBILUX Line-in"
+      assert html =~ "Audio input"
+      # …but the outputs-only "Audio outputs" card must stay hidden (no outputs).
+      refute html =~ "Audio outputs"
+    end
+
+    test ":sendspin_input_removed drops the input row again", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "sendspin:input_added",
+        {:sendspin_input_added, sample_input(%{friendly_name: "CUBILUX Line-in"})}
+      )
+
+      assert render(view) =~ "CUBILUX Line-in"
+
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "sendspin:input_removed",
+        {:sendspin_input_removed, %{key: input_key()}}
+      )
+
+      refute render(view) =~ "CUBILUX Line-in"
+    end
+
+    test "a duplex device (output + input, same key) renders as its output, not an input",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      dup_key = {"1-1.2", 0x1234, 0x5678}
+
+      # Same key surfaces on both halves of the subsystem (playback + capture).
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "sendspin:output_added",
+        {:sendspin_output_added,
+         sample_output(%{
+           key: dup_key,
+           card_index: 2,
+           usb_port: "1-1.2",
+           card_name: "Duplex DAC",
+           friendly_name: "Duplex DAC"
+         })}
+      )
+
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "sendspin:input_added",
+        {:sendspin_input_added,
+         sample_input(%{
+           key: dup_key,
+           usb_port: "1-1.2",
+           name: "Duplex DAC",
+           friendly_name: "Duplex DAC"
+         })}
+      )
+
+      html = render(view)
+      # Output wins the key-dedupe: the row is a "Sound card", and the input
+      # half never spawns a separate "Audio input" row for the same device.
+      assert html =~ "Duplex DAC"
+      assert html =~ "Sound card"
+      refute html =~ "Audio input"
+    end
+  end
+
   # `hardware_rows/2` is the slot-promotion + ordering core. It can't be
   # exercised through a live mount here: the host test env enumerates ports
   # dynamically (no declared `@external_slots`), so no empty slot ever
@@ -443,6 +523,18 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
       audio = %{a: %{key: {"1-1.1.3.1", 0x0A12, 0x4007}, usb_port: "1-1.1.3.1", stream: nil}}
       s = OverviewLive.slot_summary(ports, audio, [], %{}, @slots)
       assert s == %{in_use: 1, total: 4, active: 0, idle: 1}
+    end
+
+    test "a capture-only input occupies its slot; active only while streaming" do
+      # Input rows carry `:status` (never `:stream`); a streaming source counts
+      # as active, an idle/detected one as merely occupied.
+      idle = %{a: %{key: {"1-1.2", 1, 1}, usb_port: "1-1.2", status: :detected}}
+      s1 = OverviewLive.slot_summary([], idle, [], %{}, @slots)
+      assert s1 == %{in_use: 1, total: 4, active: 0, idle: 1}
+
+      live = %{a: %{key: {"1-1.2", 1, 1}, usb_port: "1-1.2", status: :streaming}}
+      s2 = OverviewLive.slot_summary([], live, [], %{}, @slots)
+      assert s2 == %{in_use: 1, total: 4, active: 1, idle: 0}
     end
 
     test "a BT radio without a :port (hci-only) is not counted" do
