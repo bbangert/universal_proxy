@@ -262,7 +262,9 @@ defmodule UniversalProxy.Audio.Input.Source do
   @accept_window_ms 60_000
 
   # How long the incumbent has to prove liveness before a parked challenger is
-  # promoted. A live trust-`user` session answers a `client/time` inside this.
+  # promoted. A live trust-`user` or actively-pairing session answers a
+  # `client/time` (or sends a pairing frame) inside this. Overridable per source
+  # (`:incumbent_probe_ms`) as a test seam.
   @incumbent_probe_ms 5_000
 
   # The outbound audio path is bounded: if the socket process falls this far
@@ -321,6 +323,7 @@ defmodule UniversalProxy.Audio.Input.Source do
     :pairing_attempt_timer,
     :consent_wait_timer,
     :pairing_window_ms,
+    :incumbent_probe_ms,
     fsm: :listening,
     trust: :none,
     reassembler: nil,
@@ -438,6 +441,7 @@ defmodule UniversalProxy.Audio.Input.Source do
       time_burst_ms: Keyword.get(opts, :time_burst_ms, @time_burst_ms),
       pairing_timeout_ms: Keyword.get(opts, :pairing_timeout_ms, Pairing.attempt_timeout_ms()),
       pairing_window_ms: Keyword.get(opts, :pairing_window_ms, @pairing_window_ms),
+      incumbent_probe_ms: Keyword.get(opts, :incumbent_probe_ms, @incumbent_probe_ms),
       listen_ip: Keyword.get(opts, :listen_ip, :any),
       reassembler: Wire.Reassembler.new(),
       filter: ClockFilter.new()
@@ -486,6 +490,17 @@ defmodule UniversalProxy.Audio.Input.Source do
       # peer that has proven nothing. Park the challenger and probe the
       # incumbent — it only yields if it fails a liveness check (half-open TCP).
       state.trust == :user ->
+        {:noreply, park_socket(record_accept(state), pid)}
+
+      # A pairing exchange is mid-flight on the incumbent (a held offer, a live
+      # CPace attempt, or the post-pairing re-handshake). It is still trust
+      # `none`, but tearing it down for a concurrent MA connection — MA opens
+      # several during interactive PIN pairing — would discard the in-progress
+      # pairing state and break an exchange the operator is actively completing.
+      # Protect it exactly like a trust-`user` session: park the challenger and
+      # probe liveness, so only a genuinely dead (half-open) pairing connection
+      # ever yields to the challenger via the liveness timeout.
+      pairing_in_progress?(state) ->
         {:noreply, park_socket(record_accept(state), pid)}
 
       true ->
@@ -739,6 +754,18 @@ defmodule UniversalProxy.Audio.Input.Source do
     state |> send_time_request() |> arm_liveness_timer()
   end
 
+  # A pairing exchange is mid-flight and must not be evicted by a concurrent
+  # connection even though it is still trust `none`: an open `Sendspin.Pairing`
+  # attempt, the post-pairing re-handshake window (`:awaiting_rehandshake`), or a
+  # held/attempting offer in `:pairing_required` (the armed consent-wait timer
+  # marks a held offer). The un-authenticated self-heal replace would otherwise
+  # discard the in-progress CPace / re-handshake state.
+  defp pairing_in_progress?(state) do
+    state.fsm in [:pairing_required, :awaiting_rehandshake] or
+      not is_nil(state.pairing) or
+      not is_nil(state.consent_wait_timer)
+  end
+
   # Any inbound frame from the incumbent proves it alive: cancel the probe and
   # drop the challenger.
   defp incumbent_alive(%__MODULE__{liveness_timer: nil} = state), do: state
@@ -761,7 +788,7 @@ defmodule UniversalProxy.Audio.Input.Source do
     %{
       state
       | liveness_timer:
-          Process.send_after(self(), :incumbent_liveness_timeout, @incumbent_probe_ms)
+          Process.send_after(self(), :incumbent_liveness_timeout, state.incumbent_probe_ms)
     }
   end
 

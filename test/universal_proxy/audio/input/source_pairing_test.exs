@@ -366,6 +366,96 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
       assert_receive {:source_event, @key, :connected}, 2_000
     end
 
+    test "a challenger during an active pairing exchange is parked; pairing still completes",
+         ctx do
+      {source, port} = start_source!(ctx)
+
+      {_hello, peer} = connect_hello!(port)
+      :ok = Source.allow_pairing(source)
+      {1, peer} = offer_pairing!(peer)
+      pin = await_pin!()
+
+      # Real MA opens several concurrent connections during interactive PIN
+      # pairing. This one arrives mid-exchange: the pairing incumbent (still
+      # trust `none`) must NOT be torn down for it — the challenger is parked.
+      challenger = Peer.connect!(port)
+      refute_receive {:source_event, @key, :disconnected}, 500
+      assert Source.status(source) == :pairing_required
+
+      # The exchange continues on the incumbent uninterrupted. Its first pairing
+      # frame proves the incumbent alive, so the parked challenger is dropped.
+      peer = peer |> Peer.submit_pin!(pin) |> Peer.serve_pair_auth!()
+      {psk, peer} = Peer.serve_pair_finalize!(peer)
+      assert_receive {:source_event, @key, :paired}, 2_000
+      assert Peer.closed?(challenger, 2_000)
+      assert Source.status(source) == :awaiting_rehandshake
+
+      # The re-handshake completes at trust user and the source reaches :ready.
+      peer = Peer.rehandshake!(peer, psk)
+      peer = Peer.hello!(peer)
+      {hello, peer} = Peer.await_json!(peer, "client/hello")
+      assert hello["trust_level"] == "user"
+
+      peer = Peer.activate!(peer)
+      assert_receive {:source_event, @key, :activated}, 2_000
+      {_initial, peer} = Peer.await_client_state!(peer, false)
+      {available, _peer} = Peer.await_client_state!(peer, true)
+      assert available["available"] == true
+      assert Source.status(source) == :ready
+    end
+
+    test "a challenger during the consent-hold does not evict the held offer", ctx do
+      {source, port} = start_source!(ctx)
+      {_hello, peer} = connect_hello!(port)
+
+      # A pairing offer with no consent window open: held in :pairing_required.
+      peer =
+        Peer.activate!(peer, roles: [], activities: ["pairing"], pairing: @pairing_params)
+
+      assert_receive {:source_event, @key, {:pairing_required, _params}}, 2_000
+
+      # A concurrent MA connection arrives while the offer is held. The held
+      # offer's connection must NOT be evicted.
+      challenger = Peer.connect!(port)
+      refute_receive {:source_event, @key, :disconnected}, 500
+      assert Source.status(source) == :pairing_required
+
+      # Answering a client/time proves the incumbent alive, dropping the parked
+      # challenger; the held offer survives and the operator can still consent.
+      peer = Peer.serve_time!(peer, 1)
+      assert Peer.closed?(challenger, 2_000)
+
+      :ok = Source.allow_pairing(source)
+      assert_receive {:source_event, @key, :pairing_started}, 2_000
+      {index, _peer} = Peer.await_pair_init!(peer, pin_length: @pin_length)
+      assert index == 1
+    end
+
+    test "a dead pairing incumbent yields to a challenger via the liveness probe", ctx do
+      # A short probe window so the test doesn't wait the 5 s production default.
+      {source, port} = start_source!(ctx, incumbent_probe_ms: 100)
+      {_hello, peer} = connect_hello!(port)
+      :ok = Source.allow_pairing(source)
+      {1, _peer} = offer_pairing!(peer)
+      _pin = await_pin!()
+
+      # The pairing incumbent goes silent mid-exchange (half-open TCP: the MA
+      # container restarted). A concurrent connection is parked and probes it;
+      # the incumbent never answers, so the challenger is promoted rather than
+      # deadlocking behind a dead pairing connection.
+      challenger = Peer.connect!(port)
+
+      assert_receive {:source_event, @key, :disconnected}, 2_000
+      assert_receive {:source_event, @key, :connected}, 2_000
+
+      # The promoted challenger is a live connection: it gets client/init and can
+      # complete a fresh handshake.
+      challenger = Peer.handshake!(challenger)
+      challenger = Peer.hello!(challenger)
+      {_hello, _challenger} = Peer.await_json!(challenger, "client/hello")
+      assert Source.status(source) == :awaiting_activate
+    end
+
     test "a paired reconnect uses the stored PSK, asserts trust user and never pairs", ctx do
       {_source, port} = start_source!(ctx)
       psk = Pairing.generate_psk()
