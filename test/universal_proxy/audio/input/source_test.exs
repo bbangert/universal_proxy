@@ -117,16 +117,14 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
     Peer.activate!(peer)
   end
 
-  # Activate, converge the clock filter, and confirm we went available.
+  # Activate, converge the clock filter, and confirm we went available. The
+  # `client/time` loop starts at connection setup (`:awaiting_activate`), so
+  # `await_client_state!/2` answers whatever `client/time` are in flight until
+  # the desired availability lands — regardless of when convergence happens.
   defp connect_available!(port, opts) do
     peer = connect_activated!(port, opts)
-    {initial, peer} = Peer.await_json!(peer, "client/state")
-    assert initial["available"] == false
-
-    peer = Peer.serve_time!(peer, 2)
-    {available, peer} = Peer.await_json!(peer, "client/state")
-    assert available["available"] == true
-
+    {_initial, peer} = Peer.await_client_state!(peer, false)
+    {_available, peer} = Peer.await_client_state!(peer, true)
     peer
   end
 
@@ -198,11 +196,10 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
       peer = Peer.activate!(peer)
       assert_receive {:source_event, @key, :activated}, 2_000
 
-      {initial, peer} = Peer.await_json!(peer, "client/state")
+      {initial, peer} = Peer.await_client_state!(peer, false)
       assert initial["available"] == false
 
-      peer = Peer.serve_time!(peer, 2)
-      {available, peer} = Peer.await_json!(peer, "client/state")
+      {available, peer} = Peer.await_client_state!(peer, true)
       assert available["available"] == true
       assert Source.status(source) == :ready
 
@@ -226,6 +223,50 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
       {next_timestamp_us, next_payload, _peer} = Peer.await_audio!(peer)
       assert byte_size(next_payload) == @frame_bytes
       assert next_timestamp_us >= timestamp_us
+    end
+  end
+
+  describe "connection-level time sync" do
+    # The interop fix (PR #170): the client/time loop starts at connection
+    # setup, not at role activation, so an unpaired-and-idle MA connection stays
+    # alive (Cowboy idle timeout) long enough to reach the pairing controls, and
+    # the filter is already converged when the role finally activates.
+    test "time-syncs in :awaiting_activate and activates already-converged", ctx do
+      psk = pair!(ctx)
+      # A slower burst than the default so serve_time!/3 answers each client/time
+      # before the next tick fires: that keeps the exchange count exact for the
+      # "no further exchange after activation" assertion below.
+      {source, port} = start_source!(ctx, time_burst_ms: 200)
+      assert_receive {:source_event, @key, {:listener_bound, ^port}}, 2_000
+
+      peer = Peer.connect!(port, clock_offset_us: @clock_offset_us, psk: psk)
+      peer = Peer.handshake!(peer)
+      peer = Peer.hello!(peer)
+      {_hello, peer} = Peer.await_json!(peer, "client/hello")
+
+      # No role has activated, yet the source already sends client/time and
+      # processes server/time: the periodic exchange keeps MA's connection alive
+      # while it sits unpaired. Three exchanges converge the filter.
+      assert Source.status(source) == :awaiting_activate
+      peer = Peer.serve_time!(peer, 3)
+      assert peer.time_exchanges >= 3
+      refute_received {:source_event, @key, :activated}
+      refute_received {:source_event, @key, :disconnected}
+      assert Source.status(source) == :awaiting_activate
+
+      # Activating now reports available with NO further time exchange: the
+      # filter converged during :awaiting_activate and activation does not reset
+      # it (before the fix the loop only started here, forcing a re-converge).
+      before = peer.time_exchanges
+      peer = Peer.activate!(peer)
+      assert_receive {:source_event, @key, :activated}, 2_000
+
+      {initial, peer} = Peer.await_client_state!(peer, false)
+      assert initial["available"] == false
+      {available, peer} = Peer.await_client_state!(peer, true)
+      assert available["available"] == true
+      assert peer.time_exchanges == before
+      assert Source.status(source) == :ready
     end
   end
 
@@ -350,15 +391,16 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
       refute_received {:source_event, @key, :disconnected}
       assert Source.status(source) == :awaiting_activate
 
-      # A later server/activate WITH source@v1 re-activates without a reconnect;
-      # re-converge the clock, then a fresh start resumes streaming.
+      # A later server/activate WITH source@v1 re-activates without a reconnect.
+      # The `client/time` loop kept running while the role was gone, so the
+      # filter is still converged: the source reports available again without
+      # re-running convergence, then a fresh start resumes streaming.
       peer = Peer.activate!(peer, roles: ["source@v1"])
       assert_receive {:source_event, @key, :activated}, 2_000
 
-      {initial, peer} = Peer.await_json!(peer, "client/state")
+      {initial, peer} = Peer.await_client_state!(peer, false)
       assert initial["available"] == false
-      peer = Peer.serve_time!(peer, 2)
-      {available, peer} = Peer.await_json!(peer, "client/state")
+      {available, peer} = Peer.await_client_state!(peer, true)
       assert available["available"] == true
 
       peer = Peer.command!(peer, "start")

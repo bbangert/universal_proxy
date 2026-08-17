@@ -35,14 +35,16 @@ defmodule UniversalProxy.Audio.Input.Source do
       :awaiting_server_init sent client/init, waiting for server/init
       :awaiting_handshake   waiting for Noise message 1
       :awaiting_server_hello sent Noise message 2, transport mode is up
-      :awaiting_activate    sent client/hello
+      :awaiting_activate    sent client/hello; the `client/time` clock-sync
+                            loop runs from here for the rest of the connection
       :pairing_required     activate withheld source@v1 and granted the
                             pairing activity while we are unpaired; a PIN
                             attempt is either running or waiting to be
                             re-offered
       :awaiting_rehandshake pairing completed; waiting for the server to
                             re-run the Noise handshake in band
-      :syncing              source@v1 active, clock filter not converged
+      :syncing              source@v1 active; reports available once the
+                            (already-running) clock filter converges
       :ready                converged and available; not streaming
       :streaming            capture running, audio frames going out
       :degraded             connected and active, but capture cannot start
@@ -192,9 +194,12 @@ defmodule UniversalProxy.Audio.Input.Source do
   @time_burst_ms 200
   @time_intervals [{1_000, 3_000}, {2_000, 1_000}, {5_000, 500}]
 
-  # Cowboy's websocket idle timeout. Our own `client/time` cadence tops out at
-  # 3 s, so an idle connection here means a peer that has genuinely stopped
-  # answering.
+  # Cowboy's websocket idle timeout (fires if we *receive* nothing for this
+  # long). Our `client/time` loop runs for the whole life of the connection —
+  # from `:awaiting_activate` on, not just while streaming — so the server's
+  # `server/time` replies keep inbound traffic flowing and this never trips on a
+  # live-but-idle (e.g. connected-yet-unpaired) session. Its cadence tops out at
+  # 3 s, so an actual timeout here means a peer that has genuinely gone silent.
   @ws_timeout_ms 60_000
 
   # Cap the accepted inbound websocket frame size. Each inbound binary frame
@@ -1028,8 +1033,21 @@ defmodule UniversalProxy.Audio.Input.Source do
 
   defp handle_message(%{fsm: :awaiting_server_hello} = state, :server_hello, _payload) do
     case send_client_hello(state) do
-      :ok -> {:ok, %{state | fsm: :awaiting_activate}}
-      {:error, reason} -> {:error, reason, state}
+      :ok ->
+        # Start the `client/time` clock-sync loop now, at connection setup —
+        # NOT at role activation. Time sync is connection-level and
+        # role-independent: aiosendspin's `_time_sync_loop` runs `while
+        # self.connected` and its server replies to every `client/time`
+        # regardless of any active role (ground truth §6), and a source@v1 MUST
+        # converge its filter before it can report available. Running it from
+        # here also keeps `server/time` replies flowing so a live-but-idle
+        # (connected-yet-unpaired) session never trips Cowboy's idle timeout —
+        # which is what lets MA hold the connection long enough to present its
+        # pairing controls.
+        {:ok, schedule_time_tick(%{state | fsm: :awaiting_activate}, 0)}
+
+      {:error, reason} ->
+        {:error, reason, state}
     end
   end
 
@@ -1157,14 +1175,14 @@ defmodule UniversalProxy.Audio.Input.Source do
   defp activate(state) do
     # The server ignores binary chunks until it has seen an initial
     # `client/state`, and `available` must stay false until the clock filter
-    # converges (ground truth §6/§7).
+    # converges (ground truth §6/§7). The `client/time` loop has been running
+    # since `:awaiting_activate`, so the filter may already be converged: do NOT
+    # reset it, drop in-flight measurements, or re-start the tick loop (that
+    # would re-run convergence from zero). Just move to `:syncing` and re-check
+    # availability, so an already-converged filter reports available promptly.
     case send_json(state, Wire.encode_client_state(false)) do
-      :ok ->
-        state = %{state | fsm: :syncing, filter: ClockFilter.reset(state.filter), outstanding: []}
-        {:ok, schedule_time_tick(state, 0)}
-
-      {:error, reason} ->
-        {:error, reason, state}
+      :ok -> maybe_become_available(%{state | fsm: :syncing})
+      {:error, reason} -> {:error, reason, state}
     end
   end
 
@@ -1391,7 +1409,19 @@ defmodule UniversalProxy.Audio.Input.Source do
         # The server now re-runs the Noise handshake in band; until it does,
         # this session is still keyed by the Sentinel PSK at trust `none`.
         # Consent is consumed by a successful pairing.
-        state = %{discard_pairing(close_pairing_window(state)) | fsm: :awaiting_rehandshake}
+        #
+        # Pause the `client/time` loop for the re-handshake window: the swap to
+        # the new session keys takes effect "from the next frame onwards" (ground
+        # truth §4), so a `client/time` sent under the old session whose
+        # `server/time` reply lands after we swap would fail to decrypt and drop
+        # the connection. The loop restarts at the replayed `server/hello`.
+        state =
+          %{
+            cancel_time_timer(discard_pairing(close_pairing_window(state)))
+            | fsm: :awaiting_rehandshake,
+              outstanding: []
+          }
+
         notify(state, :paired)
         {:ok, state}
 
@@ -1718,24 +1748,20 @@ defmodule UniversalProxy.Audio.Input.Source do
 
   # `source@v1` was removed from `active_roles` mid-session. End any open stream
   # (reusing the async `stop_capture` path — never a synchronous stop from a
-  # handler), stop the `client/time` loop, and rewind to `:awaiting_activate`
-  # while holding the connection, so a later `server/activate` re-activates
-  # without a reconnect. `end_stream/1` emits `client_stream/end` + `:stopped`
-  # only when a stream was actually open. Trust and the Noise session are kept.
+  # handler) and rewind to `:awaiting_activate` while holding the connection, so
+  # a later `server/activate` re-activates without a reconnect. `end_stream/1`
+  # emits `client_stream/end` + `:stopped` only when a stream was actually open.
+  # Trust and the Noise session are kept — and so are the `client/time` loop and
+  # the (converged) filter: time sync is connection-level, so it must keep
+  # running here both to hold the connection and to leave the filter ready for a
+  # prompt re-activation (the loop and filter reset only on a re-handshake or
+  # teardown).
   defp deactivate_source(state) do
     Logger.info(
       "Audio.Input.Source #{inspect(state.key)} source@v1 role removed mid-session; deactivating"
     )
 
-    state = state |> end_stream() |> cancel_time_timer()
-
-    %{
-      state
-      | fsm: :awaiting_activate,
-        start_requested: false,
-        outstanding: [],
-        filter: ClockFilter.reset(state.filter)
-    }
+    %{end_stream(state) | fsm: :awaiting_activate, start_requested: false}
   end
 
   # Closes an open stream if there is one; a no-op otherwise, so both a

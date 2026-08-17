@@ -178,7 +178,13 @@ defmodule UniversalProxy.SendspinSourcePeer do
 
     peer = send_message!(peer, "noise/handshake", %{"data" => b64(message_1)})
 
-    {payload, peer} = await_json!(peer, "noise/handshake", timeout)
+    # Do NOT answer `client/time` during the re-handshake: a real server does
+    # not, and a `server/time` reply sent under the old session would reach the
+    # source after it has swapped to the new keys and fail to decrypt. Stash any
+    # in-flight `client/time` instead (`answer_time?: false`).
+    {{:json, "noise/handshake", payload}, peer} =
+      pump!(peer, fn event -> match?({:json, "noise/handshake", _}, event) end, timeout, false)
+
     {:ok, message_2} = Base.url_decode64(payload["data"], padding: false)
     assert IO.iodata_to_binary(Decibel.handshake_decrypt(noise, message_2)) == "{}"
 
@@ -328,6 +334,29 @@ defmodule UniversalProxy.SendspinSourcePeer do
     {payload, peer}
   end
 
+  @doc """
+  Pump until a `client/state` whose `available` flag equals `available?`,
+  answering `client/time` (and so advancing the clock filter) along the way.
+
+  Robust to the source having started time-syncing before activation: whether
+  the filter converges before or after the role activates, this keeps answering
+  `client/time` until the desired `client/state` arrives. Returns
+  `{payload, peer}`.
+  """
+  def await_client_state!(peer, available?, timeout \\ @default_timeout) do
+    {{:json, "client/state", payload}, peer} =
+      pump!(
+        peer,
+        fn
+          {:json, "client/state", payload} -> Map.get(payload, "available") == available?
+          _event -> false
+        end,
+        timeout
+      )
+
+    {payload, peer}
+  end
+
   @doc "Wait for one binary audio frame, pumping everything else."
   def await_audio!(peer, timeout \\ @default_timeout) do
     {{:audio, timestamp_us, payload}, peer} =
@@ -375,23 +404,31 @@ defmodule UniversalProxy.SendspinSourcePeer do
 
   # -- Pumping --
 
-  defp pump!(peer, match_fun, timeout) do
+  defp pump!(peer, match_fun, timeout), do: pump!(peer, match_fun, timeout, true)
+
+  defp pump!(peer, match_fun, timeout, answer_time?) do
     {event, peer} = next!(peer, timeout)
 
     cond do
       match_fun.(event) ->
         {event, peer}
 
-      match?({:json, "client/time", _}, event) ->
+      answer_time? and match?({:json, "client/time", _}, event) ->
         {:json, _type, payload} = event
-        peer |> reply_time!(payload) |> pump!(match_fun, timeout)
+        peer |> reply_time!(payload) |> pump!(match_fun, timeout, answer_time?)
 
       match?({:audio, _, _}, event) ->
         {:audio, timestamp_us, payload} = event
-        pump!(%{peer | audio: [{timestamp_us, payload} | peer.audio]}, match_fun, timeout)
+
+        pump!(
+          %{peer | audio: [{timestamp_us, payload} | peer.audio]},
+          match_fun,
+          timeout,
+          answer_time?
+        )
 
       true ->
-        pump!(%{peer | messages: [event | peer.messages]}, match_fun, timeout)
+        pump!(%{peer | messages: [event | peer.messages]}, match_fun, timeout, answer_time?)
     end
   end
 

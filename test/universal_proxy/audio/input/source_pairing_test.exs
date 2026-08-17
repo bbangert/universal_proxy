@@ -234,11 +234,10 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
       peer = Peer.activate!(peer)
       assert_receive {:source_event, @key, :activated}, 2_000
 
-      {initial, peer} = Peer.await_json!(peer, "client/state")
+      {initial, peer} = Peer.await_client_state!(peer, false)
       assert initial["available"] == false
 
-      peer = Peer.serve_time!(peer, 2)
-      {available, _peer} = Peer.await_json!(peer, "client/state")
+      {available, _peer} = Peer.await_client_state!(peer, true)
       assert available["available"] == true
       assert Source.status(source) == :ready
     end
