@@ -521,6 +521,58 @@ defmodule UniversalProxy.Audio.PlayerTest do
       assert byte_size(name) <= 63
       assert name == "sendspin In"
     end
+
+    test "boundary collision: no node, friendly name truncates with ' In' at the cut" do
+      # 60 "a"s + " In" is exactly 63 bytes, so :player's untruncated
+      # composition and :source's truncate-then-append-" In" composition
+      # land on the identical 63-byte string unless the collision dodge
+      # kicks in.
+      friendly = String.duplicate("a", 60) <> " In"
+
+      player = Player.sendspin_instance_name(friendly, nil, :player)
+      source = Player.sendspin_instance_name(friendly, nil, :source)
+
+      refute source == player
+      assert byte_size(player) <= 63
+      assert byte_size(source) <= 63
+      assert String.valid?(source)
+      assert String.ends_with?(source, " In")
+    end
+
+    test "boundary collision: with node, friendly name truncates with ' In' at the cut" do
+      node = "universal-proxy-07507f"
+      friendly = String.duplicate("a", 35) <> " In" <> String.duplicate("b", 20)
+
+      player = Player.sendspin_instance_name(friendly, node, :player)
+      source = Player.sendspin_instance_name(friendly, node, :source)
+
+      refute source == player
+      assert byte_size(source) <= 63
+      assert String.ends_with?(source, " In (#{node})")
+    end
+
+    test "boundary collision is deterministic across repeated calls" do
+      node = "universal-proxy-07507f"
+      friendly = String.duplicate("a", 35) <> " In" <> String.duplicate("b", 20)
+
+      assert Player.sendspin_instance_name(friendly, node, :source) ==
+               Player.sendspin_instance_name(friendly, node, :source)
+    end
+
+    test "boundary collision with multi-byte codepoints stays valid UTF-8 and distinct" do
+      # 20 "漢" (3 bytes each) + " In" is exactly 63 bytes — same boundary
+      # shape as the ASCII case above, but exercises codepoint-respecting
+      # truncation on the shrink path.
+      friendly = String.duplicate("漢", 20) <> " In"
+
+      player = Player.sendspin_instance_name(friendly, nil, :player)
+      source = Player.sendspin_instance_name(friendly, nil, :source)
+
+      refute source == player
+      assert byte_size(source) <= 63
+      assert String.valid?(source)
+      assert String.ends_with?(source, " In")
+    end
   end
 
   describe "set_volume/2" do
