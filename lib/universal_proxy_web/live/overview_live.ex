@@ -603,9 +603,14 @@ defmodule UniversalProxyWeb.OverviewLive do
   # Both are keyed by `{slot_sub, vid, pid}`; a duplex device (e.g. BTD 700)
   # is present in both, and the OUTPUT entry wins so the row keeps its output
   # semantics (stream/volume/connection). Input-only devices (a capture-only
-  # line-in) are contributed by the inputs map.
+  # line-in) are contributed by the inputs map. For a duplex device the output
+  # presentation is kept, but the input's live capture signal is carried onto the
+  # merged map (`:capturing?`) so a device that is CAPTURING with no output stream
+  # still reads as active/in-use in the slot summary and its hardware row.
   defp merge_audio_devices(outputs, inputs) do
-    Map.merge(inputs, outputs)
+    Map.merge(inputs, outputs, fn _key, input, output ->
+      Map.put(output, :capturing?, Map.get(input, :status) == :streaming)
+    end)
   end
 
   # Cheap projection of the binary's stream_start payload to a non-nil
@@ -2378,7 +2383,7 @@ defmodule UniversalProxyWeb.OverviewLive do
       sub: out.usb_port || out.alsa_device,
       managed_by: "Sendspin",
       tab: "/audio",
-      status: audio_status(out),
+      status: sound_card_status(out),
       soft_class: "bg-audio-soft text-audio",
       dot_class: "bg-audio",
       # FlooGoo FMA120 and Sennheiser BTD 700 rows open their control
@@ -2396,6 +2401,19 @@ defmodule UniversalProxyWeb.OverviewLive do
   defp input_status(%{status: :streaming}), do: %{label: "In use", variant: :success}
   defp input_status(_), do: %{label: "Idle", variant: :warning}
 
+  # A duplex sound card renders as an output row (`audio_status/1`), but when its
+  # input side is capturing it should read as in-use even if the output isn't
+  # streaming, so the row reflects live capture and not just playback. An active
+  # output stream already resolves to a `:success` status.
+  defp sound_card_status(%{capturing?: true} = out) do
+    case audio_status(out) do
+      %{variant: :success} = streaming -> streaming
+      _ -> %{label: "In use", variant: :success}
+    end
+  end
+
+  defp sound_card_status(out), do: audio_status(out)
+
   # USB audio outputs carry a real {vid, pid} in their key; onboard SoC
   # cards key as {card_name, nil, nil}.
   defp usb_audio?(%{key: {_slot_sub, vid, pid}}) when is_integer(vid) and is_integer(pid),
@@ -2407,8 +2425,11 @@ defmodule UniversalProxyWeb.OverviewLive do
   # output carries a live `:stream` snapshot; a capture input reports
   # `status: :streaming`. The `:status` key is unique to input rows (outputs
   # never carry it), so it also serves as the input/output discriminator here.
+  # A duplex device merges as an output row carrying `:capturing?` (see
+  # `merge_audio_devices/2`), so it counts as active when EITHER direction is
+  # streaming: the output has a stream OR the input side is capturing.
   defp audio_device_active?(%{status: status}), do: status == :streaming
-  defp audio_device_active?(o), do: not is_nil(o[:stream])
+  defp audio_device_active?(o), do: not is_nil(o[:stream]) or o[:capturing?] == true
 
   defp usb_bt_peripherals(bt_radios) do
     bt_radios

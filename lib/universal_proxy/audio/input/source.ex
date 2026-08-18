@@ -252,15 +252,19 @@ defmodule UniversalProxy.Audio.Input.Source do
   @pairing_backoff_ms 300
   @pairing_window_ms 120_000
 
-  # How many un-consented pairing offers one connection may HOLD before we stop
-  # re-arming the "Allow pairing" prompt and decline outright. Each hold is
-  # already time-boxed to `pairing_window_ms`; this bounds a peer that lets the
-  # hold lapse and immediately re-offers, so it can't keep the (unauthenticated
-  # `/audio`) UI nagging indefinitely on one connection. Cross-connection churn
-  # is separately bounded by the accept rate limit. NB: the `/audio` UI is itself
-  # unauthenticated — bounding the hold is the mitigation here; gating that UI is
-  # a separate, larger piece of work.
+  # How many un-consented pairing offers a source may HOLD within `@hold_window_ms`
+  # before we stop re-arming the "Allow pairing" prompt and decline outright. The
+  # budget is tracked in `hold_times` (monotonic-ms stamps) which SURVIVES a
+  # teardown, so it bounds a peer that lets each hold lapse and immediately
+  # re-offers — including across reconnects — rather than per-connection (a
+  # per-connection counter zeroed at teardown was defeatable by replacing the
+  # held connection every `pairing_window_ms`). The window spans several
+  # 120 s hold cycles so a handful of genuine offers still get through.
+  #
+  # Residual: the `/audio` UI that shows the prompt is itself unauthenticated, so
+  # bounding the hold is the mitigation; gating that UI is separate, larger work.
   @max_holds 3
+  @hold_window_ms 600_000
 
   # A per-source accept rate limit, sized only to catch pathological churn (a
   # peer wedged in a tight connect/disconnect loop). It is a secondary backstop:
@@ -355,11 +359,13 @@ defmodule UniversalProxy.Audio.Input.Source do
     # longer matches the armed timer's `*_gen`. Never reset (monotonic across
     # connections keeps every gen unique).
     timer_gen: 0,
-    # Un-consented pairing holds opened on this connection. Bounds how long a
-    # LAN peer can keep an "Allow pairing" prompt alive without consent
-    # (reset per connection; cross-connection churn is bounded by the accept
-    # rate limit).
-    holds: 0
+    # Monotonic-ms timestamps of the un-consented pairing offers this source has
+    # HELD, within a sliding `@hold_window_ms`. Deliberately NOT reset on
+    # teardown (like `accepts`): a per-connection counter would let an unpaired
+    # peer zero the budget by replacing its held connection every `pairing_window_ms`,
+    # keeping the "Allow pairing" prompt showable forever. Bounding across
+    # reconnects is the point.
+    hold_times: []
   ]
 
   @type key :: Store.input_key()
@@ -518,14 +524,19 @@ defmodule UniversalProxy.Audio.Input.Source do
       state.trust == :user ->
         {:noreply, park_socket(record_accept(state), pid)}
 
-      # A pairing exchange is mid-flight on the incumbent (a held offer, a live
-      # CPace attempt, or the post-pairing re-handshake). It is still trust
-      # `none`, but tearing it down for a concurrent MA connection — MA opens
-      # several during interactive PIN pairing — would discard the in-progress
-      # pairing state and break an exchange the operator is actively completing.
-      # Protect it exactly like a trust-`user` session: park the challenger and
-      # probe liveness, so only a genuinely dead (half-open) pairing connection
-      # ever yields to the challenger via the liveness timeout.
+      # A CONSENTED pairing exchange is mid-flight on the incumbent (a live CPace
+      # attempt or the post-pairing re-handshake). It is still trust `none`, but
+      # tearing it down for a concurrent MA connection — MA opens several during
+      # interactive PIN pairing — would discard the in-progress exchange the
+      # operator is actively completing. A merely HELD, pre-consent offer is NOT
+      # covered (see `pairing_in_progress?/1`): it carries no consented state and
+      # falls through to the un-authenticated self-heal replace below. Park the
+      # challenger, but WITHOUT the promote-on-silence liveness probe: the
+      # exchange is legitimately silent while the operator reads and types the PIN
+      # (routinely longer than the probe window), so probing would mistake a slow
+      # human for a dead incumbent and tear the live pairing down. The exchange
+      # bounds itself (pairing timeout / socket close); once it resolves,
+      # `maybe_probe_parked/1` re-probes any still-parked challenger.
       pairing_in_progress?(state) ->
         {:noreply, park_socket(record_accept(state), pid)}
 
@@ -808,9 +819,39 @@ defmodule UniversalProxy.Audio.Input.Source do
     probe_incumbent(state)
   end
 
+  # Probe the incumbent's liveness so a genuinely dead (half-open) connection
+  # yields the slot to the parked challenger. A `client/time` goes out and the
+  # short liveness timer is armed; an inbound frame before it fires proves the
+  # incumbent alive and drops the challenger, silence promotes it.
+  #
+  # BUT a consented pairing exchange must NOT be probed: it is legitimately
+  # silent while the operator reads and types the PIN (often longer than the
+  # probe window) and its `client/time` keepalive is itself suppressed for the
+  # exchange, so the incumbent cannot answer the probe even though it is alive.
+  # Promoting on that silence would tear down a live pairing. Park the challenger
+  # and let the exchange bound itself (pairing timeout / socket close);
+  # `maybe_probe_parked/1` re-probes once the exchange resolves.
   defp probe_incumbent(state) do
-    state |> send_time_request() |> arm_liveness_timer()
+    if pairing_in_progress?(state) do
+      state
+    else
+      state |> send_time_request() |> arm_liveness_timer()
+    end
   end
+
+  # After a pairing attempt resolves with a challenger still parked, decide the
+  # incumbent's fate the normal way — probe it. A live incumbent (its keepalive
+  # resumed now the exchange is over) answers and the challenger is dropped; a
+  # genuinely dead one (the attempt timed out on a half-open socket, so no
+  # inbound frame ever arrived to drop the challenger) fails the probe and the
+  # challenger is promoted. On a live incumbent the resolving frame already ran
+  # `incumbent_alive/1` and dropped the challenger, so this is a no-op there.
+  defp maybe_probe_parked(%__MODULE__{parked_socket: nil} = state), do: state
+
+  defp maybe_probe_parked(%__MODULE__{liveness_timer: timer} = state) when not is_nil(timer),
+    do: state
+
+  defp maybe_probe_parked(state), do: probe_incumbent(state)
 
   # A pairing exchange the operator has actually consented to is mid-flight and
   # must not be evicted by a concurrent connection even though it is still trust
@@ -823,17 +864,20 @@ defmodule UniversalProxy.Audio.Input.Source do
   # A merely HELD, pre-consent offer (`:pairing_required` with `pairing == nil`,
   # consent-wait timer armed) is deliberately NOT protected: it carries no
   # operator-consented state worth keeping, and protecting it would let an
-  # unauthenticated Sentinel-PSK peer squat the single connection slot — answer
-  # the liveness probe and block legit MA from ever pairing. A challenger arriving
-  # while we only hold an un-consented offer falls through to the normal
-  # un-authenticated self-heal replace.
+  # unauthenticated Sentinel-PSK peer squat the single connection slot and block
+  # legit MA from ever pairing. A challenger arriving while we only hold an
+  # un-consented offer falls through to the normal un-authenticated self-heal
+  # replace, so the held offer is replaceable.
   defp pairing_in_progress?(state) do
     not is_nil(state.pairing) or state.fsm == :awaiting_rehandshake
   end
 
   # Any inbound frame from the incumbent proves it alive: cancel the probe and
-  # drop the challenger.
-  defp incumbent_alive(%__MODULE__{liveness_timer: nil} = state), do: state
+  # drop the challenger. This drops a parked challenger even when no liveness
+  # timer is armed — the case during a consented pairing exchange, where the
+  # incumbent's own pairing frames are what prove it alive (the promote-on-silence
+  # probe is deliberately withheld for the exchange, see `probe_incumbent/1`).
+  defp incumbent_alive(%__MODULE__{parked_socket: nil, liveness_timer: nil} = state), do: state
 
   defp incumbent_alive(state) do
     state |> cancel_liveness_timer() |> drop_parked()
@@ -1337,20 +1381,32 @@ defmodule UniversalProxy.Audio.Input.Source do
   # arm a consent-wait timeout sized to MA's own pairing window. The `client/time`
   # keepalive holds the connection open in the meantime.
   #
-  # Once a connection has burned `@max_holds` un-consented offers, stop re-arming
-  # the prompt and decline outright, so a peer can't keep the UI nagging by
-  # re-offering as soon as each hold lapses.
-  defp hold_for_consent(%__MODULE__{holds: holds} = state) when holds >= @max_holds do
-    Logger.info(
-      "Audio.Input.Source #{inspect(state.key)} exceeded #{@max_holds} un-consented pairing " <>
-        "offers; declining instead of re-holding"
-    )
+  # Once a source has burned `@max_holds` un-consented offers within
+  # `@hold_window_ms`, stop re-arming the prompt and decline outright, so a peer
+  # can't keep the UI nagging by re-offering as soon as each hold lapses. The
+  # budget lives in `hold_times`, which survives teardown, so it bounds the churn
+  # across reconnects rather than per-connection.
+  defp hold_for_consent(state) do
+    if holds_exhausted?(state) do
+      Logger.info(
+        "Audio.Input.Source #{inspect(state.key)} exceeded #{@max_holds} un-consented pairing " <>
+          "offers within the hold window; declining instead of re-holding"
+      )
 
-    {:ok, decline_held_offer(state, :user_cancelled)}
+      {:ok, decline_held_offer(state, :user_cancelled)}
+    else
+      {:ok, arm_consent_wait(record_hold(state))}
+    end
   end
 
-  defp hold_for_consent(state) do
-    {:ok, arm_consent_wait(%{state | holds: state.holds + 1})}
+  defp holds_exhausted?(state) do
+    now = System.monotonic_time(:millisecond)
+    Enum.count(state.hold_times, &(now - &1 < @hold_window_ms)) >= @max_holds
+  end
+
+  defp record_hold(state) do
+    now = System.monotonic_time(:millisecond)
+    %{state | hold_times: Enum.filter([now | state.hold_times], &(now - &1 < @hold_window_ms))}
   end
 
   # A fresh monotonic generation token for a cross-connection-risky timer. Each
@@ -1662,11 +1718,37 @@ defmodule UniversalProxy.Audio.Input.Source do
 
     state = %{discard_pairing(state) | fsm: :pairing_required}
     notify(state, {:pairing_failed, reason})
+    # The attempt just resolved: if a challenger parked (without a liveness probe)
+    # during the exchange is still waiting, probe the now-unprotected incumbent so
+    # a dead pairing connection yields the slot rather than deadlocking behind it.
+    maybe_probe_parked(state)
+  end
+
+  # An active attempt was aborted (by the peer): fail it, staying connected in
+  # `:pairing_required` for a retry.
+  defp abandon_pairing(%__MODULE__{pairing: %Pairing{}} = state, reason),
+    do: pairing_failed(state, reason)
+
+  # The peer aborted while we were only HOLDING a pre-consent offer (no attempt
+  # open). Tear the hold down, otherwise a later `allow_pairing/1` would drive
+  # `client/pair-init` for an offer MA has already withdrawn: cancel the
+  # consent-wait timer, forget the offer params, and return to connected-idle so
+  # the UI drops its "Allow pairing" affordance. No `pair/abort` is echoed back —
+  # the peer is the one that aborted.
+  defp abandon_pairing(%__MODULE__{fsm: :pairing_required, pairing: nil} = state, reason) do
+    state = %{
+      cancel_consent_wait_timer(state)
+      | fsm: :awaiting_activate,
+        last_pairing_params: nil
+    }
+
+    notify(state, {:pairing_failed, reason})
     state
   end
 
-  defp abandon_pairing(%__MODULE__{pairing: nil} = state, _reason), do: state
-  defp abandon_pairing(state, reason), do: pairing_failed(state, reason)
+  # Nothing pending at all (truly idle, no consent-wait): a stray abort is a
+  # harmless no-op.
+  defp abandon_pairing(state, _reason), do: state
 
   defp discard_pairing(state) do
     %{cancel_pairing_attempt_timer(cancel_pairing_timer(state)) | pairing: nil}
@@ -1789,11 +1871,12 @@ defmodule UniversalProxy.Audio.Input.Source do
   # -- Time sync --
 
   # No `client/time` may leave while a pairing exchange is live: MA's strict
-  # `_receive_pairing` aborts on any interleaved non-pairing frame. This also
-  # silences the incumbent-liveness probe for the duration of an exchange — a
-  # parked challenger still proves the incumbent alive via the pairing frames the
-  # exchange itself carries inbound, and the `:time_tick` loop re-arms without
-  # sending, so keepalive resumes automatically once `pairing` clears.
+  # `_receive_pairing` aborts on any interleaved non-pairing frame. The
+  # `:time_tick` loop re-arms without sending, so keepalive resumes automatically
+  # once `pairing` clears. The incumbent-liveness probe is separately withheld
+  # while an exchange is active (see `probe_incumbent/1`) — a parked challenger is
+  # instead dropped by the pairing frames the exchange carries inbound — so this
+  # suppression no longer doubles as liveness silencing.
   defp send_time_request(%__MODULE__{pairing: %Pairing{}} = state), do: state
 
   # Same suppression for the post-pairing in-band re-handshake window: the swap to
@@ -2065,7 +2148,6 @@ defmodule UniversalProxy.Audio.Input.Source do
         handshake_hash: nil,
         pairing_index: 0,
         last_pairing_params: nil,
-        holds: 0,
         frames_dropped: 0,
         fsm: :listening,
         reassembler: Wire.Reassembler.new(),

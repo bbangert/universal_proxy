@@ -156,6 +156,69 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
       refute_paired!(ctx.store)
     end
 
+    test "a peer abort during a HELD offer tears the hold down; later consent can't resurrect it",
+         ctx do
+      {source, port} = start_source!(ctx)
+      {_hello, peer} = connect_hello!(port)
+
+      # Offer held without consent: :pairing_required, no attempt open.
+      peer =
+        Peer.activate!(peer, roles: [], activities: ["pairing"], pairing: @pairing_params)
+
+      assert_receive {:source_event, @key, {:pairing_required, _params}}, 2_000
+
+      # MA withdraws the offer while we are still holding it for the operator.
+      peer = Peer.abort_pairing!(peer, "user_cancelled")
+
+      # The hold is torn down (not left live): back to connected-idle with the
+      # offer params forgotten, and the UI drops its "Allow pairing" affordance.
+      assert_receive {:source_event, @key, {:pairing_failed, {:peer_abort, :user_cancelled}}},
+                     2_000
+
+      assert Source.status(source) == :awaiting_activate
+
+      # A LATER operator "Allow pairing" must NOT drive `client/pair-init` for the
+      # offer MA already withdrew: nothing pairs and no pair-init is emitted.
+      :ok = Source.allow_pairing(source)
+      refute_receive {:source_event, @key, :pairing_started}, 300
+      peer = Peer.serve_time!(peer, 1)
+      refute Enum.any?(peer.messages, &match?({:json, "client/pair-init", _}, &1))
+      refute_paired!(ctx.store)
+    end
+
+    test "held pairing offers are bounded across reconnects (budget survives teardown)", ctx do
+      # A large consent window so a genuinely-held offer never self-declines
+      # quickly: only exhausting the hold budget produces an immediate decline.
+      {source, port} = start_source!(ctx, pairing_window_ms: 5_000)
+
+      # Burn the whole hold budget, each hold on a FRESH connection. A
+      # per-connection counter zeroed at teardown would never trip here.
+      Enum.each(1..3, fn _i ->
+        {_hello, peer} = connect_hello!(port)
+
+        peer =
+          Peer.activate!(peer, roles: [], activities: ["pairing"], pairing: @pairing_params)
+
+        assert_receive {:source_event, @key, {:pairing_required, _params}}, 2_000
+        # HELD, not declined: the prompt stays up (no immediate decline).
+        refute_receive {:source_event, @key, :pairing_declined}, 200
+
+        :ok = Peer.close!(peer)
+        assert_receive {:source_event, @key, :disconnected}, 2_000
+      end)
+
+      # The next held offer, again on a fresh connection, exceeds the budget and
+      # is declined outright instead of re-arming the prompt — proving the budget
+      # was NOT zeroed by the intervening teardowns.
+      {_hello, peer} = connect_hello!(port)
+      _peer = Peer.activate!(peer, roles: [], activities: ["pairing"], pairing: @pairing_params)
+
+      assert_receive {:source_event, @key, {:pairing_required, _params}}, 2_000
+      assert_receive {:source_event, @key, :pairing_declined}, 1_000
+      assert Source.status(source) == :awaiting_activate
+      refute_paired!(ctx.store)
+    end
+
     test "refuses to open an attempt while a long-term PSK already exists", ctx do
       {source, port} = start_source!(ctx)
 
@@ -455,9 +518,11 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
       assert_receive {:source_event, @key, :connected}, 2_000
     end
 
-    test "a challenger during an active pairing exchange is parked; pairing still completes",
+    test "a challenger parked mid-pairing does not promote past a slow human PIN entry",
          ctx do
-      {source, port} = start_source!(ctx)
+      # A short liveness-probe window so the "slow human" gap below decisively
+      # exceeds it: if the probe ran during pairing it would fire and promote.
+      {source, port} = start_source!(ctx, incumbent_probe_ms: 100)
 
       {_hello, peer} = connect_hello!(port)
       :ok = Source.allow_pairing(source)
@@ -468,11 +533,17 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
       # pairing. This one arrives mid-exchange: the pairing incumbent (still
       # trust `none`) must NOT be torn down for it — the challenger is parked.
       challenger = Peer.connect!(port)
-      refute_receive {:source_event, @key, :disconnected}, 500
       assert Source.status(source) == :pairing_required
 
-      # The exchange continues on the incumbent uninterrupted. Its first pairing
-      # frame proves the incumbent alive, so the parked challenger is dropped.
+      # The operator takes their time reading and typing the PIN — the exchange
+      # is legitimately silent for far longer than the probe window. Without the
+      # fix (an armed liveness probe) this silence would fire the 100 ms timeout,
+      # promote the challenger, and tear the live pairing down. It must not.
+      refute_receive {:source_event, @key, :disconnected}, 400
+      assert Source.status(source) == :pairing_required
+
+      # The operator finally submits: the exchange resumes and completes. The
+      # incumbent's first pairing frame proves it alive, dropping the challenger.
       peer = peer |> Peer.submit_pin!(pin) |> Peer.serve_pair_auth!()
       {psk, peer} = Peer.serve_pair_finalize!(peer)
       assert_receive {:source_event, @key, :paired}, 2_000
@@ -524,20 +595,26 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
       assert Source.status(source) == :awaiting_activate
     end
 
-    test "a dead pairing incumbent yields to a challenger via the liveness probe", ctx do
-      # A short probe window so the test doesn't wait the 5 s production default.
-      {source, port} = start_source!(ctx, incumbent_probe_ms: 100)
+    test "a dead pairing incumbent yields to a challenger once the attempt times out", ctx do
+      # Short pairing + probe windows so the test doesn't wait the production
+      # defaults. The dead exchange is bounded by the pairing timeout, NOT the
+      # liveness probe (which is withheld while an exchange is active so a slow
+      # human PIN entry can't be mistaken for a dead incumbent).
+      {source, port} = start_source!(ctx, pairing_timeout_ms: 100, incumbent_probe_ms: 100)
       {_hello, peer} = connect_hello!(port)
       :ok = Source.allow_pairing(source)
       {1, _peer} = offer_pairing!(peer)
       _pin = await_pin!()
 
       # The pairing incumbent goes silent mid-exchange (half-open TCP: the MA
-      # container restarted). A concurrent connection is parked and probes it;
-      # the incumbent never answers, so the challenger is promoted rather than
-      # deadlocking behind a dead pairing connection.
+      # container restarted). A concurrent connection is parked WITHOUT arming the
+      # promote-on-silence probe, so it does not tear the (possibly live) exchange
+      # down. Only once the attempt itself times out — leaving an unprotected held
+      # offer — does the still-parked challenger probe the now-silent incumbent
+      # and get promoted, rather than deadlocking behind a dead pairing socket.
       challenger = Peer.connect!(port)
 
+      assert_receive {:source_event, @key, {:pairing_failed, :attempt_timeout}}, 2_000
       assert_receive {:source_event, @key, :disconnected}, 2_000
       assert_receive {:source_event, @key, :connected}, 2_000
 

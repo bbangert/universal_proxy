@@ -308,6 +308,51 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
       assert html =~ "Sound card"
       refute html =~ "Audio input"
     end
+
+    test "a duplex device capturing with no output stream reads as in-use in its row",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      dup_key = {"1-1.2", 0x1234, 0x5678}
+
+      # Output half: connected but NOT streaming (no `:stream`) — on its own the
+      # row would read "Connected", never "In use".
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "sendspin:output_added",
+        {:sendspin_output_added,
+         sample_output(%{
+           key: dup_key,
+           card_index: 2,
+           usb_port: "1-1.2",
+           card_name: "Duplex DAC",
+           friendly_name: "Duplex DAC",
+           connection: :connected,
+           stream: nil
+         })}
+      )
+
+      # Input half of the same device is actively capturing.
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "sendspin:input_added",
+        {:sendspin_input_added,
+         sample_input(%{
+           key: dup_key,
+           usb_port: "1-1.2",
+           name: "Duplex DAC",
+           friendly_name: "Duplex DAC",
+           status: :streaming
+         })}
+      )
+
+      html = render(view)
+      # Output presentation is kept (a "Sound card" row), but the merged capture
+      # signal surfaces as "In use" rather than the output-only "Connected".
+      assert html =~ "Duplex DAC"
+      assert html =~ "Sound card"
+      assert html =~ "In use"
+    end
   end
 
   # `hardware_rows/2` is the slot-promotion + ordering core. It can't be
@@ -535,6 +580,19 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
       live = %{a: %{key: {"1-1.2", 1, 1}, usb_port: "1-1.2", status: :streaming}}
       s2 = OverviewLive.slot_summary([], live, [], %{}, @slots)
       assert s2 == %{in_use: 1, total: 4, active: 1, idle: 0}
+    end
+
+    test "a duplex device capturing (no output stream) counts as active" do
+      # A duplex device merges as an output row (usb key, no `:stream`) carrying
+      # the input's live capture signal `:capturing?`. It must count as active
+      # even though the output side isn't streaming, so a capture-in-use device
+      # doesn't read as idle.
+      idle = %{a: %{key: {"1-1.2", 1, 1}, usb_port: "1-1.2", stream: nil, capturing?: false}}
+      assert OverviewLive.slot_summary([], idle, [], %{}, @slots).active == 0
+
+      capturing = %{a: %{key: {"1-1.2", 1, 1}, usb_port: "1-1.2", stream: nil, capturing?: true}}
+      s = OverviewLive.slot_summary([], capturing, [], %{}, @slots)
+      assert s == %{in_use: 1, total: 4, active: 1, idle: 0}
     end
 
     test "a BT radio without a :port (hci-only) is not counted" do
