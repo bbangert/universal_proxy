@@ -307,7 +307,11 @@ defmodule UniversalProxy.Sendspin.PairingTest do
   describe "wrong PIN" do
     test "a mistyped operator PIN fails the client's MCF check and aborts" do
       %{client: client, server_confirm: confirm} =
-        pair([], fn pin -> String.replace(pin, ~r/\A./, "9") end)
+        pair([], fn pin ->
+          <<first::binary-size(1), rest::binary>> = pin
+          other = if first == "9", do: "0", else: "9"
+          other <> rest
+        end)
 
       assert {:abort, :pin_mismatch, [{"pair/abort", payload}], client} =
                Pairing.handle(client, "server/pair-confirm", confirm)
@@ -317,7 +321,12 @@ defmodule UniversalProxy.Sendspin.PairingTest do
     end
 
     test "the server rejects a client tag from a different PIN" do
-      %{server: server} = pair([], fn pin -> String.replace(pin, ~r/\A./, "9") end)
+      %{server: server} =
+        pair([], fn pin ->
+          <<first::binary-size(1), rest::binary>> = pin
+          other = if first == "9", do: "0", else: "9"
+          other <> rest
+        end)
 
       confirm = %{
         "client_kc" => b64(:crypto.strong_rand_bytes(64)),
