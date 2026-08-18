@@ -436,6 +436,58 @@ defmodule UniversalProxy.Audio.PlayerTest do
     end
   end
 
+  describe "sendspin_instance_name/3 with :source role" do
+    test "appends the ' In' marker ahead of the node suffix" do
+      assert Player.sendspin_instance_name("BTD 700 (1-1.3.1)", "universal-proxy-07507f", :source) ==
+               "BTD 700 (1-1.3.1) In (universal-proxy-07507f)"
+    end
+
+    test "differs from the :player result for identical inputs" do
+      friendly = "BTD 700 (1-1.3.1)"
+      node = "universal-proxy-07507f"
+
+      refute Player.sendspin_instance_name(friendly, node, :source) ==
+               Player.sendspin_instance_name(friendly, node, :player)
+    end
+
+    test "the ' In' marker survives truncation of a long friendly name" do
+      node = "universal-proxy-45099b"
+      # 80+ bytes, includes multi-byte UTF-8 so byte-vs-codepoint truncation
+      # bugs would show up here.
+      long = String.duplicate("漢", 40)
+
+      name = Player.sendspin_instance_name(long, node, :source)
+
+      assert byte_size(name) <= 63
+      assert String.valid?(name)
+      # The role marker is the whole point — it must never be truncated away.
+      assert String.ends_with?(name, " In (#{node})")
+    end
+
+    test "no node name → bare output name with the ' In' marker" do
+      assert Player.sendspin_instance_name("bcm2835 Headphones", nil, :source) ==
+               "bcm2835 Headphones In"
+
+      assert Player.sendspin_instance_name("bcm2835 Headphones", "", :source) ==
+               "bcm2835 Headphones In"
+    end
+
+    test "blank friendly name with a node still yields a valid marked label" do
+      assert Player.sendspin_instance_name("  \t ", "node-x", :source) == "sendspin In (node-x)"
+    end
+
+    test "pathologically long node name drops the node but keeps the marker" do
+      node = String.duplicate("n", 100)
+
+      name = Player.sendspin_instance_name("BTD 700 (1-1.3.1)", node, :source)
+
+      assert byte_size(name) <= 63
+      assert String.valid?(name)
+      assert String.ends_with?(name, " In")
+      assert String.starts_with?(name, "BTD 700 (1-1.3.1)")
+    end
+  end
+
   describe "set_volume/2" do
     test "writes JSON to stdin and the fake echoes back via PubSub" do
       pid = start_player!()

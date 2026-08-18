@@ -745,38 +745,68 @@ defmodule UniversalProxy.Audio.Player do
   # boundaries so the resulting string is always valid UTF-8 and never
   # produces a malformed mDNS RR. Control chars get stripped first,
   # and an empty post-clean string falls back to a stable placeholder.
-  defp sanitize_instance_name(raw) when is_binary(raw) do
+  #
+  # `role_marker/1` is folded into the budget here (not appended after)
+  # so a `:source` name always reserves room for its `" In"` marker —
+  # the marker is what keeps a dual-role card's source and player names
+  # from colliding, so it must survive truncation just like the node
+  # suffix does in `do_sendspin_instance_name/3`.
+  defp sanitize_instance_name(raw, role) when is_binary(raw) do
+    marker = role_marker(role)
+    budget = 63 - byte_size(marker)
+
     cleaned =
       raw
       |> String.replace(~r/[[:cntrl:]]/u, "")
       |> String.trim()
-      |> truncate_to_byte_limit(63)
+      |> truncate_to_byte_limit(budget)
 
-    if cleaned == "", do: "sendspin", else: cleaned
+    base = if cleaned == "", do: "sendspin", else: cleaned
+    base <> marker
   end
 
-  defp sanitize_instance_name(_), do: "sendspin"
+  defp sanitize_instance_name(_, role), do: "sendspin" <> role_marker(role)
+
+  defp role_marker(:player), do: ""
+  defp role_marker(:source), do: " In"
 
   @doc false
   # Compose the sendspin mDNS instance name as "<output> (<node>)",
   # preserving the device suffix within the 63-byte mDNS label budget:
   # the output portion is truncated first so the identifier always
   # survives. With no node name it degrades to the bare output name.
+  #
+  # Delegates to the 3-arity form with `:player` — existing callers and
+  # every byte of existing output are unchanged.
   @spec sendspin_instance_name(String.t(), String.t() | nil) :: String.t()
-  def sendspin_instance_name(friendly_name, node) when is_binary(node) and node != "" do
+  def sendspin_instance_name(friendly_name, node),
+    do: sendspin_instance_name(friendly_name, node, :player)
+
+  @doc false
+  # Same composition as the 2-arity form, but role-qualified: a `:source`
+  # (capture) service gets an `" In"` marker ahead of the node suffix, e.g.
+  # "<friendly> In (<node>)". This exists because the same physical card
+  # (e.g. a BTD 700) can register BOTH a player and a source
+  # `_sendspin._tcp` service under the same default friendly name — DNS-SD
+  # requires unique instance names per service type, so without the marker
+  # the two collide and Music Assistant's zeroconf shadows one of them.
+  @spec sendspin_instance_name(String.t(), String.t() | nil, :player | :source) :: String.t()
+  def sendspin_instance_name(friendly_name, node, role) when is_binary(node) and node != "" do
     # The node name (ConfigStore accepts any binary for `:name`) is
     # interpolated into the label and the TXT `name=` value, so strip
     # control chars/trim first. If nothing survives, degrade to the bare
-    # output name rather than emit a `" ()"`-style suffix.
-    do_sendspin_instance_name(friendly_name, clean_instance_string(node))
+    # (role-marked) output name rather than emit a `" ()"`-style suffix.
+    do_sendspin_instance_name(friendly_name, clean_instance_string(node), role)
   end
 
-  def sendspin_instance_name(friendly_name, _), do: sanitize_instance_name(friendly_name)
+  def sendspin_instance_name(friendly_name, _, role),
+    do: sanitize_instance_name(friendly_name, role)
 
-  defp do_sendspin_instance_name(friendly_name, ""), do: sanitize_instance_name(friendly_name)
+  defp do_sendspin_instance_name(friendly_name, "", role),
+    do: sanitize_instance_name(friendly_name, role)
 
-  defp do_sendspin_instance_name(friendly_name, node) do
-    suffix = " (#{node})"
+  defp do_sendspin_instance_name(friendly_name, node, role) do
+    suffix = node_suffix(node, role)
 
     case 63 - byte_size(suffix) do
       budget when budget > 0 ->
@@ -790,12 +820,19 @@ defmodule UniversalProxy.Audio.Player do
 
         if base == "", do: "sendspin" <> suffix, else: base <> suffix
 
-      # Pathologically long node name — can't fit a suffix, keep the
-      # output name so the player is at least still discoverable.
+      # Pathologically long node name — can't fit both name and node
+      # suffix. `:player` drops back to the bare output name (it was
+      # already unique enough before node suffixes existed). `:source`
+      # instead drops the node but keeps the `" In"` marker: for a
+      # dual-role card, staying distinct from the paired player service
+      # matters more here than the node suffix does.
       _ ->
-        sanitize_instance_name(friendly_name)
+        sanitize_instance_name(friendly_name, role)
     end
   end
+
+  defp node_suffix(node, :player), do: " (#{node})"
+  defp node_suffix(node, :source), do: " In (#{node})"
 
   # Strip control chars and trim — shared by the plain and suffixed
   # instance-name paths.

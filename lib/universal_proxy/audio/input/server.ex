@@ -872,7 +872,16 @@ defmodule UniversalProxy.Audio.Input.Server do
     # MapSet of whole service maps, so two ports means two entries.
     state = unregister_mdns(state, key)
 
-    display_name = Player.sendspin_instance_name(input.friendly_name, DeviceInfo.node_name())
+    # `:source` here, not the default `:player` — the same physical card
+    # (e.g. a BTD 700) can expose both a playback and a capture path, and
+    # both default `friendly_name` to the same card slot string. DNS-SD
+    # requires unique instance names per service type, and Music
+    # Assistant's zeroconf keys services by instance name, so identical
+    # names shadow one of the two `_sendspin._tcp` endpoints (observed
+    # live with a dual-role BTD 700). The role-qualified name keeps the
+    # two distinct.
+    display_name =
+      Player.sendspin_instance_name(input.friendly_name, DeviceInfo.node_name(), :source)
 
     service = %{
       id: mdns_service_id(key),
