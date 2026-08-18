@@ -411,7 +411,12 @@ defmodule UniversalProxy.Audio.Input.ServerTest do
       assert service.protocol == "sendspin"
       assert service.transport == "tcp"
       assert service.port == 9_928
-      assert String.starts_with?(service.instance_name, "USB Capture Card (1-1.3)")
+      # The trailing " In" role marker is what keeps this source's instance
+      # name distinct from the player's on a dual-role card — assert it's
+      # actually there rather than just the friendly-name prefix. The node
+      # suffix (if any) varies with `DeviceInfo.node_name()`, so anchor on
+      # the marker instead of the full string.
+      assert String.starts_with?(service.instance_name, "USB Capture Card (1-1.3) In")
 
       # MA silently ignores a `_sendspin._tcp` instance whose TXT `path` is
       # missing or doesn't start with "/". This is the whole discovery gate.

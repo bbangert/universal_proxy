@@ -417,6 +417,29 @@ defmodule UniversalProxy.Audio.PlayerTest do
       assert Player.sendspin_instance_name("  \t ", "node-x") == "sendspin (node-x)"
     end
 
+    test "blank output name with a node too long for the placeholder drops the node" do
+      # suffix = " (" <> 54 bytes <> ")" = 57 bytes, which would push the
+      # 8-byte "sendspin" placeholder to 65 bytes — must fall back to the
+      # bare placeholder instead of exceeding the 63-byte mDNS label limit.
+      node = String.duplicate("n", 54)
+
+      name = Player.sendspin_instance_name("  \t ", node)
+
+      assert byte_size(name) <= 63
+      assert name == "sendspin"
+    end
+
+    test "blank output name with a node right at the placeholder boundary keeps the node" do
+      # suffix = " (" <> 52 bytes <> ")" = 55 bytes; "sendspin" <> suffix
+      # is exactly 63 bytes — the placeholder path still fits here.
+      node = String.duplicate("n", 52)
+
+      name = Player.sendspin_instance_name("  \t ", node)
+
+      assert byte_size(name) == 63
+      assert name == "sendspin (#{node})"
+    end
+
     test "refuses to start when the binary is missing" do
       # `trap_exit` so `start_link/1` reports `{:error, _}` to the
       # caller (this test process) instead of propagating an `:EXIT`
@@ -433,6 +456,122 @@ defmodule UniversalProxy.Audio.PlayerTest do
                  binary_path: "/tmp/nope",
                  mdns_module: MdnsStub
                )
+    end
+  end
+
+  describe "sendspin_instance_name/3 with :source role" do
+    test "appends the ' In' marker ahead of the node suffix" do
+      assert Player.sendspin_instance_name("BTD 700 (1-1.3.1)", "universal-proxy-07507f", :source) ==
+               "BTD 700 (1-1.3.1) In (universal-proxy-07507f)"
+    end
+
+    test "differs from the :player result for identical inputs" do
+      friendly = "BTD 700 (1-1.3.1)"
+      node = "universal-proxy-07507f"
+
+      refute Player.sendspin_instance_name(friendly, node, :source) ==
+               Player.sendspin_instance_name(friendly, node, :player)
+    end
+
+    test "the ' In' marker survives truncation of a long friendly name" do
+      node = "universal-proxy-45099b"
+      # 80+ bytes, includes multi-byte UTF-8 so byte-vs-codepoint truncation
+      # bugs would show up here.
+      long = String.duplicate("漢", 40)
+
+      name = Player.sendspin_instance_name(long, node, :source)
+
+      assert byte_size(name) <= 63
+      assert String.valid?(name)
+      # The role marker is the whole point — it must never be truncated away.
+      assert String.ends_with?(name, " In (#{node})")
+    end
+
+    test "no node name → bare output name with the ' In' marker" do
+      assert Player.sendspin_instance_name("bcm2835 Headphones", nil, :source) ==
+               "bcm2835 Headphones In"
+
+      assert Player.sendspin_instance_name("bcm2835 Headphones", "", :source) ==
+               "bcm2835 Headphones In"
+    end
+
+    test "blank friendly name with a node still yields a valid marked label" do
+      assert Player.sendspin_instance_name("  \t ", "node-x", :source) == "sendspin In (node-x)"
+    end
+
+    test "pathologically long node name drops the node but keeps the marker" do
+      node = String.duplicate("n", 100)
+
+      name = Player.sendspin_instance_name("BTD 700 (1-1.3.1)", node, :source)
+
+      assert byte_size(name) <= 63
+      assert String.valid?(name)
+      assert String.ends_with?(name, " In")
+      assert String.starts_with?(name, "BTD 700 (1-1.3.1)")
+    end
+
+    test "blank friendly name with a node too long for the placeholder drops the node, keeps the marker" do
+      # suffix = " In (" <> 50 bytes <> ")" = 56 bytes, which would push
+      # the 8-byte "sendspin" placeholder to 64 bytes — must fall back to
+      # sanitize_instance_name/2 (placeholder + role marker only) instead.
+      node = String.duplicate("n", 50)
+
+      name = Player.sendspin_instance_name("   ", node, :source)
+
+      assert byte_size(name) <= 63
+      assert name == "sendspin In"
+    end
+
+    test "boundary collision: no node, friendly name truncates with ' In' at the cut" do
+      # 60 "a"s + " In" is exactly 63 bytes, so :player's untruncated
+      # composition and :source's truncate-then-append-" In" composition
+      # land on the identical 63-byte string unless the collision dodge
+      # kicks in.
+      friendly = String.duplicate("a", 60) <> " In"
+
+      player = Player.sendspin_instance_name(friendly, nil, :player)
+      source = Player.sendspin_instance_name(friendly, nil, :source)
+
+      refute source == player
+      assert byte_size(player) <= 63
+      assert byte_size(source) <= 63
+      assert String.valid?(source)
+      assert String.ends_with?(source, " In")
+    end
+
+    test "boundary collision: with node, friendly name truncates with ' In' at the cut" do
+      node = "universal-proxy-07507f"
+      friendly = String.duplicate("a", 35) <> " In" <> String.duplicate("b", 20)
+
+      player = Player.sendspin_instance_name(friendly, node, :player)
+      source = Player.sendspin_instance_name(friendly, node, :source)
+
+      refute source == player
+      assert byte_size(source) <= 63
+      assert String.ends_with?(source, " In (#{node})")
+    end
+
+    test "boundary collision is deterministic across repeated calls" do
+      node = "universal-proxy-07507f"
+      friendly = String.duplicate("a", 35) <> " In" <> String.duplicate("b", 20)
+
+      assert Player.sendspin_instance_name(friendly, node, :source) ==
+               Player.sendspin_instance_name(friendly, node, :source)
+    end
+
+    test "boundary collision with multi-byte codepoints stays valid UTF-8 and distinct" do
+      # 20 "漢" (3 bytes each) + " In" is exactly 63 bytes — same boundary
+      # shape as the ASCII case above, but exercises codepoint-respecting
+      # truncation on the shrink path.
+      friendly = String.duplicate("漢", 20) <> " In"
+
+      player = Player.sendspin_instance_name(friendly, nil, :player)
+      source = Player.sendspin_instance_name(friendly, nil, :source)
+
+      refute source == player
+      assert byte_size(source) <= 63
+      assert String.valid?(source)
+      assert String.ends_with?(source, " In")
     end
   end
 

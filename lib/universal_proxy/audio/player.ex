@@ -745,57 +745,171 @@ defmodule UniversalProxy.Audio.Player do
   # boundaries so the resulting string is always valid UTF-8 and never
   # produces a malformed mDNS RR. Control chars get stripped first,
   # and an empty post-clean string falls back to a stable placeholder.
-  defp sanitize_instance_name(raw) when is_binary(raw) do
+  #
+  # `role_marker/1` is folded into the budget here (not appended after)
+  # so a `:source` name always reserves room for its `" In"` marker —
+  # the marker is what keeps a dual-role card's source and player names
+  # from colliding, so it must survive truncation just like the node
+  # suffix does in `do_sendspin_instance_name/4`.
+  #
+  # `shrink` (default 0, added via the 2-arity wrapper below) shaves the
+  # friendly-name budget further, past what the marker alone reserves.
+  # It exists for the `:source` collision dodge below — the marker alone
+  # doesn't guarantee divergence from `:player` once the friendly name
+  # truncates with `" In"` sitting exactly at the boundary; see
+  # `distinct_source_name/4`. A 0 budget truncates to `""` and the
+  # placeholder fallback still applies.
+  defp sanitize_instance_name(raw, role), do: sanitize_instance_name(raw, role, 0)
+
+  defp sanitize_instance_name(raw, role, shrink) when is_binary(raw) do
+    marker = role_marker(role)
+    budget = max(63 - byte_size(marker) - shrink, 0)
+
     cleaned =
       raw
       |> String.replace(~r/[[:cntrl:]]/u, "")
       |> String.trim()
-      |> truncate_to_byte_limit(63)
+      |> truncate_to_byte_limit(budget)
 
-    if cleaned == "", do: "sendspin", else: cleaned
+    base = if cleaned == "", do: "sendspin", else: cleaned
+    base <> marker
   end
 
-  defp sanitize_instance_name(_), do: "sendspin"
+  defp sanitize_instance_name(_, role, _shrink), do: "sendspin" <> role_marker(role)
+
+  defp role_marker(:player), do: ""
+  defp role_marker(:source), do: " In"
 
   @doc false
   # Compose the sendspin mDNS instance name as "<output> (<node>)",
   # preserving the device suffix within the 63-byte mDNS label budget:
   # the output portion is truncated first so the identifier always
   # survives. With no node name it degrades to the bare output name.
+  #
+  # Delegates to the 3-arity form with `:player` — existing callers and
+  # every byte of existing output are unchanged.
   @spec sendspin_instance_name(String.t(), String.t() | nil) :: String.t()
-  def sendspin_instance_name(friendly_name, node) when is_binary(node) and node != "" do
+  def sendspin_instance_name(friendly_name, node),
+    do: sendspin_instance_name(friendly_name, node, :player)
+
+  @doc false
+  # Same composition as the 2-arity form, but role-qualified: a `:source`
+  # (capture) service gets an `" In"` marker ahead of the node suffix, e.g.
+  # "<friendly> In (<node>)". This exists because the same physical card
+  # (e.g. a BTD 700) can register BOTH a player and a source
+  # `_sendspin._tcp` service under the same default friendly name — DNS-SD
+  # requires unique instance names per service type, so without the marker
+  # the two collide and Music Assistant's zeroconf shadows one of them.
+  #
+  # `:player` always composes at shrink 0 — its output must stay
+  # byte-for-byte what it's always been. `:source` is handled by its own
+  # clause below: the marker alone isn't a sound divergence guarantee, so
+  # it can't just call through with a fixed marker like `:player` does.
+  @spec sendspin_instance_name(String.t(), String.t() | nil, :player | :source) :: String.t()
+  def sendspin_instance_name(friendly_name, node, :player) when is_binary(node) and node != "" do
     # The node name (ConfigStore accepts any binary for `:name`) is
     # interpolated into the label and the TXT `name=` value, so strip
     # control chars/trim first. If nothing survives, degrade to the bare
     # output name rather than emit a `" ()"`-style suffix.
-    do_sendspin_instance_name(friendly_name, clean_instance_string(node))
+    do_sendspin_instance_name(friendly_name, clean_instance_string(node), :player, 0)
   end
 
-  def sendspin_instance_name(friendly_name, _), do: sanitize_instance_name(friendly_name)
+  def sendspin_instance_name(friendly_name, _node, :player),
+    do: sanitize_instance_name(friendly_name, :player)
 
-  defp do_sendspin_instance_name(friendly_name, ""), do: sanitize_instance_name(friendly_name)
+  # The `" In"` marker only guarantees divergence from `:player` when the
+  # friendly name survives untruncated. When it doesn't — and " In" lands
+  # exactly at the truncation boundary — both roles compose the identical
+  # label byte-for-byte (confirmed by reproduction: a 60-byte name ending
+  # in " In" with no node, and a longer name/node combination where the
+  # boundary falls mid-marker). So instead of trusting the marker blindly,
+  # compute what `:player` would produce for these exact inputs and check
+  # the source candidate against it, shrinking the friendly-name budget on
+  # a match until the two differ. Pure in `(friendly_name, node)` — these
+  # labels back a boot-stable mDNS identity, so nothing here may read
+  # process state or vary run to run.
+  def sendspin_instance_name(friendly_name, node, :source) do
+    player = sendspin_instance_name(friendly_name, node, :player)
+    distinct_source_name(friendly_name, node, player, 0)
+  end
 
-  defp do_sendspin_instance_name(friendly_name, node) do
-    suffix = " (#{node})"
+  # A strictly shorter base yields a strictly shorter total label than
+  # `:player`'s fixed-budget candidate, so one shrink step past the
+  # collision suffices in practice. The loop is a safety net:
+  # `truncate_to_byte_limit/2` only cuts at codepoint boundaries, so a
+  # multi-byte friendly name can have consecutive byte budgets truncate to
+  # the same codepoint-bounded string, needing more than one step to
+  # actually shrink. Capped at 63 purely so the recursion is visibly
+  # bounded — a shrink that large truncates the base to `""`, which is
+  # already provably distinct from any non-empty `:player` base, so the
+  # cap is never actually reached.
+  defp distinct_source_name(friendly_name, node, player, shrink) when shrink <= 63 do
+    candidate = compose_source_name(friendly_name, node, shrink)
+
+    if candidate != player do
+      candidate
+    else
+      distinct_source_name(friendly_name, node, player, shrink + 1)
+    end
+  end
+
+  defp distinct_source_name(friendly_name, node, _player, shrink),
+    do: compose_source_name(friendly_name, node, shrink)
+
+  defp compose_source_name(friendly_name, node, shrink) when is_binary(node) and node != "" do
+    do_sendspin_instance_name(friendly_name, clean_instance_string(node), :source, shrink)
+  end
+
+  defp compose_source_name(friendly_name, _node, shrink),
+    do: sanitize_instance_name(friendly_name, :source, shrink)
+
+  defp do_sendspin_instance_name(friendly_name, "", role, shrink),
+    do: sanitize_instance_name(friendly_name, role, shrink)
+
+  defp do_sendspin_instance_name(friendly_name, node, role, shrink) do
+    suffix = node_suffix(node, role)
 
     case 63 - byte_size(suffix) do
       budget when budget > 0 ->
         # A blank output name falls back to the plain placeholder so we
-        # never emit a leading-space " (node)" label.
+        # never emit a leading-space " (node)" label. `shrink` only comes
+        # off the base truncation here — the suffix-fits check above and
+        # the placeholder-fits check below are untouched by it, so the
+        # `:source` collision dodge never affects whether the node suffix
+        # survives.
         base =
           friendly_name
           |> clean_instance_string()
-          |> truncate_to_byte_limit(budget)
+          |> truncate_to_byte_limit(max(budget - shrink, 0))
           |> String.trim_trailing()
 
-        if base == "", do: "sendspin" <> suffix, else: base <> suffix
+        cond do
+          base != "" ->
+            base <> suffix
 
-      # Pathologically long node name — can't fit a suffix, keep the
-      # output name so the player is at least still discoverable.
+          # The 8-byte placeholder isn't budgeted like the real name is,
+          # so a 56..62-byte suffix would push it past 63 bytes — drop
+          # the node (keeping any role marker) instead.
+          byte_size(suffix) <= 63 - byte_size("sendspin") ->
+            "sendspin" <> suffix
+
+          true ->
+            sanitize_instance_name(friendly_name, role, shrink)
+        end
+
+      # Pathologically long node name — can't fit both name and node
+      # suffix. `:player` drops back to the bare output name (it was
+      # already unique enough before node suffixes existed). `:source`
+      # instead drops the node but keeps the `" In"` marker: for a
+      # dual-role card, staying distinct from the paired player service
+      # matters more here than the node suffix does.
       _ ->
-        sanitize_instance_name(friendly_name)
+        sanitize_instance_name(friendly_name, role, shrink)
     end
   end
+
+  defp node_suffix(node, :player), do: " (#{node})"
+  defp node_suffix(node, :source), do: " In (#{node})"
 
   # Strip control chars and trim — shared by the plain and suffixed
   # instance-name paths.
