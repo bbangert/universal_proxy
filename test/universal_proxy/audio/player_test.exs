@@ -417,6 +417,29 @@ defmodule UniversalProxy.Audio.PlayerTest do
       assert Player.sendspin_instance_name("  \t ", "node-x") == "sendspin (node-x)"
     end
 
+    test "blank output name with a node too long for the placeholder drops the node" do
+      # suffix = " (" <> 54 bytes <> ")" = 57 bytes, which would push the
+      # 8-byte "sendspin" placeholder to 65 bytes — must fall back to the
+      # bare placeholder instead of exceeding the 63-byte mDNS label limit.
+      node = String.duplicate("n", 54)
+
+      name = Player.sendspin_instance_name("  \t ", node)
+
+      assert byte_size(name) <= 63
+      assert name == "sendspin"
+    end
+
+    test "blank output name with a node right at the placeholder boundary keeps the node" do
+      # suffix = " (" <> 52 bytes <> ")" = 55 bytes; "sendspin" <> suffix
+      # is exactly 63 bytes — the placeholder path still fits here.
+      node = String.duplicate("n", 52)
+
+      name = Player.sendspin_instance_name("  \t ", node)
+
+      assert byte_size(name) == 63
+      assert name == "sendspin (#{node})"
+    end
+
     test "refuses to start when the binary is missing" do
       # `trap_exit` so `start_link/1` reports `{:error, _}` to the
       # caller (this test process) instead of propagating an `:EXIT`
@@ -485,6 +508,18 @@ defmodule UniversalProxy.Audio.PlayerTest do
       assert String.valid?(name)
       assert String.ends_with?(name, " In")
       assert String.starts_with?(name, "BTD 700 (1-1.3.1)")
+    end
+
+    test "blank friendly name with a node too long for the placeholder drops the node, keeps the marker" do
+      # suffix = " In (" <> 50 bytes <> ")" = 56 bytes, which would push
+      # the 8-byte "sendspin" placeholder to 64 bytes — must fall back to
+      # sanitize_instance_name/2 (placeholder + role marker only) instead.
+      node = String.duplicate("n", 50)
+
+      name = Player.sendspin_instance_name("   ", node, :source)
+
+      assert byte_size(name) <= 63
+      assert name == "sendspin In"
     end
   end
 

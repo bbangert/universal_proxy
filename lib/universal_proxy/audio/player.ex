@@ -818,7 +818,19 @@ defmodule UniversalProxy.Audio.Player do
           |> truncate_to_byte_limit(budget)
           |> String.trim_trailing()
 
-        if base == "", do: "sendspin" <> suffix, else: base <> suffix
+        cond do
+          base != "" ->
+            base <> suffix
+
+          # The 8-byte placeholder isn't budgeted like the real name is,
+          # so a 56..62-byte suffix would push it past 63 bytes — drop
+          # the node (keeping any role marker) instead.
+          byte_size(suffix) <= 63 - byte_size("sendspin") ->
+            "sendspin" <> suffix
+
+          true ->
+            sanitize_instance_name(friendly_name, role)
+        end
 
       # Pathologically long node name — can't fit both name and node
       # suffix. `:player` drops back to the bare output name (it was
