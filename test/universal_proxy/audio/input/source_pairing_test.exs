@@ -278,6 +278,11 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
       {1, peer} = offer_pairing!(peer)
       pin = await_pin!()
 
+      # Snapshot the answered-`client/time` count: `submit_pin!` onward is strict,
+      # so this must not move. A second signal to the strict-helper flunk, closing
+      # a small CI-load window where a stray tick could slip in unnoticed.
+      time_exchanges_before = peer.time_exchanges
+
       # Let several keepalive intervals elapse while the attempt is live. Without
       # the fix a `client/time` would land between `client/pair-init` and
       # `client/pair-auth` — the exact interleave that made real MA raise
@@ -290,6 +295,64 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
       assert_receive {:source_event, @key, :paired}, 2_000
       assert {:ok, %{psk: ^psk}} = Store.get_config(ctx.store, @key)
       assert Source.status(source) == :awaiting_rehandshake
+      assert peer.time_exchanges == time_exchanges_before
+    end
+
+    test "no client/time is emitted during the re-handshake window", ctx do
+      # A fast keepalive cadence so a tick would certainly fire inside the
+      # :awaiting_rehandshake window if it were not suppressed. `rehandshake!` is
+      # strict — it flunks on any frame interleaved with the in-band re-handshake
+      # — so a completed re-handshake is proof only handshake frames flowed.
+      {source, port} = start_source!(ctx, time_burst_ms: 10)
+
+      {_hello, peer} = connect_hello!(port)
+      :ok = Source.allow_pairing(source)
+      {1, peer} = offer_pairing!(peer)
+      pin = await_pin!()
+
+      peer = peer |> Peer.submit_pin!(pin) |> Peer.serve_pair_auth!()
+      {psk, peer} = Peer.serve_pair_finalize!(peer)
+      assert_receive {:source_event, @key, :paired}, 2_000
+      assert Source.status(source) == :awaiting_rehandshake
+
+      # Let several keepalive intervals elapse inside the window before driving
+      # the re-handshake, so a stray tick queued when the loop was cancelled would
+      # have emitted `client/time` by now if the window weren't suppressed.
+      Process.sleep(60)
+
+      time_exchanges_before = peer.time_exchanges
+      peer = Peer.rehandshake!(peer, psk)
+      assert peer.time_exchanges == time_exchanges_before
+
+      # The connection is healthy afterward: it replays hello/activate at trust
+      # user.
+      peer = Peer.hello!(peer)
+      {hello, _peer} = Peer.await_json!(peer, "client/hello")
+      assert hello["trust_level"] == "user"
+    end
+
+    test "client/time keepalive resumes after an aborted pairing attempt", ctx do
+      {source, port} = start_source!(ctx, time_burst_ms: 20)
+
+      {_hello, peer} = connect_hello!(port)
+      :ok = Source.allow_pairing(source)
+      {1, peer} = offer_pairing!(peer)
+
+      # Abort the live attempt from the server side: the source returns to
+      # :pairing_required with no attempt open, so the `client/time` loop that was
+      # suppressed during the exchange must start sending again.
+      peer = Peer.abort_pairing!(peer, "user_cancelled")
+
+      assert_receive {:source_event, @key, {:pairing_failed, {:peer_abort, :user_cancelled}}},
+                     2_000
+
+      assert Source.status(source) == :pairing_required
+
+      # If keepalive had not resumed, `serve_time!` would block and flunk; two
+      # answered exchanges prove the loop is sending once more.
+      time_exchanges_before = peer.time_exchanges
+      peer = Peer.serve_time!(peer, 2)
+      assert peer.time_exchanges >= time_exchanges_before + 2
     end
 
     test "a mistyped PIN aborts the attempt and the retry pairs at index 2", ctx do
@@ -430,31 +493,35 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
       assert Source.status(source) == :ready
     end
 
-    test "a challenger during the consent-hold does not evict the held offer", ctx do
+    test "a challenger during the consent-hold replaces the un-consented held offer", ctx do
       {source, port} = start_source!(ctx)
       {_hello, peer} = connect_hello!(port)
 
-      # A pairing offer with no consent window open: held in :pairing_required.
+      # A pairing offer with no consent window open: held in :pairing_required,
+      # still trust `none`. The operator has consented to nothing, so this hold
+      # carries no state worth protecting.
       peer =
         Peer.activate!(peer, roles: [], activities: ["pairing"], pairing: @pairing_params)
 
       assert_receive {:source_event, @key, {:pairing_required, _params}}, 2_000
 
-      # A concurrent MA connection arrives while the offer is held. The held
-      # offer's connection must NOT be evicted.
+      # A concurrent MA connection arrives while the offer is merely held. Unlike a
+      # consented, live pairing exchange, the un-consented hold is REPLACED by the
+      # challenger (un-authenticated self-heal) rather than parked — an unpaired
+      # peer must not be able to squat the single connection slot and block legit
+      # MA from pairing.
       challenger = Peer.connect!(port)
-      refute_receive {:source_event, @key, :disconnected}, 500
-      assert Source.status(source) == :pairing_required
 
-      # Answering a client/time proves the incumbent alive, dropping the parked
-      # challenger; the held offer survives and the operator can still consent.
-      peer = Peer.serve_time!(peer, 1)
-      assert Peer.closed?(challenger, 2_000)
+      assert_receive {:source_event, @key, :disconnected}, 2_000
+      assert_receive {:source_event, @key, :connected}, 2_000
+      assert Peer.closed?(peer, 2_000)
 
-      :ok = Source.allow_pairing(source)
-      assert_receive {:source_event, @key, :pairing_started}, 2_000
-      {index, _peer} = Peer.await_pair_init!(peer, pin_length: @pin_length)
-      assert index == 1
+      # The promoted challenger is a live connection: client/init flows and it can
+      # complete a fresh handshake and be offered pairing itself.
+      challenger = Peer.handshake!(challenger)
+      challenger = Peer.hello!(challenger)
+      {_hello, _challenger} = Peer.await_json!(challenger, "client/hello")
+      assert Source.status(source) == :awaiting_activate
     end
 
     test "a dead pairing incumbent yields to a challenger via the liveness probe", ctx do

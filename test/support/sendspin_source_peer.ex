@@ -178,12 +178,25 @@ defmodule UniversalProxy.SendspinSourcePeer do
 
     peer = send_message!(peer, "noise/handshake", %{"data" => b64(message_1)})
 
-    # Do NOT answer `client/time` during the re-handshake: a real server does
-    # not, and a `server/time` reply sent under the old session would reach the
-    # source after it has swapped to the new keys and fail to decrypt. Stash any
-    # in-flight `client/time` instead (`answer_time?: false`).
-    {{:json, "noise/handshake", payload}, peer} =
-      pump!(peer, fn event -> match?({:json, "noise/handshake", _}, event) end, timeout, false)
+    # STRICT, mirroring the pairing exchange: the in-band re-handshake is the same
+    # strict-sequential exchange, and the source suppresses `client/time` for its
+    # whole `:awaiting_rehandshake` window (a `server/time` reply sent under the
+    # old session would reach the source after it swaps to the new keys and fail
+    # to decrypt). So the ONLY frame here is the source's `noise/handshake`
+    # message 2 — flunk on anything interleaved rather than tolerating it, which
+    # is what makes a future regression that emits `client/time` one boundary
+    # later (during re-handshake instead of pairing) fail loudly.
+    {payload, peer} =
+      case next!(peer, timeout) do
+        {{:json, "noise/handshake", payload}, peer} ->
+          {payload, peer}
+
+        {other, _peer} ->
+          flunk(
+            "expected noise/handshake message 2 but received #{inspect(other)} mid-rehandshake; " <>
+              "a real server never interleaves frames with the in-band re-handshake"
+          )
+      end
 
     {:ok, message_2} = Base.url_decode64(payload["data"], padding: false)
     assert IO.iodata_to_binary(Decibel.handshake_decrypt(noise, message_2)) == "{}"
