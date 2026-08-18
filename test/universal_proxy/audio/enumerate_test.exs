@@ -56,6 +56,8 @@ defmodule UniversalProxy.Audio.EnumerateTest do
       sys_root = Path.join(tmp_dir, "sys")
       File.mkdir_p!(Path.join(proc_root, "asound"))
       File.mkdir_p!(sys_root)
+      File.mkdir_p!(Path.join(sys_root, "pcmC0D0p"))
+      File.mkdir_p!(Path.join(sys_root, "pcmC1D0p"))
       File.write!(Path.join([proc_root, "asound", "cards"]), @sample_cards)
 
       outputs = Enumerate.list_outputs(proc_root: proc_root, sys_root: sys_root)
@@ -83,6 +85,7 @@ defmodule UniversalProxy.Audio.EnumerateTest do
       sys_root = Path.join(tmp_dir, "sys")
       File.mkdir_p!(Path.join(proc_root, "asound"))
       File.mkdir_p!(Path.join([sys_root, "card0", "device"]))
+      File.mkdir_p!(Path.join(sys_root, "pcmC0D0p"))
 
       File.write!(Path.join([proc_root, "asound", "cards"]), """
        0 [USB            ]: USB-Audio - USB Audio Gadget
@@ -121,6 +124,7 @@ defmodule UniversalProxy.Audio.EnumerateTest do
       """)
 
       File.mkdir_p!(Path.join(sys_root, "card0"))
+      File.mkdir_p!(Path.join(sys_root, "pcmC0D0p"))
       File.ln_s!("../usbdev/1-1.3/1-1.3:1.0", Path.join([sys_root, "card0", "device"]))
 
       File.write!(Path.join([proc_root, "asound", "cards"]), """
@@ -154,6 +158,7 @@ defmodule UniversalProxy.Audio.EnumerateTest do
         File.mkdir_p!(iface)
         File.write!(Path.join(iface, "uevent"), "DRIVER=snd-usb-audio\nPRODUCT=0bda/4e27/18\n")
         File.mkdir_p!(Path.join(sys_root, "card#{idx}"))
+        File.mkdir_p!(Path.join(sys_root, "pcmC#{idx}D0p"))
         File.ln_s!("../usbdev/#{port}/#{port}:1.0", Path.join([sys_root, "card#{idx}", "device"]))
       end
 
@@ -181,6 +186,7 @@ defmodule UniversalProxy.Audio.EnumerateTest do
       sys_root = Path.join(tmp_dir, "sys")
       File.mkdir_p!(Path.join(proc_root, "asound"))
       File.mkdir_p!(Path.join([sys_root, "card0", "device"]))
+      File.mkdir_p!(Path.join(sys_root, "pcmC0D0p"))
 
       File.write!(Path.join([proc_root, "asound", "cards"]), """
        0 [SoC            ]: bcm2835 - bcm2835 Headphones
@@ -200,6 +206,87 @@ defmodule UniversalProxy.Audio.EnumerateTest do
                  usb_port: nil
                }
              }
+    end
+
+    @tag :tmp_dir
+    test "excludes a capture-only card entirely", %{tmp_dir: tmp_dir} do
+      proc_root = Path.join(tmp_dir, "proc")
+      sys_root = Path.join(tmp_dir, "sys")
+      File.mkdir_p!(Path.join(proc_root, "asound"))
+      File.mkdir_p!(Path.join([sys_root, "card0", "device"]))
+      # Only a capture node — a USB line-in with no playback substream. It must
+      # not appear as an output (it surfaces via Audio.Input.Enumerate instead).
+      File.mkdir_p!(Path.join(sys_root, "pcmC0D0c"))
+
+      File.write!(Path.join([proc_root, "asound", "cards"]), """
+       0 [Line           ]: USB-Audio - USB Line In
+                            USB Line In
+      """)
+
+      File.write!(Path.join([sys_root, "card0", "device", "uevent"]), """
+      DRIVER=snd-usb-audio
+      PRODUCT=046d/0a03/6e
+      """)
+
+      assert Enumerate.list_outputs(proc_root: proc_root, sys_root: sys_root) == %{}
+    end
+
+    @tag :tmp_dir
+    test "includes a playback-only card", %{tmp_dir: tmp_dir} do
+      proc_root = Path.join(tmp_dir, "proc")
+      sys_root = Path.join(tmp_dir, "sys")
+      File.mkdir_p!(Path.join(proc_root, "asound"))
+      File.mkdir_p!(Path.join([sys_root, "card0", "device"]))
+      File.mkdir_p!(Path.join(sys_root, "pcmC0D0p"))
+
+      File.write!(Path.join([proc_root, "asound", "cards"]), """
+       0 [DAC            ]: USB-Audio - USB DAC
+                            USB DAC
+      """)
+
+      File.write!(Path.join([sys_root, "card0", "device", "uevent"]), """
+      DRIVER=snd-usb-audio
+      PRODUCT=1d6b/0104/100
+      """)
+
+      assert Enumerate.list_outputs(proc_root: proc_root, sys_root: sys_root) == %{
+               {"USB DAC", 0x1D6B, 0x0104} => %{
+                 card_index: 0,
+                 alsa_device: "plughw:0,0",
+                 card_name: "USB DAC",
+                 usb_port: nil
+               }
+             }
+    end
+
+    @tag :tmp_dir
+    test "duplex card (both directions) is an output and uses the lowest playback device",
+         %{tmp_dir: tmp_dir} do
+      proc_root = Path.join(tmp_dir, "proc")
+      sys_root = Path.join(tmp_dir, "sys")
+      File.mkdir_p!(Path.join(proc_root, "asound"))
+      File.mkdir_p!(Path.join([sys_root, "card0", "device"]))
+      # Playback devices 2 and 0, plus a capture device — the lowest playback
+      # device number (0) must win. Mirrors the BTD 700 (pcmC1D0p + pcmC1D0c).
+      File.mkdir_p!(Path.join(sys_root, "pcmC0D2p"))
+      File.mkdir_p!(Path.join(sys_root, "pcmC0D0p"))
+      File.mkdir_p!(Path.join(sys_root, "pcmC0D0c"))
+
+      File.write!(Path.join([proc_root, "asound", "cards"]), """
+       0 [Duplex         ]: USB-Audio - USB Headset
+                            USB Headset
+      """)
+
+      File.write!(Path.join([sys_root, "card0", "device", "uevent"]), """
+      DRIVER=snd-usb-audio
+      PRODUCT=0d8c/0014/100
+      """)
+
+      assert %{{"USB Headset", 0x0D8C, 0x0014} => info} =
+               Enumerate.list_outputs(proc_root: proc_root, sys_root: sys_root)
+
+      assert info.alsa_device == "plughw:0,0"
+      assert info.card_index == 0
     end
   end
 

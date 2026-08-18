@@ -7,6 +7,12 @@ defmodule UniversalProxy.Audio.Enumerate do
   source of truth for "which cards exist right now" — `Audio.Server`
   polls it every 5 s and diffs against its in-memory cache.
 
+  Mirroring `UniversalProxy.Audio.Input.Enumerate` (capture inputs), a card
+  is only an output if it exposes at least one PLAYBACK substream — presence
+  of a `/sys/class/sound/pcmC<idx>D<n>p` node (trailing `p`; capture nodes
+  end in `c`). A capture-only line-in is excluded here (it surfaces as an
+  input instead); a duplex card appears in both enumerators.
+
   Outputs are keyed by a `{slot_sub, vendor_id, product_id}` tuple,
   identical in spirit to `UniversalProxy.UART.Store`'s key shape. For
   built-in SoC cards (Pi 3 / Pi 4 `bcm2835_*`) the VID/PID slots are
@@ -74,24 +80,7 @@ defmodule UniversalProxy.Audio.Enumerate do
       {:ok, content} ->
         content
         |> parse_cards()
-        |> Enum.into(%{}, fn {index, card_name} ->
-          {vid, pid} = read_vid_pid(sys_root, index)
-          usb_port = read_usb_port(sys_root, index)
-
-          # USB cards key by their physical bus path so two identical adapters
-          # (same name + VID/PID) are distinct outputs rather than colliding on
-          # one key; SoC cards have no port and key by the card name.
-          key = {usb_port || card_name, vid, pid}
-
-          info = %{
-            card_index: index,
-            alsa_device: "plughw:#{index},0",
-            card_name: card_name,
-            usb_port: usb_port
-          }
-
-          {key, info}
-        end)
+        |> Enum.reduce(%{}, &put_playback_card(&1, &2, sys_root))
 
       {:error, :enoent} ->
         %{}
@@ -99,6 +88,70 @@ defmodule UniversalProxy.Audio.Enumerate do
       {:error, reason} ->
         Logger.warning("Audio enumerate could not read #{cards_path}: #{inspect(reason)}")
         %{}
+    end
+  end
+
+  defp put_playback_card({index, card_name}, acc, sys_root) do
+    case lowest_playback_device(sys_root, index) do
+      nil ->
+        acc
+
+      dev ->
+        {vid, pid} = read_vid_pid(sys_root, index)
+        usb_port = read_usb_port(sys_root, index)
+
+        # USB cards key by their physical bus path so two identical adapters
+        # (same name + VID/PID) are distinct outputs rather than colliding on
+        # one key; SoC cards have no port and key by the card name.
+        key = {usb_port || card_name, vid, pid}
+
+        info = %{
+          card_index: index,
+          alsa_device: "plughw:#{index},#{dev}",
+          card_name: card_name,
+          usb_port: usb_port
+        }
+
+        Map.put(acc, key, info)
+    end
+  end
+
+  # -- Playback-substream detection --
+
+  # `pcmC<card>D<dev>p` / `...c` nodes live directly under `sys_root` (siblings
+  # of `cardN`) — trailing `p` = playback, `c` = capture. A capture-only card
+  # has no `p` node and is excluded (it surfaces via `Audio.Input.Enumerate`).
+  # We pick the LOWEST playback device number so `plughw:<idx>,<dev>` names the
+  # playback-capable subdevice on a duplex card.
+  @playback_node_re ~r/^pcmC(\d+)D(\d+)p$/
+
+  defp lowest_playback_device(sys_root, card_index) do
+    case File.ls(sys_root) do
+      {:ok, entries} ->
+        entries
+        |> Enum.flat_map(&playback_device_number(&1, card_index))
+        |> case do
+          [] -> nil
+          devs -> Enum.min(devs)
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp playback_device_number(name, card_index) do
+    case Regex.run(@playback_node_re, name) do
+      [_, card_str, dev_str] ->
+        with {^card_index, ""} <- Integer.parse(card_str),
+             {dev, ""} <- Integer.parse(dev_str) do
+          [dev]
+        else
+          _ -> []
+        end
+
+      _ ->
+        []
     end
   end
 

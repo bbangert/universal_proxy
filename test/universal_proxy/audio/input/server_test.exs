@@ -508,6 +508,23 @@ defmodule UniversalProxy.Audio.Input.ServerTest do
       assert err =~ "mcf_mismatch"
     end
 
+    test "a held pairing offer surfaces as :pairing, and a declined offer falls back to :waiting",
+         %{source: source} do
+      :ok = SourceStub.emit(source, :connected)
+      assert_receive {:input_state, @usb_key, %{connection: :connected}}
+
+      # The offer is held for operator consent: it renders as `:pairing` with no
+      # PIN, which is exactly what the LiveView keys the "Allow pairing" button on.
+      :ok = SourceStub.emit(source, {:pairing_required, %{method: :dynamic_pin, pin_length: 6}})
+      assert_receive {:input_state, @usb_key, %{status: :pairing, pin: nil}}
+
+      # The consent-wait timeout elapsed with no gesture: back to connected-idle.
+      :ok = SourceStub.emit(source, :pairing_declined)
+
+      assert_receive {:input_state, @usb_key,
+                      %{status: :waiting, connection: :connected, pin: nil}}
+    end
+
     test "disconnect resets the connection half but keeps the advertisement", %{
       source: source,
       server: server

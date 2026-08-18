@@ -747,6 +747,13 @@ defmodule UniversalProxy.Audio.Input.Server do
     update_input_state(state, key, %{status: :pairing, pin: nil, last_error: describe(reason)})
   end
 
+  # A held pairing offer expired without operator consent: the source declined
+  # it and is back connected-and-idle, so clear the pairing affordance and fall
+  # back to `:waiting` (the connection is still up).
+  defp handle_source_event(state, key, :pairing_declined) do
+    update_input_state(state, key, %{status: :waiting, pin: nil})
+  end
+
   defp handle_source_event(state, key, :streaming) do
     update_input_state(state, key, %{status: :streaming, pin: nil})
   end
