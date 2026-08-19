@@ -89,6 +89,11 @@ defmodule UniversalProxy.Bluetooth do
   @radios_topic "bluetooth:radios"
   @stats_topic "bluetooth:stats"
 
+  # Static-payload beacons (iBeacon/tags) change no AD bytes, so this cache
+  # heartbeat is their only RSSI refresh; 1.5 s is presence-grade and still
+  # forwards far less than an ESP32 proxy's per-advert relay.
+  @rssi_heartbeat_ms 1_500
+
   @doc """
   Whether this build targets BT-capable hardware (compile-time constant).
 
@@ -162,7 +167,8 @@ defmodule UniversalProxy.Bluetooth do
     {Bluez,
      client: [
        on_advertisement: &UniversalProxy.ESPHome.BluetoothScanner.on_advertisement/1,
-       pubsub: UniversalProxy.PubSub
+       pubsub: UniversalProxy.PubSub,
+       rssi_heartbeat_ms: @rssi_heartbeat_ms
      ],
      gatt: [
        on_gatt_event: &UniversalProxy.ESPHome.BluetoothProxy.gatt_event/2,
