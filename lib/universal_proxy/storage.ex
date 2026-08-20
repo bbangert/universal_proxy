@@ -217,17 +217,25 @@ defmodule UniversalProxy.Storage do
   end
 
   @doc """
-  Stop the share and unmount the currently-mounted drive, keeping it
-  unmounted until it is physically removed (or formatted). There is only
-  ever one mounted drive, so this takes no drive key — it matches
-  `Storage.Server.eject/1`'s real signature (no drive-key parameter).
+  Stop the share and unmount the drive `drive_key` identifies, keeping it
+  unmounted until it is physically removed (or formatted).
+
+  Callers name the **drive**, exactly as in `format_drive/2`: only one
+  drive is ever mounted, and `Storage.Server` accepts only that drive's
+  key, so an eject crafted against a second drive (or against a stale
+  view of which drive is first) is refused with
+  `{:error, :unknown_drive}` rather than ejecting whatever happens to be
+  mounted. `nil` is the key of a drive with no derivable bus path.
 
   Returns `{:error, :unavailable}` while `Storage.Server` is down or
-  wedged, and `{:error, :not_mounted}` when nothing is mounted.
+  wedged, `{:error, :not_mounted}` when that drive has no mount, and
+  `{:error, :busy}` when the filesystem will not unmount — in which case
+  the drive is still mounted and must not be unplugged.
   """
-  @spec eject() :: :ok | {:error, term()}
-  def eject do
-    Server.eject()
+  @spec eject(drive_key() | nil) :: :ok | {:error, term()}
+  def eject(drive_key)
+      when is_nil(drive_key) or (is_tuple(drive_key) and tuple_size(drive_key) == 3) do
+    Server.eject(drive_key)
   catch
     :exit, _ -> {:error, :unavailable}
   end

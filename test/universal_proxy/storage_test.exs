@@ -121,8 +121,18 @@ defmodule UniversalProxy.StorageTest do
       assert Storage.create_folder("/", "backups") == {:error, :unavailable}
     end
 
-    test "eject/0 degrades to {:error, :unavailable}" do
-      assert Storage.eject() == {:error, :unavailable}
+    test "eject/1 degrades to {:error, :unavailable}" do
+      assert Storage.eject({"1-1.3", "0bda", "0316"}) == {:error, :unavailable}
+      # `nil` is the key of a drive with no derivable bus path.
+      assert Storage.eject(nil) == {:error, :unavailable}
+    end
+
+    test "eject/1 takes a drive key, never a device path" do
+      # Same contract as `format_drive/2`: the destructive actions name a
+      # drive, and the subsystem decides what that means.
+      assert_raise FunctionClauseError, fn ->
+        apply(Storage, :eject, ["/dev/sda1"])
+      end
     end
 
     test "format_drive/2 degrades to {:error, :unavailable} (server not running, not wedged)" do

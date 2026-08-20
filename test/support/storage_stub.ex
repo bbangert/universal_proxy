@@ -14,7 +14,9 @@ defmodule UniversalProxy.StorageStub do
   `{:storage_state, …}` on the real topic, exactly as the subsystem does.
 
   Every mutation sends `{:storage_call, name, args}` to the owner pid and
-  replies with `Map.get(replies, name, default)`. Configure per test:
+  replies with `Map.get(replies, name, default)`. A reply of
+  `{:block, value}` instead sends `{:storage_blocked, name, caller_pid}`
+  and waits for `:release` before answering `value`. Configure per test:
 
       StorageStub.install(self(), folders: %{"/" => ["backups"]})
 
@@ -95,7 +97,9 @@ defmodule UniversalProxy.StorageStub do
 
   def set_share_folder(key, path), do: reply(:set_share_folder, [key, path], :ok)
 
-  def eject, do: reply(:eject, [], :ok)
+  # Takes the drive **key**, like `format_drive/2`: only the mounted
+  # drive's key is accepted by the real façade.
+  def eject(drive_key), do: reply(:eject, [drive_key], :ok)
 
   # Takes the drive **key** (`nil` for a drive with no derivable bus path),
   # never a device path: `Storage.Server` resolves the device itself.
@@ -122,7 +126,23 @@ defmodule UniversalProxy.StorageStub do
   defp reply(name, args, default) do
     config = config()
     send(config.owner, {:storage_call, name, args})
-    Map.get(config.replies, name, default)
+
+    case Map.get(config.replies, name, default) do
+      # `{:block, value}` keeps the caller (a supervised task, for the
+      # format) inside the façade call until the test releases it, so a
+      # test can observe the LiveView while a long action is in flight.
+      {:block, value} ->
+        send(config.owner, {:storage_blocked, name, self()})
+
+        receive do
+          :release -> value
+        after
+          5_000 -> value
+        end
+
+      value ->
+        value
+    end
   end
 
   defp config, do: Application.fetch_env!(:universal_proxy, :storage_stub)

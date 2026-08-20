@@ -249,7 +249,38 @@ defmodule UniversalProxy.Storage.SettingsTest do
       stat = File.stat!(path)
       assert (stat.mode &&& 0o777) == 0o600
     end
+
+    # The credentials record holds the Samba password in the clear, so a
+    # store that could not be locked down must not serve at all — no
+    # process to call `credentials/1` on, and the table it opened closed
+    # behind it.
+    test "a chmod that fails stops init and closes the table", %{tmp_dir: tmp_dir} do
+      path = Path.join(tmp_dir, "unchmodable_#{System.unique_integer([:positive])}.dets")
+      table = :"storage_settings_chmod_#{System.unique_integer([:positive])}"
+
+      log =
+        capture_log(fn ->
+          assert {:error, {:chmod_failed, :eperm}} =
+                   start_supervised(
+                     {Settings,
+                      name: nil,
+                      table: table,
+                      dets_path: path,
+                      chmod_fun: fn _path, _mode -> {:error, :eperm} end},
+                     id: :unchmodable
+                   )
+                   |> unwrap_init_error()
+        end)
+
+      assert log =~ "could not be restricted to 0600"
+      assert :dets.info(table) == :undefined
+    end
   end
+
+  # start_supervised/2 wraps an init failure as
+  # `{:error, {reason, child_spec}}`; only the reason matters here.
+  defp unwrap_init_error({:error, {reason, _spec}}), do: {:error, reason}
+  defp unwrap_init_error(other), do: other
 
   describe "secret hygiene" do
     test "credentials/1 does not log the generated password", %{server: server} do

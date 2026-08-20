@@ -363,6 +363,7 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
   # they must never run against the test host's own disks.
   describe "USB storage drive" do
     @drive_key {"1-1.3", "0781", "55af"}
+    @second_key {"1-1.4", "0781", "55af"}
     @password "test-only-password"
 
     setup do
@@ -631,6 +632,63 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
       refute html =~ "safe to unplug"
     end
 
+    # Disabling the Eject button in the markup is not a check: `drive_arm`
+    # takes any action, so a crafted confirm can arrive on a socket whose
+    # drawer is showing a second drive. Ejecting the FIRST drive there
+    # would be an eject the user never asked for.
+    test "a crafted eject on a second drive's drawer ejects nothing", %{conn: conn} do
+      second = drive(name: "sdb", dev_path: "/dev/sdb", slot_sub: "1-1.4", key: @second_key)
+
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state(drives: [drive(), second]))
+      open_drawer(view, "/dev/sdb")
+
+      render_click(view, "drive_arm", %{"action" => "eject"})
+      html = render_click(view, "drive_eject", %{})
+
+      refute_receive {:storage_call, :eject, _}
+      refute html =~ "safe to unplug"
+    end
+
+    # `mkfs` blocks Storage.Server for its whole run, so a concurrent
+    # eject would queue behind it server-side; the drawer refuses it up
+    # front rather than leaving the user with a queued surprise.
+    test "a crafted eject while a format is in flight does nothing", %{conn: conn} do
+      StorageStub.put_replies(%{format_drive: {:block, :ok}})
+
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state())
+      open_drawer(view)
+
+      view |> element("button[phx-value-action='format']") |> render_click()
+      html = view |> element("button[phx-click='drive_format']") |> render_click()
+      assert html =~ "Formatting…"
+      assert_receive {:storage_blocked, :format_drive, task}
+
+      render_click(view, "drive_arm", %{"action" => "eject"})
+      html = render_click(view, "drive_eject", %{})
+
+      refute_receive {:storage_call, :eject, _}
+      refute html =~ "safe to unplug"
+
+      send(task, :release)
+    end
+
+    test "a busy filesystem is reported, not called safe to unplug", %{conn: conn} do
+      StorageStub.put_replies(%{eject: {:error, :busy}})
+
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state(share: :running))
+      open_drawer(view)
+
+      view |> element("button[phx-value-action='eject']") |> render_click()
+      html = view |> element("button[phx-click='drive_eject']") |> render_click()
+
+      assert_receive {:storage_call, :eject, [@drive_key]}
+      assert html =~ "Drive is busy — stop Home Assistant backups first."
+      refute html =~ "safe to unplug"
+    end
+
     test "an unarmed password regeneration does nothing", %{conn: conn} do
       {:ok, view, _html} = live(conn, "/")
       push_storage(storage_state(share: :running))
@@ -653,7 +711,7 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
       view |> element("button[phx-value-action='eject']") |> render_click()
       html = view |> element("button[phx-click='drive_eject']") |> render_click()
 
-      assert_receive {:storage_call, :eject, []}
+      assert_receive {:storage_call, :eject, [@drive_key]}
       assert html =~ "safe to unplug"
     end
 
@@ -683,7 +741,9 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
       refute_receive {:storage_call, :eject, _}
 
       html = view |> element("button[phx-click='drive_eject']") |> render_click()
-      assert_receive {:storage_call, :eject, []}
+      # The drive KEY goes over the façade, never a device path: the
+      # subsystem accepts only the mounted drive's key.
+      assert_receive {:storage_call, :eject, [@drive_key]}
       assert html =~ "safe to unplug"
 
       # The subsystem's follow-up state keeps the drive attached but unmounted.

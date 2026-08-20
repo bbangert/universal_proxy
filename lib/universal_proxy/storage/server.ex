@@ -58,7 +58,26 @@ defmodule UniversalProxy.Storage.Server do
 
   `stale?: true` means a busy filesystem survived both a plain and a lazy
   `umount` — the kernel will finish the detach on its own, but until then
-  the mount point cannot be trusted.
+  the mount point cannot be trusted. Only the removal path can produce
+  it: see the umount semantics below.
+
+  ## Two umount semantics
+
+  A lazy `umount` (`umount -l`) detaches the name but leaves the kernel
+  holding the filesystem until the last user drops it, so it is **not**
+  a flush and **not** a safe-to-unplug or safe-to-mkfs signal. The two
+  callers therefore get different unmounts:
+
+    * `eject/2` and `format/3` use `do_unmount/1`, a plain `umount` with
+      no fallback. A busy filesystem is refused (`{:error, :busy}` /
+      `{:error, {:umount_failed, _}}`) with the mount left exactly as it
+      was — telling the user to unplug, or handing `mkfs` a device the
+      kernel still has open, is what the refusal prevents.
+    * `reconcile_removal/1` uses `force_unmount/1`, which retries lazily
+      and marks the mount stale if even that fails. The drive is already
+      physically gone: there is nothing left to flush and nothing for the
+      user to unplug, so detaching the name is the best available
+      outcome.
 
   ## Untrusted paths
 
@@ -316,12 +335,29 @@ defmodule UniversalProxy.Storage.Server do
   end
 
   @doc """
-  Stop the share and unmount, and keep the drive unmounted until it is
-  physically removed (or formatted). `umount(2)` flushes, so a successful
-  eject is the safe-to-unplug signal.
+  Stop the share and unmount the drive `drive_key` identifies, and keep
+  it unmounted until it is physically removed (or formatted).
+  `umount(2)` flushes, so a successful eject is the safe-to-unplug
+  signal — which is why this never falls back to a lazy detach:
+  `{:error, :busy}` when the filesystem will not come down, with the
+  drive still mounted and the share restored by the convergence that
+  follows.
+
+  Only the first attached drive is ever mounted, so only its key is
+  accepted: `{:error, :unknown_drive}` otherwise (`nil` matches a first
+  drive with no derivable bus path, which is exactly the drive that has
+  no key). `{:error, :not_mounted}` when that drive has no mount.
+
+  A format in flight needs no extra guard: `mkfs.ext4` runs inside
+  `handle_call/3`, so this call sits in the mailbox until the format (and
+  the convergence that remounts after it) is done. Serialization is the
+  guarantee — there is no window in which both act on the same device.
   """
-  @spec eject(GenServer.server()) :: :ok | {:error, term()}
-  def eject(server \\ __MODULE__), do: GenServer.call(server, :eject)
+  @spec eject(GenServer.server(), drive_key() | nil) :: :ok | {:error, term()}
+  def eject(server \\ __MODULE__, drive_key)
+      when is_nil(drive_key) or (is_tuple(drive_key) and tuple_size(drive_key) == 3) do
+    GenServer.call(server, {:eject, drive_key})
+  end
 
   @doc """
   Make a fresh ext4 filesystem on the drive `drive_key` identifies,
@@ -336,7 +372,9 @@ defmodule UniversalProxy.Storage.Server do
   derivable bus path, which is exactly the drive that has no key).
 
   Refuses (with the unmount's error) if the drive cannot be unmounted, so
-  a busy filesystem is never handed to `mkfs`.
+  a busy filesystem is never handed to `mkfs`. The unmount is a plain
+  one: a lazy detach would leave the kernel holding the very filesystem
+  `mkfs` is about to overwrite.
   """
   @spec format(GenServer.server(), drive_key() | nil, String.t()) :: :ok | {:error, term()}
   def format(server \\ __MODULE__, drive_key, label)
@@ -463,16 +501,16 @@ defmodule UniversalProxy.Storage.Server do
     {:reply, do_create_folder(state, rel_path, name), state}
   end
 
-  def handle_call(:eject, _from, %{mounted: nil} = state) do
-    {:reply, {:error, :not_mounted}, state}
-  end
+  def handle_call({:eject, key}, _from, state) do
+    case first_drive(state, key) do
+      {:ok, _drive} ->
+        do_eject(state)
 
-  def handle_call(:eject, _from, state) do
-    ref = state.mounted_ref
-    {state, result} = state |> stop_share() |> do_unmount()
-    state = %{state | ejected: put_ref(state.ejected, ref)}
+      {:error, :unknown_drive} = error ->
+        Logger.warning("Storage: refusing to eject #{inspect(key)}: not the attached drive's key")
 
-    {:reply, result, state, {:continue, :converge}}
+        {:reply, error, state}
+    end
   end
 
   def handle_call({:format, key, label}, _from, state) do
@@ -624,7 +662,7 @@ defmodule UniversalProxy.Storage.Server do
 
       # Share first: smbd holds the mount point open, so unmounting under
       # a live daemon is what produces a busy filesystem.
-      {state, _result} = state |> stop_share() |> do_unmount()
+      {state, _result} = state |> stop_share() |> force_unmount()
       state
     end
   end
@@ -701,6 +739,30 @@ defmodule UniversalProxy.Storage.Server do
     end
   end
 
+  defp do_eject(%{mounted: nil} = state), do: {:reply, {:error, :not_mounted}, state}
+
+  defp do_eject(state) do
+    ref = state.mounted_ref
+
+    case state |> stop_share() |> do_unmount() do
+      {state, :ok} ->
+        {:reply, :ok, %{state | ejected: put_ref(state.ejected, ref)}, {:continue, :converge}}
+
+      {state, _error} ->
+        Logger.warning(
+          "Storage: eject refused, #{mount_point(state)} is busy; the drive stays mounted"
+        )
+
+        # No eject marker: the filesystem is still mounted, so the
+        # convergence that follows must keep it mounted and restart the
+        # share this stopped on the way in.
+        {:reply, {:error, :busy}, state, {:continue, :converge}}
+    end
+  end
+
+  # A plain `umount` and nothing else — the only outcome that means the
+  # filesystem is flushed and released. State is untouched on failure: the
+  # drive is still mounted, and it is the caller's job to say so.
   defp do_unmount(%{mounted: nil} = state), do: {state, {:error, :not_mounted}}
 
   defp do_unmount(state) do
@@ -709,10 +771,25 @@ defmodule UniversalProxy.Storage.Server do
         {unmounted(state), :ok}
 
       error ->
-        Logger.warning("Storage: umount failed (#{inspect(error)}); retrying lazily")
+        Logger.warning("Storage: umount failed (#{inspect(error)})")
+        {state, error}
+    end
+  end
+
+  # Removal cleanup only (see the moduledoc): the drive is gone, so a lazy
+  # detach is the right answer for a filesystem that is still busy, and a
+  # mount that survives even that is marked stale for the next pass.
+  defp force_unmount(state) do
+    case do_unmount(state) do
+      {state, :ok} ->
+        {state, :ok}
+
+      {state, _error} ->
+        Logger.warning("Storage: the drive is gone; retrying lazily")
 
         case umount(state, lazy: true) do
           :ok ->
+            Logger.info("Storage: the lazy umount detached the removed drive's mount")
             {unmounted(state), :ok}
 
           lazy_error ->
@@ -752,8 +829,16 @@ defmodule UniversalProxy.Storage.Server do
   # Only the first attached drive is ever mounted, so only its key is
   # accepted.
   defp format_target(state, key) do
+    with {:ok, drive} <- first_drive(state, key) do
+      {:ok, format_device_path(state, drive)}
+    end
+  end
+
+  # The one key check both destructive actions share: only the first
+  # attached drive is ever mounted, so only its key may name a target.
+  defp first_drive(state, key) do
     case state.drives do
-      [%{key: ^key} = drive | _rest] -> {:ok, format_device_path(state, drive)}
+      [%{key: ^key} = drive | _rest] -> {:ok, drive}
       _other -> {:error, :unknown_drive}
     end
   end

@@ -408,9 +408,12 @@ defmodule UniversalProxyWeb.OverviewLive do
     if armed?(socket, :eject) do
       socket = assign(socket, :drive_armed, nil)
 
-      case selected_drive(socket) do
-        %{dev_path: device} ->
-          case storage().eject() do
+      case ejectable_drive(socket) do
+        {:ok, %{dev_path: device} = drive} ->
+          # The drive **key**, as with the format: the façade accepts only
+          # the mounted drive's key, so a confirm aimed at another drive
+          # cannot eject this one.
+          case storage().eject(Map.get(drive, :key)) do
             :ok ->
               {:noreply,
                socket
@@ -421,7 +424,7 @@ defmodule UniversalProxyWeb.OverviewLive do
               {:noreply, flash_result(socket, error, nil)}
           end
 
-        _drive ->
+        :error ->
           {:noreply, socket}
       end
     else
@@ -1092,6 +1095,25 @@ defmodule UniversalProxyWeb.OverviewLive do
   defp selected_drive(socket),
     do: find_drive(socket.assigns.storage, socket.assigns.selected_drive)
 
+  # The drawer only offers Eject on the mounted first drive, but disabled
+  # markup is not a check: the confirm event can arrive without ever
+  # having rendered a button. These are assign-level checks for UX
+  # honesty; the security boundary is `Storage.Server`, which accepts only
+  # the first drive's key and serializes against a running format.
+  defp ejectable_drive(socket) do
+    storage = socket.assigns.storage
+    drive = selected_drive(socket)
+
+    with %{dev_path: device} <- drive,
+         %{dev_path: ^device} <- List.first(Map.get(storage, :drives, [])),
+         false <- socket.assigns.drive_formatting == device,
+         %{} <- mount_for(storage, drive) do
+      {:ok, drive}
+    else
+      _other -> :error
+    end
+  end
+
   defp find_drive(_storage, nil), do: nil
 
   defp find_drive(storage, device) do
@@ -1238,6 +1260,9 @@ defmodule UniversalProxyWeb.OverviewLive do
   defp storage_error_copy(:not_persisted), do: "The drive's credentials couldn't be saved."
   defp storage_error_copy(:unknown_drive), do: "That drive is no longer attached."
   defp storage_error_copy(:not_mounted), do: "No drive is mounted."
+
+  defp storage_error_copy(:busy), do: "Drive is busy — stop Home Assistant backups first."
+
   defp storage_error_copy(:invalid_path), do: "That folder isn't on the drive."
   defp storage_error_copy(:enoent), do: "That folder no longer exists on the drive."
   defp storage_error_copy(:timeout), do: "Still working — this can take a few minutes."

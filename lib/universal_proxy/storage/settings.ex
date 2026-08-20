@@ -53,8 +53,16 @@ defmodule UniversalProxy.Storage.Settings do
 
   The DETS file lives on the writable data partition on Nerves
   (`/data/storage_settings.dets`) and in `_build/` on the host for
-  development. Tests can override via the `:dets_path`, `:table`, `:name`
-  and `:persist_fun` (a `(table, record -> :ok | {:error, term()})` write
+  development. It is restricted to mode 0600 at open, and a `chmod` that
+  fails stops `init/1` with `{:chmod_failed, reason}` rather than serving
+  a plaintext password out of a file other users can read — the store is
+  supervised at the top level, so that failure is loud. Every filesystem
+  this runs on supports it (ext4 on target, the host's own disk in
+  development); it is a fail-closed guard, not an expected path.
+
+  Tests can override via the `:dets_path`, `:table`, `:name`,
+  `:persist_fun` (a `(table, record -> :ok | {:error, term()})` write
+  seam) and `:chmod_fun` (a `(path, mode -> :ok | {:error, term()})`
   seam) options to `start_link/1`.
   """
 
@@ -172,15 +180,31 @@ defmodule UniversalProxy.Storage.Settings do
   def init(opts) do
     table_name = Keyword.get(opts, :table, @default_table)
     path = Keyword.get(opts, :dets_path) || dets_path()
+    chmod_fun = Keyword.get(opts, :chmod_fun, &File.chmod/2)
     File.mkdir_p!(Path.dirname(path))
 
     case :dets.open_file(table_name, file: to_charlist(path), type: :set) do
       {:ok, table} ->
-        # Constrain perms: the global credentials record's password lives
-        # here, unencrypted.
-        _ = File.chmod(path, 0o600)
-        Logger.info("Storage settings store opened at #{path}")
-        {:ok, %{table: table, persist_fun: Keyword.get(opts, :persist_fun, &default_persist/2)}}
+        # The global credentials record holds the Samba password in the
+        # clear, so a file that cannot be locked down to 0600 is not a
+        # store this process will serve from: it stops instead, closing
+        # the table it opened.
+        case chmod_fun.(path, 0o600) do
+          :ok ->
+            Logger.info("Storage settings store opened at #{path}")
+
+            {:ok,
+             %{table: table, persist_fun: Keyword.get(opts, :persist_fun, &default_persist/2)}}
+
+          {:error, reason} ->
+            Logger.error(
+              "Storage settings store could not be restricted to 0600 (#{path}): " <>
+                "#{inspect(reason)}; refusing to serve a world-readable password store"
+            )
+
+            :dets.close(table)
+            {:stop, {:chmod_failed, reason}}
+        end
 
       {:error, reason} ->
         Logger.error("Storage settings store failed to open #{path}: #{inspect(reason)}")

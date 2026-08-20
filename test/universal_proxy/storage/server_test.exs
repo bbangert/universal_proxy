@@ -113,6 +113,24 @@ defmodule UniversalProxy.Storage.ServerTest do
 
     def format_ext4(device, label, opts) do
       Recorder.record({:format, device, label, Keyword.get(opts, :confirm)})
+
+      # Optional gate: with `:format_gate` set to a pid, `mkfs` blocks
+      # inside the server's handle_call until that pid releases it, which
+      # is how a test observes what a concurrent call does meanwhile.
+      case Recorder.get(:format_gate, nil) do
+        pid when is_pid(pid) ->
+          send(pid, {:format_started, self()})
+
+          receive do
+            :release_format -> :ok
+          after
+            5_000 -> :ok
+          end
+
+        _no_gate ->
+          :ok
+      end
+
       Recorder.take(:format_results, :ok)
     end
 
@@ -536,6 +554,13 @@ defmodule UniversalProxy.Storage.ServerTest do
 
       assert log =~ "refusing to format"
       refute Enum.any?(Recorder.event_names(), &(&1 == :format))
+
+      # Exactly one plain umount, and no lazy retry: a lazy detach leaves
+      # the kernel holding the filesystem mkfs would overwrite, so it must
+      # never sneak in on this path (the second queued busy result is
+      # deliberately left unconsumed).
+      assert [{:umount, false}] = Enum.filter(Recorder.events(), &match?({:umount, _}, &1))
+      assert Server.get_state(server).mount.stale? == false
     end
 
     test "the mounted partition is formatted, never the whole disk under it", ctx do
@@ -557,7 +582,7 @@ defmodule UniversalProxy.Storage.ServerTest do
       server = start_server(ctx)
       present!()
       :ok = Server.check_now(server)
-      assert :ok = Server.eject(server)
+      assert :ok = Server.eject(server, @drive_key)
       assert Server.get_state(server).mount == nil
 
       assert :ok = Server.format(server, @drive_key, "usb_backup")
@@ -728,13 +753,13 @@ defmodule UniversalProxy.Storage.ServerTest do
     end
   end
 
-  describe "eject/1" do
+  describe "eject/2" do
     test "unmounts and suppresses remounting until the drive is replugged", ctx do
       server = start_server(ctx)
       present!()
       :ok = Server.check_now(server)
 
-      assert :ok = Server.eject(server)
+      assert :ok = Server.eject(server, @drive_key)
       assert Server.get_state(server).mount == nil
 
       :ok = Server.check_now(server)
@@ -749,10 +774,95 @@ defmodule UniversalProxy.Storage.ServerTest do
       assert Enum.count(Recorder.events(), &match?({:mount, _, _}, &1)) == 2
     end
 
-    test "ejecting nothing is an error, not a crash", ctx do
+    test "ejecting a drive that has no mount is an error, not a crash", ctx do
       server = start_server(ctx)
-      assert Server.eject(server) == {:error, :not_mounted}
+      # Attached, but with a filesystem nothing recognises, so unmounted.
+      Recorder.put(:drives, [drive()])
+      :ok = Server.check_now(server)
+
+      assert Server.eject(server, @drive_key) == {:error, :not_mounted}
       assert Process.alive?(server)
+    end
+
+    test "a key that is not the attached drive's is refused, and nothing is unmounted", ctx do
+      server = start_server(ctx)
+      present!()
+      enable_share!(ctx)
+      :ok = Server.check_now(server)
+
+      log =
+        capture_log(fn ->
+          assert Server.eject(server, {"2-1.4", "1234", "5678"}) == {:error, :unknown_drive}
+          assert Server.eject(server, nil) == {:error, :unknown_drive}
+        end)
+
+      assert log =~ "refusing to eject"
+      refute Enum.any?(Recorder.event_names(), &(&1 == :umount))
+
+      state = Server.get_state(server)
+      assert state.mount.device == "/dev/sda1"
+      assert state.share == :running
+    end
+
+    # A lazy umount is not a flush and not a detach the user can act on,
+    # so "safe to unplug" must never be said on the back of one.
+    test "a busy filesystem refuses the eject instead of detaching lazily", ctx do
+      server = start_server(ctx)
+      present!()
+      enable_share!(ctx)
+      :ok = Server.check_now(server)
+      assert Server.get_state(server).share == :running
+
+      busy = {:error, {:command_failed, "/bin/umount /run/usb-backup", 32, "target is busy"}}
+      Recorder.put(:umount_results, [busy, busy])
+
+      log = capture_log(fn -> assert Server.eject(server, @drive_key) == {:error, :busy} end)
+
+      assert log =~ "eject refused"
+      # One plain umount, no lazy retry.
+      assert [{:umount, false}] = Enum.filter(Recorder.events(), &match?({:umount, _}, &1))
+
+      state = Server.get_state(server)
+      # Still mounted, not stale, and the share the eject stopped on the
+      # way in is back: a refused eject leaves nothing half-done.
+      assert state.mount.device == "/dev/sda1"
+      assert state.mount.stale? == false
+      assert state.share == :running
+
+      # And no eject suppression: the next pass keeps the drive mounted
+      # rather than treating it as ejected.
+      :ok = Server.check_now(server)
+      assert Server.get_state(server).mount.device == "/dev/sda1"
+    end
+
+    # There is no format-in-flight flag: `mkfs` runs inside handle_call, so
+    # a concurrent eject waits in the mailbox. This pins that guarantee.
+    test "an eject that arrives during a format waits for it", ctx do
+      server = start_server(ctx)
+      present!()
+      :ok = Server.check_now(server)
+
+      Recorder.put(:format_gate, self())
+      format = Task.async(fn -> Server.format(server, @drive_key, "usb_backup") end)
+      assert_receive {:format_started, _server_pid}, 1_000
+
+      eject = Task.async(fn -> Server.eject(server, @drive_key) end)
+      # The server is inside mkfs, so the eject cannot have been served.
+      assert Task.yield(eject, 100) == nil
+
+      # The server is blocked in a selective receive inside the stub, so
+      # the release jumps the queued eject call.
+      send(server, :release_format)
+      assert Task.await(format, 2_000) == :ok
+      assert Task.await(eject, 2_000) == :ok
+
+      # Serialized end to end: the format's umount, the mkfs, the remount
+      # from the convergence that follows it, and only then the eject's
+      # umount.
+      assert [:umount, :format, :mount, :umount] =
+               Recorder.event_names()
+               |> Enum.filter(&(&1 in [:umount, :format, :mount]))
+               |> Enum.drop_while(&(&1 != :umount))
     end
   end
 
