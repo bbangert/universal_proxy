@@ -25,6 +25,17 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
   with `missing_state: true` rather than a bogus `0`, so HA shows them as
   unavailable.
 
+  ## USB storage entities
+
+  `usb_storage_free`/`usb_storage_used`/`usb_storage_share` are
+  advertised unconditionally on every target, unlike the Bluetooth
+  entities: advertisements freeze per-connection at accept time, so a
+  drive-conditional set would only pick up a plugged-in drive on the
+  next reconnect (an espex bounce), not live. Instead the two sensors
+  report `missing_state: true` while `UniversalProxy.Storage.state/0`
+  reports no `capacity` (no drive mounted); the binary sensor always has
+  a real value (`false` when off/no drive).
+
   ## Testability
 
   Every data source is an injectable 0-arity fun (mirroring the
@@ -40,7 +51,7 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
 
   alias Espex.Proto
 
-  alias UniversalProxy.{Audio, Bluetooth, FirmwareUpdate, System}
+  alias UniversalProxy.{Audio, Bluetooth, FirmwareUpdate, Storage, System}
   alias UniversalProxy.Bluetooth.{RadioMonitor, Stats}
   alias UniversalProxy.ESPHome.Clients
   alias UniversalProxy.FirmwareUpdate.ConfigStore
@@ -124,6 +135,21 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
       name: "Active Audio Outputs",
       decimals: 0
     },
+    %{
+      object_id: "usb_storage_free",
+      type: :sensor,
+      name: "USB Storage Free",
+      device_class: "data_size",
+      unit: "GB",
+      decimals: 1
+    },
+    %{
+      object_id: "usb_storage_used",
+      type: :sensor,
+      name: "USB Storage Used",
+      unit: "%",
+      decimals: 0
+    },
     # text sensors
     %{object_id: "firmware_version", type: :text_sensor, name: "Firmware Version"},
     %{object_id: "board_target", type: :text_sensor, name: "Board / Target"},
@@ -142,6 +168,12 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
       object_id: "audio_streaming",
       type: :binary_sensor,
       name: "Audio Streaming",
+      device_class: "running"
+    },
+    %{
+      object_id: "usb_storage_share",
+      type: :binary_sensor,
+      name: "USB Storage Share",
       device_class: "running"
     },
     # config buttons
@@ -568,6 +600,8 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
     wifi = safe(sources.wifi, nil)
     firmware = safe(sources.firmware, %{})
     audio = safe(sources.audio, [])
+    storage = safe(sources.storage, %{drives: [], mount: nil, share: :off, capacity: nil})
+    capacity = Map.get(storage, :capacity)
 
     base = %{
       "cpu_temperature" => Map.get(metrics, :cpu_temp_c),
@@ -580,6 +614,9 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
       "api_clients" => safe(sources.clients_count, nil),
       "audio_outputs_active" => count_connected(audio),
       "audio_streaming" => any_streaming?(audio),
+      "usb_storage_free" => storage_free_gb(capacity),
+      "usb_storage_used" => capacity && Map.get(capacity, :used_pct),
+      "usb_storage_share" => Map.get(storage, :share) == :running,
       "firmware_version" => Map.get(firmware, :version),
       "board_target" => Map.get(firmware, :target),
       "network_type" => network_type_label(safe(sources.network_type, :disconnected)),
@@ -731,6 +768,12 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
   defp to_float(v) when is_float(v), do: v
   defp to_float(_), do: 0.0
 
+  # Decimal GB (÷ 1_000_000_000), matching the "GB"/1-decimal unit in the
+  # `usb_storage_free` spec — `nil` capacity (no drive mounted) stays `nil`
+  # so the sensor reports `missing_state`, not a bogus `0.0`.
+  defp storage_free_gb(nil), do: nil
+  defp storage_free_gb(capacity), do: Map.get(capacity, :free_bytes) / 1_000_000_000
+
   defp count_connected(rows), do: Enum.count(rows, &(Map.get(&1, :connection) == :connected))
   defp any_streaming?(rows), do: Enum.any?(rows, &(Map.get(&1, :stream) != nil))
   defp any_powered?(adapters), do: Enum.any?(adapters, &(Map.get(&1, :powered) == true))
@@ -781,6 +824,7 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
       ip: &device_ip/0,
       clients_count: &client_count/0,
       audio: &Audio.Server.list_outputs/0,
+      storage: &Storage.state/0,
       bt_stats: &Stats.current/0,
       adapters: &bt_adapters/0,
       # updater_state/0, not state/0: the entity needs to tell "Updater is

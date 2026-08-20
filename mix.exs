@@ -155,6 +155,9 @@ defmodule UniversalProxy.MixProject do
       # no rebus dependency of its own anymore.
       {:bluez, "~> 0.1"},
 
+      # Already transitive via bluez/vintage_net; direct dep since Storage.Smbd uses MuonTrap.Daemon directly.
+      {:muontrap, "~> 1.8"},
+
       # Improv-over-BLE Wi-Fi provisioning, extracted from this app into
       # bbangert/improv (same lineage as bluez above) and published as
       # hex improv 0.1.0 after HW validation on the interim git pin.
@@ -188,7 +191,7 @@ defmodule UniversalProxy.MixProject do
   # required (host must be linux/x86_64). rpi/rpi2 have no onboard BT but
   # support USB BT dongles; x86_64 omits the Pi-only BT firmware package. One
   # pinned tag for all of them — bump @up_systems_tag to cut a new release.
-  @up_systems_tag "v0.1.6"
+  @up_systems_tag "v0.1.7"
   @up_systems_targets [:rpi, :rpi0, :rpi0_2, :rpi2, :rpi3, :rpi4, :rpi5, :x86_64]
 
   defp up_nerves_systems do

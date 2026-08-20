@@ -34,3 +34,12 @@ config :universal_proxy, :audio_enumerate_module, UniversalProxy.Audio.NullEnume
 # duration of the suite. Focused input tests supply their own
 # `enumerate_module:` opt.
 config :universal_proxy, :audio_input_enumerate_module, UniversalProxy.Audio.NullEnumerate
+
+# Same hazard for storage: the application tree starts a singleton
+# `Storage.Server` whose `Storage.Probe` reads the real
+# `/sys/class/block`. A developer host (or CI runner) with a USB drive
+# attached would have the suite enumerate the machine's own disk — and,
+# for a filesystem it recognises, `fsck` and `mount` it. Point the sysfs
+# root at a path that cannot exist; focused `Probe` tests pass an explicit
+# `sys_root:` against a fixture tree instead.
+config :universal_proxy, :storage_sys_root, "/tmp/universal_proxy_test_no_block_devices"

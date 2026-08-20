@@ -11,6 +11,7 @@ defmodule UniversalProxyWeb.OverviewLive do
   import UniversalProxyWeb.Components.UI
   import UniversalProxyWeb.Components.Icons
   import UniversalProxyWeb.Components.Audio
+  import UniversalProxyWeb.Components.Storage
 
   alias UniversalProxy.Audio
   alias UniversalProxy.Bluetooth
@@ -18,6 +19,7 @@ defmodule UniversalProxyWeb.OverviewLive do
   alias UniversalProxy.BTD700
   alias UniversalProxy.FMA120
   alias UniversalProxy.Hardware
+  alias UniversalProxy.Storage
   alias UniversalProxy.System, as: Sys
   alias UniversalProxy.UART
   alias UniversalProxy.UART.History
@@ -25,6 +27,10 @@ defmodule UniversalProxyWeb.OverviewLive do
   alias UniversalProxyWeb.MockData
 
   @refresh_interval 10_000
+
+  # Shown when the drive behind an open drawer was swapped for another one
+  # (see `reset_actions_on_drive_change/1`).
+  @drive_changed_flash "The drive changed — actions reset."
 
   @impl true
   def mount(_params, _session, socket) do
@@ -55,6 +61,9 @@ defmodule UniversalProxyWeb.OverviewLive do
         # Paired-but-disconnected BT speakers show in the audio summary as
         # Disconnected (their durable surface); refresh on connection events.
         Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "bluetooth:audio")
+        # USB backup drives: attach/detach, mount, share and capacity all
+        # arrive as one full state map on this topic.
+        Phoenix.PubSub.subscribe(UniversalProxy.PubSub, storage().topic())
         :timer.send_interval(@refresh_interval, self(), :refresh)
         {History.packets_per_minute(), reconcile_throughputs(%{}, ports)}
       else
@@ -78,6 +87,13 @@ defmodule UniversalProxyWeb.OverviewLive do
      |> assign(:audio_inputs, build_audio_index(Audio.Input.list_inputs()))
      |> assign(:bt_radios, Bluetooth.list_radios())
      |> assign(:bt_headphones, AudioManager.list_headphones())
+     |> assign(:storage, storage().state())
+     |> assign(:storage_supported?, storage().supported?())
+     |> assign(:drive_ejected, nil)
+     |> assign(:drive_formatting, nil)
+     |> assign(:drive_format_timeout, nil)
+     |> assign(:drive_format_task, nil)
+     |> reset_drive_drawer()
      |> set_ports(ports)}
   end
 
@@ -252,6 +268,235 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   def handle_event("btd700_factory_reset", %{"key" => b64}, socket) do
     with_btd700(socket, b64, &BTD700.factory_reset/1)
+  end
+
+  # ── USB storage drive drawer ──────────────────────────────────────────
+  # Drives are selected by device path (`/dev/sda`): it is unique, always
+  # present, and — unlike the settings key — never nil, so a drive with no
+  # derivable bus path can still be inspected and formatted. The path is
+  # a *slot*, not a medium, though: the drive KEY is snapshotted alongside
+  # it so a swap behind an open drawer is detectable (see
+  # `reset_actions_on_drive_change/1`).
+
+  def handle_event("select_drive", %{"device" => device}, socket) when is_binary(device) do
+    {:noreply,
+     socket
+     |> reset_drive_drawer()
+     |> assign(:selected_drive, device)
+     |> snapshot_drive_key()
+     |> load_share_username()}
+  end
+
+  def handle_event("close_drive_drawer", _params, socket) do
+    {:noreply, reset_drive_drawer(socket)}
+  end
+
+  def handle_event("drive_toggle_share", _params, socket) do
+    case selected_drive(socket) do
+      %{key: key} when not is_nil(key) ->
+        enable? = socket.assigns.storage.share != :running
+
+        {:noreply,
+         flash_result(
+           socket,
+           storage().set_share_enabled(key, enable?),
+           if(enable?,
+             do: "Share starting. Add it as a backup target in Home Assistant.",
+             else: "Share stopped."
+           )
+         )}
+
+      _drive ->
+        {:noreply, socket}
+    end
+  end
+
+  # The password reaches the socket (and therefore the DOM) only here, on an
+  # explicit Reveal — and leaves again on Hide, on drawer close, and on a
+  # rotation. There is no assign holding it before the first click.
+  def handle_event("drive_reveal_password", _params, socket) do
+    if socket.assigns.drive_password do
+      {:noreply, assign(socket, :drive_password, nil)}
+    else
+      case storage().share_credentials() do
+        %{password: password} -> {:noreply, assign(socket, :drive_password, password)}
+        _unavailable -> {:noreply, credentials_unavailable(socket)}
+      end
+    end
+  end
+
+  # Copy works while masked: the value goes straight to the clipboard via
+  # `push_event`, never through the rendered document.
+  def handle_event("drive_copy_password", _params, socket) do
+    case storage().share_credentials() do
+      %{password: password} ->
+        {:noreply,
+         socket
+         |> assign(:drive_password_copied, true)
+         |> push_event("copy", %{text: password})}
+
+      _unavailable ->
+        {:noreply, credentials_unavailable(socket)}
+    end
+  end
+
+  def handle_event("drive_arm", %{"action" => "format"}, socket) do
+    if format_in_flight?(socket) do
+      {:noreply, format_busy_noop(socket)}
+    else
+      {:noreply, arm(socket, :format)}
+    end
+  end
+
+  def handle_event("drive_arm", %{"action" => "eject"}, socket) do
+    {:noreply, arm(socket, :eject)}
+  end
+
+  def handle_event("drive_arm", %{"action" => "regen"}, socket) do
+    {:noreply, arm(socket, :regen)}
+  end
+
+  def handle_event("drive_disarm", _params, socket) do
+    {:noreply, assign(socket, :drive_armed, nil)}
+  end
+
+  def handle_event("drive_regenerate_password", _params, socket) do
+    if armed?(socket, :regen) do
+      socket = assign(socket, :drive_armed, nil)
+
+      case storage().rotate_password() do
+        %{username: username} ->
+          {:noreply,
+           socket
+           |> assign(:drive_username, username)
+           |> assign(:drive_credentials?, true)
+           |> assign(:drive_password, nil)
+           |> assign(:drive_password_copied, false)
+           |> put_flash(:info, "Password regenerated. Update the credential in Home Assistant.")}
+
+        {:error, reason} ->
+          {:noreply, flash_result(socket, {:error, reason}, nil)}
+
+        _unavailable ->
+          {:noreply, credentials_unavailable(socket)}
+      end
+    else
+      {:noreply, unarmed_noop(socket)}
+    end
+  end
+
+  # `mkfs.ext4` blocks Storage.Server for its whole run (minutes on a large
+  # stick), so the call runs in a supervised task: blocking the LiveView
+  # would freeze every other tab control, and the new filesystem is
+  # broadcast on "storage:state" regardless. The task only reports the
+  # outcome back so the busy flag can clear (and a failure can flash).
+  #
+  # A second format must never be started while one is in flight. It would
+  # not race — `Storage.Server` serializes the calls — but the *first*
+  # result would clear the busy flag and re-enable Format and Eject while
+  # the second `mkfs` was still writing the device.
+  def handle_event("drive_format", _params, socket) do
+    cond do
+      format_in_flight?(socket) ->
+        {:noreply, format_busy_noop(socket)}
+
+      not armed?(socket, :format) ->
+        {:noreply, unarmed_noop(socket)}
+
+      not drive_key_unchanged?(socket) ->
+        {:noreply, drive_changed_noop(socket)}
+
+      true ->
+        socket = assign(socket, :drive_armed, nil)
+
+        case selected_drive(socket) do
+          %{dev_path: device} = drive ->
+            {:noreply, start_format(socket, drive, device)}
+
+          _drive ->
+            {:noreply, socket}
+        end
+    end
+  end
+
+  def handle_event("drive_eject", _params, socket) do
+    cond do
+      not armed?(socket, :eject) ->
+        {:noreply, unarmed_noop(socket)}
+
+      not drive_key_unchanged?(socket) ->
+        {:noreply, drive_changed_noop(socket)}
+
+      true ->
+        do_eject(assign(socket, :drive_armed, nil))
+    end
+  end
+
+  # ── Folder chooser ────────────────────────────────────────────────────
+  # Paths round-trip through the client, so every one of them is re-checked
+  # by the façade (`Storage.Server` sandboxes them to the mount point);
+  # nothing here treats a path parameter as trusted.
+
+  def handle_event("drive_open_chooser", _params, socket) do
+    {:noreply, open_chooser(socket, socket.assigns.storage.share_folder || "/")}
+  end
+
+  def handle_event("drive_chooser_cd", %{"path" => path}, socket) when is_binary(path) do
+    {:noreply, open_chooser(socket, path)}
+  end
+
+  def handle_event("drive_chooser_close", _params, socket) do
+    {:noreply, assign(socket, :drive_chooser, nil)}
+  end
+
+  def handle_event("drive_chooser_new", _params, socket) do
+    {:noreply, update_chooser(socket, %{creating?: true, name: "", error: nil})}
+  end
+
+  def handle_event("drive_chooser_cancel_new", _params, socket) do
+    {:noreply, update_chooser(socket, %{creating?: false, name: "", error: nil})}
+  end
+
+  def handle_event("drive_chooser_name", %{"name" => name}, socket) when is_binary(name) do
+    {:noreply, update_chooser(socket, %{name: name, error: nil})}
+  end
+
+  def handle_event("drive_chooser_create", %{"name" => name}, socket) when is_binary(name) do
+    chooser = socket.assigns.drive_chooser
+
+    cond do
+      is_nil(chooser) ->
+        {:noreply, socket}
+
+      not valid_folder_name?(name, chooser.dirs) ->
+        {:noreply, update_chooser(socket, %{error: "That folder name can't be used."})}
+
+      true ->
+        case storage().create_folder(chooser.path, String.trim(name)) do
+          {:ok, created} ->
+            # Navigate into the new folder so "Use this folder" picks it.
+            {:noreply, open_chooser(socket, created)}
+
+          {:error, reason} ->
+            {:noreply, update_chooser(socket, %{error: create_folder_error(reason)})}
+        end
+    end
+  end
+
+  def handle_event("drive_chooser_pick", _params, socket) do
+    with %{path: path} <- socket.assigns.drive_chooser,
+         %{key: key} when not is_nil(key) <- selected_drive(socket) do
+      socket = assign(socket, :drive_chooser, nil)
+
+      {:noreply,
+       flash_result(
+         socket,
+         storage().set_share_folder(key, path),
+         "Backups will be stored in #{folder_label(path)}."
+       )}
+    else
+      _ -> {:noreply, assign(socket, :drive_chooser, nil)}
+    end
   end
 
   # Peripheral rows (USB audio / USB Bluetooth) are claimed automatically
@@ -473,6 +718,61 @@ defmodule UniversalProxyWeb.OverviewLive do
     {:noreply, assign(socket, :btd700_states, Map.put(states, key, merged))}
   end
 
+  # Full storage state (drives, mount, share, capacity) on every change.
+  def handle_info({:storage_state, state}, socket) do
+    {:noreply, socket |> assign(:storage, state) |> reconcile_drive_state()}
+  end
+
+  # A call timeout is NOT an outcome: `Storage.Server` blocks its whole
+  # loop inside `mkfs.ext4`, so a timeout means the format is most likely
+  # still running (see `Storage.format_drive/2`, which keeps `:timeout`
+  # distinguishable from `:unavailable` for exactly this reason). Clearing
+  # the busy flag here would re-enable Format and Eject against a device
+  # still being written, so the flag stays and the drive is remembered as
+  # "waiting for the subsystem to come back" — `clear_timed_out_format/1`
+  # is what ends it.
+  def handle_info({:storage_format_result, task, device, {:error, :timeout} = error}, socket) do
+    if current_format_task?(socket, task) do
+      socket = assign(socket, :drive_format_task, nil)
+
+      socket =
+        if socket.assigns.drive_formatting == device,
+          do: assign(socket, :drive_format_timeout, device),
+          else: socket
+
+      {:noreply, flash_result(socket, error, nil)}
+    else
+      {:noreply, socket}
+    end
+  end
+
+  # Outcome of the supervised `format_drive/1` task. The resulting
+  # filesystem and mount arrive separately on "storage:state"; this only
+  # clears the busy flag and surfaces a failure.
+  def handle_info({:storage_format_result, task, device, result}, socket) do
+    if current_format_task?(socket, task) do
+      socket = assign(socket, :drive_format_task, nil)
+
+      socket =
+        if socket.assigns.drive_formatting == device,
+          do: assign(socket, :drive_formatting, nil),
+          else: socket
+
+      case result do
+        :ok ->
+          {:noreply,
+           socket
+           |> assign(:drive_ejected, nil)
+           |> put_flash(:info, "Drive formatted as ext4.")}
+
+        error ->
+          {:noreply, flash_result(socket, error, nil)}
+      end
+    else
+      {:noreply, socket}
+    end
+  end
+
   def handle_info(_msg, socket), do: {:noreply, socket}
 
   # Refresh the port list AND reconcile throughput subscriptions so new
@@ -680,10 +980,13 @@ defmodule UniversalProxyWeb.OverviewLive do
     # bound to @audio_outputs alone (outputs-only).
     audio_devices = merge_audio_devices(assigns.audio_outputs, assigns.audio_inputs)
 
+    # USB backup drives join the peripheral list so they slot-promote and
+    # hub-indent with everything else.
     rows =
       hardware_rows(
         assigns.ports,
-        peripherals(audio_devices, assigns.bt_radios),
+        peripherals(audio_devices, assigns.bt_radios) ++
+          drive_peripherals(assigns.storage, assigns.drive_ejected),
         assigns.usb_hubs
       )
 
@@ -695,6 +998,10 @@ defmodule UniversalProxyWeb.OverviewLive do
       |> assign(:hardware_rows, rows)
       |> assign(:slot_summary, summary)
       |> assign(:bt_disconnected, disconnected_bt(assigns.bt_headphones))
+      |> assign(
+        :selected_drive_ctx,
+        selected_drive_context(assigns.selected_drive, assigns.storage, rows)
+      )
 
     ~H"""
     <div class="max-w-[1120px] mx-auto space-y-4">
@@ -739,6 +1046,24 @@ defmodule UniversalProxyWeb.OverviewLive do
       state={Map.get(@btd700_states, @selected_btd700, %{})}
     />
 
+    <.storage_drawer
+      :if={@selected_drive_ctx}
+      drive={@selected_drive_ctx.drive}
+      slot={@selected_drive_ctx.slot}
+      first?={@selected_drive_ctx.first?}
+      storage={@storage}
+      host={@target.hostname}
+      supported?={@storage_supported?}
+      username={@drive_username}
+      credentials?={@drive_credentials?}
+      password={@drive_password}
+      copied?={@drive_password_copied}
+      armed={@drive_armed}
+      formatting?={@drive_formatting == @selected_drive_ctx.drive.dev_path}
+      ejected?={@drive_ejected == @selected_drive_ctx.drive.dev_path}
+      chooser={@drive_chooser}
+    />
+
     <.modal
       open={@pending_kind_change != nil}
       on_close="cancel_kind_change"
@@ -762,6 +1087,384 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   defp find_port(_ports, nil), do: nil
   defp find_port(ports, id), do: Enum.find(ports, &(&1.id == id))
+
+  # ── USB storage helpers ───────────────────────────────────────────────
+
+  # The `UniversalProxy.Storage` façade, swappable per the
+  # `:audio_enumerate_module` precedent. Tests point this at a stub: the
+  # drawer's real calls (`mkfs.ext4`, `umount`) must never fire against the
+  # test host's own disks.
+  defp storage, do: Application.get_env(:universal_proxy, :storage_facade, Storage)
+
+  # Drawer-local state, all of it discarded on close or drive change — the
+  # revealed password most of all (see the reveal handler).
+  defp reset_drive_drawer(socket) do
+    socket
+    |> assign(:selected_drive, nil)
+    |> assign(:selected_drive_key, nil)
+    |> assign(:drive_username, nil)
+    |> assign(:drive_credentials?, true)
+    |> assign(:drive_password, nil)
+    |> assign(:drive_password_copied, false)
+    |> assign(:drive_armed, nil)
+    |> assign(:drive_chooser, nil)
+  end
+
+  # The two-step confirmation is held **server-side**: `drive_arm` sets it,
+  # and the confirm handlers refuse to act without it. The confirm buttons
+  # only exist in the armed markup, so an unarmed confirm event is a
+  # crafted (or stale) one and must do nothing.
+  defp armed?(socket, action), do: socket.assigns.drive_armed == action
+
+  # Arming re-takes the identity snapshot: whatever the drawer was opened
+  # on, the confirm that follows is about the drive on screen *now*.
+  defp arm(socket, action) do
+    socket |> snapshot_drive_key() |> assign(:drive_armed, action)
+  end
+
+  defp unarmed_noop(socket) do
+    socket
+    |> assign(:drive_armed, nil)
+    |> put_flash(:info, "Confirm that action first.")
+  end
+
+  # The identity of the drive the drawer is open on, as the drive key —
+  # `nil` both for a closed drawer and for a drive with no derivable bus
+  # path (which is why the snapshot is only ever compared, never trusted
+  # as "there is a drive").
+  defp snapshot_drive_key(socket),
+    do: assign(socket, :selected_drive_key, current_drive_key(socket))
+
+  defp current_drive_key(socket) do
+    case selected_drive(socket) do
+      %{} = drive -> Map.get(drive, :key)
+      _no_drive -> nil
+    end
+  end
+
+  # Belt for the confirm handlers. The drawer's own state is already the
+  # first layer (`reset_actions_on_drive_change/1` disarms on the very
+  # broadcast that swapped the drive, and assigns only change on one), and
+  # `Storage.Server` is the boundary: it accepts only the active drive's
+  # key and — now that keys carry the USB serial — answers
+  # `:unknown_drive` for a stale one. This check is the middle layer, so a
+  # confirm can never reach the façade naming a drive the drawer was not
+  # armed against.
+  defp drive_key_unchanged?(socket),
+    do: socket.assigns.selected_drive_key == current_drive_key(socket)
+
+  defp do_eject(socket) do
+    case ejectable_drive(socket) do
+      {:ok, %{dev_path: device} = drive} ->
+        # The drive **key**, as with the format: the façade accepts only
+        # the mounted drive's key, so a confirm aimed at another drive
+        # cannot eject this one.
+        case storage().eject(Map.get(drive, :key)) do
+          :ok ->
+            {:noreply,
+             socket
+             |> assign(:drive_ejected, device)
+             |> put_flash(:info, "Drive ejected — it's safe to unplug now.")}
+
+          error ->
+            {:noreply, flash_result(socket, error, nil)}
+        end
+
+      :error ->
+        {:noreply, socket}
+    end
+  end
+
+  # A format is in flight until the task that owns it reports back. The
+  # busy flag alone is not enough: `clear_formatting_unless_present/2`
+  # drops it when the drive vanishes mid-format, and the task keeps
+  # writing the device regardless — so the live task is checked too.
+  defp format_in_flight?(socket) do
+    not is_nil(socket.assigns.drive_formatting) or
+      format_task_alive?(socket.assigns.drive_format_task)
+  end
+
+  defp format_task_alive?(pid) when is_pid(pid), do: Process.alive?(pid)
+  defp format_task_alive?(_task), do: false
+
+  defp start_format(socket, drive, device) do
+    parent = self()
+    facade = storage()
+    # The drive **key**, not its device path: which device gets the `mkfs`
+    # is the subsystem's decision (a whole-disk format under a mounted
+    # partition would take the partition table with it), so the UI names
+    # the drive and nothing else.
+    key = Map.get(drive, :key)
+
+    task =
+      Task.Supervisor.start_child(UniversalProxy.TaskSupervisor, fn ->
+        # The task's own pid tags the result, so a reply from a task this
+        # socket is no longer tracking is ignored rather than clearing a
+        # newer format's busy flag.
+        send(parent, {:storage_format_result, self(), device, facade.format_drive(key)})
+      end)
+
+    case task do
+      {:ok, pid} ->
+        # A fresh format starts from a clean slate: an earlier timeout
+        # marker would otherwise let the next broadcast clear THIS
+        # format's busy flag.
+        socket
+        |> assign(:drive_formatting, device)
+        |> assign(:drive_format_timeout, nil)
+        |> assign(:drive_format_task, pid)
+
+      error ->
+        Logger.warning("OverviewLive: could not start the format task: #{inspect(error)}")
+        put_flash(socket, :error, "Could not start the format. Try again.")
+    end
+  end
+
+  defp format_busy_noop(socket) do
+    socket
+    |> assign(:drive_armed, nil)
+    |> put_flash(:info, "A format is already running.")
+  end
+
+  # Results are tagged with the task pid that produced them, so a reply
+  # from a superseded (or abandoned) task cannot clear a newer format's
+  # busy flag.
+  defp current_format_task?(socket, pid) do
+    is_pid(pid) and socket.assigns.drive_format_task == pid
+  end
+
+  defp selected_drive(socket),
+    do: find_drive(socket.assigns.storage, socket.assigns.selected_drive)
+
+  # The drawer only offers Eject on the mounted first drive, but disabled
+  # markup is not a check: the confirm event can arrive without ever
+  # having rendered a button. These are assign-level checks for UX
+  # honesty; the security boundary is `Storage.Server`, which accepts only
+  # the active drive's key and serializes against a running format.
+  defp ejectable_drive(socket) do
+    storage = socket.assigns.storage
+    drive = selected_drive(socket)
+
+    with %{dev_path: device} <- drive,
+         %{dev_path: ^device} <- List.first(Map.get(storage, :drives, [])),
+         false <- socket.assigns.drive_formatting == device,
+         %{} <- mount_for(storage, drive) do
+      {:ok, drive}
+    else
+      _other -> :error
+    end
+  end
+
+  defp find_drive(_storage, nil), do: nil
+
+  defp find_drive(storage, device) do
+    storage |> Map.get(:drives, []) |> Enum.find(&(&1.dev_path == device))
+  end
+
+  # Only the username: reading credentials generates the password lazily
+  # server-side, but it never enters the socket until an explicit Reveal.
+  # `nil` covers both "store unreachable" and "generated but not
+  # persistable" (see `Storage.share_credentials/0`); either way the drawer
+  # must say the credentials are unavailable rather than imply the
+  # default account works.
+  defp load_share_username(socket) do
+    case storage().share_credentials() do
+      %{username: username} ->
+        socket |> assign(:drive_username, username) |> assign(:drive_credentials?, true)
+
+      _unavailable ->
+        socket |> assign(:drive_username, nil) |> assign(:drive_credentials?, false)
+    end
+  end
+
+  # Keep the drawer honest across hotplug: a selected drive that has left
+  # closes its drawer, a format busy-flag on a vanished drive clears, and
+  # the ejected marker lives until the drive leaves or mounts again.
+  defp reconcile_drive_state(socket) do
+    devices = MapSet.new(Map.get(socket.assigns.storage, :drives, []), & &1.dev_path)
+
+    socket
+    |> close_drawer_unless_present(devices)
+    |> reset_actions_on_drive_change()
+    |> clear_formatting_unless_present(devices)
+    |> clear_timed_out_format()
+    |> clear_ejected_when_mounted()
+  end
+
+  # The hotplug debounce can coalesce an unplug and the insertion that
+  # follows it into ONE broadcast, so an open drawer never sees an empty
+  # drives list in between: the same device path is simply occupied by a
+  # different medium. An armed confirm resolved against that state would
+  # format or eject a drive the user never named — so a changed identity
+  # disarms everything, drops the folder chooser (its listing belongs to
+  # the old filesystem) and re-snapshots, leaving the drawer showing the
+  # new drive with nothing armed. A drive that left outright has already
+  # had its drawer closed by `close_drawer_unless_present/2`.
+  #
+  # Identity is the drive key, so two drives that key alike are invisible
+  # here: a drive with no derivable bus path (`key: nil`), and a
+  # serial-less stick replaced by another serial-less stick of the same
+  # model in the same port. That is the same blind spot the persisted
+  # settings have, and for the same reason (see `Storage.Server`'s
+  # moduledoc).
+  defp reset_actions_on_drive_change(socket) do
+    if is_nil(socket.assigns.selected_drive) or drive_key_unchanged?(socket) do
+      socket
+    else
+      drive_changed_noop(socket)
+    end
+  end
+
+  defp drive_changed_noop(socket) do
+    socket
+    |> assign(:drive_armed, nil)
+    |> assign(:drive_chooser, nil)
+    |> snapshot_drive_key()
+    |> put_flash(:info, @drive_changed_flash)
+  end
+
+  defp close_drawer_unless_present(socket, devices) do
+    device = socket.assigns.selected_drive
+
+    if is_nil(device) or MapSet.member?(devices, device),
+      do: socket,
+      else: reset_drive_drawer(socket)
+  end
+
+  defp clear_formatting_unless_present(socket, devices) do
+    device = socket.assigns.drive_formatting
+
+    if is_nil(device) or MapSet.member?(devices, device),
+      do: socket,
+      else: socket |> assign(:drive_formatting, nil) |> assign(:drive_format_timeout, nil)
+  end
+
+  # This message is itself the signal that the format concluded: `mkfs`
+  # runs inside `Storage.Server`'s `handle_call`, so the subsystem cannot
+  # publish anything while a format is in flight, and it publishes on
+  # arrival at the state that follows one. Any broadcast therefore proves
+  # the server's loop is free again — which is the only thing the busy
+  # flag was protecting, and the only signal that also arrives when the
+  # format failed (a failed `mkfs` leaves no new mount to wait for). A
+  # broadcast published *before* the format cannot clear it either: the
+  # mailbox is FIFO, so anything that predates the timeout result is
+  # handled before the marker exists.
+  defp clear_timed_out_format(socket) do
+    if socket.assigns.drive_format_timeout do
+      socket |> assign(:drive_formatting, nil) |> assign(:drive_format_timeout, nil)
+    else
+      socket
+    end
+  end
+
+  # `{drives: [drive], mount: nil}` is both "safely ejected" and "attached
+  # but unmountable", so the eject is remembered in an assign and dropped
+  # only on the two events that end it: the drive leaving, or a fresh mount
+  # (a re-plug, or the remount that follows a format).
+  defp clear_ejected_when_mounted(socket) do
+    device = socket.assigns.drive_ejected
+    drive = find_drive(socket.assigns.storage, device)
+
+    cond do
+      is_nil(device) -> socket
+      is_nil(drive) -> assign(socket, :drive_ejected, nil)
+      mount_for(socket.assigns.storage, drive) -> assign(socket, :drive_ejected, nil)
+      true -> socket
+    end
+  end
+
+  # The drive the drawer renders, plus the slot label reconcile promoted it
+  # into and whether it is the one drive the subsystem will mount.
+  defp selected_drive_context(nil, _storage, _rows), do: nil
+
+  defp selected_drive_context(device, storage, rows) do
+    drives = Map.get(storage, :drives, [])
+
+    case Enum.find_index(drives, &(&1.dev_path == device)) do
+      nil ->
+        nil
+
+      index ->
+        %{
+          drive: Enum.at(drives, index),
+          slot: drive_row_slot(rows, device) || "USB storage",
+          first?: index == 0
+        }
+    end
+  end
+
+  defp drive_row_slot(rows, device) do
+    Enum.find_value(rows, fn
+      {:peripheral, %{storage?: true, device: ^device, slot: slot}} -> slot
+      _row -> nil
+    end)
+  end
+
+  defp open_chooser(socket, path) do
+    case storage().list_folders(path) do
+      {:ok, dirs} ->
+        assign(socket, :drive_chooser, %{
+          path: chooser_path(path),
+          dirs: dirs,
+          creating?: false,
+          name: "",
+          error: nil
+        })
+
+      error ->
+        # A stored folder can disappear between saves; fall back to the
+        # drive root rather than leaving the user without a chooser.
+        if chooser_path(path) == "/" do
+          flash_result(assign(socket, :drive_chooser, nil), error, nil)
+        else
+          open_chooser(socket, "/")
+        end
+    end
+  end
+
+  defp chooser_path(path) when path in [nil, "", "/"], do: "/"
+  defp chooser_path(path), do: path
+
+  defp update_chooser(socket, patch) do
+    case socket.assigns.drive_chooser do
+      nil -> socket
+      chooser -> assign(socket, :drive_chooser, Map.merge(chooser, patch))
+    end
+  end
+
+  # Façade results are `:ok` or `{:error, reason}` for every write. A
+  # failure is always a flash and never a crash: the subsystem is optional
+  # and its server can be down or wedged (see Storage's moduledoc).
+  defp flash_result(socket, :ok, nil), do: socket
+  defp flash_result(socket, :ok, message), do: put_flash(socket, :info, message)
+
+  defp flash_result(socket, {:error, reason}, _message),
+    do: put_flash(socket, :error, storage_error_copy(reason))
+
+  defp flash_result(socket, _other, _message), do: unavailable_flash(socket)
+
+  defp unavailable_flash(socket),
+    do: put_flash(socket, :error, storage_error_copy(:unavailable))
+
+  defp credentials_unavailable(socket),
+    do: socket |> assign(:drive_credentials?, false) |> unavailable_flash()
+
+  defp storage_error_copy(:unavailable), do: "Storage subsystem unavailable."
+  defp storage_error_copy(:not_persisted), do: "The drive's credentials couldn't be saved."
+  defp storage_error_copy(:unknown_drive), do: "That drive is no longer attached."
+  defp storage_error_copy(:not_mounted), do: "No drive is mounted."
+
+  defp storage_error_copy(:busy), do: "Drive is busy — stop Home Assistant backups first."
+
+  defp storage_error_copy(:invalid_path), do: "That folder isn't on the drive."
+  defp storage_error_copy(:enoent), do: "That folder no longer exists on the drive."
+  defp storage_error_copy(:timeout), do: "Still working — this can take a few minutes."
+  defp storage_error_copy(_reason), do: "The drive couldn't complete that action."
+
+  defp create_folder_error(:invalid_name), do: "That folder name can't be used."
+  defp create_folder_error(:name_too_long), do: "That folder name is too long."
+  defp create_folder_error(:eexist), do: "A folder with that name already exists."
+  defp create_folder_error(reason), do: storage_error_copy(reason)
 
   # ── FMA120 helpers ────────────────────────────────────────────────────
 
@@ -1223,6 +1926,21 @@ defmodule UniversalProxyWeb.OverviewLive do
   # per-device byte rate.
   attr(:p, :map, required: true)
 
+  # USB storage rows open the drive drawer (select_drive), keyed by device
+  # path rather than a settings key — a drive with no derivable bus path has
+  # no key but must still be inspectable.
+  defp peripheral_row(%{p: %{storage?: true}} = assigns) do
+    ~H"""
+    <tr
+      class="cursor-pointer hover:bg-sunken last:[&_td]:border-b-0"
+      phx-click="select_drive"
+      phx-value-device={@p.device}
+    >
+      <.peripheral_cells p={@p} />
+    </tr>
+    """
+  end
+
   # FMA120 rows open the control drawer (select_fma120); every other
   # peripheral routes to its managing tab (goto_tab). Same six-column body.
   defp peripheral_row(%{p: %{fma120?: true}} = assigns) do
@@ -1294,7 +2012,10 @@ defmodule UniversalProxyWeb.OverviewLive do
       </div>
     </td>
     <td class="px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle">
+      <%!-- A storage row has no managing tab: its claim ("Home Assistant
+           backups" / "Not shared") is state, not a link. --%>
       <.link
+        :if={@p.tab}
         navigate={@p.tab}
         phx-click="ignore"
         onclick="event.stopPropagation()"
@@ -1302,6 +2023,12 @@ defmodule UniversalProxyWeb.OverviewLive do
       >
         {@p.managed_by}
       </.link>
+      <span
+        :if={is_nil(@p.tab)}
+        class={["text-base", if(@p[:managed_accent?], do: "text-accent", else: "text-fg-3")]}
+      >
+        {@p.managed_by}
+      </span>
     </td>
     <td class="px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle">
       <span class="text-fg-4 text-base">—</span>

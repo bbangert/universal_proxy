@@ -45,6 +45,20 @@ defmodule UniversalProxy.Application do
         # `goodbye_for_type("_sendspin._tcp")` is type-wide, so it has to run
         # before any source service is registered.
         UniversalProxy.Audio.Input.Supervisor,
+        # USB backup storage settings (DETS): per-drive share opt-in and the
+        # generated Samba credentials. Top level, outside Storage.Supervisor,
+        # so a crash in that subtree never closes the DETS file — the same
+        # rationale as FMA120.Store below. Immediately before the subtree that
+        # reads it, so a drive attached at boot converges with its real opt-in.
+        UniversalProxy.Storage.Settings,
+        # USB backup storage subsystem (:one_for_all DaemonSupervisor +
+        # Server): detects USB drives, mounts the first data partition at
+        # /run/usb-backup, and runs `smbd` only while a drive's share is
+        # opted in. Ungated for the same reason the audio subsystems are —
+        # `Smbd.available?/1` degrades a target without the binary at
+        # runtime, so there is no target list to maintain. No-op on host
+        # (no external drives enumerate).
+        UniversalProxy.Storage.Supervisor,
         # FlooGoo FMA120 control channel (DETS prefs store + supervised
         # worker subtree). AFTER Audio.Supervisor so its hotplug events
         # (`sendspin:output_added`) flow. No-op when no FMA120 is attached
