@@ -25,6 +25,7 @@ defmodule UniversalProxy.ESPHome.EntityProviderTest do
         ip: fn -> "192.168.1.50" end,
         clients_count: fn -> 2 end,
         audio: fn -> [] end,
+        storage: fn -> %{drives: [], mount: nil, share: :off, capacity: nil} end,
         bt_stats: fn -> %{devices_15min: 7, ads_per_s: 5, connections: %{used: 1, limit: 4}} end,
         adapters: fn -> [%{powered: true}] end,
         fw_update: fn -> {:ok, idle_fw_state()} end,
@@ -61,19 +62,46 @@ defmodule UniversalProxy.ESPHome.EntityProviderTest do
     )
   end
 
+  defp mounted_storage(overrides \\ %{}) do
+    Map.merge(
+      %{
+        drives: [%{key: "usb-1"}],
+        mount: "/run/usb-backup",
+        share: :running,
+        capacity: %{
+          total_bytes: 128_000_000_000,
+          used_bytes: 53_760_000_000,
+          free_bytes: 73_900_000_000,
+          used_pct: 42
+        }
+      },
+      overrides
+    )
+  end
+
   describe "advertisements/2 (BT gating)" do
     test "includes BT entities when supported" do
       ads = EP.advertisements(all_specs(), true)
       object_ids = Enum.map(ads, & &1.object_id)
       assert Enum.all?(@bt_object_ids, &(&1 in object_ids))
-      assert length(ads) == 21
+      assert length(ads) == 24
     end
 
     test "excludes BT entities when unsupported" do
       ads = EP.advertisements(all_specs(), false)
       object_ids = Enum.map(ads, & &1.object_id)
       refute Enum.any?(@bt_object_ids, &(&1 in object_ids))
-      assert length(ads) == 17
+      assert length(ads) == 20
+    end
+
+    test "USB storage entities are advertised regardless of BT support" do
+      for supported? <- [true, false] do
+        object_ids = Enum.map(EP.advertisements(all_specs(), supported?), & &1.object_id)
+
+        assert "usb_storage_free" in object_ids
+        assert "usb_storage_used" in object_ids
+        assert "usb_storage_share" in object_ids
+      end
     end
   end
 
@@ -117,6 +145,37 @@ defmodule UniversalProxy.ESPHome.EntityProviderTest do
       ad = find_ad("audio_streaming")
       assert %Proto.ListEntitiesBinarySensorResponse{} = ad
       assert ad.device_class == "running"
+    end
+
+    test "usb_storage_free is a data_size sensor in GB with 1 decimal" do
+      ad = find_ad("usb_storage_free")
+      assert %Proto.ListEntitiesSensorResponse{} = ad
+      assert ad.device_class == "data_size"
+      assert ad.unit_of_measurement == "GB"
+      assert ad.accuracy_decimals == 1
+    end
+
+    test "usb_storage_used is a percent sensor with 0 decimals" do
+      ad = find_ad("usb_storage_used")
+      assert %Proto.ListEntitiesSensorResponse{} = ad
+      assert ad.unit_of_measurement == "%"
+      assert ad.accuracy_decimals == 0
+    end
+
+    test "usb_storage_share is a running binary sensor" do
+      ad = find_ad("usb_storage_share")
+      assert %Proto.ListEntitiesBinarySensorResponse{} = ad
+      assert ad.device_class == "running"
+    end
+
+    test "usb_storage_* entities don't collide with data_storage_used" do
+      ids = all_specs() |> Enum.map(& &1.object_id)
+
+      assert "data_storage_used" in ids
+      assert "usb_storage_free" in ids
+      assert "usb_storage_used" in ids
+      assert Enum.uniq(ids) == ids
+      assert EP.key_for("data_storage_used") != EP.key_for("usb_storage_used")
     end
   end
 
@@ -182,6 +241,34 @@ defmodule UniversalProxy.ESPHome.EntityProviderTest do
       # other sources still read
       assert v["firmware_version"] == "1.2.3"
     end
+
+    test "USB storage values are nil/false with no drive mounted (default state)" do
+      v = EP.read_values(sample_sources(), false)
+      assert v["usb_storage_free"] == nil
+      assert v["usb_storage_used"] == nil
+      assert v["usb_storage_share"] == false
+    end
+
+    test "USB storage values are read from a mounted drive's capacity" do
+      sources = sample_sources(%{storage: fn -> mounted_storage() end})
+      v = EP.read_values(sources, false)
+      assert v["usb_storage_free"] == 73.9
+      assert v["usb_storage_used"] == 42
+      assert v["usb_storage_share"] == true
+    end
+
+    test "USB storage share is false while off even if a drive is mounted" do
+      sources =
+        sample_sources(%{storage: fn -> mounted_storage(%{share: :off}) end})
+
+      v = EP.read_values(sources, false)
+      assert v["usb_storage_share"] == false
+    end
+
+    test "USB storage entities are present regardless of BT support" do
+      assert Map.has_key?(EP.read_values(sample_sources(), true), "usb_storage_free")
+      assert Map.has_key?(EP.read_values(sample_sources(), false), "usb_storage_free")
+    end
   end
 
   describe "state_responses/3 (missing_state)" do
@@ -207,6 +294,43 @@ defmodule UniversalProxy.ESPHome.EntityProviderTest do
       responses = EP.state_responses(all_specs(), EP.read_values(sample_sources(), false), false)
       refute Enum.any?(responses, &(&1.key == EP.key_for("factory_reset")))
       refute Enum.any?(responses, &(&1.key == EP.key_for("reboot")))
+    end
+
+    test "USB storage sensors are missing_state with no drive mounted" do
+      responses = EP.state_responses(all_specs(), EP.read_values(sample_sources(), false), false)
+
+      free = find_state(responses, "usb_storage_free")
+      assert %Proto.SensorStateResponse{} = free
+      assert free.missing_state == true
+
+      used = find_state(responses, "usb_storage_used")
+      assert %Proto.SensorStateResponse{} = used
+      assert used.missing_state == true
+
+      # The binary sensor always has a real value — false when off/no drive,
+      # never missing.
+      share = find_state(responses, "usb_storage_share")
+      assert %Proto.BinarySensorStateResponse{} = share
+      assert share.missing_state == false
+      assert share.state == false
+    end
+
+    test "USB storage sensors carry real values from a mounted drive" do
+      sources = sample_sources(%{storage: fn -> mounted_storage() end})
+      values = EP.read_values(sources, false)
+      responses = EP.state_responses(all_specs(), values, false)
+
+      free = find_state(responses, "usb_storage_free")
+      assert free.missing_state == false
+      assert free.state == 73.9
+
+      used = find_state(responses, "usb_storage_used")
+      assert used.missing_state == false
+      assert used.state == 42.0
+
+      share = find_state(responses, "usb_storage_share")
+      assert share.missing_state == false
+      assert share.state == true
     end
   end
 
@@ -541,11 +665,55 @@ defmodule UniversalProxy.ESPHome.EntityProviderTest do
 
       # First poll: empty `last` → every stateful (non-button) value pushed.
       GenServer.call(pid, :poll_now)
-      assert drain_pushes() == 15
+      assert drain_pushes() == 18
 
       # Identical second poll: nothing changed → no pushes.
       GenServer.call(pid, :poll_now)
       assert drain_pushes() == 0
+    end
+
+    test "a drive appearing between ticks pushes only the changed USB storage entities" do
+      server = :"ep_test_#{System.unique_integer([:positive])}"
+      registry = Module.concat(server, "Registry")
+      start_supervised!({Registry, keys: :duplicate, name: registry})
+      {:ok, _} = Registry.register(registry, :subscribers, nil)
+
+      {:ok, storage_agent} =
+        start_supervised({Agent, fn -> %{drives: [], mount: nil, share: :off, capacity: nil} end})
+
+      storage = fn -> Agent.get(storage_agent, & &1) end
+
+      name = :"ep_proc_#{System.unique_integer([:positive])}"
+
+      pid =
+        start_supervised!(
+          {EP,
+           name: name,
+           server: server,
+           poll: false,
+           supported?: false,
+           sources: Map.to_list(sample_sources(%{storage: storage}))}
+        )
+
+      GenServer.call(pid, :poll_now)
+      _ = drain_pushes()
+
+      Agent.update(storage_agent, fn _ -> mounted_storage() end)
+      GenServer.call(pid, :poll_now)
+
+      pushed = drain_all_pushes()
+      pushed_keys = Enum.map(pushed, & &1.key)
+
+      assert EP.key_for("usb_storage_free") in pushed_keys
+      assert EP.key_for("usb_storage_used") in pushed_keys
+      assert EP.key_for("usb_storage_share") in pushed_keys
+
+      free = Enum.find(pushed, &(&1.key == EP.key_for("usb_storage_free")))
+      assert free.state == 73.9
+      assert free.missing_state == false
+
+      share = Enum.find(pushed, &(&1.key == EP.key_for("usb_storage_share")))
+      assert share.state == true
     end
 
     test "startup seed populates last WITHOUT pushing (no Espex registry → no crash)" do
@@ -697,6 +865,14 @@ defmodule UniversalProxy.ESPHome.EntityProviderTest do
       {:espex_state_update, _struct} -> drain_pushes(count + 1)
     after
       50 -> count
+    end
+  end
+
+  defp drain_all_pushes(acc \\ []) do
+    receive do
+      {:espex_state_update, struct} -> drain_all_pushes([struct | acc])
+    after
+      50 -> Enum.reverse(acc)
     end
   end
 

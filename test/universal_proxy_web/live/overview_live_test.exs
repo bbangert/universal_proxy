@@ -11,6 +11,7 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
   import Phoenix.ConnTest
   import UniversalProxy.AudioFixtures
 
+  alias UniversalProxy.StorageStub
   alias UniversalProxyWeb.OverviewLive
 
   @endpoint UniversalProxyWeb.Endpoint
@@ -352,6 +353,376 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
       assert html =~ "Duplex DAC"
       assert html =~ "Sound card"
       assert html =~ "In use"
+    end
+  end
+
+  # The drive row, drawer and folder chooser are driven exactly as the
+  # subsystem drives them: a full state map broadcast on "storage:state".
+  # Writes go through a stubbed façade (`StorageStub`) — the real ones shell
+  # out to `mkfs.ext4`/`umount` against the device path they are handed, so
+  # they must never run against the test host's own disks.
+  describe "USB storage drive" do
+    @drive_key {"1-1.3", "0781", "55af"}
+    @password "test-only-password"
+
+    setup do
+      StorageStub.install(self(), folders: %{"/" => ["backups", "media"], "backups" => []})
+      :ok
+    end
+
+    defp drive(opts \\ []) do
+      %{
+        name: Keyword.get(opts, :name, "sda"),
+        dev_path: Keyword.get(opts, :dev_path, "/dev/sda"),
+        size_bytes: 1_000_204_886_016,
+        slot_sub: Keyword.get(opts, :slot_sub, "1-1.3"),
+        vendor_id: 0x0781,
+        product_id: 0x55AF,
+        partitions: [],
+        key: Keyword.get(opts, :key, @drive_key),
+        fs_type: Keyword.get(opts, :fs_type, :exfat)
+      }
+    end
+
+    defp mount(opts \\ []) do
+      %{
+        device: Keyword.get(opts, :device, "/dev/sda"),
+        fs_type: Keyword.get(opts, :fs_type, :exfat),
+        mode: Keyword.get(opts, :mode, :read_write),
+        point: "/run/usb-backup",
+        stale?: Keyword.get(opts, :stale?, false)
+      }
+    end
+
+    defp storage_state(opts \\ []) do
+      %{
+        drives: Keyword.get(opts, :drives, [drive()]),
+        mount: Keyword.get(opts, :mount, mount()),
+        share: Keyword.get(opts, :share, :off),
+        share_folder: Keyword.get(opts, :share_folder, "/"),
+        capacity:
+          Keyword.get(opts, :capacity, %{
+            total_bytes: 1_000_204_886_016,
+            used_bytes: 620_000_000_000,
+            free_bytes: 380_204_886_016,
+            used_pct: 62
+          })
+      }
+    end
+
+    defp push_storage(state) do
+      Phoenix.PubSub.broadcast(@pubsub, "storage:state", {:storage_state, state})
+    end
+
+    defp open_drawer(view, device \\ "/dev/sda") do
+      view |> element("tr[phx-value-device='#{device}']") |> render_click()
+    end
+
+    test "a mounted drive renders as a USB storage row", %{conn: conn} do
+      {:ok, view, html} = live(conn, "/")
+      refute html =~ "USB storage"
+
+      push_storage(storage_state())
+
+      html = render(view)
+      assert html =~ "USB storage"
+      assert html =~ "USB drive"
+      # USB ids + decimal-GB size, and the bus path it enumerated on.
+      assert html =~ "0781:55AF"
+      assert html =~ "1000 GB"
+      assert html =~ "1-1.3"
+      assert html =~ "Mounted"
+      assert html =~ "Not shared"
+    end
+
+    test "a running share reads as Shared, claimed by Home Assistant", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      push_storage(storage_state(share: :running))
+
+      html = render(view)
+      assert html =~ "Shared"
+      assert html =~ "Home Assistant backups"
+    end
+
+    test "an ejected (unmounted) drive reads as Unmounted", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      push_storage(storage_state(mount: nil, capacity: nil))
+
+      assert render(view) =~ "Unmounted"
+    end
+
+    test "clicking the row opens the drive drawer", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state())
+
+      html = open_drawer(view)
+      assert html =~ "Danger zone"
+      assert html =~ "Format as ext4"
+      assert html =~ "Safe eject"
+      assert html =~ "/dev/sda"
+      assert html =~ "mounted read-write"
+      assert html =~ "62%"
+    end
+
+    test "a non-journalled filesystem carries the format-to-ext4 advice", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state())
+
+      html = open_drawer(view)
+      assert html =~ "exFAT"
+      assert html =~ "Not journalled — format to ext4 recommended for backups."
+    end
+
+    test "an ext4 drive gets no journalling warning", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      push_storage(storage_state(drives: [drive(fs_type: :ext4)], mount: mount(fs_type: :ext4)))
+
+      html = open_drawer(view)
+      assert html =~ "ext4"
+      refute html =~ "Not journalled"
+    end
+
+    test "a share that failed to start says so", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state(share: :error))
+
+      html = open_drawer(view)
+      assert html =~ "Share error"
+      assert html =~ "Share failed to start — retrying."
+    end
+
+    test "the share toggle calls the façade with the drive key", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state())
+      open_drawer(view)
+
+      view |> element("button[phx-click='drive_toggle_share']") |> render_click()
+
+      assert_receive {:storage_call, :set_share_enabled, [@drive_key, true]}
+    end
+
+    test "toggling an already-running share turns it off", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state(share: :running))
+      open_drawer(view)
+
+      view |> element("button[phx-click='drive_toggle_share']") |> render_click()
+
+      assert_receive {:storage_call, :set_share_enabled, [@drive_key, false]}
+    end
+
+    test "an unavailable subsystem flashes instead of crashing", %{conn: conn} do
+      StorageStub.put_replies(%{set_share_enabled: {:error, :unavailable}})
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state())
+      open_drawer(view)
+
+      html = view |> element("button[phx-click='drive_toggle_share']") |> render_click()
+      assert html =~ "Storage subsystem unavailable."
+    end
+
+    test "the password is absent from the DOM until Reveal, and gone again after close",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state(share: :running))
+
+      html = open_drawer(view)
+      # Credentials section is rendered, but the secret is not in it.
+      assert html =~ "Username"
+      assert html =~ "Password"
+      refute html =~ @password
+
+      html = view |> element("button[phx-click='drive_reveal_password']") |> render_click()
+      assert html =~ @password
+      assert html =~ "Hide"
+
+      view |> element("button[phx-click='close_drive_drawer']") |> render_click()
+      html = open_drawer(view)
+      refute html =~ @password
+      assert html =~ "Reveal"
+    end
+
+    test "copying the password never renders it", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state(share: :running))
+      open_drawer(view)
+
+      html = view |> element("button[phx-click='drive_copy_password']") |> render_click()
+
+      assert html =~ "Copied"
+      refute html =~ @password
+    end
+
+    test "regenerating the password arms first, then rotates and re-masks", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state(share: :running))
+      open_drawer(view)
+
+      # Reveal first, so the re-mask after rotation is observable.
+      assert view |> element("button[phx-click='drive_reveal_password']") |> render_click() =~
+               @password
+
+      html = view |> element("button[phx-value-action='regen']") |> render_click()
+      assert html =~ "Regenerating invalidates the old credential in Home Assistant immediately."
+      refute_receive {:storage_call, :rotate_password, _}
+
+      html = view |> element("button[phx-click='drive_regenerate_password']") |> render_click()
+      assert_receive {:storage_call, :rotate_password, []}
+      assert html =~ "Password regenerated. Update the credential in Home Assistant."
+      refute html =~ @password
+    end
+
+    test "format needs a second, drive-naming confirmation", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state())
+      open_drawer(view)
+
+      html = view |> element("button[phx-value-action='format']") |> render_click()
+      assert html =~ "Erase everything on USB drive (/dev/sda) and format it as ext4?"
+      refute_receive {:storage_call, :format_drive, _}
+
+      view |> element("button[phx-click='drive_format']") |> render_click()
+      assert_receive {:storage_call, :format_drive, ["/dev/sda", _label]}
+      # The format runs in a supervised task; its result clears the busy flag.
+      assert render(view) =~ "Drive formatted as ext4."
+    end
+
+    test "eject needs a second confirmation, then says it's safe to unplug", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state())
+      open_drawer(view)
+
+      html = view |> element("button[phx-value-action='eject']") |> render_click()
+      assert html =~ "Eject USB drive (/dev/sda)?"
+      refute_receive {:storage_call, :eject, _}
+
+      html = view |> element("button[phx-click='drive_eject']") |> render_click()
+      assert_receive {:storage_call, :eject, []}
+      assert html =~ "safe to unplug"
+
+      # The subsystem's follow-up state keeps the drive attached but unmounted.
+      push_storage(storage_state(mount: nil, capacity: nil))
+      html = render(view)
+      assert html =~ "Re-plug the drive to mount it again."
+      assert html =~ "Unmounted"
+
+      # Re-plug: the drive mounts again and the ejected panel goes away
+      # (the flash from the eject itself is still on screen, so assert on
+      # the panel copy, not the toast).
+      push_storage(storage_state())
+      refute render(view) =~ "Re-plug the drive to mount it again."
+    end
+
+    test "unplugging the open drive closes its drawer", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state())
+      assert open_drawer(view) =~ "Danger zone"
+
+      push_storage(storage_state(drives: [], mount: nil, capacity: nil))
+      refute render(view) =~ "Danger zone"
+    end
+
+    test "a second drive says only the first is used", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      second = drive(name: "sdb", dev_path: "/dev/sdb", slot_sub: "1-1.4", key: nil)
+      push_storage(storage_state(drives: [drive(), second]))
+
+      html = open_drawer(view, "/dev/sdb")
+      assert html =~ "Only the first drive is used."
+      # Its danger-zone actions are inert.
+      assert html =~ "disabled"
+    end
+
+    test "the folder chooser lists the drive's directories and descends", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state(share: :running))
+      open_drawer(view)
+
+      html = view |> element("button[phx-click='drive_open_chooser']") |> render_click()
+      assert_receive {:storage_call, :list_folders, ["/"]}
+      assert html =~ "Choose backup folder"
+      assert html =~ "backups"
+      assert html =~ "media"
+
+      html = view |> element("button[phx-value-path='backups']") |> render_click()
+      assert_receive {:storage_call, :list_folders, ["backups"]}
+      assert html =~ "No subfolders"
+      assert html =~ "Share will map to"
+    end
+
+    test "picking a folder maps the share at that path", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state(share: :running))
+      open_drawer(view)
+
+      view |> element("button[phx-click='drive_open_chooser']") |> render_click()
+      view |> element("button[phx-value-path='backups']") |> render_click()
+      html = view |> element("button[phx-click='drive_chooser_pick']") |> render_click()
+
+      assert_receive {:storage_call, :set_share_folder, [@drive_key, "backups"]}
+      assert html =~ "Backups will be stored in backups."
+    end
+
+    test "creating a folder navigates into it", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state(share: :running))
+      open_drawer(view)
+
+      view |> element("button[phx-click='drive_open_chooser']") |> render_click()
+      view |> element("button[phx-click='drive_chooser_new']") |> render_click()
+
+      view
+      |> form("form[phx-submit='drive_chooser_create']", %{"name" => "backups"})
+      |> render_submit()
+
+      # A duplicate sibling is refused before the façade is called at all.
+      assert_receive {:storage_call, :list_folders, ["/"]}
+      refute_receive {:storage_call, :create_folder, _}
+
+      html =
+        view
+        |> form("form[phx-submit='drive_chooser_create']", %{"name" => "ha"})
+        |> render_submit()
+
+      assert_receive {:storage_call, :create_folder, ["/", "ha"]}
+      # Navigated into the new folder, so "Use this folder" picks it.
+      assert html =~ "Share will map to"
+      assert html =~ "ha"
+    end
+
+    test "a rejected folder name surfaces the façade's reason inline", %{conn: conn} do
+      StorageStub.put_replies(%{create_folder: {:error, :eexist}})
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state(share: :running))
+      open_drawer(view)
+
+      view |> element("button[phx-click='drive_open_chooser']") |> render_click()
+      view |> element("button[phx-click='drive_chooser_new']") |> render_click()
+
+      html =
+        view
+        |> form("form[phx-submit='drive_chooser_create']", %{"name" => "ha"})
+        |> render_submit()
+
+      assert_receive {:storage_call, :create_folder, ["/", "ha"]}
+      assert html =~ "A folder with that name already exists."
+    end
+
+    test "a firmware without smbd hides the share controls", %{conn: conn} do
+      StorageStub.install(self(), supported?: false)
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state())
+
+      html = open_drawer(view)
+      # HEEx escapes the apostrophe, so match the unambiguous tail.
+      assert html =~ "available on this firmware."
+      refute html =~ "Share as HA backup target"
+      # The drive is still inspectable and formattable.
+      assert html =~ "Danger zone"
     end
   end
 

@@ -11,6 +11,7 @@ defmodule UniversalProxyWeb.OverviewLive do
   import UniversalProxyWeb.Components.UI
   import UniversalProxyWeb.Components.Icons
   import UniversalProxyWeb.Components.Audio
+  import UniversalProxyWeb.Components.Storage
 
   alias UniversalProxy.Audio
   alias UniversalProxy.Bluetooth
@@ -18,6 +19,7 @@ defmodule UniversalProxyWeb.OverviewLive do
   alias UniversalProxy.BTD700
   alias UniversalProxy.FMA120
   alias UniversalProxy.Hardware
+  alias UniversalProxy.Storage
   alias UniversalProxy.System, as: Sys
   alias UniversalProxy.UART
   alias UniversalProxy.UART.History
@@ -55,6 +57,9 @@ defmodule UniversalProxyWeb.OverviewLive do
         # Paired-but-disconnected BT speakers show in the audio summary as
         # Disconnected (their durable surface); refresh on connection events.
         Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "bluetooth:audio")
+        # USB backup drives: attach/detach, mount, share and capacity all
+        # arrive as one full state map on this topic.
+        Phoenix.PubSub.subscribe(UniversalProxy.PubSub, storage().topic())
         :timer.send_interval(@refresh_interval, self(), :refresh)
         {History.packets_per_minute(), reconcile_throughputs(%{}, ports)}
       else
@@ -78,6 +83,11 @@ defmodule UniversalProxyWeb.OverviewLive do
      |> assign(:audio_inputs, build_audio_index(Audio.Input.list_inputs()))
      |> assign(:bt_radios, Bluetooth.list_radios())
      |> assign(:bt_headphones, AudioManager.list_headphones())
+     |> assign(:storage, storage().state())
+     |> assign(:storage_supported?, storage().supported?())
+     |> assign(:drive_ejected, nil)
+     |> assign(:drive_formatting, nil)
+     |> reset_drive_drawer()
      |> set_ports(ports)}
   end
 
@@ -252,6 +262,217 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   def handle_event("btd700_factory_reset", %{"key" => b64}, socket) do
     with_btd700(socket, b64, &BTD700.factory_reset/1)
+  end
+
+  # ── USB storage drive drawer ──────────────────────────────────────────
+  # Drives are selected by device path (`/dev/sda`): it is unique, always
+  # present, and — unlike the settings key — never nil, so a drive with no
+  # derivable bus path can still be inspected and formatted.
+
+  def handle_event("select_drive", %{"device" => device}, socket) when is_binary(device) do
+    {:noreply,
+     socket
+     |> reset_drive_drawer()
+     |> assign(:selected_drive, device)
+     |> load_share_username()}
+  end
+
+  def handle_event("close_drive_drawer", _params, socket) do
+    {:noreply, reset_drive_drawer(socket)}
+  end
+
+  def handle_event("drive_toggle_share", _params, socket) do
+    case selected_drive(socket) do
+      %{key: key} when not is_nil(key) ->
+        enable? = socket.assigns.storage.share != :running
+
+        {:noreply,
+         flash_result(
+           socket,
+           storage().set_share_enabled(key, enable?),
+           if(enable?,
+             do: "Share starting. Add it as a backup target in Home Assistant.",
+             else: "Share stopped."
+           )
+         )}
+
+      _drive ->
+        {:noreply, socket}
+    end
+  end
+
+  # The password reaches the socket (and therefore the DOM) only here, on an
+  # explicit Reveal — and leaves again on Hide, on drawer close, and on a
+  # rotation. There is no assign holding it before the first click.
+  def handle_event("drive_reveal_password", _params, socket) do
+    if socket.assigns.drive_password do
+      {:noreply, assign(socket, :drive_password, nil)}
+    else
+      case storage().share_credentials() do
+        %{password: password} -> {:noreply, assign(socket, :drive_password, password)}
+        _unavailable -> {:noreply, unavailable_flash(socket)}
+      end
+    end
+  end
+
+  # Copy works while masked: the value goes straight to the clipboard via
+  # `push_event`, never through the rendered document.
+  def handle_event("drive_copy_password", _params, socket) do
+    case storage().share_credentials() do
+      %{password: password} ->
+        {:noreply,
+         socket
+         |> assign(:drive_password_copied, true)
+         |> push_event("copy", %{text: password})}
+
+      _unavailable ->
+        {:noreply, unavailable_flash(socket)}
+    end
+  end
+
+  def handle_event("drive_arm", %{"action" => "format"}, socket) do
+    {:noreply, assign(socket, :drive_armed, :format)}
+  end
+
+  def handle_event("drive_arm", %{"action" => "eject"}, socket) do
+    {:noreply, assign(socket, :drive_armed, :eject)}
+  end
+
+  def handle_event("drive_arm", %{"action" => "regen"}, socket) do
+    {:noreply, assign(socket, :drive_armed, :regen)}
+  end
+
+  def handle_event("drive_disarm", _params, socket) do
+    {:noreply, assign(socket, :drive_armed, nil)}
+  end
+
+  def handle_event("drive_regenerate_password", _params, socket) do
+    socket = assign(socket, :drive_armed, nil)
+
+    case storage().rotate_password() do
+      %{username: username} ->
+        {:noreply,
+         socket
+         |> assign(:drive_username, username)
+         |> assign(:drive_password, nil)
+         |> assign(:drive_password_copied, false)
+         |> put_flash(:info, "Password regenerated. Update the credential in Home Assistant.")}
+
+      _unavailable ->
+        {:noreply, unavailable_flash(socket)}
+    end
+  end
+
+  # `mkfs.ext4` blocks Storage.Server for its whole run (minutes on a large
+  # stick), so the call runs in a supervised task: blocking the LiveView
+  # would freeze every other tab control, and the new filesystem is
+  # broadcast on "storage:state" regardless. The task only reports the
+  # outcome back so the busy flag can clear (and a failure can flash).
+  def handle_event("drive_format", _params, socket) do
+    socket = assign(socket, :drive_armed, nil)
+
+    case selected_drive(socket) do
+      %{dev_path: device} ->
+        parent = self()
+        facade = storage()
+
+        Task.Supervisor.start_child(UniversalProxy.TaskSupervisor, fn ->
+          send(parent, {:storage_format_result, device, facade.format_drive(device)})
+        end)
+
+        {:noreply, assign(socket, :drive_formatting, device)}
+
+      _drive ->
+        {:noreply, socket}
+    end
+  end
+
+  def handle_event("drive_eject", _params, socket) do
+    socket = assign(socket, :drive_armed, nil)
+
+    case selected_drive(socket) do
+      %{dev_path: device} ->
+        case storage().eject() do
+          :ok ->
+            {:noreply,
+             socket
+             |> assign(:drive_ejected, device)
+             |> put_flash(:info, "Drive ejected — it's safe to unplug now.")}
+
+          error ->
+            {:noreply, flash_result(socket, error, nil)}
+        end
+
+      _drive ->
+        {:noreply, socket}
+    end
+  end
+
+  # ── Folder chooser ────────────────────────────────────────────────────
+  # Paths round-trip through the client, so every one of them is re-checked
+  # by the façade (`Storage.Server` sandboxes them to the mount point);
+  # nothing here treats a path parameter as trusted.
+
+  def handle_event("drive_open_chooser", _params, socket) do
+    {:noreply, open_chooser(socket, socket.assigns.storage.share_folder || "/")}
+  end
+
+  def handle_event("drive_chooser_cd", %{"path" => path}, socket) when is_binary(path) do
+    {:noreply, open_chooser(socket, path)}
+  end
+
+  def handle_event("drive_chooser_close", _params, socket) do
+    {:noreply, assign(socket, :drive_chooser, nil)}
+  end
+
+  def handle_event("drive_chooser_new", _params, socket) do
+    {:noreply, update_chooser(socket, %{creating?: true, name: "", error: nil})}
+  end
+
+  def handle_event("drive_chooser_cancel_new", _params, socket) do
+    {:noreply, update_chooser(socket, %{creating?: false, name: "", error: nil})}
+  end
+
+  def handle_event("drive_chooser_name", %{"name" => name}, socket) when is_binary(name) do
+    {:noreply, update_chooser(socket, %{name: name, error: nil})}
+  end
+
+  def handle_event("drive_chooser_create", %{"name" => name}, socket) when is_binary(name) do
+    chooser = socket.assigns.drive_chooser
+
+    cond do
+      is_nil(chooser) ->
+        {:noreply, socket}
+
+      not valid_folder_name?(name, chooser.dirs) ->
+        {:noreply, update_chooser(socket, %{error: "That folder name can't be used."})}
+
+      true ->
+        case storage().create_folder(chooser.path, String.trim(name)) do
+          {:ok, created} ->
+            # Navigate into the new folder so "Use this folder" picks it.
+            {:noreply, open_chooser(socket, created)}
+
+          {:error, reason} ->
+            {:noreply, update_chooser(socket, %{error: create_folder_error(reason)})}
+        end
+    end
+  end
+
+  def handle_event("drive_chooser_pick", _params, socket) do
+    with %{path: path} <- socket.assigns.drive_chooser,
+         %{key: key} when not is_nil(key) <- selected_drive(socket) do
+      socket = assign(socket, :drive_chooser, nil)
+
+      {:noreply,
+       flash_result(
+         socket,
+         storage().set_share_folder(key, path),
+         "Backups will be stored in #{folder_label(path)}."
+       )}
+    else
+      _ -> {:noreply, assign(socket, :drive_chooser, nil)}
+    end
   end
 
   # Peripheral rows (USB audio / USB Bluetooth) are claimed automatically
@@ -473,6 +694,32 @@ defmodule UniversalProxyWeb.OverviewLive do
     {:noreply, assign(socket, :btd700_states, Map.put(states, key, merged))}
   end
 
+  # Full storage state (drives, mount, share, capacity) on every change.
+  def handle_info({:storage_state, state}, socket) do
+    {:noreply, socket |> assign(:storage, state) |> reconcile_drive_state()}
+  end
+
+  # Outcome of the supervised `format_drive/1` task. The resulting
+  # filesystem and mount arrive separately on "storage:state"; this only
+  # clears the busy flag and surfaces a failure.
+  def handle_info({:storage_format_result, device, result}, socket) do
+    socket =
+      if socket.assigns.drive_formatting == device,
+        do: assign(socket, :drive_formatting, nil),
+        else: socket
+
+    case result do
+      :ok ->
+        {:noreply,
+         socket
+         |> assign(:drive_ejected, nil)
+         |> put_flash(:info, "Drive formatted as ext4.")}
+
+      error ->
+        {:noreply, flash_result(socket, error, nil)}
+    end
+  end
+
   def handle_info(_msg, socket), do: {:noreply, socket}
 
   # Refresh the port list AND reconcile throughput subscriptions so new
@@ -680,10 +927,13 @@ defmodule UniversalProxyWeb.OverviewLive do
     # bound to @audio_outputs alone (outputs-only).
     audio_devices = merge_audio_devices(assigns.audio_outputs, assigns.audio_inputs)
 
+    # USB backup drives join the peripheral list so they slot-promote and
+    # hub-indent with everything else.
     rows =
       hardware_rows(
         assigns.ports,
-        peripherals(audio_devices, assigns.bt_radios),
+        peripherals(audio_devices, assigns.bt_radios) ++
+          drive_peripherals(assigns.storage, assigns.drive_ejected),
         assigns.usb_hubs
       )
 
@@ -695,6 +945,10 @@ defmodule UniversalProxyWeb.OverviewLive do
       |> assign(:hardware_rows, rows)
       |> assign(:slot_summary, summary)
       |> assign(:bt_disconnected, disconnected_bt(assigns.bt_headphones))
+      |> assign(
+        :selected_drive_ctx,
+        selected_drive_context(assigns.selected_drive, assigns.storage, rows)
+      )
 
     ~H"""
     <div class="max-w-[1120px] mx-auto space-y-4">
@@ -739,6 +993,23 @@ defmodule UniversalProxyWeb.OverviewLive do
       state={Map.get(@btd700_states, @selected_btd700, %{})}
     />
 
+    <.storage_drawer
+      :if={@selected_drive_ctx}
+      drive={@selected_drive_ctx.drive}
+      slot={@selected_drive_ctx.slot}
+      first?={@selected_drive_ctx.first?}
+      storage={@storage}
+      host={@target.hostname}
+      supported?={@storage_supported?}
+      username={@drive_username}
+      password={@drive_password}
+      copied?={@drive_password_copied}
+      armed={@drive_armed}
+      formatting?={@drive_formatting == @selected_drive_ctx.drive.dev_path}
+      ejected?={@drive_ejected == @selected_drive_ctx.drive.dev_path}
+      chooser={@drive_chooser}
+    />
+
     <.modal
       open={@pending_kind_change != nil}
       on_close="cancel_kind_change"
@@ -762,6 +1033,173 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   defp find_port(_ports, nil), do: nil
   defp find_port(ports, id), do: Enum.find(ports, &(&1.id == id))
+
+  # ── USB storage helpers ───────────────────────────────────────────────
+
+  # The `UniversalProxy.Storage` façade, swappable per the
+  # `:audio_enumerate_module` precedent. Tests point this at a stub: the
+  # drawer's real calls (`mkfs.ext4`, `umount`) must never fire against the
+  # test host's own disks.
+  defp storage, do: Application.get_env(:universal_proxy, :storage_facade, Storage)
+
+  # Drawer-local state, all of it discarded on close or drive change — the
+  # revealed password most of all (see the reveal handler).
+  defp reset_drive_drawer(socket) do
+    socket
+    |> assign(:selected_drive, nil)
+    |> assign(:drive_username, nil)
+    |> assign(:drive_password, nil)
+    |> assign(:drive_password_copied, false)
+    |> assign(:drive_armed, nil)
+    |> assign(:drive_chooser, nil)
+  end
+
+  defp selected_drive(socket),
+    do: find_drive(socket.assigns.storage, socket.assigns.selected_drive)
+
+  defp find_drive(_storage, nil), do: nil
+
+  defp find_drive(storage, device) do
+    storage |> Map.get(:drives, []) |> Enum.find(&(&1.dev_path == device))
+  end
+
+  # Only the username: reading credentials generates the password lazily
+  # server-side, but it never enters the socket until an explicit Reveal.
+  defp load_share_username(socket) do
+    case storage().share_credentials() do
+      %{username: username} -> assign(socket, :drive_username, username)
+      _unavailable -> assign(socket, :drive_username, nil)
+    end
+  end
+
+  # Keep the drawer honest across hotplug: a selected drive that has left
+  # closes its drawer, a format busy-flag on a vanished drive clears, and
+  # the ejected marker lives until the drive leaves or mounts again.
+  defp reconcile_drive_state(socket) do
+    devices = MapSet.new(Map.get(socket.assigns.storage, :drives, []), & &1.dev_path)
+
+    socket
+    |> close_drawer_unless_present(devices)
+    |> clear_formatting_unless_present(devices)
+    |> clear_ejected_when_mounted()
+  end
+
+  defp close_drawer_unless_present(socket, devices) do
+    device = socket.assigns.selected_drive
+
+    if is_nil(device) or MapSet.member?(devices, device),
+      do: socket,
+      else: reset_drive_drawer(socket)
+  end
+
+  defp clear_formatting_unless_present(socket, devices) do
+    device = socket.assigns.drive_formatting
+
+    if is_nil(device) or MapSet.member?(devices, device),
+      do: socket,
+      else: assign(socket, :drive_formatting, nil)
+  end
+
+  # `{drives: [drive], mount: nil}` is both "safely ejected" and "attached
+  # but unmountable", so the eject is remembered in an assign and dropped
+  # only on the two events that end it: the drive leaving, or a fresh mount
+  # (a re-plug, or the remount that follows a format).
+  defp clear_ejected_when_mounted(socket) do
+    device = socket.assigns.drive_ejected
+    drive = find_drive(socket.assigns.storage, device)
+
+    cond do
+      is_nil(device) -> socket
+      is_nil(drive) -> assign(socket, :drive_ejected, nil)
+      mount_for(socket.assigns.storage, drive) -> assign(socket, :drive_ejected, nil)
+      true -> socket
+    end
+  end
+
+  # The drive the drawer renders, plus the slot label reconcile promoted it
+  # into and whether it is the one drive the subsystem will mount.
+  defp selected_drive_context(nil, _storage, _rows), do: nil
+
+  defp selected_drive_context(device, storage, rows) do
+    drives = Map.get(storage, :drives, [])
+
+    case Enum.find_index(drives, &(&1.dev_path == device)) do
+      nil ->
+        nil
+
+      index ->
+        %{
+          drive: Enum.at(drives, index),
+          slot: drive_row_slot(rows, device) || "USB storage",
+          first?: index == 0
+        }
+    end
+  end
+
+  defp drive_row_slot(rows, device) do
+    Enum.find_value(rows, fn
+      {:peripheral, %{storage?: true, device: ^device, slot: slot}} -> slot
+      _row -> nil
+    end)
+  end
+
+  defp open_chooser(socket, path) do
+    case storage().list_folders(path) do
+      {:ok, dirs} ->
+        assign(socket, :drive_chooser, %{
+          path: chooser_path(path),
+          dirs: dirs,
+          creating?: false,
+          name: "",
+          error: nil
+        })
+
+      error ->
+        # A stored folder can disappear between saves; fall back to the
+        # drive root rather than leaving the user without a chooser.
+        if chooser_path(path) == "/" do
+          flash_result(assign(socket, :drive_chooser, nil), error, nil)
+        else
+          open_chooser(socket, "/")
+        end
+    end
+  end
+
+  defp chooser_path(path) when path in [nil, "", "/"], do: "/"
+  defp chooser_path(path), do: path
+
+  defp update_chooser(socket, patch) do
+    case socket.assigns.drive_chooser do
+      nil -> socket
+      chooser -> assign(socket, :drive_chooser, Map.merge(chooser, patch))
+    end
+  end
+
+  # Façade results are `:ok` or `{:error, reason}` for every write. A
+  # failure is always a flash and never a crash: the subsystem is optional
+  # and its server can be down or wedged (see Storage's moduledoc).
+  defp flash_result(socket, :ok, nil), do: socket
+  defp flash_result(socket, :ok, message), do: put_flash(socket, :info, message)
+
+  defp flash_result(socket, {:error, reason}, _message),
+    do: put_flash(socket, :error, storage_error_copy(reason))
+
+  defp flash_result(socket, _other, _message), do: unavailable_flash(socket)
+
+  defp unavailable_flash(socket),
+    do: put_flash(socket, :error, storage_error_copy(:unavailable))
+
+  defp storage_error_copy(:unavailable), do: "Storage subsystem unavailable."
+  defp storage_error_copy(:not_mounted), do: "No drive is mounted."
+  defp storage_error_copy(:invalid_path), do: "That folder isn't on the drive."
+  defp storage_error_copy(:enoent), do: "That folder no longer exists on the drive."
+  defp storage_error_copy(:timeout), do: "Still working — this can take a few minutes."
+  defp storage_error_copy(_reason), do: "The drive couldn't complete that action."
+
+  defp create_folder_error(:invalid_name), do: "That folder name can't be used."
+  defp create_folder_error(:name_too_long), do: "That folder name is too long."
+  defp create_folder_error(:eexist), do: "A folder with that name already exists."
+  defp create_folder_error(reason), do: storage_error_copy(reason)
 
   # ── FMA120 helpers ────────────────────────────────────────────────────
 
@@ -1223,6 +1661,21 @@ defmodule UniversalProxyWeb.OverviewLive do
   # per-device byte rate.
   attr(:p, :map, required: true)
 
+  # USB storage rows open the drive drawer (select_drive), keyed by device
+  # path rather than a settings key — a drive with no derivable bus path has
+  # no key but must still be inspectable.
+  defp peripheral_row(%{p: %{storage?: true}} = assigns) do
+    ~H"""
+    <tr
+      class="cursor-pointer hover:bg-sunken last:[&_td]:border-b-0"
+      phx-click="select_drive"
+      phx-value-device={@p.device}
+    >
+      <.peripheral_cells p={@p} />
+    </tr>
+    """
+  end
+
   # FMA120 rows open the control drawer (select_fma120); every other
   # peripheral routes to its managing tab (goto_tab). Same six-column body.
   defp peripheral_row(%{p: %{fma120?: true}} = assigns) do
@@ -1294,7 +1747,10 @@ defmodule UniversalProxyWeb.OverviewLive do
       </div>
     </td>
     <td class="px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle">
+      <%!-- A storage row has no managing tab: its claim ("Home Assistant
+           backups" / "Not shared") is state, not a link. --%>
       <.link
+        :if={@p.tab}
         navigate={@p.tab}
         phx-click="ignore"
         onclick="event.stopPropagation()"
@@ -1302,6 +1758,12 @@ defmodule UniversalProxyWeb.OverviewLive do
       >
         {@p.managed_by}
       </.link>
+      <span
+        :if={is_nil(@p.tab)}
+        class={["text-base", if(@p[:managed_accent?], do: "text-accent", else: "text-fg-3")]}
+      >
+        {@p.managed_by}
+      </span>
     </td>
     <td class="px-4 py-4 text-sm text-fg-1 border-b border-border-2 align-middle">
       <span class="text-fg-4 text-base">—</span>

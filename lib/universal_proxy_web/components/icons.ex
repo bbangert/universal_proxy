@@ -264,6 +264,34 @@ defmodule UniversalProxyWeb.Components.Icons do
     """
   end
 
+  # USB storage drive: a drive face — rounded body, activity LED, label line.
+  defp paths(:drive) do
+    assigns = %{}
+
+    ~H"""
+    <rect x="4" y="7" width="16" height="10" rx="2" />
+    <circle cx="16.5" cy="12" r="1.2" fill="currentColor" stroke="none" />
+    <path d="M7 12h5" />
+    """
+  end
+
+  defp paths(:folder) do
+    assigns = %{}
+
+    ~H"""
+    <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
+    """
+  end
+
+  defp paths(:folder_plus) do
+    assigns = %{}
+
+    ~H"""
+    <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
+    <path d="M12 11v4M10 13h4" />
+    """
+  end
+
   # Speaker glyph with mute slash + wave-count variants. Drawn here
   # rather than as a `paths/1` clause because the wave count depends
   # on volume level (0 → no waves, 1+ → one wave, 60+ → two waves),
@@ -425,6 +453,16 @@ defmodule UniversalProxyWeb.Components.Icons do
       stroke-linejoin="round"
     />
     <path d="M15 9a4 4 0 0 1 0 6M18 6a8 8 0 0 1 0 12" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" />
+    """
+  end
+
+  defp kind_glyph(:drive) do
+    assigns = %{}
+
+    ~H"""
+    <rect x="4" y="7" width="16" height="10" rx="2" stroke="currentColor" stroke-width="1.6" fill="none" />
+    <circle cx="16.5" cy="12" r="1.2" fill="currentColor" />
+    <path d="M7 12h5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
     """
   end
 
