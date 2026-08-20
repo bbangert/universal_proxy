@@ -674,6 +674,71 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
       send(task, :release)
     end
 
+    # A call timeout is the one format outcome that is not an outcome:
+    # `Storage.Server` blocks its whole loop inside `mkfs.ext4`, so the
+    # device may still be being written when the caller gives up.
+    test "a format timeout keeps the drawer busy until the subsystem reports back",
+         %{conn: conn} do
+      # Blocking the façade is what makes the busy flag observable while
+      # the format is still in flight.
+      StorageStub.put_replies(%{format_drive: {:block, :ok}})
+
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state())
+      open_drawer(view)
+
+      view |> element("button[phx-value-action='format']") |> render_click()
+
+      assert view |> element("button[phx-click='drive_format']") |> render_click() =~
+               "Formatting…"
+
+      assert_receive {:storage_blocked, :format_drive, task}
+
+      # The task's result, delivered from here so the assertion cannot race
+      # the façade call: the format timed out, the server is still wedged.
+      send(view.pid, {:storage_format_result, "/dev/sda", {:error, :timeout}})
+
+      html = render(view)
+      assert html =~ "Formatting…"
+      assert html =~ "Still working"
+
+      # And the actions stay refused, not just visually disabled.
+      render_click(view, "drive_arm", %{"action" => "eject"})
+      render_click(view, "drive_eject", %{})
+      refute_receive {:storage_call, :eject, _}
+
+      # A broadcast is proof the server's loop is free again: nothing can
+      # be published while a format runs inside its handle_call.
+      push_storage(storage_state())
+      refute render(view) =~ "Formatting…"
+
+      send(task, :release)
+    end
+
+    test "a format failure that is not a timeout clears the busy flag at once", %{conn: conn} do
+      StorageStub.put_replies(%{format_drive: {:block, :ok}})
+
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state())
+      open_drawer(view)
+
+      view |> element("button[phx-value-action='format']") |> render_click()
+
+      assert view |> element("button[phx-click='drive_format']") |> render_click() =~
+               "Formatting…"
+
+      assert_receive {:storage_blocked, :format_drive, task}
+
+      # Any other error means the server answered — it is not busy.
+      send(view.pid, {:storage_format_result, "/dev/sda", {:error, :unknown_drive}})
+
+      html = render(view)
+      refute html =~ "Formatting…"
+      assert html =~ "That drive is no longer attached."
+
+      send(task, :release)
+    end
+
     test "a busy filesystem is reported, not called safe to unplug", %{conn: conn} do
       StorageStub.put_replies(%{eject: {:error, :busy}})
 

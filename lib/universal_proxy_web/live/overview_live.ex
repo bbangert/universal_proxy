@@ -87,6 +87,7 @@ defmodule UniversalProxyWeb.OverviewLive do
      |> assign(:storage_supported?, storage().supported?())
      |> assign(:drive_ejected, nil)
      |> assign(:drive_formatting, nil)
+     |> assign(:drive_format_timeout, nil)
      |> reset_drive_drawer()
      |> set_ports(ports)}
   end
@@ -394,7 +395,13 @@ defmodule UniversalProxyWeb.OverviewLive do
             send(parent, {:storage_format_result, device, facade.format_drive(key)})
           end)
 
-          {:noreply, assign(socket, :drive_formatting, device)}
+          # A fresh format starts from a clean slate: an earlier timeout
+          # marker would otherwise let the next broadcast clear THIS
+          # format's busy flag.
+          {:noreply,
+           socket
+           |> assign(:drive_formatting, device)
+           |> assign(:drive_format_timeout, nil)}
 
         _drive ->
           {:noreply, socket}
@@ -721,6 +728,23 @@ defmodule UniversalProxyWeb.OverviewLive do
   # Full storage state (drives, mount, share, capacity) on every change.
   def handle_info({:storage_state, state}, socket) do
     {:noreply, socket |> assign(:storage, state) |> reconcile_drive_state()}
+  end
+
+  # A call timeout is NOT an outcome: `Storage.Server` blocks its whole
+  # loop inside `mkfs.ext4`, so a timeout means the format is most likely
+  # still running (see `Storage.format_drive/2`, which keeps `:timeout`
+  # distinguishable from `:unavailable` for exactly this reason). Clearing
+  # the busy flag here would re-enable Format and Eject against a device
+  # still being written, so the flag stays and the drive is remembered as
+  # "waiting for the subsystem to come back" — `clear_timed_out_format/1`
+  # is what ends it.
+  def handle_info({:storage_format_result, device, {:error, :timeout} = error}, socket) do
+    socket =
+      if socket.assigns.drive_formatting == device,
+        do: assign(socket, :drive_format_timeout, device),
+        else: socket
+
+    {:noreply, flash_result(socket, error, nil)}
   end
 
   # Outcome of the supervised `format_drive/1` task. The resulting
@@ -1145,6 +1169,7 @@ defmodule UniversalProxyWeb.OverviewLive do
     socket
     |> close_drawer_unless_present(devices)
     |> clear_formatting_unless_present(devices)
+    |> clear_timed_out_format()
     |> clear_ejected_when_mounted()
   end
 
@@ -1161,7 +1186,25 @@ defmodule UniversalProxyWeb.OverviewLive do
 
     if is_nil(device) or MapSet.member?(devices, device),
       do: socket,
-      else: assign(socket, :drive_formatting, nil)
+      else: socket |> assign(:drive_formatting, nil) |> assign(:drive_format_timeout, nil)
+  end
+
+  # This message is itself the signal that the format concluded: `mkfs`
+  # runs inside `Storage.Server`'s `handle_call`, so the subsystem cannot
+  # publish anything while a format is in flight, and it publishes on
+  # arrival at the state that follows one. Any broadcast therefore proves
+  # the server's loop is free again — which is the only thing the busy
+  # flag was protecting, and the only signal that also arrives when the
+  # format failed (a failed `mkfs` leaves no new mount to wait for). A
+  # broadcast published *before* the format cannot clear it either: the
+  # mailbox is FIFO, so anything that predates the timeout result is
+  # handled before the marker exists.
+  defp clear_timed_out_format(socket) do
+    if socket.assigns.drive_format_timeout do
+      socket |> assign(:drive_formatting, nil) |> assign(:drive_format_timeout, nil)
+    else
+      socket
+    end
   end
 
   # `{drives: [drive], mount: nil}` is both "safely ejected" and "attached

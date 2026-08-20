@@ -382,6 +382,11 @@ defmodule UniversalProxy.Storage.SmbdTest do
       spec = Smbd.child_spec(conf: "/data/samba/smb.conf", smbd_paths: ["/nope/smbd"])
 
       assert spec.id == :smbd
+      # `Storage.Server` owns the restart decision: it monitors the child
+      # it starts and brings it back through a convergence pass. A
+      # supervisor restart would resurrect smbd under a pid the Server
+      # never learns, leaving it tracking a dead one.
+      assert spec.restart == :temporary
       assert {MuonTrap.Daemon, :start_link, [bin, args, daemon_opts]} = spec.start
       assert bin == "/nope/smbd"
       assert "-F" in args

@@ -12,7 +12,8 @@ defmodule UniversalProxy.Storage.Smbd do
       everything lives under `/data/samba` + `/run/samba`).
     * `provision_user/2` — `smbpasswd -s -a <user>` with the password fed
       on **stdin only**, idempotent via a stored SHA-256.
-    * `child_spec/1` — a `MuonTrap.Daemon` spec for `smbd -F`.
+    * `child_spec/1` — a `restart: :temporary` `MuonTrap.Daemon`
+      spec for `smbd -F` (`Storage.Server` owns the restart decision).
 
   ## State layout
 
@@ -385,6 +386,15 @@ defmodule UniversalProxy.Storage.Smbd do
   `MuonTrap.Daemon` child spec running `smbd` in the foreground so
   MuonTrap owns (and can reliably kill) the process.
 
+  `restart: :temporary`, deliberately: `UniversalProxy.Storage.Server`
+  owns this daemon's lifecycle. It monitors the child it starts and brings
+  a dead one back through a convergence pass, which re-checks the drive's
+  opt-in, the live mount and the sandboxed share folder first. A
+  supervisor restart would instead resurrect `smbd` under a **new** pid
+  behind the Server's back, leaving it tracking a dead one — a share
+  reported `:off` while a real `smbd` still held port 445 and the mount
+  point (which is what breaks the next eject or format).
+
   Options: `:conf` / `:data_dir` (config path), `:smbd_paths` (candidates,
   first existing wins), `:name` (registered name, default this module).
   """
@@ -402,7 +412,8 @@ defmodule UniversalProxy.Storage.Smbd do
            log_prefix: "smbd: "
          ]
        ]},
-      id: :smbd
+      id: :smbd,
+      restart: :temporary
     )
   end
 

@@ -14,10 +14,14 @@ defmodule UniversalProxy.Storage.Server do
        seam reads its first #{4096} bytes (and each partition's),
        `Probe.fs_type/1` classifies them, `Probe.first_data_partition/1`
        picks the target,
-    3. stops the share and unmounts when the mounted drive has gone away,
-    4. mounts the target partition when nothing is mounted,
-    5. reads the mounted drive's stored `share_folder` and its capacity,
-    6. starts or stops `smbd` so that it runs **iff** the drive's
+    3. binds an adopted mount (see below) to the drive that owns its
+       device, or unmounts it when no attached drive does,
+    4. stops the share and unmounts when the mounted drive has gone away,
+    5. mounts the target partition when nothing is mounted — unless the
+       kernel already has something at the mount point, which is adopted
+       rather than stacked under a second mount,
+    6. reads the mounted drive's stored `share_folder` and its capacity,
+    7. starts or stops `smbd` so that it runs **iff** the drive's
        `share_enabled?` is set AND a drive is mounted AND an `smbd` binary
        exists AND the stored `share_folder` still passes the sandbox
        against the live mount (see `validated_share_folder/1`).
@@ -79,6 +83,47 @@ defmodule UniversalProxy.Storage.Server do
       user to unplug, so detaching the name is the best available
       outcome.
 
+  ## Adopting a mount this process did not make
+
+  The kernel's mount table outlives this process: the `:one_for_all`
+  supervisor restarts the Server (and the application can restart the
+  subtree) while `/run/usb-backup` stays mounted. `mount` does not fail on
+  an already-mounted point, it **stacks** — so a fresh Server that
+  believed nothing was mounted would either overmount the live filesystem
+  (an "unmount" then pops one layer while the drive is still held) or hand
+  `fsck.ext4` a mounted filesystem.
+
+  So `init/1` reads the OS mount table (`:mounts_path`, default
+  `/proc/self/mounts`) and adopts any entry for the mount point —
+  `device`, `fs_type` and read-only/read-write `mode` all come from the
+  table. The drive identity cannot: `Probe` has not run yet, so
+  `mounted_ref` stays `nil` until the first convergence binds it to the
+  drive owning that device. An adopted mount whose device belongs to no
+  attached drive is a drive that left while this process was down, and it
+  takes the removal path (`force_unmount/1`).
+
+  The same table read guards every mount: a point the kernel says is
+  already mounted is adopted, never mounted on top of.
+
+  ## Who restarts `smbd`
+
+  The daemon child spec is `restart: :temporary`
+  (`Storage.Smbd.child_spec/1`) and this server monitors the pid it
+  started. A `smbd` that dies on its own therefore stays dead until the
+  `{:DOWN, …}` handler marks the share `:error` and runs a convergence
+  pass, which decides afresh whether the share should run at all
+  (opt-in, mount, validated folder) — the same gate a first start goes
+  through.
+
+  A supervisor restart would instead bring `smbd` back under a **new**
+  pid, leaving this server's stored pid stale: `terminate_child` would
+  answer `:not_found`, the state would say `:off`, and a live `smbd`
+  would keep port 445 open and the mount point busy — breaking the next
+  eject or format. `stop_share/1` additionally sweeps
+  `DynamicSupervisor.which_children/1`, because nothing else runs under
+  that supervisor: any child left there is an `smbd` this server has lost
+  track of.
+
   ## Untrusted paths
 
   `set_share_folder/3`, `list_folders/2` and `create_folder/3` take paths
@@ -124,6 +169,9 @@ defmodule UniversalProxy.Storage.Server do
     * `:daemon_supervisor` — the `DynamicSupervisor` smbd runs under.
     * `:read_head_fun` — `(device_path -> {:ok, binary} | {:error, term})`.
     * `:netbios_name_fun` — `(-> String.t() | nil)`.
+    * `:mounts_path` — the OS mount table to rehydrate and guard against
+      (default `#{"/proc/self/mounts"}`); a file a test can rewrite
+      mid-run to simulate the kernel's view changing.
     * `:pubsub`, `:poll_interval`, `:debounce_ms`, `:retry_interval`.
     * `:subscribe_uevents?` — `false` skips the uevent subscription so the
       poll fallback is exercised. Needed because `nerves_uevent` (a
@@ -160,6 +208,11 @@ defmodule UniversalProxy.Storage.Server do
 
   # Superblock magics all live inside the first 4 KiB (Probe.fs_type/1).
   @head_bytes 4096
+
+  # The kernel's own view of what is mounted where. Read at init (to adopt
+  # a mount that outlived this process) and before every mount (so a point
+  # that is already mounted is never stacked under a second one).
+  @default_mounts_path "/proc/self/mounts"
 
   # mkfs.ext4 with `lazy_itable_init=0` writes every inode table up
   # front, which on a large slow stick is minutes. The Server is
@@ -214,6 +267,7 @@ defmodule UniversalProxy.Storage.Server do
             smbd_opts: [],
             read_head_fun: nil,
             netbios_name_fun: nil,
+            mounts_path: @default_mounts_path,
             pubsub: @pubsub,
             poll_interval: @poll_interval,
             debounce_ms: @debounce_ms,
@@ -235,6 +289,11 @@ defmodule UniversalProxy.Storage.Server do
             ejected: MapSet.new(),
             share: :off,
             share_pid: nil,
+            # Monitor of `share_pid`. The pid alone cannot be trusted as
+            # "the share is up": only a monitor tells this server when the
+            # daemon dies, and only demonitoring on a deliberate stop
+            # keeps that from reading back as a crash.
+            share_monitor: nil,
             # Mirror of the mounted drive's stored `share_folder`, refreshed
             # from `Storage.Settings` on every convergence pass.
             share_folder: @root_folder,
@@ -420,6 +479,7 @@ defmodule UniversalProxy.Storage.Server do
       smbd_opts: Keyword.get(opts, :smbd_opts, []),
       read_head_fun: Keyword.get(opts, :read_head_fun, &default_read_head/1),
       netbios_name_fun: Keyword.get(opts, :netbios_name_fun, &default_netbios_name/0),
+      mounts_path: Keyword.get(opts, :mounts_path, @default_mounts_path),
       pubsub: Keyword.get(opts, :pubsub, @pubsub),
       poll_interval: Keyword.get(opts, :poll_interval, @poll_interval),
       debounce_ms: Keyword.get(opts, :debounce_ms, @debounce_ms),
@@ -427,6 +487,12 @@ defmodule UniversalProxy.Storage.Server do
       subscribe_uevents?: Keyword.get(opts, :subscribe_uevents?, true),
       auto?: Keyword.get(opts, :start_timer, true)
     }
+
+    # Before anything converges: the mount point may already be mounted by
+    # a previous incarnation of this process (see the moduledoc). Adopting
+    # it is what keeps the first pass from stacking a second mount on top
+    # of it, or from fsck-ing a live filesystem.
+    state = rehydrate_mount(state)
 
     # Hotplug detection, `Audio.Server`'s triplet: prefer kernel uevents,
     # fall back to a periodic poll only when `nerves_uevent` isn't running
@@ -568,6 +634,22 @@ defmodule UniversalProxy.Storage.Server do
     {:noreply, converge(%{state | retry_timer: nil})}
   end
 
+  # The `smbd` child died on its own — its spec is `restart: :temporary`,
+  # so nothing else brings it back (see the moduledoc). The share is
+  # marked `:error` and that is published straight away, because the
+  # convergence that follows only broadcasts when the payload *changes*: a
+  # restart that fails would otherwise leave every subscriber still
+  # showing `:running`. Convergence then decides whether to start it
+  # again, through the same opt-in/mount/folder gate as a first start.
+  def handle_info({:DOWN, ref, :process, pid, reason}, %{share_monitor: ref} = state) do
+    Logger.warning("Storage: smbd (#{inspect(pid)}) exited: #{inspect(reason)}")
+
+    state = %{state | share: :error, share_pid: nil, share_monitor: nil}
+    broadcast(state)
+
+    {:noreply, converge(state)}
+  end
+
   # Kernel uevent (via NervesUEvent's PropertyTable). Only `block`
   # subsystem changes can move the drive set; everything else is ignored.
   def handle_info(%PropertyTable.Event{property: path}, state) do
@@ -588,6 +670,7 @@ defmodule UniversalProxy.Storage.Server do
     state =
       state
       |> refresh_drives()
+      |> bind_adopted_mount()
       |> reconcile_removal()
       |> reconcile_mount()
       |> refresh_share_folder()
@@ -673,8 +756,30 @@ defmodule UniversalProxy.Storage.Server do
     else
       case target(state) do
         nil -> state
-        {drive, partition} -> do_mount(state, drive, partition)
+        {drive, partition} -> mount_or_adopt(state, drive, partition)
       end
+    end
+  end
+
+  # Never stack a mount. `mount` succeeds on an already-mounted point and
+  # hides what is under it, so an overmount would make the next `umount`
+  # pop one layer while the drive stayed held (and "safe to unplug" would
+  # be a lie), and the `fsck.ext4` on the way in would run against a live
+  # filesystem. Whatever the kernel says is mounted here therefore wins
+  # and is adopted as-is — which also covers the stale-marker case, where
+  # `mounted` says "detached" while the kernel is still holding it.
+  defp mount_or_adopt(state, drive, partition) do
+    case os_mount(state) do
+      nil ->
+        do_mount(state, drive, partition)
+
+      existing ->
+        Logger.info(
+          "Storage: #{existing.point} already holds #{existing.device}; adopting that mount " <>
+            "instead of mounting #{partition.dev_path} on top of it"
+        )
+
+        bind_adopted_mount(%{state | mounted: existing, mounted_ref: nil})
     end
   end
 
@@ -817,6 +922,125 @@ defmodule UniversalProxy.Storage.Server do
       {:error, :umount_crashed},
       "Mount.umount"
     )
+  end
+
+  # -- The OS mount table --
+
+  # Adopt whatever the kernel already has at the mount point, before the
+  # first convergence: this process can be restarted while the mount
+  # survives (see the moduledoc), and `mounted: nil` would then stack a
+  # second mount on top of it. `mounted_ref` is deliberately left nil —
+  # `Probe` has not run yet, so which drive this is cannot be known here.
+  defp rehydrate_mount(state) do
+    case os_mount(state) do
+      nil ->
+        state
+
+      mount ->
+        Logger.info(
+          "Storage: adopting the existing mount of #{mount.device} at #{mount.point} " <>
+            "(#{mount.fs_type}, #{mount.mode})"
+        )
+
+        %{state | mounted: mount}
+    end
+  end
+
+  # An adopted mount has no drive identity until a pass with drives in
+  # hand binds it — `refresh_drives/1` runs first, so this is that pass.
+  # A device no attached drive owns is a drive that left while this
+  # process was down: nothing to flush and nothing to unplug, which is
+  # exactly `force_unmount/1`'s case. Stale mounts are skipped: their ref
+  # is nil because a lazy umount detached them, not because they were
+  # adopted, and re-unmounting one every pass would be a retry loop.
+  defp bind_adopted_mount(%{mounted: %{stale?: false, device: device}, mounted_ref: nil} = state)
+       when is_binary(device) do
+    case Enum.find(state.drives, &owns_device?(&1, device)) do
+      nil ->
+        Logger.info("Storage: the mount of #{device} belongs to no attached drive; unmounting it")
+
+        {state, _result} = state |> stop_share() |> force_unmount()
+        state
+
+      drive ->
+        %{state | mounted_ref: drive_ref(drive)}
+    end
+  end
+
+  defp bind_adopted_mount(state), do: state
+
+  defp owns_device?(drive, device) do
+    Map.get(drive, :dev_path) == device or
+      drive
+      |> Map.get(:partitions, [])
+      |> List.wrap()
+      |> Enum.any?(&(is_map(&1) and Map.get(&1, :dev_path) == device))
+  end
+
+  # The mount table's entry for this server's mount point, shaped as a
+  # `mount_info()`, or nil when the kernel has nothing mounted there.
+  defp os_mount(state) do
+    with point when is_binary(point) and point != "" <- mount_point(state),
+         {:ok, table} <- read_mounts(state) do
+      mount_table_entry(table, point)
+    else
+      _other -> nil
+    end
+  end
+
+  defp read_mounts(state) do
+    safe(fn -> File.read(state.mounts_path) end, {:error, :mounts_unreadable}, "read mounts")
+  end
+
+  # `/proc/self/mounts` lines are
+  # `<device> <point> <fs> <options> <freq> <passno>`, with space, tab,
+  # newline and backslash octal-escaped in the first two fields. The
+  # **last** entry for a point is the effective one: a stacked mount
+  # shadows everything under it, and shadowed layers stay listed.
+  defp mount_table_entry(table, point) do
+    table
+    |> String.split("\n", trim: true)
+    |> Enum.reduce(nil, fn line, acc ->
+      case String.split(line, " ") do
+        [device, entry_point, fs, options | _rest] ->
+          if unescape_mount_field(entry_point) == point do
+            %{
+              device: unescape_mount_field(device),
+              fs_type: table_fs_type(fs),
+              mode: table_mode(options),
+              point: point,
+              stale?: false
+            }
+          else
+            acc
+          end
+
+        _other ->
+          acc
+      end
+    end)
+  end
+
+  defp unescape_mount_field(field) do
+    field
+    |> String.replace("\\040", " ")
+    |> String.replace("\\011", "\t")
+    |> String.replace("\\012", "\n")
+    |> String.replace("\\134", "\\")
+  end
+
+  # The table names the kernel driver, `Probe.fs_type/1` names the same
+  # four by their superblock. Anything else at this mount point is a
+  # filesystem this subsystem did not put there, and `:unknown` is what
+  # keeps it from being treated as a backup volume.
+  defp table_fs_type("ext4"), do: :ext4
+  defp table_fs_type("exfat"), do: :exfat
+  defp table_fs_type("ntfs3"), do: :ntfs3
+  defp table_fs_type("vfat"), do: :vfat
+  defp table_fs_type(_other), do: :unknown
+
+  defp table_mode(options) do
+    if "ro" in String.split(options, ","), do: :read_only, else: :read_write
   end
 
   # Which device `mkfs` is pointed at is decided here, from this server's
@@ -1137,9 +1361,18 @@ defmodule UniversalProxy.Storage.Server do
     desired? = share_desired?(state)
 
     cond do
-      desired? and state.share != :running -> start_share(state)
-      not desired? and state.share != :off -> stop_share(state)
-      true -> state
+      desired? and state.share != :running ->
+        start_share(state)
+
+      # Called on every pass where the share is unwanted, not only on the
+      # `:running -> :off` edge: `stop_share/1` is idempotent, and its
+      # sweep is what makes "no share" mean "no smbd process" even if one
+      # ever escaped this server's tracking.
+      not desired? ->
+        stop_share(state)
+
+      true ->
+        state
     end
   end
 
@@ -1171,7 +1404,10 @@ defmodule UniversalProxy.Storage.Server do
          :ok <- provision_user(state, credentials),
          {:ok, pid} <- start_daemon(state) do
       Logger.info("Storage: smbd started for #{mount_point(state)}")
-      %{state | share: :running, share_pid: pid}
+      # Monitored, not linked: the DynamicSupervisor is the child's parent,
+      # and `restart: :temporary` means this server is the only thing that
+      # will ever bring it back.
+      %{state | share: :running, share_pid: pid, share_monitor: Process.monitor(pid)}
     else
       {:error, reason} ->
         Logger.error(
@@ -1179,25 +1415,67 @@ defmodule UniversalProxy.Storage.Server do
             "retrying at the next convergence"
         )
 
-        %{state | share: :error, share_pid: nil}
+        %{state | share: :error, share_pid: nil, share_monitor: nil}
     end
   end
 
-  defp stop_share(%{share: :off, share_pid: nil} = state), do: state
-
+  # Two steps, and the second is not redundant: the monitored child is
+  # terminated by pid, then any child still under the daemon supervisor is
+  # swept. Nothing else runs under that supervisor, so a survivor is an
+  # `smbd` this server lost track of — and it would keep port 445 open and
+  # the mount point busy, which is what breaks the next eject or format.
   defp stop_share(state) do
-    if state.share_pid do
-      _ =
-        safe(
-          fn -> DynamicSupervisor.terminate_child(state.daemon_supervisor, state.share_pid) end,
-          :ok,
-          "DynamicSupervisor.terminate_child"
+    state = demonitor_share(state)
+    terminated? = terminate_share_child(state)
+    swept = sweep_daemon_children(state)
+
+    if terminated? or swept > 0, do: Logger.info("Storage: smbd stopped")
+
+    %{state | share: :off, share_pid: nil, share_monitor: nil}
+  end
+
+  # `:flush` drops a `{:DOWN, …}` that is already in the mailbox: a
+  # deliberate stop must not read back as a crash and trigger a restart.
+  defp demonitor_share(%{share_monitor: nil} = state), do: state
+
+  defp demonitor_share(state) do
+    Process.demonitor(state.share_monitor, [:flush])
+    %{state | share_monitor: nil}
+  end
+
+  defp terminate_share_child(%{share_pid: nil}), do: false
+
+  defp terminate_share_child(state) do
+    safe(
+      fn -> DynamicSupervisor.terminate_child(state.daemon_supervisor, state.share_pid) end,
+      :ok,
+      "DynamicSupervisor.terminate_child"
+    ) == :ok
+  end
+
+  defp sweep_daemon_children(state) do
+    children =
+      safe(
+        fn -> DynamicSupervisor.which_children(state.daemon_supervisor) end,
+        [],
+        "DynamicSupervisor.which_children"
+      )
+
+    for {_id, pid, _type, _modules} <- List.wrap(children), is_pid(pid), reduce: 0 do
+      swept ->
+        Logger.warning(
+          "Storage: terminating an smbd child this server did not track (#{inspect(pid)})"
         )
 
-      Logger.info("Storage: smbd stopped")
-    end
+        _ =
+          safe(
+            fn -> DynamicSupervisor.terminate_child(state.daemon_supervisor, pid) end,
+            :ok,
+            "DynamicSupervisor.terminate_child"
+          )
 
-    %{state | share: :off, share_pid: nil}
+        swept + 1
+    end
   end
 
   # The credentials record holds the SMB password: never log or inspect it.

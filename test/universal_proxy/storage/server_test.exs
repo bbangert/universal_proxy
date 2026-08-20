@@ -291,6 +291,21 @@ defmodule UniversalProxy.Storage.ServerTest do
 
   defp in_root(path), do: Path.join(MountStub.point(), path)
 
+  # Stand-in for /proc/self/mounts. A real file, so a test can rewrite it
+  # mid-run and have the server see the kernel's view change.
+  defp mounts_file!(lines) do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "storage_server_mounts_#{System.unique_integer([:positive])}"
+      )
+
+    File.write!(path, Enum.map_join(lines, "", &(&1 <> "\n")))
+    on_exit(fn -> File.rm(path) end)
+
+    path
+  end
+
   defp provision_hashes, do: for({:provision_hash, hash} <- Recorder.events(), do: hash)
 
   defp last_prepare_params do
@@ -1247,6 +1262,201 @@ defmodule UniversalProxy.Storage.ServerTest do
       server = start_server(ctx)
 
       assert Server.create_folder(server, "/", "backups") == {:error, :not_mounted}
+    end
+  end
+
+  describe "smbd child lifecycle" do
+    # `Smbd.child_spec/1` is `restart: :temporary` so that this server, not
+    # the DynamicSupervisor, decides when smbd comes back — a supervisor
+    # restart would resurrect it under a new pid the server never learns.
+    test "a daemon that dies on its own is noticed and started again", ctx do
+      server = start_server(ctx)
+      present!()
+      enable_share!(ctx)
+      :ok = Server.check_now(server)
+
+      assert Server.get_state(server).share == :running
+
+      assert [{_id, first, _type, _mods}] =
+               DynamicSupervisor.which_children(ctx.daemon_supervisor)
+
+      log =
+        capture_log(fn ->
+          # Untrappable, exactly as a segfaulting smbd would go.
+          Process.exit(first, :kill)
+
+          # The share is published as down before the restart is attempted:
+          # convergence only broadcasts on a payload change, so a failed
+          # restart would otherwise leave subscribers showing :running.
+          assert_receive {:storage_state, %{share: :error}}, 1_000
+
+          # The broadcast above happens *inside* the DOWN handler, so this
+          # call is what waits for the convergence that follows it.
+          assert Server.get_state(server).share == :running
+        end)
+
+      assert log =~ "smbd"
+
+      assert [{_id, second, _type, _mods}] =
+               DynamicSupervisor.which_children(ctx.daemon_supervisor)
+
+      refute second == first
+      assert Process.alive?(second)
+      assert Server.get_state(server).share == :running
+      assert Enum.count(Recorder.events(), &match?({:smbd_started}, &1)) == 2
+    end
+
+    test "a deliberate stop is not mistaken for a crash", ctx do
+      server = start_server(ctx)
+      present!()
+      enable_share!(ctx)
+      :ok = Server.check_now(server)
+      assert Server.get_state(server).share == :running
+
+      assert :ok = Server.set_share_enabled(server, @drive_key, false)
+
+      # The monitor's DOWN is flushed on the way out, so the stop must not
+      # read back as a crash and start a replacement.
+      refute_receive {:storage_state, %{share: :error}}, 200
+      assert Server.get_state(server).share == :off
+      assert DynamicSupervisor.which_children(ctx.daemon_supervisor) == []
+
+      :ok = Server.check_now(server)
+      assert Server.get_state(server).share == :off
+      assert Enum.count(Recorder.events(), &match?({:smbd_started}, &1)) == 1
+    end
+
+    # The stored pid can only ever name one child; the sweep is what makes
+    # ":off" mean "no smbd process", whatever produced the extra one.
+    test "stopping the share sweeps an smbd child this server never started", ctx do
+      server = start_server(ctx)
+      present!()
+      enable_share!(ctx)
+      :ok = Server.check_now(server)
+
+      assert [{_id, tracked, _type, _mods}] =
+               DynamicSupervisor.which_children(ctx.daemon_supervisor)
+
+      {:ok, orphan} =
+        DynamicSupervisor.start_child(ctx.daemon_supervisor, SmbdStub.child_spec([]))
+
+      refute orphan == tracked
+
+      log =
+        capture_log(fn ->
+          assert :ok = Server.set_share_enabled(server, @drive_key, false)
+          # The reply precedes the convergence it schedules
+          # (`{:continue, :converge}`); this call is what waits for it.
+          assert Server.get_state(server).share == :off
+        end)
+
+      assert log =~ "did not track"
+      assert DynamicSupervisor.which_children(ctx.daemon_supervisor) == []
+      refute Process.alive?(orphan)
+      assert Server.get_state(server).share == :off
+    end
+
+    # A crash is not an instruction to restart: the pass it triggers
+    # re-checks the opt-in, the mount and the folder like any other.
+    test "a daemon that dies while the share is no longer wanted stays down", ctx do
+      server = start_server(ctx)
+      present!()
+      enable_share!(ctx)
+      :ok = Server.check_now(server)
+      assert [{_id, pid, _type, _mods}] = DynamicSupervisor.which_children(ctx.daemon_supervisor)
+
+      # Revoked without poking a convergence, so the crash's pass is the
+      # first one to see it.
+      :ok = Settings.put_drive(ctx.settings, @drive_key, %{share_enabled?: false})
+
+      capture_log(fn ->
+        Process.exit(pid, :kill)
+
+        assert_receive {:storage_state, %{share: :error}}, 1_000
+        assert_receive {:storage_state, %{share: :off}}, 1_000
+      end)
+
+      assert Server.get_state(server).share == :off
+      assert DynamicSupervisor.which_children(ctx.daemon_supervisor) == []
+      assert Enum.count(Recorder.events(), &match?({:smbd_started}, &1)) == 1
+    end
+  end
+
+  describe "mount rehydration" do
+    test "an existing mount is adopted at init, not mounted a second time", ctx do
+      server =
+        start_server(ctx,
+          mounts_path: mounts_file!(["/dev/sda1 #{MountStub.point()} ext4 rw,noatime 0 0"])
+        )
+
+      # Device, filesystem and mode all come from the table: the drive has
+      # not even been probed yet.
+      assert Server.get_state(server).mount == %{
+               device: "/dev/sda1",
+               fs_type: :ext4,
+               mode: :read_write,
+               point: MountStub.point(),
+               stale?: false
+             }
+
+      present!()
+      enable_share!(ctx)
+      :ok = Server.check_now(server)
+
+      state = Server.get_state(server)
+      refute Enum.any?(Recorder.events(), &match?({:mount, _, _}, &1))
+      assert state.mount.device == "/dev/sda1"
+      assert state.capacity == MountStub.capacity()
+      # Bound to the drive that owns the device, which is what lets the
+      # share (a per-drive opt-in) start over an adopted mount.
+      assert state.share == :running
+    end
+
+    test "a read-only mount-table entry is adopted as :read_only", ctx do
+      server =
+        start_server(ctx,
+          mounts_path: mounts_file!(["/dev/sda1 #{MountStub.point()} exfat ro,noatime,nodev 0 0"])
+        )
+
+      assert Server.get_state(server).mount.mode == :read_only
+      assert Server.get_state(server).mount.fs_type == :exfat
+    end
+
+    test "a filesystem this subsystem does not manage is adopted as :unknown", ctx do
+      server =
+        start_server(ctx, mounts_path: mounts_file!(["tmpfs #{MountStub.point()} tmpfs rw 0 0"]))
+
+      assert Server.get_state(server).mount.fs_type == :unknown
+    end
+
+    # Overmounting would make the next umount pop one layer while the drive
+    # stayed held, and would hand fsck a live filesystem on the way in.
+    test "a mount point the kernel already holds is adopted, never stacked", ctx do
+      path = mounts_file!([])
+      server = start_server(ctx, mounts_path: path)
+      present!()
+
+      File.write!(path, "/dev/sda1 #{MountStub.point()} ext4 rw 0 0\n")
+      :ok = Server.check_now(server)
+
+      refute Enum.any?(Recorder.events(), &match?({:mount, _, _}, &1))
+      assert Server.get_state(server).mount.device == "/dev/sda1"
+      assert Server.get_state(server).mount.stale? == false
+    end
+
+    test "an adopted mount whose drive is gone takes the removal path", ctx do
+      server =
+        start_server(ctx,
+          mounts_path: mounts_file!(["/dev/sdz1 #{MountStub.point()} ext4 rw 0 0"])
+        )
+
+      assert Server.get_state(server).mount.device == "/dev/sdz1"
+
+      # Nothing attached: the drive left while this server was down.
+      :ok = Server.check_now(server)
+
+      assert [{:umount, false}] = Enum.filter(Recorder.events(), &match?({:umount, _}, &1))
+      assert Server.get_state(server).mount == nil
     end
   end
 end
