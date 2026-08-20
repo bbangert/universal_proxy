@@ -30,6 +30,19 @@ defmodule UniversalProxy.Storage.Probe do
   ancestors is an internal disk (SD card, eMMC, SATA/PCIe) and is
   excluded — this subsystem only cares about removable USB storage.
 
+  ## The USB serial is part of a drive's identity
+
+  `idVendor`/`idProduct` describe a *model*, not a medium: two identical
+  sticks in the same port are indistinguishable by them, so a settings key
+  built from the port and the ids alone would carry an opt-in from one
+  stick over to its replacement. The USB `serial` attribute — published by
+  the very same device node that carries the ids, so it is read from the
+  dir they were found in rather than searched for separately (a hub's
+  serial one level up must never stand in for the stick's) — is the one
+  per-medium identifier available here. Cheap clone sticks omit it
+  entirely; those report `serial: nil`, and `Storage.Server`'s moduledoc
+  documents what that costs.
+
   ## Why the class entry is resolved first
 
   `/sys/class/block/sda` is itself a symlink into
@@ -56,6 +69,7 @@ defmodule UniversalProxy.Storage.Probe do
           slot_sub: String.t() | nil,
           vendor_id: non_neg_integer(),
           product_id: non_neg_integer(),
+          serial: String.t() | nil,
           partitions: [partition_info()]
         }
 
@@ -96,7 +110,7 @@ defmodule UniversalProxy.Storage.Probe do
       nil ->
         []
 
-      {slot_sub, vendor_id, product_id} ->
+      {slot_sub, vendor_id, product_id, serial} ->
         disk_dir = Path.join(sys_root, name)
 
         [
@@ -107,6 +121,7 @@ defmodule UniversalProxy.Storage.Probe do
             slot_sub: slot_sub,
             vendor_id: vendor_id,
             product_id: product_id,
+            serial: serial,
             partitions: list_partitions(sys_root, name)
           }
         ]
@@ -172,22 +187,23 @@ defmodule UniversalProxy.Storage.Probe do
     end
   end
 
-  # -- USB ancestry (slot_sub + vendor/product id) --
+  # -- USB ancestry (slot_sub + vendor/product id + serial) --
 
   # A USB-backed disk's `device` symlink resolves through the bound USB
   # interface (see `Audio.Enumerate.read_usb_port/2`) and down into the
-  # SCSI/NVMe target chain. `idVendor`/`idProduct` live on the USB
+  # SCSI/NVMe target chain. `idVendor`/`idProduct`/`serial` live on the USB
   # *device* node itself, one or more levels above the interface, so both
-  # the bus path and the ids come from the **resolved** device directory's
-  # own ancestry. A disk with no USB ancestry at all (internal
+  # the bus path and the attributes come from the **resolved** device
+  # directory's own ancestry. A disk with no USB ancestry at all (internal
   # SD/eMMC/SATA/PCIe) never finds an `idVendor` and is excluded.
   @usb_iface_re ~r/^(\d+-[\d.]+):\d+\.\d+$/
 
   defp usb_ancestry(sys_root, name) do
     with {:ok, device_dir} <- resolve_device_dir(sys_root, name),
-         {vendor_id, product_id} when is_integer(vendor_id) and is_integer(product_id) <-
-           find_ids(device_dir) do
-      {usb_bus_path(device_dir), vendor_id, product_id}
+         {vendor_id, product_id, serial}
+         when is_integer(vendor_id) and is_integer(product_id) <-
+           find_usb_attrs(device_dir) do
+      {usb_bus_path(device_dir), vendor_id, product_id, serial}
     else
       _ -> nil
     end
@@ -223,16 +239,22 @@ defmodule UniversalProxy.Storage.Probe do
     end
   end
 
-  defp find_ids(path) do
+  defp find_usb_attrs(path) do
     path
     |> ancestor_chain(@max_ancestor_depth)
-    |> Enum.find_value({nil, nil}, &ids_at/1)
+    |> Enum.find_value({nil, nil, nil}, &usb_attrs_at/1)
   end
 
-  defp ids_at(dir) do
+  # `serial` is read from the dir the ids were found in, never searched up
+  # the chain on its own: the hub above a serial-less stick publishes one,
+  # and borrowing it would give every stick in that hub the same identity.
+  defp usb_attrs_at(dir) do
     case read_hex(Path.join(dir, "idVendor")) do
-      nil -> nil
-      vendor_id -> {vendor_id, read_hex(Path.join(dir, "idProduct"))}
+      nil ->
+        nil
+
+      vendor_id ->
+        {vendor_id, read_hex(Path.join(dir, "idProduct")), read_serial(dir)}
     end
   end
 
@@ -245,6 +267,21 @@ defmodule UniversalProxy.Storage.Probe do
       [path]
     else
       [path | ancestor_chain(parent, depth - 1)]
+    end
+  end
+
+  # A stick with no `serial` attribute (or an empty one) is `nil`, not "",
+  # so the absence is one value rather than two.
+  defp read_serial(dir) do
+    case File.read(Path.join(dir, "serial")) do
+      {:ok, content} ->
+        case String.trim(content) do
+          "" -> nil
+          serial -> serial
+        end
+
+      {:error, _reason} ->
+        nil
     end
   end
 

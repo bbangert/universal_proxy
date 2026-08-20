@@ -35,7 +35,7 @@ defmodule UniversalProxy.StorageTest do
       assert Storage.list_folders("/") == {:error, :not_mounted}
       assert Storage.create_folder("/", "backups") == {:error, :not_mounted}
 
-      assert Storage.set_share_folder({"1-1.3", "0bda", "0316"}, "backups") ==
+      assert Storage.set_share_folder({"1-1.3", "0bda", "0316", "SN0001"}, "backups") ==
                {:error, :not_mounted}
     end
 
@@ -105,11 +105,12 @@ defmodule UniversalProxy.StorageTest do
     end
 
     test "set_share_enabled/2 degrades to {:error, :unavailable}" do
-      assert Storage.set_share_enabled({"1-1.3", "0bda", "0316"}, true) == {:error, :unavailable}
+      assert Storage.set_share_enabled({"1-1.3", "0bda", "0316", "SN0001"}, true) ==
+               {:error, :unavailable}
     end
 
     test "set_share_folder/2 degrades to {:error, :unavailable}" do
-      assert Storage.set_share_folder({"1-1.3", "0bda", "0316"}, "/") ==
+      assert Storage.set_share_folder({"1-1.3", "0bda", "0316", "SN0001"}, "/") ==
                {:error, :unavailable}
     end
 
@@ -122,7 +123,7 @@ defmodule UniversalProxy.StorageTest do
     end
 
     test "eject/1 degrades to {:error, :unavailable}" do
-      assert Storage.eject({"1-1.3", "0bda", "0316"}) == {:error, :unavailable}
+      assert Storage.eject({"1-1.3", "0bda", "0316", "SN0001"}) == {:error, :unavailable}
       # `nil` is the key of a drive with no derivable bus path.
       assert Storage.eject(nil) == {:error, :unavailable}
     end
@@ -136,11 +137,12 @@ defmodule UniversalProxy.StorageTest do
     end
 
     test "format_drive/2 degrades to {:error, :unavailable} (server not running, not wedged)" do
-      assert Storage.format_drive({"1-1.3", "0bda", "0316"}, "BACKUP") == {:error, :unavailable}
+      assert Storage.format_drive({"1-1.3", "0bda", "0316", "SN0001"}, "BACKUP") ==
+               {:error, :unavailable}
     end
 
     test "format_drive/1 defaults the label to USB_BACKUP and still degrades safely" do
-      assert Storage.format_drive({"1-1.3", "0bda", "0316"}) == {:error, :unavailable}
+      assert Storage.format_drive({"1-1.3", "0bda", "0316", "SN0001"}) == {:error, :unavailable}
       # `nil` is the key of a drive with no derivable bus path.
       assert Storage.format_drive(nil) == {:error, :unavailable}
     end

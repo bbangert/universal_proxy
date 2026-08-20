@@ -362,8 +362,13 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
   # out to `mkfs.ext4`/`umount` against the device path they are handed, so
   # they must never run against the test host's own disks.
   describe "USB storage drive" do
-    @drive_key {"1-1.3", "0781", "55af"}
-    @second_key {"1-1.4", "0781", "55af"}
+    # The fourth key element is the USB serial — the drive key names one
+    # medium, so a same-model stick in the same port keys differently.
+    @drive_key {"1-1.3", "0781", "55af", "SN-A"}
+    @second_key {"1-1.4", "0781", "55af", "SN-B"}
+    # The same port and model as @drive_key, a different stick: what a
+    # debounced unplug-and-replace looks like to the LiveView.
+    @swapped_key {"1-1.3", "0781", "55af", "SN-C"}
     @password "test-only-password"
 
     setup do
@@ -379,6 +384,7 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
         slot_sub: Keyword.get(opts, :slot_sub, "1-1.3"),
         vendor_id: 0x0781,
         product_id: 0x55AF,
+        serial: Keyword.get(opts, :serial, "SN-A"),
         partitions: [],
         key: Keyword.get(opts, :key, @drive_key),
         fs_type: Keyword.get(opts, :fs_type, :exfat)
@@ -890,6 +896,103 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
       # the panel copy, not the toast).
       push_storage(storage_state())
       refute render(view) =~ "Re-plug the drive to mount it again."
+    end
+
+    # The hotplug debounce can coalesce an unplug and the insertion that
+    # follows it into ONE broadcast, so a drawer that was armed on the old
+    # stick never sees an empty drives list in between: the same slot, the
+    # same model and the same /dev/sda are simply a different medium. The
+    # armed confirm must not resolve against it.
+    test "a same-model drive swap disarms an armed format", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state())
+      open_drawer(view)
+
+      assert view |> element("button[phx-value-action='format']") |> render_click() =~
+               "Erase everything on USB drive (/dev/sda) and format it as ext4?"
+
+      # One broadcast, same device path and model, different serial.
+      push_storage(storage_state(drives: [drive(key: @swapped_key, serial: "SN-C")]))
+
+      html = render(view)
+      assert html =~ "The drive changed — actions reset."
+      refute html =~ "Erase everything on USB drive"
+      # The drawer stays open on the new drive; it is simply not armed.
+      assert html =~ "Danger zone"
+
+      # And the confirm that was armed against the old stick does nothing.
+      html = render_click(view, "drive_format", %{})
+      refute_receive {:storage_call, :format_drive, _}
+      assert html =~ "Confirm that action first."
+    end
+
+    test "a same-model drive swap disarms an armed eject", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state())
+      open_drawer(view)
+
+      assert view |> element("button[phx-value-action='eject']") |> render_click() =~
+               "Eject USB drive (/dev/sda)?"
+
+      push_storage(storage_state(drives: [drive(key: @swapped_key, serial: "SN-C")]))
+
+      html = render(view)
+      assert html =~ "The drive changed — actions reset."
+
+      html = render_click(view, "drive_eject", %{})
+      refute_receive {:storage_call, :eject, _}
+      refute html =~ "safe to unplug"
+    end
+
+    # The chooser's listing belongs to the filesystem that was mounted when
+    # it was opened, and "Use this folder" would persist that path against
+    # the replacement's key.
+    test "a same-model drive swap closes the folder chooser", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state(share: :running))
+      open_drawer(view)
+
+      assert view |> element("button[phx-click='drive_open_chooser']") |> render_click() =~
+               "Choose backup folder"
+
+      push_storage(
+        storage_state(share: :running, drives: [drive(key: @swapped_key, serial: "SN-C")])
+      )
+
+      html = render(view)
+      assert html =~ "The drive changed — actions reset."
+      refute html =~ "Choose backup folder"
+    end
+
+    # The identity check must be an identity check: the subsystem
+    # rebroadcasts the same drive on every capacity read, and a reset on
+    # each of those would make the two-step confirmation unusable.
+    test "a rebroadcast of the same drive leaves an armed action alone", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state())
+      open_drawer(view)
+
+      view |> element("button[phx-value-action='eject']") |> render_click()
+
+      # Same drive, fresh capacity numbers.
+      push_storage(
+        storage_state(
+          capacity: %{
+            total_bytes: 1_000_204_886_016,
+            used_bytes: 700_000_000_000,
+            free_bytes: 300_204_886_016,
+            used_pct: 70
+          }
+        )
+      )
+
+      html = render(view)
+      refute html =~ "The drive changed"
+      assert html =~ "Eject USB drive (/dev/sda)?"
+
+      html = view |> element("button[phx-click='drive_eject']") |> render_click()
+      assert_receive {:storage_call, :eject, [@drive_key]}
+      assert html =~ "safe to unplug"
     end
 
     test "unplugging the open drive closes its drawer", %{conn: conn} do

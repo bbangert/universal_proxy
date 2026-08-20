@@ -42,6 +42,14 @@ defmodule UniversalProxy.Storage do
 
   alias UniversalProxy.Storage.{Server, Settings, Smbd}
 
+  @typedoc """
+  A drive's identity as `{slot_sub, vendor_id, product_id, serial}` — port,
+  USB model ids, and the
+  USB serial that makes it name one physical medium rather than every
+  stick of that model (see `Storage.Server`'s moduledoc, which also
+  documents what a serial-less stick loses). `nil` for a drive with no
+  derivable bus path.
+  """
   @type drive_key :: Server.drive_key()
   @type state :: Server.payload()
 
@@ -234,7 +242,7 @@ defmodule UniversalProxy.Storage do
   """
   @spec eject(drive_key() | nil) :: :ok | {:error, term()}
   def eject(drive_key)
-      when is_nil(drive_key) or (is_tuple(drive_key) and tuple_size(drive_key) == 3) do
+      when is_nil(drive_key) or (is_tuple(drive_key) and tuple_size(drive_key) == 4) do
     Server.eject(drive_key)
   catch
     :exit, _ -> {:error, :unavailable}
@@ -264,7 +272,7 @@ defmodule UniversalProxy.Storage do
   @spec format_drive(drive_key() | nil, String.t()) :: :ok | {:error, term()}
   def format_drive(drive_key, label \\ "USB_BACKUP")
       when is_binary(label) and
-             (is_nil(drive_key) or (is_tuple(drive_key) and tuple_size(drive_key) == 3)) do
+             (is_nil(drive_key) or (is_tuple(drive_key) and tuple_size(drive_key) == 4)) do
     call_server(fn -> Server.format(drive_key, label) end)
   end
 

@@ -18,8 +18,8 @@ defmodule UniversalProxy.StorageFixtures do
       the class entry points at;
     * the `device` symlink sits inside that real directory and is
       relative to it (`../../../0:0:0:0`), so its raw target contains no
-      USB segment — the bus path and `idVendor`/`idProduct` are only
-      reachable through the resolved ancestry.
+      USB segment — the bus path and `idVendor`/`idProduct`/`serial` are
+      only reachable through the resolved ancestry.
 
   The one liberty taken is depth: a real `/sys/class/block/sda` points at
   `../../devices/…`, while here the devices tree is a sibling of
@@ -36,25 +36,33 @@ defmodule UniversalProxy.StorageFixtures do
   block directory under a devices tree, a class-entry symlink to it at
   `<sys_root>/<name>`, and a relative `device` symlink into the SCSI
   target chain hanging off the USB interface of the device node that
-  carries `idVendor`/`idProduct` at `slot_sub` (e.g. "1-1.3").
+  carries `idVendor`/`idProduct`/`serial` at `slot_sub` (e.g. "1-1.3").
   Returns `:ok`.
 
   Options: `:sectors` (default ~10 GiB worth of 512-byte sectors),
-  `:slot_sub`, `:vendor_id`, `:product_id`.
+  `:slot_sub`, `:vendor_id`, `:product_id`, and `:serial` — the USB
+  `serial` attribute the device node publishes beside its ids. Pass
+  `serial: nil` for a stick that publishes none (cheap clones), which
+  writes no `serial` file at all.
   """
   def put_usb_disk!(sys_root, name, opts \\ []) do
     sectors = Keyword.get(opts, :sectors, 20_971_520)
     slot_sub = Keyword.get(opts, :slot_sub, "1-1.3")
     vendor_id = Keyword.get(opts, :vendor_id, 0x0BDA)
     product_id = Keyword.get(opts, :product_id, 0x0316)
+    serial = Keyword.get(opts, :serial, "0123456789ABCDEF")
 
-    # The USB device node: idVendor/idProduct live here, above the bound
-    # interface, which is why Probe walks the resolved ancestry.
+    # The USB device node: idVendor/idProduct/serial live here, above the
+    # bound interface, which is why Probe walks the resolved ancestry.
     usb_path = ["platform", "soc", "usb1", slot_sub]
     usb_dir = Path.join([devices_root(sys_root) | usb_path])
     File.mkdir_p!(usb_dir)
     File.write!(Path.join(usb_dir, "idVendor"), hex4(vendor_id))
     File.write!(Path.join(usb_dir, "idProduct"), hex4(product_id))
+    # The kernel newline-terminates these attributes, so the fixture does
+    # too — reading one back untrimmed is a bug the tests must be able to
+    # catch.
+    if serial, do: File.write!(Path.join(usb_dir, "serial"), "#{serial}\n")
 
     scsi_path = usb_path ++ ["#{slot_sub}:1.0", "host0", "target0:0:0", "0:0:0:0"]
     put_disk!(sys_root, name, scsi_path, sectors)

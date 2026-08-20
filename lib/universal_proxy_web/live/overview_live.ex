@@ -28,6 +28,10 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   @refresh_interval 10_000
 
+  # Shown when the drive behind an open drawer was swapped for another one
+  # (see `reset_actions_on_drive_change/1`).
+  @drive_changed_flash "The drive changed — actions reset."
+
   @impl true
   def mount(_params, _session, socket) do
     ports = Hardware.list_ports()
@@ -269,13 +273,17 @@ defmodule UniversalProxyWeb.OverviewLive do
   # ── USB storage drive drawer ──────────────────────────────────────────
   # Drives are selected by device path (`/dev/sda`): it is unique, always
   # present, and — unlike the settings key — never nil, so a drive with no
-  # derivable bus path can still be inspected and formatted.
+  # derivable bus path can still be inspected and formatted. The path is
+  # a *slot*, not a medium, though: the drive KEY is snapshotted alongside
+  # it so a swap behind an open drawer is detectable (see
+  # `reset_actions_on_drive_change/1`).
 
   def handle_event("select_drive", %{"device" => device}, socket) when is_binary(device) do
     {:noreply,
      socket
      |> reset_drive_drawer()
      |> assign(:selected_drive, device)
+     |> snapshot_drive_key()
      |> load_share_username()}
   end
 
@@ -336,16 +344,16 @@ defmodule UniversalProxyWeb.OverviewLive do
     if format_in_flight?(socket) do
       {:noreply, format_busy_noop(socket)}
     else
-      {:noreply, assign(socket, :drive_armed, :format)}
+      {:noreply, arm(socket, :format)}
     end
   end
 
   def handle_event("drive_arm", %{"action" => "eject"}, socket) do
-    {:noreply, assign(socket, :drive_armed, :eject)}
+    {:noreply, arm(socket, :eject)}
   end
 
   def handle_event("drive_arm", %{"action" => "regen"}, socket) do
-    {:noreply, assign(socket, :drive_armed, :regen)}
+    {:noreply, arm(socket, :regen)}
   end
 
   def handle_event("drive_disarm", _params, socket) do
@@ -395,6 +403,9 @@ defmodule UniversalProxyWeb.OverviewLive do
       not armed?(socket, :format) ->
         {:noreply, unarmed_noop(socket)}
 
+      not drive_key_unchanged?(socket) ->
+        {:noreply, drive_changed_noop(socket)}
+
       true ->
         socket = assign(socket, :drive_armed, nil)
 
@@ -409,30 +420,15 @@ defmodule UniversalProxyWeb.OverviewLive do
   end
 
   def handle_event("drive_eject", _params, socket) do
-    if armed?(socket, :eject) do
-      socket = assign(socket, :drive_armed, nil)
+    cond do
+      not armed?(socket, :eject) ->
+        {:noreply, unarmed_noop(socket)}
 
-      case ejectable_drive(socket) do
-        {:ok, %{dev_path: device} = drive} ->
-          # The drive **key**, as with the format: the façade accepts only
-          # the mounted drive's key, so a confirm aimed at another drive
-          # cannot eject this one.
-          case storage().eject(Map.get(drive, :key)) do
-            :ok ->
-              {:noreply,
-               socket
-               |> assign(:drive_ejected, device)
-               |> put_flash(:info, "Drive ejected — it's safe to unplug now.")}
+      not drive_key_unchanged?(socket) ->
+        {:noreply, drive_changed_noop(socket)}
 
-            error ->
-              {:noreply, flash_result(socket, error, nil)}
-          end
-
-        :error ->
-          {:noreply, socket}
-      end
-    else
-      {:noreply, unarmed_noop(socket)}
+      true ->
+        do_eject(assign(socket, :drive_armed, nil))
     end
   end
 
@@ -1105,6 +1101,7 @@ defmodule UniversalProxyWeb.OverviewLive do
   defp reset_drive_drawer(socket) do
     socket
     |> assign(:selected_drive, nil)
+    |> assign(:selected_drive_key, nil)
     |> assign(:drive_username, nil)
     |> assign(:drive_credentials?, true)
     |> assign(:drive_password, nil)
@@ -1119,10 +1116,63 @@ defmodule UniversalProxyWeb.OverviewLive do
   # crafted (or stale) one and must do nothing.
   defp armed?(socket, action), do: socket.assigns.drive_armed == action
 
+  # Arming re-takes the identity snapshot: whatever the drawer was opened
+  # on, the confirm that follows is about the drive on screen *now*.
+  defp arm(socket, action) do
+    socket |> snapshot_drive_key() |> assign(:drive_armed, action)
+  end
+
   defp unarmed_noop(socket) do
     socket
     |> assign(:drive_armed, nil)
     |> put_flash(:info, "Confirm that action first.")
+  end
+
+  # The identity of the drive the drawer is open on, as the drive key —
+  # `nil` both for a closed drawer and for a drive with no derivable bus
+  # path (which is why the snapshot is only ever compared, never trusted
+  # as "there is a drive").
+  defp snapshot_drive_key(socket),
+    do: assign(socket, :selected_drive_key, current_drive_key(socket))
+
+  defp current_drive_key(socket) do
+    case selected_drive(socket) do
+      %{} = drive -> Map.get(drive, :key)
+      _no_drive -> nil
+    end
+  end
+
+  # Belt for the confirm handlers. The drawer's own state is already the
+  # first layer (`reset_actions_on_drive_change/1` disarms on the very
+  # broadcast that swapped the drive, and assigns only change on one), and
+  # `Storage.Server` is the boundary: it accepts only the active drive's
+  # key and — now that keys carry the USB serial — answers
+  # `:unknown_drive` for a stale one. This check is the middle layer, so a
+  # confirm can never reach the façade naming a drive the drawer was not
+  # armed against.
+  defp drive_key_unchanged?(socket),
+    do: socket.assigns.selected_drive_key == current_drive_key(socket)
+
+  defp do_eject(socket) do
+    case ejectable_drive(socket) do
+      {:ok, %{dev_path: device} = drive} ->
+        # The drive **key**, as with the format: the façade accepts only
+        # the mounted drive's key, so a confirm aimed at another drive
+        # cannot eject this one.
+        case storage().eject(Map.get(drive, :key)) do
+          :ok ->
+            {:noreply,
+             socket
+             |> assign(:drive_ejected, device)
+             |> put_flash(:info, "Drive ejected — it's safe to unplug now.")}
+
+          error ->
+            {:noreply, flash_result(socket, error, nil)}
+        end
+
+      :error ->
+        {:noreply, socket}
+    end
   end
 
   # A format is in flight until the task that owns it reports back. The
@@ -1235,9 +1285,42 @@ defmodule UniversalProxyWeb.OverviewLive do
 
     socket
     |> close_drawer_unless_present(devices)
+    |> reset_actions_on_drive_change()
     |> clear_formatting_unless_present(devices)
     |> clear_timed_out_format()
     |> clear_ejected_when_mounted()
+  end
+
+  # The hotplug debounce can coalesce an unplug and the insertion that
+  # follows it into ONE broadcast, so an open drawer never sees an empty
+  # drives list in between: the same device path is simply occupied by a
+  # different medium. An armed confirm resolved against that state would
+  # format or eject a drive the user never named — so a changed identity
+  # disarms everything, drops the folder chooser (its listing belongs to
+  # the old filesystem) and re-snapshots, leaving the drawer showing the
+  # new drive with nothing armed. A drive that left outright has already
+  # had its drawer closed by `close_drawer_unless_present/2`.
+  #
+  # Identity is the drive key, so two drives that key alike are invisible
+  # here: a drive with no derivable bus path (`key: nil`), and a
+  # serial-less stick replaced by another serial-less stick of the same
+  # model in the same port. That is the same blind spot the persisted
+  # settings have, and for the same reason (see `Storage.Server`'s
+  # moduledoc).
+  defp reset_actions_on_drive_change(socket) do
+    if is_nil(socket.assigns.selected_drive) or drive_key_unchanged?(socket) do
+      socket
+    else
+      drive_changed_noop(socket)
+    end
+  end
+
+  defp drive_changed_noop(socket) do
+    socket
+    |> assign(:drive_armed, nil)
+    |> assign(:drive_chooser, nil)
+    |> snapshot_drive_key()
+    |> put_flash(:info, @drive_changed_flash)
   end
 
   defp close_drawer_unless_present(socket, devices) do

@@ -4,9 +4,15 @@ defmodule UniversalProxy.Storage.Settings do
 
   Two kinds of records share one table:
 
-    * Per-drive settings, keyed `{slot_sub, vendor_id, product_id}` — the
-      same shape as `UniversalProxy.Audio.Store` and `UniversalProxy.UART`
-      stores. Value shape:
+    * Per-drive settings, keyed
+      `{slot_sub, vendor_id, product_id, serial}` — the port-and-model
+      shape `UniversalProxy.Audio.Store` and `UniversalProxy.UART` use,
+      plus the USB serial, which is what makes the key identify a
+      **medium** rather than a model: without it the opt-in stored for one
+      stick would be found again by any same-model stick plugged into the
+      same port. A stick that publishes no serial keys as `nil` there and
+      keeps the weaker identity (see `Storage.Server`'s moduledoc). Value
+      shape:
 
           %{
             share_enabled?: boolean(),
@@ -77,7 +83,8 @@ defmodule UniversalProxy.Storage.Settings do
   @type slot_sub :: String.t()
   @type vendor_id :: String.t() | nil
   @type product_id :: String.t() | nil
-  @type drive_key :: {slot_sub(), vendor_id(), product_id()}
+  @type serial :: String.t() | nil
+  @type drive_key :: {slot_sub(), vendor_id(), product_id(), serial()}
 
   @type drive_settings :: %{
           share_enabled?: boolean(),
@@ -125,7 +132,8 @@ defmodule UniversalProxy.Storage.Settings do
 
   @doc "Look up a drive's settings. Unknown keys return the defaults."
   @spec get_drive(GenServer.server(), drive_key()) :: drive_settings()
-  def get_drive(server \\ __MODULE__, {slot_sub, _vid, _pid} = key) when is_binary(slot_sub) do
+  def get_drive(server \\ __MODULE__, {slot_sub, _vid, _pid, _serial} = key)
+      when is_binary(slot_sub) do
     GenServer.call(server, {:get_drive, key})
   end
 
@@ -134,7 +142,7 @@ defmodule UniversalProxy.Storage.Settings do
   any field not already stored and not present in `params`.
   """
   @spec put_drive(GenServer.server(), drive_key(), map()) :: :ok | {:error, term()}
-  def put_drive(server \\ __MODULE__, {slot_sub, _vid, _pid} = key, params)
+  def put_drive(server \\ __MODULE__, {slot_sub, _vid, _pid, _serial} = key, params)
       when is_binary(slot_sub) and is_map(params) do
     GenServer.call(server, {:put_drive, key, params})
   end

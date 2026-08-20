@@ -11,7 +11,9 @@ defmodule UniversalProxy.Storage.SettingsTest do
 
   @moduletag :tmp_dir
 
-  @key {"Backup Drive", "1d6b", "0104"}
+  # The fourth element is the USB serial: the key names one medium,
+  # not every stick of that model in that port.
+  @key {"Backup Drive", "1d6b", "0104", "SN0001"}
 
   setup %{tmp_dir: tmp_dir} do
     path = Path.join(tmp_dir, "storage_settings_#{System.unique_integer([:positive])}.dets")
@@ -100,6 +102,36 @@ defmodule UniversalProxy.Storage.SettingsTest do
       refute Settings.share_enabled?(server, @key)
       :ok = Settings.put_drive(server, @key, %{share_enabled?: true})
       assert Settings.share_enabled?(server, @key)
+    end
+
+    # The serial is what makes the key a medium: a same-model stick in the
+    # same port must not read back its predecessor's opt-in.
+    test "a same-port, same-model key with another serial is a different record", %{
+      server: server
+    } do
+      {slot, vid, pid, _serial} = @key
+      replacement = {slot, vid, pid, "SN0002"}
+
+      :ok = Settings.put_drive(server, @key, %{share_enabled?: true})
+
+      refute Settings.share_enabled?(server, replacement)
+      assert Settings.get_drive(server, replacement).share_folder == "/"
+
+      # And opting the replacement in leaves the original alone.
+      :ok = Settings.put_drive(server, replacement, %{share_enabled?: true})
+      assert Settings.share_enabled?(server, @key)
+    end
+
+    # A stick that publishes no serial keys as nil — one value, not two, so
+    # a missing serial cannot become a second identity for the same drive.
+    test "a nil serial is its own key and reads back consistently", %{server: server} do
+      {slot, vid, pid, _serial} = @key
+      serial_less = {slot, vid, pid, nil}
+
+      :ok = Settings.put_drive(server, serial_less, %{share_enabled?: true})
+
+      assert Settings.share_enabled?(server, serial_less)
+      refute Settings.share_enabled?(server, @key)
     end
   end
 

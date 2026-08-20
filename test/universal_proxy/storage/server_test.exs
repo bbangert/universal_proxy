@@ -14,9 +14,13 @@ defmodule UniversalProxy.Storage.ServerTest do
   @settings_table :storage_server_test
 
   # Probe reports vid/pid as integers; Storage.Settings keys them as
-  # lowercase 4-digit hex strings, which is what Server derives.
-  @drive_key {"1-1.3", "0bda", "0316"}
-  @nvme_key {"1-1.4", "0bda", "0316"}
+  # lowercase 4-digit hex strings, which is what Server derives. The
+  # fourth element is the USB serial: the key names one medium, not every
+  # stick of that model in that port.
+  @sda_serial "SN-SDA-0001"
+  @nvme_serial "SN-NVME-0001"
+  @drive_key {"1-1.3", "0bda", "0316", @sda_serial}
+  @nvme_key {"1-1.4", "0bda", "0316", @nvme_serial}
 
   defmodule Recorder do
     @moduledoc """
@@ -267,6 +271,7 @@ defmodule UniversalProxy.Storage.ServerTest do
       slot_sub: Keyword.get(opts, :slot_sub, "1-1.3"),
       vendor_id: 0x0BDA,
       product_id: 0x0316,
+      serial: Keyword.get(opts, :serial, @sda_serial),
       partitions:
         Keyword.get(opts, :partitions, [
           %{name: "sda1", dev_path: "/dev/sda1", size_bytes: 7_900_000_000}
@@ -280,6 +285,7 @@ defmodule UniversalProxy.Storage.ServerTest do
     drive(
       name: "nvme0n1",
       slot_sub: "1-1.4",
+      serial: @nvme_serial,
       partitions: [
         %{name: "nvme0n1p1", dev_path: "/dev/nvme0n1p1", size_bytes: 900_000_000_000}
       ]
@@ -554,6 +560,65 @@ defmodule UniversalProxy.Storage.ServerTest do
       assert state.share == :off
       assert [%{key: nil}] = state.drives
     end
+
+    # The hotplug debounce can coalesce a removal and the insertion that
+    # follows it into a single convergence, so this is the swap as the
+    # server really sees it: one pass in which the same port, model and
+    # device path are occupied by a different medium. Without the serial in
+    # the key the replacement would read back the predecessor's opt-in and
+    # auto-share — with the predecessor's credentials — a drive nobody
+    # opted in.
+    test "a same-model stick swapped into the port does not inherit the opt-in", ctx do
+      server = start_server(ctx)
+      present!()
+      enable_share!(ctx)
+      :ok = Server.check_now(server)
+      assert Server.get_state(server).share == :running
+
+      Recorder.put(:drives, [drive(serial: "SN-SDA-0002")])
+      :ok = Server.check_now(server)
+
+      state = Server.get_state(server)
+      assert [%{key: {"1-1.3", "0bda", "0316", "SN-SDA-0002"}}] = state.drives
+      # Mounted (it is a drive like any other) but NOT shared.
+      assert state.mount.device == "/dev/sda1"
+      assert state.share == :off
+      assert DynamicSupervisor.which_children(ctx.daemon_supervisor) == []
+      # And the predecessor's opt-in is untouched: re-plugging it shares again.
+      assert Settings.share_enabled?(ctx.settings, @drive_key)
+      refute Settings.share_enabled?(ctx.settings, {"1-1.3", "0bda", "0316", "SN-SDA-0002"})
+    end
+
+    test "opting the replacement in keys against its own serial", ctx do
+      server = start_server(ctx)
+      replacement_key = {"1-1.3", "0bda", "0316", "SN-SDA-0002"}
+      Recorder.put(:drives, [drive(serial: "SN-SDA-0002")])
+      Recorder.put(:heads, %{"/dev/sda1" => StorageFixtures.ext4_bytes()})
+      :ok = Server.check_now(server)
+
+      assert :ok = Server.set_share_enabled(server, replacement_key, true)
+
+      assert Server.get_state(server).share == :running
+      assert Settings.share_enabled?(ctx.settings, replacement_key)
+      # The stick it replaced stays opted out.
+      refute Settings.share_enabled?(ctx.settings, @drive_key)
+    end
+
+    # A stick with no `serial` attribute keys as `serial: nil` — the one
+    # case the per-medium key cannot separate, kept explicit so the
+    # limitation is a tested fact and not a surprise.
+    test "two serial-less same-model sticks still share one key", ctx do
+      server = start_server(ctx)
+      serial_less_key = {"1-1.3", "0bda", "0316", nil}
+      Recorder.put(:drives, [drive(serial: nil)])
+      Recorder.put(:heads, %{"/dev/sda1" => StorageFixtures.ext4_bytes()})
+      :ok = Settings.put_drive(ctx.settings, serial_less_key, %{share_enabled?: true})
+
+      :ok = Server.check_now(server)
+
+      assert [%{key: ^serial_less_key}] = Server.get_state(server).drives
+      assert Server.get_state(server).share == :running
+    end
   end
 
   describe "format/3" do
@@ -649,7 +714,7 @@ defmodule UniversalProxy.Storage.ServerTest do
 
       log =
         capture_log(fn ->
-          assert Server.format(server, {"9-9", "dead", "beef"}, "usb_backup") ==
+          assert Server.format(server, {"9-9", "dead", "beef", "SN-OTHER"}, "usb_backup") ==
                    {:error, :unknown_drive}
 
           assert Server.format(server, nil, "usb_backup") == {:error, :unknown_drive}
@@ -833,7 +898,9 @@ defmodule UniversalProxy.Storage.ServerTest do
 
       log =
         capture_log(fn ->
-          assert Server.eject(server, {"2-1.4", "1234", "5678"}) == {:error, :unknown_drive}
+          assert Server.eject(server, {"2-1.4", "1234", "5678", "SN-OTHER"}) ==
+                   {:error, :unknown_drive}
+
           assert Server.eject(server, nil) == {:error, :unknown_drive}
         end)
 
@@ -1036,7 +1103,7 @@ defmodule UniversalProxy.Storage.ServerTest do
       File.mkdir_p!(in_root("backups"))
       :ok = Server.check_now(server)
 
-      other_key = {"1-1.4", "0bda", "0316"}
+      other_key = @nvme_key
       assert :ok = Server.set_share_folder(server, other_key, "backups")
 
       assert Server.get_state(server).share_folder == "/"

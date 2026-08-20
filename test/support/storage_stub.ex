@@ -21,6 +21,11 @@ defmodule UniversalProxy.StorageStub do
       StorageStub.install(self(), folders: %{"/" => ["backups"]})
 
   `install/2` also registers an `on_exit` that restores the real façade.
+
+  Drive keys are the façade's `{slot_sub, vendor_id, product_id, serial}`
+  4-tuple (or `nil`), and the recorded `{:storage_call, …}` args carry
+  them verbatim — a test asserting on them is asserting on the identity
+  the drawer resolved, serial included.
   """
 
   @default_credentials %{
@@ -97,8 +102,9 @@ defmodule UniversalProxy.StorageStub do
 
   def set_share_folder(key, path), do: reply(:set_share_folder, [key, path], :ok)
 
-  # Takes the drive **key**, like `format_drive/2`: only the mounted
-  # drive's key is accepted by the real façade.
+  # Takes the drive **key** (the serial-bearing 4-tuple), like
+  # `format_drive/2`: only the mounted drive's key is accepted by the real
+  # façade.
   def eject(drive_key), do: reply(:eject, [drive_key], :ok)
 
   # Takes the drive **key** (`nil` for a drive with no derivable bus path),

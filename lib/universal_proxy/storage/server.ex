@@ -162,12 +162,30 @@ defmodule UniversalProxy.Storage.Server do
 
   ## Drive keys
 
-  Per-drive settings are keyed `{slot_sub, vendor_id, product_id}` with
-  the ids as lowercase 4-digit hex **strings** — that is the key shape
-  `Storage.Settings` declares and persists (note it differs from
-  `Audio.Store`, whose ids are integers). A drive whose `slot_sub` could
-  not be derived gets `key: nil` and can never have its share enabled:
-  there is nothing stable to persist the opt-in against.
+  Per-drive settings are keyed
+  `{slot_sub, vendor_id, product_id, serial}` with the ids as lowercase
+  4-digit hex **strings** — that is the key shape `Storage.Settings`
+  declares and persists (note it differs from `Audio.Store`, whose ids are
+  integers). A drive whose `slot_sub` could not be derived gets `key: nil`
+  and can never have its share enabled: there is nothing stable to persist
+  the opt-in against.
+
+  The `serial` component is what makes the key name a **medium** and not a
+  model. Port plus vendor/product ids are shared by every stick of the
+  same model, so a key without the serial would find the opt-in — and with
+  it the existing Samba credentials — of a *different* stick the moment
+  one was swapped for another in the same port: the share would come up
+  automatically for a drive nobody opted in. A different serial is a
+  different key, `share_enabled?` reads back `false`, and the share stays
+  off until the user opts this drive in.
+
+  A stick that publishes no `serial` at all (cheap clones do this) keys as
+  `serial: nil` and keeps exactly the old weakness — a same-model,
+  same-port, serial-less replacement still matches. There is nothing left
+  to distinguish it by: the filesystem UUID is the obvious alternative,
+  but it does not survive `format/3`, which would silently drop the drive's
+  own settings every time the user reformatted it. The USB serial is
+  therefore the identifier used, absent or not.
 
   ## Failure posture
 
@@ -254,7 +272,8 @@ defmodule UniversalProxy.Storage.Server do
   @netbios_max 15
   @netbios_fallback "universal-proxy"
 
-  @type drive_key :: {String.t(), String.t() | nil, String.t() | nil}
+  @type drive_key ::
+          {String.t(), String.t() | nil, String.t() | nil, String.t() | nil}
 
   @type mount_info :: %{
           device: String.t(),
@@ -341,7 +360,7 @@ defmodule UniversalProxy.Storage.Server do
   `smbpasswd` can't time out the caller.
   """
   @spec set_share_enabled(GenServer.server(), drive_key(), boolean()) :: :ok | {:error, term()}
-  def set_share_enabled(server \\ __MODULE__, {slot_sub, _vid, _pid} = key, enabled?)
+  def set_share_enabled(server \\ __MODULE__, {slot_sub, _vid, _pid, _serial} = key, enabled?)
       when is_binary(slot_sub) and is_boolean(enabled?) do
     GenServer.call(server, {:set_share_enabled, key, enabled?})
   end
@@ -368,7 +387,7 @@ defmodule UniversalProxy.Storage.Server do
   `{:error, :not_mounted}`.
   """
   @spec set_share_folder(GenServer.server(), drive_key(), String.t()) :: :ok | {:error, term()}
-  def set_share_folder(server \\ __MODULE__, {slot_sub, _vid, _pid} = key, path)
+  def set_share_folder(server \\ __MODULE__, {slot_sub, _vid, _pid, _serial} = key, path)
       when is_binary(slot_sub) and is_binary(path) do
     GenServer.call(server, {:set_share_folder, key, path})
   end
@@ -432,7 +451,7 @@ defmodule UniversalProxy.Storage.Server do
   """
   @spec eject(GenServer.server(), drive_key() | nil) :: :ok | {:error, term()}
   def eject(server \\ __MODULE__, drive_key)
-      when is_nil(drive_key) or (is_tuple(drive_key) and tuple_size(drive_key) == 3) do
+      when is_nil(drive_key) or (is_tuple(drive_key) and tuple_size(drive_key) == 4) do
     GenServer.call(server, {:eject, drive_key})
   end
 
@@ -456,7 +475,7 @@ defmodule UniversalProxy.Storage.Server do
   @spec format(GenServer.server(), drive_key() | nil, String.t()) :: :ok | {:error, term()}
   def format(server \\ __MODULE__, drive_key, label)
       when is_binary(label) and
-             (is_nil(drive_key) or (is_tuple(drive_key) and tuple_size(drive_key) == 3)) do
+             (is_nil(drive_key) or (is_tuple(drive_key) and tuple_size(drive_key) == 4)) do
     GenServer.call(server, {:format, drive_key, label}, @format_timeout)
   end
 
@@ -1175,7 +1194,7 @@ defmodule UniversalProxy.Storage.Server do
     %{state | share_folder: stored_share_folder(state)}
   end
 
-  defp stored_share_folder(%{mounted_ref: {_name, {slot_sub, _vid, _pid} = key}} = state)
+  defp stored_share_folder(%{mounted_ref: {_name, {slot_sub, _vid, _pid, _serial} = key}} = state)
        when is_binary(slot_sub) do
     case safe(fn -> Settings.get_drive(state.settings, key) end, nil, "Settings.get_drive") do
       %{share_folder: folder} when is_binary(folder) -> folder
@@ -1427,7 +1446,7 @@ defmodule UniversalProxy.Storage.Server do
     mounted?(state) and share_enabled?(state) and smbd_available?(state)
   end
 
-  defp share_enabled?(%{mounted_ref: {_name, {slot_sub, _vid, _pid} = key}} = state)
+  defp share_enabled?(%{mounted_ref: {_name, {slot_sub, _vid, _pid, _serial} = key}} = state)
        when is_binary(slot_sub) do
     safe(
       fn -> Settings.share_enabled?(state.settings, key) end,
@@ -1685,12 +1704,23 @@ defmodule UniversalProxy.Storage.Server do
   defp put_ref(set, nil), do: set
   defp put_ref(set, ref), do: MapSet.put(set, ref)
 
-  defp drive_key(%{slot_sub: slot_sub, vendor_id: vendor_id, product_id: product_id})
+  defp drive_key(%{slot_sub: slot_sub, vendor_id: vendor_id, product_id: product_id} = drive)
        when is_binary(slot_sub) do
-    {slot_sub, hex_id(vendor_id), hex_id(product_id)}
+    {slot_sub, hex_id(vendor_id), hex_id(product_id), serial_id(Map.get(drive, :serial))}
   end
 
   defp drive_key(_drive), do: nil
+
+  # The per-medium component (see the moduledoc). Absent, blank and
+  # non-binary all collapse to `nil` so one missing serial is one key.
+  defp serial_id(serial) when is_binary(serial) do
+    case String.trim(serial) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp serial_id(_serial), do: nil
 
   defp hex_id(id) when is_integer(id) and id >= 0 do
     id |> Integer.to_string(16) |> String.downcase() |> String.pad_leading(4, "0")

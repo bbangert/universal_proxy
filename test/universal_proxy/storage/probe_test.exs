@@ -32,7 +32,8 @@ defmodule UniversalProxy.Storage.ProbeTest do
         sectors: 20_971_520,
         slot_sub: "1-1.3",
         vendor_id: 0x0BDA,
-        product_id: 0x0316
+        product_id: 0x0316,
+        serial: "AA00BB11CC22"
       )
 
       Fixtures.put_partition!(sys_root, "sda", "sda1", sectors: 20_969_472)
@@ -45,6 +46,10 @@ defmodule UniversalProxy.Storage.ProbeTest do
       assert drive.slot_sub == "1-1.3"
       assert drive.vendor_id == 0x0BDA
       assert drive.product_id == 0x0316
+      # Trimmed: the kernel newline-terminates the attribute, and the
+      # serial is a settings-key component, so a stray "\n" would key the
+      # drive differently than a later trimmed read of the same stick.
+      assert drive.serial == "AA00BB11CC22"
 
       assert drive.partitions == [
                %{
@@ -132,6 +137,34 @@ defmodule UniversalProxy.Storage.ProbeTest do
                Probe.list_drives(sys_root: sys_root)
 
       assert size > 0
+    end
+
+    @tag :tmp_dir
+    test "a stick that publishes no serial reports serial: nil", %{tmp_dir: tmp_dir} do
+      sys_root = Path.join(tmp_dir, "sys")
+      File.mkdir_p!(sys_root)
+
+      # Cheap clone sticks omit the attribute entirely. The drive still
+      # enumerates — it just keys with a nil serial, which is the weaker
+      # identity Storage.Server's moduledoc documents.
+      Fixtures.put_usb_disk!(sys_root, "sda", serial: nil)
+
+      assert [%{slot_sub: "1-1.3", vendor_id: 0x0BDA, serial: nil}] =
+               Probe.list_drives(sys_root: sys_root)
+    end
+
+    @tag :tmp_dir
+    test "two same-model sticks are distinguished by their serials", %{tmp_dir: tmp_dir} do
+      sys_root = Path.join(tmp_dir, "sys")
+      File.mkdir_p!(sys_root)
+
+      Fixtures.put_usb_disk!(sys_root, "sda", slot_sub: "1-1.3", serial: "FIRST-STICK")
+      Fixtures.put_usb_disk!(sys_root, "sdb", slot_sub: "1-1.4", serial: "SECOND-STICK")
+
+      assert [
+               %{name: "sda", vendor_id: 0x0BDA, product_id: 0x0316, serial: "FIRST-STICK"},
+               %{name: "sdb", vendor_id: 0x0BDA, product_id: 0x0316, serial: "SECOND-STICK"}
+             ] = Probe.list_drives(sys_root: sys_root)
     end
 
     @tag :tmp_dir
