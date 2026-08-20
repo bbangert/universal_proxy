@@ -585,9 +585,92 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
       refute_receive {:storage_call, :format_drive, _}
 
       view |> element("button[phx-click='drive_format']") |> render_click()
-      assert_receive {:storage_call, :format_drive, ["/dev/sda", _label]}
+      # The drive KEY goes over the façade, never a device path: the
+      # subsystem decides which device `mkfs` is pointed at.
+      assert_receive {:storage_call, :format_drive, [@drive_key, _label]}
       # The format runs in a supervised task; its result clears the busy flag.
       assert render(view) =~ "Drive formatted as ext4."
+    end
+
+    test "a drive with no bus path formats by its nil key", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state(drives: [drive(key: nil)]))
+      open_drawer(view)
+
+      view |> element("button[phx-value-action='format']") |> render_click()
+      view |> element("button[phx-click='drive_format']") |> render_click()
+
+      assert_receive {:storage_call, :format_drive, [nil, _label]}
+    end
+
+    # The two-step confirmation is server-held state, so a confirm event
+    # that arrives without it — a crafted socket message, or a stale
+    # button — must not act. The confirm buttons don't exist in the
+    # unarmed markup, so these push the events directly.
+    test "an unarmed format confirmation does nothing", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state())
+      open_drawer(view)
+
+      html = render_click(view, "drive_format", %{})
+
+      refute_receive {:storage_call, :format_drive, _}
+      assert html =~ "Confirm that action first."
+      refute html =~ "Formatting…"
+    end
+
+    test "an unarmed eject confirmation does nothing", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state())
+      open_drawer(view)
+
+      html = render_click(view, "drive_eject", %{})
+
+      refute_receive {:storage_call, :eject, _}
+      assert html =~ "Confirm that action first."
+      refute html =~ "safe to unplug"
+    end
+
+    test "an unarmed password regeneration does nothing", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state(share: :running))
+      open_drawer(view)
+
+      html = render_click(view, "drive_regenerate_password", %{})
+
+      refute_receive {:storage_call, :rotate_password, _}
+      assert html =~ "Confirm that action first."
+    end
+
+    test "arming, then confirming, still works after a refused confirmation", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state())
+      open_drawer(view)
+
+      render_click(view, "drive_eject", %{})
+      refute_receive {:storage_call, :eject, _}
+
+      view |> element("button[phx-value-action='eject']") |> render_click()
+      html = view |> element("button[phx-click='drive_eject']") |> render_click()
+
+      assert_receive {:storage_call, :eject, []}
+      assert html =~ "safe to unplug"
+    end
+
+    test "credentials that can't be read are reported, not implied to work", %{conn: conn} do
+      # `share_credentials/0` answers nil both when the store is unreachable
+      # and when a generated password could not be persisted.
+      StorageStub.install(self(), credentials: nil)
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state(share: :running))
+
+      html = open_drawer(view)
+
+      assert html =~ "Share credentials are unavailable"
+      refute html =~ "Username"
+      refute html =~ "Regenerate password"
+      # The share's path is still shown: it is not a credential.
+      assert html =~ "Path"
     end
 
     test "eject needs a second confirmation, then says it's safe to unplug", %{conn: conn} do

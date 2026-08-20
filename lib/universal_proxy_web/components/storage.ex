@@ -188,6 +188,7 @@ defmodule UniversalProxyWeb.Components.Storage do
   attr(:host, :string, default: nil)
   attr(:supported?, :boolean, default: false)
   attr(:username, :string, default: nil)
+  attr(:credentials?, :boolean, default: true)
   attr(:password, :string, default: nil)
   attr(:copied?, :boolean, default: false)
   attr(:armed, :atom, default: nil)
@@ -320,51 +321,68 @@ defmodule UniversalProxyWeb.Components.Storage do
             </div>
 
             <.copy_row id="storage-unc" label="Path" value={unc_path(@host)} />
-            <.copy_row id="storage-user" label="Username" value={@username || "backup"} />
 
-            <%!-- The password is never rendered until Reveal: it only reaches
-                 this component once the LiveView has read it in response to
-                 an explicit click, so a pre-reveal DOM has no copy of it. --%>
-            <div class="grid grid-cols-[84px_1fr_auto] gap-2 items-center">
-              <div class="text-sm text-fg-3">Password</div>
-              <.text_input
-                name="storage_password"
-                value={@password || "••••••••••••••••"}
-                readonly
-                mono
-                class="!h-7 !text-sm min-w-0"
-              />
-              <div class="flex gap-1.5">
-                <.button variant={:secondary} size={:sm} phx-click="drive_reveal_password">
-                  {if @password, do: "Hide", else: "Reveal"}
-                </.button>
-                <.button variant={:secondary} size={:sm} phx-click="drive_copy_password">
-                  {if @copied?, do: "Copied", else: "Copy"}
-                </.button>
-              </div>
+            <%!-- No credentials to show: either the settings store can't be
+                 reached or a generated password could not be persisted. The
+                 default account name is deliberately NOT rendered here — it
+                 would read as "these work". --%>
+            <div
+              :if={not @credentials?}
+              class="px-3.5 py-3 rounded-md bg-sunken text-sm text-fg-2"
+            >
+              Share credentials are unavailable — they couldn't be read or saved on this device.
             </div>
 
-            <div class="flex items-center gap-2.5 mt-1">
-              <div class={["flex-1 text-sm", if(@armed == :regen, do: "text-danger", else: "text-fg-3")]}>
-                {if @armed == :regen,
-                  do: "Regenerating invalidates the old credential in Home Assistant immediately.",
-                  else: "Lost the password? You can mint a new one."}
+            <div :if={@credentials?} class="flex flex-col gap-2">
+              <.copy_row id="storage-user" label="Username" value={@username || "backup"} />
+
+              <%!-- The password is never rendered until Reveal: it only reaches
+                   this component once the LiveView has read it in response to
+                   an explicit click, so a pre-reveal DOM has no copy of it. --%>
+              <div class="grid grid-cols-[84px_1fr_auto] gap-2 items-center">
+                <div class="text-sm text-fg-3">Password</div>
+                <.text_input
+                  name="storage_password"
+                  value={@password || "••••••••••••••••"}
+                  readonly
+                  mono
+                  class="!h-7 !text-sm min-w-0"
+                />
+                <div class="flex gap-1.5">
+                  <.button variant={:secondary} size={:sm} phx-click="drive_reveal_password">
+                    {if @password, do: "Hide", else: "Reveal"}
+                  </.button>
+                  <.button variant={:secondary} size={:sm} phx-click="drive_copy_password">
+                    {if @copied?, do: "Copied", else: "Copy"}
+                  </.button>
+                </div>
               </div>
-              <div :if={@armed == :regen} class="flex gap-1.5 flex-none">
-                <.button variant={:ghost} size={:sm} phx-click="drive_disarm">Cancel</.button>
-                <.button variant={:danger} size={:sm} phx-click="drive_regenerate_password">
-                  Regenerate
+
+              <div class="flex items-center gap-2.5 mt-1">
+                <div class={[
+                  "flex-1 text-sm",
+                  if(@armed == :regen, do: "text-danger", else: "text-fg-3")
+                ]}>
+                  {if @armed == :regen,
+                    do: "Regenerating invalidates the old credential in Home Assistant immediately.",
+                    else: "Lost the password? You can mint a new one."}
+                </div>
+                <div :if={@armed == :regen} class="flex gap-1.5 flex-none">
+                  <.button variant={:ghost} size={:sm} phx-click="drive_disarm">Cancel</.button>
+                  <.button variant={:danger} size={:sm} phx-click="drive_regenerate_password">
+                    Regenerate
+                  </.button>
+                </div>
+                <.button
+                  :if={@armed != :regen}
+                  variant={:secondary}
+                  size={:sm}
+                  phx-click="drive_arm"
+                  phx-value-action="regen"
+                >
+                  <.icon name={:refresh} size={14} /> Regenerate password
                 </.button>
               </div>
-              <.button
-                :if={@armed != :regen}
-                variant={:secondary}
-                size={:sm}
-                phx-click="drive_arm"
-                phx-value-action="regen"
-              >
-                <.icon name={:refresh} size={14} /> Regenerate password
-              </.button>
             </div>
           </div>
         </div>

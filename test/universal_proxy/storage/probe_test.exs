@@ -1,5 +1,8 @@
 defmodule UniversalProxy.Storage.ProbeTest do
-  use ExUnit.Case, async: true
+  # async: false — the app-env test below mutates the global
+  # `:storage_sys_root` key, which every concurrently-running test would
+  # see.
+  use ExUnit.Case, async: false
 
   alias UniversalProxy.Storage.Probe
   alias UniversalProxy.StorageFixtures, as: Fixtures
@@ -110,6 +113,28 @@ defmodule UniversalProxy.Storage.ProbeTest do
     end
 
     @tag :tmp_dir
+    test "the bus path and ids come from the resolved ancestry, not the link text", %{
+      tmp_dir: tmp_dir
+    } do
+      sys_root = Path.join([tmp_dir, "sys", "class", "block"])
+
+      Fixtures.put_usb_disk!(sys_root, "sda", slot_sub: "1-1.3", vendor_id: 0x0BDA)
+
+      # The shape the kernel really publishes: a symlinked class entry, and
+      # a `device` link whose raw target names no USB segment at all — so
+      # neither the bus path nor the ids can be read off the link text.
+      assert {:ok, %File.Stat{type: :symlink}} = File.lstat(Path.join(sys_root, "sda"))
+      raw_target = Fixtures.device_link_target!(sys_root, "sda")
+      assert raw_target == "../../../0:0:0:0"
+      refute raw_target =~ "1-1.3"
+
+      assert [%{slot_sub: "1-1.3", vendor_id: 0x0BDA, size_bytes: size}] =
+               Probe.list_drives(sys_root: sys_root)
+
+      assert size > 0
+    end
+
+    @tag :tmp_dir
     test "a non-USB internal disk is excluded", %{tmp_dir: tmp_dir} do
       sys_root = Path.join(tmp_dir, "sys")
       File.mkdir_p!(sys_root)
@@ -141,8 +166,19 @@ defmodule UniversalProxy.Storage.ProbeTest do
     end
 
     test "app env :storage_sys_root is honoured when no :sys_root opt is given" do
+      # Restored, not deleted: the test env configures this key (see
+      # config/test.exs) precisely so the application-tree Storage.Server
+      # never enumerates the host's real disks, and deleting it would
+      # uncover them for every test that runs after this one.
+      previous = Application.fetch_env(:universal_proxy, :storage_sys_root)
       Application.put_env(:universal_proxy, :storage_sys_root, "/does/not/exist")
-      on_exit(fn -> Application.delete_env(:universal_proxy, :storage_sys_root) end)
+
+      on_exit(fn ->
+        case previous do
+          {:ok, value} -> Application.put_env(:universal_proxy, :storage_sys_root, value)
+          :error -> Application.delete_env(:universal_proxy, :storage_sys_root)
+        end
+      end)
 
       assert Probe.list_drives() == []
     end

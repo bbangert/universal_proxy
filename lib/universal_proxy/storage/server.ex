@@ -19,7 +19,8 @@ defmodule UniversalProxy.Storage.Server do
     5. reads the mounted drive's stored `share_folder` and its capacity,
     6. starts or stops `smbd` so that it runs **iff** the drive's
        `share_enabled?` is set AND a drive is mounted AND an `smbd` binary
-       exists.
+       exists AND the stored `share_folder` still passes the sandbox
+       against the live mount (see `validated_share_folder/1`).
 
   Convergence is idempotent, so no step ever retries in place: a failure
   is logged, the state goes degraded, and the next pass tries again. On
@@ -66,6 +67,17 @@ defmodule UniversalProxy.Storage.Server do
   are sandboxed to the mount point: see `sandboxed_path/2` for the
   two-guard strategy (segment rejection *before* expansion, prefix check
   *after*).
+
+  A *stored* mapping is untrusted too, and for a second reason: it is
+  persisted, while the drive it points into is not — the directory can be
+  deleted or replaced by a symlink between one share start and the next.
+  So the same sandbox runs again on every share start, and a mapping that
+  no longer passes leaves the share `:error` rather than falling back to
+  the drive root.
+
+  `format/3` takes a **drive key**, never a device path: the device handed
+  to `mkfs` is resolved from this server's own state (see
+  `format_target/2`), so no caller can name one.
 
   ## Drive keys
 
@@ -247,11 +259,14 @@ defmodule UniversalProxy.Storage.Server do
   Validated and sandboxed before anything is written (`..`, empty
   segments and absolute paths are refused, and the resolved directory has
   to sit under the mount point and exist). On success the setting is
-  persisted and, when this drive's share is the running one, `smbd` is
-  stopped so the convergence that follows rebuilds `smb.conf` with the
-  new `path` and starts it again. Like `set_share_enabled/3` the restart
-  is asynchronous and reports through `"storage:state"`, so a slow
-  `smbpasswd` cannot time the caller out.
+  persisted, the chosen directory is chowned to the backup account on a
+  read-write ext4 mount (a pre-existing directory can belong to another
+  uid, which would leave the share unwritable) and, when this drive's
+  share is the running one, `smbd` is stopped so the convergence that
+  follows rebuilds `smb.conf` with the new `path` and starts it again.
+  Like `set_share_enabled/3` the restart is asynchronous and reports
+  through `"storage:state"`, so a slow `smbpasswd` cannot time the caller
+  out.
 
   Returns the persistence result, `{:error, :invalid_path}`,
   `{:error, :enoent}` (no such directory on the drive), or
@@ -309,17 +324,40 @@ defmodule UniversalProxy.Storage.Server do
   def eject(server \\ __MODULE__), do: GenServer.call(server, :eject)
 
   @doc """
-  Make a fresh ext4 filesystem on `device`, labelled `label`: stop the
-  share, unmount, `mkfs.ext4`, then converge (which mounts the new
-  filesystem). Destroys every byte on the device.
+  Make a fresh ext4 filesystem on the drive `drive_key` identifies,
+  labelled `label`: stop the share, unmount, `mkfs.ext4`, then converge
+  (which mounts the new filesystem). Destroys every byte on the device.
+
+  The target device is resolved **here**, from this server's state, not
+  named by the caller: the live mount's device when the mounted drive is
+  this one, else the drive's first recognised data partition, else the
+  whole disk. `{:error, :unknown_drive}` when `drive_key` is not the
+  first attached drive's key (`nil` matches a first drive with no
+  derivable bus path, which is exactly the drive that has no key).
 
   Refuses (with the unmount's error) if the drive cannot be unmounted, so
   a busy filesystem is never handed to `mkfs`.
   """
-  @spec format(GenServer.server(), String.t(), String.t()) :: :ok | {:error, term()}
-  def format(server \\ __MODULE__, device, label) when is_binary(device) and is_binary(label) do
-    GenServer.call(server, {:format, device, label}, @format_timeout)
+  @spec format(GenServer.server(), drive_key() | nil, String.t()) :: :ok | {:error, term()}
+  def format(server \\ __MODULE__, drive_key, label)
+      when is_binary(label) and
+             (is_nil(drive_key) or (is_tuple(drive_key) and tuple_size(drive_key) == 3)) do
+    GenServer.call(server, {:format, drive_key, label}, @format_timeout)
   end
+
+  @doc """
+  Apply freshly rotated Samba credentials: a share that is running was
+  started with the old password, so its daemon is stopped and the
+  convergence that follows reprovisions the smbd account and starts it
+  again. A no-op when no share is running — the next start reads the new
+  password from `Storage.Settings` anyway.
+
+  Called by `UniversalProxy.Storage.rotate_password/0` after the rotation
+  is persisted; the rotation itself does not depend on this succeeding.
+  """
+  @spec credentials_rotated(GenServer.server()) :: :ok
+  def credentials_rotated(server \\ __MODULE__),
+    do: GenServer.call(server, :credentials_rotated)
 
   @doc "Converge synchronously. Tests use this instead of waiting on a timer."
   @spec check_now(GenServer.server()) :: :ok
@@ -390,7 +428,7 @@ defmodule UniversalProxy.Storage.Server do
 
   def handle_call({:set_share_folder, key, path}, _from, state) do
     case resolve_share_folder(state, path) do
-      {:ok, folder} ->
+      {:ok, absolute, folder} ->
         result =
           safe(
             fn -> Settings.put_drive(state.settings, key, %{share_folder: folder}) end,
@@ -398,7 +436,18 @@ defmodule UniversalProxy.Storage.Server do
             "Settings.put_drive"
           )
 
-        state = if result == :ok, do: stop_share_for(state, key), else: state
+        state =
+          if result == :ok do
+            # The chosen directory may predate this device (or have been
+            # made by another machine), in which case it belongs to some
+            # other uid and smbd's `force user` could not write into it —
+            # same reason `create_folder/3` chowns what it creates.
+            take_ownership(state, absolute)
+            stop_share_for(state, key)
+          else
+            state
+          end
+
         {:reply, result, state, {:continue, :converge}}
 
       error ->
@@ -426,23 +475,50 @@ defmodule UniversalProxy.Storage.Server do
     {:reply, result, state, {:continue, :converge}}
   end
 
-  def handle_call({:format, device, label}, _from, state) do
-    # A drive with no mount at all is legitimate here (unknown filesystem,
-    # or already ejected) — only a live mount has to come down first.
-    {state, unmount_result} =
-      if state.mounted, do: state |> stop_share() |> do_unmount(), else: {stop_share(state), :ok}
+  def handle_call({:format, key, label}, _from, state) do
+    case format_target(state, key) do
+      {:ok, device} ->
+        # A drive with no mount at all is legitimate here (unknown
+        # filesystem, or already ejected) — only a live mount has to come
+        # down first. The target is resolved before the unmount, while the
+        # mount record still says which device it is.
+        {state, unmount_result} =
+          if state.mounted,
+            do: state |> stop_share() |> do_unmount(),
+            else: {stop_share(state), :ok}
 
-    case unmount_result do
-      :ok ->
-        result = format_device(state, device, label)
-        # An explicit format overrides an earlier eject: the user asked for
-        # this drive to be prepared, so convergence must mount it again.
-        {:reply, result, %{state | ejected: MapSet.new()}, {:continue, :converge}}
+        case unmount_result do
+          :ok ->
+            result = format_device(state, device, label)
+            # An explicit format overrides an earlier eject: the user asked
+            # for this drive to be prepared, so convergence must mount it
+            # again.
+            {:reply, result, %{state | ejected: MapSet.new()}, {:continue, :converge}}
 
-      error ->
-        Logger.error("Storage: refusing to format #{device}, unmount failed: #{inspect(error)}")
-        {:reply, {:error, {:umount_failed, error}}, state, {:continue, :converge}}
+          error ->
+            Logger.error(
+              "Storage: refusing to format #{device}, unmount failed: #{inspect(error)}"
+            )
+
+            {:reply, {:error, {:umount_failed, error}}, state, {:continue, :converge}}
+        end
+
+      {:error, :unknown_drive} = error ->
+        Logger.warning(
+          "Storage: refusing to format #{inspect(key)}: not the attached drive's key"
+        )
+
+        {:reply, error, state}
     end
+  end
+
+  def handle_call(:credentials_rotated, _from, %{share: :running} = state) do
+    Logger.info("Storage: Samba password rotated; restarting smbd to reprovision it")
+    {:reply, :ok, stop_share(state), {:continue, :converge}}
+  end
+
+  def handle_call(:credentials_rotated, _from, state) do
+    {:reply, :ok, state, {:continue, :converge}}
   end
 
   @impl true
@@ -666,6 +742,38 @@ defmodule UniversalProxy.Storage.Server do
     )
   end
 
+  # Which device `mkfs` is pointed at is decided here, from this server's
+  # own state, so a caller can never name one. The live mount wins: making
+  # a whole-disk filesystem while one of its partitions is mounted would
+  # take the partition table (and the mount) with it. Failing that, the
+  # first recognised data partition, and only a drive with neither gets the
+  # whole disk — an unpartitioned superfloppy, or a stick whose partitions
+  # are all unrecognised, both of which the user formats to make usable.
+  # Only the first attached drive is ever mounted, so only its key is
+  # accepted.
+  defp format_target(state, key) do
+    case state.drives do
+      [%{key: ^key} = drive | _rest] -> {:ok, format_device_path(state, drive)}
+      _other -> {:error, :unknown_drive}
+    end
+  end
+
+  defp format_device_path(state, drive) do
+    if is_map(state.mounted) and state.mounted_ref == drive_ref(drive) and
+         is_binary(state.mounted.device) do
+      state.mounted.device
+    else
+      case safe(
+             fn -> state.probe.first_data_partition(drive) end,
+             nil,
+             "Probe.first_data_partition"
+           ) do
+        %{dev_path: dev_path} when is_binary(dev_path) -> dev_path
+        _other -> drive.dev_path
+      end
+    end
+  end
+
   defp format_device(state, device, label) do
     opts = Keyword.put(state.mount_opts, :confirm, true)
 
@@ -723,13 +831,30 @@ defmodule UniversalProxy.Storage.Server do
   # the share can only ever be the drive root.
   defp stored_share_folder(_state), do: @root_folder
 
+  # `{:ok, absolute, relative}` — the absolute form is what a caller chowns
+  # or hands to `smb.conf`; the relative form is what gets persisted.
   defp resolve_share_folder(state, path) do
     with {:ok, absolute, relative} <- sandboxed_path(state, path) do
       if File.dir?(absolute) do
-        {:ok, if(relative == "", do: @root_folder, else: relative)}
+        {:ok, absolute, if(relative == "", do: @root_folder, else: relative)}
       else
         {:error, :enoent}
       end
+    end
+  end
+
+  # The stored mapping is validated again on every share start, not just
+  # when it is chosen. It is persisted while the drive it points into is
+  # not: between two starts the directory can be deleted, or replaced by a
+  # symlink pointing off the drive, by anyone who can plug the stick into
+  # another machine. A mapping that no longer passes leaves the share off
+  # and `:error` (the next convergence retries — the directory may come
+  # back); it must never fall back to the drive root, which would export
+  # more of the drive than was ever mapped.
+  defp validated_share_folder(state) do
+    case resolve_share_folder(state, state.share_folder) do
+      {:ok, _absolute, folder} -> {:ok, folder}
+      {:error, reason} -> {:error, {:invalid_share_folder, state.share_folder, reason}}
     end
   end
 
@@ -955,7 +1080,8 @@ defmodule UniversalProxy.Storage.Server do
   end
 
   defp start_share(state) do
-    with {:ok, credentials} <- credentials(state),
+    with {:ok, _folder} <- validated_share_folder(state),
+         {:ok, credentials} <- credentials(state),
          :ok <- prepare_runtime(state, credentials),
          :ok <- provision_user(state, credentials),
          {:ok, pid} <- start_daemon(state) do
@@ -990,6 +1116,9 @@ defmodule UniversalProxy.Storage.Server do
   end
 
   # The credentials record holds the SMB password: never log or inspect it.
+  # A `{:error, :not_persisted}` reply (credentials that would not survive
+  # a reboot) lands in the same branch as an unreachable store: the share
+  # must not be provisioned with a password only this boot knows.
   defp credentials(state) do
     case safe(fn -> Settings.credentials(state.settings) end, nil, "Settings.credentials") do
       %{username: username, password: password}

@@ -9,6 +9,22 @@ defmodule UniversalProxy.StorageFixtures do
   the inline `File.mkdir_p!`/`File.ln_s!` fixtures in
   `Audio.EnumerateTest`, just factored out since `Probe` fixtures need
   more moving parts (disk + USB device chain + partitions).
+
+  The shape matches a real kernel, because `Probe` depends on it:
+
+    * the class entry (`<sys_root>/sda`) is a **symlink** into a devices
+      tree, not a directory;
+    * `size` and the partition children live in the real block directory
+      the class entry points at;
+    * the `device` symlink sits inside that real directory and is
+      relative to it (`../../../0:0:0:0`), so its raw target contains no
+      USB segment — the bus path and `idVendor`/`idProduct` are only
+      reachable through the resolved ancestry.
+
+  The one liberty taken is depth: a real `/sys/class/block/sda` points at
+  `../../devices/…`, while here the devices tree is a sibling of
+  `sys_root` (`../devices/…`) so any `sys_root` a test picks works. The
+  relative-resolution mechanics being exercised are identical.
   """
 
   @block_size 4096
@@ -16,10 +32,12 @@ defmodule UniversalProxy.StorageFixtures do
   # -- sysfs tree builders --
 
   @doc """
-  Create a USB-backed whole disk `name` (e.g. "sda", "nvme0n1") under
-  `sys_root`, with a `size` file and a `device` symlink resolving
-  through a USB interface node that carries `idVendor`/`idProduct` at
-  `slot_sub` (e.g. "1-1.3"). Returns `:ok`.
+  Create a USB-backed whole disk `name` (e.g. "sda", "nvme0n1"): a real
+  block directory under a devices tree, a class-entry symlink to it at
+  `<sys_root>/<name>`, and a relative `device` symlink into the SCSI
+  target chain hanging off the USB interface of the device node that
+  carries `idVendor`/`idProduct` at `slot_sub` (e.g. "1-1.3").
+  Returns `:ok`.
 
   Options: `:sectors` (default ~10 GiB worth of 512-byte sectors),
   `:slot_sub`, `:vendor_id`, `:product_id`.
@@ -30,55 +48,87 @@ defmodule UniversalProxy.StorageFixtures do
     vendor_id = Keyword.get(opts, :vendor_id, 0x0BDA)
     product_id = Keyword.get(opts, :product_id, 0x0316)
 
-    disk_dir = Path.join(sys_root, name)
-    File.mkdir_p!(disk_dir)
-    File.write!(Path.join(disk_dir, "size"), "#{sectors}\n")
+    # The USB device node: idVendor/idProduct live here, above the bound
+    # interface, which is why Probe walks the resolved ancestry.
+    usb_path = ["platform", "soc", "usb1", slot_sub]
+    usb_dir = Path.join([devices_root(sys_root) | usb_path])
+    File.mkdir_p!(usb_dir)
+    File.write!(Path.join(usb_dir, "idVendor"), hex4(vendor_id))
+    File.write!(Path.join(usb_dir, "idProduct"), hex4(product_id))
 
-    device_dir = Path.join([sys_root, "usbdev", slot_sub])
-    iface_name = "#{slot_sub}:0.0"
-    File.mkdir_p!(Path.join(device_dir, iface_name))
-    File.write!(Path.join(device_dir, "idVendor"), hex4(vendor_id))
-    File.write!(Path.join(device_dir, "idProduct"), hex4(product_id))
-
-    target = Path.join(["..", "usbdev", slot_sub, iface_name])
-    File.ln_s!(target, Path.join(disk_dir, "device"))
-
-    :ok
+    scsi_path = usb_path ++ ["#{slot_sub}:1.0", "host0", "target0:0:0", "0:0:0:0"]
+    put_disk!(sys_root, name, scsi_path, sectors)
   end
 
   @doc """
   Create a whole disk `name` with a device chain that carries no
   `idVendor` anywhere (an internal SD/eMMC/SATA disk) — `Probe` must
-  exclude it. Returns `:ok`.
+  exclude it. Same symlink shape as `put_usb_disk!/3`. Returns `:ok`.
   """
   def put_internal_disk!(sys_root, name, opts \\ []) do
     sectors = Keyword.get(opts, :sectors, 41_943_040)
+    scsi_path = ["platform", "soc", "ahci", "host0", "target0:0:0", "0:0:0:0"]
 
-    disk_dir = Path.join(sys_root, name)
-    File.mkdir_p!(disk_dir)
-    File.write!(Path.join(disk_dir, "size"), "#{sectors}\n")
+    put_disk!(sys_root, name, scsi_path, sectors)
+  end
 
-    scsi_dir = Path.join([sys_root, "platform", "target0:0:0", "0:0:0:0"])
-    File.mkdir_p!(scsi_dir)
+  @doc """
+  Add a partition child (e.g. "sda1", "nvme0n1p1") to an already created
+  disk's **real** block directory, with its own `size` file. Returns
+  `:ok`.
+  """
+  def put_partition!(sys_root, disk_name, partition_name, opts \\ []) do
+    sectors = Keyword.get(opts, :sectors, 2_097_152)
 
-    target = Path.join(["..", "platform", "target0:0:0", "0:0:0:0"])
-    File.ln_s!(target, Path.join(disk_dir, "device"))
+    part_dir = Path.join(block_dir(sys_root, disk_name), partition_name)
+    File.mkdir_p!(part_dir)
+    File.write!(Path.join(part_dir, "size"), "#{sectors}\n")
 
     :ok
   end
 
   @doc """
-  Add a partition child (e.g. "sda1", "nvme0n1p1") under an already
-  created disk directory, with its own `size` file. Returns `:ok`.
+  The raw (unresolved) target of a disk's inner `device` symlink — what
+  a test asserts on to show the USB bus path cannot come from the link
+  text itself.
   """
-  def put_partition!(sys_root, disk_name, partition_name, opts \\ []) do
-    sectors = Keyword.get(opts, :sectors, 2_097_152)
+  def device_link_target!(sys_root, name) do
+    File.read_link!(Path.join(block_dir(sys_root, name), "device"))
+  end
 
-    part_dir = Path.join([sys_root, disk_name, partition_name])
-    File.mkdir_p!(part_dir)
-    File.write!(Path.join(part_dir, "size"), "#{sectors}\n")
+  # The real block directory (`…/0:0:0:0/block/sda`) plus the class-entry
+  # symlink that points at it, and the `device` symlink back up to the
+  # bus device the disk hangs off — three levels up, exactly as the
+  # kernel writes it.
+  defp put_disk!(sys_root, name, device_path, sectors) do
+    block_dir = Path.join([devices_root(sys_root) | device_path] ++ ["block", name])
+    File.mkdir_p!(block_dir)
+    File.write!(Path.join(block_dir, "size"), "#{sectors}\n")
+
+    File.ln_s!(
+      Path.join(["..", "..", "..", List.last(device_path)]),
+      Path.join(block_dir, "device")
+    )
+
+    File.mkdir_p!(sys_root)
+    class_target = Path.join(["..", "devices"] ++ device_path ++ ["block", name])
+    File.ln_s!(class_target, Path.join(sys_root, name))
 
     :ok
+  end
+
+  # Sibling of the class dir; see the moduledoc on depth.
+  defp devices_root(sys_root), do: Path.join(Path.dirname(sys_root), "devices")
+
+  # Where `size` and the partition children really live, class-entry
+  # symlink resolved.
+  defp block_dir(sys_root, name) do
+    entry = Path.join(sys_root, name)
+
+    case File.read_link(entry) do
+      {:ok, target} -> entry |> Path.dirname() |> Path.join(target) |> Path.expand()
+      {:error, _reason} -> entry
+    end
   end
 
   defp hex4(id) do

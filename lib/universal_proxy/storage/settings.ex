@@ -39,10 +39,23 @@ defmodule UniversalProxy.Storage.Settings do
       smbd user. Never log or inspect this record: the password lives
       inside it.
 
+  ## A secret that isn't durable is not a secret to hand out
+
+  `credentials/1` and `rotate_password/1` answer
+  `{:error, :not_persisted}` when the DETS write fails, instead of
+  returning the fresh password anyway. Returning it would be worse than
+  failing: smbd would be provisioned with a password that dies with this
+  process, the user would copy it into Home Assistant, and the next boot
+  would mint a different one — a share that authenticates today and
+  refuses tomorrow, with nothing to point at. Callers treat the error as
+  "no credentials" (`Storage.share_credentials/0` reports `nil`, and
+  `Storage.Server` refuses to start the share).
+
   The DETS file lives on the writable data partition on Nerves
   (`/data/storage_settings.dets`) and in `_build/` on the host for
-  development. Tests can override via the `:dets_path`, `:table`, and
-  `:name` options to `start_link/1`.
+  development. Tests can override via the `:dets_path`, `:table`, `:name`
+  and `:persist_fun` (a `(table, record -> :ok | {:error, term()})` write
+  seam) options to `start_link/1`.
   """
 
   use GenServer
@@ -127,16 +140,21 @@ defmodule UniversalProxy.Storage.Settings do
   password on first read. The returned password is stable across
   subsequent reads and process restarts until `rotate_password/1` is
   called. Never log or inspect the return value.
+
+  `{:error, :not_persisted}` when a first-read generation could not be
+  written to DETS — see the moduledoc.
   """
-  @spec credentials(GenServer.server()) :: credentials()
+  @spec credentials(GenServer.server()) :: credentials() | {:error, :not_persisted}
   def credentials(server \\ __MODULE__), do: GenServer.call(server, :credentials)
 
   @doc """
   Replace the stored password with a freshly generated random value,
   clear `provisioned_hash` (forcing `Storage.Smbd` to reprovision the
-  smbd user), and stamp `rotated_at`. Returns the new credentials record.
+  smbd user), and stamp `rotated_at`. Returns the new credentials record,
+  or `{:error, :not_persisted}` when the write failed — in which case the
+  old password is still the stored one.
   """
-  @spec rotate_password(GenServer.server()) :: credentials()
+  @spec rotate_password(GenServer.server()) :: credentials() | {:error, :not_persisted}
   def rotate_password(server \\ __MODULE__), do: GenServer.call(server, :rotate_password)
 
   @doc """
@@ -162,7 +180,7 @@ defmodule UniversalProxy.Storage.Settings do
         # here, unencrypted.
         _ = File.chmod(path, 0o600)
         Logger.info("Storage settings store opened at #{path}")
-        {:ok, %{table: table}}
+        {:ok, %{table: table, persist_fun: Keyword.get(opts, :persist_fun, &default_persist/2)}}
 
       {:error, reason} ->
         Logger.error("Storage settings store failed to open #{path}: #{inspect(reason)}")
@@ -181,10 +199,10 @@ defmodule UniversalProxy.Storage.Settings do
   def handle_call({:put_drive, key, params}, _from, state) do
     merged = Map.merge(lookup_drive(state.table, key), take_drive_fields(params))
 
-    with :ok <- :dets.insert(state.table, {key, merged}),
-         :ok <- :dets.sync(state.table) do
-      {:reply, :ok, state}
-    else
+    case persist(state, key, merged) do
+      :ok ->
+        {:reply, :ok, state}
+
       {:error, reason} ->
         Logger.error("Storage settings save failed for #{inspect(key)}: #{inspect(reason)}")
         {:reply, {:error, reason}, state}
@@ -204,17 +222,18 @@ defmodule UniversalProxy.Storage.Settings do
           rotated_at: nil
         }
 
-        case persist_credentials(state.table, creds) do
+        case persist(state, @credentials_key, creds) do
           :ok ->
             Logger.info("Storage settings: Samba password generated")
+            {:reply, creds, state}
 
           {:error, reason} ->
             Logger.error(
               "Storage settings: password generated but NOT persisted: #{inspect(reason)}"
             )
-        end
 
-        {:reply, creds, state}
+            {:reply, {:error, :not_persisted}, state}
+        end
     end
   end
 
@@ -232,14 +251,14 @@ defmodule UniversalProxy.Storage.Settings do
         rotated_at: System.system_time(:second)
     }
 
-    case persist_credentials(state.table, rotated) do
+    case persist(state, @credentials_key, rotated) do
       :ok ->
         Logger.info("Storage settings: Samba password rotated")
         {:reply, rotated, state}
 
       {:error, reason} ->
         Logger.error("Storage settings: password rotation not persisted: #{inspect(reason)}")
-        {:reply, rotated, state}
+        {:reply, {:error, :not_persisted}, state}
     end
   end
 
@@ -252,10 +271,10 @@ defmodule UniversalProxy.Storage.Settings do
 
     updated = Map.put(existing, :provisioned_hash, hash)
 
-    with :ok <- :dets.insert(state.table, {@credentials_key, updated}),
-         :ok <- :dets.sync(state.table) do
-      {:reply, :ok, state}
-    else
+    case persist(state, @credentials_key, updated) do
+      :ok ->
+        {:reply, :ok, state}
+
       {:error, reason} ->
         Logger.error("Storage settings: provisioned_hash write failed: #{inspect(reason)}")
         {:reply, {:error, reason}, state}
@@ -290,11 +309,13 @@ defmodule UniversalProxy.Storage.Settings do
     end
   end
 
-  defp persist_credentials(table, creds) do
-    with :ok <- :dets.insert(table, {@credentials_key, creds}),
-         :ok <- :dets.sync(table) do
-      :ok
-    end
+  # Every write goes through the one seam, so nothing can persist without
+  # syncing (a record that is only in memory is a record the next boot has
+  # never heard of) and a test can make any of them fail.
+  defp persist(state, key, value), do: state.persist_fun.(state.table, {key, value})
+
+  defp default_persist(table, record) do
+    with :ok <- :dets.insert(table, record), do: :dets.sync(table)
   end
 
   # 15 random bytes is 120 bits of entropy; Base32 (no padding) keeps the

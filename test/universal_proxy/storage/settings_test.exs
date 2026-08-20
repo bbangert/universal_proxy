@@ -171,6 +171,77 @@ defmodule UniversalProxy.Storage.SettingsTest do
     end
   end
 
+  describe "a write that fails" do
+    setup %{tmp_dir: tmp_dir} do
+      path = Path.join(tmp_dir, "failing_#{System.unique_integer([:positive])}.dets")
+      table = :"storage_settings_failing_#{System.unique_integer([:positive])}"
+
+      server =
+        start_supervised!(
+          {Settings,
+           name: nil,
+           table: table,
+           dets_path: path,
+           persist_fun: fn _table, _record -> {:error, :enospc} end},
+          id: :failing
+        )
+
+      {:ok, failing: server}
+    end
+
+    test "credentials/1 refuses to hand out a password it could not persist", %{failing: server} do
+      log = capture_log(fn -> assert Settings.credentials(server) == {:error, :not_persisted} end)
+
+      assert log =~ "NOT persisted"
+      # And nothing was cached in memory either: the next read fails the
+      # same way rather than answering with a phantom secret.
+      capture_log(fn -> assert Settings.credentials(server) == {:error, :not_persisted} end)
+    end
+
+    test "rotate_password/1 reports the failure", %{failing: server} do
+      log =
+        capture_log(fn ->
+          assert Settings.rotate_password(server) == {:error, :not_persisted}
+        end)
+
+      assert log =~ "rotation not persisted"
+    end
+
+    test "put_drive/3 and put_provisioned_hash/2 surface the raw reason", %{failing: server} do
+      capture_log(fn ->
+        assert Settings.put_drive(server, @key, %{share_enabled?: true}) == {:error, :enospc}
+        assert Settings.put_provisioned_hash(server, "abc123") == {:error, :enospc}
+      end)
+    end
+
+    test "a rotation that fails leaves the stored password intact", %{
+      tmp_dir: tmp_dir
+    } do
+      # Same table, opened first with a working writer so a credentials
+      # record exists, then reopened with a failing one.
+      path = Path.join(tmp_dir, "intact_#{System.unique_integer([:positive])}.dets")
+      table = :"storage_settings_intact_#{System.unique_integer([:positive])}"
+
+      working = start_supervised!({Settings, name: nil, table: table, dets_path: path}, id: :ok1)
+      original = Settings.credentials(working)
+      :ok = stop_supervised(:ok1)
+
+      failing =
+        start_supervised!(
+          {Settings,
+           name: nil,
+           table: table,
+           dets_path: path,
+           persist_fun: fn _table, _record -> {:error, :enospc} end},
+          id: :fail1
+        )
+
+      capture_log(fn -> assert Settings.rotate_password(failing) == {:error, :not_persisted} end)
+
+      assert Settings.credentials(failing).password == original.password
+    end
+  end
+
   describe "file permissions" do
     test "the DETS file is created with mode 0600", %{path: path} do
       # setup already opened the store, which creates the file.

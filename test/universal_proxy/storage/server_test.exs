@@ -6,7 +6,7 @@ defmodule UniversalProxy.Storage.ServerTest do
 
   import ExUnit.CaptureLog
 
-  alias UniversalProxy.Storage.{Server, Settings}
+  alias UniversalProxy.Storage.{Server, Settings, Smbd}
   alias UniversalProxy.StorageFixtures
 
   @pubsub UniversalProxy.PubSub
@@ -164,9 +164,14 @@ defmodule UniversalProxy.Storage.ServerTest do
       before_hash = Keyword.fetch!(opts, :get_hash_fun).()
       put_result = Keyword.fetch!(opts, :put_hash_fun).("deadbeef")
 
+      username = Keyword.get(opts, :username)
+
+      Recorder.record({:provision_user, byte_size(password), username, before_hash, put_result})
+
+      # The password itself is never recorded; its provisioning hash is,
+      # which is all a test needs to tell one password from another.
       Recorder.record(
-        {:provision_user, byte_size(password), Keyword.get(opts, :username), before_hash,
-         put_result}
+        {:provision_hash, UniversalProxy.Storage.Smbd.provision_hash(username, password)}
       )
 
       Recorder.take(:provision_results, {:ok, :provisioned})
@@ -179,6 +184,13 @@ defmodule UniversalProxy.Storage.ServerTest do
 
   setup do
     start_supervised!(Recorder)
+
+    # A real mount point exists whenever something is mounted, and the
+    # share-folder revalidation that runs before every share start checks
+    # it (Server.validated_share_folder/1), so the stub's point has to be
+    # a real directory here too.
+    File.mkdir_p!(MountStub.point())
+    on_exit(fn -> File.rm_rf(MountStub.point()) end)
 
     path =
       Path.join(
@@ -248,6 +260,9 @@ defmodule UniversalProxy.Storage.ServerTest do
   defp enable_share!(ctx),
     do: :ok = Settings.put_drive(ctx.settings, @drive_key, %{share_enabled?: true})
 
+  defp set_stored_folder!(ctx, folder),
+    do: :ok = Settings.put_drive(ctx.settings, @drive_key, %{share_folder: folder})
+
   # The folder tests touch the real filesystem under MountStub's point, so
   # every one of them starts from an empty directory.
   defp fresh_mount_root! do
@@ -257,6 +272,8 @@ defmodule UniversalProxy.Storage.ServerTest do
   end
 
   defp in_root(path), do: Path.join(MountStub.point(), path)
+
+  defp provision_hashes, do: for({:provision_hash, hash} <- Recorder.events(), do: hash)
 
   defp last_prepare_params do
     Recorder.events()
@@ -488,7 +505,7 @@ defmodule UniversalProxy.Storage.ServerTest do
       :ok = Server.check_now(server)
       assert Server.get_state(server).share == :running
 
-      assert :ok = Server.format(server, "/dev/sda1", "usb_backup")
+      assert :ok = Server.format(server, @drive_key, "usb_backup")
 
       # format/3 replies before the convergence that remounts, so read the
       # state first: that call is serialized behind the continue.
@@ -514,11 +531,200 @@ defmodule UniversalProxy.Storage.ServerTest do
       log =
         capture_log(fn ->
           assert {:error, {:umount_failed, {:error, {:command_failed, _, 32, _}}}} =
-                   Server.format(server, "/dev/sda1", "usb_backup")
+                   Server.format(server, @drive_key, "usb_backup")
         end)
 
       assert log =~ "refusing to format"
       refute Enum.any?(Recorder.event_names(), &(&1 == :format))
+    end
+
+    test "the mounted partition is formatted, never the whole disk under it", ctx do
+      server = start_server(ctx)
+      present!()
+      :ok = Server.check_now(server)
+      assert Server.get_state(server).mount.device == "/dev/sda1"
+
+      assert :ok = Server.format(server, @drive_key, "usb_backup")
+
+      # The caller named the drive; the server resolved the device. The
+      # whole disk ("/dev/sda") must never reach mkfs while its partition
+      # is the mount — that would take the partition table with it.
+      assert {:format, "/dev/sda1", "usb_backup", true} in Recorder.events()
+      refute Enum.any?(Recorder.events(), &match?({:format, "/dev/sda", _label, _confirm}, &1))
+    end
+
+    test "an unmounted drive is formatted at its first data partition", ctx do
+      server = start_server(ctx)
+      present!()
+      :ok = Server.check_now(server)
+      assert :ok = Server.eject(server)
+      assert Server.get_state(server).mount == nil
+
+      assert :ok = Server.format(server, @drive_key, "usb_backup")
+
+      assert {:format, "/dev/sda1", "usb_backup", true} in Recorder.events()
+    end
+
+    test "a drive with no recognised filesystem is formatted as a whole disk", ctx do
+      server = start_server(ctx)
+      present!(StorageFixtures.garbage_bytes())
+      :ok = Server.check_now(server)
+      assert Server.get_state(server).mount == nil
+
+      assert :ok = Server.format(server, @drive_key, "usb_backup")
+
+      assert {:format, "/dev/sda", "usb_backup", true} in Recorder.events()
+    end
+
+    test "a key that is not the attached drive's is refused, and nothing is formatted", ctx do
+      server = start_server(ctx)
+      present!()
+      :ok = Server.check_now(server)
+
+      log =
+        capture_log(fn ->
+          assert Server.format(server, {"9-9", "dead", "beef"}, "usb_backup") ==
+                   {:error, :unknown_drive}
+
+          assert Server.format(server, nil, "usb_backup") == {:error, :unknown_drive}
+        end)
+
+      assert log =~ "refusing to format"
+      refute :format in Recorder.event_names()
+      # The share and mount were left alone: nothing was torn down for a
+      # format that never happened.
+      assert Server.get_state(server).mount.device == "/dev/sda1"
+    end
+
+    test "a drive with no bus path is formatted by its nil key", ctx do
+      server = start_server(ctx)
+      Recorder.put(:drives, [drive(slot_sub: nil)])
+      Recorder.put(:heads, %{"/dev/sda1" => StorageFixtures.ext4_bytes()})
+      :ok = Server.check_now(server)
+
+      assert :ok = Server.format(server, nil, "usb_backup")
+      assert {:format, "/dev/sda1", "usb_backup", true} in Recorder.events()
+    end
+  end
+
+  describe "stored share folder revalidation" do
+    setup do
+      fresh_mount_root!()
+      :ok
+    end
+
+    test "a stored folder that no longer exists keeps the share in :error", ctx do
+      server = start_server(ctx)
+      present!()
+      enable_share!(ctx)
+      # Persisted while it existed; gone by the time the share starts —
+      # exactly what a stick edited on another machine looks like.
+      set_stored_folder!(ctx, "backups/ha")
+
+      log = capture_log(fn -> :ok = Server.check_now(server) end)
+
+      assert log =~ "invalid_share_folder"
+      state = Server.get_state(server)
+      assert state.share == :error
+      # Never a silent fall back to the drive root: smbd was not even
+      # configured, let alone started.
+      assert state.share_folder == "backups/ha"
+      refute :prepare_runtime in Recorder.event_names()
+      refute :smbd_started in Recorder.event_names()
+
+      # The directory reappearing is all the next pass needs.
+      File.mkdir_p!(in_root("backups/ha"))
+      :ok = Server.check_now(server)
+
+      assert Server.get_state(server).share == :running
+      assert last_prepare_params().share_folder == "backups/ha"
+    end
+
+    test "a stored folder replaced by a symlink is refused", ctx do
+      server = start_server(ctx)
+      present!()
+      enable_share!(ctx)
+      set_stored_folder!(ctx, "backups")
+      File.ln_s!("/etc", in_root("backups"))
+
+      log = capture_log(fn -> :ok = Server.check_now(server) end)
+
+      assert log =~ "invalid_share_folder"
+      assert Server.get_state(server).share == :error
+      refute :smbd_started in Recorder.event_names()
+    end
+
+    test "credentials that could not be persisted keep the share in :error", ctx do
+      # A Settings whose credentials write fails but whose per-drive writes
+      # succeed, so the share is opted in and only the secret is missing.
+      path =
+        Path.join(
+          System.tmp_dir!(),
+          "storage_server_nopersist_#{System.unique_integer([:positive])}.dets"
+        )
+
+      on_exit(fn -> File.rm(path) end)
+
+      settings =
+        start_supervised!(
+          {Settings,
+           name: nil,
+           table: :storage_server_test_nopersist,
+           dets_path: path,
+           persist_fun: fn
+             _table, {:credentials, _creds} -> {:error, :enospc}
+             table, record -> with :ok <- :dets.insert(table, record), do: :dets.sync(table)
+           end},
+          id: :nopersist_settings
+        )
+
+      server = start_server(ctx, settings: settings)
+      present!()
+      :ok = Settings.put_drive(settings, @drive_key, %{share_enabled?: true})
+
+      log = capture_log(fn -> :ok = Server.check_now(server) end)
+
+      assert log =~ "credentials_unavailable"
+      assert Server.get_state(server).share == :error
+      refute :smbd_started in Recorder.event_names()
+    end
+  end
+
+  describe "credentials_rotated/1" do
+    test "a running share is cycled and reprovisioned with the new password", ctx do
+      server = start_server(ctx)
+      present!()
+      enable_share!(ctx)
+      :ok = Server.check_now(server)
+      assert Server.get_state(server).share == :running
+      assert [first_hash] = provision_hashes()
+
+      rotated = Settings.rotate_password(ctx.settings)
+      assert :ok = Server.credentials_rotated(server)
+
+      # get_state is serialized behind the convergence the call continues
+      # into, so the restart has already happened by the time this replies.
+      assert Server.get_state(server).share == :running
+
+      names = Recorder.event_names()
+      assert Enum.count(names, &(&1 == :smbd_terminated)) == 1
+      assert Enum.count(names, &(&1 == :smbd_started)) == 2
+
+      assert [^first_hash, second_hash] = provision_hashes()
+      assert second_hash == Smbd.provision_hash("backup", rotated.password)
+      refute second_hash == first_hash
+    end
+
+    test "with no share running it is a plain convergence, not an error", ctx do
+      server = start_server(ctx)
+      present!()
+      :ok = Server.check_now(server)
+
+      assert :ok = Server.credentials_rotated(server)
+
+      assert Server.get_state(server).share == :off
+      refute :smbd_terminated in Recorder.event_names()
+      assert Process.alive?(server)
     end
   end
 
@@ -711,6 +917,30 @@ defmodule UniversalProxy.Storage.ServerTest do
 
       assert Server.set_share_folder(server, @drive_key, "nope") == {:error, :enoent}
       assert Settings.get_drive(ctx.settings, @drive_key).share_folder == "/"
+    end
+
+    test "a selected folder is chowned to the backup account on ext4", ctx do
+      server = start_server(ctx)
+      present!()
+      :ok = Server.check_now(server)
+      # Made by another machine, so owned by another uid: without the chown
+      # smbd's `force user` could not write into it.
+      File.mkdir_p!(in_root("backups"))
+
+      assert :ok = Server.set_share_folder(server, @drive_key, "backups")
+
+      assert {:chown_backup, in_root("backups")} in Recorder.events()
+    end
+
+    test "a filesystem with no Unix ownership is not chowned on select", ctx do
+      server = start_server(ctx)
+      present!(StorageFixtures.exfat_bytes())
+      :ok = Server.check_now(server)
+      File.mkdir_p!(in_root("backups"))
+
+      assert :ok = Server.set_share_folder(server, @drive_key, "backups")
+
+      refute :chown_backup in Recorder.event_names()
     end
 
     test "a plain file on the drive is not a folder", ctx do

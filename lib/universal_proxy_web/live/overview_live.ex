@@ -310,7 +310,7 @@ defmodule UniversalProxyWeb.OverviewLive do
     else
       case storage().share_credentials() do
         %{password: password} -> {:noreply, assign(socket, :drive_password, password)}
-        _unavailable -> {:noreply, unavailable_flash(socket)}
+        _unavailable -> {:noreply, credentials_unavailable(socket)}
       end
     end
   end
@@ -326,7 +326,7 @@ defmodule UniversalProxyWeb.OverviewLive do
          |> push_event("copy", %{text: password})}
 
       _unavailable ->
-        {:noreply, unavailable_flash(socket)}
+        {:noreply, credentials_unavailable(socket)}
     end
   end
 
@@ -347,19 +347,27 @@ defmodule UniversalProxyWeb.OverviewLive do
   end
 
   def handle_event("drive_regenerate_password", _params, socket) do
-    socket = assign(socket, :drive_armed, nil)
+    if armed?(socket, :regen) do
+      socket = assign(socket, :drive_armed, nil)
 
-    case storage().rotate_password() do
-      %{username: username} ->
-        {:noreply,
-         socket
-         |> assign(:drive_username, username)
-         |> assign(:drive_password, nil)
-         |> assign(:drive_password_copied, false)
-         |> put_flash(:info, "Password regenerated. Update the credential in Home Assistant.")}
+      case storage().rotate_password() do
+        %{username: username} ->
+          {:noreply,
+           socket
+           |> assign(:drive_username, username)
+           |> assign(:drive_credentials?, true)
+           |> assign(:drive_password, nil)
+           |> assign(:drive_password_copied, false)
+           |> put_flash(:info, "Password regenerated. Update the credential in Home Assistant.")}
 
-      _unavailable ->
-        {:noreply, unavailable_flash(socket)}
+        {:error, reason} ->
+          {:noreply, flash_result(socket, {:error, reason}, nil)}
+
+        _unavailable ->
+          {:noreply, credentials_unavailable(socket)}
+      end
+    else
+      {:noreply, unarmed_noop(socket)}
     end
   end
 
@@ -369,42 +377,55 @@ defmodule UniversalProxyWeb.OverviewLive do
   # broadcast on "storage:state" regardless. The task only reports the
   # outcome back so the busy flag can clear (and a failure can flash).
   def handle_event("drive_format", _params, socket) do
-    socket = assign(socket, :drive_armed, nil)
+    if armed?(socket, :format) do
+      socket = assign(socket, :drive_armed, nil)
 
-    case selected_drive(socket) do
-      %{dev_path: device} ->
-        parent = self()
-        facade = storage()
+      case selected_drive(socket) do
+        %{dev_path: device} = drive ->
+          parent = self()
+          facade = storage()
+          # The drive **key**, not its device path: which device gets the
+          # `mkfs` is the subsystem's decision (a whole-disk format under a
+          # mounted partition would take the partition table with it), so
+          # the UI names the drive and nothing else.
+          key = Map.get(drive, :key)
 
-        Task.Supervisor.start_child(UniversalProxy.TaskSupervisor, fn ->
-          send(parent, {:storage_format_result, device, facade.format_drive(device)})
-        end)
+          Task.Supervisor.start_child(UniversalProxy.TaskSupervisor, fn ->
+            send(parent, {:storage_format_result, device, facade.format_drive(key)})
+          end)
 
-        {:noreply, assign(socket, :drive_formatting, device)}
+          {:noreply, assign(socket, :drive_formatting, device)}
 
-      _drive ->
-        {:noreply, socket}
+        _drive ->
+          {:noreply, socket}
+      end
+    else
+      {:noreply, unarmed_noop(socket)}
     end
   end
 
   def handle_event("drive_eject", _params, socket) do
-    socket = assign(socket, :drive_armed, nil)
+    if armed?(socket, :eject) do
+      socket = assign(socket, :drive_armed, nil)
 
-    case selected_drive(socket) do
-      %{dev_path: device} ->
-        case storage().eject() do
-          :ok ->
-            {:noreply,
-             socket
-             |> assign(:drive_ejected, device)
-             |> put_flash(:info, "Drive ejected — it's safe to unplug now.")}
+      case selected_drive(socket) do
+        %{dev_path: device} ->
+          case storage().eject() do
+            :ok ->
+              {:noreply,
+               socket
+               |> assign(:drive_ejected, device)
+               |> put_flash(:info, "Drive ejected — it's safe to unplug now.")}
 
-          error ->
-            {:noreply, flash_result(socket, error, nil)}
-        end
+            error ->
+              {:noreply, flash_result(socket, error, nil)}
+          end
 
-      _drive ->
-        {:noreply, socket}
+        _drive ->
+          {:noreply, socket}
+      end
+    else
+      {:noreply, unarmed_noop(socket)}
     end
   end
 
@@ -1002,6 +1023,7 @@ defmodule UniversalProxyWeb.OverviewLive do
       host={@target.hostname}
       supported?={@storage_supported?}
       username={@drive_username}
+      credentials?={@drive_credentials?}
       password={@drive_password}
       copied?={@drive_password_copied}
       armed={@drive_armed}
@@ -1048,10 +1070,23 @@ defmodule UniversalProxyWeb.OverviewLive do
     socket
     |> assign(:selected_drive, nil)
     |> assign(:drive_username, nil)
+    |> assign(:drive_credentials?, true)
     |> assign(:drive_password, nil)
     |> assign(:drive_password_copied, false)
     |> assign(:drive_armed, nil)
     |> assign(:drive_chooser, nil)
+  end
+
+  # The two-step confirmation is held **server-side**: `drive_arm` sets it,
+  # and the confirm handlers refuse to act without it. The confirm buttons
+  # only exist in the armed markup, so an unarmed confirm event is a
+  # crafted (or stale) one and must do nothing.
+  defp armed?(socket, action), do: socket.assigns.drive_armed == action
+
+  defp unarmed_noop(socket) do
+    socket
+    |> assign(:drive_armed, nil)
+    |> put_flash(:info, "Confirm that action first.")
   end
 
   defp selected_drive(socket),
@@ -1065,10 +1100,17 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   # Only the username: reading credentials generates the password lazily
   # server-side, but it never enters the socket until an explicit Reveal.
+  # `nil` covers both "store unreachable" and "generated but not
+  # persistable" (see `Storage.share_credentials/0`); either way the drawer
+  # must say the credentials are unavailable rather than imply the
+  # default account works.
   defp load_share_username(socket) do
     case storage().share_credentials() do
-      %{username: username} -> assign(socket, :drive_username, username)
-      _unavailable -> assign(socket, :drive_username, nil)
+      %{username: username} ->
+        socket |> assign(:drive_username, username) |> assign(:drive_credentials?, true)
+
+      _unavailable ->
+        socket |> assign(:drive_username, nil) |> assign(:drive_credentials?, false)
     end
   end
 
@@ -1189,7 +1231,12 @@ defmodule UniversalProxyWeb.OverviewLive do
   defp unavailable_flash(socket),
     do: put_flash(socket, :error, storage_error_copy(:unavailable))
 
+  defp credentials_unavailable(socket),
+    do: socket |> assign(:drive_credentials?, false) |> unavailable_flash()
+
   defp storage_error_copy(:unavailable), do: "Storage subsystem unavailable."
+  defp storage_error_copy(:not_persisted), do: "The drive's credentials couldn't be saved."
+  defp storage_error_copy(:unknown_drive), do: "That drive is no longer attached."
   defp storage_error_copy(:not_mounted), do: "No drive is mounted."
   defp storage_error_copy(:invalid_path), do: "That folder isn't on the drive."
   defp storage_error_copy(:enoent), do: "That folder no longer exists on the drive."

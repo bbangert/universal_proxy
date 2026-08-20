@@ -29,6 +29,16 @@ defmodule UniversalProxy.Storage.Probe do
   A drive whose `device` symlink has no `idVendor` anywhere among its
   ancestors is an internal disk (SD card, eMMC, SATA/PCIe) and is
   excluded — this subsystem only cares about removable USB storage.
+
+  ## Why the class entry is resolved first
+
+  `/sys/class/block/sda` is itself a symlink into
+  `/sys/devices/…/block/sda`, and the `device` symlink *inside* that
+  directory is relative to the **real** location
+  (`device -> ../../../0:0:0:0`). Its raw target therefore carries no USB
+  segment at all: the bus path and the `idVendor`/`idProduct` files only
+  appear once both links have been resolved. Walking the lexical class
+  path instead yields nothing, so every USB drive would look internal.
   """
 
   @type fs_type :: :ext4 | :exfat | :ntfs3 | :vfat | :unknown
@@ -167,21 +177,41 @@ defmodule UniversalProxy.Storage.Probe do
   # A USB-backed disk's `device` symlink resolves through the bound USB
   # interface (see `Audio.Enumerate.read_usb_port/2`) and down into the
   # SCSI/NVMe target chain. `idVendor`/`idProduct` live on the USB
-  # *device* node itself, one or more levels above the interface, so we
-  # walk ancestors of the resolved (not just the interface) path. A
-  # disk with no USB ancestry at all (internal SD/eMMC/SATA/PCIe) never
-  # finds an `idVendor` and is excluded.
+  # *device* node itself, one or more levels above the interface, so both
+  # the bus path and the ids come from the **resolved** device directory's
+  # own ancestry. A disk with no USB ancestry at all (internal
+  # SD/eMMC/SATA/PCIe) never finds an `idVendor` and is excluded.
   @usb_iface_re ~r/^(\d+-[\d.]+):\d+\.\d+$/
 
   defp usb_ancestry(sys_root, name) do
-    link = Path.join([sys_root, name, "device"])
-
-    with {:ok, target} <- File.read_link(link),
+    with {:ok, device_dir} <- resolve_device_dir(sys_root, name),
          {vendor_id, product_id} when is_integer(vendor_id) and is_integer(product_id) <-
-           find_ids(expand_link_target(link, target)) do
-      {usb_bus_path(target), vendor_id, product_id}
+           find_ids(device_dir) do
+      {usb_bus_path(device_dir), vendor_id, product_id}
     else
       _ -> nil
+    end
+  end
+
+  # `<class>/<name>` -> the absolute directory the `device` symlink inside
+  # the real block directory points at.
+  defp resolve_device_dir(sys_root, name) do
+    link = Path.join(resolve_class_entry(sys_root, name), "device")
+
+    case File.read_link(link) do
+      {:ok, target} -> {:ok, expand_link_target(link, target)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # The class entry is a symlink on a real kernel; a plain directory is
+  # accepted as-is so a flattened tree still enumerates.
+  defp resolve_class_entry(sys_root, name) do
+    entry = Path.join(sys_root, name)
+
+    case File.read_link(entry) do
+      {:ok, target} -> expand_link_target(entry, target)
+      {:error, _reason} -> entry
     end
   end
 
@@ -231,14 +261,15 @@ defmodule UniversalProxy.Storage.Probe do
     end
   end
 
-  # The physical USB bus path ("1-1.3"), read straight from the raw
-  # symlink target text — identical technique to
-  # `Audio.Enumerate.usb_bus_path/1`. `nil` when no interface segment
-  # is present (shouldn't happen once `find_ids/1` has already
-  # succeeded, but this is independent string parsing so it degrades
-  # gracefully rather than crashing).
-  defp usb_bus_path(symlink_target) do
-    symlink_target
+  # The physical USB bus path ("1-1.3"), read from the resolved device
+  # directory's path components — same technique as
+  # `Audio.Enumerate.usb_bus_path/1`, applied to the resolved path because
+  # the raw `device` target (`../../../0:0:0:0`) holds no USB segment.
+  # `nil` when no interface segment is present (shouldn't happen once
+  # `find_ids/1` has already succeeded, but this is independent string
+  # parsing so it degrades gracefully rather than crashing).
+  defp usb_bus_path(device_dir) do
+    device_dir
     |> String.split("/")
     |> Enum.find_value(fn seg ->
       case Regex.run(@usb_iface_re, seg) do

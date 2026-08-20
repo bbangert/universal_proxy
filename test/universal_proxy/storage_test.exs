@@ -126,11 +126,23 @@ defmodule UniversalProxy.StorageTest do
     end
 
     test "format_drive/2 degrades to {:error, :unavailable} (server not running, not wedged)" do
-      assert Storage.format_drive("/dev/sda1", "BACKUP") == {:error, :unavailable}
+      assert Storage.format_drive({"1-1.3", "0bda", "0316"}, "BACKUP") == {:error, :unavailable}
     end
 
     test "format_drive/1 defaults the label to USB_BACKUP and still degrades safely" do
-      assert Storage.format_drive("/dev/sda1") == {:error, :unavailable}
+      assert Storage.format_drive({"1-1.3", "0bda", "0316"}) == {:error, :unavailable}
+      # `nil` is the key of a drive with no derivable bus path.
+      assert Storage.format_drive(nil) == {:error, :unavailable}
+    end
+
+    test "format_drive/2 takes a drive key, never a device path" do
+      # The guard is the contract: a device path cannot even be expressed,
+      # so no caller can name what `mkfs` gets pointed at. Called through
+      # `apply/3` because a literal here is a compile-time type error —
+      # which is the point, but the compiler's warning would be noise.
+      assert_raise FunctionClauseError, fn ->
+        apply(Storage, :format_drive, ["/dev/sda1"])
+      end
     end
   end
 

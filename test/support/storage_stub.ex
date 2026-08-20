@@ -8,8 +8,8 @@ defmodule UniversalProxy.StorageStub do
   their replies.
 
   It exists because the real calls must not run in the suite: the format
-  action shells out to `mkfs.ext4` against whatever device path it is
-  handed, and eject `umount`s it. Reads (`state/0`) stay empty here — a
+  action shells out to `mkfs.ext4` against the device the subsystem
+  resolves for the drive key it is handed, and eject `umount`s it. Reads (`state/0`) stay empty here — a
   LiveView test drives the row and drawer by broadcasting
   `{:storage_state, …}` on the real topic, exactly as the subsystem does.
 
@@ -97,8 +97,10 @@ defmodule UniversalProxy.StorageStub do
 
   def eject, do: reply(:eject, [], :ok)
 
-  def format_drive(device, label \\ "USB_BACKUP"),
-    do: reply(:format_drive, [device, label], :ok)
+  # Takes the drive **key** (`nil` for a drive with no derivable bus path),
+  # never a device path: `Storage.Server` resolves the device itself.
+  def format_drive(drive_key, label \\ "USB_BACKUP"),
+    do: reply(:format_drive, [drive_key, label], :ok)
 
   def list_folders(rel_path) do
     default =

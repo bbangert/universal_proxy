@@ -248,8 +248,9 @@ defmodule UniversalProxy.Storage.Smbd do
     * `:smbpasswd_paths` — binary candidates, first existing wins.
     * `:get_hash_fun` / `:put_hash_fun` — the persistence seam, arity 0/1
       (default: `UniversalProxy.Storage.Settings`). `:get_hash_fun`
-      swallows the "settings not running" exit and reports no recorded
-      hash, so provisioning re-runs rather than being skipped.
+      swallows the "settings not running" exit (and unpersistable
+      credentials) and reports no recorded hash, so provisioning re-runs
+      rather than being skipped.
     * `:timeout` (default #{@provision_timeout} ms).
 
   The password never reaches `argv`, the log, or the returned error term.
@@ -286,7 +287,12 @@ defmodule UniversalProxy.Storage.Smbd do
   end
 
   defp default_get_hash do
-    Settings.credentials().provisioned_hash
+    case Settings.credentials() do
+      %{provisioned_hash: hash} -> hash
+      # Credentials that could not be persisted ({:error, :not_persisted}):
+      # no recorded marker to compare against.
+      _other -> nil
+    end
   catch
     # Settings not started (host, or before the subtree comes up): treat as
     # "never provisioned" so the run happens instead of being skipped.

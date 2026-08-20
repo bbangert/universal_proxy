@@ -86,14 +86,20 @@ defmodule UniversalProxy.Storage do
   on first read (see `Storage.Settings`). Never log or inspect the
   result: the password lives inside it.
 
-  Returns `nil` while `Storage.Settings` is down or wedged. **This is not
-  the same as "no password has been generated yet"** — that case always
-  succeeds (generation is lazy and happens on this very call); `nil` here
-  means the subsystem could not be reached at all.
+  Returns `nil` while `Storage.Settings` is down or wedged, and also when
+  a first-read generation could not be persisted (`Settings` answers
+  `{:error, :not_persisted}`): a password that is not durable would stop
+  matching the smbd account after the next reboot, so it is reported as
+  "no credentials" rather than handed out. **`nil` is therefore not "no
+  password has been generated yet"** — generation is lazy and happens on
+  this very call; `nil` means the credentials could not be established.
   """
   @spec share_credentials() :: Settings.credentials() | nil
   def share_credentials do
-    Settings.credentials()
+    case Settings.credentials() do
+      %{} = credentials -> credentials
+      _not_persisted -> nil
+    end
   catch
     :exit, _ -> nil
   end
@@ -178,18 +184,34 @@ defmodule UniversalProxy.Storage do
   daemon — otherwise the new password would sit in `Storage.Settings`
   unapplied until the next unrelated convergence (mount/unmount, hotplug).
 
-  The convergence poke is best-effort: if `Storage.Server` is down, the
-  rotation itself (already durably persisted in `Storage.Settings`)
-  still succeeds and is returned, and the next convergence — whenever the
-  subsystem comes back — reprovisions from the stored value. Only a
-  failure in `Storage.Settings` itself degrades the whole call to
-  `{:error, :unavailable}`.
+  Because convergence is a no-op while the share is already `:running`,
+  the poke is `Storage.Server.credentials_rotated/1` rather than a plain
+  `check_now/1`: it stops the running daemon first, so the pass that
+  follows reprovisions the account and starts it again with the new
+  password. Without that a running share would keep serving the old
+  credential until some unrelated event (mount, unmount, hotplug) restarted
+  it.
+
+  The poke is best-effort: if `Storage.Server` is down, the rotation
+  itself (already durably persisted in `Storage.Settings`) still succeeds
+  and is returned, and the next share start — whenever the subsystem comes
+  back — provisions from the stored value. A rotation that could not be
+  persisted returns `{:error, :not_persisted}` (and is not applied to the
+  daemon, which would otherwise be given a password no reboot survives),
+  and a `Storage.Settings` that cannot be reached at all degrades the
+  whole call to `{:error, :unavailable}`.
   """
-  @spec rotate_password() :: Settings.credentials() | {:error, :unavailable}
+  @spec rotate_password() ::
+          Settings.credentials() | {:error, :not_persisted} | {:error, :unavailable}
   def rotate_password do
-    credentials = Settings.rotate_password()
-    poke_convergence()
-    credentials
+    case Settings.rotate_password() do
+      %{} = credentials ->
+        poke_rotation()
+        credentials
+
+      {:error, _reason} = error ->
+        error
+    end
   catch
     :exit, _ -> {:error, :unavailable}
   end
@@ -211,9 +233,16 @@ defmodule UniversalProxy.Storage do
   end
 
   @doc """
-  Make a fresh ext4 filesystem on `device` (destroying everything on it),
-  labelled `label` (default `#{inspect("USB_BACKUP")}`). Stops the share
-  and unmounts first; refuses if the unmount fails.
+  Make a fresh ext4 filesystem on the drive `drive_key` identifies
+  (destroying everything on it), labelled `label` (default
+  `#{inspect("USB_BACKUP")}`). Stops the share and unmounts first;
+  refuses if the unmount fails.
+
+  Callers name the **drive**, never a device path: `Storage.Server`
+  resolves which device `mkfs` is pointed at from its own state (the live
+  mount, else the drive's first data partition, else the whole disk), and
+  answers `{:error, :unknown_drive}` for a key that is not the attached
+  drive's. `nil` is the key of a drive with no derivable bus path.
 
   `Storage.Server` blocks its whole loop for the duration — `mkfs.ext4`
   on a large slow stick can take minutes — so this follows
@@ -224,18 +253,19 @@ defmodule UniversalProxy.Storage do
   reachable at all. Conflating the two would make a caller believe a
   still-running format had failed.
   """
-  @spec format_drive(String.t(), String.t()) :: :ok | {:error, term()}
-  def format_drive(device, label \\ "USB_BACKUP")
-      when is_binary(device) and is_binary(label) do
-    call_server(fn -> Server.format(device, label) end)
+  @spec format_drive(drive_key() | nil, String.t()) :: :ok | {:error, term()}
+  def format_drive(drive_key, label \\ "USB_BACKUP")
+      when is_binary(label) and
+             (is_nil(drive_key) or (is_tuple(drive_key) and tuple_size(drive_key) == 3)) do
+    call_server(fn -> Server.format(drive_key, label) end)
   end
 
   # -- Private --
 
   # Best-effort: a failure here must not turn an already-successful
   # password rotation into an error return (see `rotate_password/0`).
-  defp poke_convergence do
-    Server.check_now()
+  defp poke_rotation do
+    Server.credentials_rotated()
   catch
     :exit, _ -> :ok
   end
