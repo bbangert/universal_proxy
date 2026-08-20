@@ -375,6 +375,30 @@ defmodule UniversalProxy.Storage.SmbdTest do
 
       assert {:error, :timeout} = Smbd.provision_user(@password, opts)
     end
+
+    # The timeout is a total budget from entry, not a per-chunk one: a
+    # `smbpasswd` that keeps dribbling output (still alive, just never
+    # finishing) must not have the clock reset on every chunk it emits.
+    test "a smbpasswd that dribbles output forever times out at ~ the configured total", ctx do
+      hash_holder = start_hash_holder()
+      dribbling = dribbling_smbpasswd(ctx.tmp_dir)
+
+      opts =
+        provision_opts(ctx, hash_holder)
+        |> Keyword.put(:smbpasswd_paths, [dribbling])
+        |> Keyword.put(:timeout, 200)
+
+      {elapsed_us, result} = :timer.tc(fn -> Smbd.provision_user(@password, opts) end)
+      elapsed_ms = div(elapsed_us, 1000)
+
+      assert result == {:error, :timeout}
+
+      # The fake keeps writing for ~1_000ms (20 chunks, 50ms apart) before
+      # it ever exits on its own: a per-chunk timeout bug would ride every
+      # chunk's reset and only expire once the output stops, well past
+      # 1_000ms. The fix must land close to the configured 200ms instead.
+      assert elapsed_ms < 700
+    end
   end
 
   describe "child_spec/1" do
@@ -471,6 +495,23 @@ defmodule UniversalProxy.Storage.SmbdTest do
     write_script(dir, "smbpasswd-hung", """
     #!/bin/sh
     sleep 30
+    """)
+  end
+
+  # Never blocks in a plain read (which would just hang the port write, not
+  # exercise the timeout loop's chunking): emits output every ~50ms for
+  # ~1_000ms total, then exits on its own — long enough to prove a fixed
+  # deadline fires well before the dribbling stops, short enough to keep a
+  # buggy run's worst case bounded.
+  defp dribbling_smbpasswd(dir) do
+    write_script(dir, "smbpasswd-dribbling", """
+    #!/bin/sh
+    i=0
+    while [ "$i" -lt 20 ]; do
+      echo "still working"
+      sleep 0.05
+      i=$((i + 1))
+    done
     """)
   end
 

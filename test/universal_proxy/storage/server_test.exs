@@ -160,8 +160,21 @@ defmodule UniversalProxy.Storage.ServerTest do
     def init(_opts) do
       Process.flag(:trap_exit, true)
       Recorder.record({:smbd_started})
+
+      # Opt-in simulation of a `smbd` that exits on its own the instant it
+      # starts (a bad config, a missing shared library): schedules its own
+      # crash rather than crashing from `init/1`, so the child still starts
+      # cleanly (`DynamicSupervisor.start_child/2` returns `{:ok, pid}` and
+      # the server gets to `Process.monitor/1` it) before it dies.
+      if Recorder.get(:crash_instantly?, false) do
+        send(self(), :simulate_instant_crash)
+      end
+
       {:ok, %{}}
     end
+
+    @impl true
+    def handle_info(:simulate_instant_crash, state), do: {:stop, :simulated_crash, state}
 
     @impl true
     def terminate(_reason, state) do
@@ -1362,7 +1375,11 @@ defmodule UniversalProxy.Storage.ServerTest do
     # `Smbd.child_spec/1` is `restart: :temporary` so that this server, not
     # the DynamicSupervisor, decides when smbd comes back — a supervisor
     # restart would resurrect it under a new pid the server never learns.
-    test "a daemon that dies on its own is noticed and started again", ctx do
+    # A crash must not restart the daemon from inside the very handler
+    # that noticed it: a `smbd` that dies instantly would otherwise
+    # spawn/crash/log in a tight loop, bypassing `:retry_interval` pacing
+    # entirely.
+    test "a daemon that dies on its own is not restarted within the same converge cycle", ctx do
       server = start_server(ctx)
       present!()
       enable_share!(ctx)
@@ -1378,25 +1395,74 @@ defmodule UniversalProxy.Storage.ServerTest do
           # Untrappable, exactly as a segfaulting smbd would go.
           Process.exit(first, :kill)
 
-          # The share is published as down before the restart is attempted:
-          # convergence only broadcasts on a payload change, so a failed
-          # restart would otherwise leave subscribers showing :running.
+          # The share is published as down; the convergence pass this
+          # handler triggers withholds the restart, so this is where the
+          # payload settles until the retry timer fires (there is none
+          # here — `start_timer: false` — so the state is stable to assert
+          # on).
           assert_receive {:storage_state, %{share: :error}}, 1_000
-
-          # The broadcast above happens *inside* the DOWN handler, so this
-          # call is what waits for the convergence that follows it.
-          assert Server.get_state(server).share == :running
         end)
 
       assert log =~ "smbd"
+
+      assert Server.get_state(server).share == :error
+      assert DynamicSupervisor.which_children(ctx.daemon_supervisor) == []
+      assert Enum.count(Recorder.events(), &match?({:smbd_started}, &1)) == 1
+    end
+
+    test "the retry timer restarts a crashed daemon after :retry_interval", ctx do
+      server = start_server(ctx, start_timer: true, retry_interval: 50)
+      present!()
+      enable_share!(ctx)
+      :ok = Server.check_now(server)
+
+      assert Server.get_state(server).share == :running
+      # Drain the broadcast this first start already sent, so the later
+      # `assert_receive` for the restart can't match this stale one instead.
+      assert_receive {:storage_state, %{share: :running}}, 1_000
+
+      assert [{_id, first, _type, _mods}] =
+               DynamicSupervisor.which_children(ctx.daemon_supervisor)
+
+      capture_log(fn ->
+        Process.exit(first, :kill)
+        assert_receive {:storage_state, %{share: :error}}, 1_000
+      end)
+
+      # Not restarted immediately...
+      assert Server.get_state(server).share == :error
+      assert Enum.count(Recorder.events(), &match?({:smbd_started}, &1)) == 1
+
+      # ...but the armed retry timer converges again after :retry_interval,
+      # and that pass is not paced (`restart_share?` defaults to true), so
+      # it restarts the share.
+      assert_receive {:storage_state, %{share: :running}}, 1_000
 
       assert [{_id, second, _type, _mods}] =
                DynamicSupervisor.which_children(ctx.daemon_supervisor)
 
       refute second == first
       assert Process.alive?(second)
-      assert Server.get_state(server).share == :running
       assert Enum.count(Recorder.events(), &match?({:smbd_started}, &1)) == 2
+    end
+
+    test "repeated instant crashes are paced by :retry_interval, not a loop", ctx do
+      server = start_server(ctx, start_timer: true, retry_interval: 40)
+      present!()
+      enable_share!(ctx)
+      Recorder.put(:crash_instantly?, true)
+
+      capture_log(fn ->
+        :ok = Server.check_now(server)
+        # ~5 retry intervals: enough for several restart cycles if the
+        # timer is doing its job, nowhere near enough for the hundreds a
+        # tight spawn/crash loop would produce in the same window.
+        Process.sleep(220)
+      end)
+
+      starts = Recorder.events() |> Enum.count(&match?({:smbd_started}, &1))
+      assert starts >= 2
+      assert starts <= 10
     end
 
     test "a deliberate stop is not mistaken for a crash", ctx do

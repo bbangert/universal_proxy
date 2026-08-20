@@ -341,17 +341,24 @@ defmodule UniversalProxy.Storage.Smbd do
     timeout = Keyword.get(opts, :timeout, @provision_timeout)
     port = Port.open({:spawn_executable, String.to_charlist(bin)}, port_opts(args))
     Port.command(port, password <> "\n" <> password <> "\n")
-    collect(port, password, timeout, "")
+    deadline = System.monotonic_time(:millisecond) + timeout
+    collect(port, password, deadline, "")
   rescue
     e -> {:error, {:spawn_failed, bin, Exception.message(e)}}
   end
 
   defp port_opts(args), do: [:binary, :exit_status, :stderr_to_stdout, {:args, args}]
 
-  defp collect(port, password, timeout, acc) do
+  # `deadline` is computed once, at entry (`feed_password/4`), from the
+  # configured `:timeout` — not re-armed here. Handing the full timeout to
+  # every `receive` would let a hung `smbpasswd` that keeps dribbling
+  # output reset the clock on each chunk and never time out at all.
+  defp collect(port, password, deadline, acc) do
+    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
     receive do
       {^port, {:data, data}} ->
-        collect(port, password, timeout, acc <> data)
+        collect(port, password, deadline, acc <> data)
 
       {^port, {:exit_status, 0}} ->
         :ok
@@ -359,7 +366,7 @@ defmodule UniversalProxy.Storage.Smbd do
       {^port, {:exit_status, status}} ->
         {:error, {:smbpasswd_failed, status, redact(acc, password)}}
     after
-      timeout ->
+      remaining ->
         safe_close(port)
         {:error, :timeout}
     end

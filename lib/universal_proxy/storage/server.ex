@@ -127,10 +127,19 @@ defmodule UniversalProxy.Storage.Server do
   The daemon child spec is `restart: :temporary`
   (`Storage.Smbd.child_spec/1`) and this server monitors the pid it
   started. A `smbd` that dies on its own therefore stays dead until the
-  `{:DOWN, …}` handler marks the share `:error` and runs a convergence
-  pass, which decides afresh whether the share should run at all
-  (opt-in, mount, validated folder) — the same gate a first start goes
-  through.
+  `{:DOWN, …}` handler marks the share `:error`, broadcasts, and runs a
+  convergence pass — but that pass runs with restarting the share
+  withheld (`reconcile_share/2`'s `restart?: false`), so a `smbd` that
+  exits instantly does not spawn/crash/log in a tight loop, restarted by
+  the very handler that just noticed it die. The pass still does
+  everything else convergence normally does (refresh drives, reconcile
+  removal/mount, and stop the share if it is no longer wanted at all),
+  and its tail (`schedule_retry/1`) sees the crash left work outstanding
+  and arms the `:retry_interval` timer — the same self-heal path a failed
+  mount or share start already uses — so the next convergence, paced
+  rather than immediate, is what actually decides afresh whether the
+  share should run at all (opt-in, mount, validated folder) and restarts
+  it.
 
   A supervisor restart would instead bring `smbd` back under a **new**
   pid, leaving this server's stored pid stale: `terminate_child` would
@@ -676,15 +685,28 @@ defmodule UniversalProxy.Storage.Server do
   # marked `:error` and that is published straight away, because the
   # convergence that follows only broadcasts when the payload *changes*: a
   # restart that fails would otherwise leave every subscriber still
-  # showing `:running`. Convergence then decides whether to start it
-  # again, through the same opt-in/mount/folder gate as a first start.
+  # showing `:running`.
+  #
+  # The convergence that follows runs with `restart_share?: false`: a
+  # `smbd` that dies instantly (a bad config, a missing library) would
+  # otherwise spawn/crash/log in a tight loop, restarted every time this
+  # very handler fires, bypassing `:retry_interval` entirely. Every other
+  # step still runs — drive refresh, removal/mount reconciliation, and
+  # `reconcile_share/2`'s "not desired" branch, which stops the share (a
+  # no-op here, since it is already down) when the opt-in was pulled out
+  # from under the crash — so the pass still cleans up and still lands on
+  # `:off` rather than being stuck at `:error` when the share is no longer
+  # wanted. Only the restart itself is withheld: `work_pending?/1` sees a
+  # desired share that is not `:running` and arms the retry timer, which
+  # is what actually brings it back, paced by `:retry_interval` rather
+  # than immediately.
   def handle_info({:DOWN, ref, :process, pid, reason}, %{share_monitor: ref} = state) do
     Logger.warning("Storage: smbd (#{inspect(pid)}) exited: #{inspect(reason)}")
 
     state = %{state | share: :error, share_pid: nil, share_monitor: nil}
     broadcast(state)
 
-    {:noreply, converge(state)}
+    {:noreply, converge(state, restart_share?: false)}
   end
 
   # Kernel uevent (via NervesUEvent's PropertyTable). Only `block`
@@ -701,7 +723,10 @@ defmodule UniversalProxy.Storage.Server do
 
   # -- Convergence --
 
-  defp converge(state) do
+  # `restart_share?: false` (only ever passed by the `:DOWN` handler) skips
+  # the "start it back up" branch of `reconcile_share/2` while every other
+  # step still runs — see that handler for why.
+  defp converge(state, opts \\ []) do
     before = payload(state)
 
     state =
@@ -712,7 +737,7 @@ defmodule UniversalProxy.Storage.Server do
       |> reconcile_mount()
       |> refresh_share_folder()
       |> refresh_capacity()
-      |> reconcile_share()
+      |> reconcile_share(Keyword.get(opts, :restart_share?, true))
 
     if payload(state) != before, do: broadcast(state)
 
@@ -1423,11 +1448,19 @@ defmodule UniversalProxy.Storage.Server do
 
   # -- Share reconciliation --
 
-  defp reconcile_share(state) do
+  # `restart?` gates only the "start it" branch: the crash path
+  # (`handle_info({:DOWN, …})`) passes `false` so a share that keeps
+  # dying doesn't get spawned again inside the very pass that noticed the
+  # crash — `work_pending?/1` sees the share still desired and not
+  # `:running`, which arms the retry timer instead. The "stop it" branch
+  # always runs regardless: it is what still lands on `:off` when the
+  # opt-in was pulled out from under a crash, and `stop_share/1` is a
+  # no-op when there is nothing left to stop.
+  defp reconcile_share(state, restart?) do
     desired? = share_desired?(state)
 
     cond do
-      desired? and state.share != :running ->
+      desired? and state.share != :running and restart? ->
         start_share(state)
 
       # Called on every pass where the share is unwanted, not only on the
