@@ -399,6 +399,46 @@ defmodule UniversalProxy.Storage.SmbdTest do
       # 1_000ms. The fix must land close to the configured 200ms instead.
       assert elapsed_ms < 700
     end
+
+    # A noisy or wedged smbpasswd must not be allowed to grow the
+    # collected buffer for the whole `:timeout` budget — that is
+    # unbounded memory on-device. `yes | head` floods megabytes of
+    # output far faster than a real smbpasswd ever would, so a
+    # regression back to unbounded accumulation would show up here as
+    # either a large returned output or a multi-second stall, not just as
+    # an OOM under real load.
+    test "a flood of output does not grow the collected buffer or stall", ctx do
+      hash_holder = start_hash_holder()
+      flooding = flooding_smbpasswd(ctx.tmp_dir)
+
+      opts =
+        provision_opts(ctx, hash_holder)
+        |> Keyword.put(:smbpasswd_paths, [flooding])
+        |> Keyword.put(:timeout, 5_000)
+
+      {elapsed_us, result} = :timer.tc(fn -> Smbd.provision_user(@password, opts) end)
+
+      assert {:error, {:smbpasswd_failed, 1, output}} = result
+      # Bounded regardless of how many megabytes the fake wrote: the
+      # rolling collection window, then the existing 500-char error cap.
+      assert byte_size(output) <= 500
+      assert div(elapsed_us, 1000) < 3_000
+    end
+
+    # The password is redacted out of each chunk as it arrives, not once
+    # at the end — but a chunk boundary can split the password in half.
+    # Sleeping between the two writes forces the port to deliver them as
+    # two separate `{:data, ...}` messages instead of coalescing into one,
+    # driving the seam the carry-and-rescan logic exists for.
+    test "a password split across a chunk boundary is still fully redacted", ctx do
+      hash_holder = start_hash_holder()
+      seam = seam_smbpasswd(ctx.tmp_dir)
+      opts = Keyword.put(provision_opts(ctx, hash_holder), :smbpasswd_paths, [seam])
+
+      assert {:error, {:smbpasswd_failed, 1, output}} = Smbd.provision_user(@password, opts)
+      refute output =~ @password
+      assert output =~ "[redacted]"
+    end
   end
 
   describe "child_spec/1" do
@@ -512,6 +552,40 @@ defmodule UniversalProxy.Storage.SmbdTest do
       sleep 0.05
       i=$((i + 1))
     done
+    """)
+  end
+
+  # `yes`/`head` are compiled utilities, fast enough to produce megabytes
+  # of output well inside a test timeout — a shell loop doing the same
+  # would be slow enough to look like the very stall this guards against.
+  defp flooding_smbpasswd(dir) do
+    write_script(dir, "smbpasswd-flooding", """
+    #!/bin/sh
+    read -r first
+    read -r second
+    yes "0123456789012345678901234567890123456789" | head -c 2000000
+    exit 1
+    """)
+  end
+
+  # Echoes the fed-in password back split across two writes with a real
+  # sleep between them, so the boundary lands in the middle of the
+  # password (`@password` is 24 bytes; "SEKRET-PASSW" | "ORD-12345678"),
+  # not on a chunk edge that happens to be safe. `awk`'s `printf` (unlike
+  # `cut`, which appends its own trailing newline per line) writes exactly
+  # the requested substring with nothing extra, so the two halves are
+  # contiguous in the output stream — a stray separator here would make
+  # the password never actually appear intact, which would pass this test
+  # for the wrong reason.
+  defp seam_smbpasswd(dir) do
+    write_script(dir, "smbpasswd-seam", """
+    #!/bin/sh
+    read -r first
+    read -r second
+    printf '%s' "$first" | awk '{printf "%s", substr($0,1,12)}'
+    sleep 0.2
+    printf '%s' "$first" | awk '{printf "%s", substr($0,13)}'
+    exit 1
     """)
   end
 

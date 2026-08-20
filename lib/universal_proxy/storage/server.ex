@@ -158,6 +158,19 @@ defmodule UniversalProxy.Storage.Server do
   two-guard strategy (segment rejection *before* expansion, prefix check
   *after*).
 
+  Segment rejection also refuses any control byte (`path_segments/1`), not
+  just the literal `"."`/`".."`/empty segments — the same rule
+  `validate_name/1` already applies to a created folder's own name. That
+  closes a CRLF path-smuggling gap: `Smbd.config/1` strips CR/LF from the
+  share path it interpolates into `smb.conf` (so a name can't inject a
+  config directive), and a segment like `"\n.."` is not literally `".."`
+  here yet **becomes** `".."` once that stripping runs — a mount escape
+  this sandbox never validated. Rejecting the control byte up front is
+  what keeps the path validated here byte-identical to the path Smbd
+  configures: the `sanitize/1` call on the Smbd side stays as
+  defense-in-depth, but has nothing left to transform for input this
+  sandbox accepted.
+
   A *stored* mapping is untrusted too, and for a second reason: it is
   persisted, while the drive it points into is not — the directory can be
   deleted or replaced by a symlink between one share start and the next.
@@ -380,8 +393,9 @@ defmodule UniversalProxy.Storage.Server do
   already exist inside the mount point.
 
   Validated and sandboxed before anything is written (`..`, empty
-  segments and absolute paths are refused, and the resolved directory has
-  to sit under the mount point and exist). On success the setting is
+  segments, control bytes and absolute paths are refused, and the
+  resolved directory has to sit under the mount point and exist). On
+  success the setting is
   persisted, the chosen directory is chowned to the backup account on a
   read-write ext4 mount (a pre-existing directory can belong to another
   uid, which would leave the share unwritable) and, when this drive's
@@ -1406,7 +1420,23 @@ defmodule UniversalProxy.Storage.Server do
       true ->
         segments = String.split(trimmed, "/")
 
-        if Enum.any?(segments, &(&1 == "" or &1 in [".", ".."])),
+        # A control byte (CR, LF, NUL, …) inside a segment must be refused
+        # here, before expansion, even though the segment is not literally
+        # "." or "..": `String.trim/1` above only strips whitespace from the
+        # two ends of the whole string, so an embedded `"\n.."` segment (for
+        # example `"safe/\n../etc"`) survives to this check unchanged, and
+        # neither `Path.expand/1` nor the mount-point prefix check below
+        # treats it as a traversal — it is just a directory name containing
+        # a newline. The escape happens one step later: `Smbd.config/1`
+        # strips CR/LF from the *joined* share path when it writes
+        # `smb.conf` (so a name can't inject a config directive), which
+        # turns that same segment into a literal `".."` in the file smbd
+        # reads — a mount-escape this process never validated. Rejecting
+        # control bytes on every segment here, mirroring `validate_name/1`'s
+        # rule for created folder names, is what keeps the path this
+        # function accepts byte-identical to the path Smbd ends up
+        # configuring: nothing downstream has a control byte left to act on.
+        if Enum.any?(segments, &(&1 == "" or &1 in [".", ".."] or control_bytes?(&1))),
           do: {:error, :invalid_path},
           else: {:ok, segments}
     end

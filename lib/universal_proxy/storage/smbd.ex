@@ -56,6 +56,12 @@ defmodule UniversalProxy.Storage.Smbd do
 
   @provision_timeout 15_000
 
+  # A noisy or wedged `smbpasswd` must not accumulate output for the whole
+  # `:timeout` budget — that is unbounded memory on-device. Only the last
+  # `@collected_output_max` bytes can ever matter anyway: `redact/2` slices
+  # the eventual error to 500 chars.
+  @collected_output_max 1_000
+
   @type config_params :: %{
           required(:mount_point) => String.t(),
           required(:username) => String.t(),
@@ -138,6 +144,18 @@ defmodule UniversalProxy.Storage.Smbd do
   # `"/"` (and anything that normalises to it) shares the drive root; any
   # other value is joined on as a relative path, so a stored leading slash
   # cannot turn into an absolute path that escapes the mount point.
+  #
+  # Invariant this module relies on and does not itself enforce: `folder`
+  # reaches here only after `UniversalProxy.Storage.Server`'s sandbox
+  # (`path_segments/1`) has rejected every segment that is `.`, `..`,
+  # empty, or contains a control byte — so the `sanitize/1` call below,
+  # which strips CR/LF, is defense-in-depth against a value that should
+  # already be free of them, not the boundary that makes the emitted path
+  # safe. Free-text fields (`netbios_name`, `username`) are genuinely
+  # transformed by `sanitize/1` because nothing upstream validates them the
+  # same way; `folder` is emitted verbatim in that sense — a stripped
+  # CR/LF here would only ever fire on a value the server should have
+  # already refused.
   defp share_path(mount_point, folder) do
     mount_point = sanitize(mount_point)
 
@@ -342,7 +360,7 @@ defmodule UniversalProxy.Storage.Smbd do
     port = Port.open({:spawn_executable, String.to_charlist(bin)}, port_opts(args))
     Port.command(port, password <> "\n" <> password <> "\n")
     deadline = System.monotonic_time(:millisecond) + timeout
-    collect(port, password, deadline, "")
+    collect(port, password, deadline, "", "")
   rescue
     e -> {:error, {:spawn_failed, bin, Exception.message(e)}}
   end
@@ -353,22 +371,73 @@ defmodule UniversalProxy.Storage.Smbd do
   # configured `:timeout` — not re-armed here. Handing the full timeout to
   # every `receive` would let a hung `smbpasswd` that keeps dribbling
   # output reset the clock on each chunk and never time out at all.
-  defp collect(port, password, deadline, acc) do
+  #
+  # Two independent bounds on `acc`, both required:
+  #
+  #   * the password is redacted out of *each chunk* before it is ever
+  #     appended, not once at the end — so an unredacted copy of it is
+  #     never retained even transiently. A chunk boundary can split the
+  #     password in half, so `carry` holds back the last
+  #     `byte_size(password) - 1` raw bytes of the previous chunk and
+  #     re-scans them together with the next one: the only overlap wide
+  #     enough for a straddling match to complete once more data arrives.
+  #     `String.replace/3` never touches bytes outside a full match, so
+  #     bytes that end up in `carry` are exactly the bytes that would have
+  #     been there anyway had no match reached them.
+  #   * `acc` itself is a rolling tail capped at `@collected_output_max`
+  #     bytes, oldest bytes dropped first — a flooding or wedged
+  #     `smbpasswd` must not grow it for the whole `:timeout` budget.
+  defp collect(port, password, deadline, acc, carry) do
     remaining = max(deadline - System.monotonic_time(:millisecond), 0)
 
     receive do
       {^port, {:data, data}} ->
-        collect(port, password, deadline, acc <> data)
+        window = String.replace(carry <> data, password, "[redacted]")
+        {kept, next_carry} = split_carry(window, byte_size(password))
+        collect(port, password, deadline, append_capped(acc, kept), next_carry)
 
       {^port, {:exit_status, 0}} ->
         :ok
 
       {^port, {:exit_status, status}} ->
-        {:error, {:smbpasswd_failed, status, redact(acc, password)}}
+        # `carry` alone can never hold the whole password (it is at most
+        # `byte_size(password) - 1` bytes), but it is folded back in and
+        # redacted again here as the same defense-in-depth `redact/2`
+        # already is: it should be a no-op for input this loop already
+        # scrubbed.
+        {:error, {:smbpasswd_failed, status, redact(acc <> carry, password)}}
     after
       remaining ->
         safe_close(port)
         {:error, :timeout}
+    end
+  end
+
+  # `window` has already had every fully-contained password occurrence
+  # replaced. Splitting off its last `password_size - 1` bytes defers
+  # exactly the span a straddling match could still occupy; committing the
+  # rest is safe because a match cannot start any later than that and still
+  # need more data to complete.
+  defp split_carry(window, password_size) do
+    carry_len = max(password_size - 1, 0)
+    window_size = byte_size(window)
+
+    if window_size <= carry_len do
+      {"", window}
+    else
+      {binary_part(window, 0, window_size - carry_len),
+       binary_part(window, window_size - carry_len, carry_len)}
+    end
+  end
+
+  defp append_capped(acc, chunk) do
+    combined = acc <> chunk
+    size = byte_size(combined)
+
+    if size > @collected_output_max do
+      binary_part(combined, size - @collected_output_max, @collected_output_max)
+    else
+      combined
     end
   end
 

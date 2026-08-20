@@ -1371,6 +1371,85 @@ defmodule UniversalProxy.Storage.ServerTest do
     end
   end
 
+  describe "control bytes in a path are refused (CRLF path-smuggling regression)" do
+    setup do
+      fresh_mount_root!()
+      :ok
+    end
+
+    # `String.trim/1` (in `path_segments/1`) only strips whitespace from
+    # the two ends of the *whole* path string, so a control byte embedded
+    # in a segment that is not at either edge — like `"\n.."` as the
+    # second segment of `"safe/\n../etc"` — used to survive segment
+    # rejection unchanged: it is not literally `".."`. `Smbd.config/1`
+    # then strips CR/LF from the *joined* share path when it writes
+    # `smb.conf` (to keep a name from injecting a config directive), which
+    # turned that same segment into a literal `".."` smbd would resolve at
+    # the filesystem level — a mount escape this sandbox never validated.
+    # Every one of these must be refused before expansion, by every
+    # path-taking call.
+    test "a segment containing a control byte is refused by every path-taking call", ctx do
+      server = start_server(ctx)
+      present!()
+      :ok = Server.check_now(server)
+
+      paths = [
+        "\n..",
+        "a\r\nb",
+        <<0>>,
+        # The actual escape this closes: not literally ".." here, but
+        # becomes ".." once Smbd.config/1's CRLF-strip runs on it.
+        "safe/\n../etc",
+        <<"backups/a", 0, "b">>
+      ]
+
+      for path <- paths do
+        assert Server.list_folders(server, path) == {:error, :invalid_path},
+               "expected #{inspect(path)} to be refused by list_folders/2"
+
+        assert Server.set_share_folder(server, @drive_key, path) == {:error, :invalid_path},
+               "expected #{inspect(path)} to be refused by set_share_folder/3"
+
+        assert Server.create_folder(server, path, "x") == {:error, :invalid_path},
+               "expected #{inspect(path)} to be refused by create_folder/3's rel_path"
+      end
+
+      assert Settings.get_drive(ctx.settings, @drive_key).share_folder == "/"
+      assert Process.alive?(server)
+    end
+
+    # Golden test: the sandbox's job is to make sure the folder it
+    # accepts and persists is exactly the folder Smbd ends up serving —
+    # not merely "some folder within the mount". A folder Server has
+    # validated contains no control bytes (the fix above), so nothing
+    # `Smbd.config/1`'s CRLF-strip does can alter it: the configured
+    # `[usb_backup]` path is byte-identical to the validated one.
+    test "the folder Server validates and stores is what Smbd emits verbatim in smb.conf",
+         ctx do
+      server = start_server(ctx)
+      present!()
+      :ok = Server.check_now(server)
+      File.mkdir_p!(in_root("backups/ha"))
+
+      assert :ok = Server.set_share_folder(server, @drive_key, "backups/ha")
+
+      validated = Server.get_state(server).share_folder
+      assert validated == "backups/ha"
+
+      conf =
+        Smbd.config(%{
+          mount_point: MountStub.point(),
+          username: "backup",
+          netbios_name: "node",
+          share_folder: validated
+        })
+
+      expected_path = MountStub.point() <> "/" <> validated
+      assert expected_path == in_root("backups/ha")
+      assert conf =~ "path = #{expected_path}"
+    end
+  end
+
   describe "smbd child lifecycle" do
     # `Smbd.child_spec/1` is `restart: :temporary` so that this server, not
     # the DynamicSupervisor, decides when smbd comes back — a supervisor
