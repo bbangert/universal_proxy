@@ -88,6 +88,7 @@ defmodule UniversalProxyWeb.OverviewLive do
      |> assign(:drive_ejected, nil)
      |> assign(:drive_formatting, nil)
      |> assign(:drive_format_timeout, nil)
+     |> assign(:drive_format_task, nil)
      |> reset_drive_drawer()
      |> set_ports(ports)}
   end
@@ -332,7 +333,11 @@ defmodule UniversalProxyWeb.OverviewLive do
   end
 
   def handle_event("drive_arm", %{"action" => "format"}, socket) do
-    {:noreply, assign(socket, :drive_armed, :format)}
+    if format_in_flight?(socket) do
+      {:noreply, format_busy_noop(socket)}
+    else
+      {:noreply, assign(socket, :drive_armed, :format)}
+    end
   end
 
   def handle_event("drive_arm", %{"action" => "eject"}, socket) do
@@ -377,37 +382,29 @@ defmodule UniversalProxyWeb.OverviewLive do
   # would freeze every other tab control, and the new filesystem is
   # broadcast on "storage:state" regardless. The task only reports the
   # outcome back so the busy flag can clear (and a failure can flash).
+  #
+  # A second format must never be started while one is in flight. It would
+  # not race — `Storage.Server` serializes the calls — but the *first*
+  # result would clear the busy flag and re-enable Format and Eject while
+  # the second `mkfs` was still writing the device.
   def handle_event("drive_format", _params, socket) do
-    if armed?(socket, :format) do
-      socket = assign(socket, :drive_armed, nil)
+    cond do
+      format_in_flight?(socket) ->
+        {:noreply, format_busy_noop(socket)}
 
-      case selected_drive(socket) do
-        %{dev_path: device} = drive ->
-          parent = self()
-          facade = storage()
-          # The drive **key**, not its device path: which device gets the
-          # `mkfs` is the subsystem's decision (a whole-disk format under a
-          # mounted partition would take the partition table with it), so
-          # the UI names the drive and nothing else.
-          key = Map.get(drive, :key)
+      not armed?(socket, :format) ->
+        {:noreply, unarmed_noop(socket)}
 
-          Task.Supervisor.start_child(UniversalProxy.TaskSupervisor, fn ->
-            send(parent, {:storage_format_result, device, facade.format_drive(key)})
-          end)
+      true ->
+        socket = assign(socket, :drive_armed, nil)
 
-          # A fresh format starts from a clean slate: an earlier timeout
-          # marker would otherwise let the next broadcast clear THIS
-          # format's busy flag.
-          {:noreply,
-           socket
-           |> assign(:drive_formatting, device)
-           |> assign(:drive_format_timeout, nil)}
+        case selected_drive(socket) do
+          %{dev_path: device} = drive ->
+            {:noreply, start_format(socket, drive, device)}
 
-        _drive ->
-          {:noreply, socket}
-      end
-    else
-      {:noreply, unarmed_noop(socket)}
+          _drive ->
+            {:noreply, socket}
+        end
     end
   end
 
@@ -738,33 +735,45 @@ defmodule UniversalProxyWeb.OverviewLive do
   # still being written, so the flag stays and the drive is remembered as
   # "waiting for the subsystem to come back" — `clear_timed_out_format/1`
   # is what ends it.
-  def handle_info({:storage_format_result, device, {:error, :timeout} = error}, socket) do
-    socket =
-      if socket.assigns.drive_formatting == device,
-        do: assign(socket, :drive_format_timeout, device),
-        else: socket
+  def handle_info({:storage_format_result, task, device, {:error, :timeout} = error}, socket) do
+    if current_format_task?(socket, task) do
+      socket = assign(socket, :drive_format_task, nil)
 
-    {:noreply, flash_result(socket, error, nil)}
+      socket =
+        if socket.assigns.drive_formatting == device,
+          do: assign(socket, :drive_format_timeout, device),
+          else: socket
+
+      {:noreply, flash_result(socket, error, nil)}
+    else
+      {:noreply, socket}
+    end
   end
 
   # Outcome of the supervised `format_drive/1` task. The resulting
   # filesystem and mount arrive separately on "storage:state"; this only
   # clears the busy flag and surfaces a failure.
-  def handle_info({:storage_format_result, device, result}, socket) do
-    socket =
-      if socket.assigns.drive_formatting == device,
-        do: assign(socket, :drive_formatting, nil),
-        else: socket
+  def handle_info({:storage_format_result, task, device, result}, socket) do
+    if current_format_task?(socket, task) do
+      socket = assign(socket, :drive_format_task, nil)
 
-    case result do
-      :ok ->
-        {:noreply,
-         socket
-         |> assign(:drive_ejected, nil)
-         |> put_flash(:info, "Drive formatted as ext4.")}
+      socket =
+        if socket.assigns.drive_formatting == device,
+          do: assign(socket, :drive_formatting, nil),
+          else: socket
 
-      error ->
-        {:noreply, flash_result(socket, error, nil)}
+      case result do
+        :ok ->
+          {:noreply,
+           socket
+           |> assign(:drive_ejected, nil)
+           |> put_flash(:info, "Drive formatted as ext4.")}
+
+        error ->
+          {:noreply, flash_result(socket, error, nil)}
+      end
+    else
+      {:noreply, socket}
     end
   end
 
@@ -1116,6 +1125,64 @@ defmodule UniversalProxyWeb.OverviewLive do
     |> put_flash(:info, "Confirm that action first.")
   end
 
+  # A format is in flight until the task that owns it reports back. The
+  # busy flag alone is not enough: `clear_formatting_unless_present/2`
+  # drops it when the drive vanishes mid-format, and the task keeps
+  # writing the device regardless — so the live task is checked too.
+  defp format_in_flight?(socket) do
+    not is_nil(socket.assigns.drive_formatting) or
+      format_task_alive?(socket.assigns.drive_format_task)
+  end
+
+  defp format_task_alive?(pid) when is_pid(pid), do: Process.alive?(pid)
+  defp format_task_alive?(_task), do: false
+
+  defp start_format(socket, drive, device) do
+    parent = self()
+    facade = storage()
+    # The drive **key**, not its device path: which device gets the `mkfs`
+    # is the subsystem's decision (a whole-disk format under a mounted
+    # partition would take the partition table with it), so the UI names
+    # the drive and nothing else.
+    key = Map.get(drive, :key)
+
+    task =
+      Task.Supervisor.start_child(UniversalProxy.TaskSupervisor, fn ->
+        # The task's own pid tags the result, so a reply from a task this
+        # socket is no longer tracking is ignored rather than clearing a
+        # newer format's busy flag.
+        send(parent, {:storage_format_result, self(), device, facade.format_drive(key)})
+      end)
+
+    case task do
+      {:ok, pid} ->
+        # A fresh format starts from a clean slate: an earlier timeout
+        # marker would otherwise let the next broadcast clear THIS
+        # format's busy flag.
+        socket
+        |> assign(:drive_formatting, device)
+        |> assign(:drive_format_timeout, nil)
+        |> assign(:drive_format_task, pid)
+
+      error ->
+        Logger.warning("OverviewLive: could not start the format task: #{inspect(error)}")
+        put_flash(socket, :error, "Could not start the format. Try again.")
+    end
+  end
+
+  defp format_busy_noop(socket) do
+    socket
+    |> assign(:drive_armed, nil)
+    |> put_flash(:info, "A format is already running.")
+  end
+
+  # Results are tagged with the task pid that produced them, so a reply
+  # from a superseded (or abandoned) task cannot clear a newer format's
+  # busy flag.
+  defp current_format_task?(socket, pid) do
+    is_pid(pid) and socket.assigns.drive_format_task == pid
+  end
+
   defp selected_drive(socket),
     do: find_drive(socket.assigns.storage, socket.assigns.selected_drive)
 
@@ -1123,7 +1190,7 @@ defmodule UniversalProxyWeb.OverviewLive do
   # markup is not a check: the confirm event can arrive without ever
   # having rendered a button. These are assign-level checks for UX
   # honesty; the security boundary is `Storage.Server`, which accepts only
-  # the first drive's key and serializes against a running format.
+  # the active drive's key and serializes against a running format.
   defp ejectable_drive(socket) do
     storage = socket.assigns.storage
     drive = selected_drive(socket)

@@ -29,11 +29,15 @@ defmodule UniversalProxyWeb.Components.Storage do
   # ── Row maps ──────────────────────────────────────────────────────────
 
   @doc """
-  Peripheral-row maps for the attached drives, in `Storage.Probe` order.
+  Peripheral-row maps for the attached drives, in the order the state map
+  lists them.
 
-  Only the first drive is ever mounted or shared (see
-  `UniversalProxy.Storage.Server`'s moduledoc), so drives past the first
-  render as plain unmounted rows and their drawer controls are disabled.
+  Only the first drive is ever mounted or shared, and `Storage.Server`
+  guarantees that position holds the *active* drive — the mounted one for
+  as long as a mount lasts, so a drive attached later cannot take over the
+  primary row (see that module's "The active drive is position 0"). Drives
+  past the first render as plain unmounted rows and their drawer controls
+  are disabled.
 
   `ejected_device` is the device path the user safely ejected, which the
   state map cannot express on its own (an ejected drive and a drive whose

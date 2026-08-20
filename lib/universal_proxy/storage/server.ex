@@ -39,6 +39,23 @@ defmodule UniversalProxy.Storage.Server do
   would wake drives for nothing. Drives past the first are reported with
   `fs_type: nil` ("not sniffed", distinct from `:unknown`).
 
+  ## The active drive is position 0
+
+  "First drive" is a position, not an identity: `first_drive/2` — the one
+  key check `eject/2` and `format/3` share — accepts the head of `drives`,
+  and the UI reads the same position for its primary row, its "only the
+  first drive is used" notice and its share binding. `Probe` sorts by
+  device name, so that position is **not** stable across a hotplug: an
+  `nvme0n1` enclosure attached behind a mounted `/dev/sda` sorts ahead of
+  it.
+
+  So while a mount is live, the drive that owns it is moved to position 0
+  on every pass (`active_drive_first/2`) regardless of sort order. A
+  destructive action can then only ever name the mounted drive, and the
+  mount target, the sniffed drive and the UI's primary all stay the same
+  drive for as long as the mount lasts. Only when nothing is mounted does
+  probe order choose, and what it chooses is the next mount target.
+
   ## PubSub
 
   The full state map is broadcast on `"storage:state"` as
@@ -402,10 +419,11 @@ defmodule UniversalProxy.Storage.Server do
   drive still mounted and the share restored by the convergence that
   follows.
 
-  Only the first attached drive is ever mounted, so only its key is
-  accepted: `{:error, :unknown_drive}` otherwise (`nil` matches a first
-  drive with no derivable bus path, which is exactly the drive that has
-  no key). `{:error, :not_mounted}` when that drive has no mount.
+  Only the active drive — the mounted one, else the first attached (see
+  the moduledoc) — may be named: `{:error, :unknown_drive}` otherwise
+  (`nil` matches an active drive with no derivable bus path, which is
+  exactly the drive that has no key). `{:error, :not_mounted}` when that
+  drive has no mount.
 
   A format in flight needs no extra guard: `mkfs.ext4` runs inside
   `handle_call/3`, so this call sits in the mailbox until the format (and
@@ -427,8 +445,8 @@ defmodule UniversalProxy.Storage.Server do
   named by the caller: the live mount's device when the mounted drive is
   this one, else the drive's first recognised data partition, else the
   whole disk. `{:error, :unknown_drive}` when `drive_key` is not the
-  first attached drive's key (`nil` matches a first drive with no
-  derivable bus path, which is exactly the drive that has no key).
+  active drive's key (`nil` matches an active drive with no derivable bus
+  path, which is exactly the drive that has no key).
 
   Refuses (with the unmount's error) if the drive cannot be unmounted, so
   a busy filesystem is never handed to `mkfs`. The unmount is a plain
@@ -686,6 +704,7 @@ defmodule UniversalProxy.Storage.Server do
     drives =
       safe(fn -> state.probe.list_drives(state.probe_opts) end, [], "Probe.list_drives")
       |> List.wrap()
+      |> active_drive_first(state)
       |> Enum.with_index()
       |> Enum.map(fn {drive, index} -> annotate(state, drive, index) end)
 
@@ -695,6 +714,34 @@ defmodule UniversalProxy.Storage.Server do
     # it back in mounts it again.
     %{state | drives: drives, ejected: MapSet.intersection(state.ejected, present)}
   end
+
+  # Position 0 *is* the active-drive marker (see `first_drive/2` and the
+  # moduledoc), and `Probe` sorts by device name — so an `nvme0n1`
+  # enclosure attached behind a mounted `/dev/sda` would sort ahead of it
+  # and silently move the marker: `eject`/`format` would start accepting
+  # the newcomer's key while operating on the sda mount. While a mount is
+  # live it therefore owns position 0, whatever the sort says. With nothing
+  # mounted there is no active drive and probe order picks the next mount
+  # target.
+  defp active_drive_first(drives, state) do
+    if mounted?(state) do
+      {active, others} = Enum.split_with(drives, &active_drive?(state, &1))
+      active ++ others
+    else
+      drives
+    end
+  end
+
+  # The bound identity when there is one; an adopted mount has none until
+  # `bind_adopted_mount/1` runs (which is after this), so fall back to the
+  # drive that owns the mounted device — the same test that binding uses.
+  defp active_drive?(%{mounted_ref: ref}, drive) when not is_nil(ref),
+    do: drive_ref(drive) == ref
+
+  defp active_drive?(%{mounted: %{device: device}}, drive) when is_binary(device),
+    do: owns_device?(drive, device)
+
+  defp active_drive?(_state, _drive), do: false
 
   defp annotate(state, drive, 0) do
     partitions =
@@ -1050,16 +1097,16 @@ defmodule UniversalProxy.Storage.Server do
   # first recognised data partition, and only a drive with neither gets the
   # whole disk — an unpartitioned superfloppy, or a stick whose partitions
   # are all unrecognised, both of which the user formats to make usable.
-  # Only the first attached drive is ever mounted, so only its key is
-  # accepted.
+  # Only the active drive is ever mounted, so only its key is accepted.
   defp format_target(state, key) do
     with {:ok, drive} <- first_drive(state, key) do
       {:ok, format_device_path(state, drive)}
     end
   end
 
-  # The one key check both destructive actions share: only the first
-  # attached drive is ever mounted, so only its key may name a target.
+  # The one key check both destructive actions share. Position 0 is the
+  # active drive — `active_drive_first/2` keeps the mounted drive there, so
+  # a newly attached drive that merely sorts earlier can never claim it.
   defp first_drive(state, key) do
     case state.drives do
       [%{key: ^key} = drive | _rest] -> {:ok, drive}

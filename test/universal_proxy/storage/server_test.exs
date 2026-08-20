@@ -16,6 +16,7 @@ defmodule UniversalProxy.Storage.ServerTest do
   # Probe reports vid/pid as integers; Storage.Settings keys them as
   # lowercase 4-digit hex strings, which is what Server derives.
   @drive_key {"1-1.3", "0bda", "0316"}
+  @nvme_key {"1-1.4", "0bda", "0316"}
 
   defmodule Recorder do
     @moduledoc """
@@ -257,17 +258,42 @@ defmodule UniversalProxy.Storage.ServerTest do
   end
 
   defp drive(opts \\ []) do
+    name = Keyword.get(opts, :name, "sda")
+
     %{
-      name: Keyword.get(opts, :name, "sda"),
-      dev_path: "/dev/#{Keyword.get(opts, :name, "sda")}",
+      name: name,
+      dev_path: "/dev/#{name}",
       size_bytes: 8_000_000_000,
       slot_sub: Keyword.get(opts, :slot_sub, "1-1.3"),
       vendor_id: 0x0BDA,
       product_id: 0x0316,
-      partitions: [
-        %{name: "sda1", dev_path: "/dev/sda1", size_bytes: 7_900_000_000}
-      ]
+      partitions:
+        Keyword.get(opts, :partitions, [
+          %{name: "sda1", dev_path: "/dev/sda1", size_bytes: 7_900_000_000}
+        ])
     }
+  end
+
+  # An NVMe enclosure. `Probe` sorts by device name, so "nvme0n1" comes
+  # back *before* "sda" — which is the reordering these tests turn on.
+  defp nvme_drive do
+    drive(
+      name: "nvme0n1",
+      slot_sub: "1-1.4",
+      partitions: [
+        %{name: "nvme0n1p1", dev_path: "/dev/nvme0n1p1", size_bytes: 900_000_000_000}
+      ]
+    )
+  end
+
+  # sda mounted, then the NVMe enclosure plugged in behind it.
+  defp attach_nvme! do
+    Recorder.put(:drives, [nvme_drive(), drive()])
+
+    Recorder.put(:heads, %{
+      "/dev/sda1" => StorageFixtures.ext4_bytes(),
+      "/dev/nvme0n1p1" => StorageFixtures.ext4_bytes()
+    })
   end
 
   defp present!(fs_bytes \\ nil) do
@@ -1379,6 +1405,119 @@ defmodule UniversalProxy.Storage.ServerTest do
       assert Server.get_state(server).share == :off
       assert DynamicSupervisor.which_children(ctx.daemon_supervisor) == []
       assert Enum.count(Recorder.events(), &match?({:smbd_started}, &1)) == 1
+    end
+  end
+
+  describe "the active drive holds position 0" do
+    test "a drive that sorts earlier does not displace the mounted one", ctx do
+      server = start_server(ctx)
+      present!()
+      :ok = Server.check_now(server)
+      assert Server.get_state(server).mount.device == "/dev/sda1"
+
+      attach_nvme!()
+      :ok = Server.check_now(server)
+
+      state = Server.get_state(server)
+
+      # Probe handed back [nvme0n1, sda]; the live mount's drive still
+      # leads, which is the position every "first drive" decision reads.
+      assert [
+               %{name: "sda", partitions: [%{fs_type: :ext4}]},
+               %{name: "nvme0n1", fs_type: nil, partitions: [nvme_partition]}
+             ] = state.drives
+
+      # And it is still the sniffed one: nothing past position 0 has its
+      # head read at all ("not sniffed", distinct from :unknown).
+      refute Map.has_key?(nvme_partition, :fs_type)
+
+      # Nothing was mounted on top of the live mount either.
+      assert state.mount.device == "/dev/sda1"
+      assert Enum.count(Recorder.events(), &match?({:mount, _, _}, &1)) == 1
+    end
+
+    test "the newcomer's key is refused by both destructive actions", ctx do
+      server = start_server(ctx)
+      present!()
+      :ok = Server.check_now(server)
+      attach_nvme!()
+      :ok = Server.check_now(server)
+
+      log =
+        capture_log(fn ->
+          assert Server.eject(server, @nvme_key) == {:error, :unknown_drive}
+          assert Server.format(server, @nvme_key, "usb_backup") == {:error, :unknown_drive}
+        end)
+
+      assert log =~ "refusing to eject"
+      assert log =~ "refusing to format"
+      refute :format in Recorder.event_names()
+      refute Enum.any?(Recorder.events(), &match?({:umount, _}, &1))
+      assert Server.get_state(server).mount.device == "/dev/sda1"
+    end
+
+    test "the mounted drive's own key is still accepted, at its own device", ctx do
+      server = start_server(ctx)
+      present!()
+      :ok = Server.check_now(server)
+      attach_nvme!()
+      :ok = Server.check_now(server)
+
+      assert :ok = Server.format(server, @drive_key, "usb_backup")
+
+      # The sda mount, never the drive that merely sorts first.
+      assert {:format, "/dev/sda1", "usb_backup", true} in Recorder.events()
+      refute Enum.any?(Recorder.events(), &match?({:format, "/dev/nvme0n1p1", _l, _c}, &1))
+    end
+
+    test "the broadcast payload leads with the mounted drive", ctx do
+      server = start_server(ctx)
+      present!()
+      :ok = Server.check_now(server)
+      assert_receive {:storage_state, _mounted}
+
+      attach_nvme!()
+      :ok = Server.check_now(server)
+
+      assert_receive {:storage_state, payload}
+      assert [%{name: "sda"}, %{name: "nvme0n1"}] = payload.drives
+      assert payload == Server.get_state(server)
+    end
+
+    test "an ejected drive hands position 0 back to probe order", ctx do
+      server = start_server(ctx)
+      present!()
+      :ok = Server.check_now(server)
+      attach_nvme!()
+      :ok = Server.check_now(server)
+
+      assert :ok = Server.eject(server, @drive_key)
+      :ok = Server.check_now(server)
+
+      state = Server.get_state(server)
+
+      # Nothing mounted, so probe order chooses again — and what it chooses
+      # is the next mount target.
+      assert [%{name: "nvme0n1"}, %{name: "sda"}] = state.drives
+      assert state.mount.device == "/dev/nvme0n1p1"
+      assert {:mount, "/dev/nvme0n1p1", :ext4} in Recorder.events()
+      assert Server.eject(server, @nvme_key) == :ok
+    end
+
+    test "a removed mounted drive hands position 0 back to probe order", ctx do
+      server = start_server(ctx)
+      present!()
+      :ok = Server.check_now(server)
+      attach_nvme!()
+      :ok = Server.check_now(server)
+
+      # The stick is unplugged; only the enclosure is left.
+      Recorder.put(:drives, [nvme_drive()])
+      :ok = Server.check_now(server)
+
+      state = Server.get_state(server)
+      assert [%{name: "nvme0n1", partitions: [%{fs_type: :ext4}]}] = state.drives
+      assert state.mount.device == "/dev/nvme0n1p1"
     end
   end
 

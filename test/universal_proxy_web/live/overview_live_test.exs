@@ -674,6 +674,74 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
       send(task, :release)
     end
 
+    # A crafted (or stale) re-arm while a format is already in flight must
+    # not start a second one. The two would not race — `Storage.Server`
+    # serializes them — but the FIRST result would clear the busy flag and
+    # re-enable Format and Eject while the second `mkfs` was still writing.
+    test "a crafted re-arm during an in-flight format starts no second format", %{conn: conn} do
+      StorageStub.put_replies(%{format_drive: {:block, :ok}})
+
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state())
+      open_drawer(view)
+
+      view |> element("button[phx-value-action='format']") |> render_click()
+
+      assert view |> element("button[phx-click='drive_format']") |> render_click() =~
+               "Formatting…"
+
+      assert_receive {:storage_blocked, :format_drive, task}
+      # Drain the first call so the refutation below can only see a second.
+      assert_received {:storage_call, :format_drive, _}
+
+      # The arm is refused outright, so the confirm never even sees an
+      # armed drawer — and the confirm refuses on its own account too.
+      assert render_click(view, "drive_arm", %{"action" => "format"}) =~
+               "A format is already running."
+
+      html = render_click(view, "drive_format", %{})
+
+      assert html =~ "A format is already running."
+      refute_receive {:storage_call, :format_drive, _}, 50
+      # And the one format that IS running still owns the busy flag.
+      assert html =~ "Formatting…"
+
+      send(task, :release)
+    end
+
+    # The busy flag belongs to the task that set it: a result from a task
+    # this socket no longer tracks must not clear it.
+    test "a format result from an untracked task is ignored", %{conn: conn} do
+      StorageStub.put_replies(%{format_drive: {:block, :ok}})
+
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state())
+      open_drawer(view)
+
+      view |> element("button[phx-value-action='format']") |> render_click()
+
+      assert view |> element("button[phx-click='drive_format']") |> render_click() =~
+               "Formatting…"
+
+      assert_receive {:storage_blocked, :format_drive, task}
+
+      # This test process is not the task that owns the format.
+      send(view.pid, {:storage_format_result, self(), "/dev/sda", :ok})
+
+      html = render(view)
+      assert html =~ "Formatting…"
+      refute html =~ "Drive formatted as ext4."
+
+      # The owning task's result is the one that ends it.
+      send(view.pid, {:storage_format_result, task, "/dev/sda", :ok})
+
+      html = render(view)
+      refute html =~ "Formatting…"
+      assert html =~ "Drive formatted as ext4."
+
+      send(task, :release)
+    end
+
     # A call timeout is the one format outcome that is not an outcome:
     # `Storage.Server` blocks its whole loop inside `mkfs.ext4`, so the
     # device may still be being written when the caller gives up.
@@ -696,7 +764,7 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
 
       # The task's result, delivered from here so the assertion cannot race
       # the façade call: the format timed out, the server is still wedged.
-      send(view.pid, {:storage_format_result, "/dev/sda", {:error, :timeout}})
+      send(view.pid, {:storage_format_result, task, "/dev/sda", {:error, :timeout}})
 
       html = render(view)
       assert html =~ "Formatting…"
@@ -730,7 +798,7 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
       assert_receive {:storage_blocked, :format_drive, task}
 
       # Any other error means the server answered — it is not busy.
-      send(view.pid, {:storage_format_result, "/dev/sda", {:error, :unknown_drive}})
+      send(view.pid, {:storage_format_result, task, "/dev/sda", {:error, :unknown_drive}})
 
       html = render(view)
       refute html =~ "Formatting…"
