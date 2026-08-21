@@ -77,6 +77,28 @@ const Hooks = {
         if (typeof this.el.select === "function") this.el.select()
       }, 30)
     }
+  },
+
+  // Auto-dismisses a flash message after `data-timeout` ms by replaying
+  // a click on the element itself, which reuses the existing
+  // phx-click="lv:clear-flash" binding — same path the user gets by
+  // clicking the flash manually. Hovering pauses the timer so a message
+  // being read doesn't vanish underneath the cursor.
+  AutoDismissFlash: {
+    mounted() {
+      this.startTimer()
+      this.el.addEventListener("mouseenter", () => this.clearTimer())
+      this.el.addEventListener("mouseleave", () => this.startTimer())
+    },
+    destroyed() { this.clearTimer() },
+    startTimer() {
+      const timeout = parseInt(this.el.dataset.timeout, 10) || 4000
+      this.clearTimer()
+      this.timer = setTimeout(() => this.el.click(), timeout)
+    },
+    clearTimer() {
+      if (this.timer) clearTimeout(this.timer)
+    }
   }
 }
 
