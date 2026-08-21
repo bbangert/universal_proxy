@@ -17,6 +17,26 @@ defmodule UniversalProxy.Storage.Probe do
       exFAT/NTFS's OEM name field at offset 3, vfat's BPB boot
       signature at 510) — the same bytes `blkid` itself would read.
 
+  ## Dirty-bit detection
+
+  Every one of these filesystems records whether it was unmounted
+  cleanly, and a volume that was yanked mid-write reports EIO on the
+  next write rather than anything a mount-time log line makes visible.
+  `dirty?/2` reads that record:
+
+    * exFAT keeps `VolumeFlags` in the boot sector (offset 106), so its
+      `VolumeDirty` bit is already in the 4 KiB head.
+    * FAT16/FAT32 keep theirs in **FAT[1]**, past the reserved sectors
+      and therefore usually outside the head. `dirty?/2` answers
+      `:unknown` for vfat and `dirty_probe/1` says which bytes are still
+      needed; the caller reads them through its own seam and finishes
+      with `dirty_at?/3`. Everything stays pure.
+    * ext4 answers `false` — it is `fsck`ed before every mount, so its
+      superblock state is not what the drawer should report — and NTFS3
+      answers `false` too, because the kernel refuses a dirty NTFS
+      volume read-write and the resulting read-only mount is already
+      surfaced.
+
   `list_drives/1` mirrors `UniversalProxy.Audio.Enumerate`'s
   `:audio_sys_root` seam: the sysfs root is overridable via
   `Application.get_env(:universal_proxy, :storage_sys_root, ...)` (and
@@ -54,7 +74,17 @@ defmodule UniversalProxy.Storage.Probe do
   path instead yields nothing, so every USB drive would look internal.
   """
 
+  import Bitwise
+
   @type fs_type :: :ext4 | :exfat | :ntfs3 | :vfat | :unknown
+
+  @typedoc """
+  `true`/`false` when the filesystem's own record of its last unmount was
+  readable, `:unknown` when it was not — either because the bytes holding
+  it are outside the head (`dirty_probe/1` says which) or because this
+  filesystem keeps no such record.
+  """
+  @type dirty :: boolean() | :unknown
 
   @type partition_info :: %{
           name: String.t(),
@@ -365,6 +395,176 @@ defmodule UniversalProxy.Storage.Probe do
   defp plausible_bytes_per_sector?(bytes) do
     <<bytes_per_sector::little-16>> = binary_part(bytes, @bytes_per_sector_offset, 2)
     bytes_per_sector in [512, 1024, 2048, 4096]
+  end
+
+  # -- Dirty-bit detection --
+
+  # exFAT boot sector: VolumeFlags is a u16 at 106, and bit 1 is
+  # VolumeDirty (bit 0 is ActiveFat, which says nothing about cleanliness).
+  @exfat_volume_flags_offset 106
+  @exfat_volume_dirty 0x0002
+
+  # FAT[1]'s top bit(s) are the "clean shutdown" marker, and they are set
+  # while the volume is clean — so a **cleared** bit is the dirty state.
+  # FAT32 uses bit 27 of the 32-bit entry, FAT16 bit 15 of the 16-bit one.
+  @fat32_clean_shut 0x08000000
+  @fat16_clean_shut 0x8000
+
+  # Everything up to and including BPB_FATSz32 (offset 36, 4 bytes wide).
+  @bpb_bytes 40
+
+  # The cluster-count thresholds are the FAT spec's own type determination
+  # — nothing else distinguishes the three. FAT12 has no clean-shutdown
+  # bit at all, and its 12-bit FAT[1] straddles a byte boundary, so
+  # reading it as a u16 would invent a dirty flag out of FAT[2]'s bits.
+  @fat12_max_clusters 4085
+  @fat16_max_clusters 65_525
+
+  @doc """
+  Whether the filesystem records that it was **not** unmounted cleanly.
+
+  `:unknown` means the answer is not in `head`: for vfat it is in FAT[1],
+  so ask `dirty_probe/1` which bytes to read next and finish with
+  `dirty_at?/3`. Pure — `head` is the same first 4 KiB `fs_type/1` reads.
+  """
+  @spec dirty?(fs_type() | nil, binary()) :: dirty()
+  def dirty?(fs_type, head)
+
+  def dirty?(:exfat, head) when is_binary(head) do
+    if byte_size(head) >= @exfat_volume_flags_offset + 2 do
+      <<flags::little-16>> = binary_part(head, @exfat_volume_flags_offset, 2)
+      band(flags, @exfat_volume_dirty) != 0
+    else
+      :unknown
+    end
+  end
+
+  # The dirty bit lives in FAT[1], which the reserved sectors put outside
+  # the head on any FAT32 volume — a second read is unavoidable.
+  def dirty?(:vfat, head) when is_binary(head), do: :unknown
+
+  # fsck.ext4 -p runs before every ext4 mount (Storage.Mount), so the
+  # superblock's own state is stale by the time anything could render it.
+  def dirty?(:ext4, head) when is_binary(head), do: false
+
+  # A dirty NTFS volume is mounted read-only by the kernel, and the
+  # read-only mode is already reported.
+  def dirty?(:ntfs3, head) when is_binary(head), do: false
+
+  def dirty?(_fs_type, head) when is_binary(head), do: :unknown
+
+  @doc """
+  The extra bytes needed to answer `dirty?/2` for the volume `head` came
+  from, as `{:read, offset, length}`, or `nil` when `head` alone settles
+  it (or nothing ever will).
+
+  The filesystem type and the offset both come out of `head`, so the
+  caller only has to own the read.
+  """
+  @spec dirty_probe(binary()) :: {:read, non_neg_integer(), pos_integer()} | nil
+  def dirty_probe(head) when is_binary(head) do
+    with :vfat <- fs_type(head),
+         {:ok, offset, length} <- fat_dirty_offset(head) do
+      {:read, offset, length}
+    else
+      _other -> nil
+    end
+  end
+
+  @doc """
+  Finish a `dirty_probe/1` round trip: `bytes` are what the caller read at
+  the offset the probe named, `head` is the same head the probe was
+  derived from. Pure, and `:unknown` for anything that does not line up.
+  """
+  @spec dirty_at?(fs_type() | nil, binary(), binary()) :: dirty()
+  def dirty_at?(:vfat, head, bytes) when is_binary(head) and is_binary(bytes) do
+    case fat_dirty_offset(head) do
+      {:ok, _offset, length} when byte_size(bytes) >= length -> fat_dirty?(bytes, length)
+      _other -> :unknown
+    end
+  end
+
+  def dirty_at?(fs_type, head, bytes) when is_binary(head) and is_binary(bytes),
+    do: dirty?(fs_type, head)
+
+  @doc """
+  Where FAT[1]'s clean-shutdown flag sits on the volume `head` describes,
+  as `{:ok, byte_offset, length}` (length 4 for FAT32, 2 for FAT16).
+
+  `:error` for an unparsable BPB and for FAT12, which has no such flag.
+  """
+  @spec fat_dirty_offset(binary()) :: {:ok, non_neg_integer(), 2 | 4} | :error
+  def fat_dirty_offset(head) when is_binary(head) do
+    with {:ok, bpb} <- parse_bpb(head) do
+      fat_start = bpb.reserved_sectors * bpb.bytes_per_sector
+
+      # FAT[1] is the second entry of the first FAT, so its offset is one
+      # entry width past the FAT's start.
+      case fat_kind(bpb) do
+        :fat32 -> {:ok, fat_start + 4, 4}
+        :fat16 -> {:ok, fat_start + 2, 2}
+        :fat12 -> :error
+      end
+    end
+  end
+
+  defp fat_dirty?(bytes, 4) do
+    <<entry::little-32>> = binary_part(bytes, 0, 4)
+    band(entry, @fat32_clean_shut) == 0
+  end
+
+  defp fat_dirty?(bytes, 2) do
+    <<entry::little-16>> = binary_part(bytes, 0, 2)
+    band(entry, @fat16_clean_shut) == 0
+  end
+
+  defp parse_bpb(head) when byte_size(head) >= @bpb_bytes do
+    <<_jump_and_oem::binary-size(11), bytes_per_sector::little-16, sectors_per_cluster::8,
+      reserved_sectors::little-16, num_fats::8, root_entries::little-16,
+      total_sectors_16::little-16, _media::8, fat_size_16::little-16, _geometry::binary-size(8),
+      total_sectors_32::little-32, fat_size_32::little-32, _rest::binary>> = head
+
+    # A FAT32 BPB zeroes the 16-bit FAT-size and total-sector fields and
+    # uses the 32-bit ones; a FAT16 BPB may use either total-sector field.
+    bpb = %{
+      bytes_per_sector: bytes_per_sector,
+      sectors_per_cluster: sectors_per_cluster,
+      reserved_sectors: reserved_sectors,
+      num_fats: num_fats,
+      root_entries: root_entries,
+      fat_size: if(fat_size_16 != 0, do: fat_size_16, else: fat_size_32),
+      total_sectors: if(total_sectors_16 != 0, do: total_sectors_16, else: total_sectors_32)
+    }
+
+    if plausible_bpb?(bpb), do: {:ok, bpb}, else: :error
+  end
+
+  defp parse_bpb(_head), do: :error
+
+  defp plausible_bpb?(bpb) do
+    bpb.bytes_per_sector in [512, 1024, 2048, 4096] and
+      bpb.sectors_per_cluster > 0 and bpb.reserved_sectors > 0 and
+      bpb.num_fats > 0 and bpb.fat_size > 0 and bpb.total_sectors > 0
+  end
+
+  defp fat_kind(bpb) do
+    # The root directory is a fixed region on FAT12/16 and part of the data
+    # region on FAT32, where `root_entries` is zero and this comes to zero
+    # sectors too.
+    root_dir_sectors =
+      div(bpb.root_entries * 32 + bpb.bytes_per_sector - 1, bpb.bytes_per_sector)
+
+    data_sectors =
+      bpb.total_sectors -
+        (bpb.reserved_sectors + bpb.num_fats * bpb.fat_size + root_dir_sectors)
+
+    clusters = if data_sectors > 0, do: div(data_sectors, bpb.sectors_per_cluster), else: 0
+
+    cond do
+      clusters < @fat12_max_clusters -> :fat12
+      clusters < @fat16_max_clusters -> :fat16
+      true -> :fat32
+    end
   end
 
   # -- First data partition --

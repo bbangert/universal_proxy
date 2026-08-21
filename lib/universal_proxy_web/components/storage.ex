@@ -175,6 +175,28 @@ defmodule UniversalProxyWeb.Components.Storage do
   def fs_badge(:unknown), do: %{label: "Unrecognised", variant: :neutral, journalled?: true}
   def fs_badge(_not_sniffed), do: %{label: "Not checked", variant: :neutral, journalled?: true}
 
+  @doc """
+  Whether the filesystem on show was left dirty by an unclean unmount.
+
+  The live mount's own verdict wins when it has one; an adopted mount
+  carries `dirty?: nil` (`Storage.Server` never sniffed it), so the
+  drive's sniffed partitions answer instead — narrowed to the mounted
+  device when there is one, since only that filesystem is on show.
+  """
+  @spec fs_dirty?(map() | nil, map()) :: boolean()
+  def fs_dirty?(mount, drive) do
+    case mount && Map.get(mount, :dirty?) do
+      dirty when is_boolean(dirty) -> dirty
+      _unknown -> sniffed_dirty?(drive, mount && Map.get(mount, :device))
+    end
+  end
+
+  defp sniffed_dirty?(drive, device) do
+    [drive | drive |> Map.get(:partitions, []) |> List.wrap()]
+    |> Enum.filter(&(is_map(&1) and (is_nil(device) or Map.get(&1, :dev_path) == device)))
+    |> Enum.any?(&(Map.get(&1, :dirty?) == true))
+  end
+
   @doc "The hostname for HA's \"Server\" field, from the advertised hostname."
   @spec server_host(String.t() | nil) :: String.t()
   def server_host(host) when is_binary(host) and host != "", do: host
@@ -214,6 +236,7 @@ defmodule UniversalProxyWeb.Components.Storage do
         drive_status(assigns.drive, assigns.storage, assigns.ejected?, assigns.first?)
       )
       |> assign(:fs, fs_badge((mount && mount.fs_type) || assigns.drive[:fs_type]))
+      |> assign(:dirty?, assigns.first? and fs_dirty?(mount, assigns.drive))
       |> assign(:shared?, assigns.first? and assigns.storage.share == :running)
       |> assign(:server_host, server_host(assigns.host))
       |> assign(:share_name, @share_name)
@@ -273,7 +296,14 @@ defmodule UniversalProxyWeb.Components.Storage do
           <div class="flex items-center gap-2 flex-wrap mt-2">
             <.badge variant={@fs.variant} dot>{@fs.label}</.badge>
             <span class="text-sm text-fg-3">{mount_line(@mount)}</span>
+            <.badge :if={@dirty? and not @formatting?} variant={:warning} dot>
+              Not cleanly unmounted
+            </.badge>
             <.badge :if={@formatting?} variant={:neutral}>Formatting…</.badge>
+          </div>
+          <div :if={@dirty? and not @formatting?} class="text-sm text-warning mt-2">
+            Wasn't cleanly unmounted — data may be corrupt. Repair happens automatically at mount
+            when possible; formatting to ext4 is the durable fix.
           </div>
           <div :if={not @fs.journalled? and not @formatting?} class="text-sm text-fg-2 mt-2">
             Not journalled — format to ext4 recommended for backups.

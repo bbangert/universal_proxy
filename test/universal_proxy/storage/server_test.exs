@@ -67,7 +67,7 @@ defmodule UniversalProxy.Storage.ServerTest do
 
   defmodule ProbeStub do
     @moduledoc """
-    Only `list_drives/1` is stubbed: `fs_type/1` and
+    Only `list_drives/1` is stubbed: `fs_type/1`, the dirty-bit trio and
     `first_data_partition/1` are pure, so the real implementations run
     against `StorageFixtures` superblock bytes and the sniff wiring is
     exercised end to end.
@@ -83,6 +83,9 @@ defmodule UniversalProxy.Storage.ServerTest do
     end
 
     defdelegate fs_type(bytes), to: Probe
+    defdelegate dirty?(fs_type, head), to: Probe
+    defdelegate dirty_probe(head), to: Probe
+    defdelegate dirty_at?(fs_type, head, bytes), to: Probe
     defdelegate first_data_partition(drive), to: Probe
   end
 
@@ -269,7 +272,7 @@ defmodule UniversalProxy.Storage.ServerTest do
       smbd: SmbdStub,
       settings: ctx.settings,
       daemon_supervisor: ctx.daemon_supervisor,
-      read_head_fun: &read_head/1,
+      read_at_fun: &read_at/3,
       netbios_name_fun: fn -> "universal-proxy-ab12cd" end,
       start_timer: false
     ]
@@ -277,10 +280,19 @@ defmodule UniversalProxy.Storage.ServerTest do
     start_supervised!({Server, Keyword.merge(defaults, opts)}, id: :server)
   end
 
-  defp read_head(dev_path) do
+  # The one read seam, serving both the head read (offset 0) and the
+  # FAT[1] read the dirty probe asks for, out of the same recorded image
+  # per device — exactly as a real block device would.
+  defp read_at(dev_path, offset, length) do
     case Map.fetch(Recorder.get(:heads, %{}), dev_path) do
-      {:ok, bytes} -> {:ok, bytes}
-      :error -> {:error, :enoent}
+      {:ok, image} when offset >= byte_size(image) ->
+        {:ok, <<>>}
+
+      {:ok, image} ->
+        {:ok, binary_part(image, offset, min(length, byte_size(image) - offset))}
+
+      :error ->
+        {:error, :enoent}
     end
   end
 
@@ -388,7 +400,10 @@ defmodule UniversalProxy.Storage.ServerTest do
                fs_type: :ext4,
                mode: :read_write,
                point: MountStub.point(),
-               stale?: false
+               stale?: false,
+               # ext4 is fsck'd on the way in, so Probe reports it clean
+               # rather than reading a superblock state fsck just changed.
+               dirty?: false
              }
 
       assert state.share == :off
@@ -1881,6 +1896,118 @@ defmodule UniversalProxy.Storage.ServerTest do
     end
   end
 
+  describe "dirty-filesystem detection" do
+    test "an exFAT stick's dirty bit comes out of the head read alone", ctx do
+      server = start_server(ctx)
+      present!(StorageFixtures.exfat_bytes(dirty: true))
+
+      :ok = Server.check_now(server)
+
+      state = Server.get_state(server)
+      assert state.mount.dirty? == true
+      assert [%{partitions: [%{fs_type: :exfat, dirty?: true}]}] = state.drives
+    end
+
+    test "a clean exFAT stick reports dirty?: false", ctx do
+      server = start_server(ctx)
+      present!(StorageFixtures.exfat_bytes())
+
+      :ok = Server.check_now(server)
+
+      assert Server.get_state(server).mount.dirty? == false
+    end
+
+    test "a dirty FAT32 stick needs the second read, taken through the same seam", ctx do
+      server = start_server(ctx)
+      # The whole image, not just a head: the FAT[1] flag sits at 16 388,
+      # so the read seam has to be asked for bytes past the 4 KiB head.
+      present!(StorageFixtures.fat32_image(dirty: true))
+
+      :ok = Server.check_now(server)
+
+      state = Server.get_state(server)
+      assert {:mount, "/dev/sda1", :vfat} in Recorder.events()
+      assert state.mount.fs_type == :vfat
+      assert state.mount.dirty? == true
+    end
+
+    test "a clean FAT32 stick reports dirty?: false", ctx do
+      server = start_server(ctx)
+      present!(StorageFixtures.fat32_image())
+
+      :ok = Server.check_now(server)
+
+      assert Server.get_state(server).mount.dirty? == false
+    end
+
+    test "a dirty FAT16 stick is detected too", ctx do
+      server = start_server(ctx)
+      present!(StorageFixtures.fat16_image(dirty: true))
+
+      :ok = Server.check_now(server)
+
+      assert Server.get_state(server).mount.dirty? == true
+    end
+
+    test "a FAT32 stick whose second read fails reports dirty?: nil, not false", ctx do
+      # The head is all the seam will serve; the FAT[1] read comes back
+      # short, which must read as "not known" rather than "clean".
+      server = start_server(ctx)
+      Recorder.put(:drives, [drive()])
+      Recorder.put(:heads, %{"/dev/sda1" => StorageFixtures.fat32_bytes(dirty: true)})
+
+      :ok = Server.check_now(server)
+
+      state = Server.get_state(server)
+      assert state.mount.fs_type == :vfat
+      assert state.mount.dirty? == nil
+    end
+
+    test "an unreadable device reports dirty?: nil", ctx do
+      server = start_server(ctx)
+      Recorder.put(:drives, [drive()])
+      Recorder.put(:heads, %{})
+
+      :ok = Server.check_now(server)
+
+      assert [%{dirty?: nil, partitions: [%{fs_type: :unknown, dirty?: nil}]}] =
+               Server.get_state(server).drives
+    end
+
+    test "drives past the first are not sniffed, so their dirty? is nil", ctx do
+      server = start_server(ctx)
+
+      Recorder.put(:drives, [drive(), drive(name: "sdb", slot_sub: "1-1.4", serial: "SDB")])
+      Recorder.put(:heads, %{"/dev/sda1" => StorageFixtures.exfat_bytes(dirty: true)})
+
+      :ok = Server.check_now(server)
+
+      assert [%{name: "sda"}, %{name: "sdb", fs_type: nil, dirty?: nil}] =
+               Server.get_state(server).drives
+    end
+
+    test "the dirty verdict is broadcast with the rest of the state map", ctx do
+      server = start_server(ctx)
+      present!(StorageFixtures.fat32_image(dirty: true))
+
+      :ok = Server.check_now(server)
+
+      assert_receive {:storage_state, %{mount: %{dirty?: true, fs_type: :vfat}}}
+    end
+
+    test "a raising read seam degrades to dirty?: nil rather than crashing", ctx do
+      server =
+        start_server(ctx, read_at_fun: fn _path, _offset, _length -> raise "device exploded" end)
+
+      Recorder.put(:drives, [drive()])
+
+      :ok = Server.check_now(server)
+
+      assert [%{dirty?: nil}] = Server.get_state(server).drives
+      assert Process.alive?(server)
+    end
+  end
+
   describe "mount rehydration" do
     test "an existing mount is adopted at init, not mounted a second time", ctx do
       server =
@@ -1895,7 +2022,9 @@ defmodule UniversalProxy.Storage.ServerTest do
                fs_type: :ext4,
                mode: :read_write,
                point: MountStub.point(),
-               stale?: false
+               stale?: false,
+               # An adopted mount was never sniffed by this process.
+               dirty?: nil
              }
 
       present!()

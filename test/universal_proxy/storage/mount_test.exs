@@ -152,6 +152,85 @@ defmodule UniversalProxy.Storage.MountTest do
     end
   end
 
+  describe "mount/3 vfat repair" do
+    test "fsck.fat -a runs before the mount when a checker is installed", ctx do
+      opts = opts(ctx, mount_bin: fake!(ctx, "mount"), fsck_fat_bin: fake!(ctx, "fsck.fat"))
+
+      assert Mount.mount("/dev/sdb1", :vfat, opts) == {:ok, :read_write}
+
+      assert invocations(ctx) == [
+               {"fsck.fat", ["-a", "/dev/sdb1"]},
+               {"mount",
+                [
+                  "-t",
+                  "vfat",
+                  "-o",
+                  "rw,noatime,nodev,nosuid,noexec,uid=1000,gid=1000,umask=0077",
+                  "/dev/sdb1",
+                  ctx.point
+                ]}
+             ]
+    end
+
+    test "exit status 1 means repaired, so the mount proceeds", ctx do
+      opts =
+        opts(ctx,
+          mount_bin: fake!(ctx, "mount"),
+          fsck_fat_bin: fake!(ctx, "fsck.fat", statuses: [1], stdout: "Performing changes.")
+        )
+
+      assert Mount.mount("/dev/sdb1", :vfat, opts) == {:ok, :read_write}
+      assert [{"fsck.fat", _}, {"mount", _}] = invocations(ctx)
+    end
+
+    test "exit status 2 and above aborts before mounting, as the ext4 flow does", ctx do
+      opts =
+        opts(ctx,
+          mount_bin: fake!(ctx, "mount"),
+          fsck_fat_bin:
+            fake!(ctx, "fsck.fat", statuses: [4], stdout: "Leaving filesystem unchanged")
+        )
+
+      assert {:error, {:command_failed, cmd, 4, out}} = Mount.mount("/dev/sdb1", :vfat, opts)
+      assert cmd =~ "fsck.fat -a /dev/sdb1"
+      assert out == "Leaving filesystem unchanged"
+
+      assert [{"fsck.fat", _}] = invocations(ctx)
+    end
+
+    test "an absent checker is skipped silently and the mount still happens", ctx do
+      # What every current image looks like: dosfstools does not ship
+      # until the custom systems reach v0.1.9.
+      opts =
+        opts(ctx,
+          mount_bin: fake!(ctx, "mount"),
+          fsck_fat_bin: Path.join(ctx.tmp_dir, "not-installed-fsck.fat")
+        )
+
+      assert Mount.mount("/dev/sdb1", :vfat, opts) == {:ok, :read_write}
+      assert [{"mount", _}] = invocations(ctx)
+    end
+
+    test "exFAT gets no repair at all — no exFAT checker is shipped", ctx do
+      opts = opts(ctx, mount_bin: fake!(ctx, "mount"), fsck_fat_bin: fake!(ctx, "fsck.fat"))
+
+      assert Mount.mount("/dev/sdb1", :exfat, opts) == {:ok, :read_write}
+      assert [{"mount", _}] = invocations(ctx)
+    end
+
+    test "the ext4 checker is never handed a FAT volume", ctx do
+      opts =
+        opts(ctx,
+          mount_bin: fake!(ctx, "mount"),
+          fsck_bin: fake!(ctx, "fsck.ext4"),
+          fsck_fat_bin: fake!(ctx, "fsck.fat")
+        )
+
+      assert Mount.mount("/dev/sdb1", :vfat, opts) == {:ok, :read_write}
+      assert [{"fsck.fat", _}, {"mount", _}] = invocations(ctx)
+    end
+  end
+
   describe "mount/3 failure modes" do
     test "a missing binary is an error tuple, not a raise", ctx do
       opts = opts(ctx, mount_bin: Path.join(ctx.tmp_dir, "absent-mount"))
@@ -321,8 +400,18 @@ defmodule UniversalProxy.Storage.MountTest do
   # can assert both the arguments and the order commands ran in, and
   # exits with a scripted status per invocation (the last status repeats).
 
+  # `:fsck_fat_bin` defaults to a path inside the tmp dir that no test
+  # creates, so a dev box or CI runner that happens to have dosfstools
+  # installed cannot make the vfat mounts here run a real `fsck.fat`.
   defp opts(ctx, extra) do
-    Keyword.merge([mount_point: ctx.point, chown_fun: ctx.chown_fun], extra)
+    Keyword.merge(
+      [
+        mount_point: ctx.point,
+        chown_fun: ctx.chown_fun,
+        fsck_fat_bin: Path.join(ctx.tmp_dir, "absent-fsck.fat")
+      ],
+      extra
+    )
   end
 
   defp fake!(ctx, name, opts \\ []) do

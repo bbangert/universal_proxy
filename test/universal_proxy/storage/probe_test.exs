@@ -266,6 +266,140 @@ defmodule UniversalProxy.Storage.ProbeTest do
     prefix <> patch <> suffix
   end
 
+  describe "dirty?/2 exFAT" do
+    test "a clean volume has VolumeDirty clear" do
+      assert Probe.dirty?(:exfat, Fixtures.exfat_bytes()) == false
+    end
+
+    test "a dirty volume has VolumeDirty set" do
+      assert Probe.dirty?(:exfat, Fixtures.exfat_bytes(dirty: true)) == true
+    end
+
+    test "ActiveFat alone is not dirty" do
+      # Bit 0 of VolumeFlags selects which FAT is live and says nothing
+      # about cleanliness — a "flags are non-zero" check would get this
+      # wrong on every volume that ever switched FATs.
+      assert Probe.dirty?(:exfat, Fixtures.exfat_bytes(active_fat: true)) == false
+
+      assert Probe.dirty?(:exfat, Fixtures.exfat_bytes(active_fat: true, dirty: true)) == true
+    end
+
+    test "a head too short to hold VolumeFlags is :unknown" do
+      assert Probe.dirty?(:exfat, binary_part(Fixtures.exfat_bytes(), 0, 100)) == :unknown
+    end
+
+    test "the flag is in the head, so no second read is needed" do
+      assert Probe.dirty_probe(Fixtures.exfat_bytes(dirty: true)) == nil
+    end
+  end
+
+  describe "dirty?/2 for the filesystems with nothing to read" do
+    test "ext4 is reported clean — it is fsck'd before every mount" do
+      assert Probe.dirty?(:ext4, Fixtures.ext4_bytes()) == false
+      assert Probe.dirty_probe(Fixtures.ext4_bytes()) == nil
+    end
+
+    test "NTFS is reported clean — a dirty volume mounts read-only" do
+      assert Probe.dirty?(:ntfs3, Fixtures.ntfs_bytes()) == false
+      assert Probe.dirty_probe(Fixtures.ntfs_bytes()) == nil
+    end
+
+    test "an unrecognised filesystem is :unknown, never false" do
+      assert Probe.dirty?(:unknown, Fixtures.garbage_bytes()) == :unknown
+      assert Probe.dirty?(nil, Fixtures.garbage_bytes()) == :unknown
+      assert Probe.dirty_probe(Fixtures.garbage_bytes()) == nil
+    end
+  end
+
+  describe "fat_dirty_offset/1" do
+    test "FAT32: reserved_sectors * bytes_per_sector + 4, four bytes wide" do
+      # The fixture's BPB: 512-byte sectors, 32 reserved.
+      assert Probe.fat_dirty_offset(Fixtures.fat32_bytes()) == {:ok, 32 * 512 + 4, 4}
+    end
+
+    test "FAT16: reserved_sectors * bytes_per_sector + 2, two bytes wide" do
+      # 512-byte sectors, 1 reserved.
+      assert Probe.fat_dirty_offset(Fixtures.fat16_bytes()) == {:ok, 1 * 512 + 2, 2}
+    end
+
+    test "the FAT32 flag is outside the 4 KiB head — the second read is not optional" do
+      assert {:ok, offset, _length} = Probe.fat_dirty_offset(Fixtures.fat32_bytes())
+      assert offset > 4096
+    end
+
+    test "FAT12 has no clean-shutdown bit at all" do
+      assert Probe.fat_dirty_offset(Fixtures.fat12_bytes()) == :error
+      assert Probe.dirty_probe(Fixtures.fat12_bytes()) == nil
+      assert Probe.dirty_at?(:vfat, Fixtures.fat12_bytes(), <<0xFF, 0xFF>>) == :unknown
+    end
+
+    test "an implausible BPB is :error, not a bogus offset" do
+      # The bare vfat fixture has the 0x55AA signature and a plausible
+      # sector size but zero reserved sectors and no FAT at all.
+      assert Probe.fat_dirty_offset(Fixtures.vfat_bytes()) == :error
+      assert Probe.dirty_probe(Fixtures.vfat_bytes()) == nil
+    end
+
+    test "a head shorter than the BPB is :error" do
+      assert Probe.fat_dirty_offset(<<1, 2, 3>>) == :error
+    end
+  end
+
+  describe "dirty?/2 + dirty_probe/1 + dirty_at?/3 for vfat" do
+    test "FAT32 needs a second read, which the head alone cannot supply" do
+      head = Fixtures.fat32_bytes()
+
+      assert Probe.fs_type(head) == :vfat
+      assert Probe.dirty?(:vfat, head) == :unknown
+      assert Probe.dirty_probe(head) == {:read, 16_388, 4}
+    end
+
+    test "FAT32 clean: bit 27 of FAT[1] set" do
+      image = Fixtures.fat32_image()
+      head = Fixtures.head(image)
+
+      assert {:read, offset, length} = Probe.dirty_probe(head)
+      assert Probe.dirty_at?(:vfat, head, Fixtures.read_at(image, offset, length)) == false
+    end
+
+    test "FAT32 dirty: bit 27 of FAT[1] cleared" do
+      image = Fixtures.fat32_image(dirty: true)
+      head = Fixtures.head(image)
+
+      assert {:read, offset, length} = Probe.dirty_probe(head)
+      assert Probe.dirty_at?(:vfat, head, Fixtures.read_at(image, offset, length)) == true
+    end
+
+    test "FAT16 clean: bit 15 of FAT[1] set" do
+      image = Fixtures.fat16_image()
+      head = Fixtures.head(image)
+
+      assert Probe.dirty_probe(head) == {:read, 514, 2}
+      assert Probe.dirty_at?(:vfat, head, Fixtures.read_at(image, 514, 2)) == false
+    end
+
+    test "FAT16 dirty: bit 15 of FAT[1] cleared" do
+      image = Fixtures.fat16_image(dirty: true)
+      head = Fixtures.head(image)
+
+      assert Probe.dirty_at?(:vfat, head, Fixtures.read_at(image, 514, 2)) == true
+    end
+
+    test "a short second read is :unknown, not a guess" do
+      head = Fixtures.fat32_bytes()
+
+      assert Probe.dirty_at?(:vfat, head, <<0xFF, 0xFF>>) == :unknown
+      assert Probe.dirty_at?(:vfat, head, <<>>) == :unknown
+    end
+
+    test "dirty_at?/3 falls back to the head-only answer for non-vfat" do
+      # A caller that reads bytes anyway (or replays a stale probe) still
+      # gets the boot-sector verdict for exFAT.
+      assert Probe.dirty_at?(:exfat, Fixtures.exfat_bytes(dirty: true), <<0, 0, 0, 0>>) == true
+      assert Probe.dirty_at?(:ext4, Fixtures.ext4_bytes(), <<0, 0, 0, 0>>) == false
+    end
+  end
+
   describe "first_data_partition/1" do
     test "picks the lowest-numbered recognised partition" do
       drive = %{
