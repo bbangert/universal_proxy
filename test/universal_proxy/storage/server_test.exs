@@ -198,19 +198,29 @@ defmodule UniversalProxy.Storage.ServerTest do
       # Exercise both persistence seams so a regression that wires them to
       # the wrong Settings server (or drops them) shows up here.
       before_hash = Keyword.fetch!(opts, :get_hash_fun).()
-      put_result = Keyword.fetch!(opts, :put_hash_fun).("deadbeef")
-
       username = Keyword.get(opts, :username)
+      force? = Keyword.get(opts, :force, false)
+      hash = UniversalProxy.Storage.Smbd.provision_hash(username, password)
 
-      Recorder.record({:provision_user, byte_size(password), username, before_hash, put_result})
+      # Mirrors the real `Smbd.provision_user/2` skip/force semantics
+      # closely enough to let a test prove `Storage.Server` forces past a
+      # stored hash that already matches — a 4-tuple (no size, no
+      # put_result) marks the skip branch so it can never be mistaken for
+      # a real run by a test matching on the 5-tuple shape below.
+      if not force? and hash == before_hash do
+        Recorder.record({:provision_user, :skipped, username, before_hash})
+        Recorder.take(:provision_results, {:ok, :unchanged})
+      else
+        put_result = Keyword.fetch!(opts, :put_hash_fun).(hash)
 
-      # The password itself is never recorded; its provisioning hash is,
-      # which is all a test needs to tell one password from another.
-      Recorder.record(
-        {:provision_hash, UniversalProxy.Storage.Smbd.provision_hash(username, password)}
-      )
+        Recorder.record({:provision_user, byte_size(password), username, before_hash, put_result})
 
-      Recorder.take(:provision_results, {:ok, :provisioned})
+        # The password itself is never recorded; its provisioning hash is,
+        # which is all a test needs to tell one password from another.
+        Recorder.record({:provision_hash, hash})
+
+        Recorder.take(:provision_results, {:ok, :provisioned})
+      end
     end
 
     def child_spec(_opts) do
@@ -637,7 +647,36 @@ defmodule UniversalProxy.Storage.ServerTest do
       assert {:provision_user, 24, "backup", nil, :ok} =
                Enum.find(Recorder.events(), &match?({:provision_user, _, _, _, _}, &1))
 
-      assert Settings.credentials(ctx.settings).provisioned_hash == "deadbeef"
+      password = Settings.credentials(ctx.settings).password
+
+      assert Settings.credentials(ctx.settings).provisioned_hash ==
+               Smbd.provision_hash("backup", password)
+    end
+
+    # HW failure #3 (P8 validation): a hard reboot cycle tore `passdb.tdb`
+    # (the Samba account database), but the stored `provisioned_hash`
+    # survived untouched — so the hash-skip in `Smbd.provision_user/2`
+    # matched and the account was never re-created, and auth failed with
+    # the correct stored password until a manual rotation forced a
+    # reprovision. `Storage.Server` now forces provisioning on every share
+    # start regardless of what the stored hash says.
+    test "a stored hash matching the current password does not skip provisioning", ctx do
+      server = start_server(ctx)
+      present!()
+
+      password = Settings.credentials(ctx.settings).password
+      :ok = Settings.put_provisioned_hash(ctx.settings, Smbd.provision_hash("backup", password))
+
+      enable_share!(ctx)
+      :ok = Server.check_now(server)
+
+      assert Server.get_state(server).share == :running
+      refute Enum.any?(Recorder.events(), &match?({:provision_user, :skipped, _, _}, &1))
+
+      assert [{:provision_user, _size, "backup", before_hash, :ok}] =
+               Enum.filter(Recorder.events(), &match?({:provision_user, _, _, _, _}, &1))
+
+      assert before_hash == Smbd.provision_hash("backup", password)
     end
 
     test "no daemon starts when smbd is unavailable", ctx do

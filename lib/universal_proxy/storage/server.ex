@@ -1715,6 +1715,7 @@ defmodule UniversalProxy.Storage.Server do
     opts =
       state.smbd_opts
       |> Keyword.put(:username, credentials.username)
+      |> Keyword.put(:force, true)
       |> Keyword.put(:get_hash_fun, fn -> provisioned_hash(state) end)
       |> Keyword.put(:put_hash_fun, fn hash -> put_provisioned_hash(state, hash) end)
 
