@@ -68,6 +68,15 @@ defmodule UniversalProxy.Storage.SmbdTest do
       assert conf =~ "unix password sync = no"
     end
 
+    test "DFS off — a single-share standalone server sends no DFS referrals", %{conf: conf} do
+      assert conf =~ "host msdfs = no"
+    end
+
+    test "standalone idmap backend and range pinned", %{conf: conf} do
+      assert conf =~ "idmap config * : backend = tdb"
+      assert conf =~ "idmap config * : range = 3000-7999"
+    end
+
     test "tdbsam passdb under the data dir", %{conf: conf} do
       assert conf =~ "passdb backend = tdbsam:/data/samba/private/passdb.tdb"
     end

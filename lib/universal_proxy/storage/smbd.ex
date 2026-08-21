@@ -119,6 +119,18 @@ defmodule UniversalProxy.Storage.Smbd do
     printcap name = /dev/null
     usershare max shares = 0
     unix password sync = no
+    # A single-share standalone server has no use for DFS referrals; off
+    # means clients never send DFS-form paths, which is what the kernel
+    # CIFS client backing HA OS's backup mount does when it connects via
+    # a hostname smbd doesn't consider its own (fails with
+    # "Hostname ... is not ours" under strict DFS path parsing) — see
+    # `host msdfs` in smb.conf(5).
+    host msdfs = no
+    # Standalone (non-domain) default idmap: silences the "idmap range not
+    # specified for domain '*'" startup warning and makes SID->uid mapping
+    # for the local account deterministic.
+    idmap config * : backend = tdb
+    idmap config * : range = 3000-7999
     passdb backend = tdbsam:#{Path.join([data_dir, "private", "passdb.tdb"])}
     private dir = #{Path.join(data_dir, "private")}
     state directory = #{Path.join(data_dir, "state")}
