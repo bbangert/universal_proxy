@@ -92,28 +92,29 @@ const Hooks = {
   // paused (hovered/focused), in which case it stays paused.
   AutoDismissFlash: {
     mounted() {
-      this.paused = false
+      this.hovered = false
+      this.focused = false
       this.startTimer()
-      this.el.addEventListener("mouseenter", () => this.pause())
-      this.el.addEventListener("mouseleave", () => this.resume())
-      this.el.addEventListener("focusin", () => this.pause())
-      this.el.addEventListener("focusout", () => this.resume())
+      this.el.addEventListener("mouseenter", () => this.pause("hovered"))
+      this.el.addEventListener("mouseleave", () => this.resume("hovered"))
+      this.el.addEventListener("focusin", () => this.pause("focused"))
+      this.el.addEventListener("focusout", () => this.resume("focused"))
     },
     updated() {
-      if (this.paused) {
+      if (this.hovered || this.focused) {
         this.clearTimer()
       } else {
         this.startTimer()
       }
     },
     destroyed() { this.clearTimer() },
-    pause() {
-      this.paused = true
+    pause(flag) {
+      this[flag] = true
       this.clearTimer()
     },
-    resume() {
-      this.paused = false
-      this.startTimer()
+    resume(flag) {
+      this[flag] = false
+      if (!this.hovered && !this.focused) this.startTimer()
     },
     startTimer() {
       const timeout = parseInt(this.el.dataset.timeout, 10) || 4000
