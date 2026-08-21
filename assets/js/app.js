@@ -77,6 +77,53 @@ const Hooks = {
         if (typeof this.el.select === "function") this.el.select()
       }, 30)
     }
+  },
+
+  // Auto-dismisses a flash message after `data-timeout` ms by replaying
+  // a click on the element itself, which reuses the existing
+  // phx-click="lv:clear-flash" binding — same path the user gets by
+  // clicking the flash manually. Hovering or focusing (tabindex="0",
+  // keyboard/AT-reachable) pauses the timer so a message being read
+  // doesn't vanish; leaving or blurring resumes it. The flash keeps a
+  // fixed DOM id, so a second flash of the same kind patches into this
+  // same element rather than mount/destroy — updated() restarts the
+  // countdown against the fresh data-timeout so a stale timer can't
+  // dismiss the new message early, unless the element is currently
+  // paused (hovered/focused), in which case it stays paused.
+  AutoDismissFlash: {
+    mounted() {
+      this.hovered = false
+      this.focused = false
+      this.startTimer()
+      this.el.addEventListener("mouseenter", () => this.pause("hovered"))
+      this.el.addEventListener("mouseleave", () => this.resume("hovered"))
+      this.el.addEventListener("focusin", () => this.pause("focused"))
+      this.el.addEventListener("focusout", () => this.resume("focused"))
+    },
+    updated() {
+      if (this.hovered || this.focused) {
+        this.clearTimer()
+      } else {
+        this.startTimer()
+      }
+    },
+    destroyed() { this.clearTimer() },
+    pause(flag) {
+      this[flag] = true
+      this.clearTimer()
+    },
+    resume(flag) {
+      this[flag] = false
+      if (!this.hovered && !this.focused) this.startTimer()
+    },
+    startTimer() {
+      const timeout = parseInt(this.el.dataset.timeout, 10) || 4000
+      this.clearTimer()
+      this.timer = setTimeout(() => this.el.click(), timeout)
+    },
+    clearTimer() {
+      if (this.timer) clearTimeout(this.timer)
+    }
   }
 }
 

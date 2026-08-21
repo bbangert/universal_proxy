@@ -38,19 +38,27 @@ defmodule UniversalProxyWeb.Layouts do
     <div :if={Phoenix.Flash.get(@flash, :info) || Phoenix.Flash.get(@flash, :error)} class="px-6 pt-4">
       <div
         :if={msg = Phoenix.Flash.get(@flash, :info)}
+        id="flash-info"
         class="rounded-md bg-success-soft text-success px-3.5 py-2.5 text-sm flex items-center gap-2"
         phx-click="lv:clear-flash"
         phx-value-key="info"
+        phx-hook="AutoDismissFlash"
+        data-timeout="4000"
         role="status"
+        tabindex="0"
       >
         {msg}
       </div>
       <div
         :if={msg = Phoenix.Flash.get(@flash, :error)}
+        id="flash-error"
         class="rounded-md bg-danger-soft text-danger px-3.5 py-2.5 text-sm flex items-center gap-2 mt-2"
         phx-click="lv:clear-flash"
         phx-value-key="error"
+        phx-hook="AutoDismissFlash"
+        data-timeout="8000"
         role="alert"
+        tabindex="0"
       >
         {msg}
       </div>
