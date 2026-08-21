@@ -42,6 +42,15 @@ defmodule UniversalProxy.Storage.Mount do
   ownership metadata at all, so ownership is synthesised at mount time
   with `uid=`/`gid=`/`umask=` options instead.
 
+  ## Why vfat's pre-mount check is conditional
+
+  ext4 always gets `fsck.ext4 -p`, because `e2fsprogs` is in the image.
+  `dosfstools` is not, until the custom systems ship v0.1.9 — so the vfat
+  path looks for `fsck.fat` among `#{inspect(["/sbin/fsck.fat", "/usr/sbin/fsck.fat"])}`
+  and, finding none, mounts without a repair rather than failing. Detection
+  still happens either way (`Storage.Probe.dirty?/2`); only the repair is
+  conditional. exFAT gets neither: no exFAT checker is shipped at all.
+
   ## Options
 
   All functions accept these, defaulting to the on-target paths:
@@ -49,6 +58,8 @@ defmodule UniversalProxy.Storage.Mount do
     * `:mount_bin` — `"/bin/mount"`
     * `:umount_bin` — `"/bin/umount"`
     * `:fsck_bin` — `"/sbin/fsck.ext4"`
+    * `:fsck_fat_bin` — a single `fsck.fat` candidate, replacing the two
+      searched by default; skipped when the path does not exist
     * `:mkfs_bin` — `"/sbin/mkfs.ext4"`
     * `:df_bin` — `"/bin/df"`
     * `:mount_point` — `"/run/usb-backup"`
@@ -65,6 +76,11 @@ defmodule UniversalProxy.Storage.Mount do
     mkfs_bin: "/sbin/mkfs.ext4",
     df_bin: "/bin/df"
   ]
+
+  # `fsck.fat` ships with dosfstools, which the current images do not carry
+  # (see the moduledoc). Both paths are tried so the check starts working
+  # the moment the package appears, with no code change.
+  @fsck_fat_candidates ["/sbin/fsck.fat", "/usr/sbin/fsck.fat"]
 
   @default_mount_point "/run/usb-backup"
 
@@ -109,9 +125,10 @@ defmodule UniversalProxy.Storage.Mount do
   @doc """
   Mount `device` at the mount point as `fs_type`.
 
-  ext4 volumes are checked with `fsck.ext4 -p` first; exit status 1 means
-  "errors found and fixed", which is a successful repair, so only status
-  2 and above abort the mount.
+  ext4 volumes are checked with `fsck.ext4 -p` first, and vfat ones with
+  `fsck.fat -a` when a checker is installed at all (see the moduledoc);
+  exit status 1 means "errors found and fixed", which is a successful
+  repair, so only status 2 and above abort the mount.
 
   Returns `{:ok, :read_write}`, or `{:ok, :read_only}` when only the
   read-only retry succeeded (a dirty NTFS volume or a write-protected
@@ -237,7 +254,36 @@ defmodule UniversalProxy.Storage.Mount do
     end
   end
 
+  # Same shape as ext4's, with the same "1 means repaired" reading, but
+  # only when a checker is actually installed — an absent `fsck.fat` must
+  # not turn every FAT mount into a failure.
+  defp fsck(device, :vfat, opts) do
+    case fsck_fat_bin(opts) do
+      nil ->
+        :ok
+
+      fsck ->
+        args = ["-a", device]
+
+        case cmd(fsck, args) do
+          {:ok, status, _out} when status in [0, 1] -> :ok
+          {:ok, status, out} -> failure(fsck, args, status, out)
+          {:error, _reason} = error -> error
+        end
+    end
+  end
+
   defp fsck(_device, _fs_type, _opts), do: :ok
+
+  defp fsck_fat_bin(opts) do
+    opts
+    |> Keyword.get(:fsck_fat_bin)
+    |> case do
+      nil -> @fsck_fat_candidates
+      bin -> [bin]
+    end
+    |> Enum.find(&File.exists?/1)
+  end
 
   defp mount_rw_or_ro(device, fs_type, point, opts) do
     case do_mount(device, fs_type, point, @rw_options, opts) do

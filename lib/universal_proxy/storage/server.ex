@@ -10,10 +10,13 @@ defmodule UniversalProxy.Storage.Server do
   public mutation, and each pass:
 
     1. lists drives through `Storage.Probe`,
-    2. sniffs the filesystem of the **first** drive: the `:read_head_fun`
+    2. sniffs the filesystem of the **first** drive: the `:read_at_fun`
        seam reads its first #{4096} bytes (and each partition's),
-       `Probe.fs_type/1` classifies them, `Probe.first_data_partition/1`
-       picks the target,
+       `Probe.fs_type/1` classifies them, `Probe.dirty?/2` reads the
+       "was I unmounted cleanly" record of anything **not** currently
+       mounted — taking a second read through the same seam when the flag
+       is outside the head (see below) — and
+       `Probe.first_data_partition/1` picks the target,
     3. binds an adopted mount (see below) to the drive that owns its
        device, or unmounts it when no attached drive does,
     4. stops the share and unmounts when the mounted drive has gone away,
@@ -38,6 +41,37 @@ defmodule UniversalProxy.Storage.Server do
   of scope, and reading the head of every partition of every attached disk
   would wake drives for nothing. Drives past the first are reported with
   `fs_type: nil` ("not sniffed", distinct from `:unknown`).
+
+  ## Two reads for one dirty bit
+
+  exFAT keeps its `VolumeDirty` flag in the boot sector, so the head read
+  settles it. FAT16/FAT32 keep theirs in FAT[1], which the reserved
+  sectors put outside the head on any FAT32 volume — so the sniff is a
+  two-step handshake with `Probe`, which stays pure throughout:
+  `Probe.dirty?/2` answers `:unknown`, `Probe.dirty_probe/1` names the
+  `{offset, length}` still needed, this server reads exactly those bytes
+  through the **same** `:read_at_fun` seam, and `Probe.dirty_at?/3` turns
+  them into the verdict. A read that fails, or a filesystem that keeps no
+  such record at all, lands on `dirty?: nil` — "not known", distinct from
+  a `false` that was actually read off the volume.
+
+  The verdict rides along on each sniffed drive/partition map and on the
+  mount payload. A mount this server did not make (adopted from the OS
+  mount table) carries `dirty?: nil`, because there is no sniff behind it.
+
+  ## The dirty bit is read before the mount, once
+
+  The FAT and exFAT drivers set the dirty bit when they mount a volume
+  writable and clear it only on a clean unmount, so while a mount is live
+  the bit says "mounted", not "damaged". Sniffing a mounted device would
+  therefore report every healthy drive as dirty on the second convergence
+  pass, so the bit is only ever read while the device is unmounted: the
+  pre-mount verdict is copied onto the mount record and every later pass
+  (and the capacity tick, which reads no device at all) reports that,
+  not a fresh read. An adopted mount has no pre-mount verdict and keeps
+  `dirty?: nil` for as long as it lasts — the drive/partition maps for
+  its device report the same `nil`, since the only honest read of that
+  volume already went by.
 
   ## The active drive is position 0
 
@@ -64,7 +98,7 @@ defmodule UniversalProxy.Storage.Server do
 
       %{
         drives: [drive_map()],
-        mount: nil | %{device:, fs_type:, mode:, point:, stale?:},
+        mount: nil | %{device:, fs_type:, mode:, point:, stale?:, dirty?:},
         share: :off | :running | :error,
         share_folder: String.t(),
         capacity: nil | %{total_bytes:, used_bytes:, free_bytes:, used_pct:}
@@ -248,7 +282,9 @@ defmodule UniversalProxy.Storage.Server do
       `:probe_opts`, `:mount_opts`, `:smbd_opts` passed through to them.
     * `:settings` — the `Storage.Settings` server reference.
     * `:daemon_supervisor` — the `DynamicSupervisor` smbd runs under.
-    * `:read_head_fun` — `(device_path -> {:ok, binary} | {:error, term})`.
+    * `:read_at_fun` — `(device_path, offset, length -> {:ok, binary} |
+      {:error, term})`. One seam for both reads the sniff needs: the head
+      (offset 0) and the FAT[1] bytes `Probe.dirty_probe/1` asks for.
     * `:netbios_name_fun` — `(-> String.t() | nil)`.
     * `:mounts_path` — the OS mount table to rehydrate and guard against
       (default `#{"/proc/self/mounts"}`); a file a test can rewrite
@@ -333,7 +369,8 @@ defmodule UniversalProxy.Storage.Server do
           fs_type: Probe.fs_type(),
           mode: Mount.mode(),
           point: String.t() | nil,
-          stale?: boolean()
+          stale?: boolean(),
+          dirty?: boolean() | nil
         }
 
   @type share :: :off | :running | :error
@@ -354,7 +391,7 @@ defmodule UniversalProxy.Storage.Server do
             probe_opts: [],
             mount_opts: [],
             smbd_opts: [],
-            read_head_fun: nil,
+            read_at_fun: nil,
             netbios_name_fun: nil,
             mounts_path: @default_mounts_path,
             pubsub: @pubsub,
@@ -576,7 +613,7 @@ defmodule UniversalProxy.Storage.Server do
       probe_opts: Keyword.get(opts, :probe_opts, []),
       mount_opts: Keyword.get(opts, :mount_opts, []),
       smbd_opts: Keyword.get(opts, :smbd_opts, []),
-      read_head_fun: Keyword.get(opts, :read_head_fun, &default_read_head/1),
+      read_at_fun: Keyword.get(opts, :read_at_fun, &default_read_at/3),
       netbios_name_fun: Keyword.get(opts, :netbios_name_fun, &default_netbios_name/0),
       mounts_path: Keyword.get(opts, :mounts_path, @default_mounts_path),
       pubsub: Keyword.get(opts, :pubsub, @pubsub),
@@ -858,34 +895,92 @@ defmodule UniversalProxy.Storage.Server do
     partitions =
       drive
       |> Map.get(:partitions, [])
-      |> Enum.map(fn partition ->
-        Map.put(partition, :fs_type, sniff(state, partition.dev_path))
-      end)
+      |> Enum.map(fn partition -> merge_sniff(partition, sniff(state, partition.dev_path)) end)
 
     drive
     |> Map.put(:key, drive_key(drive))
-    |> Map.put(:fs_type, sniff(state, drive.dev_path))
+    |> merge_sniff(sniff(state, drive.dev_path))
     |> Map.put(:partitions, partitions)
   end
 
   defp annotate(_state, drive, _index) do
     # `nil` is "not sniffed", not "unrecognised" — Probe treats both as
-    # non-data, but the UI can tell them apart.
-    drive |> Map.put(:key, drive_key(drive)) |> Map.put(:fs_type, nil)
+    # non-data, but the UI can tell them apart. `dirty?` is nil for the
+    # same reason: nothing was read, so nothing is known.
+    drive
+    |> Map.put(:key, drive_key(drive))
+    |> Map.put(:fs_type, nil)
+    |> Map.put(:dirty?, nil)
   end
 
+  defp merge_sniff(map, {fs_type, dirty}) do
+    map |> Map.put(:fs_type, fs_type) |> Map.put(:dirty?, dirty)
+  end
+
+  # `{fs_type, dirty?}` for one device: the head read classifies it, and
+  # the dirty bit may cost a second read (see the moduledoc).
   defp sniff(state, dev_path) do
-    case safe(fn -> state.read_head_fun.(dev_path) end, {:error, :read_head_crashed}, "read_head") do
+    case read_at(state, dev_path, 0, @head_bytes) do
       {:ok, bytes} when is_binary(bytes) ->
-        safe(fn -> state.probe.fs_type(bytes) end, :unknown, "Probe.fs_type")
+        fs_type = safe(fn -> state.probe.fs_type(bytes) end, :unknown, "Probe.fs_type")
+        {fs_type, dirty_verdict(state, dev_path, fs_type, bytes)}
 
       {:error, reason} ->
         Logger.debug("Storage: could not read #{dev_path} for fs sniff: #{inspect(reason)}")
-        :unknown
+        {:unknown, nil}
 
       _other ->
-        :unknown
+        {:unknown, nil}
     end
+  end
+
+  # The dirty bit is only ever read off an **unmounted** device: the
+  # FAT/exFAT drivers set it for the whole life of a writable mount and
+  # clear it on a clean unmount, so sniffing a mounted volume reports
+  # every healthy drive — including one this server just mounted itself —
+  # as dirty. While a mount record exists, the verdict it captured before
+  # the mount is what every later pass reports (`nil` for a mount this
+  # server did not make: no read happened, and none can happen now).
+  defp dirty_verdict(state, dev_path, fs_type, head) do
+    if mounted_device(state) == dev_path do
+      Map.get(state.mounted, :dirty?)
+    else
+      sniff_dirty(state, dev_path, fs_type, head)
+    end
+  end
+
+  # A stale mount counts: the lazy detach may not have run yet, so the
+  # kernel can still be holding the bit.
+  defp mounted_device(%{mounted: %{device: device}}) when is_binary(device), do: device
+  defp mounted_device(_state), do: nil
+
+  # `nil` is "could not be determined" — an unreadable second read, a
+  # filesystem with no such record, or a `Probe` that could not parse the
+  # geometry. A `false` here was really read off the volume.
+  defp sniff_dirty(state, dev_path, fs_type, head) do
+    with :unknown <- safe(fn -> state.probe.dirty?(fs_type, head) end, :unknown, "Probe.dirty?"),
+         {:read, offset, length} <-
+           safe(fn -> state.probe.dirty_probe(head) end, nil, "Probe.dirty_probe"),
+         {:ok, bytes} when is_binary(bytes) <- read_at(state, dev_path, offset, length),
+         verdict when is_boolean(verdict) <-
+           safe(
+             fn -> state.probe.dirty_at?(fs_type, head, bytes) end,
+             :unknown,
+             "Probe.dirty_at?"
+           ) do
+      verdict
+    else
+      verdict when is_boolean(verdict) -> verdict
+      _other -> nil
+    end
+  end
+
+  defp read_at(state, dev_path, offset, length) do
+    safe(
+      fn -> state.read_at_fun.(dev_path, offset, length) end,
+      {:error, :read_crashed},
+      "read_at"
+    )
   end
 
   defp reconcile_removal(%{mounted_ref: nil} = state), do: state
@@ -985,7 +1080,12 @@ defmodule UniversalProxy.Storage.Server do
               fs_type: partition.fs_type,
               mode: mode,
               point: mount_point(state),
-              stale?: false
+              stale?: false,
+              # Carried from the sniff, not re-read: `Mount.mount/3` may
+              # have repaired the volume on the way in, but what the user
+              # needs told is that it *was* dirty — the data on it can be
+              # damaged whether or not fsck could fix the metadata.
+              dirty?: Map.get(partition, :dirty?)
             },
             mounted_ref: drive_ref(drive)
         }
@@ -1167,7 +1267,11 @@ defmodule UniversalProxy.Storage.Server do
               fs_type: table_fs_type(fs),
               mode: table_mode(options),
               point: point,
-              stale?: false
+              stale?: false,
+              # The mount table records no such thing, and this mount was
+              # not sniffed by this process — the drawer falls back to the
+              # drive's own sniffed verdict.
+              dirty?: nil
             }
           else
             acc
@@ -1919,14 +2023,16 @@ defmodule UniversalProxy.Storage.Server do
 
   defp default_netbios_name, do: DeviceInfo.node_name() || @netbios_fallback
 
-  # Raw read of the first #{@head_bytes} bytes for the superblock sniff.
-  # `:raw` keeps it off the file-server process, and a block device that
-  # vanished mid-read must come back as an error, never an exception.
-  defp default_read_head(device_path) do
+  # Raw positioned read for the sniff: `length` bytes at `offset`, which
+  # is the head (offset 0, #{@head_bytes} bytes) for the superblock magic
+  # and a handful of FAT[1] bytes deeper in for the dirty bit. `:raw` keeps
+  # it off the file-server process, and a block device that vanished
+  # mid-read must come back as an error, never an exception.
+  defp default_read_at(device_path, offset, length) do
     case File.open(device_path, [:read, :binary, :raw]) do
       {:ok, fd} ->
         try do
-          case :file.read(fd, @head_bytes) do
+          case :file.pread(fd, offset, length) do
             {:ok, bytes} -> {:ok, bytes}
             :eof -> {:ok, <<>>}
             {:error, reason} -> {:error, reason}

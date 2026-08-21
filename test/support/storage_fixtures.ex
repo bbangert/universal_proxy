@@ -152,8 +152,20 @@ defmodule UniversalProxy.StorageFixtures do
   @doc "First 4 KiB of an ext4 superblock: LE magic 0xEF53 at offset 0x438."
   def ext4_bytes, do: block([{0x438, <<0x53, 0xEF>>}])
 
-  @doc "First 4 KiB of an exFAT boot sector: OEM name \"EXFAT   \" at offset 3."
-  def exfat_bytes, do: block([{3, "EXFAT   "}])
+  @doc """
+  First 4 KiB of an exFAT boot sector: OEM name `"EXFAT   "` at offset 3
+  plus the `VolumeFlags` u16 at offset 106.
+
+  `dirty: true` sets the `VolumeDirty` bit (0x0002); the default leaves
+  the flags clear. `active_fat: true` sets bit 0 instead, which is the
+  bit a naive "flags are non-zero" check would misread as dirty.
+  """
+  def exfat_bytes(opts \\ []) do
+    dirty = if Keyword.get(opts, :dirty, false), do: 0x0002, else: 0x0000
+    active_fat = if Keyword.get(opts, :active_fat, false), do: 0x0001, else: 0x0000
+
+    block([{3, "EXFAT   "}, {106, <<Bitwise.bor(dirty, active_fat)::little-16>>}])
+  end
 
   @doc "First 4 KiB of an NTFS boot sector: OEM name \"NTFS    \" at offset 3."
   def ntfs_bytes, do: block([{3, "NTFS    "}])
@@ -170,14 +182,137 @@ defmodule UniversalProxy.StorageFixtures do
   @doc "A binary shorter than any recognised magic offset — always :unknown."
   def short_bytes, do: <<1, 2, 3>>
 
-  defp block(patches), do: Enum.reduce(patches, zeroes(), &patch/2)
+  # -- FAT16/FAT32 volume images --
+  #
+  # The clean-shutdown bit is in FAT[1], past the reserved sectors, so
+  # these fixtures are whole volume *images* rather than just a head: a
+  # test slices the head out with `head/1` and reads the flag at the
+  # offset `Probe.fat_dirty_offset/1` computes, exercising the same two
+  # reads `Storage.Server` performs. The geometry is chosen so the FAT
+  # spec's cluster count lands in each type's range — 261 628 clusters for
+  # FAT32, 16 342 for FAT16.
 
-  defp zeroes, do: :binary.copy(<<0>>, @block_size)
+  # 32 reserved sectors of 512 bytes puts FAT[1] at 16 388 — deliberately
+  # outside the 4 KiB head, which is the case the second read exists for.
+  @fat32_bps 512
+  @fat32_reserved 32
+  @fat32_num_fats 2
+  @fat32_fat_sectors 2_048
+
+  # One reserved sector is what a real FAT16 volume has, which puts its
+  # FAT[1] at 514 — inside the head, yet still read through the same seam.
+  @fat16_bps 512
+  @fat16_reserved 1
+
+  @doc """
+  A FAT32 volume image, long enough to hold FAT[1]. `dirty: true` clears
+  bit 27 (`CLEAN_SHUT`) of FAT[1]; the default leaves it set.
+
+  `active_fat: n` sets BPB_ExtFlags bit 7 (mirroring off) and names copy
+  `n` as the active one. The `dirty:` flag then lands in copy `n` only,
+  leaving copy 0 with the clean value a mirroring-disabled volume goes on
+  reporting — the stale read this exists to catch. An `n` at or past
+  BPB_NumFATs is written through as-is, which is what an invalid volume
+  looks like; the flag stays in copy 0 there, since nothing should read
+  past it.
+  """
+  def fat32_image(opts \\ []) do
+    entry = if Keyword.get(opts, :dirty, false), do: 0x07FFFFFF, else: 0x0FFFFFFF
+    fat_start = @fat32_reserved * @fat32_bps
+    active = Keyword.get(opts, :active_fat)
+    ext_flags = if is_nil(active), do: 0x0000, else: Bitwise.bor(0x0080, active)
+    dirty_copy = if is_nil(active) or active >= @fat32_num_fats, do: 0, else: active
+    dirty_at = fat_start + dirty_copy * @fat32_fat_sectors * @fat32_bps + 4
+
+    image(max(fat_start + @fat32_bps, dirty_at + 4), [
+      {0x0B, <<@fat32_bps::little-16>>},
+      {0x0D, <<8>>},
+      {0x0E, <<@fat32_reserved::little-16>>},
+      {0x10, <<@fat32_num_fats>>},
+      {0x11, <<0::little-16>>},
+      {0x13, <<0::little-16>>},
+      {0x16, <<0::little-16>>},
+      {0x20, <<2_097_152::little-32>>},
+      {0x24, <<@fat32_fat_sectors::little-32>>},
+      {0x28, <<ext_flags::little-16>>},
+      {510, <<0x55, 0xAA>>},
+      {fat_start, <<0x0FFFFFF8::little-32>>},
+      # Copy 0 first, so a mirrored volume's `dirty_at` patch overwrites it
+      # and a mirroring-disabled one leaves it clean.
+      {fat_start + 4, <<0x0FFFFFFF::little-32>>},
+      {dirty_at, <<entry::little-32>>}
+    ])
+  end
+
+  @doc "First 4 KiB of `fat32_image/1` — what a head read returns."
+  def fat32_bytes(opts \\ []), do: head(fat32_image(opts))
+
+  @doc """
+  A FAT16 volume image, long enough to hold FAT[1]. `dirty: true` clears
+  bit 15 of FAT[1]; the default leaves it set.
+  """
+  def fat16_image(opts \\ []) do
+    entry = if Keyword.get(opts, :dirty, false), do: 0x7FFF, else: 0xFFFF
+    fat_start = @fat16_reserved * @fat16_bps
+
+    image(@block_size + @fat16_bps, [
+      {0x0B, <<@fat16_bps::little-16>>},
+      {0x0D, <<4>>},
+      {0x0E, <<@fat16_reserved::little-16>>},
+      {0x10, <<2>>},
+      {0x11, <<512::little-16>>},
+      {0x13, <<65_535::little-16>>},
+      {0x16, <<64::little-16>>},
+      {0x20, <<0::little-32>>},
+      {0x24, <<0::little-32>>},
+      {510, <<0x55, 0xAA>>},
+      {fat_start, <<0xFFF8::little-16>>},
+      {fat_start + 2, <<entry::little-16>>}
+    ])
+  end
+
+  @doc "First 4 KiB of `fat16_image/1` — what a head read returns."
+  def fat16_bytes(opts \\ []), do: head(fat16_image(opts))
+
+  @doc """
+  A FAT12 volume image (small enough that the cluster count lands under
+  4085), which has no clean-shutdown bit at all.
+  """
+  def fat12_image(_opts \\ []) do
+    fat_start = 512
+
+    image(@block_size, [
+      {0x0B, <<512::little-16>>},
+      {0x0D, <<1>>},
+      {0x0E, <<1::little-16>>},
+      {0x10, <<2>>},
+      {0x11, <<224::little-16>>},
+      {0x13, <<2_880::little-16>>},
+      {0x16, <<9::little-16>>},
+      {510, <<0x55, 0xAA>>},
+      {fat_start, <<0xFFF0::little-16>>}
+    ])
+  end
+
+  @doc "First 4 KiB of `fat12_image/1`."
+  def fat12_bytes(opts \\ []), do: head(fat12_image(opts))
+
+  @doc "The first 4 KiB of an image — the caller's head read."
+  def head(image), do: binary_part(image, 0, min(@block_size, byte_size(image)))
+
+  @doc "The `length` bytes at `offset` — the caller's second read."
+  def read_at(image, offset, length), do: binary_part(image, offset, length)
+
+  defp block(patches), do: image(@block_size, patches)
+
+  defp image(size, patches) do
+    Enum.reduce(patches, :binary.copy(<<0>>, size), &patch/2)
+  end
 
   defp patch({offset, bytes}, acc) do
     prefix = binary_part(acc, 0, offset)
     suffix_start = offset + byte_size(bytes)
-    suffix = binary_part(acc, suffix_start, @block_size - suffix_start)
+    suffix = binary_part(acc, suffix_start, byte_size(acc) - suffix_start)
     prefix <> bytes <> suffix
   end
 end

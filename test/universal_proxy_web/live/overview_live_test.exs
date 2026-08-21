@@ -387,7 +387,8 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
         serial: Keyword.get(opts, :serial, "SN-A"),
         partitions: [],
         key: Keyword.get(opts, :key, @drive_key),
-        fs_type: Keyword.get(opts, :fs_type, :exfat)
+        fs_type: Keyword.get(opts, :fs_type, :exfat),
+        dirty?: Keyword.get(opts, :dirty?, false)
       }
     end
 
@@ -397,7 +398,8 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
         fs_type: Keyword.get(opts, :fs_type, :exfat),
         mode: Keyword.get(opts, :mode, :read_write),
         point: "/run/usb-backup",
-        stale?: Keyword.get(opts, :stale?, false)
+        stale?: Keyword.get(opts, :stale?, false),
+        dirty?: Keyword.get(opts, :dirty?, false)
       }
     end
 
@@ -480,6 +482,47 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
       html = open_drawer(view)
       assert html =~ "exFAT"
       assert html =~ "Not journalled — format to ext4 recommended for backups."
+    end
+
+    test "a filesystem left dirty by an unclean unmount is flagged", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      push_storage(storage_state(drives: [drive(dirty?: true)], mount: mount(dirty?: true)))
+
+      html = open_drawer(view)
+      assert html =~ "Not cleanly unmounted"
+      assert html =~ "Wasn&#39;t cleanly unmounted — data may be corrupt."
+      assert html =~ "formatting to ext4 is the durable fix"
+    end
+
+    test "a cleanly unmounted filesystem carries no such warning", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state())
+
+      html = open_drawer(view)
+      refute html =~ "Not cleanly unmounted"
+      refute html =~ "data may be corrupt"
+    end
+
+    test "an adopted mount with no verdict is not flagged", %{conn: conn} do
+      # `Storage.Server` never sniffed an adopted mount, so it reports
+      # `dirty?: nil`, and the dirty bit of a mounted volume can no longer
+      # be read — "not known" must not render as a corruption warning.
+      {:ok, view, _html} = live(conn, "/")
+
+      push_storage(storage_state(drives: [drive(dirty?: nil)], mount: mount(dirty?: nil)))
+
+      refute open_drawer(view) =~ "Not cleanly unmounted"
+    end
+
+    test "an unmounted drive is flagged from its own sniff", %{conn: conn} do
+      # Nothing is mounted, so the pre-mount sniff on the drive map is the
+      # only verdict there is — a drive that failed to mount still warns.
+      {:ok, view, _html} = live(conn, "/")
+
+      push_storage(storage_state(drives: [drive(dirty?: true)], mount: nil, capacity: nil))
+
+      assert open_drawer(view) =~ "Not cleanly unmounted"
     end
 
     test "an ext4 drive gets no journalling warning", %{conn: conn} do
