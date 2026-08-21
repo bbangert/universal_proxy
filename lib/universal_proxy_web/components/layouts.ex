@@ -45,6 +45,7 @@ defmodule UniversalProxyWeb.Layouts do
         phx-hook="AutoDismissFlash"
         data-timeout="4000"
         role="status"
+        tabindex="0"
       >
         {msg}
       </div>
@@ -57,6 +58,7 @@ defmodule UniversalProxyWeb.Layouts do
         phx-hook="AutoDismissFlash"
         data-timeout="8000"
         role="alert"
+        tabindex="0"
       >
         {msg}
       </div>
