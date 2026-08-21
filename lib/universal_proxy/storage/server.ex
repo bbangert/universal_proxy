@@ -96,7 +96,12 @@ defmodule UniversalProxy.Storage.Server do
   and broadcasts through the same change-gated path when the number
   moved, without running the rest of convergence. The timer is armed and
   cancelled from convergence's own mount/unmount transitions, so ejecting
-  or losing the drive stops the reads. A format needs no extra guard
+  or losing the drive stops the reads. The message carries a token (same
+  tokenized-timer pattern as `WifiPolicy`) so a tick that was already
+  sitting in the mailbox when an unmount cancelled the timer, followed by
+  a remount arming a new one, is recognized as stale and dropped instead
+  of clearing the new timer's ref and re-arming a second live chain. A
+  format needs no extra guard
   either: `mkfs.ext4` runs inside `handle_call/3`, so a tick that arrives
   mid-format simply waits its turn in the mailbox behind it, the same way
   a concurrent eject already does.
@@ -363,7 +368,10 @@ defmodule UniversalProxy.Storage.Server do
             retry_timer: nil,
             # Armed while a non-stale mount exists, cancelled on unmount
             # (see the moduledoc's capacity-refresh section). Never stacked,
-            # same as `retry_timer`.
+            # same as `retry_timer`. `{timer, token}` (see
+            # `schedule_capacity_tick/1`) rather than a bare ref, so a
+            # cancelled-but-already-delivered `:capacity_tick` can't be
+            # mistaken for the timer armed after it.
             capacity_timer: nil,
             drives: [],
             mounted: nil,
@@ -726,9 +734,15 @@ defmodule UniversalProxy.Storage.Server do
     {:noreply, converge(%{state | retry_timer: nil})}
   end
 
-  def handle_info(:capacity_tick, state) do
+  # Tokenized so a cancelled-but-already-delivered `:capacity_tick` can't
+  # clear a since-armed timer's ref and re-arm a second live chain (see
+  # the moduledoc's capacity-refresh section and `WifiPolicy`'s
+  # `:evaluate` handler for the same pattern).
+  def handle_info({:capacity_tick, token}, %{capacity_timer: {_timer, token}} = state) do
     {:noreply, tick_capacity(%{state | capacity_timer: nil})}
   end
+
+  def handle_info({:capacity_tick, _stale_token}, state), do: {:noreply, state}
 
   # The `smbd` child died on its own — its spec is `restart: :temporary`,
   # so nothing else brings it back (see the moduledoc). The share is
@@ -1784,10 +1798,9 @@ defmodule UniversalProxy.Storage.Server do
   defp schedule_capacity_tick(state) do
     if state.auto? and is_nil(state.capacity_timer) and
          is_integer(state.capacity_interval) and state.capacity_interval > 0 do
-      %{
-        state
-        | capacity_timer: Process.send_after(self(), :capacity_tick, state.capacity_interval)
-      }
+      token = make_ref()
+      timer = Process.send_after(self(), {:capacity_tick, token}, state.capacity_interval)
+      %{state | capacity_timer: {timer, token}}
     else
       state
     end
@@ -1795,8 +1808,8 @@ defmodule UniversalProxy.Storage.Server do
 
   defp cancel_capacity_tick(%{capacity_timer: nil} = state), do: state
 
-  defp cancel_capacity_tick(state) do
-    _ = Process.cancel_timer(state.capacity_timer)
+  defp cancel_capacity_tick(%{capacity_timer: {timer, _token}} = state) do
+    _ = Process.cancel_timer(timer)
     %{state | capacity_timer: nil}
   end
 

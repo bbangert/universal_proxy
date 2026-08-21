@@ -508,6 +508,41 @@ defmodule UniversalProxy.Storage.ServerTest do
       assert Server.get_state(server).capacity.used_pct == 46
     end
 
+    test "a stale capacity_tick token is a no-op and the real timer ticks on", ctx do
+      server =
+        start_server(ctx, start_timer: true, capacity_interval: 30, retry_interval: 10_000)
+
+      present!()
+      :ok = Server.check_now(server)
+      assert_receive {:storage_state, %{mount: %{device: "/dev/sda1"}}}, 1_000
+
+      before_count = Enum.count(Recorder.events(), &match?({:capacity}, &1))
+
+      # `Process.cancel_timer/1` on an unmount can race a remount that
+      # arms a fresh timer before the cancelled one's message is flushed
+      # from the mailbox — the stale message still arrives holding the
+      # old token. It must be recognized as not matching the currently
+      # armed timer and dropped: no capacity read, and — critically — no
+      # clearing of the real timer's ref (which would otherwise let this
+      # handler re-arm a second, permanently duplicating tick chain).
+      send(server, {:capacity_tick, make_ref()})
+
+      refute_receive {:storage_state, _}, 20
+      assert Enum.count(Recorder.events(), &match?({:capacity}, &1)) == before_count
+
+      # The genuine timer must be untouched by the stale message: ticks
+      # keep landing afterwards at the normal ~30 ms cadence, not doubled
+      # by a second chain the stale message might otherwise have spawned.
+      Process.sleep(90)
+      after_count = Enum.count(Recorder.events(), &match?({:capacity}, &1))
+      ticks = after_count - before_count
+
+      assert ticks > 0
+      # ~3 ticks expected in 90 ms at a 30 ms cadence from one chain; a
+      # re-arm storm from the stale message would run measurably higher.
+      assert ticks <= 5
+    end
+
     test "no broadcast when the tick's capacity reading is unchanged", ctx do
       server =
         start_server(ctx, start_timer: true, capacity_interval: 30, retry_interval: 10_000)
