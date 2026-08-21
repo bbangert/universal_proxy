@@ -82,6 +82,30 @@ defmodule UniversalProxy.Storage.Server do
   the mount point cannot be trusted. Only the removal path can produce
   it: see the umount semantics below.
 
+  ## Capacity refresh while mounted
+
+  Convergence reads capacity too, but only convergence steps run it: init,
+  hotplug, poll, retry, and each public mutation. A plain file write into
+  the mounted filesystem triggers none of those, so without anything else
+  the capacity in `payload/1` would sit at whatever the last convergence
+  saw, however stale.
+
+  So while a non-stale mount exists, a `:capacity_tick` timer (opt
+  `:capacity_interval`, `#{60_000}` ms, never stacked — the same
+  non-stacking pattern as `:retry_converge`) re-reads capacity on its own
+  and broadcasts through the same change-gated path when the number
+  moved, without running the rest of convergence. The timer is armed and
+  cancelled from convergence's own mount/unmount transitions, so ejecting
+  or losing the drive stops the reads. The message carries a token (same
+  tokenized-timer pattern as `WifiPolicy`) so a tick that was already
+  sitting in the mailbox when an unmount cancelled the timer, followed by
+  a remount arming a new one, is recognized as stale and dropped instead
+  of clearing the new timer's ref and re-arming a second live chain. A
+  format needs no extra guard
+  either: `mkfs.ext4` runs inside `handle_call/3`, so a tick that arrives
+  mid-format simply waits its turn in the mailbox behind it, the same way
+  a concurrent eject already does.
+
   ## Two umount semantics
 
   A lazy `umount` (`umount -l`) detaches the name but leaves the kernel
@@ -229,7 +253,8 @@ defmodule UniversalProxy.Storage.Server do
     * `:mounts_path` — the OS mount table to rehydrate and guard against
       (default `#{"/proc/self/mounts"}`); a file a test can rewrite
       mid-run to simulate the kernel's view changing.
-    * `:pubsub`, `:poll_interval`, `:debounce_ms`, `:retry_interval`.
+    * `:pubsub`, `:poll_interval`, `:debounce_ms`, `:retry_interval`,
+      `:capacity_interval`.
     * `:subscribe_uevents?` — `false` skips the uevent subscription so the
       poll fallback is exercised. Needed because `nerves_uevent` (a
       `nerves_runtime` dependency) *does* start its PropertyTable on the
@@ -262,6 +287,12 @@ defmodule UniversalProxy.Storage.Server do
   # to be a retry loop, short enough that a transient mount or smbd
   # failure doesn't wedge the subsystem until the next replug.
   @retry_interval 30_000
+
+  # Cadence for the capacity-only refresh while a drive stays mounted (see
+  # the moduledoc): frequent enough that a backup written over SMB shows up
+  # in the drawer/entities well within a session, cheap enough (one `df`)
+  # not to matter at this rate.
+  @capacity_interval 60_000
 
   # Superblock magics all live inside the first 4 KiB (Probe.fs_type/1).
   @head_bytes 4096
@@ -330,10 +361,18 @@ defmodule UniversalProxy.Storage.Server do
             poll_interval: @poll_interval,
             debounce_ms: @debounce_ms,
             retry_interval: @retry_interval,
+            capacity_interval: @capacity_interval,
             subscribe_uevents?: true,
             auto?: true,
             hotplug_pending: false,
             retry_timer: nil,
+            # Armed while a non-stale mount exists, cancelled on unmount
+            # (see the moduledoc's capacity-refresh section). Never stacked,
+            # same as `retry_timer`. `{timer, token}` (see
+            # `schedule_capacity_tick/1`) rather than a bare ref, so a
+            # cancelled-but-already-delivered `:capacity_tick` can't be
+            # mistaken for the timer armed after it.
+            capacity_timer: nil,
             drives: [],
             mounted: nil,
             # `{drive_name, drive_key}` of the mounted drive — the identity
@@ -544,6 +583,7 @@ defmodule UniversalProxy.Storage.Server do
       poll_interval: Keyword.get(opts, :poll_interval, @poll_interval),
       debounce_ms: Keyword.get(opts, :debounce_ms, @debounce_ms),
       retry_interval: Keyword.get(opts, :retry_interval, @retry_interval),
+      capacity_interval: Keyword.get(opts, :capacity_interval, @capacity_interval),
       subscribe_uevents?: Keyword.get(opts, :subscribe_uevents?, true),
       auto?: Keyword.get(opts, :start_timer, true)
     }
@@ -694,6 +734,16 @@ defmodule UniversalProxy.Storage.Server do
     {:noreply, converge(%{state | retry_timer: nil})}
   end
 
+  # Tokenized so a cancelled-but-already-delivered `:capacity_tick` can't
+  # clear a since-armed timer's ref and re-arm a second live chain (see
+  # the moduledoc's capacity-refresh section and `WifiPolicy`'s
+  # `:evaluate` handler for the same pattern).
+  def handle_info({:capacity_tick, token}, %{capacity_timer: {_timer, token}} = state) do
+    {:noreply, tick_capacity(%{state | capacity_timer: nil})}
+  end
+
+  def handle_info({:capacity_tick, _stale_token}, state), do: {:noreply, state}
+
   # The `smbd` child died on its own — its spec is `restart: :temporary`,
   # so nothing else brings it back (see the moduledoc). The share is
   # marked `:error` and that is published straight away, because the
@@ -754,6 +804,9 @@ defmodule UniversalProxy.Storage.Server do
       |> reconcile_share(Keyword.get(opts, :restart_share?, true))
 
     if payload(state) != before, do: broadcast(state)
+
+    state =
+      if mounted?(state), do: schedule_capacity_tick(state), else: cancel_capacity_tick(state)
 
     schedule_retry(state)
   end
@@ -1224,6 +1277,24 @@ defmodule UniversalProxy.Storage.Server do
       end
     else
       %{state | capacity: nil}
+    end
+  end
+
+  # The `:capacity_tick` handler's body: a `df` and nothing else, not the
+  # rest of convergence (no probe, no mount/unmount, no share). Re-checks
+  # `mounted?/1` because the tick and an unmount racing through the mailbox
+  # both land here in delivery order — a tick that lost that race must not
+  # re-arm itself. A format in flight needs no extra guard: `mkfs.ext4`
+  # runs inside `handle_call/3`, so this handler (like any other message)
+  # simply waits behind it in the GenServer queue.
+  defp tick_capacity(state) do
+    if mounted?(state) do
+      before = payload(state)
+      state = refresh_capacity(state)
+      if payload(state) != before, do: broadcast(state)
+      schedule_capacity_tick(state)
+    else
+      state
     end
   end
 
@@ -1718,6 +1789,28 @@ defmodule UniversalProxy.Storage.Server do
   defp cancel_retry(state) do
     _ = Process.cancel_timer(state.retry_timer)
     %{state | retry_timer: nil}
+  end
+
+  # Non-stacking, same as `:retry_converge`: a timer already armed (guarded
+  # by `is_nil/1`) is left alone rather than reset, so convergence passes
+  # that run more often than `:capacity_interval` (hotplug, poll) don't
+  # keep pushing the next capacity read further out.
+  defp schedule_capacity_tick(state) do
+    if state.auto? and is_nil(state.capacity_timer) and
+         is_integer(state.capacity_interval) and state.capacity_interval > 0 do
+      token = make_ref()
+      timer = Process.send_after(self(), {:capacity_tick, token}, state.capacity_interval)
+      %{state | capacity_timer: {timer, token}}
+    else
+      state
+    end
+  end
+
+  defp cancel_capacity_tick(%{capacity_timer: nil} = state), do: state
+
+  defp cancel_capacity_tick(%{capacity_timer: {timer, _token}} = state) do
+    _ = Process.cancel_timer(timer)
+    %{state | capacity_timer: nil}
   end
 
   defp work_pending?(state) do
