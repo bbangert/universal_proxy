@@ -820,13 +820,15 @@ defmodule UniversalProxy.Storage.ServerTest do
       assert {:format, "/dev/sda1", "usb_backup", true} in Recorder.events()
     end
 
-    test "a filesystem that will not unmount is never handed to mkfs", ctx do
-      server = start_server(ctx)
+    test "a filesystem still busy after every retry is never handed to mkfs", ctx do
+      server = start_server(ctx, umount_retries: 2, umount_retry_ms: 1)
       present!()
       :ok = Server.check_now(server)
 
       busy = {:error, {:command_failed, "/bin/umount /run/usb-backup", 32, "target is busy"}}
-      Recorder.put(:umount_results, [busy, busy])
+      # N+1 = 3 busy results, so every attempt (initial plus both
+      # retries) sees "busy" and none run dry into the stub's default.
+      Recorder.put(:umount_results, [busy, busy, busy])
 
       log =
         capture_log(fn ->
@@ -837,12 +839,32 @@ defmodule UniversalProxy.Storage.ServerTest do
       assert log =~ "refusing to format"
       refute Enum.any?(Recorder.event_names(), &(&1 == :format))
 
-      # Exactly one plain umount, and no lazy retry: a lazy detach leaves
+      # Exactly N+1 plain umounts, and no lazy retry: a lazy detach leaves
       # the kernel holding the filesystem mkfs would overwrite, so it must
-      # never sneak in on this path (the second queued busy result is
-      # deliberately left unconsumed).
-      assert [{:umount, false}] = Enum.filter(Recorder.events(), &match?({:umount, _}, &1))
+      # never sneak in on this path.
+      assert [{:umount, false}, {:umount, false}, {:umount, false}] =
+               Enum.filter(Recorder.events(), &match?({:umount, _}, &1))
+
       assert Server.get_state(server).mount.stale? == false
+    end
+
+    # Same teardown-window HW finding as eject/2's: a busy umount right
+    # after the share stop is retried, plainly, before format gives up on
+    # it.
+    test "a transiently busy filesystem is retried before formatting", ctx do
+      server = start_server(ctx, umount_retry_ms: 1)
+      present!()
+      :ok = Server.check_now(server)
+
+      busy = {:error, {:command_failed, "/bin/umount /run/usb-backup", 32, "target is busy"}}
+      Recorder.put(:umount_results, [busy, busy])
+
+      assert :ok = Server.format(server, @drive_key, "usb_backup")
+
+      assert [{:umount, false}, {:umount, false}, {:umount, false}] =
+               Enum.filter(Recorder.events(), &match?({:umount, _}, &1))
+
+      assert {:format, "/dev/sda1", "usb_backup", true} in Recorder.events()
     end
 
     test "the mounted partition is formatted, never the whole disk under it", ctx do
@@ -1089,22 +1111,28 @@ defmodule UniversalProxy.Storage.ServerTest do
     end
 
     # A lazy umount is not a flush and not a detach the user can act on,
-    # so "safe to unplug" must never be said on the back of one.
-    test "a busy filesystem refuses the eject instead of detaching lazily", ctx do
-      server = start_server(ctx)
+    # so "safe to unplug" must never be said on the back of one, however
+    # many bounded plain retries it took to find that out.
+    test "a filesystem still busy after every retry refuses the eject, never lazily", ctx do
+      server = start_server(ctx, umount_retries: 2, umount_retry_ms: 1)
       present!()
       enable_share!(ctx)
       :ok = Server.check_now(server)
       assert Server.get_state(server).share == :running
 
       busy = {:error, {:command_failed, "/bin/umount /run/usb-backup", 32, "target is busy"}}
-      Recorder.put(:umount_results, [busy, busy])
+      # N+1 = 3 busy results: exactly enough that every attempt (the
+      # initial try plus both retries) sees "busy", and none run dry into
+      # the stub's own default (`:ok`).
+      Recorder.put(:umount_results, [busy, busy, busy])
 
       log = capture_log(fn -> assert Server.eject(server, @drive_key) == {:error, :busy} end)
 
       assert log =~ "eject refused"
-      # One plain umount, no lazy retry.
-      assert [{:umount, false}] = Enum.filter(Recorder.events(), &match?({:umount, _}, &1))
+      # Exactly N+1 attempts, every one plain — no lazy retry ever, on
+      # this path.
+      assert [{:umount, false}, {:umount, false}, {:umount, false}] =
+               Enum.filter(Recorder.events(), &match?({:umount, _}, &1))
 
       state = Server.get_state(server)
       # Still mounted, not stale, and the share the eject stopped on the
@@ -1117,6 +1145,29 @@ defmodule UniversalProxy.Storage.ServerTest do
       # rather than treating it as ejected.
       :ok = Server.check_now(server)
       assert Server.get_state(server).mount.device == "/dev/sda1"
+    end
+
+    # HW finding: a share stop's SIGTERM lands on smbd's *parent*, but its
+    # per-connection child (whose cwd pins the share) exits asynchronously
+    # afterwards — a real device refused the umount 9ms after "smbd
+    # stopped" logged, purely because that child hadn't exited yet. The
+    # bounded retry is what absorbs that teardown window.
+    test "a transiently busy filesystem is retried and then ejects cleanly", ctx do
+      server = start_server(ctx, umount_retry_ms: 1)
+      present!()
+      :ok = Server.check_now(server)
+
+      busy = {:error, {:command_failed, "/bin/umount /run/usb-backup", 32, "target is busy"}}
+      Recorder.put(:umount_results, [busy, busy])
+
+      assert :ok = Server.eject(server, @drive_key)
+
+      # Two busy attempts, then the third call (the stub's default `:ok`)
+      # succeeds — three plain umounts total, never a lazy one.
+      assert [{:umount, false}, {:umount, false}, {:umount, false}] =
+               Enum.filter(Recorder.events(), &match?({:umount, _}, &1))
+
+      assert Server.get_state(server).mount == nil
     end
 
     # There is no format-in-flight flag: `mkfs` runs inside handle_call, so

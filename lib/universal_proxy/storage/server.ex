@@ -147,16 +147,25 @@ defmodule UniversalProxy.Storage.Server do
   a flush and **not** a safe-to-unplug or safe-to-mkfs signal. The two
   callers therefore get different unmounts:
 
-    * `eject/2` and `format/3` use `do_unmount/1`, a plain `umount` with
-      no fallback. A busy filesystem is refused (`{:error, :busy}` /
-      `{:error, {:umount_failed, _}}`) with the mount left exactly as it
-      was — telling the user to unplug, or handing `mkfs` a device the
-      kernel still has open, is what the refusal prevents.
+    * `eject/2` and `format/3` use `do_unmount_retrying/1`, a plain
+      `umount` with no lazy fallback — but a bounded number of plain
+      retries (`:umount_retries`, `:umount_retry_ms` apart) when the
+      failure looks like "busy". A share stop forwards SIGTERM to `smbd`'s
+      *parent*, but its per-connection child (whose cwd pins the share)
+      exits asynchronously afterwards; a real device has been seen
+      refusing the umount 9ms after "smbd stopped" logged, purely because
+      that child hadn't exited yet. The retry absorbs that teardown window
+      without ever going lazy. Still refused (`{:error, :busy}` /
+      `{:error, {:umount_failed, _}}`), mount left exactly as it was, once
+      every attempt is exhausted — a persistent holder (a client
+      mid-transfer) is exactly what the refusal is for.
     * `reconcile_removal/1` uses `force_unmount/1`, which retries lazily
       and marks the mount stale if even that fails. The drive is already
       physically gone: there is nothing left to flush and nothing for the
       user to unplug, so detaching the name is the best available
-      outcome.
+      outcome. It does not get the bounded plain retry above: it calls
+      `do_unmount/1` directly and falls straight to lazy on the first
+      failure.
 
   ## Adopting a mount this process did not make
 
@@ -291,6 +300,12 @@ defmodule UniversalProxy.Storage.Server do
       mid-run to simulate the kernel's view changing.
     * `:pubsub`, `:poll_interval`, `:debounce_ms`, `:retry_interval`,
       `:capacity_interval`.
+    * `:umount_retries`, `:umount_retry_ms` — how many times
+      `do_unmount_retrying/1` (the `eject/2` / `format/3` path) retries a
+      plain umount that fails as "busy", and the delay between attempts
+      (defaults `#{6}`, `#{500}` ms — about 3 s, tuned to cover an
+      `smbd` child's teardown window). A test shrinks the delay rather
+      than the count so the bounded-attempts assertion stays meaningful.
     * `:subscribe_uevents?` — `false` skips the uevent subscription so the
       poll fallback is exercised. Needed because `nerves_uevent` (a
       `nerves_runtime` dependency) *does* start its PropertyTable on the
@@ -329,6 +344,14 @@ defmodule UniversalProxy.Storage.Server do
   # in the drawer/entities well within a session, cheap enough (one `df`)
   # not to matter at this rate.
   @capacity_interval 60_000
+
+  # `eject/2`/`format/3`'s plain umount retries this many times, this far
+  # apart, before giving up (see the moduledoc's "Two umount semantics"):
+  # 6 * 500ms is ~3s, chosen to outlast an `smbd` child's post-SIGTERM
+  # teardown (see HW finding in the moduledoc) without turning a genuinely
+  # busy filesystem (a client mid-transfer) into a long hang.
+  @umount_retries 6
+  @umount_retry_ms 500
 
   # Superblock magics all live inside the first 4 KiB (Probe.fs_type/1).
   @head_bytes 4096
@@ -399,6 +422,8 @@ defmodule UniversalProxy.Storage.Server do
             debounce_ms: @debounce_ms,
             retry_interval: @retry_interval,
             capacity_interval: @capacity_interval,
+            umount_retries: @umount_retries,
+            umount_retry_ms: @umount_retry_ms,
             subscribe_uevents?: true,
             auto?: true,
             hotplug_pending: false,
@@ -621,6 +646,8 @@ defmodule UniversalProxy.Storage.Server do
       debounce_ms: Keyword.get(opts, :debounce_ms, @debounce_ms),
       retry_interval: Keyword.get(opts, :retry_interval, @retry_interval),
       capacity_interval: Keyword.get(opts, :capacity_interval, @capacity_interval),
+      umount_retries: Keyword.get(opts, :umount_retries, @umount_retries),
+      umount_retry_ms: Keyword.get(opts, :umount_retry_ms, @umount_retry_ms),
       subscribe_uevents?: Keyword.get(opts, :subscribe_uevents?, true),
       auto?: Keyword.get(opts, :start_timer, true)
     }
@@ -725,7 +752,7 @@ defmodule UniversalProxy.Storage.Server do
         # mount record still says which device it is.
         {state, unmount_result} =
           if state.mounted,
-            do: state |> stop_share() |> do_unmount(),
+            do: state |> stop_share() |> do_unmount_retrying(),
             else: {stop_share(state), :ok}
 
         case unmount_result do
@@ -1107,7 +1134,7 @@ defmodule UniversalProxy.Storage.Server do
   defp do_eject(state) do
     ref = state.mounted_ref
 
-    case state |> stop_share() |> do_unmount() do
+    case state |> stop_share() |> do_unmount_retrying() do
       {state, :ok} ->
         {:reply, :ok, %{state | ejected: put_ref(state.ejected, ref)}, {:continue, :converge}}
 
@@ -1138,6 +1165,50 @@ defmodule UniversalProxy.Storage.Server do
         {state, error}
     end
   end
+
+  # `eject/2` and `format/3` only: a bounded number of plain-umount
+  # retries over a failure that looks like "busy" (see the moduledoc).
+  # `stop_share/1` forwards SIGTERM to `smbd`'s *parent*, but its
+  # per-connection child — whose cwd still pins the share — exits
+  # asynchronously afterwards; a real device refused the umount 9ms after
+  # "smbd stopped" logged for exactly that reason. This absorbs that
+  # teardown window without ever falling back to a lazy detach, which
+  # `do_unmount/1`'s callers must never get (see the moduledoc). Never
+  # used by `force_unmount/1`, whose own lazy fallback already answers a
+  # still-busy mount on the removal path.
+  #
+  # A holder that outlasts every retry (a client mid-transfer, a stuck
+  # process) still surfaces the same `{:error, _}` `do_unmount/1` would
+  # have returned on the first try — the retry only buys time, it never
+  # changes the verdict.
+  defp do_unmount_retrying(state), do: do_unmount_retrying(state, state.umount_retries)
+
+  defp do_unmount_retrying(state, attempts_left) do
+    case do_unmount(state) do
+      {_state, :ok} = ok ->
+        ok
+
+      {state, error} = failure ->
+        if attempts_left > 0 and busy_umount?(error) do
+          Process.sleep(state.umount_retry_ms)
+          do_unmount_retrying(state, attempts_left - 1)
+        else
+          failure
+        end
+    end
+  end
+
+  # Busybox/util-linux `umount` says "busy" (e.g. "target is busy") on
+  # EBUSY; matched on the command's own output rather than the exit
+  # status, which a stub or a different umount build could shape
+  # differently. Anything else (unreadable command, crashed seam, no such
+  # mount point) is not the transient-teardown case this retry exists
+  # for, so it is not retried.
+  defp busy_umount?({:error, {:command_failed, _cmd, _status, out}}) when is_binary(out) do
+    String.contains?(String.downcase(out), "busy")
+  end
+
+  defp busy_umount?(_error), do: false
 
   # Removal cleanup only (see the moduledoc): the drive is gone, so a lazy
   # detach is the right answer for a filesystem that is still busy, and a
