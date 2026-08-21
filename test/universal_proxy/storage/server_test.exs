@@ -484,6 +484,80 @@ defmodule UniversalProxy.Storage.ServerTest do
     end
   end
 
+  describe "capacity refresh while mounted" do
+    test "a changed capacity reading is picked up and broadcast within the tick", ctx do
+      server =
+        start_server(ctx, start_timer: true, capacity_interval: 30, retry_interval: 10_000)
+
+      present!()
+      :ok = Server.check_now(server)
+
+      assert_receive {:storage_state,
+                      %{mount: %{device: "/dev/sda1"}, capacity: %{used_pct: 10}}},
+                     1_000
+
+      # A backup written straight to the mounted filesystem (no mount,
+      # unmount, share transition, or manual op) — nothing but the tick
+      # would ever see this.
+      Recorder.put(
+        :capacity,
+        {:ok, %{total_bytes: 1_000, used_bytes: 460, free_bytes: 540, used_pct: 46}}
+      )
+
+      assert_receive {:storage_state, %{capacity: %{used_pct: 46}}}, 1_000
+      assert Server.get_state(server).capacity.used_pct == 46
+    end
+
+    test "no broadcast when the tick's capacity reading is unchanged", ctx do
+      server =
+        start_server(ctx, start_timer: true, capacity_interval: 30, retry_interval: 10_000)
+
+      present!()
+      :ok = Server.check_now(server)
+      assert_receive {:storage_state, %{mount: %{device: "/dev/sda1"}}}, 1_000
+
+      # Long enough for several ticks at 30 ms; the payload never moves,
+      # so none of them may broadcast.
+      refute_receive {:storage_state, _}, 200
+
+      assert Enum.count(Recorder.events(), &match?({:capacity}, &1)) > 1
+    end
+
+    test "the tick stops once the drive is ejected", ctx do
+      server =
+        start_server(ctx, start_timer: true, capacity_interval: 30, retry_interval: 10_000)
+
+      present!()
+      :ok = Server.check_now(server)
+      assert_receive {:storage_state, %{mount: %{device: "/dev/sda1"}}}, 1_000
+
+      # Let at least one tick land before ejecting, proving the timer was
+      # actually running.
+      Process.sleep(60)
+      before_count = Enum.count(Recorder.events(), &match?({:capacity}, &1))
+      assert before_count > 0
+
+      # `eject/2` unmounts synchronously (before the convergence pass it
+      # triggers even starts), so the transition is visible on the reply
+      # without waiting on a broadcast.
+      assert :ok = Server.eject(server, @drive_key)
+      assert Server.get_state(server).mount == nil
+
+      # One tick may already have been in flight when the eject landed —
+      # `tick_capacity/1` re-checks `mounted?/1` before re-arming itself,
+      # so at most that single read is allowed through afterwards.
+      just_after_eject = Enum.count(Recorder.events(), &match?({:capacity}, &1))
+
+      # Long enough for several more ticks, if the timer were (wrongly)
+      # still armed.
+      Process.sleep(150)
+      after_count = Enum.count(Recorder.events(), &match?({:capacity}, &1))
+
+      assert after_count - just_after_eject == 0
+      assert just_after_eject - before_count <= 1
+    end
+  end
+
   describe "share opt-in" do
     test "enabling starts the daemon child, disabling stops it", ctx do
       server = start_server(ctx)
