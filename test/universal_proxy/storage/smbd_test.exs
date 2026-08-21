@@ -340,13 +340,25 @@ defmodule UniversalProxy.Storage.SmbdTest do
       File.rm!(ctx.argv)
       File.rm!(ctx.stdin)
 
+      test_pid = self()
+
+      observing_opts =
+        Keyword.put(opts, :put_hash_fun, fn hash ->
+          Agent.update(hash_holder, fn _ -> hash end)
+          send(test_pid, {:hash_recorded, hash})
+          :ok
+        end)
+
       assert {:ok, :provisioned} =
-               Smbd.provision_user(@password, Keyword.put(opts, :force, true))
+               Smbd.provision_user(@password, Keyword.put(observing_opts, :force, true))
 
       assert File.read!(ctx.stdin) == @password <> "\n" <> @password <> "\n"
-      # The hash marker is unchanged (same username/password), but it was
-      # still (re)written by the forced run, not merely left alone.
-      assert Agent.get(hash_holder, & &1) == recorded
+      # The hash marker is unchanged (same username/password), but assert
+      # it was actually (re)recorded by the forced run — not merely left
+      # alone by a forced path that skipped record_hash/2 — by observing
+      # the call itself rather than the value it would have left behind
+      # either way.
+      assert_receive {:hash_recorded, ^recorded}
     end
 
     test "a changed password re-runs smbpasswd", ctx do
