@@ -1995,6 +1995,99 @@ defmodule UniversalProxy.Storage.ServerTest do
       assert_receive {:storage_state, %{mount: %{dirty?: true, fs_type: :vfat}}}
     end
 
+    test "a mounted device is not re-sniffed: the driver's own bit is ignored", ctx do
+      # The exFAT driver sets VolumeDirty for the whole life of a writable
+      # mount, so the seam serves dirty bytes once the mount is up. The
+      # pre-mount verdict is what the payload has to keep reporting.
+      server = start_server(ctx)
+      present!(StorageFixtures.exfat_bytes())
+
+      :ok = Server.check_now(server)
+      assert Server.get_state(server).mount.dirty? == false
+
+      Recorder.put(:heads, %{"/dev/sda1" => StorageFixtures.exfat_bytes(dirty: true)})
+      :ok = Server.check_now(server)
+
+      state = Server.get_state(server)
+      assert state.mount.dirty? == false
+      assert [%{partitions: [%{fs_type: :exfat, dirty?: false}]}] = state.drives
+    end
+
+    test "a FAT32 mount is not re-sniffed either — no second read is taken", ctx do
+      server = start_server(ctx)
+      present!(StorageFixtures.fat32_image())
+
+      :ok = Server.check_now(server)
+      assert Server.get_state(server).mount.dirty? == false
+
+      Recorder.put(:heads, %{"/dev/sda1" => StorageFixtures.fat32_image(dirty: true)})
+      :ok = Server.check_now(server)
+
+      state = Server.get_state(server)
+      assert state.mount.dirty? == false
+      assert [%{partitions: [%{dirty?: false}]}] = state.drives
+    end
+
+    test "a drive that was dirty before the mount keeps saying so", ctx do
+      # The mirror image of the two above: `Mount.mount/3` may have
+      # repaired the volume, and the seam then reads clean — the warning
+      # must survive, because the *data* can still be damaged.
+      server = start_server(ctx)
+      present!(StorageFixtures.exfat_bytes(dirty: true))
+
+      :ok = Server.check_now(server)
+      assert Server.get_state(server).mount.dirty? == true
+
+      Recorder.put(:heads, %{"/dev/sda1" => StorageFixtures.exfat_bytes()})
+      :ok = Server.check_now(server)
+
+      assert Server.get_state(server).mount.dirty? == true
+    end
+
+    test "an adopted mount has no pre-mount verdict, so dirty? stays nil", ctx do
+      # The kernel already has the volume at the mount point, so no
+      # pre-mount read ever happened — and none can happen now.
+      server =
+        start_server(ctx,
+          mounts_path: mounts_file!(["/dev/sda1 #{MountStub.point()} exfat rw,noatime 0 0"])
+        )
+
+      present!(StorageFixtures.exfat_bytes(dirty: true))
+
+      :ok = Server.check_now(server)
+
+      state = Server.get_state(server)
+      refute {:mount, "/dev/sda1", :exfat} in Recorder.events()
+      assert state.mount.dirty? == nil
+      assert [%{partitions: [%{fs_type: :exfat, dirty?: nil}]}] = state.drives
+    end
+
+    test "the capacity tick reads no device, so it cannot flip the verdict", ctx do
+      server =
+        start_server(ctx,
+          start_timer: true,
+          poll_interval: 60_000,
+          retry_interval: 60_000,
+          capacity_interval: 30
+        )
+
+      present!(StorageFixtures.exfat_bytes())
+      :ok = Server.check_now(server)
+      assert_receive {:storage_state, %{mount: %{dirty?: false}}}, 1_000
+
+      # The driver sets VolumeDirty now the volume is mounted, and from
+      # here only the capacity tick runs — the poll and retry are parked.
+      Recorder.put(:heads, %{"/dev/sda1" => StorageFixtures.exfat_bytes(dirty: true)})
+
+      Recorder.put(
+        :capacity,
+        {:ok, %{total_bytes: 1_000, used_bytes: 460, free_bytes: 540, used_pct: 46}}
+      )
+
+      assert_receive {:storage_state, %{capacity: %{used_pct: 46}, mount: %{dirty?: false}}},
+                     1_000
+    end
+
     test "a raising read seam degrades to dirty?: nil rather than crashing", ctx do
       server =
         start_server(ctx, read_at_fun: fn _path, _offset, _length -> raise "device exploded" end)

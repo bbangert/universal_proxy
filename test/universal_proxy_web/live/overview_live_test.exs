@@ -504,12 +504,23 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
       refute html =~ "data may be corrupt"
     end
 
-    test "an adopted mount with no verdict falls back to the drive's sniff", %{conn: conn} do
+    test "an adopted mount with no verdict is not flagged", %{conn: conn} do
       # `Storage.Server` never sniffed an adopted mount, so it reports
-      # `dirty?: nil` — the drive's own partition sniff is what answers.
+      # `dirty?: nil`, and the dirty bit of a mounted volume can no longer
+      # be read — "not known" must not render as a corruption warning.
       {:ok, view, _html} = live(conn, "/")
 
-      push_storage(storage_state(drives: [drive(dirty?: true)], mount: mount(dirty?: nil)))
+      push_storage(storage_state(drives: [drive(dirty?: nil)], mount: mount(dirty?: nil)))
+
+      refute open_drawer(view) =~ "Not cleanly unmounted"
+    end
+
+    test "an unmounted drive is flagged from its own sniff", %{conn: conn} do
+      # Nothing is mounted, so the pre-mount sniff on the drive map is the
+      # only verdict there is — a drive that failed to mount still warns.
+      {:ok, view, _html} = live(conn, "/")
+
+      push_storage(storage_state(drives: [drive(dirty?: true)], mount: nil, capacity: nil))
 
       assert open_drawer(view) =~ "Not cleanly unmounted"
     end

@@ -178,22 +178,20 @@ defmodule UniversalProxyWeb.Components.Storage do
   @doc """
   Whether the filesystem on show was left dirty by an unclean unmount.
 
-  The live mount's own verdict wins when it has one; an adopted mount
-  carries `dirty?: nil` (`Storage.Server` never sniffed it), so the
-  drive's sniffed partitions answer instead — narrowed to the mounted
-  device when there is one, since only that filesystem is on show.
+  While something is mounted the mount's own verdict is the only one that
+  counts: `Storage.Server` reads the dirty bit before mounting and carries
+  that reading on the mount record, because the FAT/exFAT drivers hold the
+  bit set for the whole life of a writable mount. An adopted mount was
+  never sniffed and stays `nil` — not known, and not shown as dirty. With
+  nothing mounted, the drive's own sniffed partitions answer.
   """
   @spec fs_dirty?(map() | nil, map()) :: boolean()
-  def fs_dirty?(mount, drive) do
-    case mount && Map.get(mount, :dirty?) do
-      dirty when is_boolean(dirty) -> dirty
-      _unknown -> sniffed_dirty?(drive, mount && Map.get(mount, :device))
-    end
-  end
+  def fs_dirty?(mount, _drive) when is_map(mount), do: Map.get(mount, :dirty?) == true
+  def fs_dirty?(_mount, drive), do: sniffed_dirty?(drive)
 
-  defp sniffed_dirty?(drive, device) do
+  defp sniffed_dirty?(drive) do
     [drive | drive |> Map.get(:partitions, []) |> List.wrap()]
-    |> Enum.filter(&(is_map(&1) and (is_nil(device) or Map.get(&1, :dev_path) == device)))
+    |> Enum.filter(&is_map/1)
     |> Enum.any?(&(Map.get(&1, :dirty?) == true))
   end
 

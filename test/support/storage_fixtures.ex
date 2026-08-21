@@ -196,6 +196,8 @@ defmodule UniversalProxy.StorageFixtures do
   # outside the 4 KiB head, which is the case the second read exists for.
   @fat32_bps 512
   @fat32_reserved 32
+  @fat32_num_fats 2
+  @fat32_fat_sectors 2_048
 
   # One reserved sector is what a real FAT16 volume has, which puts its
   # FAT[1] at 514 — inside the head, yet still read through the same seam.
@@ -205,24 +207,40 @@ defmodule UniversalProxy.StorageFixtures do
   @doc """
   A FAT32 volume image, long enough to hold FAT[1]. `dirty: true` clears
   bit 27 (`CLEAN_SHUT`) of FAT[1]; the default leaves it set.
+
+  `active_fat: n` sets BPB_ExtFlags bit 7 (mirroring off) and names copy
+  `n` as the active one. The `dirty:` flag then lands in copy `n` only,
+  leaving copy 0 with the clean value a mirroring-disabled volume goes on
+  reporting — the stale read this exists to catch. An `n` at or past
+  BPB_NumFATs is written through as-is, which is what an invalid volume
+  looks like; the flag stays in copy 0 there, since nothing should read
+  past it.
   """
   def fat32_image(opts \\ []) do
     entry = if Keyword.get(opts, :dirty, false), do: 0x07FFFFFF, else: 0x0FFFFFFF
     fat_start = @fat32_reserved * @fat32_bps
+    active = Keyword.get(opts, :active_fat)
+    ext_flags = if is_nil(active), do: 0x0000, else: Bitwise.bor(0x0080, active)
+    dirty_copy = if is_nil(active) or active >= @fat32_num_fats, do: 0, else: active
+    dirty_at = fat_start + dirty_copy * @fat32_fat_sectors * @fat32_bps + 4
 
-    image(fat_start + @fat32_bps, [
+    image(max(fat_start + @fat32_bps, dirty_at + 4), [
       {0x0B, <<@fat32_bps::little-16>>},
       {0x0D, <<8>>},
       {0x0E, <<@fat32_reserved::little-16>>},
-      {0x10, <<2>>},
+      {0x10, <<@fat32_num_fats>>},
       {0x11, <<0::little-16>>},
       {0x13, <<0::little-16>>},
       {0x16, <<0::little-16>>},
       {0x20, <<2_097_152::little-32>>},
-      {0x24, <<2_048::little-32>>},
+      {0x24, <<@fat32_fat_sectors::little-32>>},
+      {0x28, <<ext_flags::little-16>>},
       {510, <<0x55, 0xAA>>},
       {fat_start, <<0x0FFFFFF8::little-32>>},
-      {fat_start + 4, <<entry::little-32>>}
+      # Copy 0 first, so a mirrored volume's `dirty_at` patch overwrites it
+      # and a mirroring-disabled one leaves it clean.
+      {fat_start + 4, <<0x0FFFFFFF::little-32>>},
+      {dirty_at, <<entry::little-32>>}
     ])
   end
 

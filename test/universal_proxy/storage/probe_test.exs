@@ -343,6 +343,37 @@ defmodule UniversalProxy.Storage.ProbeTest do
     test "a head shorter than the BPB is :error" do
       assert Probe.fat_dirty_offset(<<1, 2, 3>>) == :error
     end
+
+    test "FAT32 with mirroring disabled points at the active copy, not copy 0" do
+      # BPB_ExtFlags bit 7 set, active FAT 1: the flag is a whole FAT copy
+      # (2048 sectors) further in.
+      assert Probe.fat_dirty_offset(Fixtures.fat32_bytes(active_fat: 1)) ==
+               {:ok, 32 * 512 + 2_048 * 512 + 4, 4}
+    end
+
+    test "mirroring disabled with copy 0 active reads copy 0" do
+      assert Probe.fat_dirty_offset(Fixtures.fat32_bytes(active_fat: 0)) ==
+               {:ok, 32 * 512 + 4, 4}
+    end
+
+    test "an active FAT index the volume does not have is :error" do
+      # BPB_NumFATs is 2, so copy 3 does not exist and the offset would
+      # land in the data region.
+      assert Probe.fat_dirty_offset(Fixtures.fat32_bytes(active_fat: 3)) == :error
+      assert Probe.dirty_probe(Fixtures.fat32_bytes(active_fat: 3)) == nil
+    end
+
+    test "FAT16 has no ExtFlags field, so bytes at offset 40 cannot shift it" do
+      # ExtFlags is FAT32-only: on FAT16 those two bytes are part of the
+      # boot code, and the FATs are mirrored unconditionally.
+      head = Fixtures.fat16_bytes()
+
+      poisoned =
+        binary_part(head, 0, 40) <>
+          <<0x0081::little-16>> <> binary_part(head, 42, byte_size(head) - 42)
+
+      assert Probe.fat_dirty_offset(poisoned) == {:ok, 1 * 512 + 2, 2}
+    end
   end
 
   describe "dirty?/2 + dirty_probe/1 + dirty_at?/3 for vfat" do
@@ -368,6 +399,18 @@ defmodule UniversalProxy.Storage.ProbeTest do
 
       assert {:read, offset, length} = Probe.dirty_probe(head)
       assert Probe.dirty_at?(:vfat, head, Fixtures.read_at(image, offset, length)) == true
+    end
+
+    test "FAT32, mirroring disabled: the dirty flag is read out of the active copy" do
+      # Copy 1 is dirty, copy 0 still holds the clean value it had when
+      # mirroring was switched off. Reading copy 0 would call it clean.
+      image = Fixtures.fat32_image(dirty: true, active_fat: 1)
+      head = Fixtures.head(image)
+
+      assert {:read, offset, length} = Probe.dirty_probe(head)
+      assert offset == 32 * 512 + 2_048 * 512 + 4
+      assert Probe.dirty_at?(:vfat, head, Fixtures.read_at(image, offset, length)) == true
+      assert Probe.dirty_at?(:vfat, head, Fixtures.read_at(image, 32 * 512 + 4, 4)) == false
     end
 
     test "FAT16 clean: bit 15 of FAT[1] set" do

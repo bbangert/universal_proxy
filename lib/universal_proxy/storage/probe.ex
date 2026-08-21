@@ -413,6 +413,13 @@ defmodule UniversalProxy.Storage.Probe do
   # Everything up to and including BPB_FATSz32 (offset 36, 4 bytes wide).
   @bpb_bytes 40
 
+  # BPB_ExtFlags, a FAT32-only u16 at offset 40. Bit 7 turns FAT
+  # mirroring off, and then only the copy named by bits 0-3 is
+  # maintained — every other copy keeps whatever it held when mirroring
+  # stopped. FAT16 has no such field: its FATs are always mirrored.
+  @fat32_no_mirror 0x0080
+  @fat32_active_fat 0x000F
+
   # The cluster-count thresholds are the FAT spec's own type determination
   # — nothing else distinguishes the three. FAT12 has no clean-shutdown
   # bit at all, and its 12-bit FAT[1] straddles a byte boundary, so
@@ -491,20 +498,41 @@ defmodule UniversalProxy.Storage.Probe do
   Where FAT[1]'s clean-shutdown flag sits on the volume `head` describes,
   as `{:ok, byte_offset, length}` (length 4 for FAT32, 2 for FAT16).
 
-  `:error` for an unparsable BPB and for FAT12, which has no such flag.
+  `:error` for an unparsable BPB, for FAT12 (which has no such flag), and
+  for a FAT32 volume whose BPB names an active FAT copy it does not have.
   """
   @spec fat_dirty_offset(binary()) :: {:ok, non_neg_integer(), 2 | 4} | :error
   def fat_dirty_offset(head) when is_binary(head) do
     with {:ok, bpb} <- parse_bpb(head) do
       fat_start = bpb.reserved_sectors * bpb.bytes_per_sector
 
-      # FAT[1] is the second entry of the first FAT, so its offset is one
-      # entry width past the FAT's start.
+      # FAT[1] is the second entry of a FAT, so its offset is one entry
+      # width past that FAT's start.
       case fat_kind(bpb) do
-        :fat32 -> {:ok, fat_start + 4, 4}
+        :fat32 -> fat32_dirty_offset(bpb, fat_start)
         :fat16 -> {:ok, fat_start + 2, 2}
         :fat12 -> :error
       end
+    end
+  end
+
+  # With mirroring on, copy 0 is authoritative. With it off, only the
+  # active copy is maintained and copy 0's FAT[1] may never have been
+  # updated since. A BPB too short to hold ExtFlags (no real FAT32 volume
+  # is) tells the two apart from nothing, so it gets no offset at all.
+  defp fat32_dirty_offset(%{ext_flags: nil}, _fat_start), do: :error
+
+  defp fat32_dirty_offset(bpb, fat_start) do
+    if band(bpb.ext_flags, @fat32_no_mirror) == 0 do
+      {:ok, fat_start + 4, 4}
+    else
+      active = band(bpb.ext_flags, @fat32_active_fat)
+
+      # `fat_size` is BPB_FATSz32 on any FAT32 volume: the 16-bit field is
+      # zero there, so `parse_bpb/1` took the 32-bit one.
+      if active < bpb.num_fats,
+        do: {:ok, fat_start + active * bpb.fat_size * bpb.bytes_per_sector + 4, 4},
+        else: :error
     end
   end
 
@@ -522,7 +550,7 @@ defmodule UniversalProxy.Storage.Probe do
     <<_jump_and_oem::binary-size(11), bytes_per_sector::little-16, sectors_per_cluster::8,
       reserved_sectors::little-16, num_fats::8, root_entries::little-16,
       total_sectors_16::little-16, _media::8, fat_size_16::little-16, _geometry::binary-size(8),
-      total_sectors_32::little-32, fat_size_32::little-32, _rest::binary>> = head
+      total_sectors_32::little-32, fat_size_32::little-32, rest::binary>> = head
 
     # A FAT32 BPB zeroes the 16-bit FAT-size and total-sector fields and
     # uses the 32-bit ones; a FAT16 BPB may use either total-sector field.
@@ -533,13 +561,17 @@ defmodule UniversalProxy.Storage.Probe do
       num_fats: num_fats,
       root_entries: root_entries,
       fat_size: if(fat_size_16 != 0, do: fat_size_16, else: fat_size_32),
-      total_sectors: if(total_sectors_16 != 0, do: total_sectors_16, else: total_sectors_32)
+      total_sectors: if(total_sectors_16 != 0, do: total_sectors_16, else: total_sectors_32),
+      ext_flags: ext_flags(rest)
     }
 
     if plausible_bpb?(bpb), do: {:ok, bpb}, else: :error
   end
 
   defp parse_bpb(_head), do: :error
+
+  defp ext_flags(<<flags::little-16, _rest::binary>>), do: flags
+  defp ext_flags(_too_short), do: nil
 
   defp plausible_bpb?(bpb) do
     bpb.bytes_per_sector in [512, 1024, 2048, 4096] and
