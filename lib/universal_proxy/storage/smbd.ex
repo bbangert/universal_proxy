@@ -33,9 +33,18 @@ defmodule UniversalProxy.Storage.Smbd do
   The SMB password is never passed in `argv` (visible to any process via
   `/proc/<pid>/cmdline`), never logged, and never embedded in a returned
   error term: `smbpasswd` output is scrubbed of the password before it
-  reaches an error tuple. Provisioning is skipped when
+  reaches an error tuple. By default, provisioning is skipped when
   `SHA-256(username <> ":" <> password)` matches the hash recorded after
-  the last successful run.
+  the last successful run — but that hash cannot be trusted across a hard
+  reboot: `passdb.tdb` lives on the same storage a firmware flash or power
+  loss can tear mid-write, which can lose or corrupt the account while the
+  recorded hash survives untouched. `UniversalProxy.Storage.Server` forces
+  provisioning (`force: true`) at every share start rather than trusting
+  the hash, because `smbpasswd -a` on an already-correct account is
+  idempotent and sub-second — cheap enough to always pay. The hash is
+  still written after every successful run regardless of `:force`; it
+  now serves only as a rotation marker and diagnostic, not a gate on
+  whether `smbpasswd` runs for a caller that forces.
   """
 
   require Logger
@@ -268,13 +277,19 @@ defmodule UniversalProxy.Storage.Smbd do
   Ensure the SMB account exists with `password`, feeding it to
   `smbpasswd -s -a` on stdin only.
 
-  Idempotent: `SHA-256(username <> ":" <> password)` is compared against
-  the hash recorded after the last successful run and the command is
-  skipped when they match (`{:ok, :unchanged}`).
+  Idempotent by default: `SHA-256(username <> ":" <> password)` is
+  compared against the hash recorded after the last successful run and
+  the command is skipped when they match (`{:ok, :unchanged}`). Pass
+  `force: true` to bypass that check and always run `smbpasswd` — see
+  the moduledoc for why `UniversalProxy.Storage.Server` does this on
+  every share start rather than trusting the hash. The hash is written
+  after a successful run either way.
 
   Options:
 
     * `:username` (default `"#{@default_username}"`).
+    * `:force` (default `false`) — skip the hash check and always run
+      `smbpasswd`.
     * `:conf` / `:data_dir` — config path passed as `-c`.
     * `:smbpasswd_paths` — binary candidates, first existing wins.
     * `:get_hash_fun` / `:put_hash_fun` — the persistence seam, arity 0/1
@@ -290,9 +305,10 @@ defmodule UniversalProxy.Storage.Smbd do
           {:ok, :provisioned | :unchanged} | {:error, term()}
   def provision_user(password, opts \\ []) when is_binary(password) do
     username = Keyword.get(opts, :username, @default_username)
+    force? = Keyword.get(opts, :force, false)
     hash = provision_hash(username, password)
 
-    if hash == recorded_hash(opts) do
+    if not force? and hash == recorded_hash(opts) do
       {:ok, :unchanged}
     else
       case run_smbpasswd(username, password, opts) do
