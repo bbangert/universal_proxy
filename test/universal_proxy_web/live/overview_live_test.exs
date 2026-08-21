@@ -866,8 +866,13 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
       assert html =~ "Share credentials are unavailable"
       refute html =~ "Username"
       refute html =~ "Regenerate password"
-      # The share's path is still shown: it is not a credential.
-      assert html =~ "Path"
+      # The share's Server/Share fields are still shown: they are not
+      # credentials.
+      assert html =~ "Server"
+      assert html =~ UniversalProxy.System.device_summary().hostname
+      assert html =~ "Share"
+      assert html =~ "usb_backup"
+      refute html =~ "\\\\"
     end
 
     test "eject needs a second confirmation, then says it's safe to unplug", %{conn: conn} do

@@ -18,7 +18,8 @@ defmodule UniversalProxyWeb.Components.Storage do
   import UniversalProxyWeb.Components.UI
 
   # The share name `Storage.Smbd` writes into smb.conf. Mirrored here for
-  # the UNC readout only; the daemon remains the source of truth.
+  # the drawer's "Share" readout only; the daemon remains the source of
+  # truth.
   @share_name "usb_backup"
 
   @root_folder "/"
@@ -174,10 +175,10 @@ defmodule UniversalProxyWeb.Components.Storage do
   def fs_badge(:unknown), do: %{label: "Unrecognised", variant: :neutral, journalled?: true}
   def fs_badge(_not_sniffed), do: %{label: "Not checked", variant: :neutral, journalled?: true}
 
-  @doc "The UNC path Home Assistant points at, from the advertised hostname."
-  @spec unc_path(String.t() | nil) :: String.t()
-  def unc_path(host) when is_binary(host) and host != "", do: "\\\\#{host}\\#{@share_name}"
-  def unc_path(_host), do: "\\\\universal-proxy\\#{@share_name}"
+  @doc "The hostname for HA's \"Server\" field, from the advertised hostname."
+  @spec server_host(String.t() | nil) :: String.t()
+  def server_host(host) when is_binary(host) and host != "", do: host
+  def server_host(_host), do: "universal-proxy"
 
   @doc "The folder mapping as shown to the user (`\"/\"` reads as the drive root)."
   @spec folder_label(String.t() | nil) :: String.t()
@@ -214,6 +215,8 @@ defmodule UniversalProxyWeb.Components.Storage do
       )
       |> assign(:fs, fs_badge((mount && mount.fs_type) || assigns.drive[:fs_type]))
       |> assign(:shared?, assigns.first? and assigns.storage.share == :running)
+      |> assign(:server_host, server_host(assigns.host))
+      |> assign(:share_name, @share_name)
 
     ~H"""
     <div class="fixed inset-0 z-[90] flex justify-end animate-fade">
@@ -324,7 +327,8 @@ defmodule UniversalProxyWeb.Components.Storage do
               </.button>
             </div>
 
-            <.copy_row id="storage-unc" label="Path" value={unc_path(@host)} />
+            <.copy_row id="storage-server" label="Server" value={@server_host} />
+            <.copy_row id="storage-share" label="Share" value={@share_name} />
 
             <%!-- No credentials to show: either the settings store can't be
                  reached or a generated password could not be persisted. The
