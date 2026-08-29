@@ -373,6 +373,26 @@ defmodule UniversalProxy.Storage.ServerTest do
     path
   end
 
+  # Stand-in for `/sys/bus/usb/drivers/usb-storage`: a real directory a
+  # test can point `:usb_driver_path` at and read back afterwards, since
+  # the server writes to it with plain `File.write/2`. `unbind` and `bind`
+  # start out holding `sentinel` so a test asserting "no write happened"
+  # has something concrete to check for.
+  defp driver_path!(sentinel \\ "unwritten") do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "storage_server_usb_driver_#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(path)
+    File.write!(Path.join(path, "unbind"), sentinel)
+    File.write!(Path.join(path, "bind"), sentinel)
+    on_exit(fn -> File.rm_rf(path) end)
+
+    path
+  end
+
   defp provision_hashes, do: for({:provision_hash, hash} <- Recorder.events(), do: hash)
 
   defp last_prepare_params do
@@ -933,6 +953,87 @@ defmodule UniversalProxy.Storage.ServerTest do
 
       assert :ok = Server.format(server, nil, "usb_backup")
       assert {:format, "/dev/sda1", "usb_backup", true} in Recorder.events()
+    end
+  end
+
+  describe "software replug after a whole-disk format" do
+    test "a successful whole-disk format unbinds then rebinds the drive's interface", ctx do
+      driver_path = driver_path!()
+
+      server =
+        start_server(ctx, usb_driver_path: driver_path, replug_sleep_ms: 0)
+
+      # Garbage bytes everywhere: nothing recognised, so the target is the
+      # whole disk (see "a drive with no recognised filesystem is
+      # formatted as a whole disk" above).
+      present!(StorageFixtures.garbage_bytes())
+      :ok = Server.check_now(server)
+      assert Server.get_state(server).mount == nil
+
+      assert :ok = Server.format(server, @drive_key, "usb_backup")
+
+      assert {:format, "/dev/sda", "usb_backup", true} in Recorder.events()
+      assert File.read!(Path.join(driver_path, "unbind")) == "1-1.3:1.0"
+      assert File.read!(Path.join(driver_path, "bind")) == "1-1.3:1.0"
+    end
+
+    test "a partition-target format never touches the driver's unbind/bind files", ctx do
+      driver_path = driver_path!("sentinel")
+
+      server =
+        start_server(ctx, usb_driver_path: driver_path, replug_sleep_ms: 0)
+
+      present!()
+      :ok = Server.check_now(server)
+      assert Server.get_state(server).mount.device == "/dev/sda1"
+
+      assert :ok = Server.format(server, @drive_key, "usb_backup")
+
+      assert {:format, "/dev/sda1", "usb_backup", true} in Recorder.events()
+      assert File.read!(Path.join(driver_path, "unbind")) == "sentinel"
+      assert File.read!(Path.join(driver_path, "bind")) == "sentinel"
+    end
+
+    test "a write failure is logged as a warning and the format still succeeds", ctx do
+      driver_path = driver_path!("sentinel")
+      # A directory, not a file, at "unbind": `File.write/2` against it
+      # fails (`:eisdir`) without any real sysfs involved.
+      File.rm!(Path.join(driver_path, "unbind"))
+      File.mkdir!(Path.join(driver_path, "unbind"))
+
+      server =
+        start_server(ctx, usb_driver_path: driver_path, replug_sleep_ms: 0)
+
+      present!(StorageFixtures.garbage_bytes())
+      :ok = Server.check_now(server)
+
+      log = capture_log(fn -> assert :ok = Server.format(server, @drive_key, "usb_backup") end)
+
+      assert log =~ "unbind of 1-1.3:1.0 failed"
+      # The bind write never even runs behind a failed unbind.
+      assert File.read!(Path.join(driver_path, "bind")) == "sentinel"
+    end
+
+    test "a drive with no derivable bus path is skipped", ctx do
+      driver_path = driver_path!("sentinel")
+
+      server =
+        start_server(ctx, usb_driver_path: driver_path, replug_sleep_ms: 0)
+
+      # No partitions and an unrecognised whole-disk fs: nothing to mount,
+      # and (unlike the earlier nil-key format test) nothing recognised at
+      # all, so `format_target/2` still resolves to the whole disk.
+      Recorder.put(:drives, [drive(slot_sub: nil, partitions: [])])
+      Recorder.put(:heads, %{"/dev/sda" => StorageFixtures.garbage_bytes()})
+      :ok = Server.check_now(server)
+      assert Server.get_state(server).mount == nil
+
+      log = capture_log(fn -> assert :ok = Server.format(server, nil, "usb_backup") end)
+
+      assert {:format, "/dev/sda", "usb_backup", true} in Recorder.events()
+      assert log =~ "no USB bus path"
+      assert File.read!(Path.join(driver_path, "unbind")) == "sentinel"
+      assert File.read!(Path.join(driver_path, "bind")) == "sentinel"
     end
   end
 

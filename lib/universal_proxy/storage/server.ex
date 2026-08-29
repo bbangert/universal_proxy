@@ -167,6 +167,45 @@ defmodule UniversalProxy.Storage.Server do
       `do_unmount/1` directly and falls straight to lazy on the first
       failure.
 
+  ## Software replug after a whole-disk format
+
+  `format/3` sometimes points `mkfs.ext4` at the **whole disk**
+  (`format_target/2`'s fallback, when no partition carries a recognised
+  filesystem) rather than a partition. The image ships no
+  `blockdev`/BLKRRPART tooling and no udev (`Storage.Probe`'s moduledoc),
+  so nothing ever tells the kernel to re-read the partition table after
+  `mkfs.ext4` overwrites the whole disk with a brand new superblock: the
+  block layer keeps advertising whatever partitions it enumerated at
+  attach time — a phantom `sda1` with `fs_type: :unknown`, pre-format,
+  now stale — and `target/1` can never find the fresh filesystem to
+  mount. Left alone, that phantom blocks mounting (and the share toggle
+  never appears) until someone physically unplugs and replugs the drive.
+
+  A **software** replug gets the same result without hands on the
+  device: writing the drive's usb-storage interface id to
+  `.../unbind` then, after a brief pause, back to `.../bind` forces the
+  kernel to tear the device down and re-enumerate it from scratch, which
+  is exactly the trick `hci_uart_bcm`'s serdev unbind/rebind uses to
+  clear a wedged Bluetooth UART (see CLAUDE.md's process-design
+  conventions) — same mechanism, a different bus. It only ever follows a
+  **successful whole-disk** format; a partition-target format leaves the
+  table untouched, so there is nothing stale to clear.
+
+  The write is synchronous (`format/3` already blocks the server for the
+  whole `mkfs.ext4`), but the re-enumeration it triggers is not: this
+  only produces the uevent, and the debounced convergence
+  `handle_info(%PropertyTable.Event{...})` already schedules is what
+  mounts the fresh filesystem once the kernel republishes it — on the
+  same path a physical replug would take. `format/3`'s reply therefore
+  never waits on the remount.
+
+  A drive with no derivable `slot_sub` has no interface id to write, and
+  a missing driver directory or a failed write means this image's sysfs
+  doesn't support the trick at all (or the drive left before the write
+  landed): both are logged as a warning and skipped rather than raised —
+  the fallback in every case is the same physical replug this was meant
+  to avoid, never a crash mid-format.
+
   ## Adopting a mount this process did not make
 
   The kernel's mount table outlives this process: the `:one_for_all`
@@ -306,6 +345,14 @@ defmodule UniversalProxy.Storage.Server do
       (defaults `#{6}`, `#{500}` ms — about 3 s, tuned to cover an
       `smbd` child's teardown window). A test shrinks the delay rather
       than the count so the bounded-attempts assertion stays meaningful.
+    * `:usb_driver_path` — the usb-storage driver directory whose
+      `unbind`/`bind` files the post-whole-disk-format software replug
+      writes to (default `#{"/sys/bus/usb/drivers/usb-storage"}`). A test
+      points this at a directory of its own so it can read back what was
+      written without a real sysfs.
+    * `:replug_sleep_ms` — the pause between the unbind and bind write
+      (default `#{500}` ms). A test shrinks this instead of skipping it,
+      same as `:umount_retry_ms`.
     * `:subscribe_uevents?` — `false` skips the uevent subscription so the
       poll fallback is exercised. Needed because `nerves_uevent` (a
       `nerves_runtime` dependency) *does* start its PropertyTable on the
@@ -352,6 +399,15 @@ defmodule UniversalProxy.Storage.Server do
   # busy filesystem (a client mid-transfer) into a long hang.
   @umount_retries 6
   @umount_retry_ms 500
+
+  # Where the usb-storage driver's `unbind`/`bind` files live (see
+  # "Software replug after a whole-disk format" below).
+  @default_usb_driver_path "/sys/bus/usb/drivers/usb-storage"
+
+  # HW-tuned: long enough for the kernel to tear the device down and drop
+  # the stale partition table before it is asked to probe the interface
+  # again, short enough not to matter next to a multi-minute `mkfs.ext4`.
+  @replug_sleep_ms 500
 
   # Superblock magics all live inside the first 4 KiB (Probe.fs_type/1).
   @head_bytes 4096
@@ -424,6 +480,8 @@ defmodule UniversalProxy.Storage.Server do
             capacity_interval: @capacity_interval,
             umount_retries: @umount_retries,
             umount_retry_ms: @umount_retry_ms,
+            usb_driver_path: @default_usb_driver_path,
+            replug_sleep_ms: @replug_sleep_ms,
             subscribe_uevents?: true,
             auto?: true,
             hotplug_pending: false,
@@ -648,6 +706,8 @@ defmodule UniversalProxy.Storage.Server do
       capacity_interval: Keyword.get(opts, :capacity_interval, @capacity_interval),
       umount_retries: Keyword.get(opts, :umount_retries, @umount_retries),
       umount_retry_ms: Keyword.get(opts, :umount_retry_ms, @umount_retry_ms),
+      usb_driver_path: Keyword.get(opts, :usb_driver_path, @default_usb_driver_path),
+      replug_sleep_ms: Keyword.get(opts, :replug_sleep_ms, @replug_sleep_ms),
       subscribe_uevents?: Keyword.get(opts, :subscribe_uevents?, true),
       auto?: Keyword.get(opts, :start_timer, true)
     }
@@ -745,7 +805,7 @@ defmodule UniversalProxy.Storage.Server do
 
   def handle_call({:format, key, label}, _from, state) do
     case format_target(state, key) do
-      {:ok, device} ->
+      {:ok, drive, device, whole_disk?} ->
         # A drive with no mount at all is legitimate here (unknown
         # filesystem, or already ejected) — only a live mount has to come
         # down first. The target is resolved before the unmount, while the
@@ -758,6 +818,15 @@ defmodule UniversalProxy.Storage.Server do
         case unmount_result do
           :ok ->
             result = format_device(state, device, label)
+
+            # Only a whole-disk mkfs leaves a stale partition table behind
+            # (see the moduledoc): a partition-target format never touches
+            # the table, so there is nothing for the replug to clear.
+            state =
+              if result == :ok and whole_disk?,
+                do: software_replug(state, drive),
+                else: state
+
             # An explicit format overrides an earlier eject: the user asked
             # for this drive to be prepared, so convergence must mount it
             # again.
@@ -1384,9 +1453,16 @@ defmodule UniversalProxy.Storage.Server do
   # whole disk — an unpartitioned superfloppy, or a stick whose partitions
   # are all unrecognised, both of which the user formats to make usable.
   # Only the active drive is ever mounted, so only its key is accepted.
+  #
+  # The drive and the whole-disk verdict travel back alongside the device:
+  # `handle_call({:format, ...})` needs the drive's `slot_sub` for the
+  # post-format software replug (see the moduledoc), and only when the
+  # resolved device *is* the drive's own `dev_path` rather than one of its
+  # partitions — the one case that just rewrote the partition table.
   defp format_target(state, key) do
     with {:ok, drive} <- first_drive(state, key) do
-      {:ok, format_device_path(state, drive)}
+      device = format_device_path(state, drive)
+      {:ok, drive, device, device == drive.dev_path}
     end
   end
 
@@ -1432,6 +1508,77 @@ defmodule UniversalProxy.Storage.Server do
         Logger.error("Storage: format of #{device} failed: #{inspect(error)}")
         error
     end
+  end
+
+  # -- Software replug (see the moduledoc) --
+
+  # Unbind then rebind the drive's usb-storage interface so the kernel
+  # re-enumerates it and drops the partition table it kept advertising
+  # from before the format. Only reached after a *successful* whole-disk
+  # format (the caller's guard), and only when the drive's bus path is
+  # known — a drive with no `slot_sub` has no interface id to write, which
+  # is exactly the drive `Storage.Settings` can never key anyway.
+  defp software_replug(state, %{slot_sub: slot_sub}) when is_binary(slot_sub) do
+    driver_path = state.usb_driver_path
+    iface_id = slot_sub <> ":1.0"
+
+    if File.dir?(driver_path) do
+      do_software_replug(state, driver_path, iface_id)
+    else
+      Logger.warning(
+        "Storage: #{driver_path} not found; cannot software-replug #{iface_id} after " <>
+          "whole-disk format (a physical replug is needed to mount the fresh filesystem)"
+      )
+    end
+
+    state
+  end
+
+  defp software_replug(state, _drive) do
+    Logger.warning(
+      "Storage: formatted drive has no USB bus path; cannot software-replug it " <>
+        "(a physical replug is needed to mount the fresh filesystem)"
+    )
+
+    state
+  end
+
+  defp do_software_replug(state, driver_path, iface_id) do
+    case write_driver_file(driver_path, "unbind", iface_id) do
+      :ok ->
+        # Synchronous: `format/3` already blocks the server for the whole
+        # `mkfs.ext4`, and the kernel needs a moment to tear the device
+        # down before it can be asked to probe it again. What happens
+        # after the bind write — the re-enumeration itself — is not
+        # waited on here: it lands as a uevent the debounced convergence
+        # picks up on its own (see the moduledoc).
+        Process.sleep(state.replug_sleep_ms)
+
+        case write_driver_file(driver_path, "bind", iface_id) do
+          :ok ->
+            Logger.info("Storage: software-replugged #{iface_id} after whole-disk format")
+
+          {:error, reason} ->
+            Logger.warning(
+              "Storage: rebind of #{iface_id} failed (#{inspect(reason)}) after whole-disk " <>
+                "format (a physical replug is needed to mount the fresh filesystem)"
+            )
+        end
+
+      {:error, reason} ->
+        Logger.warning(
+          "Storage: unbind of #{iface_id} failed (#{inspect(reason)}) after whole-disk " <>
+            "format (a physical replug is needed to mount the fresh filesystem)"
+        )
+    end
+  end
+
+  defp write_driver_file(driver_path, file, content) do
+    safe(
+      fn -> File.write(Path.join(driver_path, file), content) end,
+      {:error, :write_crashed},
+      "software replug write"
+    )
   end
 
   defp refresh_capacity(state) do
