@@ -44,6 +44,19 @@ defmodule UniversalProxy.StorageFixtures do
   `serial` attribute the device node publishes beside its ids. Pass
   `serial: nil` for a stick that publishes none (cheap clones), which
   writes no `serial` file at all.
+
+  `:interface_suffix` (default `"1.0"`) is the config/interface part of
+  the interface segment written after `slot_sub` (`"<slot_sub>:<suffix>"`)
+  — a composite device's mass-storage function is not always `:1.0`, so a
+  test can put it at e.g. `"2.1"` to exercise that.
+
+  `:driver` (default `"usb-storage"`) is the name a `driver` symlink is
+  written under the interface directory, standing in for the kernel's own
+  `.../driver -> ../../../../../bus/usb/drivers/<name>` link (only the
+  basename is meaningful, so the fixture's relative depth need not match a
+  real kernel's exactly). Pass `driver: "uas"` for a USB-3 UAS enclosure,
+  or `driver: nil` to leave the interface with no `driver` link at all —
+  standing in for a driver that failed to bind.
   """
   def put_usb_disk!(sys_root, name, opts \\ []) do
     sectors = Keyword.get(opts, :sectors, 20_971_520)
@@ -51,6 +64,8 @@ defmodule UniversalProxy.StorageFixtures do
     vendor_id = Keyword.get(opts, :vendor_id, 0x0BDA)
     product_id = Keyword.get(opts, :product_id, 0x0316)
     serial = Keyword.get(opts, :serial, "0123456789ABCDEF")
+    interface_suffix = Keyword.get(opts, :interface_suffix, "1.0")
+    driver = Keyword.get(opts, :driver, "usb-storage")
 
     # The USB device node: idVendor/idProduct/serial live here, above the
     # bound interface, which is why Probe walks the resolved ancestry.
@@ -64,7 +79,18 @@ defmodule UniversalProxy.StorageFixtures do
     # catch.
     if serial, do: File.write!(Path.join(usb_dir, "serial"), "#{serial}\n")
 
-    scsi_path = usb_path ++ ["#{slot_sub}:1.0", "host0", "target0:0:0", "0:0:0:0"]
+    interface_name = "#{slot_sub}:#{interface_suffix}"
+    iface_dir = Path.join(usb_dir, interface_name)
+    File.mkdir_p!(iface_dir)
+
+    if driver do
+      File.ln_s!(
+        Path.join(["..", "..", "..", "..", "..", "bus", "usb", "drivers", driver]),
+        Path.join(iface_dir, "driver")
+      )
+    end
+
+    scsi_path = usb_path ++ [interface_name, "host0", "target0:0:0", "0:0:0:0"]
     put_disk!(sys_root, name, scsi_path, sectors)
   end
 

@@ -100,6 +100,8 @@ defmodule UniversalProxy.Storage.Probe do
           vendor_id: non_neg_integer(),
           product_id: non_neg_integer(),
           serial: String.t() | nil,
+          usb_interface: String.t() | nil,
+          usb_driver: String.t() | nil,
           partitions: [partition_info()]
         }
 
@@ -140,7 +142,7 @@ defmodule UniversalProxy.Storage.Probe do
       nil ->
         []
 
-      {slot_sub, vendor_id, product_id, serial} ->
+      {slot_sub, vendor_id, product_id, serial, usb_interface, usb_driver} ->
         disk_dir = Path.join(sys_root, name)
 
         [
@@ -152,6 +154,8 @@ defmodule UniversalProxy.Storage.Probe do
             vendor_id: vendor_id,
             product_id: product_id,
             serial: serial,
+            usb_interface: usb_interface,
+            usb_driver: usb_driver,
             partitions: list_partitions(sys_root, name)
           }
         ]
@@ -217,7 +221,7 @@ defmodule UniversalProxy.Storage.Probe do
     end
   end
 
-  # -- USB ancestry (slot_sub + vendor/product id + serial) --
+  # -- USB ancestry (slot_sub + vendor/product id + serial + interface/driver) --
 
   # A USB-backed disk's `device` symlink resolves through the bound USB
   # interface (see `Audio.Enumerate.read_usb_port/2`) and down into the
@@ -226,6 +230,11 @@ defmodule UniversalProxy.Storage.Probe do
   # the bus path and the attributes come from the **resolved** device
   # directory's own ancestry. A disk with no USB ancestry at all (internal
   # SD/eMMC/SATA/PCIe) never finds an `idVendor` and is excluded.
+  #
+  # The interface segment ("1-1.3:1.0") is a bus path *and* a config/
+  # interface number: a composite device's mass-storage function is not
+  # always `:1.0` (config 2, interface 1 -> "…:2.1"), so the whole segment
+  # is captured rather than reconstructed from the bus alone.
   @usb_iface_re ~r/^(\d+-[\d.]+):\d+\.\d+$/
 
   defp usb_ancestry(sys_root, name) do
@@ -233,7 +242,8 @@ defmodule UniversalProxy.Storage.Probe do
          {vendor_id, product_id, serial}
          when is_integer(vendor_id) and is_integer(product_id) <-
            find_usb_attrs(device_dir) do
-      {usb_bus_path(device_dir), vendor_id, product_id, serial}
+      {bus, usb_interface, usb_driver} = usb_interface_info(device_dir) || {nil, nil, nil}
+      {bus, vendor_id, product_id, serial, usb_interface, usb_driver}
     else
       _ -> nil
     end
@@ -328,22 +338,50 @@ defmodule UniversalProxy.Storage.Probe do
     end
   end
 
-  # The physical USB bus path ("1-1.3"), read from the resolved device
-  # directory's path components — same technique as
+  # The physical USB bus path ("1-1.3"), the interface segment itself
+  # ("1-1.3:1.0") and the driver bound to that interface, all read from the
+  # resolved device directory's path components — same technique as
   # `Audio.Enumerate.usb_bus_path/1`, applied to the resolved path because
   # the raw `device` target (`../../../0:0:0:0`) holds no USB segment.
-  # `nil` when no interface segment is present (shouldn't happen once
-  # `find_ids/1` has already succeeded, but this is independent string
-  # parsing so it degrades gracefully rather than crashing).
-  defp usb_bus_path(device_dir) do
-    device_dir
-    |> String.split("/")
-    |> Enum.find_value(fn seg ->
+  #
+  # The interface segment matters beyond the bus path: `Storage.Server`'s
+  # software replug (see its moduledoc) unbinds/rebinds this exact
+  # interface, and a composite device's mass-storage function is not
+  # necessarily `:1.0` (a card reader combo can be `:1.1`, `:2.1`, …), so
+  # the segment has to be captured verbatim rather than synthesised from
+  # `slot_sub`. The driver bound to it also varies: a USB-3 UAS enclosure
+  # binds `uas`, not `usb-storage`, and the replug has to unbind/rebind
+  # through the driver that is actually attached.
+  #
+  # `nil` for each when no interface segment is present (shouldn't happen
+  # once `find_usb_attrs/1` has already succeeded, but this is independent
+  # string parsing so it degrades gracefully rather than crashing) or when
+  # the `driver` symlink under it is missing/unreadable.
+  defp usb_interface_info(device_dir) do
+    segments = String.split(device_dir, "/")
+
+    segments
+    |> Enum.with_index()
+    |> Enum.find_value(fn {seg, index} ->
       case Regex.run(@usb_iface_re, seg) do
-        [_, bus] -> bus
-        _ -> nil
+        [_, bus] ->
+          iface_dir = segments |> Enum.take(index + 1) |> Enum.join("/")
+          {bus, seg, read_driver_name(iface_dir)}
+
+        _ ->
+          nil
       end
     end)
+  end
+
+  # The interface's bound driver is the target of its own `driver` symlink
+  # (`… -> ../../../../../bus/usb/drivers/usb-storage`, or `.../uas`) — only
+  # the basename is meaningful, the depth of the relative path is not.
+  defp read_driver_name(iface_dir) do
+    case File.read_link(Path.join(iface_dir, "driver")) do
+      {:ok, target} -> Path.basename(target)
+      {:error, _reason} -> nil
+    end
   end
 
   # -- Filesystem type sniffing --

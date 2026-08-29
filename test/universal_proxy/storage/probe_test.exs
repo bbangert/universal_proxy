@@ -50,6 +50,8 @@ defmodule UniversalProxy.Storage.ProbeTest do
       # serial is a settings-key component, so a stray "\n" would key the
       # drive differently than a later trimmed read of the same stick.
       assert drive.serial == "AA00BB11CC22"
+      assert drive.usb_interface == "1-1.3:1.0"
+      assert drive.usb_driver == "usb-storage"
 
       assert drive.partitions == [
                %{
@@ -214,6 +216,61 @@ defmodule UniversalProxy.Storage.ProbeTest do
       end)
 
       assert Probe.list_drives() == []
+    end
+  end
+
+  describe "usb_interface/usb_driver discovery" do
+    @tag :tmp_dir
+    test "a usb-storage-bound interface reports the driver that is actually bound", %{
+      tmp_dir: tmp_dir
+    } do
+      sys_root = Path.join(tmp_dir, "sys")
+      File.mkdir_p!(sys_root)
+
+      Fixtures.put_usb_disk!(sys_root, "sda", slot_sub: "1-1.3", driver: "usb-storage")
+
+      assert [%{usb_interface: "1-1.3:1.0", usb_driver: "usb-storage"}] =
+               Probe.list_drives(sys_root: sys_root)
+    end
+
+    @tag :tmp_dir
+    test "a USB-3 UAS enclosure reports the uas driver, not usb-storage", %{tmp_dir: tmp_dir} do
+      sys_root = Path.join(tmp_dir, "sys")
+      File.mkdir_p!(sys_root)
+
+      Fixtures.put_usb_disk!(sys_root, "sda", slot_sub: "1-1.3", driver: "uas")
+
+      assert [%{usb_interface: "1-1.3:1.0", usb_driver: "uas"}] =
+               Probe.list_drives(sys_root: sys_root)
+    end
+
+    @tag :tmp_dir
+    test "a composite device's mass-storage interface is captured verbatim, not synthesised", %{
+      tmp_dir: tmp_dir
+    } do
+      sys_root = Path.join(tmp_dir, "sys")
+      File.mkdir_p!(sys_root)
+
+      # A card-reader/storage combo whose mass-storage function sits at
+      # config 2, interface 1 — `slot_sub <> ":1.0"` would name the wrong
+      # interface entirely for a device shaped like this.
+      Fixtures.put_usb_disk!(sys_root, "sda", slot_sub: "2-3", interface_suffix: "2.1")
+
+      assert [%{slot_sub: "2-3", usb_interface: "2-3:2.1"}] =
+               Probe.list_drives(sys_root: sys_root)
+    end
+
+    @tag :tmp_dir
+    test "an unreadable driver symlink reports usb_driver: nil, not a crash", %{
+      tmp_dir: tmp_dir
+    } do
+      sys_root = Path.join(tmp_dir, "sys")
+      File.mkdir_p!(sys_root)
+
+      Fixtures.put_usb_disk!(sys_root, "sda", slot_sub: "1-1.3", driver: nil)
+
+      assert [%{usb_interface: "1-1.3:1.0", usb_driver: nil}] =
+               Probe.list_drives(sys_root: sys_root)
     end
   end
 
