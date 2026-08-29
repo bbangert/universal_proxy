@@ -298,15 +298,25 @@ defmodule UniversalProxy.Storage.ServerTest do
 
   defp drive(opts \\ []) do
     name = Keyword.get(opts, :name, "sda")
+    slot_sub = Keyword.get(opts, :slot_sub, "1-1.3")
+
+    # `usb_interface`/`usb_driver` default to what a plain single-function
+    # usb-storage stick at `slot_sub` would report — a test overrides
+    # either (or sets them `nil`) to exercise a composite device's
+    # interface, a UAS enclosure's driver, or a discovery failure.
+    usb_interface = Keyword.get(opts, :usb_interface, slot_sub && slot_sub <> ":1.0")
+    usb_driver = Keyword.get(opts, :usb_driver, "usb-storage")
 
     %{
       name: name,
       dev_path: "/dev/#{name}",
       size_bytes: 8_000_000_000,
-      slot_sub: Keyword.get(opts, :slot_sub, "1-1.3"),
+      slot_sub: slot_sub,
       vendor_id: 0x0BDA,
       product_id: 0x0316,
       serial: Keyword.get(opts, :serial, @sda_serial),
+      usb_interface: usb_interface,
+      usb_driver: usb_driver,
       partitions:
         Keyword.get(opts, :partitions, [
           %{name: "sda1", dev_path: "/dev/sda1", size_bytes: 7_900_000_000}
@@ -373,22 +383,33 @@ defmodule UniversalProxy.Storage.ServerTest do
     path
   end
 
-  # Stand-in for `/sys/bus/usb/drivers/usb-storage`: a real directory a
-  # test can point `:usb_driver_path` at and read back afterwards, since
-  # the server writes to it with plain `File.write/2`. `unbind` and `bind`
-  # start out holding `sentinel` so a test asserting "no write happened"
-  # has something concrete to check for.
-  defp driver_path!(sentinel \\ "unwritten") do
+  # Stand-in for `/sys/bus/usb/drivers`: a real directory a test can point
+  # `:usb_drivers_root` at. `stage_driver!/3` creates one driver's own
+  # subdirectory under it (e.g. "usb-storage", "uas" — whatever
+  # `drive/1`'s `usb_driver` names) so the server's
+  # `Path.join(usb_drivers_root, drive.usb_driver)` resolves to something
+  # real, with `unbind`/`bind` files a test can read back afterwards since
+  # the server writes to them with plain `File.write/2`. Both files start
+  # out holding `sentinel` so a test asserting "no write happened" has
+  # something concrete to check for.
+  defp driver_root! do
     path =
       Path.join(
         System.tmp_dir!(),
-        "storage_server_usb_driver_#{System.unique_integer([:positive])}"
+        "storage_server_usb_drivers_#{System.unique_integer([:positive])}"
       )
 
     File.mkdir_p!(path)
+    on_exit(fn -> File.rm_rf(path) end)
+
+    path
+  end
+
+  defp stage_driver!(root, name, sentinel \\ "unwritten") do
+    path = Path.join(root, name)
+    File.mkdir_p!(path)
     File.write!(Path.join(path, "unbind"), sentinel)
     File.write!(Path.join(path, "bind"), sentinel)
-    on_exit(fn -> File.rm_rf(path) end)
 
     path
   end
@@ -958,10 +979,10 @@ defmodule UniversalProxy.Storage.ServerTest do
 
   describe "software replug after a whole-disk format" do
     test "a successful whole-disk format unbinds then rebinds the drive's interface", ctx do
-      driver_path = driver_path!()
+      root = driver_root!()
+      driver_path = stage_driver!(root, "usb-storage")
 
-      server =
-        start_server(ctx, usb_driver_path: driver_path, replug_sleep_ms: 0)
+      server = start_server(ctx, usb_drivers_root: root, replug_sleep_ms: 0)
 
       # Garbage bytes everywhere: nothing recognised, so the target is the
       # whole disk (see "a drive with no recognised filesystem is
@@ -977,11 +998,30 @@ defmodule UniversalProxy.Storage.ServerTest do
       assert File.read!(Path.join(driver_path, "bind")) == "1-1.3:1.0"
     end
 
-    test "a partition-target format never touches the driver's unbind/bind files", ctx do
-      driver_path = driver_path!("sentinel")
+    test "a USB-3 UAS enclosure is unbound/rebound through the uas driver, not usb-storage",
+         ctx do
+      root = driver_root!()
+      driver_path = stage_driver!(root, "uas")
 
-      server =
-        start_server(ctx, usb_driver_path: driver_path, replug_sleep_ms: 0)
+      server = start_server(ctx, usb_drivers_root: root, replug_sleep_ms: 0)
+
+      Recorder.put(:drives, [drive(usb_driver: "uas")])
+      Recorder.put(:heads, %{"/dev/sda1" => StorageFixtures.garbage_bytes()})
+      :ok = Server.check_now(server)
+      assert Server.get_state(server).mount == nil
+
+      assert :ok = Server.format(server, @drive_key, "usb_backup")
+
+      assert {:format, "/dev/sda", "usb_backup", true} in Recorder.events()
+      assert File.read!(Path.join(driver_path, "unbind")) == "1-1.3:1.0"
+      assert File.read!(Path.join(driver_path, "bind")) == "1-1.3:1.0"
+    end
+
+    test "a partition-target format never touches the driver's unbind/bind files", ctx do
+      root = driver_root!()
+      driver_path = stage_driver!(root, "usb-storage", "sentinel")
+
+      server = start_server(ctx, usb_drivers_root: root, replug_sleep_ms: 0)
 
       present!()
       :ok = Server.check_now(server)
@@ -995,14 +1035,14 @@ defmodule UniversalProxy.Storage.ServerTest do
     end
 
     test "a write failure is logged as a warning and the format still succeeds", ctx do
-      driver_path = driver_path!("sentinel")
+      root = driver_root!()
+      driver_path = stage_driver!(root, "usb-storage", "sentinel")
       # A directory, not a file, at "unbind": `File.write/2` against it
       # fails (`:eisdir`) without any real sysfs involved.
       File.rm!(Path.join(driver_path, "unbind"))
       File.mkdir!(Path.join(driver_path, "unbind"))
 
-      server =
-        start_server(ctx, usb_driver_path: driver_path, replug_sleep_ms: 0)
+      server = start_server(ctx, usb_drivers_root: root, replug_sleep_ms: 0)
 
       present!(StorageFixtures.garbage_bytes())
       :ok = Server.check_now(server)
@@ -1015,15 +1055,18 @@ defmodule UniversalProxy.Storage.ServerTest do
     end
 
     test "a drive with no derivable bus path is skipped", ctx do
-      driver_path = driver_path!("sentinel")
+      root = driver_root!()
+      driver_path = stage_driver!(root, "usb-storage", "sentinel")
 
-      server =
-        start_server(ctx, usb_driver_path: driver_path, replug_sleep_ms: 0)
+      server = start_server(ctx, usb_drivers_root: root, replug_sleep_ms: 0)
 
       # No partitions and an unrecognised whole-disk fs: nothing to mount,
       # and (unlike the earlier nil-key format test) nothing recognised at
       # all, so `format_target/2` still resolves to the whole disk.
-      Recorder.put(:drives, [drive(slot_sub: nil, partitions: [])])
+      Recorder.put(:drives, [
+        drive(slot_sub: nil, usb_interface: nil, usb_driver: nil, partitions: [])
+      ])
+
       Recorder.put(:heads, %{"/dev/sda" => StorageFixtures.garbage_bytes()})
       :ok = Server.check_now(server)
       assert Server.get_state(server).mount == nil
@@ -1032,6 +1075,29 @@ defmodule UniversalProxy.Storage.ServerTest do
 
       assert {:format, "/dev/sda", "usb_backup", true} in Recorder.events()
       assert log =~ "no USB bus path"
+      assert File.read!(Path.join(driver_path, "unbind")) == "sentinel"
+      assert File.read!(Path.join(driver_path, "bind")) == "sentinel"
+    end
+
+    test "a bus path with no discoverable interface/driver is skipped, not synthesised", ctx do
+      root = driver_root!()
+      driver_path = stage_driver!(root, "usb-storage", "sentinel")
+
+      server = start_server(ctx, usb_drivers_root: root, replug_sleep_ms: 0)
+
+      # `slot_sub` is known (an unreadable `driver` symlink, say), but
+      # `usb_interface`/`usb_driver` could not be discovered — there is
+      # nothing left to synthesise a target from, unlike the old
+      # `slot_sub <> ":1.0"` behaviour this replaces.
+      Recorder.put(:drives, [drive(usb_interface: nil, usb_driver: nil, partitions: [])])
+      Recorder.put(:heads, %{"/dev/sda" => StorageFixtures.garbage_bytes()})
+      :ok = Server.check_now(server)
+      assert Server.get_state(server).mount == nil
+
+      log = capture_log(fn -> assert :ok = Server.format(server, @drive_key, "usb_backup") end)
+
+      assert {:format, "/dev/sda", "usb_backup", true} in Recorder.events()
+      assert log =~ "interface/driver could not be discovered"
       assert File.read!(Path.join(driver_path, "unbind")) == "sentinel"
       assert File.read!(Path.join(driver_path, "bind")) == "sentinel"
     end

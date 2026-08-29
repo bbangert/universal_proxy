@@ -182,14 +182,26 @@ defmodule UniversalProxy.Storage.Server do
   never appears) until someone physically unplugs and replugs the drive.
 
   A **software** replug gets the same result without hands on the
-  device: writing the drive's usb-storage interface id to
-  `.../unbind` then, after a brief pause, back to `.../bind` forces the
-  kernel to tear the device down and re-enumerate it from scratch, which
-  is exactly the trick `hci_uart_bcm`'s serdev unbind/rebind uses to
-  clear a wedged Bluetooth UART (see CLAUDE.md's process-design
-  conventions) — same mechanism, a different bus. It only ever follows a
-  **successful whole-disk** format; a partition-target format leaves the
-  table untouched, so there is nothing stale to clear.
+  device: writing the drive's interface id to `<driver>/unbind` then,
+  after a brief pause, back to `<driver>/bind` forces the kernel to tear
+  the device down and re-enumerate it from scratch, which is exactly the
+  trick `hci_uart_bcm`'s serdev unbind/rebind uses to clear a wedged
+  Bluetooth UART (see CLAUDE.md's process-design conventions) — same
+  mechanism, a different bus. It only ever follows a **successful
+  whole-disk** format; a partition-target format leaves the table
+  untouched, so there is nothing stale to clear.
+
+  Both the interface id and the driver are **discovered**, not
+  synthesised: `slot_sub <> ":1.0"` is wrong for a composite device whose
+  mass-storage function sits at a different interface number (`:1.1`,
+  `:2.1`, …), and a hardcoded `usb-storage` driver directory is wrong for
+  a USB-3 UAS enclosure, which binds `uas` instead. `Storage.Probe`
+  resolves the same USB ancestry walk it already does for `slot_sub`/
+  `idVendor`/`idProduct` one step further, down to the bound interface's
+  own directory, and reads its `driver` symlink — so `drive.usb_interface`
+  and `drive.usb_driver` name exactly the files this replug has to touch,
+  and `usb_drivers_root` (the test seam) only ever supplies the sysfs
+  root the discovered driver name is joined onto.
 
   The write is synchronous (`format/3` already blocks the server for the
   whole `mkfs.ext4`), but the re-enumeration it triggers is not: this
@@ -199,12 +211,13 @@ defmodule UniversalProxy.Storage.Server do
   same path a physical replug would take. `format/3`'s reply therefore
   never waits on the remount.
 
-  A drive with no derivable `slot_sub` has no interface id to write, and
-  a missing driver directory or a failed write means this image's sysfs
-  doesn't support the trick at all (or the drive left before the write
-  landed): both are logged as a warning and skipped rather than raised —
-  the fallback in every case is the same physical replug this was meant
-  to avoid, never a crash mid-format.
+  A drive with no derivable `slot_sub`, no `usb_interface`, or no
+  `usb_driver` has nothing this replug can safely target, and a failed
+  write means this image's sysfs doesn't support the trick at all (or the
+  drive left before the write landed): every one of those is logged as a
+  warning and skipped rather than raised — the fallback in every case is
+  the same physical replug this was meant to avoid, never a crash
+  mid-format.
 
   ## Adopting a mount this process did not make
 
@@ -345,11 +358,13 @@ defmodule UniversalProxy.Storage.Server do
       (defaults `#{6}`, `#{500}` ms — about 3 s, tuned to cover an
       `smbd` child's teardown window). A test shrinks the delay rather
       than the count so the bounded-attempts assertion stays meaningful.
-    * `:usb_driver_path` — the usb-storage driver directory whose
-      `unbind`/`bind` files the post-whole-disk-format software replug
-      writes to (default `#{"/sys/bus/usb/drivers/usb-storage"}`). A test
-      points this at a directory of its own so it can read back what was
-      written without a real sysfs.
+    * `:usb_drivers_root` — the sysfs drivers root the post-whole-disk-
+      format software replug joins with the drive's own **discovered**
+      driver name (`drive.usb_driver` — `"usb-storage"` or `"uas"`,
+      whichever `Probe` found actually bound to the interface) to reach
+      the `unbind`/`bind` files it writes to (default
+      `#{"/sys/bus/usb/drivers"}`). A test points this at a directory of
+      its own so it can read back what was written without a real sysfs.
     * `:replug_sleep_ms` — the pause between the unbind and bind write
       (default `#{500}` ms). A test shrinks this instead of skipping it,
       same as `:umount_retry_ms`.
@@ -400,9 +415,10 @@ defmodule UniversalProxy.Storage.Server do
   @umount_retries 6
   @umount_retry_ms 500
 
-  # Where the usb-storage driver's `unbind`/`bind` files live (see
-  # "Software replug after a whole-disk format" below).
-  @default_usb_driver_path "/sys/bus/usb/drivers/usb-storage"
+  # The sysfs drivers root the discovered driver name (`drive.usb_driver`)
+  # is joined onto to reach the `unbind`/`bind` files (see "Software
+  # replug after a whole-disk format" below).
+  @default_usb_drivers_root "/sys/bus/usb/drivers"
 
   # HW-tuned: long enough for the kernel to tear the device down and drop
   # the stale partition table before it is asked to probe the interface
@@ -480,7 +496,7 @@ defmodule UniversalProxy.Storage.Server do
             capacity_interval: @capacity_interval,
             umount_retries: @umount_retries,
             umount_retry_ms: @umount_retry_ms,
-            usb_driver_path: @default_usb_driver_path,
+            usb_drivers_root: @default_usb_drivers_root,
             replug_sleep_ms: @replug_sleep_ms,
             subscribe_uevents?: true,
             auto?: true,
@@ -706,7 +722,7 @@ defmodule UniversalProxy.Storage.Server do
       capacity_interval: Keyword.get(opts, :capacity_interval, @capacity_interval),
       umount_retries: Keyword.get(opts, :umount_retries, @umount_retries),
       umount_retry_ms: Keyword.get(opts, :umount_retry_ms, @umount_retry_ms),
-      usb_driver_path: Keyword.get(opts, :usb_driver_path, @default_usb_driver_path),
+      usb_drivers_root: Keyword.get(opts, :usb_drivers_root, @default_usb_drivers_root),
       replug_sleep_ms: Keyword.get(opts, :replug_sleep_ms, @replug_sleep_ms),
       subscribe_uevents?: Keyword.get(opts, :subscribe_uevents?, true),
       auto?: Keyword.get(opts, :start_timer, true)
@@ -1512,24 +1528,43 @@ defmodule UniversalProxy.Storage.Server do
 
   # -- Software replug (see the moduledoc) --
 
-  # Unbind then rebind the drive's usb-storage interface so the kernel
-  # re-enumerates it and drops the partition table it kept advertising
-  # from before the format. Only reached after a *successful* whole-disk
-  # format (the caller's guard), and only when the drive's bus path is
-  # known — a drive with no `slot_sub` has no interface id to write, which
-  # is exactly the drive `Storage.Settings` can never key anyway.
-  defp software_replug(state, %{slot_sub: slot_sub}) when is_binary(slot_sub) do
-    driver_path = state.usb_driver_path
-    iface_id = slot_sub <> ":1.0"
+  # Unbind then rebind the drive's own USB interface, through the driver
+  # `Storage.Probe` found actually bound to it, so the kernel re-enumerates
+  # the device and drops the partition table it kept advertising from
+  # before the format. Only reached after a *successful* whole-disk format
+  # (the caller's guard), and only when the interface id and its driver
+  # were both discoverable — neither is synthesised from `slot_sub`: a
+  # composite device's mass-storage function is not always interface
+  # `:1.0`, and a USB-3 UAS enclosure binds `uas`, not `usb-storage`.
+  defp software_replug(
+         state,
+         %{slot_sub: slot_sub, usb_interface: usb_interface, usb_driver: usb_driver}
+       )
+       when is_binary(slot_sub) and is_binary(usb_interface) and is_binary(usb_driver) do
+    driver_path = Path.join(state.usb_drivers_root, usb_driver)
 
     if File.dir?(driver_path) do
-      do_software_replug(state, driver_path, iface_id)
+      do_software_replug(state, driver_path, usb_interface)
     else
       Logger.warning(
-        "Storage: #{driver_path} not found; cannot software-replug #{iface_id} after " <>
+        "Storage: #{driver_path} not found; cannot software-replug #{usb_interface} after " <>
           "whole-disk format (a physical replug is needed to mount the fresh filesystem)"
       )
     end
+
+    state
+  end
+
+  # A drive whose bus path is known but whose interface id or bound driver
+  # could not be — an unreadable `driver` symlink, most likely — has
+  # nothing safe for the replug to write to.
+  defp software_replug(state, %{slot_sub: slot_sub} = drive) when is_binary(slot_sub) do
+    Logger.warning(
+      "Storage: formatted drive's USB interface/driver could not be discovered " <>
+        "(usb_interface: #{inspect(Map.get(drive, :usb_interface))}, " <>
+        "usb_driver: #{inspect(Map.get(drive, :usb_driver))}); cannot software-replug it " <>
+        "(a physical replug is needed to mount the fresh filesystem)"
+    )
 
     state
   end
@@ -1543,8 +1578,8 @@ defmodule UniversalProxy.Storage.Server do
     state
   end
 
-  defp do_software_replug(state, driver_path, iface_id) do
-    case write_driver_file(driver_path, "unbind", iface_id) do
+  defp do_software_replug(state, driver_path, usb_interface) do
+    case write_driver_file(driver_path, "unbind", usb_interface) do
       :ok ->
         # Synchronous: `format/3` already blocks the server for the whole
         # `mkfs.ext4`, and the kernel needs a moment to tear the device
@@ -1554,21 +1589,21 @@ defmodule UniversalProxy.Storage.Server do
         # picks up on its own (see the moduledoc).
         Process.sleep(state.replug_sleep_ms)
 
-        case write_driver_file(driver_path, "bind", iface_id) do
+        case write_driver_file(driver_path, "bind", usb_interface) do
           :ok ->
-            Logger.info("Storage: software-replugged #{iface_id} after whole-disk format")
+            Logger.info("Storage: software-replugged #{usb_interface} after whole-disk format")
 
           {:error, reason} ->
             Logger.warning(
-              "Storage: rebind of #{iface_id} failed (#{inspect(reason)}) after whole-disk " <>
-                "format (a physical replug is needed to mount the fresh filesystem)"
+              "Storage: rebind of #{usb_interface} failed (#{inspect(reason)}) after " <>
+                "whole-disk format (a physical replug is needed to mount the fresh filesystem)"
             )
         end
 
       {:error, reason} ->
         Logger.warning(
-          "Storage: unbind of #{iface_id} failed (#{inspect(reason)}) after whole-disk " <>
-            "format (a physical replug is needed to mount the fresh filesystem)"
+          "Storage: unbind of #{usb_interface} failed (#{inspect(reason)}) after " <>
+            "whole-disk format (a physical replug is needed to mount the fresh filesystem)"
         )
     end
   end
