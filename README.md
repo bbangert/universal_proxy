@@ -182,9 +182,9 @@ infrared transmit and receive operations.
 
 Plug in a USB drive and it appears on the Overview at its USB slot, showing
 its capacity. The first data partition is mounted automatically (ext4, exFAT,
-NTFS, and FAT32 are supported); ext4 and FAT32 volumes that weren't unmounted
-cleanly get a filesystem check first. One drive is mounted and shared at a
-time.
+NTFS, and FAT32 are supported); ext4 and FAT32 volumes get an automatic
+filesystem check and repair before mounting. One drive is mounted and shared
+at a time.
 
 From the drive's Overview drawer you can:
 
@@ -192,13 +192,14 @@ From the drive's Overview drawer you can:
    land in. Sharing is opt-in per drive and remembered across replugs.
 2. **Add it to Home Assistant**: go to **Settings > System > Storage**, add
    a network storage with usage *Backup*, and copy the server, share name
-   (`usb_backup_<id>`, unique per drive), and the generated username and
-   password straight from the drawer -- it shows exactly the fields Home
-   Assistant's dialog asks for. The password can be revealed, copied, or
+   (`usb_backup_<id>`, derived from the drive's serial number), and the
+   generated username and password straight from the drawer -- it shows
+   exactly the fields Home Assistant's dialog asks for. The password can be revealed, copied, or
    regenerated at any time (update the credential in Home Assistant after
    regenerating).
-3. **Format** the drive to a single ext4 volume (erases everything -- the
-   button must be armed first) or **eject** it safely before unplugging.
+3. **Format** the backup partition to ext4 (erasing its contents; a drive
+   with no recognizable partition is formatted whole -- the button must be
+   armed first) or **eject** it safely before unplugging.
 
 The share requires Samba in the target's Nerves system, which every custom
 target ships except `x86_64`. On targets without it, drives still mount and
