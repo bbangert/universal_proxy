@@ -922,6 +922,44 @@ defmodule UniversalProxy.Storage.ServerTest do
 
       assert Server.get_state(server).share_name == nil
     end
+
+    # `active_drive_first/2` sorts `drives` from *last* pass's mount
+    # identity, before this pass's `reconcile_mount/1` has adopted
+    # anything — so an adoption that happens in this same pass (the
+    # kernel already holding a mount `Storage.Server` did not make) can
+    # leave its owning drive anywhere in the probe-sorted list, not just
+    # position 0. `nvme0n1` sorts ahead of `sda` by device name, so
+    # `attach_nvme!/0` puts it at `drives[0]` while the adopted mount
+    # belongs to `sda` — the share must still be named (and started)
+    # for `sda`, not the list head.
+    test "an adopted mount whose drive isn't first in the (probe-sorted) list still " <>
+           "names and starts the share under that drive, not the list head's",
+         ctx do
+      path = mounts_file!([])
+      server = start_server(ctx, mounts_path: path)
+      attach_nvme!()
+      enable_share!(ctx)
+
+      File.write!(path, "/dev/sda1 #{MountStub.point()} ext4 rw 0 0\n")
+      :ok = Server.check_now(server)
+
+      # Adopted, not mounted a second time.
+      refute Enum.any?(Recorder.events(), &match?({:mount, _, _}, &1))
+
+      state = Server.get_state(server)
+      assert [%{name: "nvme0n1"}, %{name: "sda"}] = state.drives
+      assert state.mount.device == "/dev/sda1"
+      # "usb_backup_a0001": sda's derived name (see the comment above the
+      # first test in this describe block) — not nvme's "usb_backup_e0001"
+      # ("SN-NVME-0001" -> last 6 chars, sanitized).
+      assert state.share_name == "usb_backup_a0001"
+      assert state.share == :running
+
+      assert [{:prepare_runtime, params}] =
+               Enum.filter(Recorder.events(), &match?({:prepare_runtime, _}, &1))
+
+      assert params.share_name == "usb_backup_a0001"
+    end
   end
 
   describe "format/3" do

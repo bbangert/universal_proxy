@@ -1689,12 +1689,15 @@ defmodule UniversalProxy.Storage.Server do
 
   # -- Share name --
 
-  # `active_drive_first/2` (see `refresh_drives/1`) pins the mounted
-  # drive at `drives[0]` for the whole pass, so by the time this step runs
-  # — after `reconcile_mount/1` — that position is the drive to derive the
-  # share name from, whenever something is mounted at all. `Smbd.share_name/1`
-  # is pure but still goes through `safe/3`, same as every other seam call:
-  # a malformed drive map degrades to `nil` (config/1's own default takes
+  # `active_drive_first/2` (see `refresh_drives/1`) sorts `drives` from the
+  # *previous* pass's mount identity — it runs before `reconcile_mount/1`,
+  # so a mount adopted during *this* pass (`mount_or_adopt/3` ->
+  # `bind_adopted_mount/1`) is not reflected in `drives[0]` yet. Deriving
+  # the name from `state.mounted_ref` instead (via `active_drive?/2`, the
+  # same predicate `active_drive_first/2` itself uses) picks the right
+  # drive regardless of list position. `Smbd.share_name/1` is pure but
+  # still goes through `safe/3`, same as every other seam call: a
+  # malformed drive map degrades to `nil` (config/1's own default takes
   # over) rather than taking the pass down.
   defp refresh_share_name(state) do
     %{state | share_name: mounted_share_name(state)}
@@ -1702,7 +1705,7 @@ defmodule UniversalProxy.Storage.Server do
 
   defp mounted_share_name(state) do
     if mounted?(state) do
-      case List.first(state.drives) do
+      case mounted_drive(state) do
         drive when is_map(drive) ->
           safe(fn -> state.smbd.share_name(drive) end, nil, "Smbd.share_name")
 
@@ -1710,6 +1713,15 @@ defmodule UniversalProxy.Storage.Server do
           nil
       end
     end
+  end
+
+  # The drive backing the current mount: matched by `mounted_ref` once
+  # bound, or — for a mount adopted this same pass, before
+  # `bind_adopted_mount/1` has run — by the device it owns. Same predicate
+  # `active_drive_first/2` sorts with, reused here so naming and sorting
+  # never disagree about which drive is "the" mounted one.
+  defp mounted_drive(state) do
+    Enum.find(state.drives, &active_drive?(state, &1))
   end
 
   # `{:ok, absolute, relative}` — the absolute form is what a caller chowns
