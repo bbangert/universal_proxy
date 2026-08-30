@@ -190,6 +190,10 @@ defmodule UniversalProxy.Storage.ServerTest do
     @moduledoc false
     alias UniversalProxy.Storage.ServerTest.{DaemonStub, Recorder}
 
+    # Pure, so the real derivation runs against the fixture drives — same
+    # pattern as `ProbeStub`'s `defdelegate`s for the sniff-pure functions.
+    defdelegate share_name(drive), to: UniversalProxy.Storage.Smbd
+
     def available?(_opts), do: Recorder.get(:available?, true)
 
     def prepare_runtime(opts) do
@@ -681,7 +685,8 @@ defmodule UniversalProxy.Storage.ServerTest do
       assert {:smbd_terminated} in Recorder.events()
     end
 
-    test "the share is prepared with the mount point, username and short netbios name", ctx do
+    test "the share is prepared with the mount point, username, netbios name and derived share name",
+         ctx do
       server = start_server(ctx)
       present!()
       enable_share!(ctx)
@@ -691,9 +696,13 @@ defmodule UniversalProxy.Storage.ServerTest do
       assert {:prepare_runtime, params} =
                Enum.find(Recorder.events(), &match?({:prepare_runtime, _}, &1))
 
+      # "usb_backup_a0001": the last 6 characters of @sda_serial
+      # ("SN-SDA-0001"), lowercased and stripped of the "-" (Smbd.share_name/1
+      # — see that module's tests for the derivation table).
       assert params == %{
                mount_point: MountStub.point(),
                share_folder: "/",
+               share_name: "usb_backup_a0001",
                username: "backup",
                netbios_name: "up-ab12cd"
              }
@@ -835,6 +844,83 @@ defmodule UniversalProxy.Storage.ServerTest do
 
       assert [%{key: ^serial_less_key}] = Server.get_state(server).drives
       assert Server.get_state(server).share == :running
+    end
+  end
+
+  describe "share_name (per-drive suffix, mirrors share_folder's lifecycle)" do
+    test "nil while nothing is mounted", ctx do
+      server = start_server(ctx)
+
+      assert Server.get_state(server).share_name == nil
+    end
+
+    # "usb_backup_a0001": Smbd.share_name/1 on @sda_serial ("SN-SDA-0001") —
+    # see smbd_test.exs for the derivation table this is only exercising the
+    # wiring for.
+    test "derived from the mounted drive's identity as soon as it is mounted", ctx do
+      server = start_server(ctx)
+      present!()
+
+      :ok = Server.check_now(server)
+
+      assert Server.get_state(server).share_name == "usb_backup_a0001"
+    end
+
+    test "rides along in the broadcast state map", ctx do
+      server = start_server(ctx)
+      present!()
+
+      :ok = Server.check_now(server)
+
+      assert_receive {:storage_state, %{share_name: "usb_backup_a0001"}}
+    end
+
+    test "present whether or not the share is actually enabled — it names what the share " <>
+           "would be, or is",
+         ctx do
+      server = start_server(ctx)
+      present!()
+
+      :ok = Server.check_now(server)
+
+      state = Server.get_state(server)
+      assert state.share == :off
+      assert state.share_name == "usb_backup_a0001"
+    end
+
+    test "a same-model stick swapped into the port gets its own name, not the predecessor's",
+         ctx do
+      server = start_server(ctx)
+      present!()
+      :ok = Server.check_now(server)
+      assert Server.get_state(server).share_name == "usb_backup_a0001"
+
+      Recorder.put(:drives, [drive(serial: "SN-SDA-0002")])
+      :ok = Server.check_now(server)
+
+      # Last 6 of "SN-SDA-0002" -> "a0002".
+      assert Server.get_state(server).share_name == "usb_backup_a0002"
+    end
+
+    test "a serial-less drive falls back to its vid+pid", ctx do
+      server = start_server(ctx)
+      Recorder.put(:drives, [drive(serial: nil)])
+      Recorder.put(:heads, %{"/dev/sda1" => StorageFixtures.ext4_bytes()})
+
+      :ok = Server.check_now(server)
+
+      assert Server.get_state(server).share_name == "usb_backup_0bda0316"
+    end
+
+    test "goes back to nil once the drive is ejected", ctx do
+      server = start_server(ctx)
+      present!()
+      :ok = Server.check_now(server)
+      assert Server.get_state(server).share_name == "usb_backup_a0001"
+
+      assert :ok = Server.eject(server, @drive_key)
+
+      assert Server.get_state(server).share_name == nil
     end
   end
 
@@ -1400,6 +1486,7 @@ defmodule UniversalProxy.Storage.ServerTest do
                mount: nil,
                share: :off,
                share_folder: "/",
+               share_name: nil,
                capacity: nil
              }
 

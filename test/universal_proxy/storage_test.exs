@@ -15,6 +15,7 @@ defmodule UniversalProxy.StorageTest do
                mount: nil,
                share: :off,
                share_folder: "/",
+               share_name: nil,
                capacity: nil
              }
     end
@@ -96,6 +97,7 @@ defmodule UniversalProxy.StorageTest do
                mount: nil,
                share: :off,
                share_folder: "/",
+               share_name: nil,
                capacity: nil
              }
     end

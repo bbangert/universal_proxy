@@ -53,7 +53,14 @@ defmodule UniversalProxy.Storage do
   @type drive_key :: Server.drive_key()
   @type state :: Server.payload()
 
-  @default_state %{drives: [], mount: nil, share: :off, share_folder: "/", capacity: nil}
+  @default_state %{
+    drives: [],
+    mount: nil,
+    share: :off,
+    share_folder: "/",
+    share_name: nil,
+    capacity: nil
+  }
 
   # -- Read state --
 

@@ -3,10 +3,15 @@ defmodule UniversalProxy.Storage.Smbd do
   Generates the hardened `smb.conf`, provisions the SMB account, and
   supervises `smbd` for the opt-in USB backup share.
 
-  Four parts, all seamed for host tests:
+  Five parts, all seamed for host tests:
 
-    * `config/1` — pure: the complete `smb.conf` text for one
-      `[usb_backup]` share.
+    * `share_name/1` (and `share_suffix/1`) — pure: the per-drive share
+      name (`usb_backup_<suffix>`), so a share is named for the medium it
+      serves rather than one global name every stick collides on. See
+      `share_suffix/1` for the derivation.
+    * `config/1` — pure: the complete `smb.conf` text for one share
+      (`[usb_backup]` by default, or the `:share_name` a caller passes
+      in).
     * `prepare_runtime/1` — creates the writable dirs and writes the
       config (the rootfs and `/etc/samba` are read-only squashfs, so
       everything lives under `/data/samba` + `/run/samba`).
@@ -76,9 +81,108 @@ defmodule UniversalProxy.Storage.Smbd do
           required(:username) => String.t(),
           required(:netbios_name) => String.t(),
           optional(:share_folder) => String.t(),
+          optional(:share_name) => String.t(),
           optional(:data_dir) => String.t(),
           optional(:run_dir) => String.t()
         }
+
+  # The share-suffix regex the design settles on: a conservative,
+  # SMB-safe charset (no `-`, `_`, or anything Windows/legacy SMB clients
+  # could mishandle in a share name), 2-16 characters so a bare vid+pid
+  # fallback (8 chars) and a truncated serial both fit comfortably.
+  @suffix_re ~r/^[a-z0-9]{2,16}$/
+  @suffix_min 2
+  @suffix_max 6
+
+  # -- (0) Share naming --
+
+  @doc """
+  The per-drive share name: `#{@share_name}_<suffix>` (see
+  `share_suffix/1`).
+
+  Stable for one physical medium across replugs and ports (same inputs,
+  same output), and always matches `#{inspect(@suffix_re)}` after the
+  `#{@share_name}_` prefix — safe to drop straight into `config/1`'s
+  `:share_name`.
+
+  ## Examples
+
+      iex> Smbd.share_name(%{serial: "1C6F654CED3DED51E92C01E4", vendor_id: 0x0BDA, product_id: 0x0316})
+      "usb_backup_2c01e4"
+
+      iex> Smbd.share_name(%{serial: nil, vendor_id: 0x0930, product_id: 0x6545})
+      "usb_backup_09306545"
+  """
+  @spec share_name(map()) :: String.t()
+  def share_name(drive), do: @share_name <> "_" <> share_suffix(drive)
+
+  @doc """
+  The SMB-safe per-drive suffix `share_name/1` appends, mirroring
+  `Storage.Server`'s drive-key stability semantics (the same USB serial —
+  or, absent one, the same vendor/product id pair — that makes a drive
+  key name one physical medium rather than every stick of that model).
+
+  With a `:serial` (a `Storage.Probe`-shaped drive map's raw string):
+  the last #{@suffix_max} characters, lowercased, then sanitized to
+  `[a-z0-9]` by dropping every other character. If that leaves fewer than
+  #{@suffix_min} characters (a serial that is all punctuation, or empty),
+  or there is no serial at all, this falls back to the drive's
+  `:vendor_id`/`:product_id` (integers, as `Storage.Probe` reports them):
+  lowercase 4-digit hex, concatenated — always 8 characters, so it can
+  never itself be too short.
+
+  Always matches `#{inspect(@suffix_re)}`.
+
+  ## Examples
+
+      iex> Smbd.share_suffix(%{serial: "1C6F654CED3DED51E92C01E4", vendor_id: 0x0BDA, product_id: 0x0316})
+      "2c01e4"
+
+      iex> Smbd.share_suffix(%{serial: "SN-A", vendor_id: 0x0781, product_id: 0x55AF})
+      "sna"
+
+      iex> Smbd.share_suffix(%{serial: "!!!!!!", vendor_id: 0x0930, product_id: 0x6545})
+      "09306545"
+
+      iex> Smbd.share_suffix(%{serial: nil, vendor_id: 0x0930, product_id: 0x6545})
+      "09306545"
+  """
+  @spec share_suffix(map()) :: String.t()
+  def share_suffix(%{serial: serial} = drive) when is_binary(serial) do
+    serial_suffix(serial) || vidpid_suffix(drive)
+  end
+
+  def share_suffix(drive), do: vidpid_suffix(drive)
+
+  # `nil` (not `""`) when sanitizing leaves too little to be a stable,
+  # readable suffix on its own — the caller falls back to vid+pid, which
+  # is always #{@suffix_max + 2} characters and therefore always long
+  # enough.
+  defp serial_suffix(serial) do
+    suffix =
+      serial
+      |> String.trim()
+      |> last_chars(@suffix_max)
+      |> String.downcase()
+      |> String.replace(~r/[^a-z0-9]/, "")
+
+    if String.length(suffix) >= @suffix_min, do: suffix
+  end
+
+  defp last_chars(string, n) do
+    length = String.length(string)
+    if length <= n, do: string, else: String.slice(string, length - n, n)
+  end
+
+  defp vidpid_suffix(drive) do
+    hex_id(Map.get(drive, :vendor_id)) <> hex_id(Map.get(drive, :product_id))
+  end
+
+  defp hex_id(id) when is_integer(id) and id >= 0 do
+    id |> Integer.to_string(16) |> String.downcase() |> String.pad_leading(4, "0")
+  end
+
+  defp hex_id(_id), do: "0000"
 
   # -- (a) Pure config generation --
 
@@ -89,9 +193,13 @@ defmodule UniversalProxy.Storage.Smbd do
   (the Unix and SMB account), `:netbios_name` (server identity shown to
   clients). Optional `:share_folder` (default `"/"`) maps the share at a
   subdirectory of the drive rather than its root, so the share's `path`
-  becomes `<mount_point>/<share_folder>`; `:data_dir` (default
-  `#{@default_data_dir}`) and `:run_dir` (default `#{@default_run_dir}`)
-  relocate Samba's state.
+  becomes `<mount_point>/<share_folder>`; `:share_name` (default
+  `#{@share_name}`, kept for callers that predate per-drive naming —
+  `UniversalProxy.Storage.Server` always derives and passes one via
+  `share_name/1`) names the `[…]` section itself, so a share is per-drive
+  rather than one global name every stick collides on; `:data_dir`
+  (default `#{@default_data_dir}`) and `:run_dir` (default
+  `#{@default_run_dir}`) relocate Samba's state.
 
   The folder is joined, not validated: `UniversalProxy.Storage.Server`
   owns validating that it is a sandboxed, existing directory before it
@@ -108,6 +216,7 @@ defmodule UniversalProxy.Storage.Smbd do
 
     username = sanitize(username)
     share_path = share_path(mount_point, Map.get(params, :share_folder, @default_share_folder))
+    share_name = params |> Map.get(:share_name, @share_name) |> sanitize()
 
     """
     # Generated by UniversalProxy.Storage.Smbd — regenerated on every start,
@@ -149,7 +258,7 @@ defmodule UniversalProxy.Storage.Smbd do
     ncalrpc dir = #{Path.join(run_dir, "ncalrpc")}
     log level = 1
 
-    [#{@share_name}]
+    [#{share_name}]
     path = #{share_path}
     valid users = #{username}
     force user = #{username}
