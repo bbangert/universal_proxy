@@ -101,8 +101,16 @@ defmodule UniversalProxy.Storage.Server do
         mount: nil | %{device:, fs_type:, mode:, point:, stale?:, dirty?:},
         share: :off | :running | :error,
         share_folder: String.t(),
+        share_name: nil | String.t(),
         capacity: nil | %{total_bytes:, used_bytes:, free_bytes:, used_pct:}
       }
+
+  `share_name` is the mounted drive's derived Samba share name
+  (`Storage.Smbd.share_name/1` — `"usb_backup_<suffix>"`, the suffix from
+  the drive's USB serial or, absent one, its vendor/product id, the same
+  identity components that make up a drive key below). `nil` whenever
+  nothing is mounted. It is what `config/1`'s `[…]` section is actually
+  named, refreshed every convergence pass like `share_folder`.
 
   `share_folder` is the mounted drive's stored share mapping — `"/"` for
   the drive root, otherwise a drive-relative path (`"backups/ha"`). It is
@@ -475,6 +483,7 @@ defmodule UniversalProxy.Storage.Server do
           mount: mount_info() | nil,
           share: share(),
           share_folder: String.t(),
+          share_name: String.t() | nil,
           capacity: Mount.capacity() | nil
         }
 
@@ -530,6 +539,10 @@ defmodule UniversalProxy.Storage.Server do
             # Mirror of the mounted drive's stored `share_folder`, refreshed
             # from `Storage.Settings` on every convergence pass.
             share_folder: @root_folder,
+            # The mounted drive's derived Samba share name
+            # (`Smbd.share_name/1`), refreshed every convergence pass like
+            # `share_folder`. `nil` whenever nothing is mounted.
+            share_name: nil,
             capacity: nil
 
   # -- Client API --
@@ -949,6 +962,7 @@ defmodule UniversalProxy.Storage.Server do
       |> reconcile_removal()
       |> reconcile_mount()
       |> refresh_share_folder()
+      |> refresh_share_name()
       |> refresh_capacity()
       |> reconcile_share(Keyword.get(opts, :restart_share?, true))
 
@@ -1673,6 +1687,43 @@ defmodule UniversalProxy.Storage.Server do
   # the share can only ever be the drive root.
   defp stored_share_folder(_state), do: @root_folder
 
+  # -- Share name --
+
+  # `active_drive_first/2` (see `refresh_drives/1`) sorts `drives` from the
+  # *previous* pass's mount identity — it runs before `reconcile_mount/1`,
+  # so a mount adopted during *this* pass (`mount_or_adopt/3` ->
+  # `bind_adopted_mount/1`) is not reflected in `drives[0]` yet. Deriving
+  # the name from `state.mounted_ref` instead (via `active_drive?/2`, the
+  # same predicate `active_drive_first/2` itself uses) picks the right
+  # drive regardless of list position. `Smbd.share_name/1` is pure but
+  # still goes through `safe/3`, same as every other seam call: a
+  # malformed drive map degrades to `nil` (config/1's own default takes
+  # over) rather than taking the pass down.
+  defp refresh_share_name(state) do
+    %{state | share_name: mounted_share_name(state)}
+  end
+
+  defp mounted_share_name(state) do
+    if mounted?(state) do
+      case mounted_drive(state) do
+        drive when is_map(drive) ->
+          safe(fn -> state.smbd.share_name(drive) end, nil, "Smbd.share_name")
+
+        _other ->
+          nil
+      end
+    end
+  end
+
+  # The drive backing the current mount: matched by `mounted_ref` once
+  # bound, or — for a mount adopted this same pass, before
+  # `bind_adopted_mount/1` has run — by the device it owns. Same predicate
+  # `active_drive_first/2` sorts with, reused here so naming and sorting
+  # never disagree about which drive is "the" mounted one.
+  defp mounted_drive(state) do
+    Enum.find(state.drives, &active_drive?(state, &1))
+  end
+
   # `{:ok, absolute, relative}` — the absolute form is what a caller chowns
   # or hands to `smb.conf`; the relative form is what gets persisted.
   defp resolve_share_folder(state, path) do
@@ -2051,12 +2102,14 @@ defmodule UniversalProxy.Storage.Server do
   end
 
   defp prepare_runtime(state, credentials) do
-    params = %{
-      mount_point: mount_point(state),
-      share_folder: state.share_folder,
-      username: credentials.username,
-      netbios_name: netbios_name(state)
-    }
+    params =
+      %{
+        mount_point: mount_point(state),
+        share_folder: state.share_folder,
+        username: credentials.username,
+        netbios_name: netbios_name(state)
+      }
+      |> maybe_put_share_name(state.share_name)
 
     case safe(
            fn -> state.smbd.prepare_runtime(Keyword.put(state.smbd_opts, :params, params)) end,
@@ -2067,6 +2120,18 @@ defmodule UniversalProxy.Storage.Server do
       error -> {:error, {:prepare_runtime, error}}
     end
   end
+
+  # `share_desired?/1` (the only gate on reaching `start_share/1`) implies
+  # `mounted?/1`, so `state.share_name` should already be a real derived
+  # name by the time this runs — but a `nil` here (a `Smbd.share_name/1`
+  # that raised, caught by `refresh_share_name/1`'s `safe/3`) must not
+  # become an explicit `share_name: nil` in `params`, which `Smbd.config/1`
+  # would embed as the literal section name `"[]"`. Omitting the key
+  # instead falls through to `config/1`'s own bare-`"usb_backup"` default.
+  defp maybe_put_share_name(params, nil), do: params
+
+  defp maybe_put_share_name(params, name) when is_binary(name),
+    do: Map.put(params, :share_name, name)
 
   defp provision_user(state, credentials) do
     opts =
@@ -2199,6 +2264,7 @@ defmodule UniversalProxy.Storage.Server do
       mount: state.mounted,
       share: state.share,
       share_folder: state.share_folder,
+      share_name: state.share_name,
       capacity: state.capacity
     }
   end

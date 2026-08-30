@@ -84,7 +84,14 @@ defmodule UniversalProxy.StorageStub do
   # The LiveView seeds from `state/0` on mount; tests push real drives in
   # afterwards over PubSub, so the seed is deliberately empty.
   def state,
-    do: %{drives: [], mount: nil, share: :off, share_folder: "/", capacity: nil}
+    do: %{
+      drives: [],
+      mount: nil,
+      share: :off,
+      share_folder: "/",
+      share_name: nil,
+      capacity: nil
+    }
 
   def list_drives, do: state().drives
 

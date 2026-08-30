@@ -409,6 +409,11 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
         mount: Keyword.get(opts, :mount, mount()),
         share: Keyword.get(opts, :share, :off),
         share_folder: Keyword.get(opts, :share_folder, "/"),
+        # "usb_backup_sna": Smbd.share_name/1 on the default drive()'s
+        # `serial: "SN-A"` (last 6 chars — the whole thing, it's short —
+        # lowercased and stripped of the "-"). See smbd_test.exs for the
+        # derivation table.
+        share_name: Keyword.get(opts, :share_name, "usb_backup_sna"),
         capacity:
           Keyword.get(opts, :capacity, %{
             total_bytes: 1_000_204_886_016,
@@ -914,8 +919,27 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
       assert html =~ "Server"
       assert html =~ UniversalProxy.System.device_summary().hostname
       assert html =~ "Share"
-      assert html =~ "usb_backup"
+      assert html =~ "usb_backup_sna"
       refute html =~ "\\\\"
+    end
+
+    test "the Share row renders the live per-drive share_name from the payload", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state(share: :running, share_name: "usb_backup_2c01e4"))
+
+      html = open_drawer(view)
+
+      assert html =~ "usb_backup_2c01e4"
+      refute html =~ "usb_backup_sna"
+    end
+
+    test "a nil share_name in the payload falls back to plain usb_backup", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      push_storage(storage_state(share: :running, share_name: nil))
+
+      html = open_drawer(view)
+
+      assert html =~ "usb_backup"
     end
 
     test "eject needs a second confirmation, then says it's safe to unplug", %{conn: conn} do

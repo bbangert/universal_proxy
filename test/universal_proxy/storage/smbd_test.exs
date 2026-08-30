@@ -5,11 +5,94 @@ defmodule UniversalProxy.Storage.SmbdTest do
 
   alias UniversalProxy.Storage.Smbd
 
+  doctest Smbd
+
   @params %{
     mount_point: "/run/usb-backup",
     username: "backup",
     netbios_name: "universal-proxy-a1b2c3"
   }
+
+  describe "share_suffix/1 (mirrors the drive-key stability semantics)" do
+    test "a normal serial: last 6 characters, lowercased" do
+      assert Smbd.share_suffix(%{
+               serial: "1C6F654CED3DED51E92C01E4",
+               vendor_id: 0x0BDA,
+               product_id: 0x0316
+             }) ==
+               "2c01e4"
+    end
+
+    test "a serial shorter than the tail window uses the whole (sanitized) thing" do
+      assert Smbd.share_suffix(%{serial: "AB", vendor_id: 0x0930, product_id: 0x6545}) == "ab"
+    end
+
+    test "punctuation in the tail is dropped, not just lowercased" do
+      assert Smbd.share_suffix(%{serial: "SN-A", vendor_id: 0x0781, product_id: 0x55AF}) == "sna"
+    end
+
+    test "a serial that sanitizes to fewer than 2 characters falls back to vid+pid" do
+      assert Smbd.share_suffix(%{serial: "!", vendor_id: 0x0930, product_id: 0x6545}) ==
+               "09306545"
+
+      assert Smbd.share_suffix(%{serial: "!!!!!!", vendor_id: 0x0930, product_id: 0x6545}) ==
+               "09306545"
+
+      assert Smbd.share_suffix(%{serial: "", vendor_id: 0x0930, product_id: 0x6545}) == "09306545"
+    end
+
+    test "no serial at all falls back to lowercase hex vid <> pid" do
+      assert Smbd.share_suffix(%{serial: nil, vendor_id: 0x0930, product_id: 0x6545}) ==
+               "09306545"
+    end
+
+    test "the vid+pid fallback zero-pads below 4 hex digits" do
+      assert Smbd.share_suffix(%{serial: nil, vendor_id: 0x1, product_id: 0x2}) == "00010002"
+    end
+
+    test "same serial, same suffix regardless of port (slot_sub) or repeated calls" do
+      drive = %{serial: "SN-SDA-0001", vendor_id: 0x0BDA, product_id: 0x0316}
+      moved = Map.put(drive, :slot_sub, "1-1.9")
+
+      assert Smbd.share_suffix(drive) == Smbd.share_suffix(moved)
+      assert Smbd.share_suffix(drive) == Smbd.share_suffix(drive)
+    end
+
+    test "every derived suffix matches the SMB-safe regex" do
+      cases = [
+        %{serial: "1C6F654CED3DED51E92C01E4", vendor_id: 0x0BDA, product_id: 0x0316},
+        %{serial: "SN-SDA-0001", vendor_id: 0x0BDA, product_id: 0x0316},
+        %{serial: "AB", vendor_id: 0x0930, product_id: 0x6545},
+        %{serial: "!!!!!!", vendor_id: 0x0930, product_id: 0x6545},
+        %{serial: nil, vendor_id: 0x0930, product_id: 0x6545},
+        %{serial: nil, vendor_id: 0x0, product_id: 0x0},
+        %{serial: "ünïçödé!", vendor_id: 0x1234, product_id: 0x5678}
+      ]
+
+      for drive <- cases do
+        suffix = Smbd.share_suffix(drive)
+
+        assert Regex.match?(~r/^[a-z0-9]{2,16}$/, suffix),
+               "#{inspect(suffix)} (from #{inspect(drive)})"
+      end
+    end
+  end
+
+  describe "share_name/1" do
+    test "prefixes the suffix with usb_backup_" do
+      assert Smbd.share_name(%{
+               serial: "1C6F654CED3DED51E92C01E4",
+               vendor_id: 0x0BDA,
+               product_id: 0x0316
+             }) ==
+               "usb_backup_2c01e4"
+    end
+
+    test "the serial-less fallback name" do
+      assert Smbd.share_name(%{serial: nil, vendor_id: 0x0930, product_id: 0x6545}) ==
+               "usb_backup_09306545"
+    end
+  end
 
   describe "config/1 [global] hardening (security-regression tripwire)" do
     setup do
@@ -123,10 +206,30 @@ defmodule UniversalProxy.Storage.SmbdTest do
       {:ok, conf: Smbd.config(@params)}
     end
 
-    test "single share section named usb_backup", %{conf: conf} do
+    test "single share section named usb_backup by default (no :share_name given)", %{
+      conf: conf
+    } do
       assert conf =~ "[usb_backup]"
       sections = conf |> String.split("\n") |> Enum.count(&String.starts_with?(&1, "["))
       assert sections == 2
+    end
+
+    # Golden: `Storage.Server` always passes the derived per-drive name, but
+    # `config/1` itself stays backward compatible for a caller that omits it.
+    test "an explicit :share_name names the section instead" do
+      conf = Smbd.config(Map.put(@params, :share_name, "usb_backup_2c01e4"))
+
+      assert conf =~ "[usb_backup_2c01e4]"
+      refute conf =~ "[usb_backup]"
+      sections = conf |> String.split("\n") |> Enum.count(&String.starts_with?(&1, "["))
+      assert sections == 2
+    end
+
+    test "a newline in :share_name cannot inject a directive" do
+      conf = Smbd.config(Map.put(@params, :share_name, "usb_backup_x\nguest ok = yes"))
+
+      refute "guest ok = yes" in String.split(conf, "\n")
+      assert conf =~ "guest ok = no"
     end
 
     test "path is the mount point when no folder is mapped", %{conf: conf} do

@@ -17,10 +17,11 @@ defmodule UniversalProxyWeb.Components.Storage do
   import UniversalProxyWeb.Components.Icons
   import UniversalProxyWeb.Components.UI
 
-  # The share name `Storage.Smbd` writes into smb.conf. Mirrored here for
-  # the drawer's "Share" readout only; the daemon remains the source of
-  # truth.
-  @share_name "usb_backup"
+  # Rendered only when the live payload's `:share_name` is somehow absent
+  # (a payload built by hand, or a subsystem that hasn't derived one yet)
+  # — `Storage.Server`/`Storage.Smbd` are the source of truth for the real,
+  # per-drive name.
+  @fallback_share_name "usb_backup"
 
   @root_folder "/"
 
@@ -237,7 +238,7 @@ defmodule UniversalProxyWeb.Components.Storage do
       |> assign(:dirty?, assigns.first? and fs_dirty?(mount, assigns.drive))
       |> assign(:shared?, assigns.first? and assigns.storage.share == :running)
       |> assign(:server_host, server_host(assigns.host))
-      |> assign(:share_name, @share_name)
+      |> assign(:share_name, Map.get(assigns.storage, :share_name) || @fallback_share_name)
 
     ~H"""
     <div class="fixed inset-0 z-[90] flex justify-end animate-fade">
