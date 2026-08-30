@@ -191,12 +191,12 @@ From the drive's Overview drawer you can:
 1. **Enable the SMB share** and pick (or create) the folder backups should
    land in. Sharing is opt-in per drive and remembered across replugs.
 2. **Add it to Home Assistant**: go to **Settings > System > Storage**, add
-   a network storage with usage *Backup*, and copy the server, share name
-   (`usb_backup_<id>`, derived from the drive's serial number), and the
-   generated username and password straight from the drawer -- it shows
-   exactly the fields Home Assistant's dialog asks for. The password can be revealed, copied, or
-   regenerated at any time (update the credential in Home Assistant after
-   regenerating).
+   a network storage with a name of your choosing, usage *Backup*, and the
+   Windows/Samba (CIFS) protocol, then copy the remaining fields -- server,
+   share name (`usb_backup_<id>`, derived from the drive's serial number),
+   username, and generated password -- straight from the drawer. The
+   password can be revealed, copied, or regenerated at any time (update the
+   credential in Home Assistant after regenerating).
 3. **Format** the backup partition to ext4 (erasing its contents; a drive
    with no recognizable partition is formatted whole -- the button must be
    armed first) or **eject** it safely before unplugging.
