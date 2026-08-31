@@ -46,6 +46,9 @@ range -- without needing a dedicated ESPHome microcontroller for each one.
 - **Bluetooth-audio transmitter control** -- FlooGoo FMA120 and Sennheiser
   BTD 700 dongles get full control drawers in the web UI (see
   [Supported USB devices](#supported-usb-devices))
+- **USB backup drive** -- share a plugged-in USB drive over SMB as a
+  Home Assistant network **backup target**, managed from the Overview drawer
+  (see [Using a USB drive for Home Assistant backups](#using-a-usb-drive-for-home-assistant-backups))
 - Web UI for configuration (accessible at `http://<device-ip>`)
 - USB hotplug detection -- plug/unplug serial adapters at any time
 - DETS-backed persistent device configuration across reboots
@@ -66,6 +69,7 @@ persist across reboots and replugs.
 | **Bluetooth (HCI) adapters** | Any `btusb`-supported dongle | Selectable radio for the **Bluetooth proxy** (BLE advertisement relay + active GATT connections) -- adds Bluetooth to boards without a usable onboard radio (`rpi`, `rpi2`, `x86_64`) or replaces a weak onboard one. |
 | **USB DACs / sound cards** | Any class-compliant (`snd-usb-audio`) device, including hi-res DACs (up to 24-bit/96 kHz where supported) | Each output becomes an independently discoverable **Sendspin** player for synchronized multi-room audio. |
 | **Bluetooth-audio transmitters** | FlooGoo FMA120, Sennheiser BTD 700 | Sendspin players (via their sound-card half) **plus a device control drawer** on the Overview -- details below. |
+| **USB storage drives** | Any USB flash drive or SSD (ext4, exFAT, NTFS, FAT32) | Mounted as the device's **backup drive**, with an opt-in **SMB share** Home Assistant can use as a network backup target. Folder selection, formatting (to ext4), safe eject, and the share credentials all live in the drive's Overview drawer. |
 | **USB hubs** | -- | Devices behind a hub render as an indented tree at the hub's slot; branded hubs are named. |
 
 ### Bluetooth-audio transmitter control drawers
@@ -174,6 +178,33 @@ IRDroid / IR Toy USB infrared devices are also **auto-detected** by USB ID
 Home Assistant via the ESPHome Native API as **Infrared entities**, supporting
 infrared transmit and receive operations.
 
+### Using a USB drive for Home Assistant backups
+
+Plug in a USB drive and it appears on the Overview at its USB slot, showing
+its capacity. The first data partition is mounted automatically (ext4, exFAT,
+NTFS, and FAT32 are supported); ext4 and FAT32 volumes get an automatic
+filesystem check and repair before mounting. One drive is mounted and shared
+at a time.
+
+From the drive's Overview drawer you can:
+
+1. **Enable the SMB share** and pick (or create) the folder backups should
+   land in. Sharing is opt-in per drive and remembered across replugs.
+2. **Add it to Home Assistant**: go to **Settings > System > Storage**, add
+   a network storage with a name of your choosing, usage *Backup*, and the
+   Windows/Samba (CIFS) protocol, then copy the remaining fields -- server,
+   share name (`usb_backup_<id>`, derived from the drive's serial number),
+   username, and generated password -- straight from the drawer. The
+   password can be revealed, copied, or regenerated at any time (update the
+   credential in Home Assistant after regenerating).
+3. **Format** the backup partition to ext4 (erasing its contents; a drive
+   with no recognizable partition is formatted whole -- the button must be
+   armed first) or **eject** it safely before unplugging.
+
+The share requires Samba in the target's Nerves system, which every custom
+target ships except `x86_64`. On targets without it, drives still mount and
+show in the Overview but sharing is unavailable.
+
 ### Editing ESPHome device configuration
 
 1. Go to the **ESPHome Config** tab (`/esphome-config`).
@@ -234,6 +265,7 @@ lib/
     bluez/                 # BlueZ/D-Bus stack: Client (scanner), Gatt, Agent, DeviceCache
     audio/                 # Sendspin audio: Enumerate, per-output Server/Store, Player
     firmware_update/       # In-app firmware update flow
+    storage/               # USB backup drive: mount, capacity, opt-in SMB share (smbd)
     esphome/               # ESPHome Native API adapters + Supervisor
       serial_proxy/        # Serial proxy
       zwave_proxy/         # Z-Wave proxy
