@@ -181,7 +181,7 @@ defmodule UniversalProxy.MixProject do
       {:nerves_system_qemu_aarch64, "~> 0.4", runtime: false, targets: :qemu_aarch64},
       # Pin nerves_system_br to match custom systems v0.1.10 (br 1.34.3).
       # This overrides what stock systems (bbb, mangopi, qemu) would pull in.
-      {:nerves_system_br, "1.34.3", runtime: false, override: true}
+      {:nerves_system_br, "== 1.34.4", runtime: false, override: true}
     ] ++ up_nerves_systems()
   end
 
