@@ -7,8 +7,9 @@ defmodule SendspinPlayerContractTest do
 
   Spawns the host build of the binary, drives stdin/stdout, and asserts
   the documented event/command shapes. Does not require audio hardware —
-  the binary's `start()` binds a non-privileged WebSocket port and
-  does not touch ALSA until a stream begins.
+  the binary listens on a non-privileged WebSocket port (`start()` arms
+  the server; the bind lands on a later `loop()` tick) and does not touch
+  ALSA until a stream begins.
   """
 
   use ExUnit.Case, async: false

@@ -792,9 +792,13 @@ int main(int argc, char* argv[]) {
         emit_json(os.str());
     }
 
+    // A false return means a role failed to start (thread spawn, ring
+    // buffer allocation); it does NOT mean the listener failed to bind,
+    // which cannot be known yet — start() only arms the server, and the
+    // bind happens on a later loop() tick (see the hook comment above).
     if (!client.start()) {
-        emit_json("{\"event\":\"error\",\"kind\":\"start_server\","
-                  "\"msg\":\"failed to bind WebSocket listener\"}");
+        emit_json("{\"event\":\"error\",\"kind\":\"start\","
+                  "\"msg\":\"failed to start client roles\"}");
         return 1;
     }
 
@@ -874,7 +878,16 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    // stop() rather than disconnect(): it sends the shutdown goodbye AND
+    // joins the role threads before returning. That ordering is load-
+    // bearing here — `client` is declared before `audio_sink` and the
+    // listeners, so reverse destruction would otherwise tear those down
+    // while ~SendspinClient() has yet to join the threads that call into
+    // them. Every PlayerListener callback dereferences `sink` (including
+    // on_audio_write on the role thread's hot path), so a late callback
+    // would touch a destroyed stack object. Upstream states the contract
+    // directly: listeners must outlive the client.
+    client.stop();
     emit_json("{\"event\":\"shutdown\"}");
     return 0;
 }
