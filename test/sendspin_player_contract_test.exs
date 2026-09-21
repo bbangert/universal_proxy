@@ -7,7 +7,7 @@ defmodule SendspinPlayerContractTest do
 
   Spawns the host build of the binary, drives stdin/stdout, and asserts
   the documented event/command shapes. Does not require audio hardware —
-  the binary's `start_server()` binds a non-privileged WebSocket port and
+  the binary's `start()` binds a non-privileged WebSocket port and
   does not touch ALSA until a stream begins.
   """
 

@@ -653,7 +653,7 @@ struct ClientListener : SendspinClientListener {
 
 // sendspin-cpp binds its WebSocket listener lazily — on the first
 // client.loop() tick after the network provider reports ready — so
-// start_server() returning does NOT mean the port accepts connections
+// start() returning does NOT mean the port accepts connections
 // yet. The Elixir side must not advertise the player over mDNS before
 // the listener is up: Music Assistant's discovery connect is one-shot
 // (aiosendspin `retry_initial_connection=False`), so a connection
@@ -792,7 +792,7 @@ int main(int argc, char* argv[]) {
         emit_json(os.str());
     }
 
-    if (!client.start_server()) {
+    if (!client.start()) {
         emit_json("{\"event\":\"error\",\"kind\":\"start_server\","
                   "\"msg\":\"failed to bind WebSocket listener\"}");
         return 1;
