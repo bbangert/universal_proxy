@@ -102,7 +102,7 @@ defmodule UniversalProxy.MixProject do
       {:jason, "~> 1.2"},
       {:plug_cowboy, "~> 2.5"},
       {:req, "~> 0.7"},
-      {:decibel, "~> 0.2"},
+      {:decibel, "~> 1.0"},
 
       # Static analysis
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},

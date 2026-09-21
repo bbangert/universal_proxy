@@ -143,7 +143,7 @@ defmodule UniversalProxy.SendspinSourcePeer do
     %{
       peer
       | noise: noise,
-        handshake_hash: Decibel.get_handshake_hash(noise),
+        handshake_hash: Decibel.handshake_hash(noise),
         suite: suite,
         client_id: client_id
     }
@@ -206,7 +206,7 @@ defmodule UniversalProxy.SendspinSourcePeer do
     %{
       peer
       | noise: noise,
-        handshake_hash: Decibel.get_handshake_hash(noise),
+        handshake_hash: Decibel.handshake_hash(noise),
         psk: psk,
         psk_id: psk_id
     }
