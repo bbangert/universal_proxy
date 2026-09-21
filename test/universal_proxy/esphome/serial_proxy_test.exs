@@ -140,10 +140,14 @@ defmodule UniversalProxy.ESPHome.SerialProxyTest do
 
       refute ConnectionState.serial_subscribed?(state, 99)
 
+      # espex 0.10 narrowed the unknown-instance rejection from the generic
+      # ERROR to INVALID_ARGUMENT (API 1.16 acknowledgement statuses).
       assert [
                {:log, :warning, _},
                {:send,
-                %Proto.SerialProxyRequestResponse{status: :SERIAL_PROXY_STATUS_ERROR} = resp}
+                %Proto.SerialProxyRequestResponse{
+                  status: :SERIAL_PROXY_STATUS_INVALID_ARGUMENT
+                } = resp}
              ] = actions
 
       assert resp.error_message == "unknown instance"
