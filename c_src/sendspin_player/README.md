@@ -69,8 +69,8 @@ Differences:
 ## sendspin-cpp pin
 
 Pinned via `FetchContent` to a **commit SHA** in `CMakeLists.txt`
-(`SENDSPIN_CPP_REF` cache var). Currently `30514d51...`, upstream
-`v0.7.2`. We pin to a SHA rather
+(`SENDSPIN_CPP_REF` cache var). Currently `9331ace6...`, upstream
+`v0.8.0`. We pin to a SHA rather
 than a tag because git tags are mutable server-side; a retagged upstream
 would otherwise silently flow into firmware. The friendly tag name (or
 nearest-release note) lives in a comment beside the SHA for traceability.
