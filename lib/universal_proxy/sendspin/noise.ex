@@ -27,21 +27,23 @@ defmodule UniversalProxy.Sendspin.Noise do
 
   ## Single-process ownership
 
-  Decibel keeps session state in the **process dictionary**, keyed by the ref
-  returned from `Decibel.new/4`. A session therefore only works in the process
-  that called `start/1`; the struct records that owner and every function
-  raises `ArgumentError` when called from anywhere else. Drive one session
-  from one connection process (and hand it no further once that process dies —
-  the state dies with it).
+  Decibel keeps session state in the **process dictionary**, keyed by the
+  opaque handle returned from `Decibel.new/4`. A session therefore only works
+  in the process that called `start/1`; the struct records that owner and every
+  function raises `ArgumentError` when called from anywhere else. (Decibel 1.0
+  also owner-checks the handle itself and raises `Decibel.SessionError`, but we
+  keep our own check so the error names the Sendspin session.) Drive one
+  session from one connection process (and hand it no further once that process
+  dies — the state dies with it).
 
   Distinct sessions in the same process are independent (each has its own
-  ref), so a process may hold several at once, e.g. across a re-handshake.
+  handle), so a process may hold several at once, e.g. across a re-handshake.
   """
 
   @enforce_keys [:ref, :owner, :protocol]
   defstruct [:ref, :owner, :protocol]
 
-  @opaque t :: %__MODULE__{ref: reference(), owner: pid(), protocol: String.t()}
+  @opaque t :: %__MODULE__{ref: Decibel.session(), owner: pid(), protocol: String.t()}
 
   @type suite :: String.t()
   @type key :: <<_::256>>
@@ -134,15 +136,20 @@ defmodule UniversalProxy.Sendspin.Noise do
   def read_handshake(%__MODULE__{} = session, message) do
     ref = ref!(session)
 
-    if Decibel.is_handshake_complete?(ref) do
+    if Decibel.handshake_complete?(ref) do
       {:error, :handshake_complete}
     else
       try do
         {:ok, IO.iodata_to_binary(Decibel.handshake_decrypt(ref, message))}
       rescue
-        Decibel.DecryptionError -> {:error, :decrypt_failed}
-        # A truncated message runs the token reader off the end of the buffer.
-        MatchError -> {:error, :malformed_handshake}
+        # Decibel 1.0 reports both failures as DecryptionError and tells them
+        # apart by `:reason`; a message too short to hold the pattern's tokens
+        # is `:truncated`, anything else failed to authenticate.
+        e in Decibel.DecryptionError ->
+          case e.reason do
+            :truncated -> {:error, :malformed_handshake}
+            _other -> {:error, :decrypt_failed}
+          end
       end
     end
   end
@@ -162,7 +169,7 @@ defmodule UniversalProxy.Sendspin.Noise do
   def write_handshake(%__MODULE__{} = session, payload) do
     ref = ref!(session)
 
-    if Decibel.is_handshake_complete?(ref) do
+    if Decibel.handshake_complete?(ref) do
       {:error, :handshake_complete}
     else
       {:ok, IO.iodata_to_binary(Decibel.handshake_encrypt(ref, payload))}
@@ -173,7 +180,7 @@ defmodule UniversalProxy.Sendspin.Noise do
   `true` once the handshake has completed and transport mode is active.
   """
   @spec finished?(t()) :: boolean()
-  def finished?(%__MODULE__{} = session), do: Decibel.is_handshake_complete?(ref!(session))
+  def finished?(%__MODULE__{} = session), do: Decibel.handshake_complete?(ref!(session))
 
   @doc """
   The 32-byte handshake hash of the completed handshake, or `nil` before that.
@@ -182,7 +189,7 @@ defmodule UniversalProxy.Sendspin.Noise do
   value, so it must be read from the session that ran the handshake.
   """
   @spec handshake_hash(t()) :: key() | nil
-  def handshake_hash(%__MODULE__{} = session), do: Decibel.get_handshake_hash(ref!(session))
+  def handshake_hash(%__MODULE__{} = session), do: Decibel.handshake_hash(ref!(session))
 
   @doc """
   Encrypt an outbound transport message. The result is the websocket binary
@@ -192,7 +199,7 @@ defmodule UniversalProxy.Sendspin.Noise do
   def encrypt(%__MODULE__{} = session, plaintext) do
     ref = ref!(session)
 
-    if Decibel.is_handshake_complete?(ref) do
+    if Decibel.handshake_complete?(ref) do
       {:ok, IO.iodata_to_binary(Decibel.encrypt(ref, plaintext))}
     else
       {:error, :handshake_incomplete}
@@ -210,13 +217,13 @@ defmodule UniversalProxy.Sendspin.Noise do
   def decrypt(%__MODULE__{} = session, ciphertext) do
     ref = ref!(session)
 
-    if Decibel.is_handshake_complete?(ref) do
+    if Decibel.handshake_complete?(ref) do
       try do
+        # Covers a tampered frame (`:authentication_failed`) and one too short
+        # to hold the AEAD tag (`:truncated`) alike.
         {:ok, IO.iodata_to_binary(Decibel.decrypt(ref, ciphertext))}
       rescue
         Decibel.DecryptionError -> {:error, :decrypt_failed}
-        # Anything shorter than the AEAD tag never reaches the cipher.
-        ArgumentError -> {:error, :decrypt_failed}
       end
     else
       {:error, :handshake_incomplete}
@@ -225,6 +232,10 @@ defmodule UniversalProxy.Sendspin.Noise do
 
   @doc """
   Discard the session's keys. Implicit when the owning process exits.
+
+  Not idempotent: decibel 1.0 raises `Decibel.SessionError` on a second close,
+  so callers that can reach the same session twice must handle it (see
+  `UniversalProxy.Audio.Input.Source`'s `close_noise/1`).
   """
   @spec close(t()) :: :ok
   def close(%__MODULE__{} = session), do: Decibel.close(ref!(session))

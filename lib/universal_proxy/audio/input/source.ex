@@ -2161,6 +2161,9 @@ defmodule UniversalProxy.Audio.Input.Source do
 
   defp close_noise(nil), do: :ok
 
+  # The rescue is required: decibel 1.0 raises `Decibel.SessionError` on an
+  # already-closed session, and several teardown paths here can reach the same
+  # session twice (a re-handshake retiring `previous`, then terminate/2).
   defp close_noise(session) do
     Noise.close(session)
   rescue

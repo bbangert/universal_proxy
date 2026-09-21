@@ -160,7 +160,7 @@ defmodule UniversalProxy.Sendspin.NoiseTest do
 
         hash = Noise.handshake_hash(session)
         assert byte_size(hash) == 32
-        assert hash == Decibel.get_handshake_hash(ini)
+        assert hash == Decibel.handshake_hash(ini)
       end
 
       test "transport messages round-trip in both directions", ctx do
