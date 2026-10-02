@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#MISE description="Run argus_beam OTP/BEAM analysis (needs souffle on PATH)"
+set -euo pipefail
+
+exec mise exec -- env MIX_TARGET=host mix argus "$@"
