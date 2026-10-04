@@ -1656,8 +1656,8 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   # Opaque keys go through `UniversalProxyWeb.OpaqueKey` (size cap, no
   # compressed ETF, no new atoms created, funs rejected). Existing atoms
-  # and other terms still decode, so the shape assertion here constrains
-  # the rest.
+  # and other terms still decode. The shape assertion here pins only the
+  # VID/PID; the slot is unconstrained and is used purely as a lookup key.
   defp encode_key(key), do: OpaqueKey.encode(key)
 
   defp decode_key(b64), do: decode_shaped(b64, &fma120_key?/1)
