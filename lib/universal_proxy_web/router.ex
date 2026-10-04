@@ -4,7 +4,7 @@ defmodule UniversalProxyWeb.Router do
   # Sobelow's Config.CSP only recognises a static policy passed to
   # put_secure_browser_headers; this pipeline sets a per-request
   # (nonce-bearing) policy in put_content_security_policy/2 below, which the
-  # static check can't see. Covered by test/universal_proxy_web/csp_test.exs.
+  # static check can't see. Covered by test/universal_proxy_web/web_security_test.exs.
   # sobelow_skip ["Config.CSP"]
   pipeline :browser do
     plug(:accepts, ["html"])

@@ -69,16 +69,34 @@ defmodule UniversalProxyWeb.WebSecurityTest do
   end
 
   describe "opaque key decoding" do
-    test "an encoded fun is rejected without crashing the LiveView" do
-      {:ok, view, _html} = live(build_conn(), "/audio")
-      fun = fn -> send(self(), :executed) end
-      id = fun |> :erlang.term_to_binary() |> Base.url_encode64(padding: false)
+    # Overview's FMA120/BTD 700 shape checks pin only the VID/PID, so the
+    # slot element is unconstrained: a fun nested there passes the shape
+    # check and was accepted by plain `binary_to_term(bin, [:safe])`.
+    # (AudioLive's valid_key_shape?/1 requires binary/integer/nil elements,
+    # so no fun can reach it there.)
+    @fma120_vid 0x0A12
+    @fma120_pid 0x4007
 
-      render_hook(view, "allow_pairing", %{"id" => id})
-      render_hook(view, "toggle_mute", %{"id" => id})
+    defp enc(key), do: key |> :erlang.term_to_binary() |> Base.url_encode64(padding: false)
 
-      assert render(view) =~ "Sendspin players"
-      refute_received :executed
+    test "a well-formed FMA120 key opens the drawer (control)" do
+      {:ok, view, _html} = live(build_conn(), "/")
+
+      html =
+        render_click(view, "select_fma120", %{"key" => enc({"1-1.3", @fma120_vid, @fma120_pid})})
+
+      assert html =~ "close_fma120_drawer"
+    end
+
+    test "a fun nested in an otherwise valid FMA120 key is rejected" do
+      {:ok, view, _html} = live(build_conn(), "/")
+      key = enc({fn -> :executed end, @fma120_vid, @fma120_pid})
+      # Must fit the decoder's 256-byte cap, or the size check (not the
+      # non-executable decode) would be what rejects it.
+      assert byte_size(Base.url_decode64!(key, padding: false)) <= 256
+
+      html = render_click(view, "select_fma120", %{"key" => key})
+      refute html =~ "close_fma120_drawer"
     end
   end
 end
