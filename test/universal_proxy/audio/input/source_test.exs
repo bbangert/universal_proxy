@@ -128,6 +128,87 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
     peer
   end
 
+  describe "stop_capture_process/2" do
+    import ExUnit.CaptureLog
+
+    # Stands in for a Capture whose terminate/2 hangs past the stop timeout.
+    defmodule SlowStop do
+      use GenServer
+
+      def start(ms), do: GenServer.start(__MODULE__, ms)
+
+      @impl true
+      def init(ms) do
+        Process.flag(:trap_exit, true)
+        {:ok, ms}
+      end
+
+      @impl true
+      def terminate(_reason, ms), do: Process.sleep(ms)
+    end
+
+    # Stands in for a Capture that goes away on its own once the stop has
+    # begun: its terminate/2 waits for the test's go-ahead, then exits with
+    # the given reason instead of the requested :normal, which makes
+    # GenServer.stop/3 exit in the caller.
+    defmodule ExitsDuringStop do
+      use GenServer
+
+      def start(test_pid, reason), do: GenServer.start(__MODULE__, {test_pid, reason})
+
+      @impl true
+      def init(state) do
+        Process.flag(:trap_exit, true)
+        {:ok, state}
+      end
+
+      @impl true
+      def terminate(_reason, {test_pid, exit_reason}) do
+        send(test_pid, {:stopping, self()})
+
+        receive do
+          :go -> exit(exit_reason)
+        end
+      end
+    end
+
+    test "an already-exited capture is fine" do
+      {:ok, pid} = Agent.start(fn -> :ok end)
+      Agent.stop(pid)
+      assert :ok = Source.stop_capture_process(pid, 100)
+    end
+
+    for reason <- [:shutdown, {:shutdown, :gone}, :noproc] do
+      test "a capture that exits with #{inspect(reason)} mid-stop is fine" do
+        {:ok, pid} = ExitsDuringStop.start(self(), unquote(Macro.escape(reason)))
+        ref = Process.monitor(pid)
+        stopper = Task.async(fn -> Source.stop_capture_process(pid, 1_000) end)
+
+        assert_receive {:stopping, ^pid}
+        send(pid, :go)
+
+        assert Task.await(stopper) == :ok
+        assert_receive {:DOWN, ^ref, :process, ^pid, _}
+      end
+    end
+
+    test "a live capture is stopped" do
+      {:ok, pid} = Agent.start(fn -> :ok end)
+      assert :ok = Source.stop_capture_process(pid, 1_000)
+      refute Process.alive?(pid)
+    end
+
+    test "a stop that times out is logged and the capture killed" do
+      {:ok, pid} = SlowStop.start(5_000)
+      ref = Process.monitor(pid)
+
+      log = capture_log(fn -> assert :ok = Source.stop_capture_process(pid, 50) end)
+
+      assert log =~ "did not stop within 50ms; killing it"
+      assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 1_000
+    end
+  end
+
   describe "listener" do
     test "binds an ephemeral port and reports it before any connection", ctx do
       {source, port} = start_source!(ctx)
