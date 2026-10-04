@@ -145,7 +145,7 @@ jobs:
   argus:
     name: Argus
     # Souffle's PPA package needs libffi7, which Ubuntu 24.04 dropped.
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-26.04
     env:
       MIX_ENV: dev
     steps:
