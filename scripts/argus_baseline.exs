@@ -3,8 +3,11 @@
 # Why: `argus: [ignore: [files: ...]]` hides every future finding in a file.
 # This script instead accepts only individually reviewed findings, listed in
 # `.argus-baseline.exs`, each with a `reason:` (false positive or deliberate
-# design). Any finding not in the baseline fails; baseline entries that no
-# longer occur are reported as warnings so they get pruned.
+# design). Any finding not in the baseline fails, and so does any baseline
+# entry that no longer occurs (stale): a leftover entry would otherwise be a
+# spare allowance that silently accepts a future, unreviewed finding with
+# the same fingerprint. Remove stale entries in the same change that fixes
+# or removes their finding.
 #
 # Usage (plain `elixir`, no deps; needs Elixir >= 1.18 for the JSON module):
 #
@@ -43,7 +46,8 @@
 # Findings and entries are compared as multisets: argus can report the same
 # fingerprint at several places in one file, and each baseline entry accepts
 # exactly one occurrence. A third identical finding against two entries is
-# new; two entries against one remaining finding leave one stale.
+# new; two entries against one remaining finding leave one stale, which
+# fails the check.
 
 defmodule ArgusBaseline do
   @keys [:analysis, :file, :title, :at_label, :detail]
@@ -68,8 +72,8 @@ defmodule ArgusBaseline do
     for entry <- stale do
       IO.puts(
         :stderr,
-        "::warning::stale argus baseline entry (no longer reported), remove it: " <>
-          describe(entry)
+        "::error::stale argus baseline entry (no longer reported); remove it from " <>
+          "#{baseline_path}: " <> describe(entry)
       )
     end
 
@@ -85,7 +89,7 @@ defmodule ArgusBaseline do
         "#{length(new)} new, #{length(stale)} stale"
     )
 
-    if new != [], do: System.halt(1)
+    if verdict(new, stale) == :fail, do: System.halt(1)
   end
 
   def main(_) do
@@ -96,6 +100,10 @@ defmodule ArgusBaseline do
 
     System.halt(2)
   end
+
+  # Both unreviewed findings and stale entries fail the check.
+  def verdict([], []), do: :ok
+  def verdict(_new, _stale), do: :fail
 
   # Multiset difference: each baseline entry accepts one occurrence of its
   # fingerprint. Returns {unaccepted finding fingerprints, unused entries}.
@@ -185,6 +193,11 @@ defmodule ArgusBaseline do
       {"a duplicate finding beyond the entries is new",
        compare([fp, fp, fp], [entry, entry]) == {[fp], []}},
       {"an entry beyond the findings is stale", compare([fp], [entry, entry]) == {[], [entry]}},
+      {"matching findings and entries pass", verdict([], []) == :ok},
+      {"an unreviewed finding fails", verdict([fp], []) == :fail},
+      {"a stale entry fails", verdict([], [entry]) == :fail},
+      {"one of two duplicate occurrences disappearing fails",
+       compare([fp], [entry, entry]) |> then(fn {n, st} -> verdict(n, st) end) == :fail},
       {"different detail is a different finding",
        compare([fingerprint(g)], [entry]) == {[fingerprint(g)], [entry]}},
       {"different at_label is a different finding",
