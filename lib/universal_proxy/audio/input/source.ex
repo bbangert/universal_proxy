@@ -2106,17 +2106,38 @@ defmodule UniversalProxy.Audio.Input.Source do
   # one to track.
   defp stop_capture(%__MODULE__{capture: pid} = state) do
     Task.Supervisor.start_child(UniversalProxy.TaskSupervisor, fn ->
-      # The capture may exit on its own between the alive? check and the
-      # stop (it is linked to this Source); that is the outcome we want, not
-      # a task crash to log.
-      try do
-        if Process.alive?(pid), do: GenServer.stop(pid, :normal, 2_000)
-      catch
-        :exit, _ -> :ok
-      end
+      stop_capture_process(pid, 2_000)
     end)
 
     %{state | capture: nil, stopping_capture: pid}
+  end
+
+  # Runs in the async stop task. The capture may exit on its own between the
+  # alive? check and the stop (it is linked to this Source) — that is the
+  # outcome we want, so the already-gone exits are fine. A stop that times
+  # out leaves the capture alive and `stopping_capture` set, blocking every
+  # later start: log it and kill the capture, so its `{:EXIT, _}` still
+  # reaches the Source and the deferred start proceeds. Any other exit
+  # propagates and crashes the task (logged by the Task.Supervisor).
+  @doc false
+  @spec stop_capture_process(pid(), timeout()) :: :ok
+  def stop_capture_process(pid, timeout) do
+    if Process.alive?(pid), do: GenServer.stop(pid, :normal, timeout)
+    :ok
+  catch
+    :exit, reason when reason in [:noproc, :normal, :shutdown] ->
+      :ok
+
+    :exit, {reason, _} when reason in [:noproc, :normal, :shutdown] ->
+      :ok
+
+    :exit, reason when reason == :timeout or (is_tuple(reason) and elem(reason, 0) == :timeout) ->
+      Logger.warning(
+        "Audio.Input.Source capture #{inspect(pid)} did not stop within #{timeout}ms; killing it"
+      )
+
+      Process.exit(pid, :kill)
+      :ok
   end
 
   # -- Connection teardown --

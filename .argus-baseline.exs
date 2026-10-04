@@ -225,7 +225,7 @@
     detail:
       "UniversalProxy.BTD700.Server.init/1 reaches DynamicSupervisor.start_child on a supervisor chosen at runtime. Every supervisor management call is a GenServer.call into the supervisor; start_child in particular does not return until the new child's init/1 has, so those inits now run inside this one, on the tree's startup path. A child that calls back into UniversalProxy.BTD700.Server, or into anything not yet started, deadlocks the boot; terminate_child waits for the whole shutdown of the child.",
     reason:
-      "Deliberate: init/1 sweeps orphans left by a previous incarnation under an earlier sibling DynamicSupervisor (already running under rest_for_one); terminating them before serving is the point, and they never call back into this server."
+      "Deliberate: init/1 starts a worker per device already present under the WorkerSupervisor, an earlier sibling that is already running. BTD700.DeviceWorker.init/1 only builds state and returns {:continue, :initialize}, deferring all device I/O to handle_continue/2, and never calls back into this server, so the synchronous start_child cannot deadlock or stall the boot."
   },
   %{
     analysis: "startup",
@@ -261,7 +261,7 @@
     detail:
       "UniversalProxy.ESPHome.Infrared.Server.init/1 reaches DynamicSupervisor.start_child on UniversalProxy.ESPHome.Infrared.WorkerSupervisor. Every supervisor management call is a GenServer.call into the supervisor; start_child in particular does not return until the new child's init/1 has, so those inits now run inside this one, on the tree's startup path. A child that calls back into UniversalProxy.ESPHome.Infrared.Server, or into anything not yet started, deadlocks the boot; terminate_child waits for the whole shutdown of the child.",
     reason:
-      "Deliberate: init/1 sweeps orphans left by a previous incarnation under an earlier sibling DynamicSupervisor (already running under rest_for_one); terminating them before serving is the point, and they never call back into this server."
+      "Deliberate: init/1 starts a worker per device already present under the WorkerSupervisor, an earlier sibling that is already running. the IRDroid DeviceWorker.init/1 only builds state and returns {:continue, :initialize}, deferring all device I/O to handle_continue/2, and never calls back into this server, so the synchronous start_child cannot deadlock or stall the boot."
   },
   %{
     analysis: "startup",
@@ -288,7 +288,7 @@
     detail:
       "UniversalProxy.FMA120.Server.init/1 reaches DynamicSupervisor.start_child on a supervisor chosen at runtime. Every supervisor management call is a GenServer.call into the supervisor; start_child in particular does not return until the new child's init/1 has, so those inits now run inside this one, on the tree's startup path. A child that calls back into UniversalProxy.FMA120.Server, or into anything not yet started, deadlocks the boot; terminate_child waits for the whole shutdown of the child.",
     reason:
-      "Deliberate: init/1 sweeps orphans left by a previous incarnation under an earlier sibling DynamicSupervisor (already running under rest_for_one); terminating them before serving is the point, and they never call back into this server."
+      "Deliberate: init/1 starts a worker per device already present under the WorkerSupervisor, an earlier sibling that is already running. FMA120.DeviceWorker.init/1 only builds state and returns {:continue, :initialize}, deferring all device I/O to handle_continue/2, and never calls back into this server, so the synchronous start_child cannot deadlock or stall the boot."
   },
   %{
     analysis: "startup",
@@ -333,7 +333,7 @@
     detail:
       "UniversalProxy.Storage.Settings.init/1 performs close during init, while the supervisor's start sequence waits. A slow or partitioned peer stalls local startup.",
     reason:
-      "False positive: argus classes every :dets call as a distributed (Mnesia-style) store operation, but this is a local DETS file on the device's data partition. Opening it in init/1 is deliberate so a store that cannot open fails its start instead of serving without a table."
+      "False positive: argus classes every :dets call as a distributed (Mnesia-style) store operation, but this is a local DETS file. This close runs only when chmod to 0600 fails after a successful open: init/1 releases the table it just opened before returning {:stop, {:chmod_failed, reason}}, so a store holding the clear-text Samba password never serves world-readable."
   },
   %{
     analysis: "startup",
