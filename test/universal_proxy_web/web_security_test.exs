@@ -79,24 +79,99 @@ defmodule UniversalProxyWeb.WebSecurityTest do
 
     defp enc(key), do: key |> :erlang.term_to_binary() |> Base.url_encode64(padding: false)
 
-    test "a well-formed FMA120 key opens the drawer (control)" do
+    # A key that is well-formed in every way except that its ETF is
+    # compressed. The long, repetitive slot makes `compressed: 6` actually
+    # emit the compressed form (it falls back to plain ETF when that's
+    # smaller), while the plain form still fits under the 256-byte cap.
+    defp compressed_enc(key) do
+      bin = :erlang.term_to_binary(key, compressed: 6)
+      assert <<131, 80, _::binary>> = bin
+      assert byte_size(:erlang.term_to_binary(key)) <= 256
+      Base.url_encode64(bin, padding: false)
+    end
+
+    defp long_slot(n), do: String.duplicate("a", n)
+
+    defp select_fma120(key) do
       {:ok, view, _html} = live(build_conn(), "/")
+      render_click(view, "select_fma120", %{"key" => key})
+    end
 
-      html =
-        render_click(view, "select_fma120", %{"key" => enc({"1-1.3", @fma120_vid, @fma120_pid})})
+    test "a well-formed FMA120 key opens the drawer (control)" do
+      assert select_fma120(enc({"1-1.3", @fma120_vid, @fma120_pid})) =~ "close_fma120_drawer"
 
-      assert html =~ "close_fma120_drawer"
+      assert select_fma120(enc({long_slot(200), @fma120_vid, @fma120_pid})) =~
+               "close_fma120_drawer"
     end
 
     test "a fun nested in an otherwise valid FMA120 key is rejected" do
-      {:ok, view, _html} = live(build_conn(), "/")
       key = enc({fn -> :executed end, @fma120_vid, @fma120_pid})
       # Must fit the decoder's 256-byte cap, or the size check (not the
       # non-executable decode) would be what rejects it.
       assert byte_size(Base.url_decode64!(key, padding: false)) <= 256
 
-      html = render_click(view, "select_fma120", %{"key" => key})
-      refute html =~ "close_fma120_drawer"
+      refute select_fma120(key) =~ "close_fma120_drawer"
+    end
+
+    test "a compressed FMA120 key is rejected" do
+      key = compressed_enc({long_slot(200), @fma120_vid, @fma120_pid})
+      refute select_fma120(key) =~ "close_fma120_drawer"
+    end
+
+    test "an oversized FMA120 key is rejected" do
+      refute select_fma120(enc({long_slot(300), @fma120_vid, @fma120_pid})) =~
+               "close_fma120_drawer"
+    end
+
+    # AudioLive's set_volume decodes the key and calls Audio.update_config/2;
+    # in test env the server tracks no outputs, so a key that *decodes*
+    # yields a logged {:error, :not_found}, and a rejected key logs nothing.
+    defp audio_set_volume_log(key) do
+      {:ok, view, _html} = live(build_conn(), "/audio")
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        render_hook(view, "set_volume", %{"key" => key, "value" => "50"})
+      end)
+    end
+
+    test "a well-formed Audio key is decoded (control)" do
+      assert audio_set_volume_log(enc({long_slot(200), nil, nil})) =~ "set_volume failed"
+    end
+
+    test "a compressed Audio key is rejected" do
+      refute audio_set_volume_log(compressed_enc({long_slot(200), nil, nil})) =~
+               "set_volume failed"
+    end
+
+    test "an oversized Audio key is rejected" do
+      refute audio_set_volume_log(enc({long_slot(300), nil, nil})) =~ "set_volume failed"
+    end
+  end
+
+  describe "UniversalProxyWeb.OpaqueKey" do
+    alias UniversalProxyWeb.OpaqueKey
+
+    test "round-trips encode/1" do
+      key = {"1-1.3", 0x0A12, 0x4007}
+      assert {:ok, ^key} = key |> OpaqueKey.encode() |> OpaqueKey.decode()
+    end
+
+    test "rejects garbage, non-binaries, bad ETF, compressed, oversized and funs" do
+      assert :error = OpaqueKey.decode("not base64!")
+      assert :error = OpaqueKey.decode(nil)
+      assert :error = OpaqueKey.decode(Base.url_encode64(<<131, 255>>, padding: false))
+      assert :error = OpaqueKey.decode(Base.url_encode64(<<1, 2, 3>>, padding: false))
+
+      big = {String.duplicate("a", 200), 1, 2}
+
+      assert :error =
+               big
+               |> :erlang.term_to_binary(compressed: 6)
+               |> Base.url_encode64(padding: false)
+               |> OpaqueKey.decode()
+
+      assert :error = OpaqueKey.decode(OpaqueKey.encode({String.duplicate("a", 300), 1, 2}))
+      assert :error = OpaqueKey.decode(OpaqueKey.encode({fn -> :x end, 1, 2}))
     end
   end
 end
