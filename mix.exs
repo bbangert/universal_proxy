@@ -107,6 +107,7 @@ defmodule UniversalProxy.MixProject do
       # Static analysis
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
+      {:argus_beam, "~> 0.20", only: [:dev, :test], runtime: false},
 
       # UART/serial port enumeration
       {:circuits_uart, "~> 1.5"},
