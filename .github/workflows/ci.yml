@@ -159,14 +159,15 @@ jobs:
           key: ${{ runner.os }}-host-deps-${{ hashFiles('mix.lock') }}
           restore-keys: ${{ runner.os }}-host-deps-
       - run: mix deps.get
-      # `mix hex.audit` has no per-package ignore flag. cowlib 2.19.0 (a
-      # transitive dep via cowboy) has three advisories with no fixed release
-      # available upstream; allow ONLY those specific IDs so the gate still
+      # `mix hex.audit` has no per-package ignore flag. cowlib 2.20.0 (a
+      # transitive dep via cowboy; latest release) still has two advisories
+      # with no fixed release upstream (EEF-CVE-2026-43971 was fixed in 2.20.0
+      # and dropped from this list); allow ONLY those IDs so the gate still
       # fails on any other advisory (including a future req regression).
       # Remove this allow-list once cowlib ships a patched release.
-      - name: Hex audit (cowlib 2.19.0 advisories allow-listed — no upstream fix)
+      - name: Hex audit (cowlib 2.20.0 advisories allow-listed — no upstream fix)
         run: |
-          ALLOWED='EEF-CVE-2026-43966|EEF-CVE-2026-43969|EEF-CVE-2026-43971'
+          ALLOWED='EEF-CVE-2026-43966|EEF-CVE-2026-43969'
           audit=$(mix hex.audit 2>&1) && exit 0
           echo "$audit"
           unexpected=$(echo "$audit" | grep -E '^  [^ ]+ [0-9]' | grep -Ev " - (${ALLOWED}) " || true)
