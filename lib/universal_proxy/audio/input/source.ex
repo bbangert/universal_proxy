@@ -2106,7 +2106,14 @@ defmodule UniversalProxy.Audio.Input.Source do
   # one to track.
   defp stop_capture(%__MODULE__{capture: pid} = state) do
     Task.Supervisor.start_child(UniversalProxy.TaskSupervisor, fn ->
-      if Process.alive?(pid), do: GenServer.stop(pid, :normal, 2_000)
+      # The capture may exit on its own between the alive? check and the
+      # stop (it is linked to this Source); that is the outcome we want, not
+      # a task crash to log.
+      try do
+        if Process.alive?(pid), do: GenServer.stop(pid, :normal, 2_000)
+      catch
+        :exit, _ -> :ok
+      end
     end)
 
     %{state | capture: nil, stopping_capture: pid}
