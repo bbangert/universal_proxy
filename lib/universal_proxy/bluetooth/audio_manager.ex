@@ -253,7 +253,7 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
       {:ok, adapter} ->
         case state.ops.start_discovery(state.conn, adapter) do
           :ok ->
-            if state.scan_timer, do: Process.cancel_timer(state.scan_timer)
+            cancel_scan_timer(state.scan_timer)
             timer = Process.send_after(self(), :scan_timeout, state.scan_ms)
             {:reply, :ok, %{state | scanning?: true, scan_timer: timer, scan_path: adapter}}
 
@@ -648,10 +648,24 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
 
   # -- Misc --
 
+  # Cancel the scan timeout and drop one that already fired, so a stale
+  # `:scan_timeout` can't end the next scan early.
+  defp cancel_scan_timer(nil), do: :ok
+
+  defp cancel_scan_timer(timer) do
+    _ = Process.cancel_timer(timer)
+
+    receive do
+      :scan_timeout -> :ok
+    after
+      0 -> :ok
+    end
+  end
+
   defp do_stop_scan(%{scanning?: false} = state), do: state
 
   defp do_stop_scan(state) do
-    if state.scan_timer, do: Process.cancel_timer(state.scan_timer)
+    cancel_scan_timer(state.scan_timer)
 
     # Stop on the adapter the scan was started on; fall back to the first audio
     # adapter if we somehow lost it.

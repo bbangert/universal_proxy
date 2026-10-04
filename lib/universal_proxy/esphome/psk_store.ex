@@ -85,6 +85,10 @@ defmodule UniversalProxy.ESPHome.PskStore do
 
   @impl GenServer
   def init(opts) do
+    # Trap exits so terminate/2 runs on a supervisor shutdown too (not only
+    # on a crash) and closes the DETS table cleanly.
+    Process.flag(:trap_exit, true)
+
     table_name = Keyword.get(opts, :table, :esphome_psk)
     path = Keyword.get(opts, :dets_path) || dets_path()
 

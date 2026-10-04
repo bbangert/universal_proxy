@@ -38,8 +38,8 @@ defmodule UniversalProxy.Bluetooth.RadioMonitor do
 
   use GenServer
 
-  alias UniversalProxy.Bluetooth.Radios
   alias Bluez.{Client, DevicePath}
+  alias UniversalProxy.Bluetooth.Radios
 
   def start_link(opts \\ []) do
     gen_opts =

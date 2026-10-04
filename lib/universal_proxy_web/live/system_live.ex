@@ -12,8 +12,8 @@ defmodule UniversalProxyWeb.SystemLive do
   import UniversalProxyWeb.Components.UI
   import UniversalProxyWeb.Components.Icons
 
-  alias UniversalProxy.System, as: Sys
   alias UniversalProxy.FirmwareUpdate
+  alias UniversalProxy.System, as: Sys
 
   @refresh_interval 2_000
   @log_window 80

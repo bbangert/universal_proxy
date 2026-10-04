@@ -20,6 +20,7 @@ defmodule UniversalProxy.Hardware do
   Returns ports in a fixed shape consumed by the Overview LiveView.
   """
 
+  alias UniversalProxy.ESPHome.ZWaveProxy
   alias UniversalProxy.UART
   alias UniversalProxy.UART.Enumerate
 
@@ -222,7 +223,7 @@ defmodule UniversalProxy.Hardware do
         end),
       zwave_claim:
         Keyword.get_lazy(opts, :zwave_claim, fn ->
-          UniversalProxy.ESPHome.ZWaveProxy.claimed_port()
+          ZWaveProxy.claimed_port()
         end)
     }
 
@@ -473,15 +474,11 @@ defmodule UniversalProxy.Hardware do
         names
         |> Enum.filter(&usb_serial?/1)
         |> Enum.flat_map(fn name ->
-          case File.read_link(Path.join(dir, name)) do
-            {:ok, target} ->
-              case parse_bus_path(target) do
-                nil -> []
-                bus_path -> [{name, bus_path}]
-              end
-
-            _ ->
-              []
+          with {:ok, target} <- File.read_link(Path.join(dir, name)),
+               bus_path when is_binary(bus_path) <- parse_bus_path(target) do
+            [{name, bus_path}]
+          else
+            _ -> []
           end
         end)
         |> Map.new()

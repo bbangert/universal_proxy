@@ -323,6 +323,10 @@ defmodule UniversalProxy.Audio.Input.Capture do
   defp force_kill(%__MODULE__{os_pid: pid}) do
     # SIGKILL via :os.cmd is portable and doesn't require muontrap.
     # The kernel reaps; we don't care about the result.
+    # `pid` is the integer OS pid from Port.info/2, so nothing user-controlled
+    # reaches the shell; the shell's `kill` builtin avoids depending on a
+    # separate kill binary in the rootfs.
+    # credo:disable-for-next-line Credo.Check.Warning.UnsafeExec
     _ = :os.cmd(~c"kill -9 #{pid} 2>/dev/null")
     :ok
   end

@@ -112,7 +112,7 @@ defmodule UniversalProxy.FMA120.Protocol do
     "BC:" <> header <> "=" <> payload <> @line_terminator
   end
 
-  @doc "Uppercase, zero-padded 2-char hex of a byte (`5 -> \"05\"`, `255 -> \"FF\"`)."
+  @doc ~s[Uppercase, zero-padded 2-char hex of a byte (`5 -> "05"`, `255 -> "FF"`).]
   @spec hex_byte(0..255) :: String.t()
   def hex_byte(value) when is_integer(value) and value in 0..255 do
     value |> Integer.to_string(16) |> String.upcase() |> String.pad_leading(2, "0")
