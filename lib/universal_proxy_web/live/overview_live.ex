@@ -1655,7 +1655,9 @@ defmodule UniversalProxyWeb.OverviewLive do
   defp bit_value(_), do: 0x00
 
   # Opaque keys go through `UniversalProxyWeb.OpaqueKey` (size cap, no
-  # compressed ETF, no atoms or funs) plus a shape assertion here.
+  # compressed ETF, no new atoms created, funs rejected). Existing atoms
+  # and other terms still decode, so the shape assertion here constrains
+  # the rest.
   defp encode_key(key), do: OpaqueKey.encode(key)
 
   defp decode_key(b64), do: decode_shaped(b64, &fma120_key?/1)

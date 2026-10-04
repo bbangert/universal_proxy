@@ -11,10 +11,13 @@ defmodule UniversalProxyWeb.OpaqueKey do
     * compressed ETF (`<<131, 80, ...>>`) is rejected before decoding, since
       `binary_to_term` would inflate it past the size cap first and
       `encode/1` never compresses;
-    * `Plug.Crypto.non_executable_binary_to_term/2` with `[:safe]` refuses
-      new atoms and any fun (Sobelow Misc.BinToTerm).
+    * `[:safe]` stops decoding from creating new atoms (existing atoms
+      such as `nil` still decode), and
+      `Plug.Crypto.non_executable_binary_to_term/2` rejects any fun
+      (Sobelow Misc.BinToTerm).
 
-  Callers still assert the decoded shape themselves.
+  Any other term can still come back, so callers must assert the decoded
+  shape themselves.
   """
 
   @max_bytes 256

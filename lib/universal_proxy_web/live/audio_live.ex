@@ -1174,8 +1174,9 @@ defmodule UniversalProxyWeb.AudioLive do
   end
 
   # The form passes `id` as a string; reconstitute the tuple via
-  # `UniversalProxyWeb.OpaqueKey` (size cap, no compressed ETF, no atoms or
-  # funs). Post-decode we assert the shape — only
+  # `UniversalProxyWeb.OpaqueKey` (size cap, no compressed ETF, no new
+  # atoms created, funs rejected). Existing atoms such as `nil` still
+  # decode, so post-decode we assert the shape — only
   # `{binary, nil | integer, nil | integer}` is accepted.
   defp decode_key(id) do
     with {:ok, term} <- OpaqueKey.decode(id),
