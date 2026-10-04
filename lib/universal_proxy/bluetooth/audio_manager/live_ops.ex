@@ -34,25 +34,18 @@ defmodule UniversalProxy.Bluetooth.AudioManager.LiveOps do
       {:ok, objects} ->
         Enum.flat_map(objects, fn
           {path, ifaces} ->
-            case List.keyfind(ifaces, @device_iface, 0) do
-              {_iface, props} ->
-                case mac_from_path(path) do
-                  {:ok, mac} ->
-                    [
-                      %{
-                        path: path,
-                        mac: mac,
-                        props: Variant.unwrap_props(props),
-                        battery: battery_pct(ifaces)
-                      }
-                    ]
-
-                  :error ->
-                    []
-                end
-
-              nil ->
-                []
+            with {_iface, props} <- List.keyfind(ifaces, @device_iface, 0),
+                 {:ok, mac} <- mac_from_path(path) do
+              [
+                %{
+                  path: path,
+                  mac: mac,
+                  props: Variant.unwrap_props(props),
+                  battery: battery_pct(ifaces)
+                }
+              ]
+            else
+              _ -> []
             end
 
           _ ->

@@ -70,6 +70,10 @@ defmodule UniversalProxy.SSHAccess do
 
   @impl true
   def init(opts) do
+    # Trap exits so terminate/2 runs on a supervisor shutdown too (not only
+    # on a crash) and closes the DETS table cleanly.
+    Process.flag(:trap_exit, true)
+
     table_name = Keyword.get(opts, :table, @default_table)
     path = Keyword.get(opts, :dets_path) || dets_path()
     File.mkdir_p!(Path.dirname(path))
@@ -141,9 +145,8 @@ defmodule UniversalProxy.SSHAccess do
   end
 
   defp persist(table, %Keypair{} = keypair) do
-    with :ok <- :dets.insert(table, {@key, Map.from_struct(keypair)}),
-         :ok <- :dets.sync(table) do
-      :ok
+    with :ok <- :dets.insert(table, {@key, Map.from_struct(keypair)}) do
+      :dets.sync(table)
     end
   end
 
@@ -253,6 +256,7 @@ defmodule UniversalProxy.SSHAccess do
       try do
         # `apply/3` keeps both the compiler and Dialyzer from resolving this
         # target-only module (nerves_ssh is absent from the host build/PLT).
+        # credo:disable-for-next-line Credo.Check.Refactor.Apply
         apply(NervesSSH, :add_authorized_key, [public_key])
         Logger.info("SSH access: public key authorized for ssh login")
         :ok

@@ -109,7 +109,17 @@ defmodule UniversalProxy.FirmwareUpdate.Poller do
   # -- Scheduling --
 
   defp schedule(state, delay_ms) do
-    if state.timer, do: Process.cancel_timer(state.timer)
+    if state.timer do
+      _ = Process.cancel_timer(state.timer)
+
+      # Drop a :check that already fired so it can't run an extra, early check.
+      receive do
+        :check -> :ok
+      after
+        0 -> :ok
+      end
+    end
+
     %{state | timer: Process.send_after(self(), :check, delay_ms)}
   end
 

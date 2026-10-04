@@ -2211,6 +2211,14 @@ defmodule UniversalProxy.Storage.Server do
 
   defp cancel_retry(state) do
     _ = Process.cancel_timer(state.retry_timer)
+
+    # Drop a retry that already fired so it doesn't run an extra pass.
+    receive do
+      :retry_converge -> :ok
+    after
+      0 -> :ok
+    end
+
     %{state | retry_timer: nil}
   end
 

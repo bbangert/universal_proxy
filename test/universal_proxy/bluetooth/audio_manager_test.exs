@@ -310,6 +310,46 @@ defmodule UniversalProxy.Bluetooth.AudioManagerTest do
       assert_receive {:bt_scan, :stopped}, 500
       assert_receive {:ops, {:stop_discovery, @adapter}}
     end
+
+    test "a :scan_timeout that fired before a stop doesn't end the next scan early", %{
+      settings: settings
+    } do
+      with_audio_adapter(settings)
+      mgr = start_manager(settings, scan_ms: 200)
+
+      assert :ok = AudioManager.start_scan(mgr, nil)
+      assert_receive {:ops, {:start_discovery, @adapter}}
+
+      # Queue stop_scan, then start_scan, then let the first scan's timer
+      # fire behind them: the stale :scan_timeout lands after the restart.
+      :ok = :sys.suspend(mgr)
+      stop = Task.async(fn -> AudioManager.stop_scan(mgr) end)
+      wait_for_queue(mgr, 1)
+      start = Task.async(fn -> AudioManager.start_scan(mgr, nil) end)
+      wait_for_queue(mgr, 2)
+      Process.sleep(250)
+      :ok = :sys.resume(mgr)
+
+      assert :ok = Task.await(stop)
+      assert :ok = Task.await(start)
+      assert_receive {:bt_scan, :stopped}
+
+      # The restarted scan runs its full scan_ms instead of being cut short
+      # by the first scan's already-delivered timeout.
+      refute_receive {:bt_scan, :stopped}, 120
+      assert_receive {:bt_scan, :stopped}, 500
+    end
+  end
+
+  defp wait_for_queue(pid, len) do
+    case Process.info(pid, :message_queue_len) do
+      {:message_queue_len, n} when n >= len ->
+        :ok
+
+      _ ->
+        Process.sleep(5)
+        wait_for_queue(pid, len)
+    end
   end
 
   describe "multiple :audio adapters (per-adapter bonds)" do

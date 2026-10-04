@@ -67,6 +67,10 @@ defmodule UniversalProxy.UART.Store do
 
   @impl true
   def init(_opts) do
+    # Trap exits so terminate/2 runs on a supervisor shutdown too (not only
+    # on a crash) and closes the DETS table cleanly.
+    Process.flag(:trap_exit, true)
+
     path = dets_path() |> to_charlist()
 
     case :dets.open_file(@table, file: path, type: :set) do

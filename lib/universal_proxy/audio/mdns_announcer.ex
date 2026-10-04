@@ -1,4 +1,7 @@
 defmodule UniversalProxy.Audio.MdnsAnnouncer do
+  # VintageNet is target-only: `apply/3` keeps the compiler and Dialyzer from
+  # resolving it on host, where every call is gated by Code.ensure_loaded?/1.
+  # credo:disable-for-this-file Credo.Check.Refactor.Apply
   @moduledoc """
   Re-emits unsolicited mDNS announcements whenever a network interface
   comes up.

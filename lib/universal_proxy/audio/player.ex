@@ -72,6 +72,7 @@ defmodule UniversalProxy.Audio.Player do
   require Logger
 
   alias UniversalProxy.Audio.Store
+  alias UniversalProxy.ESPHome.ConfigStore
 
   @pubsub UniversalProxy.PubSub
   @topic_state "sendspin:state"
@@ -227,60 +228,58 @@ defmodule UniversalProxy.Audio.Player do
       mac_address_fun: mac_address_fun
     }
 
-    cond do
-      not File.exists?(binary_path) ->
-        Logger.error(
-          "Audio.Player binary missing at #{binary_path}; refusing to start #{inspect(key)}"
-        )
-
-        {:stop, {:binary_missing, binary_path}}
-
-      true ->
-        port = open_port(state)
-        # Port.info/2 returns `nil` if the port closed between open and
-        # this call — happens when the binary exits immediately (bad arg,
-        # missing libasound). `force_kill/1` already guards against
-        # `os_pid: nil`, so we just pattern-match here instead of
-        # crashing init with a misleading ArgumentError.
-        os_pid =
-          case Port.info(port, :os_pid) do
-            {:os_pid, pid} -> pid
-            nil -> nil
-          end
-
-        # mDNS registration is deferred until the binary's `listening`
-        # event (WebSocket listener bound) — see the moduledoc. Only
-        # `mdns_id` is set here so `terminate/2` can best-effort
-        # remove/goodbye even if the binary never got that far.
-        new_state = %{
-          state
-          | port: port,
-            mdns_id: mdns_service_id(key),
-            os_pid: os_pid,
-            reannounce_delays_ms: Keyword.get(opts, :reannounce_delays_ms, @reannounce_delays_ms),
-            mdns_retry_ms: Keyword.get(opts, :mdns_retry_ms, @mdns_retry_ms)
-        }
-
-        # One-shot diagnostic: if the binary never reports `listening`
-        # (listener can't bind, wedged startup), the player would run
-        # healthy but undiscoverable with no trace anywhere — surface it.
-        Process.send_after(
-          self(),
-          :mdns_watchdog,
-          Keyword.get(opts, :mdns_watchdog_ms, @mdns_watchdog_ms)
-        )
-
-        # `--initial-volume` is the only startup config the binary
-        # accepts on its CLI; there's no `--initial-muted`. If DETS
-        # says this output is muted, push a `set_muted` command over
-        # stdin right after the port is open so the binary's default
-        # (unmuted) doesn't briefly play before the BEAM tells it the
-        # truth. Volume is already covered by `--initial-volume`.
-        if Map.get(config, :muted, false) do
-          send_command(new_state, {:set_muted, true})
+    if File.exists?(binary_path) do
+      port = open_port(state)
+      # Port.info/2 returns `nil` if the port closed between open and
+      # this call — happens when the binary exits immediately (bad arg,
+      # missing libasound). `force_kill/1` already guards against
+      # `os_pid: nil`, so we just pattern-match here instead of
+      # crashing init with a misleading ArgumentError.
+      os_pid =
+        case Port.info(port, :os_pid) do
+          {:os_pid, pid} -> pid
+          nil -> nil
         end
 
-        {:ok, new_state}
+      # mDNS registration is deferred until the binary's `listening`
+      # event (WebSocket listener bound) — see the moduledoc. Only
+      # `mdns_id` is set here so `terminate/2` can best-effort
+      # remove/goodbye even if the binary never got that far.
+      new_state = %{
+        state
+        | port: port,
+          mdns_id: mdns_service_id(key),
+          os_pid: os_pid,
+          reannounce_delays_ms: Keyword.get(opts, :reannounce_delays_ms, @reannounce_delays_ms),
+          mdns_retry_ms: Keyword.get(opts, :mdns_retry_ms, @mdns_retry_ms)
+      }
+
+      # One-shot diagnostic: if the binary never reports `listening`
+      # (listener can't bind, wedged startup), the player would run
+      # healthy but undiscoverable with no trace anywhere — surface it.
+      Process.send_after(
+        self(),
+        :mdns_watchdog,
+        Keyword.get(opts, :mdns_watchdog_ms, @mdns_watchdog_ms)
+      )
+
+      # `--initial-volume` is the only startup config the binary
+      # accepts on its CLI; there's no `--initial-muted`. If DETS
+      # says this output is muted, push a `set_muted` command over
+      # stdin right after the port is open so the binary's default
+      # (unmuted) doesn't briefly play before the BEAM tells it the
+      # truth. Volume is already covered by `--initial-volume`.
+      if Map.get(config, :muted, false) do
+        send_command(new_state, {:set_muted, true})
+      end
+
+      {:ok, new_state}
+    else
+      Logger.error(
+        "Audio.Player binary missing at #{binary_path}; refusing to start #{inspect(key)}"
+      )
+
+      {:stop, {:binary_missing, binary_path}}
     end
   end
 
@@ -925,7 +924,7 @@ defmodule UniversalProxy.Audio.Player do
   # starts before Audio, but a lookup failure degrades to an unsuffixed
   # name rather than blocking mDNS registration.
   defp default_device_name do
-    UniversalProxy.ESPHome.ConfigStore.current().name
+    ConfigStore.current().name
   rescue
     _ -> nil
   catch
@@ -948,7 +947,7 @@ defmodule UniversalProxy.Audio.Player do
   # ConfigStore is a GenServer: a down/wedged store degrades to
   # detection rather than blocking the player spawn.
   defp stored_mac_address do
-    Map.get(UniversalProxy.ESPHome.ConfigStore.current(), :mac_address)
+    Map.get(ConfigStore.current(), :mac_address)
   rescue
     _ -> nil
   catch
@@ -986,6 +985,10 @@ defmodule UniversalProxy.Audio.Player do
   defp force_kill(%__MODULE__{os_pid: pid}) do
     # SIGKILL via :os.cmd is portable and doesn't require muontrap.
     # The kernel will reap; we don't care about the result.
+    # `pid` is the integer OS pid from Port.info/2, so nothing user-controlled
+    # reaches the shell; the shell's `kill` builtin avoids depending on a
+    # separate kill binary in the rootfs.
+    # credo:disable-for-next-line Credo.Check.Warning.UnsafeExec
     _ = :os.cmd(~c"kill -9 #{pid} 2>/dev/null")
     :ok
   end

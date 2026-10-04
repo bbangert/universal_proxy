@@ -73,6 +73,10 @@ defmodule UniversalProxy.Bluetooth.Stats do
 
   @impl GenServer
   def init(opts) do
+    # Trap exits so terminate/2 runs on a supervisor shutdown too (not only
+    # on a crash), un-publishing the counter ref.
+    Process.flag(:trap_exit, true)
+
     counter = :counters.new(1, [:write_concurrency])
     :persistent_term.put(@counter_key, counter)
 

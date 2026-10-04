@@ -1953,6 +1953,15 @@ defmodule UniversalProxy.Audio.Input.Source do
 
   defp cancel_time_timer(%__MODULE__{time_timer: timer} = state) do
     _ = Process.cancel_timer(timer)
+
+    # A tick that fired before the cancel is already queued; drop it so it
+    # isn't handled as the next one (an early or post-stop time request).
+    receive do
+      :time_tick -> :ok
+    after
+      0 -> :ok
+    end
+
     %{state | time_timer: nil}
   end
 

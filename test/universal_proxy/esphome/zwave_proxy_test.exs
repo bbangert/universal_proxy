@@ -396,6 +396,62 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
     end
   end
 
+  describe "shutdown and the linked UART" do
+    test "a supervisor shutdown broadcasts :uart_port_closed" do
+      Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "uart:port_opened")
+      Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "uart:port_closed")
+      {:ok, fake} = FakeUART.start_link(self())
+      id = {:zw_shutdown, System.unique_integer()}
+
+      start_supervised!(
+        {ZWaveProxy,
+         name: nil, port_path: "/dev/ttyShutdown", open_fun: fn _path -> {:ok, fake} end},
+        id: id
+      )
+
+      assert_receive {:uart_port_opened, %{friendly_name: "ttyShutdown"}}
+
+      # The supervisor stops the child with a :shutdown exit signal; only a
+      # server that traps exits runs terminate/2 for it.
+      :ok = stop_supervised(id)
+
+      assert_receive {:uart_port_closed, %{friendly_name: "ttyShutdown", owner: :zwave_proxy}}
+    end
+
+    test "a crash of the linked UART process still stops the proxy" do
+      test_pid = self()
+      Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "uart:port_opened")
+
+      # Started from inside the proxy, so the fake is linked to it the way
+      # Circuits.UART.start_link/0 is.
+      open_fun = fn _path ->
+        {:ok, fake} = FakeUART.start_link(test_pid)
+        send(test_pid, {:fake_uart, fake})
+        {:ok, fake}
+      end
+
+      server =
+        start_supervised!(
+          Supervisor.child_spec(
+            {ZWaveProxy, name: nil, port_path: "/dev/ttyCrash", open_fun: open_fun},
+            id: {:zw_crash, System.unique_integer()},
+            restart: :temporary
+          )
+        )
+
+      assert_receive {:fake_uart, fake}
+      assert_receive {:uart_port_opened, %{friendly_name: "ttyCrash"}}
+      ref = Process.monitor(server)
+
+      Process.exit(fake, :kill)
+
+      # Usually the :killed link exit; a home-ID retry write racing the
+      # kill can crash it first with :noproc. Either way it doesn't survive.
+      assert_receive {:DOWN, ^ref, :process, ^server, reason}, 1_000
+      assert reason != :normal
+    end
+  end
+
   describe "callbacks tolerate a dead/missing server" do
     setup do
       {:ok, pid} = ZWaveProxy.start_link(name: nil, port_path: nil)

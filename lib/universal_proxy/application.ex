@@ -17,6 +17,12 @@ defmodule UniversalProxy.Application do
         UniversalProxyWeb.Endpoint,
         # Task supervisor for fire-and-forget work (e.g. async ESPHome restarts)
         {Task.Supervisor, name: UniversalProxy.TaskSupervisor},
+        # ESPHome device identity store (DETS). Early, before the subsystems
+        # that read the device name/MAC through it (audio players and input
+        # sources, the Storage server's NetBIOS name): started after them,
+        # their first convergence raced it and fell back to generic defaults.
+        # It depends on nothing started after it.
+        UniversalProxy.ESPHome.ConfigStore,
         # SSH access key: generates the device's ed25519 keypair on first boot,
         # authorizes the public half for ssh login, and serves the private half
         # to the Security tab for download. No-op authorize on host.
@@ -75,8 +81,6 @@ defmodule UniversalProxy.Application do
         # rationale as FMA120.Supervisor above. No-op when no BTD 700 is
         # attached (empty inventory); works on host.
         UniversalProxy.BTD700.Supervisor,
-        # ESPHome device identity store (DETS)
-        UniversalProxy.ESPHome.ConfigStore,
         # ESPHome Noise PSK store (DETS). Sits beside ConfigStore at the
         # top level so a restart/0 of the ESPHome subtree never closes its
         # DETS file. Holds the HA-provisioned API encryption key.

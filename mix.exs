@@ -35,11 +35,81 @@ defmodule UniversalProxy.MixProject do
       deps: deps(),
       releases: [{@app, release()}],
       aliases: aliases(),
+      argus: argus(),
       dialyzer: [
         plt_add_apps: [:mix],
         plt_local_path: "priv/plts",
         plt_core_path: "priv/plts",
         ignore_warnings: ".dialyzer_ignore.exs"
+      ]
+    ]
+  end
+
+  # `mix argus --fail-above 0` is a CI gate. argus can only suppress per
+  # file (`ignore: [files: ...]` drops every finding reported in that file),
+  # so each file below was reviewed and holds only findings judged false
+  # positives or deliberate design. Re-check a file's findings with
+  # `mix argus` after removing it from this list when touching it.
+  defp argus do
+    [
+      ignore: [
+        files: [
+          # DETS stores open their table in init/1 so a store that can't
+          # open fails its start. argus classes every :dets call as a
+          # *distributed* store op ("Distributed operation in init/1"); these
+          # tables are local files.
+          "lib/universal_proxy/audio/input/store.ex",
+          "lib/universal_proxy/audio/store.ex",
+          "lib/universal_proxy/bluetooth/settings.ex",
+          "lib/universal_proxy/btd700/store.ex",
+          "lib/universal_proxy/esphome/config_store.ex",
+          "lib/universal_proxy/esphome/psk_store.ex",
+          "lib/universal_proxy/firmware_update/config_store.ex",
+          "lib/universal_proxy/fma120/store.ex",
+          "lib/universal_proxy/ssh_access.ex",
+          "lib/universal_proxy/storage/settings.ex",
+          "lib/universal_proxy/uart/settings_store.ex",
+          "lib/universal_proxy/uart/store.ex",
+          # Top-level tree: the "coupled children" are callers of the DETS
+          # stores (Storage.Settings, ESPHome.ConfigStore), whose state is
+          # persisted and survives a restart, and UART.History's
+          # ZWaveProxy.claimed_port/0 query, which registers nothing.
+          "lib/universal_proxy/application.ex",
+          # History's boot-time ZWaveProxy.claimed_port/0 call tolerates the
+          # proxy not being up yet (catch :exit -> nil); the proxy's
+          # `uart:port_opened` lifecycle broadcast adds the claim later.
+          "lib/universal_proxy/uart/history.ex",
+          # rest_for_one subtrees whose server sweeps the children a previous
+          # incarnation left under the earlier DynamicSupervisor (init-time
+          # which_children/terminate_child on an already-started sibling;
+          # the swept pids are not monitored by the new incarnation), and
+          # servers that start workers in init/1 whose own init defers all
+          # work to handle_continue/2 (no call back into the server).
+          "lib/universal_proxy/uart/server.ex",
+          "lib/universal_proxy/audio/server.ex",
+          "lib/universal_proxy/audio/input/server.ex",
+          "lib/universal_proxy/btd700/server.ex",
+          "lib/universal_proxy/fma120/server.ex",
+          "lib/universal_proxy/esphome/infrared/server.ex",
+          # Storage.Server demonitors (with :flush) before terminating the
+          # smbd child, via demonitor_share/1 in stop_share/1.
+          "lib/universal_proxy/storage/server.ex",
+          # Fire-and-forget work under UniversalProxy.TaskSupervisor is the
+          # project idiom (CLAUDE.md): an ESPHome restart, a drive format or
+          # a capture stop is meant to finish even if the caller goes away.
+          # source.ex's other findings: the socket monitor is demonitored
+          # with :flush in teardown_connection/2, and `{:source_event, ...}`
+          # goes to the owning Audio.Input.Server, not to the Source.
+          "lib/universal_proxy/bluetooth.ex",
+          "lib/universal_proxy/bluetooth/manager.ex",
+          "lib/universal_proxy/esphome.ex",
+          "lib/universal_proxy/audio/input/source.ex",
+          "lib/universal_proxy_web/live/overview_live.ex",
+          # terminate/2 work is bounded: a 500ms graceful-exit wait, a
+          # Port.close and a `kill -9` of the child OS process.
+          "lib/universal_proxy/audio/player.ex",
+          "lib/universal_proxy/audio/input/capture.ex"
+        ]
       ]
     ]
   end

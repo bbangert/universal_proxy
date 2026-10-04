@@ -183,6 +183,13 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
 
   @impl GenServer
   def init(opts) do
+    # Trap exits so terminate/2 runs on a supervisor shutdown (e.g. an
+    # ESPHome subtree restart) and broadcasts `uart:port_closed` — without
+    # it History would keep the port's external claim. The linked
+    # Circuits.UART process's crash still takes this server down: see the
+    # `{:EXIT, ...}` clause in handle_info/2.
+    Process.flag(:trap_exit, true)
+
     state = %__MODULE__{
       parser: Parser.new(),
       port_path: Keyword.get(opts, :port_path),
@@ -364,6 +371,13 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
     {:noreply, %{state | subscriber: nil, monitor_ref: nil}}
   end
 
+  # The linked UART process died abnormally: stop with it, as the link did
+  # before this server trapped exits. Exits of a UART already released by
+  # cleanup_uart/1 (uart_pid no longer matches) fall to the catch-all.
+  def handle_info({:EXIT, pid, reason}, %{uart_pid: pid} = state) when reason != :normal do
+    {:stop, reason, state}
+  end
+
   def handle_info(_msg, state) do
     {:noreply, state}
   end
@@ -387,7 +401,8 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
       Circuits.UART.close(pid)
       Circuits.UART.stop(pid)
     catch
-      _, _ -> :ok
+      kind, reason ->
+        Logger.debug("Z-Wave UART cleanup failed: #{inspect({kind, reason})}")
     end
 
     :ok
