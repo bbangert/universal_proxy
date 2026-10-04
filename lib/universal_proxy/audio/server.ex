@@ -717,37 +717,39 @@ defmodule UniversalProxy.Audio.Server do
   defp persist_binary_state(state, key, update) do
     case Map.fetch(state.outputs, key) do
       {:ok, existing} ->
-        if changed?(existing, update) do
-          case Store.save_config(state.store, key, update) do
-            :ok ->
-              # Read-back can fail (corrupt/race) even after a clean write;
-              # don't crash the Server — keep the prior in-memory output.
-              case Store.get_config(state.store, key) do
-                {:ok, saved} ->
-                  merged = merge(key, hardware_fields(existing), saved)
-                  put_in(state.outputs[key], merged)
-
-                :error ->
-                  Logger.warning(
-                    "Audio.Server: read-back missing after save for #{inspect(key)}; keeping cached"
-                  )
-
-                  state
-              end
-
-            {:error, reason} ->
-              Logger.warning(
-                "Audio.Server: persisting binary state for #{inspect(key)} failed: #{inspect(reason)}"
-              )
-
-              state
-          end
-        else
-          state
-        end
+        if changed?(existing, update),
+          do: save_binary_state(state, key, existing, update),
+          else: state
 
       :error ->
         # Output disappeared between broadcast and handler — drop.
+        state
+    end
+  end
+
+  defp save_binary_state(state, key, existing, update) do
+    case Store.save_config(state.store, key, update) do
+      :ok ->
+        # Read-back can fail (corrupt/race) even after a clean write;
+        # don't crash the Server — keep the prior in-memory output.
+        case Store.get_config(state.store, key) do
+          {:ok, saved} ->
+            merged = merge(key, hardware_fields(existing), saved)
+            put_in(state.outputs[key], merged)
+
+          :error ->
+            Logger.warning(
+              "Audio.Server: read-back missing after save for #{inspect(key)}; keeping cached"
+            )
+
+            state
+        end
+
+      {:error, reason} ->
+        Logger.warning(
+          "Audio.Server: persisting binary state for #{inspect(key)} failed: #{inspect(reason)}"
+        )
+
         state
     end
   end
@@ -791,23 +793,21 @@ defmodule UniversalProxy.Audio.Server do
   defp start_player(state, merged) do
     key = merged.key
 
-    cond do
-      Map.has_key?(state.players, key) ->
-        state
+    if Map.has_key?(state.players, key) do
+      state
+    else
+      case allocate_mdns_port(state) do
+        nil ->
+          Logger.error(
+            "Audio.Server: mDNS port range #{state.port_base}..#{@mdns_port_max} " <>
+              "exhausted (used+unusable saturated); skipping spawn for #{inspect(key)}"
+          )
 
-      true ->
-        case allocate_mdns_port(state) do
-          nil ->
-            Logger.error(
-              "Audio.Server: mDNS port range #{state.port_base}..#{@mdns_port_max} " <>
-                "exhausted (used+unusable saturated); skipping spawn for #{inspect(key)}"
-            )
+          state
 
-            state
-
-          mdns_port ->
-            start_player_with_port(state, merged, mdns_port)
-        end
+        mdns_port ->
+          start_player_with_port(state, merged, mdns_port)
+      end
     end
   end
 

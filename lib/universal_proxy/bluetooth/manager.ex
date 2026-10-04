@@ -64,8 +64,8 @@ defmodule UniversalProxy.Bluetooth.Manager do
   use GenServer
   require Logger
 
-  alias UniversalProxy.Bluetooth.{Radios, Settings}
   alias Bluez.DevicePath
+  alias UniversalProxy.Bluetooth.{Radios, Settings}
 
   # Delay before re-binding the monitor after the subtree dies — the
   # DynamicSupervisor restarts a :permanent child immediately, so one tick

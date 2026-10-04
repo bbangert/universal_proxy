@@ -222,7 +222,7 @@ defmodule UniversalProxyWeb.TrafficLive do
 
     lines
     |> Enum.reverse()
-    |> Enum.map(fn line ->
+    |> Enum.map_join("\n", fn line ->
       slot =
         case Map.get(port_index, line.port) do
           %{slot: slot} -> slot
@@ -233,7 +233,6 @@ defmodule UniversalProxyWeb.TrafficLive do
       text = line.text || ""
       "#{line.ts}  #{slot}  #{dir}  #{line.proto}  #{line.summary}  #{text}"
     end)
-    |> Enum.join("\n")
   end
 
   @impl true

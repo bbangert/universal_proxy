@@ -31,6 +31,7 @@ defmodule UniversalProxy.UART.History do
 
   require Logger
 
+  alias UniversalProxy.ESPHome.ZWaveProxy
   alias UniversalProxy.UART
 
   @pubsub UniversalProxy.PubSub
@@ -380,7 +381,7 @@ defmodule UniversalProxy.UART.History do
   # and thus the Z-Wave proxy — starts after this one) via its
   # documented `catch :exit`.
   defp external_claims do
-    case UniversalProxy.ESPHome.ZWaveProxy.claimed_port() do
+    case ZWaveProxy.claimed_port() do
       %{display_name: name} -> [name]
       _ -> []
     end

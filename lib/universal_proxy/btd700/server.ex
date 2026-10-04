@@ -282,40 +282,38 @@ defmodule UniversalProxy.BTD700.Server do
 
     inventory = Enum.reject(state.inventory, &(&1.key == entry.key))
 
-    cond do
-      fast_crash? ->
-        crash_count = entry.crash_count + 1
-        backoff = backoff_ms(state, crash_count)
+    if fast_crash? do
+      crash_count = entry.crash_count + 1
+      backoff = backoff_ms(state, crash_count)
 
-        Logger.warning(
-          "BTD700 worker for #{inspect(entry.key)} fast-crashed " <>
-            "(##{crash_count}); retrying in #{backoff} ms"
-        )
+      Logger.warning(
+        "BTD700 worker for #{inspect(entry.key)} fast-crashed " <>
+          "(##{crash_count}); retrying in #{backoff} ms"
+      )
 
-        timer = Process.send_after(self(), {:retry_worker, entry.key}, backoff)
+      timer = Process.send_after(self(), {:retry_worker, entry.key}, backoff)
 
-        parked = %{
-          entry
-          | worker_pid: nil,
-            monitor: nil,
-            crash_count: crash_count,
-            retry_timer: timer
-        }
+      parked = %{
+        entry
+        | worker_pid: nil,
+          monitor: nil,
+          crash_count: crash_count,
+          retry_timer: timer
+      }
 
-        %{state | inventory: [parked | inventory]}
+      %{state | inventory: [parked | inventory]}
+    else
+      # Healthy run before dying — restart inline, counter reset. If the
+      # hidraw node no longer resolves the device is presumably gone; the
+      # removal event (or next add) handles cleanup, same as FMA120.
+      case state.hidraw.control_node(entry.usb_port) do
+        {:ok, device_path} ->
+          new_entry = start_entry(state, entry.key, entry.usb_port, device_path)
+          %{state | inventory: [new_entry | inventory]}
 
-      true ->
-        # Healthy run before dying — restart inline, counter reset. If the
-        # hidraw node no longer resolves the device is presumably gone; the
-        # removal event (or next add) handles cleanup, same as FMA120.
-        case state.hidraw.control_node(entry.usb_port) do
-          {:ok, device_path} ->
-            new_entry = start_entry(state, entry.key, entry.usb_port, device_path)
-            %{state | inventory: [new_entry | inventory]}
-
-          {:error, :not_found} ->
-            %{state | inventory: inventory}
-        end
+        {:error, :not_found} ->
+          %{state | inventory: inventory}
+      end
     end
   end
 

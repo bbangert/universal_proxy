@@ -77,6 +77,7 @@ defmodule UniversalProxy.Bluetooth do
   """
 
   alias UniversalProxy.Bluetooth.{AudioManager, Manager, RadioMonitor, Settings, Stats}
+  alias UniversalProxy.ESPHome.{BluetoothProxy, BluetoothScanner}
 
   @bluetooth_targets [:rpi, :rpi0, :rpi0_2, :rpi2, :rpi3, :rpi4, :rpi5, :x86_64]
 
@@ -166,12 +167,12 @@ defmodule UniversalProxy.Bluetooth do
   def bluez_spec do
     {Bluez,
      client: [
-       on_advertisement: &UniversalProxy.ESPHome.BluetoothScanner.on_advertisement/1,
+       on_advertisement: &BluetoothScanner.on_advertisement/1,
        pubsub: UniversalProxy.PubSub,
        rssi_heartbeat_ms: @rssi_heartbeat_ms
      ],
      gatt: [
-       on_gatt_event: &UniversalProxy.ESPHome.BluetoothProxy.gatt_event/2,
+       on_gatt_event: &BluetoothProxy.gatt_event/2,
        on_connections_changed: &Stats.connections_changed/0
      ],
      blue_alsa: [pubsub: UniversalProxy.PubSub],

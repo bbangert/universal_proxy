@@ -269,7 +269,8 @@ defmodule UniversalProxy.FMA120.DeviceWorker do
         state.uart_module.close(state.uart_pid)
         state.uart_module.stop(state.uart_pid)
       catch
-        _, _ -> :ok
+        kind, reason ->
+          Logger.debug("FMA120 UART cleanup failed: #{inspect({kind, reason})}")
       end
     end
 

@@ -30,6 +30,7 @@ defmodule UniversalProxy.ESPHome.Supervisor do
     ZWaveProxy
   }
 
+  alias UniversalProxy.Bluetooth.Settings, as: BluetoothSettings
   alias UniversalProxy.Hardware
   alias UniversalProxy.UART.Store, as: UARTStore
 
@@ -138,7 +139,7 @@ defmodule UniversalProxy.ESPHome.Supervisor do
 
   def bluetooth_opts(true, settings) do
     cond do
-      UniversalProxy.Bluetooth.Settings.proxy_paused?(settings) ->
+      BluetoothSettings.proxy_paused?(settings) ->
         []
 
       settings.active_connections == false ->
@@ -152,9 +153,9 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   # Defensive read: if the settings store isn't up (it always is on BT
   # targets by boot order, but stay safe), fall back to the defaults.
   defp bluetooth_settings do
-    UniversalProxy.Bluetooth.Settings.get()
+    BluetoothSettings.get()
   catch
-    :exit, _ -> UniversalProxy.Bluetooth.Settings.defaults()
+    :exit, _ -> BluetoothSettings.defaults()
   end
 
   # Resolve the Z-Wave-classified port as `%{path: tty, display_name:

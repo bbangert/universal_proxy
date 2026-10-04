@@ -52,6 +52,8 @@ defmodule UniversalProxy.ESPHome.BluetoothScanner do
 
   @behaviour Espex.BluetoothScanner
 
+  alias UniversalProxy.Bluetooth.Stats
+
   # Duplicate-key registry: every subscribed connection-handler pid is one
   # entry under the `:subscribers` key. Owned by `UniversalProxy.Bluetooth`.
   @registry __MODULE__.Registry
@@ -162,7 +164,7 @@ defmodule UniversalProxy.ESPHome.BluetoothScanner do
       when is_binary(raw_data) do
     # ads/s stat for the web tab — atomic counter bump, no-op when the
     # stats server isn't running.
-    UniversalProxy.Bluetooth.Stats.bump_ad()
+    Stats.bump_ad()
 
     # Address byte order validated on rpi3 (F4) — forwarded as-is, no swap.
     rssi = signed_rssi(rss)

@@ -10,12 +10,14 @@ defmodule UniversalProxy.Audio.Input.DeviceInfo do
   crashing a registration or a handshake.
   """
 
+  alias UniversalProxy.ESPHome.ConfigStore
+
   @mac_re ~r/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/
 
   @doc "The ESPHome node name, or `nil` when the config store is unavailable."
   @spec node_name() :: String.t() | nil
   def node_name do
-    UniversalProxy.ESPHome.ConfigStore.current().name
+    ConfigStore.current().name
   rescue
     _ -> nil
   catch
@@ -28,7 +30,7 @@ defmodule UniversalProxy.Audio.Input.DeviceInfo do
   """
   @spec mac_address() :: String.t() | nil
   def mac_address do
-    UniversalProxy.ESPHome.ConfigStore.current()
+    ConfigStore.current()
     |> Map.get(:mac_address)
     |> Kernel.||(Espex.DeviceConfig.detect_mac_address())
     |> normalize_mac()

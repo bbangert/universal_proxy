@@ -9,6 +9,10 @@ defmodule UniversalProxy.System do
   sysfs file, optional dep absent).
   """
 
+  alias Nerves.Runtime.KV
+  alias UniversalProxy.ESPHome
+  alias UniversalProxy.ESPHome.MdnsAdapter
+
   require Logger
 
   # These modules only exist on Nerves targets / when their apps are
@@ -45,8 +49,8 @@ defmodule UniversalProxy.System do
   end
 
   defp kv_active do
-    if Code.ensure_loaded?(Nerves.Runtime.KV),
-      do: Nerves.Runtime.KV.get_all_active(),
+    if Code.ensure_loaded?(KV),
+      do: KV.get_all_active(),
       else: %{}
   end
 
@@ -103,7 +107,7 @@ defmodule UniversalProxy.System do
   end
 
   defp advertised_host do
-    UniversalProxy.ESPHome.MdnsAdapter.host_alias(UniversalProxy.ESPHome.config().name)
+    MdnsAdapter.host_alias(ESPHome.config().name)
   rescue
     _ -> nil
   catch

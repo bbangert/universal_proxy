@@ -57,6 +57,11 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
 
   @impl true
   def init(opts) do
+    # Trap exits so terminate/2 closes the UART on a supervisor shutdown
+    # too; a crash of the linked UART process still stops this worker via
+    # the `{:EXIT, ...}` clause in handle_info/2.
+    Process.flag(:trap_exit, true)
+
     entry = Keyword.fetch!(opts, :entry)
     server_pid = Keyword.fetch!(opts, :server_pid)
     can_receive = :receive in entry.entity.capabilities
@@ -106,6 +111,12 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
     {:stop, {:uart_error, reason}, state}
   end
 
+  # The linked UART process died abnormally: stop with it, as the link did
+  # before this worker trapped exits.
+  def handle_info({:EXIT, pid, reason}, %{uart_pid: pid} = state) when reason != :normal do
+    {:stop, reason, state}
+  end
+
   def handle_info(_msg, state) do
     {:noreply, state}
   end
@@ -117,7 +128,8 @@ defmodule UniversalProxy.ESPHome.Infrared.Irdroid.DeviceWorker do
         Circuits.UART.close(state.uart_pid)
         Circuits.UART.stop(state.uart_pid)
       catch
-        _, _ -> :ok
+        kind, reason ->
+          Logger.debug("IRDroid UART cleanup failed: #{inspect({kind, reason})}")
       end
     end
 

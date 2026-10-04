@@ -1,4 +1,7 @@
 defmodule UniversalProxy.WifiPolicy do
+  # VintageNet is target-only: `apply/3` keeps the compiler and Dialyzer from
+  # resolving it on host, where every call is gated by Code.ensure_loaded?/1.
+  # credo:disable-for-this-file Credo.Check.Refactor.Apply
   @moduledoc """
   Boot-locked Ethernet-preferred Wi-Fi policy: the wired-vs-wireless choice is
   made once, shortly after boot, and held until the next reboot.

@@ -33,8 +33,9 @@ defmodule UniversalProxy.FirmwareUpdate do
 
   require Logger
 
-  alias UniversalProxy.FirmwareUpdate.{ConfigStore, Poller}
+  alias Nerves.Runtime.KV
   alias NervesGithubUpdater.Updater
+  alias UniversalProxy.FirmwareUpdate.{ConfigStore, Poller}
 
   # Aliased separately because the unaliased `Supervisor` below refers
   # to the stdlib supervisor (used by start_link/1).
@@ -342,17 +343,14 @@ defmodule UniversalProxy.FirmwareUpdate do
 
   @doc false
   def devpath do
-    cond do
-      Code.ensure_loaded?(Nerves.Runtime.KV) and
-          function_exported?(Nerves.Runtime.KV, :get, 1) ->
-        # nerves_fw_devpath is a global (non-prefixed) U-Boot variable, so it
-        # must be read with get/1 — get_active/1 prepends the active partition
-        # ("a."/"b.") and finds nothing, yielding :missing_devpath at flash time.
-        Nerves.Runtime.KV.get("nerves_fw_devpath") ||
-          Nerves.Runtime.KV.get("nerves_fw_destination")
-
-      true ->
-        nil
+    if Code.ensure_loaded?(KV) and function_exported?(KV, :get, 1) do
+      # nerves_fw_devpath is a global (non-prefixed) U-Boot variable, so it
+      # must be read with get/1 — get_active/1 prepends the active partition
+      # ("a."/"b.") and finds nothing, yielding :missing_devpath at flash time.
+      KV.get("nerves_fw_devpath") ||
+        KV.get("nerves_fw_destination")
+    else
+      nil
     end
   end
 
@@ -367,8 +365,8 @@ defmodule UniversalProxy.FirmwareUpdate do
 
   @doc false
   def kv_get(key) do
-    if Code.ensure_loaded?(Nerves.Runtime.KV) and function_exported?(Nerves.Runtime.KV, :get, 1) do
-      Nerves.Runtime.KV.get(key)
+    if Code.ensure_loaded?(KV) and function_exported?(KV, :get, 1) do
+      KV.get(key)
     else
       nil
     end
@@ -376,12 +374,12 @@ defmodule UniversalProxy.FirmwareUpdate do
 
   @doc false
   def kv_put(key, value) do
-    if Code.ensure_loaded?(Nerves.Runtime.KV) and
-         function_exported?(Nerves.Runtime.KV, :put, 2) do
+    if Code.ensure_loaded?(KV) and
+         function_exported?(KV, :put, 2) do
       # Return KV.put's real result (`:ok | {:error, any()}`) — the
       # Updater logs a failed rollback-counter write, so swallowing the
       # error here would make that log dead code on device.
-      Nerves.Runtime.KV.put(key, value)
+      KV.put(key, value)
     else
       :ok
     end
@@ -389,9 +387,9 @@ defmodule UniversalProxy.FirmwareUpdate do
 
   @doc false
   def current_version do
-    if Code.ensure_loaded?(Nerves.Runtime.KV) and
-         function_exported?(Nerves.Runtime.KV, :get_active, 1) do
-      Nerves.Runtime.KV.get_active("nerves_fw_version")
+    if Code.ensure_loaded?(KV) and
+         function_exported?(KV, :get_active, 1) do
+      KV.get_active("nerves_fw_version")
     else
       nil
     end
@@ -399,9 +397,9 @@ defmodule UniversalProxy.FirmwareUpdate do
 
   @doc false
   def current_target do
-    if Code.ensure_loaded?(Nerves.Runtime.KV) and
-         function_exported?(Nerves.Runtime.KV, :get_active, 1) do
-      Nerves.Runtime.KV.get_active("nerves_fw_platform") || @target
+    if Code.ensure_loaded?(KV) and
+         function_exported?(KV, :get_active, 1) do
+      KV.get_active("nerves_fw_platform") || @target
     else
       @target
     end

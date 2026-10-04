@@ -310,6 +310,57 @@ defmodule UniversalProxy.Bluetooth.AudioManagerTest do
       assert_receive {:bt_scan, :stopped}, 500
       assert_receive {:ops, {:stop_discovery, @adapter}}
     end
+
+    test "a :scan_timeout that fired before a stop doesn't end the next scan early", %{
+      settings: settings
+    } do
+      with_audio_adapter(settings)
+      mgr = start_manager(settings, scan_ms: 200)
+
+      assert :ok = AudioManager.start_scan(mgr, nil)
+      assert_receive {:ops, {:start_discovery, @adapter}}
+
+      # Queue stop_scan, then start_scan, then let the first scan's timer
+      # fire behind them: the stale :scan_timeout lands after the restart.
+      :ok = :sys.suspend(mgr)
+      stop = Task.async(fn -> AudioManager.stop_scan(mgr) end)
+      wait_for_queue(mgr, 1)
+      start = Task.async(fn -> AudioManager.start_scan(mgr, nil) end)
+      wait_for_queue(mgr, 2)
+      # The first scan's 200ms :scan_timeout lands third in the mailbox.
+      wait_for_queue(mgr, 3)
+      :ok = :sys.resume(mgr)
+
+      assert :ok = Task.await(stop)
+      assert :ok = Task.await(start)
+      assert_receive {:bt_scan, :stopped}
+
+      # The restarted scan runs its full scan_ms instead of being cut short
+      # by the first scan's already-delivered timeout.
+      refute_receive {:bt_scan, :stopped}, 120
+      assert_receive {:bt_scan, :stopped}, 500
+    end
+  end
+
+  # Poll the (suspended) process's mailbox until it holds `len` messages,
+  # failing after a bounded deadline instead of hanging the test.
+  defp wait_for_queue(pid, len, deadline_ms \\ 2_000) do
+    deadline = System.monotonic_time(:millisecond) + deadline_ms
+    do_wait_for_queue(pid, len, deadline)
+  end
+
+  defp do_wait_for_queue(pid, len, deadline) do
+    case Process.info(pid, :message_queue_len) do
+      {:message_queue_len, n} when n >= len ->
+        :ok
+
+      _ ->
+        if System.monotonic_time(:millisecond) > deadline,
+          do: flunk("mailbox of #{inspect(pid)} never reached #{len} messages")
+
+        Process.sleep(5)
+        do_wait_for_queue(pid, len, deadline)
+    end
   end
 
   describe "multiple :audio adapters (per-adapter bonds)" do

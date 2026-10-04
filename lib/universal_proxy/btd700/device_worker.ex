@@ -292,7 +292,8 @@ defmodule UniversalProxy.BTD700.DeviceWorker do
       try do
         state.transport_module.close(state.writer_fd)
       catch
-        _, _ -> :ok
+        kind, reason ->
+          Logger.debug("BTD 700 transport close failed: #{inspect({kind, reason})}")
       end
     end
 

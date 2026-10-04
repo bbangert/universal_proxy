@@ -24,6 +24,7 @@ defmodule UniversalProxy.ESPHome.MdnsAdapter do
 
   @behaviour Espex.Mdns
 
+  alias Espex.Mdns.MdnsLite, as: EspexMdnsLite
   alias UniversalProxy.ESPHome.ConfigStore
 
   require Logger
@@ -35,11 +36,11 @@ defmodule UniversalProxy.ESPHome.MdnsAdapter do
 
     service
     |> Map.put(:instance_name, instance_name(name))
-    |> Espex.Mdns.MdnsLite.advertise()
+    |> EspexMdnsLite.advertise()
   end
 
   @impl Espex.Mdns
-  def withdraw(service_id), do: Espex.Mdns.MdnsLite.withdraw(service_id)
+  def withdraw(service_id), do: EspexMdnsLite.withdraw(service_id)
 
   @doc """
   Resolve the unique mDNS host alias from the ESPHome node name.

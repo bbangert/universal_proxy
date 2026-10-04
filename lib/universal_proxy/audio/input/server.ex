@@ -358,7 +358,7 @@ defmodule UniversalProxy.Audio.Input.Server do
     # Retire every advertisement we own. Without this a Server restart leaves
     # peers holding records for listeners that are about to be torn down by
     # the incoming incarnation's `terminate_all_sources/1`.
-    Enum.reduce(state.mdns_registered, state, &unregister_mdns(&2, &1))
+    _ = Enum.reduce(state.mdns_registered, state, &unregister_mdns(&2, &1))
     :ok
   end
 
