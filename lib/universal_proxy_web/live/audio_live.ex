@@ -1172,8 +1172,8 @@ defmodule UniversalProxyWeb.AudioLive do
   end
 
   # The form passes `id` as a string; reconstitute the tuple via
-  # `binary_to_term/2` with `[:safe]` so a tampered param can't inject
-  # arbitrary atoms. Post-decode we assert the shape — only
+  # `Plug.Crypto.non_executable_binary_to_term/2` with `[:safe]` so a
+  # tampered param can't inject arbitrary atoms or funs. Post-decode we assert the shape — only
   # `{binary, nil | integer, nil | integer}` is accepted.
   defp decode_key(id) when is_binary(id) do
     with {:ok, bin} <- Base.url_decode64(id, padding: false),
@@ -1187,10 +1187,13 @@ defmodule UniversalProxyWeb.AudioLive do
 
   defp decode_key(_), do: {:error, :invalid_key}
 
+  # `non_executable_binary_to_term/2` also rejects funs, which `[:safe]`
+  # alone still decodes (Sobelow Misc.BinToTerm); it raises ArgumentError
+  # on any rejected or malformed input.
   defp safe_binary_to_term(bin) do
-    {:ok, :erlang.binary_to_term(bin, [:safe])}
+    {:ok, Plug.Crypto.non_executable_binary_to_term(bin, [:safe])}
   rescue
-    _ -> :error
+    ArgumentError -> :error
   end
 
   defp valid_key_shape?({slot_sub, vid, pid})

@@ -10,7 +10,7 @@ config :universal_proxy, UniversalProxyWeb.Endpoint,
   # Binding to loopback ipv4 address prevents access from other machines.
   # Change to `ip: {0, 0, 0, 0}` to allow access from other machines.
   http: [ip: {127, 0, 0, 1}, port: 4000],
-  check_origin: false,
+  check_origin: :conn,
   debug_errors: true,
   secret_key_base: "sODMOCqDOBh6ykWCXcIW3Y19hDlM4b8Y99/ExyZPE6OeBEc7z+3FgbXlM/kqW2Vm"
 

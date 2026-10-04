@@ -16,27 +16,8 @@ env:
   APT_PACKAGES: build-essential automake autoconf pkg-config libssl-dev libmnl-dev libasound2-dev
 
 jobs:
-  format:
-    name: Format
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - run: sudo apt-get update || true; sudo apt-get install -y ${{ env.APT_PACKAGES }}
-      - uses: erlef/setup-beam@v1
-        with:
-          elixir-version: ${{ env.ELIXIR_VERSION }}
-          otp-version: ${{ env.OTP_VERSION }}
-      - run: mix archive.install hex nerves_bootstrap --force
-      - uses: actions/cache@v6
-        with:
-          path: deps
-          key: ${{ runner.os }}-host-deps-${{ hashFiles('mix.lock') }}
-          restore-keys: ${{ runner.os }}-host-deps-
-      - run: mix deps.get
-      - run: mix format --check-formatted
-
-  compile:
-    name: Compile (warnings as errors)
+  compile-format:
+    name: Compile · Format
     runs-on: ubuntu-latest
     env:
       MIX_ENV: dev
@@ -57,6 +38,35 @@ jobs:
           restore-keys: ${{ runner.os }}-host-dev-
       - run: mix deps.get
       - run: mix compile --warnings-as-errors
+      - run: mix format --check-formatted
+
+  sobelow:
+    name: Sobelow
+    runs-on: ubuntu-latest
+    env:
+      MIX_ENV: dev
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update || true; sudo apt-get install -y ${{ env.APT_PACKAGES }}
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+      - run: mix archive.install hex nerves_bootstrap --force
+      - uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build/host_dev
+          key: ${{ runner.os }}-host-dev-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-host-dev-
+      - run: mix deps.get
+      # --private skips Sobelow's external update-check request.
+      # Config.HTTPS ignored deliberately: this is a LAN-only Nerves device
+      # serving plain http on port 80 with no TLS terminator (no certificate
+      # it could present for universal_proxy.local / a bare IP); force_ssl
+      # would redirect the web UI to a listener that doesn't exist.
+      - run: mix sobelow --private --skip --exit --threshold medium --ignore Config.HTTPS
 
   credo:
     name: Credo

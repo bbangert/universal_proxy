@@ -9,9 +9,10 @@ config :universal_proxy, UniversalProxyWeb.Endpoint,
   server: true,
   # Bind to all interfaces so the web UI is accessible on the network
   http: [ip: {0, 0, 0, 0}, port: 80],
-  # Allow websocket connections from any origin (hostname, IP, .local)
-  # so LiveView works when accessing via universal_proxy.local, nerves-xxxx.local, or IP
-  check_origin: false
+  # Accept the websocket Origin only when it matches the request's own
+  # host, so LiveView works via universal_proxy.local, nerves-xxxx.local or
+  # an IP while other sites can't hijack the socket.
+  check_origin: :conn
 
 # Use Ringlogger as the logger backend and remove :console.
 # See https://hexdocs.pm/ring_logger/readme.html for more information on

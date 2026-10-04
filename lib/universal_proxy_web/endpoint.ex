@@ -14,8 +14,13 @@ defmodule UniversalProxyWeb.Endpoint do
   socket("/live", Phoenix.LiveView.Socket,
     websocket: [
       connect_info: [session: @session_options],
-      # Allow connections from any host (needed when accessing via .local or IP)
-      check_origin: false
+      # The device is reached via whatever name the user typed
+      # (universal_proxy.local, nerves-xxxx.local, a bare IP), so no fixed
+      # host list works. `:conn` accepts only an Origin whose scheme, host
+      # and port match the request's own Host — i.e. the page this device
+      # served — and rejects cross-site websocket hijacking from other
+      # origins (Sobelow Config.CSWH).
+      check_origin: :conn
     ],
     longpoll: false
   )

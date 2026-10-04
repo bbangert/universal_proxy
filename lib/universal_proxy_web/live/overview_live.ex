@@ -1654,8 +1654,8 @@ defmodule UniversalProxyWeb.OverviewLive do
   defp bit_value(_), do: 0x00
 
   # URL-safe base64 of `:erlang.term_to_binary/1`, matching AudioLive's
-  # opaque-key encoding. Decoded with `[:safe]` + a shape assertion so a
-  # tampered param can't inject arbitrary atoms.
+  # opaque-key encoding. Decoded non-executably with `[:safe]` + a shape
+  # assertion so a tampered param can't inject arbitrary atoms or funs.
   defp encode_key(key), do: key |> :erlang.term_to_binary() |> Base.url_encode64(padding: false)
 
   defp decode_key(b64) when is_binary(b64) do
@@ -1684,10 +1684,13 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   defp decode_btd700_key(_), do: {:error, :invalid_key}
 
+  # `non_executable_binary_to_term/2` also rejects funs, which `[:safe]`
+  # alone still decodes (Sobelow Misc.BinToTerm); it raises ArgumentError
+  # on any rejected or malformed input.
   defp safe_binary_to_term(bin) do
-    {:ok, :erlang.binary_to_term(bin, [:safe])}
+    {:ok, Plug.Crypto.non_executable_binary_to_term(bin, [:safe])}
   rescue
-    _ -> :error
+    ArgumentError -> :error
   end
 
   attr(:port, :map, default: nil)
