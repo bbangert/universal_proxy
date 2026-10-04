@@ -327,7 +327,8 @@ defmodule UniversalProxy.Bluetooth.AudioManagerTest do
       wait_for_queue(mgr, 1)
       start = Task.async(fn -> AudioManager.start_scan(mgr, nil) end)
       wait_for_queue(mgr, 2)
-      Process.sleep(250)
+      # The first scan's 200ms :scan_timeout lands third in the mailbox.
+      wait_for_queue(mgr, 3)
       :ok = :sys.resume(mgr)
 
       assert :ok = Task.await(stop)
@@ -341,14 +342,24 @@ defmodule UniversalProxy.Bluetooth.AudioManagerTest do
     end
   end
 
-  defp wait_for_queue(pid, len) do
+  # Poll the (suspended) process's mailbox until it holds `len` messages,
+  # failing after a bounded deadline instead of hanging the test.
+  defp wait_for_queue(pid, len, deadline_ms \\ 2_000) do
+    deadline = System.monotonic_time(:millisecond) + deadline_ms
+    do_wait_for_queue(pid, len, deadline)
+  end
+
+  defp do_wait_for_queue(pid, len, deadline) do
     case Process.info(pid, :message_queue_len) do
       {:message_queue_len, n} when n >= len ->
         :ok
 
       _ ->
+        if System.monotonic_time(:millisecond) > deadline,
+          do: flunk("mailbox of #{inspect(pid)} never reached #{len} messages")
+
         Process.sleep(5)
-        wait_for_queue(pid, len)
+        do_wait_for_queue(pid, len, deadline)
     end
   end
 
