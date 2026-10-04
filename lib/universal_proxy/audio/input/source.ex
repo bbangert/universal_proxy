@@ -2131,6 +2131,9 @@ defmodule UniversalProxy.Audio.Input.Source do
     :exit, {reason, _} when reason in [:noproc, :normal, :shutdown] ->
       :ok
 
+    :exit, {{:shutdown, _}, _} ->
+      :ok
+
     :exit, reason when reason == :timeout or (is_tuple(reason) and elem(reason, 0) == :timeout) ->
       Logger.warning(
         "Audio.Input.Source capture #{inspect(pid)} did not stop within #{timeout}ms; killing it"

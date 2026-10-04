@@ -290,7 +290,7 @@
     detail:
       "UniversalProxy.ESPHome.Infrared.Server.init/1 reaches DynamicSupervisor.start_child on UniversalProxy.ESPHome.Infrared.WorkerSupervisor. Every supervisor management call is a GenServer.call into the supervisor; start_child in particular does not return until the new child's init/1 has, so those inits now run inside this one, on the tree's startup path. A child that calls back into UniversalProxy.ESPHome.Infrared.Server, or into anything not yet started, deadlocks the boot; terminate_child waits for the whole shutdown of the child.",
     reason:
-      "Deliberate: init/1 starts a worker per device already present under the WorkerSupervisor, an earlier sibling that is already running. the IRDroid DeviceWorker.init/1 only builds state and returns {:continue, :initialize}, deferring all device I/O to handle_continue/2, and never calls back into this server, so the synchronous start_child cannot deadlock or stall the boot."
+      "Deliberate: init/1 starts a worker per device already present under the WorkerSupervisor, an earlier sibling that is already running. The IRDroid DeviceWorker.init/1 only builds state and returns {:continue, :initialize}, deferring all device I/O to handle_continue/2, and never calls back into this server, so the synchronous start_child cannot deadlock or stall the boot."
   },
   %{
     analysis: "startup",

@@ -35,8 +35,10 @@
 # label of the finding's own line, `null` when it has none) and `detail`.
 # A JSON `null` and a baseline entry without `at_label:` are both `nil`.
 # Line numbers are never part of the fingerprint, so edits elsewhere in the
-# file don't invalidate the baseline; any `:N`/`line N` reference inside
-# `at_label` or `detail` is normalised away for the same reason.
+# file don't invalidate the baseline; a source location inside `at_label`
+# or `detail` (a `.ex`/`.exs`/`.erl`/`.hrl`/`.eex`/`.heex` path's `:N` or
+# `:N:M` suffix, or `line N` text) is normalised away for the same reason.
+# Other colon-numbers (ports, tuples) stay part of the fingerprint.
 #
 # Findings and entries are compared as multisets: argus can report the same
 # fingerprint at several places in one file, and each baseline entry accepts
@@ -194,6 +196,18 @@ defmodule ArgusBaseline do
        compare([fingerprint(%{f | at_label: "sent at lib/x.ex:7"})], [
          Map.take(%{f | at_label: "sent at lib/x.ex:70"}, @keys)
        ]) == {[], []}},
+      {"file:line:col and \"line N\" text normalise",
+       fingerprint(%{f | detail: "M.f/1 at lib/x.ex:12:3, see line 40"}) ==
+         fingerprint(%{f | detail: "M.f/1 at lib/x.ex:98:1, see line 7"})},
+      {"other path extensions normalise",
+       fingerprint(%{f | detail: "at src/x.erl:5 and include/x.hrl:6 and t.html.heex:7"}) ==
+         fingerprint(%{f | detail: "at src/x.erl:50 and include/x.hrl:60 and t.html.heex:70"})},
+      {"non-location numbers stay significant",
+       fingerprint(%{f | detail: "dials localhost:4000"}) !=
+         fingerprint(%{f | detail: "dials localhost:5000"})},
+      {"a source path keeps its name when normalised",
+       fingerprint(%{f | detail: "at lib/x.ex:12"}) !=
+         fingerprint(%{f | detail: "at lib/y.ex:12"})},
       {"null at_label matches an entry without at_label",
        compare([fingerprint(unlabelled)], [nil_entry]) == {[], []}},
       {"null at_label does not match a labelled entry",
@@ -223,8 +237,13 @@ defmodule ArgusBaseline do
 
   defp fingerprint(f), do: Enum.map(@keys, &normalise(&1, Map.get(f, &1)))
 
+  # Only source locations are normalised: a source file path's `:N` / `:N:M`
+  # suffix (the path itself is kept) and `line N` / `lines N` text. Other
+  # colon-numbers (`localhost:4000`, `{:a, 1}:2`) stay significant.
+  @location ~r/(\.(?:exs?|erl|hrl|h?eex)):\d+(?::\d+)?\b|\blines? \d+\b/
+
   defp normalise(key, text) when key in [:at_label, :detail] and is_binary(text),
-    do: Regex.replace(~r/(:\d+(:\d+)?\b|\blines? \d+)/, text, "")
+    do: Regex.replace(@location, text, "\\1")
 
   defp normalise(_key, value), do: value
 
