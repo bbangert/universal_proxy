@@ -1872,7 +1872,6 @@ defmodule UniversalProxyWeb.OverviewLive do
           :if={@port.user}
           href={@port.user_href}
           phx-click="ignore"
-          onclick="event.stopPropagation()"
           class="text-accent text-base no-underline"
         >
           {@port.user}
@@ -2000,7 +1999,6 @@ defmodule UniversalProxyWeb.OverviewLive do
         :if={@p.tab}
         navigate={@p.tab}
         phx-click="ignore"
-        onclick="event.stopPropagation()"
         class="text-accent text-base no-underline"
       >
         {@p.managed_by}
@@ -2753,7 +2751,7 @@ defmodule UniversalProxyWeb.OverviewLive do
         <select
           name="kind"
           disabled={@port.in_use}
-          onclick="event.stopPropagation()"
+          phx-click="ignore"
           title={
             if @port.in_use,
               do: "Disconnect the ESPHome client to change this port's type.",
