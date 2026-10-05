@@ -16,9 +16,10 @@ defmodule UniversalProxyWeb.AudioLive do
     * `"sendspin:state"`          — config change OR binary-emitted event
 
   The `{slot_sub, vid, pid}` tuple key is opaque in the DOM: encoded as
-  URL-safe base64 of `:erlang.term_to_binary/1` and decoded with
-  `[:safe]` on the way back in. The shape is asserted post-decode so a
-  malformed param surfaces as an ignored event, never as a crash.
+  URL-safe base64 of `:erlang.term_to_binary/1` and decoded via
+  `UniversalProxyWeb.OpaqueKey` on the way back in. The shape is
+  asserted post-decode so a malformed param surfaces as an ignored event,
+  never as a crash.
 
   Renames open a confirm modal because every save re-advertises over
   mDNS, which momentarily disconnects any paired Sendspin server. The
@@ -55,6 +56,7 @@ defmodule UniversalProxyWeb.AudioLive do
   alias UniversalProxy.Audio.Input
   alias UniversalProxy.Bluetooth
   alias UniversalProxy.Bluetooth.AudioManager
+  alias UniversalProxyWeb.OpaqueKey
 
   # How long a Bluetooth output keeps a "Reconnecting" placeholder card
   # after its PCM vanishes (a BT disconnect removes the ALSA PCM, like a
@@ -1172,25 +1174,17 @@ defmodule UniversalProxyWeb.AudioLive do
   end
 
   # The form passes `id` as a string; reconstitute the tuple via
-  # `binary_to_term/2` with `[:safe]` so a tampered param can't inject
-  # arbitrary atoms. Post-decode we assert the shape — only
+  # `UniversalProxyWeb.OpaqueKey` (size cap, no compressed ETF, no new
+  # atoms created, funs rejected). Existing atoms such as `nil` still
+  # decode, so post-decode we assert the shape — only
   # `{binary, nil | integer, nil | integer}` is accepted.
-  defp decode_key(id) when is_binary(id) do
-    with {:ok, bin} <- Base.url_decode64(id, padding: false),
-         {:ok, term} <- safe_binary_to_term(bin),
+  defp decode_key(id) do
+    with {:ok, term} <- OpaqueKey.decode(id),
          true <- valid_key_shape?(term) do
       {:ok, term}
     else
       _ -> {:error, :invalid_key}
     end
-  end
-
-  defp decode_key(_), do: {:error, :invalid_key}
-
-  defp safe_binary_to_term(bin) do
-    {:ok, :erlang.binary_to_term(bin, [:safe])}
-  rescue
-    _ -> :error
   end
 
   defp valid_key_shape?({slot_sub, vid, pid})
@@ -1200,9 +1194,7 @@ defmodule UniversalProxyWeb.AudioLive do
 
   defp valid_key_shape?(_), do: false
 
-  defp encode_key(key) do
-    key |> :erlang.term_to_binary() |> Base.url_encode64(padding: false)
-  end
+  defp encode_key(key), do: OpaqueKey.encode(key)
 
   # Strip control chars + trim + cap length. Used both in the modal's
   # live char counter and in the final commit path. Returns the raw

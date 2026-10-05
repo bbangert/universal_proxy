@@ -25,6 +25,7 @@ defmodule UniversalProxyWeb.OverviewLive do
   alias UniversalProxy.UART.History
   alias UniversalProxyWeb.Components.PortSparkline
   alias UniversalProxyWeb.MockData
+  alias UniversalProxyWeb.OpaqueKey
 
   @refresh_interval 10_000
 
@@ -1653,41 +1654,22 @@ defmodule UniversalProxyWeb.OverviewLive do
   defp bit_value("usb_volume"), do: 0x80
   defp bit_value(_), do: 0x00
 
-  # URL-safe base64 of `:erlang.term_to_binary/1`, matching AudioLive's
-  # opaque-key encoding. Decoded with `[:safe]` + a shape assertion so a
-  # tampered param can't inject arbitrary atoms.
-  defp encode_key(key), do: key |> :erlang.term_to_binary() |> Base.url_encode64(padding: false)
+  # Opaque keys go through `UniversalProxyWeb.OpaqueKey` (size cap, no
+  # compressed ETF, no new atoms created, funs rejected). Existing atoms
+  # and other terms still decode. The shape assertion here pins only the
+  # VID/PID; the slot is unconstrained and is used purely as a lookup key.
+  defp encode_key(key), do: OpaqueKey.encode(key)
 
-  defp decode_key(b64) when is_binary(b64) do
-    with {:ok, bin} <- Base.url_decode64(b64, padding: false),
-         true <- byte_size(bin) <= 256,
-         {:ok, term} <- safe_binary_to_term(bin),
-         true <- fma120_key?(term) do
+  defp decode_key(b64), do: decode_shaped(b64, &fma120_key?/1)
+  defp decode_btd700_key(b64), do: decode_shaped(b64, &btd700_key?/1)
+
+  defp decode_shaped(b64, shape?) do
+    with {:ok, term} <- OpaqueKey.decode(b64),
+         true <- shape?.(term) do
       {:ok, term}
     else
       _ -> {:error, :invalid_key}
     end
-  end
-
-  defp decode_key(_), do: {:error, :invalid_key}
-
-  defp decode_btd700_key(b64) when is_binary(b64) do
-    with {:ok, bin} <- Base.url_decode64(b64, padding: false),
-         true <- byte_size(bin) <= 256,
-         {:ok, term} <- safe_binary_to_term(bin),
-         true <- btd700_key?(term) do
-      {:ok, term}
-    else
-      _ -> {:error, :invalid_key}
-    end
-  end
-
-  defp decode_btd700_key(_), do: {:error, :invalid_key}
-
-  defp safe_binary_to_term(bin) do
-    {:ok, :erlang.binary_to_term(bin, [:safe])}
-  rescue
-    _ -> :error
   end
 
   attr(:port, :map, default: nil)
@@ -1890,7 +1872,6 @@ defmodule UniversalProxyWeb.OverviewLive do
           :if={@port.user}
           href={@port.user_href}
           phx-click="ignore"
-          onclick="event.stopPropagation()"
           class="text-accent text-base no-underline"
         >
           {@port.user}
@@ -2018,7 +1999,6 @@ defmodule UniversalProxyWeb.OverviewLive do
         :if={@p.tab}
         navigate={@p.tab}
         phx-click="ignore"
-        onclick="event.stopPropagation()"
         class="text-accent text-base no-underline"
       >
         {@p.managed_by}
@@ -2771,7 +2751,7 @@ defmodule UniversalProxyWeb.OverviewLive do
         <select
           name="kind"
           disabled={@port.in_use}
-          onclick="event.stopPropagation()"
+          phx-click="ignore"
           title={
             if @port.in_use,
               do: "Disconnect the ESPHome client to change this port's type.",

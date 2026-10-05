@@ -6,7 +6,7 @@
     <meta name="csrf-token" content={get_csrf_token()} />
     <title><%= assigns[:page_title] || "Universal Proxy" %></title>
     <link phx-track-static rel="stylesheet" href={~p"/assets/app.css"} />
-    <script>
+    <script nonce={@csp_nonce}>
       // Apply persisted/preferred theme before paint to avoid a flash.
       (function () {
         try {

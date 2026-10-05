@@ -38,7 +38,7 @@ if config_env() == :prod do
       System.get_env("SECRET_KEY_BASE") ||
         "HEY05EB1dFVSu6KykKHuS4rQPQzSHv4F7mGVB/gnDLrIu75wE/ytBXy2TaL3A6RA",
     cache_static_manifest: "priv/static/cache_manifest.json",
-    check_origin: false,
+    check_origin: :conn,
     server: true,
     code_reloader: false
 end
