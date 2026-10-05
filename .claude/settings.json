@@ -3,7 +3,8 @@
     "oliver-kriska": {
       "source": {
         "source": "github",
-        "repo": "oliver-kriska/claude-elixir-phoenix"
+        "repo": "oliver-kriska/claude-elixir-phoenix",
+        "ref": "v2.12.0"
       }
     }
   },
