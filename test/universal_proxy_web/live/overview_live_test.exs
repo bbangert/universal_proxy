@@ -250,6 +250,28 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
       refute html =~ "Audio outputs"
     end
 
+    test "a hot-plugged input renders from the bare broadcast payload", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      # The real broadcast omits the live-state fields that
+      # `Audio.Input.list_inputs/0` merges in; `sample_input/1` includes them.
+      hot_plugged =
+        %{friendly_name: "CUBILUX Line-in"}
+        |> sample_input()
+        |> Map.drop([:status, :connection, :pin, :port, :last_error])
+
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "sendspin:input_added",
+        {:sendspin_input_added, hot_plugged}
+      )
+
+      html = render(view)
+      assert html =~ "CUBILUX Line-in"
+      assert html =~ "Audio input"
+      refute html =~ "Audio outputs"
+    end
+
     test ":sendspin_input_removed drops the input row again", %{conn: conn} do
       {:ok, view, _html} = live(conn, "/")
 
