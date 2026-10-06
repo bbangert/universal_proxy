@@ -50,8 +50,11 @@ erl_crash.dump
 /c_src/sendspin_player/_build/
 /priv/sendspin_player/
 
-# Claude Code local workspace (plans, scratchpads, solutions, reviews) — not repo content
-/.claude/
+# Claude Code local workspace (plans, scratchpads, solutions, reviews) stays
+# untracked; only the shared project settings, which enable the
+# elixir-phoenix plugin for every checkout, are committed.
+/.claude/*
+!/.claude/settings.json
 
 # OS generated files
 .DS_Store
