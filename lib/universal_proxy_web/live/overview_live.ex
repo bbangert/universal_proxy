@@ -624,7 +624,14 @@ defmodule UniversalProxyWeb.OverviewLive do
   # Capture inputs feed the Connected-hardware index only (never the
   # outputs-only "Audio outputs" card). A capture-only device shows up here
   # and nowhere else, so these three keep its hardware row live.
+  #
+  # The hot-plug broadcast carries only the hardware fields, not the live
+  # state `Audio.Input.list_inputs/0` merges in (see
+  # `Audio.Input.Server.refresh_inputs/1`). `:status` is what marks a row as
+  # an input (`audio_peripheral_row/1`), so default it to the server's own
+  # "just detected" value or the row would be rendered as an output.
   def handle_info({:sendspin_input_added, input}, socket) do
+    input = Map.put_new(input, :status, :detected)
     {:noreply, update(socket, :audio_inputs, &Map.put(&1, input.key, input))}
   end
 
