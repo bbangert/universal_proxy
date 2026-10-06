@@ -1,24 +1,26 @@
 defmodule UniversalProxy.ESPHome.SerialProxyTest do
   # Locks in the wire-level contract between this repo's adapter and
   # espex's dispatcher for SerialProxyRequest/SerialProxyConfigureRequest/
-  # SerialProxyWriteRequest ordering, under the espex 0.8 lazy-open +
-  # persistent-subscribe-intent semantics (the old espex 0.7 contract —
-  # `{:replay_pending_subscribe, _}` actions, one-shot pending-subscribe
-  # stash — is gone; see `Espex.SerialProxy`'s moduledoc after the bump).
+  # SerialProxyWriteRequest, under espex 0.11's API 1.17 single-owner rule
+  # (on top of the 0.8 lazy-open + persistent-subscribe-intent semantics):
   #
-  #   * SUBSCRIBE / UNSUBSCRIBE / WRITE against an advertised-but-unopened
-  #     instance lazily open it via `{:serial_open, instance, :default_opts}`
-  #     and are otherwise handled inline (no stash, no replay action).
-  #   * CONFIGURE always attempts an open (closing first if already open)
-  #     and never emits a replay action.
-  #   * SUBSCRIBE/UNSUBSCRIBE against an already-open instance route
-  #     straight through `{:serial_request, instance, type}`.
+  #   * SUBSCRIBE / UNSUBSCRIBE for an advertised instance are handed to
+  #     the connection whole as `{:serial_subscribe, instance}` /
+  #     `{:serial_unsubscribe, instance}`: it claims (or releases) the
+  #     instance on the Server, records the intent, lazily opens and
+  #     acks. Dispatch itself records nothing.
+  #   * CONFIGURE and WRITE are gated on ownership (= this connection has
+  #     SUBSCRIBEd). A non-owner's CONFIGURE is refused with PORT_IN_USE;
+  #     its WRITE is dropped (no ack exists to carry an error).
+  #   * For the owner, CONFIGURE always attempts an open (closing first if
+  #     already open), and WRITE against an advertised-but-unopened
+  #     instance lazily opens via `{:serial_open, instance, :default_opts}`.
   #
   # These tests drive `Espex.Dispatch.handle_request/2` directly. They
   # do NOT call our adapter's `request/2` — that path is covered by
   # `UniversalProxy.ESPHome.SerialProxy.RelayTest`. The value here is
-  # protecting against an espex regression that would silently revert
-  # to the pre-0.8 gate.
+  # protecting against an espex change that would silently alter the
+  # contract this adapter is written against.
   use ExUnit.Case, async: true
 
   alias Espex.{ConnectionState, DeviceConfig, Dispatch, Proto, SerialProxy}
@@ -61,59 +63,66 @@ defmodule UniversalProxy.ESPHome.SerialProxyTest do
   defp write_req,
     do: %Proto.SerialProxyWriteRequest{instance: @instance, data: "hi"}
 
-  describe "SUBSCRIBE on an advertised-but-unopened instance (lazy open)" do
-    test "lazily opens, replies OK, and records subscribe intent" do
+  # Ownership is recorded by the connection after a successful claim;
+  # this is the state it leaves behind.
+  defp owned(state), do: ConnectionState.put_serial_subscription(state, @instance)
+
+  defp opened(state), do: ConnectionState.put_port(state, @instance, {self(), "/dev/null"})
+
+  describe "SUBSCRIBE" do
+    test "on an advertised-but-unopened instance is handed to the connection whole" do
       {new_state, actions} = Dispatch.handle_request(state(), subscribe_req())
 
-      assert [
-               {:log, :debug, _},
-               {:serial_open, @instance, :default_opts},
-               {:send, %Proto.SerialProxyRequestResponse{} = resp}
-             ] = actions
+      assert [{:serial_subscribe, @instance}] = actions
+      refute ConnectionState.serial_subscribed?(new_state, @instance)
+    end
 
-      assert resp.instance == @instance
-      assert resp.status == :SERIAL_PROXY_STATUS_OK
-      assert resp.type == :SERIAL_PROXY_REQUEST_TYPE_SUBSCRIBE
-      assert resp.error_message == ""
+    test "on an already-open instance is handed to the connection whole" do
+      {_state, actions} = Dispatch.handle_request(opened(state()), subscribe_req())
 
-      assert ConnectionState.serial_subscribed?(new_state, @instance)
+      assert [{:serial_subscribe, @instance}] = actions
     end
   end
 
-  describe "UNSUBSCRIBE on an advertised-but-unopened instance" do
-    test "replies OK and clears subscribe intent without opening" do
-      {state, actions} = Dispatch.handle_request(state(), unsubscribe_req())
+  describe "UNSUBSCRIBE" do
+    test "is handed to the connection whole without opening" do
+      {_state, actions} = Dispatch.handle_request(owned(state()), unsubscribe_req())
 
-      refute ConnectionState.serial_subscribed?(state, @instance)
-
-      assert [{:send, %Proto.SerialProxyRequestResponse{status: :SERIAL_PROXY_STATUS_OK} = resp}] =
-               actions
-
-      assert resp.type == :SERIAL_PROXY_REQUEST_TYPE_UNSUBSCRIBE
+      assert [{:serial_unsubscribe, @instance}] = actions
     end
   end
 
   describe "CONFIGURE" do
-    test "on an unopened instance emits :serial_open with translated opts and no replay action" do
+    test "from a non-owner is refused with PORT_IN_USE and opens nothing" do
       {_state, actions} = Dispatch.handle_request(state(), configure_req())
+
+      assert [
+               {:log, :info, _},
+               {:send, %Proto.SerialProxyRequestResponse{} = resp}
+             ] = actions
+
+      assert resp.instance == @instance
+      assert resp.status == :SERIAL_PROXY_STATUS_PORT_IN_USE
+      refute Enum.any?(actions, &match?({:serial_open, _, _}, &1))
+    end
+
+    test "from the owner on an unopened instance emits :serial_open with translated opts" do
+      {_state, actions} = Dispatch.handle_request(owned(state()), configure_req())
 
       assert [{:serial_open, @instance, opts}] = actions
       assert opts[:speed] == 9600
-      refute Enum.any?(actions, &match?({:replay_pending_subscribe, _}, &1))
     end
 
-    test "on an already-open instance closes then re-opens" do
-      opened = ConnectionState.put_port(state(), @instance, {self(), "/dev/null"})
-
-      {_state, actions} = Dispatch.handle_request(opened, configure_req())
+    test "from the owner on an already-open instance closes then re-opens" do
+      {_state, actions} = Dispatch.handle_request(opened(owned(state())), configure_req())
 
       assert [{:serial_close, @instance}, {:serial_open, @instance, _opts}] = actions
     end
   end
 
-  describe "WRITE on an advertised-but-unopened instance (restart-resume guard)" do
-    test "lazily opens then writes, with no CONFIGURE required" do
-      {_state, actions} = Dispatch.handle_request(state(), write_req())
+  describe "WRITE" do
+    test "from the owner on an advertised-but-unopened instance lazily opens then writes" do
+      {_state, actions} = Dispatch.handle_request(owned(state()), write_req())
 
       assert [
                {:log, :debug, _},
@@ -121,16 +130,11 @@ defmodule UniversalProxy.ESPHome.SerialProxyTest do
                {:serial_write, @instance, "hi"}
              ] = actions
     end
-  end
 
-  describe "SUBSCRIBE on an already-open instance" do
-    test "routes straight through :serial_request and records intent" do
-      opened = ConnectionState.put_port(state(), @instance, {self(), "/dev/null"})
+    test "from a non-owner is dropped without opening the port" do
+      {_state, actions} = Dispatch.handle_request(state(), write_req())
 
-      {new_state, actions} = Dispatch.handle_request(opened, subscribe_req())
-
-      assert [{:serial_request, @instance, :subscribe}] = actions
-      assert ConnectionState.serial_subscribed?(new_state, @instance)
+      assert [{:log, :debug, _}] = actions
     end
   end
 

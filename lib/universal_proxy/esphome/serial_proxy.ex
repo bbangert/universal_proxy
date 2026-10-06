@@ -18,18 +18,22 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
   matches the ESPHome reference semantics: after `open/3`, the port is
   configured but *no* RX data flows until the client issues a
   `SERIAL_PROXY_REQUEST_TYPE_SUBSCRIBE`. `UNSUBSCRIBE` halts forwarding
-  again. Both are handled through `c:Espex.SerialProxy.request/2` and
-  routed to the per-instance `Relay`.
+  again; since espex 0.11 it also closes the handle (`close/1`) and
+  releases the instance for the next client. Both are handled through
+  `c:Espex.SerialProxy.request/2` and routed to the per-instance `Relay`.
 
-  espex 0.8 tracks subscribe *intent* per connection rather than a
-  one-shot stash: the client's first operation of any kind (write,
-  subscribe, modem pins, flush) against an advertised-but-unopened
-  instance lazily opens it via `open/3`, and a previously-set subscribe
-  intent is reattached (another `request/2` call) after *every*
-  successful open — whether that open was triggered by CONFIGURE or by
-  the lazy path. This lets a client resume traffic (e.g. Home Assistant
-  writing to a Zigbee coordinator, or re-subscribing) after a proxy
-  restart without re-sending CONFIGURE first.
+  espex 0.11 enforces the API 1.17 single-owner rule: the connection
+  that SUBSCRIBEs an instance owns it, and a second connection's
+  SUBSCRIBE is refused with PORT_IN_USE until the owner unsubscribes or
+  disconnects. Every other operation (configure, write, modem pins,
+  flush, set mode) is accepted only from the owner — a non-owner's write
+  is dropped and the rest are refused with PORT_IN_USE. For the owner,
+  the first operation against an advertised-but-unopened instance still
+  lazily opens it via `open/3`, and the subscribe intent is reattached
+  (another `request/2` call) after every successful open. A client
+  resuming after a proxy restart (e.g. Home Assistant talking to a
+  Zigbee coordinator) re-SUBSCRIBEs on its new connection and can then
+  write without re-sending CONFIGURE first.
 
   ## Persisted line settings
 
