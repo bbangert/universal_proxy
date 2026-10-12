@@ -1,13 +1,14 @@
 diff --git a/src/host/ws_server.cpp b/src/host/ws_server.cpp
-index 0586f63..1ab37db 100644
+index 7acef5f..f43e675 100644
 --- a/src/host/ws_server.cpp
 +++ b/src/host/ws_server.cpp
-@@ -20,6 +20,16 @@
- #include "server_connection.h"
+@@ -26,8 +26,18 @@
  
  #include <atomic>
+ #include <cstddef>
 +#include <cstdint>
-+
+ #include <utility>
+ 
 +// universal_proxy patch: listener-bound hook. The embedding binary may
 +// define this symbol to learn exactly when the WebSocket listener has
 +// successfully bound and started accepting connections. Declared weak so
@@ -16,10 +17,11 @@ index 0586f63..1ab37db 100644
 +// it fires only for THIS process's listener, never for a foreign or
 +// dying-predecessor socket holding the port.
 +extern "C" void sendspin_host_listener_bound(uint16_t port) __attribute__((weak));
- 
++
  namespace sendspin {
  
-@@ -156,6 +166,13 @@ bool SendspinWsServer::start(SendspinClient* client, bool /*task_stack_in_psram*
+ static const char* const TAG = "sendspin.ws_server";
+@@ -164,6 +174,13 @@ bool SendspinWsServer::start(SendspinClient* client, bool /*task_stack_in_psram*
      }
  
      this->server_->start();

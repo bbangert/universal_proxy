@@ -21,7 +21,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "" FORCE)
 # build dirs. This also means `-DSENDSPIN_CPP_REF=...` cannot override;
 # for scratch experiments against another ref use
 # `-DFETCHCONTENT_SOURCE_DIR_SENDSPIN-CPP=<local-checkout>` instead.
-set(SENDSPIN_CPP_REF "9331ace6428979982c934384702d289958ca125e" # v0.8.0
+set(SENDSPIN_CPP_REF "91038b72892596b9ec0cccfec1b9e6ebc58ba148" # v0.9.3
     CACHE STRING "sendspin-cpp commit SHA to pin" FORCE)
 
 # Trim sendspin-cpp to just the player role. Other roles ship dead code on a
