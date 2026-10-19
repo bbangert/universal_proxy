@@ -634,7 +634,7 @@ struct PlayerListener : PlayerRoleListener {
     // The server (e.g. Music Assistant) changed the static output delay. The
     // library already applies it to playout timing in the sync task; we just
     // report it so the Elixir side can persist it and re-apply on respawn.
-    void on_static_delay_changed(uint16_t delay_ms) override {
+    void on_output_delay_changed(uint16_t delay_ms) override {
         std::ostringstream os;
         os << "{\"event\":\"static_delay\",\"value\":" << static_cast<int>(delay_ms) << "}";
         emit_json(os.str());
@@ -757,7 +757,7 @@ int main(int argc, char* argv[]) {
     // respawns by the Elixir side via the `static_delay` stdout event +
     // `--initial-static-delay-ms`). The library applies it to playout timing
     // inside the sync task; we only enable + report it.
-    player_config.initial_static_delay_ms = static_cast<uint16_t>(opts.initial_static_delay_ms);
+    player_config.initial_output_delay_ms = static_cast<uint16_t>(opts.initial_static_delay_ms);
     auto& player = client.add_player(std::move(player_config));
 
     AlsaPipeSink audio_sink;
@@ -775,7 +775,7 @@ int main(int argc, char* argv[]) {
     player.set_listener(&player_listener);
     // Advertise the static delay as server-adjustable; without this the
     // player reports it as 0 and Music Assistant exposes no delay control.
-    player.set_static_delay_adjustable(true);
+    player.set_output_delay_adjustable(true);
     client.set_listener(&client_listener);
     client.set_network_provider(&network_provider);
 
@@ -816,7 +816,7 @@ int main(int argc, char* argv[]) {
         // any UI reflect it without waiting for a server change.
         std::ostringstream os;
         os << "{\"event\":\"static_delay\",\"value\":"
-           << static_cast<int>(player.get_static_delay_ms()) << "}";
+           << static_cast<int>(player.get_output_delay_ms()) << "}";
         emit_json(os.str());
     }
 
