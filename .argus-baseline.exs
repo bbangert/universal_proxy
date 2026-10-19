@@ -98,7 +98,7 @@
     title: "Children started under another tree outlive their owner",
     at_label: "start_child onto a supervisor in another tree",
     detail:
-      "UniversalProxy.Audio.Input.Source.stop_capture/1 starts children under UniversalProxy.TaskSupervisor, a DynamicSupervisor UniversalProxy.Audio.Input.Source does not sit under. Their lifetime follows UniversalProxy.TaskSupervisor's tree, not UniversalProxy.Audio.Input.Source's: when UniversalProxy.Audio.Input.Source's tree shuts down they keep running — reconnecting, logging, calling into applications that have already stopped — and UniversalProxy.Audio.Input.Source's terminate/2 does not stop them.",
+      "UniversalProxy.Audio.Input.Source.stop_capture/1 starts children under UniversalProxy.TaskSupervisor, a supervisor UniversalProxy.Audio.Input.Source does not sit under. Their lifetime follows UniversalProxy.TaskSupervisor's tree, not UniversalProxy.Audio.Input.Source's: when UniversalProxy.Audio.Input.Source's tree shuts down they keep running — reconnecting, logging, calling into applications that have already stopped — and UniversalProxy.Audio.Input.Source's terminate/2 does not stop them.",
     reason:
       "Deliberate (CLAUDE.md idiom): fire-and-forget work goes through UniversalProxy.TaskSupervisor for crash visibility. The task is short and meant to complete even if the caller goes away: the task only stops the old arecord Capture via stop_capture_process/2 (GenServer.stop bounded at 2s; already-gone exits tolerated, a timeout logged and the Capture killed). Outliving the Source is intended: the Source has already handed the Capture off and moved on. On a tree shutdown the task is still safe: UniversalProxy.TaskSupervisor starts before Audio.Input.Supervisor in the application's child list, so it outlives the audio-input subtree while that stops. The Capture itself does not depend on the task then: the Source started it with start_link from its own callbacks, so the Source is the Capture's gen_server parent, and gen_server handles a parent {:EXIT, source, :shutdown} by running Capture.terminate/2 (port close + kill -9) even though Capture traps exits; that message never reaches Capture's catch-all handle_info/2."
   },
@@ -164,21 +164,11 @@
   },
   %{
     analysis: "shutdown",
-    file: "lib/universal_proxy/bluetooth.ex",
-    title: "Children started under another tree outlive their owner",
-    at_label: "start_child onto a supervisor in another tree",
-    detail:
-      "UniversalProxy.Bluetooth.restart_esphome/0 starts children under UniversalProxy.TaskSupervisor, a DynamicSupervisor UniversalProxyWeb.BluetoothLive does not sit under. Their lifetime follows UniversalProxy.TaskSupervisor's tree, not UniversalProxyWeb.BluetoothLive's: when UniversalProxyWeb.BluetoothLive's tree shuts down they keep running — reconnecting, logging, calling into applications that have already stopped — and UniversalProxyWeb.BluetoothLive's terminate/2 does not stop them.",
-    reason:
-      "Deliberate (CLAUDE.md idiom): fire-and-forget work goes through UniversalProxy.TaskSupervisor for crash visibility. The task is short and meant to complete even if the caller goes away: restarting the ESPHome supervisor after a settings change must still happen if the caller (a LiveView or the Bluetooth manager) exits."
-  },
-  %{
-    analysis: "shutdown",
     file: "lib/universal_proxy/bluetooth/manager.ex",
     title: "Children started under another tree outlive their owner",
     at_label: "start_child onto a supervisor in another tree",
     detail:
-      "UniversalProxy.Bluetooth.Manager.restart_esphome/0 starts children under UniversalProxy.TaskSupervisor, a DynamicSupervisor UniversalProxy.Bluetooth.Manager does not sit under. Their lifetime follows UniversalProxy.TaskSupervisor's tree, not UniversalProxy.Bluetooth.Manager's: when UniversalProxy.Bluetooth.Manager's tree shuts down they keep running — reconnecting, logging, calling into applications that have already stopped — and UniversalProxy.Bluetooth.Manager's terminate/2 does not stop them.",
+      "UniversalProxy.Bluetooth.Manager.restart_esphome/0 starts children under UniversalProxy.TaskSupervisor, a supervisor UniversalProxy.Bluetooth.Manager does not sit under. Their lifetime follows UniversalProxy.TaskSupervisor's tree, not UniversalProxy.Bluetooth.Manager's: when UniversalProxy.Bluetooth.Manager's tree shuts down they keep running — reconnecting, logging, calling into applications that have already stopped — and UniversalProxy.Bluetooth.Manager's terminate/2 does not stop them.",
     reason:
       "Deliberate (CLAUDE.md idiom): fire-and-forget work goes through UniversalProxy.TaskSupervisor for crash visibility. The task is short and meant to complete even if the caller goes away: restarting the ESPHome supervisor after a settings change must still happen if the caller (a LiveView or the Bluetooth manager) exits."
   },
@@ -191,16 +181,6 @@
       "UniversalProxy.BTD700.Server.init/1 reaches DynamicSupervisor.start_child on a supervisor chosen at runtime. Every supervisor management call is a GenServer.call into the supervisor; start_child in particular does not return until the new child's init/1 has, so those inits now run inside this one, on the tree's startup path. A child that calls back into UniversalProxy.BTD700.Server, or into anything not yet started, deadlocks the boot; terminate_child waits for the whole shutdown of the child.",
     reason:
       "Deliberate: init/1 starts a worker per device already present under the WorkerSupervisor, an earlier sibling that is already running. BTD700.DeviceWorker.init/1 only builds state and returns {:continue, :initialize}, deferring all device I/O to handle_continue/2, and never calls back into this server, so the synchronous start_child cannot deadlock or stall the boot."
-  },
-  %{
-    analysis: "shutdown",
-    file: "lib/universal_proxy/esphome.ex",
-    title: "Children started under another tree outlive their owner",
-    at_label: "start_child onto a supervisor in another tree",
-    detail:
-      "UniversalProxy.ESPHome.update_config/1 starts children under UniversalProxy.TaskSupervisor, a DynamicSupervisor UniversalProxyWeb.DiscoveryLive does not sit under. Their lifetime follows UniversalProxy.TaskSupervisor's tree, not UniversalProxyWeb.DiscoveryLive's: when UniversalProxyWeb.DiscoveryLive's tree shuts down they keep running — reconnecting, logging, calling into applications that have already stopped — and UniversalProxyWeb.DiscoveryLive's terminate/2 does not stop them.",
-    reason:
-      "Deliberate (CLAUDE.md idiom): fire-and-forget work goes through UniversalProxy.TaskSupervisor for crash visibility. The task is short and meant to complete even if the caller goes away: restarting the ESPHome supervisor after a settings change must still happen if the caller (a LiveView or the Bluetooth manager) exits."
   },
   %{
     analysis: "startup",
@@ -291,15 +271,5 @@
       "UniversalProxy.UART.Server (position 2) starts processes under DynamicSupervisor (position 0) of UniversalProxy.UART.Supervisor, a rest_for_one supervisor. When UniversalProxy.UART.Server crashes, the supervisor restarts it and every later child, but DynamicSupervisor started earlier and survives — with the processes the old UniversalProxy.UART.Server started still running inside it. The new UniversalProxy.UART.Server knows nothing of them and starts its own: duplicated work, or a stale process holding a resource the replacement expects to own.",
     reason:
       "Deliberate: the server's init/1 sweeps every child a previous incarnation left under the earlier DynamicSupervisor (which_children + terminate_child) before starting its own, so no orphan survives a server restart."
-  },
-  %{
-    analysis: "shutdown",
-    file: "lib/universal_proxy_web/live/overview_live.ex",
-    title: "Children started under another tree outlive their owner",
-    at_label: "start_child onto a supervisor in another tree",
-    detail:
-      "UniversalProxyWeb.OverviewLive.start_format/3 starts children under UniversalProxy.TaskSupervisor, a DynamicSupervisor UniversalProxyWeb.OverviewLive does not sit under. Their lifetime follows UniversalProxy.TaskSupervisor's tree, not UniversalProxyWeb.OverviewLive's: when UniversalProxyWeb.OverviewLive's tree shuts down they keep running — reconnecting, logging, calling into applications that have already stopped — and UniversalProxyWeb.OverviewLive's terminate/2 does not stop them.",
-    reason:
-      "Deliberate (CLAUDE.md idiom): fire-and-forget work goes through UniversalProxy.TaskSupervisor for crash visibility. The task is short and meant to complete even if the caller goes away: a drive format started from the Overview must run to completion even if the LiveView (browser tab) goes away; Storage.Server serializes it and reports progress over PubSub."
   }
 ]
