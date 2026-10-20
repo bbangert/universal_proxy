@@ -825,6 +825,20 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // start() generates a keypair when none is stored, and only logs a
+    // failed save of it (a full or read-only /data). Running on would
+    // advertise a client_id the next launch replaces, so every respawn
+    // would appear to Music Assistant as another new player. Exit before
+    // the listener binds instead; the BEAM side shows the error.
+    if (persistence.keypair_save_failed()) {
+        emit_json("{\"event\":\"error\",\"kind\":\"state_dir\","
+                  "\"msg\":\"failed to persist the identity keypair\"}");
+        // stop() before returning, for the listener-lifetime reason given
+        // at the normal shutdown below.
+        client.stop();
+        return 1;
+    }
+
     {
         auto v = static_cast<uint8_t>(opts.initial_volume);
         audio_sink.set_volume(v);

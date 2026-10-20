@@ -216,7 +216,10 @@ through the persistence provider. `FilePersistence` writes each library
 blob as one file in `--state-dir` (dir `0700`, files `0600`, written via
 temp file + fsync + rename), so the identity survives respawns and
 reboots. A state dir that cannot be created fails the process before the
-client starts, rather than letting it mint an identity it cannot keep.
+client starts, rather than letting it mint an identity it cannot keep. The
+library only logs a failed save of a freshly generated keypair (a full or
+read-only disk) and starts anyway, so the binary checks for that after
+`start()` and exits with a `state_dir` error event before `listening`.
 
 The library's output-delay blob is deliberately not stored: the BEAM side
 already owns that value (persisted from the `static_delay` event and

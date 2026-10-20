@@ -162,6 +162,28 @@ defmodule SendspinPlayerContractTest do
     assert assert_listening_event(again)["client_id"] == first["client_id"]
   end
 
+  test "exits before `listening` when the keypair cannot be persisted", %{tmp_dir: tmp_dir} do
+    # The state dir itself initialises fine; a non-empty directory named
+    # `keypair` then makes the library's first keypair write fail at the
+    # rename (unlike a chmod, that also fails when CI runs as root). The
+    # library only logs that failure, so the binary must refuse to run on an
+    # identity it could not keep.
+    dir = Path.join(tmp_dir, "keypair_unwritable")
+    File.mkdir_p!(Path.join([dir, "keypair", "blocker"]))
+
+    port = spawn_player(state_dir: dir, ws_port: @ws_port + 4)
+
+    assert_started_event(port)
+
+    assert next_event(port) == %{
+             "event" => "error",
+             "kind" => "state_dir",
+             "msg" => "failed to persist the identity keypair"
+           }
+
+    assert wait_for_exit(port) == 1
+  end
+
   test "exits non-zero without --state-dir" do
     port = spawn_player(state_dir: nil, ws_port: @ws_port + 3)
     assert wait_for_exit(port) != 0

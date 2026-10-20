@@ -143,6 +143,12 @@ bool FilePersistence::save_blob(const std::string& key, const uint8_t* data, siz
     // Accepted and dropped: the BEAM side owns the output delay (see the
     // header comment).
     if (key == sendspin::persistence_keys::OUTPUT_DELAY) return true;
+    bool ok = write_blob(key, data, len);
+    if (key == sendspin::persistence_keys::KEYPAIR) keypair_save_failed_ = !ok;
+    return ok;
+}
+
+bool FilePersistence::write_blob(const std::string& key, const uint8_t* data, size_t len) {
     if (!valid_key(key) || dir_fd_ < 0) {
         std::fprintf(stderr, "sendspin_player: refusing persistence key '%s'\n", key.c_str());
         return false;
