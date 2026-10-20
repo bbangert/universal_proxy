@@ -8,27 +8,7 @@
     title: "Coupled children under one_for_one",
     at_label: "supervision tree defined here",
     detail:
-      "UniversalProxy.ESPHome.EntityProvider registers with UniversalProxy.ESPHome.ConfigStore when it starts, and UniversalProxy.ESPHome.ConfigStore hands it to code outside the program, which may keep it. Both are children of the one_for_one supervisor UniversalProxy.Application, which restarts either alone. When UniversalProxy.ESPHome.ConfigStore restarts, its init/1 starts it afresh without what UniversalProxy.ESPHome.EntityProvider put there, and UniversalProxy.ESPHome.EntityProvider, which is not restarted with it, never registers again. When UniversalProxy.ESPHome.EntityProvider restarts, it registers a second time beside what its old process left.",
-    reason:
-      "False positive: ESPHome.ConfigStore.current/0 and device_config_opts/0 are reads of DETS-persisted config; ConfigStore keeps nothing about the caller and the 'handed on' call is Espex.DeviceConfig.detect_mac_address/0, a pure lookup. A ConfigStore restart loses no caller state."
-  },
-  %{
-    analysis: "coupling",
-    file: "lib/universal_proxy/application.ex",
-    title: "Coupled children under one_for_one",
-    at_label: "supervision tree defined here",
-    detail:
       "UniversalProxy.ESPHome.Supervisor registers with UniversalProxy.ESPHome.ConfigStore when it starts, and UniversalProxy.ESPHome.ConfigStore hands it to code outside the program, which may keep it. Both are children of the one_for_one supervisor UniversalProxy.Application, which restarts either alone. When UniversalProxy.ESPHome.ConfigStore restarts, its init/1 starts it afresh without what UniversalProxy.ESPHome.Supervisor put there, and UniversalProxy.ESPHome.Supervisor, which is not restarted with it, never registers again. When UniversalProxy.ESPHome.Supervisor restarts, it registers a second time beside what its old process left.",
-    reason:
-      "False positive: ESPHome.ConfigStore.current/0 and device_config_opts/0 are reads of DETS-persisted config; ConfigStore keeps nothing about the caller and the 'handed on' call is Espex.DeviceConfig.detect_mac_address/0, a pure lookup. A ConfigStore restart loses no caller state."
-  },
-  %{
-    analysis: "coupling",
-    file: "lib/universal_proxy/application.ex",
-    title: "Coupled children under one_for_one",
-    at_label: "supervision tree defined here",
-    detail:
-      "UniversalProxy.Storage.Server registers with UniversalProxy.ESPHome.ConfigStore when it starts, and UniversalProxy.ESPHome.ConfigStore hands it to code outside the program, which may keep it. Both are children of the one_for_one supervisor UniversalProxy.Application, which restarts either alone. When UniversalProxy.ESPHome.ConfigStore restarts, its init/1 starts it afresh without what UniversalProxy.Storage.Server put there, and UniversalProxy.Storage.Server, which is not restarted with it, never registers again. When UniversalProxy.Storage.Server restarts, it registers a second time beside what its old process left.",
     reason:
       "False positive: ESPHome.ConfigStore.current/0 and device_config_opts/0 are reads of DETS-persisted config; ConfigStore keeps nothing about the caller and the 'handed on' call is Espex.DeviceConfig.detect_mac_address/0, a pure lookup. A ConfigStore restart loses no caller state."
   },
@@ -118,7 +98,7 @@
     title: "Children started under another tree outlive their owner",
     at_label: "start_child onto a supervisor in another tree",
     detail:
-      "UniversalProxy.Audio.Input.Source.stop_capture/1 starts children under UniversalProxy.TaskSupervisor, a DynamicSupervisor UniversalProxy.Audio.Input.Source does not sit under. Their lifetime follows UniversalProxy.TaskSupervisor's tree, not UniversalProxy.Audio.Input.Source's: when UniversalProxy.Audio.Input.Source's tree shuts down they keep running — reconnecting, logging, calling into applications that have already stopped — and UniversalProxy.Audio.Input.Source's terminate/2 does not stop them.",
+      "UniversalProxy.Audio.Input.Source.stop_capture/1 starts children under UniversalProxy.TaskSupervisor, a supervisor UniversalProxy.Audio.Input.Source does not sit under. Their lifetime follows UniversalProxy.TaskSupervisor's tree, not UniversalProxy.Audio.Input.Source's: when UniversalProxy.Audio.Input.Source's tree shuts down they keep running — reconnecting, logging, calling into applications that have already stopped — and UniversalProxy.Audio.Input.Source's terminate/2 does not stop them.",
     reason:
       "Deliberate (CLAUDE.md idiom): fire-and-forget work goes through UniversalProxy.TaskSupervisor for crash visibility. The task is short and meant to complete even if the caller goes away: the task only stops the old arecord Capture via stop_capture_process/2 (GenServer.stop bounded at 2s; already-gone exits tolerated, a timeout logged and the Capture killed). Outliving the Source is intended: the Source has already handed the Capture off and moved on. On a tree shutdown the task is still safe: UniversalProxy.TaskSupervisor starts before Audio.Input.Supervisor in the application's child list, so it outlives the audio-input subtree while that stops. The Capture itself does not depend on the task then: the Source started it with start_link from its own callbacks, so the Source is the Capture's gen_server parent, and gen_server handles a parent {:EXIT, source, :shutdown} by running Capture.terminate/2 (port close + kill -9) even though Capture traps exits; that message never reaches Capture's catch-all handle_info/2."
   },
@@ -131,16 +111,6 @@
       "UniversalProxy.Audio.Input.Source monitors processes from its callbacks and also terminates them on purpose, without demonitoring first. The {:DOWN, ...} for a death this server caused is delivered like any other — into the clause written for crashes, which may restart, reconnect or log what was a deliberate stop.",
     reason:
       "False positive: the monitor at the flagged line is on the websocket (socket_monitor), demonitored with :flush in teardown_connection/2; the process terminated here is the linked Capture, which is not monitored."
-  },
-  %{
-    analysis: "startup",
-    file: "lib/universal_proxy/audio/input/store.ex",
-    title: "Distributed operation in init/1",
-    at_label: "remote operation during init/1",
-    detail:
-      "UniversalProxy.Audio.Input.Store.init/1 performs open_file during init, while the supervisor's start sequence waits. A slow or partitioned peer stalls local startup.",
-    reason:
-      "False positive: argus classes every :dets call as a distributed (Mnesia-style) store operation, but this is a local DETS file on the device's data partition. Opening it in init/1 is deliberate so a store that cannot open fails its start instead of serving without a table."
   },
   %{
     analysis: "shutdown",
@@ -193,54 +163,14 @@
       "Deliberate: the server's init/1 sweeps every child a previous incarnation left under the earlier DynamicSupervisor (which_children + terminate_child) before starting its own, so no orphan survives a server restart."
   },
   %{
-    analysis: "startup",
-    file: "lib/universal_proxy/audio/store.ex",
-    title: "Distributed operation in init/1",
-    at_label: "remote operation during init/1",
-    detail:
-      "UniversalProxy.Audio.Store.init/1 performs open_file during init, while the supervisor's start sequence waits. A slow or partitioned peer stalls local startup.",
-    reason:
-      "False positive: argus classes every :dets call as a distributed (Mnesia-style) store operation, but this is a local DETS file on the device's data partition. Opening it in init/1 is deliberate so a store that cannot open fails its start instead of serving without a table."
-  },
-  %{
-    analysis: "shutdown",
-    file: "lib/universal_proxy/bluetooth.ex",
-    title: "Children started under another tree outlive their owner",
-    at_label: "start_child onto a supervisor in another tree",
-    detail:
-      "UniversalProxy.Bluetooth.restart_esphome/0 starts children under UniversalProxy.TaskSupervisor, a DynamicSupervisor UniversalProxyWeb.BluetoothLive does not sit under. Their lifetime follows UniversalProxy.TaskSupervisor's tree, not UniversalProxyWeb.BluetoothLive's: when UniversalProxyWeb.BluetoothLive's tree shuts down they keep running — reconnecting, logging, calling into applications that have already stopped — and UniversalProxyWeb.BluetoothLive's terminate/2 does not stop them.",
-    reason:
-      "Deliberate (CLAUDE.md idiom): fire-and-forget work goes through UniversalProxy.TaskSupervisor for crash visibility. The task is short and meant to complete even if the caller goes away: restarting the ESPHome supervisor after a settings change must still happen if the caller (a LiveView or the Bluetooth manager) exits."
-  },
-  %{
     analysis: "shutdown",
     file: "lib/universal_proxy/bluetooth/manager.ex",
     title: "Children started under another tree outlive their owner",
     at_label: "start_child onto a supervisor in another tree",
     detail:
-      "UniversalProxy.Bluetooth.Manager.restart_esphome/0 starts children under UniversalProxy.TaskSupervisor, a DynamicSupervisor UniversalProxy.Bluetooth.Manager does not sit under. Their lifetime follows UniversalProxy.TaskSupervisor's tree, not UniversalProxy.Bluetooth.Manager's: when UniversalProxy.Bluetooth.Manager's tree shuts down they keep running — reconnecting, logging, calling into applications that have already stopped — and UniversalProxy.Bluetooth.Manager's terminate/2 does not stop them.",
+      "UniversalProxy.Bluetooth.Manager.restart_esphome/0 starts children under UniversalProxy.TaskSupervisor, a supervisor UniversalProxy.Bluetooth.Manager does not sit under. Their lifetime follows UniversalProxy.TaskSupervisor's tree, not UniversalProxy.Bluetooth.Manager's: when UniversalProxy.Bluetooth.Manager's tree shuts down they keep running — reconnecting, logging, calling into applications that have already stopped — and UniversalProxy.Bluetooth.Manager's terminate/2 does not stop them.",
     reason:
       "Deliberate (CLAUDE.md idiom): fire-and-forget work goes through UniversalProxy.TaskSupervisor for crash visibility. The task is short and meant to complete even if the caller goes away: restarting the ESPHome supervisor after a settings change must still happen if the caller (a LiveView or the Bluetooth manager) exits."
-  },
-  %{
-    analysis: "startup",
-    file: "lib/universal_proxy/bluetooth/manager.ex",
-    title: "init/1 makes a synchronous supervisor call",
-    at_label: "this call blocks init until the supervisor answers",
-    detail:
-      "UniversalProxy.Bluetooth.Manager.init/1 reaches Task.Supervisor.start_child on UniversalProxy.TaskSupervisor. Every supervisor management call is a GenServer.call into the supervisor; start_child in particular does not return until the new child's init/1 has, so those inits now run inside this one, on the tree's startup path. A child that calls back into UniversalProxy.Bluetooth.Manager, or into anything not yet started, deadlocks the boot; terminate_child waits for the whole shutdown of the child.",
-    reason:
-      "False positive: init/1 only stores &restart_esphome/0 in state (esphome_restart_fun); it is first invoked from handle_continue(:reconcile) and only on a paused-state change, never during init."
-  },
-  %{
-    analysis: "startup",
-    file: "lib/universal_proxy/bluetooth/settings.ex",
-    title: "Distributed operation in init/1",
-    at_label: "remote operation during init/1",
-    detail:
-      "UniversalProxy.Bluetooth.Settings.init/1 performs open_file during init, while the supervisor's start sequence waits. A slow or partitioned peer stalls local startup.",
-    reason:
-      "False positive: argus classes every :dets call as a distributed (Mnesia-style) store operation, but this is a local DETS file on the device's data partition. Opening it in init/1 is deliberate so a store that cannot open fails its start instead of serving without a table."
   },
   %{
     analysis: "startup",
@@ -254,36 +184,6 @@
   },
   %{
     analysis: "startup",
-    file: "lib/universal_proxy/btd700/store.ex",
-    title: "Distributed operation in init/1",
-    at_label: "remote operation during init/1",
-    detail:
-      "UniversalProxy.BTD700.Store.init/1 performs open_file during init, while the supervisor's start sequence waits. A slow or partitioned peer stalls local startup.",
-    reason:
-      "False positive: argus classes every :dets call as a distributed (Mnesia-style) store operation, but this is a local DETS file on the device's data partition. Opening it in init/1 is deliberate so a store that cannot open fails its start instead of serving without a table."
-  },
-  %{
-    analysis: "shutdown",
-    file: "lib/universal_proxy/esphome.ex",
-    title: "Children started under another tree outlive their owner",
-    at_label: "start_child onto a supervisor in another tree",
-    detail:
-      "UniversalProxy.ESPHome.update_config/1 starts children under UniversalProxy.TaskSupervisor, a DynamicSupervisor UniversalProxyWeb.DiscoveryLive does not sit under. Their lifetime follows UniversalProxy.TaskSupervisor's tree, not UniversalProxyWeb.DiscoveryLive's: when UniversalProxyWeb.DiscoveryLive's tree shuts down they keep running — reconnecting, logging, calling into applications that have already stopped — and UniversalProxyWeb.DiscoveryLive's terminate/2 does not stop them.",
-    reason:
-      "Deliberate (CLAUDE.md idiom): fire-and-forget work goes through UniversalProxy.TaskSupervisor for crash visibility. The task is short and meant to complete even if the caller goes away: restarting the ESPHome supervisor after a settings change must still happen if the caller (a LiveView or the Bluetooth manager) exits."
-  },
-  %{
-    analysis: "startup",
-    file: "lib/universal_proxy/esphome/config_store.ex",
-    title: "Distributed operation in init/1",
-    at_label: "remote operation during init/1",
-    detail:
-      "UniversalProxy.ESPHome.ConfigStore.init/1 performs open_file during init, while the supervisor's start sequence waits. A slow or partitioned peer stalls local startup.",
-    reason:
-      "False positive: argus classes every :dets call as a distributed (Mnesia-style) store operation, but this is a local DETS file on the device's data partition. Opening it in init/1 is deliberate so a store that cannot open fails its start instead of serving without a table."
-  },
-  %{
-    analysis: "startup",
     file: "lib/universal_proxy/esphome/infrared/server.ex",
     title: "init/1 makes a synchronous supervisor call",
     at_label: "this call blocks init until the supervisor answers",
@@ -291,26 +191,6 @@
       "UniversalProxy.ESPHome.Infrared.Server.init/1 reaches DynamicSupervisor.start_child on UniversalProxy.ESPHome.Infrared.WorkerSupervisor. Every supervisor management call is a GenServer.call into the supervisor; start_child in particular does not return until the new child's init/1 has, so those inits now run inside this one, on the tree's startup path. A child that calls back into UniversalProxy.ESPHome.Infrared.Server, or into anything not yet started, deadlocks the boot; terminate_child waits for the whole shutdown of the child.",
     reason:
       "Deliberate: init/1 starts a worker per device already present under the WorkerSupervisor, an earlier sibling that is already running. The IRDroid DeviceWorker.init/1 only builds state and returns {:continue, :initialize}, deferring all device I/O to handle_continue/2, and never calls back into this server, so the synchronous start_child cannot deadlock or stall the boot."
-  },
-  %{
-    analysis: "startup",
-    file: "lib/universal_proxy/esphome/psk_store.ex",
-    title: "Distributed operation in init/1",
-    at_label: "remote operation during init/1",
-    detail:
-      "UniversalProxy.ESPHome.PskStore.init/1 performs open_file during init, while the supervisor's start sequence waits. A slow or partitioned peer stalls local startup.",
-    reason:
-      "False positive: argus classes every :dets call as a distributed (Mnesia-style) store operation, but this is a local DETS file on the device's data partition. Opening it in init/1 is deliberate so a store that cannot open fails its start instead of serving without a table."
-  },
-  %{
-    analysis: "startup",
-    file: "lib/universal_proxy/firmware_update/config_store.ex",
-    title: "Distributed operation in init/1",
-    at_label: "remote operation during init/1",
-    detail:
-      "UniversalProxy.FirmwareUpdate.ConfigStore.init/1 performs open_file during init, while the supervisor's start sequence waits. A slow or partitioned peer stalls local startup.",
-    reason:
-      "False positive: argus classes every :dets call as a distributed (Mnesia-style) store operation, but this is a local DETS file on the device's data partition. Opening it in init/1 is deliberate so a store that cannot open fails its start instead of serving without a table."
   },
   %{
     analysis: "startup",
@@ -323,26 +203,6 @@
       "Deliberate: init/1 starts a worker per device already present under the WorkerSupervisor, an earlier sibling that is already running. FMA120.DeviceWorker.init/1 only builds state and returns {:continue, :initialize}, deferring all device I/O to handle_continue/2, and never calls back into this server, so the synchronous start_child cannot deadlock or stall the boot."
   },
   %{
-    analysis: "startup",
-    file: "lib/universal_proxy/fma120/store.ex",
-    title: "Distributed operation in init/1",
-    at_label: "remote operation during init/1",
-    detail:
-      "UniversalProxy.FMA120.Store.init/1 performs open_file during init, while the supervisor's start sequence waits. A slow or partitioned peer stalls local startup.",
-    reason:
-      "False positive: argus classes every :dets call as a distributed (Mnesia-style) store operation, but this is a local DETS file on the device's data partition. Opening it in init/1 is deliberate so a store that cannot open fails its start instead of serving without a table."
-  },
-  %{
-    analysis: "startup",
-    file: "lib/universal_proxy/ssh_access.ex",
-    title: "Distributed operation in init/1",
-    at_label: "remote operation during init/1",
-    detail:
-      "UniversalProxy.SSHAccess.init/1 performs open_file during init, while the supervisor's start sequence waits. A slow or partitioned peer stalls local startup.",
-    reason:
-      "False positive: argus classes every :dets call as a distributed (Mnesia-style) store operation, but this is a local DETS file on the device's data partition. Opening it in init/1 is deliberate so a store that cannot open fails its start instead of serving without a table."
-  },
-  %{
     analysis: "shutdown",
     file: "lib/universal_proxy/storage/server.ex",
     title: "Server terminates a process it still monitors",
@@ -361,26 +221,6 @@
       "UniversalProxy.Storage.Server monitors processes from its callbacks and also terminates them on purpose, without demonitoring first. The {:DOWN, ...} for a death this server caused is delivered like any other — into the clause written for crashes, which may restart, reconnect or log what was a deliberate stop.",
     reason:
       "False positive: stop_share/1 calls demonitor_share/1 (Process.demonitor(ref, [:flush])) before terminate_share_child/1 and the sweep; argus does not follow the helper."
-  },
-  %{
-    analysis: "startup",
-    file: "lib/universal_proxy/storage/settings.ex",
-    title: "Distributed operation in init/1",
-    at_label: "remote operation during init/1",
-    detail:
-      "UniversalProxy.Storage.Settings.init/1 performs close during init, while the supervisor's start sequence waits. A slow or partitioned peer stalls local startup.",
-    reason:
-      "False positive: argus classes every :dets call as a distributed (Mnesia-style) store operation, but this is a local DETS file. This close runs only when chmod to 0600 fails after a successful open: init/1 releases the table it just opened before returning {:stop, {:chmod_failed, reason}}, so a store holding the clear-text Samba password never serves world-readable."
-  },
-  %{
-    analysis: "startup",
-    file: "lib/universal_proxy/storage/settings.ex",
-    title: "Distributed operation in init/1",
-    at_label: "remote operation during init/1",
-    detail:
-      "UniversalProxy.Storage.Settings.init/1 performs open_file during init, while the supervisor's start sequence waits. A slow or partitioned peer stalls local startup.",
-    reason:
-      "False positive: argus classes every :dets call as a distributed (Mnesia-style) store operation, but this is a local DETS file on the device's data partition. Opening it in init/1 is deliberate so a store that cannot open fails its start instead of serving without a table."
   },
   %{
     analysis: "startup",
@@ -431,35 +271,5 @@
       "UniversalProxy.UART.Server (position 2) starts processes under DynamicSupervisor (position 0) of UniversalProxy.UART.Supervisor, a rest_for_one supervisor. When UniversalProxy.UART.Server crashes, the supervisor restarts it and every later child, but DynamicSupervisor started earlier and survives — with the processes the old UniversalProxy.UART.Server started still running inside it. The new UniversalProxy.UART.Server knows nothing of them and starts its own: duplicated work, or a stale process holding a resource the replacement expects to own.",
     reason:
       "Deliberate: the server's init/1 sweeps every child a previous incarnation left under the earlier DynamicSupervisor (which_children + terminate_child) before starting its own, so no orphan survives a server restart."
-  },
-  %{
-    analysis: "startup",
-    file: "lib/universal_proxy/uart/settings_store.ex",
-    title: "Distributed operation in init/1",
-    at_label: "remote operation during init/1",
-    detail:
-      "UniversalProxy.UART.SettingsStore.init/1 performs open_file during init, while the supervisor's start sequence waits. A slow or partitioned peer stalls local startup.",
-    reason:
-      "False positive: argus classes every :dets call as a distributed (Mnesia-style) store operation, but this is a local DETS file on the device's data partition. Opening it in init/1 is deliberate so a store that cannot open fails its start instead of serving without a table."
-  },
-  %{
-    analysis: "startup",
-    file: "lib/universal_proxy/uart/store.ex",
-    title: "Distributed operation in init/1",
-    at_label: "remote operation during init/1",
-    detail:
-      "UniversalProxy.UART.Store.init/1 performs open_file during init, while the supervisor's start sequence waits. A slow or partitioned peer stalls local startup.",
-    reason:
-      "False positive: argus classes every :dets call as a distributed (Mnesia-style) store operation, but this is a local DETS file on the device's data partition. Opening it in init/1 is deliberate so a store that cannot open fails its start instead of serving without a table."
-  },
-  %{
-    analysis: "shutdown",
-    file: "lib/universal_proxy_web/live/overview_live.ex",
-    title: "Children started under another tree outlive their owner",
-    at_label: "start_child onto a supervisor in another tree",
-    detail:
-      "UniversalProxyWeb.OverviewLive.start_format/3 starts children under UniversalProxy.TaskSupervisor, a DynamicSupervisor UniversalProxyWeb.OverviewLive does not sit under. Their lifetime follows UniversalProxy.TaskSupervisor's tree, not UniversalProxyWeb.OverviewLive's: when UniversalProxyWeb.OverviewLive's tree shuts down they keep running — reconnecting, logging, calling into applications that have already stopped — and UniversalProxyWeb.OverviewLive's terminate/2 does not stop them.",
-    reason:
-      "Deliberate (CLAUDE.md idiom): fire-and-forget work goes through UniversalProxy.TaskSupervisor for crash visibility. The task is short and meant to complete even if the caller goes away: a drive format started from the Overview must run to completion even if the LiveView (browser tab) goes away; Storage.Server serializes it and reports progress over PubSub."
   }
 ]

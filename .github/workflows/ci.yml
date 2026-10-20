@@ -160,17 +160,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: sudo apt-get update || true; sudo apt-get install -y ${{ env.APT_PACKAGES }}
-      - name: Install Souffle
-        run: |
-          # Souffle's PPA package links against libffi7, which Ubuntu 24.04
-          # dropped; install the Ubuntu 20.04 build (checksum-pinned) first.
-          curl -fsSLo /tmp/libffi7.deb http://archive.ubuntu.com/ubuntu/pool/main/libf/libffi/libffi7_3.3-4_amd64.deb
-          echo "4584aa8fef1bf5086168ce2f7078cd2ebd78fdc4cc0d86d958d795d4e0b0f50d  /tmp/libffi7.deb" | sha256sum -c -
-          sudo apt-get install -y /tmp/libffi7.deb
-          sudo wget https://souffle-lang.github.io/ppa/souffle-key.public -O /usr/share/keyrings/souffle-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/souffle-archive-keyring.gpg] https://souffle-lang.github.io/ppa/ubuntu/ stable main" | sudo tee /etc/apt/sources.list.d/souffle.list
-          sudo apt-get update
-          sudo apt-get install -y souffle
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
@@ -212,15 +201,16 @@ jobs:
           key: ${{ runner.os }}-host-deps-${{ hashFiles('mix.lock') }}
           restore-keys: ${{ runner.os }}-host-deps-
       - run: mix deps.get
-      # `mix hex.audit` has no per-package ignore flag. cowlib 2.20.0 (a
-      # transitive dep via cowboy; latest release) still has two advisories
+      # `mix hex.audit` has no per-package ignore flag. cowlib 2.21.0 (a
+      # transitive dep via cowboy; latest release) still has one advisory
       # with no fixed release upstream (EEF-CVE-2026-43971 was fixed in 2.20.0
-      # and dropped from this list); allow ONLY those IDs so the gate still
-      # fails on any other advisory (including a future req regression).
-      # Remove this allow-list once cowlib ships a patched release.
-      - name: Hex audit (cowlib 2.20.0 advisories allow-listed — no upstream fix)
+      # and EEF-CVE-2026-43969 in 2.21.0, both dropped from this list); allow
+      # ONLY that ID so the gate still fails on any other advisory (including
+      # a future req regression). Remove this allow-list once cowlib ships a
+      # patched release.
+      - name: Hex audit (cowlib 2.21.0 advisory allow-listed — no upstream fix)
         run: |
-          ALLOWED='EEF-CVE-2026-43966|EEF-CVE-2026-43969'
+          ALLOWED='EEF-CVE-2026-43966'
           audit=$(mix hex.audit 2>&1) && exit 0
           echo "$audit"
           unexpected=$(echo "$audit" | grep -E '^  [^ ]+ [0-9]' | grep -Ev " - (${ALLOWED}) " || true)

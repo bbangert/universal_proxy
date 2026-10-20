@@ -158,7 +158,7 @@ defmodule UniversalProxy.MixProject do
       {:bluez, "~> 0.1"},
 
       # Already transitive via bluez/vintage_net; direct dep since Storage.Smbd uses MuonTrap.Daemon directly.
-      {:muontrap, "~> 1.8"},
+      {:muontrap, "~> 2.0"},
 
       # Improv-over-BLE Wi-Fi provisioning, extracted from this app into
       # bbangert/improv (same lineage as bluez above) and published as
