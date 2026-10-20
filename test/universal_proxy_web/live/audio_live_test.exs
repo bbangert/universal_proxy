@@ -531,6 +531,38 @@ defmodule UniversalProxyWeb.AudioLiveTest do
     assert render(view) =~ "ALSA open failed"
   end
 
+  test "details disclosure shows the client_id the binary reports, not the Store's",
+       %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/audio")
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:output_added",
+      {:sendspin_output_added, sample_output()}
+    )
+
+    id = encode(@hp_key)
+    html = render_hook(view, "toggle_more", %{"id" => id})
+
+    # Before `listening`: no id yet, and the Store's per-output token
+    # (which only names the state dir) is never shown as the client id.
+    assert html =~ "Client ID"
+    refute html =~ "test-client-id"
+    refute html =~ "copy-client-"
+
+    sendspin_id = "E8oqWSUo4DZKok0mgH32tIvrxxyc_Fzn-YfXfYm_mBM"
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:state",
+      {:sendspin_state, @hp_key, %{event: "listening", port: 8928, client_id: sendspin_id}}
+    )
+
+    html = render(view)
+    assert html =~ sendspin_id
+    assert html =~ ~s(data-clipboard="#{sendspin_id}")
+  end
+
   test ":sendspin_state with shutdown event clears connection and stream", %{conn: conn} do
     {:ok, view, _html} = live(conn, "/audio")
 

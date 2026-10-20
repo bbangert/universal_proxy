@@ -191,7 +191,8 @@ defmodule UniversalProxy.Audio.Server do
       # learn that the player is already connected and streaming.
       # %{key => %{connection: :connected | :disconnected | :unknown,
       #            stream: %{codec, sample_rate, bit_depth, channels} | nil,
-      #            last_error: String.t() | nil}}
+      #            last_error: String.t() | nil,
+      #            sendspin_client_id: String.t() | nil}}
       connection_state: %{},
       # Debounce flag: a `sound` uevent schedules one delayed
       # `:check_hotplug` and sets this; the burst of sub-device uevents a
@@ -456,6 +457,14 @@ defmodule UniversalProxy.Audio.Server do
       |> String.slice(0, 256)
 
     {:noreply, update_connection_state(state, key, %{last_error: msg})}
+  end
+
+  # The Sendspin `client_id` the binary derived from its keypair (not the
+  # Store's per-output `client_id`, which only names the state dir). It is
+  # stable per output, so a respawn's `shutdown` reset leaves it alone.
+  def handle_info({:sendspin_state, key, %{event: "listening", client_id: id}}, state)
+      when is_binary(id) do
+    {:noreply, update_connection_state(state, key, %{sendspin_client_id: id})}
   end
 
   def handle_info({:sendspin_state, key, %{event: "shutdown"}}, state) do
@@ -963,7 +972,12 @@ defmodule UniversalProxy.Audio.Server do
     %{state | unusable_ports: MapSet.put(state.unusable_ports, port)}
   end
 
-  @default_live_state %{connection: :unknown, stream: nil, last_error: nil}
+  @default_live_state %{
+    connection: :unknown,
+    stream: nil,
+    last_error: nil,
+    sendspin_client_id: nil
+  }
 
   defp update_connection_state(state, key, patch) do
     existing = Map.get(state.connection_state, key, @default_live_state)

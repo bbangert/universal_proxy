@@ -65,12 +65,16 @@ Differences:
 - Sets `SendspinClientConfig::server_port` from `--mdns-port` so multiple
   binary instances can bind distinct ports (first-class upstream since
   sendspin-cpp #61)
+- A file-backed `SendspinPersistenceProvider` (`src/file_persistence.*`)
+  keeps the library's identity keypair and pairing state under
+  `--state-dir`, and unpaired access is enabled (see *Identity and
+  admission* below)
 
 ## sendspin-cpp pin
 
 Pinned via `FetchContent` to a **commit SHA** in `CMakeLists.txt`
-(`SENDSPIN_CPP_REF` cache var). Currently `9331ace6...`, upstream
-`v0.8.0`. We pin to a SHA rather
+(`SENDSPIN_CPP_REF` cache var). Currently `b95cf854...`, upstream
+`v0.9.5`. We pin to a SHA rather
 than a tag because git tags are mutable server-side; a retagged upstream
 would otherwise silently flow into firmware. The friendly tag name (or
 nearest-release note) lives in a comment beside the SHA for traceability.
@@ -142,7 +146,7 @@ Outside Mix, configure and build by hand:
 cd c_src/sendspin_player
 cmake -B _build -S . -DCMAKE_BUILD_TYPE=Release
 cmake --build _build -j
-./_build/sendspin_player --name "Test" --client-id "test-uuid"
+./_build/sendspin_player --name "Test" --state-dir /tmp/sendspin-test
 ```
 
 ## CLI surface
@@ -153,7 +157,7 @@ The flags must match what `UniversalProxy.Audio.Player` passes — see the
 | Flag                       | Required | Description                                  |
 | -------------------------- | -------- | -------------------------------------------- |
 | `--name STR`               | yes      | Friendly display name                        |
-| `--client-id STR`          | yes      | Stable unique client identifier (UUID)       |
+| `--state-dir PATH`         | yes      | Per-output directory for the persisted identity keypair and pairing state, created `0700`. The Sendspin `client_id` is derived from the keypair and reported on `listening` |
 | `--server URL`             | no       | Outbound Sendspin server WebSocket URL       |
 | `--product STR`            | no       | Product id in `device_info` (node name, e.g. `universal-proxy-07507f`); vendor is fixed to `Universal Proxy`. Default `sendspin_player` |
 | `--mac STR`                | no       | MAC for `device_info`, lowercase colon-separated. Pre-normalized by the Elixir side; empty/absent = library auto-detects from the active interface |
@@ -173,7 +177,7 @@ changes, and on errors.
 
 ```jsonc
 {"event":"started","version":"0.1.0","port":8928,"name":"Out 1","product":"universal-proxy-07507f","alsa_device":"plughw:0,0","formats":[{"codec":"flac","channels":2,"rate":48000,"bit_depth":16}]}
-{"event":"listening","port":8928}          // WebSocket listener confirmed bound
+{"event":"listening","port":8928,"client_id":"E8oqWSUo4DZKok0mgH32tIvrxxyc_Fzn-YfXfYm_mBM"} // listener bound
 {"event":"connected","server":"ws://music.local:8927/sendspin"}
 {"event":"disconnected"}
 {"event":"stream_start","sample_rate":48000,"channels":2,"bit_depth":16,"codec":"opus"}
@@ -200,7 +204,32 @@ imply the port accepts connections yet). `Audio.Player` gates its mDNS
 advertisement on this event: Music Assistant's discovery connect is one-shot
 (aiosendspin `retry_initial_connection=False`), so advertising before the
 listener is up hands MA a connection-refused that orphans the player until
-the mDNS record next flaps.
+the mDNS record next flaps. It also carries the Sendspin `client_id` (see
+below), which `Audio.Player` advertises as the TXT `client_id` entry.
+
+## Identity and admission
+
+Since sendspin-cpp v0.9.0 (Sendspin 1.0.0-rc1) the `client_id` is not
+configured. The library derives it as base64url (no padding) of a static
+X25519 public key, generates that keypair on first start, and stores it
+through the persistence provider. `FilePersistence` writes each library
+blob as one file in `--state-dir` (dir `0700`, files `0600`, written via
+temp file + fsync + rename), so the identity survives respawns and
+reboots. A state dir that cannot be created fails the process before the
+client starts, rather than letting it mint an identity it cannot keep.
+
+The library's output-delay blob is deliberately not stored: the BEAM side
+already owns that value (persisted from the `static_delay` event and
+passed back via `--initial-static-delay-ms`), and a stored blob would
+outrank the CLI value.
+
+The connection is Noise-encrypted. The player calls
+`set_unpaired_access_enabled(true)` before `start()`, so a server that has
+not paired with it can still admit it: Music Assistant approves a
+player-only client that offers unpaired access without any setup step. We
+do not advertise a pairing method yet; that would need UI to show the
+pairing code (`on_display_pairing_code`) and to confirm the pairing
+window.
 
 ## Stdin commands
 

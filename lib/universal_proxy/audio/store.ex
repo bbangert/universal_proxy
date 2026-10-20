@@ -19,8 +19,12 @@ defmodule UniversalProxy.Audio.Store do
       }
 
   `client_id` is generated once per output the first time it is sighted
-  and persists across reboots so a paired Sendspin server keeps
-  recognising the player. Volume defaults to `50` and `muted` to
+  and persists across reboots. It is no longer the Sendspin `client_id`:
+  since sendspin-cpp v0.9.0 the library derives that from an X25519
+  keypair it stores itself, and this value only names the per-output
+  directory holding that keypair (`Audio.Player`'s `--state-dir`), which
+  keeps the derived identity stable. The field keeps its name so existing
+  DETS rows need no migration. Volume defaults to `50` and `muted` to
   `false`. These defaults are applied at the `save_config/2` boundary
   so callers can pass partial maps.
 

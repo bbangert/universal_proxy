@@ -11,6 +11,9 @@ defmodule UniversalProxy.Audio.PlayerTest do
   @pubsub UniversalProxy.PubSub
   @fake_binary Path.expand("../../support/fake_sendspin_player.py", __DIR__)
   @key {"bcm2835 Headphones", nil, nil}
+  # The id `fake_sendspin_player.py` reports on `listening`, standing in
+  # for the one the real binary derives from its keypair.
+  @fake_client_id "ZmFrZS1zZW5kc3Bpbi1wbGF5ZXItaWQtMzJieXRlcyE"
 
   defmodule MdnsStub do
     @moduledoc """
@@ -117,7 +120,8 @@ defmodule UniversalProxy.Audio.PlayerTest do
         binary_path: @fake_binary,
         mdns_port: 18_928,
         device_name_fun: fn -> nil end,
-        mac_address_fun: fn -> nil end
+        mac_address_fun: fn -> nil end,
+        state_dir: "/tmp/sendspin-player-test/deadbeef"
       },
       overrides
     )
@@ -134,10 +138,11 @@ defmodule UniversalProxy.Audio.PlayerTest do
     # `started` event shape is documented in
     # `c_src/sendspin_player/README.md` ("Stdout events"). The fake
     # binary mirrors that shape exactly so this test would catch a
-    # drift in either direction. `client_id` is passed to the binary
-    # as a CLI arg + advertised in mDNS TXT but is NOT echoed back on
-    # `started`; `initial_volume` is reported via a separate `volume`
-    # event right after `started`.
+    # drift in either direction. The Sendspin `client_id` is reported by
+    # the binary on `listening` (derived from its `--state-dir` keypair)
+    # and advertised in mDNS TXT, NOT echoed on `started`;
+    # `initial_volume` is reported via a separate `volume` event right
+    # after `started`.
     test "spawns the binary and forwards CLI args via the `started` event" do
       pid = start_player!()
 
@@ -206,6 +211,32 @@ defmodule UniversalProxy.Audio.PlayerTest do
       end
     end
 
+    test "passes a per-output --state-dir named by the Store's client_id" do
+      pid = start_player!()
+      assert_receive {:sendspin_state, @key, %{event: "started"}}, 2_000
+
+      state = :sys.get_state(pid)
+      assert Path.basename(state.state_dir) == "deadbeef"
+      assert Path.basename(Path.dirname(state.state_dir)) == "sendspin_players"
+
+      assert ["--state-dir", dir | _] =
+               Enum.drop_while(Player.__cli_args__(state), &(&1 != "--state-dir"))
+
+      assert dir == state.state_dir
+      refute "--client-id" in Player.__cli_args__(state)
+    end
+
+    test "hashes a Store client_id that is not a safe directory name" do
+      # Only `generate_client_id/0` writes the field today; this guards a
+      # corrupted DETS row from turning into a path outside the base dir.
+      pid = start_player!(config: Map.put(config(), :client_id, "../../etc"))
+      assert_receive {:sendspin_state, @key, %{event: "started"}}, 2_000
+
+      state_dir = :sys.get_state(pid).state_dir
+      assert Path.basename(state_dir) =~ ~r/\A[0-9a-f]{64}\z/
+      assert Path.basename(Path.dirname(state_dir)) == "sendspin_players"
+    end
+
     test "forwards the persisted static delay via --initial-static-delay-ms" do
       _pid = start_player!(config: Map.put(config(), :static_delay_ms, 250))
       assert_receive {:sendspin_state, @key, _started}, 2_000
@@ -232,12 +263,28 @@ defmodule UniversalProxy.Audio.PlayerTest do
       assert service.transport == "tcp"
       assert service.port == 18_928
       assert "name=Headphones" in service.txt_payload
-      assert "client_id=deadbeef" in service.txt_payload
+      # The id the binary reported, never the Store's state-dir token.
+      assert "client_id=#{@fake_client_id}" in service.txt_payload
+      refute "client_id=deadbeef" in service.txt_payload
       # instance_name = friendly_name (sanitized) so each output gets
       # its own mDNS instance instead of colliding on the host's
       # default. Renames produce a clean Removed/Added cycle on peer
       # caches like avahi.
       assert service.instance_name == "Headphones"
+    end
+
+    test "omits the TXT client_id when `listening` carries none" do
+      # The entry is a non-spec extra; advertising a guessed id would
+      # disagree with the one the player presents in client/hello.
+      System.put_env("FAKE_OMIT_CLIENT_ID", "1")
+      on_exit(fn -> System.delete_env("FAKE_OMIT_CLIENT_ID") end)
+
+      _pid = start_player!()
+      assert_receive {:sendspin_state, @key, %{event: "listening"}}, 2_000
+
+      [{:add, service}] = MdnsStub.calls()
+      assert "path=/sendspin" in service.txt_payload
+      refute Enum.any?(service.txt_payload, &String.starts_with?(&1, "client_id="))
     end
 
     test "does NOT register mDNS while `listening` has not arrived" do
@@ -315,6 +362,11 @@ defmodule UniversalProxy.Audio.PlayerTest do
       add_idx = Enum.find_index(calls, &match?({:add, _}, &1))
       announce_idx = Enum.find_index(calls, &(&1 == :announce_all))
       assert add_idx < announce_idx, "reannounce burst must follow successful registration"
+
+      # The retry runs from a timer, long after the `listening` event;
+      # it must still advertise the id that event carried.
+      {:add, service} = Enum.at(calls, add_idx)
+      assert "client_id=#{@fake_client_id}" in service.txt_payload
     end
 
     test "warns when the binary never reports `listening`" do
