@@ -15,6 +15,9 @@ defmodule SendspinPlayerContractTest do
   use ExUnit.Case, async: false
 
   @moduletag :contract
+  # A fresh per-test dir for `--state-dir`, so every test starts with no
+  # persisted keypair and tests can't see each other's identity.
+  @moduletag :tmp_dir
 
   @binary_path :code.priv_dir(:universal_proxy)
                |> to_string()
@@ -23,6 +26,12 @@ defmodule SendspinPlayerContractTest do
   # Port chosen above the IANA dynamic range floor to avoid collisions with
   # the upstream default (8928).
   @ws_port 18_928
+
+  # chmod 000 does not stop root from reading a file.
+  @running_as_root (case System.cmd("id", ["-u"]) do
+                      {"0\n", 0} -> true
+                      _ -> false
+                    end)
 
   setup_all do
     unless File.exists?(@binary_path) do
@@ -38,8 +47,8 @@ defmodule SendspinPlayerContractTest do
     :ok
   end
 
-  setup do
-    port = spawn_player()
+  setup %{tmp_dir: tmp_dir} do
+    port = spawn_player(state_dir: tmp_dir)
 
     # on_exit runs in a separate process, so Port operations from inside it
     # fail with :badarg. Capture the OS PID now and shutdown via signals
@@ -118,12 +127,116 @@ defmodule SendspinPlayerContractTest do
     # only be emitted when the port actually accepts connections, so
     # Music Assistant's one-shot discovery connect can't land in the
     # spawn-to-bind gap.
-    assert event == %{"event" => "listening", "port" => @ws_port}
+    assert %{"event" => "listening", "port" => @ws_port, "client_id" => client_id} = event
+    assert map_size(event) == 3
+    assert_sendspin_client_id(client_id)
   end
 
-  test "real binary honors a non-zero --initial-static-delay-ms" do
+  test "persists the identity keypair privately under --state-dir", %{tmp_dir: tmp_dir} do
+    # Set up by `start()`, which runs before `listening` (awaited in setup).
+    assert %File.Stat{type: :directory, mode: dir_mode} = File.stat!(tmp_dir)
+    assert Bitwise.band(dir_mode, 0o777) == 0o700
+
+    keypair = Path.join(tmp_dir, "keypair")
+    assert %File.Stat{size: 32, mode: file_mode} = File.stat!(keypair)
+    assert Bitwise.band(file_mode, 0o777) == 0o600
+
+    # The output delay belongs to the BEAM side (--initial-static-delay-ms),
+    # so the provider must never store the library's copy of it.
+    refute File.exists?(Path.join(tmp_dir, "output_delay"))
+  end
+
+  test "keeps the same client_id across a restart on the same --state-dir",
+       %{port: port, tmp_dir: tmp_dir, listening_event: first} do
+    send_command(port, ~s({"cmd":"shutdown"}))
+    assert wait_for_exit(port) == 0
+
+    # Own port: the previous listener's socket may linger in TIME_WAIT.
+    again = spawn_player(state_dir: tmp_dir, ws_port: @ws_port + 2)
+
+    os_pid =
+      case Port.info(again, :os_pid) do
+        {:os_pid, pid} -> pid
+        _ -> nil
+      end
+
+    on_exit(fn -> shutdown_os_process(os_pid) end)
+
+    assert_started_event(again)
+    assert_volume_event(again)
+    assert_static_delay_event(again)
+    assert assert_listening_event(again)["client_id"] == first["client_id"]
+  end
+
+  test "exits before `listening` when the keypair cannot be persisted", %{tmp_dir: tmp_dir} do
+    # The state dir itself initialises fine and holds no keypair; a
+    # directory at the provider's temp path then makes the library's first
+    # keypair write fail at the open (unlike a chmod, that also fails when
+    # CI runs as root). The library only logs that failure, so the binary
+    # must refuse to run on an identity it could not keep.
+    dir = Path.join(tmp_dir, "keypair_unwritable")
+    File.mkdir_p!(Path.join([dir, ".keypair.tmp", "blocker"]))
+
+    port = spawn_player(state_dir: dir, ws_port: @ws_port + 4)
+
+    assert_started_event(port)
+
+    assert next_event(port) == %{
+             "event" => "error",
+             "kind" => "state_dir",
+             "msg" => "failed to persist the identity keypair"
+           }
+
+    assert wait_for_exit(port) == 1
+  end
+
+  @tag skip: @running_as_root && "chmod 000 is not enforced for root"
+  test "exits without replacing a keypair file it cannot read", %{tmp_dir: tmp_dir} do
+    dir = Path.join(tmp_dir, "keypair_unreadable")
+    first = spawn_player(state_dir: dir, ws_port: @ws_port + 5)
+    assert_started_event(first)
+    assert_volume_event(first)
+    assert_static_delay_event(first)
+    assert_listening_event(first)
+    send_command(first, ~s({"cmd":"shutdown"}))
+    assert wait_for_exit(first) == 0
+
+    keypair = Path.join(dir, "keypair")
+    original = File.read!(keypair)
+    File.chmod!(keypair, 0o000)
+    on_exit(fn -> File.chmod(keypair, 0o600) end)
+
+    # The library would mint a new identity; the provider must refuse to
+    # save it over the unreadable file, so the binary exits instead.
+    port = spawn_player(state_dir: dir, ws_port: @ws_port + 6)
+
+    assert_started_event(port)
+
+    assert next_event(port) == %{
+             "event" => "error",
+             "kind" => "state_dir",
+             "msg" => "failed to persist the identity keypair"
+           }
+
+    assert wait_for_exit(port) == 1
+
+    File.chmod!(keypair, 0o600)
+    assert File.read!(keypair) == original
+  end
+
+  test "exits non-zero without --state-dir" do
+    port = spawn_player(state_dir: nil, ws_port: @ws_port + 3)
+    assert wait_for_exit(port) != 0
+  end
+
+  test "real binary honors a non-zero --initial-static-delay-ms", %{tmp_dir: tmp_dir} do
     # Own port so it doesn't collide with the setup-spawned player on @ws_port.
-    port = spawn_player(ws_port: @ws_port + 1, extra: ["--initial-static-delay-ms", "200"])
+    port =
+      spawn_player(
+        state_dir: Path.join(tmp_dir, "second"),
+        ws_port: @ws_port + 1,
+        extra: ["--initial-static-delay-ms", "200"]
+      )
 
     os_pid =
       case Port.info(port, :os_pid) do
@@ -185,9 +298,15 @@ defmodule SendspinPlayerContractTest do
   # Helpers
   # ----------------------------------------------------------------------
 
-  defp spawn_player(opts \\ []) do
+  defp spawn_player(opts) do
     ws_port = Keyword.get(opts, :ws_port, @ws_port)
     extra = Keyword.get(opts, :extra, [])
+
+    state_dir_args =
+      case Keyword.fetch!(opts, :state_dir) do
+        nil -> []
+        dir -> ["--state-dir", dir]
+      end
 
     Port.open(
       {:spawn_executable, String.to_charlist(@binary_path)},
@@ -199,8 +318,6 @@ defmodule SendspinPlayerContractTest do
           [
             "--name",
             "contract-test",
-            "--client-id",
-            "contract-uuid-0001",
             "--mdns-port",
             Integer.to_string(ws_port),
             "--alsa-device",
@@ -209,7 +326,7 @@ defmodule SendspinPlayerContractTest do
             "42",
             "--log-level",
             "error"
-          ] ++ extra
+          ] ++ state_dir_args ++ extra
       ]
     )
   end
@@ -218,6 +335,13 @@ defmodule SendspinPlayerContractTest do
   defp assert_volume_event(port), do: receive_event(port, "volume")
   defp assert_static_delay_event(port), do: receive_event(port, "static_delay")
   defp assert_listening_event(port), do: receive_event(port, "listening")
+
+  # The library derives client_id as base64url (no padding) of the 32-byte
+  # X25519 public key, the shape aiosendspin's `_peer_pub_bytes` enforces.
+  defp assert_sendspin_client_id(id) do
+    assert is_binary(id) and byte_size(id) == 43, "client_id should be 43 chars: #{inspect(id)}"
+    assert {:ok, <<_::binary-size(32)>>} = Base.url_decode64(id, padding: false)
+  end
 
   defp receive_event(port, expected_event_kind) do
     event = next_event(port)

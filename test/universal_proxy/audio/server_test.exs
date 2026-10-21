@@ -114,6 +114,30 @@ defmodule UniversalProxy.Audio.ServerTest do
     def calls, do: __MODULE__ |> Agent.get(& &1) |> Enum.reverse()
   end
 
+  defmodule ListeningPlayerStub do
+    @moduledoc """
+    Player stand-in that publishes its one-shot `listening` event from
+    `init/1`, i.e. while `Audio.Server` is still inside the hotplug
+    refresh and has not yet broadcast `:sendspin_output_added`.
+    """
+    use GenServer, restart: :temporary
+
+    def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
+
+    @impl true
+    def init(opts) do
+      key = Keyword.fetch!(opts, :key)
+
+      Phoenix.PubSub.broadcast(
+        UniversalProxy.PubSub,
+        "sendspin:state",
+        {:sendspin_state, key, %{event: "listening", port: 8928, client_id: "derived-id"}}
+      )
+
+      {:ok, key}
+    end
+  end
+
   setup do
     path =
       Path.join(
@@ -444,6 +468,64 @@ defmodule UniversalProxy.Audio.ServerTest do
 
       :ok = Server.check_now(server)
       refute_receive {:sendspin_output_added, _}, 200
+    end
+
+    test "re-publishes a client_id whose listening event beat :sendspin_output_added" do
+      server = start_listening_server!()
+
+      EnumerateStub.set(%{@hp_key => hp_hardware()})
+
+      :ok = Server.check_now(server)
+
+      # A subscriber that knows no card yet drops `listening`; it must then
+      # see `output_added` followed by the re-published id.
+      assert [
+               {:sendspin_state, @hp_key, %{event: "listening"}},
+               {:sendspin_output_added, %{key: @hp_key}},
+               {:sendspin_state, @hp_key, %{sendspin_client_id: "derived-id"}}
+             ] = collect_messages(3)
+
+      assert {:ok, %{sendspin_client_id: "derived-id"}} = Server.get_output(server, @hp_key)
+
+      # A respawn reporting the same id is not re-published.
+      send(
+        server,
+        {:sendspin_state, @hp_key, %{event: "listening", port: 8928, client_id: "derived-id"}}
+      )
+
+      :sys.get_state(server)
+      refute_received {:sendspin_state, @hp_key, %{sendspin_client_id: _}}
+    end
+
+    test "a listening event that outlives its output does not suppress the re-publish on replug" do
+      server = start_listening_server!()
+
+      EnumerateStub.set(%{@hp_key => hp_hardware()})
+      :ok = Server.check_now(server)
+      assert [_, _, _] = collect_messages(3)
+
+      # Unplug, then the old player's `listening` arrives late.
+      EnumerateStub.set(%{})
+      :ok = Server.check_now(server)
+
+      send(
+        server,
+        {:sendspin_state, @hp_key, %{event: "listening", port: 8928, client_id: "derived-id"}}
+      )
+
+      refute Map.has_key?(:sys.get_state(server).connection_state, @hp_key)
+      drain_messages()
+
+      # Replug: the new player reports the same id before `output_added`, so
+      # the open page still needs the re-published id.
+      EnumerateStub.set(%{@hp_key => hp_hardware()})
+      :ok = Server.check_now(server)
+
+      assert [
+               {:sendspin_state, @hp_key, %{event: "listening"}},
+               {:sendspin_output_added, %{key: @hp_key}},
+               {:sendspin_state, @hp_key, %{sendspin_client_id: "derived-id"}}
+             ] = collect_messages(3)
     end
   end
 
@@ -1456,6 +1538,64 @@ defmodule UniversalProxy.Audio.ServerTest do
           do_eventually(check, deadline)
         end
       end
+    end
+  end
+
+  # An `Audio.Server` whose players are `ListeningPlayerStub`, which
+  # publishes `listening` before the server broadcasts `output_added`.
+  defp start_listening_server! do
+    player_sup =
+      start_supervised!({DynamicSupervisor, strategy: :one_for_one, name: nil},
+        id: :listening_player_sup
+      )
+
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "audio_server_listening_#{System.unique_integer([:positive])}.dets"
+      )
+
+    on_exit(fn -> File.rm(path) end)
+
+    store =
+      start_supervised!({Store, name: nil, table: :listening_store, dets_path: path},
+        id: :listening_store
+      )
+
+    start_supervised!(
+      {Server,
+       name: nil,
+       store: store,
+       enumerate_module: EnumerateStub,
+       start_timer: false,
+       player_supervisor: player_sup,
+       player_module: ListeningPlayerStub,
+       mdns_discovery: nil,
+       mdns_module: nil},
+      id: :listening_server
+    )
+  end
+
+  defp hp_hardware do
+    %{card_index: 0, alsa_device: "plughw:0,0", card_name: "bcm2835 Headphones", usb_port: nil}
+  end
+
+  defp drain_messages do
+    receive do
+      _ -> drain_messages()
+    after
+      0 -> :ok
+    end
+  end
+
+  # The next `n` messages in arrival order (assert_receive matches anywhere).
+  defp collect_messages(0), do: []
+
+  defp collect_messages(n) do
+    receive do
+      msg -> [msg | collect_messages(n - 1)]
+    after
+      1_000 -> []
     end
   end
 end

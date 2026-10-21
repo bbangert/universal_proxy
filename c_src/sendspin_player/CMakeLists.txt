@@ -21,7 +21,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "" FORCE)
 # build dirs. This also means `-DSENDSPIN_CPP_REF=...` cannot override;
 # for scratch experiments against another ref use
 # `-DFETCHCONTENT_SOURCE_DIR_SENDSPIN-CPP=<local-checkout>` instead.
-set(SENDSPIN_CPP_REF "9331ace6428979982c934384702d289958ca125e" # v0.8.0
+set(SENDSPIN_CPP_REF "b95cf854a784ed308b1f8fe9697f414b02768ddd" # v0.9.5
     CACHE STRING "sendspin-cpp commit SHA to pin" FORCE)
 
 # Trim sendspin-cpp to just the player role. Other roles ship dead code on a
@@ -32,6 +32,13 @@ set(SENDSPIN_ENABLE_METADATA   OFF CACHE BOOL "" FORCE)
 set(SENDSPIN_ENABLE_COLOR      OFF CACHE BOOL "" FORCE)
 set(SENDSPIN_ENABLE_ARTWORK    OFF CACHE BOOL "" FORCE)
 set(SENDSPIN_ENABLE_VISUALIZER OFF CACHE BOOL "" FORCE)
+# Added upstream in v0.9.x and defaulted ON: the source (audio capture) role
+# and its Opus encoder. We only play audio, so the role is off; the codec
+# option stays ON because our advertised formats include Opus (see
+# codec_name()/supported formats in src/main.cpp) and upstream made the
+# decoder optional in v0.9.0.
+set(SENDSPIN_ENABLE_SOURCE     OFF CACHE BOOL "" FORCE)
+set(SENDSPIN_ENABLE_OPUS       ON  CACHE BOOL "" FORCE)
 
 include(FetchContent)
 FetchContent_Declare(
@@ -93,6 +100,7 @@ add_executable(sendspin_player
     src/main.cpp
     src/alsa_pipe_sink.cpp
     src/alsa_caps.cpp
+    src/file_persistence.cpp
 )
 
 target_link_libraries(sendspin_player

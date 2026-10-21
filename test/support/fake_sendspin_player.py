@@ -9,7 +9,7 @@ Player tests need to drive.
   startup       → {"event":"started","version":...,"port":...,"name":...,"alsa_device":...}
                   {"event":"volume","value":<initial_volume>}
                   {"event":"static_delay","value":<initial_static_delay_ms>}
-                  {"event":"listening","port":...}
+                  {"event":"listening","port":...,"client_id":...}
   stdin commands → stdout events
     {"cmd":"set_volume","value":N} → {"event":"volume","value":N}
     {"cmd":"set_muted","value":B}  → {"event":"mute","value":B}
@@ -31,6 +31,11 @@ import sys
 # for assertions. The real binary substitutes its own VERSION here.
 FAKE_VERSION = "0.0.0-fake"
 
+# Stands in for the id the real binary derives from the keypair in
+# --state-dir: base64url (no padding) of 32 bytes, so the same 43-char
+# shape. Tests assert on this constant.
+FAKE_CLIENT_ID = "ZmFrZS1zZW5kc3Bpbi1wbGF5ZXItaWQtMzJieXRlcyE"
+
 
 def emit(event):
     sys.stdout.write(json.dumps(event) + "\n")
@@ -41,15 +46,15 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--server", default="")
     p.add_argument("--alsa-device", default="")
-    # Match the real binary's startup invariants
-    # (c_src/sendspin_player/src/main.cpp:236-241): `--name` and
-    # `--client-id` are mandatory; passing an empty string is a
-    # fatal error. Marking them required here means a regression
+    # Match the real binary's startup invariants (main.cpp parse_args):
+    # `--name` and `--state-dir` are mandatory; passing an empty string
+    # is a fatal error. Marking them required here means a regression
     # that drops either arg from `Audio.Player.build_cli_args/1`
     # surfaces as a non-zero exit from the fake, which Player.init
-    # reports as `{:binary_exited, _}` and tests fail.
+    # reports as `{:binary_exited, _}` and tests fail. The fake never
+    # writes to the state dir.
     p.add_argument("--name", required=True)
-    p.add_argument("--client-id", required=True)
+    p.add_argument("--state-dir", required=True)
     p.add_argument("--product", default="sendspin_player")
     # Accepted like the real binary; NOT echoed in any event (it only
     # affects the client/hello device_info, which never hits stdout).
@@ -62,13 +67,13 @@ def main():
 
     # Empty-string defense: argparse `required=True` only checks
     # presence, not non-empty. Real binary explicitly rejects empties.
-    if not args.name or not args.client_id:
-        sys.stderr.write("Error: --name and --client-id must be non-empty\n")
+    if not args.name or not args.state_dir:
+        sys.stderr.write("Error: --name and --state-dir must be non-empty\n")
         return 2
 
     # Match the real binary's `started` payload: event, version, port,
     # name, alsa_device (see c_src/sendspin_player/src/main.cpp:626-633).
-    # client_id, mdns_port (the CLI arg, same as port here), server,
+    # state_dir, mdns_port (the CLI arg, same as port here), server,
     # and initial_volume are NOT echoed on `started`.
     emit({
         "event": "started",
@@ -84,7 +89,7 @@ def main():
     emit({"event": "volume", "value": args.initial_volume})
 
     # ...and a `static_delay` event publishing the server-adjustable static
-    # output delay (the real binary reports get_static_delay_ms()).
+    # output delay (the real binary reports get_output_delay_ms()).
     emit({"event": "static_delay", "value": args.initial_static_delay_ms})
 
     # ...and finally `listening`, once the WebSocket listener is bound
@@ -93,10 +98,14 @@ def main():
     # FAKE_SKIP_LISTENING=1 to simulate a binary whose listener never
     # comes up and assert that no mDNS advertisement happens, or
     # FAKE_LISTENING_PORT=N to report a bound port different from the
-    # requested one (drives the wrong-port refusal path).
+    # requested one (drives the wrong-port refusal path), or
+    # FAKE_OMIT_CLIENT_ID=1 to leave `client_id` off the event.
     if os.environ.get("FAKE_SKIP_LISTENING") != "1":
         bound_port = int(os.environ.get("FAKE_LISTENING_PORT", args.mdns_port))
-        emit({"event": "listening", "port": bound_port})
+        listening = {"event": "listening", "port": bound_port}
+        if os.environ.get("FAKE_OMIT_CLIENT_ID") != "1":
+            listening["client_id"] = FAKE_CLIENT_ID
+        emit(listening)
 
     for line in sys.stdin:
         line = line.strip()

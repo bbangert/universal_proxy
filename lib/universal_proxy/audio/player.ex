@@ -38,7 +38,7 @@ defmodule UniversalProxy.Audio.Player do
   README and with `main.cpp`'s `emit_json` call sites.
 
       {"event":"started","version":"0.1.0","port":8928,"name":"Out 1","product":"universal-proxy-07507f","alsa_device":"plughw:0,0","formats":[{"codec":"flac","channels":2,"rate":48000,"bit_depth":16}]}
-      {"event":"listening","port":8928}
+      {"event":"listening","port":8928,"client_id":"E8oqWSUo4DZKok0mgH32tIvrxxyc_Fzn-YfXfYm_mBM"}
       {"event":"connected","server":"ws://music.local:8927/sendspin"}
       {"event":"disconnected"}
       {"event":"stream_start","sample_rate":48000,"channels":2,"bit_depth":16,"codec":"opus"}
@@ -108,7 +108,9 @@ defmodule UniversalProxy.Audio.Player do
     :mdns_module,
     :device_name_fun,
     :mac_address_fun,
+    :state_dir,
     port: nil,
+    client_id: nil,
     mdns_id: nil,
     mdns_registered: false,
     mdns_refused: false,
@@ -132,7 +134,9 @@ defmodule UniversalProxy.Audio.Player do
           # past the expected 0-arity function to match the runtime.
           device_name_fun: (-> String.t() | nil) | term(),
           mac_address_fun: (-> String.t() | nil) | term(),
+          state_dir: String.t(),
           port: port() | nil,
+          client_id: String.t() | nil,
           mdns_id: term(),
           mdns_registered: boolean(),
           mdns_refused: boolean(),
@@ -215,6 +219,7 @@ defmodule UniversalProxy.Audio.Player do
     mdns_module = Keyword.get(opts, :mdns_module, MdnsLite)
     device_name_fun = Keyword.get(opts, :device_name_fun, &default_device_name/0)
     mac_address_fun = Keyword.get(opts, :mac_address_fun, &default_mac_address/0)
+    state_dir = Keyword.get(opts, :state_dir) || default_state_dir(config)
 
     state = %__MODULE__{
       key: key,
@@ -225,7 +230,8 @@ defmodule UniversalProxy.Audio.Player do
       pubsub: pubsub,
       mdns_module: mdns_module,
       device_name_fun: device_name_fun,
-      mac_address_fun: mac_address_fun
+      mac_address_fun: mac_address_fun,
+      state_dir: state_dir
     }
 
     if File.exists?(binary_path) do
@@ -459,11 +465,15 @@ defmodule UniversalProxy.Audio.Player do
   # advertise — the mismatch clause below turns a silent wrong-port
   # advert (MA's discovery connect is one-shot; a dead-port record
   # orphans the player) into a loud refusal.
+  #
+  # The event also carries the Sendspin `client_id`, which the library
+  # derives from the keypair in `--state-dir`. It is kept on the state so
+  # the retry path advertises the same value.
   defp maybe_register_mdns(
          %__MODULE__{mdns_registered: false, mdns_port: port} = state,
-         %{event: "listening", port: port}
+         %{event: "listening", port: port} = event
        ) do
-    attempt_mdns_registration(state)
+    attempt_mdns_registration(%{state | client_id: binary_or_nil(event[:client_id])})
   end
 
   defp maybe_register_mdns(
@@ -539,8 +549,8 @@ defmodule UniversalProxy.Audio.Player do
       Map.fetch!(cfg, :alsa_device),
       "--name",
       Map.fetch!(cfg, :friendly_name),
-      "--client-id",
-      Map.fetch!(cfg, :client_id),
+      "--state-dir",
+      state.state_dir,
       "--mdns-port",
       Integer.to_string(state.mdns_port),
       "--initial-volume",
@@ -656,12 +666,12 @@ defmodule UniversalProxy.Audio.Player do
            config: cfg,
            mdns_port: port,
            mdns_module: mod,
-           device_name_fun: device_name_fun
+           device_name_fun: device_name_fun,
+           client_id: client_id
          },
          log_level
        ) do
     friendly_name = Map.fetch!(cfg, :friendly_name)
-    client_id = Map.fetch!(cfg, :client_id)
 
     # Set the mDNS *instance name* to the user-facing output name, suffixed
     # with the device node name (e.g. `bcm2835 Headphones
@@ -686,11 +696,14 @@ defmodule UniversalProxy.Audio.Player do
       protocol: "sendspin",
       transport: "tcp",
       port: port,
-      txt_payload: [
-        "path=/sendspin",
-        "name=#{display_name}",
-        "client_id=#{client_id}"
-      ]
+      # `client_id` is a non-spec extra (Music Assistant reads the id
+      # from client/hello, not TXT), so a `listening` event without one
+      # drops the entry rather than advertising a wrong id.
+      txt_payload:
+        [
+          "path=/sendspin",
+          "name=#{display_name}"
+        ] ++ if(client_id, do: ["client_id=#{client_id}"], else: [])
     }
 
     case mod.add_mdns_service(service) do
@@ -1006,6 +1019,35 @@ defmodule UniversalProxy.Audio.Player do
   # excluded from the rpi3 firmware. The C++ compile task already
   # places the binary at `priv/sendspin_player/<MIX_TARGET>/sendspin_player`.
   @target_dir to_string(Mix.target())
+
+  defp binary_or_nil(v) when is_binary(v) and v != "", do: v
+  defp binary_or_nil(_), do: nil
+
+  # One directory per output for the binary's keypair and pairing state,
+  # on the writable data partition on Nerves and under `_build/` on the
+  # host, like `Audio.Store`'s DETS file. Named by the Store's per-output
+  # `client_id`, which is generated once and never changes, so the
+  # Sendspin identity derived from the keypair is stable across respawns
+  # and reboots. That value is always generated hex today; anything else
+  # (a corrupted DETS row) is hashed so it can never escape the base dir.
+  defp default_state_dir(cfg) do
+    base =
+      if File.dir?("/data") do
+        "/data/sendspin_players"
+      else
+        Path.join([File.cwd!(), "_build", "sendspin_players"])
+      end
+
+    Path.join(base, state_dir_name(Map.fetch!(cfg, :client_id)))
+  end
+
+  defp state_dir_name(id) when is_binary(id) do
+    if id =~ ~r/\A[0-9A-Za-z_-]{1,64}\z/ do
+      id
+    else
+      :crypto.hash(:sha256, id) |> Base.encode16(case: :lower)
+    end
+  end
 
   defp default_binary_path do
     Path.join([

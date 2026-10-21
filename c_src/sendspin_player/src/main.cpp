@@ -13,6 +13,8 @@
 //   • JSON commands on stdin for runtime volume/mute/shutdown
 //   • Sets SendspinClientConfig::server_port from --mdns-port to bind a
 //     non-default WebSocket port so multiple players can coexist
+//   • Persists the library's identity and pairing state under --state-dir
+//     (file_persistence.h) and reports the derived client_id on stdout
 //
 // Licensed under the Apache License, Version 2.0.
 
@@ -21,6 +23,7 @@
 
 #include "alsa_pipe_sink.h"
 #include "alsa_caps.h"
+#include "file_persistence.h"
 
 #include <algorithm>
 #include <atomic>
@@ -226,7 +229,7 @@ struct Options {
     std::string server;
     std::string alsa_device;
     std::string name;
-    std::string client_id;
+    std::string state_dir;
     std::string product;
     std::string mac;
     int mdns_port = DEFAULT_WS_PORT;
@@ -240,7 +243,10 @@ static void print_usage(const char* prog) {
         "Usage: %s [options]\n\n"
         "Required:\n"
         "  --name STR            Friendly display name.\n"
-        "  --client-id STR       Stable unique client identifier (e.g. UUID).\n\n"
+        "  --state-dir PATH      Per-output directory for the persisted identity\n"
+        "                        keypair and pairing state (created 0700). The\n"
+        "                        Sendspin client_id is derived from the keypair\n"
+        "                        and reported in the `listening` event.\n\n"
         "Optional:\n"
         "  --server URL          Sendspin server WebSocket URL\n"
         "                        (e.g. ws://music.local:8927/sendspin).\n"
@@ -278,7 +284,7 @@ static bool parse_args(int argc, char** argv, Options& opts) {
         {"server",         required_argument, nullptr, 's'},
         {"alsa-device",    required_argument, nullptr, 'd'},
         {"name",           required_argument, nullptr, 'n'},
-        {"client-id",      required_argument, nullptr, 'i'},
+        {"state-dir",      required_argument, nullptr, 'S'},
         {"product",        required_argument, nullptr, 'P'},
         {"mac",            required_argument, nullptr, 'm'},
         {"mdns-port",      required_argument, nullptr, 'p'},
@@ -296,7 +302,7 @@ static bool parse_args(int argc, char** argv, Options& opts) {
             case 's': opts.server = optarg; break;
             case 'd': opts.alsa_device = optarg; break;
             case 'n': opts.name = optarg; break;
-            case 'i': opts.client_id = optarg; break;
+            case 'S': opts.state_dir = optarg; break;
             case 'P': opts.product = optarg; break;
             case 'm': opts.mac = optarg; break;
             case 'p':
@@ -327,8 +333,8 @@ static bool parse_args(int argc, char** argv, Options& opts) {
         std::fprintf(stderr, "Error: --name is required\n");
         return false;
     }
-    if (opts.client_id.empty()) {
-        std::fprintf(stderr, "Error: --client-id is required\n");
+    if (opts.state_dir.empty()) {
+        std::fprintf(stderr, "Error: --state-dir is required\n");
         return false;
     }
     if (opts.mdns_port <= 0 || opts.mdns_port > 65535) {
@@ -345,7 +351,6 @@ static bool parse_args(int argc, char** argv, Options& opts) {
     }
     // UTF-8 gate before any field flows into a stdout JSON event.
     if (!require_utf8("--name", opts.name)) return false;
-    if (!require_utf8("--client-id", opts.client_id)) return false;
     if (!require_utf8("--product", opts.product)) return false;
     if (!require_utf8("--mac", opts.mac)) return false;
     if (!require_utf8("--alsa-device", opts.alsa_device)) return false;
@@ -634,7 +639,7 @@ struct PlayerListener : PlayerRoleListener {
     // The server (e.g. Music Assistant) changed the static output delay. The
     // library already applies it to playout timing in the sync task; we just
     // report it so the Elixir side can persist it and re-apply on respawn.
-    void on_static_delay_changed(uint16_t delay_ms) override {
+    void on_output_delay_changed(uint16_t delay_ms) override {
         std::ostringstream os;
         os << "{\"event\":\"static_delay\",\"value\":" << static_cast<int>(delay_ms) << "}";
         emit_json(os.str());
@@ -708,8 +713,19 @@ int main(int argc, char* argv[]) {
 
     SendspinClient::set_log_level(log_level);
 
+    // Before the client exists, so a state dir we cannot create fails the
+    // process with a clear message instead of start() minting a keypair it
+    // cannot keep (a new client_id on every respawn).
+    FilePersistence persistence(opts.state_dir);
+    {
+        std::string err;
+        if (!persistence.init(err)) {
+            std::fprintf(stderr, "Error: --state-dir: %s\n", err.c_str());
+            return 1;
+        }
+    }
+
     SendspinClientConfig client_config;
-    client_config.client_id = opts.client_id;
     client_config.name = opts.name;
     // opts.mdns_port is validated 1–65535 in parse_args, so the narrowing
     // cast cannot truncate.
@@ -757,7 +773,7 @@ int main(int argc, char* argv[]) {
     // respawns by the Elixir side via the `static_delay` stdout event +
     // `--initial-static-delay-ms`). The library applies it to playout timing
     // inside the sync task; we only enable + report it.
-    player_config.initial_static_delay_ms = static_cast<uint16_t>(opts.initial_static_delay_ms);
+    player_config.initial_output_delay_ms = static_cast<uint16_t>(opts.initial_static_delay_ms);
     auto& player = client.add_player(std::move(player_config));
 
     AlsaPipeSink audio_sink;
@@ -775,9 +791,18 @@ int main(int argc, char* argv[]) {
     player.set_listener(&player_listener);
     // Advertise the static delay as server-adjustable; without this the
     // player reports it as 0 and Music Assistant exposes no delay control.
-    player.set_static_delay_adjustable(true);
+    player.set_output_delay_adjustable(true);
     client.set_listener(&client_listener);
     client.set_network_provider(&network_provider);
+    client.set_persistence_provider(&persistence);
+    // Admit servers that have not paired with us. Music Assistant approves
+    // a player-only client that offers this without any setup step, which
+    // keeps outputs zero-config. The library always offers `pairing_psk`
+    // (its generated PSK is persisted like the keypair), but we have no UI
+    // for the pairing-code methods or for handing out the PSK token. The
+    // library never persists this flag, so it is set on every launch,
+    // before start(), so the first client/hello carries it.
+    client.set_unpaired_access_enabled(true);
 
     {
         std::ostringstream os;
@@ -802,6 +827,21 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // start() generates a keypair when none is stored, and only logs a
+    // failed save of it (a full or read-only /data, or an existing keypair
+    // file we could not read and so refuse to overwrite). Running on would
+    // advertise a client_id the next launch replaces, so every respawn
+    // would appear to Music Assistant as another new player. Exit before
+    // the listener binds instead; the BEAM side shows the error.
+    if (persistence.keypair_save_failed()) {
+        emit_json("{\"event\":\"error\",\"kind\":\"state_dir\","
+                  "\"msg\":\"failed to persist the identity keypair\"}");
+        // stop() before returning, for the listener-lifetime reason given
+        // at the normal shutdown below.
+        client.stop();
+        return 1;
+    }
+
     {
         auto v = static_cast<uint8_t>(opts.initial_volume);
         audio_sink.set_volume(v);
@@ -816,7 +856,7 @@ int main(int argc, char* argv[]) {
         // any UI reflect it without waiting for a server change.
         std::ostringstream os;
         os << "{\"event\":\"static_delay\",\"value\":"
-           << static_cast<int>(player.get_static_delay_ms()) << "}";
+           << static_cast<int>(player.get_output_delay_ms()) << "}";
         emit_json(os.str());
     }
 
@@ -843,8 +883,11 @@ int main(int argc, char* argv[]) {
             std::ostringstream os;
             // The acquire above pairs with the hook's release store, so
             // this relaxed port load cannot observe a stale/zero value.
+            // client_id() is valid from start() on; the BEAM side
+            // advertises it in the mDNS TXT record.
             os << "{\"event\":\"listening\",\"port\":"
-               << g_listener_port.load(std::memory_order_relaxed) << "}";
+               << g_listener_port.load(std::memory_order_relaxed)
+               << ",\"client_id\":\"" << json_escape(client.client_id()) << "\"}";
             emit_json(os.str());
         }
 

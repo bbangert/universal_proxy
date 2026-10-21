@@ -744,8 +744,9 @@ defmodule UniversalProxyWeb.AudioLive do
         <span class="font-mono text-fg-2">{@output.card_index}</span>
         <span></span>
         <span>Client ID</span>
-        <span class="font-mono text-fg-2 truncate">{@output.client_id}</span>
+        <span class="font-mono text-fg-2 truncate">{@output.client_id || "—"}</span>
         <button
+          :if={@output.client_id}
           type="button"
           phx-hook="CopyToClipboard"
           data-clipboard={@output.client_id}
@@ -1037,7 +1038,9 @@ defmodule UniversalProxyWeb.AudioLive do
       enabled: output.enabled,
       volume: output.volume,
       muted: output.muted,
-      client_id: output.client_id,
+      # The id Sendspin servers see, reported by the binary once its
+      # listener is up; nil until then (see `Audio.Server`).
+      client_id: Map.get(output, :sendspin_client_id),
       connection: Map.get(output, :connection, :unknown),
       stream: Map.get(output, :stream),
       group: nil,
@@ -1052,7 +1055,8 @@ defmodule UniversalProxyWeb.AudioLive do
   end
 
   # PubSub partial messages come in two flavors:
-  #   1. Server-originated: keys are :friendly_name | :volume | :muted | :enabled
+  #   1. Server-originated: keys are :friendly_name | :volume | :muted |
+  #      :enabled | :sendspin_client_id
   #   2. Binary-originated: has an :event key plus event-specific payload
   # Both flow through this single merge function. Unknown keys fall
   # through untouched so a future binary event field doesn't crash the
@@ -1071,8 +1075,17 @@ defmodule UniversalProxyWeb.AudioLive do
       {:enabled, e}, acc when is_boolean(e) ->
         %{acc | enabled: e}
 
+      {:sendspin_client_id, id}, acc when is_binary(id) ->
+        %{acc | client_id: id}
+
       {:event, "connected"}, acc ->
         %{acc | connection: :connected, last_error: nil}
+
+      {:event, "listening"}, acc ->
+        case as_binary(Map.get(partial, :client_id)) do
+          nil -> acc
+          id -> %{acc | client_id: id}
+        end
 
       {:event, "disconnected"}, acc ->
         %{acc | connection: :disconnected, stream: nil}
