@@ -15,6 +15,8 @@
 //     non-default WebSocket port so multiple players can coexist
 //   • Persists the library's identity and pairing state under --state-dir
 //     (file_persistence.h) and reports the derived client_id on stdout
+//   • Writes the Pairing PSK token to <state-dir>/pairing_token (0600) for
+//     the BEAM side to show on demand; it never goes to stdout or stderr
 //
 // Licensed under the Apache License, Version 2.0.
 
@@ -39,6 +41,7 @@
 #include <getopt.h>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <poll.h>
 #include <sstream>
 #include <string>
@@ -798,8 +801,9 @@ int main(int argc, char* argv[]) {
     // Admit servers that have not paired with us. Music Assistant approves
     // a player-only client that offers this without any setup step, which
     // keeps outputs zero-config. The library always offers `pairing_psk`
-    // (its generated PSK is persisted like the keypair), but we have no UI
-    // for the pairing-code methods or for handing out the PSK token. The
+    // (its generated PSK is persisted like the keypair); its token is
+    // written to the state dir below for the web UI to hand out. There is
+    // no UI for the pairing-code methods. The
     // library never persists this flag, so it is set on every launch,
     // before start(), so the first client/hello carries it.
     client.set_unpaired_access_enabled(true);
@@ -840,6 +844,21 @@ int main(int argc, char* argv[]) {
         // at the normal shutdown below.
         client.stop();
         return 1;
+    }
+
+    // The token is a long-lived pairing secret: it goes only to a 0600 file
+    // in the 0700 state dir, never to stdout/stderr. Rewritten on every
+    // start so it follows the stored PSK. Failure is not fatal: unpaired
+    // access still works, the UI just has no token to show.
+    {
+        std::optional<std::string> token = client.pairing_token();
+        if (!token) {
+            emit_json("{\"event\":\"error\",\"kind\":\"pairing_token\","
+                      "\"msg\":\"pairing token unavailable\"}");
+        } else if (!persistence.write_file("pairing_token", *token)) {
+            emit_json("{\"event\":\"error\",\"kind\":\"pairing_token\","
+                      "\"msg\":\"failed to write the pairing token\"}");
+        }
     }
 
     {

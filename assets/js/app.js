@@ -21,6 +21,42 @@ function applyTheme() {
   applyThemeIcon()
 }
 
+// Write `text` to the clipboard; resolves true only once the write is
+// confirmed. Browsers expose `navigator.clipboard` only on secure
+// origins, and the device UI is plain HTTP, so fall back to
+// `execCommand("copy")` on a temporary textarea. Call it synchronously
+// from the click handler: the fallback needs the user gesture.
+function copyText(text) {
+  if (window.isSecureContext && navigator.clipboard) {
+    return navigator.clipboard.writeText(text).then(() => true, err => {
+      console.warn("Clipboard copy failed:", err)
+      return false
+    })
+  }
+
+  const previousFocus = document.activeElement
+  const textarea = document.createElement("textarea")
+  textarea.value = text
+  textarea.setAttribute("readonly", "")
+  textarea.style.position = "fixed"
+  textarea.style.top = "0"
+  textarea.style.left = "-9999px"
+  textarea.style.opacity = "0"
+  document.body.appendChild(textarea)
+  textarea.select()
+
+  let ok = false
+  try {
+    ok = document.execCommand("copy")
+  } catch (err) {
+    console.warn("Clipboard copy failed:", err)
+  }
+
+  textarea.remove()
+  if (previousFocus && typeof previousFocus.focus === "function") previousFocus.focus()
+  return Promise.resolve(ok)
+}
+
 const Hooks = {
   ThemeToggle: {
     mounted() {
@@ -51,19 +87,44 @@ const Hooks = {
 
   // Copy the element's `data-clipboard` attr to the system clipboard on
   // click. Used by the Audio tab's per-card "more" disclosure for the
-  // client_id. Briefly mutates the button's text to give the user a
-  // visible "Copied" cue without round-tripping through the server.
+  // client_id and the revealed pairing token. Briefly mutates the
+  // button's text to "Copied" only once the write is confirmed; on
+  // failure it shows a failure cue and, when `data-select-target` names
+  // an element id, selects that element's text for a manual Ctrl/Cmd+C.
   CopyToClipboard: {
     mounted() {
       this.el.addEventListener("click", () => {
         const text = this.el.dataset.clipboard
-        if (!text || !navigator.clipboard) return
-        navigator.clipboard.writeText(text).then(() => {
-          const original = this.el.textContent
-          this.el.textContent = "Copied"
-          setTimeout(() => { this.el.textContent = original }, 1200)
-        }).catch(err => console.warn("Clipboard copy failed:", err))
+        if (!text) return
+        copyText(text).then(ok => {
+          if (ok) {
+            this.flash("Copied", 1200)
+          } else {
+            this.selectTarget()
+            this.flash("Copy failed — select manually", 2500)
+          }
+        })
       })
+    },
+    destroyed() { if (this.timer) clearTimeout(this.timer) },
+    flash(label, ms) {
+      if (this.timer) clearTimeout(this.timer)
+      else this.original = this.el.textContent
+      this.el.textContent = label
+      this.timer = setTimeout(() => {
+        this.el.textContent = this.original
+        this.timer = null
+      }, ms)
+    },
+    selectTarget() {
+      const id = this.el.dataset.selectTarget
+      const target = id && document.getElementById(id)
+      if (!target) return
+      const range = document.createRange()
+      range.selectNodeContents(target)
+      const selection = window.getSelection()
+      selection.removeAllRanges()
+      selection.addRange(range)
     }
   },
 

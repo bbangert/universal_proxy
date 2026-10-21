@@ -48,6 +48,7 @@ defmodule UniversalProxy.Audio.Player do
       {"event":"mute","value":false}
       {"event":"static_delay","value":200}
       {"event":"error","kind":"alsa_configure","msg":"..."}
+      {"event":"error","kind":"pairing_token","msg":"..."}
       {"event":"shutdown"}
 
   Commands (BEAM → binary, written to stdin):
@@ -55,6 +56,11 @@ defmodule UniversalProxy.Audio.Player do
       {"cmd":"set_volume","value":75}
       {"cmd":"set_muted","value":true}
       {"cmd":"shutdown"}
+
+  The binary also writes its Sendspin pairing token to `pairing_token`
+  in the state dir (see `state_dir/1`); that secret never appears on
+  stdout, so it never reaches PubSub or the logs.
+  `UniversalProxy.Audio.pairing_token/1` reads it on demand.
 
   Each event is broadcast on PubSub topic `"sendspin:state"` as
   `{:sendspin_state, key, event_map}` so `LiveView` (Phase 4) and the
@@ -219,7 +225,7 @@ defmodule UniversalProxy.Audio.Player do
     mdns_module = Keyword.get(opts, :mdns_module, MdnsLite)
     device_name_fun = Keyword.get(opts, :device_name_fun, &default_device_name/0)
     mac_address_fun = Keyword.get(opts, :mac_address_fun, &default_mac_address/0)
-    state_dir = Keyword.get(opts, :state_dir) || default_state_dir(config)
+    state_dir = Keyword.get(opts, :state_dir) || state_dir(config)
 
     state = %__MODULE__{
       key: key,
@@ -1023,14 +1029,20 @@ defmodule UniversalProxy.Audio.Player do
   defp binary_or_nil(v) when is_binary(v) and v != "", do: v
   defp binary_or_nil(_), do: nil
 
-  # One directory per output for the binary's keypair and pairing state,
-  # on the writable data partition on Nerves and under `_build/` on the
-  # host, like `Audio.Store`'s DETS file. Named by the Store's per-output
-  # `client_id`, which is generated once and never changes, so the
-  # Sendspin identity derived from the keypair is stable across respawns
-  # and reboots. That value is always generated hex today; anything else
-  # (a corrupted DETS row) is hashed so it can never escape the base dir.
-  defp default_state_dir(cfg) do
+  @doc """
+  The `--state-dir` a player for this output config uses (unless started
+  with an explicit `:state_dir`).
+
+  One directory per output for the binary's keypair and pairing state,
+  on the writable data partition on Nerves and under `_build/` on the
+  host, like `Audio.Store`'s DETS file. Named by the Store's per-output
+  `client_id`, which is generated once and never changes, so the
+  Sendspin identity derived from the keypair is stable across respawns
+  and reboots. That value is always generated hex today; anything else
+  (a corrupted DETS row) is hashed so it can never escape the base dir.
+  """
+  @spec state_dir(%{required(:client_id) => String.t(), optional(any()) => any()}) :: String.t()
+  def state_dir(cfg) do
     base =
       if File.dir?("/data") do
         "/data/sendspin_players"

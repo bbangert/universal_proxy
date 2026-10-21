@@ -625,6 +625,29 @@ defmodule UniversalProxy.Audio.ServerTest do
     end
   end
 
+  describe "state_dir/2" do
+    test "returns the player's state dir for a present output only", %{server: server} do
+      EnumerateStub.set(%{
+        @hp_key => %{
+          card_index: 0,
+          alsa_device: "plughw:0,0",
+          card_name: "bcm2835 Headphones",
+          usb_port: nil
+        }
+      })
+
+      :ok = Server.check_now(server)
+      assert_receive {:sendspin_output_added, _}
+
+      {:ok, output} = Server.get_output(server, @hp_key)
+      assert {:ok, dir} = Server.state_dir(server, @hp_key)
+      assert dir == UniversalProxy.Audio.Player.state_dir(output)
+      assert Path.basename(dir) == output.client_id
+
+      assert :error = Server.state_dir(server, {"nope", nil, nil})
+    end
+  end
+
   describe "update_config/3" do
     setup %{server: server} do
       EnumerateStub.set(%{
