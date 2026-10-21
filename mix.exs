@@ -114,7 +114,7 @@ defmodule UniversalProxy.MixProject do
       {:circuits_uart, "~> 1.5"},
 
       # ESPHome Native API server library
-      {:espex, "~> 0.10"},
+      {:espex, "~> 0.12"},
 
       # Dependencies for all targets
       {:nerves, "~> 1.10", runtime: false},
