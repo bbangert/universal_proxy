@@ -159,6 +159,10 @@ bool FilePersistence::save_blob(const std::string& key, const uint8_t* data, siz
     return !keypair_save_failed_;
 }
 
+bool FilePersistence::write_file(const std::string& name, const std::string& data) {
+    return write_blob(name, reinterpret_cast<const uint8_t*>(data.data()), data.size());
+}
+
 bool FilePersistence::write_blob(const std::string& key, const uint8_t* data, size_t len) {
     if (!valid_key(key) || dir_fd_ < 0) {
         std::fprintf(stderr, "sendspin_player: refusing persistence key '%s'\n", key.c_str());

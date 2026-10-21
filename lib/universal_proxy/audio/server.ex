@@ -138,6 +138,17 @@ defmodule UniversalProxy.Audio.Server do
   end
 
   @doc """
+  The `--state-dir` of a currently present output's player (see
+  `UniversalProxy.Audio.Player.state_dir/1`). Returns `:error` if the
+  output isn't tracked. The dir is returned whether or not the player is
+  running: what it holds persists across respawns.
+  """
+  @spec state_dir(GenServer.server(), key()) :: {:ok, String.t()} | :error
+  def state_dir(server \\ __MODULE__, {slot_sub, _vid, _pid} = key) when is_binary(slot_sub) do
+    GenServer.call(server, {:state_dir, key})
+  end
+
+  @doc """
   Force a hotplug poll synchronously. Tests use this to avoid waiting
   on the periodic timer.
   """
@@ -279,6 +290,16 @@ defmodule UniversalProxy.Audio.Server do
         {:reply, {:ok, merge_connection_state(output, state.connection_state)}, state}
 
       :error ->
+        {:reply, :error, state}
+    end
+  end
+
+  def handle_call({:state_dir, key}, _from, state) do
+    case Map.fetch(state.outputs, key) do
+      {:ok, %{client_id: id} = output} when is_binary(id) ->
+        {:reply, {:ok, Player.state_dir(output)}, state}
+
+      _ ->
         {:reply, :error, state}
     end
   end

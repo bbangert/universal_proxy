@@ -815,4 +815,107 @@ defmodule UniversalProxyWeb.AudioLiveTest do
     refute html =~ "Reconnecting"
     assert html =~ "No audio outputs detected"
   end
+
+  describe "pairing token disclosure" do
+    @token "SP:0" <> String.duplicate("PAIRTOKEN", 12)
+
+    defmodule PairingTokenFacade do
+      @moduledoc false
+      # Stands in for `UniversalProxy.Audio` (see AudioLive's
+      # `:audio_facade` seam); the result is set per test.
+      def pairing_token(key) do
+        send(Application.get_env(:universal_proxy, :pairing_token_test_pid), {:read, key})
+        Application.get_env(:universal_proxy, :pairing_token_result)
+      end
+    end
+
+    setup do
+      Application.put_env(:universal_proxy, :audio_facade, PairingTokenFacade)
+      Application.put_env(:universal_proxy, :pairing_token_test_pid, self())
+      Application.put_env(:universal_proxy, :pairing_token_result, {:ok, @token})
+
+      on_exit(fn ->
+        Application.delete_env(:universal_proxy, :audio_facade)
+        Application.delete_env(:universal_proxy, :pairing_token_test_pid)
+        Application.delete_env(:universal_proxy, :pairing_token_result)
+      end)
+    end
+
+    defp open_disclosure(conn) do
+      {:ok, view, _html} = live(conn, "/audio")
+
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "sendspin:output_added",
+        {:sendspin_output_added, sample_output()}
+      )
+
+      id = encode(@hp_key)
+      html = render_hook(view, "toggle_more", %{"id" => id})
+      {view, id, html}
+    end
+
+    test "is hidden until Show, and hidden again after Hide", %{conn: conn} do
+      {view, id, html} = open_disclosure(conn)
+
+      assert html =~ "Pairing token"
+      assert html =~ "Pairing token&quot; option"
+      refute html =~ @token
+      # Nothing is read until the user asks.
+      refute_received {:read, _}
+
+      html = view |> element("button[phx-click=show_pairing_token]") |> render_click()
+      assert_received {:read, @hp_key}
+      assert html =~ @token
+
+      html = view |> element("button[phx-click=hide_pairing_token]") |> render_click()
+      refute html =~ @token
+
+      # Closing the disclosure drops a revealed token too.
+      render_hook(view, "show_pairing_token", %{"id" => id})
+      assert render(view) =~ @token
+      render_hook(view, "toggle_more", %{"id" => id})
+      html = render_hook(view, "toggle_more", %{"id" => id})
+      refute html =~ @token
+    end
+
+    test "Copy pushes the token without revealing it", %{conn: conn} do
+      {view, _id, _html} = open_disclosure(conn)
+
+      html = view |> element("button[phx-click=copy_pairing_token]") |> render_click()
+      assert_push_event(view, "copy", %{text: @token})
+      refute html =~ @token
+      assert html =~ "Copied"
+    end
+
+    test "shows a hint instead when the token is not ready", %{conn: conn} do
+      Application.put_env(:universal_proxy, :pairing_token_result, {:error, :not_ready})
+      {view, _id, _html} = open_disclosure(conn)
+
+      html = view |> element("button[phx-click=show_pairing_token]") |> render_click()
+      assert html =~ "Available once the output has started"
+      refute has_element?(view, "button[phx-click=copy_pairing_token]")
+    end
+
+    test "ignores events for an output that is gone", %{conn: conn} do
+      {view, id, _html} = open_disclosure(conn)
+      render_hook(view, "show_pairing_token", %{"id" => id})
+      assert render(view) =~ @token
+
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "sendspin:output_removed",
+        {:sendspin_output_removed, %{key: @hp_key}}
+      )
+
+      refute render(view) =~ @token
+      assert_received {:read, @hp_key}
+
+      render_hook(view, "show_pairing_token", %{"id" => id})
+      render_hook(view, "copy_pairing_token", %{"id" => id})
+      render_hook(view, "show_pairing_token", %{"id" => "garbage"})
+      refute_received {:read, _}
+      refute render(view) =~ @token
+    end
+  end
 end

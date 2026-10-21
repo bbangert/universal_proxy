@@ -27,6 +27,11 @@ defmodule SendspinPlayerContractTest do
   # the upstream default (8928).
   @ws_port 18_928
 
+  # pairing.md "Pairing Token", version 0: "SP:" + version + RFC 4648
+  # base32 of key || PSK (64 bytes → 103 chars unpadded), with `2` mapped
+  # to `9`.
+  @pairing_token_re ~r/\ASP:0[A-Z3-79]{103}\z/
+
   # chmod 000 does not stop root from reading a file.
   @running_as_root (case System.cmd("id", ["-u"]) do
                       {"0\n", 0} -> true
@@ -168,6 +173,65 @@ defmodule SendspinPlayerContractTest do
     assert assert_listening_event(again)["client_id"] == first["client_id"]
   end
 
+  test "writes the pairing token privately under --state-dir", %{tmp_dir: tmp_dir} do
+    path = Path.join(tmp_dir, "pairing_token")
+    assert %File.Stat{mode: mode} = File.stat!(path)
+    assert Bitwise.band(mode, 0o777) == 0o600
+
+    token = File.read!(path)
+    assert byte_size(token) == 107
+    assert token =~ @pairing_token_re
+    assert UniversalProxy.Audio.PairingToken.read(tmp_dir) == {:ok, token}
+
+    # Our own file, so the temp file of its atomic write must be gone.
+    refute File.exists?(Path.join(tmp_dir, ".pairing_token.tmp"))
+  end
+
+  test "keeps the same pairing token across a restart", %{port: port, tmp_dir: tmp_dir} do
+    token = File.read!(Path.join(tmp_dir, "pairing_token"))
+    send_command(port, ~s({"cmd":"shutdown"}))
+    assert wait_for_exit(port) == 0
+
+    again = spawn_player(state_dir: tmp_dir, ws_port: @ws_port + 7)
+
+    os_pid =
+      case Port.info(again, :os_pid) do
+        {:os_pid, pid} -> pid
+        _ -> nil
+      end
+
+    on_exit(fn -> shutdown_os_process(os_pid) end)
+
+    assert_started_event(again)
+    assert_volume_event(again)
+    assert File.read!(Path.join(tmp_dir, "pairing_token")) == token
+  end
+
+  test "never prints the pairing token on stdout or stderr", %{tmp_dir: tmp_dir} do
+    # Verbose library logging on, stderr merged into the captured stream,
+    # across a full start → listening → shutdown cycle.
+    dir = Path.join(tmp_dir, "quiet")
+
+    port =
+      spawn_player(
+        state_dir: dir,
+        ws_port: @ws_port + 8,
+        log_level: "verbose",
+        port_opts: [:stderr_to_stdout]
+      )
+
+    output = collect_until(port, ~s("event":"listening"), "")
+    send_command(port, ~s({"cmd":"shutdown"}))
+    {output, 0} = collect_until_exit(port, output)
+
+    assert output =~ ~s("event":"listening")
+    token = File.read!(Path.join(dir, "pairing_token"))
+    assert token =~ @pairing_token_re
+    refute String.contains?(output, token)
+    # Nor the bare body, in case something logs it without the prefix.
+    refute String.contains?(output, binary_part(token, 4, 103))
+  end
+
   test "exits before `listening` when the keypair cannot be persisted", %{tmp_dir: tmp_dir} do
     # The state dir itself initialises fine and holds no keypair; a
     # directory at the provider's temp path then makes the library's first
@@ -301,6 +365,8 @@ defmodule SendspinPlayerContractTest do
   defp spawn_player(opts) do
     ws_port = Keyword.get(opts, :ws_port, @ws_port)
     extra = Keyword.get(opts, :extra, [])
+    log_level = Keyword.get(opts, :log_level, "error")
+    port_opts = Keyword.get(opts, :port_opts, [])
 
     state_dir_args =
       case Keyword.fetch!(opts, :state_dir) do
@@ -314,19 +380,20 @@ defmodule SendspinPlayerContractTest do
         :binary,
         :exit_status,
         {:line, 1024},
-        args:
-          [
-            "--name",
-            "contract-test",
-            "--mdns-port",
-            Integer.to_string(ws_port),
-            "--alsa-device",
-            "default",
-            "--initial-volume",
-            "42",
-            "--log-level",
-            "error"
-          ] ++ state_dir_args ++ extra
+        {:args,
+         [
+           "--name",
+           "contract-test",
+           "--mdns-port",
+           Integer.to_string(ws_port),
+           "--alsa-device",
+           "default",
+           "--initial-volume",
+           "42",
+           "--log-level",
+           log_level
+         ] ++ state_dir_args ++ extra}
+        | port_opts
       ]
     )
   end
@@ -357,6 +424,30 @@ defmodule SendspinPlayerContractTest do
       {^port, {:data, {:eol, line}}} -> Jason.decode!(line)
     after
       5_000 -> flunk("no JSON event received within 5s")
+    end
+  end
+
+  # Raw captured output (lines and partial lines alike) until `marker`
+  # shows up.
+  defp collect_until(port, marker, acc) do
+    if String.contains?(acc, marker) do
+      acc
+    else
+      receive do
+        {^port, {:data, {_eol_or_noeol, chunk}}} ->
+          collect_until(port, marker, acc <> chunk <> "\n")
+      after
+        5_000 -> flunk("#{inspect(marker)} not seen within 5s")
+      end
+    end
+  end
+
+  defp collect_until_exit(port, acc) do
+    receive do
+      {^port, {:data, {_eol_or_noeol, chunk}}} -> collect_until_exit(port, acc <> chunk <> "\n")
+      {^port, {:exit_status, status}} -> {acc, status}
+    after
+      5_000 -> flunk("binary did not exit within 5s of shutdown command")
     end
   end
 

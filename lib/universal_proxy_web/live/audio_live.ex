@@ -46,6 +46,17 @@ defmodule UniversalProxyWeb.AudioLive do
 
   use UniversalProxyWeb, :live_view
 
+  defmodule RevealedToken do
+    @moduledoc false
+    # A pairing token the user chose to reveal. Wrapped so a LiveView
+    # crash report (which inspects the socket assigns) cannot print it.
+    @derive {Inspect, except: [:token]}
+    @enforce_keys [:token]
+    defstruct [:token]
+
+    @type t :: %__MODULE__{token: String.t()}
+  end
+
   require Logger
 
   import UniversalProxyWeb.Components.UI
@@ -117,6 +128,12 @@ defmodule UniversalProxyWeb.AudioLive do
      # index + client_id). Tracking as a MapSet keyed on the same
      # encoded ids the cards use.
      |> assign(:more_open, MapSet.new())
+     # Per-card Sendspin pairing token disclosure, keyed by the encoded
+     # card id: a `RevealedToken` while shown, or the reason it could not
+     # be read. Absent means hidden. The token is read on demand only and
+     # dropped again on Hide / disclosure close / output removal.
+     |> assign(:pairing_tokens, %{})
+     |> assign(:pairing_copied, nil)
      # Audio inputs (capture cards), keyed by the same base64-encoded
      # `{slot_sub, vid, pid}` id the outputs map above uses.
      |> assign(:inputs, build_inputs_map(inputs))}
@@ -220,13 +237,52 @@ defmodule UniversalProxyWeb.AudioLive do
 
   def handle_event("toggle_more", %{"id" => id}, socket) do
     {:noreply,
-     update(socket, :more_open, fn open ->
+     socket
+     |> update(:more_open, fn open ->
        if MapSet.member?(open, id) do
          MapSet.delete(open, id)
        else
          MapSet.put(open, id)
        end
-     end)}
+     end)
+     |> update(:pairing_tokens, &Map.delete(&1, id))}
+  end
+
+  def handle_event("show_pairing_token", %{"id" => id}, socket) do
+    case read_pairing_token(socket, id) do
+      {:ok, token} ->
+        {:noreply, put_pairing_token(socket, id, %RevealedToken{token: token})}
+
+      {:error, reason} when reason in [:not_ready, :unavailable] ->
+        {:noreply, put_pairing_token(socket, id, reason)}
+
+      {:error, :not_found} ->
+        {:noreply, socket}
+    end
+  end
+
+  def handle_event("hide_pairing_token", %{"id" => id}, socket) do
+    {:noreply, update(socket, :pairing_tokens, &Map.delete(&1, id))}
+  end
+
+  # Re-reads the token instead of using a revealed one, so Copy works
+  # while it is hidden and the token never has to be in the DOM.
+  def handle_event("copy_pairing_token", %{"id" => id}, socket) do
+    case read_pairing_token(socket, id) do
+      {:ok, token} ->
+        Process.send_after(self(), {:reset_pairing_copied, id}, 2_000)
+
+        {:noreply,
+         socket
+         |> assign(:pairing_copied, id)
+         |> push_event("copy", %{text: token})}
+
+      {:error, reason} when reason in [:not_ready, :unavailable] ->
+        {:noreply, put_pairing_token(socket, id, reason)}
+
+      {:error, :not_found} ->
+        {:noreply, socket}
+    end
   end
 
   # Operator consent gesture for pairing a capture card. Opens the source's
@@ -268,6 +324,7 @@ defmodule UniversalProxyWeb.AudioLive do
       socket
       |> update(:outputs, &Map.delete(&1, id))
       |> update(:more_open, &MapSet.delete(&1, id))
+      |> update(:pairing_tokens, &Map.delete(&1, id))
       |> maybe_start_reconnecting(key, removed)
       |> assign(:bt_meta, build_bt_meta())
 
@@ -338,6 +395,14 @@ defmodule UniversalProxyWeb.AudioLive do
     end
   end
 
+  def handle_info({:reset_pairing_copied, id}, socket) do
+    if socket.assigns.pairing_copied == id do
+      {:noreply, assign(socket, :pairing_copied, nil)}
+    else
+      {:noreply, socket}
+    end
+  end
+
   def handle_info(_msg, socket), do: {:noreply, socket}
 
   @impl true
@@ -359,6 +424,8 @@ defmodule UniversalProxyWeb.AudioLive do
           hci={get_in(@bt_meta, [output.bt_mac, :hci])}
           battery={get_in(@bt_meta, [output.bt_mac, :battery])}
           more_open?={MapSet.member?(@more_open, id)}
+          pairing={Map.get(@pairing_tokens, id)}
+          pairing_copied?={@pairing_copied == id}
         />
         <.reconnecting_card :for={{mac, info} <- active_reconnecting(@reconnecting, @outputs)} name={info.name} mac={mac} />
       </div>
@@ -581,6 +648,8 @@ defmodule UniversalProxyWeb.AudioLive do
   attr(:hci, :string, default: nil)
   attr(:battery, :integer, default: nil)
   attr(:more_open?, :boolean, required: true)
+  attr(:pairing, :any, default: nil)
+  attr(:pairing_copied?, :boolean, default: false)
 
   # Single player card. Layout is a vertical flex with three logical
   # blocks:
@@ -734,7 +803,8 @@ defmodule UniversalProxyWeb.AudioLive do
         </button>
       </div>
 
-      <%!-- Disclosure: card index + client id (mono) + copy --%>
+      <%!-- Disclosure: card index, client id and pairing token, each
+           with a copy action --%>
       <div
         :if={@more_open?}
         class="px-[22px] pt-2.5 pb-3.5 border-t border-border-2 bg-sunken
@@ -755,6 +825,50 @@ defmodule UniversalProxyWeb.AudioLive do
         >
           Copy
         </button>
+        <span class="self-start">Pairing token</span>
+        <span
+          :if={match?(%RevealedToken{}, @pairing)}
+          id={"pairing-token-#{@id}"}
+          class="font-mono text-fg-2 break-all select-all"
+        >
+          {@pairing.token}
+        </span>
+        <span :if={@pairing in [:not_ready, :unavailable]} class="text-fg-3">
+          — {pairing_token_hint(@pairing)}
+        </span>
+        <span :if={is_nil(@pairing)} class="font-mono text-fg-3">••••••••</span>
+        <div class="flex items-center gap-2.5 self-start">
+          <button
+            :if={match?(%RevealedToken{}, @pairing)}
+            type="button"
+            phx-click="hide_pairing_token"
+            phx-value-id={@id}
+            class="text-accent text-[11px] cursor-pointer bg-transparent border-none p-0"
+          >
+            Hide
+          </button>
+          <button
+            :if={not match?(%RevealedToken{}, @pairing)}
+            type="button"
+            phx-click="show_pairing_token"
+            phx-value-id={@id}
+            class="text-accent text-[11px] cursor-pointer bg-transparent border-none p-0"
+          >
+            Show
+          </button>
+          <button
+            :if={@pairing not in [:not_ready, :unavailable]}
+            type="button"
+            phx-click="copy_pairing_token"
+            phx-value-id={@id}
+            class="text-accent text-[11px] cursor-pointer bg-transparent border-none p-0"
+          >
+            {if @pairing_copied?, do: "Copied", else: "Copy"}
+          </button>
+        </div>
+        <span class="col-span-3 text-fg-4">
+          Paste into Music Assistant's Sendspin "Pairing token" option to pair this output.
+        </span>
       </div>
 
       <%!-- Last-error footnote (only when present) --%>
@@ -1178,6 +1292,28 @@ defmodule UniversalProxyWeb.AudioLive do
     |> Enum.reject(fn {mac, _info} -> MapSet.member?(live_macs, mac) end)
     |> Enum.sort_by(fn {_mac, %{name: name}} -> name end)
   end
+
+  defp pairing_token_hint(:not_ready), do: "Available once the output has started"
+  defp pairing_token_hint(:unavailable), do: "Unavailable"
+
+  # Only for a card this view still shows: a stale event for a removed
+  # output reads nothing.
+  defp read_pairing_token(socket, id) do
+    with {:ok, _output} <- fetch_output(socket, id),
+         {:ok, key} <- decode_key(id) do
+      audio_facade().pairing_token(key)
+    else
+      _ -> {:error, :not_found}
+    end
+  end
+
+  defp put_pairing_token(socket, id, value) do
+    update(socket, :pairing_tokens, &Map.put(&1, id, value))
+  end
+
+  # Test seam, like `OverviewLive`'s `:storage_facade`: the app-tree
+  # `Audio.Server` runs with no outputs in test.
+  defp audio_facade, do: Application.get_env(:universal_proxy, :audio_facade, Audio)
 
   defp fetch_output(socket, id) do
     case Map.fetch(socket.assigns.outputs, id) do

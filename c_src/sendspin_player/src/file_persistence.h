@@ -26,6 +26,11 @@
 // of the wrong length as absent, so this stays a pure byte store and never
 // interprets what it holds.
 //
+// Besides the library blobs, main.cpp stores the pairing token (the
+// "SP:..." string a Sendspin server is given to pair via the Pairing PSK)
+// as `pairing_token` through `write_file()`, so the BEAM side can show it
+// to the user on demand without it ever crossing stdout.
+//
 // The output delay key is deliberately not stored. The BEAM side already
 // owns that value (persisted from the `static_delay` event and passed back
 // as `--initial-static-delay-ms`), and a stored blob would take precedence
@@ -54,6 +59,12 @@ public:
     /// it fail without touching the file, so an unreadable identity is
     /// reported here rather than silently replaced.
     bool keypair_save_failed() const { return keypair_save_failed_; }
+
+    /// Write a file of our own (not a library blob) into the state dir with
+    /// the same atomic, 0600, fsynced path. `name` must not be one of the
+    /// library's `persistence_keys` (all at most 12 characters), or the
+    /// library would read it back as its own state.
+    bool write_file(const std::string& name, const std::string& data);
 
 private:
     /// Library keys are short lowercase identifiers (`keypair`, `rec_0`,

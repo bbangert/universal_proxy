@@ -69,6 +69,8 @@ Differences:
   keeps the library's identity keypair and pairing state under
   `--state-dir`, and unpaired access is enabled (see *Identity and
   admission* below)
+- The Pairing PSK token is written to `<state-dir>/pairing_token` (never
+  to stdout/stderr) for the web UI to show on demand
 
 ## sendspin-cpp pin
 
@@ -157,7 +159,7 @@ The flags must match what `UniversalProxy.Audio.Player` passes — see the
 | Flag                       | Required | Description                                  |
 | -------------------------- | -------- | -------------------------------------------- |
 | `--name STR`               | yes      | Friendly display name                        |
-| `--state-dir PATH`         | yes      | Per-output directory for the persisted identity keypair and pairing state, created `0700`. The Sendspin `client_id` is derived from the keypair and reported on `listening` |
+| `--state-dir PATH`         | yes      | Per-output directory for the persisted identity keypair and pairing state, created `0700`. The Sendspin `client_id` is derived from the keypair and reported on `listening`; the pairing token is written to `pairing_token` in it |
 | `--server URL`             | no       | Outbound Sendspin server WebSocket URL       |
 | `--product STR`            | no       | Product id in `device_info` (node name, e.g. `universal-proxy-07507f`); vendor is fixed to `Universal Proxy`. Default `sendspin_player` |
 | `--mac STR`                | no       | MAC for `device_info`, lowercase colon-separated. Pre-normalized by the Elixir side; empty/absent = library auto-detects from the active interface |
@@ -186,6 +188,7 @@ changes, and on errors.
 {"event":"volume","value":80}
 {"event":"mute","value":false}
 {"event":"error","kind":"alsa_configure","msg":"..."}
+{"event":"error","kind":"pairing_token","msg":"..."}  // non-fatal; token itself never on stdout
 {"event":"shutdown"}
 ```
 
@@ -239,7 +242,20 @@ player-only client that offers unpaired access without any setup step.
 The library always advertises the `pairing_psk` method in `client/hello`.
 It backs it with a Pairing PSK it generates on first start and stores
 under the `pairing_psk` key, so `--state-dir` holds pairing secrets (the
-PSK and any pairing records) as well as the identity key. We do not offer
+PSK and any pairing records) as well as the identity key.
+
+After a successful `start()` the binary writes `client.pairing_token()`
+(the 107-character `SP:0…` string, RFC 4648 base32 with `2` mapped to
+`9`) to `<state-dir>/pairing_token` through the same atomic `0600` write
+path, rewriting it on every start so it follows the stored PSK. A server
+that offers a "Pairing token" option (Music Assistant 2.10.7+) takes this
+string to pair over the PSK instead of relying on unpaired access. The
+token is a long-lived pairing secret, so it is never printed: the BEAM
+side reads the file only when a user asks to see or copy it. If the token
+is unavailable or the write fails, the binary emits a non-fatal
+`pairing_token` error event (without the token) and keeps running.
+
+We do not offer
 the pairing-code methods (dynamic or static code); those would need UI to
 show the code (`on_display_pairing_code`) and to confirm the pairing
 window.

@@ -13,7 +13,7 @@ defmodule UniversalProxy.Audio do
   `{card_name, nil, nil}` (e.g. `{"bcm2835 Headphones", nil, nil}`).
   """
 
-  alias UniversalProxy.Audio.{Server, Store}
+  alias UniversalProxy.Audio.{PairingToken, Server, Store}
 
   @typedoc """
   Composite identifier for an audio output:
@@ -54,5 +54,25 @@ defmodule UniversalProxy.Audio do
   @spec set_enabled(key(), boolean()) :: :ok | {:error, :not_found | term()}
   def set_enabled({_, _, _} = key, enabled?) when is_boolean(enabled?) do
     Server.set_enabled(key, enabled?)
+  end
+
+  @doc """
+  Read an output's Sendspin pairing token (the `"SP:..."` string a
+  Sendspin server such as Music Assistant takes to pair with the output).
+
+  Read from the player's state dir on every call and never cached or
+  broadcast: it is a long-lived pairing secret. `{:error, :not_ready}`
+  until the output's player has started once; `{:error, :unavailable}`
+  when the output isn't present, the audio subsystem is down, or the
+  file is unreadable or malformed.
+  """
+  @spec pairing_token(key()) :: {:ok, String.t()} | {:error, :not_ready | :unavailable}
+  def pairing_token({_, _, _} = key) do
+    case Server.state_dir(key) do
+      {:ok, dir} -> PairingToken.read(dir)
+      :error -> {:error, :unavailable}
+    end
+  catch
+    :exit, _ -> {:error, :unavailable}
   end
 end

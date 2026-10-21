@@ -226,6 +226,17 @@ defmodule UniversalProxy.Audio.PlayerTest do
       refute "--client-id" in Player.__cli_args__(state)
     end
 
+    @tag :tmp_dir
+    test "the pairing token lands in the state dir, never on PubSub", %{tmp_dir: tmp_dir} do
+      _pid = start_player!(state_dir: tmp_dir)
+      assert_receive {:sendspin_state, @key, %{event: "listening"}}, 2_000
+
+      assert {:ok, "SP:0" <> _ = token} = UniversalProxy.Audio.PairingToken.read(tmp_dir)
+
+      {:messages, messages} = Process.info(self(), :messages)
+      refute inspect(messages, limit: :infinity, printable_limit: :infinity) =~ token
+    end
+
     test "hashes a Store client_id that is not a safe directory name" do
       # Only `generate_client_id/0` writes the field today; this guards a
       # corrupted DETS row from turning into a path outside the base dir.

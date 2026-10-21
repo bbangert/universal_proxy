@@ -9,6 +9,7 @@ Player tests need to drive.
   startup       → {"event":"started","version":...,"port":...,"name":...,"alsa_device":...}
                   {"event":"volume","value":<initial_volume>}
                   {"event":"static_delay","value":<initial_static_delay_ms>}
+                  (writes <state-dir>/pairing_token, 0600; never printed)
                   {"event":"listening","port":...,"client_id":...}
   stdin commands → stdout events
     {"cmd":"set_volume","value":N} → {"event":"volume","value":N}
@@ -36,6 +37,26 @@ FAKE_VERSION = "0.0.0-fake"
 # shape. Tests assert on this constant.
 FAKE_CLIENT_ID = "ZmFrZS1zZW5kc3Bpbi1wbGF5ZXItaWQtMzJieXRlcyE"
 
+# Same shape as the real binary's token ("SP:" + version "0" + 103 base32
+# chars, 2 mapped to 9). Like the real one it is only ever written to
+# <state-dir>/pairing_token, never to stdout/stderr.
+FAKE_PAIRING_TOKEN = "SP:0" + ("FAKETOKEN" * 12)[:103]
+
+
+def write_pairing_token(state_dir):
+    """Mirror main.cpp: atomic 0600 write into a 0700 dir; a failure is a
+    non-fatal `pairing_token` error event that never carries the token."""
+    try:
+        os.makedirs(state_dir, mode=0o700, exist_ok=True)
+        tmp = os.path.join(state_dir, ".pairing_token.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(FAKE_PAIRING_TOKEN)
+        os.replace(tmp, os.path.join(state_dir, "pairing_token"))
+    except OSError:
+        emit({"event": "error", "kind": "pairing_token",
+              "msg": "failed to write the pairing token"})
+
 
 def emit(event):
     sys.stdout.write(json.dumps(event) + "\n")
@@ -51,8 +72,8 @@ def main():
     # is a fatal error. Marking them required here means a regression
     # that drops either arg from `Audio.Player.build_cli_args/1`
     # surfaces as a non-zero exit from the fake, which Player.init
-    # reports as `{:binary_exited, _}` and tests fail. The fake never
-    # writes to the state dir.
+    # reports as `{:binary_exited, _}` and tests fail. The only thing the
+    # fake writes to the state dir is the pairing token file.
     p.add_argument("--name", required=True)
     p.add_argument("--state-dir", required=True)
     p.add_argument("--product", default="sendspin_player")
@@ -83,6 +104,10 @@ def main():
         "product": args.product,
         "alsa_device": args.alsa_device,
     })
+
+    # Like the real binary, write the pairing token after start() and
+    # before the initial `volume` event.
+    write_pairing_token(args.state_dir)
 
     # Real binary emits a separate `volume` event after `started` to
     # publish the initial volume (main.cpp:642-649).
