@@ -14,9 +14,12 @@ defmodule UniversalProxy.Audio.PairingToken do
   @filename "pairing_token"
 
   # The spec caps a token at 127 bytes. Reads stop just past that (room for
-  # a trailing newline plus one byte), so an oversized file is rejected
-  # rather than silently truncated, and a huge one is never loaded.
+  # a trailing newline plus one byte), so a huge file is never loaded; a
+  # read that fills the whole buffer means the file is oversized and is
+  # rejected before trimming, so trailing content past the limit cannot
+  # hide behind whitespace.
   @max_bytes 127
+  @read_bytes @max_bytes + 2
 
   @type error :: :not_ready | :unavailable
 
@@ -35,7 +38,8 @@ defmodule UniversalProxy.Audio.PairingToken do
   def read(state_dir) when is_binary(state_dir) do
     path = Path.join(state_dir, @filename)
 
-    case File.open(path, [:read, :binary], &IO.binread(&1, @max_bytes + 2)) do
+    case File.open(path, [:read, :binary], &IO.binread(&1, @read_bytes)) do
+      {:ok, data} when byte_size(data) == @read_bytes -> {:error, :unavailable}
       {:ok, data} when is_binary(data) -> validate(data)
       {:ok, _eof_or_error} -> {:error, :unavailable}
       {:error, :enoent} -> {:error, :not_ready}

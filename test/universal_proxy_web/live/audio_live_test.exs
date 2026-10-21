@@ -879,22 +879,36 @@ defmodule UniversalProxyWeb.AudioLiveTest do
       refute html =~ @token
     end
 
-    test "Copy pushes the token without revealing it", %{conn: conn} do
-      {view, _id, _html} = open_disclosure(conn)
+    test "Copy is offered only while the token is revealed", %{conn: conn} do
+      {view, id, html} = open_disclosure(conn)
+      copy = "#copy-pairing-token-#{id}"
 
-      html = view |> element("button[phx-click=copy_pairing_token]") |> render_click()
-      assert_push_event(view, "copy", %{text: @token})
       refute html =~ @token
-      assert html =~ "Copied"
+      refute has_element?(view, copy)
+
+      view |> element("button[phx-click=show_pairing_token]") |> render_click()
+
+      assert has_element?(view, "#pairing-token-#{id}", @token)
+
+      assert has_element?(
+               view,
+               ~s(#{copy}[phx-hook="CopyToClipboard"][data-clipboard="#{@token}"]) <>
+                 ~s([data-select-target="pairing-token-#{id}"])
+             )
+
+      html = view |> element("button[phx-click=hide_pairing_token]") |> render_click()
+      refute html =~ @token
+      refute has_element?(view, copy)
+      refute has_element?(view, "#pairing-token-#{id}")
     end
 
     test "shows a hint instead when the token is not ready", %{conn: conn} do
       Application.put_env(:universal_proxy, :pairing_token_result, {:error, :not_ready})
-      {view, _id, _html} = open_disclosure(conn)
+      {view, id, _html} = open_disclosure(conn)
 
       html = view |> element("button[phx-click=show_pairing_token]") |> render_click()
       assert html =~ "Available once the output has started"
-      refute has_element?(view, "button[phx-click=copy_pairing_token]")
+      refute has_element?(view, "#copy-pairing-token-#{id}")
     end
 
     test "ignores events for an output that is gone", %{conn: conn} do
@@ -912,7 +926,6 @@ defmodule UniversalProxyWeb.AudioLiveTest do
       assert_received {:read, @hp_key}
 
       render_hook(view, "show_pairing_token", %{"id" => id})
-      render_hook(view, "copy_pairing_token", %{"id" => id})
       render_hook(view, "show_pairing_token", %{"id" => "garbage"})
       refute_received {:read, _}
       refute render(view) =~ @token

@@ -133,7 +133,6 @@ defmodule UniversalProxyWeb.AudioLive do
      # be read. Absent means hidden. The token is read on demand only and
      # dropped again on Hide / disclosure close / output removal.
      |> assign(:pairing_tokens, %{})
-     |> assign(:pairing_copied, nil)
      # Audio inputs (capture cards), keyed by the same base64-encoded
      # `{slot_sub, vid, pid}` id the outputs map above uses.
      |> assign(:inputs, build_inputs_map(inputs))}
@@ -265,26 +264,6 @@ defmodule UniversalProxyWeb.AudioLive do
     {:noreply, update(socket, :pairing_tokens, &Map.delete(&1, id))}
   end
 
-  # Re-reads the token instead of using a revealed one, so Copy works
-  # while it is hidden and the token never has to be in the DOM.
-  def handle_event("copy_pairing_token", %{"id" => id}, socket) do
-    case read_pairing_token(socket, id) do
-      {:ok, token} ->
-        Process.send_after(self(), {:reset_pairing_copied, id}, 2_000)
-
-        {:noreply,
-         socket
-         |> assign(:pairing_copied, id)
-         |> push_event("copy", %{text: token})}
-
-      {:error, reason} when reason in [:not_ready, :unavailable] ->
-        {:noreply, put_pairing_token(socket, id, reason)}
-
-      {:error, :not_found} ->
-        {:noreply, socket}
-    end
-  end
-
   # Operator consent gesture for pairing a capture card. Opens the source's
   # time-boxed "allow pairing" window; the source stays authoritative over what
   # happens next (it still requires MA to type the derived PIN).
@@ -395,14 +374,6 @@ defmodule UniversalProxyWeb.AudioLive do
     end
   end
 
-  def handle_info({:reset_pairing_copied, id}, socket) do
-    if socket.assigns.pairing_copied == id do
-      {:noreply, assign(socket, :pairing_copied, nil)}
-    else
-      {:noreply, socket}
-    end
-  end
-
   def handle_info(_msg, socket), do: {:noreply, socket}
 
   @impl true
@@ -425,7 +396,6 @@ defmodule UniversalProxyWeb.AudioLive do
           battery={get_in(@bt_meta, [output.bt_mac, :battery])}
           more_open?={MapSet.member?(@more_open, id)}
           pairing={Map.get(@pairing_tokens, id)}
-          pairing_copied?={@pairing_copied == id}
         />
         <.reconnecting_card :for={{mac, info} <- active_reconnecting(@reconnecting, @outputs)} name={info.name} mac={mac} />
       </div>
@@ -649,7 +619,6 @@ defmodule UniversalProxyWeb.AudioLive do
   attr(:battery, :integer, default: nil)
   attr(:more_open?, :boolean, required: true)
   attr(:pairing, :any, default: nil)
-  attr(:pairing_copied?, :boolean, default: false)
 
   # Single player card. Layout is a vertical flex with three logical
   # blocks:
@@ -856,14 +825,20 @@ defmodule UniversalProxyWeb.AudioLive do
           >
             Show
           </button>
+          <%!-- Copy is offered only while revealed, so the token is in the
+               DOM only after Show; the hook copies client-side and falls
+               back to selecting the token where the clipboard is blocked
+               (non-secure origins). --%>
           <button
-            :if={@pairing not in [:not_ready, :unavailable]}
+            :if={match?(%RevealedToken{}, @pairing)}
             type="button"
-            phx-click="copy_pairing_token"
-            phx-value-id={@id}
+            phx-hook="CopyToClipboard"
+            data-clipboard={@pairing.token}
+            data-select-target={"pairing-token-#{@id}"}
+            id={"copy-pairing-token-#{@id}"}
             class="text-accent text-[11px] cursor-pointer bg-transparent border-none p-0"
           >
-            {if @pairing_copied?, do: "Copied", else: "Copy"}
+            Copy
           </button>
         </div>
         <span class="col-span-3 text-fg-4">

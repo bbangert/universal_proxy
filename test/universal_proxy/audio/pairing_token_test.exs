@@ -47,6 +47,18 @@ defmodule UniversalProxy.Audio.PairingTokenTest do
     token = "SP:" <> String.duplicate("A", 124)
     write!(dir, token)
     assert PairingToken.read(dir) == {:ok, token}
+
+    write!(dir, token <> "\n")
+    assert PairingToken.read(dir) == {:ok, token}
+  end
+
+  test "rejects a file whose content runs past the read limit", %{tmp_dir: dir} do
+    token = "SP:" <> String.duplicate("A", 124)
+    write!(dir, token <> "\n\n" <> "garbage")
+    assert PairingToken.read(dir) == {:error, :unavailable}
+
+    write!(dir, @token <> String.duplicate(" ", 22) <> "garbage")
+    assert PairingToken.read(dir) == {:error, :unavailable}
   end
 
   test "an unreadable token path is unavailable", %{tmp_dir: dir} do
