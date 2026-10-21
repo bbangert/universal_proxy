@@ -27,6 +27,12 @@ defmodule SendspinPlayerContractTest do
   # the upstream default (8928).
   @ws_port 18_928
 
+  # chmod 000 does not stop root from reading a file.
+  @running_as_root (case System.cmd("id", ["-u"]) do
+                      {"0\n", 0} -> true
+                      _ -> false
+                    end)
+
   setup_all do
     unless File.exists?(@binary_path) do
       raise """
@@ -163,13 +169,13 @@ defmodule SendspinPlayerContractTest do
   end
 
   test "exits before `listening` when the keypair cannot be persisted", %{tmp_dir: tmp_dir} do
-    # The state dir itself initialises fine; a non-empty directory named
-    # `keypair` then makes the library's first keypair write fail at the
-    # rename (unlike a chmod, that also fails when CI runs as root). The
-    # library only logs that failure, so the binary must refuse to run on an
-    # identity it could not keep.
+    # The state dir itself initialises fine and holds no keypair; a
+    # directory at the provider's temp path then makes the library's first
+    # keypair write fail at the open (unlike a chmod, that also fails when
+    # CI runs as root). The library only logs that failure, so the binary
+    # must refuse to run on an identity it could not keep.
     dir = Path.join(tmp_dir, "keypair_unwritable")
-    File.mkdir_p!(Path.join([dir, "keypair", "blocker"]))
+    File.mkdir_p!(Path.join([dir, ".keypair.tmp", "blocker"]))
 
     port = spawn_player(state_dir: dir, ws_port: @ws_port + 4)
 
@@ -182,6 +188,40 @@ defmodule SendspinPlayerContractTest do
            }
 
     assert wait_for_exit(port) == 1
+  end
+
+  @tag skip: @running_as_root && "chmod 000 is not enforced for root"
+  test "exits without replacing a keypair file it cannot read", %{tmp_dir: tmp_dir} do
+    dir = Path.join(tmp_dir, "keypair_unreadable")
+    first = spawn_player(state_dir: dir, ws_port: @ws_port + 5)
+    assert_started_event(first)
+    assert_volume_event(first)
+    assert_static_delay_event(first)
+    assert_listening_event(first)
+    send_command(first, ~s({"cmd":"shutdown"}))
+    assert wait_for_exit(first) == 0
+
+    keypair = Path.join(dir, "keypair")
+    original = File.read!(keypair)
+    File.chmod!(keypair, 0o000)
+    on_exit(fn -> File.chmod(keypair, 0o600) end)
+
+    # The library would mint a new identity; the provider must refuse to
+    # save it over the unreadable file, so the binary exits instead.
+    port = spawn_player(state_dir: dir, ws_port: @ws_port + 6)
+
+    assert_started_event(port)
+
+    assert next_event(port) == %{
+             "event" => "error",
+             "kind" => "state_dir",
+             "msg" => "failed to persist the identity keypair"
+           }
+
+    assert wait_for_exit(port) == 1
+
+    File.chmod!(keypair, 0o600)
+    assert File.read!(keypair) == original
   end
 
   test "exits non-zero without --state-dir" do

@@ -797,9 +797,11 @@ int main(int argc, char* argv[]) {
     client.set_persistence_provider(&persistence);
     // Admit servers that have not paired with us. Music Assistant approves
     // a player-only client that offers this without any setup step, which
-    // keeps outputs zero-config; with it off, MA would wait for a pairing
-    // we have no UI for yet. The library never persists this, so it is set
-    // on every launch, before start(), so the first client/hello carries it.
+    // keeps outputs zero-config. The library always offers `pairing_psk`
+    // (its generated PSK is persisted like the keypair), but we have no UI
+    // for the pairing-code methods or for handing out the PSK token. The
+    // library never persists this flag, so it is set on every launch,
+    // before start(), so the first client/hello carries it.
     client.set_unpaired_access_enabled(true);
 
     {
@@ -826,7 +828,8 @@ int main(int argc, char* argv[]) {
     }
 
     // start() generates a keypair when none is stored, and only logs a
-    // failed save of it (a full or read-only /data). Running on would
+    // failed save of it (a full or read-only /data, or an existing keypair
+    // file we could not read and so refuse to overwrite). Running on would
     // advertise a client_id the next launch replaces, so every respawn
     // would appear to Music Assistant as another new player. Exit before
     // the listener binds instead; the BEAM side shows the error.

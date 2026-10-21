@@ -49,6 +49,10 @@ public:
     /// True if the most recent write of the identity keypair failed. The
     /// library only logs that failure and still starts, using a keypair the
     /// next launch will not find, so the caller checks this after start().
+    /// A keypair file that exists but could not be read (open() failing
+    /// with anything but ENOENT, or a read error) makes every later save of
+    /// it fail without touching the file, so an unreadable identity is
+    /// reported here rather than silently replaced.
     bool keypair_save_failed() const { return keypair_save_failed_; }
 
 private:
@@ -61,5 +65,6 @@ private:
 
     std::string dir_;
     int dir_fd_ = -1;
+    bool keypair_load_failed_ = false;
     bool keypair_save_failed_ = false;
 };

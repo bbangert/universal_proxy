@@ -1055,7 +1055,8 @@ defmodule UniversalProxyWeb.AudioLive do
   end
 
   # PubSub partial messages come in two flavors:
-  #   1. Server-originated: keys are :friendly_name | :volume | :muted | :enabled
+  #   1. Server-originated: keys are :friendly_name | :volume | :muted |
+  #      :enabled | :sendspin_client_id
   #   2. Binary-originated: has an :event key plus event-specific payload
   # Both flow through this single merge function. Unknown keys fall
   # through untouched so a future binary event field doesn't crash the
@@ -1073,6 +1074,9 @@ defmodule UniversalProxyWeb.AudioLive do
 
       {:enabled, e}, acc when is_boolean(e) ->
         %{acc | enabled: e}
+
+      {:sendspin_client_id, id}, acc when is_binary(id) ->
+        %{acc | client_id: id}
 
       {:event, "connected"}, acc ->
         %{acc | connection: :connected, last_error: nil}

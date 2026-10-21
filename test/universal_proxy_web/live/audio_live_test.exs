@@ -563,6 +563,37 @@ defmodule UniversalProxyWeb.AudioLiveTest do
     assert html =~ ~s(data-clipboard="#{sendspin_id}")
   end
 
+  test "shows the client_id re-published after a listening event that beat the card",
+       %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/audio")
+    sendspin_id = "Zp3lQb0d7d0b3Q2vYk1mAqk9R4e2Hc8xN6uT5wJ0sLo"
+
+    # Hotplug order: the player's one-shot `listening` lands before the
+    # card exists and is dropped; `Audio.Server` then re-publishes the id.
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:state",
+      {:sendspin_state, @hp_key, %{event: "listening", port: 8928, client_id: sendspin_id}}
+    )
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:output_added",
+      {:sendspin_output_added, sample_output()}
+    )
+
+    html = render_hook(view, "toggle_more", %{"id" => encode(@hp_key)})
+    refute html =~ sendspin_id
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:state",
+      {:sendspin_state, @hp_key, %{sendspin_client_id: sendspin_id}}
+    )
+
+    assert render(view) =~ ~s(data-clipboard="#{sendspin_id}")
+  end
+
   test ":sendspin_state with shutdown event clears connection and stream", %{conn: conn} do
     {:ok, view, _html} = live(conn, "/audio")
 

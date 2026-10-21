@@ -219,7 +219,12 @@ reboots. A state dir that cannot be created fails the process before the
 client starts, rather than letting it mint an identity it cannot keep. The
 library only logs a failed save of a freshly generated keypair (a full or
 read-only disk) and starts anyway, so the binary checks for that after
-`start()` and exits with a `state_dir` error event before `listening`.
+`start()` and exits with a `state_dir` error event before `listening`. A
+`keypair` file that exists but cannot be read (permissions, I/O error) is
+treated the same way: the library would mint a new identity, so
+`FilePersistence` refuses to save over the unreadable file, leaving it
+untouched, and the process exits with that error instead of changing the
+`client_id`.
 
 The library's output-delay blob is deliberately not stored: the BEAM side
 already owns that value (persisted from the `static_delay` event and
@@ -229,9 +234,14 @@ outrank the CLI value.
 The connection is Noise-encrypted. The player calls
 `set_unpaired_access_enabled(true)` before `start()`, so a server that has
 not paired with it can still admit it: Music Assistant approves a
-player-only client that offers unpaired access without any setup step. We
-do not advertise a pairing method yet; that would need UI to show the
-pairing code (`on_display_pairing_code`) and to confirm the pairing
+player-only client that offers unpaired access without any setup step.
+
+The library always advertises the `pairing_psk` method in `client/hello`.
+It backs it with a Pairing PSK it generates on first start and stores
+under the `pairing_psk` key, so `--state-dir` holds pairing secrets (the
+PSK and any pairing records) as well as the identity key. We do not offer
+the pairing-code methods (dynamic or static code); those would need UI to
+show the code (`on_display_pairing_code`) and to confirm the pairing
 window.
 
 ## Stdin commands

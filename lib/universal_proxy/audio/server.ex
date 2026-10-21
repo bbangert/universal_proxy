@@ -462,8 +462,19 @@ defmodule UniversalProxy.Audio.Server do
   # The Sendspin `client_id` the binary derived from its keypair (not the
   # Store's per-output `client_id`, which only names the state dir). It is
   # stable per output, so a respawn's `shutdown` reset leaves it alone.
+  #
+  # On hotplug the player starts before `output_added` is broadcast, so a
+  # subscriber can see this one-shot event before it knows the card. A new
+  # value is therefore re-published as `%{sendspin_client_id: id}`, which
+  # reaches every subscriber after `output_added` (both come from this
+  # process) and which this server's own catch-all clause ignores.
   def handle_info({:sendspin_state, key, %{event: "listening", client_id: id}}, state)
       when is_binary(id) do
+    if Map.has_key?(state.outputs, key) and
+         get_in(state.connection_state, [key, :sendspin_client_id]) != id do
+      broadcast_state(key, %{sendspin_client_id: id})
+    end
+
     {:noreply, update_connection_state(state, key, %{sendspin_client_id: id})}
   end
 

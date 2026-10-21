@@ -107,10 +107,12 @@ std::optional<std::vector<uint8_t>> FilePersistence::load_blob(const std::string
         return std::nullopt;
     }
     const std::string path = path_for(key);
+    const bool is_keypair = key == sendspin::persistence_keys::KEYPAIR;
     int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         if (errno != ENOENT) {
             std::fprintf(stderr, "sendspin_player: %s\n", errno_str("open", path).c_str());
+            if (is_keypair) keypair_load_failed_ = true;
         }
         return std::nullopt;
     }
@@ -122,6 +124,7 @@ std::optional<std::vector<uint8_t>> FilePersistence::load_blob(const std::string
         if (n < 0) {
             if (errno == EINTR) continue;
             std::fprintf(stderr, "sendspin_player: %s\n", errno_str("read", path).c_str());
+            if (is_keypair) keypair_load_failed_ = true;
             ok = false;
             break;
         }
@@ -143,9 +146,17 @@ bool FilePersistence::save_blob(const std::string& key, const uint8_t* data, siz
     // Accepted and dropped: the BEAM side owns the output delay (see the
     // header comment).
     if (key == sendspin::persistence_keys::OUTPUT_DELAY) return true;
-    bool ok = write_blob(key, data, len);
-    if (key == sendspin::persistence_keys::KEYPAIR) keypair_save_failed_ = !ok;
-    return ok;
+    if (key != sendspin::persistence_keys::KEYPAIR) return write_blob(key, data, len);
+    // A keypair file that exists but could not be read still holds the
+    // identity; the library would replace it with the one it just minted.
+    if (keypair_load_failed_) {
+        std::fprintf(stderr, "sendspin_player: not overwriting unreadable %s\n",
+                     path_for(key).c_str());
+        keypair_save_failed_ = true;
+        return false;
+    }
+    keypair_save_failed_ = !write_blob(key, data, len);
+    return !keypair_save_failed_;
 }
 
 bool FilePersistence::write_blob(const std::string& key, const uint8_t* data, size_t len) {
