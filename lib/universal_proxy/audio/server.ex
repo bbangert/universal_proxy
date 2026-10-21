@@ -468,10 +468,13 @@ defmodule UniversalProxy.Audio.Server do
   # value is therefore re-published as `%{sendspin_client_id: id}`, which
   # reaches every subscriber after `output_added` (both come from this
   # process) and which this server's own catch-all clause ignores.
+  #
+  # Only for a known output: a `listening` still queued when its output was
+  # removed falls through to the catch-all, so it cannot re-create the cache
+  # entry the removal dropped (which would suppress the re-publish on replug).
   def handle_info({:sendspin_state, key, %{event: "listening", client_id: id}}, state)
-      when is_binary(id) do
-    if Map.has_key?(state.outputs, key) and
-         get_in(state.connection_state, [key, :sendspin_client_id]) != id do
+      when is_binary(id) and is_map_key(state.outputs, key) do
+    if get_in(state.connection_state, [key, :sendspin_client_id]) != id do
       broadcast_state(key, %{sendspin_client_id: id})
     end
 

@@ -471,46 +471,9 @@ defmodule UniversalProxy.Audio.ServerTest do
     end
 
     test "re-publishes a client_id whose listening event beat :sendspin_output_added" do
-      player_sup =
-        start_supervised!({DynamicSupervisor, strategy: :one_for_one, name: nil},
-          id: :listening_player_sup
-        )
+      server = start_listening_server!()
 
-      path =
-        Path.join(
-          System.tmp_dir!(),
-          "audio_server_listening_#{System.unique_integer([:positive])}.dets"
-        )
-
-      on_exit(fn -> File.rm(path) end)
-
-      store =
-        start_supervised!({Store, name: nil, table: :listening_store, dets_path: path},
-          id: :listening_store
-        )
-
-      server =
-        start_supervised!(
-          {Server,
-           name: nil,
-           store: store,
-           enumerate_module: EnumerateStub,
-           start_timer: false,
-           player_supervisor: player_sup,
-           player_module: ListeningPlayerStub,
-           mdns_discovery: nil,
-           mdns_module: nil},
-          id: :listening_server
-        )
-
-      EnumerateStub.set(%{
-        @hp_key => %{
-          card_index: 0,
-          alsa_device: "plughw:0,0",
-          card_name: "bcm2835 Headphones",
-          usb_port: nil
-        }
-      })
+      EnumerateStub.set(%{@hp_key => hp_hardware()})
 
       :ok = Server.check_now(server)
 
@@ -532,6 +495,37 @@ defmodule UniversalProxy.Audio.ServerTest do
 
       :sys.get_state(server)
       refute_received {:sendspin_state, @hp_key, %{sendspin_client_id: _}}
+    end
+
+    test "a listening event that outlives its output does not suppress the re-publish on replug" do
+      server = start_listening_server!()
+
+      EnumerateStub.set(%{@hp_key => hp_hardware()})
+      :ok = Server.check_now(server)
+      assert [_, _, _] = collect_messages(3)
+
+      # Unplug, then the old player's `listening` arrives late.
+      EnumerateStub.set(%{})
+      :ok = Server.check_now(server)
+
+      send(
+        server,
+        {:sendspin_state, @hp_key, %{event: "listening", port: 8928, client_id: "derived-id"}}
+      )
+
+      refute Map.has_key?(:sys.get_state(server).connection_state, @hp_key)
+      drain_messages()
+
+      # Replug: the new player reports the same id before `output_added`, so
+      # the open page still needs the re-published id.
+      EnumerateStub.set(%{@hp_key => hp_hardware()})
+      :ok = Server.check_now(server)
+
+      assert [
+               {:sendspin_state, @hp_key, %{event: "listening"}},
+               {:sendspin_output_added, %{key: @hp_key}},
+               {:sendspin_state, @hp_key, %{sendspin_client_id: "derived-id"}}
+             ] = collect_messages(3)
     end
   end
 
@@ -1544,6 +1538,53 @@ defmodule UniversalProxy.Audio.ServerTest do
           do_eventually(check, deadline)
         end
       end
+    end
+  end
+
+  # An `Audio.Server` whose players are `ListeningPlayerStub`, which
+  # publishes `listening` before the server broadcasts `output_added`.
+  defp start_listening_server! do
+    player_sup =
+      start_supervised!({DynamicSupervisor, strategy: :one_for_one, name: nil},
+        id: :listening_player_sup
+      )
+
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "audio_server_listening_#{System.unique_integer([:positive])}.dets"
+      )
+
+    on_exit(fn -> File.rm(path) end)
+
+    store =
+      start_supervised!({Store, name: nil, table: :listening_store, dets_path: path},
+        id: :listening_store
+      )
+
+    start_supervised!(
+      {Server,
+       name: nil,
+       store: store,
+       enumerate_module: EnumerateStub,
+       start_timer: false,
+       player_supervisor: player_sup,
+       player_module: ListeningPlayerStub,
+       mdns_discovery: nil,
+       mdns_module: nil},
+      id: :listening_server
+    )
+  end
+
+  defp hp_hardware do
+    %{card_index: 0, alsa_device: "plughw:0,0", card_name: "bcm2835 Headphones", usb_port: nil}
+  end
+
+  defp drain_messages do
+    receive do
+      _ -> drain_messages()
+    after
+      0 -> :ok
     end
   end
 
