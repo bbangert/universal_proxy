@@ -30,7 +30,7 @@ They share one trick: the payload travels as a list of 16-bit service UUIDs
 
 | | Beacon v1 ("P1") | Beacon v2 ("P2") | Thing Beacon Mesh |
 |---|---|---|---|
-| App product family | `tbeacon`, config type 400 | `tbeacon`, config type 400 | scan type 500, `config_type_beacon_mesh` |
+| App scan result | category 400, device type 500 | category 400, device type 501 | SIG Mesh scan path (`BeaconMesh*` classes) |
 | Matches Tuya's public "Bluetooth Beacon Mesh" docs | partly | **yes**: groups, small XXTEA cipher | no |
 | Phone → device carrier | Local Name + one 128-bit UUID | 16-bit UUID list | 16-bit UUID list, **activation only** |
 | Device → phone carrier | Manufacturer data, company `0xD007` | 16-bit UUID list | 16-bit UUID list, **activation only** |
@@ -47,8 +47,20 @@ Tuya's developer documentation describes "Beacon Mesh" with these properties:
 - It uses an "AES-128-like algorithm with fewer operations".
 
 That description matches **Beacon v2**. The cheap AliExpress "beacon mesh" lights
-and remotes are most likely P1 or P2. The newer type-500 devices only use beacons
+and remotes are most likely P1 or P2. Thing Beacon Mesh devices only use beacons
 to get *into* a SIG Mesh network.
+
+**The app's names do not line up with these families.** Read any "beacon
+mesh" or "type 500" label with care:
+
+- P1 unpaired devices are reported as device type 500, whose constant is named
+  `TYPE_THING_BEACON_MESH` (`bluetooth.dqdpbpq`). P2 is device type 501
+  (`bluetooth.qpbdppq`). Both use category 400, the `config_type_beacon` flow.
+- The SIG-provisioned family lives in the `BeaconMesh*` classes
+  (`ThingBeaconMeshActivatorImpl`, `BeaconMeshRequest`).
+- The per-home P1/P2 key is held in `BeaconMeshBean`.
+
+Retail listings saying "Beacon Mesh" can therefore mean any of the three.
 
 ### 1.1 Identifying a device from its advertisement
 
@@ -59,7 +71,7 @@ to get *into* a SIG Mesh network.
 | AD 0x03, 26 bytes, `hdr & 0x80` set, `(hdr>>3)&0xF == 1`, CRC over `[hdr&0xFC]`+bytes 1..24 | P2, unpaired | `bluetooth.qpbdppq.pdqppqb` |
 | AD 0x03, 26 bytes, destination bytes 3..4 = `80 00` or `80 01` | P2, paired (report) | `bluetooth.ddbbqqp` |
 | AD 0x03, 26 bytes, `(hdr>>3)&0xF == 8`, CRC over bytes 0..24 unmasked | Thing Beacon Mesh, unprovisioned | `bluetooth.bqdbdbd` |
-| Service 0x1828 (Mesh Proxy) | provisioned SIG Mesh node, including activated type 500 | SIG Mesh stack |
+| Service 0x1828 (Mesh Proxy) | provisioned SIG Mesh node, including an activated Thing Beacon Mesh device | SIG Mesh stack |
 
 ---
 
@@ -456,7 +468,7 @@ The flow (`bluetooth.ppqbqbb`):
 
 ---
 
-## 6. Thing Beacon Mesh (scan type 500)
+## 6. Thing Beacon Mesh (SIG-provisioned)
 
 **Beacon frames are used only to get a device into the user's SIG Mesh
 network.** After that it is an ordinary SIG Mesh node, controlled over a SIG
@@ -611,7 +623,7 @@ The app then registers the node with `m.thing.ble.mesh.join` v3.1:
   Lightness `0x824C`, CTL Temperature `0x8264`, HSL `0x8276`.
 - **Groups** need Config Model Subscription Add, which is signed with the
   DevKey. Activation registers an empty DevKey, so **UNVERIFIED:** group
-  support for type-500 nodes.
+  support for these nodes.
 
 ---
 
