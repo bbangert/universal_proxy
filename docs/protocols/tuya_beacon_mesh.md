@@ -84,7 +84,7 @@ UUIDs. Tuya therefore smuggles the payload through the
 - **Two frames at once.** When the phone supports several advertising sets,
   two-frame requests go out on two sets simultaneously. Otherwise the frames
   alternate.
-- **Extended advertising** is used only by Thing Beacon Mesh (§5.3).
+- **Extended advertising** is used only by Thing Beacon Mesh (§6.4).
 
 Devices reply on the same carrier: a 26-byte AD 0x03 list in their own
 advertisements.
@@ -617,8 +617,9 @@ The app then registers the node with `m.thing.ble.mesh.join` v3.1:
 
 ## 7. What a controller needs from the Tuya cloud
 
-None of these protocols can be bootstrapped offline. After a one-time export,
-everything above runs locally.
+None of the app's pairing flows can be bootstrapped offline. After a one-time
+export, everything above runs locally. The one fully local alternative is to
+pose as a physical remote instead of the app (§8).
 
 | Family | Needed once | Needed for each new device |
 |---|---|---|
@@ -631,7 +632,129 @@ The keys appear in the device and home data the cloud returns: `localKey`,
 
 ---
 
-## 8. Implications for universal_proxy
+## 8. Virtual-remote route (no cloud)
+
+Tuya's beacon lights can also be paired with a physical remote control. A
+remote binds to a light **directly**, with no app or cloud, so a controller
+that pretends to be a remote never needs any Tuya key.
+
+**This section does not come from the Smart Life app.** It is based on the
+open-source [beacon-cooked](https://github.com/MadeinTaly/beacon-cooked)
+project (commit `c5e281d`, 2026-10-07):
+
+- **Physical confirmation is limited.** That project confirmed on/off and
+  colours on **one** AliExpress WRGB spotlight. It says the codec was
+  reconstructed from Tuya's public
+  [AK80x beacon SDK](https://github.com/tuya/tuya-iotos-beacon-sdk-ak80x).
+- **The key's origin is not established.** The fixed key below appears nowhere
+  in the Smart Life app (DEX and native libraries searched). It also appears
+  nowhere in any branch of the AK80x repository, including its binary files.
+- **Byte-level checks are done.** The frame format is exactly the P1 format of
+  §5.1, so the reference builders here reuse the P1 code. Their output was
+  checked against beacon-cooked's own codec (vectors in
+  `tuya_beacon_reference.py`).
+
+Treat everything beyond those vectors as **UNVERIFIED** until it works on our
+own hardware.
+
+### 8.1 Identity and keys
+
+| Item | Value |
+|---|---|
+| Fixed bind key | ASCII `jngwRugsvwtGN00a` (16 bytes, used directly as the XXTEA key) |
+| Target "MAC" in every frame | `EE EE EE EE EE 00`, the same for every light |
+| Remote identity, `sender` | a **static random** BLE address that the controller picks once: top two bits of the first byte set, e.g. `C2 xx xx xx xx xx` |
+| Salt | 2 random bytes, picked once per remote |
+| Command key | `XXTEA_encrypt(salt ‖ sender[2..6) ‖ "TuyaIoT-OS", key = "jngwRugsvwtGN00a")`, 16 bytes |
+
+The sender address and salt **are** the remote, so persist both. Every frame
+for that remote must be advertised **from that address**.
+
+**UNVERIFIED:** whether the light checks the advertiser address or only the
+key. beacon-cooked always sets it, so do the same.
+
+### 8.2 Frames
+
+Both kinds are P1 frames (§5.1): a Base64 local name of the target plus one
+XXTEA block as a 128-bit UUID. beacon-cooked sends the whole 31-byte legacy
+payload as:
+
+```
+02 01 01            Flags = LE Limited Discoverable
+09 09 <8 chars>     Complete Local Name = Base64(EE EE EE EE EE 00)[0..8) = "7u7u7u4A"
+11 07 <16 bytes>    one 128-bit service UUID = the XXTEA block
+```
+
+| Purpose | P1 cmd | Payload (≤ 9 bytes) | XXTEA key |
+|---|---|---|---|
+| Bind | 8 | `03 00 01 <salt:2> 00 00 00 00` | fixed bind key |
+| On / off | 7 | `01 01 01 <00/01>` (DP 1, bool) | command key |
+| Colour mode | 7 | `02 04 01 01` (DP 2 `work_mode`, enum, colour) | command key |
+| Hue | 7 | `0B 00 04 <hue:2 BE> 64 64` (DP 11, raw: hue 0–359, then S and V) | command key |
+
+beacon-cooked reports that the examined SDK **ignores saturation and value** on
+the remote path, so only hue changes. It has not exposed brightness or white.
+Other DPs are untested.
+
+### 8.3 Procedure
+
+1. **Create a remote:** pick a static random `sender` and a 2-byte `salt`, and
+   store them.
+2. **Bind:**
+   - Power-cycle the light. It opens a short binding window, which varies by
+     firmware.
+   - During the window, transmit bind frames for about 15 s.
+   - Each frame carries a **new** sequence number and is advertised for 0.7 s.
+3. **Control:**
+   - Send command frames with the command key, each with a new sequence number.
+   - Send each frame once for 0.7 s. beacon-cooked sends one frame per DP
+     change; colour is a mode frame followed by a hue frame.
+4. **Sequence numbers:**
+   - Use one 24-bit counter per remote, persisted, and only ever increasing.
+   - beacon-cooked starts at 20000 and reserves the numbers on disk before
+     transmitting.
+   - **UNVERIFIED:** the light's replay window, and whether the counter is per
+     remote or global.
+
+There is **no acknowledgement**. Binding success is only visible as the light
+responding afterwards, and state is optimistic.
+
+**A remote is a group.** Every light bound to the same remote obeys the same
+frames, because the target is the fixed `EE…00` and not a light's MAC.
+Individual control needs one remote identity per light, each bound with only
+that light in its window. beacon-cooked has not tested more than one lamp.
+
+### 8.4 Radio parameters used by beacon-cooked
+
+beacon-cooked drives the controller with raw HCI commands, bypassing
+`bluetoothd`. It sets the address with *LE Set Random Address*, or *LE Set
+Advertising Set Random Address* on extended-capable controllers. It then
+advertises with these parameters:
+
+| Parameter | Value |
+|---|---|
+| Advertising type | `ADV_IND` (connectable, undirected), legacy PDU |
+| Own address type | random, i.e. the remote's static address |
+| Interval | 20 ms (min = max = `0x0020`) |
+| Channels | 37, 38, 39 |
+| Scan response | empty |
+| Time per frame | 0.7 s, then advertising is disabled before the next frame |
+
+### 8.5 Recognising a light
+
+beacon-cooked identifies candidate lights from manufacturer data (AD `0xFF`)
+that meets all of these conditions:
+
+- it is exactly 29 bytes long and starts with company bytes `07 D0`;
+- the next byte is the P1 command, 1 (unpaired or pairing) or 4 (reply);
+- the 6 bytes after that equal the advertiser's own address.
+
+These are the P1 device adverts of §5.2. The remote route never decrypts them:
+it neither needs nor has the light's localKey.
+
+---
+
+## 9. Implications for universal_proxy
 
 The ESPHome Native API has no message for transmitting advertisements, and Home
 Assistant has no beacon integration. P1 and P2 control therefore has to run on
@@ -646,6 +769,13 @@ Additions needed in the `bluez` library:
    - P1 additionally needs `LocalName` plus one UUID128.
 2. **A raw advertising-report source** that keeps each AD 0x03 list intact
    (§2.1).
+3. **For the virtual-remote route (§8):** advertising from a
+   **caller-chosen static random address** with a caller-chosen local name and
+   one UUID128.
+   - `LEAdvertisement1` has no property for choosing the address, so this
+     likely needs MGMT, or raw HCI as beacon-cooked uses.
+   - **UNVERIFIED:** how raw HCI advertising coexists with `bluetoothd`'s own
+     advertising and scanning on the same controller.
 
 For Thing Beacon Mesh:
 
@@ -657,7 +787,7 @@ For Thing Beacon Mesh:
 
 ---
 
-## 9. Provenance
+## 10. Provenance
 
 | Item | Value |
 |---|---|
@@ -667,7 +797,7 @@ For Thing Beacon Mesh:
 | Signer (per APKMirror) | `CN=www.tuya.com, O=tlife, L=Hangzhou` |
 | Decompiler | JADX 1.5.6 (full source), JADX headless 0.7.1 via REA 6.7.0 (evidence records) |
 
-### 9.1 REA evidence records for the core methods
+### 10.1 REA evidence records for the core methods
 
 Each record below is a REA `inspect_android_method` result over `base.apk`
 (provider JADX headless 0.7.1). The decompiled source is complete in every one.
@@ -694,7 +824,7 @@ rea inspect-android-method base.apk <class> <method> --overload-index <n> --form
 | `bluetooth.dddbppd.bdpdqbp([BZ…)` | activation response parse | `ev_4c8dd540c5ac9e7fbccd22f1dff6569b6e07c4ace8311ae2620af1a64b1ab2b6` |
 | `bluetooth.ppbbqbb.generateBeaconMeshPairKey` | cloud pair-key API | `ev_7deae261a7c35a7b09d05f1ccb8a9845eae5d14505d58aa01f964b69f13e68d8` |
 
-### 9.2 Analysis notes
+### 10.2 Analysis notes
 
 Detailed per-family analysis notes are in [`notes/`](notes/). They cite
 `file:line` locations in the uncommitted JADX decompile; some of those line
