@@ -667,6 +667,35 @@ For Thing Beacon Mesh:
 | Signer (per APKMirror) | `CN=www.tuya.com, O=tlife, L=Hangzhou` |
 | Decompiler | JADX 1.5.6 (full source), JADX headless 0.7.1 via REA 6.7.0 (evidence records) |
 
+### 9.1 REA evidence records for the core methods
+
+Each record below is a REA `inspect_android_method` result over `base.apk`
+(provider JADX headless 0.7.1). The decompiled source is complete in every one.
+The records themselves are not committed because they contain Tuya's decompiled
+code. To regenerate one, set `REA_JADX_MCP_JAR` to the pinned
+jadx-headless-mcp 0.7.1 JAR and run:
+
+```sh
+rea inspect-android-method base.apk <class> <method> --overload-index <n> --format json
+```
+
+| Method (`com.thingclips.sdk.` omitted) | Role | Evidence ID |
+|---|---|---|
+| `bluetooth.qpbqpbq.bdpdqbp([B)` | frame → UUID16 list | `ev_debaae69e691f091ce41233d533c5ff0f469bc03bf335e51b9b0eb1a2527f066` |
+| `bluetooth.pbddddb.qqdbbpp()` | P2 payload build and XXTEA | `ev_3a23d79ebff735af67f3608db64ce72169b968dd3eee176040dc4eee7f847264` |
+| `bluetooth.pbddddb.pbbppqb()` | P2 header, CRC and mask | `ev_8b6b742e75374eb1f1d670616048eb1ed872dba1129527289e1ca4d4980c8aec` |
+| `bluetooth.bpqpqqd.pdqppqb([I[I)` | XXTEA encrypt core | `ev_688e321fb86f17ae92a3162fc58dec9639c193a699a8b3e052a84482b2cd97d6` |
+| `bluetooth.bpqpqqd.bdpdqbp([BZ)` | big-endian word packing | `ev_bce7a0db7e9420ed64cea27ddf26247cc652a9846f60903d22563ae6ffbe4022` |
+| `bluetooth.bppqppq.bdpdqbp([BI)` | CRC-8 | `ev_0b2fb7ddd0fd62014ac6e70a85db6f489d3ae3e31170a8478643e102f55f9003` |
+| `bluetooth.pdqppqb.pdqppqb([B[B[B)` | AES/CFB/NoPadding encrypt | `ev_7423ebf1a2a57ce5bb284df99d29c209a3d0f4405c96c06c719de5a0be6d8a2e` |
+| `beacon.core.transfer.bdpdqbp.qqdbbpp()` | activation plaintext | `ev_e2ae44675dc42610d121497a24e5bbb6f7dcee65f1dc5ddbdc12f6f4bc4d0200` |
+| `beacon.core.transfer.bdpdqbp.dbbpbbb()` | activation legacy frames | `ev_8a0ac17825e5985020ec68fe90a4c147cc08e25b75d8b0fd75f1e64e463bc607` |
+| `bluetooth.bqdbdbd.pdqppqb([B)` | unprovisioned advert parse | `ev_96b3fe6c8cb513e0e5f7eedd87250519e7d964b7d7afe26e750ffdb02c4473a6` |
+| `bluetooth.dddbppd.bdpdqbp([BZ…)` | activation response parse | `ev_4c8dd540c5ac9e7fbccd22f1dff6569b6e07c4ace8311ae2620af1a64b1ab2b6` |
+| `bluetooth.ppbbqbb.generateBeaconMeshPairKey` | cloud pair-key API | `ev_7deae261a7c35a7b09d05f1ccb8a9845eae5d14505d58aa01f964b69f13e68d8` |
+
+### 9.2 Analysis notes
+
 Detailed per-family analysis notes are in [`notes/`](notes/). They cite
 `file:line` locations in the uncommitted JADX decompile; some of those line
 numbers are known to be off, but the class and method names are reliable.
