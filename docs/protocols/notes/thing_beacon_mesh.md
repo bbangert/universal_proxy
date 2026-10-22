@@ -3,6 +3,11 @@
 > `base.apk` (SHA-256 `68b413e9…2e14`) that is not committed here. Some line numbers are known to be off;
 > class and method names are reliable. Where these notes and the spec disagree, the spec wins.
 
+> **Correction:** these notes call this family "type 500". That label is wrong.
+> In the app, device type 500 (`TYPE_THING_BEACON_MESH`) is what the **P1** scan
+> parser assigns, and P2 is type 501. The SIG-provisioned family described here
+> comes from the `BeaconMesh*` scan path and has neither type. See §1 of the spec.
+
 # Tuya "Thing Beacon Mesh" (BLEScanDevBean type 500, `config_type_beacon_mesh`) — protocol notes
 
 Source: JADX decompile of Smart Life 7.12.0. All paths are relative to
