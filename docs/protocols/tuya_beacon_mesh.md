@@ -642,6 +642,29 @@ pose as a physical remote instead of the app (§8).
 The keys appear in the device and home data the cloud returns: `localKey`,
 `meta.beaconData`, `BeaconMeshBean`, and the SIG mesh bean.
 
+### 7.1 Where the v2 localKey comes from (open question)
+
+The beaconKey and node ID are arbitrary values the cloud picks; a bulb accepts
+whatever the pair frame delivers. Only the **localKey** ties the bulb to the
+cloud. The bulb must already know it, because P2Pair is encrypted with it.
+Tuya's firmware initialises the v2 stack with a 16-character `authkey` from the
+device licence, so there are two candidate schemes:
+
+- **A. Static:** `localKey = authkey[0:16]`. This is how v1 works (§5).
+- **B. Per pairing:** `localKey = KDF(authkey, srand)`, computed by both the
+  bulb and the cloud. A third-party v2 project reports that the localKey
+  changes when a lamp is re-paired, which fits B. **UNVERIFIED.**
+
+To tell them apart, pair one bulb, factory-reset it so it advertises a new
+`srand`, and pair it again. The same localKey means A.
+
+Under A, one cloud pairing per bulb is enough forever: re-pairing locally to
+your own beaconKey and node ID needs only the recorded localKey. Under B you
+need the bulb's `authkey`, read from its flash, plus the KDF.
+[`tuya_kdf_search.py`](tuya_kdf_search.py) finds the KDF offline. It tests a
+set of MD5, SHA-256, HMAC, AES and XXTEA constructions against an `authkey`
+and several `(srand, localKey[, srandEncrypted])` samples from the same bulb.
+
 ---
 
 ## 8. Virtual-remote route (no cloud)
