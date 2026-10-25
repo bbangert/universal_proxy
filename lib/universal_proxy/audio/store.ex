@@ -194,10 +194,13 @@ defmodule UniversalProxy.Audio.Store do
 
   # The default `friendly_name` is the long ALSA card name. Users can
   # rename per output via the UI; until they do, "bcm2835 Headphones"
-  # is more informative than a synthesised slot.
+  # is more informative than a synthesised slot. The one exception is
+  # the Pi's KMS HDMI audio card, whose ALSA name is the driver name
+  # (`vc4-hdmi`, or `vc4-hdmi-0`/`-1` on the two-port Pi 4): that
+  # becomes "HDMI" / "HDMI 0" / "HDMI 1" — see `default_friendly_name/1`.
   defp merge_defaults(existing, params, {slot_sub, _vid, _pid}) do
     %{
-      friendly_name: pick(params, existing, :friendly_name, slot_sub),
+      friendly_name: pick(params, existing, :friendly_name, default_friendly_name(slot_sub)),
       enabled: pick(params, existing, :enabled, true),
       client_id: pick(params, existing, :client_id, &generate_client_id/0),
       volume: clamp_volume(pick(params, existing, :volume, 50)),
@@ -205,6 +208,19 @@ defmodule UniversalProxy.Audio.Store do
       static_delay_ms: clamp_static_delay(pick(params, existing, :static_delay_ms, 0))
     }
   end
+
+  @doc false
+  @spec default_friendly_name(String.t()) :: String.t()
+  def default_friendly_name("vc4-hdmi"), do: "HDMI"
+
+  def default_friendly_name("vc4-hdmi-" <> port) do
+    case Integer.parse(port) do
+      {_n, ""} -> "HDMI " <> port
+      _ -> "vc4-hdmi-" <> port
+    end
+  end
+
+  def default_friendly_name(slot_sub), do: slot_sub
 
   # Uses presence checks (via `Params.has_key?/2`) rather than `||`
   # chaining so that explicit `false` values (e.g. `enabled: false`,

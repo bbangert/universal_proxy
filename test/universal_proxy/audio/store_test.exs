@@ -26,6 +26,27 @@ defmodule UniversalProxy.Audio.StoreTest do
   end
 
   describe "save_config/3 defaults" do
+    test "names the Pi's KMS HDMI card \"HDMI\" instead of its driver name", %{server: server} do
+      :ok = Store.save_config(server, {"vc4-hdmi", nil, nil}, %{})
+      assert {:ok, %{friendly_name: "HDMI"}} = Store.get_config(server, {"vc4-hdmi", nil, nil})
+
+      :ok = Store.save_config(server, {"vc4-hdmi-1", nil, nil}, %{})
+
+      assert {:ok, %{friendly_name: "HDMI 1"}} =
+               Store.get_config(server, {"vc4-hdmi-1", nil, nil})
+
+      # Anything that isn't a bare port number keeps the raw card name.
+      assert Store.default_friendly_name("vc4-hdmi-x") == "vc4-hdmi-x"
+      assert Store.default_friendly_name("bcm2835 Headphones") == "bcm2835 Headphones"
+    end
+
+    test "a persisted friendly_name wins over the HDMI default", %{server: server} do
+      key = {"vc4-hdmi", nil, nil}
+      :ok = Store.save_config(server, key, %{friendly_name: "Living room AVR"})
+      :ok = Store.save_config(server, key, %{})
+      assert {:ok, %{friendly_name: "Living room AVR"}} = Store.get_config(server, key)
+    end
+
     test "applies defaults on first save with an empty params map", %{server: server} do
       :ok = Store.save_config(server, @key, %{})
       {:ok, cfg} = Store.get_config(server, @key)
