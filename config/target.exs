@@ -168,6 +168,11 @@ config :mdns_lite,
 config :universal_proxy,
   audio_enumerate_module: UniversalProxy.Audio.Enumerate.Composite
 
+# HDMI-CEC: the custom rpi0_2/rpi4 systems (>= v0.1.12) ship cec-ctl and the
+# vc4 CEC driver. On a system without either the subsystem simply finds no
+# adapters (no /dev/cecN) or logs that cec-ctl is missing.
+config :universal_proxy, UniversalProxy.Cec, enabled: true
+
 # Import target specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.
 # Uncomment to use target specific configurations

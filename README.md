@@ -43,6 +43,11 @@ range -- without needing a dedicated ESPHome microcontroller for each one.
   [Sendspin](https://github.com/Sendspin/sendspin-cpp) player for synchronized
   multi-room audio. USB sound cards appear in their physical USB slot in the web
   UI. See [docs/plans/10_sendspin_audio.md](docs/plans/10_sendspin_audio.md).
+- **HDMI-CEC receiver control** -- on Pis whose custom system ships `cec-ctl`
+  (rpi0_2, rpi4), a Sendspin stream starting on an HDMI output sends CEC
+  One Touch Play so an AV receiver in standby wakes and switches to the Pi's
+  input first. `UniversalProxy.Cec` also exposes standby, power/volume status
+  and volume/mute key presses from IEx.
 - **Bluetooth-audio transmitter control** -- FlooGoo FMA120 and Sennheiser
   BTD 700 dongles get full control drawers in the web UI (see
   [Supported USB devices](#supported-usb-devices))
@@ -264,6 +269,7 @@ lib/
     bluetooth/             # Bluetooth lifecycle: Settings, Manager, RadioMonitor, Stats, Radios
     bluez/                 # BlueZ/D-Bus stack: Client (scanner), Gatt, Agent, DeviceCache
     audio/                 # Sendspin audio: Enumerate, per-output Server/Store, Player
+    cec/                   # HDMI-CEC via cec-ctl: Ctl, Parser, Enumerate, Monitor, Server
     firmware_update/       # In-app firmware update flow
     storage/               # USB backup drive: mount, capacity, opt-in SMB share (smbd)
     esphome/               # ESPHome Native API adapters + Supervisor
@@ -332,6 +338,18 @@ mix assets.deploy && mise run firmware -- rpi3
 
 Other mise tasks: `mise run test` (host test suite) and
 `mise run mix-for -- <target> <task>` (run an arbitrary mix task for a target).
+
+**Building against a local checkout of the custom Nerves systems** (instead of
+the release tag pinned in `mix.exs`): build the system in its subdir first
+(`cd nerves_systems_universal_proxy/rpi4 && MIX_ENV=prod mix deps.get && mix compile`),
+then point this project at the checkout. Changing `UP_SYSTEMS_PATH` changes the
+dependency set, so re-run `deps.get`:
+
+```bash
+export UP_SYSTEMS_PATH=/path/to/nerves_systems_universal_proxy
+MIX_ENV=prod mise run mix-for -- rpi4 deps.get
+MIX_ENV=prod mise run firmware -- rpi4
+```
 
 ### Writing to an SD card
 
