@@ -20,7 +20,12 @@ defmodule UniversalProxy.Cec.Server do
 
   Dependencies are injectable through `start_link/1` opts so host tests run
   without cec-ctl or sysfs: `:ctl_module`, `:enumerate` (a 0-arity fun),
-  `:output_lookup` (key -> `{:ok, %{card_index: n}}`), `:monitor?`.
+  `:output_lookup` (key -> `{:ok, %{card_index: n}}`), `:monitor?`,
+  `:monitor_binary` (cec-ctl stand-in for the monitors).
+
+  Monitors are registered in `UniversalProxy.Cec.MonitorRegistry` under their
+  adapter's device path, so a monitor the `DynamicSupervisor` restarted after
+  a crash is still the one found (and stopped) when its adapter goes away.
   """
 
   use GenServer
@@ -32,6 +37,8 @@ defmodule UniversalProxy.Cec.Server do
   @pubsub UniversalProxy.PubSub
   @audio_topic "sendspin:state"
   @default_scan_ms 10_000
+  @monitor_registry UniversalProxy.Cec.MonitorRegistry
+  @monitor_supervisor UniversalProxy.Cec.MonitorSupervisor
 
   @type receiver :: %{
           power: :on | :standby | :to_on | :to_standby | :unknown,
@@ -52,7 +59,6 @@ defmodule UniversalProxy.Cec.Server do
         }
 
   defstruct adapters: %{},
-            monitors: %{},
             ctl: Ctl,
             enumerate: nil,
             output_lookup: nil,
@@ -61,6 +67,7 @@ defmodule UniversalProxy.Cec.Server do
             receiver_la: 5,
             scan_ms: @default_scan_ms,
             monitor?: true,
+            monitor_binary: nil,
             pubsub: @pubsub,
             task_sup: UniversalProxy.TaskSupervisor
 
@@ -112,6 +119,7 @@ defmodule UniversalProxy.Cec.Server do
       receiver_la: get.(:receiver_la, 5),
       scan_ms: get.(:scan_interval_ms, @default_scan_ms),
       monitor?: Keyword.get(opts, :monitor?, true),
+      monitor_binary: Keyword.get(opts, :monitor_binary),
       pubsub: Keyword.get(opts, :pubsub, @pubsub),
       task_sup: Keyword.get(opts, :task_supervisor, UniversalProxy.TaskSupervisor)
     }
@@ -177,11 +185,6 @@ defmodule UniversalProxy.Cec.Server do
   end
 
   def handle_info({:cec_event, _dev, _record}, state), do: {:noreply, state}
-
-  def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
-    monitors = state.monitors |> Enum.reject(fn {_dev, p} -> p == pid end) |> Map.new()
-    {:noreply, %{state | monitors: monitors}}
-  end
 
   def handle_info(_other, state), do: {:noreply, state}
 
@@ -266,13 +269,19 @@ defmodule UniversalProxy.Cec.Server do
   end
 
   defp start_monitor(state, dev) do
-    case DynamicSupervisor.start_child(
-           UniversalProxy.Cec.MonitorSupervisor,
-           {Monitor, dev: dev, pubsub: state.pubsub}
-         ) do
-      {:ok, pid} ->
-        Process.monitor(pid)
-        %{state | monitors: Map.put(state.monitors, dev, pid)}
+    spec =
+      {Monitor,
+       dev: dev,
+       pubsub: state.pubsub,
+       binary: state.monitor_binary,
+       name: {:via, Registry, {@monitor_registry, dev}}}
+
+    case DynamicSupervisor.start_child(@monitor_supervisor, spec) do
+      {:ok, _pid} ->
+        state
+
+      {:error, {:already_started, _pid}} ->
+        state
 
       {:error, reason} ->
         Logger.warning("CEC: monitor for #{dev} not started: #{inspect(reason)}")
@@ -282,26 +291,46 @@ defmodule UniversalProxy.Cec.Server do
 
   defp remove_adapter(state, dev) do
     Logger.info("CEC: #{dev} gone")
+    if state.monitor?, do: stop_monitor(dev)
+    %{state | adapters: Map.delete(state.adapters, dev)}
+  end
 
-    case Map.pop(state.monitors, dev) do
-      {nil, monitors} ->
-        %{state | adapters: Map.delete(state.adapters, dev), monitors: monitors}
-
-      {pid, monitors} ->
-        _ = DynamicSupervisor.terminate_child(UniversalProxy.Cec.MonitorSupervisor, pid)
-        %{state | adapters: Map.delete(state.adapters, dev), monitors: monitors}
+  defp stop_monitor(dev) do
+    case Registry.lookup(@monitor_registry, dev) do
+      [{pid, _}] -> _ = DynamicSupervisor.terminate_child(@monitor_supervisor, pid)
+      [] -> :ok
     end
+
+    :ok
+  rescue
+    # Registry.lookup/2 raises (not exits) when the registry isn't running.
+    ArgumentError -> :ok
   end
 
   # ── state updates ─────────────────────────────────────────────────────
 
-  defp apply_message(state, dev, %{opcode: "REPORT_POWER_STATUS"} = msg),
-    do: update_receiver(state, dev, %{power: Parser.power_state(msg)})
+  # Status reports only describe the receiver when the receiver sent them
+  # (a TV answering a power query reports its own state).
+  defp apply_message(
+         %{receiver_la: la} = state,
+         dev,
+         %{opcode: "REPORT_POWER_STATUS", from: la} = msg
+       ),
+       do: update_receiver(state, dev, %{power: Parser.power_state(msg)})
 
-  defp apply_message(state, dev, %{opcode: "REPORT_AUDIO_STATUS"} = msg),
-    do: update_receiver(state, dev, Parser.audio_status(msg))
+  defp apply_message(
+         %{receiver_la: la} = state,
+         dev,
+         %{opcode: "REPORT_AUDIO_STATUS", from: la} = msg
+       ),
+       do: update_receiver(state, dev, Parser.audio_status(msg))
 
-  defp apply_message(state, dev, %{opcode: "STANDBY"}),
+  # A broadcast Standby puts every device on the bus into standby; a directed
+  # one only counts when it comes from the receiver.
+  defp apply_message(state, dev, %{opcode: "STANDBY", to: :all}),
+    do: update_receiver(state, dev, %{power: :standby})
+
+  defp apply_message(%{receiver_la: la} = state, dev, %{opcode: "STANDBY", from: la}),
     do: update_receiver(state, dev, %{power: :standby})
 
   defp apply_message(state, _dev, _msg), do: state

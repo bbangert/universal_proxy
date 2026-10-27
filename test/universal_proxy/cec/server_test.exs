@@ -122,11 +122,116 @@ defmodule UniversalProxy.Cec.ServerTest do
              Server.get_adapter(server, @dev)
   end
 
+  test "status reports from devices other than the receiver are ignored", %{server: server} do
+    assert_receive {:cec_ctl, [_, _, "-s", "--playback" | _]}
+
+    report = fn from, opcode, args ->
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        Monitor.topic(),
+        {:cec_event, @dev,
+         %{type: :message, direction: :received, from: from, to: 4, opcode: opcode, args: args}}
+      )
+    end
+
+    report.(5, "REPORT_POWER_STATUS", %{"pwr-state" => %{text: "On", value: 0}})
+    # The TV (0) answering its own power query, and a directed Standby from it.
+    report.(0, "REPORT_POWER_STATUS", %{"pwr-state" => %{text: "Standby", value: 1}})
+
+    report.(0, "REPORT_AUDIO_STATUS", %{
+      "aud-mute-status" => %{text: "On", value: 1},
+      "aud-vol-status" => %{text: "80", value: 80}
+    })
+
+    report.(0, "STANDBY", %{})
+
+    assert {:ok, %{receiver: %{power: :on, volume: nil, muted: nil}}} =
+             Server.get_adapter(server, @dev)
+
+    report.(5, "STANDBY", %{})
+    assert {:ok, %{receiver: %{power: :standby}}} = Server.get_adapter(server, @dev)
+  end
+
   test "an unplugged adapter is dropped on the next scan", %{server: server, agent: agent} do
     assert_receive {:cec_ctl, [_, _, "-s", "--playback" | _]}
     Agent.update(agent, fn _ -> %{} end)
     :ok = Server.rescan(server)
     assert Server.list_adapters(server) == []
+  end
+
+  describe "adapter monitors" do
+    setup %{agent: agent} do
+      start_supervised!({Registry, keys: :unique, name: UniversalProxy.Cec.MonitorRegistry})
+
+      start_supervised!(
+        {DynamicSupervisor, name: UniversalProxy.Cec.MonitorSupervisor, strategy: :one_for_one}
+      )
+
+      # Stand-in for `cec-ctl -m`: runs until the port closes its stdin.
+      dir = Path.join(System.tmp_dir!(), "cec_mon_#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+      binary = Path.join(dir, "cec-ctl")
+      File.write!(binary, "#!/bin/sh\nexec cat >/dev/null\n")
+      File.chmod!(binary, 0o755)
+      on_exit(fn -> File.rm_rf!(dir) end)
+
+      server =
+        start_supervised!(
+          {Server,
+           name: nil,
+           ctl_module: FakeCtl,
+           enumerate: fn -> Agent.get(agent, & &1) end,
+           output_lookup: fn _ -> :error end,
+           monitor_binary: binary,
+           scan_interval_ms: 60_000},
+          id: :monitored_server
+        )
+
+      :ok = Server.rescan(server)
+      {:ok, server: server}
+    end
+
+    test "a restarted monitor is still stopped on unplug, and replug starts exactly one", %{
+      server: server,
+      agent: agent
+    } do
+      [{original, _}] = Registry.lookup(UniversalProxy.Cec.MonitorRegistry, @dev)
+      ref = Process.monitor(original)
+      Process.exit(original, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^original, :killed}
+
+      replacement = wait_for_monitor(original)
+      assert replacement != original
+
+      unplugged = Agent.get(agent, & &1)
+      Agent.update(agent, fn _ -> %{} end)
+      :ok = Server.rescan(server)
+
+      assert DynamicSupervisor.which_children(UniversalProxy.Cec.MonitorSupervisor) == []
+      refute Process.alive?(replacement)
+
+      Agent.update(agent, fn _ -> unplugged end)
+      :ok = Server.rescan(server)
+
+      assert [{:undefined, pid, :worker, _}] =
+               DynamicSupervisor.which_children(UniversalProxy.Cec.MonitorSupervisor)
+
+      assert [{^pid, _}] = Registry.lookup(UniversalProxy.Cec.MonitorRegistry, @dev)
+    end
+  end
+
+  defp wait_for_monitor(old, attempts \\ 50) do
+    case Registry.lookup(UniversalProxy.Cec.MonitorRegistry, @dev) do
+      [{pid, _}] when pid != old ->
+        pid
+
+      _ when attempts > 0 ->
+        Process.sleep(10)
+        wait_for_monitor(old, attempts - 1)
+
+      other ->
+        flunk("monitor for #{@dev} not restarted: #{inspect(other)}")
+    end
   end
 
   describe "facade commands against an explicit adapter" do
