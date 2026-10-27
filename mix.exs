@@ -155,7 +155,7 @@ defmodule UniversalProxy.MixProject do
       # library's vendored+namespaced rebus fork) — improv's GATT/advert
       # exporters and the AudioManager use it directly, so the app carries
       # no rebus dependency of its own anymore.
-      {:bluez, "~> 0.1"},
+      {:bluez, "~> 0.4"},
 
       # Already transitive via bluez/vintage_net; direct dep since Storage.Smbd uses MuonTrap.Daemon directly.
       {:muontrap, "~> 2.0"},
