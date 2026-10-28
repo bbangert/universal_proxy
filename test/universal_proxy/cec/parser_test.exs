@@ -127,4 +127,121 @@ defmodule UniversalProxy.Cec.ParserTest do
     refute Parser.valid_phys_addr?(nil)
     assert Parser.valid_phys_addr?("1.0.0.0")
   end
+
+  test "timestamped events from `cec-ctl -m` (monotonic and --wall-clock) are recognised" do
+    out = """
+
+    Initial Event: State Change: PA: 1.0.0.0, LA mask: 0x0010
+
+    1234.567890: Event: State Change: PA: f.f.f.f, LA mask: 0x0000
+
+    1234.600000s: Event: Lost 3 messages
+
+    Wed Oct 28 12:34:56.123456: Event: State Change: PA: 2.0.0.0, LA mask: 0x0010
+    """
+
+    assert [
+             %{type: :event, kind: :state_change, phys_addr: "1.0.0.0"},
+             %{type: :event, kind: :state_change, phys_addr: "f.f.f.f", la_mask: 0},
+             %{type: :event, kind: :other, text: "Lost 3 messages"},
+             %{type: :event, kind: :state_change, phys_addr: "2.0.0.0"}
+           ] = Parser.parse(out)
+  end
+
+  test "the verbose Sequence trailer completes a monitor record without waiting for more" do
+    st = Parser.new()
+
+    {st, []} =
+      Parser.feed(st, "Received from TV to all (0 to 15): STANDBY (0x36)")
+
+    {st, [%{opcode: "STANDBY", to: :all}]} =
+      Parser.feed(st, "\tSequence: 4 Rx Timestamp: 1234.560000s")
+
+    {st, []} =
+      Parser.feed(
+        st,
+        "Received from Audio System to Playback Device 1 (5 to 4): REPORT_AUDIO_STATUS (0x7a):"
+      )
+
+    {st, []} = Parser.feed(st, "\taud-mute-status: Off (0x00)")
+    {st, []} = Parser.feed(st, "\taud-vol-status: 20 (0x14)")
+    {st, [audio]} = Parser.feed(st, "\tSequence: 5 Rx Timestamp: 1234.570000s")
+    assert Parser.audio_status(audio) == %{volume: 20, muted: false}
+    {_st, []} = Parser.finish(st)
+  end
+
+  describe "transmit_failures/1" do
+    test "a delivered message, even one whose reply timed out, is no failure" do
+      ok = """
+
+      Transmit from Playback Device 1 to TV (4 to 0):
+      IMAGE_VIEW_ON (0x04)
+      \tSequence: 1 Tx Timestamp: 1234.000000s
+      """
+
+      reply_timeout = """
+
+      Transmit from Playback Device 1 to Audio System (4 to 5):
+      GIVE_DEVICE_POWER_STATUS (0x8f)
+      \tSequence: 2 Tx Timestamp: 1234.100000s
+      \tTx, OK, Rx, Timeout
+      """
+
+      assert Parser.transmit_failures(ok) == []
+      assert Parser.transmit_failures(reply_timeout) == []
+    end
+
+    test "output without a transmit (driver info, a claim) has no failures" do
+      assert Parser.transmit_failures("") == []
+      assert Parser.transmit_failures("Driver Info:\n\tPhysical Address : 1.0.0.0\n") == []
+    end
+
+    test "a NACKed or arbitration-lost transmit is reported" do
+      nack = """
+
+      Transmit from Playback Device 1 to Audio System (4 to 5):
+      STANDBY (0x36)
+      \tSequence: 3 Tx Timestamp: 1234.200000s
+      \tTx, Not Acknowledged (4), Max Retries
+      """
+
+      arb = """
+
+      Transmit from Playback Device 1 to TV (4 to 0):
+      IMAGE_VIEW_ON (0x04)
+      \tSequence: 4 Tx Timestamp: 1234.300000s
+      \tTx, Arbitration Lost (2), Max Retries
+      """
+
+      assert Parser.transmit_failures(nack) == ["Tx, Not Acknowledged (4), Max Retries"]
+      assert Parser.transmit_failures(arb) == ["Tx, Arbitration Lost (2), Max Retries"]
+    end
+
+    test "a transmit whose ioctl failed (no Sequence line) is reported" do
+      out = """
+
+      Transmit from Playback Device 1 to TV (4 to 0):
+      IMAGE_VIEW_ON (0x04)
+      """
+
+      assert Parser.transmit_failures(out) == ["not transmitted"]
+    end
+
+    test "every transmit in a multi-message invocation is checked" do
+      out = """
+
+      Transmit from Playback Device 1 to Audio System (4 to 5):
+      USER_CONTROL_PRESSED (0x44):
+      \tui-cmd: Volume Up (0x41)
+      \tSequence: 5 Tx Timestamp: 1234.400000s
+
+      Transmit from Playback Device 1 to Audio System (4 to 5):
+      USER_CONTROL_RELEASED (0x45)
+      \tSequence: 6 Tx Timestamp: 1234.500000s
+      \tTx, Not Acknowledged (1), Max Retries
+      """
+
+      assert Parser.transmit_failures(out) == ["Tx, Not Acknowledged (1), Max Retries"]
+    end
+  end
 end

@@ -5,8 +5,12 @@ defmodule UniversalProxy.Cec.FakeCtl do
   Every `run/2` sends `{:cec_ctl, args}` to the pid registered under
   `:cec_fake_ctl_pid` in the application env (set per test; the Cec tests
   are `async: false`) and answers from a canned table keyed on the message
-  flag in `args`.
+  flag in `args`. A test can override the output for a flag through the
+  `:cec_fake_ctl_outputs` env map (`%{"--standby" => text}`); every output
+  goes through `Ctl.check_transmits/1`, as the real `run/2` does.
   """
+
+  alias UniversalProxy.Cec.Ctl
 
   @behaviour UniversalProxy.Cec.Ctl
 
@@ -60,22 +64,33 @@ defmodule UniversalProxy.Cec.FakeCtl do
     if pid = Application.get_env(:universal_proxy, :cec_fake_ctl_pid),
       do: send(pid, {:cec_ctl, args})
 
+    overrides = Application.get_env(:universal_proxy, :cec_fake_ctl_outputs, %{})
+
+    out =
+      case Enum.find(args, &Map.has_key?(overrides, &1)) do
+        nil -> canned(args)
+        flag -> Map.fetch!(overrides, flag)
+      end
+
+    Ctl.check_transmits(out)
+  end
+
+  defp canned(args) do
     cond do
       "--give-device-power-status" in args ->
-        {:ok, @power_reply}
+        @power_reply
 
       "--give-audio-status" in args ->
-        {:ok, @audio_reply}
+        @audio_reply
 
       "--playback" in args ->
-        {:ok, ""}
+        ""
 
       length(args) == 2 ->
-        {:ok, @driver_info}
+        @driver_info
 
       true ->
-        {:ok,
-         "\nTransmit from Playback Device 1 to TV (4 to 0):\nIMAGE_VIEW_ON (0x04)\n\tSequence: 1\n"}
+        "\nTransmit from Playback Device 1 to TV (4 to 0):\nIMAGE_VIEW_ON (0x04)\n\tSequence: 1\n"
     end
   end
 end

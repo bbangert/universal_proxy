@@ -4,13 +4,20 @@ defmodule UniversalProxy.Cec.Parser do
 
   Two shapes come out of cec-ctl, both line-oriented:
 
-  Monitor stream (`cec-ctl -m`), one header line per message followed by one
-  tab-indented line per argument, plus event lines:
+  Monitor stream (`cec-ctl -v -m`), one header line per message followed by
+  one tab-indented line per argument and, with `-v`, a `Sequence:` trailer,
+  plus event lines (non-initial ones prefixed with a monotonic timestamp,
+  `1234.567890:`, or a local wall-clock one with `--wall-clock`):
 
       Received from Audio System to Playback Device 1 (5 to 4): REPORT_POWER_STATUS (0x90):
       \tpwr-state: On (0x00)
+      \tSequence: 12 Rx Timestamp: 1234.560000s
       Transmitted by Playback Device 1 to TV (4 to 0): IMAGE_VIEW_ON (0x04)
-      Event: State Change: PA: 1.0.0.0, LA mask: 0x0010
+      \tSequence: 7 Tx Timestamp: 1234.570000s
+      1234.567890: Event: State Change: PA: 1.0.0.0, LA mask: 0x0010
+
+  cec-ctl puts nothing between messages, so without the `Sequence:` trailer
+  a message only completes when the next line arrives.
 
   One-shot reply (`cec-ctl --to 5 --give-device-power-status`), where the
   reply header carries only the initiator and the opcode sits on its own
@@ -20,6 +27,9 @@ defmodule UniversalProxy.Cec.Parser do
           REPORT_POWER_STATUS (0x90):
       \tpwr-state: On (0x00)
       \tSequence: 1 Tx Timestamp: 12:00:00.000 Rx Timestamp: 12:00:00.100
+
+  A `Tx, ...` status line (after `Sequence:`) is printed only when a
+  transmit or its reply failed; `transmit_failures/1` reads those.
 
   `feed/2` is the streaming entry point (keeps the record under construction
   across lines); `parse/1` runs a whole string through it.
@@ -40,7 +50,9 @@ defmodule UniversalProxy.Cec.Parser do
   @reply_re ~r/^\s*Received from (.+?) \((\d+)\):\s*$/
   @opcode_re ~r/^\s*([A-Z][A-Z0-9_]*) \(0x([0-9a-fA-F]{2})\):?\s*$/
   @arg_re ~r/^\s+([a-z][a-z0-9-]*): (.*?)(?: \(0x([0-9a-fA-F]+)(?:, [^)]*)?\))?\s*$/
-  @event_re ~r/^(?:Initial )?(?:\d\d:\d\d:\d\d\.\d+: )?Event: (.*?)\s*$/
+  @event_re ~r/^(?:Initial |(?:\d+\.\d+s?|(?:[A-Z][a-z]{2} [A-Z][a-z]{2} [ \d]\d )?\d\d:\d\d:\d\d\.\d+): )?Event: (.*?)\s*$/
+  @sequence_re ~r/^\s+Sequence: \d+/
+  @tx_status_re ~r/^\s+(Tx, .*?)\s*$/
   @state_change_re ~r/^State Change: PA: ([0-9a-f]\.[0-9a-f]\.[0-9a-f]\.[0-9a-f]), LA mask: 0x([0-9a-fA-F]{4})/
   @phys_addr_re ~r/^\s*Physical Address\s*: ([0-9a-f]\.[0-9a-f]\.[0-9a-f]\.[0-9a-f])/m
   @log_addr_re ~r/^\s*Logical Address\s*: (\d+) \(/m
@@ -89,6 +101,24 @@ defmodule UniversalProxy.Cec.Parser do
     |> Enum.find(
       &match?(%{type: :message, direction: :received, opcode: op} when is_binary(op), &1)
     )
+  end
+
+  @doc """
+  Failed transmits in a one-shot's output, as cec-ctl's status text.
+
+  cec-ctl exits 0 even when a message was not delivered: each `Transmit
+  from` block either ends without a `Sequence:` line (the transmit ioctl
+  itself failed) or carries a `Tx, ...` status without `OK` (NACK,
+  arbitration lost, timeout). A delivered message whose reply timed out
+  (`Tx, OK, Rx, Timeout`) is not a transmit failure. Output with no
+  `Transmit from` block (driver info, a logical-address claim) has none.
+  """
+  @spec transmit_failures(String.t()) :: [String.t()]
+  def transmit_failures(text) when is_binary(text) do
+    text
+    |> String.split(["\r\n", "\n"])
+    |> Enum.chunk_while(nil, &tx_chunk/2, &tx_chunk_done/1)
+    |> Enum.flat_map(&tx_failure/1)
   end
 
   @doc "Physical and logical address from a Driver Info dump."
@@ -142,11 +172,34 @@ defmodule UniversalProxy.Cec.Parser do
 
   # ── private ───────────────────────────────────────────────────────────
 
+  # Transmit blocks: each `Transmit from` line opens one; other lines are
+  # collected into the open block (lines before the first are dropped).
+  defp tx_chunk("Transmit from" <> _, nil), do: {:cont, []}
+  defp tx_chunk("Transmit from" <> _, acc), do: {:cont, Enum.reverse(acc), []}
+  defp tx_chunk(_line, nil), do: {:cont, nil}
+  defp tx_chunk(line, acc), do: {:cont, [line | acc]}
+
+  defp tx_chunk_done(nil), do: {:cont, nil}
+  defp tx_chunk_done(acc), do: {:cont, Enum.reverse(acc), nil}
+
+  defp tx_failure(lines) do
+    statuses =
+      for line <- lines, [_, status] <- [Regex.run(@tx_status_re, line)], do: status
+
+    cond do
+      not Enum.any?(lines, &Regex.match?(@sequence_re, &1)) -> ["not transmitted"]
+      failed = Enum.find(statuses, &(not String.starts_with?(&1, "Tx, OK"))) -> [failed]
+      true -> []
+    end
+  end
+
   # One line, classified against the record under construction (`cur`).
   # Order matters: an event or a header always starts fresh; an indented
-  # opcode line only completes a reply header that has no opcode yet; any
-  # other indented line is cec-ctl detail we don't model (Sequence, Driver
-  # Info rows); a non-indented line we don't recognise ends the record.
+  # opcode line only completes a reply header that has no opcode yet; a
+  # `Sequence:` line is the per-message trailer and completes the record;
+  # any other indented line is cec-ctl detail we don't model (status,
+  # Driver Info rows); a non-indented line we don't recognise ends the
+  # record.
   defp classify(line, cur) do
     cond do
       match = Regex.run(@event_re, line) ->
@@ -163,6 +216,9 @@ defmodule UniversalProxy.Cec.Parser do
 
       match = is_map(cur) and Regex.run(@arg_re, line) ->
         arg(match)
+
+      Regex.match?(@sequence_re, line) ->
+        :break
 
       String.starts_with?(line, [" ", "\t"]) ->
         :skip

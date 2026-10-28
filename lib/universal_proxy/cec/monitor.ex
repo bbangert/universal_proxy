@@ -1,6 +1,6 @@
 defmodule UniversalProxy.Cec.Monitor do
   @moduledoc """
-  Keeps one `cec-ctl -m` running per adapter and turns its stdout into
+  Keeps one `cec-ctl -v -m` running per adapter and turns its stdout into
   `{:cec_event, dev, record}` broadcasts on the `"cec:events"` PubSub topic.
 
   Monitor mode is a separate file handle on `/dev/cecN` from the one-shot
@@ -8,12 +8,12 @@ defmodule UniversalProxy.Cec.Monitor do
   receives (directed at us, or broadcast) plus state-change events, including
   our own transmits and their replies.
 
-  Raw `Port` rather than `MuonTrap.Daemon` because the output has to be
-  parsed, not logged. cec-ctl ignores stdin, so closing the port does not
-  end it; `terminate/2` kills the OS pid explicitly, the way
-  `UniversalProxy.Audio.Player` does for the player binary. If cec-ctl
-  exits on its own (adapter unbound, crash) the port is reopened with a
-  capped backoff.
+  cec-ctl runs under a linked `MuonTrap.Daemon` whose `:logger_fun` hands
+  each stdout line back here. cec-ctl ignores stdin, so closing a plain Port
+  leaves it running (at least until its next write hits the closed pipe);
+  the muontrap wrapper kills it whenever its Daemon goes down, including
+  when this process is killed and `terminate/2` never runs. If cec-ctl exits on its own (adapter unbound, crash) the Daemon
+  stops and is restarted with a capped backoff.
   """
 
   use GenServer, restart: :transient
@@ -26,7 +26,7 @@ defmodule UniversalProxy.Cec.Monitor do
   @initial_backoff_ms 2_000
   @max_backoff_ms 60_000
 
-  defstruct [:dev, :port, :os_pid, :pubsub, :binary, parser: nil, backoff: @initial_backoff_ms]
+  defstruct [:dev, :daemon, :ref, :pubsub, :binary, parser: nil, backoff: @initial_backoff_ms]
 
   @doc "PubSub topic the parsed records are broadcast on."
   @spec topic() :: String.t()
@@ -56,69 +56,59 @@ defmodule UniversalProxy.Cec.Monitor do
   end
 
   @impl true
-  def handle_info({port, {:data, {:eol, line}}}, %{port: port} = state) do
+  def handle_info({:cec_line, ref, line}, %{ref: ref} = state) do
     {parser, records} = Parser.feed(state.parser, line)
     Enum.each(records, &broadcast(state, &1))
     {:noreply, %{state | parser: parser}}
   end
 
-  def handle_info({port, {:data, {:noeol, _partial}}}, %{port: port} = state) do
-    # Oversized line: drop the fragment; the parser is line-anchored anyway.
-    {:noreply, state}
-  end
-
-  def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
+  def handle_info({:EXIT, daemon, reason}, %{daemon: daemon} = state) do
     Logger.warning(
-      "cec-ctl monitor for #{state.dev} exited (#{status}); retrying in #{state.backoff} ms"
+      "cec-ctl monitor for #{state.dev} exited (#{inspect(reason)}); " <>
+        "retrying in #{state.backoff} ms"
     )
 
     Process.send_after(self(), :reopen, state.backoff)
 
-    {:noreply,
-     %{state | port: nil, os_pid: nil, backoff: min(state.backoff * 2, @max_backoff_ms)}}
+    {:noreply, %{state | daemon: nil, ref: nil, backoff: min(state.backoff * 2, @max_backoff_ms)}}
   end
 
-  def handle_info(:reopen, %{port: nil} = state), do: {:noreply, open(state)}
+  def handle_info(:reopen, %{daemon: nil} = state), do: {:noreply, open(state)}
 
-  def handle_info({:EXIT, port, _reason}, %{port: port} = state), do: {:noreply, state}
   def handle_info(_other, state), do: {:noreply, state}
 
   @impl true
-  def terminate(_reason, state) do
-    force_kill(state)
-    :ok
+  def terminate(_reason, %{daemon: daemon}) when is_pid(daemon) do
+    GenServer.stop(daemon)
+  catch
+    :exit, _ -> :ok
   end
+
+  def terminate(_reason, _state), do: :ok
 
   # ── private ───────────────────────────────────────────────────────────
 
   defp open(state) do
-    port =
-      Port.open(
-        {:spawn_executable, String.to_charlist(state.binary)},
-        [:binary, :exit_status, {:line, 1024}, {:args, Ctl.monitor_args(state.dev)}]
+    me = self()
+    ref = make_ref()
+
+    {:ok, daemon} =
+      MuonTrap.Daemon.start_link(state.binary, Ctl.monitor_args(state.dev),
+        logger_fun: &send(me, {:cec_line, ref, &1}),
+        exit_status_to_reason: &{:exit_status, &1}
       )
 
-    os_pid =
-      case Port.info(port, :os_pid) do
-        {:os_pid, pid} -> pid
-        _ -> nil
-      end
+    Logger.info("cec-ctl monitor started for #{state.dev} (os pid #{inspect(os_pid(daemon))})")
+    %{state | daemon: daemon, ref: ref, parser: Parser.new()}
+  end
 
-    Logger.info("cec-ctl monitor started for #{state.dev} (os pid #{inspect(os_pid)})")
-    %{state | port: port, os_pid: os_pid, parser: Parser.new()}
+  defp os_pid(daemon) do
+    MuonTrap.Daemon.os_pid(daemon)
+  catch
+    :exit, _ -> :error
   end
 
   defp broadcast(state, record) do
     Phoenix.PubSub.broadcast(state.pubsub, @topic, {:cec_event, state.dev, record})
-  end
-
-  defp force_kill(%{os_pid: nil}), do: :ok
-
-  defp force_kill(%{os_pid: pid, port: port}) do
-    if is_port(port) and Port.info(port) != nil, do: Port.close(port)
-    # Integer OS pid from Port.info/2 — nothing user-controlled reaches the shell.
-    # credo:disable-for-next-line Credo.Check.Warning.UnsafeExec
-    _ = :os.cmd(~c"kill -9 #{pid}")
-    :ok
   end
 end

@@ -8,6 +8,10 @@ defmodule UniversalProxy.Cec.Ctl do
   power-status`, `--give-audio-status`) are waited for by cec-ctl itself and
   come back in its stdout, which `UniversalProxy.Cec.Parser` decodes.
 
+  cec-ctl exits 0 even when a message was not delivered (NACK, arbitration
+  lost, a failed transmit ioctl) and only says so in its output, so `run/2`
+  checks every transmit it reports (`check_transmits/1`).
+
   A behaviour so tests swap in a recording fake via the
   `UniversalProxy.Cec` application env (`:ctl_module`).
   """
@@ -15,6 +19,8 @@ defmodule UniversalProxy.Cec.Ctl do
   @callback run([String.t()], keyword()) :: {:ok, String.t()} | {:error, term()}
 
   @behaviour __MODULE__
+
+  alias UniversalProxy.Cec.Parser
 
   @default_timeout_ms 5_000
 
@@ -39,10 +45,24 @@ defmodule UniversalProxy.Cec.Ctl do
 
       path ->
         case MuonTrap.cmd(path, args, timeout: timeout, stderr_to_stdout: true) do
-          {out, 0} -> {:ok, out}
+          {out, 0} -> check_transmits(out)
           {out, :timeout} -> {:error, {:timeout, out}}
           {out, status} -> {:error, {:exit, status, out}}
         end
+    end
+  end
+
+  @doc """
+  `{:ok, out}` when every message cec-ctl reports in `out` was transmitted,
+  else `{:error, {:transmit_failed, statuses, out}}`. Output that transmits
+  nothing (driver info, a logical-address claim) is `{:ok, out}`.
+  """
+  @spec check_transmits(String.t()) ::
+          {:ok, String.t()} | {:error, {:transmit_failed, [String.t()], String.t()}}
+  def check_transmits(out) do
+    case Parser.transmit_failures(out) do
+      [] -> {:ok, out}
+      failures -> {:error, {:transmit_failed, failures, out}}
     end
   end
 
@@ -60,8 +80,9 @@ defmodule UniversalProxy.Cec.Ctl do
   @spec driver_info_args(String.t()) :: [String.t()]
   def driver_info_args(dev), do: ["-d", dev]
 
+  @doc "`-v` adds the per-message `Sequence:` trailer the parser completes records on."
   @spec monitor_args(String.t()) :: [String.t()]
-  def monitor_args(dev), do: ["-d", dev, "-s", "-m"]
+  def monitor_args(dev), do: ["-d", dev, "-s", "-v", "-m"]
 
   @spec image_view_on_args(String.t()) :: [String.t()]
   def image_view_on_args(dev), do: ["-d", dev, "-s", "--to", "0", "--image-view-on"]

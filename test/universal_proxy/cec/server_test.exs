@@ -167,11 +167,11 @@ defmodule UniversalProxy.Cec.ServerTest do
         {DynamicSupervisor, name: UniversalProxy.Cec.MonitorSupervisor, strategy: :one_for_one}
       )
 
-      # Stand-in for `cec-ctl -m`: runs until the port closes its stdin.
+      # Stand-in for `cec-ctl -m`: silent, ignores stdin, runs until killed.
       dir = Path.join(System.tmp_dir!(), "cec_mon_#{System.unique_integer([:positive])}")
       File.mkdir_p!(dir)
       binary = Path.join(dir, "cec-ctl")
-      File.write!(binary, "#!/bin/sh\nexec cat >/dev/null\n")
+      File.write!(binary, "#!/bin/sh\nwhile :; do sleep 1; done\n")
       File.chmod!(binary, 0o755)
       on_exit(fn -> File.rm_rf!(dir) end)
 
@@ -191,6 +191,7 @@ defmodule UniversalProxy.Cec.ServerTest do
       {:ok, server: server}
     end
 
+    @tag :capture_log
     test "a restarted monitor is still stopped on unplug, and replug starts exactly one", %{
       server: server,
       agent: agent
@@ -263,6 +264,50 @@ defmodule UniversalProxy.Cec.ServerTest do
                         "ui-cmd=0x41",
                         "--user-control-released"
                       ]}
+    end
+  end
+
+  describe "standby via the registered server" do
+    setup %{agent: agent} do
+      on_exit(fn -> Application.delete_env(:universal_proxy, :cec_fake_ctl_outputs) end)
+
+      named =
+        start_supervised!(
+          {Server,
+           ctl_module: FakeCtl,
+           enumerate: fn -> Agent.get(agent, & &1) end,
+           output_lookup: fn _ -> :error end,
+           monitor?: false,
+           scan_interval_ms: 60_000},
+          id: :named_server
+        )
+
+      :ok = Server.rescan(named)
+      {:ok, named: named}
+    end
+
+    test "a delivered Standby marks the receiver as going to standby", %{named: named} do
+      assert :ok = Cec.standby(@dev, ctl: FakeCtl)
+      assert_receive {:cec_ctl, ["-d", @dev, "-s", "--to", "5", "--standby"]}
+      assert {:ok, %{receiver: %{power: :to_standby}}} = Server.get_adapter(named, @dev)
+    end
+
+    test "a NACKed Standby is an error and leaves the receiver cache alone", %{named: named} do
+      Application.put_env(:universal_proxy, :cec_fake_ctl_outputs, %{
+        "--standby" => """
+
+        Transmit from Playback Device 1 to Audio System (4 to 5):
+        STANDBY (0x36)
+        \tSequence: 2 Tx Timestamp: 1234.000000s
+        \tTx, Not Acknowledged (4), Max Retries
+        """
+      })
+
+      assert {:error, {:transmit_failed, ["Tx, Not Acknowledged (4), Max Retries"], _out}} =
+               Cec.standby(@dev, ctl: FakeCtl)
+
+      assert {:ok, %{receiver: %{power: :unknown, updated_at: nil}}} =
+               Server.get_adapter(named, @dev)
     end
   end
 
