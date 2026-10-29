@@ -38,18 +38,15 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
     FakeBluez.ensure_started()
     FakeBluez.reset()
 
-    {:ok, radio} =
-      Radio.start_link(
-        bluez_radio: FakeBluez.Radio,
-        mgmt: FakeBluez.Mgmt,
-        rebus: FakeBluez.Rebus,
-        dbus: FakeBluez.DBus,
-        receiver: FakeBluez.Receiver
+    radio =
+      start_supervised!(
+        {Radio,
+         bluez_radio: FakeBluez.Radio,
+         mgmt: FakeBluez.Mgmt,
+         rebus: FakeBluez.Rebus,
+         dbus: FakeBluez.DBus,
+         receiver: FakeBluez.Receiver}
       )
-
-    on_exit(fn ->
-      if Process.alive?(radio), do: GenServer.stop(radio)
-    end)
 
     {:ok, radio: radio}
   end

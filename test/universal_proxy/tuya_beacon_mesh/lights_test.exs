@@ -18,32 +18,30 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
     FakeBluez.ensure_started()
     FakeBluez.reset()
 
-    if pid = Process.whereis(Lights), do: GenServer.stop(pid)
-    if pid = Process.whereis(Radio), do: GenServer.stop(pid)
-
-    {:ok, radio} =
-      Radio.start_link(
-        adapter_index: 1,
-        bluez_radio: FakeBluez.Radio,
-        mgmt: FakeBluez.Mgmt,
-        rebus: FakeBluez.Rebus,
-        dbus: FakeBluez.DBus,
-        receiver: FakeBluez.Receiver
+    radio =
+      start_supervised!(
+        {Radio,
+         adapter_index: 1,
+         bluez_radio: FakeBluez.Radio,
+         mgmt: FakeBluez.Mgmt,
+         rebus: FakeBluez.Rebus,
+         dbus: FakeBluez.DBus,
+         receiver: FakeBluez.Receiver}
       )
 
     persisted = :ets.new(:lights_persist, [:public, :set])
 
-    {:ok, _lights} =
-      Lights.start_link(
-        inventory: File.read!(@fixture),
-        radio: radio,
-        on_persist: fn inv -> :ets.insert(persisted, {:inv, inv}) end
-      )
+    start_supervised!(
+      {Lights,
+       inventory: File.read!(@fixture),
+       radio: radio,
+       on_persist: fn inv -> :ets.insert(persisted, {:inv, inv}) end}
+    )
 
-    on_exit(fn ->
-      if pid = Process.whereis(Lights), do: GenServer.stop(pid)
-      if Process.alive?(radio), do: GenServer.stop(radio)
-    end)
+    # Both servers finish setup in handle_continue; these calls only return
+    # once the receiver is registered and Lights has subscribed.
+    {:ok, _} = Radio.status()
+    {:ok, _} = Lights.all()
 
     {:ok, radio: radio, persisted: persisted}
   end

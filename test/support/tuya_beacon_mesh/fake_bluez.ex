@@ -9,10 +9,12 @@ defmodule UniversalProxy.TuyaBeaconMesh.FakeBluez do
 
   @agent __MODULE__.State
 
+  # Unlinked on purpose: a linked agent would die with whichever test
+  # process happened to start it first, racing the next test's setup.
   def ensure_started do
     case Process.whereis(@agent) do
       nil ->
-        case Agent.start_link(fn -> fresh() end, name: @agent) do
+        case Agent.start(fn -> fresh() end, name: @agent) do
           {:ok, _pid} -> :ok
           {:error, {:already_started, _pid}} -> :ok
         end
