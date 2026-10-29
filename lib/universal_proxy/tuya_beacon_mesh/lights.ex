@@ -6,7 +6,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   a running `Radio`, and call `set/3` / `ping/1` / `status/1`. Sequence
   numbers come from `Seq`; pass `on_persist:` to write the updated
   inventory (including the advanced `seq`) back to Settings whenever a
-  block is reserved or groups change.
+  block is reserved, groups change or the inventory is reloaded.
 
   Reports are attributed by **node id → MAC** from the inventory. Import
   rejects duplicate node ids, so twins cannot share a status entry.
@@ -31,7 +31,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
       (decoded via `Inventory.decode/1`);
     * `:radio` — Radio server name/pid (default `Radio`);
     * `:on_persist` — `fn inventory -> ... end` called after seq/group
-      mutations (default: no-op);
+      mutations and reloads (default: no-op);
     * `:name` — process name (default `#{inspect(__MODULE__)}`).
   """
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -93,6 +93,13 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
     :exit, _ -> {:error, :not_running}
   end
 
+  @doc """
+  Replaces the inventory. For the same mesh (same mesh `beaconKey`) the
+  sequence cursor only moves forward: it becomes the later of the dump's
+  `seq` and the in-memory cursor (`Seq.advance_to/2`), so reloading an
+  older dump never reuses SNs. A different mesh starts from the dump's
+  `seq` as-is. Fires `on_persist` with the result.
+  """
   @spec reload(Inventory.t() | binary() | map()) :: :ok | {:error, term()}
   def reload(input) do
     GenServer.call(__MODULE__, {:reload, input})
@@ -203,7 +210,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
         state = %{
           state
           | beacon_key: inv.beacon_key,
-            seq: Seq.new(inv.seq),
+            seq: reload_seq(state, inv),
             sns: [],
             inventory: inv,
             bulbs: bulbs_from(inv),
@@ -211,7 +218,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
             groups: groups_from(inv)
         }
 
-        {:reply, :ok, state}
+        {:reply, :ok, persist(state)}
 
       {:error, reason} ->
         {:reply, {:error, reason}, state}
@@ -301,6 +308,28 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
         end
     end
   end
+
+  # Same mesh: the bulbs have heard everything up to our in-memory cursor
+  # (which already sits past any reserved-but-unused block), so a stale or
+  # re-dropped dump must not pull it back. A different mesh's bulbs have
+  # never heard our counter, and jumping them past their forward window
+  # would get every frame dropped, so its dump's cursor is taken as-is.
+  defp reload_seq(state, inv) do
+    if mesh_id(inv.beacon_key) == mesh_id(state.beacon_key),
+      do: Seq.advance_to(state.seq, inv.seq),
+      else: Seq.new(inv.seq)
+  end
+
+  # `Crypto.key_bytes/1`'s 16-ASCII / 32-hex rule, without raising on a
+  # 32-char key that isn't hex (Inventory checks only the length).
+  defp mesh_id(<<_::binary-size(32)>> = key) do
+    case Base.decode16(key, case: :mixed) do
+      {:ok, bytes} -> bytes
+      :error -> key
+    end
+  end
+
+  defp mesh_id(key), do: key
 
   defp persist(state) do
     inv = snapshot(state)

@@ -15,4 +15,44 @@ defmodule UniversalProxy.TuyaBeaconMesh.SeqTest do
     assert Seq.value(seq) == 1
     assert {:error, :block_too_large} = Seq.reserve(Seq.new(0), 100)
   end
+
+  describe "ahead?/2" do
+    test "plain forward / backward / equal" do
+      assert Seq.ahead?(100, 101)
+      refute Seq.ahead?(101, 100)
+      refute Seq.ahead?(100, 100)
+    end
+
+    test "across the wrap" do
+      assert Seq.ahead?(65_530, 5)
+      refute Seq.ahead?(5, 65_530)
+      assert Seq.ahead?(65_535, 0)
+    end
+
+    test "half-range boundary" do
+      assert Seq.ahead?(0, 32_767)
+      refute Seq.ahead?(0, 32_768)
+      refute Seq.ahead?(32_768, 0)
+    end
+  end
+
+  describe "advance_to/2" do
+    test "moves forward, never backward" do
+      assert Seq.value(Seq.advance_to(Seq.new(100), 150)) == 150
+      assert Seq.value(Seq.advance_to(Seq.new(150), 100)) == 150
+      assert Seq.value(Seq.advance_to(Seq.new(150), 150)) == 150
+    end
+
+    test "is a serial-number max across the wrap" do
+      assert Seq.value(Seq.advance_to(Seq.new(65_530), 5)) == 5
+      assert Seq.value(Seq.advance_to(Seq.new(5), 65_530)) == 5
+      assert Seq.value(Seq.advance_to(Seq.new(0), 32_768)) == 0
+    end
+
+    test "a cursor past a wrapped reserved block keeps it" do
+      {:ok, _sns, seq} = Seq.reserve(Seq.new(65_534), 3)
+      assert Seq.value(Seq.advance_to(seq, 65_535)) == 1
+      assert Seq.value(Seq.advance_to(seq, 2)) == 2
+    end
+  end
 end

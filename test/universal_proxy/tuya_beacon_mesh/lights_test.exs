@@ -86,6 +86,76 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
              Lights.status("path light 2")
   end
 
+  describe "reload" do
+    test "an older dump of the same mesh never pulls seq back", %{persisted: persisted} do
+      assert set_sn("path light 2", on: true) == 100
+
+      # The fixture still says seq 100; 100..131 are already reserved.
+      assert :ok = Lights.reload(File.read!(@fixture))
+      assert [{:inv, %{seq: 132}}] = :ets.lookup(persisted, :inv)
+
+      assert set_sn("path light 2", on: false) == 132
+    end
+
+    test "a newer dump of the same mesh moves seq forward", %{persisted: persisted} do
+      assert :ok = Lights.reload(fixture(%{"seq" => 5_000}))
+      assert [{:inv, %{seq: 5_000}}] = :ets.lookup(persisted, :inv)
+
+      assert set_sn("path light 2", on: true) == 5_000
+    end
+
+    test "the in-memory cursor wins across the 16-bit wrap" do
+      # 65_530 is *behind* 100 in serial order: no change.
+      assert :ok = Lights.reload(fixture(%{"seq" => 65_530}))
+      assert {:ok, %{seq: 100}} = Lights.inventory()
+
+      # A different mesh can start there; its cursor then wraps.
+      mesh = %{"beaconKey" => "ffeeddccbbaa99887766554433221100"}
+      assert :ok = Lights.reload(fixture(Map.put(mesh, "seq", 65_530)))
+      assert set_sn("path light 2", on: true) == 65_530
+
+      # Cursor is now 26 (65_530 + 32, wrapped); 65_000 is behind it.
+      assert :ok = Lights.reload(fixture(Map.put(mesh, "seq", 65_000)))
+      assert {:ok, %{seq: 26}} = Lights.inventory()
+    end
+
+    test "a different mesh takes the dump's seq as-is", %{persisted: persisted} do
+      assert set_sn("path light 2", on: true) == 100
+
+      other = fixture(%{"beaconKey" => "ffeeddccbbaa99887766554433221100", "seq" => 10})
+      assert :ok = Lights.reload(other)
+      assert [{:inv, %{seq: 10}}] = :ets.lookup(persisted, :inv)
+
+      assert set_sn("path light 2", on: true) == 10
+    end
+
+    test "the same key spelled in another case is the same mesh" do
+      assert set_sn("path light 2", on: true) == 100
+      assert :ok = Lights.reload(fixture(%{"beaconKey" => String.upcase(@beacon_key)}))
+      assert {:ok, %{seq: 132}} = Lights.inventory()
+    end
+  end
+
+  defp fixture(overrides) do
+    @fixture |> File.read!() |> Jason.decode!() |> Map.merge(overrides)
+  end
+
+  # Sets via Lights and returns the SN of the frame it advertised, then
+  # clears the radio so the next send goes on air at once.
+  defp set_sn(who, dps) do
+    before = length(advertises())
+    assert :ok = Lights.set(who, dps)
+    wait_until(fn -> length(advertises()) > before end)
+    :ok = Radio.stop_tx()
+
+    [<<_hdr, _src::binary-2, _dst::binary-2, sn::16-big, _::binary>>] =
+      advertises() |> List.last() |> Carrier.frames()
+
+    sn
+  end
+
+  defp advertises, do: for({:advertise, data, _opts} <- FakeBluez.calls(), do: data)
+
   defp wait_until(fun, timeout \\ 2_000) do
     deadline = System.monotonic_time(:millisecond) + timeout
     do_wait(fun, deadline)
