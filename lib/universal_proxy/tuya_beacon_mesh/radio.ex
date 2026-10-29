@@ -4,20 +4,31 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   advert receiver for one adapter, serialises transmissions, and fans
   received frames out to subscribers.
 
-  On start (see `start_link/1`) it:
+  `Bluez.Radio` and `Bluez.Mgmt` must already be running: they are shared
+  infrastructure the host supervises, and this process never starts or
+  links them. Setup (on start, and again after any loss):
 
-    * starts `Bluez.Radio` and `Bluez.Mgmt` when they are not running (the
-      firmware's Bluetooth stack does not run them by default), then
+    * checks the adapter through `Bluez.Mgmt` (*Read Advertising
+      Features*), subscribes to `Bluez.Radio`'s lease-end notices and
       acquires the `:mgmt` lease for the adapter — this process is the
       lease holder, so only it may advertise;
-    * opens its own system-bus connection and starts LE discovery with
-      `DuplicateData: true` on the adapter;
+    * opens its own system-bus connection (kept across retries) and starts
+      LE discovery with `DuplicateData: true` on the adapter;
     * starts a linked `Bluez.AdvertReceiver` whose `on_report:` callback
       casts only AD 0x03 26-byte frames here.
 
-  On stop it takes any advert off air, stops discovery and releases the
-  lease. `Bluez.Radio`/`Bluez.Mgmt` are left running: they are shared
-  infrastructure and hold nothing once the lease is gone.
+  When any step fails — `Bluez.Radio`/`Bluez.Mgmt` not running, adapter
+  missing, lease held by another process, D-Bus down — the radio stays up
+  but not ready: whatever the attempt got (lease, discovery) is undone,
+  the reason is logged once (`status/1`'s `:last_error`), and setup is
+  retried after 2 s, doubling up to 30 s. The same happens at runtime when
+  the lease ends, `Bluez.Radio` or the D-Bus connection goes down, the
+  receiver exits, or `Bluez.Mgmt` stops accepting sends. While not ready,
+  `send_frame/3` returns `{:error, :not_ready}` (queued frames are
+  dropped); subscriptions are kept and deliver again once ready.
+
+  On stop it takes any advert off air, stops the receiver and discovery
+  and releases the lease. `Bluez.Radio`/`Bluez.Mgmt` are left running.
 
   ## TX
 
@@ -61,6 +72,12 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   @dedupe_ms 2_000
   @dedupe_max 1_024
   @recent_tx_max 32
+  @retry_ms 2_000
+  @max_retry_ms 30_000
+
+  # Advertise errors that mean the lease or Bluez.Mgmt is gone, not that
+  # this one frame was refused: re-run setup rather than keep sending.
+  @fatal_advertise_errors [:lease_expired, :not_lease_holder, :not_running]
 
   # ── Client API ─────────────────────────────────────────────────────────
 
@@ -68,9 +85,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   Starts the radio for one adapter.
 
   Options: `:adapter_index` (default 0), `:name` (default
-  `#{inspect(__MODULE__)}`), `:drop_echoes` (default `true`), and the
-  `Bluez.*` implementation modules `:bluez_radio`, `:mgmt`, `:rebus`,
-  `:dbus`, `:receiver` (defaults are the real ones).
+  `#{inspect(__MODULE__)}`), `:drop_echoes` (default `true`),
+  `:retry_ms` (first setup retry delay, default #{@retry_ms}; doubles up
+  to #{@max_retry_ms}), and the `Bluez.*` implementation modules
+  `:bluez_radio`, `:mgmt`, `:rebus`, `:dbus`, `:receiver` (defaults are
+  the real ones).
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
@@ -89,11 +108,12 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   Queues `frame` (26 bytes) for `duration_ms` of advertising. `:class` is
   `:normal` (default) or `:control`; a `:control` send drops queued
   `:normal` frames. Returns `:ok` once the frame is on air or queued,
-  `{:error, :not_running}` when the radio is down, `{:error, :bad_frame}`
-  for a non-26-byte frame.
+  `{:error, :not_ready}` while setup is pending or being retried (see the
+  moduledoc), `{:error, :not_running}` when the radio process is down,
+  `{:error, :bad_frame}` for a non-26-byte frame.
   """
   @spec send_frame(binary(), non_neg_integer(), keyword()) ::
-          :ok | {:error, :not_running | :bad_frame}
+          :ok | {:error, :not_running | :not_ready | :bad_frame}
   def send_frame(frame, duration_ms, opts \\ [])
 
   def send_frame(<<_::binary-size(26)>> = frame, duration_ms, opts)
@@ -115,7 +135,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   @doc """
   Subscribes `pid` to `{:tuya_report, report}` messages matching
   `filter` (`:all`, `:unpaired` or `{:mac, mac}`). The pid is monitored
-  and dropped when it exits.
+  and dropped when it exits. Works while the radio is not ready; reports
+  start once it is.
   """
   @spec subscribe(pid(), :all | :unpaired | {:mac, String.t()}, GenServer.server()) ::
           :ok | {:error, :not_running | :bad_filter}
@@ -143,9 +164,10 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   end
 
   @doc """
-  Radio state: adapter index, lease held, discovery on, receiver
-  listening, subscriber count, what's on air (`:tx`) and how many frames
-  are queued (`:queued`).
+  Radio state: whether setup completed (`:ready`) and why it last failed
+  (`:last_error`, `nil` once ready), adapter index, lease held, discovery
+  on, receiver listening, subscriber count, what's on air (`:tx`) and how
+  many frames are queued (`:queued`).
   """
   @spec status(keyword()) :: {:ok, map()} | {:error, :not_running}
   def status(opts \\ []) do
@@ -185,6 +207,15 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
 
   @impl GenServer
   def init(opts) do
+    # Trapping exits turns a crash of the linked AdvertReceiver into an
+    # {:EXIT, rx, _} we answer by re-running setup, instead of taking this
+    # process (and its subscriptions and queue) down with it. It also makes
+    # a supervisor shutdown run terminate/2, so the advert, discovery and
+    # lease are cleaned up explicitly; gen_server still honours the
+    # parent's EXIT itself before handle_info sees it.
+    Process.flag(:trap_exit, true)
+    retry_ms = Keyword.get(opts, :retry_ms, @retry_ms)
+
     state = %{
       adapter_index: Keyword.get(opts, :adapter_index, 0),
       bluez_radio: Keyword.get(opts, :bluez_radio, Bluez.Radio),
@@ -193,8 +224,15 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
       dbus: Keyword.get(opts, :dbus, Bluez.DBus),
       receiver: Keyword.get(opts, :receiver, Bluez.AdvertReceiver),
       drop_echoes: Keyword.get(opts, :drop_echoes, true),
+      ready: false,
+      last_error: nil,
+      retry_ms: retry_ms,
+      backoff_ms: retry_ms,
+      retry_timer: nil,
+      radio_mon: nil,
       lease: nil,
       conn: nil,
+      conn_mon: nil,
       rx: nil,
       rx_name: nil,
       discovering: false,
@@ -209,62 +247,149 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   end
 
   @impl GenServer
-  def handle_continue(:setup, state) do
+  def handle_continue(:setup, state), do: {:noreply, attempt_setup(state)}
+
+  # ── Setup / retry ────────────────────────────────────────────────────
+
+  defp attempt_setup(state) do
     case setup(state) do
-      {:ok, state} -> {:noreply, state}
-      {:error, reason} -> {:stop, reason, state}
+      {:ok, state} ->
+        if state.last_error != nil do
+          Logger.info("#{inspect(__MODULE__)}: ready on hci#{state.adapter_index}")
+        end
+
+        %{state | ready: true, last_error: nil, backoff_ms: state.retry_ms}
+
+      {:error, reason, state} ->
+        state |> teardown() |> not_ready(reason)
     end
   end
 
+  # Each step records what it got in the state it returns (also on error),
+  # so teardown/1 can undo exactly that much.
   defp setup(state) do
-    ensure_started(state.bluez_radio)
-    ensure_started(state.mgmt)
-
-    with {:ok, lease} <- acquire(state),
-         {:ok, conn} <- connect(state),
-         :ok <- start_discovery(state, conn),
-         {:ok, rx, rx_name} <- start_receiver(state) do
-      {:ok, %{state | lease: lease, conn: conn, rx: rx, rx_name: rx_name, discovering: true}}
+    with {:ok, state} <- probe_mgmt(state),
+         {:ok, state} <- watch_bluez_radio(state),
+         {:ok, state} <- acquire(state),
+         {:ok, state} <- connect(state),
+         {:ok, state} <- start_discovery(state) do
+      start_receiver(state)
     end
   end
 
-  # The Bluetooth stack may already run these; either answer is fine.
-  defp ensure_started(module) do
-    case module.start_link([]) do
-      {:ok, _pid} -> :ok
-      {:error, {:already_started, _pid}} -> :ok
-      {:error, _reason} -> :ok
+  # A runtime loss while ready: undo everything and retry from the start
+  # of the backoff (reason is new: last_error is nil while ready).
+  defp lost(%{ready: true} = state, reason),
+    do: not_ready(%{teardown(state) | backoff_ms: state.retry_ms}, reason)
+
+  # Already retrying: the next attempt rebuilds whatever this was.
+  defp lost(state, _reason), do: state
+
+  defp not_ready(state, reason) do
+    if reason != state.last_error do
+      Logger.warning(
+        "#{inspect(__MODULE__)}: hci#{state.adapter_index} not ready (#{inspect(reason)}), retrying"
+      )
+    end
+
+    if state.retry_timer, do: Process.cancel_timer(state.retry_timer)
+    timer = Process.send_after(self(), :retry_setup, state.backoff_ms)
+
+    %{
+      state
+      | ready: false,
+        last_error: reason,
+        retry_timer: timer,
+        backoff_ms: min(state.backoff_ms * 2, @max_retry_ms)
+    }
+  end
+
+  # Takes everything setup got back down, except the D-Bus connection and
+  # the Bluez.Radio subscription, which are reused by the next attempt.
+  defp teardown(state) do
+    state = stop_current(state)
+    state = %{state | tx_queue: :queue.new(), ready: false}
+    state = stop_receiver(state)
+    state = stop_discovery(state)
+
+    if state.lease != nil, do: state.bluez_radio.release(state.lease)
+    %{state | lease: nil}
+  end
+
+  defp probe_mgmt(state) do
+    case state.mgmt.read_advertising_features(state.adapter_index) do
+      {:ok, _features} -> {:ok, state}
+      {:error, reason} -> {:error, {:mgmt, reason}, state}
     end
   end
+
+  # Subscribed before acquiring, so a lease end can't slip in between.
+  defp watch_bluez_radio(%{radio_mon: nil} = state) do
+    case state.bluez_radio.subscribe() do
+      {:ok, pid} -> {:ok, %{state | radio_mon: Process.monitor(pid)}}
+      {:error, reason} -> {:error, {:bluez_radio, reason}, state}
+    end
+  end
+
+  defp watch_bluez_radio(state), do: {:ok, state}
 
   defp acquire(state) do
     case state.bluez_radio.acquire(adapter_index: state.adapter_index) do
-      {:ok, lease} -> {:ok, lease}
-      {:error, reason} -> {:error, {:lease, reason}}
+      {:ok, lease} -> {:ok, %{state | lease: lease}}
+      {:error, reason} -> {:error, {:lease, reason}, state}
     end
   end
 
-  defp connect(state) do
-    case state.rebus.connect(:system) do
-      {:ok, conn} -> {:ok, conn}
-      {:error, reason} -> {:error, {:dbus_connect, reason}}
+  # The connection is bound to this process (rebus closes it when we
+  # exit) but not linked, so it is monitored instead.
+  defp connect(%{conn: nil} = state) do
+    case rebus_connect(state) do
+      {:ok, conn} when is_pid(conn) ->
+        {:ok, %{state | conn: conn, conn_mon: Process.monitor(conn)}}
+
+      other ->
+        {:error, {:dbus_connect, other}, state}
     end
   end
 
-  defp start_discovery(state, conn) do
-    path = "/org/bluez/hci#{state.adapter_index}"
+  defp connect(state), do: {:ok, state}
+
+  # Bluez.Rebus.connect/1 exits when its ConnectionSupervisor isn't up.
+  defp rebus_connect(state) do
+    state.rebus.connect(:system)
+  catch
+    :exit, reason -> {:exit, reason}
+  end
+
+  defp start_discovery(state) do
     filter = [{"Transport", {"s", "le"}}, {"DuplicateData", {"b", true}}]
 
-    with {:ok, _} <-
-           state.dbus.call(conn, path, "org.bluez.Adapter1", "SetDiscoveryFilter", "a{sv}", [
-             filter
-           ]),
-         {:ok, _} <-
-           state.dbus.call(conn, path, "org.bluez.Adapter1", "StartDiscovery", "", []) do
-      :ok
+    with {:ok, _} <- adapter_call(state, "SetDiscoveryFilter", "a{sv}", [filter]),
+         {:ok, _} <- start_discovery_call(state) do
+      {:ok, %{state | discovering: true}}
     else
-      {:error, reason} -> {:error, {:discovery, reason}}
+      {:error, reason} -> {:error, {:discovery, reason}, state}
     end
+  end
+
+  defp start_discovery_call(state) do
+    case adapter_call(state, "StartDiscovery", "", []) do
+      # Already discovering for this connection: goal reached.
+      {:error, "org.bluez.Error.InProgress"} -> {:ok, []}
+      other -> other
+    end
+  end
+
+  defp stop_discovery(%{discovering: true, conn: conn} = state) when conn != nil do
+    _ = adapter_call(state, "StopDiscovery", "", [])
+    %{state | discovering: false}
+  end
+
+  defp stop_discovery(state), do: %{state | discovering: false}
+
+  defp adapter_call(state, member, signature, body) do
+    path = "/org/bluez/hci#{state.adapter_index}"
+    state.dbus.call(state.conn, path, "org.bluez.Adapter1", member, signature, body)
   end
 
   defp start_receiver(state) do
@@ -281,20 +406,39 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
 
     name = Module.concat(__MODULE__, "Rx#{state.adapter_index}")
 
+    # `{:already_started, pid}` is not ours (not linked, not stopped on
+    # teardown): an error like any other, retried.
     case state.receiver.start_link(
            name: name,
            adapter_index: state.adapter_index,
            on_report: on_report
          ) do
-      {:ok, pid} -> {:ok, pid, name}
-      {:error, {:already_started, pid}} -> {:ok, pid, name}
-      {:error, reason} -> {:error, {:receiver, reason}}
+      {:ok, pid} -> {:ok, %{state | rx: pid, rx_name: name}}
+      {:error, reason} -> {:error, {:receiver, reason}, state}
     end
   end
+
+  # Unlinked first, so stopping it doesn't come back as an {:EXIT, ...}.
+  defp stop_receiver(%{rx: rx} = state) when is_pid(rx) do
+    Process.unlink(rx)
+
+    try do
+      GenServer.stop(rx, :normal, 2_000)
+    catch
+      :exit, _reason -> :ok
+    end
+
+    %{state | rx: nil, rx_name: nil}
+  end
+
+  defp stop_receiver(state), do: %{state | rx: nil, rx_name: nil}
 
   # ── TX ───────────────────────────────────────────────────────────────
 
   @impl GenServer
+  def handle_call({:send_frame, _frame, _duration_ms, _class}, _from, %{ready: false} = state),
+    do: {:reply, {:error, :not_ready}, state}
+
   def handle_call({:send_frame, frame, duration_ms, class}, _from, state) do
     state =
       if class == :control,
@@ -302,7 +446,10 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
         else: state
 
     job = %{frame: frame, duration_ms: duration_ms, class: class, norm: P2.normalize(frame)}
-    {:reply, :ok, maybe_start_next(%{state | tx_queue: :queue.in(job, state.tx_queue)})}
+    state = maybe_start_next(%{state | tx_queue: :queue.in(job, state.tx_queue)})
+
+    # Starting it may have found the lease gone (see maybe_start_next/1).
+    {:reply, if(state.ready, do: :ok, else: {:error, :not_ready}), state}
   end
 
   def handle_call(:stop_tx, _from, state) do
@@ -333,6 +480,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
 
   def handle_call(:status, _from, state) do
     status = %{
+      ready: state.ready,
+      last_error: state.last_error,
       adapter_index: state.adapter_index,
       lease_held: state.lease != nil and state.bluez_radio.valid?(state.lease),
       discovering: state.discovering,
@@ -359,37 +508,43 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
     {:noreply, maybe_start_next(stop_current(state))}
   end
 
+  def handle_info(:retry_setup, %{ready: false} = state),
+    do: {:noreply, attempt_setup(%{state | retry_timer: nil})}
+
+  # Bluez.Radio notifies every subscriber of every lease end; only ours
+  # matters. Mgmt has already taken its adverts off air.
+  def handle_info({:radio_lease_ended, ref}, %{lease: %{ref: ref}} = state) do
+    {:noreply, lost(%{state | lease: nil}, :lease_ended)}
+  end
+
+  def handle_info({:DOWN, mon, :process, _pid, reason}, %{radio_mon: mon} = state) do
+    state = %{state | radio_mon: nil, lease: nil}
+    {:noreply, lost(state, {:bluez_radio_down, reason})}
+  end
+
+  # BlueZ drops a client's discovery session when its connection closes.
+  def handle_info({:DOWN, mon, :process, _pid, reason}, %{conn_mon: mon} = state) do
+    state = %{state | conn: nil, conn_mon: nil, discovering: false}
+    {:noreply, lost(state, {:dbus_down, reason})}
+  end
+
   def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
     {:noreply, %{state | subscribers: Map.delete(state.subscribers, pid)}}
   end
+
+  def handle_info({:EXIT, rx, reason}, %{rx: rx} = state) when is_pid(rx) do
+    {:noreply, lost(%{state | rx: nil, rx_name: nil}, {:receiver_exit, reason})}
+  end
+
+  # The receiver is the only link we make, and the parent's EXIT never gets
+  # here; anything else (an earlier receiver, a failed start_link) is stale.
+  def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
 
   def handle_info(_other, state), do: {:noreply, state}
 
   @impl GenServer
   def terminate(_reason, state) do
-    _ = stop_current(state)
-
-    if state.conn != nil and state.discovering do
-      _ =
-        state.dbus.call(
-          state.conn,
-          "/org/bluez/hci#{state.adapter_index}",
-          "org.bluez.Adapter1",
-          "StopDiscovery",
-          "",
-          []
-        )
-    end
-
-    if state.rx != nil and Process.alive?(state.rx) do
-      try do
-        GenServer.stop(state.rx, :normal, 2_000)
-      catch
-        :exit, _reason -> :ok
-      end
-    end
-
-    if state.lease != nil, do: state.bluez_radio.release(state.lease)
+    _ = teardown(state)
     :ok
   end
 
@@ -397,7 +552,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
     :queue.filter(fn job -> job.class != class end, queue)
   end
 
-  defp maybe_start_next(%{tx_current: nil} = state) do
+  defp maybe_start_next(%{tx_current: nil, ready: true} = state) do
     case :queue.out(state.tx_queue) do
       {{:value, job}, queue} ->
         case state.mgmt.advertise(state.lease, Carrier.ad_bytes(job.frame), flags: [:connectable]) do
@@ -411,9 +566,12 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
                 recent_tx: Enum.take([job.norm | state.recent_tx], @recent_tx_max)
             }
 
+          {:error, reason} when reason in @fatal_advertise_errors ->
+            lost(%{state | tx_queue: queue}, {:advertise, reason})
+
           {:error, reason} ->
             Logger.warning(
-              "UniversalProxy.TuyaBeaconMesh.Radio: advertise failed (#{inspect(reason)}), dropping frame"
+              "#{inspect(__MODULE__)}: advertise failed (#{inspect(reason)}), dropping frame"
             )
 
             maybe_start_next(%{state | tx_queue: queue})
@@ -430,7 +588,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
 
   defp stop_current(%{tx_current: current} = state) do
     Process.cancel_timer(current.timer)
-    _ = state.mgmt.stop_advertising(state.lease, current.instance)
+
+    # Without a lease (it ended) Mgmt has already removed the instance.
+    if state.lease != nil, do: state.mgmt.stop_advertising(state.lease, current.instance)
     %{state | tx_current: nil}
   end
 
