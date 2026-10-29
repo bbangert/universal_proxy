@@ -16,7 +16,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
 
   require Logger
 
-  alias UniversalProxy.TuyaBeaconMesh.{Control, Inventory, P2, Radio, Seq}
+  alias UniversalProxy.TuyaBeaconMesh.{Control, Dp, Inventory, P2, Radio, Seq}
 
   @type persist_fun :: (Inventory.t() -> any())
 
@@ -104,22 +104,24 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
 
   @impl GenServer
   def init(opts) do
-    with {:ok, inv} <- decode_inventory(Keyword.fetch!(opts, :inventory)) do
-      state = %{
-        radio: Keyword.get(opts, :radio, Radio),
-        on_persist: Keyword.get(opts, :on_persist, fn _inv -> :ok end),
-        beacon_key: inv.beacon_key,
-        seq: Seq.new(inv.seq),
-        sns: [],
-        inventory: inv,
-        bulbs: bulbs_from(inv),
-        by_node: by_node(inv),
-        groups: groups_from(inv)
-      }
+    case decode_inventory(Keyword.fetch!(opts, :inventory)) do
+      {:ok, inv} ->
+        state = %{
+          radio: Keyword.get(opts, :radio, Radio),
+          on_persist: Keyword.get(opts, :on_persist, fn _inv -> :ok end),
+          beacon_key: inv.beacon_key,
+          seq: Seq.new(inv.seq),
+          sns: [],
+          inventory: inv,
+          bulbs: bulbs_from(inv),
+          by_node: by_node(inv),
+          groups: groups_from(inv)
+        }
 
-      {:ok, state, {:continue, :subscribe}}
-    else
-      {:error, reason} -> {:stop, reason}
+        {:ok, state, {:continue, :subscribe}}
+
+      {:error, reason} ->
+        {:stop, reason}
     end
   end
 
@@ -264,7 +266,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
 
   defp apply_report(bulb, %{type: 1, sub_cmd: sub, payload: payload})
        when sub in [7, 9, 10, 11] do
-    dps = Map.new(UniversalProxy.TuyaBeaconMesh.Dp.decode(payload), fn {id, _, v} -> {id, v} end)
+    dps = Map.new(Dp.decode(payload), fn {id, _, v} -> {id, v} end)
     %{bulb | dps: Map.merge(bulb.dps, dps), last_event: {:dp_report, sub}}
   end
 
@@ -332,11 +334,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   defp resolve(state, who) do
     mac = normalize_mac(who)
 
-    cond do
-      Map.has_key?(state.bulbs, mac) ->
-        {:ok, mac, state.bulbs[mac]}
+    case Map.fetch(state.bulbs, mac) do
+      {:ok, bulb} ->
+        {:ok, mac, bulb}
 
-      true ->
+      :error ->
         case Enum.find(state.bulbs, fn {_m, b} -> b.label == who end) do
           {mac, bulb} -> {:ok, mac, bulb}
           nil -> {:error, :unknown_bulb}

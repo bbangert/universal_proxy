@@ -116,36 +116,38 @@ defmodule UniversalProxy.TuyaBeaconMesh.Inventory do
   end
 
   defp fetch_bulbs(map, mesh_key) do
-    raw = first(map, ["bulbs", "lights"]) || []
+    case first(map, ["bulbs", "lights"]) || [] do
+      [_ | _] = raw -> decode_bulbs(raw, mesh_key)
+      _ -> {:error, :no_bulbs}
+    end
+  end
 
-    if not is_list(raw) or raw == [] do
-      {:error, :no_bulbs}
-    else
-      raw
-      |> Enum.reduce_while({:ok, [], MapSet.new(), MapSet.new()}, fn row,
-                                                                     {:ok, acc, macs, nodes} ->
-        case decode_bulb(row, mesh_key) do
-          {:ok, bulb} ->
-            cond do
-              MapSet.member?(macs, bulb.mac) ->
-                {:halt, {:error, {:duplicate_mac, bulb.mac}}}
-
-              MapSet.member?(nodes, bulb.node_id) ->
-                {:halt, {:error, {:duplicate_node_id, bulb.node_id, bulb.mac}}}
-
-              true ->
-                {:cont,
-                 {:ok, [bulb | acc], MapSet.put(macs, bulb.mac), MapSet.put(nodes, bulb.node_id)}}
-            end
-
-          {:error, reason} ->
-            {:halt, {:error, reason}}
-        end
-      end)
-      |> case do
-        {:ok, bulbs, _macs, _nodes} -> {:ok, Enum.reverse(bulbs)}
-        {:error, _} = err -> err
+  defp decode_bulbs(raw, mesh_key) do
+    raw
+    |> Enum.reduce_while({:ok, [], MapSet.new(), MapSet.new()}, fn row, {:ok, acc, macs, nodes} ->
+      with {:ok, bulb} <- decode_bulb(row, mesh_key),
+           :ok <- check_unique(bulb, macs, nodes) do
+        {:cont, {:ok, [bulb | acc], MapSet.put(macs, bulb.mac), MapSet.put(nodes, bulb.node_id)}}
+      else
+        {:error, _} = err -> {:halt, err}
       end
+    end)
+    |> case do
+      {:ok, bulbs, _macs, _nodes} -> {:ok, Enum.reverse(bulbs)}
+      {:error, _} = err -> err
+    end
+  end
+
+  defp check_unique(bulb, macs, nodes) do
+    cond do
+      MapSet.member?(macs, bulb.mac) ->
+        {:error, {:duplicate_mac, bulb.mac}}
+
+      MapSet.member?(nodes, bulb.node_id) ->
+        {:error, {:duplicate_node_id, bulb.node_id, bulb.mac}}
+
+      true ->
+        :ok
     end
   end
 
@@ -201,23 +203,27 @@ defmodule UniversalProxy.TuyaBeaconMesh.Inventory do
   end
 
   defp fetch_groups(map, bulbs) do
-    raw = first(map, ["groups"]) || []
-    known = MapSet.new(Enum.map(bulbs, & &1.mac))
+    case first(map, ["groups"]) || [] do
+      raw when is_list(raw) ->
+        known = MapSet.new(Enum.map(bulbs, & &1.mac))
+        decode_groups(raw, known)
 
-    if not is_list(raw) do
-      {:error, :bad_groups}
-    else
-      raw
-      |> Enum.reduce_while({:ok, []}, fn row, {:ok, acc} ->
-        case decode_group(row, known) do
-          {:ok, group} -> {:cont, {:ok, [group | acc]}}
-          {:error, reason} -> {:halt, {:error, reason}}
-        end
-      end)
-      |> case do
-        {:ok, groups} -> {:ok, Enum.reverse(groups)}
-        {:error, _} = err -> err
+      _ ->
+        {:error, :bad_groups}
+    end
+  end
+
+  defp decode_groups(raw, known) do
+    raw
+    |> Enum.reduce_while({:ok, []}, fn row, {:ok, acc} ->
+      case decode_group(row, known) do
+        {:ok, group} -> {:cont, {:ok, [group | acc]}}
+        {:error, reason} -> {:halt, {:error, reason}}
       end
+    end)
+    |> case do
+      {:ok, groups} -> {:ok, Enum.reverse(groups)}
+      {:error, _} = err -> err
     end
   end
 

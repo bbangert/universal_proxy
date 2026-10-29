@@ -51,40 +51,43 @@ defmodule UniversalProxy.TuyaBeaconMesh.Control do
   def friendly_dps(dps) when is_map(dps), do: friendly_dps(Map.to_list(dps))
 
   def friendly_dps(dps) when is_list(dps) do
-    result =
-      Enum.reduce_while(dps, {:ok, []}, fn
-        {:on, on}, {:ok, acc} when is_boolean(on) ->
-          {:cont, {:ok, acc ++ [{1, :bool, on}]}}
-
-        {:brightness, v}, {:ok, acc} when is_integer(v) and v in 10..1000 ->
-          {:cont, {:ok, acc ++ [{3, :value, v}]}}
-
-        {:temp, v}, {:ok, acc} when is_integer(v) and v in 0..1000 ->
-          {:cont, {:ok, acc ++ [{4, :value, v}]}}
-
-        {:colour, {h, s, v}}, {:ok, acc}
-        when is_integer(h) and h in 0..359 and is_integer(s) and s in 0..100 and
-               is_integer(v) and v in 0..100 ->
-          {:cont, {:ok, acc ++ [{11, :raw, <<h::16-big, s, v>>}]}}
-
-        {:mode, mode}, {:ok, acc} when is_atom(mode) ->
-          case Map.fetch(@modes, mode) do
-            {:ok, idx} -> {:cont, {:ok, acc ++ [{2, :enum, idx}]}}
-            :error -> {:halt, {:error, {:bad_mode, mode}}}
-          end
-
-        {:mode, idx}, {:ok, acc} when is_integer(idx) and idx in 0..255 ->
-          {:cont, {:ok, acc ++ [{2, :enum, idx}]}}
-
-        {key, value}, {:ok, _acc} ->
-          {:halt, {:error, {:bad_dp, key, value}}}
-      end)
-
-    case result do
+    dps
+    |> Enum.reduce_while({:ok, []}, fn entry, {:ok, acc} ->
+      case friendly_dp(entry) do
+        {:ok, dp} -> {:cont, {:ok, [dp | acc]}}
+        {:error, _} = err -> {:halt, err}
+      end
+    end)
+    |> case do
       {:ok, []} -> {:error, :no_dps}
-      other -> other
+      {:ok, acc} -> {:ok, Enum.reverse(acc)}
+      {:error, _} = err -> err
     end
   end
+
+  defp friendly_dp({:on, on}) when is_boolean(on), do: {:ok, {1, :bool, on}}
+
+  defp friendly_dp({:brightness, v}) when is_integer(v) and v in 10..1000,
+    do: {:ok, {3, :value, v}}
+
+  defp friendly_dp({:temp, v}) when is_integer(v) and v in 0..1000, do: {:ok, {4, :value, v}}
+
+  defp friendly_dp({:colour, {h, s, v}})
+       when is_integer(h) and h in 0..359 and is_integer(s) and s in 0..100 and
+              is_integer(v) and v in 0..100,
+       do: {:ok, {11, :raw, <<h::16-big, s, v>>}}
+
+  defp friendly_dp({:mode, mode}) when is_atom(mode) do
+    case Map.fetch(@modes, mode) do
+      {:ok, idx} -> {:ok, {2, :enum, idx}}
+      :error -> {:error, {:bad_mode, mode}}
+    end
+  end
+
+  defp friendly_dp({:mode, idx}) when is_integer(idx) and idx in 0..255,
+    do: {:ok, {2, :enum, idx}}
+
+  defp friendly_dp({key, value}), do: {:error, {:bad_dp, key, value}}
 
   @doc """
   Builds a unicast DP set (optionally ack-requesting) for one bulb.
