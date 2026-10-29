@@ -30,6 +30,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.P2 do
   | broadcast ping (`FF FF`) | beaconKey | beaconKey |
   | device → phone | beaconKey | beaconKey |
 
+  The app nominally keys group frames with a groupKey, but bulbs never learn
+  a distinct one: on hardware the groupKey *is* the beaconKey (see
+  `docs/protocols/notes/tuya_beacon_mesh_extraction.md`), which is what
+  `UniversalProxy.TuyaBeaconMesh.Control` passes.
+
   Addresses (`src`, `dst`, node IDs) may be given as 2-byte binaries or as
   integers `0..0xFFFF`; parsed frames always return them as 2-byte binaries.
 
@@ -230,7 +235,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.P2 do
   #
   # Callers pass the key/mask pair for the destination (see the table in the
   # moduledoc): unicast is `(localKey, beaconKey)`, a group destination is
-  # `(groupKey, beaconKey)`, and a broadcast ping is `(beaconKey, beaconKey)`.
+  # `(groupKey, beaconKey)` (groupKey = beaconKey in practice), and a
+  # broadcast ping is `(beaconKey, beaconKey)`.
 
   @doc """
   DP set with no acknowledgement (type 1, subCmd `0x05`, §4.7: send 3000 ms,
