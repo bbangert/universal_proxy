@@ -1,0 +1,159 @@
+{
+  "calls": [
+    {
+      "canonical": "a=thing.m.user.username.code.get||appVersion=7.12.0||chKey=ec9709a4||clientId=ekmnwp9f5pnh3trdtpgy||deviceId=8f25b3c2dab58dcc3cf33be653847c5463f6fcae4022||et=3||lang=en||os=Android||postData=864feac639c7b88884d2de9bd6396c54||requestId=3f1c2a9e-7b4d-4e21-9a6f-0c5d8e7b1a23||time=1761427200||ttid=sdk_international@ekmnwp9f5pnh3trdtpgy||v=3.0",
+      "params": {
+        "a": "thing.m.user.username.code.get",
+        "appVersion": "7.12.0",
+        "chKey": "ec9709a4",
+        "channel": "sdk",
+        "clientId": "ekmnwp9f5pnh3trdtpgy",
+        "cp": "gzip",
+        "deviceId": "8f25b3c2dab58dcc3cf33be653847c5463f6fcae4022",
+        "et": "3",
+        "lang": "en",
+        "nd": "1",
+        "os": "Android",
+        "osSystem": "14",
+        "platform": "Pixel 7",
+        "postData": "AQIDBAUGBwgJCgsMpVAWdGYScCsO2SpG2Rr9HwiYxlFXv57DtHh1aJPDYK37ImvDBkffALt7lZG6q0ViCsfPMM6TKYkYIqrVc96YEkN/tVrm8xvyKDeJ6nDTeZBzYHcOg9lUlKU=",
+        "requestId": "3f1c2a9e-7b4d-4e21-9a6f-0c5d8e7b1a23",
+        "sign": "2801cc2945cf7ee0c7a040a65a2d85fce1be9f832697554cae80d8e1eea65f1f",
+        "time": "1761427200",
+        "timeZoneId": "UTC",
+        "ttid": "sdk_international@ekmnwp9f5pnh3trdtpgy",
+        "v": "3.0"
+      },
+      "url": "https://a1.tuyaus.com/api.json"
+    },
+    {
+      "canonical": "a=m.life.my.group.device.list||appVersion=7.12.0||chKey=ec9709a4||clientId=ekmnwp9f5pnh3trdtpgy||deviceId=8f25b3c2dab58dcc3cf33be653847c5463f6fcae4022||et=3||lang=en||os=Android||postData=2653e7cbc8cdac9e2f40f2082f1f97f8||requestId=3f1c2a9e-7b4d-4e21-9a6f-0c5d8e7b1a23||sid=sid-xyz||time=1761427200||ttid=sdk_international@ekmnwp9f5pnh3trdtpgy||v=2.2",
+      "params": {
+        "a": "m.life.my.group.device.list",
+        "appVersion": "7.12.0",
+        "chKey": "ec9709a4",
+        "channel": "sdk",
+        "clientId": "ekmnwp9f5pnh3trdtpgy",
+        "cp": "gzip",
+        "deviceId": "8f25b3c2dab58dcc3cf33be653847c5463f6fcae4022",
+        "et": "3",
+        "gid": "42",
+        "lang": "en",
+        "nd": "1",
+        "os": "Android",
+        "osSystem": "14",
+        "platform": "Pixel 7",
+        "postData": "AQIDBAUGBwgJCgsMwefKN4JkqvWknjOR24G/u/3zj8uXYI3cWkY=",
+        "requestId": "3f1c2a9e-7b4d-4e21-9a6f-0c5d8e7b1a23",
+        "sid": "sid-xyz",
+        "sign": "f8221bcad4d5dcc010677d6ae01d35ff117333e877e18bc90239bedd34205c58",
+        "time": "1761427200",
+        "timeZoneId": "UTC",
+        "ttid": "sdk_international@ekmnwp9f5pnh3trdtpgy",
+        "v": "2.2"
+      },
+      "url": "https://a1.tuyaus.com/api.json"
+    },
+    {
+      "canonical": "a=m.life.home.space.list||appVersion=7.12.0||chKey=ec9709a4||clientId=ekmnwp9f5pnh3trdtpgy||deviceId=8f25b3c2dab58dcc3cf33be653847c5463f6fcae4022||et=3||lang=en||os=Android||requestId=3f1c2a9e-7b4d-4e21-9a6f-0c5d8e7b1a23||sid=sid-xyz||time=1761427200||ttid=sdk_international@ekmnwp9f5pnh3trdtpgy||v=1.0",
+      "params": {
+        "a": "m.life.home.space.list",
+        "appVersion": "7.12.0",
+        "chKey": "ec9709a4",
+        "channel": "sdk",
+        "clientId": "ekmnwp9f5pnh3trdtpgy",
+        "cp": "gzip",
+        "deviceId": "8f25b3c2dab58dcc3cf33be653847c5463f6fcae4022",
+        "et": "3",
+        "lang": "en",
+        "nd": "1",
+        "os": "Android",
+        "osSystem": "14",
+        "platform": "Pixel 7",
+        "requestId": "3f1c2a9e-7b4d-4e21-9a6f-0c5d8e7b1a23",
+        "sid": "sid-xyz",
+        "sign": "8e42457732bc3a577e7ef5da26423ac43d8730ab79c0ec74e2db0f860d1af9fd",
+        "time": "1761427200",
+        "timeZoneId": "UTC",
+        "ttid": "sdk_international@ekmnwp9f5pnh3trdtpgy",
+        "v": "1.0"
+      },
+      "url": "https://a1.tuyaus.com/api.json"
+    }
+  ],
+  "channel_key": "ec9709a4",
+  "decrypt_result": {
+    "gzip": "AQIDBAUGBwgJCgsMpU6lXuZGkMGU4D/0wJW0O1P0Dfwu10p+l9GjobGKXPajmQ/M6i5QGuXDJedFu8At/agiJtmk4TJLGuqAgtpro/wXLSTv/vJ9rX5hrVk=",
+    "json": {
+      "nested": {
+        "a": [
+          1,
+          2
+        ]
+      },
+      "sid": "s1",
+      "uid": "az123"
+    },
+    "key": "6afafc287be134c6",
+    "plain": "AQIDBAUGBwgJCgsMwefYN4JkquP3maWQ2XrUSJLPI3ImwQsZZ6yrySdzJRILB+FVWhtSj+TbWBwyHO3g/cworiTeg0SRRS7M8FBj"
+  },
+  "ecode": "abc123ecode",
+  "encrypt_body": {
+    "body_json": "{\"countryCode\":\"1\",\"username\":\"ben@example.com\",\"codeType\":1,\"server\":\"\"}",
+    "key": "ab6f6b7c611b1cbe",
+    "out": "AQIDBAUGBwgJCgsMpVAWdGYScCsO2SpG2Rr9HwiYxlFXv57DtHh1aJPDYK37ImvDBkffALt7lZG6q0ViCsfPMM6TKYkYIqrVc96YEkN/tVrm8xvyKDeJ6nDTeZBzYHcOg9lUlKU="
+  },
+  "global_material": "com.tuya.smartlife_0F:C3:61:99:9C:C0:C3:5B:A8:AC:A5:7D:AA:55:93:A2:0C:F5:57:27:70:2E:A8:5A:D7:B3:22:89:49:F8:88:FE_jfg5rs5kkmrj5mxahugvucrsvw43t48x_r3me7ghmxjevrvnpemwmhw3fxtacphyg",
+  "nonce": "0102030405060708090a0b0c",
+  "p2": {
+    "device_report": {
+      "beacon_key": "00112233445566778899aabbccddeeff",
+      "frame": "0b1234800001020765573d5041e7ee2cddeefe8b3467849733a4",
+      "parsed": {
+        "cmd": 1,
+        "dst": "8000",
+        "pair": false,
+        "payload": "0111010324000001f400000000000000",
+        "sn": 258,
+        "src": "1234",
+        "sub_cmd": 7
+      }
+    },
+    "pair_frame": {
+      "beacon_key": "00112233445566778899aabbccddeeff",
+      "frame": "93530fb34a0200124d4800ec463257ed3da4d4b4df741887cd3e",
+      "local_key": "abcdefghijklmnop",
+      "mac": "dc23530fb34a",
+      "node_id": "0012",
+      "round": 2
+    },
+    "pair_reply": {
+      "frame": "9b12348000000000bf72769295b09f1f5f73c883134a7cd987e5",
+      "parsed": {
+        "cmd": 3,
+        "dst": "8000",
+        "pair": true,
+        "payload": "a1b2c3d4000000000000000000000000",
+        "sn": 0,
+        "src": "1234",
+        "sub_cmd": 0
+      }
+    }
+  },
+  "password_md5": {
+    "in": "Secr3t!pw",
+    "out": "f7b878cce6c30feafd7d05826550d66c"
+  },
+  "post_data_md5": {
+    "in": "hello",
+    "out": "bc4b2a765d41402a1017c592b9719d91"
+  },
+  "request_id": "3f1c2a9e-7b4d-4e21-9a6f-0c5d8e7b1a23",
+  "request_key": "ab6f6b7c611b1cbe",
+  "request_key_ecode": "6afafc287be134c6",
+  "stable_device_id": {
+    "in": "ben@example.com",
+    "out": "8f25b3c2dab58dcc3cf33be653847c5463f6fcae4022"
+  },
+  "time": 1761427200
+}

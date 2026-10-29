@@ -1,0 +1,340 @@
+{
+  "adapter": "hci0 (Vagus board, Broadcom BT5.2)",
+  "captured": "2026-10-25",
+  "note": "AD bytes were 02 01 06 1B 03 <frame>; first_ms/last_ms relative to scan start; transformer switched on ~117 s",
+  "frames": [
+    {
+      "addr": "DC23530F957C",
+      "frame": "08000332527B440FAE44D343B7907A4C9F872D7DC8FE6334A5C1",
+      "first_ms": 459387,
+      "rssi": -87,
+      "hdr": 8,
+      "reports": 1,
+      "last_ms": 459387
+    },
+    {
+      "addr": "DC23533FDAF6",
+      "frame": "08000332527B440FAE44D343B7907A4C9F872D7DC8FE6334A5C1",
+      "first_ms": 459388,
+      "rssi": -90,
+      "hdr": 8,
+      "reports": 1,
+      "last_ms": 459388
+    },
+    {
+      "addr": "DC23533FDAF6",
+      "frame": "080BFF4C0010062E1ECA7D54CF3BF58FC3B2272700010001C532",
+      "first_ms": 328603,
+      "rssi": -90,
+      "hdr": 8,
+      "reports": 1,
+      "last_ms": 328603
+    },
+    {
+      "addr": "DC23530F7E38",
+      "frame": "0900030813C3C0A8027D1B5816080078D7FA3AE96F48D3C9502E",
+      "first_ms": 558724,
+      "rssi": -91,
+      "hdr": 9,
+      "reports": 1,
+      "last_ms": 558724
+    },
+    {
+      "addr": "DC23530F7E38",
+      "frame": "09000332527B440FAE44D343B7907A4C9F872D7DC8FE6334A5C1",
+      "first_ms": 459316,
+      "rssi": -95,
+      "hdr": 9,
+      "reports": 4,
+      "last_ms": 459429
+    },
+    {
+      "addr": "DC23530F89B0",
+      "frame": "09000332527B440FAE44D343B7907A4C9F872D7DC8FE6334A5C1",
+      "first_ms": 459304,
+      "rssi": -83,
+      "hdr": 9,
+      "reports": 3,
+      "last_ms": 459355
+    },
+    {
+      "addr": "DC23530F89B0",
+      "frame": "090BFF4C0010062E1ECA7D54CF3BF58FC3B2272700010001C532",
+      "first_ms": 328510,
+      "rssi": -79,
+      "hdr": 9,
+      "reports": 2,
+      "last_ms": 328529
+    },
+    {
+      "addr": "DC23530F9ED1",
+      "frame": "090BFF4C0010062E1ECA7D54CF3BF58FC3B2272700010001C532",
+      "first_ms": 328440,
+      "rssi": -80,
+      "hdr": 9,
+      "reports": 4,
+      "last_ms": 328532
+    },
+    {
+      "addr": "DC23530FB34A",
+      "frame": "090BFF4C0010062E1ECA7D54CF3BF58FC3B2272700010001C532",
+      "first_ms": 328501,
+      "rssi": -69,
+      "hdr": 9,
+      "reports": 1,
+      "last_ms": 328501
+    },
+    {
+      "addr": "DC23533FCD62",
+      "frame": "09000332527B440FAE44D343B7907A4C9F872D7DC8FE6334A5C1",
+      "first_ms": 459405,
+      "rssi": -91,
+      "hdr": 9,
+      "reports": 3,
+      "last_ms": 459427
+    },
+    {
+      "addr": "DC23530F7E38",
+      "frame": "0A0BFF4C0010062E1ECA7D54CF3BF58FC3B2272700010001C532",
+      "first_ms": 328407,
+      "rssi": -91,
+      "hdr": 10,
+      "reports": 4,
+      "last_ms": 328519
+    },
+    {
+      "addr": "DC23530FB34A",
+      "frame": "0A000332527B440FAE44D343B7907A4C9F872D7DC8FE6334A5C1",
+      "first_ms": 459297,
+      "rssi": -64,
+      "hdr": 10,
+      "reports": 7,
+      "last_ms": 459404
+    },
+    {
+      "addr": "DC23530FB34A",
+      "frame": "0A00030813C3C0A8027D1B5816080078D7FA3AE96F48D3C9502E",
+      "first_ms": 558589,
+      "rssi": -69,
+      "hdr": 10,
+      "reports": 6,
+      "last_ms": 558711
+    },
+    {
+      "addr": "DC23533FCD62",
+      "frame": "0A00030813C3C0A8027D1B5816080078D7FA3AE96F48D3C9502E",
+      "first_ms": 558588,
+      "rssi": -90,
+      "hdr": 10,
+      "reports": 7,
+      "last_ms": 558710
+    },
+    {
+      "addr": "DC23530F7E38",
+      "frame": "100013084AEAE534AD0741001C0929C2A2F501A4F1CF1434A5C1",
+      "first_ms": 339048,
+      "rssi": -85,
+      "hdr": 16,
+      "reports": 3,
+      "last_ms": 339138
+    },
+    {
+      "addr": "DC23530F89B0",
+      "frame": "100013084AEAE534AD0741001C0929C2A2F501A4F1CF1434A5C1",
+      "first_ms": 339057,
+      "rssi": -82,
+      "hdr": 16,
+      "reports": 3,
+      "last_ms": 339129
+    },
+    {
+      "addr": "DC23530F89B0",
+      "frame": "10000F0590005D3B6E10022304020A00D7FA3AE96F480102001D",
+      "first_ms": 444211,
+      "rssi": -80,
+      "hdr": 16,
+      "reports": 3,
+      "last_ms": 444251
+    },
+    {
+      "addr": "DC23530F957C",
+      "frame": "10000F0590005D3B6E10022304020A00D7FA3AE96F480102001D",
+      "first_ms": 444158,
+      "rssi": -84,
+      "hdr": 16,
+      "reports": 1,
+      "last_ms": 444158
+    },
+    {
+      "addr": "DC23530F9ED1",
+      "frame": "100013084AEAE534AD0741001C0929C2A2F501A4F1CF1434A5C1",
+      "first_ms": 339068,
+      "rssi": -78,
+      "hdr": 16,
+      "reports": 1,
+      "last_ms": 339068
+    },
+    {
+      "addr": "DC23530F9ED1",
+      "frame": "1008AC0B23244E6E972CEF2498DB910C4CE24388EC0001020026",
+      "first_ms": 469767,
+      "rssi": -82,
+      "hdr": 16,
+      "reports": 4,
+      "last_ms": 469848
+    },
+    {
+      "addr": "DC23530FB34A",
+      "frame": "10000F0590005D3B6E10022304020A00D7FA3AE96F480102001D",
+      "first_ms": 444117,
+      "rssi": -80,
+      "hdr": 16,
+      "reports": 3,
+      "last_ms": 444170
+    },
+    {
+      "addr": "DC23530FB34A",
+      "frame": "100009081362C0A802741B581608000DFE9DCEEA0A7166A8E990",
+      "first_ms": 375069,
+      "rssi": -70,
+      "hdr": 16,
+      "reports": 5,
+      "last_ms": 375181
+    },
+    {
+      "addr": "DC23533FCD62",
+      "frame": "100013084AEAE534AD0741001C0929C2A2F501A4F1CF1434A5C1",
+      "first_ms": 339090,
+      "rssi": -78,
+      "hdr": 16,
+      "reports": 3,
+      "last_ms": 339120
+    },
+    {
+      "addr": "DC23533FDAD9",
+      "frame": "10000F0590005D3B6E10022304020A00D7FA3AE96F480102001D",
+      "first_ms": 444127,
+      "rssi": -93,
+      "hdr": 16,
+      "reports": 1,
+      "last_ms": 444127
+    },
+    {
+      "addr": "DC23530F7E38",
+      "frame": "110009081362C0A802741B581608000DFE9DCEEA0A7166A8E990",
+      "first_ms": 375078,
+      "rssi": -85,
+      "hdr": 17,
+      "reports": 2,
+      "last_ms": 375139
+    },
+    {
+      "addr": "DC23530FB34A",
+      "frame": "110013084AEAE534AD0741001C0929C2A2F501A4F1CF1434A5C1",
+      "first_ms": 338995,
+      "rssi": -64,
+      "hdr": 17,
+      "reports": 10,
+      "last_ms": 339127
+    },
+    {
+      "addr": "DC23533FCD62",
+      "frame": "11000F0590005D3B6E10022304020A00D7FA3AE96F480102001D",
+      "first_ms": 444107,
+      "rssi": -78,
+      "hdr": 17,
+      "reports": 4,
+      "last_ms": 444156
+    },
+    {
+      "addr": "DC23530F7E38",
+      "frame": "8801A0616CDC23530F7E387664386F3630777912002EB21FE178",
+      "first_ms": 117201,
+      "rssi": -91,
+      "hdr": 136,
+      "reports": 3179,
+      "last_ms": 297097
+    },
+    {
+      "addr": "DC23530F89B0",
+      "frame": "88014EA8BEDC23530F89B07664386F36307779120017E2A7A50E",
+      "first_ms": 117238,
+      "rssi": -89,
+      "hdr": 136,
+      "reports": 6515,
+      "last_ms": 297126
+    },
+    {
+      "addr": "DC23530F957C",
+      "frame": "8801E53E95DC23530F957C7664386F3630777912008EE30D0966",
+      "first_ms": 117275,
+      "rssi": -83,
+      "hdr": 136,
+      "reports": 1871,
+      "last_ms": 297016
+    },
+    {
+      "addr": "DC23530F9ED1",
+      "frame": "880154CDFADC23530F9ED17664386F363077791200B90A0039D0",
+      "first_ms": 117273,
+      "rssi": -80,
+      "hdr": 136,
+      "reports": 3997,
+      "last_ms": 297150
+    },
+    {
+      "addr": "DC23530FA2F2",
+      "frame": "8801D21512DC23530FA2F27664386F363077791200EB28F5720A",
+      "first_ms": 117794,
+      "rssi": -98,
+      "hdr": 136,
+      "reports": 29,
+      "last_ms": 275092
+    },
+    {
+      "addr": "DC23530FB34A",
+      "frame": "880185795ADC23530FB34A7664386F36307779120016FC3C18E2",
+      "first_ms": 117209,
+      "rssi": -69,
+      "hdr": 136,
+      "reports": 7566,
+      "last_ms": 297120
+    },
+    {
+      "addr": "DC23533FCACD",
+      "frame": "8801184616DC23533FCACD7664386F3630777912008188C8C06E",
+      "first_ms": 118152,
+      "rssi": -96,
+      "hdr": 136,
+      "reports": 617,
+      "last_ms": 297135
+    },
+    {
+      "addr": "DC23533FCD62",
+      "frame": "880147847EDC23533FCD627664386F363077791200F3010C72B7",
+      "first_ms": 117216,
+      "rssi": -78,
+      "hdr": 136,
+      "reports": 4632,
+      "last_ms": 297137
+    },
+    {
+      "addr": "DC23533FDAD9",
+      "frame": "8801179C24DC23533FDAD97664386F36307779120010D3EE7E7A",
+      "first_ms": 117356,
+      "rssi": -94,
+      "hdr": 136,
+      "reports": 1552,
+      "last_ms": 297061
+    },
+    {
+      "addr": "DC23533FDAF6",
+      "frame": "88018258F7DC23533FDAF67664386F363077791200F3705A263A",
+      "first_ms": 117295,
+      "rssi": -90,
+      "hdr": 136,
+      "reports": 1055,
+      "last_ms": 296949
+    }
+  ]
+}
