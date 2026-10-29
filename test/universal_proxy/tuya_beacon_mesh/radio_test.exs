@@ -4,7 +4,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
   alias UniversalProxy.TuyaBeaconMesh.{Carrier, FakeBluez, P2, Radio}
 
   @key "jngwRugsvwtGN00a"
-  @capture "test/fixtures/tuya_beacon_mesh/p2_frames_2026-10-25.json" |> File.read!() |> Jason.decode!()
+  @capture "test/fixtures/tuya_beacon_mesh/p2_frames_2026-10-25.json"
+           |> File.read!()
+           |> Jason.decode!()
 
   defp h(hex), do: Base.decode16!(hex, case: :mixed)
 

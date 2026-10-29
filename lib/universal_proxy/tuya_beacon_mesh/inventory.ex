@@ -122,7 +122,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Inventory do
       {:error, :no_bulbs}
     else
       raw
-      |> Enum.reduce_while({:ok, [], MapSet.new(), MapSet.new()}, fn row, {:ok, acc, macs, nodes} ->
+      |> Enum.reduce_while({:ok, [], MapSet.new(), MapSet.new()}, fn row,
+                                                                     {:ok, acc, macs, nodes} ->
         case decode_bulb(row, mesh_key) do
           {:ok, bulb} ->
             cond do
@@ -182,7 +183,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Inventory do
 
   defp fetch_node_id(row) do
     case first(row, ["nodeId", "node_id"]) do
-      n when is_integer(n) and n in 0..0xFFFF -> {:ok, n}
+      n when is_integer(n) and n in 0..0xFFFF ->
+        {:ok, n}
+
       bin when is_binary(bin) ->
         case Integer.parse(bin) do
           {n, ""} when n in 0..0xFFFF -> {:ok, n}

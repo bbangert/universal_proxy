@@ -126,8 +126,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   @impl GenServer
   def handle_continue(:subscribe, state) do
     case Radio.subscribe(self(), :all, state.radio) do
-      :ok -> :ok
-      {:error, reason} -> Logger.warning("TuyaBeaconMesh.Lights: radio subscribe failed: #{inspect(reason)}")
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("TuyaBeaconMesh.Lights: radio subscribe failed: #{inspect(reason)}")
     end
 
     {:noreply, state}
