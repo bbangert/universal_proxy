@@ -59,6 +59,13 @@ Do not use `Bluez.Client` (singleton bound to the ESPHome scanner's adapter).
 via injectable `Bluez.Rebus` / `Bluez.DBus` / `Bluez.AdvertReceiver` /
 `Bluez.Radio` / `Bluez.Mgmt`. `main` must be on bluez ≥ 0.4.0.
 
+`Bluez.Radio` and `Bluez.Mgmt` are shared infrastructure: the host must
+supervise them; `Radio` never starts or links them. Until they (and the
+adapter, lease and D-Bus) are available, and again after any runtime loss,
+`Radio` stays up as not-ready (`status/1` → `ready: false, last_error: …`,
+`send_frame/3` → `{:error, :not_ready}`) and retries setup with a 2 s → 30 s
+backoff. `Lights` resubscribes to a restarted `Radio` by name.
+
 ## What's here vs left out
 
 | Included | Left out |

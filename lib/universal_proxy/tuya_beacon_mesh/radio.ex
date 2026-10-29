@@ -33,10 +33,12 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   ## TX
 
   `send_frame/3` queues a 26-byte frame for `duration_ms` of advertising
-  (20/30 ms interval, connectable, no kernel `duration_ms:` — the
-  controller has no hardware offload, so we stop on our own timer; see
-  plan 4.4). One advert is on air at a time. Frames are sent with the
-  app's queue classes (doc §4.7): a `:control` send (pair, reset, group)
+  (20/30 ms interval, connectable, no kernel `duration_ms:` — on a
+  controller without hardware offload `Bluez.Mgmt` refuses a finite
+  duration while another instance is registered, see its "Software
+  rotation" section, so we stop on our own timer). One advert is on air at
+  a time. Frames are sent with the app's queue classes
+  (tuya_beacon_mesh.md §4.7): a `:control` send (pair, reset, group)
   drops queued `:normal` sends (DP, ping); it does not interrupt the
   advert already on air.
 
@@ -53,8 +55,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   with incremented hop bits, which `normalize/1` erases), and echoes of
   our own recent transmissions (the last #{32} normalised frames sent)
   relayed back by bulbs. Echo dropping can be turned off with
-  `drop_echoes: false` / `set_drop_echoes/2` — the 4.5 TX proof needs
-  that, since a relayed copy of our frame is exactly what it looks for.
+  `drop_echoes: false` / `set_drop_echoes/2` — checking on hardware that
+  a transmission was relayed needs that, since a relayed copy of our frame
+  is exactly what it looks for.
 
   The `Bluez.*` modules are injectable (`:bluez_radio`, `:mgmt`,
   `:rebus`, `:dbus`, `:receiver` options) so the queue and fan-out logic
@@ -641,7 +644,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   end
 
   # Keep the header type handy for callers sorting frames; not used in
-  # queueing (queue classes are explicit, doc §4.7).
+  # queueing (queue classes are explicit, tuya_beacon_mesh.md §4.7).
   @doc false
   def frame_type(<<hdr, _::binary>>), do: hdr >>> 3 &&& 0xF
 end
