@@ -10,6 +10,12 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
 
   Reports are attributed by **node id → MAC** from the inventory. Import
   rejects duplicate node ids, so twins cannot share a status entry.
+
+  The `Radio` subscription is monitored: when the Radio is not running or
+  goes down, Lights keeps serving and resubscribes with a backoff (1 s,
+  doubling up to 30 s) once it is back. Address the Radio by registered
+  name for this to follow a restarted Radio; a pid only ever names one
+  incarnation.
   """
 
   use GenServer
@@ -19,6 +25,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   alias UniversalProxy.TuyaBeaconMesh.{Control, Dp, Inventory, P2, Radio, Seq}
 
   @type persist_fun :: (Inventory.t() -> any())
+
+  @resubscribe_ms 1_000
+  @max_resubscribe_ms 30_000
 
   # ── Client API ─────────────────────────────────────────────────────────
 
@@ -30,6 +39,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
     * `:inventory` — decoded `Inventory.t()` **or** a JSON binary/map
       (decoded via `Inventory.decode/1`);
     * `:radio` — Radio server name/pid (default `Radio`);
+    * `:resubscribe_ms` — first resubscribe delay after the Radio is
+      unavailable (default #{@resubscribe_ms}; doubles up to
+      #{@max_resubscribe_ms});
     * `:on_persist` — `fn inventory -> ... end` called after seq/group
       mutations and reloads (default: no-op);
     * `:name` — process name (default `#{inspect(__MODULE__)}`).
@@ -115,6 +127,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
       {:ok, inv} ->
         state = %{
           radio: Keyword.get(opts, :radio, Radio),
+          radio_mon: nil,
+          resubscribe_ms: Keyword.get(opts, :resubscribe_ms, @resubscribe_ms),
+          backoff_ms: Keyword.get(opts, :resubscribe_ms, @resubscribe_ms),
           on_persist: Keyword.get(opts, :on_persist, fn _inv -> :ok end),
           beacon_key: inv.beacon_key,
           seq: Seq.new(inv.seq),
@@ -133,16 +148,42 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   end
 
   @impl GenServer
-  def handle_continue(:subscribe, state) do
-    case Radio.subscribe(self(), :all, state.radio) do
+  def handle_continue(:subscribe, state), do: {:noreply, subscribe(state)}
+
+  # Monitor before subscribing so a Radio that dies right after accepting
+  # the subscription still delivers its :DOWN.
+  defp subscribe(state) do
+    with pid when is_pid(pid) <- GenServer.whereis(state.radio),
+         mon = Process.monitor(pid),
+         :ok <- subscribe_or_demonitor(pid, mon) do
+      %{state | radio_mon: mon, backoff_ms: state.resubscribe_ms}
+    else
+      {:error, reason} -> retry_subscribe(state, reason)
+      _not_registered -> retry_subscribe(state, :not_running)
+    end
+  end
+
+  defp subscribe_or_demonitor(pid, mon) do
+    case Radio.subscribe(self(), :all, pid) do
       :ok ->
         :ok
 
       {:error, reason} ->
-        Logger.warning("TuyaBeaconMesh.Lights: radio subscribe failed: #{inspect(reason)}")
+        Process.demonitor(mon, [:flush])
+        {:error, reason}
+    end
+  end
+
+  defp retry_subscribe(state, reason) do
+    # Only the first miss of a run is worth a line; retries stay quiet.
+    if state.backoff_ms == state.resubscribe_ms do
+      Logger.warning(
+        "TuyaBeaconMesh.Lights: radio unavailable (#{inspect(reason)}), retrying subscribe"
+      )
     end
 
-    {:noreply, state}
+    Process.send_after(self(), :resubscribe, state.backoff_ms)
+    %{state | radio_mon: nil, backoff_ms: min(state.backoff_ms * 2, @max_resubscribe_ms)}
   end
 
   @impl GenServer
@@ -228,6 +269,12 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   @impl GenServer
   def handle_info({:tuya_report, report}, state) do
     {:noreply, handle_report(state, report)}
+  end
+
+  def handle_info(:resubscribe, %{radio_mon: nil} = state), do: {:noreply, subscribe(state)}
+
+  def handle_info({:DOWN, mon, :process, _pid, reason}, %{radio_mon: mon} = state) do
+    {:noreply, retry_subscribe(%{state | radio_mon: nil}, {:radio_down, reason})}
   end
 
   def handle_info(_other, state), do: {:noreply, state}

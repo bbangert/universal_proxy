@@ -18,16 +18,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
     FakeBluez.ensure_started()
     FakeBluez.reset()
 
-    radio =
-      start_supervised!(
-        {Radio,
-         adapter_index: 1,
-         bluez_radio: FakeBluez.Radio,
-         mgmt: FakeBluez.Mgmt,
-         rebus: FakeBluez.Rebus,
-         dbus: FakeBluez.DBus,
-         receiver: FakeBluez.Receiver}
-      )
+    radio = start_supervised!(radio_spec())
 
     persisted = :ets.new(:lights_persist, [:public, :set])
 
@@ -71,19 +62,48 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
   end
 
   test "applies a DP report attributed by node id" do
-    {:ok, tlv} = UniversalProxy.TuyaBeaconMesh.Dp.encode([{1, :bool, true}])
-    report_frame = P2.build(1, 7, 2, 0x8001, 5, tlv, @beacon_key, @beacon_key)
-
-    FakeBluez.inject(%{
-      address: 0xDC23530FB34A,
-      data: Carrier.ad_bytes(report_frame),
-      rssi: -40
-    })
+    inject_dp_report(5)
 
     wait_until(fn -> match?({:ok, %{dps: %{1 => true}}}, Lights.status("path light 2")) end)
 
     assert {:ok, %{dps: %{1 => true}, last_event: {:dp_report, 7}}} =
              Lights.status("path light 2")
+  end
+
+  describe "radio restarts" do
+    @tag :capture_log
+    test "resubscribes after the Radio restarts and applies reports again" do
+      stop_supervised!(Lights)
+      start_supervised!({Lights, inventory: File.read!(@fixture), resubscribe_ms: 20})
+      {:ok, _} = Lights.all()
+      assert {:ok, %{subscribers: 1}} = Radio.status()
+
+      old = Process.whereis(Radio)
+      Process.exit(old, :kill)
+      wait_until(fn -> match?(pid when is_pid(pid) and pid != old, Process.whereis(Radio)) end)
+      wait_until(fn -> match?({:ok, %{subscribers: 1}}, Radio.status()) end)
+
+      inject_dp_report(5)
+      wait_until(fn -> match?({:ok, %{dps: %{1 => true}}}, Lights.status("path light 2")) end)
+    end
+
+    test "starts without a Radio and subscribes once one appears" do
+      stop_supervised!(Lights)
+      stop_supervised!({Radio, 1})
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          start_supervised!({Lights, inventory: File.read!(@fixture), resubscribe_ms: 20})
+          {:ok, _} = Lights.all()
+          Process.sleep(100)
+        end)
+
+      # One line for the outage, not one per retry.
+      assert length(String.split(log, "radio unavailable")) == 2
+
+      start_supervised!(radio_spec())
+      wait_until(fn -> match?({:ok, %{subscribers: 1}}, Radio.status()) end)
+    end
   end
 
   describe "reload" do
@@ -134,6 +154,28 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
       assert :ok = Lights.reload(fixture(%{"beaconKey" => String.upcase(@beacon_key)}))
       assert {:ok, %{seq: 132}} = Lights.inventory()
     end
+  end
+
+  defp radio_spec do
+    {Radio,
+     adapter_index: 1,
+     bluez_radio: FakeBluez.Radio,
+     mgmt: FakeBluez.Mgmt,
+     rebus: FakeBluez.Rebus,
+     dbus: FakeBluez.DBus,
+     receiver: FakeBluez.Receiver}
+  end
+
+  # A DP report (dp 1 = true) from "path light 2" (node 2).
+  defp inject_dp_report(sn) do
+    {:ok, tlv} = UniversalProxy.TuyaBeaconMesh.Dp.encode([{1, :bool, true}])
+    report_frame = P2.build(1, 7, 2, 0x8001, sn, tlv, @beacon_key, @beacon_key)
+
+    FakeBluez.inject(%{
+      address: 0xDC23530FB34A,
+      data: Carrier.ad_bytes(report_frame),
+      rssi: -40
+    })
   end
 
   defp fixture(overrides) do
