@@ -1,0 +1,25 @@
+{
+  "beaconKey": "00112233445566778899aabbccddeeff",
+  "seq": 100,
+  "bulbs": [
+    {
+      "mac": "DC23530FB34A",
+      "localKey": "abcdefghijklmnop",
+      "nodeId": 2,
+      "label": "path light 2"
+    },
+    {
+      "mac": "DC23533FCD62",
+      "localKey": "ponmlkjihgfedcba",
+      "nodeId": 3,
+      "label": "post spot 1"
+    }
+  ],
+  "groups": [
+    {
+      "localId": 1,
+      "name": "path and post",
+      "members": ["DC23530FB34A", "DC23533FCD62"]
+    }
+  ]
+}

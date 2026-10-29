@@ -7,43 +7,37 @@ defmodule UniversalProxy.TuyaBeaconMesh do
   not Thing Beacon Mesh. Name and namespace are deliberate so those are
   not conflated later.
 
-  Portable core extracted from the Vagus garden-bulb prototype.
+  ## Drop-in JSON → control
 
-  ## What is here (ready to use)
+  1. Decode the key dump: `Inventory.decode/1` (see
+     `test/fixtures/tuya_beacon_mesh/example_inventory.json`).
+  2. Start `Radio` on a dedicated adapter index (injectable `Bluez.*`).
+  3. Start `Lights` with that inventory and radio; pass `on_persist:` to
+     write the advanced `seq` (and any group edits) back to Settings.
+  4. `Lights.set("path light 2", on: true, mode: :colour, colour: {300, 100, 100})`.
 
-    * `UniversalProxy.TuyaBeaconMesh.Crypto` — CRC-8/SMBUS, CRC-16/MODBUS, XXTEA, key rule
-    * `UniversalProxy.TuyaBeaconMesh.Dp` — DP TLV encode/decode
-    * `UniversalProxy.TuyaBeaconMesh.P2` — 26-byte frame codec + request builders
-    * `UniversalProxy.TuyaBeaconMesh.Carrier` — AD type 0x03 advert wrap/unwrap
-    * `UniversalProxy.TuyaBeaconMesh.Control` — friendly DPs (`on`/`colour`/…) →
-      unicast/group frames, with the hardware-proven source address and
-      minimum on-air time
+  ## Modules
 
-  All of the above are pure (no I/O) and covered by ExUnit against the
-  reference vectors plus a live capture from the garden bulbs.
+  Pure:
 
-  ## What is deliberately not here
+    * `Crypto`, `Dp`, `P2`, `Carrier` — protocol codec
+    * `Control` — friendly DPs → frames (`0x8001` source, ≥3 s on-air)
+    * `Inventory` — JSON dump decode / validate (rejects duplicate node ids)
+    * `Seq` — monotonic 16-bit SN counter
 
-  Pairing, Tuya cloud login, and vagus-memory persistence. The assumed
-  path is: user pairs bulbs in the Tuya / Smart Life app, a Python script
-  exports MAC / localKey / beaconKey / nodeId / label, and Universal Proxy
-  imports that into Settings. See
+  Processes:
+
+    * `Radio` — lease, discovery (`DuplicateData: true`), TX queue, RX fan-out
+      (Bluez modules injectable; see `FakeBluez` in tests)
+    * `Lights` — inventory-backed controller: set/ping/reset/group_set,
+      report attribution by node→MAC, seq persistence callback
+
+  Still host work for Universal Proxy: Settings storage of the inventory
+  JSON, choosing the dedicated `hciN`, MQTT/HA discovery, and wiring a
+  supervisor. Hardware lessons:
   `docs/protocols/notes/tuya_beacon_mesh_extraction.md`.
 
-  ## Still to build in Universal Proxy (next session)
-
-    * Settings/import seam for the Python key dump
-    * Dedicated-adapter radio (own `hciN`: discovery filter with
-      `DuplicateData: true`, AdvertReceiver, Mgmt advertise) — do **not**
-      share `Bluez.Client` with the ESPHome scanner
-    * GenServer that holds bulb state, owns the mesh SN counter, fans DP
-      reports into HA (MQTT discovery), and sends `Control` frames
-    * Attribute reports by **MAC** (or a stable import id), never by
-      nodeId alone — the cloud reuses node ids across re-pairings
-
-  Hardware lessons that must survive the port are summarised in
-  `docs/protocols/notes/tuya_beacon_mesh_extraction.md`. The AI-generated
-  `docs/protocols/tuya_beacon_mesh.md` is partly wrong on addressing;
-  trust the notes and the working code over the doc.
+  Pairing / Tuya cloud login are intentionally absent — the dump is
+  assumed to come from a Python script after the user pairs in the app.
   """
 end

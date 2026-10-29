@@ -1,35 +1,36 @@
 # Tuya Beacon Mesh extraction notes (2026-10-29)
 
-Portable core on this branch: `UniversalProxy.TuyaBeaconMesh.*`.
+Portable stack on this branch: `UniversalProxy.TuyaBeaconMesh.*`.
 
 This is Tuya's **Beacon Mesh** family (Beacon v2 / P2 advert mesh) — not
 Tuya GATT "paired BLE", and not Thing Beacon Mesh. Proven on ten garden
 Beacon v2 bulbs under a Vagus hot patch; pairing / cloud / vagus-memory
 deliberately left behind.
 
-## Import shape (Python → Settings)
+## Drop-in JSON → control
 
-Per bulb, the next session needs at least:
+Example: `test/fixtures/tuya_beacon_mesh/example_inventory.json`.
 
-```json
-{
-  "mac": "DC23530FB34A",
-  "localKey": "<16-char or 32-hex>",
-  "beaconKey": "<32-hex mesh key>",
-  "nodeId": 2,
-  "label": "path light 2"
-}
+```elixir
+{:ok, inv} = UniversalProxy.TuyaBeaconMesh.Inventory.decode(File.read!("dump.json"))
+
+{:ok, _} = UniversalProxy.TuyaBeaconMesh.Radio.start_link(adapter_index: 1)
+
+{:ok, _} =
+  UniversalProxy.TuyaBeaconMesh.Lights.start_link(
+    inventory: inv,
+    on_persist: fn inv -> Settings.put(:tuya_beacon_mesh, Inventory.to_map(inv)) end
+  )
+
+UniversalProxy.TuyaBeaconMesh.Lights.set("path light 2", on: true)
 ```
 
-Plus one mesh-level `beaconKey` (same for every bulb on the mesh) and a
-persisted monotonic `seq` counter (16-bit, wrap at 65536). Do **not** use the
-cloud `sourceId` as a frame source.
+`Inventory.decode/1` rejects duplicate MACs and duplicate `nodeId`s — the
+cloud reuses node ids across re-pairings, and wire reports only carry the
+node id, so twins would silently share one status entry.
 
-Identity for HA entities and report attribution must be the MAC (or a stable
-import id). **Never key runtime state by `nodeId` alone** — the Tuya cloud
-reallocates node ids on re-pair and will happily hand out a duplicate (seen
-live: two bulbs both node 10; reports were credited to the wrong one while
-keyed control still worked).
+Persist the inventory whenever `on_persist` fires so the advanced `seq`
+survives restarts (never go backwards).
 
 ## Hardware-proven protocol facts
 
@@ -54,27 +55,23 @@ DP ids confirmed on these bulbs (AK80x set): 1 on/off, 2 mode, 3 brightness
 
 Beacon Mesh needs a **dedicated** Bluetooth adapter index, shared with nothing.
 Do not use `Bluez.Client` (singleton bound to the ESPHome scanner's adapter).
-Own:
+`Radio` already opens discovery with `DuplicateData: true` on `/org/bluez/hciN`
+via injectable `Bluez.Rebus` / `Bluez.DBus` / `Bluez.AdvertReceiver` /
+`Bluez.Radio` / `Bluez.Mgmt`. `main` must be on bluez ≥ 0.4.0.
 
-- D-Bus `Adapter1.SetDiscoveryFilter` (LE, `DuplicateData: true`) +
-  Start/StopDiscovery on `/org/bluez/hciN` via `Bluez.Rebus`
-- `Bluez.AdvertReceiver` with `adapter_index: N`
-- `Bluez.Radio` + `Bluez.Mgmt` for TX
+## What's here vs left out
 
-`main` must be on bluez ≥ 0.4.0 (already the board version).
-
-## Not extracted (and why)
-
-| Left behind | Reason |
+| Included | Left out |
 |---|---|
-| `Cloud` / `Cloud.Sign` / Pairing | User pairs in the Tuya app; Python dumps keys |
-| `Store` (vagus-memory) | UP Settings seam replaces it |
-| `Radio` / `Bulbs` GenServers / facade | Host-specific; rewrite against UP conventions (`Task.Supervisor`, `catch :exit`, PubSub) |
-| MQTT / HA discovery | Explicit next-session work |
+| Crypto, Dp, P2, Carrier, Control | Cloud / Cloud.Sign / Pairing |
+| Inventory (JSON), Seq | vagus-memory Store |
+| Radio GenServer (injectable Bluez) | MQTT / HA discovery (host wiring) |
+| Lights GenServer (set/ping/reset/group_set + reports) | Full group create/dismiss persistence UI |
+
+Extra group radio helpers still live on `P2` / `Control` if the host wants
+them; Lights can grow to call them without new protocol code.
 
 ## Source
 
-Prototyped under the Vagus `tuya-ble-bulbs` task
-(`…/pairing/dev/lib/vagus/tuya/`, Phases 0–8). Tests here are the pure-module
-suite (`crypto_dp`, `p2`, `carrier`) plus `control`; fixtures are the reference
-vectors and a live P2 frame capture from 2026-10-25.
+Prototyped under the Vagus `tuya-ble-bulbs` task. Fixtures: reference
+vectors + live P2 capture 2026-10-25 + example inventory JSON.
