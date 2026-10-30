@@ -129,12 +129,15 @@ defmodule UniversalProxy.TuyaBeaconMesh.Control do
     bump_send(P2.group_add(@phone_addr, node_id, sn, gg, local_key, beacon_key))
   end
 
-  @doc "Group DP set to `FFgg`, keyed beaconKey/beaconKey."
+  @doc """
+  Group DP set to `FFgg`, keyed beaconKey/beaconKey. `gg` is `0..254`:
+  255 would make `FF FF`, the mesh broadcast address, not a group.
+  """
   @spec group_set(byte(), 0..0xFFFF, keyword() | map(), key(), keyword()) ::
           {:ok, request()} | {:error, term()}
   def group_set(gg, sn, dps, beacon_key, opts \\ [])
 
-  def group_set(gg, sn, dps, beacon_key, opts) when gg in 0..255 do
+  def group_set(gg, sn, dps, beacon_key, opts) when gg in 0..254 do
     with {:ok, dp_list} <- friendly_dps(dps),
          {:ok, tlv} <- Dp.encode(dp_list) do
       dst = <<0xFF, gg>>

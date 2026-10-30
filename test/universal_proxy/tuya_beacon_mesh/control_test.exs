@@ -97,6 +97,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.ControlTest do
     {:ok, tlv} = Dp.encode([{1, :bool, true}])
     assert open_frame(frame, @beacon_key, @beacon_key) == {0x05, pad(tlv)}
 
+    # 255 would address FF FF, the mesh broadcast, not a group.
+    assert {:error, {:bad_group, 255}} = Control.group_set(255, @sn, [on: true], @beacon_key)
+    assert {:ok, _} = Control.group_set(254, @sn, [on: true], @beacon_key)
     assert {:error, {:bad_group, 256}} = Control.group_set(256, @sn, [on: true], @beacon_key)
     assert {:error, {:bad_group, "1"}} = Control.group_set("1", @sn, [on: true], @beacon_key)
   end

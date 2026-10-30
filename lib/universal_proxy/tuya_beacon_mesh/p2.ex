@@ -356,11 +356,12 @@ defmodule UniversalProxy.TuyaBeaconMesh.P2 do
     end
   end
 
-  defp group_id!(gg) when is_integer(gg) and gg in 0..255, do: <<gg>>
-  defp group_id!(<<_::8>> = gg), do: gg
+  # 255 is never a group: `FF FF` is the mesh broadcast address.
+  defp group_id!(gg) when is_integer(gg) and gg in 0..254, do: <<gg>>
+  defp group_id!(<<gg>>) when gg != 255, do: <<gg>>
 
   defp group_id!(gg),
-    do: raise(ArgumentError, "group ID must be a byte, got: #{inspect(gg)}")
+    do: raise(ArgumentError, "group ID must be 0..254, got: #{inspect(gg)}")
 
   defp group_ids!(groups) when is_integer(groups), do: group_id!(groups)
   defp group_ids!(<<_::binary>> = groups) when byte_size(groups) > 0, do: groups

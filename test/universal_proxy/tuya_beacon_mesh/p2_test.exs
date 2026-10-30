@@ -210,6 +210,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.P2Test do
       assert {<<0x13, _::binary>>, 2000, 2000, :ping_reply} = P2.ping(0x1001, 0x0012, 4, @lk, @bk)
       assert {_, 2000, 5000, :ping_reply} = P2.ping(0x1001, 0xFFFF, 5, @bk, @bk)
       assert {_, 5000, 5000, :group_list} = P2.group_add(0x1001, 0x0012, 6, 7, @lk, @bk)
+      # 255 is never a group id: FF FF is the mesh broadcast address.
+      assert_raise ArgumentError, fn -> P2.group_add(0x1001, 0x0012, 6, 255, @lk, @bk) end
+      assert_raise ArgumentError, fn -> P2.group_dismiss(0x1001, <<255>>, 8, @lk, @bk) end
       assert {_, 5000, 5000, :group_list} = P2.group_remove(0x1001, 0x0012, 7, [7, 9], @lk, @bk)
 
       assert {<<0x13, 0x10, 0x01, 0xFF, 0x07, _::binary>>, 2000, 0, :none} =
