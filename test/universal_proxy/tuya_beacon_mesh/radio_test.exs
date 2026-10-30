@@ -458,6 +458,115 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
     end
   end
 
+  describe "health check" do
+    defp start_discoveries,
+      do: Enum.count(FakeBluez.calls(), &match?({:dbus, "StartDiscovery", _}, &1))
+
+    defp health_reads,
+      do: Enum.count(FakeBluez.calls(), &match?({:dbus, "Get", _}, &1))
+
+    test "discovery that ended behind the radio's back is restarted" do
+      radio = start_supervised!(radio_spec(health_check_ms: 30))
+      wait_until(&ready?/0)
+      wait_until(fn -> health_reads() >= 1 end)
+      assert start_discoveries() == 1
+      :ok = Radio.subscribe(self(), :all)
+
+      log =
+        capture_log(fn ->
+          :ok = FakeBluez.stop_discovering()
+          wait_until(fn -> start_discoveries() == 2 end)
+          wait_until(&ready?/0)
+        end)
+
+      assert log =~ "not ready ({:health, :not_discovering})"
+      assert Process.whereis(Radio) == radio
+      assert FakeBluez.discovering?()
+      assert FakeBluez.count(:release) == 1
+
+      # Healthy again: checks keep passing without re-running setup.
+      reads = health_reads()
+      wait_until(fn -> health_reads() >= reads + 2 end)
+      assert start_discoveries() == 2
+
+      FakeBluez.inject(report(0xDC23530FB34A, device_frame(9)))
+      assert_receive {:tuya_report, %{mac: "DC23530FB34A"}}
+      assert_leases_balanced()
+    end
+
+    test "a live receiver that stopped listening re-runs setup, logged once" do
+      radio = start_supervised!(radio_spec(health_check_ms: 30))
+      wait_until(&ready?/0)
+
+      log =
+        capture_log(fn ->
+          FakeBluez.fail(:listening, true)
+          wait_until(fn -> FakeBluez.count(:receiver_started) >= 3 end)
+          FakeBluez.succeed(:listening)
+          wait_until(&ready?/0)
+          reads = health_reads()
+          wait_until(fn -> health_reads() >= reads + 1 end)
+        end)
+
+      assert length(String.split(log, "{:health, :receiver_not_listening}")) == 2
+      assert Process.whereis(Radio) == radio
+      assert {:ok, %{ready: true, listening: true}} = Radio.status()
+      assert_leases_balanced()
+    end
+
+    @tag :capture_log
+    test "an adapter that went away fails the check" do
+      start_supervised!(radio_spec(health_check_ms: 30))
+      wait_until(&ready?/0)
+
+      FakeBluez.fail({:dbus, "Get"}, "org.freedesktop.DBus.Error.UnknownObject")
+
+      wait_until(fn ->
+        match?(
+          {:ok,
+           %{last_error: {:health, {:discovering, "org.freedesktop.DBus.Error.UnknownObject"}}}},
+          Radio.status()
+        )
+      end)
+
+      FakeBluez.succeed({:dbus, "Get"})
+      wait_until(&ready?/0)
+    end
+
+    @tag :capture_log
+    test "one check is pending at a time, across setups, and none after stop" do
+      start_supervised!(radio_spec(health_check_ms: 60_000))
+      wait_until(&ready?/0)
+
+      timers =
+        for _ <- 1..3 do
+          %{health: {_token, timer}} = :sys.get_state(Radio)
+          acquired = FakeBluez.count(:acquire)
+          :ok = FakeBluez.end_lease()
+          wait_until(fn -> FakeBluez.count(:acquire) > acquired end)
+          wait_until(&ready?/0)
+          timer
+        end
+
+      for timer <- timers, do: assert(Process.read_timer(timer) == false)
+      %{health: {_token, current}} = :sys.get_state(Radio)
+      assert is_integer(Process.read_timer(current))
+
+      stop_supervised!({Radio, 0})
+      assert Process.read_timer(current) == false
+    end
+
+    @tag :capture_log
+    test "not checked while not ready" do
+      FakeBluez.fail(:mgmt, :not_running)
+      start_supervised!(radio_spec(health_check_ms: 10))
+      wait_until(fn -> match?({:ok, %{last_error: {:mgmt, :not_running}}}, Radio.status()) end)
+      Process.sleep(50)
+      assert health_reads() == 0
+      assert %{health: nil} = :sys.get_state(Radio)
+    end
+  end
+
   describe "not ready" do
     test "stays up, logs once, refuses sends and recovers when the lease frees" do
       holder = start_supervised!({Task, fn -> Process.sleep(:infinity) end})

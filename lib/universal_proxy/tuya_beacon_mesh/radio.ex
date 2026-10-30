@@ -23,9 +23,19 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   the reason is logged once (`status/1`'s `:last_error`), and setup is
   retried after 2 s, doubling up to 30 s. The same happens at runtime when
   the lease ends, `Bluez.Radio` or the D-Bus connection goes down, the
-  receiver exits, or `Bluez.Mgmt` stops accepting sends. While not ready,
+  receiver exits, `Bluez.Mgmt` stops accepting sends, or a health check
+  fails. While not ready,
   `send_frame/3` returns `{:error, :not_ready}` (queued frames are
   dropped); subscriptions are kept and deliver again once ready.
+
+  Some losses leave every process alive: an adapter removed or a
+  `bluetoothd` restart ends discovery while the D-Bus connection, the
+  lease and the receiver (which reopens its HCI socket on its own)
+  survive. So while ready, every `:health_check_ms` (default 15 s) the
+  radio checks that the receiver is `listening?` and that the adapter's
+  `org.bluez.Adapter1.Discovering` is true, and re-runs setup (which
+  restarts discovery) when either is not. A failure that comes back right
+  after the re-setup it caused is logged once, until a check passes.
 
   On stop it takes any advert off air, stops the receiver and discovery
   and releases the lease. `Bluez.Radio`/`Bluez.Mgmt` are left running.
@@ -86,6 +96,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
 
   @max_queue 8
   @receiver_stop_ms 2_000
+  @health_check_ms 15_000
+  # Kept short: the check runs in this process's loop.
+  @health_call_ms 2_000
+  @props_iface "org.freedesktop.DBus.Properties"
+  @adapter_iface "org.bluez.Adapter1"
 
   # Advertise errors that mean the lease or Bluez.Mgmt is gone, not that
   # this one frame was refused: re-run setup rather than keep sending.
@@ -101,7 +116,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   `:retry_ms` (first setup retry delay, default #{@retry_ms}; doubles up
   to #{@max_retry_ms}), `:max_queue` (default #{@max_queue}),
   `:receiver_stop_ms` (how long a stopping receiver may take before it is
-  killed, default #{@receiver_stop_ms}), and the `Bluez.*` implementation
+  killed, default #{@receiver_stop_ms}), `:health_check_ms` (interval of
+  the health check while ready, default #{@health_check_ms}), and the
+  `Bluez.*` implementation
   modules `:bluez_radio`, `:mgmt`, `:rebus`, `:dbus`, `:receiver`
   (defaults are the real ones).
 
@@ -277,6 +294,10 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
       drop_echoes: Keyword.get(opts, :drop_echoes, true),
       max_queue: Keyword.get(opts, :max_queue, @max_queue),
       receiver_stop_ms: Keyword.get(opts, :receiver_stop_ms, @receiver_stop_ms),
+      health_check_ms: Keyword.get(opts, :health_check_ms, @health_check_ms),
+      health: nil,
+      health_failure: nil,
+      quiet: false,
       ready: false,
       last_error: nil,
       retry_ms: retry_ms,
@@ -307,11 +328,17 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   defp attempt_setup(state) do
     case setup(state) do
       {:ok, state} ->
-        if state.last_error != nil do
+        if state.last_error != nil and not state.quiet do
           Logger.info("#{inspect(__MODULE__)}: ready on hci#{state.adapter_index}")
         end
 
-        %{state | ready: true, last_error: nil, backoff_ms: state.retry_ms}
+        schedule_health(%{
+          state
+          | ready: true,
+            last_error: nil,
+            quiet: false,
+            backoff_ms: state.retry_ms
+        })
 
       {:error, reason, state} ->
         state |> teardown() |> not_ready(reason)
@@ -332,14 +359,17 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
 
   # A runtime loss while ready: undo everything and retry from the start
   # of the backoff (reason is new: last_error is nil while ready).
-  defp lost(%{ready: true} = state, reason),
-    do: not_ready(%{teardown(state) | backoff_ms: state.retry_ms}, reason)
+  # `quiet` leaves the loss (and the recovery after it) unlogged.
+  defp lost(state, reason, quiet \\ false)
+
+  defp lost(%{ready: true} = state, reason, quiet),
+    do: not_ready(%{teardown(state) | backoff_ms: state.retry_ms}, reason, quiet)
 
   # Already retrying: the next attempt rebuilds whatever this was.
-  defp lost(state, _reason), do: state
+  defp lost(state, _reason, _quiet), do: state
 
-  defp not_ready(state, reason) do
-    if reason != state.last_error do
+  defp not_ready(state, reason, quiet \\ false) do
+    if reason != state.last_error and not quiet do
       Logger.warning(
         "#{inspect(__MODULE__)}: hci#{state.adapter_index} not ready (#{inspect(reason)}), retrying"
       )
@@ -351,9 +381,50 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
       state
       | ready: false,
         last_error: reason,
+        quiet: quiet,
         retry_timer: timer,
         backoff_ms: min(state.backoff_ms * 2, @max_retry_ms)
     }
+  end
+
+  # One pending check at a time, matched by token so a message that was
+  # already queued when its timer was cancelled is ignored.
+  defp schedule_health(state) do
+    state = cancel_health(state)
+    token = make_ref()
+    timer = Process.send_after(self(), {:health_check, token}, state.health_check_ms)
+    %{state | health: {token, timer}}
+  end
+
+  defp cancel_health(%{health: {_token, timer}} = state) do
+    Process.cancel_timer(timer)
+    %{state | health: nil}
+  end
+
+  defp cancel_health(state), do: state
+
+  defp check_health(state) do
+    if state.receiver.listening?(state.rx_name),
+      do: check_discovering(state),
+      else: {:error, :receiver_not_listening}
+  end
+
+  defp check_discovering(state) do
+    body = [@adapter_iface, "Discovering"]
+
+    case state.dbus.call(
+           state.conn,
+           adapter_path(state),
+           @props_iface,
+           "Get",
+           "ss",
+           body,
+           @health_call_ms
+         ) do
+      {:ok, [{_sig, true}]} -> :ok
+      {:ok, _other} -> {:error, :not_discovering}
+      {:error, reason} -> {:error, {:discovering, reason}}
+    end
   end
 
   # Takes everything setup got back down, except the D-Bus connection and
@@ -361,6 +432,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   # A failed stop_advertising needs nothing more here: releasing the lease
   # removes every instance sent under it.
   defp teardown(state) do
+    state = cancel_health(state)
     {_result, state} = stop_current(state)
     state = %{state | tx_queue: :queue.new(), ready: false}
     state = stop_receiver(state)
@@ -442,9 +514,10 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   defp stop_discovery(state), do: %{state | discovering: false}
 
   defp adapter_call(state, member, signature, body) do
-    path = "/org/bluez/hci#{state.adapter_index}"
-    state.dbus.call(state.conn, path, "org.bluez.Adapter1", member, signature, body)
+    state.dbus.call(state.conn, adapter_path(state), @adapter_iface, member, signature, body)
   end
+
+  defp adapter_path(state), do: "/org/bluez/hci#{state.adapter_index}"
 
   defp start_receiver(state) do
     radio = self()
@@ -601,6 +674,20 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
 
   def handle_info(:retry_setup, %{ready: false} = state),
     do: {:noreply, attempt_setup(%{state | retry_timer: nil})}
+
+  def handle_info({:health_check, token}, %{ready: true, health: {token, _timer}} = state) do
+    state = %{state | health: nil}
+
+    case check_health(state) do
+      :ok ->
+        {:noreply, schedule_health(%{state | health_failure: nil})}
+
+      {:error, reason} ->
+        reason = {:health, reason}
+        quiet = reason == state.health_failure
+        {:noreply, lost(%{state | health_failure: reason}, reason, quiet)}
+    end
+  end
 
   # Bluez.Radio notifies every subscriber of every lease end; only ours
   # matters. Mgmt has already taken its adverts off air.

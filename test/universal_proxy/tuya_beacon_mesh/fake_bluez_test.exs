@@ -32,7 +32,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.FakeBluezTest do
       {FakeBluez.Radio, [subscribe: 0, acquire: 1, release: 1, valid?: 1]},
       {FakeBluez.Mgmt, [read_advertising_features: 1, advertise: 3, stop_advertising: 2]},
       {FakeBluez.Rebus, [connect: 1]},
-      {FakeBluez.DBus, [call: 6]},
+      {FakeBluez.DBus, [call: 6, call: 7]},
       {FakeBluez.Receiver, [start_link: 1, listening?: 1]}
     ]
 

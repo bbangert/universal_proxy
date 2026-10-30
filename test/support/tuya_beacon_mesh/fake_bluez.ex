@@ -19,8 +19,15 @@ defmodule UniversalProxy.TuyaBeaconMesh.FakeBluez do
   Failures are injected per step with `fail/2` and cleared with
   `succeed/1`: `:mgmt` (`read_advertising_features`), `:bluez_radio`
   (`subscribe`), `:acquire`, `:connect`, `{:dbus, member}`, `:receiver`
-  (`start_link`), `:advertise`, `:stop_advertising`, and
-  `:receiver_stop` (`:hang` makes the receiver ignore a stop).
+  (`start_link`), `:advertise`, `:stop_advertising`, `:receiver_stop`
+  (`:hang` makes the receiver ignore a stop), and `:listening` (the
+  receiver stays alive but `listening?/1` is false, as while the real one
+  retries a lost HCI socket).
+
+  `Adapter1.Discovering` (read with `Properties.Get`) follows the
+  `StartDiscovery` / `StopDiscovery` calls; `stop_discovering/0` turns it
+  off behind the radio's back, as an adapter removal or a `bluetoothd`
+  restart does.
   """
 
   alias Bluez.Radio.Lease
@@ -56,9 +63,19 @@ defmodule UniversalProxy.TuyaBeaconMesh.FakeBluez do
       lease: nil,
       instances: %{},
       radio_pid: nil,
-      radio_subs: []
+      radio_subs: [],
+      discovering: false
     }
   end
+
+  @doc "Ends discovery without the client asking (bluetoothd restarted)."
+  def stop_discovering, do: Agent.update(@agent, &%{&1 | discovering: false})
+
+  @doc false
+  def discovering?, do: Agent.get(@agent, & &1.discovering)
+
+  @doc false
+  def set_discovering(on?), do: Agent.update(@agent, &%{&1 | discovering: on?})
 
   @doc false
   def record(entry), do: Agent.update(@agent, &%{&1 | calls: [entry | &1.calls]})
@@ -341,12 +358,25 @@ defmodule UniversalProxy.TuyaBeaconMesh.FakeBluez do
       case FakeBluez.failure({:dbus, member}) do
         nil ->
           FakeBluez.record({:dbus, member, body})
-          {:ok, []}
+          reply(member, body)
 
         reason ->
           FakeBluez.record({:dbus_failed, member})
           {:error, reason}
       end
+    end
+
+    defp reply("StartDiscovery", _body), do: discovering(true)
+    defp reply("StopDiscovery", _body), do: discovering(false)
+
+    defp reply("Get", ["org.bluez.Adapter1", "Discovering"]),
+      do: {:ok, [{"b", FakeBluez.discovering?()}]}
+
+    defp reply(_member, _body), do: {:ok, []}
+
+    defp discovering(on?) do
+      FakeBluez.set_discovering(on?)
+      {:ok, []}
     end
   end
 
@@ -367,7 +397,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.FakeBluez do
       end
     end
 
-    def listening?(name \\ __MODULE__), do: Process.whereis(name) != nil
+    def listening?(name \\ __MODULE__),
+      do: Process.whereis(name) != nil and FakeBluez.failure(:listening) == nil
 
     @impl GenServer
     def init(opts) do
