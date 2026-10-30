@@ -212,24 +212,32 @@ def search(authkey: str, samples):
 
 
 def _parse_sample(text: str):
-    parts = text.split(":")
-    if len(parts) not in (2, 3):
-        raise argparse.ArgumentTypeError("sample must be srand:localKey[:srandEncrypted]")
-    srand = bytes.fromhex(parts[0])
-    if len(srand) != 4:
-        raise argparse.ArgumentTypeError("srand must be 4 bytes (8 hex chars)")
-    if len(parts[1]) != 16:
-        raise argparse.ArgumentTypeError("localKey must be 16 characters")
-    enc = bytes.fromhex(parts[2]) if len(parts) == 3 else None
-    if enc is not None and len(enc) != 4:
-        raise argparse.ArgumentTypeError("srandEncrypted must be 4 bytes (8 hex chars)")
-    return srand, parts[1], enc
+    # Fixed-width, not split(":"): a 16-char localKey may itself contain ':'.
+    usage = "sample must be srand:localKey[:srandEncrypted] (8 hex : 16 chars [: 8 hex])"
+    if len(text) not in (25, 34) or text[8] != ":" or (len(text) == 34 and text[25] != ":"):
+        raise argparse.ArgumentTypeError(usage)
+    try:
+        srand = bytes.fromhex(text[:8])
+        enc = bytes.fromhex(text[26:]) if len(text) == 34 else None
+    except ValueError:
+        raise argparse.ArgumentTypeError(usage) from None
+    return srand, text[9:25], enc
 
 
 # ---------------------------------------------------------------- self test
 def _self_test() -> None:
     """Plant a few known constructions in synthetic samples and check the search finds them."""
     authkey = "TESTAUTHKEY000000000000000000000"
+    # Sample parsing is fixed-width, so a localKey containing ':' survives.
+    assert _parse_sample("1a2b3c4d:abcd:efghijklmno") == (bytes.fromhex("1a2b3c4d"), "abcd:efghijklmno", None)
+    assert _parse_sample("1a2b3c4d:abcd:efghijklmno:deadbeef")[2] == bytes.fromhex("deadbeef")
+    for bad in ("1a2b3c4d:short", "zzzzzzzz:abcdefghijklmnop", "1a2b3c4d:abcdefghijklmnop:zz"):
+        try:
+            _parse_sample(bad)
+        except argparse.ArgumentTypeError:
+            pass
+        else:
+            raise AssertionError(f"accepted bad sample {bad!r}")
     srands = [bytes.fromhex(x) for x in ("1a2b3c4d", "deadbeef", "00ff10ee", "7f000001")]
     planted = [
         ("md5(k|s) k=authkey16 s=srand -> hex[8:24]",
