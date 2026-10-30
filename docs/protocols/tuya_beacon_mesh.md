@@ -5,9 +5,15 @@ Reverse-engineered from the Tuya **Smart Life** Android app, version 7.12.0
 as REA evidence. The goal is enough detail to build a Linux/BlueZ controller in
 this project.
 
-Everything below comes from static analysis of the shipped app. **Nothing has
-been tested against a real device yet.** Claims the code does not prove are
-marked **UNVERIFIED**.
+Unless marked otherwise, everything below comes from static analysis of the
+shipped app. Claims the code does not prove are marked **UNVERIFIED**.
+
+**Hardware status.** Beacon v2 (P2) control is validated on hardware, but on
+**one product only**: the Gardenreet RGBCW G4 LED bulb, 12 V low-voltage
+bi-pin (ten bulbs, Tuya product ID `vd8o60wy`, AK80x DP set). Where the bulbs
+disagree with the app, the bulbs win; §4.9 collects what they showed. Other P2
+products may differ, for example in DP IDs or timing. Beacon v1 (P1) and Thing
+Beacon Mesh are still untested against any device.
 
 The companion file [`tuya_beacon_reference.py`](tuya_beacon_reference.py) is a
 byte-exact Python reference for every frame, cipher and checksum described
@@ -37,7 +43,7 @@ They share one trick: the payload travels as a list of 16-bit service UUIDs
 | Cipher | XXTEA (big-endian words) | XXTEA + 16-byte XOR mask | AES-128-CFB |
 | Addressing | device MAC | 16-bit node IDs | SIG Mesh unicast |
 | Control after pairing | P1 adverts | P2 adverts | **standard SIG Mesh over a GATT proxy (0x1828)** |
-| Keys from cloud | localKey, beaconKey | localKey, beaconKey, groupKey | pairKey, then SIG NetKey/AppKey |
+| Keys from cloud | localKey, beaconKey | localKey, beaconKey (the app also has a groupKey; bulbs never use it, §4.9) | pairKey, then SIG NetKey/AppKey |
 
 Tuya's developer documentation describes "Beacon Mesh" with these properties:
 
@@ -110,7 +116,8 @@ These were checked against BlueZ `master` source.
   - `parse_service_uuids` uses `bt_ad_add_service_uuid`;
   - `queue_add_uuid` is a plain `queue_push_tail` with no de-duplication;
   - the list is serialised as AD 0x03 in insertion order.
-  - The alternative is raw AD bytes through MGMT *Add Advertising*.
+  - The alternative is raw AD bytes through MGMT. That is what this project
+    uses for P2 (§9).
 - **Receive does not work through D-Bus.** `Device1.ServiceUUIDs` comes from
   `device_add_eir_uuids`:
   - it **skips UUIDs already seen** (`g_slist_find_custom`);
@@ -121,7 +128,8 @@ These were checked against BlueZ `master` source.
   The current `Bluez.Advert` reconstruction therefore cannot recover these
   frames. A raw source of LE Advertising Reports is required: the HCI monitor
   channel (as `btmon` uses) or MGMT *Device Found* events, which carry the raw
-  EIR/AD bytes.
+  EIR/AD bytes. The P2 stack reads raw HCI reports with `Bluez.AdvertReceiver`
+  (§9).
 - **The passive-scan monitor may miss frames.** `Bluez.Client`'s passive
   AdvertisementMonitor matches only Flags patterns. Tuya frames that lack a
   Flags element would never be reported. Active scanning, or an extra
@@ -153,9 +161,9 @@ These were checked against BlueZ `master` source.
 |---|---|---|
 | `localKey` | Per-device, 16 ASCII chars | `DeviceBean.localKey`, set at pairing from `thing.m.device.blu.preactive` |
 | `beaconKey` | Per-home "beacon mesh" key, 32 hex chars | `BeaconMeshBean.appKey` (home data), or `thing.m.device.beacon.mesh.create` |
-| `groupKey` | Per-group key | `GroupBean.groupKey` |
+| `groupKey` | Per-group key. The app uses it; bulbs never learn it (§4.9) | `GroupBean.groupKey` |
 | node ID | Device's 16-bit address | `DeviceBean.meta.beaconData.beaconNodeId`, assigned by the cloud at pre-activation |
-| source ID | Phone's 16-bit address, per home | `thing.m.beacon.mesh.source.id.alloc {meshId}`, cached as `NodeId_<ownerId>` |
+| source ID | Phone's 16-bit address, per home. On hardware the bulbs accept only `0x8001` (§4.9) | `thing.m.beacon.mesh.source.id.alloc {meshId}`, cached as `NodeId_<ownerId>` |
 
 Address conventions:
 
@@ -165,7 +173,8 @@ Address conventions:
 | `FF gg` | group with one-byte local ID `gg` |
 | `FF FF` | broadcast |
 | `80 00`, `80 01` | phone, as the destination of device reports |
-| `0x6000`–`0x7FFF` | random source for unactivated "raw" sends |
+| `80 01` | phone, as the source of commands: the only source the bulbs accept (§4.9) |
+| `0x6000`–`0x7FFF` | random source for unactivated "raw" sends (**UNVERIFIED** on hardware) |
 
 There is **no key derivation** for normal traffic: keys are used as-is (§3).
 RemoteAction, the smart-lock unlock, is the one exception (§4.8).
@@ -176,9 +185,13 @@ Which key encrypts and which masks, by destination
 | Destination | XXTEA key | XOR mask |
 |---|---|---|
 | unicast | localKey | beaconKey |
-| group | groupKey | beaconKey |
+| group | groupKey in the app; **beaconKey** on hardware | beaconKey |
 | broadcast ping | beaconKey | beaconKey |
 | device → phone | beaconKey | beaconKey |
+
+The app keys group frames (`FF gg`) with the groupKey, but the bulbs never
+learn a distinct one. Group frames that work on hardware use the beaconKey as
+both XXTEA key and mask (§4.9).
 
 ### 4.2 Frame (26 bytes, both directions)
 
@@ -187,7 +200,7 @@ Built in `bluetooth.pbddddb.qqdbbpp` and `pbddddb.pbbppqb`, and parsed in
 
 | Offset | Len | Field |
 |---|---|---|
-| 0 | 1 | header: bit 7 = pair flag, bits 6–3 = frame type, bits 1–0 = `3` (excluded from both CRCs) |
+| 0 | 1 | header: bit 7 = pair flag, bits 6–3 = frame type, bits 1–0 = hop TTL, sent as `3` (excluded from both CRCs) |
 | 1 | 2 | source address |
 | 3 | 2 | destination address |
 | 5 | 2 | sequence number, big-endian |
@@ -212,8 +225,11 @@ Parsing reverses this:
 4. Decrypt the payload.
 5. Check the payload CRC.
 
-The bits 1–0 that both CRCs exclude are probably a relay hop counter.
-**UNVERIFIED:** the app never relays, so it never changes them.
+The bits 1–0 that both CRCs exclude are a hop TTL. The app never relays, so
+it never changes them, but bulbs relaying a frame **decrement** them. In the
+2026-10-25 capture, 6 frames appear with more than one hop value, and in 5 of
+them the value falls over time (2 → 1 → 0). Clearing the bits makes every relayed copy of one
+frame identical, which is how receivers dedupe them (§4.9).
 
 ### 4.3 Requests the app sends
 
@@ -221,26 +237,31 @@ The bits 1–0 that both CRCs exclude are probably a relay hop counter.
 |---|---|---|---|---|---|
 | Pair (`pppbpdp`) | `0x93` | pair + 2 | — | special, §4.5 | localKey |
 | Reset (`dqdbdpd`) | `0x0B` | 1 | `0x01` | `02` | localKey |
-| DP set, no ack (`dqdpqpq`) | `0x0B` | 1 | `0x05` | DP TLVs (§4.4) | localKey or groupKey |
+| DP set, no ack (`dqdpqpq`) | `0x0B` | 1 | `0x05` | DP TLVs (§4.4) | localKey, or groupKey for a group (beaconKey on hardware, §4.9) |
 | DP set, ack wanted (`pqpbpqd`) | `0x0B` | 1 | `0x06` | DP TLVs | localKey |
 | Add to group (`qbqqdqq`) | `0x0B` | 1 | `0x01` | `A1 gg` | localKey |
 | Remove from groups (`bqpqqbb`) | `0x0B` | 1 | `0x01` | `A2 g1 [g2 …]` | localKey |
 | Ping (`dpdpqpd`) | `0x13` | 2 | `0x01` | `01` | localKey, or beaconKey for broadcast |
-| Dismiss group (`qdppdpp`) | `0x13` | 2 | `0x01` | `A2 gg`, sent to `FF gg` | groupKey |
+| Dismiss group (`qdppdpp`) | `0x13` | 2 | `0x01` | `A2 gg`, sent to `FF gg` | groupKey (beaconKey on hardware; dismiss itself untested) |
 | Raw data (`ddqbbqp`) | `0x10 + n` | 2 | `0x05` | TLV with DP id `0x57` | caller key |
 | Lock remote action (`dpddddp`) | `0x18` | 3 | `0x21` | 16 bytes, §4.8 | HKDF key |
 
 Sequence numbers come from `bluetooth.dqddqdp`:
 
-- There is one 16-bit counter per (home, source ID), persisted by the app.
+- In the app there is one 16-bit counter per (home, source ID), persisted by
+  the app. On hardware the source is always `0x8001` (§4.9), so a controller
+  keeps one counter for the whole mesh.
 - It starts at 0 and wraps at 65535.
 - The sequence number is fixed when a request is queued, so every repeat of one
   request carries the same value.
 - The **app** filters replayed device reports per (home, device address)
   (`bluetooth.ddbbqqp`). A report is dropped when its sequence number equals
-  the last one, or is lower by at most 55 536. **UNVERIFIED:** whether devices
-  apply the same rule to phone commands; reusing a sequence number should be
-  assumed to fail.
+  the last one, or is lower by at most 55 536.
+- The **bulbs** apply a stricter rule to phone commands (§4.9): each bulb
+  tracks the highest phone sequence number it has heard, across all
+  destinations, and drops anything that is not ahead of it. Forward jumps of
+  about 900 were accepted; the real limit was not measured, so do not count on
+  anything like the app's 10 000-wide report window.
 
 ### 4.4 DP encoding (P2)
 
@@ -322,7 +343,7 @@ Reports are decoded by `bluetooth.qpbdppq.bppdpdq`. Their destination is
 | 0 | 1 | 2 | `01` | ping reply (**UNVERIFIED**) |
 | 0 | 1 | 2 | `02` | reset acknowledged |
 | 0 | 1 | 2 | `A3` | group list: payload[1..9) holds up to 8 one-byte group IDs |
-| 0 | 1 | 7, 9, 10, 11 | | DP report as TLVs (§4.4). The difference between 7 and 9–11 is **UNVERIFIED** |
+| 0 | 1 | 7, 9, 10, 11 | | DP report as TLVs (§4.4). The tested bulbs report with subCmd 7 (§4.9); what 9–11 mean is **UNVERIFIED** |
 | 0 | 3 | `0x22` | | lock remote-action result |
 
 Replies are matched to requests by **source address and reply type only**.
@@ -332,17 +353,21 @@ with `thing.m.device.dp.report`.
 ### 4.7 Timing
 
 The app's defaults, in milliseconds. "Send" is how long the frame is advertised.
-"Window" is how long the app listens for a reply.
+"Window" is how long the app listens for a reply. "Send on hardware" is what
+`UniversalProxy.TuyaBeaconMesh.Control` uses for the tested bulbs: every frame
+stays on air for at least 3000 ms, which measurably improves reception (the
+bulbs' scan duty cycle and relaying need the longer window, §4.9). "—" means `Control` has no builder for that
+request.
 
-| Request | Send | Window | Ack expected |
-|---|---|---|---|
-| DP set (`0x05`) | 3000 | 5000 | no (success assumed) |
-| DP set with ack (`0x06`) | 1000 | 1000 | yes, a DP report |
-| Reset | 2000 | 2000 | yes |
-| Ping | 2000 | 2000 for 1 device, else 5000 | yes |
-| Pair | 2000 per round | 2000 | yes |
-| Group add/remove | 5000 | 5000 | yes |
-| Dismiss group | 2000 | — | no |
+| Request | Send | Send on hardware | Window | Ack expected |
+|---|---|---|---|---|
+| DP set (`0x05`) | 3000 | 3000 | 5000 | no (success assumed) |
+| DP set with ack (`0x06`) | 1000 | 3000 | 1000 | yes, a DP report |
+| Reset | 2000 | 3000 | 2000 | yes |
+| Ping | 2000 | 3000 | 2000 for 1 device, else 5000 | yes |
+| Pair | 2000 per round | — | 2000 | yes |
+| Group add/remove | 5000 | 5000 (add) | 5000 | yes |
+| Dismiss group | 2000 | — | — | no |
 
 A type-0 request (pair, reset, group) cancels queued type-2 requests (DP,
 ping). Normal DP sets are not retried.
@@ -372,6 +397,107 @@ The 16-byte payload is:
 The payload is encrypted with AES-128-CBC (no padding, IV = the transactionId as
 ASCII), then XORed with the same key. The reply layout is in
 `beacon.receiver.RemoteControlBeaconResp`.
+
+### 4.9 Hardware-validated behaviour
+
+**Tested on one product only:** the Gardenreet RGBCW G4 LED bulb, 12 V
+low-voltage bi-pin. Ten bulbs were used; their unpaired adverts carry product
+ID `vd8o60wy`, and they use Tuya's AK80x DP set. Nothing here is known to hold
+for other P2 products, whose DP IDs and timing in particular may differ.
+
+The implementation is `UniversalProxy.TuyaBeaconMesh.*` in
+`lib/universal_proxy/tuya_beacon_mesh/`. A live capture from these bulbs
+(2026-10-25) is in `test/fixtures/tuya_beacon_mesh/p2_frames_2026-10-25.json`.
+Where this section disagrees with the app-derived sections above, this section
+is right for these bulbs.
+
+**Addresses and keys**
+
+- **Phone source.** The bulbs accept commands only from source `0x8001`
+  (`Control.phone_addr/0`). They ignore frames from the cloud-allocated
+  source ID of §4.1, but those frames **still advance** their sequence-number
+  trackers (below).
+- **Unicast** frames use localKey as the XXTEA key and beaconKey as the mask,
+  as in §4.1.
+- **Group** frames (`FF gg`) use the **beaconKey as both key and mask**. The
+  bulbs never learn a distinct groupKey, even though the app nominally keys
+  group frames with one. A bulb is added to a group with the unicast `A1 gg`
+  request (§4.3) and holds at most 8 group IDs.
+- **Reports** arrive as type 1, subCmd 7, addressed to `8000` or `8001`, and
+  are unmasked and decrypted with the beaconKey (§4.6).
+
+**Sequence numbers**
+
+- There is one phone sequence number for the whole mesh. Each bulb tracks the
+  highest phone sequence number it has heard, across **all** destinations
+  (its own node ID, its groups, other bulbs), and silently drops any frame
+  that is not ahead of it.
+- Forward jumps of about 900 were accepted. The real limit was not measured;
+  it should not be assumed to be anywhere near the app's 10 000-wide report
+  window (§4.3).
+- Because cloud-sourced frames also advance the trackers, using the Tuya app
+  alongside this controller can push the bulbs past our counter. Our frames
+  are then dropped until the counter is moved ahead of the app's.
+- The sequence number sits in plaintext at bytes 5–6. Only the frame CRC
+  covers it; the cipher does not.
+
+How `Seq` and `Lights` handle this:
+
+- The counter is 16 bits and wraps from 65 535 to 0. "Ahead" is an
+  RFC 1982-style serial comparison (`Seq.ahead?/2`): `b` is ahead of `a` when
+  it is 1..32 767 steps forward modulo 65 536. Equal values and values exactly
+  half the range apart are not ahead.
+- Numbers are reserved in blocks of 32. The advanced cursor is persisted
+  (`on_persist`) **before** any number in the block is used, so a restart
+  never reuses one.
+- The cursor never moves backwards. Reloading a dump of the **same** mesh
+  (same beaconKey) only moves it forward (`Seq.advance_to/2`). A **different**
+  mesh (different beaconKey) takes its dump's `seq` as-is: its bulbs have
+  never heard our counter, and jumping them past their forward window would
+  get every frame dropped.
+- Incoming reports are de-duplicated per bulb with the app's rule (§4.3): a
+  report must be 1..9 999 ahead of the last one accepted from that bulb.
+
+**Timing and relaying**
+
+- Every frame is advertised for at least 3 s (`Control.min_send_ms/0`); see
+  the hardware column of §4.7. That measurably improves reception, given the
+  bulbs' scan duty cycle and relaying.
+- Bulbs relay frames, ours included, decrementing the hop TTL in header bits
+  1–0 (§4.2). Our frames start at 3.
+- `Radio` drops two kinds of duplicate before handing frames on: the same
+  normalised frame (hop bits cleared, `P2.normalize/1`) from the same
+  advertiser within about 2 s, and relayed echoes of its own 32 most recent
+  transmissions. Echo dropping can be turned off to check that a frame was
+  relayed.
+
+**DP IDs (these bulbs only)**
+
+Confirmed on the Gardenreet bulbs (AK80x DP set). Other P2 products may use
+other IDs or ranges. Ranges are the ones `Control.friendly_dps/1` accepts.
+
+| DP | Meaning | Type (§4.4) | Values |
+|---|---|---|---|
+| 1 | on/off | bool | |
+| 2 | mode | enum | 0 white, 1 colour, 2 scene, 3 music |
+| 3 | brightness | value | 10..1000 |
+| 4 | colour temperature | value | 0..1000 |
+| 11 | colour | raw | `<<h::16, s, v>>`: hue 0..359 big-endian, then saturation and value 0..100 |
+
+**Pairing and reset**
+
+- The localKey **changes on every re-pairing** (§7.1).
+- A factory reset is 5 consecutive power cycles of one bulb. Once its keys are
+  known, the over-the-air reset (§4.3, subCmd `0x01`, payload `02`) also
+  works. Either way the bulb returns to the unpaired advert with a new
+  `srand`.
+- The cloud **reuses node IDs** across re-pairings. Reports identify the bulb
+  only by node ID (their source address), so two inventory entries with one
+  node ID would share a status. `Inventory.decode/1` rejects duplicate node
+  IDs, as well as duplicate MACs.
+
+The radio side (MGMT advertising, a dedicated adapter, raw HCI receive) is
+described in §9.
 
 ---
 
@@ -636,32 +762,33 @@ pose as a physical remote instead of the app (§8).
 | Family | Needed once | Needed for each new device |
 |---|---|---|
 | P1 | beaconKey; localKey and groupKey per device and group | `thing.m.device.beacon.active` |
-| P2 | beaconKey, phone source ID; localKey, nodeId and groupKey | `blu.preactive` and `blu.active` |
+| P2 | beaconKey; per bulb localKey, nodeId and MAC; group local IDs; a persisted sequence number. The phone source is fixed at `0x8001` and no groupKey is needed (§4.9) | `blu.preactive` and `blu.active` |
 | Thing Beacon Mesh | SIG NetKey, AppKey, IV index, phone source address; node unicast addresses | `pair.key.batch.get`, `ble.mesh.join` |
 
 The keys appear in the device and home data the cloud returns: `localKey`,
 `meta.beaconData`, `BeaconMeshBean`, and the SIG mesh bean.
 
-### 7.1 Where the v2 localKey comes from (open question)
+### 7.1 Where the v2 localKey comes from
 
 The beaconKey and node ID are arbitrary values the cloud picks; a bulb accepts
 whatever the pair frame delivers. Only the **localKey** ties the bulb to the
 cloud. The bulb must already know it, because P2Pair is encrypted with it.
 Tuya's firmware initialises the v2 stack with a 16-character `authkey` from the
-device licence, so there are two candidate schemes:
+device licence, so there were two candidate schemes:
 
 - **A. Static:** `localKey = authkey[0:16]`. This is how v1 works (§5).
 - **B. Per pairing:** `localKey = KDF(authkey, srand)`, computed by both the
-  bulb and the cloud. A third-party v2 project reports that the localKey
-  changes when a lamp is re-paired, which fits B. **UNVERIFIED.**
+  bulb and the cloud.
 
-To tell them apart, pair one bulb, factory-reset it so it advertises a new
-`srand`, and pair it again. The same localKey means A.
+**Resolved on hardware: B** (Gardenreet bulbs, §4.9). The localKey rotates
+every time a bulb is reset and re-paired with a new `srand`. A v1 "static
+authkey" does not carry over to v2, and the route "one cloud pairing per bulb
+is enough forever, then re-pair locally with the recorded localKey" does not
+work.
 
-Under A, one cloud pairing per bulb is enough forever: re-pairing locally to
-your own beaconKey and node ID needs only the recorded localKey. Under B you
-need the bulb's `authkey`, read from its flash, plus the KDF.
-[`tuya_kdf_search.py`](tuya_kdf_search.py) finds the KDF offline. It tests a
+Re-pairing a bulb without the cloud therefore needs the bulb's `authkey`, read
+from its flash, plus the KDF, which is still unknown.
+[`tuya_kdf_search.py`](tuya_kdf_search.py) searches for it offline. It tests a
 set of MD5, SHA-256, HMAC, AES and XXTEA constructions against an `authkey`
 and several `(srand, localKey[, srandEncrypted])` samples from the same bulb.
 
@@ -795,16 +922,36 @@ The ESPHome Native API has no message for transmitting advertisements, and Home
 Assistant has no beacon integration. P1 and P2 control therefore has to run on
 the device.
 
-Additions needed in the `bluez` library:
+### 9.1 P2: what runs today
 
-1. **Legacy advertising with an ordered UUID16 list**, through
-   `LEAdvertisingManager1.RegisterAdvertisement`:
-   - the exported `LEAdvertisement1` object must allow duplicate `ServiceUUIDs`;
-   - one advertisement per command, lasting the send time in §4.7;
-   - P1 additionally needs `LocalName` plus one UUID128.
-2. **A raw advertising-report source** that keeps each AD 0x03 list intact
-   (§2.1).
-3. **For the virtual-remote route (§8):** advertising from a
+P2 is implemented in `UniversalProxy.TuyaBeaconMesh.*` and validated on the
+bulbs of §4.9. It needs `bluez` 0.4.0 or later. `UniversalProxy.TuyaBeaconMesh.Radio`
+owns one Bluetooth adapter, which must be **dedicated to the mesh**: nothing
+else may advertise or scan on it (in particular not `Bluez.Client`, which is
+bound to the ESPHome scanner's adapter).
+
+- **Transmit:** `Bluez.Mgmt` sends the raw AD bytes
+  `02 01 06 1B 03 <26-byte frame>` (Flags, then the frame as AD 0x03, 31
+  bytes; `Carrier.ad_bytes/1`) through MGMT *Add Extended Advertising
+  Parameters/Data* with a legacy PDU. It runs under a `Bluez.Radio` `:mgmt`
+  lease on the adapter. Adverts are connectable, at a 20–30 ms interval. The
+  radio stops each advert on its own timer instead of a kernel duration, and
+  has one advert on air at a time. A `:control` send (reset, group) drops
+  queued `:normal` sends (DP, ping), as the app's queue does (§4.7).
+- **Receive:** on the same adapter, D-Bus LE discovery with
+  `DuplicateData: true` keeps the controller scanning without filtering
+  repeated adverts, and `Bluez.AdvertReceiver` reads the raw HCI advertising
+  reports. Only 26-byte AD 0x03 payloads go on, after the dedupe of §4.9.
+- `Bluez.Radio` and `Bluez.Mgmt` are shared infrastructure that the host
+  supervises. Until they, the adapter, the lease and D-Bus are available, and
+  again after any loss, `Radio` stays up but not ready and retries setup.
+
+### 9.2 Still needed
+
+1. **P1:** there is no P1 builder in this project yet. Its advert (a Local
+   Name plus one UUID128 in one legacy advert) is raw AD bytes, which the
+   `Bluez.Mgmt` path above already carries.
+2. **For the virtual-remote route (§8)**, a `bluez` addition: advertising from a
    **caller-chosen static random address** with a caller-chosen local name and
    one UUID128.
    - `LEAdvertisement1` has no property for choosing the address, so this
