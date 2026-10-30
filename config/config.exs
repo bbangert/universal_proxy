@@ -74,6 +74,18 @@ config :logger, :console,
 
 # Import environment specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.
+# HDMI-CEC control of the AV receiver / TV on a Pi's HDMI link (see
+# `UniversalProxy.Cec`). Off here; config/target.exs turns it on for firmware.
+# `:ctl_module` is the cec-ctl runner (tests inject a fake), `:receiver_la`
+# the CEC logical address commands go to (5 = Audio System, i.e. the AVR).
+config :universal_proxy, UniversalProxy.Cec,
+  enabled: false,
+  ctl_module: UniversalProxy.Cec.Ctl,
+  osd_name: "Universal Proxy",
+  auto_wake: true,
+  receiver_la: 5,
+  scan_interval_ms: 10_000
+
 import_config "#{config_env()}.exs"
 
 if Mix.target() == :host do

@@ -679,7 +679,7 @@ defmodule UniversalProxy.Audio.Server do
   defp default_friendly_name(%{card_name: name, alsa_device: "bluealsa:DEV=" <> rest}),
     do: "#{name} (#{bt_mac_suffix(rest)})"
 
-  defp default_friendly_name(%{card_name: name}), do: name
+  defp default_friendly_name(%{card_name: name}), do: Store.default_friendly_name(name)
 
   # Last three octets of the MAC in `"AA:BB:CC:DD:EE:FF,PROFILE=a2dp"` — the
   # device-unique half (the first three are the vendor OUI).

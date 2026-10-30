@@ -199,16 +199,30 @@ defmodule UniversalProxy.MixProject do
   @up_systems_tag "v0.1.11"
   @up_systems_targets [:rpi, :rpi0, :rpi0_2, :rpi2, :rpi3, :rpi4, :rpi5, :x86_64]
 
+  # Set UP_SYSTEMS_PATH to a local checkout of nerves_systems_universal_proxy
+  # to build against its target subdirs as `path:` deps instead of the pinned
+  # release — a system built there (`cd <path>/rpi4 && mix compile`) is picked
+  # up from its `.nerves/artifacts/`, with no tag or CI round-trip. Changing
+  # the value is a dependency change: run `mix deps.get` again.
   defp up_nerves_systems do
     Enum.map(@up_systems_targets, fn target ->
       {:"nerves_system_#{target}",
-       github: "bbangert/nerves_systems_universal_proxy",
-       sparse: to_string(target),
-       tag: @up_systems_tag,
-       runtime: false,
-       targets: target,
-       override: true}
+       up_system_source(target) ++ [runtime: false, targets: target, override: true]}
     end)
+  end
+
+  defp up_system_source(target) do
+    case System.get_env("UP_SYSTEMS_PATH") do
+      nil ->
+        [
+          github: "bbangert/nerves_systems_universal_proxy",
+          sparse: to_string(target),
+          tag: @up_systems_tag
+        ]
+
+      root ->
+        [path: Path.join(root, to_string(target))]
+    end
   end
 
   def release do
