@@ -226,15 +226,18 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
       stop_supervised!({Radio, 1})
       assert {:error, :not_running} = Lights.set("path light 2", on: true)
 
-      # Radio up but the lease turns out to be gone: refused before air.
+      # Radio up but not ready (its lease ended and can't be re-taken):
+      # refused before it reaches Mgmt.
       start_supervised!(radio_spec())
       wait_until(&radio_ready?/0)
-      FakeBluez.fail(:advertise, :lease_expired)
+      holder = start_supervised!({Task, fn -> Process.sleep(:infinity) end})
+      FakeBluez.fail(:acquire, {:held_by, holder})
+      :ok = FakeBluez.end_lease()
+      wait_until(fn -> not radio_ready?() end)
 
-      capture_log(fn ->
-        assert {:error, :not_ready} = Lights.set("path light 2", on: true)
-        assert {:error, :not_ready} = Lights.set("path light 2", on: true)
-      end)
+      assert {:error, :not_ready} = Lights.set("path light 2", on: true)
+      assert {:error, :not_ready} = Lights.set("path light 2", on: true)
+      FakeBluez.succeed(:acquire)
 
       # The adapter refusing just this one frame.
       FakeBluez.succeed(:advertise)
@@ -248,6 +251,20 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
       FakeBluez.succeed(:advertise)
       assert set_sn("path light 2", on: true) == 100
       assert writes(persisted) == 1
+    end
+
+    @tag :capture_log
+    test "an advertise that loses Mgmt or the lease keeps its number used" do
+      for {reason, n} <- Enum.with_index([:lease_expired, :not_lease_holder, :not_running]) do
+        wait_until(&radio_ready?/0)
+        FakeBluez.fail(:advertise, reason)
+        assert {:error, {:uncertain, ^reason}} = Lights.set("path light 2", on: true)
+        FakeBluez.succeed(:advertise)
+
+        # 100 + 2n may have gone on air: the next command must not reuse it.
+        wait_until(&radio_ready?/0)
+        assert set_sn("path light 2", on: false) == 100 + 2 * n + 1
+      end
     end
 
     @tag :capture_log

@@ -392,14 +392,44 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
     end
 
     @tag :capture_log
-    test "an advertise that finds the lease gone answers :not_ready and recovers" do
-      FakeBluez.fail(:advertise, :lease_expired)
-      assert {:error, :not_ready} = Radio.send_frame(device_frame(1), 10)
-      assert {:error, :not_ready} = Radio.send_frame(device_frame(2), 10)
+    test "an advertise that loses Mgmt or the lease is uncertain and re-runs setup" do
+      for {reason, n} <- Enum.with_index([:lease_expired, :not_lease_holder, :not_running]) do
+        wait_until(&ready?/0)
+        acquired = FakeBluez.count(:acquire)
+        FakeBluez.fail(:advertise, reason)
 
+        log =
+          capture_log(fn ->
+            assert {:error, {:uncertain, ^reason}} =
+                     Radio.send_frame(device_frame(2 * n + 1), 10)
+          end)
+
+        assert log =~ "not ready ({:advertise, #{inspect(reason)}})"
+
+        # Setup is re-run (a new lease), not just this frame dropped.
+        FakeBluez.succeed(:advertise)
+        wait_until(fn -> FakeBluez.count(:acquire) > acquired end)
+        wait_until(&ready?/0)
+        assert :ok = Radio.send_frame(device_frame(2 * n + 2), 10)
+        :ok = Radio.stop_tx()
+      end
+
+      assert_leases_balanced()
+    end
+
+    @tag :capture_log
+    test "a queued frame whose advertise loses the lease drops the queue and re-runs setup" do
+      :ok = Radio.send_frame(device_frame(1), 60_000)
+      :ok = Radio.send_frame(device_frame(2), 60_000)
+      :ok = Radio.send_frame(device_frame(3), 60_000)
+      FakeBluez.fail(:advertise, :lease_expired)
+      finish_tx()
+
+      assert length(advertises()) == 1
       FakeBluez.succeed(:advertise)
+      wait_until(fn -> FakeBluez.count(:acquire) == 2 end)
       wait_until(&ready?/0)
-      assert :ok = Radio.send_frame(device_frame(3), 10)
+      assert {:ok, %{tx: nil, queued: 0}} = Radio.status()
       assert_leases_balanced()
     end
 

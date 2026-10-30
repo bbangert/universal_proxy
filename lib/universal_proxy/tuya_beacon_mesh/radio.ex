@@ -104,6 +104,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
 
   # Advertise errors that mean the lease or Bluez.Mgmt is gone, not that
   # this one frame was refused: re-run setup rather than keep sending.
+  # They don't prove the frame stayed off air (Mgmt can crash mid-request,
+  # and reports :lease_expired for an instance that already went on air),
+  # so the caller hears {:uncertain, reason}, not :not_ready.
   @fatal_advertise_errors [:lease_expired, :not_lease_holder, :not_running]
 
   # ── Client API ─────────────────────────────────────────────────────────
@@ -154,11 +157,15 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
 
   Errors, all meaning the frame was **not** transmitted unless noted:
   `{:error, :not_ready}` while setup is pending or being retried (see the
-  moduledoc), `{:error, :queue_full}`, `{:error, {:advertise, reason}}`
-  when the adapter refused it, `{:error, :not_running}` when no radio
-  process exists, `{:error, :bad_frame}` / `{:error, :bad_class}`. Not
-  known either way: `{:error, :timeout}` and `{:error, :radio_exited}`
-  (the radio died during the call).
+  moduledoc; refused before reaching `Bluez.Mgmt`), `{:error,
+  :queue_full}`, `{:error, {:advertise, reason}}` when the adapter
+  refused it, `{:error, :not_running}` when no radio process exists,
+  `{:error, :bad_frame}` / `{:error, :bad_class}`. Not known either way:
+  `{:error, :timeout}`, `{:error, :radio_exited}` (the radio died during
+  the call), and `{:error, {:uncertain, reason}}` when `Bluez.Mgmt` or the
+  lease went away during the advertise (`reason` is `:not_running`,
+  `:lease_expired` or `:not_lease_holder`); the radio then re-runs setup
+  as for any other loss.
   """
   @spec send_frame(binary(), non_neg_integer(), keyword()) ::
           :ok
@@ -167,6 +174,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
              | :not_ready
              | :queue_full
              | {:advertise, term()}
+             | {:uncertain, :lease_expired | :not_lease_holder | :not_running}
              | :bad_frame
              | :bad_class
              | :timeout
@@ -745,7 +753,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
       {{:value, job}, queue} ->
         case start_job(%{state | tx_queue: queue}, job) do
           {:ok, state} -> state
-          {:error, :not_ready, state} -> state
+          {:error, {:uncertain, _reason}, state} -> state
           {:error, _refused, state} -> maybe_start_next(state)
         end
 
@@ -771,7 +779,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
          }}
 
       {:error, reason} when reason in @fatal_advertise_errors ->
-        {:error, :not_ready, lost(state, {:advertise, reason})}
+        {:error, {:uncertain, reason}, lost(state, {:advertise, reason})}
 
       {:error, reason} ->
         Logger.warning(

@@ -38,9 +38,14 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   frames for the same bulb or group and the same DPs replace each other
   (latest wins), and the Radio's queue is bounded (`{:error, :queue_full}`).
   When the Radio refuses a frame without transmitting it (`:not_ready`,
-  `:not_running`, `:queue_full`, a refused advertise), its sequence number
-  is handed out again, so retrying while the Radio is down burns nothing.
-  `{:error, :timeout}` means the frame may still go out.
+  `:not_running`, `:queue_full`, a refused advertise `{:advertise, _}`),
+  its sequence number is handed out again, so retrying while the Radio is
+  down burns nothing. Every other error keeps the number used: reusing a
+  number the bulbs may have heard gets the next command dropped as stale,
+  while skipping one costs nothing. `{:error, :timeout}` means the frame
+  may still go out; `{:error, {:uncertain, reason}}` means the Radio lost
+  `Bluez.Mgmt` or its lease during the advertise, so the frame may have
+  gone out (the Radio re-runs setup).
 
   ## Reports
 
@@ -104,7 +109,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   @resync_reports 3
 
   # Radio replies after which the frame provably never went on air, so its
-  # sequence number can be handed out again.
+  # sequence number can be handed out again. {:uncertain, _} is not one.
   @untransmitted [:not_ready, :not_running, :queue_full]
 
   # ── Client API ─────────────────────────────────────────────────────────
@@ -403,8 +408,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   # advertise). It is the most recently taken SN and every SN still in the
   # block is newer than anything transmitted, so handing it out again keeps
   # the on-air sequence strictly increasing; the persisted cursor already
-  # sits past the whole block. A timeout or a Radio that died mid-call
-  # keeps the SN used, since the frame may have gone out.
+  # sits past the whole block. A timeout, a Radio that died mid-call or an
+  # {:uncertain, _} advertise keeps the SN used, since the frame may have
+  # gone out.
   defp transmit(state, build, send_opts) do
     with {:ok, sn, state} <- take_sn(state),
          {:ok, {frame, send_ms, _window, _expect}} <- build_with(build, sn, state) do
