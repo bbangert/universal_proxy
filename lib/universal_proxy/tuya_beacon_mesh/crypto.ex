@@ -111,12 +111,22 @@ defmodule UniversalProxy.TuyaBeaconMesh.Crypto do
 
   @doc """
   Tuya key-string rule (§3): a 16-char key is used as its ASCII bytes, a 32-char one is
-  hex-decoded. A 16-byte binary that is neither passes through unchanged.
+  hex-decoded. A 16-byte binary that is neither passes through unchanged. Raises
+  `ArgumentError` for anything `parse_key/1` refuses.
   """
   @spec key_bytes(String.t()) :: <<_::128>>
-  def key_bytes(key) when byte_size(key) == 32, do: Base.decode16!(key, case: :mixed)
-  def key_bytes(key) when byte_size(key) == 16, do: key
+  def key_bytes(key) do
+    case parse_key(key) do
+      {:ok, bytes} -> bytes
+      :error -> raise ArgumentError, "key must be 16 ASCII chars or 32 hex chars"
+    end
+  end
 
-  def key_bytes(key),
-    do: raise(ArgumentError, "key must be 16 ASCII chars or 32 hex chars, got #{byte_size(key)}")
+  @doc "Non-raising `key_bytes/1`: `{:ok, bytes}`, or `:error` for a key it can't use."
+  @spec parse_key(term()) :: {:ok, <<_::128>>} | :error
+  def parse_key(key) when is_binary(key) and byte_size(key) == 32,
+    do: Base.decode16(key, case: :mixed)
+
+  def parse_key(<<_::binary-size(16)>> = key), do: {:ok, key}
+  def parse_key(_key), do: :error
 end

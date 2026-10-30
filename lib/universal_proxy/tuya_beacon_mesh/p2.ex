@@ -185,7 +185,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.P2 do
       frame_crc>> = frame
 
     with true <- dst in [<<0x80, 0x00>>, <<0x80, 0x01>>],
-         {:ok, key} <- fetch_key(beacon_key) do
+         {:ok, key} <- Crypto.parse_key(beacon_key) do
       cipher = :crypto.exor(masked, key)
       inner = src <> dst <> <<sn::16-big, sub_cmd, payload_crc>> <> cipher
 
@@ -321,12 +321,6 @@ defmodule UniversalProxy.TuyaBeaconMesh.P2 do
   # ----------------------------------------------------------------- helpers
 
   defp hex(bin), do: Base.encode16(bin, case: :lower)
-
-  defp fetch_key(key) do
-    {:ok, Crypto.key_bytes(key)}
-  rescue
-    ArgumentError -> :error
-  end
 
   defp addr!(addr) when is_integer(addr) and addr in 0..0xFFFF, do: <<addr::16-big>>
   defp addr!(<<_::16>> = addr), do: addr

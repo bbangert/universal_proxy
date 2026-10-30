@@ -25,7 +25,22 @@ defmodule UniversalProxy.TuyaBeaconMesh.CryptoDpTest do
       assert Crypto.key_bytes("00112233445566778899aabbccddeeff") ==
                h("00112233445566778899aabbccddeeff")
 
+      assert Crypto.key_bytes("00112233445566778899AABBCCDDEEFF") ==
+               h("00112233445566778899aabbccddeeff")
+
       assert_raise ArgumentError, fn -> Crypto.key_bytes("short") end
+      assert_raise ArgumentError, fn -> Crypto.key_bytes(String.duplicate("z", 32)) end
+    end
+
+    test "parse_key never raises" do
+      assert {:ok, "abcdefghijklmnop"} = Crypto.parse_key("abcdefghijklmnop")
+
+      assert {:ok, <<0x00, 0x11, _::binary>>} =
+               Crypto.parse_key("00112233445566778899aabbccddeeff")
+
+      for bad <- [String.duplicate("z", 32), "short", nil, 42, String.duplicate("a", 17)] do
+        assert Crypto.parse_key(bad) == :error
+      end
     end
   end
 
