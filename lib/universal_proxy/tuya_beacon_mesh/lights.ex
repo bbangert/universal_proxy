@@ -656,13 +656,20 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
          {:ok, bulb} <- Map.fetch(state.bulbs, mac) do
       {:ok, mac, bulb}
     else
-      :error ->
-        case Enum.find(state.bulbs, fn {_m, b} -> b.label == who end) do
-          {mac, bulb} -> {:ok, mac, bulb}
-          nil -> {:error, :unknown_bulb}
-        end
+      :error -> resolve_label(state, who)
     end
   end
+
+  # Bulbs without a label hold nil, so only a binary is matched: a nil or
+  # other non-string `who` must not resolve to the first unlabelled bulb.
+  defp resolve_label(state, who) when is_binary(who) do
+    case Enum.find(state.bulbs, fn {_m, b} -> b.label == who end) do
+      {mac, bulb} -> {:ok, mac, bulb}
+      nil -> {:error, :unknown_bulb}
+    end
+  end
+
+  defp resolve_label(_state, _who), do: {:error, :unknown_bulb}
 
   defp resolve_group_id(state, id) when is_integer(id) do
     if Map.has_key?(state.groups, id), do: {:ok, id}, else: {:error, :unknown_group}

@@ -58,6 +58,19 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
     # Only a MAC-shaped string is looked up as a MAC: hex inside other text
     # is not pulled out and matched.
     assert {:error, :unknown_bulb} = Lights.status("xx dc23533fcd62")
+  end
+
+  test "a nil identifier does not resolve to an unlabelled bulb" do
+    dump =
+      @fixture
+      |> File.read!()
+      |> Jason.decode!()
+      |> update_in(["bulbs", Access.at(0)], &Map.delete(&1, "label"))
+
+    assert :ok = Lights.reload(dump)
+    assert {:ok, %{label: nil}} = Lights.status("DC23530FB34A")
+    assert {:error, :unknown_bulb} = Lights.status(nil)
+    assert {:error, :unknown_bulb} = Lights.reset(nil)
     assert {:error, :unknown_bulb} = Lights.status("nobody")
   end
 
