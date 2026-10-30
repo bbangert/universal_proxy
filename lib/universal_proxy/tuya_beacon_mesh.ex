@@ -10,11 +10,12 @@ defmodule UniversalProxy.TuyaBeaconMesh do
 
   ## Drop-in JSON → control
 
-  1. Decode the key dump: `Inventory.decode/1` (see
+  1. The key dump is validated by `Inventory.decode/1` (see
      `test/fixtures/tuya_beacon_mesh/example_inventory.json`).
   2. Start `Radio` on a dedicated adapter index (injectable `Bluez.*`).
-  3. Start `Lights` with that inventory and radio; pass `on_persist:` to
-     write the advanced `seq` (and any group edits) back to Settings.
+  3. Start `Lights` with a loader for the stored inventory (read on every
+     start, so a restart resumes from the persisted `seq`) and the radio;
+     pass `on_persist:` to write the advanced `seq` back to Settings.
   4. `Lights.set("path light 2", on: true, mode: :colour, colour: {300, 100, 100})`.
 
   ## Modules
