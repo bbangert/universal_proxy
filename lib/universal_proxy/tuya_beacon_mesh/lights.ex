@@ -28,6 +28,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
 
   ## Commands
 
+  Unicast commands (`set/3`, `ping/2`, `reset/2`) are encrypted with the
+  bulb's `localKey` and masked with the bulb's own `beaconKey` (the mesh
+  key unless the inventory overrides it); `group_set/3` uses the mesh
+  key for both.
+
   `:ok` from a command means the Radio accepted the frame for
   transmission (on air or queued), not that a bulb acted on it. Queued
   frames for the same bulb or group and the same DPs replace each other
@@ -95,6 +100,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   # as {:error, :timeout} rather than as an exit of the outer call.
   @send_timeout 3_000
   @report_window 9_999
+  @group_slots 8
   @resync_reports 3
 
   # Radio replies after which the frame provably never went on air, so its
@@ -220,10 +226,13 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   defp load_inventory(fun) when is_function(fun, 0), do: run_loader(fun)
   defp load_inventory(input), do: Inventory.decode(input)
 
+  # Whatever the loader returned or raised may hold the dump (a
+  # Jason.DecodeError carries its whole input), so only a category of it
+  # is kept. Inventory.decode/1's own errors carry no input.
   defp run_loader(fun) do
     case fun.() do
       {:ok, input} -> Inventory.decode(input)
-      {:error, reason} -> {:error, {:loader, reason}}
+      {:error, reason} -> {:error, {:loader, loader_error(reason)}}
       _other -> {:error, {:loader, :bad_return}}
     end
   rescue
@@ -231,6 +240,14 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   catch
     kind, _ -> {:error, {:loader, kind}}
   end
+
+  defp loader_error(reason) when is_atom(reason), do: reason
+  defp loader_error(%{__exception__: true, __struct__: module}), do: {:exception, module}
+
+  defp loader_error(reason) when is_tuple(reason) and is_atom(elem(reason, 0)),
+    do: elem(reason, 0)
+
+  defp loader_error(_reason), do: :error
 
   # Replaces everything derived from the inventory; the caller sets `seq`.
   defp load(state, inv) do
@@ -286,7 +303,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   def handle_call({:set, who, dps, opts}, _from, state) do
     case resolve(state, who) do
       {:ok, _mac, bulb} ->
-        build = &Control.set(bulb.node_id, &1, dps, bulb.local_key, state.beacon_key, opts)
+        build = &Control.set(bulb.node_id, &1, dps, bulb.local_key, bulb.beacon_key, opts)
         transmit(state, build, coalesce: {:set, bulb.node_id, dp_keys(dps)})
 
       {:error, reason} ->
@@ -297,7 +314,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   def handle_call({:ping, who}, _from, state) do
     case resolve(state, who) do
       {:ok, _mac, bulb} ->
-        build = &{:ok, Control.ping(bulb.node_id, &1, bulb.local_key, state.beacon_key)}
+        build = &{:ok, Control.ping(bulb.node_id, &1, bulb.local_key, bulb.beacon_key)}
         transmit(state, build, coalesce: {:ping, bulb.node_id})
 
       {:error, reason} ->
@@ -308,7 +325,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   def handle_call({:reset, who}, _from, state) do
     case resolve(state, who) do
       {:ok, _mac, bulb} ->
-        build = &{:ok, Control.reset(bulb.node_id, &1, bulb.local_key, state.beacon_key)}
+        build = &{:ok, Control.reset(bulb.node_id, &1, bulb.local_key, bulb.beacon_key)}
         transmit(state, build, class: :control)
 
       {:error, reason} ->
@@ -509,8 +526,15 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   defp apply_report(bulb, %{type: 1, sub_cmd: 2, payload: <<0x02, _::binary>>}),
     do: %{bulb | last_event: :reset_ack}
 
+  # P[1..9) is exactly 8 one-byte group slots, 0 = empty, in any order;
+  # the bytes after it are not group ids.
   defp apply_report(bulb, %{type: 1, sub_cmd: 2, payload: <<0xA3, groups::binary>>}) do
-    ids = groups |> :binary.bin_to_list() |> Enum.take_while(&(&1 != 0))
+    ids =
+      groups
+      |> binary_part(0, min(byte_size(groups), @group_slots))
+      |> :binary.bin_to_list()
+      |> Enum.reject(&(&1 == 0))
+
     %{bulb | groups: ids, last_event: {:group_list, ids}}
   end
 

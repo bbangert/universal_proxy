@@ -92,6 +92,29 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
       assert {:error, :unknown_bulb} = Lights.reset("nobody")
     end
 
+    test "unicast frames are masked with the bulb's own beaconKey, group frames with the mesh key" do
+      inv = fixture(%{}) |> put_in(["bulbs", Access.at(1), "beaconKey"], @other_key)
+      assert :ok = Lights.reload(inv)
+      local3 = "ponmlkjihgfedcba"
+
+      sent_sn(fn -> Lights.set("post spot 1", on: true) end)
+      sent_sn(fn -> Lights.ping("post spot 1") end)
+      sent_sn(fn -> Lights.reset("post spot 1") end)
+      sent_sn(fn -> Lights.set("path light 2", on: true) end)
+      sent_sn(fn -> Lights.group_set(1, on: true) end)
+
+      [set3, ping3, reset3, set2, group] = Enum.map(advertises(), &hd(Carrier.frames(&1)))
+
+      for frame <- [set3, ping3, reset3] do
+        assert masked_with?(frame, @other_key, local3)
+        refute masked_with?(frame, @beacon_key, local3)
+      end
+
+      assert masked_with?(set2, @beacon_key, "abcdefghijklmnop")
+      assert masked_with?(group, @beacon_key, @beacon_key)
+      refute masked_with?(group, @other_key, @beacon_key)
+    end
+
     test "a command that can't be built gives its sequence number back", %{
       persisted: persisted
     } do
@@ -282,7 +305,12 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
             fixture(%{"beaconKey" => "not-a-key"}),
             fn -> {:error, :settings_missing} end,
             fn -> raise "boom" end,
-            fn -> :nope end
+            fn -> :nope end,
+            # Loader errors that carry the dump itself.
+            fn -> Jason.decode(bad_json) end,
+            fn -> {:error, {:bad_json, bad_json}} end,
+            fn -> {:error, bad_json} end,
+            fn -> {:error, [bad_json]} end
           ] do
         log =
           capture_log(fn ->
@@ -420,6 +448,17 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
 
       inject_report(3, 5, [{1, :bool, true}], key: @other_key)
       wait_until(fn -> match?({:ok, %{dps: %{1 => true}}}, Lights.status("post spot 1")) end)
+    end
+
+    test "a group list is exactly 8 slots; empty ones are skipped, not a terminator" do
+      inject_report(2, 5, <<0xA3, 1, 0, 4, 0, 0, 0, 0, 0, 9, 9>>, sub_cmd: 2)
+      assert_groups(2, [1, 4])
+
+      inject_report(2, 6, <<0xA3, 0, 0, 0, 0, 0, 0, 0, 7, 9, 9>>, sub_cmd: 2)
+      assert_groups(2, [7])
+
+      inject_report(2, 7, <<0xA3, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10>>, sub_cmd: 2)
+      assert_groups(2, [1, 2, 3, 4, 5, 6, 7, 8])
     end
 
     test "ping replies, reset acks and group lists" do
@@ -607,6 +646,15 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
     wait_until(fn -> match?({:ok, %{dps: %{4 => ^n}}}, Lights.status("post spot 1")) end)
   end
 
+  defp assert_groups(2, ids) do
+    wait_until(fn ->
+      match?(
+        {:ok, %{groups: ^ids, last_event: {:group_list, ^ids}}},
+        Lights.status("path light 2")
+      )
+    end)
+  end
+
   defp assert_dp(2, dp, value) do
     wait_until(fn -> match?({:ok, %{dps: %{^dp => ^value}}}, Lights.status("path light 2")) end)
   end
@@ -633,6 +681,17 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
     %{tx_current: %{token: token}} = :sys.get_state(Radio)
     send(Process.whereis(Radio), {:tx_done, token})
     wait_until(fn -> length(advertises()) > before end)
+  end
+
+  # Whether `frame` unmasks with `mask` (the frame CRC holds) and its
+  # payload then decrypts with `key` (the payload CRC holds).
+  defp masked_with?(frame, mask, key) do
+    <<hdr, head::binary-7, payload_crc, masked::binary-16, crc>> = frame
+    cipher = :crypto.exor(masked, Crypto.key_bytes(mask))
+    payload = Crypto.xxtea_decrypt(cipher, Crypto.key_bytes(key))
+
+    Crypto.crc8(<<Bitwise.band(hdr, 0xFC)>> <> head <> <<payload_crc>> <> cipher) == crc and
+      Crypto.crc8(payload) == payload_crc
   end
 
   defp frame_sn(ad) do
