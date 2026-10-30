@@ -16,13 +16,12 @@ Other P2 products may differ, in DP ids and timing in particular.
 Example: `test/fixtures/tuya_beacon_mesh/example_inventory.json`.
 
 ```elixir
-{:ok, inv} = UniversalProxy.TuyaBeaconMesh.Inventory.decode(File.read!("dump.json"))
-
 {:ok, _} = UniversalProxy.TuyaBeaconMesh.Radio.start_link(adapter_index: 1)
 
 {:ok, _} =
   UniversalProxy.TuyaBeaconMesh.Lights.start_link(
-    inventory: inv,
+    # Read in init, so a restarted Lights resumes from the persisted seq.
+    inventory: fn -> Settings.fetch(:tuya_beacon_mesh) end,
     on_persist: fn inv -> Settings.put(:tuya_beacon_mesh, Inventory.to_map(inv)) end
   )
 
@@ -31,10 +30,17 @@ UniversalProxy.TuyaBeaconMesh.Lights.set("path light 2", on: true)
 
 `Inventory.decode/1` rejects duplicate MACs and duplicate `nodeId`s — the
 cloud reuses node ids across re-pairings, and wire reports only carry the
-node id, so twins would silently share one status entry.
+node id, so twins would silently share one status entry. It also rejects
+keys that aren't 32 hex / 16 printable ASCII chars, reserved node and group
+ids, and duplicate labels and group ids or names.
 
-Persist the inventory whenever `on_persist` fires so the advanced `seq`
-survives restarts (never go backwards).
+Pass a **loader** as `inventory:`, not the decoded data: a child spec's
+data is frozen at supervisor start, so a crash-restart would rewind `seq`
+and reuse SNs. `on_persist` must return `:ok` only once the write is
+durable; anything else blocks sending (`{:error, :persist_failed}`) until a
+later write succeeds. A bad stored inventory makes `Lights` `:ignore` its
+start instead of failing boot. Give the `Radio` child `shutdown: 10_000`
+(its `child_spec/1` does).
 
 ## Hardware-proven protocol facts
 
@@ -91,5 +97,7 @@ them; Lights can grow to call them without new protocol code.
 
 ## Source
 
-Prototyped under the Vagus `tuya-ble-bulbs` task. Fixtures: reference
-vectors + live P2 capture 2026-10-25 + example inventory JSON.
+Prototyped under the Vagus `tuya-ble-bulbs` task. Fixtures: the P2 reference
+vectors (`vectors.json`, P2 section only; the cloud-signing vectors stay with
+the cloud code that was left out) + live P2 capture 2026-10-25 + example
+inventory JSON.

@@ -441,6 +441,24 @@ is right for these bulbs.
 - The sequence number sits in plaintext at bytes 5–6. Only the frame CRC
   covers it; the cipher does not.
 
+**Integrity: none against an attacker**
+
+The frame CRC-8 (§4.2) is unkeyed and linear, and it covers the source,
+destination, sequence number and subCmd in cleartext. Anyone in radio range
+who captured one frame can rewrite those fields and fix the CRC up without
+knowing any key, because the encrypted payload and its CRC are untouched:
+
+- a device report can be re-attributed to another bulb, given another
+  subCmd, or replayed;
+- a report with its sequence number raised (up to the 9 999 window below)
+  makes that bulb's later genuine reports look stale;
+- one of **our** frames replayed with a higher sequence number is accepted
+  by the bulbs and pushes their phone-SN tracker past our counter, so our
+  later frames are dropped (denial of control).
+
+This is a protocol limit, not something a controller can fix. Treat report
+status as advisory. Nothing received moves our transmit counter.
+
 How `Seq` and `Lights` handle this:
 
 - The counter is 16 bits and wraps from 65 535 to 0. "Ahead" is an
@@ -457,6 +475,14 @@ How `Seq` and `Lights` handle this:
   get every frame dropped.
 - Incoming reports are de-duplicated per bulb with the app's rule (§4.3): a
   report must be 1..9 999 ahead of the last one accepted from that bulb.
+  A bulb whose report counter restarts far behind (or jumps far ahead) would
+  then be ignored until it passed the old value, so `Lights` re-anchors a bulb
+  after 3 consecutive in-order reports outside the window. Whether the bulbs'
+  report counter survives a power cycle is **UNVERIFIED**.
+- A block is reserved only once `on_persist` has confirmed the write; until
+  then nothing is sent. A frame the radio refuses before transmitting (not
+  ready, queue full, advertise refused) gives its number back, so retrying
+  while the radio is down burns nothing.
 
 **Timing and relaying**
 
@@ -936,8 +962,11 @@ bound to the ESPHome scanner's adapter).
   Parameters/Data* with a legacy PDU. It runs under a `Bluez.Radio` `:mgmt`
   lease on the adapter. Adverts are connectable, at a 20–30 ms interval. The
   radio stops each advert on its own timer instead of a kernel duration, and
-  has one advert on air at a time. A `:control` send (reset, group) drops
-  queued `:normal` sends (DP, ping), as the app's queue does (§4.7).
+  has one advert on air at a time, in the order sent. A `:control` send
+  (reset, group) drops queued `:normal` sends (DP, ping), as the app's queue
+  does (§4.7). Since each frame is on air for seconds, the queue is bounded
+  (8 frames) and a newer DP set for the same bulb or group and DPs replaces
+  a queued one.
 - **Receive:** on the same adapter, D-Bus LE discovery with
   `DuplicateData: true` keeps the controller scanning without filtering
   repeated adverts, and `Bluez.AdvertReceiver` reads the raw HCI advertising
