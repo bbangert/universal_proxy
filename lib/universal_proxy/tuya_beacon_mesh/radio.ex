@@ -496,8 +496,10 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
     receive do
       {:DOWN, ^ref, :process, ^rx, _reason} -> :ok
     after
-      1_000 -> Process.demonitor(ref, [:flush])
+      1_000 -> :ok
     end
+
+    Process.demonitor(ref, [:flush])
   end
 
   # ── TX ───────────────────────────────────────────────────────────────
