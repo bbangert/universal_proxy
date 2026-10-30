@@ -4,13 +4,23 @@ defmodule UniversalProxy.TuyaBeaconMesh.FakeBluez do
   the queue / fan-out / retry logic is testable off-board. One Agent (named
   `UniversalProxy.TuyaBeaconMesh.FakeBluez.State`) holds everything: recorded calls,
   the receiver's `on_report` fun, the current lease and injected failures.
-  Return shapes follow bluez 0.4.0. Compile-only test support, never
+  Return shapes and lease rules follow bluez 0.4.0: `acquire` is
+  idempotent for the holder and refuses another holder, `release` ends the
+  lease and notifies every `subscribe`r with `{:radio_lease_ended, ref}`
+  (the releaser included), `Mgmt` only sends for the current lease's
+  holder and only stops instances it added under that lease. A contract
+  test (`fake_bluez_test.exs`) checks every fake function exists with the
+  same arity in the real module. Compile-only test support, never
   deployed.
+
+  The Agent and the receiver names are global, so only `async: false`
+  test modules may use it.
 
   Failures are injected per step with `fail/2` and cleared with
   `succeed/1`: `:mgmt` (`read_advertising_features`), `:bluez_radio`
   (`subscribe`), `:acquire`, `:connect`, `{:dbus, member}`, `:receiver`
-  (`start_link`) and `:advertise`.
+  (`start_link`), `:advertise`, `:stop_advertising`, and
+  `:receiver_stop` (`:hang` makes the receiver ignore a stop).
   """
 
   alias Bluez.Radio.Lease
@@ -39,7 +49,15 @@ defmodule UniversalProxy.TuyaBeaconMesh.FakeBluez do
   end
 
   defp fresh do
-    %{calls: [], on_report: nil, failures: %{}, lease: nil, radio_pid: nil, radio_subs: []}
+    %{
+      calls: [],
+      on_report: nil,
+      failures: %{},
+      lease: nil,
+      instances: %{},
+      radio_pid: nil,
+      radio_subs: []
+    }
   end
 
   @doc false
@@ -74,12 +92,40 @@ defmodule UniversalProxy.TuyaBeaconMesh.FakeBluez do
 
   @doc "Ends the current lease the way `Bluez.Radio` does: notify subscribers."
   def end_lease do
-    {lease, subs} =
-      Agent.get_and_update(@agent, fn s -> {{s.lease, s.radio_subs}, %{s | lease: nil}} end)
+    case Agent.get(@agent, & &1.lease) do
+      nil -> :ok
+      lease -> end_lease(lease.ref)
+    end
+  end
 
-    if lease, do: Enum.each(subs, &send(&1, {:radio_lease_ended, lease.ref}))
+  @doc false
+  def end_lease(ref) do
+    {ended?, subs} =
+      Agent.get_and_update(@agent, fn
+        %{lease: %Lease{ref: ^ref}} = s ->
+          {{true, s.radio_subs}, %{s | lease: nil, instances: %{}}}
+
+        s ->
+          {{false, []}, s}
+      end)
+
+    if ended?, do: Enum.each(subs, &send(&1, {:radio_lease_ended, ref}))
     :ok
   end
+
+  # Bluez.Radio monitors the holder: a lease ends when its holder exits.
+  @doc false
+  def end_dead_holders_lease do
+    case Agent.get(@agent, & &1.lease) do
+      %Lease{holder: holder, ref: ref} -> unless Process.alive?(holder), do: end_lease(ref)
+      nil -> :ok
+    end
+
+    :ok
+  end
+
+  @doc "Instance numbers currently advertising, as `%{instance => lease_ref}`."
+  def instances, do: Agent.get(@agent, & &1.instances)
 
   @doc "Kills the fake `Bluez.Radio` process (every lease ends with it)."
   def kill_bluez_radio do
@@ -132,25 +178,54 @@ defmodule UniversalProxy.TuyaBeaconMesh.FakeBluez do
       end
     end
 
-    def acquire(opts) do
+    def acquire(opts \\ []) do
       case FakeBluez.failure(:acquire) do
-        nil ->
-          lease = %Lease{
-            radio: FakeBluez.radio_pid(),
-            index: Keyword.get(opts, :adapter_index, 0),
-            mode: :mgmt,
-            ref: make_ref(),
-            holder: self()
-          }
+        nil -> grant(Keyword.get(opts, :adapter_index, 0), self())
+        reason -> refuse(reason)
+      end
+    end
 
-          Agent.update(FakeBluez.State, &%{&1 | lease: lease})
+    defp grant(index, holder) do
+      radio = FakeBluez.radio_pid()
+      FakeBluez.end_dead_holders_lease()
+
+      result =
+        Agent.get_and_update(FakeBluez.State, fn
+          %{lease: %Lease{holder: ^holder} = lease} = s ->
+            {{:existing, lease}, s}
+
+          %{lease: %Lease{holder: other}} = s ->
+            {{:held_by, other}, s}
+
+          s ->
+            lease = %Lease{
+              radio: radio,
+              index: index,
+              mode: :mgmt,
+              ref: make_ref(),
+              holder: holder
+            }
+
+            {{:new, lease}, %{s | lease: lease}}
+        end)
+
+      case result do
+        {:new, lease} ->
           FakeBluez.record({:acquire, lease.ref})
           {:ok, lease}
 
-        reason ->
-          FakeBluez.record({:acquire_failed, reason})
-          {:error, reason}
+        {:existing, lease} ->
+          FakeBluez.record({:acquire_again, lease.ref})
+          {:ok, lease}
+
+        {:held_by, other} ->
+          refuse({:held_by, other})
       end
+    end
+
+    defp refuse(reason) do
+      FakeBluez.record({:acquire_failed, reason})
+      {:error, reason}
     end
 
     def valid?(%Lease{ref: ref}),
@@ -158,11 +233,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.FakeBluez do
 
     def release(%Lease{ref: ref}) do
       FakeBluez.record({:release, ref})
-
-      Agent.update(FakeBluez.State, fn
-        %{lease: %Lease{ref: ^ref}} = s -> %{s | lease: nil}
-        s -> s
-      end)
+      FakeBluez.end_lease(ref)
     end
   end
 
@@ -187,20 +258,49 @@ defmodule UniversalProxy.TuyaBeaconMesh.FakeBluez do
       end
     end
 
-    def advertise(%Lease{}, data, opts) do
-      case FakeBluez.failure(:advertise) do
-        nil ->
-          FakeBluez.record({:advertise, data, opts})
-          {:ok, 5}
+    # Like the real one, repeated sends reuse one instance number.
+    @instance 5
 
-        reason ->
-          {:error, reason}
+    def advertise(%Lease{} = lease, data, opts \\ []) do
+      with :ok <- check_holder(lease),
+           :ok <- check_lease(lease),
+           nil <- FakeBluez.failure(:advertise) do
+        FakeBluez.record({:advertise, data, opts})
+        Agent.update(FakeBluez.State, &put_in(&1.instances[@instance], lease.ref))
+        {:ok, @instance}
+      else
+        {:error, reason} -> {:error, reason}
+        reason -> {:error, reason}
       end
     end
 
-    def stop_advertising(%Lease{}, instance, _server \\ nil) do
+    def stop_advertising(%Lease{} = lease, instance, _server \\ nil) do
       FakeBluez.record({:stop, instance})
-      :ok
+
+      with :ok <- check_holder(lease),
+           nil <- FakeBluez.failure(:stop_advertising) do
+        Agent.get_and_update(FakeBluez.State, fn s ->
+          case s.instances do
+            %{^instance => ref} when ref == lease.ref ->
+              {:ok, %{s | instances: Map.delete(s.instances, instance)}}
+
+            _other ->
+              {{:error, :unknown_instance}, s}
+          end
+        end)
+      else
+        {:error, reason} -> {:error, reason}
+        reason -> {:error, reason}
+      end
+    end
+
+    defp check_holder(%Lease{holder: holder}) when holder == self(), do: :ok
+    defp check_holder(_lease), do: {:error, :not_lease_holder}
+
+    defp check_lease(%Lease{ref: ref}) do
+      if Agent.get(FakeBluez.State, &match?(%Lease{ref: ^ref}, &1.lease)),
+        do: :ok,
+        else: {:error, :lease_expired}
     end
   end
 
@@ -236,11 +336,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.FakeBluez do
     @moduledoc false
     alias UniversalProxy.TuyaBeaconMesh.FakeBluez
 
-    def call(conn, _path, _interface, member, _signature, _args, _timeout \\ 5_000)
+    def call(conn, _path, _interface, member, _signature, body, _timeout \\ 5_000)
         when is_pid(conn) do
       case FakeBluez.failure({:dbus, member}) do
         nil ->
-          FakeBluez.record({:dbus, member})
+          FakeBluez.record({:dbus, member, body})
           {:ok, []}
 
         reason ->
@@ -256,7 +356,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.FakeBluez do
 
     alias UniversalProxy.TuyaBeaconMesh.FakeBluez
 
-    def start_link(opts) do
+    def start_link(opts \\ []) do
       case FakeBluez.failure(:receiver) do
         nil ->
           {name, opts} = Keyword.pop(opts, :name, __MODULE__)
@@ -267,13 +367,19 @@ defmodule UniversalProxy.TuyaBeaconMesh.FakeBluez do
       end
     end
 
-    def listening?(name), do: Process.whereis(name) != nil
+    def listening?(name \\ __MODULE__), do: Process.whereis(name) != nil
 
     @impl GenServer
     def init(opts) do
       FakeBluez.set_on_report(Keyword.fetch!(opts, :on_report))
       FakeBluez.record({:receiver_started, self()})
       {:ok, %{}}
+    end
+
+    @impl GenServer
+    def terminate(_reason, _state) do
+      if FakeBluez.failure(:receiver_stop) == :hang, do: Process.sleep(:infinity)
+      :ok
     end
   end
 end

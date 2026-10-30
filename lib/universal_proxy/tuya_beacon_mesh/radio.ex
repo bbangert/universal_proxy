@@ -37,10 +37,18 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   controller without hardware offload `Bluez.Mgmt` refuses a finite
   duration while another instance is registered, see its "Software
   rotation" section, so we stop on our own timer). One advert is on air at
-  a time. Frames are sent with the app's queue classes
+  a time, in the order sent, so sequence numbers go on air in the order
+  they were handed out. Frames are sent with the app's queue classes
   (tuya_beacon_mesh.md §4.7): a `:control` send (pair, reset, group)
   drops queued `:normal` sends (DP, ping); it does not interrupt the
   advert already on air.
+
+  With every frame on air for seconds, the queue is latency: it holds at
+  most `:max_queue` frames (default 8; `{:error, :queue_full}` past
+  that), and a `:normal` send with a `coalesce:` key replaces a queued
+  frame with the same key (the old one is dropped and the new one goes to
+  the back, keeping the send order). A frame dropped from the queue never
+  went on air.
 
   ## RX
 
@@ -68,8 +76,6 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
 
   require Logger
 
-  import Bitwise
-
   alias UniversalProxy.TuyaBeaconMesh.{Carrier, P2}
 
   @dedupe_ms 2_000
@@ -77,6 +83,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   @recent_tx_max 32
   @retry_ms 2_000
   @max_retry_ms 30_000
+
+  @max_queue 8
+  @receiver_stop_ms 2_000
 
   # Advertise errors that mean the lease or Bluez.Mgmt is gone, not that
   # this one frame was refused: re-run setup rather than keep sending.
@@ -90,9 +99,13 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   Options: `:adapter_index` (default 0), `:name` (default
   `#{inspect(__MODULE__)}`), `:drop_echoes` (default `true`),
   `:retry_ms` (first setup retry delay, default #{@retry_ms}; doubles up
-  to #{@max_retry_ms}), and the `Bluez.*` implementation modules
-  `:bluez_radio`, `:mgmt`, `:rebus`, `:dbus`, `:receiver` (defaults are
-  the real ones).
+  to #{@max_retry_ms}), `:max_queue` (default #{@max_queue}),
+  `:receiver_stop_ms` (how long a stopping receiver may take before it is
+  killed, default #{@receiver_stop_ms}), and the `Bluez.*` implementation
+  modules `:bluez_radio`, `:mgmt`, `:rebus`, `:dbus`, `:receiver`
+  (defaults are the real ones).
+
+  Every client function takes `server:` (default `#{inspect(__MODULE__)}`).
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
@@ -100,30 +113,67 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
     GenServer.start_link(__MODULE__, opts, name: name)
   end
 
+  # Teardown can take several seconds when BlueZ is slow; a kill is still
+  # safe (Bluez.Radio ends the lease, the D-Bus connection closes).
   def child_spec(opts) do
     %{
       id: {__MODULE__, Keyword.get(opts, :adapter_index, 0)},
-      start: {__MODULE__, :start_link, [opts]}
+      start: {__MODULE__, :start_link, [opts]},
+      shutdown: 10_000
     }
   end
 
   @doc """
-  Queues `frame` (26 bytes) for `duration_ms` of advertising. `:class` is
-  `:normal` (default) or `:control`; a `:control` send drops queued
-  `:normal` frames. Returns `:ok` once the frame is on air or queued,
+  Queues `frame` (26 bytes) for `duration_ms` of advertising.
+
+  Options: `:class` — `:normal` (default) or `:control`; a `:control`
+  send drops queued `:normal` frames. `:coalesce` — a key; a `:normal`
+  send replaces a queued frame with the same key (see the moduledoc).
+  `:timeout` — call timeout (default 5000). `:server`.
+
+  `:ok` means accepted for transmission: on air, or queued. A queued frame
+  can still be dropped later (a `:control` send, a coalescing send, the
+  radio going not ready, the adapter refusing it — logged).
+
+  Errors, all meaning the frame was **not** transmitted unless noted:
   `{:error, :not_ready}` while setup is pending or being retried (see the
-  moduledoc), `{:error, :not_running}` when the radio process is down,
-  `{:error, :bad_frame}` for a non-26-byte frame.
+  moduledoc), `{:error, :queue_full}`, `{:error, {:advertise, reason}}`
+  when the adapter refused it, `{:error, :not_running}` when no radio
+  process exists, `{:error, :bad_frame}` / `{:error, :bad_class}`. Not
+  known either way: `{:error, :timeout}` and `{:error, :radio_exited}`
+  (the radio died during the call).
   """
   @spec send_frame(binary(), non_neg_integer(), keyword()) ::
-          :ok | {:error, :not_running | :not_ready | :bad_frame}
+          :ok
+          | {:error,
+             :not_running
+             | :not_ready
+             | :queue_full
+             | {:advertise, term()}
+             | :bad_frame
+             | :bad_class
+             | :timeout
+             | :radio_exited}
   def send_frame(frame, duration_ms, opts \\ [])
 
   def send_frame(<<_::binary-size(26)>> = frame, duration_ms, opts)
       when is_integer(duration_ms) and duration_ms >= 0 do
-    server = Keyword.get(opts, :server, __MODULE__)
-    class = Keyword.get(opts, :class, :normal)
-    call(server, {:send_frame, frame, duration_ms, class}, {:error, :not_running})
+    case Keyword.get(opts, :class, :normal) do
+      class when class in [:normal, :control] ->
+        request = {:send_frame, frame, duration_ms, class, Keyword.get(opts, :coalesce)}
+
+        try do
+          GenServer.call(server(opts), request, Keyword.get(opts, :timeout, 5_000))
+        catch
+          :exit, {:timeout, _} -> {:error, :timeout}
+          # The call never reached a process: nothing was sent.
+          :exit, {:noproc, _} -> {:error, :not_running}
+          :exit, _reason -> {:error, :radio_exited}
+        end
+
+      _other ->
+        {:error, :bad_class}
+    end
   end
 
   def send_frame(frame, _duration_ms, _opts) when is_binary(frame),
@@ -132,7 +182,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   @doc "Takes the current advert off air and empties the TX queue."
   @spec stop_tx(keyword()) :: :ok | {:error, :not_running}
   def stop_tx(opts \\ []) do
-    call(Keyword.get(opts, :server, __MODULE__), :stop_tx, {:error, :not_running})
+    call(server(opts), :stop_tx, {:error, :not_running})
   end
 
   @doc """
@@ -141,29 +191,25 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   and dropped when it exits. Works while the radio is not ready; reports
   start once it is.
   """
-  @spec subscribe(pid(), :all | :unpaired | {:mac, String.t()}, GenServer.server()) ::
+  @spec subscribe(pid(), :all | :unpaired | {:mac, String.t()}, keyword()) ::
           :ok | {:error, :not_running | :bad_filter}
-  def subscribe(pid, filter, server \\ __MODULE__) when is_pid(pid) do
+  def subscribe(pid, filter, opts \\ []) when is_pid(pid) do
     case normalize_filter(filter) do
-      {:ok, filter} -> call(server, {:subscribe, pid, filter}, {:error, :not_running})
+      {:ok, filter} -> call(server(opts), {:subscribe, pid, filter}, {:error, :not_running})
       :error -> {:error, :bad_filter}
     end
   end
 
   @doc "Removes `pid`'s subscription, if any."
-  @spec unsubscribe(pid(), GenServer.server()) :: :ok | {:error, :not_running}
-  def unsubscribe(pid, server \\ __MODULE__) when is_pid(pid) do
-    call(server, {:unsubscribe, pid}, {:error, :not_running})
+  @spec unsubscribe(pid(), keyword()) :: :ok | {:error, :not_running}
+  def unsubscribe(pid, opts \\ []) when is_pid(pid) do
+    call(server(opts), {:unsubscribe, pid}, {:error, :not_running})
   end
 
   @doc "Turns echo dropping (see the moduledoc) on or off at runtime."
   @spec set_drop_echoes(boolean(), keyword()) :: :ok | {:error, :not_running}
   def set_drop_echoes(drop?, opts \\ []) when is_boolean(drop?) do
-    call(
-      Keyword.get(opts, :server, __MODULE__),
-      {:set_drop_echoes, drop?},
-      {:error, :not_running}
-    )
+    call(server(opts), {:set_drop_echoes, drop?}, {:error, :not_running})
   end
 
   @doc """
@@ -174,8 +220,10 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   """
   @spec status(keyword()) :: {:ok, map()} | {:error, :not_running}
   def status(opts \\ []) do
-    call(Keyword.get(opts, :server, __MODULE__), :status, {:error, :not_running})
+    call(server(opts), :status, {:error, :not_running})
   end
+
+  defp server(opts), do: Keyword.get(opts, :server, __MODULE__)
 
   # `catch :exit` idiom (see `Bluez`): not running → the given default.
   defp call(server, request, default) do
@@ -227,6 +275,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
       dbus: Keyword.get(opts, :dbus, Bluez.DBus),
       receiver: Keyword.get(opts, :receiver, Bluez.AdvertReceiver),
       drop_echoes: Keyword.get(opts, :drop_echoes, true),
+      max_queue: Keyword.get(opts, :max_queue, @max_queue),
+      receiver_stop_ms: Keyword.get(opts, :receiver_stop_ms, @receiver_stop_ms),
       ready: false,
       last_error: nil,
       retry_ms: retry_ms,
@@ -295,7 +345,6 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
       )
     end
 
-    if state.retry_timer, do: Process.cancel_timer(state.retry_timer)
     timer = Process.send_after(self(), :retry_setup, state.backoff_ms)
 
     %{
@@ -309,8 +358,10 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
 
   # Takes everything setup got back down, except the D-Bus connection and
   # the Bluez.Radio subscription, which are reused by the next attempt.
+  # A failed stop_advertising needs nothing more here: releasing the lease
+  # removes every instance sent under it.
   defp teardown(state) do
-    state = stop_current(state)
+    {_result, state} = stop_current(state)
     state = %{state | tx_queue: :queue.new(), ready: false}
     state = stop_receiver(state)
     state = stop_discovery(state)
@@ -422,13 +473,15 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   end
 
   # Unlinked first, so stopping it doesn't come back as an {:EXIT, ...}.
+  # One that won't stop in time is killed: left alive it would keep the
+  # registered Rx name and fail every later setup with already_started.
   defp stop_receiver(%{rx: rx} = state) when is_pid(rx) do
     Process.unlink(rx)
 
     try do
-      GenServer.stop(rx, :normal, 2_000)
+      GenServer.stop(rx, :normal, state.receiver_stop_ms)
     catch
-      :exit, _reason -> :ok
+      :exit, _reason -> kill_receiver(rx)
     end
 
     %{state | rx: nil, rx_name: nil}
@@ -436,45 +489,75 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
 
   defp stop_receiver(state), do: %{state | rx: nil, rx_name: nil}
 
+  defp kill_receiver(rx) do
+    ref = Process.monitor(rx)
+    Process.exit(rx, :kill)
+
+    receive do
+      {:DOWN, ^ref, :process, ^rx, _reason} -> :ok
+    after
+      1_000 -> Process.demonitor(ref, [:flush])
+    end
+  end
+
   # ── TX ───────────────────────────────────────────────────────────────
 
   @impl GenServer
-  def handle_call({:send_frame, _frame, _duration_ms, _class}, _from, %{ready: false} = state),
+  def handle_call({:send_frame, _frame, _ms, _class, _key}, _from, %{ready: false} = state),
     do: {:reply, {:error, :not_ready}, state}
 
-  def handle_call({:send_frame, frame, duration_ms, class}, _from, state) do
-    state =
-      if class == :control,
-        do: %{state | tx_queue: drop_queued(state.tx_queue, :normal)},
-        else: state
+  def handle_call({:send_frame, frame, duration_ms, class, key}, _from, state) do
+    job = %{
+      frame: frame,
+      duration_ms: duration_ms,
+      class: class,
+      key: if(class == :normal, do: key),
+      norm: P2.normalize(frame)
+    }
 
-    job = %{frame: frame, duration_ms: duration_ms, class: class, norm: P2.normalize(frame)}
-    state = maybe_start_next(%{state | tx_queue: :queue.in(job, state.tx_queue)})
+    queue = drop_superseded(state.tx_queue, job)
+    state = %{state | tx_queue: queue}
 
-    # Starting it may have found the lease gone (see maybe_start_next/1).
-    {:reply, if(state.ready, do: :ok, else: {:error, :not_ready}), state}
+    cond do
+      # Nothing on air (so nothing queued either): start it now, so a
+      # refusal reaches the caller.
+      state.tx_current == nil and :queue.is_empty(queue) ->
+        case start_job(state, job) do
+          {:ok, state} -> {:reply, :ok, state}
+          {:error, reason, state} -> {:reply, {:error, reason}, state}
+        end
+
+      :queue.len(queue) >= state.max_queue ->
+        {:reply, {:error, :queue_full}, state}
+
+      true ->
+        {:reply, :ok, maybe_start_next(%{state | tx_queue: :queue.in(job, queue)})}
+    end
   end
 
   def handle_call(:stop_tx, _from, state) do
-    {:reply, :ok, stop_current(%{state | tx_queue: :queue.new()})}
+    {:reply, :ok, stop_and_continue(%{state | tx_queue: :queue.new()})}
   end
 
   def handle_call({:subscribe, pid, filter}, _from, state) do
-    subscribers =
+    mon =
       case state.subscribers do
-        %{^pid => _existing} ->
-          Map.put(state.subscribers, pid, filter)
-
-        _new ->
-          Process.monitor(pid)
-          Map.put(state.subscribers, pid, filter)
+        %{^pid => {_filter, mon}} -> mon
+        _new -> Process.monitor(pid)
       end
 
-    {:reply, :ok, %{state | subscribers: subscribers}}
+    {:reply, :ok, %{state | subscribers: Map.put(state.subscribers, pid, {filter, mon})}}
   end
 
   def handle_call({:unsubscribe, pid}, _from, state) do
-    {:reply, :ok, %{state | subscribers: Map.delete(state.subscribers, pid)}}
+    case Map.pop(state.subscribers, pid) do
+      {{_filter, mon}, subscribers} ->
+        Process.demonitor(mon, [:flush])
+        {:reply, :ok, %{state | subscribers: subscribers}}
+
+      {nil, _subscribers} ->
+        {:reply, :ok, state}
+    end
   end
 
   def handle_call({:set_drop_echoes, drop?}, _from, state) do
@@ -506,9 +589,12 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
     {:noreply, fan_out(state, address, frame, rssi)}
   end
 
+  # Matched by a per-advert token, not the Mgmt instance number: Mgmt
+  # reuses instance numbers, so a timer message that was already queued
+  # when its advert was stopped would otherwise cut a newer advert short.
   @impl GenServer
-  def handle_info({:tx_done, instance}, %{tx_current: %{instance: instance}} = state) do
-    {:noreply, maybe_start_next(stop_current(state))}
+  def handle_info({:tx_done, token}, %{tx_current: %{token: token}} = state) do
+    {:noreply, stop_and_continue(state)}
   end
 
   def handle_info(:retry_setup, %{ready: false} = state),
@@ -531,8 +617,14 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
     {:noreply, lost(state, {:dbus_down, reason})}
   end
 
-  def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
-    {:noreply, %{state | subscribers: Map.delete(state.subscribers, pid)}}
+  def handle_info({:DOWN, mon, :process, pid, _reason}, state) do
+    case state.subscribers do
+      %{^pid => {_filter, ^mon}} ->
+        {:noreply, %{state | subscribers: Map.delete(state.subscribers, pid)}}
+
+      _other ->
+        {:noreply, state}
+    end
   end
 
   def handle_info({:EXIT, rx, reason}, %{rx: rx} = state) when is_pid(rx) do
@@ -551,33 +643,21 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
     :ok
   end
 
-  defp drop_queued(queue, class) do
-    :queue.filter(fn job -> job.class != class end, queue)
-  end
+  # A :control job drops every queued :normal one; a :normal job with a
+  # coalesce key drops the queued job with the same key.
+  defp drop_superseded(queue, %{class: :control}),
+    do: :queue.filter(&(&1.class != :normal), queue)
+
+  defp drop_superseded(queue, %{key: nil}), do: queue
+  defp drop_superseded(queue, %{key: key}), do: :queue.filter(&(&1.key != key), queue)
 
   defp maybe_start_next(%{tx_current: nil, ready: true} = state) do
     case :queue.out(state.tx_queue) do
       {{:value, job}, queue} ->
-        case state.mgmt.advertise(state.lease, Carrier.ad_bytes(job.frame), flags: [:connectable]) do
-          {:ok, instance} ->
-            timer = Process.send_after(self(), {:tx_done, instance}, job.duration_ms)
-
-            %{
-              state
-              | tx_queue: queue,
-                tx_current: Map.merge(job, %{instance: instance, timer: timer}),
-                recent_tx: Enum.take([job.norm | state.recent_tx], @recent_tx_max)
-            }
-
-          {:error, reason} when reason in @fatal_advertise_errors ->
-            lost(%{state | tx_queue: queue}, {:advertise, reason})
-
-          {:error, reason} ->
-            Logger.warning(
-              "#{inspect(__MODULE__)}: advertise failed (#{inspect(reason)}), dropping frame"
-            )
-
-            maybe_start_next(%{state | tx_queue: queue})
+        case start_job(%{state | tx_queue: queue}, job) do
+          {:ok, state} -> state
+          {:error, :not_ready, state} -> state
+          {:error, _refused, state} -> maybe_start_next(state)
         end
 
       {:empty, _queue} ->
@@ -587,14 +667,55 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
 
   defp maybe_start_next(state), do: state
 
-  defp stop_current(%{tx_current: nil} = state), do: state
+  defp start_job(state, job) do
+    case state.mgmt.advertise(state.lease, Carrier.ad_bytes(job.frame), flags: [:connectable]) do
+      {:ok, instance} ->
+        token = make_ref()
+        timer = Process.send_after(self(), {:tx_done, token}, job.duration_ms)
+        current = Map.merge(job, %{instance: instance, timer: timer, token: token})
+
+        {:ok,
+         %{
+           state
+           | tx_current: current,
+             recent_tx: Enum.take([job.norm | state.recent_tx], @recent_tx_max)
+         }}
+
+      {:error, reason} when reason in @fatal_advertise_errors ->
+        {:error, :not_ready, lost(state, {:advertise, reason})}
+
+      {:error, reason} ->
+        Logger.warning(
+          "#{inspect(__MODULE__)}: advertise failed (#{inspect(reason)}), dropping frame"
+        )
+
+        {:error, {:advertise, reason}, state}
+    end
+  end
+
+  # Takes the current advert off air and starts the next; an advert that
+  # won't come off air means the instance (and the lease) can't be trusted,
+  # so the radio re-runs setup, whose teardown releases the lease.
+  defp stop_and_continue(state) do
+    case stop_current(state) do
+      {:ok, state} -> maybe_start_next(state)
+      {{:error, reason}, state} -> lost(state, {:stop_advertising, reason})
+    end
+  end
+
+  defp stop_current(%{tx_current: nil} = state), do: {:ok, state}
 
   defp stop_current(%{tx_current: current} = state) do
     Process.cancel_timer(current.timer)
+    state = %{state | tx_current: nil}
 
     # Without a lease (it ended) Mgmt has already removed the instance.
-    if state.lease != nil, do: state.mgmt.stop_advertising(state.lease, current.instance)
-    %{state | tx_current: nil}
+    case state.lease && state.mgmt.stop_advertising(state.lease, current.instance) do
+      nil -> {:ok, state}
+      :ok -> {:ok, state}
+      {:error, :unknown_instance} -> {:ok, state}
+      {:error, _reason} = error -> {error, state}
+    end
   end
 
   # ── RX ───────────────────────────────────────────────────────────────
@@ -614,7 +735,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
       true ->
         report = %{mac: mac_string(address), address: address, frame: frame, rssi: rssi}
 
-        for {pid, filter} <- state.subscribers, match?(filter, report, frame) do
+        for {pid, {filter, _mon}} <- state.subscribers, wants?(filter, report, frame) do
           Kernel.send(pid, {:tuya_report, report})
         end
 
@@ -622,9 +743,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
     end
   end
 
-  defp match?(:all, _report, _frame), do: true
-  defp match?(:unpaired, _report, frame), do: match?({:ok, _}, P2.parse_unpaired(frame))
-  defp match?({:mac, mac}, report, _frame), do: report.mac == mac
+  defp wants?(:all, _report, _frame), do: true
+  defp wants?(:unpaired, _report, frame), do: match?({:ok, _}, P2.parse_unpaired(frame))
+  defp wants?({:mac, mac}, report, _frame), do: report.mac == mac
 
   defp seen_recently?(dedupe, key, now) do
     case dedupe do
@@ -633,18 +754,17 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
     end
   end
 
+  # Bounded: past @dedupe_max entries expired ones are pruned, and if a
+  # flood of distinct frames leaves it still full it starts over (a missed
+  # dedupe only passes on a duplicate).
   defp remember(dedupe, key, now) do
     dedupe = Map.put(dedupe, key, now)
 
     if map_size(dedupe) > @dedupe_max do
-      Map.filter(dedupe, fn {_key, seen_ms} -> now - seen_ms < @dedupe_ms end)
+      pruned = Map.filter(dedupe, fn {_key, seen_ms} -> now - seen_ms < @dedupe_ms end)
+      if map_size(pruned) > div(@dedupe_max, 2), do: %{key => now}, else: pruned
     else
       dedupe
     end
   end
-
-  # Keep the header type handy for callers sorting frames; not used in
-  # queueing (queue classes are explicit, tuya_beacon_mesh.md §4.7).
-  @doc false
-  def frame_type(<<hdr, _::binary>>), do: hdr >>> 3 &&& 0xF
 end

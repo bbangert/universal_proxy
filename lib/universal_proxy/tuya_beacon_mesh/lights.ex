@@ -164,7 +164,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   end
 
   defp subscribe_or_demonitor(pid, mon) do
-    case Radio.subscribe(self(), :all, pid) do
+    case Radio.subscribe(self(), :all, server: pid) do
       :ok ->
         :ok
 

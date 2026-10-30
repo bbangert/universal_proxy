@@ -1,10 +1,19 @@
 defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   alias UniversalProxy.TuyaBeaconMesh.{Carrier, FakeBluez, P2, Radio}
 
   @key "jngwRugsvwtGN00a"
-  @capture "test/fixtures/tuya_beacon_mesh/p2_frames_2026-10-25.json"
+  @capture Path.join([
+             __DIR__,
+             "..",
+             "..",
+             "fixtures",
+             "tuya_beacon_mesh",
+             "p2_frames_2026-10-25.json"
+           ])
            |> File.read!()
            |> Jason.decode!()
 
@@ -48,7 +57,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
 
   defp start_radio(_context) do
     radio = start_supervised!(radio_spec())
-    wait_until(fn -> match?({:ok, %{ready: true}}, Radio.status()) end)
+    wait_until(&ready?/0)
     {:ok, radio: radio}
   end
 
@@ -66,6 +75,23 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
   end
 
   defp ready?, do: match?({:ok, %{ready: true}}, Radio.status())
+
+  # Every lease ever taken has been released (once): the radio is stopped
+  # first so no setup attempt runs between the two counts.
+  defp assert_leases_balanced do
+    stop_supervised!({Radio, 0})
+    acquired = for {:acquire, ref} <- FakeBluez.calls(), do: ref
+    released = for {:release, ref} <- FakeBluez.calls(), do: ref
+    assert Enum.sort(acquired) == Enum.sort(Enum.uniq(released))
+    assert length(released) == length(Enum.uniq(released))
+  end
+
+  # Ends the advert on air as its timer would.
+  defp finish_tx do
+    %{tx_current: %{token: token}} = :sys.get_state(Radio)
+    send(Process.whereis(Radio), {:tx_done, token})
+    {:ok, _} = Radio.status()
+  end
 
   setup do
     FakeBluez.ensure_started()
@@ -86,8 +112,13 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
       assert status.listening
       assert status.subscribers == 0
       assert status.tx == nil
-      assert {:dbus, "SetDiscoveryFilter"} in FakeBluez.calls()
-      assert {:dbus, "StartDiscovery"} in FakeBluez.calls()
+
+      assert {:dbus, "SetDiscoveryFilter", [filter]} =
+               List.keyfind(FakeBluez.calls(), "SetDiscoveryFilter", 1)
+
+      assert {"DuplicateData", {"b", true}} in filter
+      assert {"Transport", {"s", "le"}} in filter
+      assert {:dbus, "StartDiscovery", []} in FakeBluez.calls()
     end
 
     test "fan-out to :all, dedupe of exact and hop-variant copies" do
@@ -99,26 +130,46 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
       FakeBluez.inject(report(0xDC23530FB34A, frame))
       FakeBluez.inject(report(0xDC23530FB34A, hop_variant(frame)))
       FakeBluez.inject(report(0xDC23530FB34B, hop_variant(frame)))
-      refute_receive {:tuya_report, %{mac: "DC23530FB34A"}}, 150
+      # The B copy arrives after the A copies, so they were dropped.
       assert_receive {:tuya_report, %{mac: "DC23530FB34B"}}
+      refute_received {:tuya_report, %{mac: "DC23530FB34A"}}
     end
 
     test ":unpaired filter only passes unpaired adverts" do
       :ok = Radio.subscribe(self(), :unpaired)
       FakeBluez.inject(report(0xDC23530FB34A, device_frame()))
-      refute_receive {:tuya_report, _}, 150
-
       frame = unpaired_frame()
       FakeBluez.inject(report(0xDC23530FB34A, frame))
-      assert_receive {:tuya_report, %{frame: ^frame}}
+      assert_receive {:tuya_report, %{frame: received}}
+      assert received == frame
+      refute_received {:tuya_report, _}
     end
 
     test "{:mac, mac} filter matches only that advertiser" do
       :ok = Radio.subscribe(self(), {:mac, "dc:23:53:0f:b3:4a"})
-      FakeBluez.inject(report(0xDC23530FB34B, device_frame()))
-      refute_receive {:tuya_report, _}, 150
-      FakeBluez.inject(report(0xDC23530FB34A, device_frame()))
+      FakeBluez.inject(report(0xDC23530FB34B, device_frame(1)))
+      FakeBluez.inject(report(0xDC23530FB34A, device_frame(2)))
       assert_receive {:tuya_report, %{mac: "DC23530FB34A"}}
+      refute_received {:tuya_report, _}
+    end
+
+    test "unsubscribe, resubscribe with a new filter, and a dead subscriber" do
+      :ok = Radio.subscribe(self(), :all)
+      :ok = Radio.subscribe(self(), :unpaired)
+      assert {:ok, %{subscribers: 1}} = Radio.status()
+
+      FakeBluez.inject(report(0xDC23530FB34A, device_frame(1)))
+      :ok = Radio.unsubscribe(self())
+      :ok = Radio.unsubscribe(self())
+      FakeBluez.inject(report(0xDC23530FB34A, unpaired_frame()))
+      assert {:ok, %{subscribers: 0}} = Radio.status()
+      refute_received {:tuya_report, _}
+
+      sub = spawn(fn -> Process.sleep(:infinity) end)
+      :ok = Radio.subscribe(sub, :all)
+      assert {:ok, %{subscribers: 1}} = Radio.status()
+      Process.exit(sub, :kill)
+      wait_until(fn -> match?({:ok, %{subscribers: 0}}, Radio.status()) end)
     end
 
     test "TX serialises; a :control send drops queued :normal frames" do
@@ -126,35 +177,150 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
       b = device_frame(2)
       c = device_frame(3)
 
-      :ok = Radio.send_frame(a, 300)
-      :ok = Radio.send_frame(b, 10)
-      :ok = Radio.send_frame(c, 10, class: :control)
+      :ok = Radio.send_frame(a, 60_000)
+      :ok = Radio.send_frame(b, 60_000)
+      :ok = Radio.send_frame(c, 60_000, class: :control)
       assert {:ok, %{tx: %{class: :normal}, queued: 1}} = Radio.status()
 
-      # A runs its 300 ms, then C; B was dropped by the control send.
-      Process.sleep(450)
+      # A's time runs out, then C; B was dropped by the control send.
+      finish_tx()
+      assert {:ok, %{tx: %{class: :control}, queued: 0}} = Radio.status()
       assert advertises() == [Carrier.ad_bytes(a), Carrier.ad_bytes(c)]
-      assert {:ok, %{tx: nil, queued: 0}} = Radio.status()
+
+      # Two :control sends queued together keep both.
+      d = device_frame(4)
+      e = device_frame(5)
+      :ok = Radio.send_frame(d, 60_000, class: :control)
+      :ok = Radio.send_frame(e, 60_000, class: :control)
+      assert {:ok, %{queued: 2}} = Radio.status()
+      finish_tx()
+      finish_tx()
+      assert Enum.take(advertises(), -2) == [Carrier.ad_bytes(d), Carrier.ad_bytes(e)]
+      assert [flags: [:connectable]] = FakeBluez.calls() |> List.keyfind(:advertise, 0) |> elem(2)
+    end
+
+    test "an advert comes off air when its time is up" do
+      :ok = Radio.send_frame(device_frame(1), 30)
+      assert {:ok, %{tx: %{instance: 5}}} = Radio.status()
+      wait_until(fn -> match?({:ok, %{tx: nil}}, Radio.status()) end)
+      assert {:stop, 5} in FakeBluez.calls()
+      assert FakeBluez.instances() == %{}
+    end
+
+    test "the queue is bounded and coalesces by key, keeping send order" do
+      :ok = Radio.send_frame(device_frame(1), 60_000)
+
+      for sn <- 2..8, do: :ok = Radio.send_frame(device_frame(sn), 60_000, coalesce: {:x, sn})
+      :ok = Radio.send_frame(device_frame(9), 60_000, coalesce: :b)
+      assert {:ok, %{queued: 8}} = Radio.status()
+
+      assert {:error, :queue_full} = Radio.send_frame(device_frame(10), 60_000)
+
+      # Replacing a queued frame is allowed when full; it goes to the back.
+      :ok = Radio.send_frame(device_frame(11), 60_000, coalesce: {:x, 2})
+      assert {:ok, %{queued: 8}} = Radio.status()
+
+      for _ <- 1..8, do: finish_tx()
+      wait_until(fn -> length(advertises()) == 9 end)
+
+      sns =
+        for ad <- advertises() do
+          [<<_, _::binary-4, sn::16, _::binary>>] = Carrier.frames(ad)
+          sn
+        end
+
+      assert sns == [1, 3, 4, 5, 6, 7, 8, 9, 11]
+    end
+
+    test "an advertise refused for this frame is reported, a queued one is skipped" do
+      FakeBluez.fail(:advertise, :busy)
+
+      log =
+        capture_log(fn ->
+          assert {:error, {:advertise, :busy}} = Radio.send_frame(device_frame(1), 60_000)
+        end)
+
+      assert log =~ "advertise failed (:busy)"
+      assert ready?()
+
+      FakeBluez.succeed(:advertise)
+      :ok = Radio.send_frame(device_frame(2), 60_000)
+      :ok = Radio.send_frame(device_frame(3), 60_000)
+      :ok = Radio.send_frame(device_frame(4), 60_000)
+
+      FakeBluez.fail(:advertise, :rejected)
+
+      capture_log(fn ->
+        finish_tx()
+        Radio.status()
+      end)
+
+      FakeBluez.succeed(:advertise)
+
+      # 3 and 4 were refused and dropped; nothing is on air until the next send.
+      assert {:ok, %{tx: nil, queued: 0, ready: true}} = Radio.status()
+      :ok = Radio.send_frame(device_frame(5), 60_000)
+      assert length(advertises()) == 2
+    end
+
+    test "a stale tx_done for a reused instance doesn't cut the next advert short" do
+      radio = Process.whereis(Radio)
+      :ok = Radio.send_frame(device_frame(1), 300)
+
+      # Mailbox order: stop_tx, send B (same instance 5), then A's timer.
+      :sys.suspend(radio)
+      stop = Task.async(fn -> Radio.stop_tx() end)
+      wait_until(fn -> Process.info(radio, :message_queue_len) == {:message_queue_len, 1} end)
+      send_b = Task.async(fn -> Radio.send_frame(device_frame(2), 60_000) end)
+      wait_until(fn -> Process.info(radio, :message_queue_len) == {:message_queue_len, 2} end)
+      wait_until(fn -> Process.info(radio, :message_queue_len) == {:message_queue_len, 3} end)
+      :sys.resume(radio)
+
+      assert :ok = Task.await(stop)
+      assert :ok = Task.await(send_b)
+      assert {:ok, %{tx: %{instance: 5}}} = Radio.status()
+      assert FakeBluez.count(:stop) == 1
+
+      # An instance-number message is not ours either.
+      send(radio, {:tx_done, 5})
+      assert {:ok, %{tx: %{instance: 5}}} = Radio.status()
     end
 
     test "own transmissions relayed back are dropped as echoes until disabled" do
       :ok = Radio.subscribe(self(), :all)
       frame = device_frame()
       :ok = Radio.send_frame(frame, 30)
-      Process.sleep(60)
 
       FakeBluez.inject(report(0xDC23530FB34A, hop_variant(frame)))
-      refute_receive {:tuya_report, _}, 150
+      FakeBluez.inject(report(0xDC23530FB34B, device_frame(99)))
+      assert_receive {:tuya_report, %{mac: "DC23530FB34B"}}
+      refute_received {:tuya_report, %{mac: "DC23530FB34A"}}
 
       :ok = Radio.set_drop_echoes(false)
       FakeBluez.inject(report(0xDC23530FB34A, hop_variant(frame)))
       assert_receive {:tuya_report, %{mac: "DC23530FB34A"}}
     end
 
-    test "bad frames and bad filters are rejected" do
+    test "bad frames, classes and filters are rejected" do
       assert {:error, :bad_frame} = Radio.send_frame(<<1, 2, 3>>, 10)
+      assert {:error, :bad_class} = Radio.send_frame(device_frame(), 10, class: :Control)
       assert {:error, :bad_filter} = Radio.subscribe(self(), {:mac, "xyz"})
       assert {:error, :bad_filter} = Radio.subscribe(self(), :everything)
+      assert advertises() == []
+    end
+
+    test "server: addresses every call; a missing radio is :not_running" do
+      for fun <- [
+            &Radio.status/1,
+            &Radio.stop_tx/1,
+            &Radio.set_drop_echoes(true, &1),
+            &Radio.subscribe(self(), :all, &1),
+            &Radio.unsubscribe(self(), &1),
+            &Radio.send_frame(device_frame(), 10, &1)
+          ] do
+        assert {:error, :not_running} = fun.(server: :no_such_radio)
+        assert fun.(server: Radio) != {:error, :not_running}
+      end
     end
   end
 
@@ -165,6 +331,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
     test "a lost lease goes not-ready, then re-acquires", %{radio: radio} do
       :ok = Radio.subscribe(self(), :all)
       :ok = Radio.send_frame(device_frame(1), 5_000)
+      :ok = Radio.send_frame(device_frame(2), 5_000)
       :ok = FakeBluez.end_lease()
 
       wait_until(fn -> FakeBluez.count(:acquire) == 2 end)
@@ -174,6 +341,12 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
 
       FakeBluez.inject(report(0xDC23530FB34A, device_frame(9)))
       assert_receive {:tuya_report, %{mac: "DC23530FB34A"}}
+
+      # The ended lease is not released again; the new one is on stop.
+      [ended, current] = for {:acquire, ref} <- FakeBluez.calls(), do: ref
+      refute {:release, ended} in FakeBluez.calls()
+      stop_supervised!({Radio, 0})
+      assert for({:release, ref} <- FakeBluez.calls(), do: ref) == [current]
     end
 
     @tag :capture_log
@@ -193,6 +366,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
 
       FakeBluez.inject(report(0xDC23530FB34A, device_frame(9)))
       assert_receive {:tuya_report, %{mac: "DC23530FB34A"}}
+      assert_leases_balanced()
     end
 
     @tag :capture_log
@@ -202,6 +376,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
       wait_until(&ready?/0)
       assert Process.whereis(Radio) == radio
       assert FakeBluez.count(:acquire) == 2
+      assert_leases_balanced()
     end
 
     @tag :capture_log
@@ -209,6 +384,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
       :ok = FakeBluez.kill_bluez_radio()
       wait_until(fn -> FakeBluez.count(:acquire) == 2 end)
       wait_until(&ready?/0)
+
+      # The first lease died with Bluez.Radio: only the second is released.
+      [_gone, current] = for {:acquire, ref} <- FakeBluez.calls(), do: ref
+      stop_supervised!({Radio, 0})
+      assert for({:release, ref} <- FakeBluez.calls(), do: ref) == [current]
     end
 
     @tag :capture_log
@@ -220,6 +400,47 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
       FakeBluez.succeed(:advertise)
       wait_until(&ready?/0)
       assert :ok = Radio.send_frame(device_frame(3), 10)
+      assert_leases_balanced()
+    end
+
+    @tag :capture_log
+    test "an advert that won't come off air re-runs setup" do
+      :ok = Radio.send_frame(device_frame(1), 60_000)
+      FakeBluez.fail(:stop_advertising, :busy)
+
+      log = capture_log(fn -> :ok = Radio.stop_tx() end)
+      assert log =~ "not ready ({:stop_advertising, :busy})"
+
+      # Releasing the lease took the stuck instance down with it.
+      assert FakeBluez.count(:release) == 1
+      assert FakeBluez.instances() == %{}
+
+      FakeBluez.succeed(:stop_advertising)
+      wait_until(&ready?/0)
+      assert_leases_balanced()
+    end
+
+    @tag :capture_log
+    test "a receiver that won't stop is killed so its name is free again" do
+      [{:receiver_started, rx}] =
+        Enum.filter(FakeBluez.calls(), &match?({:receiver_started, _}, &1))
+
+      stop_supervised!({Radio, 0})
+      FakeBluez.reset()
+      FakeBluez.fail(:receiver_stop, :hang)
+      refute Process.alive?(rx)
+
+      start_supervised!(radio_spec(receiver_stop_ms: 50))
+      wait_until(&ready?/0)
+
+      [{:receiver_started, hung}] =
+        Enum.filter(FakeBluez.calls(), &match?({:receiver_started, _}, &1))
+
+      :ok = FakeBluez.end_lease()
+      wait_until(fn -> FakeBluez.count(:receiver_started) == 2 end)
+      wait_until(&ready?/0)
+      refute Process.alive?(hung)
+      FakeBluez.succeed(:receiver_stop)
     end
 
     test "stopping takes the advert off air, stops discovery and releases the lease" do
@@ -229,8 +450,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
 
       calls = FakeBluez.calls()
       assert {:stop, 5} in calls
-      assert {:dbus, "StopDiscovery"} in calls
+      assert {:dbus, "StopDiscovery", []} in calls
       assert FakeBluez.count(:release) == 1
+      assert FakeBluez.instances() == %{}
       # Shared infrastructure is not ours to stop.
       assert Process.alive?(bluez_radio)
     end
@@ -238,11 +460,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
 
   describe "not ready" do
     test "stays up, logs once, refuses sends and recovers when the lease frees" do
-      holder = spawn(fn -> Process.sleep(:infinity) end)
+      holder = start_supervised!({Task, fn -> Process.sleep(:infinity) end})
       FakeBluez.fail(:acquire, {:held_by, holder})
 
       log =
-        ExUnit.CaptureLog.capture_log(fn ->
+        capture_log(fn ->
           start_supervised!(radio_spec())
           wait_until(fn -> FakeBluez.count(:acquire_failed) >= 3 end)
         end)
@@ -268,17 +490,21 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
       start_supervised!(radio_spec())
       wait_until(fn -> FakeBluez.count(:acquire) >= 3 end)
 
-      # status/1 is served between attempts: every lease taken is released.
       assert {:ok, %{ready: false, last_error: {:discovery, "org.bluez.Error.Failed"}}} =
                Radio.status()
 
-      assert FakeBluez.count(:acquire) == FakeBluez.count(:release)
       assert FakeBluez.count(:receiver_started) == 0
       # The connection is reused across retries, not leaked.
       assert FakeBluez.count(:connect) == 1
+      assert_leases_balanced()
+    end
 
-      FakeBluez.succeed({:dbus, "StartDiscovery"})
+    @tag :capture_log
+    test "discovery already in progress counts as started" do
+      FakeBluez.fail({:dbus, "StartDiscovery"}, "org.bluez.Error.InProgress")
+      start_supervised!(radio_spec())
       wait_until(&ready?/0)
+      assert {:ok, %{discovering: true}} = Radio.status()
     end
 
     @tag :capture_log
@@ -312,6 +538,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
       wait_until(fn -> FakeBluez.count(:release) >= 2 end)
       FakeBluez.succeed(:receiver)
       wait_until(&ready?/0)
+      assert_leases_balanced()
+    end
+
+    test "the child spec allows time for a clean teardown" do
+      assert %{shutdown: 10_000, id: {Radio, 3}} = Radio.child_spec(adapter_index: 3)
     end
   end
 end
