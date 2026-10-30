@@ -2,13 +2,20 @@
 > that `../tuya_beacon_mesh.md` only summarises. `file:line` citations refer to a JADX 1.5.6 decompile of
 > `base.apk` (SHA-256 `68b413e9…2e14`) that is not committed here. Some line numbers are known to be off;
 > class and method names are reliable. Where these notes and the spec disagree, the spec wins.
+>
+> **Hardware status.** P2 is now validated on hardware, on one product only: Gardenreet RGBCW G4 LED bulbs,
+> 12 V low-voltage bi-pin (ten bulbs, product ID `vd8o60wy`, AK80x DP set). The bulbs override some of the
+> app behaviour described here: the phone source is always `0x8001`, group frames are keyed
+> beaconKey/beaconKey, and frames stay on air for at least 3 s. These notes describe what the **app** does;
+> what the bulbs do is in `../tuya_beacon_mesh.md` §4.9. P1 is still untested.
 
 # Tuya Bluetooth "Beacon" protocol v1 (P1) and v2 (P2): reverse-engineering notes
 
 Source: JADX decompile of Tuya Smart Life 7.12.0.
 Path shorthand: `B/` = `sources/com/thingclips/sdk/bluetooth/`. Other paths are relative to `sources/com/thingclips/`.
-Citations use the form `file:line`. Everything here was read from code. Nothing was run against a device.
-**UNVERIFIED** marks inference that the code does not prove.
+Citations use the form `file:line`. Everything here was read from code; hardware results are only
+flagged where they override it (see the note at the top). **UNVERIFIED** marks inference that the code does
+not prove.
 
 ---
 
@@ -55,7 +62,7 @@ Sources: `B/pbddddb.java:109-113` (P2 XXTEA key), `B/dqdpbpq.java:266-274` (P1 k
 |---|---|---|
 | **localKey** (per device, 16 ASCII chars) | `DeviceBean.getLocalKey()`. At activation it comes from `PreActivateResult.localKey` (P2, `thing.m.device.blu.preactive`) or `BLEActiveBean.localKey` (P1, `thing.m.device.beacon.active`) (`beacon/bean/PreActivateResult.java:5-8`, `beacon/bean/BLEActiveBean.java:5-17`) | device list |
 | **beaconKey** (per home "beacon mesh") | `qqdqqpd.getBeaconKey(ownerId)`: `BeaconMeshBean.getAppKey()`, falling back to the DataKV `"BeaconKey_"+ownerId` (`B/qqdqqpd.java:63-74`, `B/dqddqdp.java:361-373`). BeaconMeshBean comes from home data (`ThingListDataBean.getBeacons()`, `sdk/home/OooOOO.java:843-844`; cached pref `s_home_data_beacon_list`, `sdk/home/OooOo00.java:13`) or from `thing.m.device.beacon.mesh.create` (`B/pqqpqpq.java:58-62`, stored at `B/dqddqdp.java:216-219`). The device receives its beaconKey at pairing (`PreActivateResult.beaconKey` for P2, `BLEActiveBean.beaconKey` for P1). | DataKV |
-| **groupKey** (per group) | `GroupBean.getGroupKey()` from group cache (`B/qqpdddb.java:441,525`, `B/ddqpbqb.java:439,551-553`) | group cache |
+| **groupKey** (per group) | `GroupBean.getGroupKey()` from group cache (`B/qqpdddb.java:441,525`, `B/ddqpbqb.java:439,551-553`). **Hardware:** P2 bulbs never learn a distinct groupKey; group frames that work use the beaconKey (spec §4.9) | group cache |
 | **secKey** (lock/NFC only) | `IThingNfcPlugin.findDeviceKeys(uid,devId).getSecKey()` (`B/qqpdddb.java:578-588`) | NFC plugin |
 
 **UNVERIFIED:** `PreActivateResult.beaconKey` (sent to the device in P2Pair) and `BeaconMeshBean.appKey` (used by the phone for mask/RX) are probably the same value. They must be equal for RX decryption to work.
@@ -66,17 +73,19 @@ There is **no MD5/SHA derivation** for normal P1/P2 traffic. Keys are used as-is
 
 `devId` slot = `deviceBean.getOwnerId()` (home/gid as decimal string). It is used only as the sn-counter key and RX parse-info key. It never goes on air.
 
-| Request (class) | dst (`pbpqqdp`) | XXTEA key (`bpbbqdb`) | XOR mask (`qqpdpbp`) | src | Cite |
+The table is the app's behaviour. **Overridden on hardware** (spec §4.9): the bulbs accept only source `0x8001` and ignore the cloud srcId (whose frames still advance their sn trackers), and group frames need the beaconKey as the XXTEA key.
+
+| Request (class) | dst (`pbpqqdp`) | XXTEA key (`bpbbqdb`) | XOR mask (`qqpdpbp`) | src (app) | Cite |
 |---|---|---|---|---|---|
 | P2Reset `dqdbdpd` | nodeId | localKey | beaconKey | cloud srcId | `B/qqpdddb.java:555` |
 | P2Dps `dqdpqpq` (no ack) | nodeId | localKey | beaconKey | cloud srcId | `B/qqpdddb.java:347,476` |
-| P2Dps group | `"FF"+group.localId` | **groupKey** | beaconKey | cloud srcId | `B/qqpdddb.java:525` -> `:347` |
+| P2Dps group | `"FF"+group.localId` | **groupKey** (hardware: beaconKey) | beaconKey | cloud srcId | `B/qqpdddb.java:525` -> `:347` |
 | P2Dps w/ ack `pqpbpqd` | nodeId | localKey | beaconKey | cloud srcId | `B/qqpdddb.java:498` |
 | P2Ping `dpdpqpd` (1..7 devs, one at a time) | nodeId | localKey | beaconKey | cloud srcId | `B/qqpdddb.java:234-243` |
 | P2Ping broadcast (>=8 devs) | `"FFFF"` (`bpbbpbp.qppddqq`, `B/bpbbpbp.java:44`) | **beaconKey** | beaconKey | cloud srcId | `B/qqpdddb.java:294-299,513-518`, `B/dpdpqpd.java:141` |
 | P2AddSub `qbqqdqq` | nodeId | localKey | beaconKey | cloud srcId | `B/qqpdddb.java:329` |
 | P2RemoveSub `bqpqqbb` | nodeId | localKey | beaconKey | cloud srcId | `B/qqpdddb.java:369` |
-| P2DismissGroup `qdppdpp` | `"FF"+localId` (`B/qdppdpp.java:213`) | **groupKey** | beaconKey | cloud srcId | `B/qqpdddb.java:441` |
+| P2DismissGroup `qdppdpp` | `"FF"+localId` (`B/qdppdpp.java:213`) | **groupKey** (hardware: beaconKey) | beaconKey | cloud srcId | `B/qqpdddb.java:441` |
 | P2Pair `pppbpdp` | nodeId (from preactive) | **localKey** (ASCII) | n/a (not applied) | none | `B/bddqqbb.java:281` |
 | RawBeaconDataSend `ddqbbqp` | `"FFFF"` | `hex(ASCII(str))` (so the key = the ASCII bytes of a caller-supplied 16-char string) | same | `dqddqqb.randomId` | `B/qqpdddb.java:614-619` |
 | RemoteAction `dpddddp` | `"0001"` | HKDF key (§2.3) | same HKDF key | `"8001"` | `B/qqpdddb.java:598`, `B/dpddddp.java:113-126` |
@@ -137,7 +146,7 @@ Meaning of `type` (bits 6..3) on TX. **UNVERIFIED semantics**, reading off usage
 - 2 = query/broadcast-ish (ping, dismiss, raw) and also pair (with pairBit).
 - 3 = remote/secure action (AES instead of XXTEA).
 
-Low 2 bits: always 3 except RemoteAction (0) and Raw (caller). They are excluded from both CRCs (`&0xFC`), so they are probably a **TTL/relay hop counter** that relays may change. **UNVERIFIED**: no relay code is visible in the app.
+Low 2 bits: always 3 except RemoteAction (0) and Raw (caller). They are excluded from both CRCs (`&0xFC`). No relay code is visible in the app, but on hardware they are confirmed as a **hop TTL that relaying bulbs decrement** (3 → 2 → 1 → 0 in the 2026-10-25 capture; spec §4.2).
 
 ### 3.3 P2Pair frame (26 bytes, not masked, no sn)
 `B/pppbpdp.java:242-253,307-315`. Constructor `pppbpdp(localKey, homeIdStr, mac12hex, nodeId, beaconKey, round)` (`B/bddqqbb.java:281`).
@@ -187,7 +196,12 @@ Encryption: **AES-128-CBC/NoPadding**. Key = HKDF K, IV = ASCII bytes of the 16-
 
 For Raw requests, the counter key is `randomId` (`B/qqpdddb.java:618`).
 
+**Hardware** (spec §4.9): with the source fixed at `0x8001` this is one counter for the whole mesh. Each bulb tracks the highest phone sn it has heard across all destinations and drops anything not ahead of it.
+
 ### 3.7 Source address (phone's own P2 address)
+
+**Overridden on hardware** (spec §4.9): the bulbs accept commands only from source `0x8001`. Frames from the cloud-allocated source below are ignored, but they still advance the bulbs' sn trackers. What follows is the app's behaviour.
+
 `dqddqdp.bdpdqbp(meshId, ownerId, cb)` (`B/dqddqdp.java:431-443`):
 - Cached hex string in DataKV `"NodeId_"+ownerId`.
 - Otherwise `thing.m.beacon.mesh.source.id.alloc {meshId}` returns an Integer (`B/pqqpqpq.java:52-56`). It is stored as `Integer.toHexString(n)` (`B/dqddqdp.java:280`).
@@ -195,7 +209,7 @@ For Raw requests, the counter key is `randomId` (`B/qqpdddb.java:618`).
 - The address must be exactly 4 hex chars or the frame build fails (`B/pbddddb.java:103`). That implies allocated ids are in 0x1000-0xFFFF. **UNVERIFIED** server range.
 
 Other source ids:
-- Unactivated "raw" sender: `randomId = hex(0x6000 + rand(0x2000))`, i.e. 0x6000..0x7FFF (`B/dqddqqb.java:55-57`).
+- Unactivated "raw" sender: `randomId = hex(0x6000 + rand(0x2000))`, i.e. 0x6000..0x7FFF (`B/dqddqqb.java:55-57`). **UNVERIFIED** on hardware.
 - RemoteAction: 0x8001.
 
 ---
@@ -377,16 +391,16 @@ Other cloud APIs:
 | Device address | 6-byte MAC (implicit: Base64 name + CRC8(mac) in the block) | 16-bit nodeId from cloud (`beaconData.beaconNodeId`) |
 | Group address | `FF FF FF FF FF gg` | `0xFFgg` |
 | Broadcast | `FF*6` | `0xFFFF` |
-| Phone source | n/a | cloud-allocated per home/mesh; 0x6000-0x7FFF random for raw; 0x8001 remote action |
+| Phone source | n/a | app: cloud-allocated per home/mesh; 0x6000-0x7FFF random for raw; 0x8001 remote action. **Hardware: only 0x8001 is accepted** |
 | Device->phone dst | n/a | 0x8000 or 0x8001 |
 | Unicast key | localKey | localKey (+ beaconKey mask) |
-| Group key | groupKey | groupKey (+ beaconKey mask) |
+| Group key | groupKey | app: groupKey (+ beaconKey mask). **Hardware: beaconKey** (+ beaconKey mask) |
 | Broadcast key | beaconKey | beaconKey (+ beaconKey mask) |
 | RX key | localKey | beaconKey (mask and XXTEA) |
 
 - `gg` = group `localId`, one byte (2 hex chars). A device holds at most 8 group ids (A3 list).
 - **meshId** is never on air. It only selects the cloud source-id pool and the preactive context. beaconKey is the mesh-wide key (BeaconMeshBean `{id, meshId, appKey}`, `smart/sdk/bean/BeaconMeshBean.java:5-7`).
-- **Relay/TTL:** nothing in the app relays. The header's low 2 bits, excluded from CRC, are the likely TTL. **UNVERIFIED.**
+- **Relay/TTL:** nothing in the app relays. The header's low 2 bits, excluded from CRC, are the TTL: confirmed on hardware, where relaying bulbs decrement them (spec §4.2).
 - Response matching (`B/dbbbbqq.java:79-123`):
   - Each request with requestTime>0 registers a link keyed by its dst string (`pqpbpqd()` = `pbddddb()`). Ping also appends HMAC-SHA256(key 000001, sorted devIds) to make the key unique (`B/dpdpqpd.java:155-166,205-208`).
   - A received frame whose **src == request dst** is offered to `request.bdpdqbp(devId, resp)`, which returns 0 (done), 1 (ignore) or -1 (wrong) (`B/dbbbbqq.java:125-134`, `B/ppbqqdd.java:361-381`).
@@ -447,9 +461,11 @@ Retries:
 
 ## 8. Minimal reimplementation recipe (P2 control of a light)
 
-1. Get from the cloud or a backup: `localKey` (16 ASCII), `beaconKey` (32 hex), `beaconNodeId` (4 hex), group `localId` + `groupKey`, and the phone source id (4 hex).
-2. Build the payload, e.g. DP TLVs, with subCmd 0x05 (or 0x06 to request a DP-report ack), type 1, hdr 0x0B.
-3. Build the frame as in §3.1. Advertise its 26 bytes as 13 16-bit UUIDs in AD 0x03 (BlueZ: raw adv data `02 01 06 1B 03 <26 bytes>`), connectable, about 20-100 ms interval, for about 1-3 s.
+Updated for what the bulbs accept on hardware (spec §4.9; tested on Gardenreet RGBCW G4 bulbs only).
+
+1. Get from the cloud or a backup: `localKey` (16 ASCII), `beaconKey` (32 hex), `beaconNodeId` (4 hex) and the MAC per bulb, and the group `localId`s. No groupKey and no cloud source id are needed.
+2. Build the payload, e.g. DP TLVs, with subCmd 0x05 (or 0x06 to request a DP-report ack), type 1, hdr 0x0B. Use source `0x8001` and one persisted sequence number for the whole mesh that only moves forward.
+3. Build the frame as in §3.1: unicast keyed localKey/beaconKey, group `FFgg` keyed beaconKey/beaconKey. Advertise its 26 bytes as 13 16-bit UUIDs in AD 0x03 (BlueZ: raw adv data `02 01 06 1B 03 <26 bytes>`), connectable, about 20-100 ms interval, for at least 3 s.
 4. Scan for AD 0x03 with 26 bytes from the device:
    - Check dst 8000/8001.
    - Unmask with beaconKey and check the CRC.

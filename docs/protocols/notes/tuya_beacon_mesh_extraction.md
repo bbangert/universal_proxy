@@ -3,9 +3,13 @@
 Portable stack on this branch: `UniversalProxy.TuyaBeaconMesh.*`.
 
 This is Tuya's **Beacon Mesh** family (Beacon v2 / P2 advert mesh) — not
-Tuya GATT "paired BLE", and not Thing Beacon Mesh. Proven on ten garden
-Beacon v2 bulbs under a Vagus hot patch; pairing / cloud / vagus-memory
-deliberately left behind.
+Tuya GATT "paired BLE", and not Thing Beacon Mesh. Proven on ten Beacon v2
+bulbs under a Vagus hot patch; pairing / cloud / vagus-memory deliberately
+left behind.
+
+**Tested on one product only:** the Gardenreet RGBCW G4 LED bulb, 12 V
+low-voltage bi-pin (ten bulbs, Tuya product id `vd8o60wy`, AK80x DP set).
+Other P2 products may differ, in DP ids and timing in particular.
 
 ## Drop-in JSON → control
 
@@ -34,22 +38,29 @@ survives restarts (never go backwards).
 
 ## Hardware-proven protocol facts
 
-These override `docs/protocols/tuya_beacon_mesh.md` where they conflict (that
-doc is AI-generated and partly wrong on addressing):
+`docs/protocols/tuya_beacon_mesh.md` is now authoritative: §4.9 collects
+everything the bulbs showed, and §9.1 the radio side. Short list, with
+pointers:
 
-| Fact | Detail |
-|---|---|
-| Phone source | `0x8001` only. Cloud `sourceId` frames are ignored but still advance SN trackers. |
-| Unicast keying | XXTEA = `localKey`, XOR mask = mesh `beaconKey`. |
-| Group keying | Destination `FFgg`, both key and mask = `beaconKey` (bulbs never learn a distinct groupKey). |
-| Sequence | One per-source SN for the whole mesh; forward window ≥ ~900; never reuse or go backwards. |
-| On-air time | ≥ 3 s per unicast frame (scan duty cycle + relays). Hop bits start at 3. |
-| Reports | DP reports arrive as subCmd 7 to `8000`/`8001`, decrypted with `beaconKey`. |
-| localKey | Rotates on re-pair with a new srand (P1 "static authkey" does **not** carry to P2). |
-| Factory reset | 5 consecutive power cycles on one bulb; OTA `reset` also works once keys are known. |
+- Phone source is `0x8001` only; cloud `sourceId` frames are ignored but
+  still advance the bulbs' SN trackers (§4.1, §4.9).
+- Unicast keyed localKey/beaconKey; group `FFgg` keyed beaconKey/beaconKey,
+  no distinct groupKey (§4.1, §4.9).
+- One SN for the whole mesh; bulbs drop anything not ahead of the highest
+  they've heard; forward jumps of ~900 accepted; never reuse or go backwards
+  (§4.3, §4.9).
+- ≥ 3 s on air per frame (§4.7, §4.9).
+- Header bits 1–0 are a hop TTL: we send 3, relaying bulbs decrement it
+  (§4.2).
+- DP reports arrive as subCmd 7 to `8000`/`8001`, keyed beaconKey/beaconKey
+  (§4.6, §4.9).
+- localKey rotates on re-pair with a new srand (§7.1).
+- Factory reset: 5 consecutive power cycles; OTA `reset` also works once
+  keys are known (§4.9).
 
-DP ids confirmed on these bulbs (AK80x set): 1 on/off, 2 mode, 3 brightness
-10..1000, 4 temp 0..1000, 11 HSV raw `<<h::16, s, v>>`.
+DP ids confirmed on the Gardenreet bulbs only (AK80x set; table in §4.9): 1
+on/off, 2 mode, 3 brightness 10..1000, 4 temp 0..1000, 11 HSV raw
+`<<h::16, s, v>>`.
 
 ## Radio ownership in Universal Proxy
 
