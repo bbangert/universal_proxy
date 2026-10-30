@@ -16,8 +16,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.P2 do
   | 9 | `XXTEA(payload)` XOR mask (16 bytes) |
   | 25 | CRC-8 of `[hdr & 0xFC]` ‖ bytes 1..24, computed before masking |
 
-  Header bits 1–0 are excluded from both CRCs and are incremented by bulbs
-  relaying a frame; `normalize/1` clears them so relayed copies dedupe.
+  Header bits 1–0 are excluded from both CRCs and are a hop TTL: `build/8`
+  sets them to 3 and bulbs relaying a frame decrement them; `normalize/1`
+  clears them so relayed copies dedupe.
 
   Keys (§4.1) are used as-is and passed to `UniversalProxy.TuyaBeaconMesh.Crypto.key_bytes/1`, so
   each key/mask argument may be a 16-char string, a 32-char hex string, or the
@@ -32,7 +33,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.P2 do
 
   The app nominally keys group frames with a groupKey, but bulbs never learn
   a distinct one: on hardware the groupKey *is* the beaconKey (see
-  `docs/protocols/notes/tuya_beacon_mesh_extraction.md`), which is what
+  `docs/protocols/tuya_beacon_mesh.md` §4.9), which is what
   `UniversalProxy.TuyaBeaconMesh.Control` passes.
 
   Addresses (`src`, `dst`, node IDs) may be given as 2-byte binaries or as
@@ -216,9 +217,10 @@ defmodule UniversalProxy.TuyaBeaconMesh.P2 do
   def parse_device(_, _), do: :error
 
   @doc """
-  Clears the header's hop bits (1–0), which both CRCs exclude, so that copies
-  of one frame relayed by different bulbs (or one bulb several times) compare
-  equal and dedupe. The CRC byte stays valid.
+  Clears the header's hop bits (1–0, the TTL that relaying bulbs decrement),
+  which both CRCs exclude, so that copies of one frame relayed by different
+  bulbs (or one bulb several times) compare equal and dedupe. The CRC byte
+  stays valid.
   """
   @spec normalize(binary()) :: binary()
   def normalize(<<hdr, rest::binary>>), do: <<hdr &&& 0xFC, rest::binary>>

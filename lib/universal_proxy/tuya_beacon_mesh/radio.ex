@@ -52,7 +52,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
 
   Two kinds of duplicates are dropped before fan-out: the same
   `{address, P2.normalize(frame)}` seen within ~2 s (bulbs relay copies
-  with incremented hop bits, which `normalize/1` erases), and echoes of
+  with decremented hop/TTL bits, which `normalize/1` erases), and echoes of
   our own recent transmissions (the last #{32} normalised frames sent)
   relayed back by bulbs. Echo dropping can be turned off with
   `drop_echoes: false` / `set_drop_echoes/2` — checking on hardware that

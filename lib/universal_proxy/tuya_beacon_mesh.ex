@@ -1,7 +1,8 @@
 defmodule UniversalProxy.TuyaBeaconMesh do
   @moduledoc """
-  Tuya **Beacon Mesh** (Beacon v2 / P2) — the advert-based mesh protocol
-  used by bulbs such as the garden Beacon v2 set.
+  Tuya **Beacon Mesh** (Beacon v2 / P2) — the advert-based mesh protocol.
+  Hardware-validated on one product only: Gardenreet RGBCW G4 12 V bi-pin
+  bulbs (product id `vd8o60wy`); other P2 products may differ.
 
   This is **not** Tuya's GATT "paired BLE" / Tuya BLE product path, and
   not Thing Beacon Mesh. Name and namespace are deliberate so those are
@@ -34,8 +35,8 @@ defmodule UniversalProxy.TuyaBeaconMesh do
 
   Still host work for Universal Proxy: Settings storage of the inventory
   JSON, choosing the dedicated `hciN`, MQTT/HA discovery, and wiring a
-  supervisor. Hardware lessons:
-  `docs/protocols/notes/tuya_beacon_mesh_extraction.md`.
+  supervisor. Hardware behaviour: `docs/protocols/tuya_beacon_mesh.md`
+  §4.9; extraction notes: `docs/protocols/notes/tuya_beacon_mesh_extraction.md`.
 
   Pairing / Tuya cloud login are intentionally absent — the dump is
   assumed to come from a Python script after the user pairs in the app.

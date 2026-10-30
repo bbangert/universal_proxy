@@ -9,9 +9,11 @@ key, because the pairing frame is encrypted with it. So either:
 * A. the localKey is a fixed per-device secret (the factory ``authkey``), or
 * B. the bulb and the cloud both compute ``localKey = KDF(authkey, srand)``.
 
-Some users report the localKey changes when a bulb is removed and re-paired,
-which points at B. This tool tests a set of plausible constructions against
-samples from **your own bulb**. It needs:
+B is confirmed on hardware (Gardenreet RGBCW G4 bulbs, product id
+``vd8o60wy``): the localKey rotates every time a bulb is reset and re-paired
+with a new ``srand``. The KDF itself is still unknown; this tool searches for
+it by testing a set of plausible constructions against samples from **your own
+bulb**. It needs:
 
 * the bulb's ``authkey`` (16 or 32 ASCII characters, read from its flash), and
 * several samples, each a ``srand`` (4 bytes, hex) with the ``localKey`` the
