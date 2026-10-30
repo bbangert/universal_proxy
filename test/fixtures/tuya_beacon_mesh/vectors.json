@@ -1,0 +1,37 @@
+{
+  "p2": {
+    "device_report": {
+      "beacon_key": "00112233445566778899aabbccddeeff",
+      "frame": "0b1234800001020765573d5041e7ee2cddeefe8b3467849733a4",
+      "parsed": {
+        "cmd": 1,
+        "dst": "8000",
+        "pair": false,
+        "payload": "0111010324000001f400000000000000",
+        "sn": 258,
+        "src": "1234",
+        "sub_cmd": 7
+      }
+    },
+    "pair_frame": {
+      "beacon_key": "00112233445566778899aabbccddeeff",
+      "frame": "93530fb34a0200124d4800ec463257ed3da4d4b4df741887cd3e",
+      "local_key": "abcdefghijklmnop",
+      "mac": "dc23530fb34a",
+      "node_id": "0012",
+      "round": 2
+    },
+    "pair_reply": {
+      "frame": "9b12348000000000bf72769295b09f1f5f73c883134a7cd987e5",
+      "parsed": {
+        "cmd": 3,
+        "dst": "8000",
+        "pair": true,
+        "payload": "a1b2c3d4000000000000000000000000",
+        "sn": 0,
+        "src": "1234",
+        "sub_cmd": 0
+      }
+    }
+  }
+}

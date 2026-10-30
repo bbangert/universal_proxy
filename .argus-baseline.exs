@@ -271,5 +271,25 @@
       "UniversalProxy.UART.Server (position 2) starts processes under DynamicSupervisor (position 0) of UniversalProxy.UART.Supervisor, a rest_for_one supervisor. When UniversalProxy.UART.Server crashes, the supervisor restarts it and every later child, but DynamicSupervisor started earlier and survives — with the processes the old UniversalProxy.UART.Server started still running inside it. The new UniversalProxy.UART.Server knows nothing of them and starts its own: duplicated work, or a stale process holding a resource the replacement expects to own.",
     reason:
       "Deliberate: the server's init/1 sweeps every child a previous incarnation left under the earlier DynamicSupervisor (which_children + terminate_child) before starting its own, so no orphan survives a server restart."
+  },
+  %{
+    analysis: "mailbox",
+    file: "lib/universal_proxy/tuya_beacon_mesh/radio.ex",
+    title: "Monitor left live each time a wait returns",
+    at_label: "left live on some way out of the wait",
+    detail:
+      "UniversalProxy.TuyaBeaconMesh.Radio.handle_call/3 runs again and again, and each run monitors a process and waits for its :DOWN. Some way out of the wait returns with the monitor still live: the `after` clause gave up, or the answer came first, and nothing demonitors the ref. The next run monitors the same process again, so the monitors pile up on it, one per run, until it exits; then every one of them sends a :DOWN into whatever the process runs by then.",
+    reason:
+      "False positive: kill_receiver/1 calls Process.demonitor(ref, [:flush]) unconditionally after its receive, so the ref is gone on both the :DOWN and the 1 s `after` path and never outlives the call. It only runs when GenServer.stop on the receiver has already timed out."
+  },
+  %{
+    analysis: "failure",
+    file: "lib/universal_proxy/tuya_beacon_mesh/radio.ex",
+    title: "Process.exit inside a GenServer callback",
+    at_label: "sends an exit signal from a callback",
+    detail:
+      "UniversalProxy.TuyaBeaconMesh.Radio.kill_receiver/1 sends an exit signal to a process it holds as a value in what the callback UniversalProxy.TuyaBeaconMesh.Radio.handle_call/3 runs. This is often deliberate — process-manager handoff, registry name-conflict resolution, an ownership watcher killing dependents — but killing a process imperatively bypasses the supervisor that started it, so it is worth confirming the target is meant to be torn down this way rather than stopped through its own protocol.",
+    reason:
+      "Deliberate: the AdvertReceiver is Radio's own child (start_link'd by Radio, no supervisor) and was already asked to stop through its protocol; the kill is the fallback only after GenServer.stop timed out. proc_lib:stop leaves the target alive on timeout, and a live receiver keeps its registered Rx name, failing every later setup with already_started."
   }
 ]
