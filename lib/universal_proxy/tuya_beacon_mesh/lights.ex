@@ -649,13 +649,13 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
 
   # ── Resolve ──────────────────────────────────────────────────────────
 
+  # Only a MAC-shaped `who` (Inventory's rule) is looked up as a MAC, so a
+  # label never gets read as hex pulled out of it.
   defp resolve(state, who) do
-    mac = normalize_mac(who)
-
-    case Map.fetch(state.bulbs, mac) do
-      {:ok, bulb} ->
-        {:ok, mac, bulb}
-
+    with {:ok, mac} <- Inventory.normalize_mac(who),
+         {:ok, bulb} <- Map.fetch(state.bulbs, mac) do
+      {:ok, mac, bulb}
+    else
       :error ->
         case Enum.find(state.bulbs, fn {_m, b} -> b.label == who end) do
           {mac, bulb} -> {:ok, mac, bulb}
@@ -706,10 +706,4 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
        }}
     end)
   end
-
-  defp normalize_mac(mac) when is_binary(mac) do
-    mac |> String.replace(~r/[^0-9A-Fa-f]/, "") |> String.upcase()
-  end
-
-  defp normalize_mac(_), do: ""
 end

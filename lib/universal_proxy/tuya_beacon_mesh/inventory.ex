@@ -26,7 +26,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Inventory do
   the cloud reuses node ids across re-pairings, and report attribution is
   by node id on the wire, so twins silently share one status entry.
   Duplicate labels, group ids and group names are rejected too, since
-  they are what callers address bulbs and groups by.
+  they are what callers address bulbs and groups by, and so is a label
+  that is another bulb's MAC (lookups try the MAC first).
 
   Every key must be usable as-is (`UniversalProxy.TuyaBeaconMesh.Crypto.parse_key/1`): 32
   hex chars, or 16 printable ASCII chars. Node ids are unicast addresses
@@ -185,10 +186,17 @@ defmodule UniversalProxy.TuyaBeaconMesh.Inventory do
 
   defp fetch_bulbs(map, mesh_key) do
     case fetch(map, [:bulbs, :lights]) do
-      {:ok, [_ | _] = raw} -> decode_bulbs(raw, mesh_key)
-      {:ok, []} -> {:error, :no_bulbs}
-      {:ok, _other} -> {:error, :bad_bulbs}
-      :error -> {:error, :no_bulbs}
+      {:ok, [_ | _] = raw} ->
+        with {:ok, bulbs} <- decode_bulbs(raw, mesh_key), do: check_label_macs(bulbs)
+
+      {:ok, []} ->
+        {:error, :no_bulbs}
+
+      {:ok, _other} ->
+        {:error, :bad_bulbs}
+
+      :error ->
+        {:error, :no_bulbs}
     end
   end
 
@@ -229,6 +237,22 @@ defmodule UniversalProxy.TuyaBeaconMesh.Inventory do
       true ->
         :ok
     end
+  end
+
+  # Lights resolves a bulb by MAC before label, so a label spelling another
+  # bulb's MAC would silently address that bulb instead.
+  defp check_label_macs(bulbs) do
+    macs = MapSet.new(bulbs, & &1.mac)
+
+    Enum.find_value(bulbs, {:ok, bulbs}, fn bulb ->
+      with label when is_binary(label) <- bulb.label,
+           {:ok, mac} when mac != bulb.mac <- normalize_mac(label),
+           true <- MapSet.member?(macs, mac) do
+        {:error, {:label_is_other_mac, bulb.mac}}
+      else
+        _ -> nil
+      end
+    end)
   end
 
   defp decode_bulb(row, mesh_key) when is_map(row) do
@@ -397,13 +421,15 @@ defmodule UniversalProxy.TuyaBeaconMesh.Inventory do
   # Only MAC-shaped input (12 hex digits, optionally `:`/`-` separated
   # pairs): a MAC is what errors report, so it must never be hex pulled
   # out of some other string, such as a key.
-  defp normalize_mac(mac) when is_binary(mac) do
+  @doc false
+  @spec normalize_mac(term()) :: {:ok, String.t()} | :error
+  def normalize_mac(mac) when is_binary(mac) do
     if Regex.match?(~r/\A[0-9A-Fa-f]{2}(?:[:-]?[0-9A-Fa-f]{2}){5}\z/, mac),
       do: {:ok, mac |> String.replace(~r/[:-]/, "") |> String.upcase()},
       else: :error
   end
 
-  defp normalize_mac(_), do: :error
+  def normalize_mac(_), do: :error
 
   # The first of `keys` present in `map`, whatever its value (`false` and
   # `nil` included). Field names are atoms here; JSON input has them as

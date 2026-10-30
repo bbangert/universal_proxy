@@ -55,6 +55,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
     assert Enum.any?(bulbs, &(&1.label == "path light 2" and &1.node_id == 2))
     assert {:ok, %{label: "post spot 1", node_id: 3}} = Lights.status("post spot 1")
     assert {:ok, %{label: "post spot 1"}} = Lights.status("dc:23:53:3f:cd:62")
+    # Only a MAC-shaped string is looked up as a MAC: hex inside other text
+    # is not pulled out and matched.
+    assert {:error, :unknown_bulb} = Lights.status("xx dc23533fcd62")
     assert {:error, :unknown_bulb} = Lights.status("nobody")
   end
 

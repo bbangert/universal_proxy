@@ -127,6 +127,18 @@ defmodule UniversalProxy.TuyaBeaconMesh.InventoryTest do
       assert {:error, :bad_bulb} = Inventory.decode(Map.put(base(), "bulbs", ["x"]))
     end
 
+    test "a label that is another bulb's MAC is rejected, in either order" do
+      # Bulb 0 is DC23530FB34A, bulb 1 is DC23533FCD62 (example inventory).
+      assert {:error, {:label_is_other_mac, "DC23530FB34A"}} =
+               Inventory.decode(with_bulb(0, &Map.put(&1, "label", "dc:23:53:3f:cd:62")))
+
+      assert {:error, {:label_is_other_mac, "DC23533FCD62"}} =
+               Inventory.decode(with_bulb(1, &Map.put(&1, "label", "DC23530FB34A")))
+
+      # A bulb labelled with its own MAC still addresses only itself.
+      assert {:ok, _inv} = Inventory.decode(with_bulb(1, &Map.put(&1, "label", "DC23533FCD62")))
+    end
+
     test "groups: ids, names, members" do
       group = %{"localId" => 2, "name" => "post", "members" => ["DC23533FCD62"]}
       groups = fn extra -> Map.put(base(), "groups", base()["groups"] ++ [extra]) end
