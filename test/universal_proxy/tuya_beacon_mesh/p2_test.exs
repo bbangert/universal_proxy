@@ -1,12 +1,25 @@
 defmodule UniversalProxy.TuyaBeaconMesh.P2Test do
   use ExUnit.Case, async: true
 
-  alias UniversalProxy.TuyaBeaconMesh.P2
+  alias UniversalProxy.TuyaBeaconMesh.{Crypto, P2}
 
-  @vectors "test/fixtures/tuya_beacon_mesh/vectors.json" |> File.read!() |> Jason.decode!()
-  @capture "test/fixtures/tuya_beacon_mesh/p2_frames_2026-10-25.json"
+  @lk "abcdefghijklmnop"
+
+  @vectors Path.join([__DIR__, "..", "..", "fixtures", "tuya_beacon_mesh", "vectors.json"])
            |> File.read!()
            |> Jason.decode!()
+  @capture Path.join([
+             __DIR__,
+             "..",
+             "..",
+             "fixtures",
+             "tuya_beacon_mesh",
+             "p2_frames_2026-10-25.json"
+           ])
+           |> File.read!()
+           |> Jason.decode!()
+
+  @unpaired Enum.filter(@capture["frames"], &(&1["hdr"] in 0x88..0x8B))
 
   defp h(hex), do: Base.decode16!(hex, case: :mixed)
 
@@ -79,6 +92,61 @@ defmodule UniversalProxy.TuyaBeaconMesh.P2Test do
       assert P2.parse_device(a <> <<0x12, 0x34>> <> rest, v["beacon_key"]) == :error
     end
 
+    test "parse_device checks the payload CRC under a valid frame CRC" do
+      bk = h("00112233445566778899aabbccddeeff")
+      frame = P2.build(1, 7, 0x0042, 0x8001, 9, h("0111"), bk, bk)
+      assert {:ok, _} = P2.parse_device(frame, bk)
+
+      # Flip the payload CRC byte and re-seal the frame CRC (computed over
+      # the unmasked frame) so only the payload check can catch it.
+      <<hdr, head::binary-7, payload_crc, masked::binary-16, _crc>> = frame
+      cipher = :crypto.exor(masked, bk)
+      bad_crc = Bitwise.bxor(payload_crc, 0x01)
+      sealed = Crypto.crc8(<<Bitwise.band(hdr, 0xFC)>> <> head <> <<bad_crc>> <> cipher)
+      forged = <<hdr>> <> head <> <<bad_crc>> <> masked <> <<sealed>>
+
+      assert P2.parse_device(forged, bk) == :error
+    end
+
+    test "parse_device and parse_unpaired reject malformed input" do
+      v = @vectors["p2"]["device_report"]
+      frame = h(v["frame"])
+      key = v["beacon_key"]
+
+      for bad <- [<<>>, binary_part(frame, 0, 25), frame <> <<0>>, nil, 42] do
+        assert P2.parse_device(bad, key) == :error
+        assert P2.parse_unpaired(bad) == :error
+      end
+
+      for bad_key <- [nil, "short", String.duplicate("z", 32), 7] do
+        assert P2.parse_device(frame, bad_key) == :error
+      end
+
+      u = hd(@unpaired) |> Map.fetch!("frame") |> h()
+      <<hdr, mid::binary-23, flag_etc::binary-1, crc>> = u
+      # Pair flag cleared, type != 1, flag byte set: each re-sealed so only
+      # the field check rejects it.
+      reseal = fn <<hdr, rest::binary-24, _crc>> ->
+        <<hdr, rest::binary, Crypto.crc8(<<Bitwise.band(hdr, 0xFC)>> <> rest)>>
+      end
+
+      assert P2.parse_unpaired(
+               reseal.(<<Bitwise.band(hdr, 0x7F), mid::binary, flag_etc::binary, crc>>)
+             ) == :error
+
+      assert P2.parse_unpaired(reseal.(<<0x90, mid::binary, flag_etc::binary, crc>>)) == :error
+
+      <<pre::binary-20, _flag, post::binary-5>> = u
+      assert P2.parse_unpaired(reseal.(<<pre::binary, 1, post::binary>>)) == :error
+      assert {:ok, _} = P2.parse_unpaired(reseal.(u))
+    end
+
+    test "build takes 4-bit frame types only" do
+      assert <<0x7B, _::binary>> = P2.build(15, 1, 1, 2, 3, <<>>, @lk, @lk)
+
+      assert_raise FunctionClauseError, fn -> P2.build(16, 1, 1, 2, 3, <<>>, @lk, @lk) end
+    end
+
     test "build -> parse_device round trip for a frame to 8000" do
       bk = h("00112233445566778899aabbccddeeff")
       frame = P2.build(1, 9, 0x0042, 0x8000, 65_535, h("0111"), bk, bk)
@@ -89,8 +157,6 @@ defmodule UniversalProxy.TuyaBeaconMesh.P2Test do
   end
 
   describe "real capture (2026-10-25)" do
-    @unpaired Enum.filter(@capture["frames"], &(&1["hdr"] in 0x88..0x8B))
-
     test "ten unpaired adverts parse, pid vd8o60wy, MAC = advertiser" do
       assert length(@unpaired) == 10
 
@@ -129,7 +195,6 @@ defmodule UniversalProxy.TuyaBeaconMesh.P2Test do
   end
 
   describe "request builders" do
-    @lk "abcdefghijklmnop"
     @bk "00112233445566778899aabbccddeeff"
 
     test "timings and expectations per §4.7" do

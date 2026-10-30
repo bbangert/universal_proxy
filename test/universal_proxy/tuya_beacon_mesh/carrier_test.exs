@@ -3,7 +3,14 @@ defmodule UniversalProxy.TuyaBeaconMesh.CarrierTest do
 
   alias UniversalProxy.TuyaBeaconMesh.Carrier
 
-  @capture "test/fixtures/tuya_beacon_mesh/p2_frames_2026-10-25.json"
+  @capture Path.join([
+             __DIR__,
+             "..",
+             "..",
+             "fixtures",
+             "tuya_beacon_mesh",
+             "p2_frames_2026-10-25.json"
+           ])
            |> File.read!()
            |> Jason.decode!()
 

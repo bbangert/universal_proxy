@@ -9,7 +9,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Dp do
   |---|---|---|
   | `:raw` | 0 | binary |
   | `:bool` | 1 | boolean (1 byte) |
-  | `:value` | 2 | integer (4 bytes, big-endian, signed) |
+  | `:value` | 2 | integer (4 bytes, big-endian, signed; out of range is an error) |
   | `:string` | 3 | UTF-8 binary |
   | `:enum` | 4 | integer index (1 byte) |
   | `:bitmap` | 5 | non-negative integer (receive only) |
@@ -50,7 +50,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Dp do
   defp encode_one(other), do: {:error, {:bad_dp, other}}
 
   defp value_bytes(:bool, v) when is_boolean(v), do: {:ok, if(v, do: <<1>>, else: <<0>>)}
-  defp value_bytes(:value, v) when is_integer(v), do: {:ok, <<v::32-big-signed>>}
+  defp value_bytes(:value, v) when v in -0x8000_0000..0x7FFF_FFFF, do: {:ok, <<v::32-big-signed>>}
   defp value_bytes(:enum, v) when v in 0..255, do: {:ok, <<v>>}
   defp value_bytes(:string, v) when is_binary(v), do: {:ok, v}
   defp value_bytes(:raw, v) when is_binary(v), do: {:ok, v}

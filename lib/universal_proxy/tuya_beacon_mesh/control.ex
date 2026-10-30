@@ -132,7 +132,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Control do
   @doc "Group DP set to `FFgg`, keyed beaconKey/beaconKey."
   @spec group_set(byte(), 0..0xFFFF, keyword() | map(), key(), keyword()) ::
           {:ok, request()} | {:error, term()}
-  def group_set(gg, sn, dps, beacon_key, opts \\ []) do
+  def group_set(gg, sn, dps, beacon_key, opts \\ [])
+
+  def group_set(gg, sn, dps, beacon_key, opts) when gg in 0..255 do
     with {:ok, dp_list} <- friendly_dps(dps),
          {:ok, tlv} <- Dp.encode(dp_list) do
       dst = <<0xFF, gg>>
@@ -147,6 +149,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Control do
       {:ok, bump_send(request)}
     end
   end
+
+  def group_set(gg, _sn, _dps, _beacon_key, _opts), do: {:error, {:bad_group, gg}}
 
   defp bump_send({frame, send_ms, window, expect}) do
     {frame, max(send_ms, @min_send_ms), window, expect}

@@ -64,7 +64,27 @@ defmodule UniversalProxy.TuyaBeaconMesh.CryptoDpTest do
 
     test "refuses payloads over 16 bytes and bad values" do
       assert Dp.encode([{1, :raw, :binary.copy(<<1>>, 15)}]) == {:error, :too_long}
+      assert {:ok, <<1, 0x0E, _::binary-14>>} = Dp.encode([{1, :raw, :binary.copy(<<1>>, 14)}])
       assert {:error, {:bad_value, 1, :bool, 3}} = Dp.encode([{1, :bool, 3}])
+      assert {:error, {:bad_dp, {0, :bool, true}}} = Dp.encode([{0, :bool, true}])
+    end
+
+    test ":value is a signed 32-bit integer; out of range is an error, not a wrap" do
+      assert {:ok, <<3, 0x24, 0x7F, 0xFF, 0xFF, 0xFF>>} = Dp.encode([{3, :value, 2_147_483_647}])
+      assert {:ok, <<3, 0x24, 0x80, 0, 0, 0>>} = Dp.encode([{3, :value, -2_147_483_648}])
+      assert Dp.decode(<<3, 0x24, 0xFF, 0xFF, 0xFF, 0xFE>>) == [{3, :value, -2}]
+
+      for bad <- [2_147_483_648, -2_147_483_649, 4_294_967_301, 1.0] do
+        assert {:error, {:bad_value, 3, :value, ^bad}} = Dp.encode([{3, :value, bad}])
+      end
+    end
+
+    test "decode stops at a TLV that overruns the payload" do
+      assert Dp.decode(<<1, 0x11, 1, 3, 0x24, 0, 0>>) == [{1, :bool, true}]
+      assert Dp.decode(<<>>) == []
+      assert Dp.decode(<<5, 0x52, 0x01, 0x02>>) == [{5, :bitmap, 0x0102}]
+      # Unknown type nibbles come back as the number, value raw.
+      assert Dp.decode(<<6, 0x91, 0xAA>>) == [{6, 9, <<0xAA>>}]
     end
   end
 end

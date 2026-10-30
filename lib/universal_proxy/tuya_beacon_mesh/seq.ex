@@ -42,15 +42,18 @@ defmodule UniversalProxy.TuyaBeaconMesh.Seq do
   of `new_seq` before using any of `sns`. The block wraps past 65535 to 0.
   """
   @spec reserve(t(), pos_integer()) ::
-          {:ok, [non_neg_integer()], t()} | {:error, :block_too_large}
+          {:ok, [non_neg_integer()], t()} | {:error, :block_too_large | :bad_block_size}
   def reserve(seq, n \\ @default_block)
 
-  def reserve(%__MODULE__{next: start} = _seq, n) when is_integer(n) and n in 1..@max_block do
+  def reserve(%__MODULE__{next: start}, n) when is_integer(n) and n in 1..@max_block do
     block = Enum.map(0..(n - 1), fn i -> rem(start + i, @max) end)
     {:ok, block, %__MODULE__{next: rem(start + n, @max)}}
   end
 
-  def reserve(%__MODULE__{}, _n), do: {:error, :block_too_large}
+  def reserve(%__MODULE__{}, n) when is_integer(n) and n > @max_block,
+    do: {:error, :block_too_large}
+
+  def reserve(%__MODULE__{}, _n), do: {:error, :bad_block_size}
 
   @doc """
   Moves the cursor forward to `value` when `value` is ahead of it

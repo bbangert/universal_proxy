@@ -14,6 +14,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.SeqTest do
     assert {:ok, [65_534, 65_535, 0], seq} = Seq.reserve(Seq.new(65_534), 3)
     assert Seq.value(seq) == 1
     assert {:error, :block_too_large} = Seq.reserve(Seq.new(0), 100)
+    assert {:error, :bad_block_size} = Seq.reserve(Seq.new(0), 0)
+    assert {:error, :bad_block_size} = Seq.reserve(Seq.new(0), -1)
+    assert {:ok, sns, _} = Seq.reserve(Seq.new(0), 99)
+    assert length(sns) == 99
+    assert Seq.value(Seq.new(70_000)) == 70_000 - 65_536
   end
 
   describe "ahead?/2" do

@@ -119,11 +119,13 @@ defmodule UniversalProxy.TuyaBeaconMesh.P2 do
   Builds a 26-byte P2 frame (§4.2) from frame `type`, `sub_cmd`, `src`, `dst`,
   sequence number `sn`, `payload` (at most 16 bytes, zero-padded), the XXTEA
   `key` and the XOR `mask`. The payload CRC is computed over the padded
-  payload and the frame CRC over the frame before masking.
+  payload and the frame CRC over the frame before masking. `type` is the
+  4-bit frame type (header bits 6–3); the pair flag is never set here
+  (see `pair_frame/5`).
   """
-  @spec build(0..31, byte(), addr(), addr(), 0..0xFFFF, binary(), key(), key()) :: binary()
+  @spec build(0..15, byte(), addr(), addr(), 0..0xFFFF, binary(), key(), key()) :: binary()
   def build(type, sub_cmd, src, dst, sn, payload, key, mask)
-      when type in 0..31 and sub_cmd in 0..255 and sn in 0..0xFFFF and is_binary(payload) and
+      when type in 0..15 and sub_cmd in 0..255 and sn in 0..0xFFFF and is_binary(payload) and
              byte_size(payload) <= 16 do
     src = addr!(src)
     dst = addr!(dst)
@@ -132,7 +134,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.P2 do
 
     padded = payload <> :binary.copy(<<0>>, 16 - byte_size(payload))
     cipher = Crypto.xxtea_encrypt(padded, key)
-    hdr = (type <<< 3) + 3 &&& 0xFF
+    hdr = (type <<< 3) + 3
 
     inner =
       src <> dst <> <<sn::16-big, sub_cmd, Crypto.crc8(padded)>> <> cipher
@@ -143,7 +145,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.P2 do
     <<hdr>> <> src <> dst <> <<sn::16-big, sub_cmd, Crypto.crc8(padded)>> <> masked <> <<crc>>
   end
 
-  def build(_, _, _, _, _, payload, _, _) when is_binary(payload) do
+  def build(_, _, _, _, _, payload, _, _) when is_binary(payload) and byte_size(payload) > 16 do
     raise ArgumentError, "P2 payload must be at most 16 bytes, got #{byte_size(payload)}"
   end
 
