@@ -120,7 +120,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.InventoryTest do
       assert {:error, {:duplicate_mac, "DC23530FB34A"}} =
                Inventory.decode(with_bulb(1, &Map.put(&1, "mac", "dc:23:53:0f:b3:4a")))
 
-      assert {:error, {:duplicate_label, "path light 2"}} =
+      assert {:error, {:duplicate_label, "DC23533FCD62"}} =
                Inventory.decode(with_bulb(1, &Map.put(&1, "label", "path light 2")))
 
       assert {:error, :bad_mac} = Inventory.decode(with_bulb(1, &Map.put(&1, "mac", "nope")))
@@ -136,7 +136,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.InventoryTest do
       assert {:error, {:duplicate_group_id, 1}} =
                Inventory.decode(groups.(%{group | "localId" => 1}))
 
-      assert {:error, {:duplicate_group_name, "path and post"}} =
+      assert {:error, {:duplicate_group_name, 2}} =
                Inventory.decode(groups.(%{group | "name" => "path and post"}))
 
       # FF FF is broadcast.
@@ -146,11 +146,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.InventoryTest do
       assert {:error, :bad_group} = Inventory.decode(groups.("x"))
       assert {:error, :bad_groups} = Inventory.decode(Map.put(base(), "groups", %{}))
 
-      assert {:error, {:unknown_group_member, "AABBCCDDEEFF"}} =
+      assert {:error, {:unknown_group_member, 2, "AABBCCDDEEFF"}} =
                Inventory.decode(groups.(%{group | "members" => ["aa:bb:cc:dd:ee:ff"]}))
 
-      assert {:error, {:bad_group_member, 7}} =
-               Inventory.decode(groups.(%{group | "members" => [7]}))
+      assert {:error, {:bad_group_member, 2, 1}} =
+               Inventory.decode(groups.(%{group | "members" => ["DC23533FCD62", 7]}))
 
       # Repeated members collapse.
       assert {:ok, %{groups: [_, %{members: ["DC23533FCD62"]}]}} =
@@ -158,15 +158,110 @@ defmodule UniversalProxy.TuyaBeaconMesh.InventoryTest do
     end
   end
 
-  describe "input" do
-    test "seq must be 0..65535" do
-      for bad <- [-1, 65_536, "5"] do
-        assert {:error, :bad_seq} = Inventory.decode(Map.put(base(), "seq", bad))
+  describe "errors carry no input" do
+    test "a group member that is a whole bulb object is reported by position" do
+      [bulb | _] = base()["bulbs"]
+      bulb = Map.put(bulb, "beaconKey", @mesh_key)
+      group = %{"localId" => 2, "name" => "post", "members" => ["DC23533FCD62", bulb]}
+      inv = Map.put(base(), "groups", base()["groups"] ++ [group])
+
+      assert {:error, {:bad_group_member, 2, 1} = reason} = Inventory.decode(inv)
+      refute inspect(reason) =~ "abcdefghijklmnop"
+
+      error = assert_raise ArgumentError, fn -> Inventory.decode!(inv) end
+      refute Exception.message(error) =~ "abcdefghijklmnop"
+      refute Exception.message(error) =~ @mesh_key
+    end
+
+    test "no error tuple echoes a key placed in a name or member field" do
+      secret = "ponmlkjihgfedcba"
+
+      inputs = [
+        with_bulb(1, &Map.put(&1, "label", "path light 2")),
+        with_bulb(0, &Map.put(&1, "label", %{"k" => secret})),
+        Map.put(base(), "groups", [
+          %{"localId" => 1, "name" => secret},
+          %{"localId" => 2, "name" => secret}
+        ]),
+        Map.put(base(), "groups", [%{"localId" => 1, "name" => [secret]}]),
+        Map.put(base(), "groups", [%{"localId" => 1, "members" => [secret]}]),
+        # 12 hex digits inside a 16-char key are not a MAC.
+        Map.put(base(), "groups", [%{"localId" => 1, "members" => ["a1b2c3d4e5f6wxyz"]}]),
+        with_bulb(0, &Map.put(&1, "mac", "a1b2c3d4e5f6wxyz")),
+        Map.put(base(), "groups", [%{"localId" => 1, "members" => [%{"localKey" => secret}]}])
+      ]
+
+      for input <- inputs do
+        assert {:error, reason} = Inventory.decode(input)
+        refute inspect(reason) =~ secret, "leaked in #{inspect(reason)}"
+        refute inspect(reason) =~ "A1B2C3D4E5F6", "leaked in #{inspect(reason)}"
+      end
+    end
+  end
+
+  describe "present values" do
+    test "a present false or null is validated, not read as absent" do
+      for bad <- [false, nil, true, -1, 65_536, "5"] do
+        assert {:error, :bad_seq} = Inventory.decode(Map.put(base(), "seq", bad)),
+               "accepted seq #{inspect(bad)}"
       end
 
+      # A false "seq" is not skipped in favour of a later alias.
+      assert {:error, :bad_seq} =
+               base() |> Map.put("seq", false) |> Map.put("seq_reserved", 7) |> Inventory.decode()
+
+      assert {:error, :bad_seq} = Inventory.decode(%{seq: false, beacon_key: @mesh_key})
       assert {:ok, %{seq: 0}} = Inventory.decode(Map.delete(base(), "seq"))
     end
 
+    test "false in any other field is rejected" do
+      assert {:error, :bad_beacon_key} = Inventory.decode(Map.put(base(), "beaconKey", false))
+      assert {:error, :bad_beacon_key} = Inventory.decode(Map.put(base(), "beaconKey", nil))
+      assert {:error, :bad_bulbs} = Inventory.decode(Map.put(base(), "bulbs", false))
+      assert {:error, :bad_groups} = Inventory.decode(Map.put(base(), "groups", false))
+      assert {:error, :bad_mac} = Inventory.decode(with_bulb(0, &Map.put(&1, "mac", false)))
+
+      assert {:error, {:bad_local_key, "DC23530FB34A"}} =
+               Inventory.decode(with_bulb(0, &Map.put(&1, "localKey", false)))
+
+      assert {:error, {:bad_node_id, "DC23530FB34A"}} =
+               Inventory.decode(with_bulb(0, &Map.put(&1, "nodeId", false)))
+
+      assert {:error, {:bad_bulb_beacon_key, "DC23530FB34A"}} =
+               Inventory.decode(with_bulb(0, &Map.put(&1, "beaconKey", false)))
+
+      assert {:error, {:bad_label, "DC23530FB34A"}} =
+               Inventory.decode(with_bulb(0, &Map.put(&1, "label", false)))
+
+      group = %{"localId" => 1, "name" => "g", "members" => []}
+      groups = &Map.put(base(), "groups", [&1])
+
+      assert {:error, :bad_group} = Inventory.decode(groups.(%{group | "localId" => false}))
+      assert {:error, :bad_group} = Inventory.decode(groups.(%{group | "members" => false}))
+
+      assert {:error, {:bad_group_name, 1}} =
+               Inventory.decode(groups.(%{group | "name" => false}))
+
+      assert {:error, {:bad_group_member, 1, 0}} =
+               Inventory.decode(groups.(%{group | "members" => [false]}))
+    end
+
+    test "null reads as absent for the optional fields" do
+      assert {:ok, %{bulbs: [%{label: nil, beacon_key: @mesh_key} | _], groups: []}} =
+               base()
+               |> Map.put("groups", nil)
+               |> put_in(["bulbs", Access.at(0), "label"], nil)
+               |> put_in(["bulbs", Access.at(0), "beaconKey"], nil)
+               |> Inventory.decode()
+
+      assert {:ok, %{groups: [%{name: nil, members: []}]}} =
+               Inventory.decode(
+                 Map.put(base(), "groups", [%{"localId" => 1, "name" => nil, "members" => nil}])
+               )
+    end
+  end
+
+  describe "input" do
     test "bad JSON, non-maps and oversized dumps" do
       assert {:error, {:invalid_json, _position}} = Inventory.decode(~s({"beaconKey": ))
       assert {:error, :not_a_map} = Inventory.decode([1, 2])
