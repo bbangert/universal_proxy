@@ -33,13 +33,13 @@ defmodule UniversalProxy.TuyaBeaconMesh.Seq do
   @half 32_768
   @default_block 32
   @max_block 99
-  # A restart resumes at the persisted lease end. The last number that may
-  # have gone on air is at least the one before the lease's start (its
-  # first number can be given back), so a crash makes the bulbs' tracker
-  # jump forward by at most lease + 1. Jumps of about 900 were accepted on
-  # hardware and the real limit was never measured, so that jump is capped
-  # at 900 and a lease at one less. Both sit far inside the half range
-  # that ahead?/2 needs.
+  # A restart resumes at the persisted lease end, so the gap from the last
+  # number on air to it is what a crash makes the bulbs jump. Jumps of
+  # about 900 were accepted on hardware and the real limit was never
+  # measured, so that gap is capped at 900. A lease alone, from a cursor
+  # whose first number can be given back, spans lease + 1 of it, so a
+  # lease is capped at one less. Both sit far inside the half range that
+  # ahead?/2 needs.
   @max_jump 900
   @max_lease @max_jump - 1
 
@@ -75,25 +75,26 @@ defmodule UniversalProxy.TuyaBeaconMesh.Seq do
 
   @doc """
   The largest lease `lease/2` grants (#{@max_lease}): one less than
-  `max_jump/0`, so resuming at a lease end after a crash is at most a
-  #{@max_jump}-step jump past the last number that may have gone on air.
+  `max_jump/0`, so a single lease taken right after the last number on
+  air (its first number given back) still fits the gap. It doesn't bound
+  the gap on its own; see `max_jump/0`.
   """
   @spec max_lease() :: pos_integer()
   def max_lease, do: @max_lease
 
   @doc """
-  The largest forward jump (#{@max_jump}) that **one** crash restart may
-  make past the last number that may have gone on air: about what the
-  bulbs were seen to accept.
+  The largest gap (#{@max_jump}) a caller should allow between the
+  persisted cursor (`value/1`) and the last number known to have gone on
+  air: about the largest forward jump the bulbs were seen to accept. A
+  restart resumes at the persisted cursor, so that gap is what one crash
+  makes the bulbs jump. Keeping it is the caller's job (this module
+  doesn't know what went on air); `max_lease/0` only bounds one lease.
 
-  The bound is per abandoned lease, not cumulative. A restart resumes at
-  the lease end (at most `max_lease + 1` past the last number on air);
-  if that run is cut short too before any number of its own lease goes
-  out (its first number refused, then another crash), the next restart
-  resumes at that lease's end in turn. A caller whose first lease after
-  a start is `min_lease` therefore jumps at most `max_lease + 1 + k *
-  min_lease` after `k` such further restarts: only a crash loop
-  accumulates, at the pace its supervisor's restart budget allows.
+  The bound is per crash, not cumulative: a restart whose own first
+  lease is abandoned too (its first number refused, then another crash)
+  resumes at that lease's end, so `k` such restarts in a row add at most
+  `k` first leases on top. Only a crash loop accumulates, at the pace
+  its supervisor's restart budget allows.
   """
   @spec max_jump() :: pos_integer()
   def max_jump, do: @max_jump

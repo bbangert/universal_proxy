@@ -240,8 +240,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   @doc """
   Radio state: whether setup completed (`:ready`) and why it last failed
   (`:last_error`, `nil` once ready), adapter index, lease held, discovery
-  on, receiver listening, subscriber count, what's on air (`:tx`) and how
-  many frames are queued (`:queued`). `opts`: `:server`, `:timeout`
+  on, receiver listening, subscriber count, what's on air (`:tx`), how
+  many frames are queued (`:queued`), and the sequence number of the last
+  frame the adapter accepted to advertise (`:last_tx_sn`, `nil` until one
+  has; a frame queued, coalesced away or advertised with an uncertain
+  outcome doesn't count). `opts`: `:server`, `:timeout`
   (default 5000; a radio that doesn't answer in time reads as not running).
   """
   @spec status(keyword()) :: {:ok, map()} | {:error, :not_running}
@@ -323,7 +326,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
       dedupe: %{},
       recent_tx: [],
       tx_queue: :queue.new(),
-      tx_current: nil
+      tx_current: nil,
+      last_tx_sn: nil
     }
 
     {:ok, state, {:continue, :setup}}
@@ -662,7 +666,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
           nil -> nil
           %{class: class, instance: instance} -> %{class: class, instance: instance}
         end,
-      queued: :queue.len(state.tx_queue)
+      queued: :queue.len(state.tx_queue),
+      last_tx_sn: state.last_tx_sn
     }
 
     {:reply, {:ok, status}, state}
@@ -776,7 +781,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
          %{
            state
            | tx_current: current,
-             recent_tx: Enum.take([job.norm | state.recent_tx], @recent_tx_max)
+             recent_tx: Enum.take([job.norm | state.recent_tx], @recent_tx_max),
+             last_tx_sn: frame_sn(job.frame)
          }}
 
       {:error, reason} when reason in @fatal_advertise_errors ->
@@ -790,6 +796,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
         {:error, {:advertise, reason}, state}
     end
   end
+
+  # P2 header: hdr, source (2), destination (2), then the sequence number.
+  defp frame_sn(<<_hdr, _src::binary-2, _dst::binary-2, sn::16-big, _::binary>>), do: sn
 
   # Takes the current advert off air and starts the next; an advert that
   # won't come off air means the instance (and the lease) can't be trusted,

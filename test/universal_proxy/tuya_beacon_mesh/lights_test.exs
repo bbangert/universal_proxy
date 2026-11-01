@@ -807,6 +807,107 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
       assert writes(persisted) == 1
     end
 
+    @tag :capture_log
+    test "a coalesced burst is held to max_jump past the frame on air", %{
+      persisted: persisted
+    } do
+      restart_lights(persisted, min_lease: 3, max_lease: 5, max_jump: 12)
+
+      # 100 goes on air and stays there (its 3 s run outlasts the test);
+      # the rest queue and coalesce behind it. Leases: 3 (to 103), 5 (to
+      # 108), then cut to 112 = 100 + max_jump.
+      results = for _ <- 1..15, do: Lights.set("path light 2", on: true)
+      assert Enum.take(results, 12) == List.duplicate(:ok, 12)
+      assert Enum.drop(results, 12) == List.duplicate({:error, :busy}, 3)
+      assert persisted_seq(persisted) == 112
+      assert writes(persisted) == 3
+      assert {:ok, %{last_tx_sn: 100, queued: 1}} = Radio.status()
+      assert distance(100, persisted_seq(persisted)) <= 12
+
+      # A power loss here resumes at 112, 12 past what the bulbs heard. The
+      # restarted Lights takes the Radio's report as its baseline, so it
+      # stays busy while 100 is still on air.
+      kill_lights()
+      assert {:error, :busy} = Lights.set("path light 2", on: true)
+      assert persisted_seq(persisted) == 112
+
+      # 100's run ends and the coalesced 111 airs: room again, and the
+      # refused commands burned nothing.
+      finish_tx()
+      assert {:ok, %{last_tx_sn: 111}} = Radio.status()
+      :ok = Radio.stop_tx()
+      assert sent_sn(fn -> Lights.set("path light 2", on: true) end) == 112
+      assert distance(111, persisted_seq(persisted)) <= 12
+    end
+
+    @tag :capture_log
+    test "a Radio that dropped the waiting frames unaired doesn't hold sends", %{
+      persisted: persisted
+    } do
+      restart_lights(persisted, min_lease: 3, max_lease: 5, max_jump: 12)
+      for _ <- 1..12, do: assert(:ok = Lights.set("path light 2", on: true))
+      assert {:error, :busy} = Lights.set("path light 2", on: true)
+
+      # Nothing on air and nothing queued: 101..111 will never air.
+      :ok = Radio.stop_tx()
+      assert set_sn("path light 2", on: true) == 112
+    end
+
+    @tag :capture_log
+    test "the tighten floor retires once sends reach it, across the 16-bit range", %{
+      persisted: persisted
+    } do
+      restart_lights(persisted, [])
+      assert send_n(1) == [100]
+
+      fail_persist(persisted, {:error, :busy})
+      assert {:error, :persist_failed} = Lights.reload(fixture(%{"seq" => 120}))
+      fail_persist(persisted, nil)
+      assert :sys.get_state(Lights).tighten_floor == 120
+
+      # A refused frame at the floor's edge, then sends up to it.
+      assert send_n(18) == Enum.to_list(101..118)
+      assert :sys.get_state(Lights).tighten_floor == 120
+
+      capture_log(fn ->
+        FakeBluez.fail(:advertise, :busy)
+        assert {:error, {:advertise, :busy}} = Lights.set("path light 2", on: true)
+        FakeBluez.succeed(:advertise)
+      end)
+
+      assert :sys.get_state(Lights).tighten_floor == 120
+      assert send_n(2) == [119, 120]
+      assert :sys.get_state(Lights).tighten_floor == nil
+
+      # More than half the range on, a kept floor of 120 would read as
+      # ahead of the cursor and block the tighten.
+      for seq <- [16_000, 32_000, 33_000],
+          do: assert(:ok = Lights.reload(fixture(%{"seq" => seq})))
+
+      assert send_n(1) == [33_000]
+      stop_supervised!(Lights)
+      assert persisted_seq(persisted) == 33_001
+    end
+
+    test "a successful reload retires a floor the cursor passed", %{persisted: persisted} do
+      restart_lights(persisted, [])
+      assert send_n(1) == [100]
+
+      capture_log(fn ->
+        fail_persist(persisted, {:error, :busy})
+        assert {:error, :persist_failed} = Lights.reload(fixture(%{"seq" => 120}))
+        fail_persist(persisted, nil)
+      end)
+
+      assert :ok = Lights.reload(fixture(%{"seq" => 16_000}))
+      assert :sys.get_state(Lights).tighten_floor == nil
+
+      for seq <- [32_000, 33_000], do: assert(:ok = Lights.reload(fixture(%{"seq" => seq})))
+      assert send_n(1) == [33_000]
+      stop_supervised!(Lights)
+      assert persisted_seq(persisted) == 33_001
+    end
+
     test "invalid options stop the start" do
       Process.flag(:trap_exit, true)
 
@@ -819,7 +920,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
             {[min_lease: 0], :min_lease},
             {[min_lease: 50, max_lease: 40], :min_lease},
             {[on_tighten: fn _inv -> :ok end], :on_tighten},
-            {[clock: :wall], :clock}
+            {[clock: :wall], :clock},
+            {[max_jump: 901], :max_jump},
+            {[max_jump: 600], :max_jump},
+            {[min_lease: 2, max_lease: 5, max_jump: 5], :max_jump},
+            {[max_jump: 1.5], :max_jump}
           ] do
         assert {:error, {:bad_option, ^key}} =
                  Lights.start_link([inventory: File.read!(@fixture), name: :lights_opts] ++ opts)

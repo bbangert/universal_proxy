@@ -469,16 +469,22 @@ How `Seq` and `Lights` handle this:
   (`on_persist`) **before** any number in it is used, so a restart never
   reuses one. Leases are sized from the send rate for about one persist a
   minute, between 32 and 600 numbers (never more than 899). A crash
-  resumes at the lease end and skips the rest of it: a jump of at most
-  lease + 1 past the last number that may have gone on air, so one crash
-  never jumps more than 900, the largest forward jump seen accepted
-  (§4.3). The bound is per crash: each further restart in a row that
+  resumes at the lease end and skips the rest of it, so `Lights` keeps the
+  persisted lease end at most 900 (the largest forward jump seen accepted,
+  §4.3) past the last frame the radio reports it put on air. A burst the
+  radio coalesces (same bulb, same DPs, one frame on air) would otherwise
+  run the counter far ahead of what the bulbs heard; past that budget a
+  command is refused with `{:error, :busy}` until a newer frame airs. One
+  crash therefore jumps the bulbs at most 900 past the last frame known on
+  air. The bound is per crash: each further restart in a row that
   abandons its first lease (32 numbers by default: its first frame
   refused, then another crash) adds at most that lease, so only a crash
   loop accumulates, at the pace the supervisors' restart budgets allow.
   No lease is taken while the radio reports it can't transmit, which
-  keeps that rare. A lease persist that fails is retried with an end at
-  or past the one attempted, in case that one was written anyway.
+  keeps that rare. Frames with an uncertain outcome, or dropped by the
+  radio unaired, are the residual cases. A lease persist that fails is
+  retried with an end at or past the one attempted, in case that one was
+  written anyway.
 - On a clean stop the lease is cut back to the next unused number
   (`on_tighten`), so a planned restart skips nothing. That is the only time
   the persisted cursor moves back, and only to a number past every one that
