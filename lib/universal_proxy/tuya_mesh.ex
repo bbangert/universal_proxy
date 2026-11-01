@@ -38,13 +38,24 @@ defmodule UniversalProxy.TuyaMesh do
   down (CLAUDE.md `catch :exit` idiom; a timed-out change is reported as
   `{:error, :timeout}`, since it may still have happened).
 
-  Test seams: `:store` and `:resolver` server names in every `opts`.
+  Test seams: `:store` and `:resolver` server names, and `:mesh_processes`
+  (the names that must all be unregistered before a change bypasses the
+  Resolver), in every `opts`.
   """
 
   require Logger
 
-  alias UniversalProxy.TuyaBeaconMesh.Inventory
-  alias UniversalProxy.TuyaMesh.{Resolver, Store}
+  alias UniversalProxy.TuyaBeaconMesh.{Inventory, Lights, Radio}
+  alias UniversalProxy.TuyaMesh.{Mesh, Resolver, Store}
+
+  # Every registered process of the mesh subtree.
+  @mesh_processes [
+    UniversalProxy.TuyaMesh.Supervisor,
+    UniversalProxy.TuyaMesh.MeshSupervisor,
+    Mesh,
+    Radio,
+    Lights
+  ]
 
   @type upload_error ::
           {:invalid_inventory, term()}
@@ -108,11 +119,17 @@ defmodule UniversalProxy.TuyaMesh do
     :exit, _ -> offline_status(Keyword.get(opts, :store, Store))
   end
 
-  @doc "Stops the mesh and removes the stored inventory (sub-device ids and settings are kept)."
+  @doc """
+  Stops the mesh and removes the stored inventory (bulb sub-device ids and
+  settings are kept). A stored inventory that no longer validates and whose
+  `seq` can't be recovered is refused with `{:error, :seq_unrecoverable}`;
+  `force: true` clears it anyway (see `Store.clear/2`).
+  """
   @spec clear(keyword()) :: :ok | {:error, term()}
   def clear(opts \\ []) do
     store = Keyword.get(opts, :store, Store)
-    change(opts, &Resolver.clear/1, fn -> Store.clear(store) end)
+    clear_opts = Keyword.take(opts, [:force])
+    change(opts, &Resolver.clear(&1, clear_opts), fn -> Store.clear(store, clear_opts) end)
   end
 
   @doc "Mesh settings (colour-temperature range in mireds, invert flag)."
@@ -143,23 +160,35 @@ defmodule UniversalProxy.TuyaMesh do
 
   defp confirmed(_preview, _opts), do: :ok
 
-  # Through the Resolver, which stops the mesh around the change. With no
-  # Resolver (no mesh role, subtree down) no mesh runs, so the Store is
-  # changed directly and the status broadcast from here. A timeout or a
-  # Resolver dying mid-call may have applied the change: not retried.
+  # Through the Resolver, which stops the mesh around the change. Without
+  # one, the Store is written directly only when no part of the mesh
+  # subtree is alive: a missing Resolver may just be mid-restart (or
+  # killed) with its mesh still running, and writing then would break
+  # stop-before-replace. A timeout or a Resolver dying mid-call may have
+  # applied the change: not retried.
   defp change(opts, via_resolver, direct) do
     via_resolver.(Keyword.get(opts, :resolver, Resolver))
   catch
     :exit, {:noproc, _} ->
-      result = direct.()
-      broadcast(offline_status(Keyword.get(opts, :store, Store)))
-      result
+      if mesh_down?(opts) do
+        result = direct.()
+        broadcast(offline_status(Keyword.get(opts, :store, Store)))
+        result
+      else
+        {:error, :unavailable}
+      end
 
     :exit, {:timeout, _} ->
       {:error, :timeout}
 
     :exit, _reason ->
       {:error, :unavailable}
+  end
+
+  defp mesh_down?(opts) do
+    opts
+    |> Keyword.get(:mesh_processes, @mesh_processes)
+    |> Enum.all?(&(GenServer.whereis(&1) == nil))
   end
 
   defp offline_status(store) do

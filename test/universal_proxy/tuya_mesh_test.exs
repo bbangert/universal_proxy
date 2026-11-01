@@ -83,6 +83,23 @@ defmodule UniversalProxy.TuyaMeshTest do
       assert {:ok, %{seq: 3, beacon_key: @other_key}} = Store.load(ctx.store)
     end
 
+    test "no direct write while any mesh process is still alive", ctx do
+      # The Resolver gone but its old Radio (here a stand-in) still up, as
+      # in the middle of a :one_for_all restart.
+      radio = :"lingering_radio_#{ctx.n}"
+
+      start_supervised!({Agent, fn -> :radio end}, id: :lingering)
+      |> Process.register(radio)
+
+      opts = [mesh_processes: [radio]] ++ ctx.opts
+      assert {:error, :unavailable} = TuyaMesh.upload(json(), opts)
+      assert Store.load(ctx.store) == {:error, :no_inventory}
+
+      {:ok, _} = TuyaMesh.upload(json(), ctx.opts)
+      assert {:error, :unavailable} = TuyaMesh.clear(opts)
+      assert {:ok, _} = Store.load(ctx.store)
+    end
+
     test "preview reports without writing", ctx do
       [b2, _b3] = json() |> Jason.decode!() |> Map.fetch!("bulbs")
 
@@ -155,6 +172,14 @@ defmodule UniversalProxy.TuyaMeshTest do
       assert %{bulbs: []} = TuyaMesh.status(ctx.opts)
     end
 
+    test "clear of an unrecoverable record needs force", ctx do
+      :ok = :dets.insert(:sys.get_state(ctx.store).table, {:inventory, %{"bulbs" => []}})
+      assert {:error, :seq_unrecoverable} = TuyaMesh.clear(ctx.opts)
+
+      capture_log(fn -> assert :ok = TuyaMesh.clear([force: true] ++ ctx.opts) end)
+      assert Store.load(ctx.store) == {:error, :no_inventory}
+    end
+
     test "settings pass through to the store", ctx do
       assert %{min_mireds: 154} = TuyaMesh.settings(ctx.opts)
       assert :ok = TuyaMesh.put_settings(%{min_mireds: 200}, ctx.opts)
@@ -188,7 +213,7 @@ defmodule UniversalProxy.TuyaMeshTest do
          tuya_adapter: "AA:BB:CC:DD:EE:01",
          store: ctx.store,
          adapters_fun: fn -> adapters end,
-         mesh_spec_fun: fn index ->
+         mesh_spec_fun: fn index, _mac ->
            %{id: :mesh, start: {Agent, :start_link, [fn -> index end]}, restart: :temporary}
          end,
          radio: :"no_radio_#{ctx.n}",

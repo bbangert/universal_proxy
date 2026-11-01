@@ -19,7 +19,10 @@ defmodule UniversalProxy.TuyaMesh.Mesh do
   supervisor; the Resolver notices and tries again later, so a crashing
   mesh never escalates into the Bluez subtree.
 
-  Options: `:adapter_index` (required), `:radio` and `:lights` (keyword
+  The Radio gets the role MAC as `:adapter_address`, so it refuses an
+  adapter that took over the index (see `TuyaBeaconMesh.Radio`).
+
+  Options: `:adapter_index` (required), `:adapter_address`, `:radio` and `:lights` (keyword
   lists merged over the defaults, for tests), `:name`.
   """
 
@@ -45,7 +48,11 @@ defmodule UniversalProxy.TuyaMesh.Mesh do
   def init(opts) do
     index = Keyword.fetch!(opts, :adapter_index)
 
-    radio = Keyword.merge([adapter_index: index, name: Radio], Keyword.get(opts, :radio, []))
+    radio =
+      Keyword.merge(
+        [adapter_index: index, adapter_address: Keyword.get(opts, :adapter_address), name: Radio],
+        Keyword.get(opts, :radio, [])
+      )
 
     lights =
       Keyword.merge(

@@ -20,14 +20,33 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
 
   The mesh is `:temporary`. If it exhausts its own restart budget it stops,
   and the Resolver tries again after 30 s rather than letting the failure
-  escalate into the Bluez subtree. While it runs, the adapter index is
-  re-checked every 30 s; a replugged dongle that came back under another
-  index gets the mesh restarted on it.
+  escalate into the Bluez subtree.
 
-  `replace/3` and `clear/1` stop the mesh before touching the Store and
+  ## The adapter stays the one with the role
+
+  hciN indexes are reused: unplug the mesh dongle and another adapter can
+  take its index. So while the mesh runs, the Resolver re-resolves the MAC
+  on every `{:bluetooth_adapters_changed}` from `Bluez.Client`
+  (`Bluez.Client.adapters_topic/0`: claim, hotplug add/remove) and every
+  30 s. When the MAC is gone, or sits under another index, the mesh is
+  stopped at once and the start conditions are evaluated again (so a dongle
+  that came back under a new index gets the mesh there). An empty adapter
+  list means the daemon isn't answering, not that the adapter left, and
+  changes nothing. The Radio is also started with the expected
+  `adapter_address`, so it refuses to power, scan or advertise on whatever
+  else holds its index, even between two of these checks.
+
+  While idle, the same event re-evaluates at once instead of waiting for
+  the retry timer.
+
+  ## Changes and shutdown
+
+  `replace/3` and `clear/2` stop the mesh before touching the Store and
   start it again after, so no Lights is left running on an inventory that
   is no longer stored (the Store refuses such a writer anyway, see
-  `UniversalProxy.TuyaMesh.Store`).
+  `UniversalProxy.TuyaMesh.Store`). The Resolver traps exits and stops the
+  mesh in `terminate/2`, with a shutdown long enough for the Radio's
+  teardown, so it is only ever gone once the mesh is.
 
   ## Status
 
@@ -40,7 +59,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   `{:tuya_mesh_status, status}`. Statuses carry no keys.
 
   Options: `:tuya_adapter`, `:dynsup`, `:name`, and test seams `:store`,
-  `:adapters_fun`, `:mesh_spec_fun` (`(index -> child_spec)`), `:radio`,
+  `:adapters_fun`, `:mesh_spec_fun` (`(index, mac -> child_spec)`), `:radio`,
   `:lights`, `:pubsub`, `:retry_ms`, `:restart_ms`, `:tick_ms`,
   `:reachable_ms`.
   """
@@ -60,8 +79,9 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   @index_check_ticks 6
   @report_debounce_ms 300
   @reachable_ms 300_000
-  # Stopping the mesh waits for the Radio's teardown (up to 10 s).
+  # Stopping the mesh waits for Lights (5 s) and the Radio's teardown (10 s).
   @change_timeout 30_000
+  @shutdown 20_000
 
   @type reason ::
           :no_role
@@ -101,6 +121,10 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
     GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
   end
 
+  def child_spec(opts) do
+    %{id: __MODULE__, start: {__MODULE__, :start_link, [opts]}, shutdown: @shutdown}
+  end
+
   @doc "The current status (see the moduledoc). Exits when not running."
   @spec status(GenServer.server()) :: status()
   def status(server \\ __MODULE__), do: GenServer.call(server, :status)
@@ -111,9 +135,10 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   def replace(inventory, opts, server \\ __MODULE__),
     do: GenServer.call(server, {:replace, inventory, opts}, @change_timeout)
 
-  @doc "Stops the mesh and clears the Store. Exits when not running."
-  @spec clear(GenServer.server()) :: :ok | {:error, term()}
-  def clear(server \\ __MODULE__), do: GenServer.call(server, :clear, @change_timeout)
+  @doc "Stops the mesh and clears the Store (`Store.clear/2` opts). Exits when not running."
+  @spec clear(GenServer.server(), keyword()) :: :ok | {:error, term()}
+  def clear(server \\ __MODULE__, opts \\ []),
+    do: GenServer.call(server, {:clear, opts}, @change_timeout)
 
   @doc false
   # The status shape for when no Resolver runs (`UniversalProxy.TuyaMesh`'s
@@ -143,6 +168,8 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
 
   @impl GenServer
   def init(opts) do
+    # So terminate/2 runs on a supervisor shutdown and stops the mesh first.
+    Process.flag(:trap_exit, true)
     retry_ms = Keyword.get(opts, :retry_ms, @retry_ms)
 
     state = %{
@@ -150,7 +177,12 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
       dynsup: Keyword.fetch!(opts, :dynsup),
       store: Keyword.get(opts, :store, Store),
       adapters_fun: Keyword.get(opts, :adapters_fun, &Bluez.Client.adapters_info/0),
-      mesh_spec_fun: Keyword.get(opts, :mesh_spec_fun, &Mesh.child_spec(adapter_index: &1)),
+      mesh_spec_fun:
+        Keyword.get(
+          opts,
+          :mesh_spec_fun,
+          &Mesh.child_spec(adapter_index: &1, adapter_address: &2)
+        ),
       radio: Keyword.get(opts, :radio, Radio),
       lights: Keyword.get(opts, :lights, Lights),
       pubsub: Keyword.get(opts, :pubsub, UniversalProxy.PubSub),
@@ -173,7 +205,23 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
       published: nil
     }
 
+    subscribe_adapters(state.pubsub)
     {:ok, state, {:continue, :evaluate}}
+  end
+
+  # PubSub's registry raises (not exits) when it isn't started.
+  defp subscribe_adapters(pubsub) do
+    Phoenix.PubSub.subscribe(pubsub, Bluez.Client.adapters_topic())
+  rescue
+    ArgumentError -> :ok
+  end
+
+  @impl GenServer
+  def terminate(_reason, state) do
+    _ = stop_mesh(state)
+    :ok
+  catch
+    :exit, _reason -> :ok
   end
 
   @impl GenServer
@@ -188,9 +236,9 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
     {:reply, reply, %{state | backoff_ms: state.retry_ms} |> evaluate() |> publish()}
   end
 
-  def handle_call(:clear, _from, state) do
+  def handle_call({:clear, opts}, _from, state) do
     state = stop_mesh(state)
-    reply = Store.clear(state.store)
+    reply = Store.clear(state.store, opts)
     {:reply, reply, %{state | backoff_ms: state.retry_ms} |> evaluate() |> publish()}
   end
 
@@ -210,6 +258,12 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
 
     {:noreply, state |> observe() |> schedule_tick() |> publish()}
   end
+
+  def handle_info({:bluetooth_adapters_changed}, %{mesh: %{}} = state),
+    do: {:noreply, state |> check_index() |> publish()}
+
+  def handle_info({:bluetooth_adapters_changed}, state),
+    do: {:noreply, %{state | backoff_ms: state.retry_ms} |> evaluate() |> publish()}
 
   def handle_info({:tuya_report, _report}, %{refresh_timer: nil, mesh: %{}} = state) do
     {:noreply, %{state | refresh_timer: arm(:refresh_reports, @report_debounce_ms)}}
@@ -259,18 +313,24 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   defp resolve_index(state) do
     adapters = state.adapters_fun.()
 
-    with %{path: path} <- Enum.find(adapters, &(normalize_mac(&1[:address]) == state.mac)),
-         {:ok, index} <- Bluez.Hci.adapter_index(path) do
+    with {:ok, index} <- find_index(adapters, state.mac) do
       if Enum.any?(adapters, &(normalize_mac(&1[:address]) != state.mac)),
         do: {:ok, index},
         else: {:error, :lone_radio}
+    end
+  end
+
+  defp find_index(adapters, mac) do
+    with %{path: path} <- Enum.find(adapters, &(normalize_mac(&1[:address]) == mac)),
+         {:ok, index} <- Bluez.Hci.adapter_index(path) do
+      {:ok, index}
     else
       _ -> {:error, :adapter_missing}
     end
   end
 
   defp start_mesh(state, index) do
-    case DynamicSupervisor.start_child(state.dynsup, state.mesh_spec_fun.(index)) do
+    case DynamicSupervisor.start_child(state.dynsup, state.mesh_spec_fun.(index, state.mac)) do
       {:ok, pid} ->
         Logger.info("TuyaMesh: mesh started on hci#{index} (#{state.mac})")
         mesh = %{pid: pid, mon: Process.monitor(pid), index: index}
@@ -335,19 +395,27 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
     }
   end
 
-  # A dongle replugged under a new index: move the mesh there. A missing
-  # one is left to the Radio's own retries.
+  # The running mesh's index must still name its MAC: gone or moved stops
+  # it now (and a moved one restarts on the new index). [] is the daemon
+  # not answering, which proves nothing either way.
   defp check_index(%{mesh: %{index: index}} = state) do
-    case resolve_index(state) do
-      {:ok, ^index} ->
+    case state.adapters_fun.() do
+      [] ->
         state
 
-      {:ok, new_index} ->
-        Logger.info("TuyaMesh: #{state.mac} moved to hci#{new_index}; restarting the mesh")
-        state |> stop_mesh() |> evaluate()
+      adapters ->
+        case find_index(adapters, state.mac) do
+          {:ok, ^index} ->
+            state
 
-      {:error, _reason} ->
-        state
+          {:ok, new_index} ->
+            Logger.info("TuyaMesh: #{state.mac} moved to hci#{new_index}; restarting the mesh")
+            state |> stop_mesh() |> evaluate()
+
+          {:error, :adapter_missing} ->
+            Logger.warning("TuyaMesh: #{state.mac} is gone from hci#{index}; stopping the mesh")
+            state |> stop_mesh() |> evaluate()
+        end
     end
   end
 

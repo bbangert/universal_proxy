@@ -59,10 +59,18 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
 
   defp inventory, do: @fixture |> File.read!() |> Inventory.decode!()
 
-  # A stand-in mesh: an Agent holding the index it was started for.
-  defp fake_mesh(index) do
-    %{id: :mesh, start: {Agent, :start_link, [fn -> index end]}, restart: :temporary}
+  # A stand-in mesh: an Agent holding the index and MAC it was started for.
+  defp fake_mesh(index, mac) do
+    %{id: :mesh, start: {Agent, :start_link, [fn -> {index, mac} end]}, restart: :temporary}
   end
+
+  defp adapters_changed(ctx),
+    do:
+      Phoenix.PubSub.broadcast(
+        ctx.pubsub,
+        Bluez.Client.adapters_topic(),
+        {:bluetooth_adapters_changed}
+      )
 
   defp start_mesh_sup(ctx, opts \\ []) do
     adapters = ctx.adapters
@@ -75,7 +83,7 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
       store: ctx.store,
       pubsub: ctx.pubsub,
       adapters_fun: fn -> Agent.get(adapters, & &1) end,
-      mesh_spec_fun: &fake_mesh/1,
+      mesh_spec_fun: &fake_mesh/2,
       radio: :"no_radio_#{System.unique_integer([:positive])}",
       lights: :"no_lights_#{System.unique_integer([:positive])}",
       retry_ms: 20,
@@ -93,16 +101,19 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
 
   defp mesh_index(ctx) do
     case DynamicSupervisor.which_children(ctx.names.dynsup) do
-      [{_, pid, _, _}] when is_pid(pid) -> Agent.get(pid, & &1)
+      [{_, pid, _, _}] when is_pid(pid) -> Agent.get(pid, &elem(&1, 0))
       [] -> nil
     end
   end
 
+  # nil also while the subtree restarts (the DynamicSupervisor is down).
   defp mesh_pid(ctx) do
     case DynamicSupervisor.which_children(ctx.names.dynsup) do
       [{_, pid, _, _}] -> pid
       [] -> nil
     end
+  catch
+    :exit, _ -> nil
   end
 
   defp wait_until(fun, timeout \\ 2_000) do
@@ -166,11 +177,12 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
       wait_until(fn -> mesh_index(ctx) == 0 end)
     end
 
-    test "all conditions met: started on the resolved index", ctx do
+    test "all conditions met: started on the resolved index, fenced by the MAC", ctx do
       {:ok, _} = Store.replace(inventory(), [], ctx.store)
-      start_mesh_sup(ctx)
+      start_mesh_sup(ctx, tuya_adapter: String.downcase(@mesh_mac))
 
       assert mesh_index(ctx) == 1
+      assert Agent.get(mesh_pid(ctx), & &1) == {1, @mesh_mac}
       assert %{state: :running, adapter_index: 1, bulbs: bulbs, groups: [group]} = status(ctx)
       assert [%{label: "path light 2", reachable: false, last_seen: nil}, _] = bulbs
       assert group.name == "path and post"
@@ -220,16 +232,77 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
       assert Store.load(ctx.store) == {:error, :no_inventory}
     end
 
-    test "a dongle that comes back under another index moves the mesh", ctx do
+    test "a dongle that comes back under another index moves the mesh (poll)", ctx do
       set_adapters(ctx, [adapter(@proxy_mac, 0), adapter(@mesh_mac, 7)])
       wait_until(fn -> mesh_index(ctx) == 7 end)
     end
 
-    test "a missing adapter while running is left to the Radio", ctx do
+    test "an empty adapter list (daemon not answering) changes nothing", ctx do
       pid = mesh_pid(ctx)
-      set_adapters(ctx, [adapter(@proxy_mac, 0)])
+      set_adapters(ctx, [])
+      adapters_changed(ctx)
       Process.sleep(200)
       assert mesh_pid(ctx) == pid
+    end
+
+    test "the Resolver stops the mesh before it exits", ctx do
+      test_pid = self()
+      resolver = ctx.names.resolver
+      sup = UniversalProxy.TuyaMesh.Supervisor
+      stop_supervised!(sup)
+
+      probe = fn _index, _mac ->
+        %{
+          id: :mesh,
+          start: {GenServer, :start_link, [__MODULE__.ProbeMesh, {test_pid, resolver}]},
+          restart: :temporary
+        }
+      end
+
+      start_mesh_sup(ctx, mesh_spec_fun: probe)
+      assert is_pid(mesh_pid(ctx))
+
+      # A stop of the Resolver alone (the start of a :one_for_all restart)...
+      GenServer.stop(resolver, :boom)
+      assert_receive {:mesh_stopped, resolver_alive?: true}
+
+      # ...and a shutdown of the whole subtree.
+      wait_until(fn -> is_pid(mesh_pid(ctx)) end)
+      stop_supervised!(sup)
+      assert_receive {:mesh_stopped, resolver_alive?: true}
+    end
+  end
+
+  describe "adapter changes while running" do
+    setup ctx do
+      {:ok, _} = Store.replace(inventory(), [], ctx.store)
+      # No tick in these tests: only the adapter-change event can react.
+      start_mesh_sup(ctx, tick_ms: 60_000)
+      assert mesh_index(ctx) == 1
+      :ok
+    end
+
+    test "the mesh adapter leaving stops the mesh at once", ctx do
+      set_adapters(ctx, [adapter(@proxy_mac, 0)])
+      adapters_changed(ctx)
+
+      wait_until(fn -> mesh_pid(ctx) == nil end, 500)
+      assert %{state: :idle, reason: :adapter_missing} = status(ctx)
+
+      # Back (under a new index): restarted there.
+      set_adapters(ctx, [adapter(@proxy_mac, 0), adapter(@mesh_mac, 2)])
+      adapters_changed(ctx)
+      wait_until(fn -> mesh_index(ctx) == 2 end, 500)
+    end
+
+    test "another adapter taking the mesh's index never gets the mesh", ctx do
+      set_adapters(ctx, [adapter(@proxy_mac, 0), adapter("11:22:33:44:55:66", 1)])
+      adapters_changed(ctx)
+
+      wait_until(fn -> mesh_pid(ctx) == nil end, 500)
+      Process.sleep(100)
+      assert mesh_pid(ctx) == nil
+      assert %{state: :idle, reason: :adapter_missing} = status(ctx)
     end
   end
 
@@ -237,12 +310,14 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
     setup ctx do
       FakeBluez.ensure_started()
       FakeBluez.reset()
+      FakeBluez.set_address(1, @mesh_mac)
       {:ok, _} = Store.replace(inventory(), [], ctx.store)
       store = ctx.store
 
-      spec = fn index ->
+      spec = fn index, mac ->
         Mesh.child_spec(
           adapter_index: index,
+          adapter_address: mac,
           radio: [
             bluez_radio: FakeBluez.Radio,
             mgmt: FakeBluez.Mgmt,
@@ -261,7 +336,7 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
     end
 
     test "Radio on the resolved adapter, powered; Lights persists through the Store", ctx do
-      assert {:ok, %{adapter_index: 1, ready: true}} = Radio.status()
+      assert {:ok, %{adapter_index: 1, adapter_address: @mesh_mac, ready: true}} = Radio.status()
       assert {:dbus_path, "/org/bluez/hci1", "Set"} in FakeBluez.calls()
 
       assert :ok = Lights.set("path light 2", on: true)
@@ -292,6 +367,23 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
       wait_until(fn -> match?(%{radio: %{ready: true}, lights_running: true}, status(ctx)) end)
       assert Process.whereis(Radio) != radio
       assert {:ok, %Inventory{seq: 1_000}} = Lights.inventory()
+    end
+  end
+
+  defmodule ProbeMesh do
+    @moduledoc false
+    # Reports, when stopped, whether the Resolver was still registered.
+    use GenServer
+
+    @impl GenServer
+    def init(arg) do
+      Process.flag(:trap_exit, true)
+      {:ok, arg}
+    end
+
+    @impl GenServer
+    def terminate(_reason, {test_pid, resolver}) do
+      send(test_pid, {:mesh_stopped, resolver_alive?: Process.whereis(resolver) != nil})
     end
   end
 

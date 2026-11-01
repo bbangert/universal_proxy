@@ -154,7 +154,7 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
       store =
         start_store(Path.join(ctx.tmp_dir, "failing.dets"), :"failing_#{System.unique_integer()}",
           id: :failing,
-          write_fun: fn _table, _inserts, _deletes -> {:error, :sync_failed} end
+          write_fun: fn _table, _records -> {:error, :sync_failed} end
         )
 
       log =
@@ -263,7 +263,84 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
     end
   end
 
+  describe "an invalid stored record" do
+    # Valid key and seq, but no bulbs: not servable, floor recoverable.
+    defp put_raw(ctx, raw), do: :ok = :dets.insert(ctx.table, {:inventory, raw})
+
+    test "clear deletes it, keeps its seq floor and drops its group ids", ctx do
+      {:ok, _} = Store.replace(inventory(), [], ctx.store)
+      put_raw(ctx, Map.merge(raw(), %{"seq" => 700, "bulbs" => []}))
+      capture_log(fn -> assert {:error, {:invalid, _}} = Store.load(ctx.store) end)
+
+      assert :ok = Store.clear(ctx.store)
+      assert Store.load(ctx.store) == {:error, :no_inventory}
+      refute Map.has_key?(Store.device_ids(ctx.store), {:group, 1})
+
+      assert {:ok, :same_mesh} = Store.replace(inventory(), [], ctx.store)
+      assert {:ok, %Inventory{seq: 700}} = Store.load(ctx.store)
+    end
+
+    test "clear refuses to drop a floor it can't recover, unless forced", ctx do
+      put_raw(ctx, %{"seq" => "garbage", "beaconKey" => "short"})
+
+      assert {:error, :seq_unrecoverable} = Store.clear(ctx.store)
+      capture_log(fn -> assert {:error, {:invalid, _}} = Store.load(ctx.store) end)
+
+      log = capture_log(fn -> assert :ok = Store.clear(ctx.store, force: true) end)
+      assert log =~ "seq is lost"
+      assert Store.load(ctx.store) == {:error, :no_inventory}
+    end
+
+    test "replace over it salvages the floor too", ctx do
+      put_raw(ctx, Map.merge(raw(), %{"seq" => 700, "bulbs" => []}))
+      assert Store.classify(inventory(), ctx.store) == :empty
+      assert {:ok, :same_mesh} = Store.replace(inventory(), [], ctx.store)
+      assert {:ok, %Inventory{seq: 700}} = Store.load(ctx.store)
+    end
+  end
+
   describe "device ids" do
+    test "a new mesh never inherits the old mesh's group ids", ctx do
+      {:ok, _} = Store.replace(inventory(), [], ctx.store)
+      assert %{{:group, 1} => 3} = Store.device_ids(ctx.store)
+
+      # Same bulbs (by MAC) and the same local group id 1, different mesh.
+      {:ok, :new_mesh} = Store.replace(other_mesh(), [allow_new_mesh: true], ctx.store)
+
+      assert Store.device_ids(ctx.store) == %{
+               {:bulb, @mac2} => 1,
+               {:bulb, @mac3} => 2,
+               {:group, 1} => 4
+             }
+
+      # The same mesh keeps its group ids.
+      {:ok, :same_mesh} = Store.replace(other_mesh(), [], ctx.store)
+      assert %{{:group, 1} => 4} = Store.device_ids(ctx.store)
+    end
+
+    test "are written in the same insert as their inventory", ctx do
+      test_pid = self()
+      n = System.unique_integer([:positive])
+
+      store =
+        start_store(Path.join(ctx.tmp_dir, "spy.dets"), :"spy_#{n}",
+          id: :spy,
+          write_fun: fn table, records ->
+            send(test_pid, {:write, Enum.map(records, &elem(&1, 0))})
+            with :ok <- :dets.insert(table, records), do: :dets.sync(table)
+          end
+        )
+
+      {:ok, _} = Store.replace(inventory(), [], store)
+      assert_received {:write, keys}
+      assert [:inventory, :device_ids, :next_device_id | _] = keys
+      refute_received {:write, _}
+
+      :ok = Store.clear(store)
+      assert_received {:write, [:inventory, :device_ids, :seq_floors]}
+      refute_received {:write, _}
+    end
+
     test "allocated for every bulb and group, from 1, persisted", ctx do
       {:ok, _} = Store.replace(inventory(), [], ctx.store)
 

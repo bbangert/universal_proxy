@@ -28,7 +28,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.FakeBluez do
   `StartDiscovery` / `StopDiscovery` calls; `stop_discovering/0` turns it
   off behind the radio's back, as an adapter removal or a `bluetoothd`
   restart does. Every D-Bus call is recorded twice: `{:dbus, member, body}`
-  and `{:dbus_path, object_path, member}`.
+  and `{:dbus_path, object_path, member}`. `set_address/2` gives an
+  adapter path its `Adapter1.Address`.
   """
 
   alias Bluez.Radio.Lease
@@ -65,12 +66,28 @@ defmodule UniversalProxy.TuyaBeaconMesh.FakeBluez do
       instances: %{},
       radio_pid: nil,
       radio_subs: [],
-      discovering: false
+      discovering: false,
+      addresses: %{}
     }
   end
 
   @doc "Ends discovery without the client asking (bluetoothd restarted)."
   def stop_discovering, do: Agent.update(@agent, &%{&1 | discovering: false})
+
+  @doc """
+  Sets `Adapter1.Address` of `/org/bluez/hci<index>` (unset: the object is
+  unknown, as for a missing adapter). `nil` removes it.
+  """
+  def set_address(index, nil),
+    do: Agent.update(@agent, &%{&1 | addresses: Map.delete(&1.addresses, path(index))})
+
+  def set_address(index, address),
+    do: Agent.update(@agent, &put_in(&1.addresses[path(index)], address))
+
+  @doc false
+  def address(path), do: Agent.get(@agent, &Map.get(&1.addresses, path))
+
+  defp path(index), do: "/org/bluez/hci#{index}"
 
   @doc false
   def discovering?, do: Agent.get(@agent, & &1.discovering)
@@ -360,7 +377,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.FakeBluez do
         nil ->
           FakeBluez.record({:dbus, member, body})
           FakeBluez.record({:dbus_path, path, member})
-          reply(member, body)
+          reply(path, member, body)
 
         reason ->
           FakeBluez.record({:dbus_failed, member})
@@ -368,13 +385,20 @@ defmodule UniversalProxy.TuyaBeaconMesh.FakeBluez do
       end
     end
 
-    defp reply("StartDiscovery", _body), do: discovering(true)
-    defp reply("StopDiscovery", _body), do: discovering(false)
+    defp reply(_path, "StartDiscovery", _body), do: discovering(true)
+    defp reply(_path, "StopDiscovery", _body), do: discovering(false)
 
-    defp reply("Get", ["org.bluez.Adapter1", "Discovering"]),
+    defp reply(_path, "Get", ["org.bluez.Adapter1", "Discovering"]),
       do: {:ok, [{"b", FakeBluez.discovering?()}]}
 
-    defp reply(_member, _body), do: {:ok, []}
+    defp reply(path, "Get", ["org.bluez.Adapter1", "Address"]) do
+      case FakeBluez.address(path) do
+        nil -> {:error, "org.freedesktop.DBus.Error.UnknownObject"}
+        address -> {:ok, [{"s", address}]}
+      end
+    end
+
+    defp reply(_path, _member, _body), do: {:ok, []}
 
     defp discovering(on?) do
       FakeBluez.set_discovering(on?)

@@ -29,9 +29,19 @@ defmodule UniversalProxy.TuyaMesh.Store do
       later of the stored one and the dump's (`Seq.advance_to/2`), so an old
       dump never pulls it back. A different mesh needs `allow_new_mesh:
       true` and takes the dump's `seq`.
-    * When a mesh leaves the store (`clear/1`, or `replace/3` with another
+    * When a mesh leaves the store (`clear/2`, or `replace/3` with another
       mesh), its last `seq` is kept as a floor under a SHA-256 fingerprint of
       its key. A later upload of that mesh starts no lower than the floor.
+
+  A stored record that no longer validates (a schema change, a corrupted
+  file) is never served, but it still holds the last `seq` of its mesh.
+  `clear/2` and `replace/3` salvage that floor from the raw record when its
+  key and `seq` are still usable. When they are not, `clear/2` refuses with
+  `{:error, :seq_unrecoverable}` instead of silently dropping the floor;
+  `clear(server, force: true)` drops it anyway, and is the caller's explicit
+  acknowledgement that the next upload of that mesh may reuse sequence
+  numbers. `replace/3` goes ahead (the upload brings its own `seq`) and logs
+  the loss.
 
   ## Sub-device ids
 
@@ -42,11 +52,14 @@ defmodule UniversalProxy.TuyaMesh.Store do
   groups. A bulb's entry is kept when the bulb leaves the inventory (a MAC
   is a physical bulb, so a returning bulb gets its old sub-device back). A
   group's entry is dropped when the group leaves, because group ids are
-  reused for unrelated groups.
+  reused for unrelated groups, and every group entry is dropped whenever
+  the stored mesh changes (a new mesh, a clear, an invalid record replaced):
+  local group ids of one mesh say nothing about another's. Mappings are
+  written in the same DETS insert as the inventory they belong to.
 
   Tests can override `:dets_path`, `:table`, `:name`, `:chmod_fun`
   (`(path, mode -> :ok | {:error, term()})`), `:write_fun` (`(table,
-  inserts, delete_keys -> :ok | {:error, term()})`) and `:enabled` (default:
+  records -> :ok | {:error, term()})`, one atomic insert) and `:enabled` (default:
   `UniversalProxy.Bluetooth.supported?/0`; when false, `start_link/1`
   returns `:ignore`).
   """
@@ -108,7 +121,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
   """
   @spec persist(Inventory.t(), GenServer.server()) :: :ok | {:error, atom()}
   def persist(inventory, server \\ __MODULE__),
-    do: call(server, {:persist, inventory}, {:error, :unavailable})
+    do: call(server, {:persist, inventory, :advance}, {:error, :unavailable})
 
   @doc """
   How `inventory` relates to the stored one: `:empty` (nothing stored),
@@ -139,9 +152,15 @@ defmodule UniversalProxy.TuyaMesh.Store do
   def replace(inventory, opts \\ [], server \\ __MODULE__),
     do: call(server, {:replace, inventory, opts}, {:error, :unavailable})
 
-  @doc "Removes the inventory. Device ids, the id counter and settings are kept."
-  @spec clear(GenServer.server()) :: :ok | {:error, term()}
-  def clear(server \\ __MODULE__), do: call(server, :clear, {:error, :unavailable})
+  @doc """
+  Removes the inventory, keeping its `seq` floor. Bulb device ids, the id
+  counter and settings are kept; group ids are dropped. For an invalid
+  record whose floor can't be recovered: `{:error, :seq_unrecoverable}`,
+  unless `force: true` (see the moduledoc).
+  """
+  @spec clear(GenServer.server(), keyword()) :: :ok | {:error, term()}
+  def clear(server \\ __MODULE__, opts \\ []),
+    do: call(server, {:clear, opts}, {:error, :unavailable})
 
   @doc "Every allocated sub-device id (see the moduledoc). `%{}` when unavailable."
   @spec device_ids(GenServer.server()) :: %{device_key() => pos_integer()}
@@ -207,7 +226,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
         case chmod_fun.(path, 0o600) do
           :ok ->
             Logger.info("TuyaMesh.Store opened at #{path}")
-            {:ok, %{table: table, write_fun: Keyword.get(opts, :write_fun, &default_write/3)}}
+            {:ok, %{table: table, write_fun: Keyword.get(opts, :write_fun, &default_write/2)}}
 
           {:error, reason} ->
             Logger.error(
@@ -233,11 +252,11 @@ defmodule UniversalProxy.TuyaMesh.Store do
     {:reply, load_stored(state.table), state}
   end
 
-  def handle_call({:persist, input}, _from, state) do
+  def handle_call({:persist, input, mode}, _from, state) do
     with {:ok, inv} <- validate(input),
          {:ok, stored} <- fetch_stored(state.table),
-         :ok <- check_persistable(stored, inv) do
-      {:reply, write_inventory(state, inv, []), state}
+         :ok <- check_persistable(stored, inv, mode) do
+      {:reply, write_inventory(state, inv, [], false), state}
     else
       {:error, _reason} = error -> {:reply, error, state}
     end
@@ -246,7 +265,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
   def handle_call({:classify, input}, _from, state) do
     reply =
       case validate(input) do
-        {:ok, inv} -> classify_against(stored_or_nil(state.table), inv)
+        {:ok, inv} -> classify_against(valid_or_nil(state.table), inv)
         error -> error
       end
 
@@ -256,7 +275,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
   def handle_call({:preview, input}, _from, state) do
     reply =
       case validate(input) do
-        {:ok, inv} -> {:ok, build_preview(stored_or_nil(state.table), inv)}
+        {:ok, inv} -> {:ok, build_preview(valid_or_nil(state.table), inv)}
         error -> error
       end
 
@@ -273,16 +292,28 @@ defmodule UniversalProxy.TuyaMesh.Store do
     {:reply, reply, state}
   end
 
-  def handle_call(:clear, _from, state) do
+  def handle_call({:clear, opts}, _from, state) do
     reply =
-      case stored_or_nil(state.table) do
-        nil ->
+      case stored(state.table) do
+        :absent ->
           :ok
 
-        stored ->
-          ids = state.table |> lookup(:device_ids, %{}) |> prune_groups([])
-          inserts = [{:device_ids, ids}, {:seq_floors, put_floor(state.table, stored)}]
-          write(state, inserts, [:inventory])
+        {:valid, inv} ->
+          write_clear(state, put_floor(floors(state.table), inv_floor(inv)))
+
+        {:invalid, raw} ->
+          case raw_floor(raw) do
+            {:ok, floor} ->
+              write_clear(state, put_floor(floors(state.table), floor))
+
+            :error ->
+              if Keyword.get(opts, :force, false) do
+                Logger.warning("TuyaMesh.Store: invalid inventory cleared; its seq is lost")
+                write_clear(state, floors(state.table))
+              else
+                {:error, :seq_unrecoverable}
+              end
+          end
       end
 
     {:reply, reply, state}
@@ -293,10 +324,10 @@ defmodule UniversalProxy.TuyaMesh.Store do
   end
 
   def handle_call({:allocate, keys}, _from, state) do
-    {ids, next} = allocate(state.table, keys)
+    {ids, next} = allocate(lookup(state.table, :device_ids, %{}), state.table, keys)
 
     reply =
-      case write(state, [{:device_ids, ids}, {:next_device_id, next}], []) do
+      case write(state, [{:device_ids, ids}, {:next_device_id, next}]) do
         :ok -> {:ok, Map.take(ids, keys)}
         error -> error
       end
@@ -314,7 +345,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
 
     reply =
       if valid_settings?(merged),
-        do: write(state, [{:settings, merged}], []),
+        do: write(state, [{:settings, merged}]),
         else: {:error, :invalid_settings}
 
     {:reply, reply, state}
@@ -334,39 +365,60 @@ defmodule UniversalProxy.TuyaMesh.Store do
   # ── Replace ──────────────────────────────────────────────────────────
 
   defp do_replace(state, inv, opts) do
-    stored = stored_or_nil(state.table)
-    floors = lookup(state.table, :seq_floors, %{})
+    case stored(state.table) do
+      {:valid, stored} ->
+        replace_stored(state, stored, inv, opts)
 
-    case classify_against(stored, inv) do
-      :new_mesh ->
-        if Keyword.get(opts, :allow_new_mesh, false) do
-          # The displaced mesh leaves its seq behind as a floor.
-          floors = put_floor(state.table, stored)
-          store_replacement(state, inv, floor_seq(floors, inv), floors)
-        else
-          {:error, :new_mesh}
-        end
+      :absent ->
+        store_replacement(state, inv, floor_seq(floors(state.table), inv), floors(state.table))
 
-      :same_mesh ->
-        store_replacement(state, inv, {:same_mesh, later_seq(stored.seq, inv.seq)}, floors)
+      {:invalid, raw} ->
+        floors =
+          case raw_floor(raw) do
+            {:ok, floor} ->
+              put_floor(floors(state.table), floor)
 
-      :empty ->
+            :error ->
+              Logger.warning("TuyaMesh.Store: replacing an invalid inventory; its seq is lost")
+              floors(state.table)
+          end
+
         store_replacement(state, inv, floor_seq(floors, inv), floors)
+    end
+  end
+
+  defp replace_stored(state, stored, inv, opts) do
+    floors = floors(state.table)
+
+    cond do
+      same_mesh?(stored, inv) ->
+        seq = {:same_mesh, later_seq(stored.seq, inv.seq)}
+        store_replacement(state, inv, seq, floors, true)
+
+      Keyword.get(opts, :allow_new_mesh, false) ->
+        # The displaced mesh leaves its seq behind as a floor.
+        floors = put_floor(floors, inv_floor(stored))
+        store_replacement(state, inv, floor_seq(floors, inv), floors)
+
+      true ->
+        {:error, :new_mesh}
     end
   end
 
   # A mesh with a recorded floor never starts below it.
   defp floor_seq(floors, inv) do
-    case Map.fetch(floors, fingerprint(inv)) do
+    case Map.fetch(floors, fingerprint(inv.beacon_key)) do
       {:ok, floor} -> {:same_mesh, later_seq(floor, inv.seq)}
       :error -> {:new_mesh, inv.seq}
     end
   end
 
-  defp store_replacement(state, inv, {kind, seq}, floors) do
+  # Group mappings survive only a write over the same stored mesh.
+  defp store_replacement(state, inv, {kind, seq}, floors, keep_groups? \\ false) do
     inv = %{inv | seq: seq}
+    floors = Map.delete(floors, fingerprint(inv.beacon_key))
 
-    case write_inventory(state, inv, [{:seq_floors, Map.delete(floors, fingerprint(inv))}]) do
+    case write_inventory(state, inv, [{:seq_floors, floors}], keep_groups?) do
       :ok -> {:ok, kind}
       error -> error
     end
@@ -376,13 +428,17 @@ defmodule UniversalProxy.TuyaMesh.Store do
 
   # ── Persist checks ───────────────────────────────────────────────────
 
-  defp check_persistable(stored, inv) do
+  defp check_persistable(stored, inv, mode) do
     cond do
       not same_mesh?(stored, inv) -> {:error, :mesh_changed}
       stored.bulbs != inv.bulbs -> {:error, :bulbs_changed}
-      inv.seq != stored.seq and not Seq.ahead?(stored.seq, inv.seq) -> {:error, :seq_behind}
-      true -> :ok
+      true -> check_seq(mode, stored.seq, inv.seq)
     end
+  end
+
+  # The one rule per persist mode for how the stored cursor may move.
+  defp check_seq(:advance, stored, new) do
+    if new == stored or Seq.ahead?(stored, new), do: :ok, else: {:error, :seq_behind}
   end
 
   defp classify_against(nil, _inv), do: :empty
@@ -392,11 +448,26 @@ defmodule UniversalProxy.TuyaMesh.Store do
 
   defp same_mesh?(a, b), do: Crypto.key_bytes(a.beacon_key) == Crypto.key_bytes(b.beacon_key)
 
-  # Not reversible to the key (SHA-256 of a 128-bit key), and never shown.
-  defp fingerprint(inv), do: :crypto.hash(:sha256, Crypto.key_bytes(inv.beacon_key))
+  # ── Seq floors ───────────────────────────────────────────────────────
 
-  defp put_floor(table, stored),
-    do: table |> lookup(:seq_floors, %{}) |> Map.put(fingerprint(stored), stored.seq)
+  # Not reversible to the key (SHA-256 of a 128-bit key), and never shown.
+  defp fingerprint(beacon_key), do: :crypto.hash(:sha256, Crypto.key_bytes(beacon_key))
+
+  defp floors(table), do: lookup(table, :seq_floors, %{})
+
+  defp inv_floor(inv), do: {fingerprint(inv.beacon_key), inv.seq}
+
+  # An invalid record's floor, when its mesh key and seq are still usable
+  # whatever else broke.
+  defp raw_floor(%{"beaconKey" => key, "seq" => seq})
+       when is_integer(seq) and seq >= 0 and seq <= 65_535 do
+    if Inventory.valid_key?(key), do: {:ok, {fingerprint(key), seq}}, else: :error
+  end
+
+  defp raw_floor(_raw), do: :error
+
+  # Never lowers a floor already recorded for that mesh.
+  defp put_floor(floors, {fp, seq}), do: Map.update(floors, fp, seq, &later_seq(&1, seq))
 
   # ── Preview ──────────────────────────────────────────────────────────
 
@@ -423,8 +494,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
 
   # ── Device ids ───────────────────────────────────────────────────────
 
-  defp allocate(table, keys) do
-    ids = lookup(table, :device_ids, %{})
+  defp allocate(ids, table, keys) do
     next = lookup(table, :next_device_id, 1)
 
     Enum.reduce(keys, {ids, next}, fn key, {ids, next} ->
@@ -446,21 +516,30 @@ defmodule UniversalProxy.TuyaMesh.Store do
 
   # ── Storage ──────────────────────────────────────────────────────────
 
-  # One write: the inventory, its device ids (allocated for every bulb and
-  # group, departed groups dropped) and the counter, plus `extra` records.
-  defp write_inventory(state, inv, extra) do
-    {ids, next} = allocate(state.table, inventory_keys(inv))
+  # One insert: the inventory, its device ids (allocated for every bulb and
+  # group, departed groups dropped, every group dropped first unless
+  # `keep_groups?`) and the counter, plus `extra` records.
+  defp write_inventory(state, inv, extra, keep_groups?) do
+    ids = lookup(state.table, :device_ids, %{})
+    ids = if keep_groups?, do: ids, else: prune_groups(ids, [])
+    {ids, next} = allocate(ids, state.table, inventory_keys(inv))
     ids = prune_groups(ids, Enum.map(inv.groups, & &1.local_id))
 
     inserts =
       [{:inventory, Inventory.to_map(inv)}, {:device_ids, ids}, {:next_device_id, next}] ++
         extra
 
-    write(state, inserts, [])
+    write(state, inserts)
   end
 
-  defp write(state, inserts, deletes) do
-    case state.write_fun.(state.table, inserts, deletes) do
+  # A cleared inventory is stored as `nil`, so the clear is one insert too.
+  defp write_clear(state, floors) do
+    ids = state.table |> lookup(:device_ids, %{}) |> prune_groups([])
+    write(state, [{:inventory, nil}, {:device_ids, ids}, {:seq_floors, floors}])
+  end
+
+  defp write(state, inserts) do
+    case state.write_fun.(state.table, inserts) do
       :ok ->
         :ok
 
@@ -471,9 +550,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
     end
   end
 
-  defp default_write(table, inserts, deletes) do
-    Enum.each(deletes, &:dets.delete(table, &1))
-
+  defp default_write(table, inserts) do
     with :ok <- :dets.insert(table, inserts), do: :dets.sync(table)
   end
 
@@ -484,35 +561,44 @@ defmodule UniversalProxy.TuyaMesh.Store do
     end
   end
 
-  defp load_stored(table) do
+  # :absent, {:valid, inventory} or {:invalid, raw}. The raw form never
+  # leaves this module.
+  defp stored(table) do
     case :dets.lookup(table, :inventory) do
-      [{:inventory, map}] ->
-        case Inventory.decode(map) do
-          {:ok, inv} ->
-            {:ok, inv}
-
-          {:error, reason} ->
-            # Inventory errors carry no key material.
-            Logger.warning("TuyaMesh.Store: stored inventory is invalid (#{inspect(reason)})")
-            {:error, {:invalid, reason}}
+      [{:inventory, raw}] when raw != nil ->
+        case Inventory.decode(raw) do
+          {:ok, inv} -> {:valid, inv}
+          {:error, _reason} -> {:invalid, raw}
         end
 
       _ ->
-        {:error, :no_inventory}
+        :absent
+    end
+  end
+
+  defp load_stored(table) do
+    with [{:inventory, raw}] when raw != nil <- :dets.lookup(table, :inventory),
+         {:error, reason} <- Inventory.decode(raw) do
+      # Inventory errors carry no key material.
+      Logger.warning("TuyaMesh.Store: stored inventory is invalid (#{inspect(reason)})")
+      {:error, {:invalid, reason}}
+    else
+      {:ok, inv} -> {:ok, inv}
+      _absent -> {:error, :no_inventory}
     end
   end
 
   defp fetch_stored(table) do
-    case load_stored(table) do
-      {:ok, inv} -> {:ok, inv}
-      {:error, :no_inventory} -> {:error, :no_inventory}
-      {:error, {:invalid, _}} -> {:error, :invalid_stored}
+    case stored(table) do
+      {:valid, inv} -> {:ok, inv}
+      :absent -> {:error, :no_inventory}
+      {:invalid, _raw} -> {:error, :invalid_stored}
     end
   end
 
-  defp stored_or_nil(table) do
-    case load_stored(table) do
-      {:ok, inv} -> inv
+  defp valid_or_nil(table) do
+    case stored(table) do
+      {:valid, inv} -> inv
       _ -> nil
     end
   end
@@ -547,7 +633,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
 
   defp redact_message(message), do: redact_request(message)
 
-  defp redact_request({:persist, _inv}), do: {:persist, :redacted}
+  defp redact_request({:persist, _inv, mode}), do: {:persist, :redacted, mode}
   defp redact_request({:classify, _inv}), do: {:classify, :redacted}
   defp redact_request({:preview, _inv}), do: {:preview, :redacted}
   defp redact_request({:replace, _inv, opts}), do: {:replace, :redacted, opts}
