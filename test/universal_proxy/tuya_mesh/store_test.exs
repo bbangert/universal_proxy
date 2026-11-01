@@ -517,6 +517,73 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
     end
   end
 
+  describe "redaction of every inventory representation" do
+    alias UniversalProxy.TuyaMesh.KeyLeak
+
+    test "JSON and snake_case requests stay out of :sys status and debug logs", ctx do
+      :ok = :sys.log(ctx.store, true)
+
+      assert {:ok, _} = Store.replace(KeyLeak.json(), [], ctx.store)
+      assert :same_mesh = Store.classify(KeyLeak.snake_map(), ctx.store)
+      assert {:ok, _} = Store.preview(KeyLeak.snake_map(), ctx.store)
+      _ = Store.persist(KeyLeak.json(), ctx.store)
+      _ = Store.tighten(KeyLeak.snake_map(), 100, ctx.store)
+
+      KeyLeak.refute_keys(:sys.get_status(ctx.store))
+    end
+
+    test "a crash mid-request, with requests queued, leaks no key", ctx do
+      store =
+        start_store(Path.join(ctx.tmp_dir, "q.dets"), :"q_#{System.unique_integer()}",
+          id: :queued,
+          write_fun: fn _table, records ->
+            Process.sleep(150)
+            apply(__MODULE__, :explode, [records])
+          end
+        )
+
+      log =
+        capture_log(fn ->
+          spawn(fn -> catch_exit(GenServer.call(store, {:replace, KeyLeak.json(), []})) end)
+          Process.sleep(30)
+
+          # Queued behind the crashing call.
+          for request <- [{:replace, KeyLeak.snake_map(), []}, {:classify, KeyLeak.json()}] do
+            spawn(fn -> catch_exit(GenServer.call(store, request)) end)
+          end
+
+          Process.sleep(400)
+        end)
+
+      assert log =~ "TuyaMesh.Store: FunctionClauseError raised"
+      KeyLeak.refute_keys(log)
+    end
+
+    test "format_status redacts by request shape and by representation" do
+      json = KeyLeak.json()
+      snake = KeyLeak.snake_map()
+      from = {self(), make_ref()}
+
+      status =
+        Store.format_status(%{
+          state: %{table: :t},
+          message: {:"$gen_call", from, {:persist, json, {:tighten, 132}}},
+          queue: [
+            {:"$gen_call", from, {:replace, snake, [allow_new_mesh: true]}},
+            {:"$gen_call", from, {:preview, json}},
+            # Shapes the store doesn't know still lose what looks like keys.
+            {:unknown, json, snake, String.to_charlist(json)}
+          ],
+          log: [{:in, {:"$gen_call", from, {:classify, snake}}}],
+          reason: {{:badmatch, json}, [{Store, :x, [snake], []}]}
+        })
+
+      KeyLeak.refute_keys(status)
+      assert {:"$gen_call", _, {:persist, :redacted, {:tighten, 132}}} = status.message
+      assert [{:"$gen_call", _, {:replace, :redacted, [allow_new_mesh: true]}} | _] = status.queue
+    end
+  end
+
   describe "redaction" do
     # Fails with the records (keys and all) as its arguments, as a BIF
     # refusing them would.

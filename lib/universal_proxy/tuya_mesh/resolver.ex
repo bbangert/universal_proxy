@@ -142,7 +142,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   @spec replace(Inventory.t(), keyword(), GenServer.server()) ::
           {:ok, :same_mesh | :new_mesh} | {:error, term()}
   def replace(inventory, opts, server \\ __MODULE__),
-    do: GenServer.call(server, {:replace, inventory, opts}, @change_timeout)
+    do: GenServer.call(server, {:replace, Redact.seal(inventory), opts}, @change_timeout)
 
   @doc "Stops the mesh and clears the Store (`Store.clear/2` opts). Exits when not running."
   @spec clear(GenServer.server(), keyword()) :: :ok | {:error, term()}
@@ -298,7 +298,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
 
   defp do_call({:replace, inventory, opts}, _from, state) do
     state = stop_mesh(state)
-    reply = Store.replace(inventory, opts, state.store)
+    reply = inventory |> Redact.unseal() |> Store.replace(opts, state.store)
     {:reply, reply, %{state | backoff_ms: state.retry_ms} |> evaluate() |> publish()}
   end
 

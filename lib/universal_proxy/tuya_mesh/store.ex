@@ -151,7 +151,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
   """
   @spec persist(Inventory.t(), GenServer.server()) :: :ok | {:error, atom()}
   def persist(inventory, server \\ __MODULE__),
-    do: call(server, {:persist, inventory, :advance}, {:error, :unavailable})
+    do: send_inventory(server, inventory, &{:persist, &1, :advance})
 
   @doc """
   `Lights`' `on_tighten`: writes `inventory`'s `seq` (the exact next number,
@@ -164,7 +164,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
 
   def tighten(inventory, leased, server)
       when is_integer(leased) and leased >= 0 and leased <= 65_535,
-      do: call(server, {:persist, inventory, {:tighten, leased}}, {:error, :unavailable})
+      do: send_inventory(server, inventory, &{:persist, &1, {:tighten, leased}})
 
   def tighten(_inventory, _leased, _server), do: {:error, :bad_lease}
 
@@ -174,7 +174,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
   """
   @spec classify(Inventory.t(), GenServer.server()) :: classification() | {:error, :unavailable}
   def classify(inventory, server \\ __MODULE__),
-    do: call(server, {:classify, inventory}, {:error, :unavailable})
+    do: send_inventory(server, inventory, &{:classify, &1})
 
   @doc """
   What `replace/3` with `inventory` would change: the mesh classification
@@ -183,7 +183,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
   """
   @spec preview(Inventory.t(), GenServer.server()) :: {:ok, preview()} | {:error, term()}
   def preview(inventory, server \\ __MODULE__),
-    do: call(server, {:preview, inventory}, {:error, :unavailable})
+    do: send_inventory(server, inventory, &{:preview, &1})
 
   @doc """
   Stores an uploaded inventory (see the moduledoc for the `seq` rule).
@@ -195,7 +195,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
   @spec replace(Inventory.t(), keyword(), GenServer.server()) ::
           {:ok, :same_mesh | :new_mesh} | {:error, term()}
   def replace(inventory, opts \\ [], server \\ __MODULE__),
-    do: call(server, {:replace, inventory, opts}, {:error, :unavailable})
+    do: send_inventory(server, inventory, &{:replace, &1, opts})
 
   @doc """
   Removes the inventory, keeping its `seq` floor. Bulb device ids, the id
@@ -248,6 +248,16 @@ defmodule UniversalProxy.TuyaMesh.Store do
     GenServer.call(server, request)
   catch
     :exit, _reason -> default
+  end
+
+  # Validated here, in the caller, and sent sealed (`Redact.seal/1`), so
+  # no JSON, map or struct with keys ever sits in this process's mailbox,
+  # its sys debug log or a crash report, whatever the caller passed.
+  defp send_inventory(server, input, request) do
+    case validate(input) do
+      {:ok, inv} -> call(server, request.(Redact.seal(inv)), {:error, :unavailable})
+      error -> error
+    end
   end
 
   defp device_key?({:bulb, mac}) when is_binary(mac), do: true
@@ -689,8 +699,10 @@ defmodule UniversalProxy.TuyaMesh.Store do
     end
   end
 
+  # Server side, a request arrives sealed from the client API, or raw from a
+  # direct call: validated either way.
   defp validate(input) do
-    case Inventory.decode(input) do
+    case input |> Redact.unseal() |> Inventory.decode() do
       {:ok, inv} -> {:ok, inv}
       {:error, reason} -> {:error, {:invalid, reason}}
     end

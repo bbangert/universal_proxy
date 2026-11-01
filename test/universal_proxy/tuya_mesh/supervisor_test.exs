@@ -403,6 +403,45 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
       refute_keys(log)
     end
 
+    test "JSON and snake_case uploads: a crash mid-request with more queued leaks no key",
+         ctx do
+      alias UniversalProxy.TuyaMesh.KeyLeak
+
+      once = start_supervised!({Agent, fn -> true end}, id: :once)
+
+      spec = fn index, mac ->
+        if Agent.get_and_update(once, &{&1, false}) do
+          Process.sleep(150)
+          apply(__MODULE__, :explode, [KeyLeak.snake_map()])
+        else
+          fake_mesh(index, mac)
+        end
+      end
+
+      start_mesh_sup(ctx, mesh_spec_fun: spec)
+      resolver = ctx.names.resolver
+
+      log =
+        capture_log(fn ->
+          spawn(fn -> catch_exit(Resolver.replace(KeyLeak.json(), [], resolver)) end)
+          Process.sleep(30)
+          spawn(fn -> catch_exit(Resolver.replace(KeyLeak.snake_map(), [], resolver)) end)
+          Process.sleep(30)
+          spawn(fn -> catch_exit(Resolver.replace(KeyLeak.json(), [], resolver)) end)
+          wait_until(fn -> is_pid(mesh_pid(ctx)) end)
+          Process.sleep(100)
+        end)
+
+      assert log =~ "TuyaMesh.Resolver: FunctionClauseError raised"
+      KeyLeak.refute_keys(log)
+
+      # And its :sys status and debug log after more of them.
+      :ok = :sys.log(resolver, true)
+      {:ok, _} = Resolver.replace(KeyLeak.snake_map(), [], resolver)
+      {:ok, _} = Resolver.replace(KeyLeak.json(), [], resolver)
+      KeyLeak.refute_keys(:sys.get_status(resolver))
+    end
+
     test "format_status keeps keys out of messages, logs and reasons" do
       inv = inventory()
       map = Inventory.to_map(inv)
