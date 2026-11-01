@@ -252,6 +252,30 @@ defmodule UniversalProxy.Bluetooth.SettingsTest do
 
       assert Settings.tuya_adapter(settings) == "11:22:33:44:55:66"
     end
+
+    test "case-variant twins of one MAC keep its mesh reservation", %{dets_path: path} do
+      stop_supervised!(Settings)
+
+      pid =
+        seed_legacy(path, %{
+          enabled: true,
+          active_connections: true,
+          adapter: nil,
+          roles: %{
+            "AA:BB:CC:DD:EE:FF" => :tuya_mesh,
+            "aa:bb:cc:dd:ee:ff" => :tuya_mesh,
+            "Aa:Bb:Cc:Dd:Ee:Ff" => :proxy,
+            "11:22:33:44:55:66" => :proxy
+          }
+        })
+
+      # The twins collapse to one :tuya_mesh entry (never demoted or dropped
+      # by each other), so the other radio's :proxy isn't displaced either.
+      assert Settings.get(pid).roles == %{
+               "AA:BB:CC:DD:EE:FF" => :tuya_mesh,
+               "11:22:33:44:55:66" => :proxy
+             }
+    end
   end
 
   describe "set_role/3" do

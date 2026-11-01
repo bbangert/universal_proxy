@@ -372,6 +372,11 @@ defmodule UniversalProxy.Bluetooth.Settings do
   # single-proxy and single-mesh invariants on read too, in case a
   # hand-edited/foreign record carries two. Defensive path only (setters
   # can't write two). Pairs are sorted by MAC first, so the lowest MAC wins.
+  #
+  # Case variants of one MAC (`"aa:…"` and `"AA:…"`) collapse to a single
+  # entry FIRST, so a duplicate can't demote or drop its own twin. Sorted
+  # pairs + last-wins keep the highest role atom for that MAC, and
+  # :tuya_mesh sorts last, so a mesh reservation is never lost to a twin.
   defp sanitize_roles(roles) when is_map(roles) do
     roles
     |> Enum.flat_map(fn {mac, role} ->
@@ -380,6 +385,8 @@ defmodule UniversalProxy.Bluetooth.Settings do
         _ -> []
       end
     end)
+    |> Enum.sort()
+    |> Map.new()
     |> Enum.sort()
     |> Enum.reduce({%{}, MapSet.new()}, fn
       # A second :proxy is dropped (absent = :off), as apply_role/3 does.
