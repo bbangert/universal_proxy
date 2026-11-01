@@ -75,10 +75,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.SeqTest do
     end
 
     test "rejects empty and oversized leases" do
-      assert Seq.max_lease() == 900
-      assert {:ok, seq} = Seq.lease(Seq.new(0), 900)
-      assert Seq.value(seq) == 900
-      assert {:error, :lease_too_large} = Seq.lease(Seq.new(0), 901)
+      assert Seq.max_jump() == 900
+      assert Seq.max_lease() == 899
+      assert {:ok, seq} = Seq.lease(Seq.new(0), 899)
+      assert Seq.value(seq) == 899
+      assert {:error, :lease_too_large} = Seq.lease(Seq.new(0), 900)
       assert {:error, :bad_lease_size} = Seq.lease(Seq.new(0), 0)
       assert {:error, :bad_lease_size} = Seq.lease(Seq.new(0), -3)
       assert {:error, :bad_lease_size} = Seq.lease(Seq.new(0), 1.5)
@@ -94,17 +95,17 @@ defmodule UniversalProxy.TuyaBeaconMesh.SeqTest do
     end
 
     test "a large lease wraps past 65535" do
-      {:ok, seq} = Seq.lease(Seq.new(65_000), 900)
-      assert Seq.value(seq) == 364
-      assert Seq.remaining(seq) == 900
+      {:ok, seq} = Seq.lease(Seq.new(65_000), 899)
+      assert Seq.value(seq) == 363
+      assert Seq.remaining(seq) == 899
 
       {sns, seq} =
-        Enum.map_reduce(1..900, seq, fn _, seq ->
+        Enum.map_reduce(1..899, seq, fn _, seq ->
           {:ok, sn, seq} = Seq.take(seq)
           {sn, seq}
         end)
 
-      assert sns == Enum.to_list(65_000..65_535) ++ Enum.to_list(0..363)
+      assert sns == Enum.to_list(65_000..65_535) ++ Enum.to_list(0..362)
       assert {:error, :lease_exhausted} = Seq.take(seq)
       assert Seq.ahead?(List.last(sns), Seq.value(seq))
     end

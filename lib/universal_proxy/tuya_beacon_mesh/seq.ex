@@ -14,7 +14,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Seq do
 
     * `reserve/2` takes a block of 1..99 numbers at once and moves both
       cursors past it;
-    * `lease/2` moves only `value/1`, by up to 900 numbers; persist it,
+    * `lease/2` moves only `value/1`, by up to 899 numbers; persist it,
       then `take/1` numbers from the lease one at a time. `give_back/2`
       returns the number just taken (one that provably never went on
       air), and `tighten/1` pulls `value/1` back to `next/1` (see it for
@@ -33,12 +33,15 @@ defmodule UniversalProxy.TuyaBeaconMesh.Seq do
   @half 32_768
   @default_block 32
   @max_block 99
-  # A restart resumes at the persisted lease end, so a lease is the most a
-  # crash can make the bulbs' tracker jump forward. Jumps of about 900 were
-  # accepted on hardware and the real limit was never measured, so no lease
-  # goes past that. It also keeps a lease far inside the half range that
-  # ahead?/2 needs.
-  @max_lease 900
+  # A restart resumes at the persisted lease end. The last number that may
+  # have gone on air is at least the one before the lease's start (its
+  # first number can be given back), so a crash makes the bulbs' tracker
+  # jump forward by at most lease + 1. Jumps of about 900 were accepted on
+  # hardware and the real limit was never measured, so that jump is capped
+  # at 900 and a lease at one less. Both sit far inside the half range
+  # that ahead?/2 needs.
+  @max_jump 900
+  @max_lease @max_jump - 1
 
   @type t :: %{
           __struct__: __MODULE__,
@@ -70,9 +73,21 @@ defmodule UniversalProxy.TuyaBeaconMesh.Seq do
   @spec remaining(t()) :: non_neg_integer()
   def remaining(%__MODULE__{next: n, until: until}), do: Integer.mod(until - n, @max)
 
-  @doc "The largest lease `lease/2` grants (#{@max_lease})."
+  @doc """
+  The largest lease `lease/2` grants (#{@max_lease}): one less than
+  `max_jump/0`, so resuming at a lease end after a crash is at most a
+  #{@max_jump}-step jump past the last number that may have gone on air.
+  """
   @spec max_lease() :: pos_integer()
   def max_lease, do: @max_lease
+
+  @doc """
+  The largest forward jump (#{@max_jump}) a crash restart may make past
+  the last number that may have gone on air: about what the bulbs were
+  seen to accept.
+  """
+  @spec max_jump() :: pos_integer()
+  def max_jump, do: @max_jump
 
   @doc """
   Reserves `n` sequence numbers (1..99). Returns `{:ok, sns, new_seq}`

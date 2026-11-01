@@ -468,9 +468,12 @@ How `Seq` and `Lights` handle this:
 - Numbers come from a persisted **lease**. Its end is persisted
   (`on_persist`) **before** any number in it is used, so a restart never
   reuses one. Leases are sized from the send rate for about one persist a
-  minute, between 32 and 600 numbers (never more than 900, the largest
-  forward jump seen accepted, §4.3), since a crash resumes at the lease end
-  and skips the rest of it.
+  minute, between 32 and 600 numbers (never more than 899). A crash
+  resumes at the lease end and skips the rest of it: a jump of at most
+  lease + 1 past the last number that may have gone on air, so never more
+  than 900, the largest forward jump seen accepted (§4.3). A lease persist
+  that fails is retried with an end at or past the one attempted, in case
+  that one was written anyway.
 - On a clean stop the lease is cut back to the next unused number
   (`on_tighten`), so a planned restart skips nothing. That is the only time
   the persisted cursor moves back, and only to a number past every one that

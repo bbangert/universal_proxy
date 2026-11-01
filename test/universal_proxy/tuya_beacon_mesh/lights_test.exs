@@ -29,6 +29,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
   # "path light 2" is node 2, "post spot 1" node 3.
   @mac2 0xDC23530FB34A
   @mac3 0xDC23533FCD62
+  # max_lease of the random-operations runs.
+  @random_max_lease 8
 
   setup do
     FakeBluez.ensure_started()
@@ -686,6 +688,70 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
       assert writes(persisted) == 2
     end
 
+    @tag :capture_log
+    test "a retry after a persist that landed anyway never proposes an end behind it", %{
+      persisted: persisted
+    } do
+      restart_lights(persisted,
+        on_persist: store_persist(persisted),
+        min_lease: 2,
+        max_lease: 12
+      )
+
+      assert send_n(2) == [100, 101]
+      assert persisted_seq(persisted) == 102
+
+      # Used up inside the interval, so this attempt is a max lease (114).
+      # It is written, but the sync fails.
+      tick(persisted, 30_000)
+      fail_persist(persisted, {:written, {:error, :sync_failed}})
+      assert {:error, :persist_failed} = Lights.set("path light 2", on: true)
+      assert persisted_seq(persisted) == 114
+      fail_persist(persisted, nil)
+
+      # Past the interval the rate wants only min_lease (104), behind what
+      # the store holds: the retry still proposes 114.
+      tick(persisted, 60_000)
+      assert send_n(12) == Enum.to_list(102..113)
+      assert persisted_seq(persisted) == 114
+
+      # A reload of the same mesh covers a landed attempt too.
+      tick(persisted, 30_000)
+      fail_persist(persisted, {:written, {:error, :sync_failed}})
+      assert {:error, :persist_failed} = Lights.set("path light 2", on: true)
+      fail_persist(persisted, nil)
+      attempted = persisted_seq(persisted)
+      assert attempted > 114
+
+      assert :ok = Lights.reload(File.read!(@fixture))
+      assert persisted_seq(persisted) == attempted
+      assert send_n(1) == [114]
+    end
+
+    test "a crash after a refused first number jumps at most max_lease + 1", %{
+      persisted: persisted
+    } do
+      restart_lights(persisted, min_lease: 5, max_lease: 5)
+      assert send_n(5) == Enum.to_list(100..104)
+
+      # A new lease (105..109, persisted 110) whose first number is refused
+      # and given back: 104 is still the last number on air.
+      capture_log(fn ->
+        FakeBluez.fail(:advertise, :busy)
+        assert {:error, {:advertise, :busy}} = Lights.set("path light 2", on: true)
+        FakeBluez.succeed(:advertise)
+      end)
+
+      assert persisted_seq(persisted) == 110
+
+      old = Process.whereis(Lights)
+      Process.exit(old, :kill)
+      wait_until(fn -> match?(pid when is_pid(pid) and pid != old, Process.whereis(Lights)) end)
+
+      assert [110] = send_n(1)
+      assert distance(104, 110) == 5 + 1
+    end
+
     test "invalid options stop the start" do
       Process.flag(:trap_exit, true)
 
@@ -693,7 +759,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
             {[persist_interval_ms: 0], :persist_interval_ms},
             {[persist_interval_ms: 1.5], :persist_interval_ms},
             {[max_lease: 0], :max_lease},
-            {[max_lease: 901], :max_lease},
+            {[max_lease: 900], :max_lease},
             {[max_lease: 600.0], :max_lease},
             {[min_lease: 0], :min_lease},
             {[min_lease: 50, max_lease: 40], :min_lease},
@@ -708,8 +774,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
                Lights.start_link(
                  inventory: File.read!(@fixture),
                  name: :lights_opts,
-                 min_lease: 900,
-                 max_lease: 900,
+                 min_lease: 899,
+                 max_lease: 899,
                  persist_interval_ms: 1
                )
 
@@ -879,11 +945,19 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
     :rand.seed(:exsss, {seed, seed, seed})
     {:ok, inv} = Inventory.decode(fixture(%{"seq" => 65_500}))
     :ets.insert(persisted, {:inv, inv})
-    opts = lights_opts(persisted, min_lease: 2, max_lease: 8, persist_interval_ms: 10_000)
+
+    opts =
+      lights_opts(persisted,
+        on_persist: store_persist(persisted),
+        min_lease: 2,
+        max_lease: @random_max_lease,
+        persist_interval_ms: 10_000
+      )
+
     stop_supervised!(Lights)
     start_lights(opts)
 
-    Enum.reduce(1..steps, %{last: nil, crashed?: false}, fn step, acc ->
+    Enum.reduce(1..steps, %{last: nil, may_skip?: false}, fn step, acc ->
       acc = random_op(:rand.uniform(9), opts, persisted, acc)
       where = "seed #{seed} step #{step}"
 
@@ -894,14 +968,23 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
     end)
   end
 
+  # A persist may fail outright or after its write landed (a failed sync).
+  # Without an injected failure the send must go out: a store refusing a
+  # retry as :seq_behind would block it.
   defp random_op(n, _opts, persisted, acc) when n <= 4 do
-    if :rand.uniform(4) == 1, do: fail_persist(persisted, {:error, :busy})
+    injected? =
+      case :rand.uniform(6) do
+        1 -> fail_persist(persisted, {:error, :busy})
+        2 -> fail_persist(persisted, {:written, {:error, :sync_failed}})
+        _ -> false
+      end
+
     result = attempt(fn -> Lights.set("path light 2", on: true) end)
     fail_persist(persisted, nil)
 
     case result do
       {:sent, sn} -> used(acc, sn)
-      {:error, :persist_failed} -> acc
+      {:error, :persist_failed} when injected? != false -> acc
     end
   end
 
@@ -932,25 +1015,31 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
     Process.exit(old, :kill)
     wait_until(fn -> match?(pid when is_pid(pid) and pid != old, Process.whereis(Lights)) end)
     {:ok, _} = Lights.all()
-    %{acc | crashed?: true}
+    %{acc | may_skip?: true}
   end
 
-  defp random_op(9, opts, _persisted, acc) do
+  # A clean stop tightens to the cursor unless the store refuses it (a
+  # failed persist's write landed since); then the restart resumes at the
+  # stored lease end like a crash.
+  defp random_op(9, opts, persisted, acc) do
+    next = Seq.next(:sys.get_state(Lights).seq)
     stop_supervised!(Lights)
     start_lights(opts)
-    acc
+    if persisted_seq(persisted) == next, do: acc, else: %{acc | may_skip?: true}
   end
 
-  defp used(%{last: nil} = acc, sn), do: %{acc | last: sn, crashed?: false}
+  defp used(%{last: nil} = acc, sn), do: %{acc | last: sn, may_skip?: false}
 
-  defp used(%{last: last, crashed?: crashed?} = acc, sn) do
+  # A restart at a lease end jumps at most max_lease + 1 past the last
+  # number that may have gone on air (the lease's first can be given back).
+  defp used(%{last: last, may_skip?: may_skip?} = acc, sn) do
     gap = distance(last, sn)
 
-    if crashed?,
-      do: assert(gap in 1..9, "gap #{gap} after a crash"),
-      else: assert(gap == 1, "gap #{gap} without a crash")
+    if may_skip?,
+      do: assert(gap in 1..(@random_max_lease + 1), "gap #{gap} after a restart at a lease end"),
+      else: assert(gap == 1, "gap #{gap} without a restart at a lease end")
 
-    %{acc | last: sn, crashed?: false}
+    %{acc | last: sn, may_skip?: false}
   end
 
   # ── helpers ──────────────────────────────────────────────────────────
@@ -985,6 +1074,35 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
           :ets.insert(table, {:inv, inv})
           :ets.update_counter(table, :writes, 1)
           :ok
+      end
+    end
+  end
+
+  # on_persist with the host store's rules: a seq behind the stored one is
+  # refused (:seq_behind), and {:written, result} stores the inventory and
+  # then returns `result`, like a DETS insert whose sync fails.
+  defp store_persist(table) do
+    fn inv ->
+      stored = with [{:inv, stored}] <- :ets.lookup(table, :inv), do: stored.seq
+
+      cond do
+        is_integer(stored) and inv.seq != stored and not Seq.ahead?(stored, inv.seq) ->
+          {:error, :seq_behind}
+
+        true ->
+          case :ets.lookup(table, :fail) do
+            [{:fail, {:written, result}}] ->
+              :ets.insert(table, {:inv, inv})
+              result
+
+            [{:fail, result}] ->
+              result
+
+            [] ->
+              :ets.insert(table, {:inv, inv})
+              :ets.update_counter(table, :writes, 1)
+              :ok
+          end
       end
     end
   end

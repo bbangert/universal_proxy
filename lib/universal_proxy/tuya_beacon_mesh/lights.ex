@@ -41,9 +41,21 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   before the interval has passed is followed by a `:max_lease` one at
   once (correctness first), so writes exceed one per interval only above
   `:max_lease` frames per interval. A restart after a crash or power
-  loss resumes at the lease end, a jump of at most `:max_lease` past the
-  last number the bulbs heard; the bulbs accepted jumps of about 900
-  (`docs/protocols/tuya_beacon_mesh.md` §4.3), hence the cap.
+  loss resumes at the lease end. The last number that may have gone on
+  air is at least the one before the lease's first (that first one can
+  be given back), so the bulbs' tracker jumps by at most `:max_lease + 1`.
+  The bulbs accepted jumps of about 900
+  (`docs/protocols/tuya_beacon_mesh.md` §4.3), so `:max_lease` is capped
+  at `Seq.max_lease/0` (899) and the jump at `Seq.max_jump/0` (900); the
+  default 600 jumps at most 601.
+
+  A lease persist that fails may still have reached the store (a write
+  that lands before its sync fails), and a host store refuses a `seq`
+  behind the one it holds. So the largest lease end attempted since the
+  last successful persist is remembered, and every retry (and a same-mesh
+  reload) proposes an end at or past it. That end is never more than
+  `:max_lease` past the cursor, so the jump bound holds; using numbers up
+  to it is safe whether or not it was written.
 
   On a clean stop (`:normal`, `:shutdown`, `{:shutdown, _}`; Lights traps
   exits so a supervisor shutdown reaches `terminate/2`), the unused rest
@@ -179,8 +191,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
       integer, default #{@persist_interval_ms});
     * `:min_lease` / `:max_lease` — bounds of a lease (default
       #{@min_lease} / #{@max_lease}; `1 <= min_lease <= max_lease <=
-      #{Seq.max_lease()}`, the largest jump known to be accepted, see
-      `Seq.max_lease/0`);
+      #{Seq.max_lease()}`, so a crash jumps at most `Seq.max_jump/0`, the
+      largest jump known to be accepted);
     * `:clock` — `(-> integer())` monotonic milliseconds (default
       `System.monotonic_time(:millisecond)`; a test seam);
     * `:name` — process name (default `#{inspect(__MODULE__)}`).
@@ -278,7 +290,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
           backoff_ms: Keyword.get(opts, :resubscribe_ms, @resubscribe_ms),
           on_persist: Keyword.get(opts, :on_persist, fn _inv -> :ok end),
           seq: Seq.new(inv.seq),
-          lease: nil
+          lease: nil,
+          attempted: nil
         }
         |> Map.merge(leasing)
         |> load(inv)
@@ -474,11 +487,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   end
 
   def handle_call({:reload, input}, _from, state) do
-    with {:ok, inv} <- Inventory.decode(input),
-         reloaded = load(%{state | seq: reload_seq(state, inv), lease: nil}, inv),
-         :ok <- persist(reloaded) do
-      {:reply, :ok, reloaded}
-    else
+    case Inventory.decode(input) do
+      {:ok, inv} -> apply_reload(state, inv)
       {:error, reason} -> {:reply, {:error, reason}, state}
     end
   end
@@ -553,7 +563,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
           {:reply, error, state}
       end
     else
-      {:error, reason} -> {:reply, {:error, reason}, state}
+      {:error, reason, state} -> {:reply, {:error, reason}, state}
       {:build_error, reason, state} -> {:reply, {:error, reason}, state}
     end
   end
@@ -672,30 +682,62 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   # ── Seq / persist ────────────────────────────────────────────────────
 
   # SNs come from the persisted lease. Once it is used up, a new lease is
-  # persisted before any SN in it is used; when that fails the state is
-  # left as it was, so the next call tries again.
+  # persisted before any SN in it is used; when that fails only the
+  # attempted end is kept (below), so the next call tries again.
   defp take_sn(state) do
     case Seq.take(state.seq) do
       {:ok, sn, seq} ->
         {:ok, sn, %{state | seq: seq}}
 
       {:error, :lease_exhausted} ->
-        with {:ok, state} <- new_lease(state) do
-          {:ok, sn, seq} = Seq.take(state.seq)
-          {:ok, sn, %{state | seq: seq}}
+        case new_lease(state) do
+          {:ok, state} ->
+            {:ok, sn, seq} = Seq.take(state.seq)
+            {:ok, sn, %{state | seq: seq}}
+
+          {:error, reason, state} ->
+            {:error, reason, state}
         end
     end
   end
 
   defp new_lease(state) do
     now = state.clock.()
-    {size, why} = lease_size(state, now)
-    {:ok, seq} = Seq.lease(state.seq, size)
-    leased = %{state | seq: seq}
+    leased = %{state | seq: lease_seq(state, now)}
 
-    with :ok <- persist(leased) do
-      Logger.debug("TuyaBeaconMesh.Lights: leased #{size} sequence numbers (#{why})")
-      {:ok, %{leased | lease: {size, now}}}
+    case persist(leased) do
+      :ok ->
+        size = Seq.remaining(leased.seq)
+        Logger.debug("TuyaBeaconMesh.Lights: leased #{size} sequence numbers")
+        {:ok, %{leased | lease: {size, now}, attempted: nil}}
+
+      {:error, reason} ->
+        {:error, reason, %{state | attempted: Seq.value(leased.seq)}}
+    end
+  end
+
+  # The next lease: sized by lease_size/2, and never ending before an end
+  # a failed persist attempted. Such a write may have reached the store
+  # (DETS inserts, then its sync fails), which then refuses any seq behind
+  # it, so a shorter retry would block sending for good. The attempted
+  # end was a lease from this same cursor (next only moves once a persist
+  # succeeds), so covering it stays within max_lease.
+  defp lease_seq(state, now) do
+    {:ok, seq} =
+      state.seq |> cover_attempted(state.attempted) |> Seq.lease(lease_size(state, now))
+
+    seq
+  end
+
+  # Extends the lease to `attempted`. One that is not ahead of the cursor,
+  # or further ahead than a lease, can't come from a lease attempt from
+  # here and is ignored.
+  defp cover_attempted(seq, nil), do: seq
+
+  defp cover_attempted(seq, attempted) do
+    case Seq.lease(seq, Integer.mod(attempted - Seq.next(seq), 65_536)) do
+      {:ok, covered} -> covered
+      {:error, _not_a_lease} -> seq
     end
   end
 
@@ -704,31 +746,57 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   # than the interval was sized for a lower rate than the one now seen:
   # the next is max_lease, which keeps writes at one per interval up to
   # max_lease numbers per interval.
-  defp lease_size(%{lease: nil} = state, _now), do: {state.min_lease, :initial}
+  defp lease_size(%{lease: nil} = state, _now), do: state.min_lease
 
   defp lease_size(%{lease: {used, since}} = state, now) do
     elapsed = now - since
 
     if elapsed < state.interval_ms do
-      {state.max_lease, :early}
+      state.max_lease
     else
       # ceil(used / elapsed * interval * 1.5)
       wanted = div(used * state.interval_ms * 3 + 2 * elapsed - 1, 2 * elapsed)
-      {wanted |> max(state.min_lease) |> min(state.max_lease), :rate}
+      wanted |> max(state.min_lease) |> min(state.max_lease)
     end
   end
 
   # Same mesh: the bulbs may have heard everything up to our in-memory
   # cursor, so a stale or re-dropped dump must not pull it back, and the
   # persisted lease end never moves back either (a host store refuses
-  # that outside a tighten); the rest of the lease stays usable. A
-  # different mesh's bulbs have never heard our counter, and jumping them
-  # past their forward window would get every frame dropped, so its dump's
-  # cursor is taken as-is, with no lease.
-  defp reload_seq(state, inv) do
-    if Crypto.key_bytes(inv.beacon_key) == Crypto.key_bytes(state.beacon_key),
-      do: Seq.advance_to(state.seq, inv.seq),
-      else: Seq.new(inv.seq)
+  # that outside a tighten), including an end a failed persist attempted;
+  # the rest of the lease stays usable. A different mesh's bulbs have
+  # never heard our counter, and jumping them past their forward window
+  # would get every frame dropped, so its dump's cursor is taken as-is,
+  # with no lease.
+  #
+  # A failed same-mesh reload keeps its end as attempted when that is
+  # within a lease of the cursor, like a failed lease. One further ahead
+  # (a newer dump) can't be covered by a lease; retrying the reload
+  # proposes it again.
+  defp apply_reload(state, inv) do
+    same_mesh? = Crypto.key_bytes(inv.beacon_key) == Crypto.key_bytes(state.beacon_key)
+
+    seq =
+      if same_mesh?,
+        do: state.seq |> cover_attempted(state.attempted) |> Seq.advance_to(inv.seq),
+        else: Seq.new(inv.seq)
+
+    reloaded = load(%{state | seq: seq, lease: nil, attempted: nil}, inv)
+
+    case persist(reloaded) do
+      :ok ->
+        {:reply, :ok, reloaded}
+
+      {:error, reason} ->
+        state = if same_mesh?, do: note_reload_attempt(state, Seq.value(seq)), else: state
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  defp note_reload_attempt(state, until) do
+    if Integer.mod(until - Seq.next(state.seq), 65_536) in 1..state.max_lease//1,
+      do: %{state | attempted: until},
+      else: state
   end
 
   # Runs on_tighten in a task so a stuck host store can't hold terminate/2
