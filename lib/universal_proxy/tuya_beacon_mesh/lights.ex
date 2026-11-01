@@ -165,15 +165,32 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   name for this to follow a restarted Radio; a pid only ever names one
   incarnation.
 
-  Key material is kept out of `:sys.get_status/1` and crash reports
-  (`format_status/1`).
+  ## Bad input and key material
+
+  Every request is validated before anything is leased, persisted or
+  sent: a bad bulb, group, DP list (`Control.friendly_dps/1`, which also
+  takes raw `{id, type, value}` DPs) or option is an `{:error, reason}`
+  reply, an unknown request `{:error, :unknown_request}`, and stray casts
+  and messages are ignored. None of them stops Lights.
+
+  Keys are held **sealed** (`UniversalProxy.TuyaBeaconMesh.Redact`): the
+  inventory and every bulb's keys sit in the state as opaque closures,
+  opened only to build or parse a frame or to persist, so neither
+  `:sys.get_state/1` nor the raw `:sys` debug log (`{:out, reply, to,
+  state}` and the like, which `format_status/1` never sees) can print
+  them. `reload/2` sends its input sealed and `inventory/1`'s reply
+  travels sealed, opened in the caller. `format_status/1` redacts what
+  remains, and every callback runs under `Redact.guard/2`, so a crash
+  leaves a key-free exit reason (supervisor reports print it raw). A
+  plain inventory in the child spec is printed by supervisor reports as
+  given; the host passes a loader.
   """
 
   use GenServer
 
   require Logger
 
-  alias UniversalProxy.TuyaBeaconMesh.{Control, Crypto, Dp, Inventory, P2, Radio, Seq}
+  alias UniversalProxy.TuyaBeaconMesh.{Control, Crypto, Dp, Inventory, P2, Radio, Redact, Seq}
 
   @type inventory_source ::
           Inventory.t()
@@ -207,6 +224,10 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   # Radio replies after which the frame provably never went on air, so its
   # sequence number can be handed out again. {:uncertain, _} is not one.
   @untransmitted [:not_ready, :not_running, :queue_full]
+
+  @label "TuyaBeaconMesh.Lights"
+  # Requests whose second element is an inventory (format_status/1).
+  @inventory_requests [:reload]
 
   # ── Client API ─────────────────────────────────────────────────────────
 
@@ -258,11 +279,15 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
     }
   end
 
-  @doc "DP set for one bulb (by MAC or label). `opts`: `:ack` (default `false`), `:server`."
-  @spec set(String.t(), keyword() | map(), keyword()) :: :ok | {:error, term()}
+  @doc """
+  DP set for one bulb (by MAC or label). `dps`: friendly keys or raw DP
+  tuples (`Control.friendly_dps/1`). `opts`: `:ack` (a boolean, default
+  `false`), `:server`.
+  """
+  @spec set(String.t(), keyword() | map() | [Dp.dp()], keyword()) :: :ok | {:error, term()}
   def set(mac_or_label, dps, opts \\ []) do
-    {server, opts} = Keyword.pop(opts, :server, __MODULE__)
-    call(server, {:set, mac_or_label, dps, opts})
+    with {:ok, server, opts} <- split_server(opts),
+         do: call_server(server, {:set, mac_or_label, dps, opts})
   end
 
   @spec ping(String.t(), keyword()) :: :ok | {:error, term()}
@@ -271,11 +296,12 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   @spec reset(String.t(), keyword()) :: :ok | {:error, term()}
   def reset(mac_or_label, opts \\ []), do: call(opts, {:reset, mac_or_label})
 
-  @doc "Group DP set (by group name or local id). `opts`: `:ack`, `:server`."
-  @spec group_set(String.t() | byte(), keyword() | map(), keyword()) :: :ok | {:error, term()}
+  @doc "Group DP set (by group name or local id). `dps` and `opts` as in `set/3`."
+  @spec group_set(String.t() | byte(), keyword() | map() | [Dp.dp()], keyword()) ::
+          :ok | {:error, term()}
   def group_set(name_or_id, dps, opts \\ []) do
-    {server, opts} = Keyword.pop(opts, :server, __MODULE__)
-    call(server, {:group_set, name_or_id, dps, opts})
+    with {:ok, server, opts} <- split_server(opts),
+         do: call_server(server, {:group_set, name_or_id, dps, opts})
   end
 
   @spec status(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
@@ -284,9 +310,15 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   @spec all(keyword()) :: {:ok, [map()]} | {:error, term()}
   def all(opts \\ []), do: call(opts, :all)
 
-  @doc "The current inventory, keys included, with the persisted-form `seq`."
+  @doc """
+  The current inventory, keys included, with the persisted-form `seq`.
+  The reply travels sealed and is opened here, in the caller, which then
+  holds the keys in the clear: keep it out of logs, state and messages.
+  """
   @spec inventory(keyword()) :: {:ok, Inventory.t()} | {:error, term()}
-  def inventory(opts \\ []), do: call(opts, :inventory)
+  def inventory(opts \\ []) do
+    with {:ok, sealed} <- call(opts, :inventory), do: {:ok, Redact.unseal(sealed)}
+  end
 
   @doc """
   Replaces the inventory (validated with `Inventory.decode/1`). For the
@@ -300,14 +332,23 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   (`Radio.clear_tx/1`).
   """
   @spec reload(Inventory.t() | binary() | map(), keyword()) :: :ok | {:error, term()}
-  def reload(input, opts \\ []), do: call(opts, {:reload, input})
+  def reload(input, opts \\ []), do: call(opts, {:reload, Redact.seal(input)})
 
-  defp call(opts, request) when is_list(opts),
-    do: call(Keyword.get(opts, :server, __MODULE__), request)
+  # Opts that aren't a keyword list name no server: refused here, before
+  # anything is sent.
+  defp split_server(opts) do
+    if Keyword.keyword?(opts),
+      do: {:ok, Keyword.get(opts, :server, __MODULE__), Keyword.delete(opts, :server)},
+      else: {:error, :bad_opts}
+  end
+
+  defp call(opts, request) do
+    with {:ok, server, _opts} <- split_server(opts), do: call_server(server, request)
+  end
 
   # `catch :exit` idiom (CLAUDE.md), with timeouts kept apart: a command
   # that timed out may still have been sent.
-  defp call(server, request) do
+  defp call_server(server, request) do
     GenServer.call(server, request, @call_timeout)
   catch
     :exit, {:timeout, _} -> {:error, :timeout}
@@ -317,7 +358,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   # ── GenServer ────────────────────────────────────────────────────────
 
   @impl GenServer
-  def init(opts) do
+  def init(opts), do: Redact.guard(@label, fn -> do_init(opts) end)
+
+  defp do_init(opts) do
     with {:ok, leasing} <- lease_opts(opts),
          {:ok, inv} <- load_inventory(Keyword.fetch!(opts, :inventory)) do
       # Only so a supervisor shutdown runs terminate/2 (the tighten).
@@ -423,18 +466,21 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   defp monotonic_ms, do: System.monotonic_time(:millisecond)
 
   # Replaces everything derived from the inventory; the caller sets `seq`.
+  # The inventory and the bulbs' keys are kept sealed (see the moduledoc).
   defp load(state, inv) do
     Map.merge(state, %{
-      inventory: inv,
-      beacon_key: inv.beacon_key,
+      inventory: Redact.seal(inv),
       bulbs: bulbs_from(inv),
       by_node: Map.new(inv.bulbs, &{&1.node_id, &1.mac}),
       groups: Map.new(inv.groups, &{&1.local_id, &1})
     })
   end
 
+  defp mesh_key(state), do: Redact.unseal(state.inventory).beacon_key
+
   @impl GenServer
-  def handle_continue(:subscribe, state), do: {:noreply, subscribe(state)}
+  def handle_continue(:subscribe, state),
+    do: Redact.guard(@label, fn -> {:noreply, subscribe(state)} end)
 
   # Monitor before subscribing so a Radio that dies right after accepting
   # the subscription still delivers its :DOWN.
@@ -473,21 +519,26 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   end
 
   @impl GenServer
-  def handle_call({:set, who, dps, opts}, _from, state) do
-    case resolve(state, who) do
-      {:ok, _mac, bulb} ->
-        build = &Control.set(bulb.node_id, &1, dps, bulb.local_key, bulb.beacon_key, opts)
-        transmit(state, build, coalesce: {:set, bulb.node_id, dp_keys(dps)})
+  def handle_call(request, _from, state),
+    do: Redact.guard(@label, fn -> do_call(request, state) end)
 
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
+  # Each clause checks its target and DPs and replies with an error for a
+  # bad one; frames are built before any SN is taken (transmit/3), so a
+  # command that can't be built (bad options included) uses nothing.
+  defp do_call({:set, who, dps, opts}, state) do
+    with {:ok, _mac, bulb} <- resolve(state, who),
+         {:ok, dp_list} <- Control.friendly_dps(dps) do
+      build = unicast(bulb, &Control.set(bulb.node_id, &1, dp_list, &2, &3, opts))
+      transmit(state, build, coalesce: {:set, bulb.node_id, dp_ids(dp_list)})
+    else
+      {:error, reason} -> {:reply, {:error, reason}, state}
     end
   end
 
-  def handle_call({:ping, who}, _from, state) do
+  defp do_call({:ping, who}, state) do
     case resolve(state, who) do
       {:ok, _mac, bulb} ->
-        build = &{:ok, Control.ping(bulb.node_id, &1, bulb.local_key, bulb.beacon_key)}
+        build = unicast(bulb, &{:ok, Control.ping(bulb.node_id, &1, &2, &3)})
         transmit(state, build, coalesce: {:ping, bulb.node_id})
 
       {:error, reason} ->
@@ -495,10 +546,10 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
     end
   end
 
-  def handle_call({:reset, who}, _from, state) do
+  defp do_call({:reset, who}, state) do
     case resolve(state, who) do
       {:ok, _mac, bulb} ->
-        build = &{:ok, Control.reset(bulb.node_id, &1, bulb.local_key, bulb.beacon_key)}
+        build = unicast(bulb, &{:ok, Control.reset(bulb.node_id, &1, &2, &3)})
         transmit(state, build, class: :control)
 
       {:error, reason} ->
@@ -506,59 +557,76 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
     end
   end
 
-  def handle_call({:group_set, who, dps, opts}, _from, state) do
-    case resolve_group_id(state, who) do
-      {:ok, id} ->
-        build = &Control.group_set(id, &1, dps, state.beacon_key, opts)
-        transmit(state, build, coalesce: {:group_set, id, dp_keys(dps)})
-
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
+  defp do_call({:group_set, who, dps, opts}, state) do
+    with {:ok, id} <- resolve_group_id(state, who),
+         {:ok, dp_list} <- Control.friendly_dps(dps) do
+      build = &Control.group_set(id, &1, dp_list, mesh_key(state), opts)
+      transmit(state, build, coalesce: {:group_set, id, dp_ids(dp_list)})
+    else
+      {:error, reason} -> {:reply, {:error, reason}, state}
     end
   end
 
-  def handle_call({:status, who}, _from, state) do
+  defp do_call({:status, who}, state) do
     case resolve(state, who) do
       {:ok, mac, bulb} -> {:reply, {:ok, public(mac, bulb)}, state}
       {:error, reason} -> {:reply, {:error, reason}, state}
     end
   end
 
-  def handle_call(:all, _from, state) do
+  defp do_call(:all, state) do
     {:reply, {:ok, Enum.map(state.bulbs, fn {mac, b} -> public(mac, b) end)}, state}
   end
 
-  def handle_call(:inventory, _from, state) do
-    {:reply, {:ok, snapshot(state)}, state}
+  # Sealed: the debug log records replies (inventory/1 opens it).
+  defp do_call(:inventory, state) do
+    {:reply, {:ok, Redact.seal(snapshot(state))}, state}
   end
 
-  def handle_call({:reload, input}, _from, state) do
-    case Inventory.decode(input) do
+  defp do_call({:reload, input}, state) do
+    case input |> Redact.unseal() |> Inventory.decode() do
       {:ok, inv} -> apply_reload(state, inv)
       {:error, reason} -> {:reply, {:error, reason}, state}
     end
   end
 
+  defp do_call(_unknown, state), do: {:reply, {:error, :unknown_request}, state}
+
+  # A builder for transmit/3 that opens the bulb's keys only to build.
+  defp unicast(bulb, build) do
+    fn sn ->
+      {local_key, mask} = Redact.unseal(bulb.keys)
+      build.(sn, local_key, mask)
+    end
+  end
+
   @impl GenServer
-  def handle_info({:tuya_report, report}, state) do
+  def handle_cast(_msg, state), do: {:noreply, state}
+
+  @impl GenServer
+  def handle_info(message, state), do: Redact.guard(@label, fn -> do_info(message, state) end)
+
+  defp do_info({:tuya_report, report}, state) do
     {:noreply, handle_report(state, report)}
   end
 
-  def handle_info(:resubscribe, %{radio_mon: nil} = state), do: {:noreply, subscribe(state)}
+  defp do_info(:resubscribe, %{radio_mon: nil} = state), do: {:noreply, subscribe(state)}
 
-  def handle_info({:DOWN, mon, :process, _pid, reason}, %{radio_mon: mon} = state) do
+  defp do_info({:DOWN, mon, :process, _pid, reason}, %{radio_mon: mon} = state) do
     {:noreply, retry_subscribe(%{state | radio_mon: nil}, {:radio_down, reason})}
   end
 
-  def handle_info(_other, state), do: {:noreply, state}
+  defp do_info(_other, state), do: {:noreply, state}
 
   # A clean stop runs between callbacks, so state holds every SN handed to
   # the Radio. A crash's state can predate SNs the crashing callback
   # handed out, so tightening to its cursor could reuse one: not done.
   @impl GenServer
   def terminate(reason, state) do
-    if clean_stop?(reason), do: tighten(state)
-    :ok
+    Redact.guard(@label, fn ->
+      if clean_stop?(reason), do: tighten(state)
+      :ok
+    end)
   end
 
   defp clean_stop?(:normal), do: true
@@ -567,16 +635,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   defp clean_stop?(_reason), do: false
 
   @impl GenServer
-  def format_status(status) do
-    Map.new(status, fn
-      {:state, s} -> {:state, redact_state(s)}
-      {:message, m} -> {:message, redact_message(m)}
-      {:queue, q} when is_list(q) -> {:queue, Enum.map(q, &redact_message/1)}
-      {:log, log} when is_list(log) -> {:log, Enum.map(log, &redact_log_entry/1)}
-      {:reason, r} -> {:reason, redact_reason(r)}
-      other -> other
-    end)
-  end
+  def format_status(status), do: Redact.format_status(status, @inventory_requests)
 
   # ── Transmit ─────────────────────────────────────────────────────────
 
@@ -618,20 +677,17 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
 
   defp give_back(state, sn), do: %{state | seq: Seq.give_back(state.seq, sn)}
 
-  defp dp_keys(dps) when is_map(dps), do: dps |> Map.keys() |> Enum.sort()
-  defp dp_keys(dps) when is_list(dps), do: dps |> Enum.map(&dp_key/1) |> Enum.sort()
-  defp dp_keys(_dps), do: []
-
-  defp dp_key({key, _value}), do: key
-  defp dp_key(other), do: other
+  # The DPs a frame sets, by id: friendly and raw forms of one DP
+  # coalesce alike, and no value enters the key.
+  defp dp_ids(dp_list), do: dp_list |> Enum.map(&elem(&1, 0)) |> Enum.sort() |> Enum.uniq()
 
   # ── Reports ──────────────────────────────────────────────────────────
 
-  defp handle_report(state, report) do
-    with <<_hdr, src::binary-2, _rest::binary>> <- report.frame,
+  defp handle_report(state, %{frame: frame}) do
+    with <<_hdr, src::binary-2, _rest::binary>> <- frame,
          mac when is_binary(mac) <- Map.get(state.by_node, :binary.decode_unsigned(src)),
          bulb = Map.fetch!(state.bulbs, mac),
-         {:ok, parsed} <- parse(state, bulb, report.frame) do
+         {:ok, parsed} <- parse(state, bulb, frame) do
       case check_fresh(bulb, parsed.sn) do
         :accept ->
           bulb = %{
@@ -654,10 +710,14 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
     end
   end
 
+  defp handle_report(state, _malformed), do: state
+
   defp put_bulb(state, mac, bulb), do: %{state | bulbs: Map.put(state.bulbs, mac, bulb)}
 
   defp parse(state, bulb, frame) do
-    [bulb.beacon_key, state.beacon_key]
+    {_local_key, mask} = Redact.unseal(bulb.keys)
+
+    [mask, mesh_key(state)]
     |> Enum.uniq()
     |> Enum.find_value(:error, fn key ->
       case P2.parse_device(frame, key) do
@@ -899,7 +959,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   # (a newer dump) can't be covered by a lease; retrying the reload
   # proposes it again.
   defp apply_reload(state, inv) do
-    same_mesh? = Crypto.key_bytes(inv.beacon_key) == Crypto.key_bytes(state.beacon_key)
+    same_mesh? = Crypto.key_bytes(inv.beacon_key) == Crypto.key_bytes(mesh_key(state))
 
     seq =
       if same_mesh?,
@@ -1031,52 +1091,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
     kind, _ -> "#{kind}"
   end
 
-  defp snapshot(state), do: %{state.inventory | seq: Seq.value(state.seq)}
-
-  # ── Redaction ────────────────────────────────────────────────────────
-
-  defp redact_state(%{bulbs: bulbs} = state) when is_map(bulbs) do
-    bulbs =
-      Map.new(bulbs, fn {mac, b} -> {mac, %{b | local_key: :redacted, beacon_key: :redacted}} end)
-
-    %{state | bulbs: bulbs, inventory: :redacted, beacon_key: :redacted}
-  end
-
-  defp redact_state(_other), do: :redacted
-
-  defp redact_message({:"$gen_call", from, request}),
-    do: {:"$gen_call", from, redact_request(request)}
-
-  defp redact_message(message), do: redact_request(message)
-
-  defp redact_request({:reload, _input}), do: {:reload, :redacted}
-  defp redact_request(request), do: request
-
-  defp redact_log_entry(entry) when is_tuple(entry) do
-    entry
-    |> Tuple.to_list()
-    |> Enum.map(fn
-      %{bulbs: _} = state -> redact_state(state)
-      {:ok, %Inventory{}} -> {:ok, :redacted}
-      other -> redact_message(other)
-    end)
-    |> List.to_tuple()
-  end
-
-  defp redact_log_entry(entry), do: entry
-
-  # Stack frames can carry call arguments (keys among them): keep arities.
-  defp redact_reason({reason, [_ | _] = stack}) do
-    {redact_exception(reason), Enum.map(stack, &arity_frame/1)}
-  end
-
-  defp redact_reason(reason), do: redact_exception(reason)
-
-  defp redact_exception(%FunctionClauseError{} = e), do: %{e | args: nil}
-  defp redact_exception(reason), do: reason
-
-  defp arity_frame({m, f, args, loc}) when is_list(args), do: {m, f, length(args), loc}
-  defp arity_frame(frame), do: frame
+  defp snapshot(state), do: %{Redact.unseal(state.inventory) | seq: Seq.value(state.seq)}
 
   # ── Resolve ──────────────────────────────────────────────────────────
 
@@ -1131,10 +1146,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
     Map.new(inv.bulbs, fn b ->
       {b.mac,
        %{
-         local_key: b.local_key,
+         keys: Redact.seal({b.local_key, b.beacon_key}),
          node_id: b.node_id,
          label: b.label,
-         beacon_key: b.beacon_key,
          dps: %{},
          groups: nil,
          last_sn: nil,

@@ -12,8 +12,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
     Lights,
     P2,
     Radio,
+    Redact,
     Seq
   }
+
+  alias UniversalProxy.TuyaMesh.KeyLeak
 
   @fixture Path.join([
              __DIR__,
@@ -137,7 +140,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
     test "a command that can't be built gives its sequence number back", %{
       persisted: persisted
     } do
-      assert {:error, {:bad_mode, :disco}} = Lights.set("path light 2", mode: :disco)
+      assert {:error, {:bad_dp, :mode}} = Lights.set("path light 2", mode: :disco)
       assert {:error, :no_dps} = Lights.group_set(1, [])
       assert {:error, :too_long} = Lights.set("path light 2", too_long_dps())
       assert advertises() == []
@@ -388,6 +391,77 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
       refute log =~ "abcdefghijklmnop"
     end
 
+    test "a crash with keys in its exception and stack leaves a key-free reason and log",
+         %{persisted: persisted} do
+      stop_supervised!(Lights)
+      # A loader: a plain inventory in the child spec would be printed by
+      # supervisor reports as given.
+      start_lights(lights_opts(persisted, []))
+      pid = Process.whereis(Lights)
+      ref = Process.monitor(pid)
+
+      # An SN past 16 bits makes P2.build/8 fail its guard: a
+      # FunctionClauseError whose arguments (and top stack frame) hold the
+      # bulb's localKey and beaconKey.
+      :sys.replace_state(Lights, &%{&1 | seq: %{&1.seq | next: 70_000}})
+
+      log =
+        capture_log(fn ->
+          assert {:error, :not_running} = Lights.set("path light 2", [on: true], ack: true)
+          assert_receive {:DOWN, ^ref, :process, ^pid, reason}
+          send(self(), {:reason, reason})
+
+          wait_until(fn ->
+            match?(new when is_pid(new) and new != pid, Process.whereis(Lights))
+          end)
+        end)
+
+      assert_received {:reason, reason}
+
+      assert {%Redact.Error{message: "TuyaBeaconMesh.Lights: FunctionClauseError raised"}, stack} =
+               reason
+
+      assert Enum.all?(stack, &is_integer(elem(&1, 2)))
+      KeyLeak.refute_keys(reason)
+      assert log =~ "FunctionClauseError raised"
+      KeyLeak.refute_keys(log)
+    end
+
+    test ":sys.log, get_status and get_state show no keys after commands, reloads and reports" do
+      :ok = :sys.log(Lights, {true, 200})
+
+      sent_sn(fn -> Lights.set("path light 2", [on: true, colour: {1, 2, 3}], ack: true) end)
+      sent_sn(fn -> Lights.ping("post spot 1") end)
+      sent_sn(fn -> Lights.group_set(1, on: false) end)
+      assert {:ok, %Inventory{beacon_key: @beacon_key}} = Lights.inventory()
+      assert :ok = Lights.reload(KeyLeak.json())
+      assert :ok = Lights.reload(KeyLeak.snake_map())
+      assert :ok = Lights.reload(Inventory.decode!(KeyLeak.json()))
+      assert {:error, _} = Lights.reload(Map.put(KeyLeak.snake_map(), "bulbs", :none))
+      inject_report(2, 5, [{1, :bool, true}])
+      assert_dp(2, 1, true)
+      assert {:ok, _} = Lights.status("path light 2")
+      assert {:ok, _} = Lights.all()
+
+      {:ok, events} = :sys.log(Lights, :get)
+      # The inventory reply and the reload input travel sealed.
+      assert Enum.any?(events, fn
+               {:out, {:ok, sealed}, _to, %{bulbs: _}} -> is_function(sealed, 0)
+               _other -> false
+             end)
+
+      assert Enum.any?(events, fn
+               {:in, {:"$gen_call", _from, {:reload, sealed}}} -> is_function(sealed, 0)
+               _other -> false
+             end)
+
+      KeyLeak.refute_keys(events)
+      KeyLeak.refute_keys(:sys.get_state(Lights))
+      KeyLeak.refute_keys(:sys.get_status(Lights))
+      assert inspect(:sys.get_status(Lights)) =~ "path light 2"
+      :ok = :sys.log(Lights, false)
+    end
+
     test "a pending or last {:reload, dump} message is redacted" do
       dump = File.read!(@fixture)
       call = {:"$gen_call", {self(), make_ref()}, {:reload, dump}}
@@ -403,6 +477,79 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
       refute inspect(status) =~ @beacon_key
       assert {:"$gen_call", _, {:reload, :redacted}} = status.message
       assert {:badarg, [{Crypto, :key_bytes, 1, []}]} = status.reason
+    end
+  end
+
+  describe "bad input" do
+    test "a raw DP tuple is a DP set like its friendly form" do
+      assert :ok = Lights.set("path light 2", [{1, :bool, true}], ack: true)
+      wait_until(fn -> advertises() != [] end)
+
+      assert [<<_hdr, 0x80, 0x01, 0x00, 0x02, 100::16-big, 0x06, _::binary>>] =
+               advertises() |> List.last() |> Carrier.frames()
+    end
+
+    test "bad DPs, options, targets and requests are errors; nothing is leased, persisted or sent",
+         %{persisted: persisted} do
+      pid = Process.whereis(Lights)
+      bulb = "path light 2"
+
+      for {result, expected} <- [
+            {Lights.set(bulb, [{1, :bool, "yes"}]), {:bad_dp, {1, :bool}}},
+            {Lights.set(bulb, [{0, :bool, true}], ack: true), {:bad_dp, {0, :bool}}},
+            {Lights.set(bulb, [{1, :bool, true, :extra}]), {:bad_dp, {:tuple, 4}}},
+            {Lights.set(bulb, [{"on", true}]), {:bad_dp, :binary}},
+            {Lights.set(bulb, [:on]), {:bad_dp, :on}},
+            {Lights.set(bulb, %{1 => true}), {:bad_dp, 1}},
+            {Lights.set(bulb, [{:on, true} | :tail]), :bad_dps},
+            {Lights.set(bulb, :on), :bad_dps},
+            {Lights.set(bulb, nil), :bad_dps},
+            {Lights.set(bulb, "on"), :bad_dps},
+            {Lights.set(bulb, [on: true], ack: "yes"), {:bad_option, :ack}},
+            {Lights.set(bulb, [on: true], [:ack]), :bad_opts},
+            {Lights.set(bulb, [on: true], %{ack: true}), :bad_opts},
+            {GenServer.call(Lights, {:set, bulb, [on: true], %{ack: true}}), {:bad_option, :ack}},
+            {GenServer.call(Lights, {:set, bulb, [on: true], [:ack | :tail]}),
+             {:bad_option, :ack}},
+            {Lights.set({:bulb}, on: true), :unknown_bulb},
+            {Lights.group_set(1, [{1, :bool, 2}]), {:bad_dp, {1, :bool}}},
+            {Lights.group_set(1, :off), :bad_dps},
+            {Lights.group_set(1, [on: true], ack: 1), {:bad_option, :ack}},
+            {GenServer.call(Lights, {:group_set, 1, [on: true], nil}), {:bad_option, :ack}},
+            {Lights.group_set([1], on: true), :unknown_group},
+            {Lights.group_set(1.0, on: true), :unknown_group},
+            {Lights.ping(%{}), :unknown_bulb},
+            {Lights.ping(bulb, :not_opts), :bad_opts},
+            {Lights.reset(123), :unknown_bulb},
+            {Lights.reset(bulb, [:server]), :bad_opts},
+            {Lights.status([bulb]), :unknown_bulb},
+            {Lights.all(%{}), :bad_opts},
+            {Lights.inventory([1 | 2]), :bad_opts},
+            {Lights.reload([1 | 2]), :not_a_map},
+            {Lights.reload(Map.put(fixture(%{}), "bulbs", [%{} | :tail])), :bad_bulbs},
+            {Lights.reload(%{"beaconKey" => @beacon_key, "bulbs" => :all}), :bad_bulbs},
+            {GenServer.call(Lights, {:reload, fn -> raise "ran" end}), :not_a_map},
+            {GenServer.call(Lights, :bogus), :unknown_request},
+            {GenServer.call(Lights, {:set, bulb}), :unknown_request}
+          ] do
+        assert result == {:error, expected}
+      end
+
+      GenServer.cast(Lights, {:set, bulb, [on: true], []})
+      send(Lights, {:tuya_report, :junk})
+      send(Lights, {:tuya_report, %{frame: 123}})
+      send(Lights, {:tuya_report, %{frame: <<1, 0, 2>>}})
+      send(Lights, {:tuya_report, %{}})
+
+      assert {:ok, [_, _]} = Lights.all()
+      assert Process.whereis(Lights) == pid
+      assert writes(persisted) == 0
+      assert advertises() == []
+      assert {:ok, %{seq: 100}} = Lights.inventory()
+
+      # The cursor never moved: the first good command gets 100.
+      assert set_sn(bulb, on: true) == 100
+      assert Process.whereis(Lights) == pid
     end
   end
 
@@ -794,7 +941,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
       # A command that can't be built takes no lease either.
       FakeBluez.succeed(:acquire)
       wait_until(&radio_ready?/0)
-      assert {:error, {:bad_mode, :disco}} = Lights.set("path light 2", mode: :disco)
+      assert {:error, {:bad_dp, :mode}} = Lights.set("path light 2", mode: :disco)
       assert writes(persisted) == 0
 
       stop_supervised!({Radio, 1})
