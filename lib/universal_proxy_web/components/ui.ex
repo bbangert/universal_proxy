@@ -9,6 +9,8 @@ defmodule UniversalProxyWeb.Components.UI do
 
   import UniversalProxyWeb.Components.Icons
 
+  alias Phoenix.LiveView.JS
+
   # ── Badge ─────────────────────────────────────────────────────────────
   attr(:variant, :atom,
     default: :neutral,
@@ -259,19 +261,57 @@ defmodule UniversalProxyWeb.Components.UI do
   end
 
   # ── Modal ─────────────────────────────────────────────────────────────
+  # A server-driven dialog: rendered while `open`, closed by the caller
+  # handling `on_close` (backdrop click, Escape) or its own footer buttons.
+  #
+  # Accessibility: `role="dialog"` + `aria-modal`, labelled by the title and
+  # described by the subtitle/body; Tab is contained by `focus_wrap/1`. On
+  # open (`phx-mounted`, client side only, so never on the dead render) it
+  # remembers the focused element and focuses the first focusable control
+  # (footer buttons put Cancel first, so a destructive action is never the
+  # default); on close (`phx-remove`, when a patch drops it) focus returns
+  # there, or to `return_focus` (a selector) when the opener won't be
+  # usable afterwards.
   attr(:open, :boolean, required: true)
   attr(:on_close, :string, default: "modal_close")
-  # `phx-target` of the backdrop's close event (a LiveComponent's `@myself`).
+  # `phx-target` of the close events (a LiveComponent's `@myself`).
   attr(:target, :any, default: nil)
+  # DOM id; defaults to one derived from `on_close`, unique per page as each
+  # modal closes through its own event.
+  attr(:id, :string, default: nil)
+  attr(:return_focus, :string, default: nil)
   attr(:title, :string, required: true)
   attr(:subtitle, :string, default: nil)
   slot(:inner_block, required: true)
   slot(:footer)
 
   def modal(assigns) do
+    id = assigns.id || "modal-#{assigns.on_close}"
+
+    described_by =
+      [
+        assigns.subtitle && "#{id}-subtitle",
+        assigns.inner_block != [] && "#{id}-body"
+      ]
+      |> Enum.filter(&is_binary/1)
+      |> Enum.join(" ")
+
+    assigns =
+      assigns
+      |> assign(:id, id)
+      |> assign(:described_by, if(described_by != "", do: described_by))
+      |> assign(:on_open, modal_open_js(id, assigns.return_focus))
+      |> assign(:on_remove, modal_close_js(assigns.return_focus))
+
     ~H"""
     <div
       :if={@open}
+      id={@id}
+      phx-mounted={@on_open}
+      phx-remove={@on_remove}
+      phx-window-keydown={@on_close}
+      phx-key="escape"
+      phx-target={@target}
       class="fixed inset-0 z-[100] flex items-center justify-center p-5 animate-fade"
     >
       <%!--
@@ -284,12 +324,19 @@ defmodule UniversalProxyWeb.Components.UI do
       <div phx-click={@on_close} phx-target={@target} class="absolute inset-0 bg-overlay"></div>
       <%!-- Bounded to the padded viewport: the body scrolls, the title and
            footer actions stay in view however long the content. --%>
-      <div class="relative bg-raised rounded-lg shadow-lg max-w-[520px] w-full max-h-full flex flex-col animate-pop">
+      <.focus_wrap
+        id={"#{@id}-content"}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={"#{@id}-title"}
+        aria-describedby={@described_by}
+        class="relative bg-raised rounded-lg shadow-lg max-w-[520px] w-full max-h-full flex flex-col animate-pop"
+      >
         <div class="flex-none px-6 pt-5 pb-3">
-          <h3 class="text-lg font-semibold m-0 text-fg-1">{@title}</h3>
-          <p :if={@subtitle} class="text-sm text-fg-2 mt-1">{@subtitle}</p>
+          <h3 id={"#{@id}-title"} class="text-lg font-semibold m-0 text-fg-1">{@title}</h3>
+          <p :if={@subtitle} id={"#{@id}-subtitle"} class="text-sm text-fg-2 mt-1">{@subtitle}</p>
         </div>
-        <div :if={@inner_block != []} class="overflow-auto px-6 pb-5">
+        <div :if={@inner_block != []} id={"#{@id}-body"} class="overflow-auto px-6 pb-5">
           {render_slot(@inner_block)}
         </div>
         <div
@@ -298,10 +345,18 @@ defmodule UniversalProxyWeb.Components.UI do
         >
           {render_slot(@footer)}
         </div>
-      </div>
+      </.focus_wrap>
     </div>
     """
   end
+
+  defp modal_open_js(id, nil),
+    do: JS.push_focus() |> JS.focus_first(to: "##{id}-content")
+
+  defp modal_open_js(id, _return_focus), do: JS.focus_first(to: "##{id}-content")
+
+  defp modal_close_js(nil), do: JS.pop_focus()
+  defp modal_close_js(selector), do: JS.focus(to: selector)
 
   # ── Connected-clients pill + popover ──────────────────────────────────
   # Header pill showing how many ESPHome native-API clients are connected.

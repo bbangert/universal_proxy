@@ -86,6 +86,14 @@ defmodule UniversalProxyWeb.TuyaMeshComponentTest do
     token
   end
 
+  defp cancel_ids(view) do
+    view
+    |> render()
+    |> LazyHTML.from_fragment()
+    |> LazyHTML.query("button[phx-click=cancel_upload]")
+    |> LazyHTML.attribute("id")
+  end
+
   defp refute_secrets(html) do
     KeyLeak.refute_keys(html)
     refute html =~ @other_key
@@ -387,6 +395,49 @@ defmodule UniversalProxyWeb.TuyaMeshComponentTest do
       assert {:ok, %{seq: 100}} = Store.load(ctx.store)
     end
 
+    test "the confirmation is an accessible dialog; Escape cancels it", %{conn: conn} = ctx do
+      {:ok, _} = TuyaMesh.upload(KeyLeak.json())
+      view = mount_tab(conn)
+      assert submit_upload(view, other_mesh_json()) =~ "Replace the stored mesh?"
+
+      doc = view |> render() |> LazyHTML.from_fragment()
+      dialog = LazyHTML.query(doc, "#modal-cancel_upload-content[role=dialog][aria-modal=true]")
+      assert Enum.count(dialog) == 1
+      [title_id] = LazyHTML.attribute(dialog, "aria-labelledby")
+
+      assert doc |> LazyHTML.query("##{title_id}") |> LazyHTML.text() =~
+               "Replace the stored mesh?"
+
+      # Focus moves in on open (Cancel, never the destructive action) and
+      # returns to the file picker on close, which exists behind it.
+      [cancel] =
+        doc
+        |> LazyHTML.query("#modal-cancel_upload-content button[phx-click=cancel_upload]")
+        |> LazyHTML.attribute("phx-mounted")
+
+      assert cancel =~ ~s("focus")
+
+      [on_remove] =
+        doc |> LazyHTML.query("#modal-cancel_upload") |> LazyHTML.attribute("phx-remove")
+
+      assert on_remove =~ "#tuya-mesh-upload input[type=file]"
+      assert has_element?(view, "#tuya-mesh-upload input[type=file]")
+
+      # A stale re-ask mounts a new Cancel (new id), so focus moves to it.
+      [first_id] = cancel_ids(view)
+
+      {:ok, :new_mesh} =
+        TuyaMesh.upload(json(%{"beaconKey" => String.duplicate("ab", 16)}), confirm: true)
+
+      view |> element("button[phx-click=confirm_upload]") |> render_click()
+      [second_id] = cancel_ids(view)
+      assert second_id != first_id
+
+      html = view |> element("#modal-cancel_upload") |> render_keydown(%{"key" => "Escape"})
+      refute html =~ "Replace the stored mesh?"
+      assert {:ok, %{seq: 100, beacon_key: "abab" <> _}} = Store.load(ctx.store)
+    end
+
     test "invalid JSON: a friendly error without key material", %{conn: conn} = ctx do
       view = mount_tab(conn)
       truncated = binary_part(KeyLeak.json(), 0, 120)
@@ -557,6 +608,8 @@ defmodule UniversalProxyWeb.TuyaMeshComponentTest do
       # that opened the force dialog, does nothing.
       html = view |> with_target("#tuya-mesh") |> render_click("confirm_clear", %{})
       assert html =~ "Clear anyway (sequence will be lost)"
+      # The force dialog's Cancel is a new element that takes focus.
+      assert has_element?(view, "#tuya-mesh-force-clear-cancel[phx-mounted]")
       html = view |> with_target("#tuya-mesh") |> render_click("confirm_clear", %{})
       assert html =~ "Clear anyway (sequence will be lost)"
       assert {:error, {:invalid, _}} = Store.load(ctx.store)

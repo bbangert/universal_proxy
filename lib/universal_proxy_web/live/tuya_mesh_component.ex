@@ -471,9 +471,26 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
     assigns = assign(assigns, :copy, confirm_copy(assigns.preview))
 
     ~H"""
-    <.modal open={true} on_close="cancel_upload" target={@myself} title={@copy.title}>
+    <%!-- On close, focus goes back to the file picker (the submit button
+         that opened it is disabled by then). Each dialog's Cancel has its
+         token in its id, so a stale re-ask mounts a new one and focus moves
+         to it, off the destructive button the user just pressed. --%>
+    <.modal
+      open={true}
+      on_close="cancel_upload"
+      target={@myself}
+      title={@copy.title}
+      return_focus="#tuya-mesh-upload input[type=file]"
+    >
       <:footer>
-        <.button variant={:ghost} size={:sm} phx-click="cancel_upload" phx-target={@myself}>
+        <.button
+          id={"tuya-mesh-upload-cancel-#{@token}"}
+          variant={:ghost}
+          size={:sm}
+          phx-click="cancel_upload"
+          phx-target={@myself}
+          phx-mounted={JS.focus()}
+        >
           Cancel
         </.button>
         <.button
@@ -562,7 +579,17 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
       title="The stored inventory can't be read"
     >
       <:footer>
-        <.button variant={:ghost} size={:sm} phx-click="cancel_clear" phx-target={@myself}>
+        <%!-- Its own Cancel, focused when this replaces the first dialog
+             (focus would otherwise stay on the button just pressed, now
+             "Clear anyway"). --%>
+        <.button
+          id="tuya-mesh-force-clear-cancel"
+          variant={:ghost}
+          size={:sm}
+          phx-click="cancel_clear"
+          phx-target={@myself}
+          phx-mounted={JS.focus()}
+        >
           Cancel
         </.button>
         <.button
