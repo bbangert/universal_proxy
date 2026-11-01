@@ -841,6 +841,32 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
     end
 
     @tag :capture_log
+    test "after a switch to another mesh, the old mesh's frames don't count as progress", %{
+      persisted: persisted
+    } do
+      restart_lights(persisted, min_lease: 3, max_lease: 5, max_jump: 12)
+
+      # Old mesh: 100 airs, 101..108 coalesce behind it, then 108 airs.
+      for _ <- 1..9, do: assert(:ok = Lights.set("path light 2", on: true))
+      finish_tx()
+      assert {:ok, %{last_tx_sn: 108}} = Radio.status()
+
+      # The new mesh starts at 100: its baseline is 99, and the Radio forgets
+      # the old frames (108 would otherwise read as new-mesh progress).
+      assert :ok = Lights.reload(fixture(%{"beaconKey" => @other_key, "seq" => 100}))
+      assert {:ok, %{last_tx_sn: nil, tx: nil, queued: 0}} = Radio.status()
+
+      results = for _ <- 1..15, do: Lights.set("path light 2", on: true)
+      assert Enum.take(results, 12) == List.duplicate(:ok, 12)
+      assert Enum.drop(results, 12) == List.duplicate({:error, :busy}, 3)
+
+      # The new mesh's 100 is the one on air: the persisted end stays 12
+      # past it.
+      assert {:ok, %{last_tx_sn: 100}} = Radio.status()
+      assert persisted_seq(persisted) == 112
+    end
+
+    @tag :capture_log
     test "a Radio that dropped the waiting frames unaired doesn't hold sends", %{
       persisted: persisted
     } do

@@ -28,6 +28,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
     P2.build(1, 0x05, 0x6506, 0xFFFF, sn, <<1, 2, 3>>, @key, @key)
   end
 
+  defp phone_frame(sn), do: P2.build(1, 0x05, 0x8001, 0x0002, sn, <<1, 2, 3>>, @key, @key)
+
   # The same frame as a bulb would relay it: hop bits 1 instead of 0
   # (our own builds carry hop 3, so start from the normalised frame).
   defp hop_variant(frame) do
@@ -197,6 +199,18 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
       finish_tx()
       assert Enum.take(advertises(), -2) == [Carrier.ad_bytes(d), Carrier.ad_bytes(e)]
       assert [flags: [:connectable]] = FakeBluez.calls() |> List.keyfind(:advertise, 0) |> elem(2)
+    end
+
+    test "clear_tx drops what's on air and queued, and forgets last_tx_sn" do
+      assert {:ok, %{last_tx_sn: nil}} = Radio.status()
+
+      :ok = Radio.send_frame(phone_frame(42), 60_000)
+      :ok = Radio.send_frame(phone_frame(43), 60_000)
+      assert {:ok, %{last_tx_sn: 42, queued: 1}} = Radio.status()
+
+      assert :ok = Radio.clear_tx()
+      assert {:ok, %{last_tx_sn: nil, tx: nil, queued: 0}} = Radio.status()
+      assert {:stop, 5} in FakeBluez.calls()
     end
 
     test "an advert comes off air when its time is up" do

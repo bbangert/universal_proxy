@@ -295,7 +295,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   cursor (`Seq.advance_to/2`), so reloading an older dump never reuses
   SNs. A different mesh starts from the dump's `seq` as-is. The result is
   written through `on_persist` first; if that fails nothing changes and
-  the reply is `{:error, :persist_failed}`.
+  the reply is `{:error, :persist_failed}`. Once a different mesh is
+  written, the old mesh's frames still on air or queued are dropped
+  (`Radio.clear_tx/1`).
   """
   @spec reload(Inventory.t() | binary() | map(), keyword()) :: :ok | {:error, term()}
   def reload(input, opts \\ []), do: call(opts, {:reload, input})
@@ -909,6 +911,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
 
     case persist(reloaded) do
       :ok ->
+        unless same_mesh?, do: clear_old_mesh_tx(state)
         {:reply, :ok, reloaded |> rebase_aired(state, same_mesh?) |> retire_floor()}
 
       {:error, reason} when same_mesh? ->
@@ -941,6 +944,18 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   end
 
   defp retire_floor(state), do: state
+
+  # The old mesh's frames still on air or queued would go out under keys
+  # the new mesh doesn't know, and the Radio would report their SNs as the
+  # new mesh's progress (letting leases run past max_jump while the new
+  # frames wait). Dropping them and the reported SN with them keeps
+  # `aired` the new mesh's own. A Radio that doesn't answer is down or
+  # wedged and airs nothing either way. (The host's upload path restarts
+  # the whole mesh, Radio included, so only reload/2 needs this.)
+  defp clear_old_mesh_tx(state) do
+    _ = Radio.clear_tx(server: state.radio, timeout: @ready_timeout)
+    :ok
+  end
 
   # A reload that moved the cursor (a newer dump, another mesh) takes the
   # number before it as the baseline: the dump says the app got there.

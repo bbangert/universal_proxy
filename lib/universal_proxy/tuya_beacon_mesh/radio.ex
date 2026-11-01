@@ -222,6 +222,17 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   end
 
   @doc """
+  `stop_tx/1`, and forgets `:last_tx_sn` (see `status/1`): for a
+  controller switching to another mesh, whose earlier frames must neither
+  air under the new mesh nor count as its progress. `opts`: `:server`,
+  `:timeout` (default 5000).
+  """
+  @spec clear_tx(keyword()) :: :ok | {:error, :not_running}
+  def clear_tx(opts \\ []) do
+    call(server(opts), :clear_tx, {:error, :not_running}, Keyword.get(opts, :timeout, 5_000))
+  end
+
+  @doc """
   Subscribes `pid` to `{:tuya_report, report}` messages matching
   `filter` (`:all`, `:unpaired` or `{:mac, mac}`). The pid is monitored
   and dropped when it exits. Works while the radio is not ready; reports
@@ -254,10 +265,10 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   lease held, discovery on, receiver listening, subscriber count, what's
   on air (`:tx`), how many frames are queued (`:queued`), and the
   sequence number of the last frame the adapter accepted to advertise
-  (`:last_tx_sn`, `nil` until one has; a frame queued, coalesced away or
-  advertised with an uncertain outcome doesn't count). `opts`: `:server`,
-  `:timeout` (default 5000; a radio that doesn't answer in time reads as
-  not running).
+  (`:last_tx_sn`, `nil` until one has or after `clear_tx/1`; a frame
+  queued, coalesced away or advertised with an uncertain outcome doesn't
+  count). `opts`: `:server`, `:timeout` (default 5000; a radio that
+  doesn't answer in time reads as not running).
   """
   @spec status(keyword()) :: {:ok, map()} | {:error, :not_running}
   def status(opts \\ []) do
@@ -690,6 +701,10 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
 
   def handle_call(:stop_tx, _from, state) do
     {:reply, :ok, stop_and_continue(%{state | tx_queue: :queue.new()})}
+  end
+
+  def handle_call(:clear_tx, _from, state) do
+    {:reply, :ok, stop_and_continue(%{state | tx_queue: :queue.new(), last_tx_sn: nil})}
   end
 
   def handle_call({:subscribe, pid, filter}, _from, state) do
