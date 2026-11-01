@@ -325,6 +325,16 @@ defmodule UniversalProxyWeb.BluetoothLiveTest do
       assert Settings.get().roles == %{}
     end
 
+    test "an unavailable radio list renders inline", %{conn: conn} do
+      # Subsystem down (host): RadioMonitor isn't running, so the MAC can't
+      # be checked.
+      {:ok, view, _html} = live(conn, "/bluetooth")
+
+      html = render_click(view, "set_role", %{"mac" => @mesh_a, "role" => "tuya_mesh"})
+
+      assert html =~ "The radio list isn&#39;t available yet"
+    end
+
     test "switching a radio to Tuya mesh marks it dedicated", %{conn: conn} do
       start_subsystem([{"hci0", @mesh_a}, {"hci1", @mesh_b}])
       {:ok, view, html} = live(conn, "/bluetooth")

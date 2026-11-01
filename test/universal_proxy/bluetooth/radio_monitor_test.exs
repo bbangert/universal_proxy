@@ -134,4 +134,13 @@ defmodule UniversalProxy.Bluetooth.RadioMonitorTest do
 
     assert RadioMonitor.list(monitor) == []
   end
+
+  test "the mesh radio is never in_use?, even on the claimed/default path", ctx do
+    # A lone mesh radio at hci0: the client never claims it, but hci0 is the
+    # default adapter path.
+    :persistent_term.put(DevicePath.adapter_path_key(), "/org/bluez/hci0")
+    monitor = start_monitor(ctx, roles_fun: fn -> %{@pi_mac => :tuya_mesh} end)
+
+    assert [%{address: @pi_mac, role: :tuya_mesh, in_use?: false}] = RadioMonitor.list(monitor)
+  end
 end

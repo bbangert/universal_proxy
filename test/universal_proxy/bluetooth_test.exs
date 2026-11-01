@@ -6,7 +6,7 @@ defmodule UniversalProxy.BluetoothTest do
   use ExUnit.Case, async: false
 
   alias UniversalProxy.Bluetooth
-  alias UniversalProxy.Bluetooth.{Manager, RadioMonitor, Settings}
+  alias UniversalProxy.Bluetooth.{AudioManager, Manager, RadioMonitor, Settings}
   alias Bluez.DevicePath
 
   @pubsub UniversalProxy.PubSub
@@ -20,6 +20,58 @@ defmodule UniversalProxy.BluetoothTest do
     use Agent
 
     def start_link(_opts), do: Agent.start_link(fn -> :ok end)
+  end
+
+  # AudioManager ops for the bond-cleanup ordering test: one speaker bonded to
+  # hci1, whose Disconnect blocks until the test releases it.
+  defmodule BlockingOps do
+    @moduledoc false
+    @behaviour UniversalProxy.Bluetooth.AudioManager.Ops
+
+    @adapter "/org/bluez/hci1"
+    @speaker "/org/bluez/hci1/dev_11_22_33_44_55_66"
+
+    def speaker_path, do: @speaker
+
+    @impl true
+    def adapters_info(_c), do: [%{path: @adapter, address: "AA:BB:CC:DD:EE:FF"}]
+
+    @impl true
+    def managed_devices(_c) do
+      [
+        %{
+          path: @speaker,
+          mac: "11:22:33:44:55:66",
+          props: %{"UUIDs" => [AudioManager.audio_sink_uuid()]}
+        }
+      ]
+    end
+
+    @impl true
+    def disconnect(_c, path) do
+      send(:bt_cleanup_test, {:cleanup_started, self(), path})
+
+      receive do
+        :release -> :ok
+      end
+    end
+
+    @impl true
+    def remove(_c, _adapter, path) do
+      send(:bt_cleanup_test, {:removed, path})
+      :ok
+    end
+
+    @impl true
+    def start_discovery(_c, _a), do: :ok
+    @impl true
+    def stop_discovery(_c, _a), do: :ok
+    @impl true
+    def pair(_c, _p), do: :ok
+    @impl true
+    def set_trusted(_c, _p, _v), do: :ok
+    @impl true
+    def connect(_c, _p), do: :ok
   end
 
   setup do
@@ -289,6 +341,20 @@ defmodule UniversalProxy.BluetoothTest do
       assert subtree_pid(dynsup) == pid_before
     end
 
+    test "is refused while the radio list is unavailable, leaving the settings untouched" do
+      %{dynsup: dynsup} = start_subsystem()
+      :ok = Bluetooth.set_role(@hci1_mac, :tuya_mesh)
+      [{_, pid_before, _, _}] = DynamicSupervisor.which_children(dynsup)
+      stop_supervised!(RadioMonitor)
+
+      # Unverifiable MAC: accepting it would demote the real mesh radio.
+      assert Bluetooth.set_role("00:11:22:33:44:55", :tuya_mesh) ==
+               {:error, :radios_unavailable}
+
+      assert Settings.get().roles == %{@hci1_mac => :tuya_mesh}
+      assert [{_, ^pid_before, _, _}] = DynamicSupervisor.which_children(dynsup)
+    end
+
     test "is refused for a MAC no present radio has" do
       start_subsystem()
 
@@ -304,6 +370,43 @@ defmodule UniversalProxy.BluetoothTest do
 
       assert Settings.get().roles == %{@hci0_mac => :tuya_mesh, @hci1_mac => :off}
       assert :persistent_term.get(DevicePath.excluded_adapters_key()) == [@hci0_mac]
+    end
+  end
+
+  describe "set_role/2 bond cleanup before a restart" do
+    test "leaving :audio for a role that restarts the subtree waits for the cleanup" do
+      %{dynsup: dynsup} = start_subsystem()
+      Process.register(self(), :bt_cleanup_test)
+      start_supervised!({Task.Supervisor, name: __MODULE__.CleanupTasks})
+
+      start_supervised!(
+        {AudioManager,
+         conn: nil,
+         ops: BlockingOps,
+         settings: Settings,
+         task_supervisor: __MODULE__.CleanupTasks,
+         reconnect_on_boot: false}
+      )
+
+      :ok = Bluetooth.set_role(@hci1_mac, :audio)
+      [{_, pid_before, _, _}] = DynamicSupervisor.which_children(dynsup)
+
+      # :audio -> :proxy moves the proxy radio, so the subtree restarts.
+      setter = Task.async(fn -> Bluetooth.set_role(@hci1_mac, :proxy) end)
+
+      speaker = BlockingOps.speaker_path()
+      assert_receive {:cleanup_started, cleanup_pid, ^speaker}, 1_000
+
+      # Cleanup still running: the subtree hasn't been touched yet.
+      refute Task.yield(setter, 100)
+      assert [{_, ^pid_before, _, _}] = DynamicSupervisor.which_children(dynsup)
+
+      send(cleanup_pid, :release)
+      assert Task.await(setter) == :ok
+
+      assert_received {:removed, ^speaker}
+      [{_, pid_after, _, _}] = DynamicSupervisor.which_children(dynsup)
+      assert pid_after != pid_before
     end
   end
 end

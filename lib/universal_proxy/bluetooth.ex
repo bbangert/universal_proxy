@@ -76,7 +76,9 @@ defmodule UniversalProxy.Bluetooth do
   custom systems) hot-plugged later is picked up by the next cycle.
   """
 
-  alias UniversalProxy.Bluetooth.{AudioManager, Manager, RadioMonitor, Radios, Settings, Stats}
+  require Logger
+
+  alias UniversalProxy.Bluetooth.{AudioManager, Manager, RadioMonitor, Settings, Stats}
   alias UniversalProxy.ESPHome.{BluetoothProxy, BluetoothScanner}
 
   @bluetooth_targets [:rpi, :rpi0, :rpi0_2, :rpi2, :rpi3, :rpi4, :rpi5, :x86_64]
@@ -94,6 +96,11 @@ defmodule UniversalProxy.Bluetooth do
   # heartbeat is their only RSSI refresh; 1.5 s is presence-grade and still
   # forwards far less than an ESP32 proxy's per-advert relay.
   @rssi_heartbeat_ms 1_500
+
+  # Upper bound on waiting for a leaving-:audio radio's bond cleanup before a
+  # subtree restart (see do_set_role/2). Disconnect + RemoveDevice per speaker
+  # normally take well under a second each.
+  @bond_cleanup_timeout_ms 10_000
 
   @doc """
   Whether this build targets BT-capable hardware (compile-time constant).
@@ -411,15 +418,19 @@ defmodule UniversalProxy.Bluetooth do
 
   `:tuya_mesh` dedicates the radio to the mesh, so it needs another radio
   left over for everything else: it is refused with
-  `{:error, :needs_second_radio}` on a lone-radio board, and with
-  `{:error, :unknown_radio}` when no present radio has that MAC.
+  `{:error, :needs_second_radio}` on a lone-radio board, with
+  `{:error, :unknown_radio}` when no present radio has that MAC, and with
+  `{:error, :radios_unavailable}` while the radio list is empty (monitor
+  down, or no radio answering yet), since the MAC can't be checked then.
 
   Because BlueZ bonds are per-adapter, a radio **leaving** the `:audio` role
   would orphan its paired speakers — so this disconnects + forgets them
   (`AudioManager.forget_all_on_adapter/2`). When the change moves the
   proxy-role radio or the mesh radio, the BlueZ subtree is restarted (the
   claim, its exclusions and Mgmt are all decided at subtree start);
-  otherwise it just rebroadcasts status. When the change flips the role-paused state
+  otherwise it just rebroadcasts status. A restart waits for that bond
+  cleanup first (bounded; logged and skipped on timeout), because the
+  cleanup task runs inside the subtree being restarted. When the change flips the role-paused state
   (`Settings.proxy_paused?/1`), the Manager's reconcile bounces espex so the
   HA-facing feature flags follow — pausing really stops the proxy, resuming
   re-advertises it.
@@ -450,14 +461,13 @@ defmodule UniversalProxy.Bluetooth do
 
   def set_role(mac, role) when is_binary(mac), do: do_set_role(mac, role)
 
-  # The mesh radio must be present and leave at least one other radio. The
-  # monitor's list carries MACs; when it's empty (monitor down, daemon not
-  # answering yet) only the sysfs count is known, so presence can't be
-  # checked and the count alone decides.
+  # The mesh radio must be present and leave at least one other radio. An
+  # empty list (monitor down, daemon not answering) can't confirm the MAC, and
+  # an unchecked one would still demote the real mesh radio, so refuse.
   defp check_mesh_radio(mac) do
     case list_radios() do
       [] ->
-        if length(Radios.enumerate()) >= 2, do: :ok, else: {:error, :needs_second_radio}
+        {:error, :radios_unavailable}
 
       radios ->
         cond do
@@ -476,22 +486,25 @@ defmodule UniversalProxy.Bluetooth do
     before_role = Settings.role(settings, normalized)
 
     with :ok <- Settings.set_role(normalized, role) do
+      after_settings = Settings.get()
+
+      restart? =
+        Settings.proxy_adapter(after_settings) != before_proxy or
+          Settings.tuya_adapter(after_settings) != before_tuya
+
       # Only when a radio actually LEAVES the :audio role do we forget its
       # per-adapter bonds — matching the UI's deactivate-confirm, which gates on
       # the same transition. Other transitions (e.g. :off -> :proxy) must not
       # forget (the radio holds no audio bonds to begin with, and there'd be no
       # confirmation step).
       if before_role == :audio and role != :audio do
-        AudioManager.forget_all_on_adapter(normalized)
+        forget_bonds(normalized, restart?)
       end
 
       # The Manager owns the pausedness→espex reaction: its reconcile
       # detects a proxy_paused?/1 flip and bounces espex itself, serialized
       # in one process so concurrent setters can't misattribute the flip.
-      after_settings = Settings.get()
-
-      if Settings.proxy_adapter(after_settings) != before_proxy or
-           Settings.tuya_adapter(after_settings) != before_tuya do
+      if restart? do
         :ok = Manager.reconcile(restart: true)
       else
         :ok = Manager.reconcile()
@@ -502,6 +515,24 @@ defmodule UniversalProxy.Bluetooth do
     end
   catch
     :exit, _ -> {:error, :unavailable}
+  end
+
+  # The cleanup task runs under the AudioManager's Task.Supervisor, inside the
+  # Bluez subtree, so a restart right after it would kill it mid-way. Wait for
+  # it when a restart follows; a timeout is logged and the restart goes ahead.
+  defp forget_bonds(mac, false), do: AudioManager.forget_all_on_adapter(mac)
+
+  defp forget_bonds(mac, true) do
+    case AudioManager.forget_all_on_adapter_sync(mac, @bond_cleanup_timeout_ms) do
+      :ok ->
+        :ok
+
+      {:error, :timeout} ->
+        Logger.warning(
+          "Bluetooth: bond cleanup on #{mac} still running after " <>
+            "#{@bond_cleanup_timeout_ms} ms; restarting the subtree anyway"
+        )
+    end
   end
 
   # Espex restart so device-info feature flags follow the settings — async

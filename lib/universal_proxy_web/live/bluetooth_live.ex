@@ -393,10 +393,10 @@ defmodule UniversalProxyWeb.BluetoothLive do
         |> assign(:busy, false)
         |> assign(:role_error, nil)
 
-      {:error, :needs_second_radio} ->
+      {:error, reason} when reason in [:needs_second_radio, :radios_unavailable] ->
         socket
         |> assign(:busy, false)
-        |> assign(:role_error, role_error(:needs_second_radio))
+        |> assign(:role_error, role_error(reason))
 
       {:error, reason} ->
         Logger.warning("Bluetooth set_role failed: #{inspect(reason)}")
@@ -449,6 +449,10 @@ defmodule UniversalProxyWeb.BluetoothLive do
     do:
       "The Tuya mesh needs a radio of its own. Plug in a second Bluetooth adapter first, " <>
         "so the proxy keeps one."
+
+  defp role_error(:radios_unavailable),
+    do:
+      "The radio list isn't available yet, so the Tuya mesh can't be assigned. Try again shortly."
 
   defp scan_error(:no_audio_adapter), do: "Assign a radio to the Audio role first."
   defp scan_error(:not_audio_adapter), do: "That radio isn't set to Audio."

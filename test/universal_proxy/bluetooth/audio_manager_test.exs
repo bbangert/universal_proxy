@@ -69,6 +69,16 @@ defmodule UniversalProxy.Bluetooth.AudioManagerTest do
     @impl true
     def disconnect(_c, p) do
       record({:disconnect, p})
+
+      # Optional gate: hold the cleanup until the test sends :release.
+      if cfg(:block_disconnect, false) do
+        record({:disconnect_blocked, self()})
+
+        receive do
+          :release -> :ok
+        end
+      end
+
       :ok
     end
 
@@ -444,6 +454,56 @@ defmodule UniversalProxy.Bluetooth.AudioManagerTest do
 
       # The speaker on the other audio adapter is untouched.
       refute_receive {:ops, {:remove, @adapter2, _}}, 150
+    end
+
+    test "forget_all_on_adapter_sync returns only once the cleanup has finished", %{
+      settings: settings
+    } do
+      with_audio_adapter(settings)
+
+      MockOps.configure(%{
+        devices: [dev(@hs_path, @hs, %{"UUIDs" => [@sink_uuid]})],
+        block_disconnect: true
+      })
+
+      mgr = start_manager(settings)
+
+      caller =
+        Task.async(fn -> AudioManager.forget_all_on_adapter_sync(mgr, @audio_mac, 5_000) end)
+
+      assert_receive {:ops, {:disconnect_blocked, cleanup}}
+      refute Task.yield(caller, 100)
+      # The wait is in the caller: the server keeps answering meanwhile.
+      assert is_list(AudioManager.list_headphones(mgr))
+
+      send(cleanup, :release)
+      assert Task.await(caller) == :ok
+      assert_received {:ops, {:remove, @adapter, @hs_path}}
+    end
+
+    test "forget_all_on_adapter_sync gives up after the timeout", %{settings: settings} do
+      with_audio_adapter(settings)
+
+      MockOps.configure(%{
+        devices: [dev(@hs_path, @hs, %{"UUIDs" => [@sink_uuid]})],
+        block_disconnect: true
+      })
+
+      mgr = start_manager(settings)
+
+      assert AudioManager.forget_all_on_adapter_sync(mgr, @audio_mac, 50) == {:error, :timeout}
+      assert_received {:ops, {:disconnect_blocked, cleanup}}
+      send(cleanup, :release)
+    end
+
+    test "forget_all_on_adapter_sync is :ok with nothing to clean or no server", %{
+      settings: settings
+    } do
+      mgr = start_manager(settings)
+
+      # No adapter with that MAC: no task to wait for.
+      assert AudioManager.forget_all_on_adapter_sync(mgr, @audio_mac, 50) == :ok
+      assert AudioManager.forget_all_on_adapter_sync(:no_such_server, @audio_mac, 50) == :ok
     end
 
     test "forget_all_on_adapter resolves even after the role flipped off (raw lookup)", %{

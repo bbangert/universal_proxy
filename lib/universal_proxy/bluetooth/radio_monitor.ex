@@ -133,16 +133,22 @@ defmodule UniversalProxy.Bluetooth.RadioMonitor do
 
     for radio <- sysfs do
       adapter = Map.get(live, radio.hci, %{})
+      role = adapter[:address] && Map.get(roles, adapter[:address])
 
       # Address and Name exist only via the daemon (the kernel exposes no
       # BT MAC in sysfs) — nil while the BlueZ subtree is down. in_use? =
       # the adapter our stack claimed AND the daemon is answering for it;
-      # independent of the HA-facing enabled toggle.
+      # independent of the HA-facing enabled toggle. Never the mesh radio:
+      # the client doesn't claim it, so a path match is only the hci0 default
+      # or a stale earlier claim.
       radio
       |> Map.put(:address, adapter[:address])
       |> Map.put(:name, adapter[:name])
-      |> Map.put(:in_use?, adapter != %{} and "/org/bluez/#{radio.hci}" == active_path)
-      |> Map.put(:role, adapter[:address] && Map.get(roles, adapter[:address]))
+      |> Map.put(
+        :in_use?,
+        role != :tuya_mesh and adapter != %{} and "/org/bluez/#{radio.hci}" == active_path
+      )
+      |> Map.put(:role, role)
     end
   end
 

@@ -452,6 +452,40 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
       assert %{proxying?: false, adapter: nil} = Manager.status(manager)
     end
 
+    test "status reports no adapter when the proxy radio is gone and only the mesh is left",
+         ctx do
+      # The proxy on hci0 was unplugged: its stale path matches no live
+      # adapter, and the only one left is the excluded mesh radio.
+      :persistent_term.put(DevicePath.adapter_path_key(), "/org/bluez/hci0")
+      :ok = Settings.set_role(ctx.settings, @hci1_mac, :tuya_mesh)
+
+      manager =
+        start_manager(ctx,
+          adapters_info_fun: fn ->
+            [%{path: "/org/bluez/hci1", address: @hci1_mac, name: "dongle", powered: true}]
+          end
+        )
+
+      assert %{proxying?: false, adapter: nil} = Manager.status(manager)
+    end
+
+    test "an unmatched path with a non-mesh radio still present keeps the adapter map", ctx do
+      :persistent_term.put(DevicePath.adapter_path_key(), "/org/bluez/hci2")
+      :ok = Settings.set_role(ctx.settings, @hci1_mac, :tuya_mesh)
+
+      manager =
+        start_manager(ctx,
+          adapters_info_fun: fn ->
+            [
+              %{path: "/org/bluez/hci0", address: @hci0_mac, name: "pi", powered: true},
+              %{path: "/org/bluez/hci1", address: @hci1_mac, name: "dongle", powered: true}
+            ]
+          end
+        )
+
+      assert %{proxying?: true, adapter: %{hci: "hci2", address: nil}} = Manager.status(manager)
+    end
+
     test "boot warns about a lone mesh radio but keeps the role", ctx do
       File.rm_rf!(Path.join(ctx.sysfs, "hci1"))
       :ok = Settings.set_role(ctx.settings, @hci0_mac, :tuya_mesh)

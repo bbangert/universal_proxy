@@ -380,18 +380,27 @@ defmodule UniversalProxy.Bluetooth.Manager do
   # first controller's hci name — address/name appear once the daemon is
   # up (adapters_info_fun is exit-safe and returns [] until then).
   #
-  # `:mesh` when the path names the excluded mesh radio. The client never
-  # claims it, so that's the hci0 default or a stale earlier claim, with
-  # nothing relaying; build_status/1 reports no adapter instead.
+  # `:mesh` when nothing but the excluded mesh radio can be relaying: the path
+  # names it (the client never claims it, so that's the hci0 default or a
+  # stale earlier claim), or the path names a radio that's gone and the mesh
+  # radio is all that's left. build_status/1 reports no adapter instead.
   defp adapter_status(state, running?, tuya_adapter) do
     if running? do
       path = DevicePath.adapter_path()
       hci = Path.basename(path)
+      live = state.adapters_info_fun.()
 
-      case Enum.find(state.adapters_info_fun.(), &(&1.path == path)) do
-        %{address: address} when is_binary(address) and address == tuya_adapter -> :mesh
-        %{address: address, name: name} -> %{hci: hci, address: address, name: name}
-        nil -> %{hci: hci, address: nil, name: nil}
+      case Enum.find(live, &(&1.path == path)) do
+        %{address: address} when is_binary(address) and address == tuya_adapter ->
+          :mesh
+
+        %{address: address, name: name} ->
+          %{hci: hci, address: address, name: name}
+
+        nil ->
+          if only_mesh_left?(live, tuya_adapter),
+            do: :mesh,
+            else: %{hci: hci, address: nil, name: nil}
       end
     else
       case Radios.sysfs_adapters(state.sysfs_root) do
@@ -400,6 +409,11 @@ defmodule UniversalProxy.Bluetooth.Manager do
       end
     end
   end
+
+  defp only_mesh_left?([_ | _] = live, mac) when is_binary(mac),
+    do: Enum.all?(live, &(Map.get(&1, :address) == mac))
+
+  defp only_mesh_left?(_live, _mac), do: false
 
   defp connection_usage do
     {free, total} = Bluez.Gatt.connections_free()
