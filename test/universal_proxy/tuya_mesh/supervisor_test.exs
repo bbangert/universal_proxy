@@ -27,18 +27,19 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
   setup %{tmp_dir: tmp_dir} do
     n = System.unique_integer([:positive])
 
+    pubsub = :"tuya_pubsub_#{n}"
+    start_supervised!(pubsub_spec(pubsub))
+    Phoenix.PubSub.subscribe(pubsub, Resolver.topic())
+
     store =
       start_supervised!(
         {Store,
          name: nil,
          enabled: true,
+         pubsub: pubsub,
          table: :"tuya_sup_#{n}",
          dets_path: Path.join(tmp_dir, "m.dets")}
       )
-
-    pubsub = :"tuya_pubsub_#{n}"
-    start_supervised!({Phoenix.PubSub, name: pubsub})
-    Phoenix.PubSub.subscribe(pubsub, Resolver.topic())
 
     adapters =
       start_supervised!({Agent, fn -> [adapter(@mesh_mac, 1), adapter(@proxy_mac, 0)] end})
@@ -51,6 +52,8 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
 
     {:ok, store: store, pubsub: pubsub, adapters: adapters, names: names}
   end
+
+  defp pubsub_spec(pubsub), do: Supervisor.child_spec({Phoenix.PubSub, name: pubsub}, id: :pubsub)
 
   defp adapter(mac, index),
     do: %{path: "/org/bluez/hci#{index}", address: mac, name: nil, powered: true}
@@ -114,6 +117,12 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
     end
   catch
     :exit, _ -> nil
+  end
+
+  defp safe_keys(pubsub, pid) do
+    Registry.keys(pubsub, pid)
+  rescue
+    ArgumentError -> []
   end
 
   defp wait_until(fun, timeout \\ 2_000) do
@@ -303,6 +312,117 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
       Process.sleep(100)
       assert mesh_pid(ctx) == nil
       assert %{state: :idle, reason: :adapter_missing} = status(ctx)
+    end
+  end
+
+  describe "subscriptions and inventory changes" do
+    setup ctx do
+      {:ok, _} = Store.replace(inventory(), [], ctx.store)
+      # No tick: only events can make the Resolver react.
+      start_mesh_sup(ctx, tick_ms: 60_000)
+      assert mesh_index(ctx) == 1
+      :ok
+    end
+
+    test "a PubSub restart doesn't lose the adapter subscription", ctx do
+      resolver = Process.whereis(ctx.names.resolver)
+      # This process subscribed too (setup), so the registry is linked to it.
+      Process.flag(:trap_exit, true)
+      stop_supervised!(:pubsub)
+      start_supervised!(pubsub_spec(ctx.pubsub))
+
+      wait_until(fn ->
+        Bluez.Client.adapters_topic() in safe_keys(ctx.pubsub, resolver) and
+          Store.topic() in safe_keys(ctx.pubsub, resolver)
+      end)
+
+      # Subscribed once, not twice.
+      assert Enum.count(safe_keys(ctx.pubsub, resolver), &(&1 == Store.topic())) == 1
+
+      set_adapters(ctx, [adapter(@proxy_mac, 0)])
+      adapters_changed(ctx)
+      wait_until(fn -> mesh_pid(ctx) == nil end, 500)
+      assert Process.whereis(ctx.names.resolver) == resolver
+    end
+
+    test "a persisted group removal reaches the status and its broadcast", ctx do
+      assert %{groups: [%{local_id: 1}]} = status(ctx)
+      Phoenix.PubSub.subscribe(ctx.pubsub, Store.topic())
+
+      # Seq-only: no re-read.
+      :ok = Store.persist(%{inventory() | seq: 132}, ctx.store)
+      refute_receive {:tuya_mesh_store, _}, 100
+
+      # A Lights persist after a group delete.
+      :ok = Store.persist(%{inventory() | seq: 132, groups: []}, ctx.store)
+      assert_receive {:tuya_mesh_store, :inventory_changed}
+      assert_receive {:tuya_mesh_status, %{groups: [], bulbs: [_, _]}}
+      assert %{groups: []} = status(ctx)
+    end
+  end
+
+  describe "key redaction" do
+    @local_keys ["abcdefghijklmnop", "ponmlkjihgfedcba"]
+
+    defp refute_keys(text) do
+      raw = Base.decode16!(@beacon_key, case: :lower)
+
+      for secret <- [@beacon_key, String.upcase(@beacon_key) | @local_keys] do
+        refute text =~ secret
+      end
+
+      refute text =~ raw
+      refute text =~ inspect(raw)
+      refute text =~ raw |> :binary.bin_to_list() |> Enum.join(", ")
+    end
+
+    # Raises a FunctionClauseError whose arguments and top stack frame hold
+    # the inventory (as a crash in a key-handling callback would).
+    def explode(%{"never" => _}), do: :ok
+
+    test "a crash while handling an upload leaves no key in any report", ctx do
+      once = start_supervised!({Agent, fn -> true end}, id: :once)
+      inv = inventory()
+
+      spec = fn index, mac ->
+        if Agent.get_and_update(once, &{&1, false}),
+          do: apply(__MODULE__, :explode, [Inventory.to_map(inv)]),
+          else: fake_mesh(index, mac)
+      end
+
+      start_mesh_sup(ctx, mesh_spec_fun: spec)
+
+      log =
+        capture_log(fn ->
+          catch_exit(Resolver.replace(inv, [], ctx.names.resolver))
+          # The restarted Resolver starts the mesh.
+          wait_until(fn -> is_pid(mesh_pid(ctx)) end)
+        end)
+
+      assert log =~ "TuyaMesh.Resolver: FunctionClauseError raised"
+      refute_keys(log)
+    end
+
+    test "format_status keeps keys out of messages, logs and reasons" do
+      inv = inventory()
+      map = Inventory.to_map(inv)
+      call = {:"$gen_call", {self(), make_ref()}, {:replace, inv, []}}
+
+      status =
+        Resolver.format_status(%{
+          state: %{mac: @mesh_mac, inventory: %{bulbs: [], groups: []}},
+          message: call,
+          queue: [call],
+          log: [{:in, call}, {:noreply, %{inventory: inv}}],
+          reason:
+            {%FunctionClauseError{module: Mesh, function: :x, arity: 1, args: [map]},
+             [{Mesh, :x, [map], []}]}
+        })
+
+      refute_keys(inspect(status, limit: :infinity, printable_limit: :infinity))
+      assert {:"$gen_call", _from, {:replace, :redacted, []}} = status.message
+      assert {{:exception, FunctionClauseError}, [{Mesh, :x, 1, []}]} = status.reason
+      assert status.state.mac == @mesh_mac
     end
   end
 

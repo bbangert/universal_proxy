@@ -488,7 +488,57 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
     end
   end
 
+  describe "inventory change notifications" do
+    test "on uploads, group changes and clears; not on seq-only writes", ctx do
+      pubsub = :"store_pubsub_#{System.unique_integer([:positive])}"
+      start_supervised!({Phoenix.PubSub, name: pubsub})
+      Phoenix.PubSub.subscribe(pubsub, Store.topic())
+
+      store =
+        start_store(Path.join(ctx.tmp_dir, "n.dets"), :"n_#{System.unique_integer()}",
+          id: :notifying,
+          pubsub: pubsub
+        )
+
+      {:ok, _} = Store.replace(inventory(), [], store)
+      assert_receive {:tuya_mesh_store, :inventory_changed}
+
+      :ok = Store.persist(%{inventory() | seq: 132}, store)
+      :ok = Store.tighten(%{inventory() | seq: 101}, 132, store)
+      refute_receive {:tuya_mesh_store, _}, 50
+
+      :ok = Store.persist(%{inventory() | seq: 140, groups: []}, store)
+      assert_receive {:tuya_mesh_store, :inventory_changed}
+
+      :ok = Store.clear(store)
+      assert_receive {:tuya_mesh_store, :inventory_changed}
+      :ok = Store.clear(store)
+      refute_receive {:tuya_mesh_store, _}, 50
+    end
+  end
+
   describe "redaction" do
+    # Fails with the records (keys and all) as its arguments, as a BIF
+    # refusing them would.
+    def explode(%{never: _}), do: :ok
+
+    test "a crash in a call leaves no key in the reports", ctx do
+      store =
+        start_store(Path.join(ctx.tmp_dir, "x.dets"), :"x_#{System.unique_integer()}",
+          id: :exploding,
+          write_fun: fn _table, records -> apply(__MODULE__, :explode, [records]) end
+        )
+
+      log =
+        capture_log(fn ->
+          catch_exit(GenServer.call(store, {:replace, inventory(), []}))
+          Process.sleep(50)
+        end)
+
+      assert log =~ "TuyaMesh.Store: FunctionClauseError raised"
+      refute_secrets(log)
+    end
+
     test "format_status keeps keys out of messages, logs and crash reasons" do
       inv = inventory()
       map = Inventory.to_map(inv)

@@ -74,7 +74,13 @@ defmodule UniversalProxy.TuyaMesh.Store do
   Mappings are written in the same DETS insert as the inventory they belong
   to.
 
-  Tests can override `:dets_path`, `:table`, `:name`, `:chmod_fun`
+  After every write that changes what the inventory summary shows (an
+  upload, a clear, a persist that changed the groups), `{:tuya_mesh_store,
+  :inventory_changed}` is broadcast on `topic/0` (`:pubsub`, default
+  `UniversalProxy.PubSub`). It carries nothing; subscribers re-read with
+  `load/1`. Seq-only writes (persist, tighten) stay silent.
+
+  Tests can override `:pubsub`, `:dets_path`, `:table`, `:name`, `:chmod_fun`
   (`(path, mode -> :ok | {:error, term()})`), `:write_fun` (`(table,
   records -> :ok | {:error, term()})`, one atomic insert) and `:enabled` (default:
   `UniversalProxy.Bluetooth.supported?/0`; when false, `start_link/1`
@@ -86,6 +92,9 @@ defmodule UniversalProxy.TuyaMesh.Store do
   require Logger
 
   alias UniversalProxy.TuyaBeaconMesh.{Crypto, Inventory, Seq}
+  alias UniversalProxy.TuyaMesh.Redact
+
+  @topic "tuya_mesh:store"
 
   @default_table :tuya_mesh
   @default_settings %{min_mireds: 154, max_mireds: 370, invert: false}
@@ -122,6 +131,10 @@ defmodule UniversalProxy.TuyaMesh.Store do
   def child_spec(opts) do
     %{id: Keyword.get(opts, :id, __MODULE__), start: {__MODULE__, :start_link, [opts]}}
   end
+
+  @doc "PubSub topic of `{:tuya_mesh_store, :inventory_changed}` broadcasts."
+  @spec topic() :: String.t()
+  def topic, do: @topic
 
   @doc """
   The stored inventory, re-validated: `{:ok, inventory}`, or
@@ -258,7 +271,13 @@ defmodule UniversalProxy.TuyaMesh.Store do
         case chmod_fun.(path, 0o600) do
           :ok ->
             Logger.info("TuyaMesh.Store opened at #{path}")
-            {:ok, %{table: table, write_fun: Keyword.get(opts, :write_fun, &default_write/2)}}
+
+            {:ok,
+             %{
+               table: table,
+               write_fun: Keyword.get(opts, :write_fun, &default_write/2),
+               pubsub: Keyword.get(opts, :pubsub, UniversalProxy.PubSub)
+             }}
 
           {:error, reason} ->
             Logger.error(
@@ -279,22 +298,29 @@ defmodule UniversalProxy.TuyaMesh.Store do
   @impl GenServer
   def terminate(_reason, %{table: table}), do: :dets.close(table)
 
+  # Requests carry inventories and the table holds them: anything raised
+  # in here leaves as a key-free Redact.Error (see Redact.guard/2).
   @impl GenServer
-  def handle_call(:load, _from, state) do
+  def handle_call(request, from, state),
+    do: Redact.guard("TuyaMesh.Store", fn -> do_call(request, from, state) end)
+
+  defp do_call(:load, _from, state) do
     {:reply, load_stored(state.table), state}
   end
 
-  def handle_call({:persist, input, mode}, _from, state) do
+  defp do_call({:persist, input, mode}, _from, state) do
     with {:ok, inv} <- validate(input),
          {:ok, stored} <- fetch_stored(state.table),
-         :ok <- check_persistable(stored, inv, mode) do
-      {:reply, write_inventory(state, inv, [], :same_mesh), state}
+         :ok <- check_persistable(stored, inv, mode),
+         :ok <- write_inventory(state, inv, [], :same_mesh) do
+      if inv.groups != stored.groups, do: notify(state)
+      {:reply, :ok, state}
     else
       {:error, _reason} = error -> {:reply, error, state}
     end
   end
 
-  def handle_call({:classify, input}, _from, state) do
+  defp do_call({:classify, input}, _from, state) do
     reply =
       case validate(input) do
         {:ok, inv} -> classify_against(valid_or_nil(state.table), inv)
@@ -304,7 +330,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
     {:reply, reply, state}
   end
 
-  def handle_call({:preview, input}, _from, state) do
+  defp do_call({:preview, input}, _from, state) do
     reply =
       case validate(input) do
         {:ok, inv} -> {:ok, build_preview(valid_or_nil(state.table), inv)}
@@ -314,7 +340,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
     {:reply, reply, state}
   end
 
-  def handle_call({:replace, input, opts}, _from, state) do
+  defp do_call({:replace, input, opts}, _from, state) do
     reply =
       case validate(input) do
         {:ok, inv} -> do_replace(state, inv, opts)
@@ -324,7 +350,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
     {:reply, reply, state}
   end
 
-  def handle_call({:clear, opts}, _from, state) do
+  defp do_call({:clear, opts}, _from, state) do
     reply =
       case stored(state.table) do
         :absent ->
@@ -351,11 +377,11 @@ defmodule UniversalProxy.TuyaMesh.Store do
     {:reply, reply, state}
   end
 
-  def handle_call(:device_ids, _from, state) do
+  defp do_call(:device_ids, _from, state) do
     {:reply, lookup(state.table, :device_ids, %{}), state}
   end
 
-  def handle_call({:allocate, keys}, _from, state) do
+  defp do_call({:allocate, keys}, _from, state) do
     {ids, next} = allocate(lookup(state.table, :device_ids, %{}), state.table, keys)
 
     reply =
@@ -367,11 +393,11 @@ defmodule UniversalProxy.TuyaMesh.Store do
     {:reply, reply, state}
   end
 
-  def handle_call(:settings, _from, state) do
+  defp do_call(:settings, _from, state) do
     {:reply, current_settings(state.table), state}
   end
 
-  def handle_call({:put_settings, changes}, _from, state) do
+  defp do_call({:put_settings, changes}, _from, state) do
     merged =
       Map.merge(current_settings(state.table), Map.take(changes, Map.keys(@default_settings)))
 
@@ -384,15 +410,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
   end
 
   @impl GenServer
-  def format_status(status) do
-    Map.new(status, fn
-      {:message, m} -> {:message, redact_message(m)}
-      {:queue, q} when is_list(q) -> {:queue, Enum.map(q, &redact_message/1)}
-      {:log, log} when is_list(log) -> {:log, Enum.map(log, &redact_log_entry/1)}
-      {:reason, r} -> {:reason, redact_reason(r)}
-      other -> other
-    end)
-  end
+  def format_status(status), do: Redact.format_status(status)
 
   # ── Replace ──────────────────────────────────────────────────────────
 
@@ -451,8 +469,12 @@ defmodule UniversalProxy.TuyaMesh.Store do
     floors = Map.delete(floors, fingerprint(inv.beacon_key))
 
     case write_inventory(state, inv, [{:seq_floors, floors}], over) do
-      :ok -> {:ok, kind}
-      error -> error
+      :ok ->
+        notify(state)
+        {:ok, kind}
+
+      error ->
+        error
     end
   end
 
@@ -588,7 +610,18 @@ defmodule UniversalProxy.TuyaMesh.Store do
   # A cleared inventory is stored as `nil`, so the clear is one insert too.
   defp write_clear(state, floors) do
     ids = state.table |> lookup(:device_ids, %{}) |> prune_groups([])
-    write(state, [{:inventory, nil}, {:device_ids, ids}, {:seq_floors, floors}])
+
+    with :ok <- write(state, [{:inventory, nil}, {:device_ids, ids}, {:seq_floors, floors}]) do
+      notify(state)
+    end
+  end
+
+  # PubSub's registry raises (not exits) when it isn't started.
+  defp notify(state) do
+    Phoenix.PubSub.broadcast(state.pubsub, @topic, {:tuya_mesh_store, :inventory_changed})
+    :ok
+  rescue
+    ArgumentError -> :ok
   end
 
   defp write(state, inserts) do
@@ -678,38 +711,4 @@ defmodule UniversalProxy.TuyaMesh.Store do
       do: "/data/tuya_mesh.dets",
       else: Path.join([File.cwd!(), "_build", "tuya_mesh.dets"])
   end
-
-  # ── Redaction ────────────────────────────────────────────────────────
-
-  defp redact_message({:"$gen_call", from, request}),
-    do: {:"$gen_call", from, redact_request(request)}
-
-  defp redact_message(message), do: redact_request(message)
-
-  defp redact_request({:persist, _inv, mode}), do: {:persist, :redacted, mode}
-  defp redact_request({:classify, _inv}), do: {:classify, :redacted}
-  defp redact_request({:preview, _inv}), do: {:preview, :redacted}
-  defp redact_request({:replace, _inv, opts}), do: {:replace, :redacted, opts}
-  defp redact_request(request) when is_tuple(request) or is_map(request), do: :redacted
-  defp redact_request(request), do: request
-
-  defp redact_log_entry(entry) when is_tuple(entry) do
-    entry |> Tuple.to_list() |> Enum.map(&redact_message/1) |> List.to_tuple()
-  end
-
-  defp redact_log_entry(_entry), do: :redacted
-
-  # A crash reason can hold whatever was being matched (the stored map,
-  # keys and all): keep the exception module and the stack's arities.
-  defp redact_reason({reason, [_ | _] = stack}),
-    do: {redact_exception(reason), Enum.map(stack, &arity_frame/1)}
-
-  defp redact_reason(reason), do: redact_exception(reason)
-
-  defp redact_exception(%{__exception__: true, __struct__: module}), do: {:exception, module}
-  defp redact_exception(reason) when is_atom(reason), do: reason
-  defp redact_exception(_reason), do: :redacted
-
-  defp arity_frame({m, f, args, loc}) when is_list(args), do: {m, f, length(args), loc}
-  defp arity_frame(frame), do: frame
 end

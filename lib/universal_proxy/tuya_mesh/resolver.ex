@@ -54,9 +54,17 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   mesh, so it stays cheap. The state is kept current by subscribing to the
   Radio's reports (each burst triggers one `Lights.all/1` read, 300 ms
   later) and by a 5 s tick that reads `Radio.status/1` (the Radio publishes
-  no readiness events) and re-evaluates reachability. Every change is
-  broadcast on `UniversalProxy.PubSub` topic `"tuya_mesh"` as
+  no readiness events) and re-evaluates reachability. The bulb and group
+  lists come from the Store, re-read on its `{:tuya_mesh_store,
+  :inventory_changed}` broadcasts (`Store.topic/0`), so a group removed by
+  a Lights persist disappears too; seq-only writes cause no re-read. Every
+  change is broadcast on `UniversalProxy.PubSub` topic `"tuya_mesh"` as
   `{:tuya_mesh_status, status}`. Statuses carry no keys.
+
+  Both subscriptions survive a PubSub restart: the Resolver monitors the
+  PubSub registry and subscribes again once it is back.
+  Uploads pass the inventory, keys and all, through `replace/3`, so
+  `format_status/1` and every call handler redact it (`Redact`).
 
   Options: `:tuya_adapter`, `:dynsup`, `:name`, and test seams `:store`,
   `:adapters_fun`, `:mesh_spec_fun` (`(index, mac -> child_spec)`), `:radio`,
@@ -69,7 +77,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   require Logger
 
   alias UniversalProxy.TuyaBeaconMesh.{Inventory, Lights, Radio}
-  alias UniversalProxy.TuyaMesh.{Mesh, Store}
+  alias UniversalProxy.TuyaMesh.{Mesh, Redact, Store}
 
   @topic "tuya_mesh"
   @retry_ms 2_000
@@ -78,6 +86,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   @tick_ms 5_000
   @index_check_ticks 6
   @report_debounce_ms 300
+  @resubscribe_ms 1_000
   @reachable_ms 300_000
   # Stopping the mesh waits for Lights (5 s) and the Radio's teardown (10 s).
   @change_timeout 30_000
@@ -202,19 +211,68 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
       subscribed: nil,
       lights_running: false,
       last_reports: %{},
-      published: nil
+      published: nil,
+      pubsub_mon: nil,
+      sub_timer: nil
     }
 
-    subscribe_adapters(state.pubsub)
-    {:ok, state, {:continue, :evaluate}}
+    {:ok, ensure_subscribed(state), {:continue, :evaluate}}
   end
 
-  # PubSub's registry raises (not exits) when it isn't started.
-  defp subscribe_adapters(pubsub) do
-    Phoenix.PubSub.subscribe(pubsub, Bluez.Client.adapters_topic())
-  rescue
-    ArgumentError -> :ok
+  # ── Subscriptions ────────────────────────────────────────────────────
+
+  # Adapter changes and Store inventory changes both arrive over PubSub,
+  # which is a sibling at the application's top level and may restart on
+  # its own, taking every subscription with it. The Registry behind it is
+  # monitored and the subscriptions re-made (every second until it is back);
+  # each tick also checks them, since a Registry partition can restart
+  # under the same top-level pid. Subscribing is skipped for a topic already
+  # held, as the registry is :duplicate and would deliver twice.
+  defp ensure_subscribed(state) do
+    state = cancel_sub_timer(state)
+
+    if subscribe_topics(state.pubsub) == :ok,
+      do: monitor_pubsub(state),
+      else: %{state | sub_timer: arm(:resubscribe, @resubscribe_ms)}
   end
+
+  # Registry raises ArgumentError when it isn't running.
+  defp subscribe_topics(pubsub) do
+    held = Registry.keys(pubsub, self())
+
+    for topic <- [Bluez.Client.adapters_topic(), Store.topic()], topic not in held do
+      :ok = Phoenix.PubSub.subscribe(pubsub, topic)
+    end
+
+    :ok
+  rescue
+    ArgumentError -> :error
+  end
+
+  defp monitor_pubsub(state) do
+    case {GenServer.whereis(state.pubsub), state.pubsub_mon} do
+      {pid, {pid, _mon}} ->
+        state
+
+      {pid, previous} when is_pid(pid) ->
+        with {_old, mon} <- previous, do: Process.demonitor(mon, [:flush])
+        %{state | pubsub_mon: {pid, Process.monitor(pid)}}
+
+      {_none, _previous} ->
+        state
+    end
+  end
+
+  defp cancel_sub_timer(%{sub_timer: {_token, tref}} = state) do
+    Process.cancel_timer(tref)
+    %{state | sub_timer: nil}
+  end
+
+  defp cancel_sub_timer(state), do: state
+
+  # Uploads bring the whole inventory, keys and all, through here.
+  @impl GenServer
+  def format_status(status), do: Redact.format_status(status)
 
   @impl GenServer
   def terminate(_reason, state) do
@@ -224,32 +282,43 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
     :exit, _reason -> :ok
   end
 
+  # Evaluation loads the inventory (keys and all) from the Store, so the
+  # continue and info callbacks are guarded like the calls.
   @impl GenServer
-  def handle_continue(:evaluate, state), do: {:noreply, state |> evaluate() |> publish()}
+  def handle_continue(:evaluate, state),
+    do: Redact.guard("TuyaMesh.Resolver", fn -> {:noreply, state |> evaluate() |> publish()} end)
 
+  # A :replace request holds the inventory, keys and all: anything raised
+  # while handling a call leaves as a key-free Redact.Error.
   @impl GenServer
-  def handle_call(:status, _from, state), do: {:reply, build_status(state), state}
+  def handle_call(request, from, state),
+    do: Redact.guard("TuyaMesh.Resolver", fn -> do_call(request, from, state) end)
 
-  def handle_call({:replace, inventory, opts}, _from, state) do
+  defp do_call(:status, _from, state), do: {:reply, build_status(state), state}
+
+  defp do_call({:replace, inventory, opts}, _from, state) do
     state = stop_mesh(state)
     reply = Store.replace(inventory, opts, state.store)
     {:reply, reply, %{state | backoff_ms: state.retry_ms} |> evaluate() |> publish()}
   end
 
-  def handle_call({:clear, opts}, _from, state) do
+  defp do_call({:clear, opts}, _from, state) do
     state = stop_mesh(state)
     reply = Store.clear(state.store, opts)
     {:reply, reply, %{state | backoff_ms: state.retry_ms} |> evaluate() |> publish()}
   end
 
   @impl GenServer
+  def handle_info(message, state),
+    do: Redact.guard("TuyaMesh.Resolver", fn -> do_info(message, state) end)
+
   # Timer messages carry the token they were armed with, so one that was
   # already delivered when its timer was cancelled is recognised and dropped.
-  def handle_info({:evaluate, token}, %{timer: {token, _}} = state),
+  defp do_info({:evaluate, token}, %{timer: {token, _}} = state),
     do: {:noreply, %{state | timer: nil} |> evaluate() |> publish()}
 
-  def handle_info({:tick, token}, %{timer: {token, _}, mesh: %{}} = state) do
-    state = %{state | timer: nil, ticks: state.ticks + 1}
+  defp do_info({:tick, token}, %{timer: {token, _}, mesh: %{}} = state) do
+    state = %{state | timer: nil, ticks: state.ticks + 1} |> ensure_subscribed()
 
     state =
       if rem(state.ticks, @index_check_ticks) == 0,
@@ -259,29 +328,39 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
     {:noreply, state |> observe() |> schedule_tick() |> publish()}
   end
 
-  def handle_info({:bluetooth_adapters_changed}, %{mesh: %{}} = state),
+  defp do_info({:resubscribe, token}, %{sub_timer: {token, _}} = state),
+    do: {:noreply, %{state | sub_timer: nil} |> ensure_subscribed()}
+
+  defp do_info({:DOWN, mon, :process, _pid, _reason}, %{pubsub_mon: {_pid2, mon}} = state),
+    do: {:noreply, %{state | pubsub_mon: nil} |> ensure_subscribed()}
+
+  # Uploads, clears and group changes: re-read the summary (no keys kept).
+  defp do_info({:tuya_mesh_store, :inventory_changed}, state),
+    do: {:noreply, state |> load_inventory() |> publish()}
+
+  defp do_info({:bluetooth_adapters_changed}, %{mesh: %{}} = state),
     do: {:noreply, state |> check_index() |> publish()}
 
-  def handle_info({:bluetooth_adapters_changed}, state),
+  defp do_info({:bluetooth_adapters_changed}, state),
     do: {:noreply, %{state | backoff_ms: state.retry_ms} |> evaluate() |> publish()}
 
-  def handle_info({:tuya_report, _report}, %{refresh_timer: nil, mesh: %{}} = state) do
+  defp do_info({:tuya_report, _report}, %{refresh_timer: nil, mesh: %{}} = state) do
     {:noreply, %{state | refresh_timer: arm(:refresh_reports, @report_debounce_ms)}}
   end
 
-  def handle_info({:tuya_report, _report}, state), do: {:noreply, state}
+  defp do_info({:tuya_report, _report}, state), do: {:noreply, state}
 
-  def handle_info({:refresh_reports, token}, %{refresh_timer: {token, _}} = state) do
+  defp do_info({:refresh_reports, token}, %{refresh_timer: {token, _}} = state) do
     {:noreply, %{state | refresh_timer: nil} |> read_lights() |> publish()}
   end
 
-  def handle_info({:DOWN, mon, :process, _pid, _reason}, %{mesh: %{mon: mon}} = state) do
+  defp do_info({:DOWN, mon, :process, _pid, _reason}, %{mesh: %{mon: mon}} = state) do
     Logger.warning("TuyaMesh: mesh stopped on its own; retrying in #{state.restart_ms} ms")
     state = %{clear_mesh(state) | backoff_ms: state.restart_ms}
     {:noreply, state |> idle(:mesh_exited, true) |> publish()}
   end
 
-  def handle_info(_other, state), do: {:noreply, state}
+  defp do_info(_other, state), do: {:noreply, state}
 
   # ── Lifecycle ────────────────────────────────────────────────────────
 
