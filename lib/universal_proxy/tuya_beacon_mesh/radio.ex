@@ -58,7 +58,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   rotation" section, so we stop on our own timer). One advert is on air at
   a time, in the order sent, so sequence numbers go on air in the order
   they were handed out. Frames are sent with the app's queue classes
-  (tuya_beacon_mesh.md §4.7): a `:control` send (pair, reset, group)
+  (tuya_beacon_mesh.md §4.7): a `:control` send (reset, group)
   drops queued `:normal` sends (DP, ping); it does not interrupt the
   advert already on air.
 
