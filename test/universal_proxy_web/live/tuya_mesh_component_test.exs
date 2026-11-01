@@ -192,6 +192,13 @@ defmodule UniversalProxyWeb.TuyaMeshComponentTest do
       assert html =~ "Group removed: <strong>path and post</strong>"
       refute html =~ "Replace the stored mesh?"
       refute_secrets(html)
+      # The dump held for the confirm stays sealed in the LiveView process
+      # (where the component's state lives), under inspect and ~p alike.
+      # Its raw state: the channel's format_status(:normal) only summarises
+      # it, but format_status(:terminate) hands the whole state to crash
+      # reports.
+      KeyLeak.refute_keys(:sys.get_state(view.pid))
+      KeyLeak.refute_keys(:sys.get_status(view.pid))
       assert {:ok, %{bulbs: [_, _]}} = Store.load(ctx.store)
 
       html = view |> element("button[phx-click=confirm_upload]") |> render_click()
@@ -297,6 +304,41 @@ defmodule UniversalProxyWeb.TuyaMeshComponentTest do
       html = view |> element("button[phx-click=cancel_upload]") |> render_click()
       refute html =~ "Remove 2 bulbs?"
       assert {:ok, %{bulbs: [_, _, _]}} = Store.load(ctx.store)
+    end
+
+    test "a new submit drops the pending confirmation, whatever the new file is",
+         %{conn: conn} = ctx do
+      {:ok, _} = TuyaMesh.upload(KeyLeak.json())
+      view = mount_tab(conn)
+      [b2, _b3] = KeyLeak.json() |> Jason.decode!() |> Map.fetch!("bulbs")
+      removal = json(%{"bulbs" => [b2], "groups" => []})
+
+      # While a dialog is open, the form behind it is inert.
+      assert submit_upload(view, removal) =~ "Remove 1 bulb?"
+      assert has_element?(view, "#tuya-mesh-upload[inert]")
+      old = confirm_token(view)
+
+      # An invalid file: an error, and the old dialog is gone.
+      html = submit_upload(view, binary_part(KeyLeak.json(), 0, 120))
+      assert html =~ "it isn&#39;t valid JSON"
+      refute html =~ "Remove 1 bulb?"
+      refute has_element?(view, "#tuya-mesh-upload[inert]")
+
+      html =
+        view |> with_target("#tuya-mesh") |> render_click("confirm_upload", %{"token" => old})
+
+      refute html =~ "Inventory updated"
+      assert {:ok, %{bulbs: [_, _]}} = Store.load(ctx.store)
+
+      # A file that uploads directly (nothing removed): the old dialog's
+      # token confirms nothing afterwards.
+      assert submit_upload(view, removal) =~ "Remove 1 bulb?"
+      old = confirm_token(view)
+      html = submit_upload(view, KeyLeak.json())
+      assert html =~ "No bulbs or groups were added or removed."
+      refute html =~ "Remove 1 bulb?"
+      view |> with_target("#tuya-mesh") |> render_click("confirm_upload", %{"token" => old})
+      assert {:ok, %{bulbs: [_, _]}} = Store.load(ctx.store)
     end
 
     test "a confirm queued from a dialog that went stale can't confirm its replacement",

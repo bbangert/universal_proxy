@@ -110,7 +110,12 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   def handle_event("cancel_entry", %{"ref" => ref}, socket),
     do: {:noreply, cancel_upload(socket, :inventory, ref)}
 
+  # A new submit replaces any pending confirmation first (its dialog and
+  # sealed dump), whatever the new file turns out to be: Confirm must never
+  # act on an earlier file.
   def handle_event("upload", _params, socket) do
+    socket = assign(socket, :pending, nil)
+
     case uploaded_entries(socket, :inventory) do
       {[_ | _], []} ->
         socket = assign(socket, notice: nil, error: nil)
@@ -277,8 +282,11 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
           phx-change="validate"
           phx-target={@myself}
           phx-drop-target={@uploads.inventory.ref}
+          inert={@pending != nil}
           class="px-[22px] pb-[18px]"
         >
+          <%!-- Inert behind an open confirmation (not focusable or
+               clickable); the submit handler drops `:pending` anyway. --%>
           <div class="flex items-center gap-3 flex-wrap">
             <.live_file_input
               upload={@uploads.inventory}
@@ -289,7 +297,7 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
               type="submit"
               variant={:primary}
               size={:sm}
-              disabled={@uploads.inventory.entries == []}
+              disabled={@uploads.inventory.entries == [] or @pending != nil}
               phx-disable-with="Uploading…"
             >
               Upload dump
