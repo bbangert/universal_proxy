@@ -75,6 +75,17 @@ defmodule UniversalProxyWeb.TuyaMeshComponentTest do
     render(view)
   end
 
+  defp confirm_token(view) do
+    [token] =
+      view
+      |> render()
+      |> LazyHTML.from_fragment()
+      |> LazyHTML.query("button[phx-click=confirm_upload]")
+      |> LazyHTML.attribute("phx-value-token")
+
+    token
+  end
+
   defp refute_secrets(html) do
     KeyLeak.refute_keys(html)
     refute html =~ @other_key
@@ -117,10 +128,14 @@ defmodule UniversalProxyWeb.TuyaMeshComponentTest do
       assert html =~ "upload a fresh dump"
       assert html =~ "The mesh radio is dedicated"
 
+      # The file picker has an accessible name.
+      assert has_element?(view, ~s(input[type="file"][aria-label="Tuya mesh JSON key dump"]))
+
       idle = %{TuyaMesh.status() | reason: :no_inventory}
       html = push_status(view, idle)
       assert html =~ "Not set up"
       assert html =~ "Upload your mesh&#39;s JSON dump to start."
+      refute has_element?(view, "button[phx-click=ask_clear]")
     end
 
     test "a valid upload into an empty store succeeds and lists the bulbs", %{conn: conn} = ctx do
@@ -282,6 +297,37 @@ defmodule UniversalProxyWeb.TuyaMeshComponentTest do
       html = view |> element("button[phx-click=cancel_upload]") |> render_click()
       refute html =~ "Remove 2 bulbs?"
       assert {:ok, %{bulbs: [_, _, _]}} = Store.load(ctx.store)
+    end
+
+    test "a confirm queued from a dialog that went stale can't confirm its replacement",
+         %{conn: conn} = ctx do
+      {:ok, _} = TuyaMesh.upload(KeyLeak.json())
+      view = mount_tab(conn)
+      assert submit_upload(view, other_mesh_json()) =~ "Replace the stored mesh?"
+      old = confirm_token(view)
+
+      third = json(%{"beaconKey" => String.duplicate("ab", 16), "seq" => 9})
+      {:ok, :new_mesh} = TuyaMesh.upload(third, confirm: true)
+
+      # A double-click: both clicks carry the first dialog's token. The first
+      # goes stale and opens a fresh dialog; the second must not confirm it.
+      target = with_target(view, "#tuya-mesh")
+
+      assert render_click(target, "confirm_upload", %{"token" => old}) =~
+               "changed since you chose"
+
+      fresh = confirm_token(view)
+      assert fresh != old
+
+      html = render_click(target, "confirm_upload", %{"token" => old})
+      assert html =~ "Replace the stored mesh?"
+      assert html =~ "changed since you chose"
+      assert confirm_token(view) == fresh
+      assert {:ok, %{seq: 9}} = Store.load(ctx.store)
+
+      # The fresh dialog's own button still works.
+      assert render_click(target, "confirm_upload", %{"token" => fresh}) =~ "New mesh uploaded."
+      assert {:ok, %{beacon_key: @other_key}} = Store.load(ctx.store)
     end
 
     test "cancelling a new mesh leaves the store alone", %{conn: conn} = ctx do
@@ -458,15 +504,27 @@ defmodule UniversalProxyWeb.TuyaMeshComponentTest do
       :ok = :dets.insert(:sys.get_state(ctx.store).table, {:inventory, %{"bulbs" => []}})
       view = mount_tab(conn)
 
-      # Its bulbs can't be listed, so the button shows for the bad record.
-      html = push_status(view, %{TuyaMesh.status() | reason: :invalid_inventory})
-      assert html =~ "The stored inventory can&#39;t be read."
+      # Offline (no Resolver), an unreadable record lists no bulbs and reads
+      # as :not_running: Clear is still offered, as the way out.
+      assert %{reason: :not_running, bulbs: [], groups: []} = TuyaMesh.status()
+      assert has_element?(view, "button[phx-click=ask_clear]")
 
       view |> element("button[phx-click=ask_clear]") |> render_click()
-      html = view |> element("button[phx-click=confirm_clear]") |> render_click()
 
+      # A repeated click on the first dialog's button, queued behind the one
+      # that opened the force dialog, does nothing.
+      html = view |> with_target("#tuya-mesh") |> render_click("confirm_clear", %{})
       assert html =~ "Clear anyway (sequence will be lost)"
+      html = view |> with_target("#tuya-mesh") |> render_click("confirm_clear", %{})
+      assert html =~ "Clear anyway (sequence will be lost)"
+      assert {:error, {:invalid, _}} = Store.load(ctx.store)
 
+      # With the Resolver up, the same record reports :invalid_inventory.
+      html = push_status(view, %{TuyaMesh.status() | reason: :invalid_inventory})
+      assert html =~ "The stored inventory can&#39;t be read."
+      assert has_element?(view, "button[phx-click=ask_clear]")
+
+      # The force dialog is still the one open.
       html = view |> element("button[phx-click=confirm_force_clear]") |> render_click()
       assert html =~ "Inventory cleared."
 

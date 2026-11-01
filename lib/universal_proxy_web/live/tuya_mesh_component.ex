@@ -35,7 +35,10 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   component's `:pending` assign, sealed in a closure
   (`UniversalProxy.TuyaMesh.Redact.seal/1`) so a crash report or an
   inspected socket prints it as an opaque function. It is never rendered,
-  and is dropped on confirm, cancel, success and failure.
+  and is dropped on confirm, cancel, success and failure. Each dialog
+  carries a fresh token in its confirm button, and only a click with the
+  token of the dialog on screen uploads, so a click queued from a dialog
+  that went stale can't confirm its replacement unseen.
 
   Errors are rendered from their reasons, which carry no key material
   (`Inventory.decode/1` names entries by MAC, node id, group id or
@@ -128,10 +131,15 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
     end
   end
 
-  def handle_event("confirm_upload", _params, %{assigns: %{pending: nil}} = socket),
-    do: {:noreply, socket}
-
-  def handle_event("confirm_upload", _params, socket) do
+  # Only the dialog on screen can confirm: a click queued from an earlier
+  # one (a double-click on a dialog that then went stale) carries its old
+  # token and is ignored. Events run one at a time in this process, so the
+  # consumed token is also what stops a repeated confirm.
+  def handle_event(
+        "confirm_upload",
+        %{"token" => token},
+        %{assigns: %{pending: %{token: token}}} = socket
+      ) do
     %{inventory: sealed, preview: preview} = socket.assigns.pending
     socket = assign(socket, :pending, nil)
     confirm = if preview.mesh == :new_mesh, do: [confirm: true], else: []
@@ -149,6 +157,9 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   def handle_event("cancel_clear", _params, socket),
     do: {:noreply, assign(socket, :clearing, nil)}
 
+  # Each confirm only matches its own dialog's state, so a repeated or
+  # queued click (e.g. a second "Clear" after the force dialog replaced the
+  # first) falls through to the no-op clause.
   def handle_event("confirm_clear", _params, %{assigns: %{clearing: :confirm}} = socket),
     do: {:noreply, clear(socket, [])}
 
@@ -191,8 +202,15 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   defp needs_confirm?(%{mesh: :new_mesh}), do: true
   defp needs_confirm?(%{bulbs: %{removed: removed}}), do: removed != []
 
-  defp await_confirm(socket, json, preview, stale?),
-    do: assign(socket, :pending, %{inventory: Redact.seal(json), preview: preview, stale: stale?})
+  # Each dialog gets its own token, even for the same revision.
+  defp await_confirm(socket, json, preview, stale?) do
+    assign(socket, :pending, %{
+      inventory: Redact.seal(json),
+      preview: preview,
+      stale: stale?,
+      token: Integer.to_string(System.unique_integer([:positive]))
+    })
+  end
 
   defp clear(socket, opts) do
     case TuyaMesh.clear(opts) do
@@ -223,7 +241,7 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
         </.eyebrow>
         <div class="flex-1"></div>
         <.button
-          :if={@status.bulbs != [] or @status.reason == :invalid_inventory}
+          :if={clearable?(@status)}
           variant={:ghost}
           size={:sm}
           phx-click="ask_clear"
@@ -262,7 +280,11 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
           class="px-[22px] pb-[18px]"
         >
           <div class="flex items-center gap-3 flex-wrap">
-            <.live_file_input upload={@uploads.inventory} class="flex-1 min-w-0 text-sm text-fg-2" />
+            <.live_file_input
+              upload={@uploads.inventory}
+              aria-label="Tuya mesh JSON key dump"
+              class="flex-1 min-w-0 text-sm text-fg-2"
+            />
             <.button
               type="submit"
               variant={:primary}
@@ -351,6 +373,7 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
         :if={@pending}
         preview={@pending.preview}
         stale={@pending.stale}
+        token={@pending.token}
         myself={@myself}
       />
       <.clear_modal :if={@clearing} mode={@clearing} myself={@myself} />
@@ -433,6 +456,7 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
 
   attr(:preview, :map, required: true)
   attr(:stale, :boolean, required: true)
+  attr(:token, :string, required: true)
   attr(:myself, :any, required: true)
 
   defp confirm_upload_modal(assigns) do
@@ -444,7 +468,14 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
         <.button variant={:ghost} size={:sm} phx-click="cancel_upload" phx-target={@myself}>
           Cancel
         </.button>
-        <.button variant={:danger} size={:sm} phx-click="confirm_upload" phx-target={@myself}>
+        <.button
+          variant={:danger}
+          size={:sm}
+          phx-click="confirm_upload"
+          phx-value-token={@token}
+          phx-target={@myself}
+          phx-disable-with="Uploading…"
+        >
           {@copy.action}
         </.button>
       </:footer>
@@ -526,7 +557,13 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
         <.button variant={:ghost} size={:sm} phx-click="cancel_clear" phx-target={@myself}>
           Cancel
         </.button>
-        <.button variant={:danger} size={:sm} phx-click="confirm_force_clear" phx-target={@myself}>
+        <.button
+          variant={:danger}
+          size={:sm}
+          phx-click="confirm_force_clear"
+          phx-target={@myself}
+          phx-disable-with="Clearing…"
+        >
           Clear anyway (sequence will be lost)
         </.button>
       </:footer>
@@ -546,7 +583,13 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
         <.button variant={:ghost} size={:sm} phx-click="cancel_clear" phx-target={@myself}>
           Cancel
         </.button>
-        <.button variant={:danger} size={:sm} phx-click="confirm_clear" phx-target={@myself}>
+        <.button
+          variant={:danger}
+          size={:sm}
+          phx-click="confirm_clear"
+          phx-target={@myself}
+          phx-disable-with="Clearing…"
+        >
           Clear inventory
         </.button>
       </:footer>
@@ -574,6 +617,14 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
 
   defp state_view(%{reason: reason}),
     do: %{label: "Idle", variant: :warning, hint: idle_hint(reason)}
+
+  # Offered whenever a record may be stored, readable or not: offline (no
+  # Resolver) an unreadable record lists nothing, and the forced clear is
+  # the way out. Clearing an empty store is a no-op.
+  defp clearable?(%{bulbs: bulbs, groups: groups, reason: reason}),
+    do:
+      bulbs != [] or groups != [] or
+        reason in [:not_running, :invalid_inventory, :store_unavailable]
 
   defp idle_hint(:no_role), do: "No radio holds the Tuya mesh role."
   defp idle_hint(:no_inventory), do: "Upload your mesh's JSON dump to start."
