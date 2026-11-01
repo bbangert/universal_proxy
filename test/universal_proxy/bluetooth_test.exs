@@ -6,7 +6,7 @@ defmodule UniversalProxy.BluetoothTest do
   use ExUnit.Case, async: false
 
   alias UniversalProxy.Bluetooth
-  alias UniversalProxy.Bluetooth.{Manager, RadioMonitor, Settings}
+  alias UniversalProxy.Bluetooth.{AudioManager, Manager, RadioMonitor, Settings}
   alias Bluez.DevicePath
 
   @pubsub UniversalProxy.PubSub
@@ -22,15 +22,69 @@ defmodule UniversalProxy.BluetoothTest do
     def start_link(_opts), do: Agent.start_link(fn -> :ok end)
   end
 
+  # AudioManager ops for the bond-cleanup ordering test: one speaker bonded to
+  # hci1, whose Disconnect blocks until the test releases it.
+  defmodule BlockingOps do
+    @moduledoc false
+    @behaviour UniversalProxy.Bluetooth.AudioManager.Ops
+
+    @adapter "/org/bluez/hci1"
+    @speaker "/org/bluez/hci1/dev_11_22_33_44_55_66"
+
+    def speaker_path, do: @speaker
+
+    @impl true
+    def adapters_info(_c), do: [%{path: @adapter, address: "AA:BB:CC:DD:EE:FF"}]
+
+    @impl true
+    def managed_devices(_c) do
+      [
+        %{
+          path: @speaker,
+          mac: "11:22:33:44:55:66",
+          props: %{"UUIDs" => [AudioManager.audio_sink_uuid()]}
+        }
+      ]
+    end
+
+    @impl true
+    def disconnect(_c, path) do
+      send(:bt_cleanup_test, {:cleanup_started, self(), path})
+
+      receive do
+        :release -> :ok
+      end
+    end
+
+    @impl true
+    def remove(_c, _adapter, path) do
+      send(:bt_cleanup_test, {:removed, path})
+      :ok
+    end
+
+    @impl true
+    def start_discovery(_c, _a), do: :ok
+    @impl true
+    def stop_discovery(_c, _a), do: :ok
+    @impl true
+    def pair(_c, _p), do: :ok
+    @impl true
+    def set_trusted(_c, _p, _v), do: :ok
+    @impl true
+    def connect(_c, _p), do: :ok
+  end
+
   setup do
     # Pre-clear AND on_exit-clear — a crashed predecessor must not leak
     # adapter terms into the "subsystem down" / auto-selection tests.
     :persistent_term.erase(DevicePath.adapter_path_key())
     :persistent_term.erase(DevicePath.desired_adapter_key())
+    :persistent_term.erase(DevicePath.excluded_adapters_key())
 
     on_exit(fn ->
       :persistent_term.erase(DevicePath.adapter_path_key())
       :persistent_term.erase(DevicePath.desired_adapter_key())
+      :persistent_term.erase(DevicePath.excluded_adapters_key())
     end)
 
     :ok = Phoenix.PubSub.subscribe(@pubsub, Bluetooth.state_topic())
@@ -39,13 +93,13 @@ defmodule UniversalProxy.BluetoothTest do
 
   # Brings up the whole subsystem under the production-global names, with
   # fixture sysfs + a stub Bluez child — the shape the public API targets.
-  defp start_subsystem do
+  # `radios` is the [{hci, mac}] set present (both by default).
+  defp start_subsystem(radios \\ [{"hci0", @hci0_mac}, {"hci1", @hci1_mac}]) do
     tmp = Path.join(System.tmp_dir!(), "bt_public_test_#{System.unique_integer([:positive])}")
     on_exit(fn -> File.rm_rf(tmp) end)
 
     sysfs = Path.join(tmp, "sysfs")
-    add_radio(sysfs, "hci0", @hci0_mac)
-    add_radio(sysfs, "hci1", @hci1_mac)
+    for {hci, mac} <- radios, do: add_radio(sysfs, hci, mac)
 
     start_supervised!({Settings, table: @table, dets_path: Path.join(tmp, "s.dets")})
     dynsup = start_supervised!({DynamicSupervisor, strategy: :one_for_one})
@@ -67,10 +121,8 @@ defmodule UniversalProxy.BluetoothTest do
        pubsub: @pubsub,
        poll_ms: 60_000,
        adapters_info_fun: fn ->
-         [
-           %{path: "/org/bluez/hci0", address: @hci0_mac, name: "pi", powered: true},
-           %{path: "/org/bluez/hci1", address: @hci1_mac, name: "dongle", powered: true}
-         ]
+         for {hci, mac} <- radios,
+             do: %{path: "/org/bluez/#{hci}", address: mac, name: hci, powered: true}
        end}
     )
 
@@ -96,6 +148,10 @@ defmodule UniversalProxy.BluetoothTest do
                adapter: nil,
                active_connections: %{allowed?: false, used: 0, limit: 0}
              } = Bluetooth.status()
+    end
+
+    test "roles/0 degrades to the empty-role shape" do
+      assert Bluetooth.roles() == %{proxy: nil, audio: [], tuya_mesh: nil}
     end
 
     test "radio reads degrade to empty lists" do
@@ -230,6 +286,127 @@ defmodule UniversalProxy.BluetoothTest do
       assert Settings.audio_adapters(Settings.get()) == []
       # Non-audio roles pass the gate untouched.
       assert Bluetooth.set_role(@hci1_mac, :off) == :ok
+    end
+  end
+
+  describe "set_role/2 with :tuya_mesh" do
+    defp subtree_pid(dynsup) do
+      [{_, pid, _, _}] = DynamicSupervisor.which_children(dynsup)
+      pid
+    end
+
+    test "dedicates a radio: persisted, excluded, surfaced, subtree restarted" do
+      %{dynsup: dynsup} = start_subsystem()
+      pid_before = subtree_pid(dynsup)
+
+      assert Bluetooth.set_role(String.downcase(@hci1_mac), :tuya_mesh) == :ok
+
+      assert %{tuya_mesh: @hci1_mac, proxy: nil} = Bluetooth.roles()
+      assert :persistent_term.get(DevicePath.excluded_adapters_key()) == [@hci1_mac]
+      assert subtree_pid(dynsup) != pid_before
+
+      # The radio list carries the role, so the UI can show the mesh radio
+      # as taken even though the proxy stack never claims it.
+      radios = Bluetooth.list_radios()
+      assert %{role: :tuya_mesh, in_use?: false} = Enum.find(radios, &(&1.address == @hci1_mac))
+      assert %{role: nil} = Enum.find(radios, &(&1.address == @hci0_mac))
+
+      # Not a pause: the other radio keeps proxying via the auto fallback.
+      assert %{paused?: false, proxying?: true} = Bluetooth.status()
+    end
+
+    test "a mesh change restarts the subtree even when the proxy radio doesn't move" do
+      %{dynsup: dynsup} = start_subsystem()
+      :ok = Bluetooth.set_role(@hci0_mac, :proxy)
+      pid_before = subtree_pid(dynsup)
+
+      assert Bluetooth.set_role(@hci1_mac, :tuya_mesh) == :ok
+      assert Settings.proxy_adapter(Settings.get()) == @hci0_mac
+      pid_mesh = subtree_pid(dynsup)
+      assert pid_mesh != pid_before
+
+      # Leaving the role restarts too, clearing the exclusion.
+      assert Bluetooth.set_role(@hci1_mac, :off) == :ok
+      assert :persistent_term.get(DevicePath.excluded_adapters_key()) == []
+      assert subtree_pid(dynsup) != pid_mesh
+    end
+
+    test "is refused on a lone radio, leaving the settings untouched" do
+      %{dynsup: dynsup} = start_subsystem([{"hci0", @hci0_mac}])
+      pid_before = subtree_pid(dynsup)
+
+      assert Bluetooth.set_role(@hci0_mac, :tuya_mesh) == {:error, :needs_second_radio}
+
+      assert Settings.get().roles == %{}
+      assert subtree_pid(dynsup) == pid_before
+    end
+
+    test "is refused while the radio list is unavailable, leaving the settings untouched" do
+      %{dynsup: dynsup} = start_subsystem()
+      :ok = Bluetooth.set_role(@hci1_mac, :tuya_mesh)
+      [{_, pid_before, _, _}] = DynamicSupervisor.which_children(dynsup)
+      stop_supervised!(RadioMonitor)
+
+      # Unverifiable MAC: accepting it would demote the real mesh radio.
+      assert Bluetooth.set_role("00:11:22:33:44:55", :tuya_mesh) ==
+               {:error, :radios_unavailable}
+
+      assert Settings.get().roles == %{@hci1_mac => :tuya_mesh}
+      assert [{_, ^pid_before, _, _}] = DynamicSupervisor.which_children(dynsup)
+    end
+
+    test "is refused for a MAC no present radio has" do
+      start_subsystem()
+
+      assert Bluetooth.set_role("00:11:22:33:44:55", :tuya_mesh) == {:error, :unknown_radio}
+      assert Settings.get().roles == %{}
+    end
+
+    test "moving the mesh to another radio demotes the old one to :off" do
+      start_subsystem()
+      :ok = Bluetooth.set_role(@hci1_mac, :tuya_mesh)
+
+      assert Bluetooth.set_role(@hci0_mac, :tuya_mesh) == :ok
+
+      assert Settings.get().roles == %{@hci0_mac => :tuya_mesh, @hci1_mac => :off}
+      assert :persistent_term.get(DevicePath.excluded_adapters_key()) == [@hci0_mac]
+    end
+  end
+
+  describe "set_role/2 bond cleanup before a restart" do
+    test "leaving :audio for a role that restarts the subtree waits for the cleanup" do
+      %{dynsup: dynsup} = start_subsystem()
+      Process.register(self(), :bt_cleanup_test)
+      start_supervised!({Task.Supervisor, name: __MODULE__.CleanupTasks})
+
+      start_supervised!(
+        {AudioManager,
+         conn: nil,
+         ops: BlockingOps,
+         settings: Settings,
+         task_supervisor: __MODULE__.CleanupTasks,
+         reconnect_on_boot: false}
+      )
+
+      :ok = Bluetooth.set_role(@hci1_mac, :audio)
+      [{_, pid_before, _, _}] = DynamicSupervisor.which_children(dynsup)
+
+      # :audio -> :proxy moves the proxy radio, so the subtree restarts.
+      setter = Task.async(fn -> Bluetooth.set_role(@hci1_mac, :proxy) end)
+
+      speaker = BlockingOps.speaker_path()
+      assert_receive {:cleanup_started, cleanup_pid, ^speaker}, 1_000
+
+      # Cleanup still running: the subtree hasn't been touched yet.
+      refute Task.yield(setter, 100)
+      assert [{_, ^pid_before, _, _}] = DynamicSupervisor.which_children(dynsup)
+
+      send(cleanup_pid, :release)
+      assert Task.await(setter) == :ok
+
+      assert_received {:removed, ^speaker}
+      [{_, pid_after, _, _}] = DynamicSupervisor.which_children(dynsup)
+      assert pid_after != pid_before
     end
   end
 end

@@ -156,6 +156,53 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
   def forget_all_on_adapter(server \\ __MODULE__, adapter_mac),
     do: call(server, {:forget_all_on_adapter, adapter_mac}, :ok)
 
+  @doc """
+  `forget_all_on_adapter/2`, but returns only once the Disconnect/RemoveDevice
+  task has finished, or `{:error, :timeout}` after `timeout` ms (the task keeps
+  running). For callers that restart the Bluez subtree next: it owns the task's
+  supervisor, so a restart mid-cleanup would kill the task and leave bonds
+  behind.
+
+  `timeout` bounds the whole wait: the call that starts the task and the
+  wait for it share one budget. The wait happens in the caller, not in this
+  server's loop, which only starts the task (enumeration included) and
+  replies with its pid. A call that times out (a busy loop) is
+  `{:error, :timeout}` too; any other exit means this server isn't running,
+  so there is nothing to clean up and the result is `:ok`.
+  """
+  @spec forget_all_on_adapter_sync(GenServer.server(), mac(), non_neg_integer()) ::
+          :ok | {:error, :timeout}
+  def forget_all_on_adapter_sync(server \\ __MODULE__, adapter_mac, timeout) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    case GenServer.call(server, {:forget_all_on_adapter, adapter_mac, :task}, timeout) do
+      pid when is_pid(pid) ->
+        await_exit(pid, max(deadline - System.monotonic_time(:millisecond), 0))
+
+      :ok ->
+        :ok
+    end
+  catch
+    # Separate from the not-running case (see CLAUDE.md's `catch :exit` idiom):
+    # a wedged loop must not read as "nothing to clean up".
+    :exit, {:timeout, _} -> {:error, :timeout}
+    :exit, _ -> :ok
+  end
+
+  # Monitoring an already-dead pid delivers :DOWN at once, so a task that
+  # finished before this runs is not missed.
+  defp await_exit(pid, timeout) do
+    ref = Process.monitor(pid)
+
+    receive do
+      {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
+    after
+      timeout ->
+        Process.demonitor(ref, [:flush])
+        {:error, :timeout}
+    end
+  end
+
   # Exit-safe call: off-target/not-running yields the inert default.
   defp call(server, msg, default) do
     GenServer.call(server, msg)
@@ -288,7 +335,12 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
   def handle_call({:forget, mac}, _from, state),
     do: {:reply, dispatch(state, mac, &forget_flow(state, mac, &1)), state}
 
-  def handle_call({:forget_all_on_adapter, adapter_mac}, _from, state),
+  def handle_call({:forget_all_on_adapter, adapter_mac}, _from, state) do
+    _ = forget_all(state, adapter_mac)
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:forget_all_on_adapter, adapter_mac, :task}, _from, state),
     do: {:reply, forget_all(state, adapter_mac), state}
 
   @impl true
@@ -411,30 +463,31 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
 
   # Disconnect + RemoveDevice every A2DP-sink bonded to `adapter_mac`. Resolves
   # the adapter from the RAW adapter list (not role-filtered) so it works even
-  # once the role has flipped off. Runs in a Task; broadcasts a disconnect per
-  # device so subscribers refresh.
+  # once the role has flipped off. Runs in a Task, enumeration included (D-Bus
+  # round-trips that can be slow), so the loop replies with the pid at once
+  # and a waiter's budget covers the whole cleanup; broadcasts a disconnect per
+  # device so subscribers refresh. Returns the task pid, or :ok once the inline
+  # fallback has run.
   defp forget_all(state, adapter_mac) do
-    case raw_adapter_path(state, adapter_mac) do
-      nil ->
-        :ok
+    spawn_task(state, fn ->
+      case raw_adapter_path(state, adapter_mac) do
+        nil -> :ok
+        adapter_path -> forget_devices_on(state, adapter_path)
+      end
+    end)
+  end
 
-      adapter_path ->
-        devices =
-          Enum.filter(managed_devices(state), fn d ->
-            String.starts_with?(d.path, adapter_path <> "/") and
-              audio_sink?(d.props["UUIDs"] || [])
-          end)
-
-        spawn_task(state, fn ->
-          Enum.each(devices, fn d ->
-            _ = state.ops.disconnect(state.conn, d.path)
-            _ = state.ops.remove(state.conn, adapter_path, d.path)
-            broadcast_connection(state, d.mac, :disconnected)
-          end)
-        end)
-
-        :ok
-    end
+  defp forget_devices_on(state, adapter_path) do
+    state
+    |> managed_devices()
+    |> Enum.filter(fn d ->
+      String.starts_with?(d.path, adapter_path <> "/") and audio_sink?(d.props["UUIDs"] || [])
+    end)
+    |> Enum.each(fn d ->
+      _ = state.ops.disconnect(state.conn, d.path)
+      _ = state.ops.remove(state.conn, adapter_path, d.path)
+      broadcast_connection(state, d.mac, :disconnected)
+    end)
   end
 
   # Object path for an adapter MAC across ALL adapters (any role / none).
@@ -446,11 +499,16 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
     end)
   end
 
-  # Run `fun` under the Task.Supervisor; inline fallback if it's unavailable.
+  # Run `fun` under the Task.Supervisor (returning its pid); inline fallback
+  # if it's unavailable (returning :ok once it has run).
   defp spawn_task(state, fun) do
     case Task.Supervisor.start_child(state.task_sup, fun) do
-      {:ok, _pid} -> :ok
-      {:error, _} -> fun.()
+      {:ok, pid} ->
+        pid
+
+      {:error, _} ->
+        _ = fun.()
+        :ok
     end
   end
 

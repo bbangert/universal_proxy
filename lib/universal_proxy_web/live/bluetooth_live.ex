@@ -10,9 +10,10 @@ defmodule UniversalProxyWeb.BluetoothLive do
 
   Each radio carries an explicit **role** — `:proxy` (relays BLE to HA;
   at most one), `:audio` (dedicated to A2DP streaming; any number, one
-  speaker each), or `:off`. A single controller can't proxy and stream
-  well at once, so with one radio it's one or the other; with ≥2 you can
-  run both. Roles are set through `UniversalProxy.Bluetooth.set_role/2`,
+  speaker each), `:tuya_mesh` (dedicated to the Tuya mesh; at most one,
+  and only with a second radio left over), or `:off`. A single controller
+  can't proxy and stream well at once, so with one radio it's one or the
+  other; with ≥2 you can run both. Roles are set through `UniversalProxy.Bluetooth.set_role/2`,
   which also disconnects + forgets a radio's paired speakers when it
   leaves the `:audio` role (BlueZ bonds are per-radio) — the UI confirms
   that loss first.
@@ -79,6 +80,8 @@ defmodule UniversalProxyWeb.BluetoothLive do
      # Set true around a proxy setter call so its controls disable until
      # the resulting `{:bluetooth_state, _}` broadcast lands.
      |> assign(:busy, false)
+     # Inline role-picker error (a refused :tuya_mesh), cleared on success.
+     |> assign(:role_error, nil)
      # Per-row "more" menu (Forget) open set, keyed by device MAC.
      |> assign(:menu_open, MapSet.new())
      # `nil` when closed; otherwise the confirm/pairing modal state maps.
@@ -388,12 +391,22 @@ defmodule UniversalProxyWeb.BluetoothLive do
         |> assign(:radios, Bluetooth.refresh_radios())
         |> assign(:headphones, AudioManager.list_headphones())
         |> assign(:busy, false)
+        |> assign(:role_error, nil)
+
+      # Every mesh refusal renders inline, beside the role picker.
+      {:error, reason}
+      when role == :tuya_mesh and
+             reason in [:needs_second_radio, :radios_unavailable, :unknown_radio] ->
+        socket
+        |> assign(:busy, false)
+        |> assign(:role_error, role_error(reason))
 
       {:error, reason} ->
         Logger.warning("Bluetooth set_role failed: #{inspect(reason)}")
 
         socket
         |> assign(:busy, false)
+        |> assign(:role_error, nil)
         |> put_flash(:error, setter_error(reason))
     end
   end
@@ -436,12 +449,25 @@ defmodule UniversalProxyWeb.BluetoothLive do
   defp setter_error(:invalid_role), do: "That role can't be assigned."
   defp setter_error(_), do: "Bluetooth setting could not be saved."
 
+  defp role_error(:needs_second_radio),
+    do:
+      "The Tuya mesh needs a radio of its own. Plug in a second Bluetooth adapter first, " <>
+        "so the proxy keeps one."
+
+  defp role_error(:unknown_radio),
+    do: "That radio is no longer available, so the Tuya mesh can't be assigned to it."
+
+  defp role_error(:radios_unavailable),
+    do:
+      "The radio list isn't available yet, so the Tuya mesh can't be assigned. Try again shortly."
+
   defp scan_error(:no_audio_adapter), do: "Assign a radio to the Audio role first."
   defp scan_error(:not_audio_adapter), do: "That radio isn't set to Audio."
   defp scan_error(_), do: "Couldn't start scanning. Try again."
 
   defp parse_role("proxy"), do: :proxy
   defp parse_role("audio"), do: :audio
+  defp parse_role("tuya_mesh"), do: :tuya_mesh
   defp parse_role("off"), do: :off
   defp parse_role(_), do: nil
 
@@ -459,6 +485,7 @@ defmodule UniversalProxyWeb.BluetoothLive do
     assigns =
       assigns
       |> assign(:proxy_status, proxy_status(assigns.status, assigns.roles, assigns.radios))
+      |> assign(:mesh_only?, mesh_only?(assigns.radios, assigns.roles))
       |> assign(:radio_count, length(assigns.radios))
       |> assign(:audio_radios, audio_radios(assigns.radios, assigns.roles))
       |> assign(:paired, Enum.filter(assigns.headphones, & &1.paired))
@@ -478,7 +505,13 @@ defmodule UniversalProxyWeb.BluetoothLive do
         </p>
       </div>
 
-      <.proxy_card status={@status} stats={@stats} proxy_status={@proxy_status} busy={@busy} />
+      <.proxy_card
+        status={@status}
+        stats={@stats}
+        proxy_status={@proxy_status}
+        busy={@busy}
+        mesh_only?={@mesh_only?}
+      />
 
       <.improv_card :if={@improv.state != :disarmed} improv={@improv} />
 
@@ -490,6 +523,7 @@ defmodule UniversalProxyWeb.BluetoothLive do
         status={@status}
         busy={@busy}
         audio_role_supported={@audio_role_supported}
+        role_error={@role_error}
       />
 
       <.audio_devices_section
@@ -529,6 +563,7 @@ defmodule UniversalProxyWeb.BluetoothLive do
   attr(:stats, :map, required: true)
   attr(:proxy_status, :map, required: true)
   attr(:busy, :boolean, required: true)
+  attr(:mesh_only?, :boolean, required: true)
 
   defp proxy_card(assigns) do
     ~H"""
@@ -558,6 +593,8 @@ defmodule UniversalProxyWeb.BluetoothLive do
               <% @status.proxying? and @status.adapter -> %>
                 Relaying on <span class="font-mono">{@status.adapter.hci}</span>
                 · {adapter_name(@status.adapter)}
+              <% @status.enabled and is_nil(@status.adapter) and @mesh_only? -> %>
+                Enabled, but the only radio is dedicated to the Tuya mesh.
               <% @status.enabled and is_nil(@status.adapter) -> %>
                 Enabled, but no Bluetooth radio is available.
               <% @proxy_status.paused? -> %>
@@ -579,8 +616,13 @@ defmodule UniversalProxyWeb.BluetoothLive do
         class="mx-[22px] mb-[18px] p-[10px_12px] rounded-md bg-warning-soft text-warning text-xs font-medium flex items-center gap-2"
       >
         <.icon name={:alert} size={14} stroke={2.0} />
-        Plug in a USB Bluetooth adapter, or enable the onboard radio. The proxy
-        starts automatically when a radio appears.
+        <%= if @mesh_only? do %>
+          Plug in a second USB Bluetooth adapter for the proxy. The proxy starts
+          automatically when it appears.
+        <% else %>
+          Plug in a USB Bluetooth adapter, or enable the onboard radio. The proxy
+          starts automatically when a radio appears.
+        <% end %>
       </div>
 
       <%!-- Paused-role notice (a radio exists but none is :proxy) --%>
@@ -693,9 +735,13 @@ defmodule UniversalProxyWeb.BluetoothLive do
   attr(:status, :map, required: true)
   attr(:busy, :boolean, required: true)
   attr(:audio_role_supported, :boolean, required: true)
+  attr(:role_error, :string, default: nil)
 
   defp radios_section(assigns) do
-    assigns = assign(assigns, :single_audio?, single_radio_audio?(assigns.radios, assigns.roles))
+    assigns =
+      assigns
+      |> assign(:single_audio?, single_radio_audio?(assigns.radios, assigns.roles))
+      |> assign(:mesh_label, mesh_label(assigns.radios, assigns.roles))
 
     ~H"""
     <div class="mt-7">
@@ -731,8 +777,11 @@ defmodule UniversalProxyWeb.BluetoothLive do
           paired_count={length(paired_on(@headphones, radio.address))}
           busy={@busy}
           audio_role_supported={@audio_role_supported}
+          mesh_available={@radio_count >= 2}
         />
       </.card>
+
+      <.tuya_mesh_notes error={@role_error} mesh_label={@mesh_label} />
 
       <%!-- Single-radio contention: only radio is on Audio → proxy paused --%>
       <div
@@ -775,6 +824,7 @@ defmodule UniversalProxyWeb.BluetoothLive do
   attr(:paired_count, :integer, required: true)
   attr(:busy, :boolean, required: true)
   attr(:audio_role_supported, :boolean, required: true)
+  attr(:mesh_available, :boolean, required: true)
 
   defp bt_radio_row(assigns) do
     ~H"""
@@ -814,7 +864,36 @@ defmodule UniversalProxyWeb.BluetoothLive do
         role={@role}
         busy={@busy}
         audio_role_supported={@audio_role_supported}
+        mesh_available={@mesh_available}
       />
+    </div>
+    """
+  end
+
+  # ── Tuya mesh notes (under the radio list) ──────────────────────────────
+  attr(:error, :string, default: nil)
+  attr(:mesh_label, :string, default: nil)
+
+  defp tuya_mesh_notes(assigns) do
+    ~H"""
+    <div
+      :if={@error}
+      role="alert"
+      class="mt-2.5 p-[10px_12px] rounded-md bg-warning-soft text-warning text-xs font-medium flex items-start gap-2"
+    >
+      <.icon name={:alert} size={14} stroke={2.0} class="mt-px flex-none" />
+      <span>{@error}</span>
+    </div>
+
+    <div
+      :if={@mesh_label}
+      class="mt-2.5 p-[10px_12px] rounded-md bg-sunken text-fg-2 text-xs font-medium flex items-start gap-2"
+    >
+      <.icon name={:info} size={14} class="mt-px flex-none" />
+      <span>
+        <strong>{@mesh_label}</strong> is dedicated to the <strong>Tuya mesh</strong>.
+        Nothing else uses it: the proxy, audio and Wi-Fi setup run on your other radios.
+      </span>
     </div>
     """
   end
@@ -824,6 +903,7 @@ defmodule UniversalProxyWeb.BluetoothLive do
   attr(:role, :atom, required: true)
   attr(:busy, :boolean, required: true)
   attr(:audio_role_supported, :boolean, required: true)
+  attr(:mesh_available, :boolean, required: true)
 
   defp role_seg(assigns) do
     ~H"""
@@ -839,6 +919,16 @@ defmodule UniversalProxyWeb.BluetoothLive do
         label="Audio"
         active={@role == :audio}
         active_class="bg-surface shadow-xs text-audio"
+      />
+      <%!-- Offered only with a second radio (the server refuses it on a lone
+            one); kept on a radio that already holds it so it can be left. --%>
+      <.role_seg_btn
+        :if={@mesh_available or @role == :tuya_mesh}
+        mac={@mac}
+        value="tuya_mesh"
+        label="Tuya mesh"
+        active={@role == :tuya_mesh}
+        active_class="bg-surface shadow-xs text-success"
       />
       <.role_seg_btn mac={@mac} value="off" label="Off" active={@role == :off} active_class="bg-surface shadow-xs text-fg-1" />
     </div>
@@ -1041,8 +1131,7 @@ defmodule UniversalProxyWeb.BluetoothLive do
   attr(:deactivate, :map, required: true)
 
   defp deactivate_modal(assigns) do
-    assigns =
-      assign(assigns, :to_label, if(assigns.deactivate.role == :proxy, do: "Proxy", else: "Off"))
+    assigns = assign(assigns, :to_label, role_label(assigns.deactivate.role))
 
     ~H"""
     <.modal open={true} on_close="cancel_deactivate" title={"Deactivate audio on #{@deactivate.radio_name}?"}>
@@ -1432,10 +1521,39 @@ defmodule UniversalProxyWeb.BluetoothLive do
     do: %{label: "Off", variant: :neutral, paused?: false, paused_hint: nil}
 
   defp paused_hint(radios, roles) do
-    if single_radio_audio?(radios, roles) do
-      "Your only radio is streaming audio. Set it back to Proxy to relay BLE again."
-    else
-      "Assign a radio to the Proxy role below to start relaying."
+    cond do
+      single_radio_audio?(radios, roles) ->
+        "Your only radio is streaming audio. Set it back to Proxy to relay BLE again."
+
+      is_binary(Map.get(roles, :tuya_mesh)) ->
+        "Assign a radio other than the Tuya mesh one to the Proxy role below to start relaying."
+
+      true ->
+        "Assign a radio to the Proxy role below to start relaying."
+    end
+  end
+
+  # True when the only present radio is the Tuya mesh one: it's excluded from
+  # the proxy, so nothing can relay until another radio appears.
+  defp mesh_only?(radios, roles) do
+    case radios do
+      [%{address: addr}] when is_binary(addr) -> role_of(roles, addr) == :tuya_mesh
+      _ -> false
+    end
+  end
+
+  # "Name (hciN)" of the present mesh radio, its MAC while it's absent, or
+  # nil without a mesh role.
+  defp mesh_label(radios, roles) do
+    case Map.get(roles, :tuya_mesh) do
+      nil ->
+        nil
+
+      mac ->
+        case Enum.find(radios, &(&1.address == mac)) do
+          nil -> mac
+          radio -> "#{radio_name(radio)} (#{radio.hci})"
+        end
     end
   end
 
@@ -1466,12 +1584,13 @@ defmodule UniversalProxyWeb.BluetoothLive do
     end
   end
 
-  # Role of a MAC from the {proxy, audio} role map. A radio without an
-  # address (BlueZ not answering for it — radio dead or subtree down) holds
-  # no role: without the guard, nil == nil matches an unassigned proxy role
-  # and the dead radio renders as :proxy with an "In use" badge.
-  defp role_of(%{proxy: proxy, audio: audio}, mac) when is_binary(mac) do
+  # Role of a MAC from the {proxy, audio, tuya_mesh} role map. A radio
+  # without an address (BlueZ not answering for it — radio dead or subtree
+  # down) holds no role: without the guard, nil == nil matches an unassigned
+  # proxy role and the dead radio renders as :proxy with an "In use" badge.
+  defp role_of(%{proxy: proxy, audio: audio} = roles, mac) when is_binary(mac) do
     cond do
+      mac == Map.get(roles, :tuya_mesh) -> :tuya_mesh
       mac == proxy -> :proxy
       mac in audio -> :audio
       true -> :off
@@ -1484,7 +1603,8 @@ defmodule UniversalProxyWeb.BluetoothLive do
   # exception is the auto-claimed proxy: with NO roles assigned anywhere
   # (fresh install / pre-roles settings) the stack falls back to a radio
   # on its own, and showing that radio as "Off" while the header says
-  # Proxying would be a lie. Clicking Off on it then genuinely pauses
+  # Proxying would be a lie. A mesh role doesn't count as "assigned": the
+  # stack still auto-claims one of the other radios. Clicking Off on it then genuinely pauses
   # (the :off is stored, ending the auto fallback).
   defp effective_role(roles, radio, status) do
     role = role_of(roles, radio.address)
@@ -1497,8 +1617,14 @@ defmodule UniversalProxyWeb.BluetoothLive do
     end
   end
 
+  # Destination label in the deactivate confirmation.
+  defp role_label(:proxy), do: "Proxy"
+  defp role_label(:tuya_mesh), do: "Tuya mesh"
+  defp role_label(_role), do: "Off"
+
   defp role_tile_classes(:proxy), do: "bg-accent-soft text-accent"
   defp role_tile_classes(:audio), do: "bg-audio-soft text-audio"
+  defp role_tile_classes(:tuya_mesh), do: "bg-success-soft text-success"
   defp role_tile_classes(_), do: "bg-sunken text-fg-3"
 
   # Present radios holding the :audio role (the pairing/grouping choices).

@@ -3161,13 +3161,9 @@ defmodule UniversalProxyWeb.OverviewLive do
         name: bt_radio_name(radio),
         detail: bt_radio_detail(radio),
         sub: radio[:port] || radio.hci,
-        managed_by: "Bluetooth proxy",
+        managed_by: bt_radio_owner(radio),
         tab: "/bluetooth",
-        status:
-          if(radio.in_use?,
-            do: %{label: "In use", variant: :success},
-            else: %{label: "Idle", variant: :warning}
-          ),
+        status: bt_radio_status(radio),
         soft_class: "bg-accent-soft text-accent",
         dot_class: "bg-accent",
         fma120?: false,
@@ -3177,6 +3173,15 @@ defmodule UniversalProxyWeb.OverviewLive do
       }
     end)
   end
+
+  # The Tuya mesh radio is never claimed by the proxy stack (never in_use?),
+  # so its role is what marks it as taken.
+  defp bt_radio_owner(%{role: :tuya_mesh}), do: "Tuya mesh"
+  defp bt_radio_owner(_radio), do: "Bluetooth proxy"
+
+  defp bt_radio_status(%{role: :tuya_mesh}), do: %{label: "Tuya mesh", variant: :success}
+  defp bt_radio_status(%{in_use?: true}), do: %{label: "In use", variant: :success}
+  defp bt_radio_status(_radio), do: %{label: "Idle", variant: :warning}
 
   defp bt_radio_name(%{name: name}) when is_binary(name) and name != "", do: name
   defp bt_radio_name(_), do: "USB Bluetooth adapter"

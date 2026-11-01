@@ -30,4 +30,24 @@ defmodule UniversalProxy.BluezSpecTest do
     assert client_opts[:pubsub] == UniversalProxy.PubSub
     assert client_opts[:rssi_heartbeat_ms] == 1_500
   end
+
+  test "bluez_spec/0 clears any exclusion and leaves Mgmt off" do
+    assert {Bluez, opts} = UniversalProxy.Bluetooth.bluez_spec()
+
+    assert Keyword.fetch!(opts, :exclude_adapters) == []
+    refute Keyword.has_key?(opts, :mgmt)
+  end
+
+  test "bluez_spec/1 with a mesh adapter excludes it and starts Mgmt" do
+    mac = "AA:BB:CC:DD:EE:FF"
+    assert {Bluez, opts} = UniversalProxy.Bluetooth.bluez_spec(tuya_adapter: mac)
+
+    assert Keyword.fetch!(opts, :exclude_adapters) == [mac]
+    assert Keyword.fetch!(opts, :mgmt) == true
+    # The rest of the wiring is unchanged.
+    {Bluez, base} = UniversalProxy.Bluetooth.bluez_spec()
+
+    assert Keyword.drop(opts, [:exclude_adapters, :mgmt]) ==
+             Keyword.drop(base, [:exclude_adapters])
+  end
 end

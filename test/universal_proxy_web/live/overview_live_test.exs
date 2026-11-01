@@ -57,6 +57,37 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
     refute html =~ "hci1"
   end
 
+  test "a USB radio dedicated to the Tuya mesh is labelled as such", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/")
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "bluetooth:radios",
+      {:bluetooth_radios,
+       [
+         %{
+           hci: "hci1",
+           bus: :usb,
+           port: "1-1.1.2",
+           detail: "USB 2.0 · port 1-1.1.2",
+           chip: "Realtek RTL8761B",
+           bt_version: "5.1",
+           ble?: true,
+           bredr?: true,
+           name: "ASUS USB-BT500",
+           address: "AA:BB:CC:DD:EE:FF",
+           in_use?: false,
+           role: :tuya_mesh
+         }
+       ]}
+    )
+
+    # Both the owner column and the status badge ("Idle" otherwise: the
+    # proxy stack never claims the mesh radio).
+    html = render(view)
+    assert length(String.split(html, "Tuya mesh")) - 1 == 2
+  end
+
   test "Overview omits the audio card when no outputs are present", %{conn: conn} do
     {:ok, _view, html} = live(conn, "/")
     # Audio summary card is gated on a non-empty list, and the
