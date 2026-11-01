@@ -396,6 +396,45 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
     end
   end
 
+  describe "subscription recovery on a tick" do
+    setup ctx do
+      {:ok, _} = Store.replace(inventory(), [], ctx.store)
+      # Every tick re-checks the adapter, so the catch-up and the periodic
+      # check land in the same tick.
+      start_mesh_sup(ctx, tick_ms: 20, index_check_ticks: 1)
+      assert mesh_index(ctx) == 1
+      :ok
+    end
+
+    test "finding the adapter gone stops the mesh and leaves the Resolver idle", ctx do
+      resolver = Process.whereis(ctx.names.resolver)
+      Process.flag(:trap_exit, true)
+
+      # No :DOWN path: only a tick may notice the lost subscriptions.
+      :sys.replace_state(resolver, &%{&1 | pubsub_mon: nil})
+
+      log =
+        capture_log(fn ->
+          stop_supervised!(:pubsub)
+          # A few ticks fail to resubscribe while it is down.
+          Process.sleep(80)
+
+          :ok = :sys.suspend(resolver)
+          start_supervised!(pubsub_spec(ctx.pubsub))
+          set_adapters(ctx, [adapter(@proxy_mac, 0)])
+          :ok = :sys.resume(resolver)
+
+          wait_until(fn -> mesh_pid(ctx) == nil end)
+          Process.sleep(100)
+        end)
+
+      assert Process.whereis(ctx.names.resolver) == resolver
+      assert %{state: :idle, reason: :adapter_missing} = status(ctx)
+      refute log =~ "terminating"
+      refute log =~ "raised"
+    end
+  end
+
   describe "key redaction" do
     @local_keys ["abcdefghijklmnop", "ponmlkjihgfedcba"]
 

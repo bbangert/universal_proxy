@@ -69,6 +69,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   Options: `:tuya_adapter`, `:dynsup`, `:name`, and test seams `:store`,
   `:adapters_fun`, `:mesh_spec_fun` (`(index, mac -> child_spec)`), `:radio`,
   `:lights`, `:pubsub`, `:retry_ms`, `:restart_ms`, `:tick_ms`,
+  `:index_check_ticks` (ticks between adapter re-checks, default 6),
   `:reachable_ms`.
   """
 
@@ -199,6 +200,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
       backoff_ms: retry_ms,
       restart_ms: Keyword.get(opts, :restart_ms, @restart_ms),
       tick_ms: Keyword.get(opts, :tick_ms, @tick_ms),
+      index_check_ticks: Keyword.get(opts, :index_check_ticks, @index_check_ticks),
       reachable_ms: Keyword.get(opts, :reachable_ms, @reachable_ms),
       timer: nil,
       refresh_timer: nil,
@@ -338,10 +340,13 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
     do: {:noreply, %{state | timer: nil} |> evaluate() |> publish()}
 
   defp do_info({:tick, token}, %{timer: {token, _}, mesh: %{}} = state) do
+    # The catch-up can stop the mesh (its adapter left while the PubSub was
+    # down): everything after it works on whatever state it left, running
+    # or idle.
     state = %{state | timer: nil, ticks: state.ticks + 1} |> ensure_subscribed()
 
     state =
-      if rem(state.ticks, @index_check_ticks) == 0,
+      if rem(state.ticks, state.index_check_ticks) == 0,
         do: check_index(state),
         else: state
 
@@ -497,7 +502,10 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
 
   # The running mesh's index must still name its MAC: gone or moved stops
   # it now (and a moved one restarts on the new index). [] is the daemon
-  # not answering, which proves nothing either way.
+  # not answering, which proves nothing either way. An idle Resolver has no
+  # index to check: its own evaluation (and retry timer) covers it.
+  defp check_index(%{mesh: nil} = state), do: state
+
   defp check_index(%{mesh: %{index: index}} = state) do
     case state.adapters_fun.() do
       [] ->
