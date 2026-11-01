@@ -237,6 +237,45 @@ defmodule UniversalProxyWeb.BluetoothLiveTest do
     end
   end
 
+  # AudioManager ops: one paired speaker bonded to hci1 (AA:BB:CC:DD:EE:FF).
+  defmodule PairedSpeakerOps do
+    @moduledoc false
+    @behaviour UniversalProxy.Bluetooth.AudioManager.Ops
+
+    @impl true
+    def adapters_info(_c), do: [%{path: "/org/bluez/hci1", address: "AA:BB:CC:DD:EE:FF"}]
+
+    @impl true
+    def managed_devices(_c) do
+      [
+        %{
+          path: "/org/bluez/hci1/dev_11_22_33_44_55_66",
+          mac: "11:22:33:44:55:66",
+          props: %{
+            "Alias" => "Speaker",
+            "Paired" => true,
+            "UUIDs" => [UniversalProxy.Bluetooth.AudioManager.audio_sink_uuid()]
+          }
+        }
+      ]
+    end
+
+    @impl true
+    def start_discovery(_c, _a), do: :ok
+    @impl true
+    def stop_discovery(_c, _a), do: :ok
+    @impl true
+    def pair(_c, _p), do: :ok
+    @impl true
+    def set_trusted(_c, _p, _v), do: :ok
+    @impl true
+    def connect(_c, _p), do: :ok
+    @impl true
+    def disconnect(_c, _p), do: :ok
+    @impl true
+    def remove(_c, _a, _p), do: :ok
+  end
+
   describe "Tuya mesh role" do
     alias UniversalProxy.Bluetooth.{Manager, RadioMonitor, Settings}
 
@@ -333,6 +372,32 @@ defmodule UniversalProxyWeb.BluetoothLiveTest do
       html = render_click(view, "set_role", %{"mac" => @mesh_a, "role" => "tuya_mesh"})
 
       assert html =~ "The radio list isn&#39;t available yet"
+    end
+
+    test "the deactivate confirmation names Tuya mesh as the destination", %{conn: conn} do
+      start_subsystem([{"hci0", @mesh_a}, {"hci1", @mesh_b}])
+      :ok = UniversalProxy.Bluetooth.set_role(@mesh_b, :audio)
+      start_supervised!({Task.Supervisor, name: __MODULE__.AudioTasks})
+
+      start_supervised!(
+        {UniversalProxy.Bluetooth.AudioManager,
+         conn: nil,
+         ops: PairedSpeakerOps,
+         settings: Settings,
+         task_supervisor: __MODULE__.AudioTasks,
+         reconnect_on_boot: false}
+      )
+
+      {:ok, view, _html} = live(conn, "/bluetooth")
+
+      html =
+        view
+        |> element(~s(button[phx-value-mac="#{@mesh_b}"][phx-value-role="tuya_mesh"]))
+        |> render_click()
+
+      assert html =~ "Deactivate audio on"
+      assert html =~ "Switching this radio to <strong>Tuya mesh</strong>"
+      refute html =~ "<strong>Off</strong>"
     end
 
     test "switching a radio to Tuya mesh marks it dedicated", %{conn: conn} do

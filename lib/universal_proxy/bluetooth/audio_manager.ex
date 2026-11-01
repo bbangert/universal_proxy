@@ -163,17 +163,30 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
   supervisor, so a restart mid-cleanup would kill the task and leave bonds
   behind.
 
-  The wait happens in the caller, not in this server's loop: the loop only
-  starts the task and replies with its pid. `:ok` without waiting when there
-  is nothing to clean up or this server isn't running.
+  `timeout` bounds the whole wait: the call that starts the task and the
+  wait for it share one budget. The wait happens in the caller, not in this
+  server's loop, which only starts the task (enumeration included) and
+  replies with its pid. A call that times out (a busy loop) is
+  `{:error, :timeout}` too; any other exit means this server isn't running,
+  so there is nothing to clean up and the result is `:ok`.
   """
-  @spec forget_all_on_adapter_sync(GenServer.server(), mac(), timeout()) ::
+  @spec forget_all_on_adapter_sync(GenServer.server(), mac(), non_neg_integer()) ::
           :ok | {:error, :timeout}
   def forget_all_on_adapter_sync(server \\ __MODULE__, adapter_mac, timeout) do
-    case call(server, {:forget_all_on_adapter, adapter_mac, :task}, :ok) do
-      pid when is_pid(pid) -> await_exit(pid, timeout)
-      :ok -> :ok
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    case GenServer.call(server, {:forget_all_on_adapter, adapter_mac, :task}, timeout) do
+      pid when is_pid(pid) ->
+        await_exit(pid, max(deadline - System.monotonic_time(:millisecond), 0))
+
+      :ok ->
+        :ok
     end
+  catch
+    # Separate from the not-running case (see CLAUDE.md's `catch :exit` idiom):
+    # a wedged loop must not read as "nothing to clean up".
+    :exit, {:timeout, _} -> {:error, :timeout}
+    :exit, _ -> :ok
   end
 
   # Monitoring an already-dead pid delivers :DOWN at once, so a task that
@@ -450,29 +463,31 @@ defmodule UniversalProxy.Bluetooth.AudioManager do
 
   # Disconnect + RemoveDevice every A2DP-sink bonded to `adapter_mac`. Resolves
   # the adapter from the RAW adapter list (not role-filtered) so it works even
-  # once the role has flipped off. Runs in a Task; broadcasts a disconnect per
-  # device so subscribers refresh. Returns the task pid, or :ok when there was
-  # no task to wait for (unknown adapter, or the inline fallback already ran).
+  # once the role has flipped off. Runs in a Task, enumeration included (D-Bus
+  # round-trips that can be slow), so the loop replies with the pid at once
+  # and a waiter's budget covers the whole cleanup; broadcasts a disconnect per
+  # device so subscribers refresh. Returns the task pid, or :ok once the inline
+  # fallback has run.
   defp forget_all(state, adapter_mac) do
-    case raw_adapter_path(state, adapter_mac) do
-      nil ->
-        :ok
+    spawn_task(state, fn ->
+      case raw_adapter_path(state, adapter_mac) do
+        nil -> :ok
+        adapter_path -> forget_devices_on(state, adapter_path)
+      end
+    end)
+  end
 
-      adapter_path ->
-        devices =
-          Enum.filter(managed_devices(state), fn d ->
-            String.starts_with?(d.path, adapter_path <> "/") and
-              audio_sink?(d.props["UUIDs"] || [])
-          end)
-
-        spawn_task(state, fn ->
-          Enum.each(devices, fn d ->
-            _ = state.ops.disconnect(state.conn, d.path)
-            _ = state.ops.remove(state.conn, adapter_path, d.path)
-            broadcast_connection(state, d.mac, :disconnected)
-          end)
-        end)
-    end
+  defp forget_devices_on(state, adapter_path) do
+    state
+    |> managed_devices()
+    |> Enum.filter(fn d ->
+      String.starts_with?(d.path, adapter_path <> "/") and audio_sink?(d.props["UUIDs"] || [])
+    end)
+    |> Enum.each(fn d ->
+      _ = state.ops.disconnect(state.conn, d.path)
+      _ = state.ops.remove(state.conn, adapter_path, d.path)
+      broadcast_connection(state, d.mac, :disconnected)
+    end)
   end
 
   # Object path for an adapter MAC across ALL adapters (any role / none).

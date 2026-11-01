@@ -1124,8 +1124,7 @@ defmodule UniversalProxyWeb.BluetoothLive do
   attr(:deactivate, :map, required: true)
 
   defp deactivate_modal(assigns) do
-    assigns =
-      assign(assigns, :to_label, if(assigns.deactivate.role == :proxy, do: "Proxy", else: "Off"))
+    assigns = assign(assigns, :to_label, role_label(assigns.deactivate.role))
 
     ~H"""
     <.modal open={true} on_close="cancel_deactivate" title={"Deactivate audio on #{@deactivate.radio_name}?"}>
@@ -1610,6 +1609,11 @@ defmodule UniversalProxyWeb.BluetoothLive do
       role
     end
   end
+
+  # Destination label in the deactivate confirmation.
+  defp role_label(:proxy), do: "Proxy"
+  defp role_label(:tuya_mesh), do: "Tuya mesh"
+  defp role_label(_role), do: "Off"
 
   defp role_tile_classes(:proxy), do: "bg-accent-soft text-accent"
   defp role_tile_classes(:audio), do: "bg-audio-soft text-audio"

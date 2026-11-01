@@ -35,7 +35,12 @@ defmodule UniversalProxy.Bluetooth.AudioManagerTest do
     @impl true
     def adapters_info(_c), do: cfg(:adapters, [])
     @impl true
-    def managed_devices(_c), do: cfg(:devices, [])
+    def managed_devices(_c) do
+      # Optional slow enumeration (a sluggish D-Bus GetManagedObjects).
+      Process.sleep(cfg(:devices_delay_ms, 0))
+      cfg(:devices, [])
+    end
+
     @impl true
     def start_discovery(_c, a) do
       record({:start_discovery, a})
@@ -494,6 +499,47 @@ defmodule UniversalProxy.Bluetooth.AudioManagerTest do
       assert AudioManager.forget_all_on_adapter_sync(mgr, @audio_mac, 50) == {:error, :timeout}
       assert_received {:ops, {:disconnect_blocked, cleanup}}
       send(cleanup, :release)
+    end
+
+    test "forget_all_on_adapter_sync: slow enumeration past the budget is a timeout", %{
+      settings: settings
+    } do
+      with_audio_adapter(settings)
+
+      MockOps.configure(%{
+        devices: [dev(@hs_path, @hs, %{"UUIDs" => [@sink_uuid]})],
+        devices_delay_ms: 400
+      })
+
+      mgr = start_manager(settings)
+
+      {elapsed_us, result} =
+        :timer.tc(fn -> AudioManager.forget_all_on_adapter_sync(mgr, @audio_mac, 100) end)
+
+      # Not :ok: the cleanup hasn't even reached Disconnect yet.
+      assert result == {:error, :timeout}
+      refute_received {:ops, {:disconnect, _}}
+      # The budget bounds the whole wait.
+      assert elapsed_us < 300_000
+    end
+
+    test "forget_all_on_adapter_sync: a busy server past the budget is a timeout", %{
+      settings: settings
+    } do
+      with_audio_adapter(settings)
+      MockOps.configure(%{devices: [], devices_delay_ms: 400})
+      mgr = start_manager(settings)
+
+      # list_headphones enumerates inside the loop, so the loop is busy.
+      busy = Task.async(fn -> AudioManager.list_headphones(mgr) end)
+      Process.sleep(20)
+
+      {elapsed_us, result} =
+        :timer.tc(fn -> AudioManager.forget_all_on_adapter_sync(mgr, @audio_mac, 100) end)
+
+      assert result == {:error, :timeout}
+      assert elapsed_us < 300_000
+      Task.await(busy)
     end
 
     test "forget_all_on_adapter_sync is :ok with nothing to clean or no server", %{
