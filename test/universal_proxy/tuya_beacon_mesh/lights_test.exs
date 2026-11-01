@@ -11,7 +11,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
     Inventory,
     Lights,
     P2,
-    Radio
+    Radio,
+    Seq
   }
 
   @fixture Path.join([
@@ -28,6 +29,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
   # "path light 2" is node 2, "post spot 1" node 3.
   @mac2 0xDC23530FB34A
   @mac3 0xDC23533FCD62
+  # max_lease of the random-operations runs.
+  @random_max_lease 8
 
   setup do
     FakeBluez.ensure_started()
@@ -36,7 +39,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
     start_supervised!(radio_spec())
 
     persisted = :ets.new(:lights_persist, [:public, :set])
-    :ets.insert(persisted, {:writes, 0})
+    :ets.insert(persisted, [{:writes, 0}, {:tightens, 0}, {:now, 0}])
 
     start_supervised!(
       {Lights, inventory: File.read!(@fixture), radio: Radio, on_persist: persist_to(persisted)}
@@ -143,12 +146,14 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
       assert writes(persisted) == 1
     end
 
-    test "a second block is reserved and persisted after 32 sends", %{persisted: persisted} do
+    test "a lease used up within the interval is followed by a max lease", %{
+      persisted: persisted
+    } do
       sns = for i <- 1..33, do: set_sn("path light 2", brightness: 10 + i)
 
       assert sns == Enum.to_list(100..132)
       assert writes(persisted) == 2
-      assert %{seq: 164} = last_persisted(persisted)
+      assert %{seq: 732} = last_persisted(persisted)
     end
 
     test "the sequence wraps from 65535 to 0 through Lights" do
@@ -213,15 +218,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
     } do
       stop_supervised!(Lights)
 
-      loader = fn ->
-        case :ets.lookup(persisted, :inv) do
-          [{:inv, inv}] -> {:ok, inv}
-          [] -> {:ok, File.read!(@fixture)}
-        end
-      end
-
       start_supervised!(
-        {Lights, inventory: loader, radio: Radio, on_persist: persist_to(persisted)}
+        {Lights, inventory: loader(persisted), radio: Radio, on_persist: persist_to(persisted)}
       )
 
       assert set_sn("path light 2", on: true) == 100
@@ -558,11 +556,13 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
     test "an older dump of the same mesh never pulls seq back", %{persisted: persisted} do
       assert set_sn("path light 2", on: true) == 100
 
-      # The fixture still says seq 100; 100..131 are already reserved.
+      # The fixture still says seq 100; 100..131 are leased. The rest of the
+      # lease stays usable and the persisted lease end doesn't move back.
       assert :ok = Lights.reload(File.read!(@fixture))
       assert %{seq: 132} = last_persisted(persisted)
+      assert writes(persisted) == 2
 
-      assert set_sn("path light 2", on: false) == 132
+      assert set_sn("path light 2", on: false) == 101
     end
 
     test "a newer dump of the same mesh moves seq forward", %{persisted: persisted} do
@@ -603,6 +603,657 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
     end
   end
 
+  describe "sequence leases" do
+    test "sends within one lease persist once", %{persisted: persisted} do
+      restart_lights(persisted, min_lease: 25)
+
+      sns =
+        for _ <- 1..25 do
+          tick(persisted, 1_000)
+          set_sn("path light 2", on: true)
+        end
+
+      assert sns == Enum.to_list(100..124)
+      assert writes(persisted) == 1
+      assert persisted_seq(persisted) == 125
+    end
+
+    test "the lease follows the send rate, clamped to min and max", %{persisted: persisted} do
+      restart_lights(persisted, min_lease: 2, max_lease: 12)
+
+      # The first lease is min_lease.
+      assert send_n(2) == [100, 101]
+      assert persisted_seq(persisted) == 102
+
+      # 2 used in 60 s: 2 / 60 s × 60 s × 1.5 = 3.
+      tick(persisted, 60_000)
+      assert send_n(3) == [102, 103, 104]
+      assert persisted_seq(persisted) == 105
+
+      # 3 in 60 s: 4.5, rounded up.
+      tick(persisted, 60_000)
+      assert send_n(5) == Enum.to_list(105..109)
+      assert persisted_seq(persisted) == 110
+
+      # 5 in 30 s: used up before the interval, so max_lease at once.
+      tick(persisted, 30_000)
+      assert send_n(12) == Enum.to_list(110..121)
+      assert persisted_seq(persisted) == 122
+
+      # 12 in 60 s wants 18: clamped to max_lease.
+      tick(persisted, 60_000)
+      assert send_n(12) == Enum.to_list(122..133)
+      assert persisted_seq(persisted) == 134
+
+      # 12 in an hour wants 1: clamped to min_lease.
+      tick(persisted, 3_600_000)
+      assert send_n(1) == [134]
+      assert persisted_seq(persisted) == 136
+
+      assert writes(persisted) == 6
+    end
+
+    test "a burst past max_lease persists early and never uses an unpersisted number", %{
+      persisted: persisted
+    } do
+      restart_lights(persisted, min_lease: 2, max_lease: 5)
+
+      # The clock never moves: every lease runs out inside the interval.
+      for _ <- 1..17 do
+        sn = set_sn("path light 2", on: true)
+        assert Seq.ahead?(sn, persisted_seq(persisted))
+      end
+
+      # 2 (first), then max_lease each time: 2 + 5 + 5 + 5 covers 17.
+      assert writes(persisted) == 4
+      assert persisted_seq(persisted) == 117
+      assert Enum.map(advertises(), &frame_sn/1) == Enum.to_list(100..116)
+    end
+
+    @tag :capture_log
+    test "a failed lease persist sends nothing and is retried", %{persisted: persisted} do
+      restart_lights(persisted, min_lease: 2, max_lease: 5)
+      assert send_n(2) == [100, 101]
+
+      fail_persist(persisted, {:error, :enospc})
+      assert {:error, :persist_failed} = Lights.set("path light 2", on: true)
+      assert {:error, :persist_failed} = Lights.ping("path light 2")
+      assert persisted_seq(persisted) == 102
+      assert length(advertises()) == 2
+
+      # The retry leases from where the failed one would have, no gap.
+      fail_persist(persisted, nil)
+      assert send_n(1) == [102]
+      assert persisted_seq(persisted) == 107
+      assert writes(persisted) == 2
+    end
+
+    @tag :capture_log
+    test "a retry after a persist that landed anyway never proposes an end behind it", %{
+      persisted: persisted
+    } do
+      restart_lights(persisted,
+        on_persist: store_persist(persisted),
+        min_lease: 2,
+        max_lease: 12
+      )
+
+      assert send_n(2) == [100, 101]
+      assert persisted_seq(persisted) == 102
+
+      # Used up inside the interval, so this attempt is a max lease (114).
+      # It is written, but the sync fails.
+      tick(persisted, 30_000)
+      fail_persist(persisted, {:written, {:error, :sync_failed}})
+      assert {:error, :persist_failed} = Lights.set("path light 2", on: true)
+      assert persisted_seq(persisted) == 114
+      fail_persist(persisted, nil)
+
+      # Past the interval the rate wants only min_lease (104), behind what
+      # the store holds: the retry still proposes 114.
+      tick(persisted, 60_000)
+      assert send_n(12) == Enum.to_list(102..113)
+      assert persisted_seq(persisted) == 114
+
+      # A reload of the same mesh covers a landed attempt too.
+      tick(persisted, 30_000)
+      fail_persist(persisted, {:written, {:error, :sync_failed}})
+      assert {:error, :persist_failed} = Lights.set("path light 2", on: true)
+      fail_persist(persisted, nil)
+      attempted = persisted_seq(persisted)
+      assert attempted > 114
+
+      assert :ok = Lights.reload(File.read!(@fixture))
+      assert persisted_seq(persisted) == attempted
+      assert send_n(1) == [114]
+    end
+
+    test "a crash after a refused first number jumps at most max_lease + 1", %{
+      persisted: persisted
+    } do
+      restart_lights(persisted, min_lease: 5, max_lease: 5)
+      assert send_n(5) == Enum.to_list(100..104)
+
+      # A new lease (105..109, persisted 110) whose first number is refused
+      # and given back: 104 is still the last number on air.
+      capture_log(fn ->
+        FakeBluez.fail(:advertise, :busy)
+        assert {:error, {:advertise, :busy}} = Lights.set("path light 2", on: true)
+        FakeBluez.succeed(:advertise)
+      end)
+
+      assert persisted_seq(persisted) == 110
+
+      old = Process.whereis(Lights)
+      Process.exit(old, :kill)
+      wait_until(fn -> match?(pid when is_pid(pid) and pid != old, Process.whereis(Lights)) end)
+
+      assert [110] = send_n(1)
+      assert distance(104, 110) == 5 + 1
+    end
+
+    test "consecutive crashes that abandon their first lease add min_lease each", %{
+      persisted: persisted
+    } do
+      restart_lights(persisted, min_lease: 3, max_lease: 6)
+      assert send_n(3) == [100, 101, 102]
+
+      # Each round: a new lease whose first frame is refused, then a kill.
+      # The first is max_lease (used up early), then min_lease after each
+      # restart.
+      for expected <- [109, 112, 115] do
+        capture_log(fn ->
+          FakeBluez.fail(:advertise, :busy)
+          assert {:error, {:advertise, :busy}} = Lights.set("path light 2", on: true)
+          FakeBluez.succeed(:advertise)
+        end)
+
+        assert persisted_seq(persisted) == expected
+        kill_lights()
+      end
+
+      # 102 was the last on air: max_lease + 1 for the first crash, plus
+      # min_lease for each of the 2 restarts that abandoned theirs.
+      assert send_n(1) == [115]
+      assert distance(102, 115) == 6 + 1 + 2 * 3
+    end
+
+    @tag :capture_log
+    test "no lease is taken while the Radio can't transmit", %{persisted: persisted} do
+      restart_lights(persisted, [])
+
+      holder = start_supervised!({Task, fn -> Process.sleep(:infinity) end})
+      FakeBluez.fail(:acquire, {:held_by, holder})
+      :ok = FakeBluez.end_lease()
+      wait_until(fn -> not radio_ready?() end)
+
+      assert {:error, :not_ready} = Lights.set("path light 2", on: true)
+      assert {:error, :not_ready} = Lights.ping("path light 2")
+      assert writes(persisted) == 0
+
+      # A command that can't be built takes no lease either.
+      FakeBluez.succeed(:acquire)
+      wait_until(&radio_ready?/0)
+      assert {:error, {:bad_mode, :disco}} = Lights.set("path light 2", mode: :disco)
+      assert writes(persisted) == 0
+
+      stop_supervised!({Radio, 1})
+      assert {:error, :not_running} = Lights.set("path light 2", on: true)
+      assert writes(persisted) == 0
+
+      start_supervised!(radio_spec())
+      wait_until(&radio_ready?/0)
+      assert send_n(1) == [100]
+      assert writes(persisted) == 1
+    end
+
+    @tag :capture_log
+    test "a coalesced burst is held to max_jump past the frame on air", %{
+      persisted: persisted
+    } do
+      restart_lights(persisted, min_lease: 3, max_lease: 5, max_jump: 12)
+
+      # 100 goes on air and stays there (its 3 s run outlasts the test);
+      # the rest queue and coalesce behind it. Leases: 3 (to 103), 5 (to
+      # 108), then cut to 112 = 100 + max_jump.
+      results = for _ <- 1..15, do: Lights.set("path light 2", on: true)
+      assert Enum.take(results, 12) == List.duplicate(:ok, 12)
+      assert Enum.drop(results, 12) == List.duplicate({:error, :busy}, 3)
+      assert persisted_seq(persisted) == 112
+      assert writes(persisted) == 3
+      assert {:ok, %{last_tx_sn: 100, queued: 1}} = Radio.status()
+      assert distance(100, persisted_seq(persisted)) <= 12
+
+      # A power loss here resumes at 112, 12 past what the bulbs heard. The
+      # restarted Lights takes the Radio's report as its baseline, so it
+      # stays busy while 100 is still on air.
+      kill_lights()
+      assert {:error, :busy} = Lights.set("path light 2", on: true)
+      assert persisted_seq(persisted) == 112
+
+      # 100's run ends and the coalesced 111 airs: room again, and the
+      # refused commands burned nothing.
+      finish_tx()
+      assert {:ok, %{last_tx_sn: 111}} = Radio.status()
+      :ok = Radio.stop_tx()
+      assert sent_sn(fn -> Lights.set("path light 2", on: true) end) == 112
+      assert distance(111, persisted_seq(persisted)) <= 12
+    end
+
+    @tag :capture_log
+    test "after a switch to another mesh, the old mesh's frames don't count as progress", %{
+      persisted: persisted
+    } do
+      restart_lights(persisted, min_lease: 3, max_lease: 5, max_jump: 12)
+
+      # Old mesh: 100 airs, 101..108 coalesce behind it, then 108 airs.
+      for _ <- 1..9, do: assert(:ok = Lights.set("path light 2", on: true))
+      finish_tx()
+      assert {:ok, %{last_tx_sn: 108}} = Radio.status()
+
+      # The new mesh starts at 100: its baseline is 99, and the Radio forgets
+      # the old frames (108 would otherwise read as new-mesh progress).
+      assert :ok = Lights.reload(fixture(%{"beaconKey" => @other_key, "seq" => 100}))
+      assert {:ok, %{last_tx_sn: nil, tx: nil, queued: 0}} = Radio.status()
+
+      results = for _ <- 1..15, do: Lights.set("path light 2", on: true)
+      assert Enum.take(results, 12) == List.duplicate(:ok, 12)
+      assert Enum.drop(results, 12) == List.duplicate({:error, :busy}, 3)
+
+      # The new mesh's 100 is the one on air: the persisted end stays 12
+      # past it.
+      assert {:ok, %{last_tx_sn: 100}} = Radio.status()
+      assert persisted_seq(persisted) == 112
+    end
+
+    @tag :capture_log
+    test "a Radio that dropped the waiting frames unaired doesn't hold sends", %{
+      persisted: persisted
+    } do
+      restart_lights(persisted, min_lease: 3, max_lease: 5, max_jump: 12)
+      for _ <- 1..12, do: assert(:ok = Lights.set("path light 2", on: true))
+      assert {:error, :busy} = Lights.set("path light 2", on: true)
+
+      # Nothing on air and nothing queued: 101..111 will never air.
+      :ok = Radio.stop_tx()
+      assert set_sn("path light 2", on: true) == 112
+    end
+
+    @tag :capture_log
+    test "the tighten floor retires once sends reach it, across the 16-bit range", %{
+      persisted: persisted
+    } do
+      restart_lights(persisted, [])
+      assert send_n(1) == [100]
+
+      fail_persist(persisted, {:error, :busy})
+      assert {:error, :persist_failed} = Lights.reload(fixture(%{"seq" => 120}))
+      fail_persist(persisted, nil)
+      assert :sys.get_state(Lights).tighten_floor == 120
+
+      # A refused frame at the floor's edge, then sends up to it.
+      assert send_n(18) == Enum.to_list(101..118)
+      assert :sys.get_state(Lights).tighten_floor == 120
+
+      capture_log(fn ->
+        FakeBluez.fail(:advertise, :busy)
+        assert {:error, {:advertise, :busy}} = Lights.set("path light 2", on: true)
+        FakeBluez.succeed(:advertise)
+      end)
+
+      assert :sys.get_state(Lights).tighten_floor == 120
+      assert send_n(2) == [119, 120]
+      assert :sys.get_state(Lights).tighten_floor == nil
+
+      # More than half the range on, a kept floor of 120 would read as
+      # ahead of the cursor and block the tighten.
+      for seq <- [16_000, 32_000, 33_000],
+          do: assert(:ok = Lights.reload(fixture(%{"seq" => seq})))
+
+      assert send_n(1) == [33_000]
+      stop_supervised!(Lights)
+      assert persisted_seq(persisted) == 33_001
+    end
+
+    test "a successful reload retires a floor the cursor passed", %{persisted: persisted} do
+      restart_lights(persisted, [])
+      assert send_n(1) == [100]
+
+      capture_log(fn ->
+        fail_persist(persisted, {:error, :busy})
+        assert {:error, :persist_failed} = Lights.reload(fixture(%{"seq" => 120}))
+        fail_persist(persisted, nil)
+      end)
+
+      assert :ok = Lights.reload(fixture(%{"seq" => 16_000}))
+      assert :sys.get_state(Lights).tighten_floor == nil
+
+      for seq <- [32_000, 33_000], do: assert(:ok = Lights.reload(fixture(%{"seq" => seq})))
+      assert send_n(1) == [33_000]
+      stop_supervised!(Lights)
+      assert persisted_seq(persisted) == 33_001
+    end
+
+    test "invalid options stop the start" do
+      Process.flag(:trap_exit, true)
+
+      for {opts, key} <- [
+            {[persist_interval_ms: 0], :persist_interval_ms},
+            {[persist_interval_ms: 1.5], :persist_interval_ms},
+            {[max_lease: 0], :max_lease},
+            {[max_lease: 900], :max_lease},
+            {[max_lease: 600.0], :max_lease},
+            {[min_lease: 0], :min_lease},
+            {[min_lease: 50, max_lease: 40], :min_lease},
+            {[on_tighten: fn _inv -> :ok end], :on_tighten},
+            {[clock: :wall], :clock},
+            {[max_jump: 901], :max_jump},
+            {[max_jump: 600], :max_jump},
+            {[min_lease: 2, max_lease: 5, max_jump: 5], :max_jump},
+            {[max_jump: 1.5], :max_jump}
+          ] do
+        assert {:error, {:bad_option, ^key}} =
+                 Lights.start_link([inventory: File.read!(@fixture), name: :lights_opts] ++ opts)
+      end
+
+      assert {:ok, pid} =
+               Lights.start_link(
+                 inventory: File.read!(@fixture),
+                 name: :lights_opts,
+                 min_lease: 899,
+                 max_lease: 899,
+                 persist_interval_ms: 1
+               )
+
+      GenServer.stop(pid)
+    end
+
+    test "the child spec leaves room for the tighten" do
+      assert %{shutdown: 5_000, id: Lights} = Lights.child_spec([])
+    end
+  end
+
+  describe "tighten on a clean stop" do
+    test "persists the exact next number", %{persisted: persisted} do
+      restart_lights(persisted, [])
+      assert send_n(3) == [100, 101, 102]
+      assert persisted_seq(persisted) == 132
+
+      stop_supervised!(Lights)
+      assert persisted_seq(persisted) == 103
+      assert tightens(persisted) == 1
+
+      start_lights(lights_opts(persisted, []))
+      assert send_n(1) == [103]
+    end
+
+    @tag :capture_log
+    test "a given-back number is the next one; an uncertain one stays used", %{
+      persisted: persisted
+    } do
+      restart_lights(persisted, [])
+      assert send_n(2) == [100, 101]
+
+      # Refused before going on air: 102 is handed out again.
+      FakeBluez.fail(:advertise, :busy)
+      assert {:error, {:advertise, :busy}} = Lights.set("path light 2", on: true)
+      FakeBluez.succeed(:advertise)
+
+      stop_supervised!(Lights)
+      assert persisted_seq(persisted) == 102
+
+      start_lights(lights_opts(persisted, []))
+      wait_until(&radio_ready?/0)
+
+      # May have gone on air: 102 is used, and the tighten stays past it.
+      FakeBluez.fail(:advertise, :lease_expired)
+      assert {:error, {:uncertain, :lease_expired}} = Lights.set("path light 2", on: true)
+      FakeBluez.succeed(:advertise)
+
+      stop_supervised!(Lights)
+      assert persisted_seq(persisted) == 103
+
+      start_lights(lights_opts(persisted, []))
+      wait_until(&radio_ready?/0)
+      assert send_n(1) == [103]
+    end
+
+    @tag :capture_log
+    test "a failed or refused tighten keeps the lease end", %{persisted: persisted} do
+      restart_lights(persisted, [])
+      assert send_n(1) == [100]
+
+      :ets.insert(persisted, {:fail_tighten, {:error, :busy}})
+      stop_supervised!(Lights)
+      assert persisted_seq(persisted) == 132
+      :ets.delete(persisted, :fail_tighten)
+
+      # A store that moved on since the last persist refuses it.
+      start_lights(lights_opts(persisted, []))
+      assert send_n(1) == [132]
+      :ets.insert(persisted, {:inv, %{last_persisted(persisted) | seq: 500}})
+      stop_supervised!(Lights)
+      assert persisted_seq(persisted) == 500
+
+      # Raising is a failure too.
+      start_lights(lights_opts(persisted, on_tighten: fn _inv, _leased -> raise "no" end))
+      assert send_n(1) == [500]
+      stop_supervised!(Lights)
+      assert persisted_seq(persisted) == 532
+      assert tightens(persisted) == 0
+    end
+
+    @tag :capture_log
+    test "never below the cursor of a failed same-mesh reload", %{persisted: persisted} do
+      restart_lights(persisted, on_persist: store_persist(persisted))
+      assert send_n(1) == [100]
+      assert persisted_seq(persisted) == 132
+
+      # The dump's cursor (120) may be what the app used. The reload's write
+      # lands (132, its lease end) but reports a failure, so next stays 101.
+      fail_persist(persisted, {:written, {:error, :sync_failed}})
+      assert {:error, :persist_failed} = Lights.reload(fixture(%{"seq" => 120}))
+      fail_persist(persisted, nil)
+
+      stop_supervised!(Lights)
+      assert persisted_seq(persisted) == 120
+
+      start_lights(lights_opts(persisted, on_persist: store_persist(persisted)))
+      assert send_n(1) == [120]
+
+      # A failed reload's cursor at or past the lease end: nothing to tighten.
+      fail_persist(persisted, {:error, :busy})
+      assert {:error, :persist_failed} = Lights.reload(fixture(%{"seq" => 5_000}))
+      fail_persist(persisted, nil)
+      stop_supervised!(Lights)
+      assert persisted_seq(persisted) == 152
+    end
+
+    test "nothing is tightened without on_tighten, or with nothing left", %{
+      persisted: persisted
+    } do
+      restart_lights(persisted, on_tighten: nil)
+      assert send_n(1) == [100]
+      stop_supervised!(Lights)
+      assert persisted_seq(persisted) == 132
+
+      # Started and stopped without sending: the lease end is the cursor.
+      start_lights(lights_opts(persisted, []))
+      stop_supervised!(Lights)
+      assert persisted_seq(persisted) == 132
+      assert tightens(persisted) == 0
+    end
+
+    @tag :capture_log
+    test "a crash doesn't tighten", %{persisted: persisted} do
+      restart_lights(persisted, [])
+      assert send_n(1) == [100]
+
+      :sys.replace_state(Lights, &%{&1 | seq: :broken})
+      old = Process.whereis(Lights)
+      assert {:error, :not_running} = Lights.reload(File.read!(@fixture))
+      wait_until(fn -> match?(pid when is_pid(pid) and pid != old, Process.whereis(Lights)) end)
+
+      assert tightens(persisted) == 0
+      assert persisted_seq(persisted) == 132
+      assert send_n(1) == [132]
+    end
+
+    @tag :capture_log
+    test "a tighten that hangs is cut short inside the shutdown", %{persisted: persisted} do
+      restart_lights(persisted, [])
+      assert send_n(1) == [100]
+
+      :ets.insert(persisted, {:fail_tighten, :hang})
+      {elapsed_us, :ok} = :timer.tc(fn -> stop_supervised!(Lights) end)
+
+      assert elapsed_us < 5_000_000
+      assert persisted_seq(persisted) == 132
+    end
+  end
+
+  describe "reload with a lease" do
+    test "persists at once and re-bases the lease", %{persisted: persisted} do
+      restart_lights(persisted, min_lease: 2, max_lease: 10)
+      assert send_n(3) == [100, 101, 102]
+      # 2, then 10 at once (used up inside the interval).
+      assert persisted_seq(persisted) == 112
+
+      assert :ok = Lights.reload(File.read!(@fixture))
+      assert writes(persisted) == 3
+      assert persisted_seq(persisted) == 112
+
+      # The rest of the lease is still used; the next lease starts over at
+      # min_lease instead of following the burst before the reload.
+      assert send_n(10) == Enum.to_list(103..112)
+      assert persisted_seq(persisted) == 114
+
+      # A newer dump moves past the lease: it starts again from there.
+      assert :ok = Lights.reload(fixture(%{"seq" => 5_000}))
+      assert persisted_seq(persisted) == 5_000
+      assert send_n(1) == [5_000]
+      assert persisted_seq(persisted) == 5_002
+    end
+  end
+
+  describe "sequence safety under random operations" do
+    @describetag :capture_log
+
+    for seed <- [11, 23] do
+      test "seed #{seed}: the persisted cursor stays past every number used", %{
+        persisted: persisted
+      } do
+        random_run(persisted, unquote(seed), 120)
+      end
+    end
+  end
+
+  # Random sends, failures, clock steps, crashes and clean restarts across
+  # the 16-bit wrap. `last` is the newest number that may have gone on air
+  # (sent or uncertain). After every step the persisted seq must be ahead
+  # of it; every new number must be ahead of it, by exactly 1 unless a
+  # crash skipped the rest of a lease (at most max_lease numbers).
+  defp random_run(persisted, seed, steps) do
+    :rand.seed(:exsss, {seed, seed, seed})
+    {:ok, inv} = Inventory.decode(fixture(%{"seq" => 65_500}))
+    :ets.insert(persisted, {:inv, inv})
+
+    opts =
+      lights_opts(persisted,
+        on_persist: store_persist(persisted),
+        min_lease: 2,
+        max_lease: @random_max_lease,
+        persist_interval_ms: 10_000
+      )
+
+    stop_supervised!(Lights)
+    start_lights(opts)
+
+    Enum.reduce(1..steps, %{last: nil, may_skip?: false}, fn step, acc ->
+      acc = random_op(:rand.uniform(9), opts, persisted, acc)
+      where = "seed #{seed} step #{step}"
+
+      if acc.last,
+        do: assert(Seq.ahead?(acc.last, persisted_seq(persisted)), where)
+
+      acc
+    end)
+  end
+
+  # A persist may fail outright or after its write landed (a failed sync).
+  # Without an injected failure the send must go out: a store refusing a
+  # retry as :seq_behind would block it.
+  defp random_op(n, _opts, persisted, acc) when n <= 4 do
+    injected? =
+      case :rand.uniform(6) do
+        1 -> fail_persist(persisted, {:error, :busy})
+        2 -> fail_persist(persisted, {:written, {:error, :sync_failed}})
+        _ -> false
+      end
+
+    result = attempt(fn -> Lights.set("path light 2", on: true) end)
+    fail_persist(persisted, nil)
+
+    case result do
+      {:sent, sn} -> used(acc, sn)
+      {:error, :persist_failed} when injected? != false -> acc
+    end
+  end
+
+  defp random_op(5, _opts, _persisted, acc) do
+    FakeBluez.fail(:advertise, :busy)
+    assert {:error, {:advertise, :busy}} = Lights.set("path light 2", on: true)
+    FakeBluez.succeed(:advertise)
+    acc
+  end
+
+  defp random_op(6, _opts, _persisted, acc) do
+    wait_until(&radio_ready?/0)
+    sn = Seq.next(:sys.get_state(Lights).seq)
+    FakeBluez.fail(:advertise, :lease_expired)
+    assert {:error, {:uncertain, :lease_expired}} = Lights.set("path light 2", on: true)
+    FakeBluez.succeed(:advertise)
+    wait_until(&radio_ready?/0)
+    used(acc, sn)
+  end
+
+  defp random_op(7, _opts, persisted, acc) do
+    tick(persisted, :rand.uniform(15_000))
+    acc
+  end
+
+  defp random_op(8, _opts, _persisted, acc) do
+    old = Process.whereis(Lights)
+    Process.exit(old, :kill)
+    wait_until(fn -> match?(pid when is_pid(pid) and pid != old, Process.whereis(Lights)) end)
+    {:ok, _} = Lights.all()
+    %{acc | may_skip?: true}
+  end
+
+  # A clean stop tightens to the cursor unless the store refuses it (a
+  # failed persist's write landed since); then the restart resumes at the
+  # stored lease end like a crash.
+  defp random_op(9, opts, persisted, acc) do
+    next = Seq.next(:sys.get_state(Lights).seq)
+    stop_supervised!(Lights)
+    start_lights(opts)
+    if persisted_seq(persisted) == next, do: acc, else: %{acc | may_skip?: true}
+  end
+
+  defp used(%{last: nil} = acc, sn), do: %{acc | last: sn, may_skip?: false}
+
+  # A restart at a lease end jumps at most max_lease + 1 past the last
+  # number that may have gone on air (the lease's first can be given back).
+  defp used(%{last: last, may_skip?: may_skip?} = acc, sn) do
+    gap = distance(last, sn)
+
+    if may_skip?,
+      do: assert(gap in 1..(@random_max_lease + 1), "gap #{gap} after a restart at a lease end"),
+      else: assert(gap == 1, "gap #{gap} without a restart at a lease end")
+
+    %{acc | last: sn, may_skip?: false}
+  end
+
   # ── helpers ──────────────────────────────────────────────────────────
 
   defp radio_spec(opts \\ []) do
@@ -638,6 +1289,122 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
       end
     end
   end
+
+  # on_persist with the host store's rules: a seq behind the stored one is
+  # refused (:seq_behind), and {:written, result} stores the inventory and
+  # then returns `result`, like a DETS insert whose sync fails.
+  defp store_persist(table) do
+    fn inv ->
+      stored = with [{:inv, stored}] <- :ets.lookup(table, :inv), do: stored.seq
+
+      cond do
+        is_integer(stored) and inv.seq != stored and not Seq.ahead?(stored, inv.seq) ->
+          {:error, :seq_behind}
+
+        true ->
+          case :ets.lookup(table, :fail) do
+            [{:fail, {:written, result}}] ->
+              :ets.insert(table, {:inv, inv})
+              result
+
+            [{:fail, result}] ->
+              result
+
+            [] ->
+              :ets.insert(table, {:inv, inv})
+              :ets.update_counter(table, :writes, 1)
+              :ok
+          end
+      end
+    end
+  end
+
+  # on_tighten backed by the same table, with the compare-and-set a host
+  # store needs: applied only while the stored seq is still `leased`.
+  defp tighten_to(table) do
+    fn inv, leased ->
+      case {:ets.lookup(table, :fail_tighten), :ets.lookup(table, :inv)} do
+        {[{:fail_tighten, :hang}], _} ->
+          Process.sleep(:infinity)
+
+        {[{:fail_tighten, result}], _} ->
+          result
+
+        {[], [{:inv, %{seq: ^leased}}]} ->
+          :ets.insert(table, {:inv, inv})
+          :ets.update_counter(table, :tightens, 1)
+          :ok
+
+        _moved ->
+          {:error, :seq_moved}
+      end
+    end
+  end
+
+  defp loader(table) do
+    fn ->
+      case :ets.lookup(table, :inv) do
+        [{:inv, inv}] -> {:ok, inv}
+        [] -> {:ok, File.read!(@fixture)}
+      end
+    end
+  end
+
+  # Lights reading and writing `table`, with its clock in `table` too
+  # (`tick/2`).
+  defp lights_opts(table, opts) do
+    Keyword.merge(
+      [
+        inventory: loader(table),
+        radio: Radio,
+        on_persist: persist_to(table),
+        on_tighten: tighten_to(table),
+        clock: fn -> :ets.lookup_element(table, :now, 2) end
+      ],
+      opts
+    )
+  end
+
+  defp restart_lights(table, opts) do
+    stop_supervised!(Lights)
+    start_lights(lights_opts(table, opts))
+  end
+
+  defp start_lights(opts) do
+    start_supervised!({Lights, opts})
+    {:ok, _} = Lights.all()
+  end
+
+  defp kill_lights do
+    old = Process.whereis(Lights)
+    Process.exit(old, :kill)
+    wait_until(fn -> match?(pid when is_pid(pid) and pid != old, Process.whereis(Lights)) end)
+    {:ok, _} = Lights.all()
+  end
+
+  defp tick(table, ms), do: :ets.update_counter(table, :now, ms)
+  defp tightens(table), do: :ets.lookup_element(table, :tightens, 2)
+  defp persisted_seq(table), do: last_persisted(table).seq
+
+  # Sends while the lease lasts: `n` SNs, all expected in order.
+  defp send_n(n), do: for(_ <- 1..n//1, do: set_sn("path light 2", on: true))
+
+  # A command's outcome: {:sent, sn} once its frame is on air, or the error.
+  defp attempt(fun) do
+    before = length(advertises())
+
+    case fun.() do
+      :ok ->
+        wait_until(fn -> length(advertises()) > before end)
+        :ok = Radio.stop_tx()
+        {:sent, advertises() |> List.last() |> frame_sn()}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp distance(a, b), do: Integer.mod(b - a, 65_536)
 
   defp fail_persist(table, nil), do: :ets.delete(table, :fail)
   defp fail_persist(table, result), do: :ets.insert(table, {:fail, result})

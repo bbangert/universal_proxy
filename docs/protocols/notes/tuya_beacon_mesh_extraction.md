@@ -38,7 +38,11 @@ Pass a **loader** as `inventory:`, not the decoded data: a child spec's
 data is frozen at supervisor start, so a crash-restart would rewind `seq`
 and reuse SNs. `on_persist` must return `:ok` only once the write is
 durable; anything else blocks sending (`{:error, :persist_failed}`) until a
-later write succeeds. A bad stored inventory makes `Lights` `:ignore` its
+later write succeeds. Persists are rate-limited by leasing numbers (about
+one write a minute, `:persist_interval_ms` / `:min_lease` / `:max_lease`).
+An optional `on_tighten` (`fn inv, leased -> … end`) hands the unused rest
+of the lease back on a clean stop; apply it only while the stored `seq` is
+still `leased` (it moves `seq` back). A bad stored inventory makes `Lights` `:ignore` its
 start instead of failing boot. Give the `Radio` child `shutdown: 10_000`
 (its `child_spec/1` does).
 
