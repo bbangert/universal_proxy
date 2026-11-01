@@ -752,6 +752,61 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
       assert distance(104, 110) == 5 + 1
     end
 
+    test "consecutive crashes that abandon their first lease add min_lease each", %{
+      persisted: persisted
+    } do
+      restart_lights(persisted, min_lease: 3, max_lease: 6)
+      assert send_n(3) == [100, 101, 102]
+
+      # Each round: a new lease whose first frame is refused, then a kill.
+      # The first is max_lease (used up early), then min_lease after each
+      # restart.
+      for expected <- [109, 112, 115] do
+        capture_log(fn ->
+          FakeBluez.fail(:advertise, :busy)
+          assert {:error, {:advertise, :busy}} = Lights.set("path light 2", on: true)
+          FakeBluez.succeed(:advertise)
+        end)
+
+        assert persisted_seq(persisted) == expected
+        kill_lights()
+      end
+
+      # 102 was the last on air: max_lease + 1 for the first crash, plus
+      # min_lease for each of the 2 restarts that abandoned theirs.
+      assert send_n(1) == [115]
+      assert distance(102, 115) == 6 + 1 + 2 * 3
+    end
+
+    @tag :capture_log
+    test "no lease is taken while the Radio can't transmit", %{persisted: persisted} do
+      restart_lights(persisted, [])
+
+      holder = start_supervised!({Task, fn -> Process.sleep(:infinity) end})
+      FakeBluez.fail(:acquire, {:held_by, holder})
+      :ok = FakeBluez.end_lease()
+      wait_until(fn -> not radio_ready?() end)
+
+      assert {:error, :not_ready} = Lights.set("path light 2", on: true)
+      assert {:error, :not_ready} = Lights.ping("path light 2")
+      assert writes(persisted) == 0
+
+      # A command that can't be built takes no lease either.
+      FakeBluez.succeed(:acquire)
+      wait_until(&radio_ready?/0)
+      assert {:error, {:bad_mode, :disco}} = Lights.set("path light 2", mode: :disco)
+      assert writes(persisted) == 0
+
+      stop_supervised!({Radio, 1})
+      assert {:error, :not_running} = Lights.set("path light 2", on: true)
+      assert writes(persisted) == 0
+
+      start_supervised!(radio_spec())
+      wait_until(&radio_ready?/0)
+      assert send_n(1) == [100]
+      assert writes(persisted) == 1
+    end
+
     test "invalid options stop the start" do
       Process.flag(:trap_exit, true)
 
@@ -855,6 +910,32 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
       stop_supervised!(Lights)
       assert persisted_seq(persisted) == 532
       assert tightens(persisted) == 0
+    end
+
+    @tag :capture_log
+    test "never below the cursor of a failed same-mesh reload", %{persisted: persisted} do
+      restart_lights(persisted, on_persist: store_persist(persisted))
+      assert send_n(1) == [100]
+      assert persisted_seq(persisted) == 132
+
+      # The dump's cursor (120) may be what the app used. The reload's write
+      # lands (132, its lease end) but reports a failure, so next stays 101.
+      fail_persist(persisted, {:written, {:error, :sync_failed}})
+      assert {:error, :persist_failed} = Lights.reload(fixture(%{"seq" => 120}))
+      fail_persist(persisted, nil)
+
+      stop_supervised!(Lights)
+      assert persisted_seq(persisted) == 120
+
+      start_lights(lights_opts(persisted, on_persist: store_persist(persisted)))
+      assert send_n(1) == [120]
+
+      # A failed reload's cursor at or past the lease end: nothing to tighten.
+      fail_persist(persisted, {:error, :busy})
+      assert {:error, :persist_failed} = Lights.reload(fixture(%{"seq" => 5_000}))
+      fail_persist(persisted, nil)
+      stop_supervised!(Lights)
+      assert persisted_seq(persisted) == 152
     end
 
     test "nothing is tightened without on_tighten, or with nothing left", %{
@@ -1160,6 +1241,13 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
 
   defp start_lights(opts) do
     start_supervised!({Lights, opts})
+    {:ok, _} = Lights.all()
+  end
+
+  defp kill_lights do
+    old = Process.whereis(Lights)
+    Process.exit(old, :kill)
+    wait_until(fn -> match?(pid when is_pid(pid) and pid != old, Process.whereis(Lights)) end)
     {:ok, _} = Lights.all()
   end
 

@@ -17,8 +17,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Seq do
     * `lease/2` moves only `value/1`, by up to 899 numbers; persist it,
       then `take/1` numbers from the lease one at a time. `give_back/2`
       returns the number just taken (one that provably never went on
-      air), and `tighten/1` pulls `value/1` back to `next/1` (see it for
-      when that is safe).
+      air), and `tighten/2` pulls `value/1` back to `next/1` or a floor
+      (see it for when that is safe).
 
   The counter wraps modulo 2^16 (`65_535, 0, 1, …`), so "ahead" and
   "behind" are serial-number comparisons (RFC 1982 style, `ahead?/2`): `b`
@@ -82,9 +82,18 @@ defmodule UniversalProxy.TuyaBeaconMesh.Seq do
   def max_lease, do: @max_lease
 
   @doc """
-  The largest forward jump (#{@max_jump}) a crash restart may make past
-  the last number that may have gone on air: about what the bulbs were
-  seen to accept.
+  The largest forward jump (#{@max_jump}) that **one** crash restart may
+  make past the last number that may have gone on air: about what the
+  bulbs were seen to accept.
+
+  The bound is per abandoned lease, not cumulative. A restart resumes at
+  the lease end (at most `max_lease + 1` past the last number on air);
+  if that run is cut short too before any number of its own lease goes
+  out (its first number refused, then another crash), the next restart
+  resumes at that lease's end in turn. A caller whose first lease after
+  a start is `min_lease` therefore jumps at most `max_lease + 1 + k *
+  min_lease` after `k` such further restarts: only a crash loop
+  accumulates, at the pace its supervisor's restart budget allows.
   """
   @spec max_jump() :: pos_integer()
   def max_jump, do: @max_jump
@@ -144,16 +153,26 @@ defmodule UniversalProxy.TuyaBeaconMesh.Seq do
   end
 
   @doc """
-  Ends the lease at `next/1`: `value/1` becomes `next/1`, dropping the
-  leased numbers not yet taken.
+  Ends the lease at `next/1`, or at `floor` when that is later:
+  `value/1` becomes the later of the two, dropping the leased numbers
+  not yet taken below it. A `floor` at or past `value/1` leaves `seq`
+  unchanged (this only ever moves the persisted cursor back).
 
-  This moves the persisted cursor **back**. Persist the result only when
-  no number at or past `next/1` was ever used: every number `take/1`
-  handed out is behind it (whether or not its frame went on air), and a
-  given-back number never went on air.
+  Persist the result only when no number at or past it was ever used:
+  every number `take/1` handed out is behind `next/1` (whether or not its
+  frame went on air), and a given-back number never went on air. Pass a
+  `floor` for a cursor that may be stored, or heard, beyond `next/1`.
   """
-  @spec tighten(t()) :: t()
-  def tighten(%__MODULE__{next: n} = seq), do: %{seq | until: n}
+  @spec tighten(t(), non_neg_integer() | nil) :: t()
+  def tighten(seq, floor \\ nil)
+
+  def tighten(%__MODULE__{next: n} = seq, nil), do: tighten(seq, n)
+
+  def tighten(%__MODULE__{next: n, until: until} = seq, floor)
+      when is_integer(floor) and floor >= 0 do
+    target = later(n, rem(floor, @max))
+    if ahead?(target, until), do: %{seq | until: target}, else: seq
+  end
 
   @doc """
   Moves the cursor forward to `value` when `value` is ahead of it

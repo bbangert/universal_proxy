@@ -136,6 +136,20 @@ defmodule UniversalProxy.TuyaBeaconMesh.SeqTest do
       assert Seq.tighten(Seq.new(7)) == Seq.new(7)
     end
 
+    test "tighten/2 stops at a floor ahead of the next number, never past the lease" do
+      {:ok, seq} = Seq.lease(Seq.new(65_530), 40)
+      {:ok, 65_530, seq} = Seq.take(seq)
+
+      assert Seq.value(Seq.tighten(seq, 5)) == 5
+      # A floor behind next, or nil, tightens to next.
+      assert Seq.value(Seq.tighten(seq, 65_000)) == 65_531
+      assert Seq.value(Seq.tighten(seq, nil)) == 65_531
+      # At or past the lease end: unchanged.
+      assert Seq.tighten(seq, 34) == seq
+      assert Seq.tighten(seq, 500) == seq
+      assert Seq.next(Seq.tighten(seq, 5)) == 65_531
+    end
+
     test "reserve/2 and advance_to/2 keep a lease that is still ahead" do
       {:ok, seq} = Seq.lease(Seq.new(100), 50)
       assert {:ok, [100, 101], reserved} = Seq.reserve(seq, 2)

@@ -241,18 +241,19 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   Radio state: whether setup completed (`:ready`) and why it last failed
   (`:last_error`, `nil` once ready), adapter index, lease held, discovery
   on, receiver listening, subscriber count, what's on air (`:tx`) and how
-  many frames are queued (`:queued`).
+  many frames are queued (`:queued`). `opts`: `:server`, `:timeout`
+  (default 5000; a radio that doesn't answer in time reads as not running).
   """
   @spec status(keyword()) :: {:ok, map()} | {:error, :not_running}
   def status(opts \\ []) do
-    call(server(opts), :status, {:error, :not_running})
+    call(server(opts), :status, {:error, :not_running}, Keyword.get(opts, :timeout, 5_000))
   end
 
   defp server(opts), do: Keyword.get(opts, :server, __MODULE__)
 
   # `catch :exit` idiom (see `Bluez`): not running → the given default.
-  defp call(server, request, default) do
-    GenServer.call(server, request)
+  defp call(server, request, default, timeout \\ 5_000) do
+    GenServer.call(server, request, timeout)
   catch
     :exit, _reason -> default
   end
