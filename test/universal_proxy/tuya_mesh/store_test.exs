@@ -528,6 +528,8 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
       assert {:ok, _} = Store.preview(KeyLeak.snake_map(), ctx.store)
       _ = Store.persist(KeyLeak.json(), ctx.store)
       _ = Store.tighten(KeyLeak.snake_map(), 100, ctx.store)
+      # Replies are logged too: load answers with the whole inventory.
+      assert {:ok, %Inventory{beacon_key: "0011" <> _}} = Store.load(ctx.store)
 
       KeyLeak.refute_keys(:sys.get_status(ctx.store))
     end

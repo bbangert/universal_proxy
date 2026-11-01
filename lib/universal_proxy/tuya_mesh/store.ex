@@ -143,7 +143,13 @@ defmodule UniversalProxy.TuyaMesh.Store do
   """
   @spec load(GenServer.server()) ::
           {:ok, Inventory.t()} | {:error, :no_inventory | :unavailable | {:invalid, term()}}
-  def load(server \\ __MODULE__), do: call(server, :load, {:error, :unavailable})
+  def load(server \\ __MODULE__) do
+    # Replies cross the mailbox and the raw sys debug log as well: sealed.
+    case call(server, :load, {:error, :unavailable}) do
+      {:ok, sealed} -> {:ok, Redact.unseal(sealed)}
+      error -> error
+    end
+  end
 
   @doc """
   `Lights`' `on_persist`: writes `inventory` (same mesh and bulbs as the
@@ -315,7 +321,13 @@ defmodule UniversalProxy.TuyaMesh.Store do
     do: Redact.guard("TuyaMesh.Store", fn -> do_call(request, from, state) end)
 
   defp do_call(:load, _from, state) do
-    {:reply, load_stored(state.table), state}
+    reply =
+      case load_stored(state.table) do
+        {:ok, inv} -> {:ok, Redact.seal(inv)}
+        error -> error
+      end
+
+    {:reply, reply, state}
   end
 
   defp do_call({:persist, input, mode}, _from, state) do

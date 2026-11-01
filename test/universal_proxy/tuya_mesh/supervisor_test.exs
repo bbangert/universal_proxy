@@ -345,6 +345,41 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
       assert Process.whereis(ctx.names.resolver) == resolver
     end
 
+    test "a group removed while the PubSub was down shows up after recovery", ctx do
+      assert %{groups: [%{local_id: 1}]} = status(ctx)
+      Process.flag(:trap_exit, true)
+      stop_supervised!(:pubsub)
+
+      # The Store's broadcast for this is lost: nothing is listening.
+      :ok = Store.persist(%{inventory() | seq: 132, groups: []}, ctx.store)
+
+      start_supervised!(pubsub_spec(ctx.pubsub))
+      wait_until(fn -> match?(%{groups: []}, status(ctx)) end)
+    end
+
+    test "a load and a whole evaluation leave no key in either :sys status", ctx do
+      alias UniversalProxy.TuyaMesh.KeyLeak
+
+      resolver = Process.whereis(ctx.names.resolver)
+      :ok = :sys.log(ctx.store, true)
+      :ok = :sys.log(resolver, true)
+
+      assert {:ok, %Inventory{}} = Store.load(ctx.store)
+      # A group change makes the Resolver re-read; an adapter loss and its
+      # return make it stop the mesh and evaluate (and load) again.
+      :ok = Store.persist(%{inventory() | seq: 132, groups: []}, ctx.store)
+      wait_until(fn -> match?(%{groups: []}, status(ctx)) end)
+      set_adapters(ctx, [adapter(@proxy_mac, 0)])
+      adapters_changed(ctx)
+      wait_until(fn -> mesh_pid(ctx) == nil end)
+      set_adapters(ctx, [adapter(@proxy_mac, 0), adapter(@mesh_mac, 1)])
+      adapters_changed(ctx)
+      wait_until(fn -> mesh_index(ctx) == 1 end)
+
+      KeyLeak.refute_keys(:sys.get_status(ctx.store))
+      KeyLeak.refute_keys(:sys.get_status(resolver))
+    end
+
     test "a persisted group removal reaches the status and its broadcast", ctx do
       assert %{groups: [%{local_id: 1}]} = status(ctx)
       Phoenix.PubSub.subscribe(ctx.pubsub, Store.topic())

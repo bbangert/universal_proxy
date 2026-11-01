@@ -216,7 +216,9 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
       sub_timer: nil
     }
 
-    {:ok, ensure_subscribed(state), {:continue, :evaluate}}
+    # The evaluation that follows reads everything fresh: nothing to catch up.
+    {state, _added} = subscribe(state)
+    {:ok, state, {:continue, :evaluate}}
   end
 
   # ── Subscriptions ────────────────────────────────────────────────────
@@ -228,25 +230,43 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   # each tick also checks them, since a Registry partition can restart
   # under the same top-level pid. Subscribing is skipped for a topic already
   # held, as the registry is :duplicate and would deliver twice.
+  #
+  # Whatever was broadcast while a subscription was gone is lost, so a
+  # re-made one catches up: the Store topic re-reads the summary, the
+  # adapters topic re-checks the adapter.
   defp ensure_subscribed(state) do
+    {state, added} = subscribe(state)
+    catch_up(state, added)
+  end
+
+  # The topics it (re)subscribed to come back alongside the state.
+  defp subscribe(state) do
     state = cancel_sub_timer(state)
 
-    if subscribe_topics(state.pubsub) == :ok,
-      do: monitor_pubsub(state),
-      else: %{state | sub_timer: arm(:resubscribe, @resubscribe_ms)}
+    case subscribe_topics(state.pubsub) do
+      {:ok, added} -> {monitor_pubsub(state), added}
+      :error -> {%{state | sub_timer: arm(:resubscribe, @resubscribe_ms)}, []}
+    end
   end
 
   # Registry raises ArgumentError when it isn't running.
   defp subscribe_topics(pubsub) do
     held = Registry.keys(pubsub, self())
 
-    for topic <- [Bluez.Client.adapters_topic(), Store.topic()], topic not in held do
-      :ok = Phoenix.PubSub.subscribe(pubsub, topic)
-    end
+    added =
+      for topic <- [Bluez.Client.adapters_topic(), Store.topic()], topic not in held do
+        :ok = Phoenix.PubSub.subscribe(pubsub, topic)
+        topic
+      end
 
-    :ok
+    {:ok, added}
   rescue
     ArgumentError -> :error
+  end
+
+  defp catch_up(state, added) do
+    state = if Store.topic() in added, do: load_inventory(state), else: state
+    if Bluez.Client.adapters_topic() in added, do: adapters_changed(state), else: state
   end
 
   defp monitor_pubsub(state) do
@@ -329,20 +349,17 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   end
 
   defp do_info({:resubscribe, token}, %{sub_timer: {token, _}} = state),
-    do: {:noreply, %{state | sub_timer: nil} |> ensure_subscribed()}
+    do: {:noreply, %{state | sub_timer: nil} |> ensure_subscribed() |> publish()}
 
   defp do_info({:DOWN, mon, :process, _pid, _reason}, %{pubsub_mon: {_pid2, mon}} = state),
-    do: {:noreply, %{state | pubsub_mon: nil} |> ensure_subscribed()}
+    do: {:noreply, %{state | pubsub_mon: nil} |> ensure_subscribed() |> publish()}
 
   # Uploads, clears and group changes: re-read the summary (no keys kept).
   defp do_info({:tuya_mesh_store, :inventory_changed}, state),
     do: {:noreply, state |> load_inventory() |> publish()}
 
-  defp do_info({:bluetooth_adapters_changed}, %{mesh: %{}} = state),
-    do: {:noreply, state |> check_index() |> publish()}
-
   defp do_info({:bluetooth_adapters_changed}, state),
-    do: {:noreply, %{state | backoff_ms: state.retry_ms} |> evaluate() |> publish()}
+    do: {:noreply, state |> adapters_changed() |> publish()}
 
   defp do_info({:tuya_report, _report}, %{refresh_timer: nil, mesh: %{}} = state) do
     {:noreply, %{state | refresh_timer: arm(:refresh_reports, @report_debounce_ms)}}
@@ -363,6 +380,10 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   defp do_info(_other, state), do: {:noreply, state}
 
   # ── Lifecycle ────────────────────────────────────────────────────────
+
+  # Running: the adapter must still be the mesh's. Idle: maybe it can start.
+  defp adapters_changed(%{mesh: %{}} = state), do: check_index(state)
+  defp adapters_changed(state), do: %{state | backoff_ms: state.retry_ms} |> evaluate()
 
   defp evaluate(%{mesh: %{}} = state), do: state
 

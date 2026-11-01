@@ -7,8 +7,9 @@ defmodule UniversalProxy.TuyaMesh.Redact do
       every printer (`Inspect`, `~p`, crash reports, the raw `:sys` debug
       log, which `format_status/1` never sees) shows as an opaque
       function. The client APIs of `Store` and `Resolver` send inventories
-      only this way; `unseal/1` takes it back out (and passes anything else
-      through, for direct calls).
+      only this way, and `Store.load/1`'s reply travels sealed too (the
+      debug log records replies as well); `unseal/1` takes it back out in
+      the caller (and passes anything else through, for direct calls).
     * `request/1` redacts by shape: the inventory argument of every request
       that carries one (`:replace`, `:persist`, `:classify`, `:preview`;
       `tighten` travels as `:persist`) becomes `:redacted`, whatever its

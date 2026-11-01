@@ -1,8 +1,9 @@
 defmodule UniversalProxy.TuyaMesh.KeyLeak do
   @moduledoc """
   Test support: the example inventory in the representations a Store or
-  Resolver request may carry it in, and an assertion that a text (a log, an
-  inspected status) holds none of its keys in any encoding. Compile-only
+  Resolver request may carry it in, and an assertion that a text (a log) or
+  a term (a status, printed both with `inspect/2` and Erlang's `~p`) holds
+  none of its keys in any encoding. Compile-only
   test support, never deployed.
   """
 
@@ -37,7 +38,10 @@ defmodule UniversalProxy.TuyaMesh.KeyLeak do
 
     texts =
       [@beacon_key, String.upcase(@beacon_key), raw, inspect(raw), Base.encode64(raw)] ++
-        [raw |> :binary.bin_to_list() |> Enum.join(", ")] ++
+        [
+          raw |> :binary.bin_to_list() |> Enum.join(", "),
+          raw |> :binary.bin_to_list() |> Enum.join(",")
+        ] ++
         Enum.flat_map(@local_keys, &[&1, Base.encode16(&1), Base.encode16(&1, case: :lower)])
 
     for secret <- texts do
@@ -47,6 +51,10 @@ defmodule UniversalProxy.TuyaMesh.KeyLeak do
     :ok
   end
 
-  def refute_keys(term),
-    do: refute_keys(inspect(term, limit: :infinity, printable_limit: :infinity))
+  # Both printers: Elixir's (which honours the structs' Inspect, keys left
+  # out) and Erlang's ~p (which doesn't, as a raw report or debug dump would).
+  def refute_keys(term) do
+    refute_keys(inspect(term, limit: :infinity, printable_limit: :infinity))
+    refute_keys(~c"~tp" |> :io_lib.format([term]) |> IO.chardata_to_string())
+  end
 end
