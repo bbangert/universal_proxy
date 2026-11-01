@@ -291,5 +291,15 @@
       "UniversalProxy.TuyaBeaconMesh.Radio.kill_receiver/1 sends an exit signal to a process it holds as a value in what the callback UniversalProxy.TuyaBeaconMesh.Radio.handle_call/3 runs. This is often deliberate — process-manager handoff, registry name-conflict resolution, an ownership watcher killing dependents — but killing a process imperatively bypasses the supervisor that started it, so it is worth confirming the target is meant to be torn down this way rather than stopped through its own protocol.",
     reason:
       "Deliberate: the AdvertReceiver is Radio's own child (start_link'd by Radio, no supervisor) and was already asked to stop through its protocol; the kill is the fallback only after GenServer.stop timed out. proc_lib:stop leaves the target alive on timeout, and a live receiver keeps its registered Rx name, failing every later setup with already_started."
+  },
+  %{
+    analysis: "mailbox",
+    file: "lib/universal_proxy/tuya_mesh/resolver.ex",
+    title: "Subscription made again each time a callback runs",
+    at_label: "subscribes again on every run",
+    detail:
+      "UniversalProxy.TuyaMesh.Resolver.handle_info/2 runs again and again, and each run reaches an anonymous function in UniversalProxy.TuyaMesh.Resolver.subscribe_topics/1's subscription. A second subscription to a topic the process already holds is not a no-op: every later broadcast arrives once more, and nothing UniversalProxy.TuyaMesh.Resolver runs ever unsubscribes, so the copies accumulate for the life of the process.",
+    reason:
+      "False positive: subscribe_topics/1 subscribes only to topics missing from Registry.keys(pubsub, self()) (the comprehension filter), so a held topic is never subscribed twice; it re-subscribes only after a PubSub/Registry restart dropped the subscription. Covered by the supervisor test asserting exactly one Store.topic() key after a PubSub restart."
   }
 ]
