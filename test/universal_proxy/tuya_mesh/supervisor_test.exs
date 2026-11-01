@@ -306,6 +306,23 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
     end
   end
 
+  describe "mesh wiring" do
+    test "Lights persists and tightens through the Store; the Radio is fenced by MAC" do
+      assert {:ok, {_flags, [radio, lights]}} =
+               Mesh.init(adapter_index: 2, adapter_address: @mesh_mac)
+
+      %{start: {Radio, :start_link, [radio_opts]}} = radio
+      assert radio_opts[:adapter_index] == 2
+      assert radio_opts[:adapter_address] == @mesh_mac
+
+      %{start: {Lights, :start_link, [lights_opts]}} = lights
+      assert lights_opts[:on_persist] == (&Store.persist/1)
+      assert lights_opts[:on_tighten] == (&Store.tighten/2)
+      assert lights_opts[:inventory] == (&Store.load/0)
+    end
+  end
+
+  # The Lights here takes `on_tighten:` whether or not it knows the option.
   describe "with the real mesh (FakeBluez)" do
     setup ctx do
       FakeBluez.ensure_started()
@@ -326,7 +343,11 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
             receiver: FakeBluez.Receiver,
             retry_ms: 20
           ],
-          lights: [inventory: fn -> Store.load(store) end, on_persist: &Store.persist(&1, store)]
+          lights: [
+            inventory: fn -> Store.load(store) end,
+            on_persist: &Store.persist(&1, store),
+            on_tighten: &Store.tighten(&1, &2, store)
+          ]
         )
       end
 

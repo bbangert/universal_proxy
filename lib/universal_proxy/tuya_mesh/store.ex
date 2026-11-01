@@ -25,6 +25,15 @@ defmodule UniversalProxy.TuyaMesh.Store do
       from `replace/3`, and a `seq` behind the stored one is refused, so a
       `Lights` still running on a replaced or cleared inventory can't
       write it back.
+    * `tighten/3` is `Lights`' `on_tighten`: on a clean stop, Lights moves
+      the stored cursor back from the end of its lease to the exact next
+      sequence number. It is a compare-and-set: applied only while the same
+      mesh is stored with exactly that lease end (`leased`) and the same
+      bulbs and groups, and it changes only the `seq`. Anything else
+      (`{:error, :stale_tighten | :mesh_changed | :inventory_changed}`)
+      leaves the lease end stored, which is safe; without the check, a
+      `replace/3` that moved the cursor forward (a newer dump) could be
+      pulled back to a stale Lights cursor.
     * `replace/3` stores an upload. For the same mesh, the `seq` becomes the
       later of the stored one and the dump's (`Seq.advance_to/2`), so an old
       dump never pulls it back. A different mesh needs `allow_new_mesh:
@@ -32,6 +41,12 @@ defmodule UniversalProxy.TuyaMesh.Store do
     * When a mesh leaves the store (`clear/2`, or `replace/3` with another
       mesh), its last `seq` is kept as a floor under a SHA-256 fingerprint of
       its key. A later upload of that mesh starts no lower than the floor.
+      A floor exists only while its mesh is out of the store (storing a mesh
+      deletes its floor), so a tighten, which needs the mesh stored, never
+      meets one. The tightened `seq` is the next unused number, at or above
+      every number sent, so the floor recorded from it when the mesh later
+      leaves (the later of any floor and the stored `seq`) is still a valid
+      lower bound.
 
   A stored record that no longer validates (a schema change, a corrupted
   file) is never served, but it still holds the last `seq` of its mesh.
@@ -54,8 +69,10 @@ defmodule UniversalProxy.TuyaMesh.Store do
   group's entry is dropped when the group leaves, because group ids are
   reused for unrelated groups, and every group entry is dropped whenever
   the stored mesh changes (a new mesh, a clear, an invalid record replaced):
-  local group ids of one mesh say nothing about another's. Mappings are
-  written in the same DETS insert as the inventory they belong to.
+  local group ids of one mesh say nothing about another's. Every write over
+  the same stored mesh (persist, tighten, a same-mesh replace) keeps them.
+  Mappings are written in the same DETS insert as the inventory they belong
+  to.
 
   Tests can override `:dets_path`, `:table`, `:name`, `:chmod_fun`
   (`(path, mode -> :ok | {:error, term()})`), `:write_fun` (`(table,
@@ -122,6 +139,21 @@ defmodule UniversalProxy.TuyaMesh.Store do
   @spec persist(Inventory.t(), GenServer.server()) :: :ok | {:error, atom()}
   def persist(inventory, server \\ __MODULE__),
     do: call(server, {:persist, inventory, :advance}, {:error, :unavailable})
+
+  @doc """
+  `Lights`' `on_tighten`: writes `inventory`'s `seq` (the exact next number,
+  possibly behind the stored one) only when the stored inventory is the
+  same mesh, with the same bulbs and groups, and its `seq` is still
+  `leased`. See the moduledoc. `:ok` only once synced.
+  """
+  @spec tighten(Inventory.t(), non_neg_integer(), GenServer.server()) :: :ok | {:error, atom()}
+  def tighten(inventory, leased, server \\ __MODULE__)
+
+  def tighten(inventory, leased, server)
+      when is_integer(leased) and leased >= 0 and leased <= 65_535,
+      do: call(server, {:persist, inventory, {:tighten, leased}}, {:error, :unavailable})
+
+  def tighten(_inventory, _leased, _server), do: {:error, :bad_lease}
 
   @doc """
   How `inventory` relates to the stored one: `:empty` (nothing stored),
@@ -256,7 +288,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
     with {:ok, inv} <- validate(input),
          {:ok, stored} <- fetch_stored(state.table),
          :ok <- check_persistable(stored, inv, mode) do
-      {:reply, write_inventory(state, inv, [], false), state}
+      {:reply, write_inventory(state, inv, [], :same_mesh), state}
     else
       {:error, _reason} = error -> {:reply, error, state}
     end
@@ -370,7 +402,8 @@ defmodule UniversalProxy.TuyaMesh.Store do
         replace_stored(state, stored, inv, opts)
 
       :absent ->
-        store_replacement(state, inv, floor_seq(floors(state.table), inv), floors(state.table))
+        floors = floors(state.table)
+        store_replacement(state, inv, floor_seq(floors, inv), floors, :other_mesh)
 
       {:invalid, raw} ->
         floors =
@@ -383,7 +416,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
               floors(state.table)
           end
 
-        store_replacement(state, inv, floor_seq(floors, inv), floors)
+        store_replacement(state, inv, floor_seq(floors, inv), floors, :other_mesh)
     end
   end
 
@@ -393,12 +426,12 @@ defmodule UniversalProxy.TuyaMesh.Store do
     cond do
       same_mesh?(stored, inv) ->
         seq = {:same_mesh, later_seq(stored.seq, inv.seq)}
-        store_replacement(state, inv, seq, floors, true)
+        store_replacement(state, inv, seq, floors, :same_mesh)
 
       Keyword.get(opts, :allow_new_mesh, false) ->
         # The displaced mesh leaves its seq behind as a floor.
         floors = put_floor(floors, inv_floor(stored))
-        store_replacement(state, inv, floor_seq(floors, inv), floors)
+        store_replacement(state, inv, floor_seq(floors, inv), floors, :other_mesh)
 
       true ->
         {:error, :new_mesh}
@@ -413,12 +446,11 @@ defmodule UniversalProxy.TuyaMesh.Store do
     end
   end
 
-  # Group mappings survive only a write over the same stored mesh.
-  defp store_replacement(state, inv, {kind, seq}, floors, keep_groups? \\ false) do
+  defp store_replacement(state, inv, {kind, seq}, floors, over) do
     inv = %{inv | seq: seq}
     floors = Map.delete(floors, fingerprint(inv.beacon_key))
 
-    case write_inventory(state, inv, [{:seq_floors, floors}], keep_groups?) do
+    case write_inventory(state, inv, [{:seq_floors, floors}], over) do
       :ok -> {:ok, kind}
       error -> error
     end
@@ -429,16 +461,27 @@ defmodule UniversalProxy.TuyaMesh.Store do
   # ── Persist checks ───────────────────────────────────────────────────
 
   defp check_persistable(stored, inv, mode) do
+    if same_mesh?(stored, inv), do: check_seq(mode, stored, inv), else: {:error, :mesh_changed}
+  end
+
+  # Per persist mode: what may change besides the seq, and how the stored
+  # cursor may move. :advance may change groups and only moves forward;
+  # {:tighten, leased} changes nothing but the seq, which may move back,
+  # and only from exactly `leased`.
+  defp check_seq(:advance, stored, inv) do
     cond do
-      not same_mesh?(stored, inv) -> {:error, :mesh_changed}
       stored.bulbs != inv.bulbs -> {:error, :bulbs_changed}
-      true -> check_seq(mode, stored.seq, inv.seq)
+      inv.seq == stored.seq or Seq.ahead?(stored.seq, inv.seq) -> :ok
+      true -> {:error, :seq_behind}
     end
   end
 
-  # The one rule per persist mode for how the stored cursor may move.
-  defp check_seq(:advance, stored, new) do
-    if new == stored or Seq.ahead?(stored, new), do: :ok, else: {:error, :seq_behind}
+  defp check_seq({:tighten, leased}, stored, inv) do
+    cond do
+      stored.seq != leased -> {:error, :stale_tighten}
+      stored.bulbs != inv.bulbs or stored.groups != inv.groups -> {:error, :inventory_changed}
+      true -> :ok
+    end
   end
 
   defp classify_against(nil, _inv), do: :empty
@@ -471,14 +514,23 @@ defmodule UniversalProxy.TuyaMesh.Store do
 
   # ── Preview ──────────────────────────────────────────────────────────
 
+  # Bulbs are matched by MAC whatever the mesh (they keep their ids). A new
+  # mesh's groups are all new and the old ones all go, even where local ids
+  # coincide, since every group gets a fresh sub-device id.
   defp build_preview(stored, inv) do
     {old_bulbs, old_groups} = if stored, do: {stored.bulbs, stored.groups}, else: {[], []}
+    mesh = classify_against(stored, inv)
+    group = &%{local_id: &1.local_id, name: &1.name}
+
+    groups =
+      if mesh == :same_mesh,
+        do: diff(old_groups, inv.groups, & &1.local_id, group),
+        else: %{added: Enum.map(inv.groups, group), removed: Enum.map(old_groups, group)}
 
     %{
-      mesh: classify_against(stored, inv),
+      mesh: mesh,
       bulbs: diff(old_bulbs, inv.bulbs, & &1.mac, &%{mac: &1.mac, label: &1.label}),
-      groups:
-        diff(old_groups, inv.groups, & &1.local_id, &%{local_id: &1.local_id, name: &1.name})
+      groups: groups
     }
   end
 
@@ -517,11 +569,12 @@ defmodule UniversalProxy.TuyaMesh.Store do
   # ── Storage ──────────────────────────────────────────────────────────
 
   # One insert: the inventory, its device ids (allocated for every bulb and
-  # group, departed groups dropped, every group dropped first unless
-  # `keep_groups?`) and the counter, plus `extra` records.
-  defp write_inventory(state, inv, extra, keep_groups?) do
+  # group, departed groups dropped) and the counter, plus `extra` records.
+  # `over` says what the write replaces: the :same_mesh (its group ids are
+  # kept) or an :other_mesh, absent or invalid record (all group ids drop).
+  defp write_inventory(state, inv, extra, over) when over in [:same_mesh, :other_mesh] do
     ids = lookup(state.table, :device_ids, %{})
-    ids = if keep_groups?, do: ids, else: prune_groups(ids, [])
+    ids = if over == :same_mesh, do: ids, else: prune_groups(ids, [])
     {ids, next} = allocate(ids, state.table, inventory_keys(inv))
     ids = prune_groups(ids, Enum.map(inv.groups, & &1.local_id))
 

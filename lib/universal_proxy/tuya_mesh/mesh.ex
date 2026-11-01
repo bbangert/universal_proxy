@@ -8,7 +8,8 @@ defmodule UniversalProxy.TuyaMesh.Mesh do
   `:rest_for_one`: Lights holds a subscription inside the Radio, so a
   Radio restart restarts Lights too (Lights would resubscribe on its own,
   but only after its backoff). Lights reads its inventory through
-  `Store.load/1` on every start and writes through `Store.persist/2`, so a
+  `Store.load/1` on every start and writes through `Store.persist/2` (and,
+  on a clean stop, `Store.tighten/3` as its `on_tighten`), so a
   restart resumes from the persisted `seq`; a Lights restart alone leaves
   the Radio running.
   An inventory that no longer validates makes Lights return `:ignore`,
@@ -59,6 +60,8 @@ defmodule UniversalProxy.TuyaMesh.Mesh do
         [
           inventory: &Store.load/0,
           on_persist: &Store.persist/1,
+          # A Lights without the seq lease ignores this option.
+          on_tighten: &Store.tighten/2,
           radio: Keyword.fetch!(radio, :name),
           name: Lights
         ],

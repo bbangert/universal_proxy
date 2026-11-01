@@ -219,6 +219,22 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
       refute_secrets(preview)
     end
 
+    test "a new mesh's groups are all new, even with the same local ids", ctx do
+      {:ok, _} = Store.replace(inventory(), [], ctx.store)
+      group = %{local_id: 1, name: "path and post"}
+
+      # Same mesh: group 1 is kept.
+      assert {:ok, %{groups: %{added: [], removed: []}}} =
+               Store.preview(inventory(%{"seq" => 900}), ctx.store)
+
+      # Another mesh with an identical group 1: it goes and comes back new.
+      assert {:ok, %{mesh: :new_mesh, bulbs: bulbs, groups: groups}} =
+               Store.preview(other_mesh(), ctx.store)
+
+      assert groups == %{added: [group], removed: [group]}
+      assert bulbs == %{added: [], removed: []}
+    end
+
     test "the same mesh never moves the seq back", ctx do
       {:ok, :new_mesh} = Store.replace(inventory(), [], ctx.store)
       :ok = Store.persist(%{inventory() | seq: 500}, ctx.store)
@@ -299,7 +315,76 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
     end
   end
 
+  describe "tighten (the Lights on_tighten)" do
+    setup ctx do
+      {:ok, _} = Store.replace(inventory(), [], ctx.store)
+      # Lights persisted its lease end (100 + 32).
+      :ok = Store.persist(%{inventory() | seq: 132}, ctx.store)
+      {:ok, ids: Store.device_ids(ctx.store)}
+    end
+
+    test "moves the stored cursor back to the exact next on a lease match", ctx do
+      assert :ok = Store.tighten(%{inventory() | seq: 105}, 132, ctx.store)
+      store = restart_store(ctx)
+      assert {:ok, %Inventory{seq: 105}} = Store.load(store)
+      assert Store.device_ids(store) == ctx.ids
+    end
+
+    test "is refused once the stored cursor moved on", ctx do
+      # A newer dump moved it forward while Lights still ran.
+      {:ok, :same_mesh} = Store.replace(inventory(%{"seq" => 5_000}), [], ctx.store)
+
+      assert {:error, :stale_tighten} = Store.tighten(%{inventory() | seq: 105}, 132, ctx.store)
+      assert {:ok, %Inventory{seq: 5_000}} = Store.load(ctx.store)
+    end
+
+    test "is refused for another mesh or a changed inventory", ctx do
+      inv = inventory()
+
+      assert {:error, :mesh_changed} = Store.tighten(%{other_mesh() | seq: 105}, 132, ctx.store)
+
+      assert {:error, :inventory_changed} =
+               Store.tighten(%{inv | seq: 105, groups: []}, 132, ctx.store)
+
+      assert {:error, :inventory_changed} =
+               Store.tighten(%{inv | seq: 105, bulbs: tl(inv.bulbs), groups: []}, 132, ctx.store)
+
+      assert {:error, :bad_lease} = Store.tighten(%{inv | seq: 105}, -1, ctx.store)
+      assert {:ok, %Inventory{seq: 132}} = Store.load(ctx.store)
+
+      :ok = Store.clear(ctx.store)
+      assert {:error, :no_inventory} = Store.tighten(%{inv | seq: 105}, 132, ctx.store)
+    end
+
+    test "the floor after tighten + clear is the tightened cursor", ctx do
+      :ok = Store.tighten(%{inventory() | seq: 105}, 132, ctx.store)
+      :ok = Store.clear(ctx.store)
+
+      # An old dump comes back no lower than 105 (every SN sent is below it).
+      assert {:ok, :same_mesh} = Store.replace(inventory(%{"seq" => 0}), [], ctx.store)
+      assert {:ok, %Inventory{seq: 105}} = Store.load(ctx.store)
+    end
+  end
+
   describe "device ids" do
+    test "seq-only persists and same-mesh replaces keep group ids", ctx do
+      {:ok, _} = Store.replace(inventory(), [], ctx.store)
+      ids = Store.device_ids(ctx.store)
+
+      for seq <- [132, 164, 164, 196] do
+        :ok = Store.persist(%{inventory() | seq: seq}, ctx.store)
+        assert Store.device_ids(ctx.store) == ids
+      end
+
+      # A same-mesh replace keeps the groups that remain.
+      {:ok, :same_mesh} = Store.replace(inventory(%{"seq" => 900}), [], ctx.store)
+      assert Store.device_ids(ctx.store) == ids
+
+      # A persist that drops the group drops only its id.
+      :ok = Store.persist(%{inventory() | seq: 900, groups: []}, ctx.store)
+      assert Store.device_ids(ctx.store) == Map.delete(ids, {:group, 1})
+    end
+
     test "a new mesh never inherits the old mesh's group ids", ctx do
       {:ok, _} = Store.replace(inventory(), [], ctx.store)
       assert %{{:group, 1} => 3} = Store.device_ids(ctx.store)
