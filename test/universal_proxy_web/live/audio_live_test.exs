@@ -335,7 +335,7 @@ defmodule UniversalProxyWeb.AudioLiveTest do
     )
 
     html = render(view)
-    assert html =~ "OPUS"
+    assert html =~ ~r/\bOPUS\b/
     assert html =~ "48 kHz"
     assert html =~ "16-bit"
   end
@@ -500,7 +500,7 @@ defmodule UniversalProxyWeb.AudioLiveTest do
        %{event: "stream_start", codec: "opus", sample_rate: 48_000, bit_depth: 16, channels: 2}}
     )
 
-    assert render(view) =~ "OPUS"
+    assert render(view) =~ ~r/\bOPUS\b/
 
     Phoenix.PubSub.broadcast(
       @pubsub,
@@ -509,7 +509,7 @@ defmodule UniversalProxyWeb.AudioLiveTest do
     )
 
     html = render(view)
-    refute html =~ "OPUS"
+    refute html =~ ~r/\bOPUS\b/
     refute html =~ "48 kHz"
   end
 
@@ -626,7 +626,7 @@ defmodule UniversalProxyWeb.AudioLiveTest do
 
     html = render(view)
     refute html =~ "Streaming"
-    refute html =~ "OPUS"
+    refute html =~ ~r/\bOPUS\b/
     assert html =~ "Searching"
   end
 
