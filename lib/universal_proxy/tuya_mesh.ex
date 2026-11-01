@@ -38,8 +38,8 @@ defmodule UniversalProxy.TuyaMesh do
 
   `status/0` (see `t:UniversalProxy.TuyaMesh.Resolver.status/0`): the role
   MAC, whether the mesh runs (or why it is idle), the radio's readiness and
-  last error, then the bulbs (label, MAC, node id, last seen, reachable)
-  and groups. No keys. Changes are broadcast on `UniversalProxy.PubSub`
+  last error, then the bulbs (label, MAC, node id, last seen, reachable,
+  checking) and groups. No keys. Changes are broadcast on `UniversalProxy.PubSub`
   topic `topic/0` as `{:tuya_mesh_status, status}`.
 
   Every function here is safe on any target and while the subsystem is
@@ -54,7 +54,7 @@ defmodule UniversalProxy.TuyaMesh do
   require Logger
 
   alias UniversalProxy.TuyaBeaconMesh.{Inventory, Lights, Radio}
-  alias UniversalProxy.TuyaMesh.{Mesh, Resolver, Store}
+  alias UniversalProxy.TuyaMesh.{Mesh, Presence, Resolver, Store}
 
   # Every registered process of the mesh subtree.
   @mesh_processes [
@@ -62,7 +62,8 @@ defmodule UniversalProxy.TuyaMesh do
     UniversalProxy.TuyaMesh.MeshSupervisor,
     Mesh,
     Radio,
-    Lights
+    Lights,
+    Presence
   ]
 
   @type upload_error ::

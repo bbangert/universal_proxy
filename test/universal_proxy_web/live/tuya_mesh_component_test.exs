@@ -573,6 +573,39 @@ defmodule UniversalProxyWeb.TuyaMeshComponentTest do
       assert push_status(view, missing) =~ "Mesh dongle not found."
     end
 
+    test "a bulb reads Checking until the pinger concludes", %{conn: conn} do
+      view = mount_tab(conn)
+
+      bulb = %{
+        mac: "DC23530FB34A",
+        label: "path light 2",
+        node_id: 2,
+        last_seen: nil,
+        reachable: false,
+        checking: true
+      }
+
+      status = %{
+        TuyaMesh.status()
+        | state: :running,
+          radio: %{ready: true, last_error: nil, queued: 0},
+          bulbs: [bulb]
+      }
+
+      html = push_status(view, status)
+      assert html =~ "Never seen"
+      assert html =~ "Checking…"
+      refute html =~ "Not reachable"
+
+      html = push_status(view, %{status | bulbs: [%{bulb | checking: false}]})
+      assert html =~ "Not reachable"
+      refute html =~ "Checking…"
+
+      html = push_status(view, %{status | bulbs: [%{bulb | reachable: true, checking: false}]})
+      assert html =~ "Reachable"
+      refute html =~ "Checking…"
+    end
+
     test "clear asks first, then clears", %{conn: conn} = ctx do
       {:ok, _} = TuyaMesh.upload(KeyLeak.json())
       view = mount_tab(conn)

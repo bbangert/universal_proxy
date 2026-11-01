@@ -402,9 +402,7 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
         </div>
       </div>
       <span class="text-xs text-fg-3">{last_seen(@bulb.last_seen, @now)}</span>
-      <.badge variant={if(@bulb.reachable, do: :success, else: :neutral)} dot>
-        {if @bulb.reachable, do: "Reachable", else: "Not reachable"}
-      </.badge>
+      <.badge variant={presence_variant(@bulb)} dot>{presence_label(@bulb)}</.badge>
     </div>
     """
   end
@@ -693,6 +691,16 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   defp radio_error(_reason), do: "unknown error"
 
   defp humanize(atom), do: atom |> Atom.to_string() |> String.replace("_", " ")
+
+  # "Checking" while the pinger hasn't concluded: a bulb is "Not reachable"
+  # only once it missed enough pings in a row (see the Resolver).
+  defp presence_variant(%{reachable: true}), do: :success
+  defp presence_variant(%{checking: true}), do: :accent
+  defp presence_variant(_bulb), do: :neutral
+
+  defp presence_label(%{reachable: true}), do: "Reachable"
+  defp presence_label(%{checking: true}), do: "Checking…"
+  defp presence_label(_bulb), do: "Not reachable"
 
   defp last_seen(nil, _now), do: "Never seen"
 

@@ -66,11 +66,44 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   Uploads pass the inventory, keys and all, through `replace/3`, so
   `format_status/1` and every call handler redact it (`Redact`).
 
+  ## Last seen and reachable
+
+  Bulbs never report on their own, only in reply to a ping or an acked
+  DP set, so presence comes from the mesh's pinger
+  (`UniversalProxy.TuyaMesh.Presence`), which pushes a snapshot here
+  (`{:tuya_mesh_presence, snapshot}`) whenever it changes.
+
+  Last seen is merged, never replaced: per MAC the latest report time from
+  `Lights.all/1` or a Presence snapshot is kept, and nil never overwrites
+  a known time. So a Lights restart, a mesh restart, a same-mesh upload
+  (each starts Lights with every bulb unheard) keep it. A MAC that leaves
+  the inventory is dropped; a new mesh, or a clear, drops them all. It is
+  in memory only (monotonic ms within one boot): after a reboot every bulb
+  is "never seen" until it answers, which the pinger's first round
+  (15 s after start, then one bulb per 30 s) makes quick, and nothing is
+  written to flash for it.
+
+  Missed pings are kept the same way: per MAC the most consecutive misses
+  reported, cleared only by a report newer than the last missed ping. A
+  restarted Presence starts at zero misses; this keeps a bulb it had given
+  up on unreachable until it actually answers.
+
+  While the mesh runs, a bulb is **reachable** when it has been heard
+  this boot, has fewer than `:miss_limit` (2) consecutive missed pings,
+  and was last heard within `max(:reachable_ms, 2.5 × interval)`, where
+  `interval` is the time Presence expects between its checks of that
+  bulb. The window keeps a bulb reachable between scheduled pings and
+  while pinging waits for the radio, so marginal range (a missed ping or
+  two) or a busy queue never flips it alone: only `:miss_limit` misses in
+  a row do. A bulb not reachable yet below `:miss_limit` misses, with
+  Presence running and the radio ready, is **checking** (a verdict is
+  pending). Idle, nothing is reachable or checking.
+
   Options: `:tuya_adapter`, `:dynsup`, `:name`, and test seams `:store`,
   `:adapters_fun`, `:mesh_spec_fun` (`(index, mac -> child_spec)`), `:radio`,
   `:lights`, `:pubsub`, `:retry_ms`, `:restart_ms`, `:tick_ms`,
   `:index_check_ticks` (ticks between adapter re-checks, default 6),
-  `:reachable_ms`.
+  `:reachable_ms`, `:miss_limit`.
   """
 
   use GenServer
@@ -89,6 +122,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   @report_debounce_ms 300
   @resubscribe_ms 1_000
   @reachable_ms 300_000
+  @miss_limit 2
   # Stopping the mesh waits for Lights (5 s) and the Radio's teardown (10 s).
   @change_timeout 30_000
   @shutdown 20_000
@@ -117,7 +151,8 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
               label: String.t() | nil,
               node_id: non_neg_integer(),
               last_seen: DateTime.t() | nil,
-              reachable: boolean()
+              reachable: boolean(),
+              checking: boolean()
             }
           ],
           groups: [%{local_id: 0..254, name: String.t() | nil, members: [String.t()]}]
@@ -169,7 +204,11 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
       adapter_index: nil,
       radio: nil,
       lights_running: false,
-      bulbs: Enum.map(inventory.bulbs, &Map.merge(&1, %{last_seen: nil, reachable: false})),
+      bulbs:
+        Enum.map(
+          inventory.bulbs,
+          &Map.merge(&1, %{last_seen: nil, reachable: false, checking: false})
+        ),
       groups: inventory.groups
     }
   end
@@ -191,7 +230,11 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
         Keyword.get(
           opts,
           :mesh_spec_fun,
-          &Mesh.child_spec(adapter_index: &1, adapter_address: &2)
+          &Mesh.child_spec(
+            adapter_index: &1,
+            adapter_address: &2,
+            presence: [notify: self()]
+          )
         ),
       radio: Keyword.get(opts, :radio, Radio),
       lights: Keyword.get(opts, :lights, Lights),
@@ -202,6 +245,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
       tick_ms: Keyword.get(opts, :tick_ms, @tick_ms),
       index_check_ticks: Keyword.get(opts, :index_check_ticks, @index_check_ticks),
       reachable_ms: Keyword.get(opts, :reachable_ms, @reachable_ms),
+      miss_limit: Keyword.get(opts, :miss_limit, @miss_limit),
       timer: nil,
       refresh_timer: nil,
       ticks: 0,
@@ -213,6 +257,8 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
       subscribed: nil,
       lights_running: false,
       last_reports: %{},
+      presence: %{},
+      presence_live: false,
       published: nil,
       pubsub_mon: nil,
       sub_timer: nil
@@ -321,6 +367,8 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   defp do_call({:replace, inventory, opts}, _from, state) do
     state = stop_mesh(state)
     reply = inventory |> Redact.unseal() |> Store.replace(opts, state.store)
+    # Other bulbs under the same MACs: nothing heard from them yet.
+    state = if reply == {:ok, :new_mesh}, do: forget_presence(state), else: state
     {:reply, reply, %{state | backoff_ms: state.retry_ms} |> evaluate() |> publish()}
   end
 
@@ -375,6 +423,10 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   defp do_info({:refresh_reports, token}, %{refresh_timer: {token, _}} = state) do
     {:noreply, %{state | refresh_timer: nil} |> read_lights() |> publish()}
   end
+
+  # A snapshot still in the mailbox from a mesh already stopped is dropped.
+  defp do_info({:tuya_mesh_presence, snapshot}, %{mesh: %{}} = state) when is_map(snapshot),
+    do: {:noreply, state |> merge_presence(snapshot) |> publish()}
 
   defp do_info({:DOWN, mon, :process, _pid, _reason}, %{mesh: %{mon: mon}} = state) do
     Logger.warning("TuyaMesh: mesh stopped on its own; retrying in #{state.restart_ms} ms")
@@ -488,6 +540,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
 
   defp clear_mesh(state) do
     with {_token, tref} <- state.refresh_timer, do: Process.cancel_timer(tref)
+    flush_presence()
 
     %{
       cancel_timer(state)
@@ -496,8 +549,18 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
         radio_status: nil,
         subscribed: nil,
         lights_running: false,
-        last_reports: %{}
+        presence_live: false
     }
+  end
+
+  # The stopped mesh's Presence may have pushed a snapshot just before:
+  # for a new mesh, it would bring back what the old one heard.
+  defp flush_presence do
+    receive do
+      {:tuya_mesh_presence, _snapshot} -> flush_presence()
+    after
+      0 -> :ok
+    end
   end
 
   # The running mesh's index must still name its MAC: gone or moved stops
@@ -547,12 +610,21 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
 
   # ── Observation ──────────────────────────────────────────────────────
 
+  # Last seen and misses follow the inventory: kept while it can't be read
+  # (store down, invalid), pruned to it once it can, gone with it.
   defp load_inventory(state) do
     case Store.load(state.store) do
-      {:ok, inv} -> %{state | inventory: summarize(inv), inventory_error: nil}
-      {:error, :no_inventory} -> %{state | inventory: nil, inventory_error: :no_inventory}
-      {:error, :unavailable} -> %{state | inventory: nil, inventory_error: :store_unavailable}
-      {:error, _invalid} -> %{state | inventory: nil, inventory_error: :invalid_inventory}
+      {:ok, inv} ->
+        prune(%{state | inventory: summarize(inv), inventory_error: nil})
+
+      {:error, :no_inventory} ->
+        forget_presence(%{state | inventory: nil, inventory_error: :no_inventory})
+
+      {:error, :unavailable} ->
+        %{state | inventory: nil, inventory_error: :store_unavailable}
+
+      {:error, _invalid} ->
+        %{state | inventory: nil, inventory_error: :invalid_inventory}
     end
   end
 
@@ -598,13 +670,94 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   defp read_lights(state) do
     case Lights.all(server: state.lights) do
       {:ok, bulbs} ->
-        reports = Map.new(bulbs, &{&1.mac, &1.last_report_ms})
-        %{state | lights_running: true, last_reports: reports}
+        reports =
+          Enum.reduce(bulbs, state.last_reports, &put_report(&2, &1.mac, &1.last_report_ms))
+
+        prune(%{state | lights_running: true, last_reports: reports})
 
       {:error, _} ->
         %{state | lights_running: false}
     end
   end
+
+  # ── Presence ─────────────────────────────────────────────────────────
+
+  # A restarted Lights reports every bulb unheard (nil): never let that
+  # overwrite a known time.
+  defp put_report(reports, _mac, nil), do: reports
+  defp put_report(reports, mac, ms), do: Map.update(reports, mac, ms, &max(&1, ms))
+
+  defp merge_presence(state, snapshot) do
+    reports =
+      Enum.reduce(snapshot, state.last_reports, fn {mac, p}, acc ->
+        put_report(acc, mac, p.last_ms)
+      end)
+
+    presence =
+      Enum.reduce(snapshot, state.presence, fn {mac, p}, acc ->
+        Map.put(acc, mac, merge_verdict(Map.get(acc, mac), p, Map.get(reports, mac)))
+      end)
+
+    prune(%{state | last_reports: reports, presence: presence, presence_live: true})
+  end
+
+  # Misses only clear on a report newer than the last missed ping, so a
+  # restarted Presence (zero misses, nothing heard) doesn't undo a verdict.
+  defp merge_verdict(nil, p, _last), do: verdict(p.misses, p.missed_at, p)
+
+  defp merge_verdict(old, p, last) do
+    old =
+      if replied_since?(last, old.missed_at), do: %{old | misses: 0, missed_at: nil}, else: old
+
+    verdict(max(old.misses, p.misses), later(old.missed_at, p.missed_at), p)
+  end
+
+  defp verdict(misses, missed_at, p),
+    do: %{misses: misses, missed_at: missed_at, interval_ms: p.interval_ms}
+
+  defp replied_since?(nil, _missed_at), do: false
+  defp replied_since?(_last, nil), do: false
+  defp replied_since?(last, missed_at), do: last >= missed_at
+
+  defp later(nil, b), do: b
+  defp later(a, nil), do: a
+  defp later(a, b), do: max(a, b)
+
+  defp prune(%{inventory: %{bulbs: bulbs}} = state) do
+    macs = Enum.map(bulbs, & &1.mac)
+
+    %{
+      state
+      | last_reports: Map.take(state.last_reports, macs),
+        presence: Map.take(state.presence, macs)
+    }
+  end
+
+  defp prune(state), do: state
+
+  defp forget_presence(state), do: %{state | last_reports: %{}, presence: %{}}
+
+  defp bulb_presence(%{mesh: nil}, _last, _presence, _now), do: {false, false}
+
+  defp bulb_presence(state, last, presence, now) do
+    misses = effective_misses(presence, last)
+    window = max(state.reachable_ms, div(interval_of(presence) * 5, 2))
+    reachable = last != nil and misses < state.miss_limit and now - last <= window
+
+    checking =
+      not reachable and misses < state.miss_limit and state.presence_live and
+        match?(%{ready: true}, state.radio_status)
+
+    {reachable, checking}
+  end
+
+  defp effective_misses(nil, _last), do: 0
+
+  defp effective_misses(%{misses: misses, missed_at: at}, last),
+    do: if(replied_since?(last, at), do: 0, else: misses)
+
+  defp interval_of(%{interval_ms: ms}) when is_integer(ms), do: ms
+  defp interval_of(_presence), do: 0
 
   defp build_status(state) do
     now = System.monotonic_time(:millisecond)
@@ -621,10 +774,10 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
         Enum.map(inventory.bulbs, fn bulb ->
           last = Map.get(state.last_reports, bulb.mac)
 
-          Map.merge(bulb, %{
-            last_seen: last_seen(last),
-            reachable: last != nil and now - last <= state.reachable_ms
-          })
+          {reachable, checking} =
+            bulb_presence(state, last, Map.get(state.presence, bulb.mac), now)
+
+          Map.merge(bulb, %{last_seen: last_seen(last), reachable: reachable, checking: checking})
         end),
       groups: inventory.groups
     }
