@@ -14,17 +14,55 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   that old `seq` and reuse sequence numbers the bulbs have already heard
   (they silently drop such frames). A plain inventory is fine for tests.
 
-  `on_persist:` (`(Inventory.t() -> :ok | {:error, term()})`) writes the
-  inventory with the advanced `seq` back to Settings whenever a block of
-  sequence numbers is reserved or the inventory is reloaded. Only `:ok`
-  counts as written. On anything else (an error, another value, a raise)
-  nothing is sent, the caller gets `{:error, :persist_failed}`, and the
-  next command tries again: no sequence number is used before the cursor
-  past it is durable.
+  `on_persist:` (`t:persist_fun/0`) writes the inventory with the
+  advanced `seq` back to Settings whenever a new lease of sequence
+  numbers is taken or the inventory is reloaded. Only `:ok` counts as
+  written. On anything else (an error, another value, a raise) nothing is
+  sent, the caller gets `{:error, :persist_failed}`, and the next command
+  tries again: no sequence number is used before the cursor past it is
+  durable. Every persist is a flash write on the host, so they are
+  rate-limited (below).
 
   An inventory that doesn't load or validate makes `init/1` return
   `:ignore` (with a warning that carries no key material) rather than
   fail the host's boot.
+
+  ## Sequence leases
+
+  Numbers are handed out from memory while the in-memory cursor is behind
+  a persisted **lease** end; the persisted `seq` is always that lease end,
+  so a crash resumes at or past every number ever used. When the lease
+  runs out, a new one is persisted before any number in it is used.
+
+  A new lease is sized for one persist per `:persist_interval_ms`: the
+  numbers the last lease held, divided by how long it lasted, times the
+  interval, times 1.5, clamped to `[:min_lease, :max_lease]`. The first
+  lease after a start or reload is `:min_lease`. A lease that runs out
+  before the interval has passed is followed by a `:max_lease` one at
+  once (correctness first), so writes exceed one per interval only above
+  `:max_lease` frames per interval. A restart after a crash or power
+  loss resumes at the lease end, a jump of at most `:max_lease` past the
+  last number the bulbs heard; the bulbs accepted jumps of about 900
+  (`docs/protocols/tuya_beacon_mesh.md` §4.3), hence the cap.
+
+  On a clean stop (`:normal`, `:shutdown`, `{:shutdown, _}`; Lights traps
+  exits so a supervisor shutdown reaches `terminate/2`), the unused rest
+  of the lease is handed back through the optional `on_tighten:`
+  (`t:tighten_fun/0`), so a planned restart doesn't jump the bulbs
+  forward. It is called as `on_tighten.(inventory, leased)`:
+  `inventory.seq` is the in-memory cursor, the next number Lights would
+  have used, and `leased` is the lease end the last `on_persist` wrote. A
+  host store should apply it only when its stored `seq` still equals
+  `leased` (nothing else wrote since) and the mesh is the one stored; the
+  `seq` it then stores moves **back**, to a value at or ahead of every
+  number ever used. That holds because every number handed to the Radio
+  (sent, queued, or with an uncertain outcome) is behind the cursor and a
+  number goes back to the cursor only when its frame provably never went
+  out. After a crash `terminate/2` may see state that predates numbers
+  handed to the Radio, so nothing is tightened then. A tighten that fails,
+  is refused or takes over 4 s changes nothing: the lease end stays
+  persisted, which is always safe. Without `on_tighten` nothing is
+  tightened.
 
   ## Commands
 
@@ -39,10 +77,10 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   (latest wins), and the Radio's queue is bounded (`{:error, :queue_full}`).
   When the Radio refuses a frame without transmitting it (`:not_ready`,
   `:not_running`, `:queue_full`, a refused advertise `{:advertise, _}`),
-  its sequence number is handed out again, so retrying while the Radio is
-  down burns nothing. Every other error keeps the number used: reusing a
-  number the bulbs may have heard gets the next command dropped as stale,
-  while skipping one costs nothing. `{:error, :timeout}` means the frame
+  or the frame can't be built, its sequence number is handed out again,
+  so retrying while the Radio is down burns nothing. Every other error
+  keeps the number used: reusing a number the bulbs may have heard gets
+  the next command dropped as stale, while skipping one costs nothing. `{:error, :timeout}` means the frame
   may still go out; `{:error, {:uncertain, reason}}` means the Radio lost
   `Bluez.Mgmt` or its lease during the advertise, so the frame may have
   gone out (the Radio re-runs setup).
@@ -96,8 +134,15 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
           | {module(), atom(), list()}
 
   @type persist_fun :: (Inventory.t() -> :ok | {:error, term()})
+  @type tighten_fun :: (Inventory.t(), leased :: non_neg_integer() -> :ok | {:error, term()})
 
-  @block 32
+  @persist_interval_ms 60_000
+  @min_lease 32
+  @max_lease 600
+  # Bounds terminate/2's tighten so it ends inside @shutdown_ms; a tighten
+  # cut short is harmless (the lease end stays persisted).
+  @tighten_timeout 4_000
+  @shutdown_ms 5_000
   @resubscribe_ms 1_000
   @max_resubscribe_ms 30_000
   @call_timeout 5_000
@@ -128,7 +173,20 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
       unavailable (default #{@resubscribe_ms}; doubles up to
       #{@max_resubscribe_ms});
     * `:on_persist` — a `t:persist_fun/0` (default: no-op `:ok`);
+    * `:on_tighten` — a `t:tighten_fun/0` called on a clean stop (default:
+      none, nothing is tightened); see "Sequence leases";
+    * `:persist_interval_ms` — the target time between persists (positive
+      integer, default #{@persist_interval_ms});
+    * `:min_lease` / `:max_lease` — bounds of a lease (default
+      #{@min_lease} / #{@max_lease}; `1 <= min_lease <= max_lease <=
+      #{Seq.max_lease()}`, the largest jump known to be accepted, see
+      `Seq.max_lease/0`);
+    * `:clock` — `(-> integer())` monotonic milliseconds (default
+      `System.monotonic_time(:millisecond)`; a test seam);
     * `:name` — process name (default `#{inspect(__MODULE__)}`).
+
+  An option outside those bounds stops the start with `{:error,
+  {:bad_option, key}}`.
 
   Every client function takes `server:` (default `#{inspect(__MODULE__)}`).
   """
@@ -138,8 +196,13 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
     GenServer.start_link(__MODULE__, opts, name: name)
   end
 
+  # The shutdown leaves room for terminate/2's one bounded tighten.
   def child_spec(opts) do
-    %{id: Keyword.get(opts, :name, __MODULE__), start: {__MODULE__, :start_link, [opts]}}
+    %{
+      id: Keyword.get(opts, :name, __MODULE__),
+      start: {__MODULE__, :start_link, [opts]},
+      shutdown: @shutdown_ms
+    }
   end
 
   @doc "DP set for one bulb (by MAC or label). `opts`: `:ack` (default `false`), `:server`."
@@ -200,21 +263,30 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
 
   @impl GenServer
   def init(opts) do
-    case load_inventory(Keyword.fetch!(opts, :inventory)) do
-      {:ok, inv} ->
-        state =
-          %{
-            radio: Keyword.get(opts, :radio, Radio),
-            radio_mon: nil,
-            resubscribe_ms: Keyword.get(opts, :resubscribe_ms, @resubscribe_ms),
-            backoff_ms: Keyword.get(opts, :resubscribe_ms, @resubscribe_ms),
-            on_persist: Keyword.get(opts, :on_persist, fn _inv -> :ok end),
-            seq: Seq.new(inv.seq),
-            sns: []
-          }
-          |> load(inv)
+    with {:ok, leasing} <- lease_opts(opts),
+         {:ok, inv} <- load_inventory(Keyword.fetch!(opts, :inventory)) do
+      # Only so a supervisor shutdown runs terminate/2 (the tighten).
+      # Nothing long-lived is linked; a stray EXIT falls through
+      # handle_info.
+      Process.flag(:trap_exit, true)
 
-        {:ok, state, {:continue, :subscribe}}
+      state =
+        %{
+          radio: Keyword.get(opts, :radio, Radio),
+          radio_mon: nil,
+          resubscribe_ms: Keyword.get(opts, :resubscribe_ms, @resubscribe_ms),
+          backoff_ms: Keyword.get(opts, :resubscribe_ms, @resubscribe_ms),
+          on_persist: Keyword.get(opts, :on_persist, fn _inv -> :ok end),
+          seq: Seq.new(inv.seq),
+          lease: nil
+        }
+        |> Map.merge(leasing)
+        |> load(inv)
+
+      {:ok, state, {:continue, :subscribe}}
+    else
+      {:error, {:bad_option, _key} = reason} ->
+        {:stop, reason}
 
       {:error, reason} ->
         Logger.warning(
@@ -253,6 +325,43 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
     do: elem(reason, 0)
 
   defp loader_error(_reason), do: :error
+
+  defp lease_opts(opts) do
+    interval = Keyword.get(opts, :persist_interval_ms, @persist_interval_ms)
+    min = Keyword.get(opts, :min_lease, @min_lease)
+    max = Keyword.get(opts, :max_lease, @max_lease)
+    on_tighten = Keyword.get(opts, :on_tighten)
+    clock = Keyword.get(opts, :clock, &monotonic_ms/0)
+
+    cond do
+      not (is_integer(interval) and interval > 0) ->
+        {:error, {:bad_option, :persist_interval_ms}}
+
+      not (is_integer(max) and max in 1..Seq.max_lease()) ->
+        {:error, {:bad_option, :max_lease}}
+
+      not (is_integer(min) and min in 1..max) ->
+        {:error, {:bad_option, :min_lease}}
+
+      not (is_nil(on_tighten) or is_function(on_tighten, 2)) ->
+        {:error, {:bad_option, :on_tighten}}
+
+      not is_function(clock, 0) ->
+        {:error, {:bad_option, :clock}}
+
+      true ->
+        {:ok,
+         %{
+           interval_ms: interval,
+           min_lease: min,
+           max_lease: max,
+           on_tighten: on_tighten,
+           clock: clock
+         }}
+    end
+  end
+
+  defp monotonic_ms, do: System.monotonic_time(:millisecond)
 
   # Replaces everything derived from the inventory; the caller sets `seq`.
   defp load(state, inv) do
@@ -366,7 +475,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
 
   def handle_call({:reload, input}, _from, state) do
     with {:ok, inv} <- Inventory.decode(input),
-         reloaded = load(%{state | seq: reload_seq(state, inv), sns: []}, inv),
+         reloaded = load(%{state | seq: reload_seq(state, inv), lease: nil}, inv),
          :ok <- persist(reloaded) do
       {:reply, :ok, reloaded}
     else
@@ -387,6 +496,20 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
 
   def handle_info(_other, state), do: {:noreply, state}
 
+  # A clean stop runs between callbacks, so state holds every SN handed to
+  # the Radio. A crash's state can predate SNs the crashing callback
+  # handed out, so tightening to its cursor could reuse one: not done.
+  @impl GenServer
+  def terminate(reason, state) do
+    if clean_stop?(reason), do: tighten(state)
+    :ok
+  end
+
+  defp clean_stop?(:normal), do: true
+  defp clean_stop?(:shutdown), do: true
+  defp clean_stop?({:shutdown, _}), do: true
+  defp clean_stop?(_reason), do: false
+
   @impl GenServer
   def format_status(status) do
     Map.new(status, fn
@@ -402,15 +525,15 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   # ── Transmit ─────────────────────────────────────────────────────────
 
   # Takes a sequence number, builds the frame with it and hands it to the
-  # Radio. An SN is given back (pushed back onto the reserved block) only
-  # when the frame provably never went on air: the build failed, or the
-  # Radio refused it before transmitting (@untransmitted, or a refused
-  # advertise). It is the most recently taken SN and every SN still in the
-  # block is newer than anything transmitted, so handing it out again keeps
-  # the on-air sequence strictly increasing; the persisted cursor already
-  # sits past the whole block. A timeout, a Radio that died mid-call or an
-  # {:uncertain, _} advertise keeps the SN used, since the frame may have
-  # gone out.
+  # Radio. An SN is given back (the cursor moves back onto it) only when
+  # the frame provably never went on air: the build failed, or the Radio
+  # refused it before transmitting (@untransmitted, or a refused
+  # advertise). It is the SN taken in this same call, and every SN after
+  # it is unused, so handing it out again keeps the on-air sequence
+  # strictly increasing; the persisted lease end already sits past it. A
+  # timeout, a Radio that died mid-call or an {:uncertain, _} advertise
+  # keeps the SN used (behind the cursor), since the frame may have gone
+  # out: that is what makes tightening to the cursor safe.
   defp transmit(state, build, send_opts) do
     with {:ok, sn, state} <- take_sn(state),
          {:ok, {frame, send_ms, _window, _expect}} <- build_with(build, sn, state) do
@@ -442,7 +565,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
     end
   end
 
-  defp give_back(state, sn), do: %{state | sns: [sn | state.sns]}
+  defp give_back(state, sn), do: %{state | seq: Seq.give_back(state.seq, sn)}
 
   defp dp_keys(dps) when is_map(dps), do: dps |> Map.keys() |> Enum.sort()
   defp dp_keys(dps) when is_list(dps), do: dps |> Enum.map(&dp_key/1) |> Enum.sort()
@@ -548,27 +671,92 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
 
   # ── Seq / persist ────────────────────────────────────────────────────
 
-  # A new block is persisted before any of its SNs is used; when that
-  # fails the state is left as it was, so the next call tries the same
-  # block again.
-  defp take_sn(%{sns: [sn | rest]} = state), do: {:ok, sn, %{state | sns: rest}}
-
+  # SNs come from the persisted lease. Once it is used up, a new lease is
+  # persisted before any SN in it is used; when that fails the state is
+  # left as it was, so the next call tries again.
   defp take_sn(state) do
-    {:ok, [sn | rest], seq} = Seq.reserve(state.seq, @block)
-    reserved = %{state | seq: seq, sns: rest}
+    case Seq.take(state.seq) do
+      {:ok, sn, seq} ->
+        {:ok, sn, %{state | seq: seq}}
 
-    with :ok <- persist(reserved), do: {:ok, sn, reserved}
+      {:error, :lease_exhausted} ->
+        with {:ok, state} <- new_lease(state) do
+          {:ok, sn, seq} = Seq.take(state.seq)
+          {:ok, sn, %{state | seq: seq}}
+        end
+    end
   end
 
-  # Same mesh: the bulbs have heard everything up to our in-memory cursor
-  # (which already sits past any reserved-but-unused block), so a stale or
-  # re-dropped dump must not pull it back. A different mesh's bulbs have
-  # never heard our counter, and jumping them past their forward window
-  # would get every frame dropped, so its dump's cursor is taken as-is.
+  defp new_lease(state) do
+    now = state.clock.()
+    {size, why} = lease_size(state, now)
+    {:ok, seq} = Seq.lease(state.seq, size)
+    leased = %{state | seq: seq}
+
+    with :ok <- persist(leased) do
+      Logger.debug("TuyaBeaconMesh.Lights: leased #{size} sequence numbers (#{why})")
+      {:ok, %{leased | lease: {size, now}}}
+    end
+  end
+
+  # Only called once the current lease is used up, so the last lease's
+  # size is what was used since it was persisted. A lease that lasted less
+  # than the interval was sized for a lower rate than the one now seen:
+  # the next is max_lease, which keeps writes at one per interval up to
+  # max_lease numbers per interval.
+  defp lease_size(%{lease: nil} = state, _now), do: {state.min_lease, :initial}
+
+  defp lease_size(%{lease: {used, since}} = state, now) do
+    elapsed = now - since
+
+    if elapsed < state.interval_ms do
+      {state.max_lease, :early}
+    else
+      # ceil(used / elapsed * interval * 1.5)
+      wanted = div(used * state.interval_ms * 3 + 2 * elapsed - 1, 2 * elapsed)
+      {wanted |> max(state.min_lease) |> min(state.max_lease), :rate}
+    end
+  end
+
+  # Same mesh: the bulbs may have heard everything up to our in-memory
+  # cursor, so a stale or re-dropped dump must not pull it back, and the
+  # persisted lease end never moves back either (a host store refuses
+  # that outside a tighten); the rest of the lease stays usable. A
+  # different mesh's bulbs have never heard our counter, and jumping them
+  # past their forward window would get every frame dropped, so its dump's
+  # cursor is taken as-is, with no lease.
   defp reload_seq(state, inv) do
     if Crypto.key_bytes(inv.beacon_key) == Crypto.key_bytes(state.beacon_key),
       do: Seq.advance_to(state.seq, inv.seq),
       else: Seq.new(inv.seq)
+  end
+
+  # Runs on_tighten in a task so a stuck host store can't hold terminate/2
+  # past the supervisor's shutdown. Whatever happens, the stored cursor is
+  # either the lease end or the tightened one, and both are safe.
+  defp tighten(%{on_tighten: nil}), do: :ok
+
+  defp tighten(state) do
+    leased = Seq.value(state.seq)
+    tight = Seq.tighten(state.seq)
+
+    if Seq.value(tight) != leased do
+      {on_tighten, inv} = {state.on_tighten, snapshot(%{state | seq: tight})}
+      task = Task.async(fn -> run_persist(&on_tighten.(&1, leased), inv) end)
+
+      case Task.yield(task, @tighten_timeout) || Task.shutdown(task, :brutal_kill) do
+        {:ok, :ok} ->
+          Logger.debug("TuyaBeaconMesh.Lights: tightened seq #{leased} -> #{Seq.value(tight)}")
+
+        {:ok, failure} ->
+          Logger.debug("TuyaBeaconMesh.Lights: tighten failed (#{failure}); seq stays #{leased}")
+
+        _exit_or_timeout ->
+          Logger.debug("TuyaBeaconMesh.Lights: tighten did not finish; seq stays #{leased}")
+      end
+    end
+
+    :ok
   end
 
   defp persist(state) do

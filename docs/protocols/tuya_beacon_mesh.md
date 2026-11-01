@@ -465,21 +465,28 @@ How `Seq` and `Lights` handle this:
   RFC 1982-style serial comparison (`Seq.ahead?/2`): `b` is ahead of `a` when
   it is 1..32 767 steps forward modulo 65 536. Equal values and values exactly
   half the range apart are not ahead.
-- Numbers are reserved in blocks of 32. The advanced cursor is persisted
-  (`on_persist`) **before** any number in the block is used, so a restart
-  never reuses one.
-- The cursor never moves backwards. Reloading a dump of the **same** mesh
-  (same beaconKey) only moves it forward (`Seq.advance_to/2`). A **different**
-  mesh (different beaconKey) takes its dump's `seq` as-is: its bulbs have
-  never heard our counter, and jumping them past their forward window would
-  get every frame dropped.
+- Numbers come from a persisted **lease**. Its end is persisted
+  (`on_persist`) **before** any number in it is used, so a restart never
+  reuses one. Leases are sized from the send rate for about one persist a
+  minute, between 32 and 600 numbers (never more than 900, the largest
+  forward jump seen accepted, §4.3), since a crash resumes at the lease end
+  and skips the rest of it.
+- On a clean stop the lease is cut back to the next unused number
+  (`on_tighten`), so a planned restart skips nothing. That is the only time
+  the persisted cursor moves back, and only to a number past every one that
+  may have gone on air.
+- Otherwise the cursor never moves backwards. Reloading a dump of the
+  **same** mesh (same beaconKey) only moves it forward (`Seq.advance_to/2`).
+  A **different** mesh (different beaconKey) takes its dump's `seq` as-is:
+  its bulbs have never heard our counter, and jumping them past their
+  forward window would get every frame dropped.
 - Incoming reports are de-duplicated per bulb with the app's rule (§4.3): a
   report must be 1..9 999 ahead of the last one accepted from that bulb.
   A bulb whose report counter restarts far behind (or jumps far ahead) would
   then be ignored until it passed the old value, so `Lights` re-anchors a bulb
   after 3 consecutive in-order reports outside the window. Whether the bulbs'
   report counter survives a power cycle is **UNVERIFIED**.
-- A block is reserved only once `on_persist` has confirmed the write; until
+- A lease is used only once `on_persist` has confirmed the write; until
   then nothing is sent. A frame the radio refuses before transmitting (not
   ready, queue full, advertise refused) gives its number back, so retrying
   while the radio is down burns nothing.
