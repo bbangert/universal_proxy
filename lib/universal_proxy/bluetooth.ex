@@ -162,9 +162,11 @@ defmodule UniversalProxy.Bluetooth do
 
     * `:tuya_adapter` — MAC of the `:tuya_mesh`-role radio, or `nil`.
       When set, the spec excludes it from the client's adapter claim
-      (`exclude_adapters:`) and starts `Bluez.Radio` + `Bluez.Mgmt`
-      (`mgmt: true`), which the mesh radio needs. Without it,
-      `exclude_adapters: []` clears any earlier exclusion and Mgmt stays off.
+      (`exclude_adapters:`), starts `Bluez.Radio` + `Bluez.Mgmt`
+      (`mgmt: true`), which the mesh radio needs, and mounts
+      `UniversalProxy.TuyaMesh.Supervisor` for it. Without it,
+      `exclude_adapters: []` clears any earlier exclusion, Mgmt stays off
+      and no mesh subtree is mounted.
 
   Wiring:
 
@@ -173,24 +175,30 @@ defmodule UniversalProxy.Bluetooth do
       `BluetoothProxy.gatt_event/2`;
     * connection-slot changes tick `Stats`;
     * the app's own children mount in the `extra_children:` slot (after
-      `BlueAlsa`): the AudioManager pair (BT-headphone control plane)
-      first — preserving the restart-ordering semantics it had as a
-      hardcoded child — then `Improv.Supervisor` LAST, so
-      an Improv fault never disturbs the proxy scanning/GATT or audio
-      stacks while a bluetoothd/Client restart (`:rest_for_one`) still
-      rebuilds the whole group. Improv gets the app's PubSub +
-      connectivity probe here.
+      `BlueAlsa` and Mgmt): the AudioManager pair (BT-headphone control
+      plane) first — preserving the restart-ordering semantics it had as a
+      hardcoded child — then the mesh subtree (only with `:tuya_adapter`),
+      then `Improv.Supervisor` LAST, so an Improv fault never disturbs the
+      proxy scanning/GATT, audio or mesh stacks while a bluetoothd/Client
+      restart (`:rest_for_one`) still rebuilds the whole group. A mesh
+      subtree restart only restarts Improv after it, which idles unless
+      provisioning; mesh faults normally stay inside that subtree. Improv
+      gets the app's PubSub + connectivity probe here.
   """
   @spec bluez_spec(keyword()) :: Supervisor.child_spec() | {module(), keyword()}
   def bluez_spec(opts \\ []) do
-    {Bluez, base} = base_bluez_spec()
-    {Bluez, mesh_opts(Keyword.get(opts, :tuya_adapter)) ++ base}
+    tuya_adapter = Keyword.get(opts, :tuya_adapter)
+    {Bluez, base} = base_bluez_spec(mesh_children(tuya_adapter))
+    {Bluez, mesh_opts(tuya_adapter) ++ base}
   end
 
   defp mesh_opts(nil), do: [exclude_adapters: []]
   defp mesh_opts(mac) when is_binary(mac), do: [exclude_adapters: [mac], mgmt: true]
 
-  defp base_bluez_spec do
+  defp mesh_children(nil), do: []
+  defp mesh_children(mac), do: [{UniversalProxy.TuyaMesh.Supervisor, tuya_adapter: mac}]
+
+  defp base_bluez_spec(mesh_children) do
     {Bluez,
      client: [
        on_advertisement: &BluetoothScanner.on_advertisement/1,
@@ -202,23 +210,27 @@ defmodule UniversalProxy.Bluetooth do
        on_connections_changed: &Stats.connections_changed/0
      ],
      blue_alsa: [pubsub: UniversalProxy.PubSub],
-     extra_children: [
-       {Task.Supervisor, name: AudioManager.TaskSupervisor},
-       AudioManager,
-       {Improv.Supervisor,
-        [
-          pubsub: UniversalProxy.PubSub,
-          network_type: &UniversalProxy.System.network_type/0,
-          # Advert branding: keeps the BLE-visible name "Universal Proxy <mac4>"
-          # while the suffix derivation stays inside Improv.
-          name_prefix: "Universal Proxy",
-          # Identify (0x02): blink the board ACT LED so the provisioner can
-          # spot the device. Device Info (0x03): static identity strings.
-          # Both configured → Improv capabilities derive to 0x07.
-          identify_fun: &UniversalProxy.Identify.blink_act_led/0,
-          device_info: improv_device_info()
-        ]}
-     ]}
+     extra_children:
+       [
+         {Task.Supervisor, name: AudioManager.TaskSupervisor},
+         AudioManager
+       ] ++
+         mesh_children ++
+         [
+           {Improv.Supervisor,
+            [
+              pubsub: UniversalProxy.PubSub,
+              network_type: &UniversalProxy.System.network_type/0,
+              # Advert branding: keeps the BLE-visible name "Universal Proxy <mac4>"
+              # while the suffix derivation stays inside Improv.
+              name_prefix: "Universal Proxy",
+              # Identify (0x02): blink the board ACT LED so the provisioner can
+              # spot the device. Device Info (0x03): static identity strings.
+              # Both configured → Improv capabilities derive to 0x07.
+              identify_fun: &UniversalProxy.Identify.blink_act_led/0,
+              device_info: improv_device_info()
+            ]}
+         ]}
   end
 
   # Static Improv Device Info strings (spec command 0x03), resolved when the

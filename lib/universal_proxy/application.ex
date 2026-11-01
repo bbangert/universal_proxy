@@ -98,6 +98,12 @@ defmodule UniversalProxy.Application do
         # Firmware update flow (ConfigStore + library Supervisor, wired
         # together so the snapshot lands before the library starts).
         UniversalProxy.FirmwareUpdate,
+        # Tuya Beacon Mesh inventory store (DETS, 0600: holds the mesh keys).
+        # Top level, before Bluetooth: the mesh's Lights controller reads and
+        # persists through it from inside the Bluez subtree, which restarts
+        # far more often than this store should close its file. BT targets
+        # only (`start_link/1` returns `:ignore` elsewhere).
+        UniversalProxy.TuyaMesh.Store,
         # Bluetooth subtree (registry, settings store, Bluez lifecycle).
         # BEFORE the ESPHome supervisor: its bluetooth_opts/0 reads the
         # persisted Bluetooth settings at espex boot. child_spec returns

@@ -597,6 +597,131 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
     end
   end
 
+  describe "adapter power" do
+    test "powers its own adapter before starting discovery" do
+      start_supervised!(radio_spec(adapter_index: 2))
+      wait_until(&ready?/0)
+
+      calls = FakeBluez.calls()
+      power = Enum.find_index(calls, &match?({:dbus, "Set", _}, &1))
+      filter = Enum.find_index(calls, &match?({:dbus, "SetDiscoveryFilter", _}, &1))
+
+      assert {:dbus, "Set", ["org.bluez.Adapter1", "Powered", {"b", true}]} =
+               Enum.at(calls, power)
+
+      assert power < filter
+      assert {:dbus_path, "/org/bluez/hci2", "Set"} in calls
+      refute Enum.any?(calls, &match?({:dbus_path, "/org/bluez/hci0", _}, &1))
+    end
+
+    @tag :capture_log
+    test "an adapter that won't power on is retried, and discovery waits for it" do
+      FakeBluez.fail({:dbus, "Set"}, "org.bluez.Error.Blocked")
+      start_supervised!(radio_spec())
+
+      wait_until(fn ->
+        match?({:ok, %{last_error: {:power, "org.bluez.Error.Blocked"}}}, Radio.status())
+      end)
+
+      refute Enum.any?(FakeBluez.calls(), &match?({:dbus, "StartDiscovery", _}, &1))
+
+      FakeBluez.succeed({:dbus, "Set"})
+      wait_until(&ready?/0)
+      assert_leases_balanced()
+    end
+  end
+
+  describe "adapter fence" do
+    @mesh "AA:BB:CC:DD:EE:01"
+    @intruder "11:22:33:44:55:66"
+
+    defp touched_adapter?(calls) do
+      Enum.any?(calls, fn
+        {:acquire, _} -> true
+        {:advertise, _, _} -> true
+        {:dbus, member, _} -> member in ["Set", "SetDiscoveryFilter", "StartDiscovery"]
+        _ -> false
+      end)
+    end
+
+    test "checks the address before touching the adapter, in any case" do
+      FakeBluez.set_address(1, String.downcase(@mesh))
+      start_supervised!(radio_spec(adapter_index: 1, adapter_address: @mesh))
+      wait_until(&ready?/0)
+
+      calls = FakeBluez.calls()
+      check = Enum.find_index(calls, &(&1 == {:dbus, "Get", ["org.bluez.Adapter1", "Address"]}))
+      first_touch = Enum.find_index(calls, &touched_adapter?([&1]))
+      assert check < first_touch
+      assert {:ok, %{adapter_address: @mesh}} = Radio.status()
+    end
+
+    @tag :capture_log
+    test "an index reused by another adapter is never powered, scanned or advertised on" do
+      FakeBluez.set_address(1, @intruder)
+      start_supervised!(radio_spec(adapter_index: 1, adapter_address: @mesh))
+
+      wait_until(fn -> FakeBluez.count(:dbus) >= 3 end)
+
+      assert {:ok, %{ready: false, last_error: {:wrong_adapter, @intruder}}} = Radio.status()
+      assert {:error, :not_ready} = Radio.send_frame(device_frame(), 10)
+      refute touched_adapter?(FakeBluez.calls())
+
+      # A missing adapter is refused the same way.
+      FakeBluez.set_address(1, nil)
+
+      wait_until(fn ->
+        match?({:ok, %{last_error: {:adapter_address, _}}}, Radio.status())
+      end)
+
+      refute touched_adapter?(FakeBluez.calls())
+
+      # The right adapter back under that index: setup completes.
+      FakeBluez.set_address(1, @mesh)
+      wait_until(&ready?/0)
+    end
+
+    @tag :capture_log
+    test "an adapter swapped under a ready radio is dropped at the next health check" do
+      FakeBluez.set_address(1, @mesh)
+
+      start_supervised!(radio_spec(adapter_index: 1, adapter_address: @mesh, health_check_ms: 20))
+
+      wait_until(&ready?/0)
+      FakeBluez.set_address(1, @intruder)
+
+      wait_until(fn ->
+        match?({:ok, %{ready: false, last_error: {:wrong_adapter, @intruder}}}, Radio.status())
+      end)
+
+      # Two more refused setups, and nothing touched the adapter meanwhile.
+      checks = address_checks()
+      wait_until(fn -> address_checks() >= checks + 2 end)
+      refute touched_adapter?(Enum.drop(FakeBluez.calls(), length(calls_upto_checks(checks))))
+      assert {:error, :not_ready} = Radio.send_frame(device_frame(), 10)
+    end
+
+    defp address_check?(call), do: call == {:dbus, "Get", ["org.bluez.Adapter1", "Address"]}
+
+    defp address_checks, do: Enum.count(FakeBluez.calls(), &address_check?/1)
+
+    # The calls up to and including the `n`th address check.
+    defp calls_upto_checks(n) do
+      FakeBluez.calls()
+      |> Enum.reduce_while({[], 0}, fn call, {acc, seen} ->
+        seen = if address_check?(call), do: seen + 1, else: seen
+        if seen > n, do: {:halt, {acc, seen}}, else: {:cont, {[call | acc], seen}}
+      end)
+      |> elem(0)
+    end
+
+    test "without :adapter_address the address is never read" do
+      start_supervised!(radio_spec())
+      wait_until(&ready?/0)
+      refute {:dbus, "Get", ["org.bluez.Adapter1", "Address"]} in FakeBluez.calls()
+    end
+  end
+
   describe "not ready" do
     test "stays up, logs once, refuses sends and recovers when the lease frees" do
       holder = start_supervised!({Task, fn -> Process.sleep(:infinity) end})

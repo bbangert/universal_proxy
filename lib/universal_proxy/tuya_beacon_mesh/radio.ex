@@ -8,12 +8,20 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   infrastructure the host supervises, and this process never starts or
   links them. Setup (on start, and again after any loss):
 
+    * opens its own system-bus connection (kept across retries) and, when
+      `:adapter_address` is given, checks that `/org/bluez/hci<index>` is
+      still that adapter (`Adapter1.Address`). An index is reused when a
+      dongle is unplugged and another takes its place, so a mismatch fails
+      setup with `{:wrong_adapter, address}` before anything below touches
+      the adapter (no lease, no power, no discovery, no advert), and setup
+      keeps retrying;
     * checks the adapter through `Bluez.Mgmt` (*Read Advertising
       Features*), subscribes to `Bluez.Radio`'s lease-end notices and
       acquires the `:mgmt` lease for the adapter — this process is the
       lease holder, so only it may advertise;
-    * opens its own system-bus connection (kept across retries) and starts
-      LE discovery with `DuplicateData: true` on the adapter;
+    * powers the adapter (`Adapter1.Powered = true`: `Bluez.Client` powers
+      only the adapter it claims, and a dedicated mesh adapter is never
+      claimed) and starts LE discovery with `DuplicateData: true` on it;
     * starts a linked `Bluez.AdvertReceiver` whose `on_report:` callback
       casts only AD 0x03 26-byte frames here.
 
@@ -32,9 +40,10 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   `bluetoothd` restart ends discovery while the D-Bus connection, the
   lease and the receiver (which reopens its HCI socket on its own)
   survive. So while ready, every `:health_check_ms` (default 15 s) the
-  radio checks that the receiver is `listening?` and that the adapter's
-  `org.bluez.Adapter1.Discovering` is true, and re-runs setup (which
-  restarts discovery) when either is not. A failure that comes back right
+  radio checks that the receiver is `listening?`, that the adapter's
+  `org.bluez.Adapter1.Discovering` is true and (with `:adapter_address`)
+  that the index still names that adapter, and re-runs setup (which
+  restarts discovery, or refuses a replaced adapter) when any is not. A failure that comes back right
   after the re-setup it caused is logged once, until a check passes.
 
   On stop it takes any advert off air, stops the receiver and discovery
@@ -114,7 +123,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   @doc """
   Starts the radio for one adapter.
 
-  Options: `:adapter_index` (default 0), `:name` (default
+  Options: `:adapter_index` (default 0), `:adapter_address` (the
+  adapter's expected MAC, any case; `nil`, the default, skips the check),
+  `:name` (default
   `#{inspect(__MODULE__)}`), `:drop_echoes` (default `true`),
   `:retry_ms` (first setup retry delay, default #{@retry_ms}; doubles up
   to #{@max_retry_ms}), `:max_queue` (default #{@max_queue}),
@@ -239,7 +250,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
 
   @doc """
   Radio state: whether setup completed (`:ready`) and why it last failed
-  (`:last_error`, `nil` once ready), adapter index, lease held, discovery
+  (`:last_error`, `nil` once ready), adapter index and expected address, lease held, discovery
   on, receiver listening, subscriber count, what's on air (`:tx`) and how
   many frames are queued (`:queued`).
   """
@@ -294,6 +305,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
 
     state = %{
       adapter_index: Keyword.get(opts, :adapter_index, 0),
+      adapter_address: opts |> Keyword.get(:adapter_address) |> upcase(),
       bluez_radio: Keyword.get(opts, :bluez_radio, Bluez.Radio),
       mgmt: Keyword.get(opts, :mgmt, Bluez.Mgmt),
       rebus: Keyword.get(opts, :rebus, Bluez.Rebus),
@@ -356,10 +368,12 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   # Each step records what it got in the state it returns (also on error),
   # so teardown/1 can undo exactly that much.
   defp setup(state) do
-    with {:ok, state} <- probe_mgmt(state),
+    with {:ok, state} <- connect(state),
+         {:ok, state} <- check_adapter(state),
+         {:ok, state} <- probe_mgmt(state),
          {:ok, state} <- watch_bluez_radio(state),
          {:ok, state} <- acquire(state),
-         {:ok, state} <- connect(state),
+         {:ok, state} <- power_on(state),
          {:ok, state} <- start_discovery(state) do
       start_receiver(state)
     end
@@ -412,9 +426,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   defp cancel_health(state), do: state
 
   defp check_health(state) do
-    if state.receiver.listening?(state.rx_name),
-      do: check_discovering(state),
-      else: {:error, :receiver_not_listening}
+    if state.receiver.listening?(state.rx_name) do
+      with :ok <- check_discovering(state), do: verify_address(state)
+    else
+      {:error, :receiver_not_listening}
+    end
   end
 
   defp check_discovering(state) do
@@ -493,6 +509,54 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
     state.rebus.connect(:system)
   catch
     :exit, reason -> {:exit, reason}
+  end
+
+  defp check_adapter(state) do
+    case verify_address(state) do
+      :ok -> {:ok, state}
+      {:error, reason} -> {:error, reason, state}
+    end
+  end
+
+  defp verify_address(%{adapter_address: nil}), do: :ok
+
+  defp verify_address(state) do
+    body = [@adapter_iface, "Address"]
+
+    case state.dbus.call(
+           state.conn,
+           adapter_path(state),
+           @props_iface,
+           "Get",
+           "ss",
+           body,
+           @health_call_ms
+         ) do
+      {:ok, [{_sig, address}]} when is_binary(address) ->
+        if upcase(address) == state.adapter_address,
+          do: :ok,
+          else: {:error, {:wrong_adapter, upcase(address)}}
+
+      {:ok, _other} ->
+        {:error, {:adapter_address, :unexpected_reply}}
+
+      {:error, reason} ->
+        {:error, {:adapter_address, reason}}
+    end
+  end
+
+  defp upcase(mac) when is_binary(mac), do: String.upcase(mac)
+  defp upcase(_mac), do: nil
+
+  # Idempotent: setting Powered on a powered adapter is a no-op. It is not
+  # undone on teardown, since the adapter is dedicated to this radio.
+  defp power_on(state) do
+    body = [@adapter_iface, "Powered", {"b", true}]
+
+    case state.dbus.call(state.conn, adapter_path(state), @props_iface, "Set", "ssv", body) do
+      {:ok, _} -> {:ok, state}
+      {:error, reason} -> {:error, {:power, reason}, state}
+    end
   end
 
   defp start_discovery(state) do
@@ -652,6 +716,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
       ready: state.ready,
       last_error: state.last_error,
       adapter_index: state.adapter_index,
+      adapter_address: state.adapter_address,
       lease_held: state.lease != nil and state.bluez_radio.valid?(state.lease),
       discovering: state.discovering,
       listening: state.rx_name != nil and state.receiver.listening?(state.rx_name),
