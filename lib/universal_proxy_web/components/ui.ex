@@ -282,15 +282,19 @@ defmodule UniversalProxyWeb.Components.UI do
       phx-click handlers on inner buttons.
       --%>
       <div phx-click={@on_close} phx-target={@target} class="absolute inset-0 bg-overlay"></div>
-      <div class="relative bg-raised rounded-lg shadow-lg max-w-[520px] w-full animate-pop">
-        <div class="px-6 pt-5 pb-3">
+      <%!-- Bounded to the padded viewport: the body scrolls, the title and
+           footer actions stay in view however long the content. --%>
+      <div class="relative bg-raised rounded-lg shadow-lg max-w-[520px] w-full max-h-full flex flex-col animate-pop">
+        <div class="flex-none px-6 pt-5 pb-3">
           <h3 class="text-lg font-semibold m-0 text-fg-1">{@title}</h3>
           <p :if={@subtitle} class="text-sm text-fg-2 mt-1">{@subtitle}</p>
         </div>
-        <div :if={@inner_block != []} class="px-6 pb-5">{render_slot(@inner_block)}</div>
+        <div :if={@inner_block != []} class="overflow-auto px-6 pb-5">
+          {render_slot(@inner_block)}
+        </div>
         <div
           :if={@footer != []}
-          class="flex justify-end gap-2 px-6 py-4 border-t border-border-2"
+          class="flex-none flex justify-end gap-2 px-6 py-4 border-t border-border-2"
         >
           {render_slot(@footer)}
         </div>

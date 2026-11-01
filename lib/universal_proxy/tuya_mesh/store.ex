@@ -58,6 +58,18 @@ defmodule UniversalProxy.TuyaMesh.Store do
   numbers. `replace/3` goes ahead (the upload brings its own `seq`) and logs
   the loss.
 
+  ## Revision
+
+  A persisted counter, bumped in the same insert as every write that
+  changes what `preview/2` diffs against: an upload, a clear, a persist
+  that changed the groups. Seq-only writes (persist, tighten) leave it, so
+  the Lights lease never invalidates a pending confirmation. `preview/2`
+  returns it as `revision` (an integer, key-free; 0 for a store never
+  written), and `replace/3` with `expected_revision:` refuses to write
+  unless it still matches, checked in the same call as the write, with
+  `{:error, {:stale_preview, preview}}` (a fresh preview). So a confirmed
+  upload only applies the diff the user was shown.
+
   ## Sub-device ids
 
   `device_ids/1` maps `{:bulb, mac}` and `{:group, local_id}` to HA
@@ -109,7 +121,8 @@ defmodule UniversalProxy.TuyaMesh.Store do
           groups: %{
             added: [%{local_id: 0..254, name: String.t() | nil}],
             removed: [%{local_id: 0..254, name: String.t() | nil}]
-          }
+          },
+          revision: non_neg_integer()
         }
 
   # ── Client API ─────────────────────────────────────────────────────────
@@ -184,7 +197,8 @@ defmodule UniversalProxy.TuyaMesh.Store do
 
   @doc """
   What `replace/3` with `inventory` would change: the mesh classification
-  and the bulbs (by MAC) and groups (by local id) added and removed. No
+  and the bulbs (by MAC) and groups (by local id) added and removed, plus
+  the stored `revision` it was computed against (see the moduledoc). No
   keys.
   """
   @spec preview(Inventory.t(), GenServer.server()) :: {:ok, preview()} | {:error, term()}
@@ -194,7 +208,10 @@ defmodule UniversalProxy.TuyaMesh.Store do
   @doc """
   Stores an uploaded inventory (see the moduledoc for the `seq` rule).
   `opts`: `allow_new_mesh:` (default `false`), without which a different
-  mesh is refused with `{:error, :new_mesh}`. Returns how it was stored:
+  mesh is refused with `{:error, :new_mesh}`; `expected_revision:`, the
+  `revision` of a preview, without a match for which nothing is written
+  and the reply is `{:error, {:stale_preview, preview}}`, the preview fresh.
+  Returns how it was stored:
   `:same_mesh` when a stored or earlier `seq` of this mesh was honoured,
   else `:new_mesh`.
   """
@@ -334,8 +351,10 @@ defmodule UniversalProxy.TuyaMesh.Store do
     with {:ok, inv} <- validate(input),
          {:ok, stored} <- fetch_stored(state.table),
          :ok <- check_persistable(stored, inv, mode),
-         :ok <- write_inventory(state, inv, [], :same_mesh) do
-      if inv.groups != stored.groups, do: notify(state)
+         groups_changed? = inv.groups != stored.groups,
+         extra = if(groups_changed?, do: [bump(state.table)], else: []),
+         :ok <- write_inventory(state, inv, extra, :same_mesh) do
+      if groups_changed?, do: notify(state)
       {:reply, :ok, state}
     else
       {:error, _reason} = error -> {:reply, error, state}
@@ -355,18 +374,25 @@ defmodule UniversalProxy.TuyaMesh.Store do
   defp do_call({:preview, input}, _from, state) do
     reply =
       case validate(input) do
-        {:ok, inv} -> {:ok, build_preview(valid_or_nil(state.table), inv)}
+        {:ok, inv} -> {:ok, preview_of(state.table, inv)}
         error -> error
       end
 
     {:reply, reply, state}
   end
 
+  # The revision is checked in the same call as the write: nothing can land
+  # between them.
   defp do_call({:replace, input, opts}, _from, state) do
     reply =
       case validate(input) do
-        {:ok, inv} -> do_replace(state, inv, opts)
-        error -> error
+        {:ok, inv} ->
+          if stale?(state.table, opts),
+            do: {:error, {:stale_preview, preview_of(state.table, inv)}},
+            else: do_replace(state, inv, opts)
+
+        error ->
+          error
       end
 
     {:reply, reply, state}
@@ -490,7 +516,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
     inv = %{inv | seq: seq}
     floors = Map.delete(floors, fingerprint(inv.beacon_key))
 
-    case write_inventory(state, inv, [{:seq_floors, floors}], over) do
+    case write_inventory(state, inv, [{:seq_floors, floors}, bump(state.table)], over) do
       :ok ->
         notify(state)
         {:ok, kind}
@@ -578,6 +604,9 @@ defmodule UniversalProxy.TuyaMesh.Store do
     }
   end
 
+  defp preview_of(table, inv),
+    do: table |> valid_or_nil() |> build_preview(inv) |> Map.put(:revision, revision(table))
+
   defp diff(old, new, key_fun, summary_fun) do
     old_keys = MapSet.new(old, key_fun)
     new_keys = MapSet.new(new, key_fun)
@@ -586,6 +615,20 @@ defmodule UniversalProxy.TuyaMesh.Store do
       added: for(x <- new, not MapSet.member?(old_keys, key_fun.(x)), do: summary_fun.(x)),
       removed: for(x <- old, not MapSet.member?(new_keys, key_fun.(x)), do: summary_fun.(x))
     }
+  end
+
+  # ── Revision ─────────────────────────────────────────────────────────
+
+  defp revision(table), do: lookup(table, :revision, 0)
+
+  # The record to insert with an inventory-changing write.
+  defp bump(table), do: {:revision, revision(table) + 1}
+
+  defp stale?(table, opts) do
+    case Keyword.fetch(opts, :expected_revision) do
+      {:ok, expected} -> expected != revision(table)
+      :error -> false
+    end
   end
 
   # ── Device ids ───────────────────────────────────────────────────────
@@ -633,7 +676,9 @@ defmodule UniversalProxy.TuyaMesh.Store do
   defp write_clear(state, floors) do
     ids = state.table |> lookup(:device_ids, %{}) |> prune_groups([])
 
-    with :ok <- write(state, [{:inventory, nil}, {:device_ids, ids}, {:seq_floors, floors}]) do
+    inserts = [{:inventory, nil}, {:device_ids, ids}, {:seq_floors, floors}, bump(state.table)]
+
+    with :ok <- write(state, inserts) do
       notify(state)
     end
   end

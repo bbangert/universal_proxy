@@ -25,6 +25,12 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
       another mesh be stored meanwhile, the unconfirmed upload comes back
       as `{:error, {:confirm_new_mesh, preview}}` and is asked again.
 
+  Every upload carries the preview's `revision` as `expected_revision:`,
+  so it only lands on the inventory that preview diffed against. When
+  another tab uploaded, cleared or changed groups in between, the facade
+  answers `{:error, {:stale_preview, fresh}}` with nothing written, and the
+  confirmation re-opens on the fresh diff, flagged as changed.
+
   Between the preview and the confirm (or cancel) the dump sits in this
   component's `:pending` assign, sealed in a closure
   (`UniversalProxy.TuyaMesh.Redact.seal/1`) so a crash report or an
@@ -41,6 +47,13 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   forwards each `{:tuya_mesh_status, status}` here with
   `send_update(__MODULE__, id: id, status: status)`; `update/2` takes such
   an update as the new status. The first status is read in `mount/1`.
+
+  "Last seen" is relative to the `:now` assign, not the render time: the
+  Resolver only publishes changed statuses, so the parent also sends
+  `send_update(__MODULE__, id: id, now: now)` on a timer while the card is
+  shown. `now` comes from the `:clock` attr (a 0-arity fun returning a
+  `DateTime`, the parent's), read on the first update and on each status
+  update.
   """
 
   use UniversalProxyWeb, :live_component
@@ -59,8 +72,9 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
     {:ok,
      socket
      |> assign(:status, TuyaMesh.status())
-     # `nil`, or `%{inventory: sealed_json, preview: preview}` while a new
-     # mesh awaits confirmation.
+     # `nil`, or `%{inventory: sealed_json, preview: preview, stale: bool}`
+     # while an upload awaits confirmation (`stale`: the store changed
+     # since the user last saw a diff).
      |> assign(:pending, nil)
      # `nil`, `:confirm`, or `:force` (the stored record's seq is lost).
      |> assign(:clearing, nil)
@@ -75,8 +89,15 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   end
 
   @impl true
-  def update(%{status: status}, socket), do: {:ok, assign(socket, :status, status)}
-  def update(assigns, socket), do: {:ok, assign(socket, assigns)}
+  def update(%{status: status}, socket),
+    do: {:ok, assign(socket, status: status, now: socket.assigns.clock.())}
+
+  def update(%{now: now}, socket), do: {:ok, assign(socket, :now, now)}
+
+  def update(assigns, socket) do
+    socket = assign(socket, assigns)
+    {:ok, assign_new(socket, :now, fn -> socket.assigns.clock.() end)}
+  end
 
   # ── Upload ──────────────────────────────────────────────────────────────
 
@@ -113,8 +134,8 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   def handle_event("confirm_upload", _params, socket) do
     %{inventory: sealed, preview: preview} = socket.assigns.pending
     socket = assign(socket, :pending, nil)
-    opts = if preview.mesh == :new_mesh, do: [confirm: true], else: []
-    {:noreply, upload(socket, Redact.unseal(sealed), preview, opts)}
+    confirm = if preview.mesh == :new_mesh, do: [confirm: true], else: []
+    {:noreply, upload(socket, Redact.unseal(sealed), preview, confirm)}
   end
 
   def handle_event("cancel_upload", _params, socket),
@@ -142,7 +163,7 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
     case TuyaMesh.preview(json) do
       {:ok, preview} ->
         if needs_confirm?(preview),
-          do: await_confirm(socket, json, preview),
+          do: await_confirm(socket, json, preview, false),
           else: upload(socket, json, preview, [])
 
       {:error, reason} ->
@@ -151,15 +172,15 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   end
 
   defp upload(socket, json, preview, opts) do
-    case TuyaMesh.upload(json, opts) do
+    case TuyaMesh.upload(json, [expected_revision: preview.revision] ++ opts) do
       {:ok, _kind} ->
         socket
         |> assign(:notice, %{title: uploaded_title(preview.mesh), preview: preview})
         |> assign(:status, TuyaMesh.status())
 
-      # Another mesh was stored since the preview: confirm against it.
-      {:error, {:confirm_new_mesh, preview}} ->
-        await_confirm(socket, json, preview)
+      # The store changed since the preview: confirm the fresh diff.
+      {:error, {stale, fresh}} when stale in [:stale_preview, :confirm_new_mesh] ->
+        await_confirm(socket, json, fresh, true)
 
       {:error, reason} ->
         assign(socket, :error, upload_error(reason))
@@ -170,8 +191,8 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   defp needs_confirm?(%{mesh: :new_mesh}), do: true
   defp needs_confirm?(%{bulbs: %{removed: removed}}), do: removed != []
 
-  defp await_confirm(socket, json, preview),
-    do: assign(socket, :pending, %{inventory: Redact.seal(json), preview: preview})
+  defp await_confirm(socket, json, preview, stale?),
+    do: assign(socket, :pending, %{inventory: Redact.seal(json), preview: preview, stale: stale?})
 
   defp clear(socket, opts) do
     case TuyaMesh.clear(opts) do
@@ -192,10 +213,7 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
 
   @impl true
   def render(assigns) do
-    assigns =
-      assigns
-      |> assign(:view, state_view(assigns.status))
-      |> assign(:now, DateTime.utc_now())
+    assigns = assign(assigns, :view, state_view(assigns.status))
 
     ~H"""
     <div id={@id} class="mt-7">
@@ -329,7 +347,12 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
 
       <.help />
 
-      <.confirm_upload_modal :if={@pending} preview={@pending.preview} myself={@myself} />
+      <.confirm_upload_modal
+        :if={@pending}
+        preview={@pending.preview}
+        stale={@pending.stale}
+        myself={@myself}
+      />
       <.clear_modal :if={@clearing} mode={@clearing} myself={@myself} />
     </div>
     """
@@ -360,7 +383,7 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   defp diff(assigns) do
     ~H"""
     <div class="mt-1.5 flex flex-col gap-1 font-normal">
-      <div :if={no_changes?(@preview)}>No bulbs or groups changed.</div>
+      <div :if={no_changes?(@preview)}>No bulbs or groups were added or removed.</div>
       <div :for={bulb <- @preview.bulbs.added}>
         Bulb added: <strong>{bulb.label || "Unnamed bulb"}</strong>
         <span class="font-mono">{bulb.mac}</span>
@@ -409,23 +432,39 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   end
 
   attr(:preview, :map, required: true)
+  attr(:stale, :boolean, required: true)
   attr(:myself, :any, required: true)
 
-  defp confirm_upload_modal(%{preview: %{mesh: :new_mesh}} = assigns) do
+  defp confirm_upload_modal(assigns) do
+    assigns = assign(assigns, :copy, confirm_copy(assigns.preview))
+
     ~H"""
-    <.modal open={true} on_close="cancel_upload" target={@myself} title="Replace the stored mesh?">
+    <.modal open={true} on_close="cancel_upload" target={@myself} title={@copy.title}>
       <:footer>
         <.button variant={:ghost} size={:sm} phx-click="cancel_upload" phx-target={@myself}>
           Cancel
         </.button>
         <.button variant={:danger} size={:sm} phx-click="confirm_upload" phx-target={@myself}>
-          Replace mesh
+          {@copy.action}
         </.button>
       </:footer>
+      <div
+        :if={@stale}
+        role="alert"
+        class="mb-3 p-[10px_12px] rounded-md bg-warning-soft text-warning text-xs font-medium flex items-start gap-2"
+      >
+        <.icon name={:alert} size={14} stroke={2.0} class="mt-px flex-none" />
+        <span>
+          The stored inventory changed since you chose this file. Review the
+          updated changes below.
+        </span>
+      </div>
       <p class="text-sm text-fg-2 mt-0 mb-3">
-        This dump is for a <strong>different mesh</strong> than the one stored.
-        Uploading it replaces every bulb and group. Home&nbsp;Assistant drops the
-        entities of the bulbs removed below, and their history with them.
+        {@copy.body}
+        <span :if={@preview.bulbs.removed != []}>
+          Home&nbsp;Assistant drops the entities of the bulbs removed below, and
+          their history with them.
+        </span>
       </p>
       <div class="p-[10px_12px] rounded-md bg-sunken text-fg-2 text-xs">
         <.diff preview={@preview} />
@@ -434,35 +473,42 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
     """
   end
 
-  defp confirm_upload_modal(assigns) do
-    assigns = assign(assigns, :removed, length(assigns.preview.bulbs.removed))
+  defp confirm_copy(%{mesh: :new_mesh}) do
+    %{
+      title: "Replace the stored mesh?",
+      action: "Replace mesh",
+      body:
+        "This dump is for a different mesh than the one stored. " <>
+          "Uploading it replaces every bulb and group."
+    }
+  end
 
-    ~H"""
-    <.modal
-      open={true}
-      on_close="cancel_upload"
-      target={@myself}
-      title={"Remove #{@removed} #{pluralize(@removed, "bulb", "bulbs")}?"}
-    >
-      <:footer>
-        <.button variant={:ghost} size={:sm} phx-click="cancel_upload" phx-target={@myself}>
-          Cancel
-        </.button>
-        <.button variant={:danger} size={:sm} phx-click="confirm_upload" phx-target={@myself}>
-          Upload and remove
-        </.button>
-      </:footer>
-      <p class="text-sm text-fg-2 mt-0 mb-3">
-        This dump is for the stored mesh but leaves out
-        <strong>{@removed} {pluralize(@removed, "bulb", "bulbs")}</strong>.
-        Home&nbsp;Assistant drops the entities of the bulbs removed below, and
-        their history with them.
-      </p>
-      <div class="p-[10px_12px] rounded-md bg-sunken text-fg-2 text-xs">
-        <.diff preview={@preview} />
-      </div>
-    </.modal>
-    """
+  defp confirm_copy(%{bulbs: %{removed: [_ | _] = removed}}) do
+    n = length(removed)
+    bulbs = pluralize(n, "bulb", "bulbs")
+
+    %{
+      title: "Remove #{n} #{bulbs}?",
+      action: "Upload and remove",
+      body: "This dump is for the stored mesh but leaves out #{n} #{bulbs}."
+    }
+  end
+
+  # Only after a stale confirmation: the fresh diff removes nothing.
+  defp confirm_copy(%{mesh: :empty}) do
+    %{
+      title: "Upload this dump?",
+      action: "Upload",
+      body: "The stored inventory was cleared, so this dump will be stored as a new mesh."
+    }
+  end
+
+  defp confirm_copy(_preview) do
+    %{
+      title: "Upload this dump?",
+      action: "Upload",
+      body: "This dump is for the stored mesh and removes no bulbs."
+    }
   end
 
   attr(:mode, :atom, required: true)

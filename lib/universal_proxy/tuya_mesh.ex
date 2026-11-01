@@ -19,7 +19,15 @@ defmodule UniversalProxy.TuyaMesh do
   replaces every bulb and its HA entities, so it needs `confirm: true`;
   without it the reply is `{:error, {:confirm_new_mesh, preview}}`, where
   `preview` (also from `preview/1`) lists the bulbs and groups added and
-  removed. The mesh is stopped before the Store changes and restarted
+  removed.
+
+  A confirmation is only good for the diff it showed: pass the preview's
+  `revision` as `expected_revision:` and the upload is refused, with
+  nothing written, as `{:error, {:stale_preview, fresh_preview}}` if the
+  stored inventory changed since (another upload, a clear, a group
+  change). The Store checks it in the same call as the write; it is also
+  checked here first, so a stale confirmation doesn't stop the mesh for
+  nothing. The mesh is stopped before the Store changes and restarted
   after, so the Lights controller reads the new inventory (and its `seq`)
   from the Store on start.
 
@@ -60,6 +68,7 @@ defmodule UniversalProxy.TuyaMesh do
   @type upload_error ::
           {:invalid_inventory, term()}
           | {:confirm_new_mesh, Store.preview()}
+          | {:stale_preview, Store.preview()}
           | :unavailable
           | :timeout
           | term()
@@ -70,8 +79,9 @@ defmodule UniversalProxy.TuyaMesh do
 
   @doc """
   Stores an uploaded JSON dump (or decoded map) and restarts the mesh on
-  it. `opts`: `confirm: true` to replace a different mesh. See the
-  moduledoc.
+  it. `opts`: `confirm: true` to replace a different mesh;
+  `expected_revision:` (a preview's `revision`) to write only over the
+  inventory that preview was computed against. See the moduledoc.
   """
   @spec upload(binary() | map(), keyword()) ::
           {:ok, :same_mesh | :new_mesh} | {:error, upload_error()}
@@ -80,11 +90,13 @@ defmodule UniversalProxy.TuyaMesh do
 
     with {:ok, inv} <- decode(json),
          {:ok, preview} <- Store.preview(inv, store),
+         :ok <- current(preview, opts),
          :ok <- confirmed(preview, opts) do
-      allow? = preview.mesh == :new_mesh
+      replace_opts =
+        [allow_new_mesh: preview.mesh == :new_mesh] ++ Keyword.take(opts, [:expected_revision])
 
-      case change(opts, &Resolver.replace(inv, [allow_new_mesh: allow?], &1), fn ->
-             Store.replace(inv, [allow_new_mesh: allow?], store)
+      case change(opts, &Resolver.replace(inv, replace_opts, &1), fn ->
+             Store.replace(inv, replace_opts, store)
            end) do
         {:ok, kind} ->
           Logger.info("TuyaMesh: inventory uploaded (#{kind}, #{length(inv.bulbs)} bulbs)")
@@ -151,6 +163,13 @@ defmodule UniversalProxy.TuyaMesh do
       {:error, reason} ->
         Logger.info("TuyaMesh: inventory upload rejected (#{inspect(reason)})")
         {:error, {:invalid_inventory, reason}}
+    end
+  end
+
+  defp current(preview, opts) do
+    case Keyword.fetch(opts, :expected_revision) do
+      {:ok, revision} when revision != preview.revision -> {:error, {:stale_preview, preview}}
+      _ -> :ok
     end
   end
 

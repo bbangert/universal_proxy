@@ -213,7 +213,8 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
                  added: [%{mac: "AABBCCDDEEFF", label: nil}],
                  removed: [%{mac: @mac2, label: "path light 2"}]
                },
-               groups: %{added: [], removed: [%{local_id: 1, name: "path and post"}]}
+               groups: %{added: [], removed: [%{local_id: 1, name: "path and post"}]},
+               revision: 1
              }
 
       refute_secrets(preview)
@@ -422,7 +423,7 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
       refute_received {:write, _}
 
       :ok = Store.clear(store)
-      assert_received {:write, [:inventory, :device_ids, :seq_floors]}
+      assert_received {:write, [:inventory, :device_ids, :seq_floors, :revision]}
       refute_received {:write, _}
     end
 
@@ -485,6 +486,68 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
 
       store = restart_store(ctx)
       assert Store.settings(store) == %{min_mireds: 154, max_mireds: 400, invert: true}
+    end
+  end
+
+  describe "revision" do
+    defp revision(store) do
+      {:ok, %{revision: revision}} = Store.preview(inventory(), store)
+      revision
+    end
+
+    test "bumps on uploads, group changes and clears; not on seq-only writes", ctx do
+      assert revision(ctx.store) == 0
+
+      {:ok, _} = Store.replace(inventory(), [], ctx.store)
+      assert revision(ctx.store) == 1
+
+      :ok = Store.persist(%{inventory() | seq: 132}, ctx.store)
+      :ok = Store.tighten(%{inventory() | seq: 101}, 132, ctx.store)
+      {:ok, _} = Store.allocate_device_ids([{:group, 7}], ctx.store)
+      :ok = Store.put_settings(%{min_mireds: 200}, ctx.store)
+      assert revision(ctx.store) == 1
+
+      :ok = Store.persist(%{inventory() | seq: 140, groups: []}, ctx.store)
+      assert revision(ctx.store) == 2
+
+      {:ok, _} = Store.replace(inventory(), [], ctx.store)
+      assert revision(ctx.store) == 3
+
+      :ok = Store.clear(ctx.store)
+      assert revision(ctx.store) == 4
+      # Nothing to clear: no write.
+      :ok = Store.clear(ctx.store)
+      assert revision(ctx.store) == 4
+
+      # Persisted.
+      assert revision(restart_store(ctx)) == 4
+    end
+
+    test "replace with a stale expected_revision writes nothing and returns a fresh preview",
+         ctx do
+      {:ok, %{revision: seen}} = Store.preview(inventory(), ctx.store)
+      # Another writer lands between the preview and the replace.
+      {:ok, _} = Store.replace(other_mesh(%{"seq" => 7}), [], ctx.store)
+
+      assert {:error, {:stale_preview, fresh}} =
+               Store.replace(
+                 inventory(),
+                 [allow_new_mesh: true, expected_revision: seen],
+                 ctx.store
+               )
+
+      assert %{mesh: :new_mesh, revision: 1} = fresh
+      refute_secrets(fresh)
+      assert {:ok, %Inventory{seq: 7}} = Store.load(ctx.store)
+
+      assert {:ok, :new_mesh} =
+               Store.replace(
+                 inventory(),
+                 [allow_new_mesh: true, expected_revision: fresh.revision],
+                 ctx.store
+               )
+
+      assert {:ok, %Inventory{seq: 100}} = Store.load(ctx.store)
     end
   end
 

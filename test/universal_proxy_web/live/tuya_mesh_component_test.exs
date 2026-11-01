@@ -202,7 +202,7 @@ defmodule UniversalProxyWeb.TuyaMeshComponentTest do
       {:ok, _} = TuyaMesh.upload(KeyLeak.json())
       view = mount_tab(conn)
 
-      assert submit_upload(view, KeyLeak.json()) =~ "No bulbs or groups changed."
+      assert submit_upload(view, KeyLeak.json()) =~ "No bulbs or groups were added or removed."
     end
 
     test "a new mesh asks first; confirm uploads it", %{conn: conn} = ctx do
@@ -228,6 +228,60 @@ defmodule UniversalProxyWeb.TuyaMeshComponentTest do
       assert {:ok, %{seq: 3, beacon_key: @other_key}} = Store.load(ctx.store)
       assert render(view) =~ "porch"
       refute_secrets(render(view))
+    end
+
+    test "a new-mesh confirm over a store changed meanwhile re-asks with the fresh diff",
+         %{conn: conn} = ctx do
+      {:ok, _} = TuyaMesh.upload(KeyLeak.json())
+      view = mount_tab(conn)
+      assert submit_upload(view, other_mesh_json()) =~ "Replace the stored mesh?"
+
+      # Another tab stores a third mesh, without "path light 2".
+      [_b2, b3] = KeyLeak.json() |> Jason.decode!() |> Map.fetch!("bulbs")
+      third = json(%{"beaconKey" => String.duplicate("ab", 16), "bulbs" => [b3], "groups" => []})
+      {:ok, :new_mesh} = TuyaMesh.upload(third, confirm: true)
+
+      html = view |> element("button[phx-click=confirm_upload]") |> render_click()
+      assert html =~ "Replace the stored mesh?"
+      assert html =~ "The stored inventory changed since you chose this file."
+      assert html =~ "Bulb added: <strong>path light 2</strong>"
+      assert html =~ "Bulb removed: <strong>post spot 1</strong>"
+      refute html =~ "Group removed"
+      refute_secrets(html)
+      assert {:ok, %{bulbs: [%{label: "post spot 1"}]}} = Store.load(ctx.store)
+
+      html = view |> element("button[phx-click=confirm_upload]") |> render_click()
+      assert html =~ "New mesh uploaded."
+      assert {:ok, %{beacon_key: @other_key}} = Store.load(ctx.store)
+    end
+
+    test "a bulb-removal confirm over bulbs added meanwhile re-asks", %{conn: conn} = ctx do
+      {:ok, _} = TuyaMesh.upload(KeyLeak.json())
+      view = mount_tab(conn)
+
+      [b2, b3] = KeyLeak.json() |> Jason.decode!() |> Map.fetch!("bulbs")
+      assert submit_upload(view, json(%{"bulbs" => [b2], "groups" => []})) =~ "Remove 1 bulb?"
+
+      # Another tab adds a bulb to the same mesh.
+      porch = %{
+        "mac" => "DC2353000001",
+        "localKey" => @new_local_key,
+        "nodeId" => 9,
+        "label" => "porch"
+      }
+
+      {:ok, :same_mesh} = TuyaMesh.upload(json(%{"bulbs" => [b2, b3, porch]}))
+
+      html = view |> element("button[phx-click=confirm_upload]") |> render_click()
+      assert html =~ "Remove 2 bulbs?"
+      assert html =~ "The stored inventory changed since you chose this file."
+      assert html =~ "Bulb removed: <strong>porch</strong>"
+      refute_secrets(html)
+      assert {:ok, %{bulbs: [_, _, _]}} = Store.load(ctx.store)
+
+      html = view |> element("button[phx-click=cancel_upload]") |> render_click()
+      refute html =~ "Remove 2 bulbs?"
+      assert {:ok, %{bulbs: [_, _, _]}} = Store.load(ctx.store)
     end
 
     test "cancelling a new mesh leaves the store alone", %{conn: conn} = ctx do
@@ -297,6 +351,40 @@ defmodule UniversalProxyWeb.TuyaMeshComponentTest do
 
       assert {:error, _} = render_upload(input, "a.json")
       assert render(view) =~ "Choose one file at a time."
+    end
+
+    test "last-seen times advance on the clock tick, without a status change", %{conn: conn} do
+      t0 = ~U[2026-11-01 12:00:00Z]
+      clock = start_supervised!({Agent, fn -> t0 end})
+      Application.put_env(:universal_proxy, :tuya_mesh_clock, fn -> Agent.get(clock, & &1) end)
+      on_exit(fn -> Application.delete_env(:universal_proxy, :tuya_mesh_clock) end)
+
+      view = mount_tab(conn)
+
+      status = %{
+        TuyaMesh.status()
+        | bulbs: [
+            %{
+              mac: "DC23530FB34A",
+              label: "path light 2",
+              node_id: 2,
+              last_seen: DateTime.add(t0, -120, :second),
+              reachable: true
+            }
+          ]
+      }
+
+      assert push_status(view, status) =~ "Seen 2 min ago"
+
+      Agent.update(clock, &DateTime.add(&1, 600, :second))
+      send(view.pid, :tuya_mesh_tick)
+      _ = render(view)
+      assert render(view) =~ "Seen 12 min ago"
+
+      Agent.update(clock, &DateTime.add(&1, 3_600, :second))
+      send(view.pid, :tuya_mesh_tick)
+      _ = render(view)
+      assert render(view) =~ "Seen 1 h ago"
     end
 
     test "status updates live from the PubSub broadcast", %{conn: conn} do

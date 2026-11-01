@@ -34,6 +34,10 @@ defmodule UniversalProxyWeb.BluetoothLive do
     * `UniversalProxy.TuyaMesh.topic/0` — `{:tuya_mesh_status, status}`,
       forwarded to `UniversalProxyWeb.TuyaMeshComponent` with `send_update/3`
 
+  While the Tuya mesh card is shown, a `:tuya_mesh_tick` every 30 s sends
+  it the current time (`:tuya_mesh_clock` app env overrides the clock, for
+  tests), so its "last seen" times advance between status changes.
+
   The public API is safe on every target, so this view renders the same
   way on the host as on hardware. Proxy setters bounce espex, so the UI
   disables those controls while a write is in flight.
@@ -58,6 +62,8 @@ defmodule UniversalProxyWeb.BluetoothLive do
   @scan_poll_ms 1_500
 
   @audio_topic "bluetooth:audio"
+
+  @mesh_tick_ms 30_000
   @scan_topic "bluetooth:scan"
 
   @impl true
@@ -72,27 +78,35 @@ defmodule UniversalProxyWeb.BluetoothLive do
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, TuyaMesh.topic())
     end
 
-    {:ok,
-     socket
-     |> assign(:page_title, "Bluetooth")
-     |> assign(:audio_role_supported, Bluetooth.audio_role_supported?())
-     |> assign(:status, Bluetooth.status())
-     |> assign(:improv, Improv.status())
-     |> assign(:stats, Bluetooth.stats())
-     |> assign(:radios, Bluetooth.list_radios())
-     |> assign(:roles, Bluetooth.roles())
-     |> assign(:headphones, AudioManager.list_headphones())
-     # Set true around a proxy setter call so its controls disable until
-     # the resulting `{:bluetooth_state, _}` broadcast lands.
-     |> assign(:busy, false)
-     # Inline role-picker error (a refused :tuya_mesh), cleared on success.
-     |> assign(:role_error, nil)
-     # Per-row "more" menu (Forget) open set, keyed by device MAC.
-     |> assign(:menu_open, MapSet.new())
-     # `nil` when closed; otherwise the confirm/pairing modal state maps.
-     |> assign(:forget, nil)
-     |> assign(:deactivate, nil)
-     |> assign(:pairing, nil)}
+    socket =
+      socket
+      |> assign(:page_title, "Bluetooth")
+      |> assign(:audio_role_supported, Bluetooth.audio_role_supported?())
+      |> assign(:status, Bluetooth.status())
+      |> assign(:improv, Improv.status())
+      |> assign(:stats, Bluetooth.stats())
+      |> assign(:radios, Bluetooth.list_radios())
+      |> assign(:roles, Bluetooth.roles())
+      |> assign(:headphones, AudioManager.list_headphones())
+      # Set true around a proxy setter call so its controls disable until
+      # the resulting `{:bluetooth_state, _}` broadcast lands.
+      |> assign(:busy, false)
+      # Inline role-picker error (a refused :tuya_mesh), cleared on success.
+      |> assign(:role_error, nil)
+      # Per-row "more" menu (Forget) open set, keyed by device MAC.
+      |> assign(:menu_open, MapSet.new())
+      # `nil` when closed; otherwise the confirm/pairing modal state maps.
+      |> assign(:forget, nil)
+      |> assign(:deactivate, nil)
+      |> assign(:pairing, nil)
+      |> assign(
+        :mesh_clock,
+        Application.get_env(:universal_proxy, :tuya_mesh_clock, &DateTime.utc_now/0)
+      )
+      |> assign(:mesh_tick, nil)
+
+    # The tick goes to the LiveView process, so only once connected.
+    {:ok, if(connected?(socket), do: sync_mesh_tick(socket), else: socket)}
   end
 
   # ── Proxy controls (espex-bouncing; guarded by `busy`) ──────────────────
@@ -322,7 +336,8 @@ defmodule UniversalProxyWeb.BluetoothLive do
      socket
      |> assign(:status, status)
      |> assign(:roles, Bluetooth.roles())
-     |> assign(:busy, false)}
+     |> assign(:busy, false)
+     |> sync_mesh_tick()}
   end
 
   def handle_info({:bluetooth_stats, stats}, socket) do
@@ -345,6 +360,20 @@ defmodule UniversalProxyWeb.BluetoothLive do
     end
 
     {:noreply, socket}
+  end
+
+  # Advances the mesh card's relative times; status isn't re-read.
+  def handle_info(:tuya_mesh_tick, socket) do
+    cancel_timer(socket.assigns.mesh_tick)
+
+    if socket.assigns.roles.tuya_mesh do
+      Phoenix.LiveView.send_update(TuyaMeshComponent,
+        id: "tuya-mesh",
+        now: socket.assigns.mesh_clock.()
+      )
+    end
+
+    {:noreply, socket |> assign(:mesh_tick, nil) |> sync_mesh_tick()}
   end
 
   # A connection change (incl. forget-on-deactivate) refreshes the list.
@@ -407,6 +436,7 @@ defmodule UniversalProxyWeb.BluetoothLive do
         |> assign(:headphones, AudioManager.list_headphones())
         |> assign(:busy, false)
         |> assign(:role_error, nil)
+        |> sync_mesh_tick()
 
       # Every mesh refusal renders inline, beside the role picker.
       {:error, reason}
@@ -443,6 +473,24 @@ defmodule UniversalProxyWeb.BluetoothLive do
     socket
     |> assign(:pairing, nil)
     |> assign(:headphones, AudioManager.list_headphones())
+  end
+
+  # The mesh card's clock tick runs only while the card is shown. Called
+  # from connected callbacks only (mount guards its call).
+  defp sync_mesh_tick(socket) do
+    shown? = is_binary(socket.assigns.roles.tuya_mesh)
+
+    case socket.assigns.mesh_tick do
+      nil when shown? ->
+        assign(socket, :mesh_tick, Process.send_after(self(), :tuya_mesh_tick, @mesh_tick_ms))
+
+      ref when not shown? and ref != nil ->
+        cancel_timer(ref)
+        assign(socket, :mesh_tick, nil)
+
+      _ ->
+        socket
+    end
   end
 
   defp cancel_timer(nil), do: :ok
@@ -546,6 +594,7 @@ defmodule UniversalProxyWeb.BluetoothLive do
         module={TuyaMeshComponent}
         id="tuya-mesh"
         mesh_label={mesh_label(@radios, @roles)}
+        clock={@mesh_clock}
       />
 
       <.audio_devices_section
