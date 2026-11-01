@@ -66,6 +66,23 @@ defmodule UniversalProxy.ESPHome.SupervisorTest do
                )
     end
 
+    test "a mesh-only role wires the full set (the other radio auto-proxies)" do
+      # The mesh radio is excluded from the BlueZ claim, so the client's auto
+      # fallback proxies on the remaining radio: not a pause.
+      assert [bluetooth_scanner: _, bluetooth_proxy: _] =
+               ESPHomeSupervisor.bluetooth_opts(
+                 true,
+                 settings(roles: %{"AA:BB:CC:DD:EE:FF" => :tuya_mesh})
+               )
+    end
+
+    test "a mesh role with every other radio :off wires nothing" do
+      assert ESPHomeSupervisor.bluetooth_opts(
+               true,
+               settings(roles: %{"AA:BB:CC:DD:EE:FF" => :tuya_mesh, "11:22:33:44:55:66" => :off})
+             ) == []
+    end
+
     test "an explicit :proxy role wires the full set" do
       assert [bluetooth_scanner: _, bluetooth_proxy: _] =
                ESPHomeSupervisor.bluetooth_opts(

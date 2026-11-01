@@ -120,9 +120,11 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   so the enabled × paused × active_connections matrix is host-testable.
 
     * unsupported target or `enabled: false` → no adapters (flags 0)
-    * role-paused (`Settings.proxy_paused?/1` — roles assigned, none
-      `:proxy`) → no adapters: "Off" on every radio must mean HA gets
-      nothing, not a silent auto-fallback
+    * role-paused (`Settings.proxy_paused?/1` — non-mesh roles assigned,
+      none `:proxy`) → no adapters: "Off" on every radio must mean HA gets
+      nothing, not a silent auto-fallback. A `:tuya_mesh` role alone is not
+      a pause: the mesh radio is excluded from the BlueZ claim and the auto
+      fallback proxies on another radio
     * `active_connections: false` → scanner only (HA sees a passive-only
       proxy: no ACTIVE_CONNECTIONS / REMOTE_CACHING / PAIRING flags)
     * both on → scanner + GATT proxy (full flag set, 0x7F)

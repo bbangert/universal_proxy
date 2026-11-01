@@ -4,7 +4,10 @@ defmodule UniversalProxy.Bluetooth.RadioMonitor do
   (`UniversalProxy.Bluetooth.Radios.enumerate/1`) overlaid with live
   `org.bluez.Adapter1` properties (Address, Name) when the daemon is up,
   plus an `in_use?` mark on the radio the BlueZ subtree is driving
-  (selected/claimed — independent of the HA-facing `enabled` toggle).
+  (selected/claimed — independent of the HA-facing `enabled` toggle) and
+  each radio's stored `role` (`nil` when unassigned). The `:tuya_mesh` radio
+  is excluded from the claim, so it is never `in_use?`; its `role` is what
+  marks it as taken by the mesh.
 
   ## Event-driven, not polled
 
@@ -31,7 +34,10 @@ defmodule UniversalProxy.Bluetooth.RadioMonitor do
 
   `:name`, `:sysfs_root`, `:pubsub`, plus the `:adapters_info_fun`
   injection point (defaults to
-  `Bluez.Client.adapters_info/0`). Tests drive a
+  `Bluez.Client.adapters_info/0`) and `:roles_fun` (the stored
+  `%{mac => role}` map, defaults to `Settings.get/0`'s, `%{}` while Settings
+  is down). Role changes reach the list through
+  `UniversalProxy.Bluetooth.set_role/2`'s `refresh/1`. Tests drive a
   re-enumeration by broadcasting `{:bluetooth_adapters_changed}` on
   `Bluez.Client.adapters_topic/0`.
   """
@@ -39,7 +45,7 @@ defmodule UniversalProxy.Bluetooth.RadioMonitor do
   use GenServer
 
   alias Bluez.{Client, DevicePath}
-  alias UniversalProxy.Bluetooth.Radios
+  alias UniversalProxy.Bluetooth.{Radios, Settings}
 
   def start_link(opts \\ []) do
     gen_opts =
@@ -55,7 +61,7 @@ defmodule UniversalProxy.Bluetooth.RadioMonitor do
   The current radio list (cached from the last enumeration):
 
       [%{hci:, address:, name:, chip:, bus:, detail:, bt_version:,
-         ble?:, bredr?:, in_use?:}]
+         ble?:, bredr?:, in_use?:, role:}]
   """
   @spec list(GenServer.server()) :: [map()]
   def list(server \\ __MODULE__) do
@@ -74,6 +80,7 @@ defmodule UniversalProxy.Bluetooth.RadioMonitor do
       sysfs_root: Keyword.get(opts, :sysfs_root, "/sys/class/bluetooth"),
       pubsub: Keyword.get(opts, :pubsub, UniversalProxy.PubSub),
       adapters_info_fun: Keyword.get(opts, :adapters_info_fun, &Bluez.Client.adapters_info/0),
+      roles_fun: Keyword.get(opts, :roles_fun, &stored_roles/0),
       radios: []
     }
 
@@ -122,6 +129,7 @@ defmodule UniversalProxy.Bluetooth.RadioMonitor do
     sysfs = Radios.enumerate(state.sysfs_root)
     live = by_hci(state.adapters_info_fun.())
     active_path = DevicePath.adapter_path()
+    roles = state.roles_fun.()
 
     for radio <- sysfs do
       adapter = Map.get(live, radio.hci, %{})
@@ -134,7 +142,16 @@ defmodule UniversalProxy.Bluetooth.RadioMonitor do
       |> Map.put(:address, adapter[:address])
       |> Map.put(:name, adapter[:name])
       |> Map.put(:in_use?, adapter != %{} and "/org/bluez/#{radio.hci}" == active_path)
+      |> Map.put(:role, adapter[:address] && Map.get(roles, adapter[:address]))
     end
+  end
+
+  # Settings is an earlier sibling under the Bluetooth supervisor, but may be
+  # down (restart, host tests): no roles then.
+  defp stored_roles do
+    Settings.get().roles
+  catch
+    :exit, _ -> %{}
   end
 
   # Index live Adapter1 entries by hci name ("/org/bluez/hci1" → "hci1").

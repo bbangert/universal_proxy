@@ -228,6 +228,30 @@ defmodule UniversalProxy.Bluetooth.SettingsTest do
       assert map_size(roles) == 1
       assert Enum.count(roles, fn {_m, r} -> r == :proxy end) == 1
     end
+
+    test "a hand-edited record with two :tuya_mesh entries keeps the lowest MAC", %{
+      dets_path: path
+    } do
+      stop_supervised!(Settings)
+
+      pid =
+        seed_legacy(path, %{
+          enabled: true,
+          active_connections: true,
+          adapter: nil,
+          roles: %{"AA:BB:CC:DD:EE:FF" => :tuya_mesh, "11:22:33:44:55:66" => :tuya_mesh}
+        })
+
+      # The other one is demoted to a stored :off, as set_role/3 does.
+      settings = Settings.get(pid)
+
+      assert settings.roles == %{
+               "11:22:33:44:55:66" => :tuya_mesh,
+               "AA:BB:CC:DD:EE:FF" => :off
+             }
+
+      assert Settings.tuya_adapter(settings) == "11:22:33:44:55:66"
+    end
   end
 
   describe "set_role/3" do
@@ -284,6 +308,53 @@ defmodule UniversalProxy.Bluetooth.SettingsTest do
       settings = Settings.get(server)
       assert Settings.audio_adapters(settings) == ["AA:BB:CC:DD:EE:FF"]
       assert Settings.proxy_adapter(settings) == nil
+    end
+  end
+
+  describe "set_role/3 with :tuya_mesh" do
+    test "assigns the mesh role and surfaces it in tuya_adapter/1", %{server: server} do
+      assert Settings.tuya_adapter(Settings.get(server)) == nil
+
+      :ok = Settings.set_role(server, "aa:bb:cc:dd:ee:ff", :tuya_mesh)
+
+      settings = Settings.get(server)
+      assert Settings.role(settings, "AA:BB:CC:DD:EE:FF") == :tuya_mesh
+      assert Settings.tuya_adapter(settings) == "AA:BB:CC:DD:EE:FF"
+    end
+
+    test "a new mesh radio demotes the previous one to a stored :off", %{server: server} do
+      :ok = Settings.set_role(server, "AA:BB:CC:DD:EE:FF", :tuya_mesh)
+      :ok = Settings.set_role(server, "11:22:33:44:55:66", :proxy)
+      :ok = Settings.set_role(server, "11:22:33:44:55:66", :tuya_mesh)
+
+      settings = Settings.get(server)
+      assert settings.roles == %{"11:22:33:44:55:66" => :tuya_mesh, "AA:BB:CC:DD:EE:FF" => :off}
+      assert Settings.tuya_adapter(settings) == "11:22:33:44:55:66"
+    end
+
+    test "re-assigning the same radio keeps it the mesh radio", %{server: server} do
+      :ok = Settings.set_role(server, "AA:BB:CC:DD:EE:FF", :tuya_mesh)
+      :ok = Settings.set_role(server, "AA:BB:CC:DD:EE:FF", :tuya_mesh)
+
+      assert Settings.get(server).roles == %{"AA:BB:CC:DD:EE:FF" => :tuya_mesh}
+    end
+
+    test "moving the :proxy radio to the mesh leaves no proxy role", %{server: server} do
+      :ok = Settings.set_role(server, "AA:BB:CC:DD:EE:FF", :proxy)
+      :ok = Settings.set_role(server, "AA:BB:CC:DD:EE:FF", :tuya_mesh)
+
+      settings = Settings.get(server)
+      assert Settings.proxy_adapter(settings) == nil
+      assert Settings.tuya_adapter(settings) == "AA:BB:CC:DD:EE:FF"
+    end
+
+    test "the legacy adapter radio given the mesh role never resolves as the proxy", %{
+      server: server
+    } do
+      :ok = Settings.set_adapter(server, "AA:BB:CC:DD:EE:FF")
+      :ok = Settings.set_role(server, "AA:BB:CC:DD:EE:FF", :tuya_mesh)
+
+      assert Settings.proxy_adapter(Settings.get(server)) == nil
     end
   end
 
@@ -357,6 +428,34 @@ defmodule UniversalProxy.Bluetooth.SettingsTest do
       refute settings.enabled
       refute Settings.proxy_paused?(settings)
       assert Settings.proxy_adapter(settings) == "AA:BB:CC:DD:EE:FF"
+    end
+
+    test "a mesh-only roles map is not paused (the other radio auto-proxies)" do
+      # Regression: radio A dedicated to the mesh, radio B never assigned.
+      # The client's exclusion-aware auto fallback claims B, so pausing here
+      # would bounce espex for nothing.
+      refute Settings.proxy_paused?(%{roles: %{"AA:BB:CC:DD:EE:FF" => :tuya_mesh}, adapter: nil})
+
+      # Same when the mesh radio is the legacy adapter (its fallback is
+      # suppressed, so auto takes over).
+      refute Settings.proxy_paused?(%{
+               roles: %{"AA:BB:CC:DD:EE:FF" => :tuya_mesh},
+               adapter: "AA:BB:CC:DD:EE:FF"
+             })
+    end
+
+    test "a mesh radio plus an explicitly :off radio is paused" do
+      assert Settings.proxy_paused?(%{
+               roles: %{"AA:BB:CC:DD:EE:FF" => :tuya_mesh, "11:22:33:44:55:66" => :off},
+               adapter: nil
+             })
+    end
+
+    test "a mesh radio plus a :proxy radio is not paused" do
+      refute Settings.proxy_paused?(%{
+               roles: %{"AA:BB:CC:DD:EE:FF" => :tuya_mesh, "11:22:33:44:55:66" => :proxy},
+               adapter: nil
+             })
     end
 
     test "a surviving legacy fallback is not paused" do

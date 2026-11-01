@@ -3,6 +3,8 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
   # a constant DETS table atom across tests.
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   alias UniversalProxy.Bluetooth.{Manager, Settings}
   alias Bluez.DevicePath
 
@@ -17,6 +19,23 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
     use Agent
 
     def start_link(_opts), do: Agent.start_link(fn -> :ok end)
+  end
+
+  defmodule RecordingBluez do
+    @moduledoc "Reports the adapter terms it sees when it starts."
+
+    def child_spec(test_pid) do
+      %{id: __MODULE__, start: {__MODULE__, :start_link, [test_pid]}}
+    end
+
+    def start_link(test_pid) do
+      send(
+        test_pid,
+        {:bluez_started, DevicePath.desired_adapter(), DevicePath.excluded_adapters()}
+      )
+
+      Agent.start_link(fn -> :ok end)
+    end
   end
 
   defmodule FlakyBluez do
@@ -42,6 +61,7 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
     # "auto" assertions below.
     :persistent_term.erase(DevicePath.adapter_path_key())
     :persistent_term.erase(DevicePath.desired_adapter_key())
+    :persistent_term.erase(DevicePath.excluded_adapters_key())
 
     tmp = Path.join(System.tmp_dir!(), "bt_manager_test_#{System.unique_integer([:positive])}")
 
@@ -54,6 +74,7 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
     on_exit(fn ->
       :persistent_term.erase(DevicePath.adapter_path_key())
       :persistent_term.erase(DevicePath.desired_adapter_key())
+      :persistent_term.erase(DevicePath.excluded_adapters_key())
       File.rm_rf(tmp)
     end)
 
@@ -349,6 +370,104 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
 
       assert_receive {:bluetooth_state, %{proxying?: true, paused?: false}}, 1_000
       refute_receive :esphome_bounced, 100
+    end
+  end
+
+  describe "Tuya mesh adapter" do
+    test "the Bluez spec is built per start, with the mesh adapter only once assigned", ctx do
+      test_pid = self()
+
+      spec_fun = fn opts ->
+        send(test_pid, {:spec_opts, opts})
+        StubBluez
+      end
+
+      # nil first: Keyword.get takes the first match, so this overrides the
+      # harness's fixed StubBluez child and the per-start fun runs.
+      manager = start_manager(ctx, bluez_child: nil, bluez_spec_fun: spec_fun)
+      assert_receive {:spec_opts, [tuya_adapter: nil]}
+
+      :ok = Settings.set_role(ctx.settings, @hci1_mac, :tuya_mesh)
+      :ok = Manager.reconcile(manager, restart: true)
+      assert_receive {:spec_opts, [tuya_adapter: @hci1_mac]}
+
+      :ok = Settings.set_role(ctx.settings, @hci1_mac, :off)
+      :ok = Manager.reconcile(manager, restart: true)
+      assert_receive {:spec_opts, [tuya_adapter: nil]}
+    end
+
+    test "a bluez_child: override wins over the per-start spec", ctx do
+      test_pid = self()
+
+      _manager =
+        start_manager(ctx, bluez_spec_fun: fn opts -> send(test_pid, {:spec_opts, opts}) end)
+
+      assert child_count(ctx.dynsup) == 1
+      refute_received {:spec_opts, _}
+    end
+
+    test "the exclusion is published before the subtree starts and cleared with the role", ctx do
+      :ok = Settings.set_role(ctx.settings, @hci1_mac, :tuya_mesh)
+      manager = start_manager(ctx, bluez_child: RecordingBluez.child_spec(self()))
+
+      # Seen from inside the child's start: the term landed first.
+      assert_receive {:bluez_started, nil, [@hci1_mac]}
+
+      :ok = Settings.set_role(ctx.settings, @hci1_mac, :off)
+      :ok = Manager.reconcile(manager, restart: true)
+
+      # [] is written, not left stale, so the client may claim it again.
+      assert_receive {:bluez_started, nil, []}
+      assert :persistent_term.get(DevicePath.excluded_adapters_key()) == []
+    end
+
+    test "the mesh radio and the proxy radio are published side by side", ctx do
+      :ok = Settings.set_role(ctx.settings, @hci0_mac, :proxy)
+      :ok = Settings.set_role(ctx.settings, @hci1_mac, :tuya_mesh)
+      _manager = start_manager(ctx, bluez_child: RecordingBluez.child_spec(self()))
+
+      assert_receive {:bluez_started, @hci0_mac, [@hci1_mac]}
+    end
+
+    test "a mesh-only role isn't paused: the auto fallback proxies on another radio", ctx do
+      :ok = Settings.set_role(ctx.settings, @hci1_mac, :tuya_mesh)
+      manager = start_manager(ctx)
+
+      assert %{proxying?: true, paused?: false} = Manager.status(manager)
+      assert :persistent_term.get(DevicePath.desired_adapter_key(), :unset) == nil
+    end
+
+    test "status reports no adapter when the path names the excluded mesh radio", ctx do
+      # A lone mesh radio: the client never claims it, so the path is still
+      # the hci0 default, and that's the mesh radio.
+      :ok = Settings.set_role(ctx.settings, @hci0_mac, :tuya_mesh)
+
+      manager =
+        start_manager(ctx,
+          adapters_info_fun: fn ->
+            [%{path: "/org/bluez/hci0", address: @hci0_mac, name: "pi", powered: true}]
+          end
+        )
+
+      assert %{proxying?: false, adapter: nil} = Manager.status(manager)
+    end
+
+    test "boot warns about a lone mesh radio but keeps the role", ctx do
+      File.rm_rf!(Path.join(ctx.sysfs, "hci1"))
+      :ok = Settings.set_role(ctx.settings, @hci0_mac, :tuya_mesh)
+
+      log = capture_log(fn -> start_manager(ctx) end)
+
+      assert log =~ "#{@hci0_mac} holds the :tuya_mesh role but 1 radio(s) are present"
+      assert Settings.tuya_adapter(Settings.get(ctx.settings)) == @hci0_mac
+      # Still excluded: the radio stays dedicated to the mesh.
+      assert :persistent_term.get(DevicePath.excluded_adapters_key()) == [@hci0_mac]
+    end
+
+    test "no boot warning with a second radio present", ctx do
+      :ok = Settings.set_role(ctx.settings, @hci1_mac, :tuya_mesh)
+
+      refute capture_log(fn -> start_manager(ctx) end) =~ ":tuya_mesh role"
     end
   end
 

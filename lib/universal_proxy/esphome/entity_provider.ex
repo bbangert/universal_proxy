@@ -845,11 +845,28 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
   defp client_count, do: length(Clients.list())
 
   # Prefer the BlueZ Powered property; fall back to radio presence if the
-  # D-Bus client isn't answering.
+  # D-Bus client isn't answering. The Tuya mesh radio is dropped either way:
+  # it's dedicated to the mesh, so it must not read as a powered proxy.
   defp bt_adapters do
-    case Bluez.Client.adapters_info() do
-      [] -> Enum.map(RadioMonitor.list(), &%{powered: Map.get(&1, :in_use?, false)})
-      infos -> infos
-    end
+    adapters =
+      case Bluez.Client.adapters_info() do
+        [] ->
+          Enum.map(
+            RadioMonitor.list(),
+            &%{address: Map.get(&1, :address), powered: Map.get(&1, :in_use?, false)}
+          )
+
+        infos ->
+          infos
+      end
+
+    without_mesh_adapter(adapters, Bluetooth.roles().tuya_mesh)
   end
+
+  @doc false
+  @spec without_mesh_adapter([map()], String.t() | nil) :: [map()]
+  def without_mesh_adapter(adapters, nil), do: adapters
+
+  def without_mesh_adapter(adapters, mesh_mac),
+    do: Enum.reject(adapters, &(Map.get(&1, :address) == mesh_mac))
 end

@@ -76,7 +76,7 @@ defmodule UniversalProxy.Bluetooth do
   custom systems) hot-plugged later is picked up by the next cycle.
   """
 
-  alias UniversalProxy.Bluetooth.{AudioManager, Manager, RadioMonitor, Settings, Stats}
+  alias UniversalProxy.Bluetooth.{AudioManager, Manager, RadioMonitor, Radios, Settings, Stats}
   alias UniversalProxy.ESPHome.{BluetoothProxy, BluetoothScanner}
 
   @bluetooth_targets [:rpi, :rpi0, :rpi0_2, :rpi2, :rpi3, :rpi4, :rpi5, :x86_64]
@@ -148,7 +148,18 @@ defmodule UniversalProxy.Bluetooth do
   @doc """
   The `Bluez` child spec with every app-side callback wired
   in — the single place the app plugs itself into the (espex-agnostic)
-  Bluez subtree. `Manager`'s `bluez_child:` default starts exactly this.
+  Bluez subtree. `Manager` builds it on every subtree start (unless a
+  `bluez_child:` override is given), passing the current `:tuya_adapter`.
+
+  Options:
+
+    * `:tuya_adapter` — MAC of the `:tuya_mesh`-role radio, or `nil`.
+      When set, the spec excludes it from the client's adapter claim
+      (`exclude_adapters:`) and starts `Bluez.Radio` + `Bluez.Mgmt`
+      (`mgmt: true`), which the mesh radio needs. Without it,
+      `exclude_adapters: []` clears any earlier exclusion and Mgmt stays off.
+
+  Wiring:
 
     * adverts fan out to HA via `BluetoothScanner.on_advertisement/1`;
     * GATT events are translated to espex messages by
@@ -163,8 +174,16 @@ defmodule UniversalProxy.Bluetooth do
       rebuilds the whole group. Improv gets the app's PubSub +
       connectivity probe here.
   """
-  @spec bluez_spec() :: Supervisor.child_spec() | {module(), keyword()}
-  def bluez_spec do
+  @spec bluez_spec(keyword()) :: Supervisor.child_spec() | {module(), keyword()}
+  def bluez_spec(opts \\ []) do
+    {Bluez, base} = base_bluez_spec()
+    {Bluez, mesh_opts(Keyword.get(opts, :tuya_adapter)) ++ base}
+  end
+
+  defp mesh_opts(nil), do: [exclude_adapters: []]
+  defp mesh_opts(mac) when is_binary(mac), do: [exclude_adapters: [mac], mgmt: true]
+
+  defp base_bluez_spec do
     {Bluez,
      client: [
        on_advertisement: &BluetoothScanner.on_advertisement/1,
@@ -255,9 +274,12 @@ defmodule UniversalProxy.Bluetooth do
   The known radios (cached, ≤ 5 s old):
 
       [%{hci:, address:, name:, chip:, bus:, detail:, bt_version:,
-         ble?:, bredr?:, in_use?:}]
+         ble?:, bredr?:, in_use?:, role:}]
 
-  `[]` on non-BT targets or before the monitor is up.
+  `role` is the radio's stored role (`nil` when unassigned or the address
+  is unknown). `in_use?` marks only the radio the proxy stack claimed, so a
+  `:tuya_mesh` radio is never `in_use?`. `[]` on non-BT targets or before
+  the monitor is up.
   """
   @spec list_radios() :: [map()]
   def list_radios do
@@ -280,19 +302,29 @@ defmodule UniversalProxy.Bluetooth do
   @doc """
   Per-radio role assignment for the web tab, as
 
-      %{proxy: String.t() | nil, audio: [String.t()]}
+      %{proxy: String.t() | nil, audio: [String.t()], tuya_mesh: String.t() | nil}
 
   `proxy` is the proxy-role radio MAC (or the legacy auto fallback, which may
-  be `nil`); `audio` is the list of audio-role radio MACs. Any radio not in
-  either is `:off`. Safe on non-BT targets / while Settings is down (returns
-  the empty-role shape). Read-only; role changes go through `set_role/2`.
+  be `nil`); `audio` is the list of audio-role radio MACs; `tuya_mesh` is the
+  radio dedicated to the Tuya mesh. Any radio not in these is `:off`. Safe on
+  non-BT targets / while Settings is down (returns the empty-role shape).
+  Read-only; role changes go through `set_role/2`.
   """
-  @spec roles() :: %{proxy: String.t() | nil, audio: [String.t()]}
+  @spec roles() :: %{
+          proxy: String.t() | nil,
+          audio: [String.t()],
+          tuya_mesh: String.t() | nil
+        }
   def roles do
     settings = Settings.get()
-    %{proxy: Settings.proxy_adapter(settings), audio: Settings.audio_adapters(settings)}
+
+    %{
+      proxy: Settings.proxy_adapter(settings),
+      audio: Settings.audio_adapters(settings),
+      tuya_mesh: Settings.tuya_adapter(settings)
+    }
   catch
-    :exit, _ -> %{proxy: nil, audio: []}
+    :exit, _ -> %{proxy: nil, audio: [], tuya_mesh: nil}
   end
 
   @doc """
@@ -374,13 +406,20 @@ defmodule UniversalProxy.Bluetooth do
   end
 
   @doc """
-  Assign a radio's role (`:proxy | :audio | :off`) and act on the change.
+  Assign a radio's role (`:proxy | :audio | :tuya_mesh | :off`) and act on
+  the change.
+
+  `:tuya_mesh` dedicates the radio to the mesh, so it needs another radio
+  left over for everything else: it is refused with
+  `{:error, :needs_second_radio}` on a lone-radio board, and with
+  `{:error, :unknown_radio}` when no present radio has that MAC.
 
   Because BlueZ bonds are per-adapter, a radio **leaving** the `:audio` role
   would orphan its paired speakers — so this disconnects + forgets them
   (`AudioManager.forget_all_on_adapter/2`). When the change moves the
-  proxy-role radio, the BlueZ subtree is restarted to re-target it; otherwise
-  it just rebroadcasts status. When the change flips the role-paused state
+  proxy-role radio or the mesh radio, the BlueZ subtree is restarted (the
+  claim, its exclusions and Mgmt are all decided at subtree start);
+  otherwise it just rebroadcasts status. When the change flips the role-paused state
   (`Settings.proxy_paused?/1`), the Manager's reconcile bounces espex so the
   HA-facing feature flags follow — pausing really stops the proxy, resuming
   re-advertises it.
@@ -403,12 +442,37 @@ defmodule UniversalProxy.Bluetooth do
     end
   end
 
+  def set_role(mac, :tuya_mesh) when is_binary(mac) do
+    normalized = String.upcase(mac)
+
+    with :ok <- check_mesh_radio(normalized), do: do_set_role(normalized, :tuya_mesh)
+  end
+
   def set_role(mac, role) when is_binary(mac), do: do_set_role(mac, role)
+
+  # The mesh radio must be present and leave at least one other radio. The
+  # monitor's list carries MACs; when it's empty (monitor down, daemon not
+  # answering yet) only the sysfs count is known, so presence can't be
+  # checked and the count alone decides.
+  defp check_mesh_radio(mac) do
+    case list_radios() do
+      [] ->
+        if length(Radios.enumerate()) >= 2, do: :ok, else: {:error, :needs_second_radio}
+
+      radios ->
+        cond do
+          not Enum.any?(radios, &(&1.address == mac)) -> {:error, :unknown_radio}
+          length(radios) < 2 -> {:error, :needs_second_radio}
+          true -> :ok
+        end
+    end
+  end
 
   defp do_set_role(mac, role) do
     normalized = String.upcase(mac)
     settings = Settings.get()
     before_proxy = Settings.proxy_adapter(settings)
+    before_tuya = Settings.tuya_adapter(settings)
     before_role = Settings.role(settings, normalized)
 
     with :ok <- Settings.set_role(normalized, role) do
@@ -424,7 +488,10 @@ defmodule UniversalProxy.Bluetooth do
       # The Manager owns the pausedness→espex reaction: its reconcile
       # detects a proxy_paused?/1 flip and bounces espex itself, serialized
       # in one process so concurrent setters can't misattribute the flip.
-      if Settings.proxy_adapter(Settings.get()) != before_proxy do
+      after_settings = Settings.get()
+
+      if Settings.proxy_adapter(after_settings) != before_proxy or
+           Settings.tuya_adapter(after_settings) != before_tuya do
         :ok = Manager.reconcile(restart: true)
       else
         :ok = Manager.reconcile()

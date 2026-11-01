@@ -27,10 +27,12 @@ defmodule UniversalProxy.BluetoothTest do
     # adapter terms into the "subsystem down" / auto-selection tests.
     :persistent_term.erase(DevicePath.adapter_path_key())
     :persistent_term.erase(DevicePath.desired_adapter_key())
+    :persistent_term.erase(DevicePath.excluded_adapters_key())
 
     on_exit(fn ->
       :persistent_term.erase(DevicePath.adapter_path_key())
       :persistent_term.erase(DevicePath.desired_adapter_key())
+      :persistent_term.erase(DevicePath.excluded_adapters_key())
     end)
 
     :ok = Phoenix.PubSub.subscribe(@pubsub, Bluetooth.state_topic())
@@ -39,13 +41,13 @@ defmodule UniversalProxy.BluetoothTest do
 
   # Brings up the whole subsystem under the production-global names, with
   # fixture sysfs + a stub Bluez child — the shape the public API targets.
-  defp start_subsystem do
+  # `radios` is the [{hci, mac}] set present (both by default).
+  defp start_subsystem(radios \\ [{"hci0", @hci0_mac}, {"hci1", @hci1_mac}]) do
     tmp = Path.join(System.tmp_dir!(), "bt_public_test_#{System.unique_integer([:positive])}")
     on_exit(fn -> File.rm_rf(tmp) end)
 
     sysfs = Path.join(tmp, "sysfs")
-    add_radio(sysfs, "hci0", @hci0_mac)
-    add_radio(sysfs, "hci1", @hci1_mac)
+    for {hci, mac} <- radios, do: add_radio(sysfs, hci, mac)
 
     start_supervised!({Settings, table: @table, dets_path: Path.join(tmp, "s.dets")})
     dynsup = start_supervised!({DynamicSupervisor, strategy: :one_for_one})
@@ -67,10 +69,8 @@ defmodule UniversalProxy.BluetoothTest do
        pubsub: @pubsub,
        poll_ms: 60_000,
        adapters_info_fun: fn ->
-         [
-           %{path: "/org/bluez/hci0", address: @hci0_mac, name: "pi", powered: true},
-           %{path: "/org/bluez/hci1", address: @hci1_mac, name: "dongle", powered: true}
-         ]
+         for {hci, mac} <- radios,
+             do: %{path: "/org/bluez/#{hci}", address: mac, name: hci, powered: true}
        end}
     )
 
@@ -96,6 +96,10 @@ defmodule UniversalProxy.BluetoothTest do
                adapter: nil,
                active_connections: %{allowed?: false, used: 0, limit: 0}
              } = Bluetooth.status()
+    end
+
+    test "roles/0 degrades to the empty-role shape" do
+      assert Bluetooth.roles() == %{proxy: nil, audio: [], tuya_mesh: nil}
     end
 
     test "radio reads degrade to empty lists" do
@@ -230,6 +234,76 @@ defmodule UniversalProxy.BluetoothTest do
       assert Settings.audio_adapters(Settings.get()) == []
       # Non-audio roles pass the gate untouched.
       assert Bluetooth.set_role(@hci1_mac, :off) == :ok
+    end
+  end
+
+  describe "set_role/2 with :tuya_mesh" do
+    defp subtree_pid(dynsup) do
+      [{_, pid, _, _}] = DynamicSupervisor.which_children(dynsup)
+      pid
+    end
+
+    test "dedicates a radio: persisted, excluded, surfaced, subtree restarted" do
+      %{dynsup: dynsup} = start_subsystem()
+      pid_before = subtree_pid(dynsup)
+
+      assert Bluetooth.set_role(String.downcase(@hci1_mac), :tuya_mesh) == :ok
+
+      assert %{tuya_mesh: @hci1_mac, proxy: nil} = Bluetooth.roles()
+      assert :persistent_term.get(DevicePath.excluded_adapters_key()) == [@hci1_mac]
+      assert subtree_pid(dynsup) != pid_before
+
+      # The radio list carries the role, so the UI can show the mesh radio
+      # as taken even though the proxy stack never claims it.
+      radios = Bluetooth.list_radios()
+      assert %{role: :tuya_mesh, in_use?: false} = Enum.find(radios, &(&1.address == @hci1_mac))
+      assert %{role: nil} = Enum.find(radios, &(&1.address == @hci0_mac))
+
+      # Not a pause: the other radio keeps proxying via the auto fallback.
+      assert %{paused?: false, proxying?: true} = Bluetooth.status()
+    end
+
+    test "a mesh change restarts the subtree even when the proxy radio doesn't move" do
+      %{dynsup: dynsup} = start_subsystem()
+      :ok = Bluetooth.set_role(@hci0_mac, :proxy)
+      pid_before = subtree_pid(dynsup)
+
+      assert Bluetooth.set_role(@hci1_mac, :tuya_mesh) == :ok
+      assert Settings.proxy_adapter(Settings.get()) == @hci0_mac
+      pid_mesh = subtree_pid(dynsup)
+      assert pid_mesh != pid_before
+
+      # Leaving the role restarts too, clearing the exclusion.
+      assert Bluetooth.set_role(@hci1_mac, :off) == :ok
+      assert :persistent_term.get(DevicePath.excluded_adapters_key()) == []
+      assert subtree_pid(dynsup) != pid_mesh
+    end
+
+    test "is refused on a lone radio, leaving the settings untouched" do
+      %{dynsup: dynsup} = start_subsystem([{"hci0", @hci0_mac}])
+      pid_before = subtree_pid(dynsup)
+
+      assert Bluetooth.set_role(@hci0_mac, :tuya_mesh) == {:error, :needs_second_radio}
+
+      assert Settings.get().roles == %{}
+      assert subtree_pid(dynsup) == pid_before
+    end
+
+    test "is refused for a MAC no present radio has" do
+      start_subsystem()
+
+      assert Bluetooth.set_role("00:11:22:33:44:55", :tuya_mesh) == {:error, :unknown_radio}
+      assert Settings.get().roles == %{}
+    end
+
+    test "moving the mesh to another radio demotes the old one to :off" do
+      start_subsystem()
+      :ok = Bluetooth.set_role(@hci1_mac, :tuya_mesh)
+
+      assert Bluetooth.set_role(@hci0_mac, :tuya_mesh) == :ok
+
+      assert Settings.get().roles == %{@hci0_mac => :tuya_mesh, @hci1_mac => :off}
+      assert :persistent_term.get(DevicePath.excluded_adapters_key()) == [@hci0_mac]
     end
   end
 end

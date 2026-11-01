@@ -29,6 +29,13 @@ defmodule UniversalProxy.Bluetooth.Manager do
   to the lowest-index adapter when the MAC is absent. A crash-restart
   re-resolves against the same desired MAC — consistent by construction.
 
+  The `:tuya_mesh`-role MAC is published the same way, as the excluded
+  adapter list (`Bluez.DevicePath.excluded_adapters_key/0`, `[]` when no
+  radio holds the role, so a stale list is cleared): the client never claims
+  it, even as the auto fallback. The Bluez child spec is also built per
+  start (`UniversalProxy.Bluetooth.bluez_spec/1`), so `mgmt: true` is only
+  there while a mesh radio is assigned.
+
   ## Broadcasts
 
   The full status map (`status/0` shape) is published on
@@ -55,10 +62,11 @@ defmodule UniversalProxy.Bluetooth.Manager do
   ## Options (host-testability)
 
   `start_link/1` accepts `:name`, `:settings` (Settings server ref),
-  `:dynamic_supervisor`, `:bluez_child` (child spec started under it),
-  `:sysfs_root`, `:pubsub`, and `:esphome_restart_fun` (the pausedness-flip
-  reaction) — production defaults wire the real modules; tests substitute
-  fixtures and stubs.
+  `:dynamic_supervisor`, `:bluez_child` (a fixed child spec started under
+  it, overriding the per-start one), `:bluez_spec_fun` (builds the per-start
+  spec from `[tuya_adapter: mac | nil]`), `:sysfs_root`, `:pubsub`, and
+  `:esphome_restart_fun` (the pausedness-flip reaction) — production
+  defaults wire the real modules; tests substitute fixtures and stubs.
   """
 
   use GenServer
@@ -131,7 +139,8 @@ defmodule UniversalProxy.Bluetooth.Manager do
     state = %{
       settings: Keyword.get(opts, :settings, Settings),
       dynsup: Keyword.get(opts, :dynamic_supervisor, UniversalProxy.Bluetooth.DynamicSupervisor),
-      bluez_child: Keyword.get_lazy(opts, :bluez_child, &UniversalProxy.Bluetooth.bluez_spec/0),
+      bluez_child: Keyword.get(opts, :bluez_child),
+      bluez_spec_fun: Keyword.get(opts, :bluez_spec_fun, &UniversalProxy.Bluetooth.bluez_spec/1),
       sysfs_root: Keyword.get(opts, :sysfs_root, "/sys/class/bluetooth"),
       pubsub: Keyword.get(opts, :pubsub, UniversalProxy.PubSub),
       adapters_info_fun: Keyword.get(opts, :adapters_info_fun, &Bluez.Client.adapters_info/0),
@@ -160,6 +169,7 @@ defmodule UniversalProxy.Bluetooth.Manager do
   @impl GenServer
   def handle_continue(:reconcile, state) do
     coerce_audio_roles(state)
+    warn_lone_mesh_radio(state)
     state = state |> do_reconcile([]) |> sync_paused()
     broadcast(state)
     {:noreply, state}
@@ -175,6 +185,23 @@ defmodule UniversalProxy.Bluetooth.Manager do
         Logger.info("Bluetooth.Manager: audio role unsupported on this target — #{mac} -> :off")
         :ok = Settings.set_role(state.settings, mac, :off)
       end
+    end
+
+    :ok
+  end
+
+  # Boot sanity for the mesh role. The role is kept even with one radio: a
+  # USB dongle may simply enumerate late. MACs aren't in sysfs and the
+  # daemon isn't up yet, so only the count is known here; if the one radio
+  # is the mesh radio, every adapter is excluded and nothing proxies.
+  defp warn_lone_mesh_radio(state) do
+    with mac when is_binary(mac) <- Settings.tuya_adapter(settings(state)),
+         count when count < 2 <- length(Radios.sysfs_adapters(state.sysfs_root)) do
+      Logger.warning(
+        "Bluetooth.Manager: #{mac} holds the :tuya_mesh role but #{count} radio(s) are " <>
+          "present. It stays excluded from the proxy; if it is the only radio, nothing " <>
+          "proxies until a second radio appears."
+      )
     end
 
     :ok
@@ -271,10 +298,19 @@ defmodule UniversalProxy.Bluetooth.Manager do
     proxy_adapter = Settings.proxy_adapter(config)
     :persistent_term.put(DevicePath.desired_adapter_key(), proxy_adapter)
 
-    case DynamicSupervisor.start_child(state.dynsup, state.bluez_child) do
+    # Same constraint for the exclusion: the client drops it before both the
+    # desired-MAC match and the auto fallback. `[]` clears a list left by an
+    # earlier start whose mesh role has since been removed.
+    tuya_adapter = Settings.tuya_adapter(config)
+    :persistent_term.put(DevicePath.excluded_adapters_key(), List.wrap(tuya_adapter))
+
+    child = state.bluez_child || state.bluez_spec_fun.(tuya_adapter: tuya_adapter)
+
+    case DynamicSupervisor.start_child(state.dynsup, child) do
       {:ok, pid} ->
         Logger.info(
-          "Bluetooth.Manager: Bluez subtree started (radio: #{proxy_adapter || "auto"})"
+          "Bluetooth.Manager: Bluez subtree started (radio: #{proxy_adapter || "auto"}" <>
+            if(tuya_adapter, do: ", mesh: #{tuya_adapter})", else: ")")
         )
 
         %{state | bluez_pid: pid, monitor: Process.monitor(pid)}
@@ -320,6 +356,7 @@ defmodule UniversalProxy.Bluetooth.Manager do
     running? = running?(state)
     paused? = Settings.proxy_paused?(config)
     {used, limit} = connection_usage()
+    adapter = adapter_status(state, running?, Settings.tuya_adapter(config))
 
     %{
       enabled: config.enabled,
@@ -330,9 +367,9 @@ defmodule UniversalProxy.Bluetooth.Manager do
       # (the radio list needs the daemon for MACs) but nothing is relayed
       # — see ESPHome.Supervisor.bluetooth_opts/2, which gates on the
       # same predicate.
-      proxying?: config.enabled and running? and not paused?,
+      proxying?: config.enabled and running? and adapter != :mesh and not paused?,
       paused?: paused?,
-      adapter: adapter_status(state, running?),
+      adapter: if(adapter == :mesh, do: nil, else: adapter),
       active_connections: %{allowed?: config.active_connections, used: used, limit: limit}
     }
   end
@@ -342,12 +379,17 @@ defmodule UniversalProxy.Bluetooth.Manager do
   # BT MAC in sysfs, so while the subtree is DOWN all we can show is the
   # first controller's hci name — address/name appear once the daemon is
   # up (adapters_info_fun is exit-safe and returns [] until then).
-  defp adapter_status(state, running?) do
+  #
+  # `:mesh` when the path names the excluded mesh radio. The client never
+  # claims it, so that's the hci0 default or a stale earlier claim, with
+  # nothing relaying; build_status/1 reports no adapter instead.
+  defp adapter_status(state, running?, tuya_adapter) do
     if running? do
       path = DevicePath.adapter_path()
       hci = Path.basename(path)
 
       case Enum.find(state.adapters_info_fun.(), &(&1.path == path)) do
+        %{address: address} when is_binary(address) and address == tuya_adapter -> :mesh
         %{address: address, name: name} -> %{hci: hci, address: address, name: name}
         nil -> %{hci: hci, address: nil, name: nil}
       end

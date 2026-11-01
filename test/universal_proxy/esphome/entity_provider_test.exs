@@ -219,6 +219,21 @@ defmodule UniversalProxy.ESPHome.EntityProviderTest do
       assert v["bluetooth_powered"] == true
     end
 
+    test "the Tuya mesh radio never counts as a powered proxy adapter" do
+      adapters = [
+        %{address: "AA:BB:CC:DD:EE:FF", powered: true},
+        %{address: "11:22:33:44:55:66", powered: false}
+      ]
+
+      assert EP.without_mesh_adapter(adapters, nil) == adapters
+
+      only_mesh_powered = EP.without_mesh_adapter(adapters, "AA:BB:CC:DD:EE:FF")
+      assert only_mesh_powered == [%{address: "11:22:33:44:55:66", powered: false}]
+
+      v = EP.read_values(sample_sources(%{adapters: fn -> only_mesh_powered end}), true)
+      assert v["bluetooth_powered"] == false
+    end
+
     test "audio counts active outputs and streaming flag" do
       audio = fn ->
         [

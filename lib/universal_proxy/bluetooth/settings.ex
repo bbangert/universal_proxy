@@ -12,14 +12,19 @@ defmodule UniversalProxy.Bluetooth.Settings do
         roles: %{mac => role}          # explicit per-adapter role
       }
 
-  where `role` is `:proxy | :audio | :off`:
+  where `role` is `:proxy | :audio | :tuya_mesh | :off`:
 
     * `:proxy` — drives the HA-facing BLE scanner/GATT proxy. At most one
       adapter may be `:proxy` (`set_role/2` enforces this); it's the
       successor to the single `adapter` selector.
     * `:audio` — used by `UniversalProxy.Bluetooth.AudioManager` to
       pair/connect A2DP headsets.
-    * `:off` — neither.
+    * `:tuya_mesh` — dedicated to the Tuya Beacon Mesh radio
+      (`UniversalProxy.TuyaBeaconMesh`). At most one adapter (`set_role/2`
+      enforces this); it is excluded from the BlueZ client's adapter claim,
+      so the proxy, audio and Improv never touch it, and it never resolves
+      as `proxy_adapter/1`.
+    * `:off` — none of these.
 
   `roles` keys by **MAC** like `adapter`. A record written before this field
   existed is migrated on read (see `migrate_roles/1`): a concrete selected
@@ -66,9 +71,9 @@ defmodule UniversalProxy.Bluetooth.Settings do
 
   @mac_format ~r/^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$/
 
-  @roles [:proxy, :audio, :off]
+  @roles [:proxy, :audio, :tuya_mesh, :off]
 
-  @type role :: :proxy | :audio | :off
+  @type role :: :proxy | :audio | :tuya_mesh | :off
   @type t :: %{
           enabled: boolean(),
           active_connections: boolean(),
@@ -129,11 +134,14 @@ defmodule UniversalProxy.Bluetooth.Settings do
   end
 
   @doc """
-  Set an adapter's role (`:proxy | :audio | :off`), keyed by MAC.
+  Set an adapter's role (`:proxy | :audio | :tuya_mesh | :off`), keyed by MAC.
 
   Assigning `:proxy` demotes any other current `:proxy` adapter to `:off` so
   the single-proxy invariant always holds (only one radio can drive the HA
-  proxy). Setting `:off` STORES the entry — an explicitly-off radio is
+  proxy). Assigning `:tuya_mesh` likewise demotes the previous mesh adapter,
+  storing it as an explicit `:off`. This module doesn't check that another
+  radio is left over; `UniversalProxy.Bluetooth.set_role/2` refuses a
+  lone-radio mesh. Setting `:off` STORES the entry — an explicitly-off radio is
   distinguishable from a never-assigned one (see `proxy_paused?/1`) and
   keeps the legacy-adapter fallback suppressed. Rejects a malformed MAC
   (`{:error, :invalid_adapter}`) or unknown role (`{:error, :invalid_role}`).
@@ -158,7 +166,8 @@ defmodule UniversalProxy.Bluetooth.Settings do
   legacy `adapter` selector (`nil` = auto). Pure; takes a settings map.
 
   The legacy fallback is suppressed when the `adapter` radio has since been
-  given a non-proxy role: otherwise a radio the user set to `:audio` would still
+  given a non-proxy role (so a `:tuya_mesh` radio never reads back as the
+  proxy either): otherwise a radio the user set to `:audio` would still
   read back as the proxy (its `:proxy` fallback masking its `:audio` role),
   which forced "assign some other radio to Proxy first" before an audio toggle
   would stick.
@@ -179,6 +188,11 @@ defmodule UniversalProxy.Bluetooth.Settings do
   (any explicit role assignment, including `:off`) and `proxy_adapter/1`
   resolves to no radio. Pure; takes a settings map.
 
+  `:tuya_mesh` entries don't count as engaging the role model: the mesh
+  radio is excluded from the BlueZ claim, so with no other role assigned the
+  client's auto fallback still proxies on the remaining radio. Counting it
+  would pause a two-radio board that only dedicated its mesh adapter.
+
   An empty roles map is NOT paused — that's a fresh install or pre-roles
   settings, where the legacy adapter/auto fallback keeps the zero-config
   proxy working. A surviving legacy fallback (roles assigned, but the
@@ -189,13 +203,23 @@ defmodule UniversalProxy.Bluetooth.Settings do
   """
   @spec proxy_paused?(t()) :: boolean()
   def proxy_paused?(%{roles: roles} = settings) do
-    roles != %{} and is_nil(proxy_adapter(settings))
+    Enum.any?(roles, fn {_mac, role} -> role != :tuya_mesh end) and
+      is_nil(proxy_adapter(settings))
   end
 
   @doc "MACs assigned the `:audio` role. Pure; takes a settings map."
   @spec audio_adapters(t()) :: [String.t()]
   def audio_adapters(%{roles: roles}) do
     for {mac, :audio} <- roles, do: mac
+  end
+
+  @doc "MAC assigned the `:tuya_mesh` role, or `nil`. Pure; takes a settings map."
+  @spec tuya_adapter(t()) :: String.t() | nil
+  def tuya_adapter(%{roles: roles}) do
+    Enum.find_value(roles, fn
+      {mac, :tuya_mesh} -> mac
+      _ -> nil
+    end)
   end
 
   @doc "Role for a MAC (`:off` if unset). Pure; takes a settings map."
@@ -278,6 +302,18 @@ defmodule UniversalProxy.Bluetooth.Settings do
     |> Map.put(mac, :proxy)
   end
 
+  # Single-mesh invariant. Unlike :proxy, the previous holder is demoted to
+  # a stored :off rather than dropped: a dropped entry would make it
+  # unassigned, which hands it back to the legacy/auto proxy fallback.
+  defp apply_role(roles, mac, :tuya_mesh) do
+    roles
+    |> Map.new(fn
+      {other, :tuya_mesh} -> {other, :off}
+      entry -> entry
+    end)
+    |> Map.put(mac, :tuya_mesh)
+  end
+
   defp apply_role(roles, mac, role), do: Map.put(roles, mac, role)
 
   # Merge over the defaults so records written by an older firmware (fewer
@@ -333,8 +369,9 @@ defmodule UniversalProxy.Bluetooth.Settings do
   # Keep only well-formed `mac => role` pairs (normalized MAC, known role —
   # a stored :off included: it marks "explicitly turned off", which
   # proxy_paused?/1 must distinguish from never-assigned), and enforce the
-  # single-proxy invariant on read too, in case a hand-edited/foreign
-  # record carries two.
+  # single-proxy and single-mesh invariants on read too, in case a
+  # hand-edited/foreign record carries two. Defensive path only (setters
+  # can't write two). Pairs are sorted by MAC first, so the lowest MAC wins.
   defp sanitize_roles(roles) when is_map(roles) do
     roles
     |> Enum.flat_map(fn {mac, role} ->
@@ -343,19 +380,26 @@ defmodule UniversalProxy.Bluetooth.Settings do
         _ -> []
       end
     end)
-    |> Enum.reduce({%{}, false}, fn
-      # A second :proxy is dropped (absent = :off), preserving the invariant.
-      # Which of the two survives follows map enumeration order — arbitrary
-      # but stable for a given map. Defensive path only (setters can't write
-      # two); not worth imposing an ordering rule.
-      {_mac, :proxy}, {acc, true} -> {acc, true}
-      {mac, :proxy}, {acc, false} -> {Map.put(acc, mac, :proxy), true}
-      {mac, role}, {acc, seen?} -> {Map.put(acc, mac, role), seen?}
+    |> Enum.sort()
+    |> Enum.reduce({%{}, MapSet.new()}, fn
+      # A second :proxy is dropped (absent = :off), as apply_role/3 does.
+      {mac, :proxy}, {acc, seen} -> keep_first(acc, seen, mac, :proxy, nil)
+      # A second :tuya_mesh becomes a stored :off, as apply_role/3 does.
+      {mac, :tuya_mesh}, {acc, seen} -> keep_first(acc, seen, mac, :tuya_mesh, :off)
+      {mac, role}, {acc, seen} -> {Map.put(acc, mac, role), seen}
     end)
     |> elem(0)
   end
 
   defp sanitize_roles(_), do: %{}
+
+  defp keep_first(acc, seen, mac, role, demoted) do
+    cond do
+      not MapSet.member?(seen, role) -> {Map.put(acc, mac, role), MapSet.put(seen, role)}
+      is_nil(demoted) -> {acc, seen}
+      true -> {Map.put(acc, mac, demoted), seen}
+    end
+  end
 
   defp bool_or(value, _default) when is_boolean(value), do: value
   defp bool_or(_value, default), do: default
