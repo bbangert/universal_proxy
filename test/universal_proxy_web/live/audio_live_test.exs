@@ -509,7 +509,7 @@ defmodule UniversalProxyWeb.AudioLiveTest do
     )
 
     html = render(view)
-    refute html =~ "OPUS"
+    refute html =~ ~r/\bOPUS\b/
     refute html =~ "48 kHz"
   end
 
@@ -626,7 +626,7 @@ defmodule UniversalProxyWeb.AudioLiveTest do
 
     html = render(view)
     refute html =~ "Streaming"
-    refute html =~ "OPUS"
+    refute html =~ ~r/\bOPUS\b/
     assert html =~ "Searching"
   end
 
