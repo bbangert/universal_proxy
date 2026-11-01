@@ -44,27 +44,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.P2Test do
       assert P2.build(2, 1, h("7fff"), h("0005"), 7, <<1>>, "abcdefghijklmnop", <<0::128>>) ==
                h("137fff000500070102ae24bdd3ca49b5952756a204bf1d01c0a8")
     end
-
-    test "pair frame" do
-      assert P2.pair_frame(
-               "abcdefghijklmnop",
-               h("dc234f001122"),
-               h("0012"),
-               h("00112233445566778899aabbccddeeff"),
-               1
-             ) ==
-               h("934f0011220100124d4800ec463257ed3da4d4b4df741887cd1e")
-    end
   end
 
   describe "vectors.json p2 entries" do
-    test "pair frame, round 2, MAC as hex string" do
-      v = @vectors["p2"]["pair_frame"]
-
-      assert P2.pair_frame(v["local_key"], v["mac"], h(v["node_id"]), v["beacon_key"], v["round"]) ==
-               h(v["frame"])
-    end
-
     for name <- ["device_report", "pair_reply"] do
       test "parse_device: #{name}" do
         v = @vectors["p2"][unquote(name)]

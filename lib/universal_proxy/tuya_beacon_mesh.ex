@@ -15,7 +15,8 @@ defmodule UniversalProxy.TuyaBeaconMesh do
   2. Start `Radio` on a dedicated adapter index (injectable `Bluez.*`).
   3. Start `Lights` with a loader for the stored inventory (read on every
      start, so a restart resumes from the persisted `seq`) and the radio;
-     pass `on_persist:` to write the advanced `seq` back to Settings.
+     pass `on_persist:` to write the advanced `seq` back to Settings (and
+     optionally `on_tighten:` to hand back an unused lease on a clean stop).
   4. `Lights.set("path light 2", on: true, mode: :colour, colour: {300, 100, 100})`.
 
   ## Modules
@@ -25,7 +26,7 @@ defmodule UniversalProxy.TuyaBeaconMesh do
     * `Crypto`, `Dp`, `P2`, `Carrier` — protocol codec
     * `Control` — friendly DPs → frames (`0x8001` source, ≥3 s on-air)
     * `Inventory` — JSON dump decode / validate (rejects duplicate node ids)
-    * `Seq` — monotonic 16-bit SN counter
+    * `Seq` — monotonic 16-bit SN counter with persisted leases
 
   Processes:
 

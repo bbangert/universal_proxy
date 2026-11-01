@@ -58,7 +58,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   rotation" section, so we stop on our own timer). One advert is on air at
   a time, in the order sent, so sequence numbers go on air in the order
   they were handed out. Frames are sent with the app's queue classes
-  (tuya_beacon_mesh.md §4.7): a `:control` send (pair, reset, group)
+  (tuya_beacon_mesh.md §4.7): a `:control` send (reset, group)
   drops queued `:normal` sends (DP, ping); it does not interrupt the
   advert already on air.
 
@@ -222,6 +222,17 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   end
 
   @doc """
+  `stop_tx/1`, and forgets `:last_tx_sn` (see `status/1`): for a
+  controller switching to another mesh, whose earlier frames must neither
+  air under the new mesh nor count as its progress. `opts`: `:server`,
+  `:timeout` (default 5000).
+  """
+  @spec clear_tx(keyword()) :: :ok | {:error, :not_running}
+  def clear_tx(opts \\ []) do
+    call(server(opts), :clear_tx, {:error, :not_running}, Keyword.get(opts, :timeout, 5_000))
+  end
+
+  @doc """
   Subscribes `pid` to `{:tuya_report, report}` messages matching
   `filter` (`:all`, `:unpaired` or `{:mac, mac}`). The pid is monitored
   and dropped when it exits. Works while the radio is not ready; reports
@@ -250,20 +261,25 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
 
   @doc """
   Radio state: whether setup completed (`:ready`) and why it last failed
-  (`:last_error`, `nil` once ready), adapter index and expected address, lease held, discovery
-  on, receiver listening, subscriber count, what's on air (`:tx`) and how
-  many frames are queued (`:queued`).
+  (`:last_error`, `nil` once ready), adapter index and expected address,
+  lease held, discovery on, receiver listening, subscriber count, what's
+  on air (`:tx`), how many frames are queued (`:queued`), and the
+  sequence number of the last frame the adapter accepted to advertise
+  (`:last_tx_sn`, `nil` until one has or after `clear_tx/1`; a frame
+  queued, coalesced away or advertised with an uncertain outcome doesn't
+  count). `opts`: `:server`, `:timeout` (default 5000; a radio that
+  doesn't answer in time reads as not running).
   """
   @spec status(keyword()) :: {:ok, map()} | {:error, :not_running}
   def status(opts \\ []) do
-    call(server(opts), :status, {:error, :not_running})
+    call(server(opts), :status, {:error, :not_running}, Keyword.get(opts, :timeout, 5_000))
   end
 
   defp server(opts), do: Keyword.get(opts, :server, __MODULE__)
 
   # `catch :exit` idiom (see `Bluez`): not running → the given default.
-  defp call(server, request, default) do
-    GenServer.call(server, request)
+  defp call(server, request, default, timeout \\ 5_000) do
+    GenServer.call(server, request, timeout)
   catch
     :exit, _reason -> default
   end
@@ -334,7 +350,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
       dedupe: %{},
       recent_tx: [],
       tx_queue: :queue.new(),
-      tx_current: nil
+      tx_current: nil,
+      last_tx_sn: nil
     }
 
     {:ok, state, {:continue, :setup}}
@@ -686,6 +703,10 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
     {:reply, :ok, stop_and_continue(%{state | tx_queue: :queue.new()})}
   end
 
+  def handle_call(:clear_tx, _from, state) do
+    {:reply, :ok, stop_and_continue(%{state | tx_queue: :queue.new(), last_tx_sn: nil})}
+  end
+
   def handle_call({:subscribe, pid, filter}, _from, state) do
     mon =
       case state.subscribers do
@@ -726,7 +747,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
           nil -> nil
           %{class: class, instance: instance} -> %{class: class, instance: instance}
         end,
-      queued: :queue.len(state.tx_queue)
+      queued: :queue.len(state.tx_queue),
+      last_tx_sn: state.last_tx_sn
     }
 
     {:reply, {:ok, status}, state}
@@ -840,7 +862,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
          %{
            state
            | tx_current: current,
-             recent_tx: Enum.take([job.norm | state.recent_tx], @recent_tx_max)
+             recent_tx: Enum.take([job.norm | state.recent_tx], @recent_tx_max),
+             last_tx_sn: frame_sn(job.frame)
          }}
 
       {:error, reason} when reason in @fatal_advertise_errors ->
@@ -854,6 +877,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
         {:error, {:advertise, reason}, state}
     end
   end
+
+  # P2 header: hdr, source (2), destination (2), then the sequence number.
+  defp frame_sn(<<_hdr, _src::binary-2, _dst::binary-2, sn::16-big, _::binary>>), do: sn
 
   # Takes the current advert off air and starts the next; an advert that
   # won't come off air means the instance (and the lease) can't be trusted,

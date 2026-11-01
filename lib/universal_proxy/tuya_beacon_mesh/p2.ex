@@ -1,7 +1,8 @@
 defmodule UniversalProxy.TuyaBeaconMesh.P2 do
   @moduledoc """
   Beacon v2 ("P2") frames (tuya_beacon_mesh.md §4): the unpaired advert, the
-  26-byte request/device frame, the pair frame, and the §4.7 request builders.
+  26-byte request/device frame, and the §4.7 request builders. Pairing is
+  done in the Tuya app and isn't implemented here.
 
   Frame layout (§4.2), both directions:
 
@@ -120,8 +121,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.P2 do
   sequence number `sn`, `payload` (at most 16 bytes, zero-padded), the XXTEA
   `key` and the XOR `mask`. The payload CRC is computed over the padded
   payload and the frame CRC over the frame before masking. `type` is the
-  4-bit frame type (header bits 6–3); the pair flag is never set here
-  (see `pair_frame/5`).
+  4-bit frame type (header bits 6–3); the pair flag is never set here.
   """
   @spec build(0..15, byte(), addr(), addr(), 0..0xFFFF, binary(), key(), key()) :: binary()
   def build(type, sub_cmd, src, dst, sn, payload, key, mask)
@@ -147,29 +147,6 @@ defmodule UniversalProxy.TuyaBeaconMesh.P2 do
 
   def build(_, _, _, _, _, payload, _, _) when is_binary(payload) and byte_size(payload) > 16 do
     raise ArgumentError, "P2 payload must be at most 16 bytes, got #{byte_size(payload)}"
-  end
-
-  @doc """
-  Builds the P2Pair frame (§4.5): header `0x93`, not masked and with no
-  sequence number. It carries MAC bytes 2..5, the pairing `round`, the cloud
-  assigned `node_id`, `crc8(beaconKey)`, and the beaconKey XXTEA-encrypted
-  with the localKey. The trailing CRC is over `[0x90]` ‖ bytes 1..24.
-  """
-  @spec pair_frame(key(), binary(), addr(), key(), byte()) :: binary()
-  def pair_frame(local_key, mac, node_id, beacon_key, round)
-      when round in 0..255 do
-    mac = mac!(mac)
-    beacon_key = Crypto.key_bytes(beacon_key)
-    <<_::binary-2, mac_tail::binary-4>> = mac
-
-    inner =
-      mac_tail <>
-        <<round>> <>
-        addr!(node_id) <>
-        <<Crypto.crc8(beacon_key)>> <>
-        Crypto.xxtea_encrypt(beacon_key, Crypto.key_bytes(local_key))
-
-    <<0x93>> <> inner <> <<Crypto.crc8(<<0x90>> <> inner)>>
   end
 
   @doc """
@@ -332,19 +309,6 @@ defmodule UniversalProxy.TuyaBeaconMesh.P2 do
       raise(
         ArgumentError,
         "address must be 2 bytes or an integer 0..65535, got: #{inspect(addr)}"
-      )
-
-  defp mac!(mac) when byte_size(mac) == 6, do: mac
-  defp mac!(mac) when byte_size(mac) == 12, do: Base.decode16!(mac, case: :mixed)
-
-  defp mac!(mac) when byte_size(mac) == 17,
-    do: mac |> String.replace(":", "") |> Base.decode16!(case: :mixed)
-
-  defp mac!(mac),
-    do:
-      raise(
-        ArgumentError,
-        "MAC must be 6 bytes or a hex string, got: #{inspect(mac)}"
       )
 
   defp dp_payload!(payload) when is_binary(payload), do: payload
