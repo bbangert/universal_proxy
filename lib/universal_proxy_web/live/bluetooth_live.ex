@@ -22,7 +22,7 @@ defmodule UniversalProxyWeb.BluetoothLive do
   (incl. disconnected ones); the Audio tab only shows them while actively
   streaming. They're owned by `UniversalProxy.Bluetooth.AudioManager`.
 
-  Live state comes from five PubSub topics:
+  Live state comes from these PubSub topics:
 
     * `state_topic/0`  — `{:bluetooth_state, status}` on proxy toggles /
       role changes / subtree lifecycle
@@ -31,6 +31,8 @@ defmodule UniversalProxyWeb.BluetoothLive do
     * `"bluetooth:scan"`  — `{:bt_scan, :stopped}` when a pairing scan ends
     * `"bluetooth:audio"` — `{:bt_audio, :pairing, mac, step}` /
       `{:bt_audio, :connection, mac, status}`
+    * `UniversalProxy.TuyaMesh.topic/0` — `{:tuya_mesh_status, status}`,
+      forwarded to `UniversalProxyWeb.TuyaMeshComponent` with `send_update/3`
 
   The public API is safe on every target, so this view renders the same
   way on the host as on hardware. Proxy setters bounce espex, so the UI
@@ -46,6 +48,8 @@ defmodule UniversalProxyWeb.BluetoothLive do
 
   alias UniversalProxy.Bluetooth
   alias UniversalProxy.Bluetooth.AudioManager
+  alias UniversalProxy.TuyaMesh
+  alias UniversalProxyWeb.TuyaMeshComponent
 
   # Discovered-device list refresh cadence while a pairing scan runs.
   # AudioManager pushes only `{:bt_scan, :stopped}`, but `list_headphones/0`
@@ -65,6 +69,7 @@ defmodule UniversalProxyWeb.BluetoothLive do
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, @scan_topic)
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, @audio_topic)
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, Improv.status_topic())
+      Phoenix.PubSub.subscribe(UniversalProxy.PubSub, TuyaMesh.topic())
     end
 
     {:ok,
@@ -332,6 +337,16 @@ defmodule UniversalProxyWeb.BluetoothLive do
     {:noreply, assign(socket, :improv, improv)}
   end
 
+  # A LiveComponent can't subscribe: route mesh status to it, re-rendering
+  # only the component.
+  def handle_info({:tuya_mesh_status, status}, socket) do
+    if socket.assigns.roles.tuya_mesh do
+      Phoenix.LiveView.send_update(TuyaMeshComponent, id: "tuya-mesh", status: status)
+    end
+
+    {:noreply, socket}
+  end
+
   # A connection change (incl. forget-on-deactivate) refreshes the list.
   def handle_info({:bt_audio, :connection, _mac, _status}, socket) do
     {:noreply, assign(socket, :headphones, AudioManager.list_headphones())}
@@ -524,6 +539,13 @@ defmodule UniversalProxyWeb.BluetoothLive do
         busy={@busy}
         audio_role_supported={@audio_role_supported}
         role_error={@role_error}
+      />
+
+      <.live_component
+        :if={@roles.tuya_mesh}
+        module={TuyaMeshComponent}
+        id="tuya-mesh"
+        mesh_label={mesh_label(@radios, @roles)}
       />
 
       <.audio_devices_section

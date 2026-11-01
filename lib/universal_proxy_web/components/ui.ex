@@ -261,6 +261,8 @@ defmodule UniversalProxyWeb.Components.UI do
   # ── Modal ─────────────────────────────────────────────────────────────
   attr(:open, :boolean, required: true)
   attr(:on_close, :string, default: "modal_close")
+  # `phx-target` of the backdrop's close event (a LiveComponent's `@myself`).
+  attr(:target, :any, default: nil)
   attr(:title, :string, required: true)
   attr(:subtitle, :string, default: nil)
   slot(:inner_block, required: true)
@@ -279,7 +281,7 @@ defmodule UniversalProxyWeb.Components.UI do
       which would block LiveView's click delegation from reaching
       phx-click handlers on inner buttons.
       --%>
-      <div phx-click={@on_close} class="absolute inset-0 bg-overlay"></div>
+      <div phx-click={@on_close} phx-target={@target} class="absolute inset-0 bg-overlay"></div>
       <div class="relative bg-raised rounded-lg shadow-lg max-w-[520px] w-full animate-pop">
         <div class="px-6 pt-5 pb-3">
           <h3 class="text-lg font-semibold m-0 text-fg-1">{@title}</h3>

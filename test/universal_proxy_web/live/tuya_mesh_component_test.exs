@@ -1,0 +1,388 @@
+defmodule UniversalProxyWeb.TuyaMeshComponentTest do
+  @moduledoc """
+  The Tuya mesh card on the Bluetooth tab, against a real
+  `UniversalProxy.TuyaMesh.Store` (tmp DETS, under its global name, which
+  the host leaves free) and a real `Bluetooth.Settings` holding the role.
+  No Resolver runs on the host, so the facade writes the Store directly and
+  broadcasts the offline status, as when the mesh subtree is down.
+  """
+  use ExUnit.Case, async: false
+
+  import Phoenix.LiveViewTest
+  import Phoenix.ConnTest
+
+  alias UniversalProxy.Bluetooth.Settings
+  alias UniversalProxy.TuyaMesh
+  alias UniversalProxy.TuyaMesh.{KeyLeak, Store}
+
+  @endpoint UniversalProxyWeb.Endpoint
+  @pubsub UniversalProxy.PubSub
+
+  @mesh_mac "AA:BB:CC:DD:EE:01"
+  @other_key "ffeeddccbbaa99887766554433221100"
+  @new_local_key "qrstuvwxyzabcdef"
+
+  @moduletag :tmp_dir
+
+  setup %{tmp_dir: tmp_dir} do
+    n = System.unique_integer([:positive])
+
+    start_supervised!(
+      {Settings, table: :"tuya_ui_settings_#{n}", dets_path: Path.join(tmp_dir, "bt.dets")}
+    )
+
+    store =
+      start_supervised!(
+        {Store,
+         enabled: true, table: :"tuya_ui_store_#{n}", dets_path: Path.join(tmp_dir, "mesh.dets")}
+      )
+
+    {:ok, conn: build_conn(), store: store}
+  end
+
+  defp assign_role, do: :ok = Settings.set_role(@mesh_mac, :tuya_mesh)
+
+  defp mount_tab(conn) do
+    {:ok, view, _html} = live(conn, "/bluetooth")
+    view
+  end
+
+  defp json(overrides),
+    do: KeyLeak.json() |> Jason.decode!() |> Map.merge(overrides) |> Jason.encode!()
+
+  defp dump_entry(content, overrides \\ %{}) do
+    Map.merge(
+      %{name: "mesh.json", content: content, size: byte_size(content), type: "application/json"},
+      overrides
+    )
+  end
+
+  defp select_file(view, entry) do
+    input = file_input(view, "#tuya-mesh-upload", :inventory, [entry])
+    {input, render_upload(input, entry.name)}
+  end
+
+  defp submit_upload(view, content) do
+    {_input, _} = select_file(view, dump_entry(content))
+    view |> form("#tuya-mesh-upload") |> render_submit()
+  end
+
+  # The parent forwards a broadcast with send_update/3, a message to itself
+  # queued behind the first render call: the second render sees it.
+  defp push_status(view, status) do
+    Phoenix.PubSub.broadcast(@pubsub, TuyaMesh.topic(), {:tuya_mesh_status, status})
+    _ = render(view)
+    render(view)
+  end
+
+  defp refute_secrets(html) do
+    KeyLeak.refute_keys(html)
+    refute html =~ @other_key
+    refute html =~ @new_local_key
+  end
+
+  # A dump of another mesh: bulb "post spot 1" replaced by a new one, no groups.
+  defp other_mesh_json do
+    [b2, _b3] = KeyLeak.json() |> Jason.decode!() |> Map.fetch!("bulbs")
+
+    new_bulb = %{
+      "mac" => "DC2353000001",
+      "localKey" => @new_local_key,
+      "nodeId" => 9,
+      "label" => "porch"
+    }
+
+    json(%{"beaconKey" => @other_key, "seq" => 3, "bulbs" => [b2, new_bulb], "groups" => []})
+  end
+
+  test "hidden without a Tuya mesh role", %{conn: conn} do
+    view = mount_tab(conn)
+    refute has_element?(view, "#tuya-mesh")
+  end
+
+  describe "with a Tuya mesh role" do
+    setup do
+      assign_role()
+      :ok
+    end
+
+    test "shown, with the help text", %{conn: conn} do
+      view = mount_tab(conn)
+      assert has_element?(view, "#tuya-mesh")
+      html = render(view)
+      # No Resolver on the host: the facade's offline status.
+      assert html =~ "Idle"
+      assert html =~ "The mesh service isn&#39;t running."
+      assert html =~ "0600"
+      assert html =~ "upload a fresh dump"
+      assert html =~ "The mesh radio is dedicated"
+
+      idle = %{TuyaMesh.status() | reason: :no_inventory}
+      html = push_status(view, idle)
+      assert html =~ "Not set up"
+      assert html =~ "Upload your mesh&#39;s JSON dump to start."
+    end
+
+    test "a valid upload into an empty store succeeds and lists the bulbs", %{conn: conn} = ctx do
+      view = mount_tab(conn)
+      html = submit_upload(view, KeyLeak.json())
+
+      assert html =~ "Inventory uploaded."
+      assert html =~ "Bulb added: <strong>path light 2</strong>"
+      assert {:ok, %{seq: 100}} = Store.load(ctx.store)
+
+      html = render(view)
+      assert html =~ "path light 2"
+      assert html =~ "DC23530FB34A · node 2"
+      assert html =~ "post spot 1"
+      assert html =~ "Never seen"
+      assert html =~ "Not reachable"
+      assert html =~ "path and post"
+      assert html =~ "2 bulbs"
+      assert html =~ "Clear inventory"
+      refute_secrets(html)
+    end
+
+    test "a same-mesh upload that only adds bulbs or changes groups goes straight through",
+         %{conn: conn} = ctx do
+      [b2, _b3] = KeyLeak.json() |> Jason.decode!() |> Map.fetch!("bulbs")
+      {:ok, _} = TuyaMesh.upload(json(%{"bulbs" => [b2], "groups" => []}))
+      view = mount_tab(conn)
+
+      html = submit_upload(view, KeyLeak.json())
+      refute html =~ "Remove 1 bulb?"
+      assert html =~ "Inventory updated (same mesh)."
+      assert html =~ "Bulb added: <strong>post spot 1</strong>"
+      assert html =~ "Group added: <strong>path and post</strong>"
+      assert {:ok, %{bulbs: [_, _], groups: [_]}} = Store.load(ctx.store)
+
+      html = submit_upload(view, json(%{"groups" => []}))
+      assert html =~ "Group removed: <strong>path and post</strong>"
+      assert {:ok, %{bulbs: [_, _], groups: []}} = Store.load(ctx.store)
+      refute_secrets(render(view))
+    end
+
+    test "a same-mesh upload that removes a bulb asks first; confirm uploads it",
+         %{conn: conn} = ctx do
+      {:ok, _} = TuyaMesh.upload(KeyLeak.json())
+      view = mount_tab(conn)
+
+      [b2, _b3] = KeyLeak.json() |> Jason.decode!() |> Map.fetch!("bulbs")
+      html = submit_upload(view, json(%{"bulbs" => [b2], "groups" => []}))
+
+      assert html =~ "Remove 1 bulb?"
+      assert html =~ "leaves out"
+      assert html =~ "drops the"
+      assert html =~ "Bulb removed: <strong>post spot 1</strong>"
+      assert html =~ "Group removed: <strong>path and post</strong>"
+      refute html =~ "Replace the stored mesh?"
+      refute_secrets(html)
+      assert {:ok, %{bulbs: [_, _]}} = Store.load(ctx.store)
+
+      html = view |> element("button[phx-click=confirm_upload]") |> render_click()
+      refute html =~ "Remove 1 bulb?"
+      assert html =~ "Inventory updated (same mesh)."
+      assert {:ok, %{bulbs: [_], seq: 100}} = Store.load(ctx.store)
+      refute_secrets(render(view))
+    end
+
+    test "cancelling a same-mesh bulb removal leaves the store alone", %{conn: conn} = ctx do
+      {:ok, _} = TuyaMesh.upload(KeyLeak.json())
+      view = mount_tab(conn)
+
+      [b2, _b3] = KeyLeak.json() |> Jason.decode!() |> Map.fetch!("bulbs")
+      assert submit_upload(view, json(%{"bulbs" => [b2], "groups" => []})) =~ "Remove 1 bulb?"
+
+      html = view |> element("button[phx-click=cancel_upload]") |> render_click()
+      refute html =~ "Remove 1 bulb?"
+      assert {:ok, %{bulbs: [_, _], groups: [_]}} = Store.load(ctx.store)
+    end
+
+    test "an identical re-upload says nothing changed", %{conn: conn} do
+      {:ok, _} = TuyaMesh.upload(KeyLeak.json())
+      view = mount_tab(conn)
+
+      assert submit_upload(view, KeyLeak.json()) =~ "No bulbs or groups changed."
+    end
+
+    test "a new mesh asks first; confirm uploads it", %{conn: conn} = ctx do
+      {:ok, _} = TuyaMesh.upload(KeyLeak.json())
+      view = mount_tab(conn)
+
+      html = submit_upload(view, other_mesh_json())
+      assert html =~ "Replace the stored mesh?"
+      assert html =~ "different mesh"
+      assert html =~ "drops the"
+      assert html =~ "Bulb added: <strong>porch</strong>"
+      assert html =~ "DC2353000001"
+      assert html =~ "Bulb removed: <strong>post spot 1</strong>"
+      assert html =~ "Group removed: <strong>path and post</strong>"
+      refute_secrets(html)
+
+      # Nothing written yet.
+      assert {:ok, %{seq: 100, beacon_key: "00112233" <> _}} = Store.load(ctx.store)
+
+      html = view |> element("button[phx-click=confirm_upload]") |> render_click()
+      refute html =~ "Replace the stored mesh?"
+      assert html =~ "New mesh uploaded."
+      assert {:ok, %{seq: 3, beacon_key: @other_key}} = Store.load(ctx.store)
+      assert render(view) =~ "porch"
+      refute_secrets(render(view))
+    end
+
+    test "cancelling a new mesh leaves the store alone", %{conn: conn} = ctx do
+      {:ok, _} = TuyaMesh.upload(KeyLeak.json())
+      view = mount_tab(conn)
+
+      assert submit_upload(view, other_mesh_json()) =~ "Replace the stored mesh?"
+
+      html = view |> element("button[phx-click=cancel_upload]") |> render_click()
+      refute html =~ "Replace the stored mesh?"
+      assert {:ok, %{seq: 100, beacon_key: "00112233" <> _}} = Store.load(ctx.store)
+
+      # The held dump is gone: a stale confirm does nothing.
+      view |> with_target("#tuya-mesh") |> render_click("confirm_upload", %{})
+      assert {:ok, %{seq: 100}} = Store.load(ctx.store)
+    end
+
+    test "invalid JSON: a friendly error without key material", %{conn: conn} = ctx do
+      view = mount_tab(conn)
+      truncated = binary_part(KeyLeak.json(), 0, 120)
+
+      html = submit_upload(view, truncated)
+      assert html =~ "That file isn&#39;t a usable mesh dump: it isn&#39;t valid JSON"
+      refute_secrets(html)
+      assert Store.load(ctx.store) == {:error, :no_inventory}
+    end
+
+    test "an invalid key names the bulb, never the key", %{conn: conn} do
+      view = mount_tab(conn)
+
+      bad =
+        KeyLeak.json()
+        |> Jason.decode!()
+        |> Map.update!("bulbs", fn [b | rest] -> [Map.put(b, "localKey", "short") | rest] end)
+        |> Jason.encode!()
+
+      html = submit_upload(view, bad)
+      assert html =~ "bulb DC23530FB34A&#39;s localKey isn&#39;t a valid key"
+      refute_secrets(html)
+    end
+
+    test "too large and wrong type files are refused with upload errors", %{conn: conn} do
+      view = mount_tab(conn)
+
+      big = String.duplicate(" ", 65_537)
+      {_input, result} = select_file(view, dump_entry(big))
+      assert {:error, [[_ref, :too_large]]} = result
+      assert render(view) =~ "That file is larger than 64 KB"
+
+      view = mount_tab(conn)
+
+      {_input, result} =
+        select_file(view, dump_entry("{}", %{name: "mesh.txt", type: "text/plain"}))
+
+      assert {:error, [[_ref, :not_accepted]]} = result
+      assert render(view) =~ "Choose a .json file"
+    end
+
+    test "more than one file is refused", %{conn: conn} do
+      view = mount_tab(conn)
+
+      input =
+        file_input(view, "#tuya-mesh-upload", :inventory, [
+          dump_entry("{}", %{name: "a.json"}),
+          dump_entry("{}", %{name: "b.json"})
+        ])
+
+      assert {:error, _} = render_upload(input, "a.json")
+      assert render(view) =~ "Choose one file at a time."
+    end
+
+    test "status updates live from the PubSub broadcast", %{conn: conn} do
+      view = mount_tab(conn)
+      refute render(view) =~ "Running on"
+
+      status = %{
+        role_mac: @mesh_mac,
+        state: :running,
+        reason: nil,
+        adapter_index: 1,
+        radio: %{ready: true, last_error: nil, queued: 0},
+        lights_running: true,
+        bulbs: [
+          %{
+            mac: "DC23530FB34A",
+            label: "path light 2",
+            node_id: 2,
+            last_seen: DateTime.add(DateTime.utc_now(), -120, :second),
+            reachable: true
+          }
+        ],
+        groups: [%{local_id: 1, name: "path and post", members: ["DC23530FB34A"]}]
+      }
+
+      html = push_status(view, status)
+
+      assert html =~ "Running on hci1."
+      assert html =~ "Radio ready."
+      assert html =~ "Seen 2 min ago"
+      assert html =~ "Reachable"
+      assert html =~ "1 bulb"
+
+      not_ready = %{status | radio: %{ready: false, last_error: :not_discovering, queued: 0}}
+      html = push_status(view, not_ready)
+      assert html =~ "Radio not ready"
+      assert html =~ "Radio not ready: not discovering."
+
+      missing = %{
+        not_ready
+        | state: :idle,
+          reason: :adapter_missing,
+          radio: nil,
+          adapter_index: nil
+      }
+
+      assert push_status(view, missing) =~ "Mesh dongle not found."
+    end
+
+    test "clear asks first, then clears", %{conn: conn} = ctx do
+      {:ok, _} = TuyaMesh.upload(KeyLeak.json())
+      view = mount_tab(conn)
+
+      html = view |> element("button[phx-click=ask_clear]") |> render_click()
+      assert html =~ "Clear the Tuya mesh inventory?"
+
+      html = view |> element("button[phx-click=cancel_clear]") |> render_click()
+      refute html =~ "Clear the Tuya mesh inventory?"
+      assert {:ok, _} = Store.load(ctx.store)
+
+      view |> element("button[phx-click=ask_clear]") |> render_click()
+      html = view |> element("button[phx-click=confirm_clear]") |> render_click()
+
+      assert html =~ "Inventory cleared."
+      assert Store.load(ctx.store) == {:error, :no_inventory}
+      refute html =~ "path light 2"
+    end
+
+    @tag :capture_log
+    test "an unrecoverable record needs a second, forced clear", %{conn: conn} = ctx do
+      :ok = :dets.insert(:sys.get_state(ctx.store).table, {:inventory, %{"bulbs" => []}})
+      view = mount_tab(conn)
+
+      # Its bulbs can't be listed, so the button shows for the bad record.
+      html = push_status(view, %{TuyaMesh.status() | reason: :invalid_inventory})
+      assert html =~ "The stored inventory can&#39;t be read."
+
+      view |> element("button[phx-click=ask_clear]") |> render_click()
+      html = view |> element("button[phx-click=confirm_clear]") |> render_click()
+
+      assert html =~ "Clear anyway (sequence will be lost)"
+
+      html = view |> element("button[phx-click=confirm_force_clear]") |> render_click()
+      assert html =~ "Inventory cleared."
+
+      assert Store.load(ctx.store) == {:error, :no_inventory}
+    end
+  end
+end
