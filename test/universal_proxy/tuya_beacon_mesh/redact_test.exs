@@ -1,6 +1,12 @@
 defmodule UniversalProxy.TuyaBeaconMesh.RedactTest do
   use ExUnit.Case, async: true
 
+  defmodule Foreign do
+    @moduledoc false
+    def closure(pid), do: fn -> send(pid, :foreign) end
+    def notify, do: send(self(), :foreign)
+  end
+
   alias UniversalProxy.TuyaBeaconMesh.{Inventory, Redact}
   alias UniversalProxy.TuyaMesh.KeyLeak
 
@@ -50,11 +56,26 @@ defmodule UniversalProxy.TuyaBeaconMesh.RedactTest do
 
     test "unseal leaves other terms and other functions alone, uncalled" do
       me = self()
-      fun = fn -> send(me, :called) end
 
-      assert Redact.unseal(fun) == fun
+      for fun <- [
+            # A local closure from another module.
+            fn -> send(me, :called) end,
+            # Another module's closure.
+            Foreign.closure(me),
+            # External zero-arity captures naming Redact: one that exists
+            # (it would return the module info) and one that doesn't.
+            &Redact.module_info/0,
+            Function.capture(Redact, :no_such_fun, 0),
+            # Another module's external capture.
+            &Foreign.notify/0
+          ] do
+        assert Redact.unseal(fun) == fun
+      end
+
       refute_received :called
+      refute_received :foreign
       assert Redact.unseal(:plain) == :plain
+      assert Redact.unseal(Redact.seal(:inside)) == :inside
     end
   end
 

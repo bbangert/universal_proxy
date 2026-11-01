@@ -7,8 +7,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Redact do
       (`Inspect`, `~p`, crash reports, the raw `:sys` debug log and
       `:sys.get_state/1`, none of which `format_status/1` reaches) shows as
       a bare function. `unseal/1` takes it back out, and only opens
-      closures `seal/1` made: any other function passes through uncalled,
-      so a request can't get a caller's fun run inside a server.
+      closures `seal/1` made (checked by fun identity): any other
+      function passes through uncalled, so a request can't get a caller's
+      fun run inside a server.
     * `term/1` is the defence in depth for everything else: it replaces
       anything that may carry keys wherever it sits inside a term — an
       `Inventory` or one of its bulbs, a map with a `beaconKey`/`localKey`
@@ -84,16 +85,23 @@ defmodule UniversalProxy.TuyaBeaconMesh.Redact do
   @spec seal(term()) :: (-> term())
   def seal(term), do: fn -> term end
 
-  @doc "What `seal/1` wrapped; anything else (other funs included) as is."
+  @doc """
+  What `seal/1` wrapped; anything else as is. A fun is opened only when it
+  is the closure `seal/1` builds (a local fun with that closure's module,
+  index and code hash), so no other fun is ever called: not another
+  module's, not an external capture such as `&Redact.module_info/0`.
+  """
   @spec unseal(term()) :: term()
   def unseal(sealed) when is_function(sealed, 0) do
-    case Function.info(sealed, :module) do
-      {:module, __MODULE__} -> sealed.()
-      _other -> sealed
-    end
+    if identity(sealed) == identity(seal(nil)), do: sealed.(), else: sealed
   end
 
   def unseal(other), do: other
+
+  # An external fun has no index or code hash, so it never matches.
+  defp identity(fun) do
+    Enum.map([:type, :module, :new_index, :new_uniq], &Function.info(fun, &1))
+  end
 
   @doc """
   A request (the body of a call, cast or plain message) with the second
