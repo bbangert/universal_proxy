@@ -115,6 +115,47 @@ defmodule UniversalProxy.TuyaMeshTest do
     end
   end
 
+  describe "expected_revision" do
+    test "a confirmation goes stale when the store changes under it", ctx do
+      {:ok, _} = TuyaMesh.upload(json(), ctx.opts)
+      other = json(%{"beaconKey" => @other_key, "seq" => 3})
+      {:ok, %{mesh: :new_mesh, revision: seen}} = TuyaMesh.preview(other, ctx.opts)
+
+      # Another tab uploads a third mesh while this one confirms.
+      third = json(%{"beaconKey" => String.duplicate("ab", 16), "seq" => 9})
+      {:ok, :new_mesh} = TuyaMesh.upload(third, [confirm: true] ++ ctx.opts)
+
+      assert {:error, {:stale_preview, fresh}} =
+               TuyaMesh.upload(other, [confirm: true, expected_revision: seen] ++ ctx.opts)
+
+      assert fresh.revision != seen
+      refute_secrets(fresh)
+      assert {:ok, %{seq: 9}} = Store.load(ctx.store)
+
+      assert {:ok, :new_mesh} =
+               TuyaMesh.upload(
+                 other,
+                 [confirm: true, expected_revision: fresh.revision] ++ ctx.opts
+               )
+
+      assert {:ok, %{seq: 3, beacon_key: @other_key}} = Store.load(ctx.store)
+    end
+
+    test "a same-mesh confirmation goes stale too", ctx do
+      [b2, _b3] = json() |> Jason.decode!() |> Map.fetch!("bulbs")
+      {:ok, _} = TuyaMesh.upload(json(), ctx.opts)
+      fewer = json(%{"bulbs" => [b2], "groups" => []})
+      {:ok, %{mesh: :same_mesh, revision: seen}} = TuyaMesh.preview(fewer, ctx.opts)
+
+      :ok = TuyaMesh.clear(ctx.opts)
+
+      assert {:error, {:stale_preview, %{mesh: :empty}}} =
+               TuyaMesh.upload(fewer, [expected_revision: seen] ++ ctx.opts)
+
+      assert Store.load(ctx.store) == {:error, :no_inventory}
+    end
+  end
+
   describe "bad input" do
     test "malformed JSON: a redacted error, nothing logged with keys", ctx do
       truncated = binary_part(json(), 0, 120)
@@ -237,6 +278,12 @@ defmodule UniversalProxy.TuyaMeshTest do
       # An unconfirmed new mesh leaves the running mesh alone.
       assert {:error, {:confirm_new_mesh, _}} =
                TuyaMesh.upload(json(%{"beaconKey" => @other_key}), ctx.opts)
+
+      assert [{_, ^second, _, _}] = DynamicSupervisor.which_children(ctx.dynsup)
+
+      # A stale confirmation is refused before the mesh is stopped.
+      assert {:error, {:stale_preview, _}} =
+               TuyaMesh.upload(json(), [expected_revision: -1] ++ ctx.opts)
 
       assert [{_, ^second, _, _}] = DynamicSupervisor.which_children(ctx.dynsup)
 
