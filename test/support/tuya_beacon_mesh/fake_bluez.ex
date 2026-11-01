@@ -27,7 +27,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.FakeBluez do
   `Adapter1.Discovering` (read with `Properties.Get`) follows the
   `StartDiscovery` / `StopDiscovery` calls; `stop_discovering/0` turns it
   off behind the radio's back, as an adapter removal or a `bluetoothd`
-  restart does.
+  restart does. Every D-Bus call is recorded twice: `{:dbus, member, body}`
+  and `{:dbus_path, object_path, member}`.
   """
 
   alias Bluez.Radio.Lease
@@ -353,11 +354,12 @@ defmodule UniversalProxy.TuyaBeaconMesh.FakeBluez do
     @moduledoc false
     alias UniversalProxy.TuyaBeaconMesh.FakeBluez
 
-    def call(conn, _path, _interface, member, _signature, body, _timeout \\ 5_000)
+    def call(conn, path, _interface, member, _signature, body, _timeout \\ 5_000)
         when is_pid(conn) do
       case FakeBluez.failure({:dbus, member}) do
         nil ->
           FakeBluez.record({:dbus, member, body})
+          FakeBluez.record({:dbus_path, path, member})
           reply(member, body)
 
         reason ->

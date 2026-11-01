@@ -47,7 +47,24 @@ defmodule UniversalProxy.BluezSpecTest do
     # The rest of the wiring is unchanged.
     {Bluez, base} = UniversalProxy.Bluetooth.bluez_spec()
 
-    assert Keyword.drop(opts, [:exclude_adapters, :mgmt]) ==
-             Keyword.drop(base, [:exclude_adapters])
+    assert Keyword.drop(opts, [:exclude_adapters, :mgmt, :extra_children]) ==
+             Keyword.drop(base, [:exclude_adapters, :extra_children])
+  end
+
+  test "bluez_spec/1 with a mesh adapter mounts the mesh subtree before Improv" do
+    mac = "AA:BB:CC:DD:EE:FF"
+    assert {Bluez, opts} = UniversalProxy.Bluetooth.bluez_spec(tuya_adapter: mac)
+
+    extra = Keyword.fetch!(opts, :extra_children)
+
+    assert Enum.map(extra, &id_of/1) == [
+             Task.Supervisor,
+             UniversalProxy.Bluetooth.AudioManager,
+             UniversalProxy.TuyaMesh.Supervisor,
+             Improv.Supervisor
+           ]
+
+    assert {UniversalProxy.TuyaMesh.Supervisor, [tuya_adapter: ^mac]} =
+             Enum.at(extra, 2)
   end
 end

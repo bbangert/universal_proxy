@@ -34,9 +34,9 @@ defmodule UniversalProxy.TuyaBeaconMesh do
     * `Lights` — inventory-backed controller: set/ping/reset/group_set,
       report attribution by node→MAC, seq persistence callback
 
-  Still host work for Universal Proxy: Settings storage of the inventory
-  JSON, choosing the dedicated `hciN`, MQTT/HA discovery, and wiring a
-  supervisor. Hardware behaviour: `docs/protocols/tuya_beacon_mesh.md`
+  The host wiring (inventory store, choosing the dedicated `hciN`,
+  supervision, upload and status) is `UniversalProxy.TuyaMesh`. Hardware
+  behaviour: `docs/protocols/tuya_beacon_mesh.md`
   §4.9; extraction notes: `docs/protocols/notes/tuya_beacon_mesh_extraction.md`.
 
   Pairing / Tuya cloud login are intentionally absent — the dump is

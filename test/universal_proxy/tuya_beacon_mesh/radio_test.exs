@@ -597,6 +597,40 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
     end
   end
 
+  describe "adapter power" do
+    test "powers its own adapter before starting discovery" do
+      start_supervised!(radio_spec(adapter_index: 2))
+      wait_until(&ready?/0)
+
+      calls = FakeBluez.calls()
+      power = Enum.find_index(calls, &match?({:dbus, "Set", _}, &1))
+      filter = Enum.find_index(calls, &match?({:dbus, "SetDiscoveryFilter", _}, &1))
+
+      assert {:dbus, "Set", ["org.bluez.Adapter1", "Powered", {"b", true}]} =
+               Enum.at(calls, power)
+
+      assert power < filter
+      assert {:dbus_path, "/org/bluez/hci2", "Set"} in calls
+      refute Enum.any?(calls, &match?({:dbus_path, "/org/bluez/hci0", _}, &1))
+    end
+
+    @tag :capture_log
+    test "an adapter that won't power on is retried, and discovery waits for it" do
+      FakeBluez.fail({:dbus, "Set"}, "org.bluez.Error.Blocked")
+      start_supervised!(radio_spec())
+
+      wait_until(fn ->
+        match?({:ok, %{last_error: {:power, "org.bluez.Error.Blocked"}}}, Radio.status())
+      end)
+
+      refute Enum.any?(FakeBluez.calls(), &match?({:dbus, "StartDiscovery", _}, &1))
+
+      FakeBluez.succeed({:dbus, "Set"})
+      wait_until(&ready?/0)
+      assert_leases_balanced()
+    end
+  end
+
   describe "not ready" do
     test "stays up, logs once, refuses sends and recovers when the lease frees" do
       holder = start_supervised!({Task, fn -> Process.sleep(:infinity) end})

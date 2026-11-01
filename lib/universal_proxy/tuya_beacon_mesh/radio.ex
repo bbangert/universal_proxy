@@ -12,8 +12,10 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
       Features*), subscribes to `Bluez.Radio`'s lease-end notices and
       acquires the `:mgmt` lease for the adapter — this process is the
       lease holder, so only it may advertise;
-    * opens its own system-bus connection (kept across retries) and starts
-      LE discovery with `DuplicateData: true` on the adapter;
+    * opens its own system-bus connection (kept across retries), powers the
+      adapter (`Adapter1.Powered = true`: `Bluez.Client` powers only the
+      adapter it claims, and a dedicated mesh adapter is never claimed) and
+      starts LE discovery with `DuplicateData: true` on it;
     * starts a linked `Bluez.AdvertReceiver` whose `on_report:` callback
       casts only AD 0x03 26-byte frames here.
 
@@ -360,6 +362,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
          {:ok, state} <- watch_bluez_radio(state),
          {:ok, state} <- acquire(state),
          {:ok, state} <- connect(state),
+         {:ok, state} <- power_on(state),
          {:ok, state} <- start_discovery(state) do
       start_receiver(state)
     end
@@ -493,6 +496,17 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
     state.rebus.connect(:system)
   catch
     :exit, reason -> {:exit, reason}
+  end
+
+  # Idempotent: setting Powered on a powered adapter is a no-op. It is not
+  # undone on teardown, since the adapter is dedicated to this radio.
+  defp power_on(state) do
+    body = [@adapter_iface, "Powered", {"b", true}]
+
+    case state.dbus.call(state.conn, adapter_path(state), @props_iface, "Set", "ssv", body) do
+      {:ok, _} -> {:ok, state}
+      {:error, reason} -> {:error, {:power, reason}, state}
+    end
   end
 
   defp start_discovery(state) do
