@@ -187,7 +187,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Inventory do
   defp fetch_bulbs(map, mesh_key) do
     case fetch(map, [:bulbs, :lights]) do
       {:ok, [_ | _] = raw} ->
-        with {:ok, bulbs} <- decode_bulbs(raw, mesh_key), do: check_label_macs(bulbs)
+        with :ok <- check_proper(raw, :bad_bulbs),
+             {:ok, bulbs} <- decode_bulbs(raw, mesh_key),
+             do: check_label_macs(bulbs)
 
       {:ok, []} ->
         {:error, :no_bulbs}
@@ -334,10 +336,18 @@ defmodule UniversalProxy.TuyaBeaconMesh.Inventory do
 
   defp fetch_groups(map, bulbs) do
     case fetch(map, [:groups]) do
-      {:ok, raw} when is_list(raw) -> decode_groups(raw, MapSet.new(bulbs, & &1.mac))
-      {:ok, nil} -> {:ok, []}
-      :error -> {:ok, []}
-      {:ok, _other} -> {:error, :bad_groups}
+      {:ok, raw} when is_list(raw) ->
+        with :ok <- check_proper(raw, :bad_groups),
+             do: decode_groups(raw, MapSet.new(bulbs, & &1.mac))
+
+      {:ok, nil} ->
+        {:ok, []}
+
+      :error ->
+        {:ok, []}
+
+      {:ok, _other} ->
+        {:error, :bad_groups}
     end
   end
 
@@ -376,6 +386,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Inventory do
            fetch(row, [:localId, :local_id, :id]),
          {:ok, name} <- fetch_name(row, [:name, :label], {:bad_group_name, id}),
          {:ok, members} when is_list(members) <- fetch_members(row),
+         true <- proper_list?(members),
          {:ok, macs} <- normalize_members(members, id, known) do
       {:ok, %Group{local_id: id, name: name, members: macs}}
     else
@@ -430,6 +441,13 @@ defmodule UniversalProxy.TuyaBeaconMesh.Inventory do
   end
 
   def normalize_mac(_), do: :error
+
+  # Elixir-term input (not JSON) can hold improper lists, which Enum raises on.
+  defp check_proper(list, error), do: if(proper_list?(list), do: :ok, else: {:error, error})
+
+  defp proper_list?([]), do: true
+  defp proper_list?([_ | rest]), do: proper_list?(rest)
+  defp proper_list?(_improper), do: false
 
   # The first of `keys` present in `map`, whatever its value (`false` and
   # `nil` included). Field names are atoms here; JSON input has them as
