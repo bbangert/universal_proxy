@@ -275,6 +275,22 @@ defmodule UniversalProxy.ESPHome.EntityProviderMeshTest do
                       %Proto.BinarySensorStateResponse{key: ^conn, device_id: 1, state: false}}
     end
 
+    test "a change held back by an identity blip is pushed once it is back" do
+      {sources, put} = start_inputs(%{ids: %{}})
+      pid = start_provider(sources)
+      conn = Entities.key_for("tuya_dc23530fb34a_connectivity")
+
+      send(pid, {:tuya_mesh_status, %{bulbs: [%{mac: @mac1, reachable: false, last_seen: nil}]}})
+      _ = :sys.get_state(pid)
+      refute_received {:mesh_push, _}
+
+      put.(:ids, %{{:bulb, @mac1} => 1, {:bulb, @mac2} => 2, {:group, 1} => 3})
+      send(pid, :mesh_check)
+
+      assert_receive {:mesh_push,
+                      %Proto.BinarySensorStateResponse{key: ^conn, device_id: 1, state: false}}
+    end
+
     test "no live push for a bulb whose sub-device changed" do
       {sources, _put} = start_inputs(%{ids: %{{:bulb, @mac1} => 99, {:bulb, @mac2} => 2}})
       pid = start_provider(sources)

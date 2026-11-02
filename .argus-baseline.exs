@@ -311,5 +311,15 @@
       "UniversalProxy.ESPHome.EntityProvider.handle_info/2 runs again and again, and each run reaches an anonymous function in UniversalProxy.ESPHome.EntityProvider.MeshSync.subscribe_topics/2's subscription. A second subscription to a topic the process already holds is not a no-op: every later broadcast arrives once more, and nothing UniversalProxy.ESPHome.EntityProvider runs ever unsubscribes, so the copies accumulate for the life of the process.",
     reason:
       "False positive (same pattern as the Resolver entry above): subscribe_topics/2 subscribes only to topics missing from Registry.keys(pubsub, self()) (the comprehension filter), so a held topic is never subscribed twice; it re-subscribes only after a PubSub/Registry restart dropped the subscription. Covered by entity_provider_mesh_test asserting each topic is held exactly once after a PubSub restart and repeated checks."
+  },
+  %{
+    analysis: "mailbox",
+    file: "lib/universal_proxy/tuya_mesh/commander.ex",
+    title: "Subscription made again each time a callback runs",
+    at_label: "subscribes again on every run",
+    detail:
+      "UniversalProxy.TuyaMesh.Commander.handle_info/2 runs again and again, and each run reaches an anonymous function in UniversalProxy.TuyaMesh.Commander.subscribe/1's subscription. A second subscription to a topic the process already holds is not a no-op: every later broadcast arrives once more, and nothing UniversalProxy.TuyaMesh.Commander runs ever unsubscribes, so the copies accumulate for the life of the process.",
+    reason:
+      "False positive (same pattern as the Resolver and MeshSync entries above): subscribe/1 subscribes only to topics missing from Registry.keys(pubsub, self()) (the comprehension filter), and :resubscribe is only scheduled after a failed attempt (PubSub down), so a held topic is never subscribed twice. Covered by commander_test asserting each topic is held exactly once after a late PubSub start and further retries."
   }
 ]
