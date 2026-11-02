@@ -2,10 +2,11 @@ defmodule UniversalProxy.TuyaMesh.FakeLights do
   @moduledoc false
   # Answers `Lights.all/1` and `Lights.ping/2` (both plain calls). Bulbs in
   # `replying` answer a ping at once: their `last_report_ms` becomes the
-  # clock. `ping_reply` is what every ping returns; `on_ping` (`mac -> any`)
+  # clock. Bulbs in `held` answer with a frame Lights holds (a reset
+  # counter): only their `heard_ms` moves. `ping_reply` is what every ping returns; `on_ping` (`mac -> any`)
   # runs for each accepted one (to air it on a FakeRadio, say). `all_reply`,
-  # when set, replaces `Lights.all/1`'s answer. `heard` (`mac => ms`) is
-  # each bulb's `heard_ms`.
+  # when set, replaces `Lights.all/1`'s answer. `heard` (`mac => ms`) adds
+  # frames heard but held (not accepted), as Lights' `heard_ms` does.
   use GenServer
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name))
@@ -20,6 +21,7 @@ defmodule UniversalProxy.TuyaMesh.FakeLights do
      %{
        bulbs: Map.new(Keyword.get(opts, :macs, []), &{&1, nil}),
        replying: MapSet.new(Keyword.get(opts, :replying, [])),
+       held: MapSet.new(Keyword.get(opts, :held, [])),
        clock: Keyword.get(opts, :clock, fn -> System.monotonic_time(:millisecond) end),
        ping_reply: :ok,
        all_reply: nil,
@@ -38,7 +40,7 @@ defmodule UniversalProxy.TuyaMesh.FakeLights do
       state.bulbs
       |> Enum.sort()
       |> Enum.map(fn {mac, last} ->
-        %{mac: mac, last_report_ms: last, heard_ms: Map.get(state.heard, mac)}
+        %{mac: mac, last_report_ms: last, heard_ms: later(Map.get(state.heard, mac), last)}
       end)
 
     {:reply, {:ok, bulbs}, state}
@@ -49,9 +51,12 @@ defmodule UniversalProxy.TuyaMesh.FakeLights do
     if state.ping_reply == :ok, do: state.on_ping.(mac)
 
     state =
-      if state.ping_reply == :ok and mac in state.replying,
-        do: %{state | bulbs: Map.put(state.bulbs, mac, state.clock.())},
-        else: state
+      cond do
+        state.ping_reply != :ok -> state
+        mac in state.replying -> %{state | bulbs: Map.put(state.bulbs, mac, state.clock.())}
+        mac in state.held -> %{state | heard: Map.put(state.heard, mac, state.clock.())}
+        true -> state
+      end
 
     {:reply, state.ping_reply, state}
   end
@@ -71,6 +76,11 @@ defmodule UniversalProxy.TuyaMesh.FakeLights do
     do: {:reply, :ok, %{state | bulbs: Map.put(state.bulbs, mac, ms)}}
 
   def handle_call(:pings, _from, state), do: {:reply, Enum.reverse(state.pings), state}
+
+  # As in Lights: heard_ms is never behind last_report_ms.
+  defp later(nil, b), do: b
+  defp later(a, nil), do: a
+  defp later(a, b), do: max(a, b)
 end
 
 defmodule UniversalProxy.TuyaMesh.FakeRadio do

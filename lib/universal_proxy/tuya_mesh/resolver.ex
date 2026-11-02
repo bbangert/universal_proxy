@@ -74,7 +74,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   (`{:tuya_mesh_presence, {mesh_generation, pinger_generation}, snapshot}`)
   whenever it changes.
 
-  Last seen is merged, never replaced: per MAC the latest report time from
+  Last seen is merged, never replaced: per MAC the latest `heard_ms` from
   `Lights.all/1` or a Presence snapshot is kept, and nil never overwrites
   a known time. So a Lights restart, a mesh restart, a same-mesh upload
   (each starts Lights with every bulb unheard) keep it. Before the mesh is
@@ -130,7 +130,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   require Logger
 
   alias UniversalProxy.TuyaBeaconMesh.{Inventory, Lights, Radio}
-  alias UniversalProxy.TuyaMesh.{Mesh, Presence, Redact, Store}
+  alias UniversalProxy.TuyaMesh.{Mesh, Redact, Store}
 
   @topic "tuya_mesh"
   @retry_ms 2_000
@@ -709,7 +709,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
     case Lights.all(server: state.lights) do
       {:ok, bulbs} ->
         reports =
-          Enum.reduce(bulbs, state.last_reports, &put_report(&2, &1.mac, Presence.heard_ms(&1)))
+          Enum.reduce(bulbs, state.last_reports, &put_report(&2, &1.mac, &1.heard_ms))
 
         prune(%{state | lights_running: true, last_reports: reports})
 

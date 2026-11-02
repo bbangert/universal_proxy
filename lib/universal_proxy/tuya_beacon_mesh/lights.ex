@@ -157,6 +157,16 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   until it passed the old value, so 3 consecutive in-order reports
   outside the window re-anchor it.
 
+  Each bulb has two times (`:clock` milliseconds, in `all/1` and
+  `status/2`): `last_report_ms`, when a report was last accepted, and
+  `heard_ms`, when a frame that parses under the bulb's keys last came
+  from it, accepted or held for re-anchoring (an exact repeat of the last
+  sequence number doesn't count). A held frame changes nothing else (no
+  DPs, no sequence tracking beyond the re-anchor count), but it shows the
+  bulb is there: right after a power cycle the bulb's first answers are
+  held, and presence must not read them as silence. Like every report,
+  `heard_ms` is advisory (see above).
+
   ## Radio
 
   The `Radio` subscription is monitored: when the Radio is not running or
@@ -690,17 +700,21 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
          {:ok, parsed} <- parse(state, bulb, frame) do
       case check_fresh(bulb, parsed.sn) do
         :accept ->
+          now = state.clock.()
+
           bulb = %{
             bulb
             | last_sn: parsed.sn,
               resync: nil,
-              last_report_ms: System.monotonic_time(:millisecond)
+              last_report_ms: now,
+              heard_ms: now
           }
 
           put_bulb(state, mac, apply_report(bulb, parsed))
 
+        # Held for re-anchoring: heard, nothing applied.
         {:hold, resync} ->
-          put_bulb(state, mac, %{bulb | resync: resync})
+          put_bulb(state, mac, %{bulb | resync: resync, heard_ms: state.clock.()})
 
         :ignore ->
           state
@@ -1138,7 +1152,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
       dps: bulb.dps,
       groups: bulb.groups,
       last_event: bulb.last_event,
-      last_report_ms: bulb.last_report_ms
+      last_report_ms: bulb.last_report_ms,
+      heard_ms: bulb.heard_ms
     }
   end
 
@@ -1154,7 +1169,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
          last_sn: nil,
          resync: nil,
          last_event: nil,
-         last_report_ms: nil
+         last_report_ms: nil,
+         heard_ms: nil
        }}
     end)
   end

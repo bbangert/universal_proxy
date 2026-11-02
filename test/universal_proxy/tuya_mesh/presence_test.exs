@@ -22,6 +22,7 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
   defp start(ctx, opts \\ []) do
     {macs, opts} = Keyword.pop(opts, :macs, [@a, @b, @c])
     {replying, opts} = Keyword.pop(opts, :replying, [])
+    {held, opts} = Keyword.pop(opts, :held, [])
     {on_ping, opts} = Keyword.pop(opts, :on_ping, fn _mac, radio -> FakeRadio.air(radio) end)
     Agent.update(ctx.clock, fn _ -> -Keyword.get(opts, :min_gap_ms, 30_000) end)
 
@@ -30,7 +31,7 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
     lights =
       start_supervised!(
         {FakeLights,
-         macs: macs, replying: replying, clock: ctx.now, on_ping: &on_ping.(&1, radio)},
+         macs: macs, replying: replying, held: held, clock: ctx.now, on_ping: &on_ping.(&1, radio)},
         id: :lights
       )
 
@@ -404,15 +405,7 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
     end
   end
 
-  describe "heard_ms" do
-    test "prefers Lights' heard_ms, falling back to last_report_ms" do
-      assert Presence.heard_ms(%{last_report_ms: 5}) == 5
-      assert Presence.heard_ms(%{heard_ms: nil, last_report_ms: 5}) == 5
-      assert Presence.heard_ms(%{heard_ms: 9, last_report_ms: 5}) == 9
-      assert Presence.heard_ms(%{heard_ms: 9, last_report_ms: nil}) == 9
-      assert Presence.heard_ms(%{heard_ms: nil, last_report_ms: nil}) == nil
-    end
-
+  describe "a reset bulb counter" do
     test "a frame held by Lights for resync still counts as the reply", ctx do
       # Lights stamps heard_ms but not last_report_ms on a held frame.
       ctx = start(ctx, macs: [@a])
@@ -421,6 +414,14 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
       :ok = FakeLights.put(ctx.lights, :heard, %{@a => 2_000})
       at(ctx, 5_000)
       assert %{pinging: false, misses: 0, last_ms: 2_000} = bulb(ctx, @a)
+    end
+
+    test "a bulb whose counter reset, answering pings, is never marked missed", ctx do
+      ctx = start(ctx, macs: [@a], held: [@a], min_gap_ms: 0)
+      for t <- 0..3_600_000//5_000, do: at(ctx, t)
+
+      assert length(pings(ctx)) >= 25
+      assert %{misses: 0} = bulb(ctx, @a)
     end
   end
 

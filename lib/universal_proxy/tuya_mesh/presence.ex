@@ -12,9 +12,10 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   ## Schedule
 
   Every `:tick_ms` (5 s; `:pending_tick_ms`, 1 s, while a ping is
-  outstanding) it reads `Lights.all/1` (when each bulb was last heard,
-  `heard_ms/1`, kept as the latest seen) and then, at most once, pings
-  the most overdue bulb that is:
+  outstanding) it reads `Lights.all/1` (each bulb's `heard_ms`: the last
+  frame from it, including ones Lights holds while re-anchoring a reset
+  counter; kept as the latest seen) and then, at most once, pings the
+  most overdue bulb that is:
 
     * due: its next check time has passed (below);
     * silent for over `:silence_ms` (60 s), or never heard;
@@ -176,20 +177,6 @@ defmodule UniversalProxy.TuyaMesh.Presence do
     :exit, _reason -> {:error, :not_running}
   end
 
-  @doc """
-  When a bulb entry of `Lights.all/1` was last heard (monotonic ms, or
-  nil): its `heard_ms` when Lights reports one (any authenticated frame
-  from the bulb), else `last_report_ms` (frames accepted as fresh).
-  """
-  @spec heard_ms(map()) :: integer() | nil
-  def heard_ms(bulb) do
-    case {Map.get(bulb, :heard_ms), Map.get(bulb, :last_report_ms)} do
-      {nil, last} -> last
-      {heard, nil} -> heard
-      {heard, last} -> max(heard, last)
-    end
-  end
-
   @doc false
   # Runs one tick now: tests drive the schedule with a fake clock.
   @spec poll(GenServer.server()) :: :ok
@@ -270,7 +257,7 @@ defmodule UniversalProxy.TuyaMesh.Presence do
       {:ok, list} ->
         bulbs =
           Map.new(list, fn %{mac: mac} = bulb ->
-            {mac, merge(Map.get(state.bulbs, mac), heard_ms(bulb), now, state)}
+            {mac, merge(Map.get(state.bulbs, mac), bulb.heard_ms, now, state)}
           end)
 
         pending = if state.pending && Map.has_key?(bulbs, state.pending.mac), do: state.pending
