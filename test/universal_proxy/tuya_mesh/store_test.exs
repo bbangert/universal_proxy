@@ -554,11 +554,11 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
 
       {:ok, _} = Store.replace(inventory(), [], store)
       assert_received {:write, keys}
-      assert [:inventory, :device_ids, :next_device_id | _] = keys
+      assert [:inventory, :summary, :device_ids, :next_device_id | _] = keys
       refute_received {:write, _}
 
       :ok = Store.clear(store)
-      assert_received {:write, [:inventory, :device_ids, :seq_floors, :revision]}
+      assert_received {:write, [:inventory, :summary, :device_ids, :seq_floors, :revision]}
       refute_received {:write, _}
     end
 
@@ -621,6 +621,50 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
 
       store = restart_store(ctx)
       assert Store.settings(store) == %{min_mireds: 154, max_mireds: 400, invert: true}
+    end
+  end
+
+  describe "inventory_summary" do
+    test "key-free bulbs and groups with their sub-device ids", ctx do
+      assert {:ok, %{bulbs: [], groups: [], device_ids: %{}}} =
+               Store.inventory_summary(ctx.store)
+
+      {:ok, _} = Store.replace(inventory(), [], ctx.store)
+      assert {:ok, summary} = Store.inventory_summary(ctx.store)
+
+      assert summary.bulbs == [
+               %{mac: @mac2, label: "path light 2"},
+               %{mac: @mac3, label: "post spot 1"}
+             ]
+
+      assert summary.groups == [%{local_id: 1, name: "path and post"}]
+      assert summary.device_ids == Store.device_ids(ctx.store)
+      assert map_size(summary.device_ids) == 3
+      refute_secrets(summary)
+    end
+
+    test "unavailable or invalid is an error, not an empty inventory", ctx do
+      down = :"down_#{System.unique_integer([:positive])}"
+      assert {:error, :unavailable} = Store.inventory_summary(down)
+
+      :ok = :dets.insert(ctx.table, {:inventory, %{"beaconKey" => "nope"}})
+      assert {:error, :invalid_inventory} = Store.inventory_summary(ctx.store)
+    end
+
+    test "a stored inventory that stops validating still serves its last summary", ctx do
+      {:ok, _} = Store.replace(inventory(), [], ctx.store)
+      {:ok, good} = Store.inventory_summary(ctx.store)
+
+      :ok = :dets.insert(ctx.table, {:inventory, %{"beaconKey" => "nope"}})
+      assert {:error, {:invalid, _}} = Store.load(ctx.store)
+      assert {:ok, ^good} = Store.inventory_summary(ctx.store)
+      refute_secrets(:dets.lookup(ctx.table, :summary))
+
+      # A clear drops it with the inventory.
+      :ok = Store.clear(ctx.store, force: true)
+      assert {:ok, %{bulbs: [], groups: []}} = Store.inventory_summary(ctx.store)
+      :ok = :dets.insert(ctx.table, {:inventory, %{"beaconKey" => "nope"}})
+      assert {:error, :invalid_inventory} = Store.inventory_summary(ctx.store)
     end
   end
 
@@ -698,6 +742,8 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
           pubsub: pubsub
         )
 
+      assert_receive {:tuya_mesh_store, :ready}
+
       {:ok, _} = Store.replace(inventory(), [], store)
       assert_receive {:tuya_mesh_store, :inventory_changed}
 
@@ -711,6 +757,43 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
       :ok = Store.clear(store)
       assert_receive {:tuya_mesh_store, :inventory_changed}
       :ok = Store.clear(store)
+      refute_receive {:tuya_mesh_store, _}, 50
+    end
+
+    test "every start, so readers that found it down catch up", ctx do
+      pubsub = :"store_pubsub_#{System.unique_integer([:positive])}"
+      start_supervised!({Phoenix.PubSub, name: pubsub})
+      Phoenix.PubSub.subscribe(pubsub, Store.topic())
+      path = Path.join(ctx.tmp_dir, "r.dets")
+      table = :"r_#{System.unique_integer()}"
+
+      start_store(path, table, id: :ready, pubsub: pubsub)
+      assert_receive {:tuya_mesh_store, :ready}
+
+      stop_supervised!(:ready)
+      start_store(path, table, id: :ready, pubsub: pubsub)
+      assert_receive {:tuya_mesh_store, :ready}
+    end
+
+    test "settings changes, once written", ctx do
+      pubsub = :"store_pubsub_#{System.unique_integer([:positive])}"
+      start_supervised!({Phoenix.PubSub, name: pubsub})
+      Phoenix.PubSub.subscribe(pubsub, Store.topic())
+
+      store =
+        start_store(Path.join(ctx.tmp_dir, "s.dets"), :"s_#{System.unique_integer()}",
+          id: :settings_notifying,
+          pubsub: pubsub
+        )
+
+      assert_receive {:tuya_mesh_store, :ready}
+
+      :ok = Store.put_settings(%{max_mireds: 400}, store)
+      assert_receive {:tuya_mesh_store, :settings_changed}
+
+      # Unchanged or invalid: nothing written, nothing sent.
+      :ok = Store.put_settings(%{max_mireds: 400}, store)
+      {:error, :invalid_settings} = Store.put_settings(%{min_mireds: 999}, store)
       refute_receive {:tuya_mesh_store, _}, 50
     end
   end

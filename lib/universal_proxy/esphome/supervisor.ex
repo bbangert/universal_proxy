@@ -14,6 +14,17 @@ defmodule UniversalProxy.ESPHome.Supervisor do
 
   `ConfigStore` lives one level up in the application supervisor so a
   `restart/0` of this tree does not close and reopen the DETS file.
+
+  ## Tuya mesh sub-devices
+
+  The device config carries the mesh's ESPHome sub-devices
+  (`UniversalProxy.TuyaMesh.Entities`). At runtime the `EntityProvider`
+  keeps them current with `Espex.update_device_config/2`, which only lasts
+  for the running Espex. So `init/1` merges the current ones, and every
+  Espex start (`start_espex/2`, also a restart of Espex alone) takes the
+  provider's, the ones its entities are advertised with. Without that, a
+  restart would come back with fewer sub-devices and Home Assistant would
+  delete the missing ones, and their history, on the next connect.
   """
 
   use Supervisor
@@ -31,6 +42,7 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   }
 
   alias UniversalProxy.Bluetooth.Settings, as: BluetoothSettings
+  alias UniversalProxy.ESPHome.EntityProvider.MeshSync
   alias UniversalProxy.Hardware
   alias UniversalProxy.UART.Store, as: UARTStore
 
@@ -59,7 +71,11 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   end
 
   @impl true
-  def init(_init_arg) do
+  def init(init_arg) do
+    opts = if Keyword.keyword?(init_arg), do: init_arg, else: []
+    mesh_devices_fun = Keyword.get(opts, :mesh_devices_fun, &MeshSync.boot_devices/0)
+    live_devices_fun = Keyword.get(opts, :live_devices_fun, &EntityProvider.mesh_devices/0)
+
     # Seed the persisted PSK into device_config so a previously
     # HA-provisioned key survives restart/reboot. accepts_key_provisioning
     # is opened only while keyless: once a key exists, no LAN client can
@@ -69,6 +85,7 @@ defmodule UniversalProxy.ESPHome.Supervisor do
     device_config =
       ConfigStore.device_config_opts()
       |> Keyword.merge(psk: psk, accepts_key_provisioning: psk == nil)
+      |> merge_devices(mesh_devices(mesh_devices_fun))
 
     espex_opts =
       [
@@ -94,10 +111,49 @@ defmodule UniversalProxy.ESPHome.Supervisor do
       # Pushes go to the default Espex.Server name (espex_opts sets no
       # :server_name).
       {EntityProvider, server: Espex.Server},
-      {Espex, espex_opts}
+      Supervisor.child_spec({Espex, espex_opts},
+        start: {__MODULE__, :start_espex, [espex_opts, live_devices_fun]}
+      )
     ]
 
     Supervisor.init(children, strategy: :rest_for_one)
+  end
+
+  @doc """
+  Starts Espex with the sub-devices `live_devices_fun` gives (`{:ok,
+  devices}`, the provider's), falling back to the ones in `espex_opts`
+  when it gives anything else: a provider that doesn't know the mesh yet
+  must not start Espex without it.
+  """
+  @spec start_espex(keyword(), (-> {:ok, [Espex.DeviceConfig.Device.t()]} | term())) ::
+          Supervisor.on_start()
+  def start_espex(espex_opts, live_devices_fun) do
+    espex_opts
+    |> refresh_devices(live_devices_fun.())
+    |> Espex.Supervisor.start_link()
+  end
+
+  @doc false
+  @spec refresh_devices(keyword(), {:ok, [Espex.DeviceConfig.Device.t()]} | term()) :: keyword()
+  def refresh_devices(espex_opts, {:ok, devices}),
+    do: Keyword.update!(espex_opts, :device_config, &merge_devices(&1, devices))
+
+  def refresh_devices(espex_opts, _unavailable), do: espex_opts
+
+  @doc """
+  `device_config` with `devices` as its sub-devices (replacing any).
+  """
+  @spec merge_devices(keyword(), [Espex.DeviceConfig.Device.t()]) :: keyword()
+  def merge_devices(device_config, devices), do: Keyword.put(device_config, :devices, devices)
+
+  # `MeshSync.boot_devices/0` never raises, but a supervisor init must not
+  # fail over sub-devices: none is the safe answer.
+  defp mesh_devices(fun) do
+    fun.()
+  rescue
+    _e -> []
+  catch
+    :exit, _reason -> []
   end
 
   # Wire the BLE adapters (passive scanner + active GATT proxy) into espex
