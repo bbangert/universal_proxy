@@ -211,7 +211,6 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       resubscribe_ms: Keyword.get(opts, :resubscribe_ms, 1_000),
       states: states_table(opts),
       mesh_groups: %{},
-      reported: %{},
       pushed: %{},
       dirty: MapSet.new(),
       flush: nil,
@@ -434,7 +433,8 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   # A diverted batch a member accepted: kept for that member, and for the
   # group once the diversion is over.
   defp accept(state, %{phase: :direct} = job, mac, batch) do
-    state = update_member_view(state, mac, Commands.expected(batch), job.components)
+    ids = read_ids(state)
+    state = update_member_view(state, mac, Commands.expected(batch), job.components, ids)
     {state, %{job | accepted: Map.update(job.accepted, mac, batch, &(&1 ++ batch))}}
   end
 
@@ -870,14 +870,20 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       |> Map.merge(Commands.committed(job.components, sent))
       |> Commands.reconcile_components(sent)
 
-    sent_at = sent_times(Map.get(state.views, job.target), job.command.device_id, sent)
-    view = %{device_id: job.command.device_id, dps: dps, sent_at: sent_at}
+    id = job.command.device_id
+
+    view =
+      case Map.get(state.views, job.target) do
+        %{device_id: ^id} = view -> %{view | dps: dps, sent_at: sent_times(view, id, sent)}
+        _none_or_stale -> %{device_id: id, dps: dps, sent_at: sent_times(nil, id, sent)}
+      end
+
     %{state | views: Map.put(state.views, job.target, view)}
   end
 
   # A member whose state isn't known yet still gets the send times (and
   # no values), so a report older than the group's send can't win later.
-  defp update_member_view(state, mac, sent, components, ids \\ %{}) do
+  defp update_member_view(state, mac, sent, components, ids) do
     target = {:bulb, mac}
 
     case Map.fetch(state.views, target) do
@@ -972,17 +978,22 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   # Per DP: a DP whose report time (`dp_at`) moved since last seen here is
   # taken unless it was set here after that report. A ping moves no DP's
   # time, so it never brings old values back.
+  #
+  # The cursor (when each DP was last seen, `:reported`) lives in the bulb's
+  # view, so it goes wherever the view goes: a view dropped and built again
+  # (an identity blip, say, then a group send's send times) starts with
+  # none, and the retained DPs are taken again.
   defp real_report(state, %{mac: mac} = bulb, id) when is_integer(id) do
     values = Map.get(bulb, :dps) || %{}
+    target = {:bulb, mac}
 
-    # The cursor counts only while the view it fed is still there: once a
-    # view is dropped (an identity blip, say), the retained DPs are taken
-    # again.
-    seen =
-      case Map.get(state.views, {:bulb, mac}) do
-        %{device_id: ^id} -> Map.get(state.reported, mac, %{})
-        _gone -> %{}
+    view =
+      case Map.get(state.views, target) do
+        %{device_id: ^id} = view -> view
+        _none_or_stale -> %{device_id: id, dps: %{}, sent_at: %{}}
       end
+
+    seen = Map.get(view, :reported, %{})
 
     fresh =
       for {dp, at} <- Map.get(bulb, :dp_at) || %{},
@@ -995,14 +1006,6 @@ defmodule UniversalProxy.TuyaMesh.Commander do
     if fresh == %{} do
       nil
     else
-      target = {:bulb, mac}
-
-      view =
-        case Map.get(state.views, target) do
-          %{device_id: ^id} = view -> view
-          _none_or_stale -> %{device_id: id, dps: %{}, sent_at: %{}}
-        end
-
       real =
         for {dp, at} <- fresh,
             later?(at, Map.fetch(view.sent_at, dp)),
@@ -1010,12 +1013,16 @@ defmodule UniversalProxy.TuyaMesh.Commander do
             do: {dp, values[dp]}
 
       dps = view.dps |> Map.merge(real) |> Commands.reconcile_components(real)
-      view = %{view | dps: dps, sent_at: Map.drop(view.sent_at, Map.keys(real))}
-      state = %{state | reported: Map.put(state.reported, mac, Map.merge(seen, fresh))}
 
-      if real == %{},
-        do: {:seen, state},
-        else: %{state | views: Map.put(state.views, target, view)}
+      view =
+        Map.merge(view, %{
+          dps: dps,
+          sent_at: Map.drop(view.sent_at, Map.keys(real)),
+          reported: Map.merge(seen, fresh)
+        })
+
+      state = %{state | views: Map.put(state.views, target, view)}
+      if real == %{}, do: {:seen, state}, else: state
     end
   end
 

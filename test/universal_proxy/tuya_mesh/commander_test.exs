@@ -742,6 +742,51 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       assert %{state: false} = last_push(pushed, 6)
     end
 
+    test "a member's report older than a diverted direct send never wins, even before it is known" do
+      script = %{group_set: [{:error, :busy}]}
+      {pid, _agent} = start(push_debounce_ms: 10, script: script, retry_ms: 100)
+      report(pid, [])
+      before = now()
+
+      Commander.command(cmd({:group, 1}, on()), pid)
+      assert_receive {:lights, {:group_set, 1, [on: true], _}}, 2_000
+      Commander.command(cmd({:bulb, @b}, %Req{has_state: true, state: false}, 99, 7), pid)
+      idle(pid)
+      flushed(pid)
+      assert {@a, [on: true]} in sets()
+      _ = pushes()
+
+      # A's off report, sent before the diverted on, arrives late.
+      report(pid, [{@a, @off, before - 1}])
+      assert of(pushes(), 5) == []
+      refute Map.has_key?(:sys.get_state(pid).views[{:bulb, @a}].dps, 1)
+
+      report(pid, [{@a, @off, now() + 1}])
+      assert %{state: false} = last_push(pushes(), 5)
+    end
+
+    test "a view rebuilt by a group send after an identity blip takes the retained report" do
+      {pid, agent} = start(push_debounce_ms: 10)
+      at = now()
+      report(pid, [{@a, @on_white, at}])
+
+      Agent.update(agent, &%{&1 | ids: %{}})
+      send(pid, {:tuya_mesh_store, :inventory_changed})
+      flushed(pid)
+      refute Map.has_key?(:sys.get_state(pid).views, {:bulb, @a})
+
+      # Back, and a group send stamps A before the Resolver's next status.
+      Agent.update(agent, &%{&1 | ids: @ids})
+      send(pid, {:tuya_mesh_store, :inventory_changed})
+      Commander.command(cmd({:group, 1}, on()), pid)
+      idle(pid)
+      assert :sys.get_state(pid).views[{:bulb, @a}].dps == %{}
+
+      # The same retained stamps: every DP the send didn't touch is taken.
+      report(pid, [{@a, @on_white, at}])
+      assert %{2 => 0, 3 => 1000, 4 => 0} = :sys.get_state(pid).views[{:bulb, @a}].dps
+    end
+
     test "what was pushed is kept for new connections" do
       {pid, _agent} = start(push_debounce_ms: 10, states_table: :unnamed)
       report(pid, [{@a, @on_white, now()}])
