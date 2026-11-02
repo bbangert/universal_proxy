@@ -80,8 +80,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
 
   # Every lease ever taken has been released (once): the radio is stopped
   # first so no setup attempt runs between the two counts.
-  defp assert_leases_balanced do
-    stop_supervised!({Radio, 0})
+  defp assert_leases_balanced(adapter_index \\ 0) do
+    stop_supervised!({Radio, adapter_index})
     acquired = for {:acquire, ref} <- FakeBluez.calls(), do: ref
     released = for {:release, ref} <- FakeBluez.calls(), do: ref
     assert Enum.sort(acquired) == Enum.sort(Enum.uniq(released))
@@ -114,6 +114,16 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
       assert status.listening
       assert status.subscribers == 0
       assert status.tx == nil
+
+      assert %{
+               advertise_failures: 0,
+               wedges: 0,
+               wedge_streak: 0,
+               recoveries: 0,
+               last_wedge_at: nil,
+               last_recovery_at: nil,
+               controller_reset_needed: false
+             } = status
 
       assert {:dbus, "SetDiscoveryFilter", [filter]} =
                List.keyfind(FakeBluez.calls(), "SetDiscoveryFilter", 1)
@@ -733,6 +743,279 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
       start_supervised!(radio_spec())
       wait_until(&ready?/0)
       refute {:dbus, "Get", ["org.bluez.Adapter1", "Address"]} in FakeBluez.calls()
+    end
+  end
+
+  describe "wedged controller" do
+    @mesh "AA:BB:CC:DD:EE:01"
+    @intruder "11:22:33:44:55:66"
+    @powered_off {:dbus, "Set", ["org.bluez.Adapter1", "Powered", {"b", false}]}
+
+    # Every `Powered` Set, as {object_path, value}, in call order.
+    defp power_sets(calls) do
+      calls
+      |> Enum.chunk_every(2, 1, :discard)
+      |> Enum.flat_map(fn
+        [{:dbus, "Set", ["org.bluez.Adapter1", "Powered", {"b", on?}]}, {:dbus_path, path, "Set"}] ->
+          [{path, on?}]
+
+        _other ->
+          []
+      end)
+    end
+
+    defp fail_frames(sns) do
+      for sn <- sns do
+        assert {:error, {:advertise, :failed}} = Radio.send_frame(device_frame(sn), 10)
+      end
+    end
+
+    defp wedge(sns), do: capture_log(fn -> fail_frames(sns) end)
+
+    defp status! do
+      {:ok, status} = Radio.status()
+      status
+    end
+
+    defp calls_since(mark), do: Enum.drop(FakeBluez.calls(), mark)
+
+    # The wedge's retry is pending, due in at most `ms`.
+    defp assert_retry_in(ms) do
+      %{retry_timer: timer, ready: false} = :sys.get_state(Radio)
+      left = Process.read_timer(timer)
+      assert left > ms - 5_000 and left <= ms
+    end
+
+    defp retry_now do
+      send(Process.whereis(Radio), :retry_setup)
+      wait_until(&ready?/0)
+    end
+
+    test "consecutive controller faults wedge it; re-setup power-cycles the fenced adapter" do
+      FakeBluez.set_address(1, @mesh)
+
+      start_supervised!(radio_spec(adapter_index: 1, adapter_address: @mesh, wedge_retry_ms: 300))
+
+      wait_until(&ready?/0)
+      assert power_sets(FakeBluez.calls()) == [{"/org/bluez/hci1", true}]
+
+      FakeBluez.fail(:advertise, :failed)
+      log = wedge(1..2)
+      assert log =~ "advertise failed (:failed)"
+      assert %{ready: true, advertise_failures: 2, wedges: 0} = status!()
+
+      log = wedge([3])
+      assert log =~ "controller wedged"
+      mark = length(FakeBluez.calls())
+
+      status = status!()
+
+      assert %{
+               ready: false,
+               last_error: {:controller_wedged, :failed},
+               lease_held: false,
+               advertise_failures: 0,
+               wedges: 1,
+               wedge_streak: 1,
+               recoveries: 0,
+               controller_reset_needed: false
+             } = status
+
+      assert %DateTime{} = status.last_wedge_at
+
+      # Recovering: refused before reaching Mgmt, so callers back off.
+      assert {:error, :not_ready} = Radio.send_frame(device_frame(4), 10)
+      assert advertises() == []
+
+      FakeBluez.succeed(:advertise)
+      capture_log(fn -> wait_until(&ready?/0) end)
+
+      new = calls_since(mark)
+
+      assert power_sets(new) == [
+               {"/org/bluez/hci1", false},
+               {"/org/bluez/hci1", true},
+               {"/org/bluez/hci1", true}
+             ]
+
+      check = Enum.find_index(new, &(&1 == {:dbus, "Get", ["org.bluez.Adapter1", "Address"]}))
+      off = Enum.find_index(new, &(&1 == @powered_off))
+      acquire = Enum.find_index(new, &match?({:acquire, _}, &1))
+      assert check < off and off < acquire
+      refute Enum.any?(FakeBluez.calls(), &match?({:dbus_path, "/org/bluez/hci0", _}, &1))
+
+      status = status!()
+      assert %{last_error: nil, recoveries: 1, wedge_streak: 1} = status
+      assert %DateTime{} = status.last_recovery_at
+
+      # The first accepted advertise proves it recovered.
+      assert :ok = Radio.send_frame(device_frame(5), 10)
+      assert %{wedge_streak: 0, wedges: 1, controller_reset_needed: false} = status!()
+      assert_leases_balanced(1)
+    end
+
+    @tag :capture_log
+    test "an index taken over by another adapter is never power-cycled" do
+      FakeBluez.set_address(1, @mesh)
+
+      start_supervised!(radio_spec(adapter_index: 1, adapter_address: @mesh, wedge_retry_ms: 20))
+
+      wait_until(&ready?/0)
+      FakeBluez.set_address(1, @intruder)
+      FakeBluez.fail(:advertise, :failed)
+      wedge(1..3)
+      mark = length(FakeBluez.calls())
+
+      wait_until(fn ->
+        match?(%{last_error: {:wrong_adapter, @intruder}}, status!()) and
+          length(calls_since(mark)) > 6
+      end)
+
+      assert power_sets(calls_since(mark)) == []
+      assert %{recoveries: 0} = status!()
+
+      # Its own adapter back: that one is cycled.
+      FakeBluez.set_address(1, @mesh)
+      wait_until(&ready?/0)
+      assert [{"/org/bluez/hci1", false} | _] = power_sets(calls_since(mark))
+      assert %{recoveries: 1} = status!()
+    end
+
+    @tag :capture_log
+    test "a power-cycle that fails is retried before the lease is taken" do
+      start_supervised!(radio_spec(wedge_retry_ms: 20))
+      wait_until(&ready?/0)
+      acquired = FakeBluez.count(:acquire)
+      FakeBluez.fail(:advertise, :failed)
+      FakeBluez.fail({:dbus, "Set"}, "org.bluez.Error.Busy")
+      wedge(1..3)
+
+      wait_until(fn ->
+        match?(%{last_error: {:power_cycle, "org.bluez.Error.Busy"}}, status!())
+      end)
+
+      assert FakeBluez.count(:acquire) == acquired
+
+      FakeBluez.succeed({:dbus, "Set"})
+      wait_until(&ready?/0)
+      assert %{recoveries: 1} = status!()
+      assert_leases_balanced()
+    end
+
+    @tag :capture_log
+    test "an accepted advertise in between resets the count" do
+      start_supervised!(radio_spec())
+      wait_until(&ready?/0)
+      FakeBluez.fail(:advertise, :failed)
+      fail_frames(1..2)
+
+      FakeBluez.succeed(:advertise)
+      assert :ok = Radio.send_frame(device_frame(3), 10)
+      :ok = Radio.stop_tx()
+      assert %{advertise_failures: 0} = status!()
+
+      FakeBluez.fail(:advertise, :failed)
+      fail_frames(4..5)
+      assert %{ready: true, advertise_failures: 2, wedges: 0} = status!()
+    end
+
+    @tag :capture_log
+    test "refusals of the frame neither count nor reset the count" do
+      start_supervised!(radio_spec())
+      wait_until(&ready?/0)
+
+      for {reason, sn} <-
+            Enum.with_index([
+              :busy,
+              :rotation_busy,
+              :rejected,
+              :invalid_params,
+              :no_free_instance
+            ]) do
+        FakeBluez.fail(:advertise, reason)
+        assert {:error, {:advertise, ^reason}} = Radio.send_frame(device_frame(sn), 10)
+      end
+
+      assert %{ready: true, advertise_failures: 0} = status!()
+
+      FakeBluez.fail(:advertise, :failed)
+      fail_frames(10..11)
+      FakeBluez.fail(:advertise, :busy)
+      assert {:error, {:advertise, :busy}} = Radio.send_frame(device_frame(12), 10)
+      assert %{ready: true, advertise_failures: 2} = status!()
+
+      FakeBluez.fail(:advertise, :timeout)
+      assert {:error, {:advertise, :timeout}} = Radio.send_frame(device_frame(13), 10)
+      assert %{ready: false, last_error: {:controller_wedged, :timeout}} = status!()
+    end
+
+    @tag :capture_log
+    test "failures spread over more than the window wedge it too" do
+      start_supervised!(radio_spec(wedge_failures: 100, wedge_window_ms: 50))
+      wait_until(&ready?/0)
+      FakeBluez.fail(:advertise, :failed)
+      fail_frames([1])
+      Process.sleep(60)
+      fail_frames([2])
+      assert %{ready: false, last_error: {:controller_wedged, :failed}, wedges: 1} = status!()
+    end
+
+    @tag :capture_log
+    test "queued frames refused by a wedged controller drop the queue" do
+      start_supervised!(radio_spec())
+      wait_until(&ready?/0)
+
+      for sn <- 1..4, do: :ok = Radio.send_frame(device_frame(sn), 60_000)
+      FakeBluez.fail(:advertise, :failed)
+      finish_tx()
+
+      # Frames 2, 3 and 4 were each refused: the third wedged it.
+      assert length(advertises()) == 1
+
+      assert %{ready: false, last_error: {:controller_wedged, :failed}, tx: nil, queued: 0} =
+               status!()
+
+      assert {:error, :not_ready} = Radio.send_frame(device_frame(5), 10)
+    end
+
+    test "recovery backs off, escalates, and starts over once advertising works" do
+      start_supervised!(radio_spec(wedge_retry_ms: 40_000, max_wedge_retry_ms: 100_000))
+      wait_until(&ready?/0)
+      FakeBluez.fail(:advertise, :failed)
+
+      log = wedge(1..3)
+      assert log =~ "controller wedged"
+      refute log =~ "transport needs a reset"
+      assert_retry_in(40_000)
+      capture_log(&retry_now/0)
+      assert %{recoveries: 1, wedge_streak: 1, controller_reset_needed: false} = status!()
+
+      # Still failing right after the power-cycle: escalated.
+      log = wedge(4..6)
+      assert log =~ "still wedged"
+      assert log =~ "transport needs a reset"
+      assert_retry_in(80_000)
+      assert %{wedges: 2, wedge_streak: 2, controller_reset_needed: true} = status!()
+      capture_log(&retry_now/0)
+      assert %{recoveries: 2, controller_reset_needed: true} = status!()
+
+      log = wedge(7..9)
+      assert log =~ "wedged 3 times in a row"
+      assert_retry_in(100_000)
+      capture_log(&retry_now/0)
+
+      FakeBluez.succeed(:advertise)
+      capture_log(fn -> assert :ok = Radio.send_frame(device_frame(10), 10) end)
+      :ok = Radio.stop_tx()
+
+      assert %{wedges: 3, recoveries: 3, wedge_streak: 0, controller_reset_needed: false} =
+               status!()
+
+      # A later wedge starts the ladder (and the backoff) over.
+      FakeBluez.fail(:advertise, :failed)
+      log = wedge(11..13)
+      refute log =~ "still wedged"
+      assert_retry_in(40_000)
     end
   end
 
