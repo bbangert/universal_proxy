@@ -175,6 +175,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   until it passed the old value, so 3 consecutive in-order reports
   outside the window re-anchor it.
 
+  `dp_reported_at` (in `all/1` and `status/2`) maps each DP id to when a
+  DP report carrying it was last accepted (`:clock` ms): `dps` merges
+  every report, and a ping reply moves `last_report_ms` but no DP's time,
+  so this says which values a report actually brought, and when.
+
   Each bulb has two times (`:clock` milliseconds, in `all/1` and
   `status/2`): `last_report_ms`, when a report was last accepted, and
   `heard_ms`, when a frame that parses under the bulb's keys last came
@@ -745,7 +750,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
               heard_ms: now
           }
 
-          put_bulb(state, mac, apply_report(bulb, parsed))
+          put_bulb(state, mac, apply_report(bulb, parsed, now))
 
         # Held for re-anchoring: heard, nothing applied.
         {:hold, resync} ->
@@ -803,11 +808,21 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
 
   defp fresh?(last, sn), do: Integer.mod(sn - last, 65_536) in 1..@report_window
 
-  defp apply_report(bulb, %{type: 1, sub_cmd: sub, payload: payload})
+  # Only a DP report stamps the DPs it carried (`dp_reported_at`).
+  defp apply_report(bulb, %{type: 1, sub_cmd: sub, payload: payload}, now)
        when sub in [7, 9, 10, 11] do
     dps = Map.new(Dp.decode(payload), fn {id, _, v} -> {id, v} end)
-    %{bulb | dps: Map.merge(bulb.dps, dps), last_event: {:dp_report, sub}}
+    stamped = Map.new(dps, fn {id, _v} -> {id, now} end)
+
+    %{
+      bulb
+      | dps: Map.merge(bulb.dps, dps),
+        dp_reported_at: Map.merge(bulb.dp_reported_at, stamped),
+        last_event: {:dp_report, sub}
+    }
   end
+
+  defp apply_report(bulb, parsed, _now), do: apply_report(bulb, parsed)
 
   defp apply_report(bulb, %{type: 1, sub_cmd: 2, payload: <<0x01, _::binary>>}),
     do: %{bulb | last_event: :ping_reply}
@@ -1188,6 +1203,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
       groups: bulb.groups,
       last_event: bulb.last_event,
       last_report_ms: bulb.last_report_ms,
+      dp_reported_at: bulb.dp_reported_at,
       heard_ms: bulb.heard_ms
     }
   end
@@ -1200,6 +1216,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
          node_id: b.node_id,
          label: b.label,
          dps: %{},
+         dp_reported_at: %{},
          groups: nil,
          last_sn: nil,
          resync: nil,

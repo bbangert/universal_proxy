@@ -428,7 +428,9 @@ defmodule UniversalProxy.TuyaMesh.CommandsTest do
                Commands.reconcile_components(dps, %{11 => <<0::16, 100, 40>>})
 
       assert %{brightness: 0.4, color_brightness: 1.0, peak: 1.0} =
-               Commands.reconcile_components(%{11 => <<0::16, 1, 40>>}, %{11 => <<0::16, 1, 40>>})
+               Commands.reconcile_components(%{2 => 1, 11 => <<0::16, 1, 40>>}, %{
+                 11 => <<0::16, 1, 40>>
+               })
     end
 
     test "a reported DP3 sets the brightness in white mode only" do
@@ -437,6 +439,17 @@ defmodule UniversalProxy.TuyaMesh.CommandsTest do
 
       colour = %{2 => 1, 3 => 300, brightness: 1.0}
       assert Commands.reconcile_components(colour, %{3 => 300}) == colour
+    end
+
+    test "in white mode an old colour in a merged report doesn't set the brightness" do
+      dps = %{2 => 0, 3 => 800, 11 => <<0::16, 100, 20>>}
+      reported = %{3 => 800, 11 => <<0::16, 100, 20>>}
+      assert %{brightness: 0.8} = Commands.reconcile_components(dps, reported)
+
+      refute Map.has_key?(
+               Commands.reconcile_components(dps, %{11 => <<0::16, 100, 20>>}),
+               :brightness
+             )
     end
 
     test "other reports leave them" do

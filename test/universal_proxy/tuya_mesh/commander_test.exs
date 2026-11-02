@@ -97,8 +97,22 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
 
     defp report(s, mac, batch) do
       s = %{s | clock: s.clock + 1}
+      sent = Commands.expected(batch)
       bulb = Map.get(s.bulbs, mac, %{dps: %{}, last_report_ms: nil})
-      bulb = %{bulb | dps: Map.merge(bulb.dps, Commands.expected(batch)), last_report_ms: s.clock}
+
+      stamps =
+        Map.merge(
+          Map.get(bulb, :dp_reported_at, %{}),
+          Map.new(sent, fn {dp, _} -> {dp, s.clock} end)
+        )
+
+      bulb =
+        Map.merge(bulb, %{
+          dps: Map.merge(bulb.dps, sent),
+          last_report_ms: s.clock,
+          dp_reported_at: stamps
+        })
+
       %{s | bulbs: Map.put(s.bulbs, mac, bulb)}
     end
   end
@@ -213,7 +227,10 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
   # A Resolver status: `bulbs` as {mac, dps, dps_at}.
   defp status(bulbs, groups \\ @groups) do
     %{
-      bulbs: for({mac, dps, at} <- bulbs, do: %{mac: mac, dps: dps, dps_at: at}),
+      bulbs:
+        for {mac, dps, at} <- bulbs do
+          %{mac: mac, dps: dps, dp_at: Map.new(dps, fn {dp, _v} -> {dp, at} end), dps_at: at}
+        end,
       groups: groups
     }
   end
@@ -589,6 +606,48 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       flushed(pid)
 
       assert [%{device_id: 5, state: true, brightness: 0.3}] = of(pushes(), 5)
+    end
+
+    test "a ping after a local send never brings an old report back" do
+      {pid, _agent} = start(push_debounce_ms: 10)
+      at = now()
+      report(pid, [{@a, @on_white, at}])
+
+      Commander.command(cmd({:bulb, @a}, %Req{has_brightness: true, brightness: 0.5}), pid)
+      idle(pid)
+      flushed(pid)
+      _ = pushes()
+
+      # The ping reply moved no DP's report time: the same stamps again.
+      send(pid, {:tuya_mesh_status, status([{@a, @on_white, at}])})
+      flushed(pid)
+      assert pushes() == []
+      assert :sys.get_state(pid).views[{:bulb, @a}].dps[3] == 500
+    end
+
+    test "a group whose members change is derived again without a report" do
+      {pid, _agent} = start(push_debounce_ms: 10)
+      at = now()
+      groups = [%{local_id: 3, members: [@b]}]
+
+      send(pid, {:tuya_mesh_status, status([{@b, @on_white, at}, {@c, @off, at}], groups)})
+      flushed(pid)
+      assert %{state: true} = last_push(pushes(), 11)
+
+      # Group 3 moves from the on bulb to the off one; nothing reports.
+      send(pid, {:tuya_mesh_status, status([], [%{local_id: 3, members: [@c]}])})
+      flushed(pid)
+      assert %{state: false} = last_push(pushes(), 11)
+
+      # A new group over known bulbs gets its state at once.
+      send(
+        pid,
+        {:tuya_mesh_status,
+         status([], [%{local_id: 3, members: [@c]}, %{local_id: 1, members: [@b]}])}
+      )
+
+      flushed(pid)
+      assert [%{device_id: 6, state: true}] = pushes()
     end
 
     test "what was pushed is kept for new connections" do

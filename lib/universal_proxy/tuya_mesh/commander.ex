@@ -48,10 +48,9 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       frame reaches only part of the members (4–9 of 10 on hardware), so
       after `:window_ms` every member that hasn't confirmed a DP gets one
       round of direct sets carrying only what it is missing, one every
-      `:followup_gap_ms`. A DP is confirmed only by a report after the
-      command that changed it to the wanted value (Lights keeps merged
-      DPs, not per-report ones), so a DP that already held that value is
-      resent.
+      `:followup_gap_ms`. A DP is confirmed only by a DP report after the
+      command that carried it with the wanted value (Lights stamps each
+      reported DP, `dp_reported_at`; a ping reply stamps none).
 
   `{:error, :busy}` and `{:error, :queue_full}` wait for capacity (see
   "Backlog"); any other error stops the command. A direct send that fails
@@ -104,13 +103,12 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       sends records only what at least one member accepted; nothing
       refused is recorded.
     * **Real:** every bulb's reported DPs arrive with the Resolver's
-      status (`{:tuya_mesh_status, _}`: `dps` and `dps_at`). A bulb with a
-      newer report gets every reported DP that wasn't set here after
-      that report (a DP's send time against the report's), and the
-      components follow a reported colour or brightness
-      (`Commands.reconcile_components/2`). Lights keeps merged DPs, not
-      per-report ones, so a report may carry older values for DPs it
-      didn't contain; the next report corrects them.
+      status (`{:tuya_mesh_status, _}`: `dps`, and `dp_at`, when a DP
+      report last carried each). A DP reported since it was last seen
+      here is taken unless it was set here after that report (its send
+      time against its report time), and the components follow a
+      reported colour or brightness (`Commands.reconcile_components/2`).
+      A ping reply carries no DPs and moves no DP's time.
     * **Groups** follow their members (`UniversalProxy.TuyaMesh.GroupState`,
       Home Assistant's light-group rules) over the members whose state is
       known; a group with none known shows what was last sent to it.
@@ -540,27 +538,27 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   end
 
   defp followups_for(mac, bulb, job) do
-    {before_ms, before_dps} = Map.get(job.snapshot, mac, {nil, %{}})
-
-    missing =
-      if reported_since?(bulb, before_ms),
-        do: Commands.unconfirmed(job.sent, fresh_dps(Map.get(bulb, :dps), before_dps)),
-        else: job.sent
-
-    Commands.split(missing)
+    before = Map.get(job.snapshot, mac, %{})
+    Commands.split(Commands.unconfirmed(job.sent, reported_since(bulb, before)))
   end
 
-  defp reported_since?(%{last_report_ms: at}, before) when is_integer(at), do: at != before
-  defp reported_since?(_bulb, _before), do: false
+  # The DPs a report carried after the command: Lights stamps each DP a DP
+  # report carries (`dp_reported_at`), and a ping reply none, so a DP is
+  # confirmed only when its stamp moved and its value is the one sent.
+  defp reported_since(%{dps: dps, dp_reported_at: stamps}, before)
+       when is_map(dps) and is_map(stamps) do
+    for {dp, at} <- stamps,
+        is_integer(at),
+        later?(at, Map.fetch(before, dp)),
+        Map.has_key?(dps, dp),
+        into: %{},
+        do: {dp, dps[dp]}
+  end
 
-  # Lights merges partial reports into a bulb's cached DPs, and a ping
-  # reply moves `last_report_ms` too, so only a DP whose value changed since
-  # the command was provably reported after it. One that already held the
-  # wanted value counts as unconfirmed: at worst a redundant frame.
-  defp fresh_dps(dps, before) when is_map(dps),
-    do: Map.reject(dps, fn {id, value} -> Map.fetch(before, id) == {:ok, value} end)
+  defp reported_since(_bulb, _before), do: %{}
 
-  defp fresh_dps(_dps, _before), do: %{}
+  defp later?(_at, :error), do: true
+  defp later?(at, {:ok, before}), do: at > before
 
   defp newer_command?(state, mac, job), do: Map.get(state.touched, mac, 0) > job.id
 
@@ -877,12 +875,24 @@ defmodule UniversalProxy.TuyaMesh.Commander do
     groups =
       Map.new(Map.get(status, :groups, []), fn g -> {g.local_id, Map.get(g, :members, [])} end)
 
-    state = %{state | mesh_groups: groups}
+    # A new group, or one whose members changed, is derived again whether
+    # or not anything reported; a removed one is forgotten.
+    changed =
+      for {gid, members} <- groups, Map.get(state.mesh_groups, gid) != members, do: {:group, gid}
+
+    removed =
+      for gid <- Map.keys(state.mesh_groups), not Map.has_key?(groups, gid), do: {:group, gid}
+
+    state =
+      %{state | mesh_groups: groups, views: Map.drop(state.views, removed)}
+      |> forget_pushed(removed)
+      |> mark_dirty(changed)
 
     {state, macs} =
       Enum.reduce(bulbs, {state, []}, fn bulb, {state, macs} ->
         case real_report(state, bulb, Map.get(ids, {:bulb, bulb.mac})) do
           nil -> {state, macs}
+          {:seen, state} -> {state, macs}
           state -> {state, [bulb.mac | macs]}
         end
       end)
@@ -892,10 +902,24 @@ defmodule UniversalProxy.TuyaMesh.Commander do
 
   defp apply_status(state, _status), do: state
 
+  # Per DP: a DP whose report time (`dp_at`) moved since last seen here is
+  # taken unless it was set here after that report. A ping moves no DP's
+  # time, so it never brings old values back.
   defp real_report(state, %{mac: mac} = bulb, id) when is_integer(id) do
-    at = Map.get(bulb, :dps_at)
+    values = Map.get(bulb, :dps) || %{}
+    seen = Map.get(state.reported, mac, %{})
 
-    if is_integer(at) and at != Map.get(state.reported, mac) do
+    fresh =
+      for {dp, at} <- Map.get(bulb, :dp_at) || %{},
+          is_integer(dp) and is_integer(at),
+          Map.has_key?(values, dp),
+          later?(at, Map.fetch(seen, dp)),
+          into: %{},
+          do: {dp, at}
+
+    if fresh == %{} do
+      nil
+    else
       target = {:bulb, mac}
 
       view =
@@ -905,29 +929,22 @@ defmodule UniversalProxy.TuyaMesh.Commander do
         end
 
       real =
-        for {dp, v} <- Map.get(bulb, :dps, %{}), real_newer?(view, dp, at), into: %{}, do: {dp, v}
+        for {dp, at} <- fresh,
+            later?(at, Map.fetch(view.sent_at, dp)),
+            into: %{},
+            do: {dp, values[dp]}
 
       dps = view.dps |> Map.merge(real) |> Commands.reconcile_components(real)
       view = %{view | dps: dps, sent_at: Map.drop(view.sent_at, Map.keys(real))}
+      state = %{state | reported: Map.put(state.reported, mac, Map.merge(seen, fresh))}
 
-      %{
-        state
-        | views: Map.put(state.views, target, view),
-          reported: Map.put(state.reported, mac, at)
-      }
+      if real == %{},
+        do: {:seen, state},
+        else: %{state | views: Map.put(state.views, target, view)}
     end
   end
 
   defp real_report(_state, _bulb, _id), do: nil
-
-  defp real_newer?(view, dp, at) when is_integer(dp) do
-    case Map.get(view.sent_at, dp) do
-      nil -> true
-      sent -> sent < at
-    end
-  end
-
-  defp real_newer?(_view, _dp, _at), do: false
 
   defp groups_of(state, macs) do
     for {gid, members} <- state.mesh_groups, Enum.any?(macs, &(&1 in members)), do: {:group, gid}
@@ -1064,7 +1081,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
         for %{mac: mac} = bulb <- bulbs,
             mac in members,
             into: %{},
-            do: {mac, {Map.get(bulb, :last_report_ms), Map.get(bulb, :dps) || %{}}}
+            do: {mac, Map.get(bulb, :dp_reported_at) || %{}}
 
       _error ->
         %{}

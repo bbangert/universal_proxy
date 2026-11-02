@@ -49,13 +49,14 @@ defmodule UniversalProxy.TuyaMesh.FakeLights do
       state.bulbs
       |> Enum.sort()
       |> Enum.map(fn {mac, last} ->
-        {dps, event} = Map.get(state.dps, mac, {%{}, nil})
+        {dps, event, stamps} = Map.get(state.dps, mac, {%{}, nil, %{}})
 
         %{
           mac: mac,
           last_report_ms: last,
           heard_ms: later(Map.get(state.heard, mac), last),
           dps: dps,
+          dp_reported_at: stamps,
           last_event: event
         }
       end)
@@ -105,13 +106,14 @@ defmodule UniversalProxy.TuyaMesh.FakeLights do
     do: {:reply, :ok, %{state | bulbs: Map.put(state.bulbs, mac, ms)}}
 
   def handle_call({:report_dps, mac, ms, dps}, _from, state) do
-    {known, _event} = Map.get(state.dps, mac, {%{}, nil})
+    {known, _event, stamps} = Map.get(state.dps, mac, {%{}, nil, %{}})
+    stamps = Map.merge(stamps, Map.new(dps, fn {dp, _v} -> {dp, ms} end))
 
     {:reply, :ok,
      %{
        state
        | bulbs: Map.put(state.bulbs, mac, ms),
-         dps: Map.put(state.dps, mac, {Map.merge(known, dps), {:dp_report, 7}})
+         dps: Map.put(state.dps, mac, {Map.merge(known, dps), {:dp_report, 7}, stamps})
      }}
   end
 

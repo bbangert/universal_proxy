@@ -773,6 +773,40 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
       assert {:ok, %{heard_ms: 10, last_report_ms: 10}} = Lights.status("path light 2")
     end
 
+    test "a ping reply moves last_report_ms, never a DP's report time", %{persisted: persisted} do
+      restart_lights(persisted, [])
+
+      tick(persisted, 10)
+      inject_report(2, 5, [{1, :bool, true}, {3, :value, 500}])
+
+      wait_until(fn ->
+        match?({:ok, %{dp_reported_at: %{1 => 10, 3 => 10}}}, Lights.status("path light 2"))
+      end)
+
+      tick(persisted, 10)
+      inject_report(2, 6, <<0x01>>, sub_cmd: 2)
+
+      wait_until(fn ->
+        match?(
+          {:ok, %{last_event: :ping_reply, last_report_ms: 20}},
+          Lights.status("path light 2")
+        )
+      end)
+
+      assert {:ok, %{dp_reported_at: %{1 => 10, 3 => 10}}} = Lights.status("path light 2")
+
+      # A later DP report stamps only the DPs it carried.
+      tick(persisted, 10)
+      inject_report(2, 7, [{3, :value, 600}])
+
+      wait_until(fn ->
+        match?({:ok, %{dp_reported_at: %{1 => 10, 3 => 30}}}, Lights.status("path light 2"))
+      end)
+
+      assert {:ok, [_ | _] = bulbs} = Lights.all()
+      assert %{dp_reported_at: %{1 => 10, 3 => 30}} = Enum.find(bulbs, &(&1.node_id == 2))
+    end
+
     test "a reply from a node not in the inventory is ignored" do
       pid = Process.whereis(Lights)
       assert :ok = Lights.ping_all()

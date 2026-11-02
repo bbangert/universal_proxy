@@ -69,9 +69,12 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   ## Reported DPs
 
   Every status bulb carries `dps`, the DPs Lights has from the bulb's
-  reports (merged per MAC, like last seen, so a restarted Lights that
-  knows none yet never empties them), and `dps_at`, the Lights time
-  (`last_report_ms`, monotonic ms) of the newest DP report seen, or nil.
+  reports, `dp_at`, when a DP report last carried each of them (Lights'
+  `dp_reported_at`, monotonic ms; a ping reply moves none), and `dps_at`,
+  the newest of those or nil. They are merged per MAC, like last seen, so
+  a restarted Lights that knows none yet never empties them.
+  `last_seen_ms` is last seen as that monotonic time, for a reader that
+  converts it to wall time only once the clock is known good.
   Lights is re-read on every Radio report (debounced), so a new report
   reaches the broadcast within about 300 ms. Bulbs report only on acked
   sets and pings (pings carry no DPs).
@@ -183,8 +186,10 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
               label: String.t() | nil,
               node_id: non_neg_integer(),
               last_seen: DateTime.t() | nil,
+              last_seen_ms: integer() | nil,
               reachable: boolean(),
               dps: %{optional(pos_integer()) => term()},
+              dp_at: %{optional(pos_integer()) => integer()},
               dps_at: integer() | nil,
               checking: boolean()
             }
@@ -243,9 +248,11 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
           inventory.bulbs,
           &Map.merge(&1, %{
             last_seen: nil,
+            last_seen_ms: nil,
             reachable: false,
             checking: false,
             dps: %{},
+            dp_at: %{},
             dps_at: nil
           })
         ),
@@ -782,19 +789,23 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
 
   # ── Presence ─────────────────────────────────────────────────────────
 
-  # A bulb's DPs and the time of its newest DP report: merged, so a
-  # restarted Lights (no DPs yet) never empties them. The time moves on a
-  # DP report (Lights' last event) or a change in the DPs.
+  # A bulb's DPs, each with when a DP report last carried it (Lights'
+  # `dp_reported_at`): a DP is taken only when reported later than the one
+  # known, so a restarted Lights (nothing reported yet) never empties them
+  # and a ping reply never moves them.
   defp put_dps(%{mac: mac} = bulb, acc) do
-    {known, at} = Map.get(acc, mac, {%{}, nil})
-    dps = Map.merge(known, Map.get(bulb, :dps) || %{})
-    reported = Map.get(bulb, :last_report_ms)
+    {known, known_at} = Map.get(acc, mac, {%{}, %{}})
+    values = Map.get(bulb, :dps) || %{}
 
-    fresh? =
-      is_integer(reported) and (at == nil or reported > at) and
-        (match?({:dp_report, _}, Map.get(bulb, :last_event)) or dps != known)
+    newer =
+      for {dp, at} <- Map.get(bulb, :dp_reported_at) || %{},
+          is_integer(at),
+          Map.has_key?(values, dp),
+          at > Map.get(known_at, dp, at - 1),
+          do: {dp, at}
 
-    Map.put(acc, mac, {dps, if(fresh?, do: reported, else: at)})
+    dps = Map.merge(known, Map.new(newer, fn {dp, _at} -> {dp, values[dp]} end))
+    Map.put(acc, mac, {dps, Map.merge(known_at, Map.new(newer))})
   end
 
   # A restarted Lights reports every bulb unheard (nil): never let that
@@ -935,14 +946,16 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
           {reachable, checking} =
             bulb_presence(state, last, Map.get(state.presence, bulb.mac), now)
 
-          {dps, dps_at} = Map.get(state.last_dps, bulb.mac, {%{}, nil})
+          {dps, dp_at} = Map.get(state.last_dps, bulb.mac, {%{}, %{}})
 
           Map.merge(bulb, %{
             last_seen: last_seen(last),
+            last_seen_ms: last,
             reachable: reachable,
             checking: checking,
             dps: dps,
-            dps_at: dps_at
+            dp_at: dp_at,
+            dps_at: dp_at |> Map.values() |> Enum.max(fn -> nil end)
           })
         end),
       groups: inventory.groups

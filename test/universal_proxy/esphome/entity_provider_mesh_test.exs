@@ -226,6 +226,55 @@ defmodule UniversalProxy.ESPHome.EntityProviderMeshTest do
                       %Proto.TextSensorStateResponse{key: ^last, missing_state: false}}
     end
 
+    test "a status built before the sync never shows its 1970 date" do
+      {sources, put} = start_inputs(%{synced: false})
+      pid = start_provider(sources)
+      last = Entities.key_for("tuya_dc23530fb34a_last_seen")
+      heard = System.monotonic_time(:millisecond)
+
+      # Built before the sync: the wall clock it used said 1970.
+      status = %{
+        bulbs: [
+          %{mac: @mac1, reachable: true, last_seen: ~U[1970-01-01 00:00:05Z], last_seen_ms: heard}
+        ]
+      }
+
+      send(pid, {:tuya_mesh_status, status})
+      assert_receive {:mesh_push, %Proto.TextSensorStateResponse{key: ^last, missing_state: true}}
+
+      # The clock syncs; no new status arrives before the check tick.
+      put.(:synced, true)
+      send(pid, :mesh_check)
+
+      assert_receive {:mesh_push,
+                      %Proto.TextSensorStateResponse{
+                        key: ^last,
+                        missing_state: false,
+                        state: shown
+                      }}
+
+      refute shown =~ "1970"
+      assert shown =~ "#{Date.utc_today().year}"
+    end
+
+    test "a catch-up after a PubSub outage pushes what changed meanwhile" do
+      pubsub = :"ep_mesh_catchup_pubsub_#{System.unique_integer([:positive])}"
+
+      {sources, put} =
+        start_inputs(%{status: %{bulbs: [%{mac: @mac1, reachable: true, last_seen: nil}]}})
+
+      pid = start_provider(sources, subscribe: true, pubsub: pubsub)
+      conn = Entities.key_for("tuya_dc23530fb34a_connectivity")
+
+      # Unreachable while nothing was subscribed.
+      put.(:status, %{bulbs: [%{mac: @mac1, reachable: false, last_seen: nil}]})
+      start_supervised!({Phoenix.PubSub, name: pubsub})
+      fire(pid, :resubscribe)
+
+      assert_receive {:mesh_push,
+                      %Proto.BinarySensorStateResponse{key: ^conn, device_id: 1, state: false}}
+    end
+
     test "no live push for a bulb whose sub-device changed" do
       {sources, _put} = start_inputs(%{ids: %{{:bulb, @mac1} => 99, {:bulb, @mac2} => 2}})
       pid = start_provider(sources)

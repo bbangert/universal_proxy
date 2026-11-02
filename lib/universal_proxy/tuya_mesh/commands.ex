@@ -270,26 +270,31 @@ defmodule UniversalProxy.TuyaMesh.Commands do
 
   @doc """
   Keeps the components (`components/2`) true to `reported`, DPs a bulb
-  reported (already merged into `dps`): a reported colour whose `v` the
-  kept components don't produce resets them to brightness `v`/100, colour
-  brightness and peak 1; a reported DP3 in white mode sets the
+  reported (already merged into `dps`). The light's mode (DP2 in `dps`)
+  picks the DP that counts: in colour mode, a reported colour whose `v`
+  the kept components don't produce resets them to brightness `v`/100,
+  colour brightness and peak 1; otherwise a reported DP3 sets the
   brightness. Anything else leaves them.
   """
   @spec reconcile_components(dps(), dps()) :: dps()
   def reconcile_components(dps, reported) do
-    cond do
-      match?(<<_h::16, _s, _v>>, Map.get(reported, 11)) ->
-        <<_h::16, _s, v>> = reported[11]
-
+    # Only the DP of the light's mode says its brightness: a merged report
+    # can carry an old colour while white, or an old DP3 while in colour.
+    case {Map.get(dps, 2), Map.get(reported, 11), Map.get(reported, 3)} do
+      {1, <<_h::16, _s, v>>, _dp3} ->
         if components_give?(dps, v),
           do: dps,
           else:
-            Map.merge(dps, %{brightness: clamp(v, 0, 100) / 100, color_brightness: 1.0, peak: 1.0})
+            Map.merge(dps, %{
+              brightness: clamp(v, 0, 100) / 100,
+              color_brightness: 1.0,
+              peak: 1.0
+            })
 
-      is_integer(Map.get(reported, 3)) and Map.get(dps, 2) != 1 ->
-        Map.put(dps, :brightness, clamp(reported[3], 10, 1000) / 1000)
+      {mode, _colour, dp3} when mode != 1 and is_integer(dp3) ->
+        Map.put(dps, :brightness, clamp(dp3, 10, 1000) / 1000)
 
-      true ->
+      _other ->
         dps
     end
   end

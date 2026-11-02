@@ -614,11 +614,17 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
       assert %{dps: dps, dps_at: nil} = bulb(ctx, @bulb3)
       assert dps == %{}
 
-      # A later report merges into what was known.
+      # A ping reply (no DPs) moves no DP's report time.
+      :ok = FakeLights.report(ctx.lights, @bulb2, at + 5)
+      wait_until(fn -> match?(%{last_seen: %DateTime{}}, bulb(ctx, @bulb2)) end)
+      Process.sleep(60)
+      assert %{dps_at: ^at, dp_at: %{1 => ^at, 3 => ^at}} = bulb(ctx, @bulb2)
+
+      # A later report merges into what was known, stamping only its DPs.
       later = at + 10
       :ok = FakeLights.report_dps(ctx.lights, @bulb2, later, %{3 => 600})
       wait_until(fn -> match?(%{dps_at: ^later}, bulb(ctx, @bulb2)) end)
-      assert %{dps: %{1 => true, 3 => 600}} = bulb(ctx, @bulb2)
+      assert %{dps: %{1 => true, 3 => 600}, dp_at: %{1 => ^at, 3 => ^later}} = bulb(ctx, @bulb2)
 
       # A restarted Lights knows no DPs: the status keeps them.
       :ok = FakeLights.put(ctx.lights, :dps, %{})

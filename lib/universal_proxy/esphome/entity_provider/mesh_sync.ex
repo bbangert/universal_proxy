@@ -168,7 +168,8 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
         t -> t
       end
 
-    read_live(t)
+    t = read_status(t)
+    if t.status, do: %{t | live: live_of(t, t.status)}, else: t
   end
 
   @doc """
@@ -356,11 +357,8 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
   defp same?(a, b),
     do: a.devices == b.devices and Entities.advertisements(a) == Entities.advertisements(b)
 
-  # Without pushing: before Espex runs, or a catch-up whose values the
-  # next status pushes anyway.
-  defp read_live(t) do
-    status = t.sources.mesh_status.()
-    %{t | status: status, live: live_of(t, status)}
+  defp read_status(t) do
+    %{t | status: t.sources.mesh_status.()}
   rescue
     _e -> t
   catch
@@ -370,14 +368,38 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
   # ── Live values ──────────────────────────────────────────────────────
 
   # Last seen is hidden (missing_state) until the clock has synchronised:
-  # a pre-sync wall clock would show 1970.
+  # a pre-sync wall clock would show 1970. It is converted here, with the
+  # current offset, from the status' monotonic `last_seen_ms`, so a status
+  # built before the sync never exposes the date it computed then.
   defp live_of(t, status) do
     live = Entities.live_from_status(status)
 
-    if source(t, :mesh_time_synced, [], &time_synced?/0),
-      do: live,
-      else: Map.new(live, fn {mac, v} -> {mac, %{v | last_seen: nil}} end)
+    if source(t, :mesh_time_synced, [], &time_synced?/0) do
+      seen_ms = last_seen_ms(status)
+
+      Map.new(live, fn {mac, v} ->
+        case Map.fetch(seen_ms, mac) do
+          {:ok, ms} -> {mac, %{v | last_seen: wall_time(ms)}}
+          :error -> {mac, v}
+        end
+      end)
+    else
+      Map.new(live, fn {mac, v} -> {mac, %{v | last_seen: nil}} end)
+    end
   end
+
+  defp last_seen_ms(%{bulbs: bulbs}) when is_list(bulbs),
+    do: for(%{mac: mac, last_seen_ms: ms} <- bulbs, into: %{}, do: {mac, ms})
+
+  defp last_seen_ms(_status), do: %{}
+
+  defp wall_time(ms) when is_integer(ms) do
+    (ms + System.time_offset(:millisecond))
+    |> DateTime.from_unix!(:millisecond)
+    |> DateTime.truncate(:second)
+  end
+
+  defp wall_time(_ms), do: nil
 
   # Pushes the connectivity and last-seen states that changed, each for
   # its bulb's current sub-device only.
@@ -574,5 +596,7 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
     end
   end
 
-  defp catch_up(t), do: t |> arm_read(0) |> read_live()
+  # What was missed is pushed: `live` is what the connections were last
+  # given, so the recovered status is compared against it.
+  defp catch_up(t), do: t |> arm_read(0) |> read_status() |> refresh_live()
 end
