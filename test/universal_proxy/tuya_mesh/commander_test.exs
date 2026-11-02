@@ -141,6 +141,8 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       end,
       push: &send(test, {:push, &1}),
       device_ids: fn -> Agent.get(agent, & &1.ids) end,
+      radio_status: fn -> Agent.get(agent, &radio_status/1) end,
+      radio_poll_ms: 10,
       subscribe: false,
       window_ms: 20,
       retry_ms: 1,
@@ -202,6 +204,15 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
   end
 
   defp now, do: System.monotonic_time(:millisecond)
+
+  # The Radio's queue as the test sets it (`:radio_queued`, default empty;
+  # `:down` for a Radio that doesn't answer).
+  defp radio_status(s) do
+    case Map.get(s, :radio_queued, 0) do
+      :down -> {:error, :not_running}
+      queued -> {:ok, %{queued: queued}}
+    end
+  end
 
   defp refusals(n \\ 0) do
     receive do
@@ -569,6 +580,33 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
 
       refute_received {:push, _}
       refute Map.has_key?(:sys.get_state(pid).views, {:group, 1})
+    end
+
+    test "follow-ups wait for the Radio's queue to drain; user commands don't" do
+      {pid, agent} = start()
+      Agent.update(agent, &Map.put(&1, :radio_queued, 2))
+
+      Commander.command(cmd({:group, 1}, on()), pid)
+      assert_receive {:lights, {:group_set, 1, [on: true], _}}, 2_000
+
+      # Past the window, the follow-ups are planned but held.
+      Process.sleep(150)
+      assert sets() == []
+
+      # A Radio that doesn't answer holds them too.
+      Agent.update(agent, &Map.put(&1, :radio_queued, :down))
+      Process.sleep(50)
+      assert sets() == []
+
+      # A new user command goes regardless.
+      Commander.command(cmd({:bulb, @e}, on()), pid)
+      assert_receive {:lights, {:set, @e, [on: true], _}}, 2_000
+      assert sets() == []
+
+      # Drained: the follow-ups resume.
+      Agent.update(agent, &Map.put(&1, :radio_queued, 0))
+      idle(pid)
+      assert length(sets()) == 3
     end
 
     test "a burst of group on/off/on ends in the last state" do

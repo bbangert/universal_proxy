@@ -21,8 +21,10 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       direct sends) go first, oldest command first; a confirmation read
       next (it only plans the follow-ups); follow-ups last, one per
       `:followup_gap_ms` (3 s, about one frame's airtime) across every
-      command, so they never queue more than a frame ahead of a new
-      command. The pacing never delays user frames.
+      command, and only while `Radio.status/1` shows nothing queued
+      (polled every `:radio_poll_ms`, 500 ms; unknown counts as busy), so
+      a new command never waits behind more than the frame on air. Neither
+      gate ever delays user frames.
     * **Capacity:** `{:error, :busy}` or `{:error, :queue_full}` keeps the
       frame where it is and holds every frame for `:retry_ms` (500 ms),
       doubling to `:max_retry_ms` (4 s) while the refusals last, back to
@@ -107,7 +109,9 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   `:device_ids` (`-> map`, default `Store.device_ids/1`), `:pubsub` and
   `:subscribe` (default `true`) for the Store broadcasts, `:push` (`struct
   -> any`, default `Espex.push_state/2` on `:server`), `:server`,
-  `:presence` (server, default `Presence`), `:window_ms` (6 s),
+  `:presence` (server, default `Presence`), `:radio_status` (`-> {:ok,
+  map} | {:error, term}`, default `Radio.status/1` with a 500 ms timeout),
+  `:radio_poll_ms`, `:window_ms` (6 s),
   `:retry_ms`, `:max_retry_ms`, `:stale_ms`, `:followup_gap_ms`,
   `:activity_hold_ms`, `:keepalive_ms` (see "Backlog"), `:max_followups`
   (10).
@@ -121,7 +125,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   require Logger
 
   alias Espex.Proto
-  alias UniversalProxy.TuyaBeaconMesh.Lights
+  alias UniversalProxy.TuyaBeaconMesh.{Lights, Radio}
   alias UniversalProxy.TuyaMesh
   alias UniversalProxy.TuyaMesh.{Commands, Presence, Store}
 
@@ -153,6 +157,8 @@ defmodule UniversalProxy.TuyaMesh.Commander do
     state = %{
       lights: Keyword.get(opts, :lights, Lights),
       lights_opts: Keyword.get(opts, :lights_opts, []),
+      radio_status: Keyword.get(opts, :radio_status, &default_radio_status/0),
+      radio_poll_ms: Keyword.get(opts, :radio_poll_ms, 500),
       members: Keyword.get(opts, :members, &default_members/1),
       device_ids: Keyword.get(opts, :device_ids, &default_device_ids/0),
       pubsub: Keyword.get(opts, :pubsub, UniversalProxy.PubSub),
@@ -533,10 +539,36 @@ defmodule UniversalProxy.TuyaMesh.Commander do
     state = state |> expire(now) |> signal_activity(false)
 
     case next_job(state, now) do
-      nil -> state
-      job -> step(state, job)
+      nil ->
+        state
+
+      job ->
+        if followup_frame?(job) and not radio_drained?(state),
+          do: wait_for_radio(state, now),
+          else: step(state, job)
     end
   end
+
+  # A follow-up goes only when the Radio has nothing queued: `:ok` from
+  # Lights means the frame entered the Radio's FIFO, so pacing alone would
+  # still let several follow-ups queue ahead of a later user command. An
+  # unknown status counts as not drained (for follow-ups only).
+  defp radio_drained?(state) do
+    case state.radio_status.() do
+      {:ok, %{queued: 0}} -> true
+      _queued_or_unknown -> false
+    end
+  catch
+    :exit, _reason -> false
+  end
+
+  # Polled again after `:radio_poll_ms` (user frames are never held).
+  defp wait_for_radio(state, now) do
+    at = now + state.radio_poll_ms
+    %{state | next_followup_at: max(state.next_followup_at || at, at)}
+  end
+
+  defp default_radio_status, do: Radio.status(timeout: 500)
 
   defp next_job(state, now) do
     state.jobs
