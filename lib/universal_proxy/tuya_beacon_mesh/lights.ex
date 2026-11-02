@@ -129,9 +129,12 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   is tied to the request that drew it, so a broadcast's replies count
   exactly as unicast ones do. A bulb whose inventory `beaconKey`
   overrides the mesh key can't open the broadcast; ping it with
-  `ping/2`. **UNVERIFIED** on hardware: whether these bulbs answer a
-  broadcast ping at all, and how many replies survive when they all
-  answer at once.
+  `ping/2`. Measured on one installation (a UB500 dongle, ten bulbs):
+  each broadcast drew replies from 8–9 of the 10, with a different bulb
+  missing each time (reply collisions or marginal reception). The rate in
+  larger meshes is unknown. So a bulb missing from a broadcast's replies
+  is **unconfirmed, not offline**: follow up with `ping/2` before counting
+  a miss.
 
   `:ok` from a command means the Radio accepted the frame for
   transmission (on air or queued), not that a bulb acted on it. Queued
@@ -321,7 +324,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   @doc """
   One broadcast ping to every bulb (see "Commands"); returns like `ping/2`.
   Replies update each answering bulb's `last_event` and `heard_ms`.
-  `opts`: `:server`. **UNVERIFIED** on hardware.
+  `opts`: `:server`.
+
+  Not every bulb answers every broadcast (about 80–90 % per frame on one
+  installation). A bulb that doesn't answer is unconfirmed, not offline:
+  ping it with `ping/2` before counting a miss.
   """
   @spec ping_all(keyword()) :: :ok | {:error, term()}
   def ping_all(opts \\ []), do: call(opts, :ping_all)

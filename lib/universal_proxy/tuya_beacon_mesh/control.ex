@@ -17,8 +17,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Control do
       the scan duty cycle needs the longer window).
 
   `ping_all/2` builds the app's broadcast ping (`FF FF`, keyed
-  `(beaconKey, beaconKey)`); unlike the conventions above, it is
-  **UNVERIFIED** on these bulbs.
+  `(beaconKey, beaconKey)`). It works on these bulbs, but on one
+  installation only: about 80–90 % of the bulbs answered each broadcast
+  (`docs/protocols/tuya_beacon_mesh.md` §4.9).
 
   Sequence numbers are the caller's problem: every bulb tracks the phone's
   SN across all destinations, accepts only SNs ahead of the highest it has
@@ -153,7 +154,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Control do
   @doc """
   Broadcast ping to `FF FF`, keyed `(beaconKey, beaconKey)`: every bulb that
   hears it should answer with a ping reply from its own node id. The reply
-  window is 5000 ms (§4.7). **UNVERIFIED** on hardware.
+  window is 5000 ms (§4.7). On hardware about 80–90 % of the bulbs answer
+  each broadcast (one installation, §4.9).
   """
   @spec ping_all(0..0xFFFF, key()) :: request()
   def ping_all(sn, beacon_key) do

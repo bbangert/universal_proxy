@@ -186,7 +186,7 @@ Which key encrypts and which masks, by destination
 |---|---|---|
 | unicast | localKey | beaconKey |
 | group | groupKey in the app; **beaconKey** on hardware | beaconKey |
-| broadcast ping | beaconKey | beaconKey (built as `Control.ping_all/2`; **UNVERIFIED** on hardware) |
+| broadcast ping | beaconKey | beaconKey (`Control.ping_all/2`; works on hardware, §4.9) |
 | device → phone | beaconKey | beaconKey |
 
 The app keys group frames (`FF gg`) with the groupKey, but the bulbs never
@@ -241,7 +241,7 @@ frame identical, which is how receivers dedupe them (§4.9).
 | DP set, ack wanted (`pqpbpqd`) | `0x0B` | 1 | `0x06` | DP TLVs | localKey |
 | Add to group (`qbqqdqq`) | `0x0B` | 1 | `0x01` | `A1 gg` | localKey |
 | Remove from groups (`bqpqqbb`) | `0x0B` | 1 | `0x01` | `A2 g1 [g2 …]` | localKey |
-| Ping (`dpdpqpd`) | `0x13` | 2 | `0x01` | `01` | localKey, or beaconKey for broadcast to `FF FF` (built, **UNVERIFIED** on hardware, §4.9) |
+| Ping (`dpdpqpd`) | `0x13` | 2 | `0x01` | `01` | localKey, or beaconKey for broadcast to `FF FF` (broadcast works on hardware, §4.9) |
 | Dismiss group (`qdppdpp`) | `0x13` | 2 | `0x01` | `A2 gg`, sent to `FF gg` | groupKey (beaconKey on hardware; dismiss itself untested) |
 | Raw data (`ddqbbqp`) | `0x10 + n` | 2 | `0x05` | TLV with DP id `0x57` | caller key |
 | Lock remote action (`dpddddp`) | `0x18` | 3 | `0x21` | 16 bytes, §4.8 | HKDF key |
@@ -340,7 +340,7 @@ Reports are decoded by `bluetooth.qpbdppq.bppdpdq`. Their destination is
 | Pair flag | Type | subCmd | First payload byte | Meaning |
 |---|---|---|---|---|
 | 1 | 3 | any | | pair result: `beaconExt` = payload[0..4) |
-| 0 | 1 | 2 | `01` | ping reply (**UNVERIFIED**) |
+| 0 | 1 | 2 | `01` | ping reply: the answer to a unicast or broadcast ping, and also sent unprompted at power-on, with no DPs (§4.9) |
 | 0 | 1 | 2 | `02` | reset acknowledged |
 | 0 | 1 | 2 | `A3` | group list: payload[1..9) holds up to 8 one-byte group IDs |
 | 0 | 1 | 7, 9, 10, 11 | | DP report as TLVs (§4.4). The tested bulbs report with subCmd 7 (§4.9); what 9–11 mean is **UNVERIFIED** |
@@ -426,11 +426,21 @@ is right for these bulbs.
 - **Reports** arrive as type 1, subCmd 7, addressed to `8000` or `8001`, and
   are unmasked and decrypted with the beaconKey (§4.6).
 - **Broadcast ping** (`FF FF`, beaconKey as both key and mask, 5000 ms
-  window) is built (`Control.ping_all/2`, `Lights.ping_all/1`) but
-  **UNVERIFIED**: not yet sent to these bulbs. Each reply is expected from
-  the answering bulb's own node ID, so `Lights` attributes it like any
-  report. Whether all ten answer, and how many replies survive answering
-  at once, is unmeasured.
+  window; `Control.ping_all/2`, `Lights.ping_all/1`) works. Each bulb
+  answers with an ordinary ping reply (§4.6) from its own node ID, so
+  `Lights` attributes it like any report, and one broadcast takes one
+  sequence number. Measured on one installation only (a UB500 dongle and
+  these ten bulbs): three broadcasts drew replies from 9, 9 and 8 of the
+  10 bulbs, so roughly 80–90 % per frame, with a different bulb missing
+  each time. That fits replies colliding on air or marginal reception, not
+  a bulb that ignores broadcasts. How the rate holds up in larger meshes
+  is unknown.
+- **A missing broadcast reply proves nothing.** It leaves that bulb
+  *unconfirmed*, not offline. A presence check should follow up with a
+  unicast ping (`Lights.ping/2`) before counting a miss.
+- **Power-on announce.** On power-up a bulb sends an unprompted ping reply
+  (type 1, subCmd 2, payload `01`, no DPs). When the transformer was
+  switched on, 8 of the 10 bulbs were heard within about 1 s.
 
 **Sequence numbers**
 
