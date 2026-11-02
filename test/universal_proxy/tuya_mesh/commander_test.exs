@@ -54,7 +54,11 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       {reply, s}
     end
 
+    # `on_all` runs on every read (the count includes this one), e.g. to
+    # replace the mesh while a read is in flight.
     defp handle(:all, s) do
+      s = %{s | all_reads: s.all_reads + 1}
+      s = s.on_all.(s)
       bulbs = for {mac, b} <- s.bulbs, do: Map.put(b, :mac, mac)
       {{:ok, bulbs}, s}
     end
@@ -84,7 +88,17 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
         {Agent,
          fn ->
            Map.merge(
-             %{test: test, set: %{}, group_set: [], hears: [], bulbs: %{}, clock: 0, ids: @ids},
+             %{
+               test: test,
+               set: %{},
+               group_set: [],
+               hears: [],
+               bulbs: %{},
+               clock: 0,
+               ids: @ids,
+               all_reads: 0,
+               on_all: & &1
+             },
              script
            )
          end}
@@ -598,6 +612,43 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       assert after_cmd.touched == before.touched
       assert after_cmd.views == before.views
       refute_received {:lights, {:group_set, _, _, _}}
+    end
+
+    test "a mesh change during the confirmation read sends no direct frame" do
+      # Read 1 is the snapshot at the command, read 2 the confirmation pass.
+      on_all = fn
+        %{all_reads: 2} = s -> %{s | ids: Map.put(s.ids, {:group, 1}, 42)}
+        s -> s
+      end
+
+      {pid, _agent} = start(script: %{on_all: on_all})
+
+      Commander.command(cmd({:group, 1}, on()), pid)
+      assert_receive {:lights, {:group_set, 1, [on: true], _}}
+      idle(pid)
+
+      assert sets() == []
+      refute Map.has_key?(:sys.get_state(pid).views, {:group, 1})
+    end
+
+    test "a kept view of another sub-device is never used" do
+      {pid, agent} = start(script: %{hears: [@a, @b, @c]})
+
+      red = %Req{has_state: true, state: true, has_rgb: true, red: 1.0, green: 0.0, blue: 0.0}
+      Commander.command(cmd({:group, 1}, red), pid)
+      idle(pid)
+      assert_receive {:lights, {:group_set, 1, [on: true, mode: :colour, colour: _], _}}
+
+      # The mesh was replaced with no Store broadcast reaching us.
+      new_mesh(agent, %{{:group, 1} => 42})
+      half = %Req{has_brightness: true, brightness: 0.5}
+      Commander.command(cmd({:group, 1}, half, 77, 42), pid)
+      idle(pid)
+
+      assert_received {:lights, {:group_set, 1, [brightness: 500], _}}
+      assert %{device_id: 42, dps: dps} = :sys.get_state(pid).views[{:group, 1}]
+      refute Map.has_key?(dps, 11)
+      refute_received {:push, %LightStateResponse{device_id: 42}}
     end
 
     test "a Store change drops stale commands and the kept DPs of changed lights" do

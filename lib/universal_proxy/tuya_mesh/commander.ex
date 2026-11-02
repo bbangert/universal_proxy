@@ -55,9 +55,11 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   them (`Store.device_ids/1`): a group's id is new whenever the stored
   mesh changes or the group leaves it (local group ids are reused for
   unrelated groups), and a bulb's follows its MAC, the physical bulb.
-  Right before every Lights call the light's id is read back, and a
-  command whose light no longer has that id is dropped, along with the
-  light's kept DPs. On every `{:tuya_mesh_store, _}` broadcast the same
+  A command is admitted only while its light still has that id, and
+  every frame goes out through one function that reads the id back right
+  before the Lights call: a command whose light no longer has it is
+  dropped, along with the light's kept DPs. Kept DPs are tied to their
+  sub-device id and never used for another. On every `{:tuya_mesh_store, _}` broadcast the same
   check drops the stale commands and kept DPs at once (subscribed at
   start; the per-send check is what guarantees it).
 
@@ -165,8 +167,9 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   def handle_cast(_msg, state), do: {:noreply, state}
 
   defp admit(state, %{target: target, request: request} = command) do
+    state = drop_stale_view(state, target, command.device_id)
     base = base_dps(state, target)
-    current = view_dps(state, target) || base
+    current = view_dps(state, target, command.device_id) || base
 
     case Commands.batches(request, command.settings, current) do
       [] ->
@@ -262,11 +265,14 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   end
 
   defp send_step(state, %{pending: [batch | rest]} = job) do
-    case send_batch(state, job.target, batch) do
+    case send_frame(state, job, job.target, batch) do
       :ok ->
         state = record(state, job, batch)
         job = %{job | pending: rest, sent: job.sent ++ batch, attempts: 0, sent_at: now()}
         if rest == [], do: sent_all(state, job), else: continue(state, job, 0)
+
+      :stale ->
+        abandon(state, job)
 
       {:error, reason} when reason in @retryable ->
         retry(state, job, reason, fn state -> stop_sending(state, job) end)
@@ -307,7 +313,10 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   end
 
   defp direct_send(state, job, mac, batch, rest) do
-    case state.lights.set(mac, batch, [ack: true] ++ state.lights_opts) do
+    case send_frame(state, job, {:bulb, mac}, batch) do
+      :stale ->
+        abandon(state, job)
+
       :ok ->
         {state, job} = accept(state, job, mac, batch)
         continue(state, %{job | pending: rest, attempts: 0}, state.followup_gap_ms)
@@ -350,10 +359,18 @@ defmodule UniversalProxy.TuyaMesh.Commander do
 
   defp drop_mac(items, mac), do: Enum.reject(items, &match?({^mac, _batch}, &1))
 
-  defp send_batch(state, {:bulb, mac}, batch),
+  # The one way a frame goes out: the job's light is checked against the
+  # Store right before every send, since a mesh can change during any
+  # earlier call (a confirmation read, a failed send) before its
+  # broadcast reaches this process.
+  defp send_frame(state, job, dest, batch) do
+    if current?(state, job), do: lights_send(state, dest, batch), else: :stale
+  end
+
+  defp lights_send(state, {:bulb, mac}, batch),
     do: state.lights.set(mac, batch, [ack: true] ++ state.lights_opts)
 
-  defp send_batch(state, {:group, gid}, batch),
+  defp lights_send(state, {:group, gid}, batch),
     do: state.lights.group_set(gid, batch, [ack: true] ++ state.lights_opts)
 
   defp retry(state, job, reason, give_up) do
@@ -529,10 +546,19 @@ defmodule UniversalProxy.TuyaMesh.Commander do
 
   # ── Views and optimistic state ───────────────────────────────────────
 
-  defp view_dps(state, target) do
+  # A kept view belongs to one sub-device: another id's is never used
+  # (without Store broadcasts, a replaced mesh's would linger).
+  defp view_dps(state, target, device_id) do
     case Map.get(state.views, target) do
-      %{dps: dps} -> dps
-      nil -> nil
+      %{device_id: ^device_id, dps: dps} -> dps
+      _none_or_stale -> nil
+    end
+  end
+
+  defp drop_stale_view(state, target, device_id) do
+    case Map.get(state.views, target) do
+      %{device_id: id} when id != device_id -> %{state | views: Map.delete(state.views, target)}
+      _same_or_none -> state
     end
   end
 
@@ -549,7 +575,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
 
   defp record_light(state, job, sent) do
     dps =
-      (view_dps(state, job.target) || job.base)
+      (view_dps(state, job.target, job.command.device_id) || job.base)
       |> Map.merge(sent)
       |> Map.merge(Commands.committed(job.components, sent))
 
@@ -570,7 +596,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
 
   defp push(state, job) do
     %{key: key, device_id: device_id, settings: settings} = job.command
-    dps = view_dps(state, job.target) || %{}
+    dps = view_dps(state, job.target, device_id) || %{}
 
     case Commands.state_response(dps, settings, key, device_id) do
       nil -> :ok
