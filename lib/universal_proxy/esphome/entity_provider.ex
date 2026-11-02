@@ -36,6 +36,29 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
   reports no `capacity` (no drive mounted); the binary sensor always has
   a real value (`false` when off/no drive).
 
+  ## Tuya mesh entities
+
+  On Bluetooth targets the mesh's bulbs and groups are advertised too, as
+  ESPHome sub-devices with entities (`UniversalProxy.TuyaMesh.Entities`),
+  after the static ones. That set is held here (with the key lookup it
+  adds) and rebuilt from the Store, the mesh role and the mesh settings
+  when any of them may have changed: on the Store's `{:tuya_mesh_store,
+  _}` broadcasts (uploads, clears, group changes, settings) and the
+  Bluetooth Manager's `{:bluetooth_state, _}` (role changes), debounced
+  (`:mesh_debounce_ms`, 1 s). Only when the sub-devices or the
+  advertisements differ from the held ones does it switch to the new set,
+  then `Espex.update_device_config(devices: ...)` and
+  `Espex.disconnect_clients/1`, in that order, so Home Assistant
+  reconnects and re-reads both. A label rename is a sub-device name
+  change, so it reconnects too. Inputs that can't be read keep the held
+  set: an unreadable Store must not read as "no bulbs" and make HA delete
+  them. `ESPHome.Supervisor` starts Espex with the held sub-devices
+  (`mesh_devices/0`), so a restarted Espex agrees with these entities.
+
+  Live values for the initial states (connectivity, last seen) come from
+  the Resolver's `{:tuya_mesh_status, status}` broadcasts. Mesh light
+  commands are acknowledged and logged, not acted on yet.
+
   ## Testability
 
   Every data source is an injectable 0-arity fun (mirroring the
@@ -55,8 +78,11 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
   alias UniversalProxy.Bluetooth.{RadioMonitor, Stats}
   alias UniversalProxy.ESPHome.Clients
   alias UniversalProxy.FirmwareUpdate.ConfigStore
+  alias UniversalProxy.TuyaMesh
+  alias UniversalProxy.TuyaMesh.{Entities, Store}
 
   @default_tick_ms 30_000
+  @default_mesh_debounce_ms 1_000
 
   # Updater phases that mean "an install is running" for HA's progress bar.
   @in_progress_phases [:downloading, :installing]
@@ -223,6 +249,17 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
   @impl Espex.EntityProvider
   def handle_command(command), do: GenServer.cast(__MODULE__, {:command, command})
 
+  @doc """
+  The Tuya mesh sub-devices the advertised entities belong to, `{:ok,
+  devices}`, or `:error` when this provider isn't running.
+  """
+  @spec mesh_devices(GenServer.server()) :: {:ok, [Espex.DeviceConfig.Device.t()]} | :error
+  def mesh_devices(server \\ __MODULE__) do
+    GenServer.call(server, :mesh_devices)
+  catch
+    :exit, _reason -> :error
+  end
+
   # Entities whose commands can reboot, wipe or reflash the device.
   @privileged_object_ids ~w(firmware_update factory_reset reboot)
 
@@ -285,20 +322,38 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
 
   @impl GenServer
   def init(opts) do
+    supported? = Keyword.get(opts, :supported?, default_supported?())
+    sources = build_sources(opts)
+
     state = %{
       server: Keyword.get(opts, :server, Espex.Server),
       tick_ms: Keyword.get(opts, :tick_ms, @default_tick_ms),
-      supported?: Keyword.get(opts, :supported?, default_supported?()),
-      sources: build_sources(opts),
+      supported?: supported?,
+      sources: sources,
       keys: key_lookup(),
-      last: %{}
+      last: %{},
+      pubsub: Keyword.get(opts, :pubsub, UniversalProxy.PubSub),
+      mesh: Entities.empty(),
+      mesh_live: %{},
+      mesh_timer: nil,
+      mesh_debounce_ms: Keyword.get(opts, :mesh_debounce_ms, @default_mesh_debounce_ms),
+      update_device_config:
+        Keyword.get(opts, :update_device_config, &Espex.update_device_config/2),
+      disconnect_clients: Keyword.get(opts, :disconnect_clients, &Espex.disconnect_clients/1)
     }
 
     # Firmware-update progress is event-driven, not poll-driven: a 30 s tick
     # would render HA's progress bar useless during an install. Subscribing is
     # best-effort — PubSub may not be up yet during a supervised restart, and
     # the poll tick still backstops the entity either way.
-    if Keyword.get(opts, :subscribe, true), do: subscribe_fw_progress()
+    if Keyword.get(opts, :subscribe, true) do
+      subscribe_fw_progress()
+      if supported?, do: subscribe_mesh(state.pubsub)
+    end
+
+    # Before any client can connect (Espex starts after this provider), and
+    # without telling Espex: it is started with these sub-devices.
+    state = if supported?, do: init_mesh(state), else: state
 
     # Seed `last` once at startup (before any client can connect) so
     # `initial_states/0` answers instantly off the connection-accept path
@@ -323,14 +378,19 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
 
   @impl GenServer
   def handle_call(:list_entities, _from, state) do
-    {:reply, advertisements(@specs, state.supported?), state}
+    {:reply, advertisements(@specs, state.supported?) ++ Entities.advertisements(state.mesh),
+     state}
   end
 
   # Returns the last-polled values (seeded at startup) — no source reads on
   # the connection-accept path. Values may be up to one tick stale.
   def handle_call(:initial_states, _from, state) do
-    {:reply, state_responses(@specs, state.last, state.supported?), state}
+    {:reply,
+     state_responses(@specs, state.last, state.supported?) ++
+       Entities.state_responses(state.mesh, state.mesh_live), state}
   end
+
+  def handle_call(:mesh_devices, _from, state), do: {:reply, {:ok, state.mesh.devices}, state}
 
   # Exposed for tests that drive a tick deterministically (no reschedule).
   def handle_call(:poll_now, _from, state) do
@@ -374,6 +434,17 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
       {:noreply, %{state | last: Map.put(state.last, "firmware_update", value)}}
     end
   end
+
+  # Uploads, clears, group and settings changes, and role changes: the
+  # mesh's sub-devices or entities may have changed.
+  def handle_info({:tuya_mesh_store, _event}, state), do: {:noreply, arm_mesh_sync(state)}
+  def handle_info({:bluetooth_state, _status}, state), do: {:noreply, arm_mesh_sync(state)}
+
+  def handle_info({:tuya_mesh_status, status}, state),
+    do: {:noreply, %{state | mesh_live: Entities.live_from_status(status)}}
+
+  def handle_info({:mesh_sync, ref}, %{mesh_timer: ref} = state),
+    do: {:noreply, sync_mesh(%{state | mesh_timer: nil})}
 
   def handle_info(_msg, state), do: {:noreply, state}
 
@@ -423,9 +494,112 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
     {:noreply, state}
   end
 
+  def handle_cast({:command, %Proto.LightCommandRequest{key: key}}, state) do
+    case Map.get(state.keys, key) do
+      {:tuya_mesh, target} ->
+        Logger.debug(
+          "EntityProvider: Tuya mesh light command for #{inspect(target)} not yet mapped"
+        )
+
+      other ->
+        Logger.debug("EntityProvider: ignoring light command for key #{inspect(other)}")
+    end
+
+    {:noreply, state}
+  end
+
   def handle_cast({:command, other}, state) do
     Logger.debug("EntityProvider: ignoring unknown command #{inspect(other)}")
     {:noreply, state}
+  end
+
+  def handle_cast(other, state) do
+    Logger.debug("EntityProvider: ignoring unexpected cast #{inspect(other)}")
+    {:noreply, state}
+  end
+
+  # ── Tuya mesh ───────────────────────────────────────────────────────
+
+  defp init_mesh(state) do
+    state =
+      case read_mesh(state) do
+        {:ok, mesh} -> put_mesh(state, mesh)
+        :unknown -> state
+      end
+
+    %{state | mesh_live: Entities.live_from_status(safe(state.sources.mesh_status, %{}))}
+  end
+
+  defp arm_mesh_sync(%{supported?: false} = state), do: state
+  defp arm_mesh_sync(%{mesh_timer: ref} = state) when is_reference(ref), do: state
+
+  defp arm_mesh_sync(state) do
+    ref = make_ref()
+    Process.send_after(self(), {:mesh_sync, ref}, state.mesh_debounce_ms)
+    %{state | mesh_timer: ref}
+  end
+
+  defp sync_mesh(state) do
+    with {:ok, mesh} <- read_mesh(state),
+         false <- same_mesh?(mesh, state.mesh) do
+      state = put_mesh(state, mesh)
+      reconnect(state, mesh.devices)
+      state
+    else
+      _unchanged_or_unknown -> state
+    end
+  end
+
+  defp same_mesh?(a, b),
+    do: a.devices == b.devices and Entities.advertisements(a) == Entities.advertisements(b)
+
+  defp read_mesh(state) do
+    Entities.read(
+      %{
+        supported?: true,
+        role: state.sources.mesh_role,
+        inventory: state.sources.mesh_inventory,
+        settings: state.sources.mesh_settings
+      },
+      reserved_keys: Map.keys(key_lookup()),
+      on_collision: Application.get_env(:universal_proxy, :tuya_entity_collisions, :skip)
+    )
+  end
+
+  defp put_mesh(state, mesh) do
+    mesh_keys = Map.new(mesh.keys, fn {key, target} -> {key, {:tuya_mesh, target}} end)
+    %{state | mesh: mesh, keys: Map.merge(mesh_keys, key_lookup())}
+  end
+
+  # Sub-devices first, then the reconnect, so the new connection reads both
+  # the new DeviceInfo and the new entities. With Espex down there is no
+  # one to reconnect, and its next start takes `mesh_devices/0`.
+  defp reconnect(state, devices) do
+    Logger.info("EntityProvider: Tuya mesh entities changed; reconnecting Home Assistant")
+
+    case state.update_device_config.(state.server, devices: devices) do
+      :ok ->
+        state.disconnect_clients.(state.server)
+
+      {:error, reason} ->
+        Logger.warning("EntityProvider: mesh sub-device update refused: #{inspect(reason)}")
+    end
+  rescue
+    ArgumentError -> :ok
+  catch
+    :exit, reason -> Logger.debug("EntityProvider: Espex not running (#{inspect(reason)})")
+  end
+
+  # Same best-effort contract as `subscribe_fw_progress/0`.
+  defp subscribe_mesh(pubsub) do
+    for topic <- [Store.topic(), TuyaMesh.topic(), Bluetooth.state_topic()],
+        do: Phoenix.PubSub.subscribe(pubsub, topic)
+
+    :ok
+  rescue
+    e in ArgumentError ->
+      Logger.debug("EntityProvider: Tuya mesh subscribe failed: #{Exception.message(e)}")
+      :ok
   end
 
   # Run the firmware command off this process. `install_latest/0` is a call
@@ -835,7 +1009,11 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
       fw_version: &FirmwareUpdate.current_version/0,
       fw_repo: &ConfigStore.get_repo/0,
       fw_check: &FirmwareUpdate.check/0,
-      fw_install: &FirmwareUpdate.install_latest/0
+      fw_install: &FirmwareUpdate.install_latest/0,
+      mesh_role: &Entities.mesh_role/0,
+      mesh_inventory: &Store.inventory_summary/0,
+      mesh_settings: &Store.settings/0,
+      mesh_status: &TuyaMesh.status/0
     }
 
     Map.merge(defaults, Map.new(Keyword.get(opts, :sources, [])))

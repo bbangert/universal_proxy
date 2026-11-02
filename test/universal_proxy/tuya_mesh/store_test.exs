@@ -624,6 +624,34 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
     end
   end
 
+  describe "inventory_summary" do
+    test "key-free bulbs and groups with their sub-device ids", ctx do
+      assert {:ok, %{bulbs: [], groups: [], device_ids: %{}}} =
+               Store.inventory_summary(ctx.store)
+
+      {:ok, _} = Store.replace(inventory(), [], ctx.store)
+      assert {:ok, summary} = Store.inventory_summary(ctx.store)
+
+      assert summary.bulbs == [
+               %{mac: @mac2, label: "path light 2"},
+               %{mac: @mac3, label: "post spot 1"}
+             ]
+
+      assert summary.groups == [%{local_id: 1, name: "path and post"}]
+      assert summary.device_ids == Store.device_ids(ctx.store)
+      assert map_size(summary.device_ids) == 3
+      refute_secrets(summary)
+    end
+
+    test "unavailable or invalid is an error, not an empty inventory", ctx do
+      down = :"down_#{System.unique_integer([:positive])}"
+      assert {:error, :unavailable} = Store.inventory_summary(down)
+
+      :ok = :dets.insert(ctx.table, {:inventory, %{"beaconKey" => "nope"}})
+      assert {:error, :invalid_inventory} = Store.inventory_summary(ctx.store)
+    end
+  end
+
   describe "revision" do
     defp revision(store) do
       {:ok, %{revision: revision}} = Store.preview(inventory(), store)
@@ -711,6 +739,26 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
       :ok = Store.clear(store)
       assert_receive {:tuya_mesh_store, :inventory_changed}
       :ok = Store.clear(store)
+      refute_receive {:tuya_mesh_store, _}, 50
+    end
+
+    test "settings changes, once written", ctx do
+      pubsub = :"store_pubsub_#{System.unique_integer([:positive])}"
+      start_supervised!({Phoenix.PubSub, name: pubsub})
+      Phoenix.PubSub.subscribe(pubsub, Store.topic())
+
+      store =
+        start_store(Path.join(ctx.tmp_dir, "s.dets"), :"s_#{System.unique_integer()}",
+          id: :settings_notifying,
+          pubsub: pubsub
+        )
+
+      :ok = Store.put_settings(%{max_mireds: 400}, store)
+      assert_receive {:tuya_mesh_store, :settings_changed}
+
+      # Unchanged or invalid: nothing written, nothing sent.
+      :ok = Store.put_settings(%{max_mireds: 400}, store)
+      {:error, :invalid_settings} = Store.put_settings(%{min_mireds: 999}, store)
       refute_receive {:tuya_mesh_store, _}, 50
     end
   end

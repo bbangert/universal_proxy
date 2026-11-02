@@ -144,7 +144,12 @@ defmodule UniversalProxy.TuyaMesh.Store do
   upload, a clear, a persist that changed the groups), `{:tuya_mesh_store,
   :inventory_changed}` is broadcast on `topic/0` (`:pubsub`, default
   `UniversalProxy.PubSub`). It carries nothing; subscribers re-read with
-  `load/1`. Seq-only writes (persist, tighten) stay silent.
+  `load/1`. Seq-only writes (persist, tighten) stay silent. A settings
+  change that was written broadcasts `{:tuya_mesh_store, :settings_changed}`.
+
+  `inventory_summary/1` is the key-free view the HA entities are built from:
+  the bulbs (MAC, label) and groups (local id, name) with their sub-device
+  ids, read in one call so they always agree.
 
   `:max_dump_advance` (default and maximum 299, see above) sets the bound.
 
@@ -176,6 +181,11 @@ defmodule UniversalProxy.TuyaMesh.Store do
   @type classification :: :empty | :same_mesh | :new_mesh
   @type settings :: %{min_mireds: pos_integer(), max_mireds: pos_integer(), invert: boolean()}
   @type summary :: %{mac: String.t(), label: String.t() | nil}
+  @type inventory_summary :: %{
+          bulbs: [summary()],
+          groups: [%{local_id: 0..254, name: String.t() | nil}],
+          device_ids: %{device_key() => pos_integer()}
+        }
   @type preview :: %{
           mesh: classification(),
           bulbs: %{added: [summary()], removed: [summary()]},
@@ -214,7 +224,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
     %{id: Keyword.get(opts, :id, __MODULE__), start: {__MODULE__, :start_link, [opts]}}
   end
 
-  @doc "PubSub topic of `{:tuya_mesh_store, :inventory_changed}` broadcasts."
+  @doc "PubSub topic of `{:tuya_mesh_store, :inventory_changed | :settings_changed}` broadcasts."
   @spec topic() :: String.t()
   def topic, do: @topic
 
@@ -299,6 +309,18 @@ defmodule UniversalProxy.TuyaMesh.Store do
   @spec clear(GenServer.server(), keyword()) :: :ok | {:error, term()}
   def clear(server \\ __MODULE__, opts \\ []),
     do: call(server, {:clear, opts}, {:error, :unavailable})
+
+  @doc """
+  The stored inventory without keys, plus every allocated sub-device id
+  (see the moduledoc): `{:ok, %{bulbs:, groups:, device_ids:}}`, with empty
+  lists when nothing is stored. `{:error, :invalid_inventory}` for a record
+  that no longer validates and `{:error, :unavailable}` when the Store is
+  down, so a caller can tell "nothing stored" from "can't tell".
+  """
+  @spec inventory_summary(GenServer.server()) ::
+          {:ok, inventory_summary()} | {:error, :invalid_inventory | :unavailable}
+  def inventory_summary(server \\ __MODULE__),
+    do: call(server, :inventory_summary, {:error, :unavailable})
 
   @doc "Every allocated sub-device id (see the moduledoc). `%{}` when unavailable."
   @spec device_ids(GenServer.server()) :: %{device_key() => pos_integer()}
@@ -504,6 +526,29 @@ defmodule UniversalProxy.TuyaMesh.Store do
     {:reply, reply, state}
   end
 
+  defp do_call(:inventory_summary, _from, state) do
+    ids = lookup(state.table, :device_ids, %{})
+
+    reply =
+      case stored(state.table) do
+        :absent ->
+          {:ok, %{bulbs: [], groups: [], device_ids: ids}}
+
+        {:valid, inv} ->
+          {:ok,
+           %{
+             bulbs: Enum.map(inv.bulbs, &%{mac: &1.mac, label: &1.label}),
+             groups: Enum.map(inv.groups, &%{local_id: &1.local_id, name: &1.name}),
+             device_ids: ids
+           }}
+
+        {:invalid, _raw} ->
+          {:error, :invalid_inventory}
+      end
+
+    {:reply, reply, state}
+  end
+
   defp do_call(:device_ids, _from, state) do
     {:reply, lookup(state.table, :device_ids, %{}), state}
   end
@@ -529,9 +574,17 @@ defmodule UniversalProxy.TuyaMesh.Store do
       Map.merge(current_settings(state.table), Map.take(changes, Map.keys(@default_settings)))
 
     reply =
-      if valid_settings?(merged),
-        do: write(state, [{:settings, merged}]),
-        else: {:error, :invalid_settings}
+      cond do
+        not valid_settings?(merged) ->
+          {:error, :invalid_settings}
+
+        merged == current_settings(state.table) ->
+          :ok
+
+        true ->
+          with :ok <- write(state, [{:settings, merged}]),
+               do: notify(state, :settings_changed)
+      end
 
     {:reply, reply, state}
   end
@@ -856,8 +909,8 @@ defmodule UniversalProxy.TuyaMesh.Store do
   end
 
   # PubSub's registry raises (not exits) when it isn't started.
-  defp notify(state) do
-    Phoenix.PubSub.broadcast(state.pubsub, @topic, {:tuya_mesh_store, :inventory_changed})
+  defp notify(state, event \\ :inventory_changed) do
+    Phoenix.PubSub.broadcast(state.pubsub, @topic, {:tuya_mesh_store, event})
     :ok
   rescue
     ArgumentError -> :ok

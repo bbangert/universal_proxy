@@ -43,3 +43,7 @@ config :universal_proxy, :audio_input_enumerate_module, UniversalProxy.Audio.Nul
 # root at a path that cannot exist; focused `Probe` tests pass an explicit
 # `sys_root:` against a fixture tree instead.
 config :universal_proxy, :storage_sys_root, "/tmp/universal_proxy_test_no_block_devices"
+
+# A crc32 collision between a Tuya mesh entity key and another entity's is
+# logged and skipped in production; tests fail on it instead.
+config :universal_proxy, :tuya_entity_collisions, :raise

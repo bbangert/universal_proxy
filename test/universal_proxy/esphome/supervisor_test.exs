@@ -91,4 +91,62 @@ defmodule UniversalProxy.ESPHome.SupervisorTest do
                )
     end
   end
+
+  describe "Tuya mesh sub-devices in the device config" do
+    alias Espex.DeviceConfig.Device
+
+    @devices [%Device{id: 1, name: "path light 2"}, %Device{id: 3, name: "path and post"}]
+
+    # The Espex child's start args: its options and the live-devices fun.
+    defp espex_start(init_opts) do
+      {:ok, {_flags, children}} = ESPHomeSupervisor.init(init_opts)
+
+      %{start: {ESPHomeSupervisor, :start_espex, [opts, fun]}} =
+        Enum.find(children, &(&1.id == Espex))
+
+      {opts, fun}
+    end
+
+    defp devices_of(opts), do: Keyword.fetch!(opts[:device_config], :devices)
+
+    test "init merges the current mesh devices" do
+      {opts, _fun} = espex_start(mesh_devices_fun: fn -> @devices end)
+      assert devices_of(opts) == @devices
+      # The rest of the device config is untouched.
+      assert Keyword.has_key?(opts[:device_config], :accepts_key_provisioning)
+    end
+
+    test "no mesh role, or the Store down, means no devices (the default reader on this host)" do
+      {opts, _fun} = espex_start([])
+      assert devices_of(opts) == []
+    end
+
+    test "a failing mesh read never fails the init" do
+      for fun <- [fn -> raise "boom" end, fn -> exit(:noproc) end] do
+        {opts, _fun} = espex_start(mesh_devices_fun: fun)
+        assert devices_of(opts) == []
+      end
+    end
+
+    test "every Espex start takes the provider's devices, else keeps the init ones" do
+      live = [%Device{id: 7, name: "added later"}]
+
+      {opts, fun} =
+        espex_start(mesh_devices_fun: fn -> @devices end, live_devices_fun: fn -> {:ok, live} end)
+
+      assert devices_of(ESPHomeSupervisor.refresh_devices(opts, fun.())) == live
+      assert devices_of(ESPHomeSupervisor.refresh_devices(opts, :error)) == @devices
+    end
+
+    test "the default live source is the running provider (no Bluetooth here: no devices)" do
+      {_opts, fun} = espex_start(mesh_devices_fun: fn -> @devices end)
+      assert fun.() in [:error, {:ok, []}]
+    end
+
+    test "merge_devices replaces the sub-devices and keeps the rest" do
+      merged = ESPHomeSupervisor.merge_devices([name: "x", devices: []], @devices)
+      assert merged[:name] == "x"
+      assert Keyword.get_values(merged, :devices) == [@devices]
+    end
+  end
 end
