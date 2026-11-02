@@ -216,6 +216,14 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
   @spec keys(t()) :: %{non_neg_integer() => Entities.target()}
   def keys(t), do: t.desired.keys
 
+  @doc "The desired build's entity with `key`, or `nil`."
+  @spec entity(t(), non_neg_integer()) :: Entities.entity() | nil
+  def entity(t, key), do: Enum.find(t.desired.entities, &(&1.key == key))
+
+  @doc "The desired build's mesh settings."
+  @spec settings(t()) :: Store.settings()
+  def settings(t), do: t.desired.settings
+
   @doc """
   Handles a provider message: `{:ok, t}` when it was one of ours,
   `:unhandled` otherwise.

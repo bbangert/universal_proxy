@@ -11,6 +11,8 @@ defmodule UniversalProxy.ESPHome.Supervisor do
        (the `Espex.InfraredProxy` adapter)
     3. `Espex` — the library supervisor: registry, server, TCP acceptor,
        and (optionally) mDNS advertiser
+    4. `UniversalProxy.TuyaMesh.Commander` (Bluetooth targets) — runs the
+       Tuya mesh light commands the `EntityProvider` hands it
 
   `ConfigStore` lives one level up in the application supervisor so a
   `restart/0` of this tree does not close and reopen the DETS file.
@@ -44,6 +46,7 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   alias UniversalProxy.Bluetooth.Settings, as: BluetoothSettings
   alias UniversalProxy.ESPHome.EntityProvider.MeshSync
   alias UniversalProxy.Hardware
+  alias UniversalProxy.TuyaMesh.Commander
   alias UniversalProxy.UART.Store, as: UARTStore
 
   def start_link(init_arg) do
@@ -115,6 +118,13 @@ defmodule UniversalProxy.ESPHome.Supervisor do
         start: {__MODULE__, :start_espex, [espex_opts, live_devices_fun]}
       )
     ]
+
+    # Last, so its crash restarts only itself. Runs the provider's mesh
+    # light commands; Bluetooth targets only, like the mesh.
+    children =
+      if Keyword.get(opts, :mesh_commander?, UniversalProxy.Bluetooth.supported?()),
+        do: children ++ [{Commander, server: Espex.Server}],
+        else: children
 
     Supervisor.init(children, strategy: :rest_for_one)
   end
