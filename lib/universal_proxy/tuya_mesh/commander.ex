@@ -63,9 +63,10 @@ defmodule UniversalProxy.TuyaMesh.Commander do
 
   ## Optimistic state
 
-  Each light's last known DPs are kept here, with its brightness and
-  colour brightness (`Commands.components/2`): what was sent to it and
-  accepted, over the Lights report DPs for a bulb first commanded. Once a
+  Each light's last known DPs are kept here, with its brightness, colour
+  brightness and RGB peak (`Commands.components/2`, each kept only once a
+  batch carrying the DP it shapes was accepted: `Commands.committed/2`):
+  what was sent to it and accepted, over the Lights report DPs for a bulb first commanded. Once a
   command's sends are accepted, the light's `LightStateResponse` (with
   its `device_id`) is pushed to Espex, so HA doesn't snap back. A group
   diverted to direct sends records only what at least one member
@@ -146,22 +147,37 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   def handle_continue(:subscribe, state), do: {:noreply, subscribe(state)}
 
   @impl GenServer
-  def handle_cast({:command, %{target: target, request: request} = command}, state) do
+  # Identity is checked first: a command for a light that no longer has
+  # its sub-device id (an old mesh's group, during the provider's resync)
+  # must not touch views, members or other jobs.
+  def handle_cast({:command, %{target: target, device_id: device_id} = command}, state) do
+    if valid?(read_ids(state), target, device_id) do
+      {:noreply, admit(state, command)}
+    else
+      Logger.debug(
+        "TuyaMesh.Commander: #{describe(target)} command for a stale sub-device; dropped"
+      )
+
+      {:noreply, state}
+    end
+  end
+
+  def handle_cast(_msg, state), do: {:noreply, state}
+
+  defp admit(state, %{target: target, request: request} = command) do
     base = base_dps(state, target)
     current = view_dps(state, target) || base
 
     case Commands.batches(request, command.settings, current) do
       [] ->
         Logger.debug("TuyaMesh.Commander: nothing to send for #{inspect(target)}")
-        {:noreply, state}
+        state
 
       batches ->
         components = Commands.components(request, current)
-        {:noreply, start_job(state, command, base, components, batches)}
+        start_job(state, command, base, components, batches)
     end
   end
-
-  def handle_cast(_msg, state), do: {:noreply, state}
 
   @impl GenServer
   def handle_info({:step, target, id}, state) do
@@ -461,8 +477,9 @@ defmodule UniversalProxy.TuyaMesh.Commander do
 
   # ── Mesh identity ────────────────────────────────────────────────────
 
-  defp current?(state, job),
-    do: Map.get(read_ids(state), job.target) == job.command.device_id
+  defp current?(state, job), do: valid?(read_ids(state), job.target, job.command.device_id)
+
+  defp valid?(ids, target, device_id), do: Map.get(ids, target) == device_id
 
   defp abandon(state, job) do
     Logger.info(
@@ -534,7 +551,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
     dps =
       (view_dps(state, job.target) || job.base)
       |> Map.merge(sent)
-      |> Map.merge(job.components)
+      |> Map.merge(Commands.committed(job.components, sent))
 
     view = %{device_id: job.command.device_id, dps: dps}
     %{state | views: Map.put(state.views, job.target, view)}
@@ -543,7 +560,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   defp update_member_view(state, mac, sent, components) do
     case Map.fetch(state.views, {:bulb, mac}) do
       {:ok, view} ->
-        dps = view.dps |> Map.merge(sent) |> Map.merge(components)
+        dps = view.dps |> Map.merge(sent) |> Map.merge(Commands.committed(components, sent))
         %{state | views: Map.put(state.views, {:bulb, mac}, %{view | dps: dps})}
 
       :error ->

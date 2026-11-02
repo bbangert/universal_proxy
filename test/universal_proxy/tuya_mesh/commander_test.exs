@@ -282,6 +282,27 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
                :sys.get_state(pid).views[{:bulb, @a}].dps
     end
 
+    test "a brightness frame that failed leaves the kept brightness as it was" do
+      script = %{set: %{@a => [:ok, :ok, {:error, :not_ready}]}}
+      {pid, _agent} = start(script: script)
+
+      red = %Req{has_state: true, state: true, has_rgb: true, red: 1.0, green: 0.0, blue: 0.0}
+      Commander.command(cmd({:bulb, @a}, red), pid)
+      idle(pid)
+      assert [_red] = sets()
+
+      white = %{warm_full_on() | brightness: 0.3}
+      Commander.command(cmd({:bulb, @a}, white), pid)
+      idle(pid)
+      assert [{@a, [on: true, mode: :white, temp: 0]}, {@a, [brightness: 300]}] = sets()
+      assert :sys.get_state(pid).views[{:bulb, @a}].dps.brightness == 1.0
+
+      green = %Req{has_rgb: true, red: 0.0, green: 1.0, blue: 0.0}
+      Commander.command(cmd({:bulb, @a}, green), pid)
+      idle(pid)
+      assert [{@a, [mode: :colour, colour: {120, 100, 100}]}] = sets()
+    end
+
     test "nothing mappable sends nothing" do
       {pid, _agent} = start()
       Commander.command(cmd({:bulb, @a}, %Req{has_effect: true, effect: "x"}), pid)
@@ -557,6 +578,26 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       refute_received {:lights, {:group_set, _, _, _}}
       assert sets() == []
       refute_received {:push, _}
+    end
+
+    test "a stale group command never touches its members' pending work" do
+      script = %{set: %{@b => [{:error, :busy}]}}
+      {pid, agent} = start(script: script, retry_ms: 60_000)
+
+      Commander.command(cmd({:bulb, @b}, on()), pid)
+      assert_receive {:lights, {:set, @b, [on: true], _}}
+      before = :sys.get_state(pid)
+
+      # The Store moved group 1 to a new sub-device; the provider hasn't
+      # caught up and still sends the old one.
+      new_mesh(agent, %{{:group, 1} => 42})
+      Commander.command(cmd({:group, 1}, %Req{has_state: true, state: false}), pid)
+
+      after_cmd = :sys.get_state(pid)
+      assert after_cmd.jobs == before.jobs
+      assert after_cmd.touched == before.touched
+      assert after_cmd.views == before.views
+      refute_received {:lights, {:group_set, _, _, _}}
     end
 
     test "a Store change drops stale commands and the kept DPs of changed lights" do

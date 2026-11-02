@@ -60,10 +60,15 @@ defmodule UniversalProxy.TuyaMesh.Commands do
   @type settings :: %{min_mireds: pos_integer(), max_mireds: pos_integer(), invert: boolean()}
   @typedoc """
   DP id → decoded value, as `Lights` keeps a bulb's reported DPs, plus
-  optionally the `:brightness` and `:color_brightness` components
+  optionally the `:brightness`, `:color_brightness` and `:peak` components
   (`components/2`).
   """
-  @type dps :: %{optional(pos_integer() | :brightness | :color_brightness) => term()}
+  @type dps :: %{optional(pos_integer() | :brightness | :color_brightness | :peak) => term()}
+  @type components :: %{
+          optional(:brightness) => float(),
+          optional(:color_brightness) => float(),
+          optional(:peak) => float()
+        }
 
   @doc """
   The DP batches for `request`, in send order, each at most 16 bytes
@@ -214,8 +219,7 @@ defmodule UniversalProxy.TuyaMesh.Commands do
   # Both components come from the stored ones, never from v, which already
   # holds their product.
   defp colour_v(request, current) do
-    {master, colour} = resolve(request, current)
-    peak = if request.has_rgb, do: rgb_peak(request), else: 1.0
+    {master, colour, peak} = resolve(request, current)
     (master * colour * peak * 100) |> round() |> clamp(1, 100)
   end
 
@@ -229,33 +233,53 @@ defmodule UniversalProxy.TuyaMesh.Commands do
         true -> 1.0
       end
 
-    {unit(master), unit(colour)}
+    peak =
+      cond do
+        request.has_rgb -> rgb_peak(request)
+        is_number(Map.get(current, :peak)) -> current.peak
+        true -> 1.0
+      end
+
+    {unit(master), unit(colour), unit(peak)}
   end
 
   @doc """
-  The light's brightness components after `request`: `%{brightness:,
-  color_brightness:}` (each 0..1), for the caller to keep with the light's
-  DPs (`current` takes them under those atom keys) so a later colour is
-  computed from them rather than from the already-scaled `v`. Unknown
-  ones start as `color_brightness` 1 and the current brightness (DP3, or
-  `v` in colour mode). `%{}` when the request changes neither, or turns
-  the light off.
+  The light's colour components after `request`: `%{brightness:,
+  color_brightness:, peak:}` (each 0..1; `peak` is the RGB's largest
+  channel), for the caller to keep with the light's DPs (`current` takes
+  them under those atom keys) so a later colour is computed from them
+  rather than from the already-scaled `v`. Unknown ones start as
+  `color_brightness` and `peak` 1 and the current brightness (DP3, or `v`
+  in colour mode). `%{}` when the request changes none, or turns the light
+  off. Keep them with `committed/2`.
   """
-  @spec components(Proto.LightCommandRequest.t(), dps()) :: %{
-          optional(:brightness) => float(),
-          optional(:color_brightness) => float()
-        }
+  @spec components(Proto.LightCommandRequest.t(), dps()) :: components()
   def components(%Proto.LightCommandRequest{} = request, current \\ %{}) do
     cond do
       request.has_state and request.state == false ->
         %{}
 
       brightness?(request) or colour_brightness?(request) or request.has_rgb ->
-        {master, colour} = resolve(request, current)
-        %{brightness: master, color_brightness: colour}
+        {master, colour, peak} = resolve(request, current)
+        %{brightness: master, color_brightness: colour, peak: peak}
 
       true ->
         %{}
+    end
+  end
+
+  @doc """
+  The components that an accepted batch setting `sent` (a DP map) makes
+  true on the light: all of them with a colour (DP11), the brightness
+  alone with DP3, none otherwise. A component whose DP never went out
+  must not be kept, or a later colour would be computed from it.
+  """
+  @spec committed(components(), dps()) :: components()
+  def committed(components, sent) do
+    cond do
+      Map.has_key?(sent, 11) -> Map.take(components, [:brightness, :color_brightness, :peak])
+      Map.has_key?(sent, 3) -> Map.take(components, [:brightness])
+      true -> %{}
     end
   end
 
@@ -383,7 +407,8 @@ defmodule UniversalProxy.TuyaMesh.Commands do
   its on/off (DP1) is unknown: the protocol has no unknown light state.
   Colour mode (DP2 1 with a colour) reports RGB at full value with the
   colour's `v` as the brightness (or the kept `:brightness` and
-  `:color_brightness` components, see `components/2`); anything else reports colour
+  `:color_brightness` components, see `components/2`, with the RGB scaled
+  by the kept `:peak`); anything else reports colour
   temperature with DP3's brightness. Unknown values take HA-neutral
   defaults (full brightness, white, mid-range temperature).
   """
@@ -427,7 +452,14 @@ defmodule UniversalProxy.TuyaMesh.Commands do
   defp with_mode(response, :colour, dps) do
     case Map.get(dps, 11) do
       <<h::16, s, v>> when h in 0..359 and s in 0..100 ->
+        peak =
+          case Map.get(dps, :peak) do
+            p when is_number(p) -> p
+            _unknown -> 1.0
+          end
+
         {r, g, b} = hs_to_rgb(h, s)
+        {r, g, b} = {r * peak, g * peak, b * peak}
 
         brightness =
           case Map.get(dps, :brightness) do

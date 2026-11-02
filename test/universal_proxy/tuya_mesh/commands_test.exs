@@ -204,13 +204,22 @@ defmodule UniversalProxy.TuyaMesh.CommandsTest do
       half = %Req{has_color_brightness: true, color_brightness: 0.5}
 
       # Unknown components start as brightness v/100 and colour brightness 1.
-      assert Commands.components(half, colour) == %{brightness: 1.0, color_brightness: 0.5}
+      assert Commands.components(half, colour) == %{
+               brightness: 1.0,
+               color_brightness: 0.5,
+               peak: 1.0
+             }
 
       current =
         %{colour | 11 => <<120::16, 80, 50>>} |> Map.merge(Commands.components(half, colour))
 
       assert Commands.batches(half, @settings, current) == [[colour: {120, 80, 50}]]
-      assert Commands.components(half, current) == %{brightness: 1.0, color_brightness: 0.5}
+
+      assert Commands.components(half, current) == %{
+               brightness: 1.0,
+               color_brightness: 0.5,
+               peak: 1.0
+             }
     end
 
     test "brightness then colour brightness compose" do
@@ -226,6 +235,40 @@ defmodule UniversalProxy.TuyaMesh.CommandsTest do
       assert current[:brightness] == 0.5 and current[:color_brightness] == 0.5
       full = %Req{has_brightness: true, brightness: 1.0}
       assert Commands.batches(full, @settings, current) == [[colour: {0, 100, 50}]]
+    end
+
+    test "the RGB peak is kept, so a later brightness keeps the v ratio" do
+      green = %Req{
+        has_rgb: true,
+        red: 0.0,
+        green: 0.5,
+        blue: 0.0,
+        has_brightness: true,
+        brightness: 0.5
+      }
+
+      assert Commands.batches(green, @settings) == [[mode: :colour, colour: {120, 100, 25}]]
+      components = Commands.components(green)
+      assert components == %{brightness: 0.5, color_brightness: 1.0, peak: 0.5}
+
+      current =
+        green |> Commands.entries(@settings) |> Commands.expected() |> Map.merge(components)
+
+      same = %Req{has_brightness: true, brightness: 0.5}
+      assert Commands.batches(same, @settings, current) == [[colour: {120, 100, 25}]]
+      full = %Req{has_brightness: true, brightness: 1.0}
+      assert Commands.batches(full, @settings, current) == [[colour: {120, 100, 50}]]
+
+      r = Commands.state_response(Map.put(current, 1, true), @settings, 1, 1)
+      assert %{brightness: 0.5, color_mode: :COLOR_MODE_RGB} = r
+      assert {r.red, r.green, r.blue} == {0.0, 0.5, 0.0}
+    end
+
+    test "committed keeps only the components a sent DP shapes" do
+      c = %{brightness: 0.3, color_brightness: 0.5, peak: 0.8}
+      assert Commands.committed(c, %{1 => true, 2 => 0, 4 => 0}) == %{}
+      assert Commands.committed(c, %{3 => 300}) == %{brightness: 0.3}
+      assert Commands.committed(c, %{11 => <<0::16, 1, 2>>}) == c
     end
 
     test "components are untouched by off and by commands without a brightness" do

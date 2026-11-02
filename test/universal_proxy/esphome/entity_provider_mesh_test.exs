@@ -251,6 +251,21 @@ defmodule UniversalProxy.ESPHome.EntityProviderMeshTest do
       assert_receive {:routed, %{target: {:group, 1}, device_id: 3, request: ^group}}
     end
 
+    test "a request naming another sub-device than the current entity's is dropped" do
+      {sources, _put} = start_inputs()
+      test = self()
+      pid = start_provider(sources, mesh_command: &send(test, {:routed, &1}))
+      key = Entities.key_for("tuya_group_1_light")
+
+      # 3 is the group's current sub-device; 9 an old mesh's.
+      GenServer.cast(pid, {:command, %Proto.LightCommandRequest{key: key, device_id: 3}})
+      assert_receive {:routed, %{target: {:group, 1}, device_id: 3}}
+
+      GenServer.cast(pid, {:command, %Proto.LightCommandRequest{key: key, device_id: 9}})
+      _ = :sys.get_state(pid)
+      refute_received {:routed, _}
+    end
+
     test "unknown keys and non-light mesh entities are not routed" do
       {sources, _put} = start_inputs()
       test = self()

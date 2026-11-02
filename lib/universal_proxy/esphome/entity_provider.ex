@@ -557,14 +557,27 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
     )
   end
 
-  # Handed to the Commander, which sends it off this loop.
+  # Handed to the Commander, which sends it off this loop. A key outlives
+  # its light (a new mesh reuses local group ids), so a request naming
+  # another sub-device than the current entity's is for a light that is
+  # gone; only the default 0 takes the current one.
   defp mesh_light_command(state, target, request) do
-    device_id =
-      case MeshSync.entity(state.mesh, request.key) do
-        %{device_id: id} -> id
-        nil -> request.device_id
-      end
+    case {MeshSync.entity(state.mesh, request.key), request.device_id} do
+      {%{device_id: id}, requested} when requested in [0, id] ->
+        route_light_command(state, target, request, id)
 
+      {nil, requested} when requested != 0 ->
+        route_light_command(state, target, request, requested)
+
+      {_entity, requested} ->
+        Logger.debug(
+          "EntityProvider: Tuya mesh light command for sub-device #{requested} " <>
+            "doesn't match #{inspect(target)}; dropped"
+        )
+    end
+  end
+
+  defp route_light_command(state, target, request, device_id) do
     state.mesh_command.(%{
       target: target,
       key: request.key,
