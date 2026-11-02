@@ -199,6 +199,42 @@ defmodule UniversalProxy.TuyaMesh.CommandsTest do
       assert Commands.batches(req, @settings, %{2 => 1}) == []
     end
 
+    test "v comes from the kept components, so repeating a command is stable" do
+      colour = %{2 => 1, 11 => <<120::16, 80, 100>>}
+      half = %Req{has_color_brightness: true, color_brightness: 0.5}
+
+      # Unknown components start as brightness v/100 and colour brightness 1.
+      assert Commands.components(half, colour) == %{brightness: 1.0, color_brightness: 0.5}
+
+      current =
+        %{colour | 11 => <<120::16, 80, 50>>} |> Map.merge(Commands.components(half, colour))
+
+      assert Commands.batches(half, @settings, current) == [[colour: {120, 80, 50}]]
+      assert Commands.components(half, current) == %{brightness: 1.0, color_brightness: 0.5}
+    end
+
+    test "brightness then colour brightness compose" do
+      current = %{2 => 1, 11 => <<0::16, 100, 100>>}
+      dim = %Req{has_brightness: true, brightness: 0.5}
+      assert Commands.batches(dim, @settings, current) == [[colour: {0, 100, 50}]]
+
+      current = Map.merge(current, Commands.components(dim, current))
+      half = %Req{has_color_brightness: true, color_brightness: 0.5}
+      assert Commands.batches(half, @settings, current) == [[colour: {0, 100, 25}]]
+
+      current = Map.merge(current, Commands.components(half, current))
+      assert current[:brightness] == 0.5 and current[:color_brightness] == 0.5
+      full = %Req{has_brightness: true, brightness: 1.0}
+      assert Commands.batches(full, @settings, current) == [[colour: {0, 100, 50}]]
+    end
+
+    test "components are untouched by off and by commands without a brightness" do
+      assert Commands.components(%Req{has_state: true, state: false, has_brightness: true}) == %{}
+
+      assert Commands.components(%Req{has_color_temperature: true, color_temperature: 300.0}) ==
+               %{}
+    end
+
     test "the RGB mode alone switches to colour" do
       req = %Req{has_color_mode: true, color_mode: :COLOR_MODE_RGB}
       assert Commands.batches(req, @settings) == [[mode: :colour]]
@@ -360,6 +396,12 @@ defmodule UniversalProxy.TuyaMesh.CommandsTest do
 
       assert %{state: false, color_mode: :COLOR_MODE_RGB, brightness: 0.3} = r
       assert {r.red, r.green, r.blue} == {0.0, 0.0, 1.0}
+    end
+
+    test "colour mode reports the kept components when known" do
+      dps = %{1 => true, 2 => 1, 11 => <<0::16, 100, 25>>, brightness: 0.5, color_brightness: 0.5}
+      r = Commands.state_response(dps, @settings, 7, 9)
+      assert %{brightness: 0.5, color_brightness: 0.5, color_mode: :COLOR_MODE_RGB} = r
     end
 
     test "unknown values take neutral defaults" do

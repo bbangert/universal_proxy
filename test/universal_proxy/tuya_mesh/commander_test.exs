@@ -11,6 +11,14 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
   @a "DC23530FB34A"
   @b "DC23533FCD62"
   @c "DC2353000001"
+  @ids %{
+    {:bulb, @a} => 5,
+    {:bulb, @b} => 7,
+    {:bulb, @c} => 8,
+    {:group, 1} => 6,
+    {:group, 2} => 9,
+    {:group, 3} => 11
+  }
 
   # A Lights stand-in: records calls to the test, replies from a script,
   # and makes the `hears` bulbs report what a group frame set.
@@ -76,7 +84,7 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
         {Agent,
          fn ->
            Map.merge(
-             %{test: test, set: %{}, group_set: [], hears: [], bulbs: %{}, clock: 0},
+             %{test: test, set: %{}, group_set: [], hears: [], bulbs: %{}, clock: 0, ids: @ids},
              script
            )
          end}
@@ -92,6 +100,8 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
         _ -> :error
       end,
       push: &send(test, {:push, &1}),
+      device_ids: fn -> Agent.get(agent, & &1.ids) end,
+      subscribe: false,
       window_ms: 20,
       retry_ms: 1,
       max_retries: 3,
@@ -104,8 +114,20 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
     {pid, agent}
   end
 
-  defp cmd(target, request, key \\ 77, device_id \\ 5),
-    do: %{target: target, key: key, device_id: device_id, settings: @settings, request: request}
+  defp cmd(target, request, key \\ 77, device_id \\ nil) do
+    %{
+      target: target,
+      key: key,
+      device_id: device_id || Map.fetch!(@ids, target),
+      settings: @settings,
+      request: request
+    }
+  end
+
+  defp cb(value), do: %Req{has_color_brightness: true, color_brightness: value}
+
+  defp new_mesh(agent, changes),
+    do: Agent.update(agent, fn s -> %{s | ids: Map.merge(s.ids, changes)} end)
 
   defp on, do: %Req{has_state: true, state: true}
 
@@ -236,6 +258,30 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       refute_received {:push, %LightStateResponse{state: true}}
     end
 
+    test "colour brightness is kept apart from brightness, so repeats are stable" do
+      {pid, _agent} = start()
+
+      red = %Req{has_state: true, state: true, has_rgb: true, red: 1.0, green: 0.0, blue: 0.0}
+      Commander.command(cmd({:bulb, @a}, red), pid)
+      idle(pid)
+      assert [{@a, [on: true, mode: :colour, colour: {0, 100, 100}]}] = sets()
+
+      for {request, v} <- [
+            {cb(0.5), 50},
+            {cb(0.5), 50},
+            {%Req{has_brightness: true, brightness: 0.4}, 20},
+            {cb(1.0), 40},
+            {cb(1.0), 40}
+          ] do
+        Commander.command(cmd({:bulb, @a}, request), pid)
+        idle(pid)
+        assert [{@a, [colour: {0, 100, ^v}]}] = sets()
+      end
+
+      assert %{brightness: 0.4, color_brightness: 1.0} =
+               :sys.get_state(pid).views[{:bulb, @a}].dps
+    end
+
     test "nothing mappable sends nothing" do
       {pid, _agent} = start()
       Commander.command(cmd({:bulb, @a}, %Req{has_effect: true, effect: "x"}), pid)
@@ -248,7 +294,7 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
     test "members that didn't confirm get direct follow-ups; confirmers don't" do
       {pid, _agent} = start(script: %{hears: [@a]})
 
-      Commander.command(cmd({:group, 1}, warm_full_on(), 88, 6), pid)
+      Commander.command(cmd({:group, 1}, warm_full_on(), 88), pid)
 
       assert_receive {:lights, {:group_set, 1, [on: true, mode: :white, temp: 0], [ack: true]}}
 
@@ -439,6 +485,125 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       followups = sets()
       assert {@a, [brightness: 1000]} in followups
       refute {@a, [on: true, mode: :white, temp: 0]} in followups
+    end
+
+    test "every diverted send failing pushes nothing and keeps the cache" do
+      script = %{
+        group_set: [{:error, :busy}],
+        set: %{@a => [{:error, :not_ready}], @c => [{:error, :not_ready}]}
+      }
+
+      {pid, _agent} = start(script: script, retry_ms: 100)
+
+      Commander.command(cmd({:group, 1}, on()), pid)
+      assert_receive {:lights, {:group_set, 1, [on: true], _}}
+      Commander.command(cmd({:bulb, @b}, %Req{has_state: true, state: false}), pid)
+      assert_receive {:push, %LightStateResponse{key: 77, device_id: 7, state: false}}
+      views = :sys.get_state(pid).views
+
+      idle(pid)
+      assert {@a, [on: true]} in sets()
+      refute_received {:push, _}
+      assert :sys.get_state(pid).views == views
+    end
+
+    test "a diversion plans every member's first frame before any second one" do
+      {pid, _agent} =
+        start(script: %{group_set: [{:error, :busy}]}, retry_ms: 100, max_followups: 3)
+
+      Commander.command(cmd({:group, 1}, warm_full_on()), pid)
+      assert_receive {:lights, {:group_set, 1, _, _}}
+      Commander.command(cmd({:bulb, @b}, %Req{has_state: true, state: false}), pid)
+      idle(pid)
+
+      assert sets() == [
+               {@b, [on: false]},
+               {@a, [on: true, mode: :white, temp: 0]},
+               {@c, [on: true, mode: :white, temp: 0]},
+               {@a, [brightness: 1000]}
+             ]
+    end
+
+    test "the direct-frame budget is shared by the diversion and the confirmation pass" do
+      script = %{group_set: [:ok, {:error, :busy}]}
+      {pid, _agent} = start(script: script, retry_ms: 100, max_followups: 3)
+
+      # The first frame goes out as a broadcast nobody hears; the second
+      # is diverted once B has a newer command.
+      Commander.command(cmd({:group, 1}, warm_full_on()), pid)
+      assert_receive {:lights, {:group_set, 1, [brightness: 1000], _}}
+      Commander.command(cmd({:bulb, @b}, %Req{has_state: true, state: false}), pid)
+      idle(pid)
+
+      direct = Enum.reject(sets(), &match?({@b, _}, &1))
+
+      assert direct == [
+               {@a, [brightness: 1000]},
+               {@c, [brightness: 1000]},
+               {@a, [on: true, mode: :white, temp: 0]}
+             ]
+    end
+
+    test "a pending group retry across a new-mesh upload sends nothing" do
+      {pid, agent} = start(script: %{group_set: [{:error, :busy}]}, retry_ms: 50)
+
+      Commander.command(cmd({:group, 1}, on()), pid)
+      assert_receive {:lights, {:group_set, 1, [on: true], _}}
+
+      # The new mesh reuses local id 1 for another group: a new sub-device.
+      new_mesh(agent, %{{:group, 1} => 42})
+      idle(pid)
+
+      refute_received {:lights, {:group_set, _, _, _}}
+      assert sets() == []
+      refute_received {:push, _}
+    end
+
+    test "a Store change drops stale commands and the kept DPs of changed lights" do
+      {pid, agent} = start(script: %{group_set: [:ok, {:error, :busy}]}, retry_ms: 60_000)
+
+      Commander.command(cmd({:bulb, @a}, on()), pid)
+      Commander.command(cmd({:group, 3}, on()), pid)
+      idle(pid)
+      Commander.command(cmd({:group, 1}, on()), pid)
+      assert_receive {:lights, {:group_set, 1, [on: true], _}}
+
+      assert %{{:bulb, @a} => _, {:group, 3} => _} = :sys.get_state(pid).views
+      assert Map.has_key?(:sys.get_state(pid).jobs, {:group, 1})
+
+      new_mesh(agent, %{{:group, 1} => 42, {:group, 3} => 43})
+      send(pid, {:tuya_mesh_store, :inventory_changed})
+      state = :sys.get_state(pid)
+
+      assert state.jobs == %{}
+      assert Map.has_key?(state.views, {:bulb, @a})
+      refute Map.has_key?(state.views, {:group, 3})
+    end
+
+    test "it follows the Store's broadcasts" do
+      pubsub = :"commander_pubsub_#{System.unique_integer([:positive])}"
+      start_supervised!({Phoenix.PubSub, name: pubsub})
+
+      {pid, agent} =
+        start(
+          script: %{group_set: [{:error, :busy}]},
+          retry_ms: 60_000,
+          pubsub: pubsub,
+          subscribe: true
+        )
+
+      Commander.command(cmd({:group, 1}, on()), pid)
+      assert_receive {:lights, {:group_set, 1, [on: true], _}}
+
+      new_mesh(agent, %{{:group, 1} => 42})
+
+      Phoenix.PubSub.broadcast(
+        pubsub,
+        UniversalProxy.TuyaMesh.Store.topic(),
+        {:tuya_mesh_store, :inventory_changed}
+      )
+
+      assert :sys.get_state(pid).jobs == %{}
     end
 
     test "unknown members means no follow-ups" do

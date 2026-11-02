@@ -19,15 +19,24 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       frame reaches only part of the members (4–9 of 10 on hardware), so
       after `:window_ms` every member that hasn't confirmed a DP gets one
       round of direct sets carrying only what it is missing, one every
-      `:followup_gap_ms` and at most `:max_followups` frames per command.
-      A DP is confirmed only by a report after the command that changed
-      it to the wanted value (Lights keeps merged DPs, not per-report
-      ones), so a DP that already held that value is resent.
+      `:followup_gap_ms`. A DP is confirmed only by a report after the
+      command that changed it to the wanted value (Lights keeps merged
+      DPs, not per-report ones), so a DP that already held that value is
+      resent.
 
   `{:error, :busy}` and `{:error, :queue_full}` are retried after
   `:retry_ms`, doubling, at most `:max_retries` times; any other error
-  stops the command. A follow-up that fails, or runs out of retries,
+  stops the command. A direct send that fails, or runs out of retries,
   drops every remaining frame for that bulb.
+
+  ## Direct-frame budget
+
+  A group command sends at most `:max_followups` direct frames in all,
+  shared between a diversion (below) and the confirmation pass. Each pass
+  plans every member's first frame (on, mode and its value) before any
+  member's second (a brightness that didn't fit), members in inventory
+  order. What doesn't fit is dropped, not deferred: those bulbs keep what
+  the broadcast gave them (or nothing) until the next command.
 
   ## Superseding
 
@@ -38,21 +47,38 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   group's). A group command replaces its members' bulb commands; a group
   never broadcasts again once a member has a newer command (its remaining
   batches go directly to the other members, or nowhere when every member
-  is superseded), and no follow-up goes to a bulb with a newer command.
+  is superseded), and no direct frame goes to a bulb with a newer command.
+
+  ## Mesh identity
+
+  Every command carries its light's sub-device id. The Store allocates
+  them (`Store.device_ids/1`): a group's id is new whenever the stored
+  mesh changes or the group leaves it (local group ids are reused for
+  unrelated groups), and a bulb's follows its MAC, the physical bulb.
+  Right before every Lights call the light's id is read back, and a
+  command whose light no longer has that id is dropped, along with the
+  light's kept DPs. On every `{:tuya_mesh_store, _}` broadcast the same
+  check drops the stale commands and kept DPs at once (subscribed at
+  start; the per-send check is what guarantees it).
 
   ## Optimistic state
 
-  Each light's last known DPs are kept here: what was sent to it, over
-  the Lights report DPs for a bulb first commanded. Once a command's sends
-  are accepted, the light's `LightStateResponse` (with its `device_id`) is
-  pushed to Espex, so HA doesn't snap back. A light whose on/off isn't
-  known yet gets no push. A refused send pushes nothing.
+  Each light's last known DPs are kept here, with its brightness and
+  colour brightness (`Commands.components/2`): what was sent to it and
+  accepted, over the Lights report DPs for a bulb first commanded. Once a
+  command's sends are accepted, the light's `LightStateResponse` (with
+  its `device_id`) is pushed to Espex, so HA doesn't snap back. A group
+  diverted to direct sends records only what at least one member
+  accepted. A light whose on/off isn't known yet gets no push, and
+  nothing refused is recorded or pushed.
 
   Options: `:name`, `:lights` (module, default `Lights`) and `:lights_opts`
   (extra options to its calls, e.g. `server:`), `:members` (`gid ->
   {:ok, [mac]} | :error`, default from `UniversalProxy.TuyaMesh.status/1`),
-  `:push` (`struct -> any`, default `Espex.push_state/2` on `:server`),
-  `:server`, `:window_ms` (6 s), `:retry_ms` (500 ms), `:max_retries` (5),
+  `:device_ids` (`-> map`, default `Store.device_ids/1`), `:pubsub` and
+  `:subscribe` (default `true`) for the Store broadcasts, `:push` (`struct
+  -> any`, default `Espex.push_state/2` on `:server`), `:server`,
+  `:window_ms` (6 s), `:retry_ms` (500 ms), `:max_retries` (5),
   `:followup_gap_ms` (2 s), `:max_followups` (10).
   """
 
@@ -66,7 +92,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   alias Espex.Proto
   alias UniversalProxy.TuyaBeaconMesh.Lights
   alias UniversalProxy.TuyaMesh
-  alias UniversalProxy.TuyaMesh.Commands
+  alias UniversalProxy.TuyaMesh.{Commands, Store}
 
   @retryable [:busy, :queue_full]
 
@@ -93,28 +119,36 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   def init(opts) do
     server = Keyword.get(opts, :server, Espex.Server)
 
-    {:ok,
-     %{
-       lights: Keyword.get(opts, :lights, Lights),
-       lights_opts: Keyword.get(opts, :lights_opts, []),
-       members: Keyword.get(opts, :members, &default_members/1),
-       push: Keyword.get(opts, :push, &default_push(server, &1)),
-       window_ms: Keyword.get(opts, :window_ms, 6_000),
-       retry_ms: Keyword.get(opts, :retry_ms, 500),
-       max_retries: Keyword.get(opts, :max_retries, 5),
-       followup_gap_ms: Keyword.get(opts, :followup_gap_ms, 2_000),
-       max_followups: Keyword.get(opts, :max_followups, 10),
-       next_id: 1,
-       jobs: %{},
-       views: %{},
-       touched: %{}
-     }}
+    state = %{
+      lights: Keyword.get(opts, :lights, Lights),
+      lights_opts: Keyword.get(opts, :lights_opts, []),
+      members: Keyword.get(opts, :members, &default_members/1),
+      device_ids: Keyword.get(opts, :device_ids, &default_device_ids/0),
+      pubsub: Keyword.get(opts, :pubsub, UniversalProxy.PubSub),
+      push: Keyword.get(opts, :push, &default_push(server, &1)),
+      window_ms: Keyword.get(opts, :window_ms, 6_000),
+      retry_ms: Keyword.get(opts, :retry_ms, 500),
+      max_retries: Keyword.get(opts, :max_retries, 5),
+      followup_gap_ms: Keyword.get(opts, :followup_gap_ms, 2_000),
+      max_followups: Keyword.get(opts, :max_followups, 10),
+      next_id: 1,
+      jobs: %{},
+      views: %{},
+      touched: %{}
+    }
+
+    if Keyword.get(opts, :subscribe, true),
+      do: {:ok, state, {:continue, :subscribe}},
+      else: {:ok, state}
   end
+
+  @impl GenServer
+  def handle_continue(:subscribe, state), do: {:noreply, subscribe(state)}
 
   @impl GenServer
   def handle_cast({:command, %{target: target, request: request} = command}, state) do
     base = base_dps(state, target)
-    current = Map.get(state.views, target, base)
+    current = view_dps(state, target) || base
 
     case Commands.batches(request, command.settings, current) do
       [] ->
@@ -122,7 +156,8 @@ defmodule UniversalProxy.TuyaMesh.Commander do
         {:noreply, state}
 
       batches ->
-        {:noreply, start_job(state, command, base, batches)}
+        components = Commands.components(request, current)
+        {:noreply, start_job(state, command, base, components, batches)}
     end
   end
 
@@ -136,11 +171,13 @@ defmodule UniversalProxy.TuyaMesh.Commander do
     end
   end
 
+  def handle_info({:tuya_mesh_store, _event}, state), do: {:noreply, reconcile(state)}
+
   def handle_info(_msg, state), do: {:noreply, state}
 
   # ── Jobs ─────────────────────────────────────────────────────────────
 
-  defp start_job(state, command, base, batches) do
+  defp start_job(state, command, base, components, batches) do
     id = state.next_id
     target = command.target
     members = members(state, target)
@@ -150,6 +187,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       target: target,
       command: command,
       base: base,
+      components: components,
       phase: :send,
       pending: batches,
       sent: [],
@@ -157,7 +195,9 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       members: members,
       snapshot: snapshot(state, target, members),
       sent_at: nil,
-      then_check?: false
+      then_check?: false,
+      budget: state.max_followups,
+      accepted: %{}
     }
 
     macs = if match?({:bulb, _}, target), do: [elem(target, 1)], else: members
@@ -176,31 +216,33 @@ defmodule UniversalProxy.TuyaMesh.Commander do
     }
   end
 
+  # Every step starts at the execution boundary: a light that is no longer
+  # the one commanded gets nothing more.
+  defp step(state, job) do
+    if current?(state, job), do: run(state, job), else: abandon(state, job)
+  end
+
   # Never re-broadcast over a member's newer command (its own, or another
   # group's): the rest goes to the other members directly.
-  defp step(state, %{phase: :send, target: {:group, _}} = job) do
+  defp run(state, %{phase: :send, target: {:group, _}} = job) do
     case Enum.filter(job.members, &newer_command?(state, &1, job)) do
       [] -> send_step(state, job)
       superseded -> divert(state, job, job.members -- superseded)
     end
   end
 
-  defp step(state, %{phase: :send} = job), do: send_step(state, job)
+  defp run(state, %{phase: :send} = job), do: send_step(state, job)
 
-  defp step(state, %{phase: :check} = job), do: check(state, job)
+  defp run(state, %{phase: :check} = job), do: check(state, job)
 
-  defp step(state, %{phase: :followup, pending: []} = job) do
-    if job.then_check?,
-      do: continue(state, %{job | phase: :check}, check_delay(state, job)),
-      else: done(state, job)
-  end
+  defp run(state, %{phase: :direct, pending: []} = job), do: finish_direct(state, job)
 
-  defp step(state, %{phase: :followup, pending: [{mac, batch} | rest]} = job) do
-    if newer_command?(state, mac, job) do
-      step(state, %{job | pending: drop_mac(rest, mac), attempts: 0})
-    else
-      followup(state, job, mac, batch, rest)
-    end
+  defp run(state, %{phase: :followup, pending: []} = job), do: done(state, job)
+
+  defp run(state, %{pending: [{mac, batch} | rest]} = job) do
+    if newer_command?(state, mac, job),
+      do: run(state, %{job | pending: drop_mac(rest, mac), attempts: 0}),
+      else: direct_send(state, job, mac, batch, rest)
   end
 
   defp send_step(state, %{pending: [batch | rest]} = job) do
@@ -222,8 +264,8 @@ defmodule UniversalProxy.TuyaMesh.Commander do
     end
   end
 
-  # The unsent batches go to `live` members directly; what was broadcast
-  # is still checked after the window.
+  # The unsent batches go to `live` members directly, within the budget;
+  # what was broadcast is still checked after the window.
   defp divert(state, job, []) do
     Logger.debug("TuyaMesh.Commander: #{describe(job.target)} superseded on every member")
     stop_sending(state, job)
@@ -232,36 +274,62 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   defp divert(state, job, live) do
     Logger.debug("TuyaMesh.Commander: #{describe(job.target)} goes direct to #{length(live)}")
     remaining = List.flatten(job.pending)
-    state = record(state, %{job | members: live}, remaining)
-    items = for mac <- live, batch <- Commands.split(remaining), do: {mac, batch}
+    plan = for mac <- live, do: {mac, Commands.split(remaining)}
+    {items, budget} = within_budget(job, plan)
 
     job = %{
       job
-      | phase: :followup,
+      | phase: :direct,
         pending: items,
+        budget: budget,
         attempts: 0,
         members: live,
         then_check?: job.sent != []
     }
 
-    step(push(state, job), job)
+    run(state, job)
   end
 
-  defp followup(state, job, mac, batch, rest) do
+  defp direct_send(state, job, mac, batch, rest) do
     case state.lights.set(mac, batch, [ack: true] ++ state.lights_opts) do
       :ok ->
+        {state, job} = accept(state, job, mac, batch)
         continue(state, %{job | pending: rest, attempts: 0}, state.followup_gap_ms)
 
       # A bulb that failed gets none of its later frames either.
       {:error, reason} when reason in @retryable ->
         retry(state, job, reason, fn state ->
-          step(state, %{job | pending: drop_mac(rest, mac), attempts: 0})
+          run(state, %{job | pending: drop_mac(rest, mac), attempts: 0})
         end)
 
       {:error, reason} ->
-        Logger.info("TuyaMesh.Commander: follow-up to #{mac} failed: #{inspect(reason)}")
-        step(state, %{job | pending: drop_mac(rest, mac), attempts: 0})
+        Logger.info("TuyaMesh.Commander: direct send to #{mac} failed: #{inspect(reason)}")
+        run(state, %{job | pending: drop_mac(rest, mac), attempts: 0})
     end
+  end
+
+  # A diverted batch a member accepted: kept for that member, and for the
+  # group once the diversion is over.
+  defp accept(state, %{phase: :direct} = job, mac, batch) do
+    state = update_member_view(state, mac, Commands.expected(batch), job.components)
+    {state, %{job | accepted: Map.update(job.accepted, mac, batch, &(&1 ++ batch))}}
+  end
+
+  defp accept(state, job, _mac, _batch), do: {state, job}
+
+  defp finish_direct(state, job) do
+    accepted = job.accepted |> Map.values() |> List.flatten() |> Enum.uniq()
+
+    state =
+      if accepted == [],
+        do: state,
+        else: record_light(state, job, Commands.expected(accepted))
+
+    state = if job.sent != [] or accepted != [], do: push(state, job), else: state
+
+    if job.then_check?,
+      do: continue(state, %{job | phase: :check, pending: []}, check_delay(state, job)),
+      else: done(state, job)
   end
 
   defp drop_mac(items, mac), do: Enum.reject(items, &match?({^mac, _batch}, &1))
@@ -307,24 +375,48 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       {:ok, bulbs} ->
         by_mac = Map.new(bulbs, &{&1.mac, &1})
 
-        {followups, dropped} =
-          job.members
-          |> Enum.reject(&newer_command?(state, &1, job))
-          |> Enum.flat_map(&followups_for(&1, Map.get(by_mac, &1), job))
-          |> Enum.split(state.max_followups)
+        plan =
+          for mac <- job.members, not newer_command?(state, mac, job) do
+            {mac, followups_for(mac, Map.get(by_mac, mac), job)}
+          end
 
-        if dropped != [] do
-          Logger.debug(
-            "TuyaMesh.Commander: #{describe(job.target)}: #{length(dropped)} follow-ups over the cap"
-          )
-        end
+        {items, budget} = within_budget(job, plan)
 
-        step(state, %{job | phase: :followup, pending: followups, attempts: 0, then_check?: false})
+        run(state, %{
+          job
+          | phase: :followup,
+            pending: items,
+            budget: budget,
+            attempts: 0,
+            then_check?: false
+        })
 
       {:error, reason} ->
         Logger.debug("TuyaMesh.Commander: no follow-ups (Lights: #{inspect(reason)})")
         done(state, job)
     end
+  end
+
+  # Every member's first frame, then every member's second, cut at the
+  # command's remaining budget.
+  defp within_budget(job, plan) do
+    rounds = plan |> Enum.map(fn {_mac, batches} -> length(batches) end) |> Enum.max(fn -> 0 end)
+
+    items =
+      for i <- 0..(rounds - 1)//1,
+          {mac, batches} <- plan,
+          i < length(batches),
+          do: {mac, Enum.at(batches, i)}
+
+    {taken, dropped} = Enum.split(items, job.budget)
+
+    if dropped != [] do
+      Logger.debug(
+        "TuyaMesh.Commander: #{describe(job.target)}: #{length(dropped)} direct frames over the budget"
+      )
+    end
+
+    {taken, job.budget - length(taken)}
   end
 
   defp followups_for(mac, bulb, job) do
@@ -335,7 +427,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
         do: Commands.unconfirmed(job.sent, fresh_dps(Map.get(bulb, :dps), before_dps)),
         else: job.sent
 
-    for batch <- Commands.split(missing), do: {mac, batch}
+    Commands.split(missing)
   end
 
   defp reported_since?(%{last_report_ms: at}, before) when is_integer(at), do: at != before
@@ -367,31 +459,103 @@ defmodule UniversalProxy.TuyaMesh.Commander do
     end
   end
 
-  # ── Views and optimistic state ───────────────────────────────────────
+  # ── Mesh identity ────────────────────────────────────────────────────
 
-  # What a sent batch set, kept for the light (and for members already
-  # known, after a group batch).
-  defp record(state, job, batch) do
-    sent = Commands.expected(batch)
-    views = Map.update(state.views, job.target, Map.merge(job.base, sent), &Map.merge(&1, sent))
+  defp current?(state, job),
+    do: Map.get(read_ids(state), job.target) == job.command.device_id
 
-    views =
-      job.members
-      |> Enum.reject(&newer_command?(state, &1, job))
-      |> Enum.reduce(views, fn mac, views ->
-        case Map.fetch(views, {:bulb, mac}) do
-          {:ok, view} -> Map.put(views, {:bulb, mac}, Map.merge(view, sent))
-          :error -> views
-        end
+  defp abandon(state, job) do
+    Logger.info(
+      "TuyaMesh.Commander: #{describe(job.target)} is no longer the light commanded; dropped"
+    )
+
+    %{done(state, job) | views: Map.delete(state.views, job.target)}
+  end
+
+  # Drops the commands and kept DPs of every light whose id changed.
+  defp reconcile(state) do
+    ids = read_ids(state)
+
+    {jobs, stale} =
+      Map.split_with(state.jobs, fn {target, job} ->
+        Map.get(ids, target) == job.command.device_id
       end)
 
-    %{state | views: views}
+    if stale != %{} do
+      Logger.info("TuyaMesh.Commander: mesh changed; dropped #{map_size(stale)} commands")
+    end
+
+    views =
+      Map.filter(state.views, fn {target, view} -> Map.get(ids, target) == view.device_id end)
+
+    %{state | jobs: jobs, views: views}
+  end
+
+  defp read_ids(state) do
+    case state.device_ids.() do
+      ids when is_map(ids) -> ids
+      _unreadable -> %{}
+    end
+  end
+
+  # Once, at start. The subscription links this process to the PubSub
+  # registry, so a registry restart restarts it and it subscribes afresh;
+  # without PubSub it runs unsubscribed, the per-send check still holding.
+  defp subscribe(state) do
+    Phoenix.PubSub.subscribe(state.pubsub, Store.topic())
+    reconcile(state)
+  rescue
+    ArgumentError ->
+      Logger.warning("TuyaMesh.Commander: PubSub unavailable; not following Store changes")
+      state
+  end
+
+  # ── Views and optimistic state ───────────────────────────────────────
+
+  defp view_dps(state, target) do
+    case Map.get(state.views, target) do
+      %{dps: dps} -> dps
+      nil -> nil
+    end
+  end
+
+  # What an accepted batch set, kept for the light (and, after a group
+  # batch, for its members already known).
+  defp record(state, job, batch) do
+    sent = Commands.expected(batch)
+    state = record_light(state, job, sent)
+
+    job.members
+    |> Enum.reject(&newer_command?(state, &1, job))
+    |> Enum.reduce(state, &update_member_view(&2, &1, sent, job.components))
+  end
+
+  defp record_light(state, job, sent) do
+    dps =
+      (view_dps(state, job.target) || job.base)
+      |> Map.merge(sent)
+      |> Map.merge(job.components)
+
+    view = %{device_id: job.command.device_id, dps: dps}
+    %{state | views: Map.put(state.views, job.target, view)}
+  end
+
+  defp update_member_view(state, mac, sent, components) do
+    case Map.fetch(state.views, {:bulb, mac}) do
+      {:ok, view} ->
+        dps = view.dps |> Map.merge(sent) |> Map.merge(components)
+        %{state | views: Map.put(state.views, {:bulb, mac}, %{view | dps: dps})}
+
+      :error ->
+        state
+    end
   end
 
   defp push(state, job) do
     %{key: key, device_id: device_id, settings: settings} = job.command
+    dps = view_dps(state, job.target) || %{}
 
-    case Commands.state_response(Map.get(state.views, job.target, %{}), settings, key, device_id) do
+    case Commands.state_response(dps, settings, key, device_id) do
       nil -> :ok
       response -> state.push.(response)
     end
@@ -448,6 +612,8 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       nil -> :error
     end
   end
+
+  defp default_device_ids, do: Store.device_ids()
 
   defp describe({:bulb, mac}), do: "bulb #{mac}"
   defp describe({:group, gid}), do: "group #{gid}"
