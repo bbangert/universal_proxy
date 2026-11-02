@@ -699,6 +699,49 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       idle(pid)
     end
 
+    test "a view dropped by an identity blip is rebuilt from the retained report" do
+      {pid, agent} = start(push_debounce_ms: 10, states_table: :unnamed)
+      at = now()
+      report(pid, [{@a, @on_white, at}])
+      assert [_] = of(Commander.light_states(:sys.get_state(pid).states), 5)
+
+      # The Store briefly answers without any sub-device.
+      Agent.update(agent, &%{&1 | ids: %{}})
+      send(pid, {:tuya_mesh_store, :inventory_changed})
+      flushed(pid)
+      refute Map.has_key?(:sys.get_state(pid).views, {:bulb, @a})
+
+      # Back; the Resolver's next status carries the same retained stamps.
+      Agent.update(agent, &%{&1 | ids: @ids})
+      send(pid, {:tuya_mesh_store, :inventory_changed})
+      report(pid, [{@a, @on_white, at}])
+
+      assert [%LightStateResponse{state: true}] =
+               of(Commander.light_states(:sys.get_state(pid).states), 5)
+    end
+
+    test "a member's report older than a group send never wins, even before it is known" do
+      {pid, _agent} = start(push_debounce_ms: 10)
+      report(pid, [])
+      before = now()
+
+      Commander.command(cmd({:group, 1}, on()), pid)
+      idle(pid)
+      flushed(pid)
+      assert %{state: true} = last_push(pushes(), 6)
+
+      # A's off report, sent before the group's on, arrives late.
+      report(pid, [{@a, @off, before - 1}])
+      assert of(pushes(), 5) == []
+      assert of(pushes(), 6) == []
+
+      # A report after the send is taken.
+      report(pid, [{@a, @off, now() + 1}])
+      pushed = pushes()
+      assert %{state: false} = last_push(pushed, 5)
+      assert %{state: false} = last_push(pushed, 6)
+    end
+
     test "what was pushed is kept for new connections" do
       {pid, _agent} = start(push_debounce_ms: 10, states_table: :unnamed)
       report(pid, [{@a, @on_white, now()}])
@@ -707,6 +750,39 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       assert [%LightStateResponse{state: true}] = of(states, 5)
       # A's groups were derived from it.
       assert [%LightStateResponse{state: true}] = of(states, 6)
+    end
+  end
+
+  describe "subscriptions" do
+    test "a PubSub down at start is retried, then a fresh status is read" do
+      pubsub = :"commander_late_pubsub_#{System.unique_integer([:positive])}"
+      test = self()
+
+      {pid, _agent} =
+        start(
+          subscribe: true,
+          pubsub: pubsub,
+          resubscribe_ms: 20,
+          status: fn ->
+            send(test, :status_read)
+            status([])
+          end
+        )
+
+      refute_received :status_read
+      start_supervised!({Phoenix.PubSub, name: pubsub}, id: :late_pubsub)
+
+      assert_receive :status_read, 2_000
+      _ = :sys.get_state(pid)
+
+      topics = Registry.keys(pubsub, pid) |> Enum.sort()
+
+      assert topics ==
+               Enum.sort([UniversalProxy.TuyaMesh.Store.topic(), UniversalProxy.TuyaMesh.topic()])
+
+      # Retries stop once subscribed: never held twice.
+      Process.sleep(60)
+      assert Registry.keys(pubsub, pid) |> Enum.sort() == topics
     end
   end
 
