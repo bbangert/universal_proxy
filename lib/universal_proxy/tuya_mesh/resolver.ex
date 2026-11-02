@@ -85,9 +85,9 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   (`Store.mesh_fingerprint/1`, a hash of its key, compared on every
   inventory load, so A → B → A forgets twice). It is in memory only
   (monotonic ms within one boot): after a reboot every bulb is "never
-  seen" until it answers, which the pinger's first round (60 s after
-  start, then one bulb a minute) settles, and nothing is written to flash
-  for it.
+  seen" until it answers, which the pinger's first broadcast (about a
+  minute after start) settles for most bulbs, and nothing is written to
+  flash for it.
 
   Snapshots are ordered by generation, not by arrival (messages from two
   processes have none): the Resolver bumps its mesh generation for every
@@ -107,10 +107,12 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   this boot, has fewer than `:miss_limit` (2) consecutive missed pings,
   and was last heard within `max(:reachable_ms, 2.5 × interval)`, where
   `interval` is the time Presence expects between its checks of that
-  bulb. The window keeps a bulb reachable between scheduled pings and
-  while pinging waits for the radio, so marginal range (a missed ping or
-  two) or a busy queue never flips it alone: only `:miss_limit` misses in
-  a row do. A bulb not reachable yet below `:miss_limit` misses, with
+  bulb: its 60 s cycle, so 150 s (`:reachable_ms`, 2 min, is the floor
+  without a pinger). The window keeps a bulb reachable between checks, a
+  broadcast reply lost to a collision, and a follow-up carried over a
+  cycle, while still tracking reality within a few minutes; a missed
+  direct ping (marginal range) never flips it alone: only `:miss_limit`
+  misses in a row do. A bulb not reachable yet below `:miss_limit` misses, with
   Presence running and the radio ready, is **checking** (a verdict is
   pending), as long as the latest `Lights.all/1` read worked and the
   current pinger has reported the bulb. Idle, nothing is reachable or
@@ -140,7 +142,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   @index_check_ticks 6
   @report_debounce_ms 300
   @resubscribe_ms 1_000
-  @reachable_ms 300_000
+  @reachable_ms 120_000
   @miss_limit 2
   # Stopping the mesh waits for Lights (5 s) and the Radio's teardown (10 s).
   @change_timeout 30_000

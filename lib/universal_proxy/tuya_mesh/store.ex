@@ -66,10 +66,10 @@ defmodule UniversalProxy.TuyaMesh.Store do
 
   Sequence numbers are 16-bit and compared as serial numbers (half the
   range ahead counts as ahead), and our own traffic keeps moving the
-  cursor: background pinging alone uses up to 60 an hour
+  cursor: background pinging alone uses up to 240 an hour
   (`UniversalProxy.TuyaMesh.Presence`), plus every command. A dump keeps
-  the value it was exported with, so after 32_768 numbers (about 23 days
-  of pinging alone) an old dump of the same mesh would read as *ahead* of
+  the value it was exported with, so after 32_768 numbers (under 6 days
+  of pinging at its cap) an old dump of the same mesh would read as *ahead* of
   the stored cursor, and taking it would move the bulbs' tracker back
   onto numbers they already heard, which they drop.
 

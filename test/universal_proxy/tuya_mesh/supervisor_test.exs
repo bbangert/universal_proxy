@@ -626,19 +626,19 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
     end
 
     test "a stale report within 2.5 pinger intervals stays reachable", ctx do
-      last = now_ms() - 400_000
+      last = now_ms() - 140_000
       :ok = FakeLights.report(ctx.lights, @bulb2, last)
       wait_until(fn -> match?(%{last_seen: %DateTime{}}, bulb(ctx, @bulb2)) end)
 
-      # No pinger yet: the plain 300 s window.
+      # No pinger yet: the plain 2 min window.
       assert %{reachable: false, checking: false} = bulb(ctx, @bulb2)
 
-      # Checks every 200 s: a 500 s window.
-      presence(ctx, %{@bulb2 => p(%{last_ms: last, interval_ms: 200_000})})
+      # The pinger's 60 s cycle: a 150 s window.
+      presence(ctx, %{@bulb2 => p(%{last_ms: last, interval_ms: 60_000})})
       assert %{reachable: true} = bulb(ctx, @bulb2)
 
-      # Every 100 s: back to 300 s, but no verdict yet.
-      presence(ctx, %{@bulb2 => p(%{last_ms: last, interval_ms: 100_000})})
+      # Checks every 40 s: back to 2 min, but no verdict yet.
+      presence(ctx, %{@bulb2 => p(%{last_ms: last, interval_ms: 40_000})})
       assert %{reachable: false, checking: true} = bulb(ctx, @bulb2)
     end
 
@@ -965,9 +965,10 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
         restart.()
         wait_until(fn -> Process.whereis(Presence) not in [nil, old] end)
         state = :sys.get_state(Presence)
-        # Settling: no attempt before a Lights read, an idle Radio and a gap.
+        # Settling (no attempt before a Lights read, an idle Radio and a
+        # gap), with the start-up minute's frame cap counted as spent.
         assert state.settling in [:lights, :radio]
-        assert state.next_attempt >= state.started + state.gap_ms
+        assert length(state.sent) == state.per_minute
       end
     end
 
