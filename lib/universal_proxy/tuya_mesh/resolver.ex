@@ -66,11 +66,63 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   Uploads pass the inventory, keys and all, through `replace/3`, so
   `format_status/1` and every call handler redact it (`Redact`).
 
+  ## Last seen and reachable
+
+  Bulbs never report on their own, only in reply to a ping or an acked
+  DP set, so presence comes from the mesh's pinger
+  (`UniversalProxy.TuyaMesh.Presence`), which pushes a snapshot here
+  (`{:tuya_mesh_presence, {mesh_generation, pinger_generation}, snapshot}`)
+  whenever it changes.
+
+  Last seen is merged, never replaced: per MAC the latest `heard_ms` from
+  `Lights.all/1` or a Presence snapshot is kept, and nil never overwrites
+  a known time. So a Lights restart, a mesh restart, a same-mesh upload
+  (each starts Lights with every bulb unheard) keep it. Before the mesh is
+  stopped for a change, Lights is read once more and every snapshot
+  already queued here is merged, so nothing heard just before is lost. A
+  MAC that leaves the inventory is dropped. Everything is forgotten on a
+  clear, and whenever the stored mesh changes identity
+  (`Store.mesh_fingerprint/1`, a hash of its key, compared on every
+  inventory load, so A → B → A forgets twice). It is in memory only
+  (monotonic ms within one boot): after a reboot every bulb is "never
+  seen" until it answers, which the pinger's first round (60 s after
+  start, then one bulb a minute) settles, and nothing is written to flash
+  for it.
+
+  Snapshots are ordered by generation, not by arrival (messages from two
+  processes have none): the Resolver bumps its mesh generation for every
+  mesh it starts and whenever the stored mesh changes identity, and passes
+  it to the mesh's Presence; each Presence adds a monotonic pinger
+  generation of its own. A snapshot from an older mesh generation, or an
+  older pinger within the current one, is dropped, so a late snapshot
+  can neither retire the live pinger nor bring back another mesh's
+  observations.
+
+  Missed pings carry across pinger restarts: each Presence counts from
+  zero, so when a newer pinger reports (or the mesh stops) what the old
+  one counted becomes a per-bulb baseline that the new one's count adds
+  to. Any report newer than the last missed ping clears it all.
+
+  While the mesh runs, a bulb is **reachable** when it has been heard
+  this boot, has fewer than `:miss_limit` (2) consecutive missed pings,
+  and was last heard within `max(:reachable_ms, 2.5 × interval)`, where
+  `interval` is the time Presence expects between its checks of that
+  bulb. The window keeps a bulb reachable between scheduled pings and
+  while pinging waits for the radio, so marginal range (a missed ping or
+  two) or a busy queue never flips it alone: only `:miss_limit` misses in
+  a row do. A bulb not reachable yet below `:miss_limit` misses, with
+  Presence running and the radio ready, is **checking** (a verdict is
+  pending), as long as the latest `Lights.all/1` read worked and the
+  current pinger has reported the bulb. Idle, nothing is reachable or
+  checking.
+
   Options: `:tuya_adapter`, `:dynsup`, `:name`, and test seams `:store`,
-  `:adapters_fun`, `:mesh_spec_fun` (`(index, mac -> child_spec)`), `:radio`,
+  `:adapters_fun`, `:mesh_spec_fun` (`(index, mac -> child_spec)`, or
+  `(index, mac, presence_opts -> child_spec)` to get the Presence options
+  `notify:` and `mesh_generation:`), `:radio`,
   `:lights`, `:pubsub`, `:retry_ms`, `:restart_ms`, `:tick_ms`,
   `:index_check_ticks` (ticks between adapter re-checks, default 6),
-  `:reachable_ms`.
+  `:reachable_ms`, `:miss_limit`.
   """
 
   use GenServer
@@ -89,6 +141,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   @report_debounce_ms 300
   @resubscribe_ms 1_000
   @reachable_ms 300_000
+  @miss_limit 2
   # Stopping the mesh waits for Lights (5 s) and the Radio's teardown (10 s).
   @change_timeout 30_000
   @shutdown 20_000
@@ -117,7 +170,8 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
               label: String.t() | nil,
               node_id: non_neg_integer(),
               last_seen: DateTime.t() | nil,
-              reachable: boolean()
+              reachable: boolean(),
+              checking: boolean()
             }
           ],
           groups: [%{local_id: 0..254, name: String.t() | nil, members: [String.t()]}]
@@ -169,7 +223,11 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
       adapter_index: nil,
       radio: nil,
       lights_running: false,
-      bulbs: Enum.map(inventory.bulbs, &Map.merge(&1, %{last_seen: nil, reachable: false})),
+      bulbs:
+        Enum.map(
+          inventory.bulbs,
+          &Map.merge(&1, %{last_seen: nil, reachable: false, checking: false})
+        ),
       groups: inventory.groups
     }
   end
@@ -191,7 +249,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
         Keyword.get(
           opts,
           :mesh_spec_fun,
-          &Mesh.child_spec(adapter_index: &1, adapter_address: &2)
+          &Mesh.child_spec(adapter_index: &1, adapter_address: &2, presence: &3)
         ),
       radio: Keyword.get(opts, :radio, Radio),
       lights: Keyword.get(opts, :lights, Lights),
@@ -202,6 +260,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
       tick_ms: Keyword.get(opts, :tick_ms, @tick_ms),
       index_check_ticks: Keyword.get(opts, :index_check_ticks, @index_check_ticks),
       reachable_ms: Keyword.get(opts, :reachable_ms, @reachable_ms),
+      miss_limit: Keyword.get(opts, :miss_limit, @miss_limit),
       timer: nil,
       refresh_timer: nil,
       ticks: 0,
@@ -213,6 +272,10 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
       subscribed: nil,
       lights_running: false,
       last_reports: %{},
+      presence: %{},
+      mesh_generation: 0,
+      pinger_generation: 0,
+      presence_mesh: nil,
       published: nil,
       pubsub_mon: nil,
       sub_timer: nil
@@ -298,7 +361,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
 
   @impl GenServer
   def terminate(_reason, state) do
-    _ = stop_mesh(state)
+    _ = halt_mesh(state)
     :ok
   catch
     :exit, _reason -> :ok
@@ -376,6 +439,12 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
     {:noreply, %{state | refresh_timer: nil} |> read_lights() |> publish()}
   end
 
+  # The mesh's queued snapshots are merged when it stops: one arriving
+  # after that is dropped.
+  defp do_info({:tuya_mesh_presence, generation, snapshot}, %{mesh: %{}} = state)
+       when is_map(snapshot),
+       do: {:noreply, state |> merge_presence(generation, snapshot) |> publish()}
+
   defp do_info({:DOWN, mon, :process, _pid, _reason}, %{mesh: %{mon: mon}} = state) do
     Logger.warning("TuyaMesh: mesh stopped on its own; retrying in #{state.restart_ms} ms")
     state = %{clear_mesh(state) | backoff_ms: state.restart_ms}
@@ -435,7 +504,9 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   end
 
   defp start_mesh(state, index) do
-    case DynamicSupervisor.start_child(state.dynsup, state.mesh_spec_fun.(index, state.mac)) do
+    state = new_mesh_generation(state)
+
+    case DynamicSupervisor.start_child(state.dynsup, mesh_spec(state, index)) do
       {:ok, pid} ->
         Logger.info("TuyaMesh: mesh started on hci#{index} (#{state.mac})")
         mesh = %{pid: pid, mon: Process.monitor(pid), index: index}
@@ -450,6 +521,11 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
         idle(state, :start_failed, true)
     end
   end
+
+  defp mesh_spec(%{mesh_spec_fun: fun} = state, index) when is_function(fun, 3),
+    do: fun.(index, state.mac, notify: self(), mesh_generation: state.mesh_generation)
+
+  defp mesh_spec(state, index), do: state.mesh_spec_fun.(index, state.mac)
 
   defp error_kind({:error, {reason, _detail}}) when is_atom(reason), do: inspect(reason)
   defp error_kind({:error, reason}) when is_atom(reason), do: inspect(reason)
@@ -478,16 +554,21 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
 
   defp log_idle(_state, reason), do: Logger.info("TuyaMesh: mesh idle (#{reason})")
 
-  defp stop_mesh(%{mesh: %{pid: pid, mon: mon}} = state) do
+  # Before a change: what Lights heard last is read first, as the restart
+  # loses it.
+  defp stop_mesh(state), do: state |> read_lights() |> halt_mesh()
+
+  defp halt_mesh(%{mesh: %{pid: pid, mon: mon}} = state) do
     Process.demonitor(mon, [:flush])
     _ = DynamicSupervisor.terminate_child(state.dynsup, pid)
     clear_mesh(state)
   end
 
-  defp stop_mesh(state), do: cancel_timer(state)
+  defp halt_mesh(state), do: cancel_timer(state)
 
   defp clear_mesh(state) do
     with {_token, tref} <- state.refresh_timer, do: Process.cancel_timer(tref)
+    state = state |> drain_presence() |> fold_misses()
 
     %{
       cancel_timer(state)
@@ -495,9 +576,19 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
         refresh_timer: nil,
         radio_status: nil,
         subscribed: nil,
-        lights_running: false,
-        last_reports: %{}
+        lights_running: false
     }
+  end
+
+  # Snapshots the stopped mesh's Presence pushed before it went: merged,
+  # not lost. Whether they still apply is the next inventory load's call.
+  defp drain_presence(state) do
+    receive do
+      {:tuya_mesh_presence, generation, snapshot} when is_map(snapshot) ->
+        state |> merge_presence(generation, snapshot) |> drain_presence()
+    after
+      0 -> state
+    end
   end
 
   # The running mesh's index must still name its MAC: gone or moved stops
@@ -547,17 +638,36 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
 
   # ── Observation ──────────────────────────────────────────────────────
 
+  # Last seen and misses follow the inventory: kept while it can't be read
+  # (store down, invalid), pruned to it once it can, gone with it.
   defp load_inventory(state) do
     case Store.load(state.store) do
-      {:ok, inv} -> %{state | inventory: summarize(inv), inventory_error: nil}
-      {:error, :no_inventory} -> %{state | inventory: nil, inventory_error: :no_inventory}
-      {:error, :unavailable} -> %{state | inventory: nil, inventory_error: :store_unavailable}
-      {:error, _invalid} -> %{state | inventory: nil, inventory_error: :invalid_inventory}
+      {:ok, inv} ->
+        summary = summarize(inv)
+
+        state =
+          if state.presence_mesh in [nil, summary.mesh],
+            do: state,
+            else: state |> forget_presence() |> new_mesh_generation()
+
+        prune(%{state | inventory: summary, inventory_error: nil, presence_mesh: summary.mesh})
+
+      {:error, :no_inventory} ->
+        state = forget_presence(state)
+        %{state | inventory: nil, inventory_error: :no_inventory, presence_mesh: nil}
+
+      {:error, :unavailable} ->
+        %{state | inventory: nil, inventory_error: :store_unavailable}
+
+      {:error, _invalid} ->
+        %{state | inventory: nil, inventory_error: :invalid_inventory}
     end
   end
 
-  defp summarize(%Inventory{bulbs: bulbs, groups: groups}) do
+  # `mesh` is the key-free fingerprint, never shown in a status.
+  defp summarize(%Inventory{bulbs: bulbs, groups: groups} = inv) do
     %{
+      mesh: Store.mesh_fingerprint(inv),
       bulbs: Enum.map(bulbs, &%{mac: &1.mac, label: &1.label, node_id: &1.node_id}),
       groups: Enum.map(groups, &%{local_id: &1.local_id, name: &1.name, members: &1.members})
     }
@@ -598,13 +708,136 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   defp read_lights(state) do
     case Lights.all(server: state.lights) do
       {:ok, bulbs} ->
-        reports = Map.new(bulbs, &{&1.mac, &1.last_report_ms})
-        %{state | lights_running: true, last_reports: reports}
+        reports =
+          Enum.reduce(bulbs, state.last_reports, &put_report(&2, &1.mac, &1.heard_ms))
+
+        prune(%{state | lights_running: true, last_reports: reports})
 
       {:error, _} ->
         %{state | lights_running: false}
     end
   end
+
+  # ── Presence ─────────────────────────────────────────────────────────
+
+  # A restarted Lights reports every bulb unheard (nil): never let that
+  # overwrite a known time.
+  defp put_report(reports, _mac, nil), do: reports
+  defp put_report(reports, mac, ms), do: Map.update(reports, mac, ms, &max(&1, ms))
+
+  # Generations order snapshots (see the moduledoc): another mesh
+  # generation's, or an older pinger's, are dropped.
+  defp merge_presence(state, {mesh_gen, pinger_gen}, snapshot)
+       when mesh_gen == state.mesh_generation and pinger_gen >= state.pinger_generation do
+    state = if pinger_gen > state.pinger_generation, do: fold_misses(state), else: state
+    seen_by = {mesh_gen, pinger_gen}
+
+    reports =
+      Enum.reduce(snapshot, state.last_reports, fn {mac, p}, acc ->
+        put_report(acc, mac, p.last_ms)
+      end)
+
+    presence =
+      Enum.reduce(snapshot, state.presence, fn {mac, p}, acc ->
+        Map.put(acc, mac, merge_entry(Map.get(acc, mac), p, Map.get(reports, mac), seen_by))
+      end)
+
+    prune(%{state | last_reports: reports, presence: presence, pinger_generation: pinger_gen})
+  end
+
+  defp merge_presence(state, _generation, _snapshot), do: state
+
+  # `current` is this pinger's own count; `base` what pingers before it
+  # counted since the last report; `seen_by` the pinger that last reported
+  # the bulb.
+  defp merge_entry(nil, p, last, seen_by),
+    do:
+      merge_entry(
+        %{base: 0, current: 0, missed_at: nil, interval_ms: nil, seen_by: nil},
+        p,
+        last,
+        seen_by
+      )
+
+  defp merge_entry(entry, p, last, seen_by) do
+    {base, missed_at} =
+      if replied_since?(last, entry.missed_at),
+        do: {0, p.missed_at},
+        else: {entry.base, later(entry.missed_at, p.missed_at)}
+
+    %{
+      base: base,
+      current: p.misses,
+      missed_at: missed_at,
+      interval_ms: p.interval_ms,
+      seen_by: seen_by
+    }
+  end
+
+  # The pinger counting is gone (replaced, or its mesh stopped): its count
+  # becomes the baseline the next one adds to.
+  defp fold_misses(state) do
+    presence =
+      Map.new(state.presence, fn {mac, e} ->
+        {mac, %{e | base: e.base + e.current, current: 0}}
+      end)
+
+    %{state | presence: presence}
+  end
+
+  defp new_mesh_generation(state),
+    do: %{state | mesh_generation: state.mesh_generation + 1, pinger_generation: 0}
+
+  defp replied_since?(nil, _missed_at), do: false
+  defp replied_since?(_last, nil), do: false
+  defp replied_since?(last, missed_at), do: last >= missed_at
+
+  defp later(nil, b), do: b
+  defp later(a, nil), do: a
+  defp later(a, b), do: max(a, b)
+
+  defp prune(%{inventory: %{bulbs: bulbs}} = state) do
+    macs = Enum.map(bulbs, & &1.mac)
+
+    %{
+      state
+      | last_reports: Map.take(state.last_reports, macs),
+        presence: Map.take(state.presence, macs)
+    }
+  end
+
+  defp prune(state), do: state
+
+  defp forget_presence(state), do: %{state | last_reports: %{}, presence: %{}}
+
+  defp bulb_presence(%{mesh: nil}, _last, _presence, _now), do: {false, false}
+
+  defp bulb_presence(state, last, presence, now) do
+    misses = effective_misses(presence, last)
+    window = max(state.reachable_ms, div(interval_of(presence) * 5, 2))
+    reachable = last != nil and misses < state.miss_limit and now - last <= window
+
+    # Only a bulb the live pinger reported, with Lights answering, can be
+    # pinged at all.
+    checking =
+      not reachable and misses < state.miss_limit and state.lights_running and
+        live_entry?(state, presence) and match?(%{ready: true}, state.radio_status)
+
+    {reachable, checking}
+  end
+
+  defp live_entry?(state, %{seen_by: seen_by}),
+    do: seen_by == {state.mesh_generation, state.pinger_generation}
+
+  defp live_entry?(_state, nil), do: false
+
+  defp effective_misses(nil, _last), do: 0
+
+  defp effective_misses(%{base: base, current: current, missed_at: at}, last),
+    do: if(replied_since?(last, at), do: 0, else: base + current)
+
+  defp interval_of(%{interval_ms: ms}) when is_integer(ms), do: ms
+  defp interval_of(_presence), do: 0
 
   defp build_status(state) do
     now = System.monotonic_time(:millisecond)
@@ -621,10 +854,10 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
         Enum.map(inventory.bulbs, fn bulb ->
           last = Map.get(state.last_reports, bulb.mac)
 
-          Map.merge(bulb, %{
-            last_seen: last_seen(last),
-            reachable: last != nil and now - last <= state.reachable_ms
-          })
+          {reachable, checking} =
+            bulb_presence(state, last, Map.get(state.presence, bulb.mac), now)
+
+          Map.merge(bulb, %{last_seen: last_seen(last), reachable: reachable, checking: checking})
         end),
       groups: inventory.groups
     }

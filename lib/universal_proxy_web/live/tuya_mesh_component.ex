@@ -25,6 +25,15 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
       another mesh be stored meanwhile, the unconfirmed upload comes back
       as `{:error, {:confirm_new_mesh, preview}}` and is asked again.
 
+  A dump whose sequence counter is far ahead of the device's (the
+  preview's `seq` is `:kept_local` / `:beyond_bound`) also opens the
+  confirmation, with a notice: the Tuya or Smart Life app may have moved
+  the bulbs on since the last upload. Its main action keeps the device's
+  counter. "Adopt the dump's counter…" replaces the dialog with a second
+  one (a fresh token) that warns what adopting a stale dump does, and only
+  its confirm uploads with `adopt_dump_seq: true`. Cancel in either keeps
+  everything as stored.
+
   Every upload carries the preview's `revision` as `expected_revision:`,
   so it only lands on the inventory that preview diffed against. When
   another tab uploaded, cleared or changed groups in between, the facade
@@ -75,9 +84,10 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
     {:ok,
      socket
      |> assign(:status, TuyaMesh.status())
-     # `nil`, or `%{inventory: sealed_json, preview: preview, stale: bool}`
-     # while an upload awaits confirmation (`stale`: the store changed
-     # since the user last saw a diff).
+     # `nil`, or `%{inventory: sealed_json, preview: preview, stale: bool,
+     # mode: :review | :adopt, token: token}` while an upload awaits
+     # confirmation (`stale`: the store changed since the user last saw a
+     # diff; `:adopt`: the second, adopt-the-counter dialog).
      |> assign(:pending, nil)
      # `nil`, `:confirm`, or `:force` (the stored record's seq is lost).
      |> assign(:clearing, nil)
@@ -143,13 +153,27 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   def handle_event(
         "confirm_upload",
         %{"token" => token},
-        %{assigns: %{pending: %{token: token}}} = socket
+        %{assigns: %{pending: %{token: token, mode: :review}}} = socket
+      ),
+      do: {:noreply, confirm_pending(socket, [])}
+
+  # The adopt dialog replaces the review one, with a token of its own.
+  def handle_event(
+        "ask_adopt",
+        %{"token" => token},
+        %{assigns: %{pending: %{token: token, mode: :review} = pending}} = socket
       ) do
-    %{inventory: sealed, preview: preview} = socket.assigns.pending
-    socket = assign(socket, :pending, nil)
-    confirm = if preview.mesh == :new_mesh, do: [confirm: true], else: []
-    {:noreply, upload(socket, Redact.unseal(sealed), preview, confirm)}
+    if adoptable?(pending.preview),
+      do: {:noreply, assign(socket, :pending, %{pending | mode: :adopt, token: new_token()})},
+      else: {:noreply, socket}
   end
+
+  def handle_event(
+        "confirm_adopt",
+        %{"token" => token},
+        %{assigns: %{pending: %{token: token, mode: :adopt}}} = socket
+      ),
+      do: {:noreply, confirm_pending(socket, adopt_dump_seq: true)}
 
   def handle_event("cancel_upload", _params, socket),
     do: {:noreply, assign(socket, :pending, nil)}
@@ -203,7 +227,16 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
     end
   end
 
-  # A new mesh replaces everything; a removed bulb loses its HA entities.
+  defp confirm_pending(socket, opts) do
+    %{inventory: sealed, preview: preview} = socket.assigns.pending
+    socket = assign(socket, :pending, nil)
+    confirm = if preview.mesh == :new_mesh, do: [confirm: true], else: []
+    upload(socket, Redact.unseal(sealed), preview, confirm ++ opts)
+  end
+
+  # A dump far ahead asks whether to adopt its counter; a new mesh
+  # replaces everything; a removed bulb loses its HA entities.
+  defp needs_confirm?(%{seq: %{reason: :beyond_bound}}), do: true
   defp needs_confirm?(%{mesh: :new_mesh}), do: true
   defp needs_confirm?(%{bulbs: %{removed: removed}}), do: removed != []
 
@@ -213,9 +246,14 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
       inventory: Redact.seal(json),
       preview: preview,
       stale: stale?,
-      token: Integer.to_string(System.unique_integer([:positive]))
+      mode: :review,
+      token: new_token()
     })
   end
+
+  defp new_token, do: Integer.to_string(System.unique_integer([:positive]))
+
+  defp adoptable?(preview), do: match?(%{seq: %{reason: :beyond_bound}}, preview)
 
   defp clear(socket, opts) do
     case TuyaMesh.clear(opts) do
@@ -378,9 +416,15 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
       <.help />
 
       <.confirm_upload_modal
-        :if={@pending}
+        :if={@pending && @pending.mode == :review}
         preview={@pending.preview}
         stale={@pending.stale}
+        token={@pending.token}
+        myself={@myself}
+      />
+      <.adopt_modal
+        :if={@pending && @pending.mode == :adopt}
+        preview={@pending.preview}
         token={@pending.token}
         myself={@myself}
       />
@@ -402,9 +446,7 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
         </div>
       </div>
       <span class="text-xs text-fg-3">{last_seen(@bulb.last_seen, @now)}</span>
-      <.badge variant={if(@bulb.reachable, do: :success, else: :neutral)} dot>
-        {if @bulb.reachable, do: "Reachable", else: "Not reachable"}
-      </.badge>
+      <.badge variant={presence_variant(@bulb)} dot>{presence_label(@bulb)}</.badge>
     </div>
     """
   end
@@ -494,14 +536,24 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
           Cancel
         </.button>
         <.button
-          variant={:danger}
+          :if={adoptable?(@preview)}
+          variant={:secondary}
+          size={:sm}
+          phx-click="ask_adopt"
+          phx-value-token={@token}
+          phx-target={@myself}
+        >
+          Adopt the dump's counter…
+        </.button>
+        <.button
+          variant={if(destructive?(@preview), do: :danger, else: :primary)}
           size={:sm}
           phx-click="confirm_upload"
           phx-value-token={@token}
           phx-target={@myself}
           phx-disable-with="Uploading…"
         >
-          {@copy.action}
+          {if adoptable?(@preview), do: "#{@copy.action}, keep the device's counter", else: @copy.action}
         </.button>
       </:footer>
       <div
@@ -513,6 +565,19 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
         <span>
           The stored inventory changed since you chose this file. Review the
           updated changes below.
+        </span>
+      </div>
+      <div
+        :if={adoptable?(@preview)}
+        role="alert"
+        class="mb-3 p-[10px_12px] rounded-md bg-warning-soft text-warning text-xs font-medium flex items-start gap-2"
+      >
+        <.icon name={:alert} size={14} stroke={2.0} class="mt-px flex-none" />
+        <span>
+          This dump's sequence counter ({@preview.seq.dump}) is far ahead of the
+          device's ({@preview.seq.local}). If you've used the Tuya or Smart Life app
+          since the last upload, adopt the dump's counter; otherwise keep the
+          device's.
         </span>
       </div>
       <p class="text-sm text-fg-2 mt-0 mb-3">
@@ -528,6 +593,74 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
     </.modal>
     """
   end
+
+  attr(:preview, :map, required: true)
+  attr(:token, :string, required: true)
+  attr(:myself, :any, required: true)
+
+  defp adopt_modal(assigns) do
+    ~H"""
+    <%!-- Replaces the review dialog: its Cancel (token in its id) takes
+         focus, off the button just pressed. --%>
+    <.modal
+      open={true}
+      on_close="cancel_upload"
+      target={@myself}
+      title="Adopt the dump's counter?"
+      return_focus="#tuya-mesh-upload input[type=file]"
+    >
+      <:footer>
+        <.button
+          id={"tuya-mesh-adopt-cancel-#{@token}"}
+          variant={:ghost}
+          size={:sm}
+          phx-click="cancel_upload"
+          phx-target={@myself}
+          phx-mounted={JS.focus()}
+        >
+          Cancel
+        </.button>
+        <.button
+          variant={:danger}
+          size={:sm}
+          phx-click="confirm_adopt"
+          phx-value-token={@token}
+          phx-target={@myself}
+          phx-disable-with="Uploading…"
+        >
+          Adopt counter and upload
+        </.button>
+      </:footer>
+      <div
+        role="alert"
+        class="mb-3 p-[10px_12px] rounded-md bg-warning-soft text-warning text-xs font-medium flex items-start gap-2"
+      >
+        <.icon name={:alert} size={14} stroke={2.0} class="mt-px flex-none" />
+        <span>
+          Only adopt it if this dump was exported after you last used the Tuya or
+          Smart Life app. If it is older than that, the bulbs will ignore this
+          device until you upload, and adopt, a fresh dump.
+        </span>
+      </div>
+      <p class="text-sm text-fg-2 mt-0 mb-3">
+        This sets the device's sequence counter to {@preview.seq.dump}, the
+        dump's, instead of keeping {@preview.seq.local}.
+        <span :if={@preview.mesh == :new_mesh}>
+          It also replaces every bulb and group of the stored mesh.
+        </span>
+        <span :if={@preview.bulbs.removed != []}>
+          Home&nbsp;Assistant drops the entities of the bulbs removed below, and
+          their history with them.
+        </span>
+      </p>
+      <div class="p-[10px_12px] rounded-md bg-sunken text-fg-2 text-xs">
+        <.diff preview={@preview} />
+      </div>
+    </.modal>
+    """
+  end
+
+  defp destructive?(preview), do: preview.mesh == :new_mesh or preview.bulbs.removed != []
 
   defp confirm_copy(%{mesh: :new_mesh}) do
     %{
@@ -694,6 +827,16 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
 
   defp humanize(atom), do: atom |> Atom.to_string() |> String.replace("_", " ")
 
+  # "Checking" while the pinger hasn't concluded: a bulb is "Not reachable"
+  # only once it missed enough pings in a row (see the Resolver).
+  defp presence_variant(%{reachable: true}), do: :success
+  defp presence_variant(%{checking: true}), do: :accent
+  defp presence_variant(_bulb), do: :neutral
+
+  defp presence_label(%{reachable: true}), do: "Reachable"
+  defp presence_label(%{checking: true}), do: "Checking…"
+  defp presence_label(_bulb), do: "Not reachable"
+
   defp last_seen(nil, _now), do: "Never seen"
 
   defp last_seen(%DateTime{} = at, now) do
@@ -732,6 +875,11 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   # TuyaMesh.preview/1 and upload/2
   defp upload_error({:invalid_inventory, reason}),
     do: "That file isn't a usable mesh dump: " <> inventory_error(reason)
+
+  defp upload_error({:seq_not_ahead, %{local: local}}),
+    do:
+      "The dump's sequence counter is no longer ahead of the device's (#{local}). " <>
+        "Nothing was changed."
 
   defp upload_error(reason), do: change_error(reason)
 

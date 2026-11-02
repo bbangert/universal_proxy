@@ -1,7 +1,8 @@
 defmodule UniversalProxy.TuyaMesh.Mesh do
   @moduledoc """
   The running mesh: `TuyaBeaconMesh.Radio` on the dedicated adapter, then
-  `TuyaBeaconMesh.Lights` on the stored inventory. Started (and stopped)
+  `TuyaBeaconMesh.Lights` on the stored inventory, then the pinger
+  `UniversalProxy.TuyaMesh.Presence`. Started (and stopped)
   only by `UniversalProxy.TuyaMesh.Resolver`, as a `:temporary` child of
   its DynamicSupervisor.
 
@@ -15,6 +16,11 @@ defmodule UniversalProxy.TuyaMesh.Mesh do
   An inventory that no longer validates makes Lights return `:ignore`,
   leaving the Radio idle.
 
+  Presence comes last so that its crash restarts only itself, never Radio
+  or Lights; a Radio or Lights restart restarts it too (its view of them
+  is stale then). It shares this supervisor's restart budget, but every
+  call it makes is wrapped, so only a bug can crash it.
+
   Radio's own child spec gives it a 10 s `shutdown` (its teardown makes
   blocking D-Bus and lease calls). Exceeding the restart budget stops this
   supervisor; the Resolver notices and tries again later, so a crashing
@@ -23,14 +29,15 @@ defmodule UniversalProxy.TuyaMesh.Mesh do
   The Radio gets the role MAC as `:adapter_address`, so it refuses an
   adapter that took over the index (see `TuyaBeaconMesh.Radio`).
 
-  Options: `:adapter_index` (required), `:adapter_address`, `:radio` and `:lights` (keyword
-  lists merged over the defaults, for tests), `:name`.
+  Options: `:adapter_index` (required), `:adapter_address`, `:radio`,
+  `:lights` and `:presence` (keyword lists merged over the defaults; the
+  Resolver passes `presence: [notify: self()]`), `:name`.
   """
 
   use Supervisor
 
   alias UniversalProxy.TuyaBeaconMesh.{Lights, Radio}
-  alias UniversalProxy.TuyaMesh.Store
+  alias UniversalProxy.TuyaMesh.{Presence, Store}
 
   def start_link(opts) do
     Supervisor.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
@@ -62,13 +69,25 @@ defmodule UniversalProxy.TuyaMesh.Mesh do
           on_persist: &Store.persist/1,
           # A Lights without the seq lease ignores this option.
           on_tighten: &Store.tighten/2,
+          # The Store's upload bound is derived from it.
+          max_lease: Store.lights_max_lease(),
           radio: Keyword.fetch!(radio, :name),
           name: Lights
         ],
         Keyword.get(opts, :lights, [])
       )
 
-    Supervisor.init([{Radio, radio}, {Lights, lights}],
+    presence =
+      Keyword.merge(
+        [
+          lights: Keyword.fetch!(lights, :name),
+          radio: Keyword.fetch!(radio, :name),
+          name: Presence
+        ],
+        Keyword.get(opts, :presence, [])
+      )
+
+    Supervisor.init([{Radio, radio}, {Lights, lights}, {Presence, presence}],
       strategy: :rest_for_one,
       max_restarts: 5,
       max_seconds: 60

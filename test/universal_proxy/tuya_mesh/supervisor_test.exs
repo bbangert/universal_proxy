@@ -5,7 +5,7 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
   import ExUnit.CaptureLog
 
   alias UniversalProxy.TuyaBeaconMesh.{Carrier, Dp, FakeBluez, Inventory, Lights, P2, Radio}
-  alias UniversalProxy.TuyaMesh.{Mesh, Resolver, Store}
+  alias UniversalProxy.TuyaMesh.{FakeLights, FakeRadio, Mesh, Presence, Resolver, Store}
 
   @moduletag :tmp_dir
   @moduletag :capture_log
@@ -23,6 +23,8 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
   @mesh_mac "AA:BB:CC:DD:EE:01"
   @proxy_mac "AA:BB:CC:DD:EE:02"
   @mac2 0xDC23530FB34A
+  @bulb2 "DC23530FB34A"
+  @bulb3 "DC23533FCD62"
 
   setup %{tmp_dir: tmp_dir} do
     n = System.unique_integer([:positive])
@@ -539,10 +541,346 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
     end
   end
 
+  describe "last seen and reachability" do
+    setup ctx do
+      {:ok, _} = Store.replace(inventory(), [], ctx.store)
+      n = System.unique_integer([:positive])
+      lights = :"fake_lights_#{n}"
+      radio = :"fake_radio_#{n}"
+      start_supervised!({FakeLights, name: lights, macs: [@bulb2, @bulb3]}, id: :fake_lights)
+      start_supervised!({FakeRadio, name: radio}, id: :fake_radio)
+      start_mesh_sup(ctx, lights: lights, radio: radio)
+      {:ok, lights: lights}
+    end
+
+    defp bulb(ctx, mac), do: Enum.find(status(ctx).bulbs, &(&1.mac == mac))
+    defp now_ms, do: System.monotonic_time(:millisecond)
+    defp resolver_pid(ctx), do: Process.whereis(ctx.names.resolver)
+
+    defp presence(ctx, snapshot), do: presence(ctx, 1, snapshot)
+
+    # From pinger `pinger` of the running mesh.
+    defp presence(ctx, pinger, snapshot),
+      do: presence(ctx, mesh_generation(ctx), pinger, snapshot)
+
+    defp presence(ctx, mesh_generation, pinger, snapshot) do
+      send(resolver_pid(ctx), {:tuya_mesh_presence, {mesh_generation, pinger}, snapshot})
+      # A call returns once the message before it was handled.
+      status(ctx)
+    end
+
+    defp mesh_generation(ctx), do: :sys.get_state(resolver_pid(ctx)).mesh_generation
+
+    defp p(fields),
+      do:
+        Map.merge(
+          %{last_ms: nil, misses: 0, missed_at: nil, interval_ms: 120_000, pinging: false},
+          fields
+        )
+
+    test "a Lights restart and a same-mesh upload keep last seen; a removed bulb drops out",
+         ctx do
+      :ok = FakeLights.report(ctx.lights, @bulb2, now_ms())
+      wait_until(fn -> match?(%{last_seen: %DateTime{}, reachable: true}, bulb(ctx, @bulb2)) end)
+      seen = bulb(ctx, @bulb2).last_seen
+
+      # A restarted Lights: every bulb unheard.
+      :ok = FakeLights.put(ctx.lights, :bulbs, %{@bulb2 => nil, @bulb3 => nil})
+      Process.sleep(60)
+      assert %{last_seen: ^seen, reachable: true} = bulb(ctx, @bulb2)
+
+      assert {:ok, :same_mesh} = Resolver.replace(inventory(), [], ctx.names.resolver)
+      Process.sleep(60)
+      assert %{last_seen: ^seen} = bulb(ctx, @bulb2)
+
+      # Removed, then back: nothing kept for it.
+      without = %{
+        inventory()
+        | bulbs: Enum.reject(inventory().bulbs, &(&1.mac == @bulb2)),
+          groups: []
+      }
+
+      assert {:ok, :same_mesh} = Resolver.replace(without, [], ctx.names.resolver)
+      assert bulb(ctx, @bulb2) == nil
+      assert {:ok, :same_mesh} = Resolver.replace(inventory(), [], ctx.names.resolver)
+      assert %{last_seen: nil, reachable: false} = bulb(ctx, @bulb2)
+    end
+
+    test "a new mesh forgets what the old one heard", ctx do
+      :ok = FakeLights.report(ctx.lights, @bulb2, now_ms())
+      wait_until(fn -> match?(%{last_seen: %DateTime{}}, bulb(ctx, @bulb2)) end)
+      :ok = FakeLights.put(ctx.lights, :bulbs, %{@bulb2 => nil, @bulb3 => nil})
+
+      key = "ffeeddccbbaa99887766554433221100"
+
+      other = %{
+        inventory()
+        | beacon_key: key,
+          bulbs: Enum.map(inventory().bulbs, &%{&1 | beacon_key: key})
+      }
+
+      assert {:ok, :new_mesh} =
+               Resolver.replace(other, [allow_new_mesh: true], ctx.names.resolver)
+
+      assert %{last_seen: nil} = bulb(ctx, @bulb2)
+    end
+
+    test "a stale report within 2.5 pinger intervals stays reachable", ctx do
+      last = now_ms() - 400_000
+      :ok = FakeLights.report(ctx.lights, @bulb2, last)
+      wait_until(fn -> match?(%{last_seen: %DateTime{}}, bulb(ctx, @bulb2)) end)
+
+      # No pinger yet: the plain 300 s window.
+      assert %{reachable: false, checking: false} = bulb(ctx, @bulb2)
+
+      # Checks every 200 s: a 500 s window.
+      presence(ctx, %{@bulb2 => p(%{last_ms: last, interval_ms: 200_000})})
+      assert %{reachable: true} = bulb(ctx, @bulb2)
+
+      # Every 100 s: back to 300 s, but no verdict yet.
+      presence(ctx, %{@bulb2 => p(%{last_ms: last, interval_ms: 100_000})})
+      assert %{reachable: false, checking: true} = bulb(ctx, @bulb2)
+    end
+
+    test "not reachable only after two missed pings in a row, until a reply", ctx do
+      t0 = now_ms()
+      :ok = FakeLights.report(ctx.lights, @bulb2, t0)
+      wait_until(fn -> match?(%{reachable: true}, bulb(ctx, @bulb2)) end)
+
+      presence(ctx, %{@bulb2 => p(%{last_ms: t0, misses: 1, missed_at: t0 + 1})})
+      assert %{reachable: true} = bulb(ctx, @bulb2)
+
+      presence(ctx, %{@bulb2 => p(%{last_ms: t0, misses: 2, missed_at: t0 + 2})})
+      assert %{reachable: false, checking: false} = bulb(ctx, @bulb2)
+
+      # A restarted pinger knows nothing: the verdict stands.
+      restarted = 2
+      presence(ctx, restarted, %{@bulb2 => p(%{})})
+      assert %{reachable: false, checking: false} = bulb(ctx, @bulb2)
+      presence(ctx, restarted, %{@bulb2 => p(%{misses: 1, missed_at: t0 + 3})})
+      assert %{reachable: false} = bulb(ctx, @bulb2)
+
+      # Any report after the last missed ping clears it.
+      :ok = FakeLights.report(ctx.lights, @bulb2, t0 + 4)
+      wait_until(fn -> match?(%{reachable: true}, bulb(ctx, @bulb2)) end)
+      presence(ctx, restarted, %{@bulb2 => p(%{last_ms: t0 + 4})})
+      assert %{reachable: true} = bulb(ctx, @bulb2)
+
+      # And counting starts over.
+      presence(ctx, restarted, %{@bulb2 => p(%{last_ms: t0 + 4, misses: 1, missed_at: t0 + 5})})
+      assert %{reachable: true} = bulb(ctx, @bulb2)
+    end
+
+    test "misses add up across a pinger restart, and a mesh restart", ctx do
+      t0 = now_ms()
+      :ok = FakeLights.report(ctx.lights, @bulb2, t0)
+      wait_until(fn -> match?(%{reachable: true}, bulb(ctx, @bulb2)) end)
+
+      presence(ctx, %{@bulb2 => p(%{last_ms: t0, misses: 1, missed_at: t0 + 1})})
+      assert %{reachable: true} = bulb(ctx, @bulb2)
+
+      # The new pinger's first miss is the second in a row.
+      second = 2
+      presence(ctx, second, %{@bulb2 => p(%{last_ms: t0, misses: 1, missed_at: t0 + 2})})
+      assert %{reachable: false} = bulb(ctx, @bulb2)
+
+      # A late snapshot from the pinger before is stale: dropped.
+      presence(ctx, 1, %{@bulb2 => p(%{last_ms: t0 + 3})})
+      assert %{reachable: false} = bulb(ctx, @bulb2)
+
+      # A reply clears it; one miss, a mesh restart, one more: two again.
+      :ok = FakeLights.report(ctx.lights, @bulb2, t0 + 4)
+      wait_until(fn -> match?(%{reachable: true}, bulb(ctx, @bulb2)) end)
+      presence(ctx, second, %{@bulb2 => p(%{last_ms: t0 + 4, misses: 1, missed_at: t0 + 5})})
+      assert %{reachable: true} = bulb(ctx, @bulb2)
+
+      assert {:ok, :same_mesh} = Resolver.replace(inventory(), [], ctx.names.resolver)
+      presence(ctx, 1, %{@bulb2 => p(%{last_ms: t0 + 4, misses: 1, missed_at: t0 + 6})})
+      assert %{reachable: false} = bulb(ctx, @bulb2)
+    end
+
+    test "A → B → A: each change of mesh forgets what the other heard", ctx do
+      key = "ffeeddccbbaa99887766554433221100"
+      a = inventory()
+      b = %{a | beacon_key: key, bulbs: Enum.map(a.bulbs, &%{&1 | beacon_key: key})}
+
+      for inv <- [b, a] do
+        :ok = FakeLights.report(ctx.lights, @bulb2, now_ms())
+        wait_until(fn -> match?(%{last_seen: %DateTime{}}, bulb(ctx, @bulb2)) end)
+        # The new mesh's Lights hasn't heard it.
+        :ok = FakeLights.put(ctx.lights, :bulbs, %{@bulb2 => nil, @bulb3 => nil})
+
+        assert {:ok, _kind} =
+                 Resolver.replace(inv, [allow_new_mesh: true], ctx.names.resolver)
+
+        assert %{last_seen: nil} = bulb(ctx, @bulb2)
+      end
+    end
+
+    test "a delayed snapshot from a replaced pinger is dropped, even its first", ctx do
+      t0 = now_ms()
+      presence(ctx, 5, %{@bulb2 => p(%{misses: 2, missed_at: t0})})
+      assert %{reachable: false, last_seen: nil} = bulb(ctx, @bulb2)
+
+      # Pinger 3 started before 5 but was never heard from until now.
+      presence(ctx, 3, %{@bulb2 => p(%{last_ms: t0 + 1})})
+      assert %{reachable: false, last_seen: nil} = bulb(ctx, @bulb2)
+    end
+
+    test "an old mesh's snapshot arriving after a change of mesh is dropped", ctx do
+      old = mesh_generation(ctx)
+      key = "ffeeddccbbaa99887766554433221100"
+
+      other = %{
+        inventory()
+        | beacon_key: key,
+          bulbs: Enum.map(inventory().bulbs, &%{&1 | beacon_key: key})
+      }
+
+      assert {:ok, :new_mesh} =
+               Resolver.replace(other, [allow_new_mesh: true], ctx.names.resolver)
+
+      assert mesh_generation(ctx) > old
+
+      presence(ctx, old, 9, %{@bulb3 => p(%{last_ms: now_ms()})})
+      assert %{last_seen: nil} = bulb(ctx, @bulb3)
+    end
+
+    test "checking needs Lights answering and the live pinger to have reported the bulb", ctx do
+      # A pinger with nothing to report (Lights gave it nothing).
+      presence(ctx, %{})
+      assert %{checking: false} = bulb(ctx, @bulb3)
+
+      presence(ctx, %{@bulb3 => p(%{})})
+      assert %{checking: true} = bulb(ctx, @bulb3)
+
+      # A newer pinger that hasn't reported it yet.
+      presence(ctx, 2, %{@bulb2 => p(%{})})
+      assert %{checking: false} = bulb(ctx, @bulb3)
+      presence(ctx, 2, %{@bulb3 => p(%{})})
+      assert %{checking: true} = bulb(ctx, @bulb3)
+
+      # Lights not answering (stopped, or :ignore on a bad inventory).
+      :ok = FakeLights.put(ctx.lights, :all_reply, {:error, :not_running})
+      wait_until(fn -> match?(%{lights_running: false}, status(ctx)) end)
+      assert %{checking: false} = bulb(ctx, @bulb3)
+    end
+
+    test "never heard, with the pinger running and the radio ready: checking", ctx do
+      assert %{reachable: false, checking: false} = bulb(ctx, @bulb3)
+      presence(ctx, %{@bulb3 => p(%{pinging: true})})
+      assert %{reachable: false, checking: true, last_seen: nil} = bulb(ctx, @bulb3)
+
+      presence(ctx, %{@bulb3 => p(%{misses: 2, missed_at: now_ms()})})
+      assert %{reachable: false, checking: false} = bulb(ctx, @bulb3)
+    end
+
+    test "idle: nothing reachable or checking, last seen kept", ctx do
+      :ok = FakeLights.report(ctx.lights, @bulb2, now_ms())
+      wait_until(fn -> match?(%{reachable: true}, bulb(ctx, @bulb2)) end)
+
+      set_adapters(ctx, [adapter(@proxy_mac, 0)])
+      adapters_changed(ctx)
+      wait_until(fn -> status(ctx).state == :idle end)
+      assert %{reachable: false, checking: false, last_seen: %DateTime{}} = bulb(ctx, @bulb2)
+
+      # A snapshot arriving now (from the stopped mesh) is dropped.
+      presence(ctx, %{@bulb3 => p(%{last_ms: now_ms()})})
+      assert %{last_seen: nil} = bulb(ctx, @bulb3)
+    end
+  end
+
+  defmodule PushingMesh do
+    @moduledoc false
+    # A stand-in mesh whose stop makes Lights forget (as a stopping Lights
+    # does) and may push one last snapshot to the Resolver.
+    use GenServer
+
+    @impl GenServer
+    def init(arg) do
+      Process.flag(:trap_exit, true)
+      {:ok, arg}
+    end
+
+    @impl GenServer
+    def terminate(_reason, %{lights: lights, resolver: resolver, push: push, generation: gen}) do
+      UniversalProxy.TuyaMesh.FakeLights.put(lights, :bulbs, %{
+        "DC23530FB34A" => nil,
+        "DC23533FCD62" => nil
+      })
+
+      if push, do: send(Process.whereis(resolver), {:tuya_mesh_presence, {gen, 1}, push.()})
+    end
+  end
+
+  describe "a change keeps what was heard just before it" do
+    setup ctx do
+      {:ok, _} = Store.replace(inventory(), [], ctx.store)
+      n = System.unique_integer([:positive])
+      lights = :"fake_lights_#{n}"
+      radio = :"fake_radio_#{n}"
+      start_supervised!({FakeLights, name: lights, macs: [@bulb2, @bulb3]}, id: :fake_lights)
+      start_supervised!({FakeRadio, name: radio}, id: :fake_radio)
+      {:ok, lights: lights, radio: radio}
+    end
+
+    defp start_pushing(ctx, push) do
+      arg = %{lights: ctx.lights, resolver: ctx.names.resolver, push: push}
+
+      spec = fn _index, _mac, presence ->
+        arg = Map.put(arg, :generation, presence[:mesh_generation])
+        %{id: :mesh, start: {GenServer, :start_link, [PushingMesh, arg]}, restart: :temporary}
+      end
+
+      # No tick: only the change itself reads Lights.
+      start_mesh_sup(ctx,
+        mesh_spec_fun: spec,
+        lights: ctx.lights,
+        radio: ctx.radio,
+        tick_ms: 60_000
+      )
+    end
+
+    defp seen(ctx, mac), do: Enum.find(status(ctx).bulbs, &(&1.mac == mac)).last_seen
+
+    test "a report Lights holds when an upload stops it", ctx do
+      start_pushing(ctx, nil)
+      :ok = FakeLights.report(ctx.lights, @bulb2, System.monotonic_time(:millisecond))
+      assert seen(ctx, @bulb2) == nil
+
+      assert {:ok, :same_mesh} = Resolver.replace(inventory(), [], ctx.names.resolver)
+      assert %DateTime{} = seen(ctx, @bulb2)
+    end
+
+    test "a snapshot the pinger pushed as the mesh stopped", ctx do
+      now = System.monotonic_time(:millisecond)
+
+      start_pushing(ctx, fn ->
+        %{
+          "DC23533FCD62" => %{
+            last_ms: now,
+            misses: 0,
+            missed_at: nil,
+            interval_ms: 120_000,
+            pinging: false
+          }
+        }
+      end)
+
+      assert {:ok, :same_mesh} = Resolver.replace(inventory(), [], ctx.names.resolver)
+      assert %DateTime{} = seen(ctx, @bulb3)
+    end
+  end
+
   describe "mesh wiring" do
     test "Lights persists and tightens through the Store; the Radio is fenced by MAC" do
-      assert {:ok, {_flags, [radio, lights]}} =
-               Mesh.init(adapter_index: 2, adapter_address: @mesh_mac)
+      assert {:ok, {_flags, [radio, lights, presence]}} =
+               Mesh.init(adapter_index: 2, adapter_address: @mesh_mac, presence: [notify: self()])
+
+      %{start: {Presence, :start_link, [presence_opts]}} = presence
+      assert presence_opts[:lights] == Lights
+      assert presence_opts[:radio] == Radio
+      assert presence_opts[:notify] == self()
 
       %{start: {Radio, :start_link, [radio_opts]}} = radio
       assert radio_opts[:adapter_index] == 2
@@ -552,6 +890,8 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
       assert lights_opts[:on_persist] == (&Store.persist/1)
       assert lights_opts[:on_tighten] == (&Store.tighten/2)
       assert lights_opts[:inventory] == (&Store.load/0)
+      # The Store's upload bound is derived from this lease cap.
+      assert lights_opts[:max_lease] == Store.lights_max_lease()
     end
   end
 
@@ -614,13 +954,43 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
       assert %DateTime{} = bulb.last_seen
     end
 
+    test "a replacement pinger starts settling before its first attempt", ctx do
+      restarts = [
+        fn -> Process.exit(Process.whereis(Presence), :kill) end,
+        fn -> {:ok, :same_mesh} = Resolver.replace(inventory(), [], ctx.names.resolver) end
+      ]
+
+      for restart <- restarts do
+        old = Process.whereis(Presence)
+        restart.()
+        wait_until(fn -> Process.whereis(Presence) not in [nil, old] end)
+        state = :sys.get_state(Presence)
+        # Settling: no attempt before a Lights read, an idle Radio and a gap.
+        assert state.settling in [:lights, :radio]
+        assert state.next_attempt >= state.started + state.gap_ms
+      end
+    end
+
+    test "a pinger crash restarts only the pinger", ctx do
+      radio = Process.whereis(Radio)
+      lights = Process.whereis(Lights)
+      presence = Process.whereis(Presence)
+      assert is_pid(presence)
+
+      Process.exit(presence, :kill)
+      wait_until(fn -> Process.whereis(Presence) not in [nil, presence] end)
+      assert Process.whereis(Radio) == radio
+      assert Process.whereis(Lights) == lights
+      assert %{state: :running, lights_running: true} = status(ctx)
+    end
+
     test "an upload restarts Radio and Lights on the new inventory", ctx do
       radio = Process.whereis(Radio)
-      new = inventory() |> Map.put(:seq, 1_000)
+      new = inventory() |> Map.put(:seq, 350)
       assert {:ok, :same_mesh} = Resolver.replace(new, [], ctx.names.resolver)
       wait_until(fn -> match?(%{radio: %{ready: true}, lights_running: true}, status(ctx)) end)
       assert Process.whereis(Radio) != radio
-      assert {:ok, %Inventory{seq: 1_000}} = Lights.inventory()
+      assert {:ok, %Inventory{seq: 350}} = Lights.inventory()
     end
   end
 

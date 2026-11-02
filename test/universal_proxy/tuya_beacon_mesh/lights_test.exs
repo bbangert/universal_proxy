@@ -646,6 +646,30 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
       assert_dp(2, 3, 6)
     end
 
+    test "a frame held for re-anchoring is heard, and nothing else" do
+      inject_report(2, 30_000, [{3, :value, 1}])
+      assert_dp(2, 3, 1)
+      {:ok, %{last_report_ms: accepted, heard_ms: accepted}} = Lights.status("path light 2")
+
+      # The counter restarted: held, not applied, but heard.
+      Process.sleep(2)
+      inject_report(2, 10, [{3, :value, 2}])
+      sentinel()
+      {:ok, held} = Lights.status("path light 2")
+      assert held.dps == %{3 => 1}
+      assert held.last_report_ms == accepted
+      assert held.heard_ms > accepted
+      assert {:ok, [_ | _] = all} = Lights.all()
+      assert Enum.find(all, &(&1.mac == held.mac)).heard_ms == held.heard_ms
+
+      # An exact repeat isn't heard again.
+      Process.sleep(2)
+      inject_report(2, 10, [{3, :value, 3}], address: @mac3)
+      sentinel()
+      assert {:ok, %{heard_ms: heard}} = Lights.status("path light 2")
+      assert heard == held.heard_ms
+    end
+
     test "wrong keys, unknown nodes and junk are ignored" do
       inject_report(2, 5, [{3, :value, 1}], key: @other_key)
       inject_report(9, 5, [{3, :value, 1}])

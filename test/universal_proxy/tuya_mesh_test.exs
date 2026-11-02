@@ -8,6 +8,7 @@ defmodule UniversalProxy.TuyaMeshTest do
   alias UniversalProxy.TuyaMesh.Store
 
   @moduletag :tmp_dir
+  @moduletag :capture_log
 
   @fixture Path.join([
              __DIR__,
@@ -48,6 +49,40 @@ defmodule UniversalProxy.TuyaMeshTest do
     for secret <- [@beacon_key, @other_key | @local_keys] do
       refute text =~ secret
       refute text =~ String.upcase(secret)
+    end
+  end
+
+  describe "adopting a dump's counter" do
+    test "a dump the app moved on is adopted only when asked, with a revision", ctx do
+      {:ok, _} = TuyaMesh.upload(json(%{"seq" => 1_000}), ctx.opts)
+      newer = json(%{"seq" => 6_000})
+
+      assert {:ok, %{seq: %{outcome: :kept_local, reason: :beyond_bound} = seq, revision: rev}} =
+               TuyaMesh.preview(newer, ctx.opts)
+
+      assert %{local: 1_000, dump: 6_000} = seq
+
+      assert {:error, :adopt_needs_revision} =
+               TuyaMesh.upload(newer, [adopt_dump_seq: true] ++ ctx.opts)
+
+      # Not adopting keeps the device's.
+      assert {:ok, :same_mesh} = TuyaMesh.upload(newer, [expected_revision: rev] ++ ctx.opts)
+      assert {:ok, %{seq: 1_000}} = Store.load(ctx.store)
+
+      {:ok, %{revision: rev}} = TuyaMesh.preview(newer, ctx.opts)
+
+      assert {:ok, :same_mesh} =
+               TuyaMesh.upload(newer, [adopt_dump_seq: true, expected_revision: rev] ++ ctx.opts)
+
+      assert {:ok, %{seq: 6_000}} = Store.load(ctx.store)
+
+      {:ok, %{revision: rev}} = TuyaMesh.preview(json(%{"seq" => 5_000}), ctx.opts)
+
+      assert {:error, {:seq_not_ahead, %{local: 6_000, dump: 5_000}}} =
+               TuyaMesh.upload(
+                 json(%{"seq" => 5_000}),
+                 [adopt_dump_seq: true, expected_revision: rev] ++ ctx.opts
+               )
     end
   end
 
