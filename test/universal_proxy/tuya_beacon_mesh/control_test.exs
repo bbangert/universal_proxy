@@ -141,6 +141,17 @@ defmodule UniversalProxy.TuyaBeaconMesh.ControlTest do
     assert open_frame(reset_frame, @local_key, @beacon_key) == {0x01, pad(<<0x02>>)}
   end
 
+  test "ping_all is a broadcast ping to FFFF keyed beaconKey/beaconKey" do
+    assert {frame, send_ms, 5_000, :ping_reply} = Control.ping_all(@sn, @beacon_key)
+    assert send_ms >= 3_000
+
+    assert <<0x13, 0x80, 0x01, 0xFF, 0xFF, @sn::16-big, 0x01, _::binary>> = frame
+    assert open_frame(frame, @beacon_key, @beacon_key) == {0x01, pad(<<0x01>>)}
+
+    {expected, _, _, _} = P2.ping(0x8001, 0xFFFF, @sn, @beacon_key, @beacon_key)
+    assert frame == expected
+  end
+
   test "set encrypts with the localKey and masks with the beaconKey" do
     {:ok, {frame, _, _, :none}} = Control.set(@node, @sn, [on: true], @local_key, @beacon_key)
     {:ok, tlv} = Dp.encode([{1, :bool, true}])

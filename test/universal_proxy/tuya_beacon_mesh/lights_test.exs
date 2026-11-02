@@ -556,6 +556,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
             {Lights.group_set(1.0, on: true), :unknown_group},
             {Lights.ping(%{}), :unknown_bulb},
             {Lights.ping(bulb, :not_opts), :bad_opts},
+            {Lights.ping_all(:not_opts), :bad_opts},
+            {Lights.ping_all(%{}), :bad_opts},
+            {GenServer.call(Lights, {:ping_all, bulb}), :unknown_request},
             {Lights.reset(123), :unknown_bulb},
             {Lights.reset(bulb, [:server]), :bad_opts},
             {Lights.status([bulb]), :unknown_bulb},
@@ -720,6 +723,112 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
           Lights.status("path light 2")
         )
       end)
+    end
+  end
+
+  describe "broadcast ping" do
+    test "ping_all sends one FFFF frame keyed with the mesh key and takes one number", %{
+      persisted: persisted
+    } do
+      # A bulb overriding beaconKey doesn't change the broadcast's keys.
+      inv = fixture(%{}) |> put_in(["bulbs", Access.at(1), "beaconKey"], @other_key)
+      assert :ok = Lights.reload(inv)
+      before = writes(persisted)
+
+      assert sent_sn(fn -> Lights.ping_all() end) == 100
+      assert [frame] = advertises() |> List.last() |> Carrier.frames()
+      assert <<0x13, 0x80, 0x01, 0xFF, 0xFF, 100::16-big, 0x01, _::binary>> = frame
+      assert masked_with?(frame, @beacon_key, @beacon_key)
+      refute masked_with?(frame, @other_key, @beacon_key)
+
+      # One number from the lease it took; the next command gets the next.
+      assert writes(persisted) == before + 1
+      assert set_sn("path light 2", on: true) == 101
+      assert writes(persisted) == before + 1
+    end
+
+    test "each bulb's reply updates that bulb, attributed by source node id", %{
+      persisted: persisted
+    } do
+      restart_lights(persisted, [])
+      assert :ok = Lights.ping_all()
+      assert {:ok, bulbs} = Lights.all()
+      assert Enum.all?(bulbs, &(&1.heard_ms == nil and &1.last_event == nil))
+
+      tick(persisted, 10)
+      inject_report(2, 5, <<0x01>>, sub_cmd: 2, address: @mac2)
+
+      wait_until(fn ->
+        match?({:ok, %{last_event: :ping_reply, heard_ms: 10}}, Lights.status("path light 2"))
+      end)
+
+      # Node 3's reply, relayed by node 2's bulb, counts for node 3 alone.
+      tick(persisted, 10)
+      inject_report(3, 9, <<0x01>>, sub_cmd: 2, address: @mac2)
+
+      wait_until(fn ->
+        match?({:ok, %{last_event: :ping_reply, heard_ms: 20}}, Lights.status("post spot 1"))
+      end)
+
+      assert {:ok, %{heard_ms: 10, last_report_ms: 10}} = Lights.status("path light 2")
+    end
+
+    test "a reply from a node not in the inventory is ignored" do
+      pid = Process.whereis(Lights)
+      assert :ok = Lights.ping_all()
+
+      inject_report(9, 5, <<0x01>>, sub_cmd: 2)
+      inject_report(0xFFFF, 6, <<0x01>>, sub_cmd: 2)
+      sentinel()
+
+      assert {:ok, %{heard_ms: nil, last_event: nil}} = Lights.status("path light 2")
+      assert {:ok, [_, _]} = Lights.all()
+      assert Process.whereis(Lights) == pid
+    end
+
+    @tag :capture_log
+    test "queued broadcasts coalesce; a full queue gives the number back" do
+      stop_supervised!({Radio, 1})
+      start_supervised!(radio_spec(max_queue: 1))
+      wait_until(&radio_ready?/0)
+
+      # 100 on air; 101 queued, then replaced by 102.
+      assert :ok = Lights.set("path light 2", on: true)
+      wait_until(fn -> length(advertises()) == 1 end)
+      assert :ok = Lights.ping_all()
+      assert :ok = Lights.ping_all()
+      assert {:ok, %{queued: 1}} = Radio.status()
+      assert [%{key: {:ping_all}, class: :normal}] = queued_jobs()
+
+      # A unicast ping is another key: the queue is full.
+      assert {:error, :queue_full} = Lights.ping("path light 2")
+      finish_tx()
+
+      # 102 on air, the unicast ping (103) queued: a broadcast into the full
+      # queue gives its number back.
+      assert :ok = Lights.ping("path light 2")
+      assert {:error, :queue_full} = Lights.ping_all()
+      finish_tx()
+      :ok = Radio.stop_tx()
+      assert set_sn("path light 2", on: false) == 104
+
+      assert Enum.map(advertises(), &frame_sn/1) == [100, 102, 103, 104]
+    end
+
+    @tag :capture_log
+    test "a broadcast burst is held to max_jump past the frame on air", %{persisted: persisted} do
+      restart_lights(persisted, min_lease: 3, max_lease: 5, max_jump: 12)
+
+      results = for _ <- 1..13, do: Lights.ping_all()
+      assert Enum.take(results, 12) == List.duplicate(:ok, 12)
+      assert List.last(results) == {:error, :busy}
+      assert {:ok, %{last_tx_sn: 100, queued: 1}} = Radio.status()
+      assert persisted_seq(persisted) == 112
+
+      # The coalesced 111 airs: room again, and the refusal burned nothing.
+      finish_tx()
+      :ok = Radio.stop_tx()
+      assert sent_sn(fn -> Lights.ping_all() end) == 112
     end
   end
 
@@ -996,6 +1105,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
 
       assert {:error, :not_ready} = Lights.set("path light 2", on: true)
       assert {:error, :not_ready} = Lights.ping("path light 2")
+      assert {:error, :not_ready} = Lights.ping_all()
       assert writes(persisted) == 0
 
       # A command that can't be built takes no lease either.

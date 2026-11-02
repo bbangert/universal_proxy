@@ -186,7 +186,7 @@ Which key encrypts and which masks, by destination
 |---|---|---|
 | unicast | localKey | beaconKey |
 | group | groupKey in the app; **beaconKey** on hardware | beaconKey |
-| broadcast ping | beaconKey | beaconKey |
+| broadcast ping | beaconKey | beaconKey (built as `Control.ping_all/2`; **UNVERIFIED** on hardware) |
 | device → phone | beaconKey | beaconKey |
 
 The app keys group frames (`FF gg`) with the groupKey, but the bulbs never
@@ -241,7 +241,7 @@ frame identical, which is how receivers dedupe them (§4.9).
 | DP set, ack wanted (`pqpbpqd`) | `0x0B` | 1 | `0x06` | DP TLVs | localKey |
 | Add to group (`qbqqdqq`) | `0x0B` | 1 | `0x01` | `A1 gg` | localKey |
 | Remove from groups (`bqpqqbb`) | `0x0B` | 1 | `0x01` | `A2 g1 [g2 …]` | localKey |
-| Ping (`dpdpqpd`) | `0x13` | 2 | `0x01` | `01` | localKey, or beaconKey for broadcast |
+| Ping (`dpdpqpd`) | `0x13` | 2 | `0x01` | `01` | localKey, or beaconKey for broadcast to `FF FF` (built, **UNVERIFIED** on hardware, §4.9) |
 | Dismiss group (`qdppdpp`) | `0x13` | 2 | `0x01` | `A2 gg`, sent to `FF gg` | groupKey (beaconKey on hardware; dismiss itself untested) |
 | Raw data (`ddqbbqp`) | `0x10 + n` | 2 | `0x05` | TLV with DP id `0x57` | caller key |
 | Lock remote action (`dpddddp`) | `0x18` | 3 | `0x21` | 16 bytes, §4.8 | HKDF key |
@@ -425,6 +425,12 @@ is right for these bulbs.
   request (§4.3) and holds at most 8 group IDs.
 - **Reports** arrive as type 1, subCmd 7, addressed to `8000` or `8001`, and
   are unmasked and decrypted with the beaconKey (§4.6).
+- **Broadcast ping** (`FF FF`, beaconKey as both key and mask, 5000 ms
+  window) is built (`Control.ping_all/2`, `Lights.ping_all/1`) but
+  **UNVERIFIED**: not yet sent to these bulbs. Each reply is expected from
+  the answering bulb's own node ID, so `Lights` attributes it like any
+  report. Whether all ten answer, and how many replies survive answering
+  at once, is unmeasured.
 
 **Sequence numbers**
 

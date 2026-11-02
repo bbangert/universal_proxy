@@ -3,7 +3,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   Runtime controller for a Beacon Mesh loaded from an `Inventory`.
 
   Start this GenServer with an inventory and a running `Radio`, then call
-  `set/3` / `ping/2` / `status/2`. Sequence numbers come from `Seq`.
+  `set/3` / `ping/2` / `ping_all/1` / `status/2`. Sequence numbers come
+  from `Seq`.
 
   ## Inventory and persistence
 
@@ -117,6 +118,20 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   bulb's `localKey` and masked with the bulb's own `beaconKey` (the mesh
   key unless the inventory overrides it); `group_set/3` uses the mesh
   key for both.
+
+  `ping_all/1` sends one broadcast ping (`FF FF`), keyed with the mesh
+  key for both, like the app's (§4.1 of
+  `docs/protocols/tuya_beacon_mesh.md`). It takes one sequence number
+  and goes through the same lease, admission and Radio path as `ping/2`;
+  queued broadcasts coalesce with each other (never with unicast pings).
+  Every bulb that hears it should answer, and each answer is an ordinary
+  ping reply, attributed by its source node id (see "Reports"): no reply
+  is tied to the request that drew it, so a broadcast's replies count
+  exactly as unicast ones do. A bulb whose inventory `beaconKey`
+  overrides the mesh key can't open the broadcast; ping it with
+  `ping/2`. **UNVERIFIED** on hardware: whether these bulbs answer a
+  broadcast ping at all, and how many replies survive when they all
+  answer at once.
 
   `:ok` from a command means the Radio accepted the frame for
   transmission (on air or queued), not that a bulb acted on it. Queued
@@ -302,6 +317,14 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
 
   @spec ping(String.t(), keyword()) :: :ok | {:error, term()}
   def ping(mac_or_label, opts \\ []), do: call(opts, {:ping, mac_or_label})
+
+  @doc """
+  One broadcast ping to every bulb (see "Commands"); returns like `ping/2`.
+  Replies update each answering bulb's `last_event` and `heard_ms`.
+  `opts`: `:server`. **UNVERIFIED** on hardware.
+  """
+  @spec ping_all(keyword()) :: :ok | {:error, term()}
+  def ping_all(opts \\ []), do: call(opts, :ping_all)
 
   @spec reset(String.t(), keyword()) :: :ok | {:error, term()}
   def reset(mac_or_label, opts \\ []), do: call(opts, {:reset, mac_or_label})
@@ -554,6 +577,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
       {:error, reason} ->
         {:reply, {:error, reason}, state}
     end
+  end
+
+  defp do_call(:ping_all, state) do
+    build = fn sn -> {:ok, Control.ping_all(sn, mesh_key(state))} end
+    transmit(state, build, coalesce: {:ping_all})
   end
 
   defp do_call({:reset, who}, state) do
