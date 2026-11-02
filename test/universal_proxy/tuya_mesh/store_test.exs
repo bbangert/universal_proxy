@@ -982,6 +982,42 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
       refute_receive {:lights_write, _}, 400
     end
 
+    test "a write whose sync failed is written again, though the table has it", ctx do
+      test_pid = self()
+      failures = :counters.new(1, [])
+      :counters.put(failures, 1, 1)
+      n = System.unique_integer([:positive])
+
+      # The first light-state write inserts, then fails to sync.
+      write_fun = fn table, records ->
+        :ok = :dets.insert(table, records)
+
+        if Keyword.has_key?(records, :light_states) and :counters.get(failures, 1) > 0 and
+             Keyword.fetch!(records, :light_states) != %{} do
+          :counters.sub(failures, 1, 1)
+          {:error, :sync_failed}
+        else
+          if Keyword.has_key?(records, :light_states),
+            do: send(test_pid, {:synced, Keyword.fetch!(records, :light_states)})
+
+          :dets.sync(table)
+        end
+      end
+
+      store =
+        start_store(Path.join(ctx.tmp_dir, "sync_#{n}.dets"), :"sync_#{n}",
+          id: :sync,
+          write_fun: write_fun,
+          light_state_interval_ms: 50
+        )
+
+      {:ok, _} = Store.replace(inventory(), [], store)
+      assert_receive {:synced, %{}}
+
+      :ok = Store.put_light_state(@mac2, @on, store)
+      assert_receive {:synced, %{@mac2 => @on}}, 1_000
+    end
+
     test "nothing is written for an unchanged state, a stranger or a bad one", ctx do
       {store, _path, _table} = spy_store(ctx, interval: 0)
       {:ok, _} = Store.replace(inventory(), [], store)

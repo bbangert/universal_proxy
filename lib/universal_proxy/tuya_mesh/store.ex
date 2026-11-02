@@ -460,11 +460,13 @@ defmodule UniversalProxy.TuyaMesh.Store do
               max_dump_advance: max_dump_advance(opts),
               light_interval_ms:
                 Keyword.get(opts, :light_state_interval_ms, @light_state_interval_ms),
-              # Changed states not written yet, the pending write's timer and
-              # when light states were last written (monotonic ms).
+              # Changed states not written yet, the pending write's timer,
+              # when light states were last written (monotonic ms) and what
+              # the last synced write stored.
               lights_held: %{},
               lights_timer: nil,
-              lights_written_at: nil
+              lights_written_at: nil,
+              lights_synced: lookup(table, :light_states, %{})
             }
 
             # Readers that failed while it was down catch up on this.
@@ -677,7 +679,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
     state = %{state | lights_timer: nil}
 
     case write_lights(state) do
-      :ok -> {:noreply, lights_written(state)}
+      {:ok, lights} -> {:noreply, %{lights_written(state) | lights_synced: lights}}
       :unchanged -> {:noreply, lights_kept(state)}
       {:error, _reason} -> {:noreply, schedule_lights(%{state | lights_written_at: now()})}
     end
@@ -986,19 +988,27 @@ defmodule UniversalProxy.TuyaMesh.Store do
   defp kept_lights(state, inv, :same_mesh),
     do: Map.take(current_lights(state), Enum.map(inv.bulbs, & &1.mac))
 
-  # The held states, written unless nothing changed after all.
+  # The held states, written unless nothing changed after all. Compared
+  # with the last synced write, not the table: an insert whose sync failed
+  # is in the table already, and must still be written again.
   defp write_lights(%{lights_held: held}) when held == %{}, do: :unchanged
 
   defp write_lights(state) do
-    stored = lookup(state.table, :light_states, %{})
     lights = Map.take(current_lights(state), stored_macs(state.table))
-    if lights == stored, do: :unchanged, else: write(state, [{:light_states, lights}])
+
+    cond do
+      lights == state.lights_synced -> :unchanged
+      write(state, [{:light_states, lights}]) == :ok -> {:ok, lights}
+      true -> {:error, :write_failed}
+    end
   end
 
   defp lights_written(state), do: %{lights_kept(state) | lights_written_at: now()}
 
-  # Held states an inventory write stored (it doesn't move the interval).
-  defp lights_kept(state), do: %{state | lights_held: %{}}
+  # After a synced inventory write, which stored the held states (it
+  # doesn't move the interval).
+  defp lights_kept(state),
+    do: %{state | lights_held: %{}, lights_synced: lookup(state.table, :light_states, %{})}
 
   # At once when the last light-state write is an interval old, else when
   # it will be. One timer at a time; it finds what is held when it fires.

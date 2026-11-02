@@ -865,6 +865,48 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       refute_received {:saved, _, _}
     end
 
+    test "a state DP change the response doesn't show is saved too" do
+      test = self()
+
+      {pid, _agent} =
+        start(push_debounce_ms: 10, save_state: &send(test, {:saved, &1, &2}))
+
+      white = Map.put(@on_white, 11, <<120::16, 100, 100>>)
+      report(pid, [{@a, white, now()}])
+      assert [_] = of(pushes(), 5)
+      assert_received {:saved, @a, %{11 => <<120::16, 100, 100>>}}
+
+      # A new colour while white: the same response, a new state.
+      report(pid, [{@a, %{11 => <<240::16, 100, 100>>}, now() + 1}])
+      assert of(pushes(), 5) == []
+      assert_received {:saved, @a, %{2 => 0, 11 => <<240::16, 100, 100>>}}
+    end
+
+    test "a subscription that comes late seeds what the Store kept meanwhile" do
+      pubsub = :"commander_seed_pubsub_#{System.unique_integer([:positive])}"
+      saved = start_supervised!({Agent, fn -> %{} end}, id: :saved)
+
+      {pid, _agent} =
+        start(
+          push_debounce_ms: 10,
+          subscribe: true,
+          pubsub: pubsub,
+          resubscribe_ms: 20,
+          status: fn -> status([]) end,
+          saved_states: fn -> Agent.get(saved, & &1) end
+        )
+
+      # Started, nothing seeded; the Store comes up (its :ready unheard)
+      # while PubSub is down.
+      _ = :sys.get_state(pid)
+      Agent.update(saved, fn _ -> %{@b => @off} end)
+      refute_receive {:push, _}, 50
+      start_supervised!({Phoenix.PubSub, name: pubsub}, id: :seed_pubsub)
+
+      assert_receive {:push, %LightStateResponse{device_id: 7, state: false}}, 2_000
+      assert Registry.keys(pubsub, pid) != []
+    end
+
     test "a Store that starts late seeds the bulbs still unknown" do
       saved = start_supervised!({Agent, fn -> %{} end}, id: :saved)
 
