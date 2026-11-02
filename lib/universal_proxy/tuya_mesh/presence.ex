@@ -11,21 +11,25 @@ defmodule UniversalProxy.TuyaMesh.Presence do
 
   ## Schedule
 
-  Every `:tick_ms` (5 s) it reads `Lights.all/1` (each bulb's
-  `last_report_ms`, kept as the latest seen) and then, at most once, pings
-  the most overdue bulb that is:
+  Every `:tick_ms` (5 s; `:pending_tick_ms`, 1 s, while a ping is
+  outstanding) it reads `Lights.all/1` (each bulb's `last_report_ms`,
+  kept as the latest seen) and then, at most once, pings the most overdue
+  bulb that is:
 
     * due: its next check time has passed (below);
     * silent for over `:silence_ms` (60 s), or never heard;
 
   and only when all of these hold:
 
-    * no ping is outstanding (one at a time: the last one got its reply,
-      or `:reply_ms`, 10 s, passed without one);
-    * `:min_gap_ms` (30 s) passed since the last ping attempt;
-    * `Radio.status/1` reads ready, nothing on air and nothing queued
-      (`queued == 0`), so a ping never queues in front of, or behind, a
-      command.
+    * no ping is outstanding (one at a time);
+    * `:min_gap_ms` (30 s) passed since the last ping attempt. A new
+      process (a restart of this one, of Lights or the Radio, or of the
+      whole mesh after an upload) starts as if it had just attempted one:
+      its predecessor may have, and no state survives the restart to say
+      when;
+    * `Radio.status/1` reads ready, discovering and listening, with
+      nothing on air and nothing queued, so a ping never queues in front
+      of, or behind, a command.
 
   A bulb's next check is its last reply plus its interval, or the missed
   ping plus its interval, each with `:jitter` added (default ±10 %), so
@@ -34,12 +38,45 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   consecutive missed pings it is `base * 2^(n-1)`, capped at
   `:max_interval_ms` (15 min): 2, 2, 4, 8, 15 min. Any report (a ping
   reply, a DP report from an acked command) resets it. A fresh start
-  checks every bulb once after `:start_delay_ms` (15 s, jittered), or at
-  its last reply plus the base interval when that is later.
+  checks every bulb once after `:start_delay_ms` (15 s, jittered; the
+  gap above holds the first attempt to 30 s), or at its last reply plus
+  the base interval when that is later.
 
-  A ping refused for a reason of the moment (`:busy`, `:queue_full`,
-  `:not_ready`, `:not_running`, a timeout, anything but `:ok`) is not a
-  miss: the bulb stays due and is tried again after the gap.
+  ## What counts as a miss
+
+  A miss is counted only when the ping provably aired alone and the whole
+  reply window passed with a working receiver. Anything uncertain gives
+  no verdict: the attempt is dropped, the bulb stays due and is tried
+  again after the gap, and nothing counts towards the miss limit.
+
+    * A ping refused (`:busy`, `:queue_full`, `:not_ready`,
+      `:not_running`, a timeout, anything but `:ok`): no verdict.
+    * `Lights.ping/2` returns `:ok` for a frame merely queued: a command
+      can reach the Radio between the idle check and the ping, and then
+      the ping waits behind it (or a control send drops it). So right
+      after the call, `Radio.status/1` must show the ping on air: the
+      radio still working (as above), something on air, nothing queued,
+      and `last_tx_sn` exactly one past the value read at the idle check.
+      Otherwise no verdict.
+    * The reply window (`:reply_ms`, 10 s) starts when that confirmation
+      is read. A report counts as the reply when it is no older than the
+      moment just before the ping call, so one arriving during the call
+      counts too.
+    * Every tick in the window reads the Radio again: not ready, not
+      discovering or not listening drops the attempt (a receiver that was
+      down may have missed the reply).
+    * The window closing while `Lights.all/1` fails defers the verdict to
+      the next read that works, which may still show the reply.
+
+  Residual imprecision, which only core changes could remove: the Radio
+  is sampled once a second, so a receiver lost and back inside one second
+  goes unseen; `last_tx_sn` one ahead could, in principle, belong to
+  another frame if Lights' cursor skipped a number and that frame aired
+  while the ping was dropped, both inside the call; an advert cut short by
+  `Radio.stop_tx/1` after the confirmation is not seen. Numbers handed
+  out but never aired (a cursor gap), or a Radio that hasn't sent a frame
+  yet (`last_tx_sn` nil), make one ping fail confirmation for nothing;
+  the next one passes.
 
   ## Budget
 
@@ -58,13 +95,15 @@ defmodule UniversalProxy.TuyaMesh.Presence do
 
   ## Snapshot
 
-  After each tick, when it changed, `{:tuya_mesh_presence, snapshot}` is
-  sent to `:notify` (a pid; the Resolver passes itself), where
-  `snapshot` maps each MAC to `t:bulb/0`: the latest report time, the
-  consecutive missed pings and when the last missed one was sent, the
-  bulb's expected time between checks (`interval_ms`: its interval, or the
-  gap times the bulb count when that is longer), and whether a ping to it
-  is outstanding. Times are monotonic milliseconds from `:clock`.
+  After each tick, when it changed, `{:tuya_mesh_presence, session,
+  snapshot}` is sent to `:notify` (a pid; the Resolver passes itself).
+  `session` is a reference made when this process starts, so the Resolver
+  tells a restarted pinger from the one before. `snapshot` maps each MAC
+  to `t:bulb/0`: the latest report time, the consecutive misses this
+  process counted and when the last missed ping was asked for, the bulb's
+  expected time between checks (`interval_ms`: its interval, or the gap
+  times the bulb count when that is longer), and whether a ping to it is
+  outstanding. Times are monotonic milliseconds from `:clock`.
 
   ## Supervision
 
@@ -72,17 +111,17 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   Radio → Lights → Presence). A crash here restarts only this process:
   Radio and Lights keep running. A Radio or Lights restart restarts it
   too, which is right: its view of either is stale then. Its state is
-  only the schedule, so a restart costs one early round of pings; the
-  verdicts it pushed survive in the Resolver. Every call it makes goes
-  through `Lights`'/`Radio`'s own `catch :exit` wrappers, which turn a
-  stopped or stuck server into an error tuple, so only a bug here can
+  only the schedule; the verdicts it pushed survive in the Resolver, which
+  adds a restarted pinger's misses to the old one's. Every call it makes
+  goes through `Lights`'/`Radio`'s own `catch :exit` wrappers, which turn
+  a stopped or stuck server into an error tuple, so only a bug here can
   crash it.
 
   Options: `:lights`, `:radio` (server names), `:notify`, `:name`, and
-  the timing above (`:tick_ms`, `:start_delay_ms`, `:silence_ms`,
-  `:base_interval_ms`, `:max_interval_ms`, `:min_gap_ms`, `:reply_ms`),
-  plus test seams `:clock` (`(-> integer())`, monotonic ms) and `:jitter`
-  (`(interval_ms -> offset_ms)`).
+  the timing above (`:tick_ms`, `:pending_tick_ms`, `:start_delay_ms`,
+  `:silence_ms`, `:base_interval_ms`, `:max_interval_ms`, `:min_gap_ms`,
+  `:reply_ms`), plus test seams `:clock` (`(-> integer())`, monotonic ms)
+  and `:jitter` (`(interval_ms -> offset_ms)`).
   """
 
   use GenServer
@@ -90,14 +129,16 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   alias UniversalProxy.TuyaBeaconMesh.{Lights, Radio}
 
   @tick_ms 5_000
+  @pending_tick_ms 1_000
   @start_delay_ms 15_000
   @silence_ms 60_000
   @base_interval_ms 120_000
   @max_interval_ms 900_000
   @min_gap_ms 30_000
   @reply_ms 10_000
-  # Short: the readiness check runs in this loop.
+  # Short: the readiness checks run in this loop.
   @radio_timeout 1_000
+  @sn_space 65_536
 
   @type bulb :: %{
           last_ms: integer() | nil,
@@ -131,25 +172,30 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   @impl GenServer
   def init(opts) do
     clock = Keyword.get(opts, :clock, fn -> System.monotonic_time(:millisecond) end)
+    started = clock.()
+    gap_ms = Keyword.get(opts, :min_gap_ms, @min_gap_ms)
 
     state = %{
       lights: Keyword.get(opts, :lights, Lights),
       radio: Keyword.get(opts, :radio, Radio),
       notify: Keyword.get(opts, :notify),
+      session: make_ref(),
       clock: clock,
-      started: clock.(),
+      started: started,
       jitter: Keyword.get(opts, :jitter, &default_jitter/1),
       tick_ms: Keyword.get(opts, :tick_ms, @tick_ms),
+      pending_tick_ms: Keyword.get(opts, :pending_tick_ms, @pending_tick_ms),
       start_delay_ms: Keyword.get(opts, :start_delay_ms, @start_delay_ms),
       silence_ms: Keyword.get(opts, :silence_ms, @silence_ms),
       base_ms: Keyword.get(opts, :base_interval_ms, @base_interval_ms),
       max_ms: Keyword.get(opts, :max_interval_ms, @max_interval_ms),
-      gap_ms: Keyword.get(opts, :min_gap_ms, @min_gap_ms),
+      gap_ms: gap_ms,
       reply_ms: Keyword.get(opts, :reply_ms, @reply_ms),
       bulbs: %{},
       lights_ok: false,
       pending: nil,
-      next_attempt: nil,
+      # The predecessor may have just attempted one.
+      next_attempt: started + gap_ms,
       pushed: nil,
       timer: nil
     }
@@ -167,27 +213,30 @@ defmodule UniversalProxy.TuyaMesh.Presence do
 
   def handle_info(_other, state), do: {:noreply, state}
 
+  # Faster while a ping is outstanding, so the receiver is checked
+  # through its reply window.
   defp schedule(state) do
     with {_token, tref} <- state.timer, do: Process.cancel_timer(tref)
+    ms = if state.pending, do: min(state.tick_ms, state.pending_tick_ms), else: state.tick_ms
     token = make_ref()
-    %{state | timer: {token, Process.send_after(self(), {:tick, token}, state.tick_ms)}}
+    %{state | timer: {token, Process.send_after(self(), {:tick, token}, ms)}}
   end
 
   # ── Tick ─────────────────────────────────────────────────────────────
 
   defp run(state) do
-    now = state.clock.()
-
     state
-    |> refresh(now)
-    |> resolve_pending(now)
-    |> maybe_ping(now)
+    |> refresh()
+    |> resolve_pending()
+    |> maybe_ping()
     |> push()
   end
 
   # Bulbs come and go with the inventory Lights holds; while Lights is
   # down the last view is kept and nothing is pinged.
-  defp refresh(state, now) do
+  defp refresh(state) do
+    now = state.clock.()
+
     case Lights.all(server: state.lights) do
       {:ok, list} ->
         bulbs =
@@ -229,50 +278,65 @@ defmodule UniversalProxy.TuyaMesh.Presence do
     }
   end
 
-  defp resolve_pending(%{pending: nil} = state, _now), do: state
+  defp resolve_pending(%{pending: nil} = state), do: state
 
-  defp resolve_pending(%{pending: %{mac: mac, sent: sent}} = state, now) do
+  defp resolve_pending(%{pending: %{mac: mac, asked: asked, deadline: deadline}} = state) do
     bulb = Map.fetch!(state.bulbs, mac)
 
     cond do
       # Refresh already reset it (heard/3).
-      bulb.last != nil and bulb.last >= sent ->
+      bulb.last != nil and bulb.last >= asked ->
         %{state | pending: nil}
 
-      now - sent >= state.reply_ms ->
-        %{state | pending: nil, bulbs: Map.put(state.bulbs, mac, missed(bulb, sent, state))}
+      # The reply may have gone unheard: no verdict.
+      not receiving?(state) ->
+        %{state | pending: nil}
+
+      # The read that would show the reply failed: decide on a later one.
+      not state.lights_ok ->
+        state
+
+      state.clock.() >= deadline ->
+        %{state | pending: nil, bulbs: Map.put(state.bulbs, mac, missed(bulb, asked, state))}
 
       true ->
         state
     end
   end
 
-  defp missed(bulb, sent, state) do
+  defp missed(bulb, asked, state) do
     misses = bulb.misses + 1
     interval = min(state.base_ms * Integer.pow(2, misses - 1), state.max_ms)
 
     %{
       bulb
       | misses: misses,
-        missed_at: sent,
+        missed_at: asked,
         interval: interval,
-        due: sent + interval + state.jitter.(interval)
+        due: asked + interval + state.jitter.(interval)
     }
   end
 
-  defp maybe_ping(state, now) do
+  defp maybe_ping(state) do
+    now = state.clock.()
+
     with nil <- state.pending,
          true <- state.lights_ok,
-         true <- state.next_attempt == nil or now >= state.next_attempt,
+         true <- now >= state.next_attempt,
          {:ok, mac} <- next_due(state, now),
-         true <- radio_idle?(state) do
-      state = %{state | next_attempt: now + state.gap_ms}
+         {:idle, sn} <- radio_idle(state) do
+      asked = state.clock.()
+      state = %{state | next_attempt: asked + state.gap_ms}
 
       # Anything but :ok (busy, queue full, not ready, timeout...) is
-      # "try later": the bulb stays due, nothing counts as a miss.
-      case Lights.ping(mac, server: state.lights) do
-        :ok -> %{state | pending: %{mac: mac, sent: now}}
-        {:error, _reason} -> state
+      # "try later": the bulb stays due, nothing counts as a miss. So is
+      # an :ok that can't be confirmed on air alone.
+      with :ok <- Lights.ping(mac, server: state.lights),
+           true <- aired_alone?(state, sn) do
+        deadline = state.clock.() + state.reply_ms
+        %{state | pending: %{mac: mac, asked: asked, deadline: deadline}}
+      else
+        _ -> state
       end
     else
       _ -> state
@@ -292,12 +356,45 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   defp silent?(%{last: nil}, _now, _state), do: true
   defp silent?(%{last: last}, now, state), do: now - last > state.silence_ms
 
-  defp radio_idle?(state) do
-    case Radio.status(server: state.radio, timeout: @radio_timeout) do
-      {:ok, %{ready: true, queued: 0} = status} -> Map.get(status, :tx) == nil
+  # ── Radio ────────────────────────────────────────────────────────────
+
+  defp radio_status(state), do: Radio.status(server: state.radio, timeout: @radio_timeout)
+
+  # The SN of the last frame aired, read with the idle check: the ping's
+  # confirmation compares against it.
+  defp radio_idle(state) do
+    case radio_status(state) do
+      {:ok, %{queued: 0, tx: nil} = status} ->
+        if working?(status), do: {:idle, status.last_tx_sn}, else: :busy
+
+      _ ->
+        :busy
+    end
+  end
+
+  # The ping is the frame on air and the only one the Radio took since the
+  # idle check: nothing queued in front of or behind it.
+  defp aired_alone?(state, sn) when is_integer(sn) do
+    case radio_status(state) do
+      {:ok, %{queued: 0, tx: tx, last_tx_sn: last} = status} when tx != nil ->
+        working?(status) and last == rem(sn + 1, @sn_space)
+
+      _ ->
+        false
+    end
+  end
+
+  defp aired_alone?(_state, nil), do: false
+
+  defp receiving?(state) do
+    case radio_status(state) do
+      {:ok, status} -> working?(status)
       _ -> false
     end
   end
+
+  defp working?(%{ready: true, discovering: true, listening: true}), do: true
+  defp working?(_status), do: false
 
   # ── Snapshot ─────────────────────────────────────────────────────────
 
@@ -307,7 +404,7 @@ defmodule UniversalProxy.TuyaMesh.Presence do
     snapshot = build_snapshot(state)
 
     if snapshot != state.pushed do
-      send(state.notify, {:tuya_mesh_presence, snapshot})
+      send(state.notify, {:tuya_mesh_presence, state.session, snapshot})
       %{state | pushed: snapshot}
     else
       state

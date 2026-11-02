@@ -265,6 +265,14 @@ defmodule UniversalProxy.TuyaMesh.Store do
   @spec default_settings() :: settings()
   def default_settings, do: @default_settings
 
+  @doc """
+  A key-free identity of the mesh an inventory belongs to: the SHA-256 of
+  its `beaconKey` bytes, the fingerprint seq floors are kept under. Not
+  reversible to the key.
+  """
+  @spec mesh_fingerprint(Inventory.t()) :: binary()
+  def mesh_fingerprint(%Inventory{beacon_key: key}), do: fingerprint(key)
+
   # `catch :exit` idiom (CLAUDE.md). A timed-out write may still land; its
   # caller sees an error and retries, which every write here tolerates.
   defp call(server, request, default) do

@@ -2,7 +2,9 @@ defmodule UniversalProxy.TuyaMesh.FakeLights do
   @moduledoc false
   # Answers `Lights.all/1` and `Lights.ping/2` (both plain calls). Bulbs in
   # `replying` answer a ping at once: their `last_report_ms` becomes the
-  # clock. `ping_reply` is what every ping returns.
+  # clock. `ping_reply` is what every ping returns; `on_ping` (`mac -> any`)
+  # runs for each accepted one (to air it on a FakeRadio, say). `all_reply`,
+  # when set, replaces `Lights.all/1`'s answer.
   use GenServer
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name))
@@ -19,11 +21,16 @@ defmodule UniversalProxy.TuyaMesh.FakeLights do
        replying: MapSet.new(Keyword.get(opts, :replying, [])),
        clock: Keyword.get(opts, :clock, fn -> System.monotonic_time(:millisecond) end),
        ping_reply: :ok,
+       all_reply: nil,
+       on_ping: Keyword.get(opts, :on_ping, fn _mac -> :ok end),
        pings: []
      }}
   end
 
   @impl GenServer
+  def handle_call(:all, _from, %{all_reply: reply} = state) when reply != nil,
+    do: {:reply, reply, state}
+
   def handle_call(:all, _from, state) do
     bulbs =
       state.bulbs
@@ -35,6 +42,7 @@ defmodule UniversalProxy.TuyaMesh.FakeLights do
 
   def handle_call({:ping, mac}, _from, state) do
     state = %{state | pings: [mac | state.pings]}
+    if state.ping_reply == :ok, do: state.on_ping.(mac)
 
     state =
       if state.ping_reply == :ok and mac in state.replying,
@@ -64,19 +72,48 @@ end
 defmodule UniversalProxy.TuyaMesh.FakeRadio do
   @moduledoc false
   # Answers `Radio.status/1` with whatever was put; accepts subscriptions.
+  # `air/1` puts the next frame on air for 3 s of the clock, as the Radio
+  # does for a send while idle.
   use GenServer
 
-  @idle %{ready: true, last_error: nil, queued: 0, tx: nil}
+  @idle %{
+    ready: true,
+    discovering: true,
+    listening: true,
+    last_error: nil,
+    queued: 0,
+    tx: nil,
+    last_tx_sn: 0
+  }
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name))
 
   def put(server, changes), do: GenServer.call(server, {:put, changes})
+  def air(server), do: GenServer.call(server, :air)
 
   @impl GenServer
-  def init(opts), do: {:ok, Map.merge(@idle, Map.new(Keyword.get(opts, :status, [])))}
+  def init(opts) do
+    clock = Keyword.get(opts, :clock, fn -> System.monotonic_time(:millisecond) end)
+    status = Map.merge(@idle, Map.new(Keyword.get(opts, :status, [])))
+    {:ok, %{status: status, clock: clock, air_until: nil}}
+  end
 
   @impl GenServer
-  def handle_call(:status, _from, state), do: {:reply, {:ok, state}, state}
-  def handle_call({:put, changes}, _from, state), do: {:reply, :ok, Map.merge(state, changes)}
+  def handle_call(:status, _from, state) do
+    airing = state.air_until != nil and state.clock.() < state.air_until
+    tx = state.status.tx || if(airing, do: %{class: :normal, instance: 1})
+    {:reply, {:ok, %{state.status | tx: tx}}, state}
+  end
+
+  def handle_call({:put, changes}, _from, state),
+    do: {:reply, :ok, %{state | status: Map.merge(state.status, changes)}}
+
+  def handle_call(:air, _from, state) do
+    sn = rem((state.status.last_tx_sn || 0) + 1, 65_536)
+
+    {:reply, :ok,
+     %{state | status: %{state.status | last_tx_sn: sn}, air_until: state.clock.() + 3_000}}
+  end
+
   def handle_call({:subscribe, _pid, _filter}, _from, state), do: {:reply, :ok, state}
 end

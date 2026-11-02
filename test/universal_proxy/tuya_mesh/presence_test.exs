@@ -15,15 +15,24 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
     {:ok, clock: clock, now: now}
   end
 
-  # Ticks only when the test polls; no jitter, no start delay.
+  # Ticks only when the test polls; no jitter, no start delay. Started a
+  # gap before 0, so the first attempt may go at 0. Every accepted ping
+  # airs on the FakeRadio unless `on_ping` (`(mac, radio) -> any`) says
+  # otherwise.
   defp start(ctx, opts \\ []) do
     {macs, opts} = Keyword.pop(opts, :macs, [@a, @b, @c])
     {replying, opts} = Keyword.pop(opts, :replying, [])
+    {on_ping, opts} = Keyword.pop(opts, :on_ping, fn _mac, radio -> FakeRadio.air(radio) end)
+    Agent.update(ctx.clock, fn _ -> -Keyword.get(opts, :min_gap_ms, 30_000) end)
+
+    radio = start_supervised!({FakeRadio, clock: ctx.now}, id: :radio)
 
     lights =
-      start_supervised!({FakeLights, macs: macs, replying: replying, clock: ctx.now}, id: :lights)
-
-    radio = start_supervised!({FakeRadio, []}, id: :radio)
+      start_supervised!(
+        {FakeLights,
+         macs: macs, replying: replying, clock: ctx.now, on_ping: &on_ping.(&1, radio)},
+        id: :lights
+      )
 
     defaults = [
       name: nil,
@@ -37,7 +46,13 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
     ]
 
     presence = start_supervised!({Presence, Keyword.merge(defaults, opts)}, id: :presence)
-    Map.merge(ctx, %{lights: lights, radio: radio, presence: presence})
+
+    Map.merge(ctx, %{
+      lights: lights,
+      radio: radio,
+      presence: presence,
+      opts: Keyword.merge(defaults, opts)
+    })
   end
 
   defp at(ctx, ms) do
@@ -218,7 +233,10 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
       ctx = start(ctx, macs: [@a, @b], replying: [@a])
 
       at(ctx, 0)
-      assert_receive {:tuya_mesh_presence, %{@a => %{last_ms: nil, pinging: true}, @b => b}}
+
+      assert_receive {:tuya_mesh_presence, _session,
+                      %{@a => %{last_ms: nil, pinging: true}, @b => b}}
+
       # Two bulbs, a 30 s gap: the base 2 min is the longer.
       assert b == %{
                last_ms: nil,
@@ -230,13 +248,13 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
 
       # The reply is read on the next tick.
       at(ctx, 0)
-      assert_receive {:tuya_mesh_presence, %{@a => %{last_ms: 0, pinging: false}}}
+      assert_receive {:tuya_mesh_presence, _session, %{@a => %{last_ms: 0, pinging: false}}}
 
       at(ctx, 0)
-      refute_receive {:tuya_mesh_presence, _}, 50
+      refute_receive {:tuya_mesh_presence, _, _}, 50
 
       at(ctx, 30_000)
-      assert_receive {:tuya_mesh_presence, %{@b => %{pinging: true}}}
+      assert_receive {:tuya_mesh_presence, _session, %{@b => %{pinging: true}}}
     end
 
     test "the interval covers a full round when the gap paces the bulbs", ctx do
@@ -259,6 +277,150 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
       # The outstanding ping went with it: the next one is free to go.
       at(ctx, 30_000)
       assert pings(ctx) == [@a, @b]
+    end
+  end
+
+  describe "verdicts" do
+    test "a command slipping in before the ping gives no verdict", ctx do
+      on_ping = fn _mac, radio ->
+        FakeRadio.air(radio)
+        FakeRadio.put(radio, %{queued: 1})
+      end
+
+      ctx = start(ctx, macs: [@a], on_ping: on_ping)
+      at(ctx, 0)
+      assert pings(ctx) == [@a]
+      refute bulb(ctx, @a).pinging
+
+      :ok = FakeRadio.put(ctx.radio, %{queued: 0})
+      at(ctx, 15_000)
+      assert bulb(ctx, @a).misses == 0
+
+      # Still due: tried again after the gap.
+      at(ctx, 30_000)
+      assert pings(ctx) == [@a, @a]
+    end
+
+    test "a ping not on air, or not the next SN, gives no verdict", ctx do
+      skipped = fn _mac, radio ->
+        FakeRadio.air(radio)
+        FakeRadio.air(radio)
+      end
+
+      for on_ping <- [fn _mac, _radio -> :ok end, skipped] do
+        ctx = start(ctx, macs: [@a], on_ping: on_ping)
+        at(ctx, 0)
+        refute bulb(ctx, @a).pinging
+        at(ctx, 15_000)
+        assert bulb(ctx, @a).misses == 0
+        Enum.each([:presence, :lights, :radio], &stop_supervised!/1)
+      end
+    end
+
+    test "a Radio that never sent a frame can't confirm: no verdict, the next ping can", ctx do
+      ctx = start(ctx, macs: [@a])
+      :ok = FakeRadio.put(ctx.radio, %{last_tx_sn: nil})
+
+      at(ctx, 0)
+      refute bulb(ctx, @a).pinging
+      at(ctx, 30_000)
+      assert bulb(ctx, @a).pinging
+      at(ctx, 40_000)
+      assert bulb(ctx, @a).misses == 1
+    end
+
+    test "a receiver lost during the reply window drops the attempt", ctx do
+      for loss <- [%{ready: false}, %{listening: false}, %{discovering: false}] do
+        ctx = start(ctx, macs: [@a])
+        at(ctx, 0)
+        assert bulb(ctx, @a).pinging
+
+        :ok = FakeRadio.put(ctx.radio, loss)
+        at(ctx, 5_000)
+        :ok = FakeRadio.put(ctx.radio, %{ready: true, listening: true, discovering: true})
+        at(ctx, 15_000)
+        assert %{misses: 0, pinging: false} = bulb(ctx, @a)
+        Enum.each([:presence, :lights, :radio], &stop_supervised!/1)
+      end
+    end
+
+    test "a failed Lights read defers the verdict to the next one", ctx do
+      ctx = start(ctx, macs: [@a, @b])
+      at(ctx, 0)
+      at(ctx, 30_000)
+      assert pings(ctx) == [@a, @b]
+
+      # @b's window closes while Lights can't be read.
+      :ok = FakeLights.put(ctx.lights, :all_reply, {:error, :timeout})
+      at(ctx, 45_000)
+      assert %{misses: 0, pinging: true} = bulb(ctx, @b)
+
+      # The next read shows a reply that came in meanwhile: no miss.
+      :ok = FakeLights.put(ctx.lights, :all_reply, nil)
+      :ok = FakeLights.report(ctx.lights, @b, 41_000)
+      at(ctx, 50_000)
+      assert %{misses: 0, pinging: false, last_ms: 41_000} = bulb(ctx, @b)
+
+      # @a's window closed with a working read and no reply: a miss.
+      assert bulb(ctx, @a).misses == 1
+    end
+
+    test "the window starts once the ping is confirmed; a reply during the call counts", ctx do
+      # The ping call takes 4 s.
+      slow = fn _mac, radio ->
+        Agent.update(ctx.clock, &(&1 + 4_000))
+        FakeRadio.air(radio)
+      end
+
+      ctx = start(ctx, macs: [@a], on_ping: slow)
+      at(ctx, 0)
+      Agent.update(ctx.clock, fn _ -> 13_999 end)
+      :ok = Presence.poll(ctx.presence)
+      assert bulb(ctx, @a).pinging
+      at(ctx, 14_000)
+      assert %{misses: 1, missed_at: 0} = bulb(ctx, @a)
+
+      :ok = stop_supervised!(:presence)
+      :ok = stop_supervised!(:lights)
+      :ok = stop_supervised!(:radio)
+
+      # Heard while the call ran (the clock read before it): the reply.
+      ctx = start(ctx, macs: [@a], replying: [@a], on_ping: slow)
+      at(ctx, 0)
+      at(ctx, 4_000)
+      assert %{misses: 0, last_ms: 4_000, pinging: false} = bulb(ctx, @a)
+    end
+  end
+
+  describe "a replacement" do
+    test "waits a full gap after its start before its first attempt", ctx do
+      ctx = start(ctx, macs: [@a, @b])
+      at(ctx, 0)
+      assert pings(ctx) == [@a]
+
+      # Restarted (a crash, Lights restarting, an upload) right after.
+      :ok = stop_supervised!(:presence)
+      Agent.update(ctx.clock, fn _ -> 1_000 end)
+      presence = start_supervised!({Presence, ctx.opts}, id: :presence)
+      ctx = %{ctx | presence: presence}
+
+      at(ctx, 1_000)
+      at(ctx, 30_999)
+      assert pings(ctx) == [@a]
+      at(ctx, 31_000)
+      assert pings(ctx) == [@a, @a]
+    end
+
+    test "pushes under a session of its own", ctx do
+      ctx = start(ctx, macs: [@a])
+      at(ctx, 0)
+      assert_receive {:tuya_mesh_presence, first, _snapshot}
+
+      :ok = stop_supervised!(:presence)
+      presence = start_supervised!({Presence, ctx.opts}, id: :presence)
+      at(%{ctx | presence: presence}, 1_000)
+      assert_receive {:tuya_mesh_presence, second, _snapshot}
+      assert is_reference(first) and is_reference(second) and first != second
     end
   end
 
