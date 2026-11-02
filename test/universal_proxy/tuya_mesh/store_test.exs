@@ -726,6 +726,8 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
           pubsub: pubsub
         )
 
+      assert_receive {:tuya_mesh_store, :ready}
+
       {:ok, _} = Store.replace(inventory(), [], store)
       assert_receive {:tuya_mesh_store, :inventory_changed}
 
@@ -742,6 +744,21 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
       refute_receive {:tuya_mesh_store, _}, 50
     end
 
+    test "every start, so readers that found it down catch up", ctx do
+      pubsub = :"store_pubsub_#{System.unique_integer([:positive])}"
+      start_supervised!({Phoenix.PubSub, name: pubsub})
+      Phoenix.PubSub.subscribe(pubsub, Store.topic())
+      path = Path.join(ctx.tmp_dir, "r.dets")
+      table = :"r_#{System.unique_integer()}"
+
+      start_store(path, table, id: :ready, pubsub: pubsub)
+      assert_receive {:tuya_mesh_store, :ready}
+
+      stop_supervised!(:ready)
+      start_store(path, table, id: :ready, pubsub: pubsub)
+      assert_receive {:tuya_mesh_store, :ready}
+    end
+
     test "settings changes, once written", ctx do
       pubsub = :"store_pubsub_#{System.unique_integer([:positive])}"
       start_supervised!({Phoenix.PubSub, name: pubsub})
@@ -752,6 +769,8 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
           id: :settings_notifying,
           pubsub: pubsub
         )
+
+      assert_receive {:tuya_mesh_store, :ready}
 
       :ok = Store.put_settings(%{max_mireds: 400}, store)
       assert_receive {:tuya_mesh_store, :settings_changed}

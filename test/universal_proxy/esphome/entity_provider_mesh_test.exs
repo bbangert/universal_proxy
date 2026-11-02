@@ -63,8 +63,13 @@ defmodule UniversalProxy.ESPHome.EntityProviderMeshTest do
       poll: false,
       subscribe: false,
       supported?: true,
-      mesh_debounce_ms: 10,
+      # Timers never fire on their own here: tests fire them (settle/1,
+      # fire/2), so every step is deterministic.
+      mesh_debounce_ms: 60_000,
+      mesh_retry_ms: 60_000,
+      mesh_check_ms: 60_000,
       sources: sources,
+      espex_devices: fn _server -> exit(:noproc) end,
       update_device_config: fn server, opts ->
         send(test, {:espex, :update_device_config, server, opts})
         :ok
@@ -78,17 +83,29 @@ defmodule UniversalProxy.ESPHome.EntityProviderMeshTest do
     start_supervised!({EP, Keyword.merge(defaults, opts)})
   end
 
-  # The triggers sent before this are handled once :sys.get_state/1 returns
-  # (which arms the debounce); then wait for the armed sync to have run.
-  defp settle(pid, tries \\ 100) do
-    case :sys.get_state(pid) do
-      %{mesh_timer: nil} = state ->
-        state
+  # Handles every message sent before it, then runs the armed read (the
+  # debounce or a retry) at once.
+  defp settle(pid), do: fire(pid, :read)
 
-      _armed when tries > 0 ->
-        Process.sleep(5)
-        settle(pid, tries - 1)
+  # Fires the armed `kind` timer now (a no-op when none is armed).
+  defp fire(pid, kind) do
+    %{mesh: mesh} = :sys.get_state(pid)
+
+    case {kind, mesh} do
+      {:read, %{read_timer: token}} when is_reference(token) ->
+        send(pid, {:mesh_read, token})
+
+      {:apply, %{apply_timer: token}} when is_reference(token) ->
+        send(pid, {:mesh_apply, token})
+
+      {:resubscribe, %{sub_timer: token}} when is_reference(token) ->
+        send(pid, {:mesh_resubscribe, token})
+
+      _none ->
+        :ok
     end
+
+    :sys.get_state(pid)
   end
 
   defp espex_calls(acc \\ []) do
@@ -338,10 +355,11 @@ defmodule UniversalProxy.ESPHome.EntityProviderMeshTest do
 
       put.(:inventory, {:ok, summary(%{groups: []})})
       send(pid, {:tuya_mesh_store, :inventory_changed})
-      settle(pid)
+      assert %{mesh: %{pending: :update}} = settle(pid)
+      assert %{mesh: %{pending: :update}} = fire(pid, :apply)
 
       refute_received :disconnected
-      # Still switched, so the next Espex start takes the new sub-devices.
+      # Desired all the same, so the next Espex start takes the new sub-devices.
       assert {:ok, [_, _]} = EP.mesh_devices(pid)
     end
 
@@ -373,7 +391,220 @@ defmodule UniversalProxy.ESPHome.EntityProviderMeshTest do
         {:tuya_mesh_status, %{bulbs: [%{mac: @mac1, reachable: true, last_seen: nil}]}}
       )
 
-      assert %{mesh_live: %{@mac1 => %{reachable: true}}} = settle(pid)
+      assert %{mesh: %{live: %{@mac1 => %{reachable: true}}}} = settle(pid)
+    end
+  end
+
+  describe "applying to Espex" do
+    test "a failed update is retried with backoff; the reconnect runs once, after it worked" do
+      {sources, put} = start_inputs()
+      test = self()
+      results = start_supervised!({Agent, fn -> [{:error, :not_ready}, :ok] end}, id: :results)
+
+      pid =
+        start_provider(sources,
+          mesh_retry_ms: 5_000,
+          update_device_config: fn _server, opts ->
+            send(test, {:espex, :update_device_config, :s, opts})
+            Agent.get_and_update(results, fn [r | rest] -> {r, rest ++ [:ok]} end)
+          end
+        )
+
+      put.(:inventory, {:ok, summary(%{groups: []})})
+      send(pid, {:tuya_mesh_store, :inventory_changed})
+
+      assert %{mesh: %{pending: :update, apply_timer: token, apply_backoff_ms: 10_000}} =
+               settle(pid)
+
+      assert is_reference(token)
+      assert espex_calls() == [:update_device_config]
+
+      # A read that finds nothing new doesn't drop the pending work.
+      send(pid, {:tuya_mesh_store, :inventory_changed})
+      settle(pid)
+      assert espex_calls() == []
+
+      assert %{mesh: %{pending: nil, apply_timer: nil, apply_backoff_ms: 5_000}} =
+               fire(pid, :apply)
+
+      assert espex_calls() == [:update_device_config, :disconnect_clients]
+
+      # The stale retry token does nothing.
+      send(pid, {:mesh_apply, token})
+      settle(pid)
+      assert espex_calls() == []
+    end
+
+    test "a change while an update is pending applies the latest set" do
+      {sources, put} = start_inputs()
+      test = self()
+      ok? = start_supervised!({Agent, fn -> false end}, id: :ok?)
+
+      pid =
+        start_provider(sources,
+          update_device_config: fn _server, opts ->
+            send(test, {:espex, :update_device_config, :s, opts})
+            if Agent.get(ok?, & &1), do: :ok, else: {:error, :not_ready}
+          end
+        )
+
+      put.(:inventory, {:ok, summary(%{groups: []})})
+      send(pid, {:tuya_mesh_store, :inventory_changed})
+      settle(pid)
+      assert_received {:espex, :update_device_config, _, [devices: [_, _]]}
+
+      Agent.update(ok?, fn _ -> true end)
+      put.(:inventory, {:ok, summary(%{bulbs: [%{mac: @mac1, label: "x"}], groups: []})})
+      send(pid, {:tuya_mesh_store, :inventory_changed})
+      assert %{mesh: %{pending: nil}} = settle(pid)
+
+      assert_received {:espex, :update_device_config, _, [devices: [%Device{name: "x"}]]}
+      assert_received {:espex, :disconnect_clients, _}
+    end
+
+    test "an Espex holding other sub-devices (restarted on stale ones) gets the desired ones" do
+      {sources, _put} = start_inputs()
+      held = start_supervised!({Agent, fn -> [%Device{id: 1, name: "stale"}] end}, id: :held)
+
+      pid = start_provider(sources, espex_devices: fn _server -> Agent.get(held, & &1) end)
+
+      send(pid, :mesh_check)
+      settle(pid)
+      assert_received {:espex, :update_device_config, _, [devices: [_, _, _] = desired]}
+      assert_received {:espex, :disconnect_clients, _}
+
+      # Once Espex holds them, the check is quiet.
+      Agent.update(held, fn _ -> desired end)
+      send(pid, :mesh_check)
+      settle(pid)
+      assert espex_calls() == []
+    end
+
+    test "the check is quiet while Espex is down (its start takes mesh_devices/0)" do
+      {sources, _put} = start_inputs()
+      pid = start_provider(sources)
+      send(pid, :mesh_check)
+      settle(pid)
+      assert espex_calls() == []
+    end
+  end
+
+  describe "unknown inputs" do
+    test "an unreadable Store at start is retried, and its recovery is synced" do
+      {sources, put} = start_inputs(%{inventory: {:error, :unavailable}})
+      pid = start_provider(sources, mesh_retry_ms: 5_000)
+
+      assert %{mesh: %{read_timer: token, read_backoff_ms: 10_000}} = :sys.get_state(pid)
+      assert is_reference(token)
+      assert EP.mesh_devices(pid) == {:ok, []}
+
+      # Still down: retried again, backing off.
+      assert %{mesh: %{read_timer: token2, read_backoff_ms: 20_000}} = settle(pid)
+      assert is_reference(token2)
+      assert espex_calls() == []
+
+      put.(:inventory, {:ok, summary()})
+      assert %{mesh: %{read_timer: nil, read_backoff_ms: 5_000}} = settle(pid)
+      assert {:ok, [_, _, _]} = EP.mesh_devices(pid)
+      assert espex_calls() == [:update_device_config, :disconnect_clients]
+    end
+
+    test "an outage after a change notification is retried until it reads" do
+      {sources, put} = start_inputs()
+      pid = start_provider(sources)
+
+      put.(:inventory, {:error, :unavailable})
+      send(pid, {:tuya_mesh_store, :inventory_changed})
+      assert %{mesh: %{read_timer: token}} = settle(pid)
+      assert is_reference(token)
+
+      put.(:inventory, {:ok, summary(%{groups: []})})
+      settle(pid)
+      assert_received {:espex, :update_device_config, _, [devices: [_, _]]}
+      assert_received {:espex, :disconnect_clients, _}
+    end
+  end
+
+  describe "subscriptions" do
+    defp held_topics(pubsub, pid), do: Registry.keys(pubsub, pid) |> Enum.sort()
+
+    defp mesh_topics,
+      do:
+        Enum.sort([
+          Store.topic(),
+          UniversalProxy.TuyaMesh.topic(),
+          UniversalProxy.Bluetooth.state_topic()
+        ])
+
+    test "a PubSub down at start is retried; the subscription catches up" do
+      pubsub = :"ep_mesh_late_pubsub_#{System.unique_integer([:positive])}"
+      {sources, put} = start_inputs()
+      pid = start_provider(sources, subscribe: true, pubsub: pubsub)
+
+      assert %{mesh: %{sub_timer: token}} = :sys.get_state(pid)
+      assert is_reference(token)
+
+      start_supervised!({Phoenix.PubSub, name: pubsub})
+      put.(:inventory, {:ok, summary(%{groups: []})})
+
+      fire(pid, :resubscribe)
+      assert held_topics(pubsub, pid) == mesh_topics()
+
+      # The catch-up read finds what was missed meanwhile.
+      settle(pid)
+      assert espex_calls() == [:update_device_config, :disconnect_clients]
+    end
+
+    test "a PubSub restart resubscribes once and catches up; checks never double up" do
+      pubsub = :"ep_mesh_pubsub_#{System.unique_integer([:positive])}"
+      start_supervised!({Phoenix.PubSub, name: pubsub}, id: :pubsub)
+      {sources, put} = start_inputs()
+      pid = start_provider(sources, subscribe: true, pubsub: pubsub)
+      assert held_topics(pubsub, pid) == mesh_topics()
+
+      stop_supervised!(:pubsub)
+      # The monitor fires and the resubscribe fails: retried on a timer.
+      assert %{mesh: %{sub_timer: token, pubsub_mon: nil}} = :sys.get_state(pid)
+      assert is_reference(token)
+
+      start_supervised!({Phoenix.PubSub, name: pubsub}, id: :pubsub)
+      put.(:inventory, {:ok, summary(%{groups: []})})
+      fire(pid, :resubscribe)
+      assert held_topics(pubsub, pid) == mesh_topics()
+      settle(pid)
+      assert espex_calls() == [:update_device_config, :disconnect_clients]
+
+      for _ <- 1..2, do: send(pid, :mesh_check)
+      assert %{mesh: %{read_timer: nil}} = :sys.get_state(pid)
+      assert held_topics(pubsub, pid) == mesh_topics()
+
+      # Monitored again: a second restart is noticed too.
+      assert %{mesh: %{pubsub_mon: {_pid, _mon}}} = :sys.get_state(pid)
+    end
+
+    test "extra topics (the firmware-progress one) are held and re-held the same way" do
+      pubsub = :"ep_mesh_extra_pubsub_#{System.unique_integer([:positive])}"
+      start_supervised!({Phoenix.PubSub, name: pubsub})
+      {sources, _put} = start_inputs()
+
+      mesh =
+        [
+          enabled?: true,
+          pubsub: pubsub,
+          extra_topics: ["firmware_update"],
+          sources: Map.new(sources),
+          check_ms: 60_000,
+          espex_devices: fn _ -> exit(:noproc) end
+        ]
+        |> UniversalProxy.ESPHome.EntityProvider.MeshSync.new()
+        |> UniversalProxy.ESPHome.EntityProvider.MeshSync.start()
+
+      assert "firmware_update" in Registry.keys(pubsub, self())
+
+      assert {:ok, _} =
+               UniversalProxy.ESPHome.EntityProvider.MeshSync.handle_info(:mesh_check, mesh)
+
+      assert Enum.count(Registry.keys(pubsub, self()), &(&1 == "firmware_update")) == 1
     end
   end
 end

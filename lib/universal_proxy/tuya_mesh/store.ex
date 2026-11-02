@@ -145,7 +145,9 @@ defmodule UniversalProxy.TuyaMesh.Store do
   :inventory_changed}` is broadcast on `topic/0` (`:pubsub`, default
   `UniversalProxy.PubSub`). It carries nothing; subscribers re-read with
   `load/1`. Seq-only writes (persist, tighten) stay silent. A settings
-  change that was written broadcasts `{:tuya_mesh_store, :settings_changed}`.
+  change that was written broadcasts `{:tuya_mesh_store, :settings_changed}`,
+  and every start (a restart included) `{:tuya_mesh_store, :ready}`, so
+  readers that found the Store down re-read.
 
   `inventory_summary/1` is the key-free view the HA entities are built from:
   the bulbs (MAC, label) and groups (local id, name) with their sub-device
@@ -224,7 +226,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
     %{id: Keyword.get(opts, :id, __MODULE__), start: {__MODULE__, :start_link, [opts]}}
   end
 
-  @doc "PubSub topic of `{:tuya_mesh_store, :inventory_changed | :settings_changed}` broadcasts."
+  @doc "PubSub topic of `{:tuya_mesh_store, :inventory_changed | :settings_changed | :ready}` broadcasts."
   @spec topic() :: String.t()
   def topic, do: @topic
 
@@ -405,13 +407,16 @@ defmodule UniversalProxy.TuyaMesh.Store do
           :ok ->
             Logger.info("TuyaMesh.Store opened at #{path}")
 
-            {:ok,
-             %{
-               table: table,
-               write_fun: Keyword.get(opts, :write_fun, &default_write/2),
-               pubsub: Keyword.get(opts, :pubsub, UniversalProxy.PubSub),
-               max_dump_advance: max_dump_advance(opts)
-             }}
+            state = %{
+              table: table,
+              write_fun: Keyword.get(opts, :write_fun, &default_write/2),
+              pubsub: Keyword.get(opts, :pubsub, UniversalProxy.PubSub),
+              max_dump_advance: max_dump_advance(opts)
+            }
+
+            # Readers that failed while it was down catch up on this.
+            notify(state, :ready)
+            {:ok, state}
 
           {:error, reason} ->
             Logger.error(
