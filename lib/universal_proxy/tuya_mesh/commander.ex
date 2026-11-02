@@ -19,9 +19,10 @@ defmodule UniversalProxy.TuyaMesh.Commander do
 
     * **Order:** user frames (a command's batches, and a group's diverted
       direct sends) go first, oldest command first; a confirmation read
-      next; follow-ups last, one per `:followup_gap_ms` (3 s, about one
-      frame's airtime) so they never queue more than a frame ahead of a
-      new command.
+      next (it only plans the follow-ups); follow-ups last, one per
+      `:followup_gap_ms` (3 s, about one frame's airtime) across every
+      command, so they never queue more than a frame ahead of a new
+      command. The pacing never delays user frames.
     * **Capacity:** `{:error, :busy}` or `{:error, :queue_full}` keeps the
       frame where it is and holds every frame for `:retry_ms` (500 ms),
       doubling to `:max_retry_ms` (4 s) while the refusals last, back to
@@ -174,6 +175,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       blocked_until: nil,
       backoff_ms: Keyword.get(opts, :retry_ms, 500),
       signalled_at: nil,
+      next_followup_at: nil,
       dispatch: nil
     }
 
@@ -352,8 +354,8 @@ defmodule UniversalProxy.TuyaMesh.Commander do
 
       :ok ->
         {state, job} = state |> accepted_frame() |> accept(job, mac, batch)
-        gap = if job.phase == :followup, do: state.followup_gap_ms, else: 0
-        continue(state, %{job | pending: rest}, gap)
+        state = if job.phase == :followup, do: followup_sent(state), else: state
+        continue(state, %{job | pending: rest}, 0)
 
       {:error, reason} when reason in @retryable ->
         hold(state, job)
@@ -446,13 +448,13 @@ defmodule UniversalProxy.TuyaMesh.Commander do
 
         {items, budget} = within_budget(job, plan)
 
-        run(state, %{
-          job
-          | phase: :followup,
-            pending: items,
-            budget: budget,
-            then_check?: false
-        })
+        # Only plans: the follow-ups go through the dispatcher, under the
+        # capacity hold, the follow-up pacing and user-frame priority.
+        continue(
+          state,
+          %{job | phase: :followup, pending: items, budget: budget, then_check?: false},
+          0
+        )
 
       {:error, reason} ->
         Logger.debug("TuyaMesh.Commander: no follow-ups (Lights: #{inspect(reason)})")
@@ -535,13 +537,30 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   end
 
   defp next_job(state, now) do
-    blocked? = state.blocked_until != nil and now < state.blocked_until
-
     state.jobs
     |> Map.values()
-    |> Enum.filter(&(&1.ready_at <= now and not (blocked? and frame?(&1))))
+    |> Enum.filter(&(available_at(state, &1) <= now))
     |> Enum.min_by(&{priority(&1), &1.id}, fn -> nil end)
   end
+
+  # When a job's next action may run: frames not during a capacity hold,
+  # follow-up frames not before the shared follow-up pacing allows.
+  defp available_at(state, job) do
+    holds =
+      cond do
+        followup_frame?(job) -> [state.blocked_until, state.next_followup_at]
+        frame?(job) -> [state.blocked_until]
+        true -> []
+      end
+
+    Enum.max([job.ready_at | Enum.reject(holds, &is_nil/1)])
+  end
+
+  defp followup_frame?(job), do: job.phase == :followup and frame?(job)
+
+  # One follow-up per `:followup_gap_ms` across every command, so they
+  # never queue more than a frame ahead of a new user command.
+  defp followup_sent(state), do: %{state | next_followup_at: now() + state.followup_gap_ms}
 
   defp priority(%{phase: phase}) when phase in [:send, :direct], do: 0
   defp priority(%{phase: :check}), do: 1
@@ -559,11 +578,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   defp reschedule(state) do
     now = now()
 
-    due =
-      for job <- Map.values(state.jobs) do
-        at = job.ready_at
-        if frame?(job) and state.blocked_until != nil, do: max(at, state.blocked_until), else: at
-      end
+    due = for job <- Map.values(state.jobs), do: available_at(state, job)
 
     deadlines = for job <- Map.values(state.jobs), do: job.deadline + 1
     at = Enum.min([now + state.keepalive_ms | due ++ deadlines])

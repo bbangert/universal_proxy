@@ -282,7 +282,10 @@ defmodule UniversalProxy.ESPHome.EntityProviderMeshTest do
 
     test "routing never waits on the Commander" do
       {sources, _put} = start_inputs()
-      commander = start_supervised!({UniversalProxy.TuyaMesh.Commander, name: nil})
+      # Unsubscribed: other tests' Store broadcasts would land in its mailbox.
+      commander =
+        start_supervised!({UniversalProxy.TuyaMesh.Commander, name: nil, subscribe: false})
+
       :ok = :sys.suspend(commander)
 
       pid =

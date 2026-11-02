@@ -12,11 +12,14 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
   @b "DC23533FCD62"
   @c "DC2353000001"
   @d "DC2353000002"
+  @e "DC2353000003"
   @ids %{
     {:bulb, @a} => 5,
     {:bulb, @b} => 7,
     {:bulb, @c} => 8,
     {:bulb, @d} => 12,
+    {:bulb, @e} => 14,
+    {:group, 5} => 13,
     {:group, 1} => 6,
     {:group, 2} => 9,
     {:group, 3} => 11
@@ -46,6 +49,7 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
 
     defp handle({:set, mac, batch, opts} = req, s) do
       send(s.test, {:lights, req})
+      send(s.test, {:set_at, mac, System.monotonic_time(:millisecond)})
       {reply, rest} = pop(Map.get(s.set, mac, []))
       s = %{s | set: Map.put(s.set, mac, rest)}
       s = if reply == :ok and opts[:ack], do: report(s, mac, batch), else: s
@@ -130,6 +134,7 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       members: fn
         1 -> {:ok, [@a, @b, @c]}
         3 -> {:ok, [@b, @c]}
+        5 -> {:ok, [@d]}
         _ -> :error
       end,
       push: &send(test, {:push, &1}),
@@ -210,6 +215,15 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       {:lights, :refused} -> last_group_set(last)
     after
       0 -> last
+    end
+  end
+
+  # Every set's MAC and call time, in order.
+  defp set_times(acc \\ []) do
+    receive do
+      {:set_at, mac, at} -> set_times([{mac, at} | acc])
+    after
+      0 -> Enum.reverse(acc)
     end
   end
 
@@ -471,6 +485,44 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       assert next == {@d, [on: true]}
       assert length(rest) == 2
       refute {first, [on: true]} in rest
+    end
+
+    test "follow-ups of two groups share one pacing, and a user command goes first" do
+      gap = 300
+      {pid, _agent} = start(followup_gap_ms: gap)
+
+      # Nobody hears either broadcast: group 1 (A, B, C) and group 5 (D)
+      # both run a follow-up pass at once.
+      Commander.command(cmd({:group, 1}, on()), pid)
+      Commander.command(cmd({:group, 5}, on()), pid)
+      assert_receive {:lights, {:set, _first, [on: true], _}}, 2_000
+
+      Commander.command(cmd({:bulb, @e}, on()), pid)
+      idle(pid)
+
+      sent = set_times()
+      followups = Enum.reject(sent, &match?({@e, _}, &1))
+      assert length(followups) == 4
+
+      for [{_m1, t1}, {_m2, t2}] <- Enum.chunk_every(followups, 2, 1, :discard),
+          do: assert(t2 - t1 >= gap)
+
+      # The user command went before the second follow-up.
+      assert [{_first, _}, {@e, _} | _] = sent
+    end
+
+    test "a confirmation pass during a capacity hold only plans" do
+      script = %{set: %{@e => [{:error, :queue_full}, :ok]}}
+      {pid, _agent} = start(script: script, retry_ms: 300, max_retry_ms: 300)
+
+      Commander.command(cmd({:group, 1}, on()), pid)
+      Commander.command(cmd({:bulb, @e}, on()), pid)
+      idle(pid)
+
+      # The refused user frame, then (after the hold) that frame again,
+      # and only then the follow-ups the check planned during the hold.
+      assert [{@e, _}, {@e, _} | followups] = sets()
+      assert length(followups) == 3
     end
 
     test "a burst of group on/off/on ends in the last state" do
