@@ -40,12 +40,16 @@ defmodule UniversalProxy.TuyaMesh.Presence do
       unconfirmed first and, from the same broadcast, misses first.
     * **routine**: everything else, a bulb that missed one broadcast (a
       collision, most likely), a persistent straggler's check, a dead
-      bulb's backed-off one. Heard bulbs below the miss limit go first,
-      by deadline: the moment the bulb's reachable window at the
-      Resolver (2.5 × its `interval_ms`) would run out. Then bulbs never
-      heard (they have no window to keep), and last the retries of bulbs
-      already missed twice, with what capacity is left; those recover
-      through broadcasts and their power-on announce anyway.
+      bulb's backed-off one. Bulbs below the miss limit go first, by
+      deadline: the moment the bulb's reachable window at the Resolver
+      (2.5 × its `interval_ms`) would run out, or, for a bulb never
+      heard, 5 cycles after it was first seen. So a heard bulb whose
+      window is closing goes before it, but it can't be starved: once
+      that synthetic deadline is the earliest it goes next, so a new bulb
+      that answers direct pings is confirmed within about 5 cycles and one
+      routine spacing of appearing (5.5 min). The retries of bulbs
+      already missed twice go last, with what capacity is left; those
+      recover through broadcasts and their power-on announce anyway.
 
   What the budget (below) doesn't fit carries over, keeping its place.
 
@@ -61,7 +65,8 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   mesh key and can't open broadcasts) is checked directly every other
   cycle at most, and its `interval_ms` in the snapshot is honest about it:
   two cycles, or, when the routine budget can't serve all stragglers that
-  often, the time it takes to: stragglers × the routine spacing, against
+  often, the time it takes to: stragglers (and never-heard bulbs still
+  waiting for their first check) × the routine spacing, against
   the routine rate less what suspect checks took over the last ten
   minutes (counted as at least half of it), rounded up to 30 s. 4
   stragglers: 120 s (window 300 s); 10: 300 s (window 750 s). Deadline
@@ -279,6 +284,9 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   # suspected outage.
   @recent_ms 600_000
   @interval_step 30_000
+  # A never-heard bulb's check competes by deadline as if its window ran
+  # out this many cycles after it was first seen.
+  @never_heard_cycles 5
   # A persistent straggler (missed the broadcast, answered the direct ping,
   # twice in a row) is checked directly every other cycle.
   @straggler_cycles 2
@@ -443,10 +451,12 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   defp refresh(state) do
     case Lights.all(server: state.lights) do
       {:ok, list} ->
+        now = state.clock.()
+
         bulbs =
           Map.new(list, fn %{mac: mac} = bulb ->
-            {mac,
-             merge(Map.get(state.bulbs, mac), bulb.heard_ms, Map.get(state.remembered, mac, 0))}
+            old = Map.get(state.bulbs, mac)
+            {mac, merge(old, bulb.heard_ms, Map.get(state.remembered, mac, 0), now)}
           end)
 
         pending =
@@ -463,9 +473,10 @@ defmodule UniversalProxy.TuyaMesh.Presence do
     end
   end
 
-  defp merge(nil, last, straggles),
+  defp merge(nil, last, straggles, now),
     do: %{
       last: last,
+      seen: now,
       misses: 0,
       missed_at: nil,
       unconfirmed: nil,
@@ -473,7 +484,7 @@ defmodule UniversalProxy.TuyaMesh.Presence do
       straggles: straggles
     }
 
-  defp merge(bulb, last, _straggles),
+  defp merge(bulb, last, _straggles, _now),
     do: if(newer?(last, bulb.last), do: heard(bulb, last), else: bulb)
 
   defp newer?(nil, _known), do: false
@@ -652,16 +663,17 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   defp class(_state, _bulb), do: :routine
 
   defp order(_state, b, :urgent, mac), do: {0, b.unconfirmed, -b.misses, mac}
-  # Heard bulbs below the miss limit by deadline (they have a reachable
-  # window to keep); then bulbs never heard (they have none); retries of
-  # bulbs already missed twice only with what is left.
-  defp order(state, b, :routine, mac), do: {1, tier(b), deadline(state, b), mac}
+  # Bulbs below the miss limit by deadline; retries of bulbs already missed
+  # twice only with what is left.
+  defp order(state, b, :routine, mac),
+    do: {1, if(b.misses >= 2, do: 1, else: 0), deadline(state, b), mac}
 
-  defp tier(%{misses: misses}) when misses >= 2, do: 2
-  defp tier(%{last: nil}), do: 1
-  defp tier(_bulb), do: 0
-
-  defp deadline(state, b), do: (b.last || b.unconfirmed) + div(interval(state, b) * 5, 2)
+  # When the Resolver's window for a heard bulb (2.5 intervals) runs out;
+  # a never-heard bulb has none, so it gets a later, synthetic one: it
+  # never jumps a heard bulb whose window is closing, and never waits more
+  # than that for its first check.
+  defp deadline(state, %{last: nil} = b), do: b.seen + @never_heard_cycles * state.cycle_ms
+  defp deadline(state, b), do: b.last + div(interval(state, b) * 5, 2)
 
   # Routine checks of stragglers and dead bulbs are maintenance; others
   # (a bulb that just missed a broadcast) suspect. Both count as routine.
@@ -897,13 +909,20 @@ defmodule UniversalProxy.TuyaMesh.Presence do
 
   defp interval(state, _bulb), do: state.cycle_ms
 
+  # Never-heard bulbs below the miss limit count too: each takes a routine
+  # slot from the stragglers before it is heard.
   defp straggler_interval(state, now) do
-    stragglers = Enum.count(state.bulbs, fn {_mac, b} -> b.straggles >= @straggler_cycles end)
+    stragglers =
+      Enum.count(state.bulbs, fn {_mac, b} ->
+        b.straggles >= @straggler_cycles or (b.last == nil and b.misses < 2)
+      end)
+
     per_minute = @minute / max(state.routine_spacing_ms, 1)
     suspects = frames_since(state, now - @ten_minutes, [:suspect]) / 10
     share = max(per_minute - suspects, per_minute / 2)
 
-    if stragglers == 0 or share <= 0 do
+    if not Enum.any?(state.bulbs, fn {_mac, b} -> b.straggles >= @straggler_cycles end) or
+         share <= 0 do
       0
     else
       ms = stragglers * @minute / share

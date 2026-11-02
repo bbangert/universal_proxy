@@ -511,6 +511,49 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
       assert max_in_a_minute(log(ctx)) <= 10
     end
 
+    test "a new bulb among nine learned stragglers is confirmed within 5.5 minutes", ctx do
+      stragglers = macs(9)
+      new = "CC0000000001"
+      ctx = start(ctx, macs: stragglers, replying: stragglers ++ [new], deaf: stragglers ++ [new])
+
+      within_windows = fn t ->
+        {:ok, snapshot} = Presence.snapshot(ctx.presence)
+
+        for mac <- stragglers do
+          b = snapshot[mac]
+          assert b.misses == 0
+          assert t - b.last_ms <= div(b.interval_ms * 5, 2)
+        end
+      end
+
+      for t <- 0..(30 * @min)//@s do
+        at(ctx, t)
+        if t >= 5 * @min and rem(t, 10 * @s) == 0, do: within_windows.(t)
+      end
+
+      # Added to the inventory (never heard, answers direct pings only).
+      added = 30 * @min + @s
+      :ok = FakeLights.put(ctx.lights, :macs, stragglers ++ [new])
+
+      confirmed =
+        Enum.find_value(added..(added + 10 * @min)//@s, fn t ->
+          at(ctx, t)
+          if rem(t, 10 * @s) == 0, do: within_windows.(t)
+          if bulb(ctx, new).last_ms, do: t
+        end)
+
+      assert confirmed - added <= 330 * @s
+
+      # And the stragglers keep their windows for the rest of the hour.
+      for t <- (confirmed + @s)..(90 * @min)//@s do
+        at(ctx, t)
+        if rem(t, 10 * @s) == 0, do: within_windows.(t)
+      end
+
+      assert max_in_an_hour(log(ctx)) <= 240
+      assert max_in_a_minute(log(ctx)) <= 10
+    end
+
     test "a log that doesn't know the last hour allows only broadcasts for an hour", ctx do
       table = :ets.new(:frames, [:set, :public])
       Presence.unknown_history(table, -@min)
