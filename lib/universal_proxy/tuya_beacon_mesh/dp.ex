@@ -24,7 +24,10 @@ defmodule UniversalProxy.TuyaBeaconMesh.Dp do
   @types %{raw: 0, bool: 1, value: 2, string: 3, enum: 4, bitmap: 5}
   @names Map.new(@types, fn {k, v} -> {v, k} end)
 
-  @doc "Encodes DPs into TLVs; `{:error, :too_long}` past 16 bytes."
+  @doc """
+  Encodes DPs into TLVs; `{:error, :too_long}` past 16 bytes. Errors name
+  a DP by `shape/1`, never by its value.
+  """
   @spec encode([dp()]) :: {:ok, binary()} | {:error, term()}
   def encode(dps) when is_list(dps) do
     tlvs = Enum.map(dps, &encode_one/1)
@@ -43,11 +46,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.Dp do
     case value_bytes(type, value) do
       {:ok, v} when byte_size(v) <= 15 -> <<id, @types[type] <<< 4 ||| byte_size(v), v::binary>>
       {:ok, _} -> {:error, {:value_too_long, id}}
-      :error -> {:error, {:bad_value, id, type, value}}
+      :error -> {:error, {:bad_value, id, shape(type)}}
     end
   end
 
-  defp encode_one(other), do: {:error, {:bad_dp, other}}
+  defp encode_one(other), do: {:error, {:bad_dp, shape(other)}}
 
   defp value_bytes(:bool, v) when is_boolean(v), do: {:ok, if(v, do: <<1>>, else: <<0>>)}
   defp value_bytes(:value, v) when v in -0x8000_0000..0x7FFF_FFFF, do: {:ok, <<v::32-big-signed>>}
@@ -55,6 +58,22 @@ defmodule UniversalProxy.TuyaBeaconMesh.Dp do
   defp value_bytes(:string, v) when is_binary(v), do: {:ok, v}
   defp value_bytes(:raw, v) when is_binary(v), do: {:ok, v}
   defp value_bytes(_, _), do: :error
+
+  @doc """
+  What an error may say about a malformed DP or DP key: a DP's `{id,
+  type}`, an atom or byte, or else only the kind of term. Never a value,
+  which may be anything the caller passed.
+  """
+  @spec shape(term()) :: term()
+  def shape({id, type, _value}) when is_integer(id) and is_atom(type), do: {shape(id), type}
+  def shape(atom) when is_atom(atom), do: atom
+  def shape(byte) when is_integer(byte) and byte in 0..255, do: byte
+  def shape(int) when is_integer(int), do: :integer
+  def shape(tuple) when is_tuple(tuple), do: {:tuple, tuple_size(tuple)}
+  def shape(binary) when is_binary(binary), do: :binary
+  def shape(list) when is_list(list), do: :list
+  def shape(map) when is_map(map), do: :map
+  def shape(_other), do: :term
 
   @doc "Decodes TLVs until a zero DP id or the end of the payload."
   @spec decode(binary()) :: [dp()]

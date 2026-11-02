@@ -304,5 +304,15 @@ defmodule UniversalProxy.TuyaBeaconMesh.InventoryTest do
       bad_key = %{inv | bulbs: [%{b1 | local_key: "not a key"}, b2]}
       assert {:error, {:bad_local_key, _}} = Inventory.decode(bad_key)
     end
+
+    test "improper lists in term input are errors, not raises" do
+      [b1 | _] = base()["bulbs"]
+
+      assert {:error, :bad_bulbs} = Inventory.decode(Map.put(base(), "bulbs", [b1 | :tail]))
+      assert {:error, :bad_groups} = Inventory.decode(Map.put(base(), "groups", [%{} | :tail]))
+
+      group = %{"localId" => 7, "members" => [b1["mac"] | :tail]}
+      assert {:error, :bad_group} = Inventory.decode(Map.put(base(), "groups", [group]))
+    end
   end
 end

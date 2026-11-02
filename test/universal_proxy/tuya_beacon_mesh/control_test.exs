@@ -32,7 +32,68 @@ defmodule UniversalProxy.TuyaBeaconMesh.ControlTest do
            ]
 
     assert {:error, :no_dps} = Control.friendly_dps([])
-    assert {:error, {:bad_mode, :disco}} = Control.friendly_dps(mode: :disco)
+    assert {:error, {:bad_dp, :mode}} = Control.friendly_dps(mode: :disco)
+  end
+
+  test "friendly_dps accepts raw DP tuples once Dp.encode/1 does" do
+    assert {:ok, [{1, :bool, true}, {26, :value, 60}, {3, :value, 500}]} =
+             Control.friendly_dps([{1, :bool, true}, {26, :value, 60}, brightness: 500])
+
+    assert {:error, {:bad_dp, {1, :bool}}} = Control.friendly_dps([{1, :bool, "yes"}])
+    assert {:error, {:bad_dp, {0, :bool}}} = Control.friendly_dps([{0, :bool, true}])
+    assert {:error, {:bad_dp, {:integer, :raw}}} = Control.friendly_dps([{300, :raw, <<1>>}])
+    assert {:error, {:bad_dp, {1, :nope}}} = Control.friendly_dps([{1, :nope, 1}])
+    # Receive-only.
+    assert {:error, {:bad_dp, {5, :bitmap}}} = Control.friendly_dps([{5, :bitmap, 1}])
+    assert {:error, {:bad_dp, {:tuple, 3}}} = Control.friendly_dps([{"1", :bool, true}])
+  end
+
+  test "friendly_dps is total, and its errors carry no values" do
+    secret = "00112233445566778899aabbccddeeff"
+
+    for {input, expected} <- [
+          {[on: secret], {:bad_dp, :on}},
+          {[brightness: 5], {:bad_dp, :brightness}},
+          {[temp: 1001], {:bad_dp, :temp}},
+          {[colour: {360, 0, 0}], {:bad_dp, :colour}},
+          {[colour: secret], {:bad_dp, :colour}},
+          {[mode: 256], {:bad_dp, :mode}},
+          {[disco: true], {:bad_dp, :disco}},
+          {[{secret, true}], {:bad_dp, :binary}},
+          {[{1_000, true}], {:bad_dp, :integer}},
+          {[{1, true}], {:bad_dp, 1}},
+          {[secret], {:bad_dp, :binary}},
+          {[{1, :bool, true, secret}], {:bad_dp, {:tuple, 4}}},
+          {[[on: true]], {:bad_dp, :list}},
+          {%{"on" => true}, {:bad_dp, :binary}},
+          {[{:on, true} | :tail], :bad_dps},
+          {secret, :bad_dps},
+          {nil, :bad_dps},
+          {{:on, true}, :bad_dps}
+        ] do
+      assert Control.friendly_dps(input) == {:error, expected}, inspect(input)
+    end
+  end
+
+  test "set and group_set refuse bad options and DPs without raising" do
+    assert {:error, {:bad_option, :ack}} =
+             Control.set(@node, @sn, [on: true], @local_key, @beacon_key, ack: "yes")
+
+    assert {:error, {:bad_option, :ack}} =
+             Control.set(@node, @sn, [on: true], @local_key, @beacon_key, %{ack: true})
+
+    assert {:error, {:bad_option, :ack}} =
+             Control.group_set(1, @sn, [on: true], @beacon_key, [:ack])
+
+    assert {:error, {:bad_dp, {1, :bool}}} =
+             Control.set(@node, @sn, [{1, :bool, 1}], @local_key, @beacon_key)
+
+    assert {:error, :bad_dps} = Control.group_set(1, @sn, :on, @beacon_key)
+  end
+
+  test "a raw DP builds the same frame as its friendly form" do
+    assert Control.set(@node, @sn, [{1, :bool, true}], @local_key, @beacon_key) ==
+             Control.set(@node, @sn, [on: true], @local_key, @beacon_key)
   end
 
   test "set builds a phone-sourced unicast dp_set_ack with bumped send_ms" do
