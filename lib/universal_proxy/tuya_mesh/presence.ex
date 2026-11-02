@@ -85,6 +85,12 @@ defmodule UniversalProxy.TuyaMesh.Presence do
       nothing on air and nothing queued, so a frame never queues in front
       of, or behind, a command.
 
+  And no new frame starts while light commands are active: the
+  `UniversalProxy.TuyaMesh.Commander` calls `command_activity/2` when a
+  command arrives and while it has work, and every frame waits until that
+  hold has passed. A frame held back is no attempt (nothing is counted,
+  unconfirmed or missed); it goes when the hold ends.
+
   A broadcast that is due goes before follow-ups. Ticks come every
   `:tick_ms` (5 s), or every `:busy_tick_ms` (1 s) while a frame is
   outstanding, follow-ups wait, or the pinger is settling.
@@ -337,6 +343,15 @@ defmodule UniversalProxy.TuyaMesh.Presence do
     :ets.insert(table, [{:unknown_until, now + @hour} | rows])
   end
 
+  @doc """
+  Holds off new frames for `hold_ms` from now (by this process's clock),
+  or longer if an earlier hold runs longer: light commands are active.
+  Never blocks; a no-op when not running.
+  """
+  @spec command_activity(GenServer.server(), non_neg_integer()) :: :ok
+  def command_activity(server \\ __MODULE__, hold_ms),
+    do: GenServer.cast(server, {:command_activity, hold_ms})
+
   @doc false
   # Runs one tick now: tests drive the schedule with a fake clock.
   @spec poll(GenServer.server()) :: :ok
@@ -392,7 +407,9 @@ defmodule UniversalProxy.TuyaMesh.Presence do
       # Stragglers a predecessor learned (see "Frame log"), as written last.
       remembered: remembered(frames),
       pushed: nil,
-      timer: nil
+      timer: nil,
+      # No new frame before this (light commands active).
+      hold_until: nil
     }
 
     {:ok, state |> budgets() |> schedule()}
@@ -415,6 +432,14 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   @impl GenServer
   def handle_call(:snapshot, _from, state), do: {:reply, {:ok, build_snapshot(state)}, state}
   def handle_call(:poll, _from, state), do: {:reply, :ok, run(state)}
+
+  @impl GenServer
+  def handle_cast({:command_activity, hold_ms}, state) when is_integer(hold_ms) do
+    until = state.clock.() + hold_ms
+    {:noreply, %{state | hold_until: max(state.hold_until || until, until)}}
+  end
+
+  def handle_cast(_msg, state), do: {:noreply, state}
 
   @impl GenServer
   def handle_info({:tick, token}, %{timer: {token, _}} = state),
@@ -620,6 +645,7 @@ defmodule UniversalProxy.TuyaMesh.Presence do
     with nil <- state.pending,
          true <- state.lights_ok,
          true <- now >= state.next_attempt,
+         false <- held?(state, now),
          {:ok, kind, tag} <- next_frame(state, now),
          {:idle, sn} <- radio_idle(state) do
       send_frame(state, kind, tag, sn)
@@ -627,6 +653,8 @@ defmodule UniversalProxy.TuyaMesh.Presence do
       _ -> state
     end
   end
+
+  defp held?(%{hold_until: until}, now), do: until != nil and now < until
 
   # A due broadcast within its reservation goes first; a follow-up only
   # within the follow-up budget (see "Budget").
