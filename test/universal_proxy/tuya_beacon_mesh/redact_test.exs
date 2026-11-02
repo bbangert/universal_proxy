@@ -46,6 +46,63 @@ defmodule UniversalProxy.TuyaBeaconMesh.RedactTest do
     end
   end
 
+  describe "term/1 through containers" do
+    defmodule Holder do
+      @moduledoc false
+      defstruct [:label, :payload]
+    end
+
+    test "a MapSet, a struct field, a map key and deep nesting hold no key afterwards" do
+      inv = Inventory.decode!(KeyLeak.json())
+
+      cases = [
+        MapSet.new([inv, "kept"]),
+        MapSet.new([{:dump, KeyLeak.json()}]),
+        %Holder{label: "lamp", payload: inv},
+        %Holder{label: "lamp", payload: %{nested: [MapSet.new([KeyLeak.snake_map()])]}},
+        %{inv => :value},
+        %{{:k, @beacon_key} => 1, [hd(inv.bulbs)] => 2},
+        {:a, [b: {:c, [%{d: [inv]}]}]},
+        [{:ok, [MapSet.new([%Holder{payload: {"x", inv}}])]}],
+        Enum.reduce(1..10, inv, &{&1, [&2]})
+      ]
+
+      for t <- cases do
+        KeyLeak.refute_keys(Redact.term(t))
+      end
+    end
+
+    test "keeps what it needn't change and marks a changed struct" do
+      inv = Inventory.decode!(KeyLeak.json())
+      plain = [1..3, ~r/x/, ~D[2026-11-02], DateTime.from_unix!(0), %Holder{label: "lamp"}]
+
+      assert Redact.term(plain) == plain
+      assert Redact.term(MapSet.new([inv, "kept"])) == MapSet.new([:redacted, "kept"])
+
+      assert Redact.term(%Holder{label: "lamp", payload: inv}) ==
+               {:struct, Holder, %{label: "lamp", payload: :redacted}}
+
+      assert Redact.term(%{inv => :value}) == %{redacted: :value}
+    end
+
+    test "is bounded: anything nested past the depth limit is redacted whole" do
+      deep = Enum.reduce(1..100, "leaf", &{&1, &2})
+      assert Redact.term(deep) |> inspect(limit: :infinity) =~ ":redacted"
+      refute Redact.term(deep) |> inspect(limit: :infinity) =~ "leaf"
+      assert Redact.term(Enum.reduce(1..10, "leaf", &{&1, &2})) |> inspect() =~ "leaf"
+    end
+
+    test "format_status/2 walks containers in requests" do
+      inv = Inventory.decode!(KeyLeak.json())
+      call = {:"$gen_call", {self(), make_ref()}, {:other, MapSet.new([inv])}}
+
+      status =
+        Redact.format_status(%{message: call, queue: [call], state: %{s: MapSet.new([inv])}})
+
+      KeyLeak.refute_keys(status)
+    end
+  end
+
   describe "seal/1 and unseal/1" do
     test "a sealed term prints as a bare function in both printers" do
       sealed = Redact.seal(Inventory.decode!(KeyLeak.json()))

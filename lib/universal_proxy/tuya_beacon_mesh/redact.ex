@@ -16,8 +16,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.Redact do
       field in any spelling (string or atom, camel or snake case, any
       letter case), a binary or charlist naming such a field (inventory
       JSON), and a 32-hex-digit binary (a key's shape; MACs are 12).
-      Exceptions shrink to their module (their fields, such as a
-      `FunctionClauseError`'s arguments, may hold anything).
+      It walks tuples, lists, map keys and values, `MapSet`s and other
+      structs (a struct it had to change becomes `{:struct, module,
+      fields}`); an improper list, or anything nested past 64 levels, is
+      redacted whole. Exceptions shrink to their module (their fields,
+      such as a `FunctionClauseError`'s arguments, may hold anything).
     * `request/2` and `message/2` redact the second element of the
       requests tagged in `tags` (the inventory argument, in whatever
       representation) by position, then apply `term/1`.
@@ -48,38 +51,63 @@ defmodule UniversalProxy.TuyaBeaconMesh.Redact do
 
   @doc "`term` with every key-bearing part replaced by `:redacted`."
   @spec term(term()) :: term()
-  def term(%Inventory{}), do: :redacted
-  def term(%Inventory.Bulb{}), do: :redacted
-  # Built key-free by guard/2.
-  def term(%Error{} = error), do: error
-  def term(%{__exception__: true, __struct__: module}), do: {:exception, module}
-  # Other structs (pids in from-tuples, refs, Seq) carry no inventory.
-  def term(%_{} = struct), do: struct
+  def term(term), do: term(term, 0)
 
-  def term(map) when is_map(map) do
+  # Past this nesting depth a term is redacted whole (fail closed): no
+  # legitimate status or request nests this deep, and it bounds the walk.
+  @max_depth 64
+
+  # Structs that can hold only numbers, atoms and calendar names, kept as
+  # they are (and printed normally).
+  @plain_structs [Range, Regex, Date, Time, DateTime, NaiveDateTime]
+
+  defp term(_term, depth) when depth > @max_depth, do: :redacted
+  defp term(%Inventory{}, _depth), do: :redacted
+  defp term(%Inventory.Bulb{}, _depth), do: :redacted
+  # Built key-free by guard/2.
+  defp term(%Error{} = error, _depth), do: error
+  defp term(%{__exception__: true, __struct__: module}, _depth), do: {:exception, module}
+  defp term(%module{} = struct, _depth) when module in @plain_structs, do: struct
+  defp term(%MapSet{} = set, depth), do: MapSet.new(set, &term(&1, depth + 1))
+  defp term(%module{} = struct, depth), do: struct_term(module, struct, depth)
+
+  defp term(map, depth) when is_map(map) do
     if Enum.any?(Map.keys(map), &key_name?/1),
       do: :redacted,
-      else: Map.new(map, fn {k, v} -> {term(k), term(v)} end)
+      else: Map.new(map, fn {k, v} -> {term(k, depth + 1), term(v, depth + 1)} end)
   end
 
-  def term(tuple) when is_tuple(tuple),
-    do: tuple |> Tuple.to_list() |> Enum.map(&term/1) |> List.to_tuple()
+  defp term(tuple, depth) when is_tuple(tuple),
+    do: tuple |> Tuple.to_list() |> Enum.map(&term(&1, depth + 1)) |> List.to_tuple()
 
-  def term(binary) when is_binary(binary) do
+  defp term(binary, _depth) when is_binary(binary) do
     if Regex.match?(@key_name, binary) or Regex.match?(@key_shape, binary),
       do: :redacted,
       else: binary
   end
 
-  def term(list) when is_list(list) do
+  defp term(list, depth) when is_list(list) do
     cond do
       not proper_list?(list) -> :redacted
       charlist_naming_key?(list) -> :redacted
-      true -> Enum.map(list, &term/1)
+      true -> Enum.map(list, &term(&1, depth + 1))
     end
   end
 
-  def term(other), do: other
+  defp term(other, _depth), do: other
+
+  # Any other struct is walked like a map. One that comes out unchanged is
+  # kept; otherwise it becomes `{:struct, module, fields}`, since putting
+  # `:redacted` into its fields could break its invariants (and its
+  # Inspect).
+  defp struct_term(module, struct, depth) do
+    fields = Map.from_struct(struct)
+
+    case term(fields, depth) do
+      ^fields -> struct
+      redacted -> {:struct, module, redacted}
+    end
+  end
 
   @doc "Wraps `term` in an opaque closure (see the moduledoc)."
   @spec seal(term()) :: (-> term())
