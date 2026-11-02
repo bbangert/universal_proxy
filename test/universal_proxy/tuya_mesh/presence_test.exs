@@ -436,6 +436,81 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
       assert Enum.count(sent, &(elem(&1, 0) != :all)) > 0
     end
 
+    test "repeated pinger restarts on a shared log keep broadcasts a cycle apart", ctx do
+      bulbs = macs(10)
+      table = :ets.new(:frames, [:set, :public])
+      ctx = start(ctx, macs: bulbs, replying: bulbs, frames: table)
+
+      ctx =
+        Enum.reduce(0..29, ctx, fn n, ctx ->
+          from = n * 20 * @s
+          ctx = if n > 0, do: restart(ctx, from), else: ctx
+          run(ctx, from, from + 19 * @s)
+
+          if from >= 2 * @min do
+            {:ok, snapshot} = Presence.snapshot(ctx.presence)
+            for {_mac, b} <- snapshot, do: assert(from + 19 * @s - b.last_ms <= 150_000)
+          end
+
+          ctx
+        end)
+
+      broadcasts = for {:all, at} <- log(ctx), do: at
+      gaps = broadcasts |> Enum.zip(tl(broadcasts)) |> Enum.map(fn {a, b} -> b - a end)
+      assert Enum.all?(gaps, &(&1 >= @min and &1 <= @min + 10 * @s))
+      assert length(broadcasts) in 9..10
+      assert Presence.snapshot(ctx.presence) |> elem(1) |> map_size() == 10
+    end
+
+    test "a healthy straggler stays within its window across a pinger restart", ctx do
+      bulbs = macs(10)
+      stragglers = Enum.take(bulbs, 4)
+      table = :ets.new(:frames, [:set, :public])
+      ctx = start(ctx, macs: bulbs, replying: bulbs, deaf: stragglers, frames: table)
+
+      check = fn ctx, t ->
+        {:ok, snapshot} = Presence.snapshot(ctx.presence)
+
+        for mac <- stragglers do
+          b = snapshot[mac]
+          assert b.interval_ms >= 2 * @min
+          assert t - b.last_ms <= div(b.interval_ms * 5, 2)
+        end
+      end
+
+      for t <- 0..(10 * @min)//@s do
+        at(ctx, t)
+        if t >= 5 * @min, do: check.(ctx, t)
+      end
+
+      ctx = restart(ctx, 10 * @min + @s)
+
+      for t <- (10 * @min + @s)..(20 * @min)//@s do
+        at(ctx, t)
+        check.(ctx, t)
+      end
+    end
+
+    test "nine dead bulbs' retries never push a healthy straggler out of its window",
+         ctx do
+      [healthy | dead] = bulbs = macs(10)
+      ctx = start(ctx, macs: bulbs, replying: [healthy], deaf: [healthy])
+
+      for t <- 0..(120 * @min - 1)//@s do
+        at(ctx, t)
+
+        if t >= 3 * @min and rem(t, 10 * @s) == 0 do
+          b = bulb(ctx, healthy)
+          assert b.misses == 0
+          assert t - b.last_ms <= div(b.interval_ms * 5, 2)
+        end
+      end
+
+      assert Enum.all?(dead, &(bulb(ctx, &1).misses >= 2))
+      assert max_in_an_hour(log(ctx)) <= 240
+      assert max_in_a_minute(log(ctx)) <= 10
+    end
+
     test "a log that doesn't know the last hour allows only broadcasts for an hour", ctx do
       table = :ets.new(:frames, [:set, :public])
       Presence.unknown_history(table, -@min)

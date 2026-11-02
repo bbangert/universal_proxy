@@ -40,9 +40,12 @@ defmodule UniversalProxy.TuyaMesh.Presence do
       unconfirmed first and, from the same broadcast, misses first.
     * **routine**: everything else, a bulb that missed one broadcast (a
       collision, most likely), a persistent straggler's check, a dead
-      bulb's backed-off one. They go by deadline: the moment the bulb's
-      reachable window at the Resolver (2.5 × its `interval_ms`) would run
-      out.
+      bulb's backed-off one. Heard bulbs below the miss limit go first,
+      by deadline: the moment the bulb's reachable window at the
+      Resolver (2.5 × its `interval_ms`) would run out. Then bulbs never
+      heard (they have no window to keep), and last the retries of bulbs
+      already missed twice, with what capacity is left; those recover
+      through broadcasts and their power-on announce anyway.
 
   What the budget (below) doesn't fit carries over, keeping its place.
 
@@ -206,7 +209,12 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   The caps count the frames of the last hour from a frame log, an ETS
   table (`:frames`) that the Resolver owns and passes to every Presence
   it starts, so a pinger restart or a mesh restart (an upload) keeps the
-  hour's history. Each attempt is logged before its call (a crash inside
+  hour's history. A new Presence also takes from it the time of the last
+  broadcast (the next one comes a cycle after it, not at once: repeated
+  restarts can't spend the broadcasts' reservation early) and which bulbs
+  are persistent stragglers (so a restart doesn't shrink their advertised
+  interval, and with it the Resolver's window, while their last-heard
+  time stays). Each attempt is logged before its call (a crash inside
   the call still counts it) and removed again only when the frame was
   provably refused. A Resolver that stops hands the log to its successor;
   one that was killed leaves its successor a log that doesn't know the
@@ -371,7 +379,10 @@ defmodule UniversalProxy.TuyaMesh.Presence do
       pending: nil,
       next_attempt: started,
       frames: frames,
-      next_broadcast: started,
+      # A predecessor's broadcast still counts: the next is a cycle after it.
+      next_broadcast: next_broadcast(frames, started, cycle_ms),
+      # Stragglers a predecessor learned (see "Frame log"), as written last.
+      remembered: remembered(frames),
       pushed: nil,
       timer: nil
     }
@@ -423,6 +434,7 @@ defmodule UniversalProxy.TuyaMesh.Presence do
     |> resolve_pending()
     |> then(&%{&1 | straggler_interval: straggler_interval(&1, &1.clock.())})
     |> maybe_send()
+    |> remember()
     |> push()
   end
 
@@ -433,7 +445,8 @@ defmodule UniversalProxy.TuyaMesh.Presence do
       {:ok, list} ->
         bulbs =
           Map.new(list, fn %{mac: mac} = bulb ->
-            {mac, merge(Map.get(state.bulbs, mac), bulb.heard_ms)}
+            {mac,
+             merge(Map.get(state.bulbs, mac), bulb.heard_ms, Map.get(state.remembered, mac, 0))}
           end)
 
         pending =
@@ -450,17 +463,18 @@ defmodule UniversalProxy.TuyaMesh.Presence do
     end
   end
 
-  defp merge(nil, last),
+  defp merge(nil, last, straggles),
     do: %{
       last: last,
       misses: 0,
       missed_at: nil,
       unconfirmed: nil,
       direct_after: nil,
-      straggles: 0
+      straggles: straggles
     }
 
-  defp merge(bulb, last), do: if(newer?(last, bulb.last), do: heard(bulb, last), else: bulb)
+  defp merge(bulb, last, _straggles),
+    do: if(newer?(last, bulb.last), do: heard(bulb, last), else: bulb)
 
   defp newer?(nil, _known), do: false
   defp newer?(_last, nil), do: true
@@ -638,7 +652,14 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   defp class(_state, _bulb), do: :routine
 
   defp order(_state, b, :urgent, mac), do: {0, b.unconfirmed, -b.misses, mac}
-  defp order(state, b, :routine, mac), do: {1, deadline(state, b), mac}
+  # Heard bulbs below the miss limit by deadline (they have a reachable
+  # window to keep); then bulbs never heard (they have none); retries of
+  # bulbs already missed twice only with what is left.
+  defp order(state, b, :routine, mac), do: {1, tier(b), deadline(state, b), mac}
+
+  defp tier(%{misses: misses}) when misses >= 2, do: 2
+  defp tier(%{last: nil}), do: 1
+  defp tier(_bulb), do: 0
 
   defp deadline(state, b), do: (b.last || b.unconfirmed) + div(interval(state, b) * 5, 2)
 
@@ -714,6 +735,38 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   end
 
   defp unlog_frame(state, key), do: :ets.delete(state.frames, key)
+
+  defp next_broadcast(frames, started, cycle_ms) do
+    last =
+      :ets.tab2list(frames)
+      |> Enum.flat_map(fn
+        {_key, at, :broadcast} -> [at]
+        _row -> []
+      end)
+      |> Enum.max(fn -> nil end)
+
+    if last, do: last + cycle_ms, else: started
+  end
+
+  defp remembered(frames) do
+    for {{:straggles, mac}, n} <- :ets.tab2list(frames), into: %{}, do: {mac, n}
+  end
+
+  # Writes the straggler record when it changed (the bulbs as Lights read
+  # them last, so bulbs that left drop out).
+  defp remember(%{lights_ok: false} = state), do: state
+
+  defp remember(state) do
+    current = for {mac, b} <- state.bulbs, b.straggles > 0, into: %{}, do: {mac, b.straggles}
+
+    if current == state.remembered do
+      state
+    else
+      :ets.match_delete(state.frames, {{:straggles, :_}, :_})
+      :ets.insert(state.frames, for({mac, n} <- current, do: {{:straggles, mac}, n}))
+      %{state | remembered: current}
+    end
+  end
 
   @followups [:urgent, :suspect, :maintenance]
   @routine [:suspect, :maintenance]
