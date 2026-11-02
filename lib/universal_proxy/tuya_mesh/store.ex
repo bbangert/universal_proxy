@@ -1,8 +1,9 @@
 defmodule UniversalProxy.TuyaMesh.Store do
   @moduledoc """
   DETS-backed store for the Tuya Beacon Mesh: the uploaded inventory (keys
-  included), the HA sub-device ids allocated to its bulbs and groups, and
-  the mesh settings (colour-temperature range).
+  included), the HA sub-device ids allocated to its bulbs and groups, the
+  mesh settings (colour-temperature range) and each bulb's last-known
+  light state.
 
   The DETS file lives at `/data/tuya_mesh.dets` on Nerves (`_build/` on the
   host). The inventory holds every key of the mesh, so the file is
@@ -157,11 +158,29 @@ defmodule UniversalProxy.TuyaMesh.Store do
   corrupted record) still has a summary to serve: Home Assistant deletes
   sub-devices it isn't shown, and the user re-uploading is what fixes it.
 
+  ## Light states
+
+  The bulbs can't be asked for their state (only an acked set draws a DP
+  report), so `put_light_state/3` keeps each bulb's last-known DPs (the
+  Commander's, see `UniversalProxy.TuyaMesh.Commander`) for the next
+  start. Key-free: DP ids and their values only, per MAC. A state equal
+  to the kept one changes nothing; a change is written at once when the
+  last light-state write is `:light_state_interval_ms` (60 s) old, else
+  held until it is, so a scene or music mode costs one write a minute.
+  Held changes also go out with any inventory write and on a clean stop,
+  and a write that fails is retried after the interval. Light-state
+  writes broadcast nothing and leave the revision.
+
+  Only bulbs of the stored inventory are kept: a state for any other MAC
+  is ignored, an upload drops the bulbs it removes, and a clear or an
+  upload of another mesh drops them all.
+
   `:max_dump_advance` (default and maximum 299, see above) sets the bound.
 
   Tests can override `:pubsub`, `:dets_path`, `:table`, `:name`, `:chmod_fun`
   (`(path, mode -> :ok | {:error, term()})`), `:write_fun` (`(table,
-  records -> :ok | {:error, term()})`, one atomic insert) and `:enabled` (default:
+  records -> :ok | {:error, term()})`, one atomic insert),
+  `:light_state_interval_ms` and `:enabled` (default:
   `UniversalProxy.Bluetooth.supported?/0`; when false, `start_link/1`
   returns `:ignore`).
   """
@@ -177,6 +196,8 @@ defmodule UniversalProxy.TuyaMesh.Store do
 
   @default_table :tuya_mesh
   @default_settings %{min_mireds: 154, max_mireds: 370, invert: false}
+  @light_state_interval_ms 60_000
+  @components [:brightness, :color_brightness, :peak]
   @seq_space 65_536
   # The :max_lease the mesh's Lights runs with; the upload bound is
   # derived from it (moduledoc, "Upload seq").
@@ -187,6 +208,10 @@ defmodule UniversalProxy.TuyaMesh.Store do
   @type classification :: :empty | :same_mesh | :new_mesh
   @type settings :: %{min_mireds: pos_integer(), max_mireds: pos_integer(), invert: boolean()}
   @type summary :: %{mac: String.t(), label: String.t() | nil}
+  @type light_state :: %{
+          optional(1..255 | :brightness | :color_brightness | :peak) =>
+            boolean() | number() | binary()
+        }
   @type inventory_summary :: %{
           bulbs: [summary()],
           groups: [%{local_id: 0..254, name: String.t() | nil}],
@@ -308,8 +333,8 @@ defmodule UniversalProxy.TuyaMesh.Store do
 
   @doc """
   Removes the inventory, keeping its `seq` floor. Bulb device ids, the id
-  counter and settings are kept; group ids are dropped. For an invalid
-  record whose floor can't be recovered: `{:error, :seq_unrecoverable}`,
+  counter and settings are kept; group ids and light states are dropped.
+  For an invalid record whose floor can't be recovered: `{:error, :seq_unrecoverable}`,
   unless `force: true` (see the moduledoc).
   """
   @spec clear(GenServer.server(), keyword()) :: :ok | {:error, term()}
@@ -360,6 +385,21 @@ defmodule UniversalProxy.TuyaMesh.Store do
   @spec put_settings(map(), GenServer.server()) :: :ok | {:error, term()}
   def put_settings(changes, server \\ __MODULE__) when is_map(changes),
     do: call(server, {:put_settings, changes}, {:error, :unavailable})
+
+  @doc """
+  Keeps `dps` as the bulb `mac`'s last-known light state (see "Light
+  states"): DP ids (1..255) and the `:brightness`, `:color_brightness` and
+  `:peak` components, with boolean, number or binary values. A cast: never
+  blocks, and anything else, or a MAC not in the stored inventory, is
+  ignored.
+  """
+  @spec put_light_state(String.t(), light_state(), GenServer.server()) :: :ok
+  def put_light_state(mac, dps, server \\ __MODULE__) when is_binary(mac) and is_map(dps),
+    do: GenServer.cast(server, {:put_light_state, mac, dps})
+
+  @doc "Every bulb's last-known light state, by MAC (held changes included). `%{}` when unavailable."
+  @spec light_states(GenServer.server()) :: %{String.t() => light_state()}
+  def light_states(server \\ __MODULE__), do: call(server, :light_states, %{})
 
   @doc "Default mesh settings."
   @spec default_settings() :: settings()
@@ -417,7 +457,14 @@ defmodule UniversalProxy.TuyaMesh.Store do
               table: table,
               write_fun: Keyword.get(opts, :write_fun, &default_write/2),
               pubsub: Keyword.get(opts, :pubsub, UniversalProxy.PubSub),
-              max_dump_advance: max_dump_advance(opts)
+              max_dump_advance: max_dump_advance(opts),
+              light_interval_ms:
+                Keyword.get(opts, :light_state_interval_ms, @light_state_interval_ms),
+              # Changed states not written yet, the pending write's timer and
+              # when light states were last written (monotonic ms).
+              lights_held: %{},
+              lights_timer: nil,
+              lights_written_at: nil
             }
 
             # Readers that failed while it was down catch up on this.
@@ -441,7 +488,10 @@ defmodule UniversalProxy.TuyaMesh.Store do
   end
 
   @impl GenServer
-  def terminate(_reason, %{table: table}), do: :dets.close(table)
+  def terminate(_reason, state) do
+    write_lights(state)
+    :dets.close(state.table)
+  end
 
   # Requests carry inventories and the table holds them: anything raised
   # in here leaves as a key-free Redact.Error (see Redact.guard/2).
@@ -467,7 +517,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
          extra = if(groups_changed?, do: [bump(state.table)], else: []),
          :ok <- write_inventory(state, inv, extra, :same_mesh) do
       if groups_changed?, do: notify(state)
-      {:reply, :ok, state}
+      {:reply, :ok, lights_kept(state)}
     else
       {:error, _reason} = error -> {:reply, error, state}
     end
@@ -507,7 +557,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
           error
       end
 
-    {:reply, reply, state}
+    {:reply, reply, if(match?({:ok, _}, reply), do: lights_kept(state), else: state)}
   end
 
   defp do_call({:clear, opts}, _from, state) do
@@ -534,7 +584,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
           end
       end
 
-    {:reply, reply, state}
+    {:reply, reply, if(reply == :ok, do: lights_kept(state), else: state)}
   end
 
   defp do_call(:inventory_summary, _from, state) do
@@ -574,6 +624,10 @@ defmodule UniversalProxy.TuyaMesh.Store do
     {:reply, reply, state}
   end
 
+  defp do_call(:light_states, _from, state) do
+    {:reply, current_lights(state), state}
+  end
+
   defp do_call(:settings, _from, state) do
     {:reply, current_settings(state.table), state}
   end
@@ -597,6 +651,39 @@ defmodule UniversalProxy.TuyaMesh.Store do
 
     {:reply, reply, state}
   end
+
+  # Light states carry no keys: outside Redact.guard/2.
+  @impl GenServer
+  def handle_cast({:put_light_state, mac, dps}, state) do
+    cond do
+      not light_state?(dps) ->
+        {:noreply, state}
+
+      mac not in stored_macs(state.table) ->
+        {:noreply, state}
+
+      Map.get(current_lights(state), mac) == dps ->
+        {:noreply, state}
+
+      true ->
+        {:noreply, schedule_lights(%{state | lights_held: Map.put(state.lights_held, mac, dps)})}
+    end
+  end
+
+  def handle_cast(_msg, state), do: {:noreply, state}
+
+  @impl GenServer
+  def handle_info(:write_lights, state) do
+    state = %{state | lights_timer: nil}
+
+    case write_lights(state) do
+      :ok -> {:noreply, lights_written(state)}
+      :unchanged -> {:noreply, lights_kept(state)}
+      {:error, _reason} -> {:noreply, schedule_lights(%{state | lights_written_at: now()})}
+    end
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
 
   @doc "The `:max_lease` the mesh's Lights runs with (see \"Upload seq\")."
   @spec lights_max_lease() :: pos_integer()
@@ -887,10 +974,71 @@ defmodule UniversalProxy.TuyaMesh.Store do
     end)
   end
 
+  # ── Light states ─────────────────────────────────────────────────────
+
+  defp current_lights(state),
+    do: Map.merge(lookup(state.table, :light_states, %{}), state.lights_held)
+
+  # What an inventory write stores: the states it keeps, held ones
+  # included (the caller then clears the held ones).
+  defp kept_lights(_state, _inv, :other_mesh), do: %{}
+
+  defp kept_lights(state, inv, :same_mesh),
+    do: Map.take(current_lights(state), Enum.map(inv.bulbs, & &1.mac))
+
+  # The held states, written unless nothing changed after all.
+  defp write_lights(%{lights_held: held}) when held == %{}, do: :unchanged
+
+  defp write_lights(state) do
+    stored = lookup(state.table, :light_states, %{})
+    lights = Map.take(current_lights(state), stored_macs(state.table))
+    if lights == stored, do: :unchanged, else: write(state, [{:light_states, lights}])
+  end
+
+  defp lights_written(state), do: %{lights_kept(state) | lights_written_at: now()}
+
+  # Held states an inventory write stored (it doesn't move the interval).
+  defp lights_kept(state), do: %{state | lights_held: %{}}
+
+  # At once when the last light-state write is an interval old, else when
+  # it will be. One timer at a time; it finds what is held when it fires.
+  defp schedule_lights(%{lights_timer: nil} = state) do
+    delay =
+      case state.lights_written_at do
+        nil -> 0
+        at -> max(at + state.light_interval_ms - now(), 0)
+      end
+
+    %{state | lights_timer: Process.send_after(self(), :write_lights, delay)}
+  end
+
+  defp schedule_lights(state), do: state
+
+  defp stored_macs(table) do
+    case lookup(table, :summary, nil) do
+      %{bulbs: bulbs} -> Enum.map(bulbs, & &1.mac)
+      _none -> []
+    end
+  end
+
+  defp light_state?(dps) when is_map(dps) and map_size(dps) <= 16,
+    do: Enum.all?(dps, fn {k, v} -> light_key?(k) and light_value?(v) end)
+
+  defp light_state?(_dps), do: false
+
+  defp light_key?(k) when is_integer(k), do: k in 1..255
+  defp light_key?(k), do: k in @components
+
+  defp light_value?(v) when is_binary(v), do: byte_size(v) <= 16
+  defp light_value?(v), do: is_boolean(v) or is_number(v)
+
+  defp now, do: System.monotonic_time(:millisecond)
+
   # ── Storage ──────────────────────────────────────────────────────────
 
   # One insert: the inventory, its device ids (allocated for every bulb and
-  # group, departed groups dropped) and the counter, plus `extra` records.
+  # group, departed groups dropped), the counter and the light states it
+  # keeps, plus `extra` records.
   # `over` says what the write replaces: the :same_mesh (its group ids are
   # kept) or an :other_mesh, absent or invalid record (all group ids drop).
   defp write_inventory(state, inv, extra, over) when over in [:same_mesh, :other_mesh] do
@@ -904,7 +1052,8 @@ defmodule UniversalProxy.TuyaMesh.Store do
         {:inventory, Inventory.to_map(inv)},
         {:summary, summary_of(inv)},
         {:device_ids, ids},
-        {:next_device_id, next}
+        {:next_device_id, next},
+        {:light_states, kept_lights(state, inv, over)}
       ] ++ extra
 
     write(state, inserts)
@@ -919,6 +1068,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
       {:summary, nil},
       {:device_ids, ids},
       {:seq_floors, floors},
+      {:light_states, %{}},
       bump(state.table)
     ]
 

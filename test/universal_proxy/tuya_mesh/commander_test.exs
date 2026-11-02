@@ -798,6 +798,94 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
     end
   end
 
+  describe "saved light states" do
+    @on_white %{1 => true, 2 => 0, 3 => 1000, 4 => 0}
+    @off %{1 => false, 2 => 0, 3 => 1000, 4 => 0}
+
+    test "seed the initial states at start, groups derived from them" do
+      saved = %{@a => @on_white, @b => @off, "FFFFFFFFFFFF" => @on_white}
+
+      {pid, _agent} =
+        start(push_debounce_ms: 10, states_table: :unnamed, saved_states: fn -> saved end)
+
+      # The groups come with the first status (no bulb reported yet).
+      report(pid, [])
+      states = Commander.light_states(:sys.get_state(pid).states)
+
+      assert [%{state: true, brightness: 1.0}] = of(states, 5)
+      assert [%{state: false}] = of(states, 7)
+      # Group 1 (A, B, C): A on; group 3 (B, C): B off, C unknown.
+      assert [%{state: true}] = of(states, 6)
+      assert [%{state: false}] = of(states, 11)
+      # No sub-device, no state.
+      assert length(states) == 4
+    end
+
+    test "a seed loses to any report Lights holds, however old its stamps" do
+      {pid, _agent} =
+        start(push_debounce_ms: 10, saved_states: fn -> %{@a => %{@on_white | 3 => 500}} end)
+
+      flushed(pid)
+      assert [%{state: true, brightness: 0.5}] = of(pushes(), 5)
+
+      # Only DP1 reported, stamped long before the seed was read: taken,
+      # the seeded brightness kept.
+      report(pid, [{@a, %{1 => false}, -1_000_000}])
+      assert [%{state: false, brightness: 0.5}] = of(pushes(), 5)
+    end
+
+    test "a seed loses to a command, which starts from it" do
+      {pid, _agent} = start(push_debounce_ms: 10, saved_states: fn -> %{@a => @off} end)
+      flushed(pid)
+      assert [%{state: false}] = of(pushes(), 5)
+
+      Commander.command(cmd({:bulb, @a}, on()), pid)
+      # Known from the seed: only DP1 goes, and Lights isn't asked.
+      assert_receive {:lights, {:set, @a, [on: true], _}}, 2_000
+      refute_received {:lights, {:status, @a}}
+      idle(pid)
+      assert %{state: true, brightness: 1.0} = last_push(pushes(), 5)
+    end
+
+    test "every pushed bulb state is saved, its state DPs only; groups aren't" do
+      test = self()
+
+      {pid, _agent} =
+        start(push_debounce_ms: 10, save_state: &send(test, {:saved, &1, &2}))
+
+      report(pid, [{@a, Map.put(@on_white, 21, 3), now()}])
+      assert last_push(pushes(), 6)
+
+      assert_received {:saved, @a, %{1 => true, 2 => 0, 3 => 1000, 4 => 0} = saved}
+      refute Map.has_key?(saved, 21)
+      refute_received {:saved, _, _}
+
+      # An unchanged state isn't pushed, so not saved again.
+      report(pid, [{@a, @on_white, now() + 1}])
+      refute_received {:saved, _, _}
+    end
+
+    test "a Store that starts late seeds the bulbs still unknown" do
+      saved = start_supervised!({Agent, fn -> %{} end}, id: :saved)
+
+      {pid, _agent} =
+        start(push_debounce_ms: 10, saved_states: fn -> Agent.get(saved, & &1) end)
+
+      at = now()
+      report(pid, [{@a, @on_white, at}])
+      assert [%{state: true}] = of(pushes(), 5)
+
+      Agent.update(saved, fn _ -> %{@a => @off, @b => @off} end)
+      send(pid, {:tuya_mesh_store, :ready})
+      flushed(pid)
+
+      # A has a view already; B is seeded.
+      pushed = pushes()
+      assert of(pushed, 5) == []
+      assert [%{state: false}] = of(pushed, 7)
+    end
+  end
+
   describe "subscriptions" do
     test "a PubSub down at start is retried, then a fresh status is read" do
       pubsub = :"commander_late_pubsub_#{System.unique_integer([:positive])}"
