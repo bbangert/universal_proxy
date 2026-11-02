@@ -650,6 +650,55 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       assert [%{device_id: 6, state: true}] = pushes()
     end
 
+    test "a settings change re-encodes every light, kept initial states too" do
+      settings = start_supervised!({Agent, fn -> @settings end}, id: :settings)
+      read_settings = fn -> Agent.get(settings, & &1) end
+
+      {pid, _agent} =
+        start(push_debounce_ms: 10, states_table: :unnamed, settings: read_settings)
+
+      report(pid, [{@a, @on_white, now()}])
+      assert %{color_temperature: 370.0} = last_push(pushes(), 5)
+
+      Agent.update(settings, fn _ -> %{@settings | invert: true} end)
+      send(pid, {:tuya_mesh_store, :settings_changed})
+      flushed(pid)
+
+      assert %{color_temperature: 154.0} = last_push(pushes(), 5)
+      states = Commander.light_states(:sys.get_state(pid).states)
+      assert [%{color_temperature: 154.0}] = of(states, 5)
+    end
+
+    test "a group under a new sub-device gets its state again without a report" do
+      {pid, agent} = start(push_debounce_ms: 10)
+      report(pid, for(mac <- [@a, @b, @c], do: {mac, @on_white, now()}))
+      assert %{state: true} = last_push(pushes(), 6)
+
+      # A new mesh keeps group 1's local id and members, not its sub-device.
+      new_mesh(agent, %{{:group, 1} => 42})
+      send(pid, {:tuya_mesh_store, :inventory_changed})
+      flushed(pid)
+
+      assert [%{device_id: 42, state: true}] = of(pushes(), 42)
+    end
+
+    test "an all-off group keeps its mode and colour for the next on" do
+      {pid, _agent} = start(push_debounce_ms: 10, script: %{hears: [@a, @b, @c]})
+      colour = %{1 => true, 2 => 1, 11 => <<120::16, 100, 100>>}
+      report(pid, for(mac <- [@a, @b, @c], do: {mac, colour, now()}))
+      assert %{color_mode: :COLOR_MODE_RGB} = last_push(pushes(), 6)
+
+      off = %{colour | 1 => false}
+      report(pid, for(mac <- [@a, @b, @c], do: {mac, off, now() + 1}))
+      assert %{state: false, color_mode: :COLOR_MODE_RGB} = last_push(pushes(), 6)
+
+      # On at half brightness, no mode: still the colour's v, not DP3.
+      on_half = %Req{has_state: true, state: true, has_brightness: true, brightness: 0.5}
+      Commander.command(cmd({:group, 1}, on_half), pid)
+      assert_receive {:lights, {:group_set, 1, [on: true, colour: {120, 100, 50}], _}}, 2_000
+      idle(pid)
+    end
+
     test "what was pushed is kept for new connections" do
       {pid, _agent} = start(push_debounce_ms: 10, states_table: :unnamed)
       report(pid, [{@a, @on_white, now()}])

@@ -273,8 +273,15 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   def handle_info({:dispatch, token}, %{dispatch: {token, _tref}} = state),
     do: {:noreply, %{state | dispatch: nil} |> dispatch() |> reschedule()}
 
+  # The colour-temperature range or direction changed: every kept light
+  # is encoded again (and its kept initial state with it).
+  def handle_info({:tuya_mesh_store, :settings_changed}, state) do
+    targets = Map.keys(state.views) ++ for(gid <- Map.keys(state.mesh_groups), do: {:group, gid})
+    {:noreply, state |> reconcile() |> mark_dirty(targets) |> arm_flush() |> reschedule()}
+  end
+
   def handle_info({:tuya_mesh_store, _event}, state),
-    do: {:noreply, state |> reconcile() |> reschedule()}
+    do: {:noreply, state |> reconcile() |> arm_flush() |> reschedule()}
 
   def handle_info({:tuya_mesh_status, status}, state),
     do: {:noreply, state |> apply_status(status) |> arm_flush()}
@@ -757,15 +764,29 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       Logger.info("TuyaMesh.Commander: mesh changed; dropped #{map_size(stale)} commands")
     end
 
-    views =
-      Map.filter(state.views, fn {target, view} -> Map.get(ids, target) == view.device_id end)
+    {views, stale_views} =
+      Map.split_with(state.views, fn {target, view} -> Map.get(ids, target) == view.device_id end)
 
     stale_pushed =
       for {target, response} <- state.pushed,
           Map.get(ids, target) != response.device_id,
           do: target
 
-    %{state | jobs: jobs, views: views} |> forget_pushed(stale_pushed)
+    # A light that is still there under a new sub-device (a new mesh can
+    # keep a group's local id and members) gets its state again, derived
+    # from what is still known; so does a group never pushed.
+    renewed =
+      (Map.keys(stale_views) ++ stale_pushed)
+      |> Enum.filter(&Map.has_key?(ids, &1))
+
+    unpushed =
+      for gid <- Map.keys(state.mesh_groups),
+          not Map.has_key?(state.pushed, {:group, gid}),
+          do: {:group, gid}
+
+    %{state | jobs: jobs, views: views}
+    |> forget_pushed(stale_pushed)
+    |> mark_dirty(renewed ++ unpushed)
   end
 
   defp read_ids(state) do
@@ -822,6 +843,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       (view_dps(state, job.target, job.command.device_id) || job.base)
       |> Map.merge(sent)
       |> Map.merge(Commands.committed(job.components, sent))
+      |> Commands.reconcile_components(sent)
 
     sent_at = sent_times(Map.get(state.views, job.target), job.command.device_id, sent)
     view = %{device_id: job.command.device_id, dps: dps, sent_at: sent_at}
@@ -831,7 +853,12 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   defp update_member_view(state, mac, sent, components) do
     case Map.fetch(state.views, {:bulb, mac}) do
       {:ok, view} ->
-        dps = view.dps |> Map.merge(sent) |> Map.merge(Commands.committed(components, sent))
+        dps =
+          view.dps
+          |> Map.merge(sent)
+          |> Map.merge(Commands.committed(components, sent))
+          |> Commands.reconcile_components(sent)
+
         view = %{view | dps: dps, sent_at: sent_times(view, view.device_id, sent)}
         %{state | views: Map.put(state.views, {:bulb, mac}, view)}
 
@@ -1025,7 +1052,8 @@ defmodule UniversalProxy.TuyaMesh.Commander do
           state
 
         agg ->
-          %{state | views: Map.put(state.views, target, %{device_id: id, dps: agg, sent_at: %{}})}
+          dps = with_controls(agg, view_dps(state, target, id))
+          %{state | views: Map.put(state.views, target, %{device_id: id, dps: dps, sent_at: %{}})}
       end
 
     case view_dps(state, target, id) do
@@ -1033,6 +1061,13 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       dps -> {state, Commands.state_response(dps, settings, light_key(target), id)}
     end
   end
+
+  # Off says nothing about the mode, colour or brightness: an all-off group
+  # keeps the ones it had, so a later "on" without a mode keeps them too.
+  defp with_controls(%{1 => false} = off, kept) when map_size(off) == 1 and is_map(kept),
+    do: Map.put(kept, 1, false)
+
+  defp with_controls(agg, _kept), do: agg
 
   defp light_key({:bulb, mac}), do: Entities.key_for(Entities.object_id({:bulb, mac, :light}))
   defp light_key({:group, gid}), do: Entities.key_for(Entities.object_id({:group, gid, :light}))
