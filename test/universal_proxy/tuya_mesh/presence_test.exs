@@ -42,7 +42,8 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
       clock: ctx.now,
       jitter: fn _ms -> 0 end,
       tick_ms: 3_600_000,
-      start_delay_ms: 0
+      start_delay_ms: 0,
+      min_gap_ms: 30_000
     ]
 
     presence = start_supervised!({Presence, Keyword.merge(defaults, opts)}, id: :presence)
@@ -207,6 +208,17 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
   end
 
   describe "the budget" do
+    test "the default gap is a minute: at most 60 pings an hour", ctx do
+      macs = for n <- 1..10, do: "DD00000000" <> String.pad_leading("#{n}", 2, "0")
+      ctx = start(ctx, macs: macs, replying: macs, min_gap_ms: 60_000)
+      for t <- 0..3_600_000//5_000, do: at(ctx, t)
+      assert length(pings(ctx)) <= 61
+
+      opts = Keyword.delete(ctx.opts, :min_gap_ms)
+      presence = start_supervised!({Presence, opts}, id: :default_gap)
+      assert :sys.get_state(presence).gap_ms == 60_000
+    end
+
     test "ten answering bulbs over an hour: at most one ping per gap", ctx do
       macs = for n <- 1..10, do: "BB00000000" <> String.pad_leading("#{n}", 2, "0")
       ctx = start(ctx, macs: macs, replying: macs)
@@ -392,6 +404,26 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
     end
   end
 
+  describe "heard_ms" do
+    test "prefers Lights' heard_ms, falling back to last_report_ms" do
+      assert Presence.heard_ms(%{last_report_ms: 5}) == 5
+      assert Presence.heard_ms(%{heard_ms: nil, last_report_ms: 5}) == 5
+      assert Presence.heard_ms(%{heard_ms: 9, last_report_ms: 5}) == 9
+      assert Presence.heard_ms(%{heard_ms: 9, last_report_ms: nil}) == 9
+      assert Presence.heard_ms(%{heard_ms: nil, last_report_ms: nil}) == nil
+    end
+
+    test "a frame held by Lights for resync still counts as the reply", ctx do
+      # Lights stamps heard_ms but not last_report_ms on a held frame.
+      ctx = start(ctx, macs: [@a])
+      at(ctx, 0)
+      assert bulb(ctx, @a).pinging
+      :ok = FakeLights.put(ctx.lights, :heard, %{@a => 2_000})
+      at(ctx, 5_000)
+      assert %{pinging: false, misses: 0, last_ms: 2_000} = bulb(ctx, @a)
+    end
+  end
+
   describe "a replacement" do
     test "waits a full gap after its start before its first attempt", ctx do
       ctx = start(ctx, macs: [@a, @b])
@@ -411,16 +443,16 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
       assert pings(ctx) == [@a, @a]
     end
 
-    test "pushes under a session of its own", ctx do
-      ctx = start(ctx, macs: [@a])
+    test "pushes under a later generation, in the mesh generation it was given", ctx do
+      ctx = start(ctx, macs: [@a], mesh_generation: 7)
       at(ctx, 0)
-      assert_receive {:tuya_mesh_presence, first, _snapshot}
+      assert_receive {:tuya_mesh_presence, {7, first}, _snapshot}
 
       :ok = stop_supervised!(:presence)
       presence = start_supervised!({Presence, ctx.opts}, id: :presence)
       at(%{ctx | presence: presence}, 1_000)
-      assert_receive {:tuya_mesh_presence, second, _snapshot}
-      assert is_reference(first) and is_reference(second) and first != second
+      assert_receive {:tuya_mesh_presence, {7, second}, _snapshot}
+      assert second > first
     end
   end
 

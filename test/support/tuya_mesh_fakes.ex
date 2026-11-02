@@ -4,7 +4,8 @@ defmodule UniversalProxy.TuyaMesh.FakeLights do
   # `replying` answer a ping at once: their `last_report_ms` becomes the
   # clock. `ping_reply` is what every ping returns; `on_ping` (`mac -> any`)
   # runs for each accepted one (to air it on a FakeRadio, say). `all_reply`,
-  # when set, replaces `Lights.all/1`'s answer.
+  # when set, replaces `Lights.all/1`'s answer. `heard` (`mac => ms`) is
+  # each bulb's `heard_ms`.
   use GenServer
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name))
@@ -22,6 +23,7 @@ defmodule UniversalProxy.TuyaMesh.FakeLights do
        clock: Keyword.get(opts, :clock, fn -> System.monotonic_time(:millisecond) end),
        ping_reply: :ok,
        all_reply: nil,
+       heard: %{},
        on_ping: Keyword.get(opts, :on_ping, fn _mac -> :ok end),
        pings: []
      }}
@@ -35,7 +37,9 @@ defmodule UniversalProxy.TuyaMesh.FakeLights do
     bulbs =
       state.bulbs
       |> Enum.sort()
-      |> Enum.map(fn {mac, last} -> %{mac: mac, last_report_ms: last} end)
+      |> Enum.map(fn {mac, last} ->
+        %{mac: mac, last_report_ms: last, heard_ms: Map.get(state.heard, mac)}
+      end)
 
     {:reply, {:ok, bulbs}, state}
   end

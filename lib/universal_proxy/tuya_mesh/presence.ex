@@ -12,9 +12,9 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   ## Schedule
 
   Every `:tick_ms` (5 s; `:pending_tick_ms`, 1 s, while a ping is
-  outstanding) it reads `Lights.all/1` (each bulb's `last_report_ms`,
-  kept as the latest seen) and then, at most once, pings the most overdue
-  bulb that is:
+  outstanding) it reads `Lights.all/1` (when each bulb was last heard,
+  `heard_ms/1`, kept as the latest seen) and then, at most once, pings
+  the most overdue bulb that is:
 
     * due: its next check time has passed (below);
     * silent for over `:silence_ms` (60 s), or never heard;
@@ -22,7 +22,7 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   and only when all of these hold:
 
     * no ping is outstanding (one at a time);
-    * `:min_gap_ms` (30 s) passed since the last ping attempt. A new
+    * `:min_gap_ms` (60 s) passed since the last ping attempt. A new
       process (a restart of this one, of Lights or the Radio, or of the
       whole mesh after an upload) starts as if it had just attempted one:
       its predecessor may have, and no state survives the restart to say
@@ -39,7 +39,7 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   `:max_interval_ms` (15 min): 2, 2, 4, 8, 15 min. Any report (a ping
   reply, a DP report from an acked command) resets it. A fresh start
   checks every bulb once after `:start_delay_ms` (15 s, jittered; the
-  gap above holds the first attempt to 30 s), or at its last reply plus
+  gap above holds the first attempt to 60 s), or at its last reply plus
   the base interval when that is later.
 
   ## What counts as a miss
@@ -82,23 +82,36 @@ defmodule UniversalProxy.TuyaMesh.Presence do
 
   Every attempt waits `:min_gap_ms` after the previous one, so pings are
   bounded by `3_600_000 / min_gap_ms` per hour whatever the bulb count:
-  120/hour with the defaults. That bound is only reached when every bulb
-  answers: each wants a ping every 2 min, so from `base / min_gap` = 4
-  bulbs on, the gap paces them (10 bulbs: one each ~5 min). Dead bulbs
-  cost little: at 15 min each, 4/hour. Each ping takes one sequence
-  number (refused frames hand theirs back) and one advert slot of at least
-  3 s, so the worst case is 120 numbers and 6 min of airtime (10 %) per
-  hour. Lights sizes leases for one persist per minute at the observed
-  rate, clamped to at least 32 numbers: 2 numbers a minute make one
-  persist every 16 min at most (90 a day) from pinging alone, far under
-  that target.
+  60/hour with the default 60 s. That bound is reached when every bulb
+  answers: each wants a ping every 2 min, so from `base / min_gap` = 2
+  bulbs on, the gap paces them (10 bulbs: one each ~10 min). Dead bulbs
+  cost little: at 15 min each, 4/hour.
+
+  Each ping takes one sequence number (refused frames hand theirs back)
+  and one advert slot of at least 3 s. At the bound that is 60 numbers
+  (1_440 a day) and 3 min of airtime (5 %) an hour. Lights sizes leases for
+  one persist per minute at the observed rate, clamped to at least 32
+  numbers, so pinging alone causes one persist every 32 min at most (45 a
+  day). It also moves the shared 16-bit counter half its range in about 23
+  days, past which an old dump would compare as ahead: the Store accepts a
+  dump's `seq` only as a bounded advance on its own cursor
+  (`UniversalProxy.TuyaMesh.Store`, "Upload seq"), so that is safe.
+
+  60 s rather than 30 s: twice the numbers, persists and airtime would buy
+  only a faster first round after a restart (10 bulbs: 10 min instead of
+  5 min to all heard) and checks every 5 min instead of 10 for live bulbs.
+  A dead bulb is still found within about two of its checks either way.
 
   ## Snapshot
 
-  After each tick, when it changed, `{:tuya_mesh_presence, session,
+  After each tick, when it changed, `{:tuya_mesh_presence, generation,
   snapshot}` is sent to `:notify` (a pid; the Resolver passes itself).
-  `session` is a reference made when this process starts, so the Resolver
-  tells a restarted pinger from the one before. `snapshot` maps each MAC
+  `generation` is `{mesh, pinger}`: `:mesh_generation` (given by the
+  Resolver, bumped for every mesh it starts) and a
+  `System.unique_integer([:monotonic])` taken when this process starts,
+  so a later pinger always has a larger one. Messages from two processes
+  have no order between them; these numbers do, so the Resolver can drop
+  a late snapshot from a pinger already replaced. `snapshot` maps each MAC
   to `t:bulb/0`: the latest report time, the consecutive misses this
   process counted and when the last missed ping was asked for, the bulb's
   expected time between checks (`interval_ms`: its interval, or the gap
@@ -117,7 +130,8 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   a stopped or stuck server into an error tuple, so only a bug here can
   crash it.
 
-  Options: `:lights`, `:radio` (server names), `:notify`, `:name`, and
+  Options: `:lights`, `:radio` (server names), `:notify`,
+  `:mesh_generation`, `:name`, and
   the timing above (`:tick_ms`, `:pending_tick_ms`, `:start_delay_ms`,
   `:silence_ms`, `:base_interval_ms`, `:max_interval_ms`, `:min_gap_ms`,
   `:reply_ms`), plus test seams `:clock` (`(-> integer())`, monotonic ms)
@@ -134,7 +148,7 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   @silence_ms 60_000
   @base_interval_ms 120_000
   @max_interval_ms 900_000
-  @min_gap_ms 30_000
+  @min_gap_ms 60_000
   @reply_ms 10_000
   # Short: the readiness checks run in this loop.
   @radio_timeout 1_000
@@ -162,6 +176,20 @@ defmodule UniversalProxy.TuyaMesh.Presence do
     :exit, _reason -> {:error, :not_running}
   end
 
+  @doc """
+  When a bulb entry of `Lights.all/1` was last heard (monotonic ms, or
+  nil): its `heard_ms` when Lights reports one (any authenticated frame
+  from the bulb), else `last_report_ms` (frames accepted as fresh).
+  """
+  @spec heard_ms(map()) :: integer() | nil
+  def heard_ms(bulb) do
+    case {Map.get(bulb, :heard_ms), Map.get(bulb, :last_report_ms)} do
+      {nil, last} -> last
+      {heard, nil} -> heard
+      {heard, last} -> max(heard, last)
+    end
+  end
+
   @doc false
   # Runs one tick now: tests drive the schedule with a fake clock.
   @spec poll(GenServer.server()) :: :ok
@@ -179,7 +207,8 @@ defmodule UniversalProxy.TuyaMesh.Presence do
       lights: Keyword.get(opts, :lights, Lights),
       radio: Keyword.get(opts, :radio, Radio),
       notify: Keyword.get(opts, :notify),
-      session: make_ref(),
+      generation:
+        {Keyword.get(opts, :mesh_generation, 0), System.unique_integer([:monotonic, :positive])},
       clock: clock,
       started: started,
       jitter: Keyword.get(opts, :jitter, &default_jitter/1),
@@ -241,7 +270,7 @@ defmodule UniversalProxy.TuyaMesh.Presence do
       {:ok, list} ->
         bulbs =
           Map.new(list, fn %{mac: mac} = bulb ->
-            {mac, merge(Map.get(state.bulbs, mac), bulb.last_report_ms, now, state)}
+            {mac, merge(Map.get(state.bulbs, mac), heard_ms(bulb), now, state)}
           end)
 
         pending = if state.pending && Map.has_key?(bulbs, state.pending.mac), do: state.pending
@@ -404,7 +433,7 @@ defmodule UniversalProxy.TuyaMesh.Presence do
     snapshot = build_snapshot(state)
 
     if snapshot != state.pushed do
-      send(state.notify, {:tuya_mesh_presence, state.session, snapshot})
+      send(state.notify, {:tuya_mesh_presence, state.generation, snapshot})
       %{state | pushed: snapshot}
     else
       state

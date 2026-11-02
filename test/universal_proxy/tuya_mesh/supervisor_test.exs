@@ -550,20 +550,26 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
       start_supervised!({FakeLights, name: lights, macs: [@bulb2, @bulb3]}, id: :fake_lights)
       start_supervised!({FakeRadio, name: radio}, id: :fake_radio)
       start_mesh_sup(ctx, lights: lights, radio: radio)
-      {:ok, lights: lights, session: make_ref()}
+      {:ok, lights: lights}
     end
 
     defp bulb(ctx, mac), do: Enum.find(status(ctx).bulbs, &(&1.mac == mac))
     defp now_ms, do: System.monotonic_time(:millisecond)
     defp resolver_pid(ctx), do: Process.whereis(ctx.names.resolver)
 
-    defp presence(ctx, snapshot), do: presence(ctx, ctx.session, snapshot)
+    defp presence(ctx, snapshot), do: presence(ctx, 1, snapshot)
 
-    defp presence(ctx, session, snapshot) do
-      send(resolver_pid(ctx), {:tuya_mesh_presence, session, snapshot})
+    # From pinger `pinger` of the running mesh.
+    defp presence(ctx, pinger, snapshot),
+      do: presence(ctx, mesh_generation(ctx), pinger, snapshot)
+
+    defp presence(ctx, mesh_generation, pinger, snapshot) do
+      send(resolver_pid(ctx), {:tuya_mesh_presence, {mesh_generation, pinger}, snapshot})
       # A call returns once the message before it was handled.
       status(ctx)
     end
+
+    defp mesh_generation(ctx), do: :sys.get_state(resolver_pid(ctx)).mesh_generation
 
     defp p(fields),
       do:
@@ -648,7 +654,7 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
       assert %{reachable: false, checking: false} = bulb(ctx, @bulb2)
 
       # A restarted pinger knows nothing: the verdict stands.
-      restarted = make_ref()
+      restarted = 2
       presence(ctx, restarted, %{@bulb2 => p(%{})})
       assert %{reachable: false, checking: false} = bulb(ctx, @bulb2)
       presence(ctx, restarted, %{@bulb2 => p(%{misses: 1, missed_at: t0 + 3})})
@@ -674,12 +680,12 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
       assert %{reachable: true} = bulb(ctx, @bulb2)
 
       # The new pinger's first miss is the second in a row.
-      second = make_ref()
+      second = 2
       presence(ctx, second, %{@bulb2 => p(%{last_ms: t0, misses: 1, missed_at: t0 + 2})})
       assert %{reachable: false} = bulb(ctx, @bulb2)
 
       # A late snapshot from the pinger before is stale: dropped.
-      presence(ctx, ctx.session, %{@bulb2 => p(%{last_ms: t0 + 3})})
+      presence(ctx, 1, %{@bulb2 => p(%{last_ms: t0 + 3})})
       assert %{reachable: false} = bulb(ctx, @bulb2)
 
       # A reply clears it; one miss, a mesh restart, one more: two again.
@@ -689,7 +695,7 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
       assert %{reachable: true} = bulb(ctx, @bulb2)
 
       assert {:ok, :same_mesh} = Resolver.replace(inventory(), [], ctx.names.resolver)
-      presence(ctx, make_ref(), %{@bulb2 => p(%{last_ms: t0 + 4, misses: 1, missed_at: t0 + 6})})
+      presence(ctx, 1, %{@bulb2 => p(%{last_ms: t0 + 4, misses: 1, missed_at: t0 + 6})})
       assert %{reachable: false} = bulb(ctx, @bulb2)
     end
 
@@ -709,6 +715,55 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
 
         assert %{last_seen: nil} = bulb(ctx, @bulb2)
       end
+    end
+
+    test "a delayed snapshot from a replaced pinger is dropped, even its first", ctx do
+      t0 = now_ms()
+      presence(ctx, 5, %{@bulb2 => p(%{misses: 2, missed_at: t0})})
+      assert %{reachable: false, last_seen: nil} = bulb(ctx, @bulb2)
+
+      # Pinger 3 started before 5 but was never heard from until now.
+      presence(ctx, 3, %{@bulb2 => p(%{last_ms: t0 + 1})})
+      assert %{reachable: false, last_seen: nil} = bulb(ctx, @bulb2)
+    end
+
+    test "an old mesh's snapshot arriving after a change of mesh is dropped", ctx do
+      old = mesh_generation(ctx)
+      key = "ffeeddccbbaa99887766554433221100"
+
+      other = %{
+        inventory()
+        | beacon_key: key,
+          bulbs: Enum.map(inventory().bulbs, &%{&1 | beacon_key: key})
+      }
+
+      assert {:ok, :new_mesh} =
+               Resolver.replace(other, [allow_new_mesh: true], ctx.names.resolver)
+
+      assert mesh_generation(ctx) > old
+
+      presence(ctx, old, 9, %{@bulb3 => p(%{last_ms: now_ms()})})
+      assert %{last_seen: nil} = bulb(ctx, @bulb3)
+    end
+
+    test "checking needs Lights answering and the live pinger to have reported the bulb", ctx do
+      # A pinger with nothing to report (Lights gave it nothing).
+      presence(ctx, %{})
+      assert %{checking: false} = bulb(ctx, @bulb3)
+
+      presence(ctx, %{@bulb3 => p(%{})})
+      assert %{checking: true} = bulb(ctx, @bulb3)
+
+      # A newer pinger that hasn't reported it yet.
+      presence(ctx, 2, %{@bulb2 => p(%{})})
+      assert %{checking: false} = bulb(ctx, @bulb3)
+      presence(ctx, 2, %{@bulb3 => p(%{})})
+      assert %{checking: true} = bulb(ctx, @bulb3)
+
+      # Lights not answering (stopped, or :ignore on a bad inventory).
+      :ok = FakeLights.put(ctx.lights, :all_reply, {:error, :not_running})
+      wait_until(fn -> match?(%{lights_running: false}, status(ctx)) end)
+      assert %{checking: false} = bulb(ctx, @bulb3)
     end
 
     test "never heard, with the pinger running and the radio ready: checking", ctx do
@@ -748,13 +803,13 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
     end
 
     @impl GenServer
-    def terminate(_reason, %{lights: lights, resolver: resolver, push: push}) do
+    def terminate(_reason, %{lights: lights, resolver: resolver, push: push, generation: gen}) do
       UniversalProxy.TuyaMesh.FakeLights.put(lights, :bulbs, %{
         "DC23530FB34A" => nil,
         "DC23533FCD62" => nil
       })
 
-      if push, do: send(Process.whereis(resolver), {:tuya_mesh_presence, make_ref(), push.()})
+      if push, do: send(Process.whereis(resolver), {:tuya_mesh_presence, {gen, 1}, push.()})
     end
   end
 
@@ -772,7 +827,8 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
     defp start_pushing(ctx, push) do
       arg = %{lights: ctx.lights, resolver: ctx.names.resolver, push: push}
 
-      spec = fn _index, _mac ->
+      spec = fn _index, _mac, presence ->
+        arg = Map.put(arg, :generation, presence[:mesh_generation])
         %{id: :mesh, start: {GenServer, :start_link, [PushingMesh, arg]}, restart: :temporary}
       end
 

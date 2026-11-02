@@ -7,6 +7,7 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
   alias UniversalProxy.TuyaMesh.Store
 
   @moduletag :tmp_dir
+  @moduletag :capture_log
 
   @fixture Path.join([
              __DIR__,
@@ -214,7 +215,8 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
                  removed: [%{mac: @mac2, label: "path light 2"}]
                },
                groups: %{added: [], removed: [%{local_id: 1, name: "path and post"}]},
-               revision: 1
+               revision: 1,
+               seq: %{outcome: :taken, local: nil, dump: 100}
              }
 
       refute_secrets(preview)
@@ -280,6 +282,75 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
     end
   end
 
+  describe "upload seq" do
+    defp upload(ctx, seq) do
+      inv = inventory(%{"seq" => seq})
+      {:ok, %{seq: outcome}} = Store.preview(inv, ctx.store)
+      {:ok, _kind} = Store.replace(inv, [], ctx.store)
+      {:ok, %Inventory{seq: stored}} = Store.load(ctx.store)
+      {outcome.outcome, stored}
+    end
+
+    defp stored_at(ctx, seq) do
+      :ok = Store.clear(ctx.store, force: true)
+      :ok = :dets.delete(ctx.table, :seq_floors)
+      {:taken, ^seq} = upload(ctx, seq)
+    end
+
+    test "a stale dump of the same mesh never moves the cursor back", ctx do
+      stored_at(ctx, 40_000)
+      inv = inventory(%{"seq" => 0})
+
+      assert {:ok, %{seq: %{outcome: :kept_local, local: 40_000, dump: 0}}} =
+               Store.preview(inv, ctx.store)
+
+      log = capture_log(fn -> assert {:ok, :same_mesh} = Store.replace(inv, [], ctx.store) end)
+      assert log =~ "keeping the device's"
+      assert {:ok, %Inventory{seq: 40_000}} = Store.load(ctx.store)
+    end
+
+    test "only a bounded advance is taken; behind or far ahead keeps the local cursor", ctx do
+      stored_at(ctx, 40_000)
+      assert upload(ctx, 40_000) == {:same, 40_000}
+      assert upload(ctx, 44_096) == {:taken, 44_096}
+      capture_log(fn -> assert upload(ctx, 48_193) == {:kept_local, 44_096} end)
+      capture_log(fn -> assert upload(ctx, 44_095) == {:kept_local, 44_096} end)
+      # 20_000 ahead: a plain serial comparison would take it.
+      capture_log(fn -> assert upload(ctx, 64_096) == {:kept_local, 44_096} end)
+    end
+
+    test "around the wrap", ctx do
+      stored_at(ctx, 65_000)
+      assert upload(ctx, 100) == {:taken, 100}
+      capture_log(fn -> assert upload(ctx, 65_000) == {:kept_local, 100} end)
+
+      stored_at(ctx, 65_535)
+      assert upload(ctx, 0) == {:taken, 0}
+      capture_log(fn -> assert upload(ctx, 65_535) == {:kept_local, 0} end)
+    end
+
+    test "a floor is a local cursor too", ctx do
+      stored_at(ctx, 40_000)
+      :ok = Store.clear(ctx.store)
+      capture_log(fn -> assert upload(ctx, 0) == {:kept_local, 40_000} end)
+    end
+
+    test "the bound is an option", %{tmp_dir: tmp_dir} = ctx do
+      store =
+        start_store(
+          Path.join(tmp_dir, "b.dets"),
+          :"tuya_bound_#{System.unique_integer([:positive])}",
+          id: :bounded,
+          max_dump_advance: 10
+        )
+
+      ctx = %{ctx | store: store}
+      assert upload(ctx, 40_000) == {:taken, 40_000}
+      assert upload(ctx, 40_010) == {:taken, 40_010}
+      capture_log(fn -> assert upload(ctx, 40_021) == {:kept_local, 40_010} end)
+    end
+  end
+
   describe "an invalid stored record" do
     # Valid key and seq, but no bulbs: not servable, floor recoverable.
     defp put_raw(ctx, raw), do: :ok = :dets.insert(ctx.table, {:inventory, raw})
@@ -333,10 +404,10 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
 
     test "is refused once the stored cursor moved on", ctx do
       # A newer dump moved it forward while Lights still ran.
-      {:ok, :same_mesh} = Store.replace(inventory(%{"seq" => 5_000}), [], ctx.store)
+      {:ok, :same_mesh} = Store.replace(inventory(%{"seq" => 4_000}), [], ctx.store)
 
       assert {:error, :stale_tighten} = Store.tighten(%{inventory() | seq: 105}, 132, ctx.store)
-      assert {:ok, %Inventory{seq: 5_000}} = Store.load(ctx.store)
+      assert {:ok, %Inventory{seq: 4_000}} = Store.load(ctx.store)
     end
 
     test "is refused for another mesh or a changed inventory", ctx do

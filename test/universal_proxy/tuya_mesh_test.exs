@@ -8,6 +8,7 @@ defmodule UniversalProxy.TuyaMeshTest do
   alias UniversalProxy.TuyaMesh.Store
 
   @moduletag :tmp_dir
+  @moduletag :capture_log
 
   @fixture Path.join([
              __DIR__,

@@ -34,10 +34,14 @@ defmodule UniversalProxy.TuyaMesh.Store do
       leaves the lease end stored, which is safe; without the check, a
       `replace/3` that moved the cursor forward (a newer dump) could be
       pulled back to a stale Lights cursor.
-    * `replace/3` stores an upload. For the same mesh, the `seq` becomes the
-      later of the stored one and the dump's (`Seq.advance_to/2`), so an old
-      dump never pulls it back. A different mesh needs `allow_new_mesh:
-      true` and takes the dump's `seq`.
+    * `replace/3` stores an upload. A different mesh needs `allow_new_mesh:
+      true`. For a mesh with a local cursor (the stored `seq` of the same
+      mesh, or its floor, below), the local cursor is authoritative: the
+      dump's `seq` is taken only when it is 1 to `:max_dump_advance`
+      (4096) ahead of it (the Tuya app moved the bulbs on since our last
+      write). Equal, behind, or further "ahead" than that, the local cursor
+      is kept (see "Upload seq" below). A mesh with no local cursor takes
+      the dump's `seq`.
     * When a mesh leaves the store (`clear/2`, or `replace/3` with another
       mesh), its last `seq` is kept as a floor under a SHA-256 fingerprint of
       its key. A later upload of that mesh starts no lower than the floor.
@@ -57,6 +61,38 @@ defmodule UniversalProxy.TuyaMesh.Store do
   acknowledgement that the next upload of that mesh may reuse sequence
   numbers. `replace/3` goes ahead (the upload brings its own `seq`) and logs
   the loss.
+
+  ## Upload seq
+
+  Sequence numbers are 16-bit and compared as serial numbers (half the
+  range ahead counts as ahead), and our own traffic keeps moving the
+  cursor: background pinging alone uses up to 60 an hour
+  (`UniversalProxy.TuyaMesh.Presence`), plus every command. A dump keeps
+  the value it was exported with, so after 32_768 numbers (about 23 days
+  of pinging alone) an old dump of the same mesh would read as *ahead* of
+  the stored cursor, and taking it would move the bulbs' tracker back
+  onto numbers they already heard, which they drop.
+
+  So a dump only ever moves the cursor forward, by at most
+  `:max_dump_advance`. What the Tuya app can legitimately have advanced
+  the bulbs by between our last write and its export is one number per
+  app command: thousands at the very most. 4096 covers that with room,
+  and at 1/16 of the range it stays far from the serial-comparison
+  ambiguity: a dump actually behind the cursor reads as within the bound
+  only once 61_440 numbers have passed since it (months of normal use),
+  and even then taking it is a forward move of at most 4096 in real
+  terms, never a step back. Every other move of the local cursor is small
+  and forward too (Lights persists at most a lease ahead; a tighten goes
+  back only to the next unused number), so the 16-bit cursor stays
+  unambiguous relative to itself and no unwrapped (64-bit) copy is kept:
+  the dump only carries 16 bits, so a longer local history couldn't place
+  it any better.
+
+  `preview/2` reports the outcome as `seq: %{outcome:, local:, dump:}`:
+  `:taken` (no local cursor, or the dump is within the bound ahead),
+  `:same`, or `:kept_local` (the dump's counter is older than the
+  device's, or implausibly far ahead; the device's is kept). `replace/3`
+  logs a `:kept_local`.
 
   ## Revision
 
@@ -92,6 +128,8 @@ defmodule UniversalProxy.TuyaMesh.Store do
   `UniversalProxy.PubSub`). It carries nothing; subscribers re-read with
   `load/1`. Seq-only writes (persist, tighten) stay silent.
 
+  `:max_dump_advance` (default 4096, at most 32_767) sets the bound above.
+
   Tests can override `:pubsub`, `:dets_path`, `:table`, `:name`, `:chmod_fun`
   (`(path, mode -> :ok | {:error, term()})`), `:write_fun` (`(table,
   records -> :ok | {:error, term()})`, one atomic insert) and `:enabled` (default:
@@ -110,6 +148,8 @@ defmodule UniversalProxy.TuyaMesh.Store do
 
   @default_table :tuya_mesh
   @default_settings %{min_mireds: 154, max_mireds: 370, invert: false}
+  @max_dump_advance 4_096
+  @seq_space 65_536
 
   @type device_key :: {:bulb, String.t()} | {:group, 0..254}
   @type classification :: :empty | :same_mesh | :new_mesh
@@ -122,7 +162,14 @@ defmodule UniversalProxy.TuyaMesh.Store do
             added: [%{local_id: 0..254, name: String.t() | nil}],
             removed: [%{local_id: 0..254, name: String.t() | nil}]
           },
-          revision: non_neg_integer()
+          revision: non_neg_integer(),
+          seq: seq_outcome()
+        }
+
+  @type seq_outcome :: %{
+          outcome: :taken | :same | :kept_local,
+          local: 0..65_535 | nil,
+          dump: 0..65_535
         }
 
   # ── Client API ─────────────────────────────────────────────────────────
@@ -317,7 +364,8 @@ defmodule UniversalProxy.TuyaMesh.Store do
              %{
                table: table,
                write_fun: Keyword.get(opts, :write_fun, &default_write/2),
-               pubsub: Keyword.get(opts, :pubsub, UniversalProxy.PubSub)
+               pubsub: Keyword.get(opts, :pubsub, UniversalProxy.PubSub),
+               max_dump_advance: max_dump_advance(opts)
              }}
 
           {:error, reason} ->
@@ -382,7 +430,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
   defp do_call({:preview, input}, _from, state) do
     reply =
       case validate(input) do
-        {:ok, inv} -> {:ok, preview_of(state.table, inv)}
+        {:ok, inv} -> {:ok, preview_of(state, inv)}
         error -> error
       end
 
@@ -396,7 +444,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
       case validate(input) do
         {:ok, inv} ->
           if stale?(state.table, opts),
-            do: {:error, {:stale_preview, preview_of(state.table, inv)}},
+            do: {:error, {:stale_preview, preview_of(state, inv)}},
             else: do_replace(state, inv, opts)
 
         error ->
@@ -477,7 +525,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
 
       :absent ->
         floors = floors(state.table)
-        store_replacement(state, inv, floor_seq(floors, inv), floors, :other_mesh)
+        store_replacement(state, inv, upload_seq(state, inv), floors, :other_mesh)
 
       {:invalid, raw} ->
         floors =
@@ -490,7 +538,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
               floors(state.table)
           end
 
-        store_replacement(state, inv, floor_seq(floors, inv), floors, :other_mesh)
+        store_replacement(state, inv, upload_seq(state, inv), floors, :other_mesh)
     end
   end
 
@@ -499,24 +547,76 @@ defmodule UniversalProxy.TuyaMesh.Store do
 
     cond do
       same_mesh?(stored, inv) ->
-        seq = {:same_mesh, later_seq(stored.seq, inv.seq)}
-        store_replacement(state, inv, seq, floors, :same_mesh)
+        store_replacement(state, inv, upload_seq(state, inv), floors, :same_mesh)
 
       Keyword.get(opts, :allow_new_mesh, false) ->
         # The displaced mesh leaves its seq behind as a floor.
         floors = put_floor(floors, inv_floor(stored))
-        store_replacement(state, inv, floor_seq(floors, inv), floors, :other_mesh)
+        store_replacement(state, inv, upload_seq(state, inv), floors, :other_mesh)
 
       true ->
         {:error, :new_mesh}
     end
   end
 
-  # A mesh with a recorded floor never starts below it.
-  defp floor_seq(floors, inv) do
-    case Map.fetch(floors, fingerprint(inv.beacon_key)) do
-      {:ok, floor} -> {:same_mesh, later_seq(floor, inv.seq)}
-      :error -> {:new_mesh, inv.seq}
+  # The seq an upload is stored with (see "Upload seq"), and whether a
+  # local cursor of its mesh was honoured.
+  defp upload_seq(state, inv) do
+    local = local_seq(state.table, inv)
+    %{outcome: outcome} = seq_outcome(local, inv.seq, state.max_dump_advance)
+
+    if outcome == :kept_local do
+      Logger.warning(
+        "TuyaMesh.Store: the upload's seq (#{inv.seq}) is not a plausible advance on " <>
+          "the device's (#{local}); keeping the device's"
+      )
+    end
+
+    stored = if outcome == :taken, do: inv.seq, else: local
+    {if(local, do: :same_mesh, else: :new_mesh), stored}
+  end
+
+  # This mesh's local cursor: the stored seq when it is the stored mesh,
+  # else its floor (an invalid stored record's salvaged one included).
+  defp local_seq(table, inv) do
+    fp = fingerprint(inv.beacon_key)
+    floors = floors(table)
+
+    case stored(table) do
+      {:valid, stored} ->
+        if same_mesh?(stored, inv), do: stored.seq, else: Map.get(floors, fp)
+
+      {:invalid, raw} ->
+        floors =
+          case raw_floor(raw) do
+            {:ok, floor} -> put_floor(floors, floor)
+            :error -> floors
+          end
+
+        Map.get(floors, fp)
+
+      :absent ->
+        Map.get(floors, fp)
+    end
+  end
+
+  defp seq_outcome(nil, dump, _bound), do: %{outcome: :taken, local: nil, dump: dump}
+
+  defp seq_outcome(local, dump, bound) do
+    outcome =
+      case Integer.mod(dump - local, @seq_space) do
+        0 -> :same
+        ahead when ahead <= bound -> :taken
+        _behind_or_too_far -> :kept_local
+      end
+
+    %{outcome: outcome, local: local, dump: dump}
+  end
+
+  defp max_dump_advance(opts) do
+    case Keyword.get(opts, :max_dump_advance, @max_dump_advance) do
+      n when is_integer(n) and n >= 0 and n < div(@seq_space, 2) -> n
+      _other -> raise ArgumentError, "max_dump_advance must be 0..32_767"
     end
   end
 
@@ -534,7 +634,8 @@ defmodule UniversalProxy.TuyaMesh.Store do
     end
   end
 
-  defp later_seq(stored, dump), do: stored |> Seq.new() |> Seq.advance_to(dump) |> Seq.value()
+  # Of two local cursors of one mesh (a floor and a salvaged record).
+  defp later_seq(a, b), do: a |> Seq.new() |> Seq.advance_to(b) |> Seq.value()
 
   # ── Persist checks ───────────────────────────────────────────────────
 
@@ -612,8 +713,15 @@ defmodule UniversalProxy.TuyaMesh.Store do
     }
   end
 
-  defp preview_of(table, inv),
-    do: table |> valid_or_nil() |> build_preview(inv) |> Map.put(:revision, revision(table))
+  defp preview_of(state, inv) do
+    state.table
+    |> valid_or_nil()
+    |> build_preview(inv)
+    |> Map.merge(%{
+      revision: revision(state.table),
+      seq: seq_outcome(local_seq(state.table, inv), inv.seq, state.max_dump_advance)
+    })
+  end
 
   defp diff(old, new, key_fun, summary_fun) do
     old_keys = MapSet.new(old, key_fun)
