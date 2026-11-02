@@ -890,6 +890,8 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
       assert lights_opts[:on_persist] == (&Store.persist/1)
       assert lights_opts[:on_tighten] == (&Store.tighten/2)
       assert lights_opts[:inventory] == (&Store.load/0)
+      # The Store's upload bound is derived from this lease cap.
+      assert lights_opts[:max_lease] == Store.lights_max_lease()
     end
   end
 
@@ -982,11 +984,11 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
 
     test "an upload restarts Radio and Lights on the new inventory", ctx do
       radio = Process.whereis(Radio)
-      new = inventory() |> Map.put(:seq, 1_000)
+      new = inventory() |> Map.put(:seq, 350)
       assert {:ok, :same_mesh} = Resolver.replace(new, [], ctx.names.resolver)
       wait_until(fn -> match?(%{radio: %{ready: true}, lights_running: true}, status(ctx)) end)
       assert Process.whereis(Radio) != radio
-      assert {:ok, %Inventory{seq: 1_000}} = Lights.inventory()
+      assert {:ok, %Inventory{seq: 350}} = Lights.inventory()
     end
   end
 

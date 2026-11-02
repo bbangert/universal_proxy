@@ -38,10 +38,10 @@ defmodule UniversalProxy.TuyaMesh.Store do
       true`. For a mesh with a local cursor (the stored `seq` of the same
       mesh, or its floor, below), the local cursor is authoritative: the
       dump's `seq` is taken only when it is 1 to `:max_dump_advance`
-      (4096) ahead of it (the Tuya app moved the bulbs on since our last
-      write). Equal, behind, or further "ahead" than that, the local cursor
-      is kept (see "Upload seq" below). A mesh with no local cursor takes
-      the dump's `seq`.
+      (299) ahead of it. Equal, behind, or further ahead than that, the
+      local cursor is kept, unless the upload says `adopt_dump_seq: true`
+      for a dump that is ahead (see "Upload seq" below). A mesh with no
+      local cursor takes the dump's `seq`.
     * When a mesh leaves the store (`clear/2`, or `replace/3` with another
       mesh), its last `seq` is kept as a floor under a SHA-256 fingerprint of
       its key. A later upload of that mesh starts no lower than the floor.
@@ -73,26 +73,44 @@ defmodule UniversalProxy.TuyaMesh.Store do
   the stored cursor, and taking it would move the bulbs' tracker back
   onto numbers they already heard, which they drop.
 
-  So a dump only ever moves the cursor forward, by at most
-  `:max_dump_advance`. What the Tuya app can legitimately have advanced
-  the bulbs by between our last write and its export is one number per
-  app command: thousands at the very most. 4096 covers that with room,
-  and at 1/16 of the range it stays far from the serial-comparison
-  ambiguity: a dump actually behind the cursor reads as within the bound
-  only once 61_440 numbers have passed since it (months of normal use),
-  and even then taking it is a forward move of at most 4096 in real
-  terms, never a step back. Every other move of the local cursor is small
-  and forward too (Lights persists at most a lease ahead; a tighten goes
-  back only to the next unused number), so the 16-bit cursor stays
-  unambiguous relative to itself and no unwrapped (64-bit) copy is kept:
-  the dump only carries 16 bits, so a longer local history couldn't place
-  it any better.
+  So a dump moves the cursor on its own only forward, and only by at most
+  `:max_dump_advance`. The bound is derived from what the bulbs are known
+  to accept: they took jumps of about `Seq.max_jump/0` (900), and nothing
+  larger was ever tested. Take the worst case, a stale dump that reads as
+  a small advance (after a near-full wrap, 65_536 - B numbers past it):
+  the cursor moves B past what the bulbs last heard. The Lights started
+  on it knows nothing of what aired before (its baseline is the number
+  before its cursor), so its first lease can end up to its `:max_lease`
+  past the cursor, and a crash before any frame airs resumes there. The
+  bulbs then see a jump of B + lease + 1. Keeping that within `max_jump`
+  gives B = `max_jump - max_lease - 1` = 900 - 600 - 1 = **299**, with the
+  mesh's Lights run at `lights_max_lease/0` (600, passed by
+  `UniversalProxy.TuyaMesh.Mesh`). The option may only lower it. Every
+  other move of the local cursor is small and forward too (Lights persists
+  at most a lease ahead; a tighten goes back only to the next unused
+  number), so the 16-bit cursor stays unambiguous relative to itself and
+  no unwrapped (64-bit) copy is kept: the dump only carries 16 bits, so a
+  longer local history couldn't place it any better.
 
-  `preview/2` reports the outcome as `seq: %{outcome:, local:, dump:}`:
-  `:taken` (no local cursor, or the dump is within the bound ahead),
-  `:same`, or `:kept_local` (the dump's counter is older than the
-  device's, or implausibly far ahead; the device's is kept). `replace/3`
-  logs a `:kept_local`.
+  299 is small next to what the Tuya app can legitimately advance the
+  bulbs by (one number per app command) between our last write and an
+  export. A genuinely newer dump further ahead is adopted only when asked:
+  `replace/3` with `adopt_dump_seq: true` takes the dump's `seq` whenever
+  it is ahead of the local cursor in serial terms (1..32_767), however
+  far, and refuses one behind or equal with `{:error, {:seq_not_ahead,
+  %{local:, dump:}}}`. That is safe when the dump really is newer: the
+  app moved the bulbs' trackers to (about) its `seq` already, so the
+  bulbs see no forward jump at all, and until it is adopted they drop
+  everything this device sends as stale. The risk is a dump that only
+  looks newer (an old export after the counter wrapped): adopting it jumps
+  the bulbs past their acceptance window and they ignore this device until
+  a fresh dump is uploaded and adopted. Hence the confirmation in the UI.
+
+  `preview/2` reports the outcome as `seq: %{outcome:, reason:, local:,
+  dump:}`: `:taken` (no local cursor, or the dump is within the bound
+  ahead), `:same`, or `:kept_local`, with `reason` `:beyond_bound` (ahead,
+  but further than the bound: adoptable) or `:behind` (`reason` is nil for
+  the others). `replace/3` logs a `:kept_local` and an adoption.
 
   ## Revision
 
@@ -128,7 +146,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
   `UniversalProxy.PubSub`). It carries nothing; subscribers re-read with
   `load/1`. Seq-only writes (persist, tighten) stay silent.
 
-  `:max_dump_advance` (default 4096, at most 32_767) sets the bound above.
+  `:max_dump_advance` (default and maximum 299, see above) sets the bound.
 
   Tests can override `:pubsub`, `:dets_path`, `:table`, `:name`, `:chmod_fun`
   (`(path, mode -> :ok | {:error, term()})`), `:write_fun` (`(table,
@@ -148,8 +166,11 @@ defmodule UniversalProxy.TuyaMesh.Store do
 
   @default_table :tuya_mesh
   @default_settings %{min_mireds: 154, max_mireds: 370, invert: false}
-  @max_dump_advance 4_096
   @seq_space 65_536
+  # The :max_lease the mesh's Lights runs with; the upload bound is
+  # derived from it (moduledoc, "Upload seq").
+  @lights_max_lease 600
+  @max_dump_advance Seq.max_jump() - @lights_max_lease - 1
 
   @type device_key :: {:bulb, String.t()} | {:group, 0..254}
   @type classification :: :empty | :same_mesh | :new_mesh
@@ -168,6 +189,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
 
   @type seq_outcome :: %{
           outcome: :taken | :same | :kept_local,
+          reason: :beyond_bound | :behind | nil,
           local: 0..65_535 | nil,
           dump: 0..65_535
         }
@@ -257,8 +279,9 @@ defmodule UniversalProxy.TuyaMesh.Store do
   `opts`: `allow_new_mesh:` (default `false`), without which a different
   mesh is refused with `{:error, :new_mesh}`; `expected_revision:`, the
   `revision` of a preview, without a match for which nothing is written
-  and the reply is `{:error, {:stale_preview, preview}}`, the preview fresh.
-  Returns how it was stored:
+  and the reply is `{:error, {:stale_preview, preview}}`, the preview fresh;
+  `adopt_dump_seq:` (default `false`) to take a dump's `seq` that is ahead
+  beyond the bound (see "Upload seq"). Returns how it was stored:
   `:same_mesh` when a stored or earlier `seq` of this mesh was honoured,
   else `:new_mesh`.
   """
@@ -513,6 +536,10 @@ defmodule UniversalProxy.TuyaMesh.Store do
     {:reply, reply, state}
   end
 
+  @doc "The `:max_lease` the mesh's Lights runs with (see \"Upload seq\")."
+  @spec lights_max_lease() :: pos_integer()
+  def lights_max_lease, do: @lights_max_lease
+
   @impl GenServer
   def format_status(status), do: Redact.format_status(status)
 
@@ -525,7 +552,9 @@ defmodule UniversalProxy.TuyaMesh.Store do
 
       :absent ->
         floors = floors(state.table)
-        store_replacement(state, inv, upload_seq(state, inv), floors, :other_mesh)
+
+        with {:ok, seq} <- upload_seq(state, inv, opts),
+             do: store_replacement(state, inv, seq, floors, :other_mesh)
 
       {:invalid, raw} ->
         floors =
@@ -538,7 +567,8 @@ defmodule UniversalProxy.TuyaMesh.Store do
               floors(state.table)
           end
 
-        store_replacement(state, inv, upload_seq(state, inv), floors, :other_mesh)
+        with {:ok, seq} <- upload_seq(state, inv, opts),
+             do: store_replacement(state, inv, seq, floors, :other_mesh)
     end
   end
 
@@ -547,12 +577,15 @@ defmodule UniversalProxy.TuyaMesh.Store do
 
     cond do
       same_mesh?(stored, inv) ->
-        store_replacement(state, inv, upload_seq(state, inv), floors, :same_mesh)
+        with {:ok, seq} <- upload_seq(state, inv, opts),
+             do: store_replacement(state, inv, seq, floors, :same_mesh)
 
       Keyword.get(opts, :allow_new_mesh, false) ->
         # The displaced mesh leaves its seq behind as a floor.
         floors = put_floor(floors, inv_floor(stored))
-        store_replacement(state, inv, upload_seq(state, inv), floors, :other_mesh)
+
+        with {:ok, seq} <- upload_seq(state, inv, opts),
+             do: store_replacement(state, inv, seq, floors, :other_mesh)
 
       true ->
         {:error, :new_mesh}
@@ -561,20 +594,41 @@ defmodule UniversalProxy.TuyaMesh.Store do
 
   # The seq an upload is stored with (see "Upload seq"), and whether a
   # local cursor of its mesh was honoured.
-  defp upload_seq(state, inv) do
+  defp upload_seq(state, inv, opts) do
     local = local_seq(state.table, inv)
-    %{outcome: outcome} = seq_outcome(local, inv.seq, state.max_dump_advance)
+    seq = seq_outcome(local, inv.seq, state.max_dump_advance)
+    kind = if local, do: :same_mesh, else: :new_mesh
 
-    if outcome == :kept_local do
-      Logger.warning(
-        "TuyaMesh.Store: the upload's seq (#{inv.seq}) is not a plausible advance on " <>
-          "the device's (#{local}); keeping the device's"
-      )
+    cond do
+      seq.outcome == :taken ->
+        {:ok, {kind, inv.seq}}
+
+      Keyword.get(opts, :adopt_dump_seq, false) ->
+        adopt(kind, seq)
+
+      seq.outcome == :kept_local ->
+        Logger.warning(
+          "TuyaMesh.Store: the upload's seq (#{inv.seq}) is not a plausible advance on " <>
+            "the device's (#{local}); keeping the device's"
+        )
+
+        {:ok, {kind, local}}
+
+      true ->
+        {:ok, {kind, local}}
     end
-
-    stored = if outcome == :taken, do: inv.seq, else: local
-    {if(local, do: :same_mesh, else: :new_mesh), stored}
   end
+
+  defp adopt(kind, %{reason: :beyond_bound, local: local, dump: dump}) do
+    Logger.warning(
+      "TuyaMesh.Store: adopting the upload's seq (#{dump}) over the device's (#{local})"
+    )
+
+    {:ok, {kind, dump}}
+  end
+
+  defp adopt(_kind, %{local: local, dump: dump}),
+    do: {:error, {:seq_not_ahead, %{local: local, dump: dump}}}
 
   # This mesh's local cursor: the stored seq when it is the stored mesh,
   # else its floor (an invalid stored record's salvaged one included).
@@ -600,23 +654,25 @@ defmodule UniversalProxy.TuyaMesh.Store do
     end
   end
 
-  defp seq_outcome(nil, dump, _bound), do: %{outcome: :taken, local: nil, dump: dump}
+  defp seq_outcome(nil, dump, _bound),
+    do: %{outcome: :taken, reason: nil, local: nil, dump: dump}
 
   defp seq_outcome(local, dump, bound) do
-    outcome =
+    {outcome, reason} =
       case Integer.mod(dump - local, @seq_space) do
-        0 -> :same
-        ahead when ahead <= bound -> :taken
-        _behind_or_too_far -> :kept_local
+        0 -> {:same, nil}
+        ahead when ahead <= bound -> {:taken, nil}
+        ahead when ahead < div(@seq_space, 2) -> {:kept_local, :beyond_bound}
+        _behind -> {:kept_local, :behind}
       end
 
-    %{outcome: outcome, local: local, dump: dump}
+    %{outcome: outcome, reason: reason, local: local, dump: dump}
   end
 
   defp max_dump_advance(opts) do
     case Keyword.get(opts, :max_dump_advance, @max_dump_advance) do
-      n when is_integer(n) and n >= 0 and n < div(@seq_space, 2) -> n
-      _other -> raise ArgumentError, "max_dump_advance must be 0..32_767"
+      n when is_integer(n) and n >= 0 and n <= @max_dump_advance -> n
+      _other -> raise ArgumentError, "max_dump_advance must be 0..#{@max_dump_advance}"
     end
   end
 

@@ -86,6 +86,17 @@ defmodule UniversalProxyWeb.TuyaMeshComponentTest do
     token
   end
 
+  defp token_of(view, event) do
+    [token] =
+      view
+      |> render()
+      |> LazyHTML.from_fragment()
+      |> LazyHTML.query("button[phx-click=#{event}]")
+      |> LazyHTML.attribute("phx-value-token")
+
+    token
+  end
+
   defp cancel_ids(view) do
     view
     |> render()
@@ -378,6 +389,87 @@ defmodule UniversalProxyWeb.TuyaMeshComponentTest do
       # The fresh dialog's own button still works.
       assert render_click(target, "confirm_upload", %{"token" => fresh}) =~ "New mesh uploaded."
       assert {:ok, %{beacon_key: @other_key}} = Store.load(ctx.store)
+    end
+
+    test "a dump far ahead asks; the default keeps the device's counter", %{conn: conn} = ctx do
+      {:ok, _} = TuyaMesh.upload(KeyLeak.json())
+      view = mount_tab(conn)
+      ahead = json(%{"seq" => 5_000})
+
+      html = submit_upload(view, ahead)
+      assert html =~ "sequence counter (5000) is far ahead of the"
+      assert html =~ "device&#39;s (100)"
+      assert html =~ "Adopt the dump"
+      assert html =~ "keep the device"
+      refute_secrets(html)
+
+      # Cancel keeps everything.
+      view |> element("button[phx-click=cancel_upload]") |> render_click()
+      assert {:ok, %{seq: 100}} = Store.load(ctx.store)
+
+      # The main action uploads, keeping the device's counter.
+      submit_upload(view, ahead)
+      html = view |> element("button[phx-click=confirm_upload]") |> render_click()
+      assert html =~ "Inventory updated (same mesh)."
+      assert {:ok, %{seq: 100}} = Store.load(ctx.store)
+    end
+
+    test "adopting the dump's counter takes a second, warned confirmation", %{conn: conn} = ctx do
+      {:ok, _} = TuyaMesh.upload(KeyLeak.json())
+      view = mount_tab(conn)
+      target = with_target(view, "#tuya-mesh")
+
+      submit_upload(view, json(%{"seq" => 5_000}))
+      review = token_of(view, "confirm_upload")
+
+      html = render_click(target, "ask_adopt", %{"token" => review})
+      assert html =~ "Adopt the dump&#39;s counter?"
+      assert html =~ "the bulbs will ignore this"
+      assert html =~ "sets the device&#39;s sequence counter to 5000"
+      refute has_element?(view, "button[phx-click=confirm_upload]")
+      adopt = token_of(view, "confirm_adopt")
+      assert adopt != review
+
+      # Focus moves to the new dialog's Cancel.
+      assert has_element?(view, "#tuya-mesh-adopt-cancel-#{adopt}")
+
+      # Clicks queued from the review dialog do nothing now.
+      render_click(target, "confirm_upload", %{"token" => review})
+      render_click(target, "confirm_adopt", %{"token" => review})
+      render_click(target, "ask_adopt", %{"token" => review})
+      assert token_of(view, "confirm_adopt") == adopt
+      assert {:ok, %{seq: 100}} = Store.load(ctx.store)
+
+      html = render_click(target, "confirm_adopt", %{"token" => adopt})
+      assert html =~ "Inventory updated (same mesh)."
+      assert {:ok, %{seq: 5_000}} = Store.load(ctx.store)
+
+      # Consumed: a repeat does nothing.
+      render_click(target, "confirm_adopt", %{"token" => adopt})
+      assert {:ok, %{seq: 5_000}} = Store.load(ctx.store)
+    end
+
+    test "cancelling the adopt dialog keeps the device's counter", %{conn: conn} = ctx do
+      {:ok, _} = TuyaMesh.upload(KeyLeak.json())
+      view = mount_tab(conn)
+
+      submit_upload(view, json(%{"seq" => 5_000}))
+      view |> element("button[phx-click=ask_adopt]") |> render_click()
+      html = view |> element("button[phx-click=cancel_upload]") |> render_click()
+      refute html =~ "Adopt the dump&#39;s counter?"
+      assert {:ok, %{seq: 100}} = Store.load(ctx.store)
+    end
+
+    test "a dump only slightly ahead, or behind, offers no adoption", %{conn: conn} = ctx do
+      {:ok, _} = TuyaMesh.upload(KeyLeak.json())
+      view = mount_tab(conn)
+
+      assert submit_upload(view, json(%{"seq" => 200})) =~ "Inventory updated (same mesh)."
+      assert {:ok, %{seq: 200}} = Store.load(ctx.store)
+
+      html = submit_upload(view, json(%{"seq" => 150}))
+      refute html =~ "Adopt the dump"
+      assert {:ok, %{seq: 200}} = Store.load(ctx.store)
     end
 
     test "cancelling a new mesh leaves the store alone", %{conn: conn} = ctx do

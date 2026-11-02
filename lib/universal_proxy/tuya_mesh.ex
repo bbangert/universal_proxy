@@ -31,6 +31,15 @@ defmodule UniversalProxy.TuyaMesh do
   after, so the Lights controller reads the new inventory (and its `seq`)
   from the Store on start.
 
+  The dump's `seq` is taken only as a small advance on the device's own
+  counter (`Store`, "Upload seq"); the preview's `seq` says what happens to
+  it. A dump whose counter is ahead beyond that bound (the Tuya app was
+  used since the last upload) is adopted only with `adopt_dump_seq: true`,
+  which also requires `expected_revision:` (`{:error,
+  :adopt_needs_revision}` otherwise), so it lands only on the inventory
+  whose counter the user was shown. One behind or equal is refused as
+  `{:error, {:seq_not_ahead, %{local:, dump:}}}`.
+
   Decode errors come back as `{:error, {:invalid_inventory, reason}}`;
   `Inventory.decode/1` reasons carry no key material.
 
@@ -70,6 +79,8 @@ defmodule UniversalProxy.TuyaMesh do
           {:invalid_inventory, term()}
           | {:confirm_new_mesh, Store.preview()}
           | {:stale_preview, Store.preview()}
+          | {:seq_not_ahead, %{local: non_neg_integer(), dump: non_neg_integer()}}
+          | :adopt_needs_revision
           | :unavailable
           | :timeout
           | term()
@@ -82,19 +93,22 @@ defmodule UniversalProxy.TuyaMesh do
   Stores an uploaded JSON dump (or decoded map) and restarts the mesh on
   it. `opts`: `confirm: true` to replace a different mesh;
   `expected_revision:` (a preview's `revision`) to write only over the
-  inventory that preview was computed against. See the moduledoc.
+  inventory that preview was computed against; `adopt_dump_seq: true` to
+  take a dump's counter that is ahead beyond the bound. See the moduledoc.
   """
   @spec upload(binary() | map(), keyword()) ::
           {:ok, :same_mesh | :new_mesh} | {:error, upload_error()}
   def upload(json, opts \\ []) do
     store = Keyword.get(opts, :store, Store)
 
-    with {:ok, inv} <- decode(json),
+    with :ok <- adoption_confirmed(opts),
+         {:ok, inv} <- decode(json),
          {:ok, preview} <- Store.preview(inv, store),
          :ok <- current(preview, opts),
          :ok <- confirmed(preview, opts) do
       replace_opts =
-        [allow_new_mesh: preview.mesh == :new_mesh] ++ Keyword.take(opts, [:expected_revision])
+        [allow_new_mesh: preview.mesh == :new_mesh] ++
+          Keyword.take(opts, [:expected_revision, :adopt_dump_seq])
 
       case change(opts, &Resolver.replace(inv, replace_opts, &1), fn ->
              Store.replace(inv, replace_opts, store)
@@ -165,6 +179,13 @@ defmodule UniversalProxy.TuyaMesh do
         Logger.info("TuyaMesh: inventory upload rejected (#{inspect(reason)})")
         {:error, {:invalid_inventory, reason}}
     end
+  end
+
+  defp adoption_confirmed(opts) do
+    if Keyword.get(opts, :adopt_dump_seq, false) and
+         not Keyword.has_key?(opts, :expected_revision),
+       do: {:error, :adopt_needs_revision},
+       else: :ok
   end
 
   defp current(preview, opts) do

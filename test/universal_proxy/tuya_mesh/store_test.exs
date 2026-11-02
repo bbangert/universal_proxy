@@ -3,7 +3,7 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
 
   import ExUnit.CaptureLog
 
-  alias UniversalProxy.TuyaBeaconMesh.Inventory
+  alias UniversalProxy.TuyaBeaconMesh.{Inventory, Seq}
   alias UniversalProxy.TuyaMesh.Store
 
   @moduletag :tmp_dir
@@ -216,7 +216,7 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
                },
                groups: %{added: [], removed: [%{local_id: 1, name: "path and post"}]},
                revision: 1,
-               seq: %{outcome: :taken, local: nil, dump: 100}
+               seq: %{outcome: :taken, reason: nil, local: nil, dump: 100}
              }
 
       refute_secrets(preview)
@@ -245,8 +245,8 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
       # An older dump keeps the stored cursor; a newer one advances it.
       assert {:ok, :same_mesh} = Store.replace(inventory(), [], ctx.store)
       assert {:ok, %Inventory{seq: 500}} = Store.load(ctx.store)
-      assert {:ok, :same_mesh} = Store.replace(inventory(%{"seq" => 900}), [], ctx.store)
-      assert {:ok, %Inventory{seq: 900}} = Store.load(ctx.store)
+      assert {:ok, :same_mesh} = Store.replace(inventory(%{"seq" => 750}), [], ctx.store)
+      assert {:ok, %Inventory{seq: 750}} = Store.load(ctx.store)
     end
 
     test "a different mesh needs allow_new_mesh and takes the dump's seq", ctx do
@@ -283,10 +283,10 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
   end
 
   describe "upload seq" do
-    defp upload(ctx, seq) do
+    defp upload(ctx, seq, opts \\ []) do
       inv = inventory(%{"seq" => seq})
       {:ok, %{seq: outcome}} = Store.preview(inv, ctx.store)
-      {:ok, _kind} = Store.replace(inv, [], ctx.store)
+      {:ok, _kind} = Store.replace(inv, opts, ctx.store)
       {:ok, %Inventory{seq: stored}} = Store.load(ctx.store)
       {outcome.outcome, stored}
     end
@@ -297,12 +297,20 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
       {:taken, ^seq} = upload(ctx, seq)
     end
 
+    test "the bound keeps a stale dump's jump, plus a crashed lease, within max_jump" do
+      assert Seq.max_jump() - Store.lights_max_lease() - 1 == 299
+    end
+
     test "a stale dump of the same mesh never moves the cursor back", ctx do
       stored_at(ctx, 40_000)
       inv = inventory(%{"seq" => 0})
 
-      assert {:ok, %{seq: %{outcome: :kept_local, local: 40_000, dump: 0}}} =
+      # 0 reads as 25_536 ahead in serial terms: kept, adoptable only on request.
+      assert {:ok, %{seq: %{outcome: :kept_local, reason: :beyond_bound, local: 40_000, dump: 0}}} =
                Store.preview(inv, ctx.store)
+
+      assert {:ok, %{seq: %{reason: :behind}}} =
+               Store.preview(inventory(%{"seq" => 39_999}), ctx.store)
 
       log = capture_log(fn -> assert {:ok, :same_mesh} = Store.replace(inv, [], ctx.store) end)
       assert log =~ "keeping the device's"
@@ -312,21 +320,28 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
     test "only a bounded advance is taken; behind or far ahead keeps the local cursor", ctx do
       stored_at(ctx, 40_000)
       assert upload(ctx, 40_000) == {:same, 40_000}
-      assert upload(ctx, 44_096) == {:taken, 44_096}
-      capture_log(fn -> assert upload(ctx, 48_193) == {:kept_local, 44_096} end)
-      capture_log(fn -> assert upload(ctx, 44_095) == {:kept_local, 44_096} end)
+      assert upload(ctx, 40_299) == {:taken, 40_299}
+      capture_log(fn -> assert upload(ctx, 40_599) == {:kept_local, 40_299} end)
+      capture_log(fn -> assert upload(ctx, 40_298) == {:kept_local, 40_299} end)
       # 20_000 ahead: a plain serial comparison would take it.
-      capture_log(fn -> assert upload(ctx, 64_096) == {:kept_local, 44_096} end)
+      capture_log(fn -> assert upload(ctx, 60_299) == {:kept_local, 40_299} end)
+
+      assert {:ok, %{seq: %{reason: :beyond_bound}}} =
+               Store.preview(inventory(%{"seq" => 40_599}), ctx.store)
     end
 
-    test "around the wrap", ctx do
-      stored_at(ctx, 65_000)
+    test "around the wrap; a stale dump after a near-full wrap stays out", ctx do
+      stored_at(ctx, 65_400)
       assert upload(ctx, 100) == {:taken, 100}
-      capture_log(fn -> assert upload(ctx, 65_000) == {:kept_local, 100} end)
+      capture_log(fn -> assert upload(ctx, 65_400) == {:kept_local, 100} end)
 
       stored_at(ctx, 65_535)
       assert upload(ctx, 0) == {:taken, 0}
       capture_log(fn -> assert upload(ctx, 65_535) == {:kept_local, 0} end)
+
+      # 64000 against an old dump at 1000: 2_536 "ahead", past the bound.
+      stored_at(ctx, 64_000)
+      capture_log(fn -> assert upload(ctx, 1_000) == {:kept_local, 64_000} end)
     end
 
     test "a floor is a local cursor too", ctx do
@@ -335,7 +350,7 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
       capture_log(fn -> assert upload(ctx, 0) == {:kept_local, 40_000} end)
     end
 
-    test "the bound is an option", %{tmp_dir: tmp_dir} = ctx do
+    test "the bound is an option, and can only be lowered", %{tmp_dir: tmp_dir} = ctx do
       store =
         start_store(
           Path.join(tmp_dir, "b.dets"),
@@ -348,6 +363,55 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
       assert upload(ctx, 40_000) == {:taken, 40_000}
       assert upload(ctx, 40_010) == {:taken, 40_010}
       capture_log(fn -> assert upload(ctx, 40_021) == {:kept_local, 40_010} end)
+
+      assert {:error, _} =
+               start_supervised(
+                 {Store,
+                  name: nil,
+                  enabled: true,
+                  table: :"tuya_bound_#{System.unique_integer([:positive])}",
+                  dets_path: Path.join(tmp_dir, "c.dets"),
+                  max_dump_advance: 300},
+                 id: :too_far
+               )
+    end
+
+    test "a genuinely newer dump is adopted when asked", ctx do
+      # The Tuya app moved the bulbs from 1000 to 6000 while we were offline.
+      stored_at(ctx, 1_000)
+      capture_log(fn -> assert upload(ctx, 6_000) == {:kept_local, 1_000} end)
+
+      log =
+        capture_log(fn ->
+          assert upload(ctx, 6_000, adopt_dump_seq: true) == {:kept_local, 6_000}
+        end)
+
+      assert log =~ "adopting"
+    end
+
+    test "adopting a dump behind, or equal to, the local cursor is refused", ctx do
+      stored_at(ctx, 6_000)
+
+      for seq <- [5_999, 6_000, 6_000 + 32_768] do
+        assert {:error, {:seq_not_ahead, %{local: 6_000, dump: ^seq}}} =
+                 Store.replace(inventory(%{"seq" => seq}), [adopt_dump_seq: true], ctx.store)
+      end
+
+      assert {:ok, %Inventory{seq: 6_000}} = Store.load(ctx.store)
+    end
+
+    test "clear, re-upload and adopt recovers a cursor the app moved on", ctx do
+      stored_at(ctx, 1_000)
+      :ok = Store.clear(ctx.store)
+      capture_log(fn -> assert upload(ctx, 6_000) == {:kept_local, 1_000} end)
+
+      :ok = Store.clear(ctx.store)
+      capture_log(fn -> upload(ctx, 6_000, adopt_dump_seq: true) end)
+      assert {:ok, %Inventory{seq: 6_000}} = Store.load(ctx.store)
+
+      # The floor moved with it: a later stale dump stays out.
+      :ok = Store.clear(ctx.store)
+      capture_log(fn -> assert upload(ctx, 1_000) == {:kept_local, 6_000} end)
     end
   end
 
@@ -404,10 +468,10 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
 
     test "is refused once the stored cursor moved on", ctx do
       # A newer dump moved it forward while Lights still ran.
-      {:ok, :same_mesh} = Store.replace(inventory(%{"seq" => 4_000}), [], ctx.store)
+      {:ok, :same_mesh} = Store.replace(inventory(%{"seq" => 400}), [], ctx.store)
 
       assert {:error, :stale_tighten} = Store.tighten(%{inventory() | seq: 105}, 132, ctx.store)
-      assert {:ok, %Inventory{seq: 4_000}} = Store.load(ctx.store)
+      assert {:ok, %Inventory{seq: 400}} = Store.load(ctx.store)
     end
 
     test "is refused for another mesh or a changed inventory", ctx do

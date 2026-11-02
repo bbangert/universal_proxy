@@ -69,6 +69,8 @@ defmodule UniversalProxy.TuyaMesh.Mesh do
           on_persist: &Store.persist/1,
           # A Lights without the seq lease ignores this option.
           on_tighten: &Store.tighten/2,
+          # The Store's upload bound is derived from it.
+          max_lease: Store.lights_max_lease(),
           radio: Keyword.fetch!(radio, :name),
           name: Lights
         ],
