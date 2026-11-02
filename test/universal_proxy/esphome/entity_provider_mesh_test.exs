@@ -562,6 +562,65 @@ defmodule UniversalProxy.ESPHome.EntityProviderMeshTest do
       assert espex_calls() == [:update_device_config, :disconnect_clients]
     end
 
+    test "unknown at start never pushes to an Espex that holds the mesh; recovery syncs" do
+      {sources, put} = start_inputs(%{inventory: {:error, :unavailable}})
+      boot = [%Device{id: 1, name: "path light 2"}, %Device{id: 2, name: "post spot 1"}]
+
+      pid =
+        start_provider(sources,
+          mesh_retry_ms: 5_000,
+          espex_devices: fn _server -> boot end
+        )
+
+      # The periodic check, the read retry and any apply retry: none of them
+      # may move Espex off its boot devices or disconnect HA.
+      send(pid, :mesh_check)
+      settle(pid)
+      fire(pid, :apply)
+      send(pid, :mesh_check)
+      assert %{mesh: %{source: :none, pending: nil}} = settle(pid)
+      assert espex_calls() == []
+      assert EP.mesh_devices(pid) == {:error, :unknown}
+
+      # The check keeps a read retry armed.
+      assert %{mesh: %{read_timer: token}} = :sys.get_state(pid)
+      assert is_reference(token)
+
+      put.(:inventory, {:ok, summary()})
+      assert %{mesh: %{source: :read}} = settle(pid)
+      assert_received {:espex, :update_device_config, _, [devices: [_, _, _]]}
+      assert_received {:espex, :disconnect_clients, _}
+    end
+
+    test "the boot-time read is the last good build a provider with unknown inputs adopts" do
+      server = :"ep_mesh_boot_#{System.unique_integer([:positive])}"
+      {sources, put} = start_inputs()
+
+      good = %{
+        supported?: true,
+        role: fn -> {:ok, @role} end,
+        inventory: fn -> {:ok, summary()} end,
+        settings: fn -> Store.default_settings() end
+      }
+
+      boot = MeshSync.boot_devices(server, good)
+      assert length(boot) == 3
+
+      put.(:inventory, {:error, :unavailable})
+      pid = start_provider(sources, server: server, espex_devices: fn _ -> boot end)
+
+      assert EP.mesh_devices(pid) == {:ok, boot}
+
+      assert Enum.any?(
+               GenServer.call(pid, :list_entities),
+               &(&1.object_id == "tuya_group_1_light")
+             )
+
+      send(pid, :mesh_check)
+      settle(pid)
+      assert espex_calls() == []
+    end
+
     test "an outage after a change notification is retried until it reads" do
       {sources, put} = start_inputs()
       pid = start_provider(sources)

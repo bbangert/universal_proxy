@@ -41,7 +41,9 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
 
   With `:none`, `devices/1` is `{:error, :unknown}`, so Espex keeps the
   sub-devices `ESPHome.Supervisor.init/1` started it with
-  (`boot_devices/1`), and `advertisements/1` is `:defer` for up to
+  (`boot_devices/1`, whose read is also kept as the last good build), and
+  nothing is ever pushed to Espex or disconnected (the check tick only
+  retries the read), and `advertisements/1` is `:defer` for up to
   `:defer_ms` (2 min) from start: the provider then refuses the connection
   and HA retries, rather than reconcile against a list without the mesh.
   After that window it advertises what it has (an inventory that can't be
@@ -65,6 +67,7 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
   require Logger
 
   alias Espex.DeviceConfig.Device
+  alias UniversalProxy.ESPHome.EntityProvider
   alias UniversalProxy.TuyaMesh
   alias UniversalProxy.TuyaMesh.{Entities, Store}
 
@@ -184,13 +187,17 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
 
   @doc """
   The sub-devices to start Espex with before any provider runs: a fresh
-  read, else the last good build of this boot (`[]` if none). `sources`
-  as for `UniversalProxy.TuyaMesh.Entities.read/2`.
+  read (kept as the last good build), else the last good build of this
+  boot (`[]` if none). `sources` as for
+  `UniversalProxy.TuyaMesh.Entities.read/2`.
   """
   @spec boot_devices(GenServer.server(), map()) :: [Device.t()]
   def boot_devices(server \\ Espex.Server, sources \\ %{}) do
-    case Entities.read(sources) do
+    case Entities.read(sources, EntityProvider.mesh_build_opts()) do
       {:ok, build} ->
+        # Also the provider's last good build: one that then finds its
+        # inputs unreadable advertises what Espex was started with.
+        put_last_good(server, build)
         build.devices
 
       :unknown ->
@@ -330,6 +337,10 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
 
   # ── Apply ────────────────────────────────────────────────────────────
 
+  # Only a build that was read (or the last good one) is ever pushed: an
+  # unknown one is a placeholder, and pushing it would make HA delete the
+  # mesh Espex still holds.
+  defp apply_pending(%{source: :none} = t), do: t
   defp apply_pending(%{pending: nil} = t), do: t
 
   defp apply_pending(%{pending: :update} = t) do
@@ -369,6 +380,9 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
     Process.send_after(self(), {:mesh_apply, token}, t.apply_backoff_ms)
     %{t | apply_timer: token, apply_backoff_ms: backoff(t.apply_backoff_ms)}
   end
+
+  # Unknown: nothing to compare Espex with; only the read is retried.
+  defp verify_applied(%{source: :none} = t), do: arm_read(t, t.read_backoff_ms)
 
   # An Espex that started on other sub-devices than `desired`.
   defp verify_applied(%{pending: nil} = t) do

@@ -532,6 +532,15 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
 
   # ── Tuya mesh ───────────────────────────────────────────────────────
 
+  @doc false
+  # `Entities.build/3` options: mesh keys must not collide with ours.
+  @spec mesh_build_opts() :: keyword()
+  def mesh_build_opts,
+    do: [
+      reserved_keys: Map.keys(key_lookup()),
+      on_collision: Application.get_env(:universal_proxy, :tuya_entity_collisions, :skip)
+    ]
+
   # MeshSync option ← this provider's option.
   defp mesh_sync(opts, supported?, sources, extra_topics) do
     passed = for {key, opt} <- @mesh_opts, Keyword.has_key?(opts, opt), do: {key, opts[opt]}
@@ -543,10 +552,8 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
           subscribe?: Keyword.get(opts, :subscribe, true),
           extra_topics: extra_topics,
           server: Keyword.get(opts, :server, Espex.Server),
-          sources: Map.take(sources, [:mesh_role, :mesh_inventory, :mesh_settings, :mesh_status]),
-          reserved_keys: Map.keys(key_lookup()),
-          on_collision: Application.get_env(:universal_proxy, :tuya_entity_collisions, :skip)
-        ]
+          sources: Map.take(sources, [:mesh_role, :mesh_inventory, :mesh_settings, :mesh_status])
+        ] ++ mesh_build_opts()
     )
   end
 
