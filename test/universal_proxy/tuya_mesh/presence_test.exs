@@ -215,7 +215,65 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
     end
   end
 
+  # Polls once a second from `from` until all `bulbs` are missed twice (at
+  # most 5 minutes); the time each was, from `from`.
+  defp until_all_missed(ctx, bulbs, from) do
+    Enum.reduce_while(from..(from + 5 * @min)//@s, %{}, fn t, decided ->
+      at(ctx, t)
+
+      decided =
+        Enum.reduce(bulbs, decided, fn mac, acc ->
+          if bulb(ctx, mac).misses >= 2, do: Map.put_new(acc, mac, t - from), else: acc
+        end)
+
+      if map_size(decided) == length(bulbs), do: {:halt, decided}, else: {:cont, decided}
+    end)
+  end
+
   describe "a whole-mesh outage" do
+    test "after an hour of rotating broadcast misses: all Not reachable within 4 min", ctx do
+      bulbs = macs(10)
+      ctx = start(ctx, macs: bulbs, replying: bulbs)
+
+      # Each cycle two different bulbs miss the broadcast (collisions).
+      for t <- 0..(60 * @min - 1)//@s do
+        if rem(t, @min) == 0 do
+          cycle = div(t, @min)
+          deaf = [Enum.at(bulbs, rem(2 * cycle, 10)), Enum.at(bulbs, rem(2 * cycle + 1, 10))]
+          :ok = FakeLights.put(ctx.lights, :deaf, deaf)
+        end
+
+        at(ctx, t)
+      end
+
+      assert Enum.all?(bulbs, &(bulb(ctx, &1).misses == 0))
+      assert Enum.count(pings(ctx), &(&1 != :all)) >= 100
+
+      # The power goes just after the next broadcast was answered.
+      run(ctx, 60 * @min, 60 * @min + 5 * @s)
+      :ok = FakeLights.put(ctx.lights, :replying, [])
+      decided = until_all_missed(ctx, bulbs, 60 * @min + 6 * @s)
+
+      assert map_size(decided) == 10
+      assert Enum.max(Map.values(decided)) <= 4 * @min
+      assert max_in_a_minute(log(ctx)) <= 10
+      assert max_in_an_hour(log(ctx)) <= 240
+    end
+
+    test "after the four-straggler warm-up: all Not reachable within 4 min", ctx do
+      bulbs = macs(10)
+      ctx = start(ctx, macs: bulbs, replying: bulbs, deaf: Enum.take(bulbs, 4))
+      run(ctx, 0, 10 * @min + 5 * @s)
+      assert Enum.all?(bulbs, &(bulb(ctx, &1).misses == 0))
+
+      :ok = FakeLights.put(ctx.lights, :replying, [])
+      decided = until_all_missed(ctx, bulbs, 10 * @min + 6 * @s)
+
+      assert map_size(decided) == 10
+      assert Enum.max(Map.values(decided)) <= 4 * @min
+      assert max_in_a_minute(log(ctx)) <= 10
+    end
+
     test "every bulb is Not reachable (two misses) within 4 minutes, inside the caps", ctx do
       bulbs = macs(10)
       ctx = start(ctx, macs: bulbs, replying: bulbs)
@@ -259,6 +317,40 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
       assert %{interval_ms: @min} = bulb(ctx, List.last(bulbs))
     end
 
+    test "ten stragglers for two hours: never unreachable, honest intervals, caps hold",
+         ctx do
+      bulbs = macs(10)
+      ctx = start(ctx, macs: bulbs, replying: bulbs, deaf: bulbs)
+
+      for t <- 0..(120 * @min - 1)//@s do
+        at(ctx, t)
+
+        # Once each was heard (the first round takes a couple of minutes).
+        if t >= 3 * @min and rem(t, 10 * @s) == 0 do
+          {:ok, snapshot} = Presence.snapshot(ctx.presence)
+
+          for {_mac, b} <- snapshot do
+            assert b.misses == 0
+            # The Resolver's window for it (2.5 x its interval) still holds.
+            assert t - b.last_ms <= div(b.interval_ms * 5, 2)
+          end
+        end
+      end
+
+      sent = log(ctx)
+      assert max_in_an_hour(sent) <= 240
+      assert max_in_a_minute(sent) <= 10
+
+      # The advertised interval covers the real gaps between checks.
+      {:ok, snapshot} = Presence.snapshot(ctx.presence)
+
+      for mac <- bulbs do
+        times = for {^mac, at} <- sent, at >= 30 * @min, do: at
+        gaps = times |> Enum.zip(tl(times)) |> Enum.map(fn {a, b} -> b - a end)
+        assert Enum.max(gaps) <= snapshot[mac].interval_ms
+      end
+    end
+
     test "four permanent stragglers for two hours: broadcasts never stop, all stay heard",
          ctx do
       bulbs = macs(10)
@@ -268,7 +360,7 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
       for t <- 0..(120 * @min - 1)//@s do
         at(ctx, t)
 
-        if t >= 70 * @s and rem(t, 10 * @s) == 0 do
+        if t >= 3 * @min and rem(t, 10 * @s) == 0 do
           {:ok, snapshot} = Presence.snapshot(ctx.presence)
 
           for mac <- healthy do
@@ -316,8 +408,8 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
 
     test "the frame log survives the pinger and the mesh: <= 240 in any rolling hour",
          ctx do
-      # Every bulb a straggler and no ten-minute pacing: follow-ups run
-      # into the hour cap within the first hour.
+      # Every bulb a straggler and no spacing: routine follow-ups run into
+      # their hour cap within the first hour.
       bulbs = macs(10)
       table = :ets.new(:frames, [:set, :public])
 
@@ -327,7 +419,7 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
           replying: bulbs,
           deaf: bulbs,
           frames: table,
-          max_followups_per_10_min: 1_000
+          routine_spacing_ms: 0
         )
 
       run(ctx, 0, 40 * @min)
@@ -389,7 +481,7 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
         end
 
         ctx = start(ctx, macs: [@a], on_ping: on_ping)
-        run(ctx, 0, 30 * @s)
+        run(ctx, 0, 59 * @s)
         assert bulb(ctx, @a).misses == 0
         assert Enum.count(pings(ctx), &(&1 == @a)) >= 2
         stop_all()
@@ -418,8 +510,8 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
         at(ctx, 9 * @s)
         assert %{misses: 0, pinging: false} = bulb(ctx, @a)
 
-        # Still unconfirmed: asked again a gap after the last attempt.
-        at(ctx, 10 * @s)
+        # Still unconfirmed: asked again once routine spacing allows.
+        run(ctx, 10 * @s, 33 * @s)
         assert pings(ctx) == [:all, @a, @a]
         stop_all()
       end
