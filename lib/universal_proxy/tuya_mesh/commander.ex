@@ -48,10 +48,9 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       frame reaches only part of the members (4–9 of 10 on hardware), so
       after `:window_ms` every member that hasn't confirmed a DP gets one
       round of direct sets carrying only what it is missing, one every
-      `:followup_gap_ms`. A DP is confirmed only by a report after the
-      command that changed it to the wanted value (Lights keeps merged
-      DPs, not per-report ones), so a DP that already held that value is
-      resent.
+      `:followup_gap_ms`. A DP is confirmed only by a DP report after the
+      command that carried it with the wanted value (Lights stamps each
+      reported DP, `dp_reported_at`; a ping reply stamps none).
 
   `{:error, :busy}` and `{:error, :queue_full}` wait for capacity (see
   "Backlog"); any other error stops the command. A direct send that fails
@@ -91,17 +90,38 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   check drops the stale commands and kept DPs at once (subscribed at
   start; the per-send check is what guarantees it).
 
-  ## Optimistic state
+  ## Light state
 
-  Each light's last known DPs are kept here, with its brightness, colour
-  brightness and RGB peak (`Commands.components/2`, each kept only once a
-  batch carrying the DP it shapes was accepted: `Commands.committed/2`):
-  what was sent to it and accepted, over the Lights report DPs for a bulb first commanded. Once a
-  command's sends are accepted, the light's `LightStateResponse` (with
-  its `device_id`) is pushed to Espex, so HA doesn't snap back. A group
-  diverted to direct sends records only what at least one member
-  accepted. A light whose on/off isn't known yet gets no push, and
-  nothing refused is recorded or pushed.
+  This process is the only one that pushes light states to Home
+  Assistant. Each light's last known DPs are kept here, with its
+  brightness, colour brightness and RGB peak (`Commands.components/2`,
+  each kept only once a batch carrying the DP it shapes was accepted:
+  `Commands.committed/2`):
+
+    * **Optimistic:** what was sent to it and accepted, over the Lights
+      report DPs for a bulb first commanded. A group diverted to direct
+      sends records only what at least one member accepted; nothing
+      refused is recorded.
+    * **Real:** every bulb's reported DPs arrive with the Resolver's
+      status (`{:tuya_mesh_status, _}`: `dps`, and `dp_at`, when a DP
+      report last carried each). A DP reported since it was last seen
+      here is taken unless it was set here after that report (its send
+      time against its report time), and the components follow a
+      reported colour or brightness (`Commands.reconcile_components/2`).
+      A ping reply carries no DPs and moves no DP's time.
+    * **Groups** follow their members (`UniversalProxy.TuyaMesh.GroupState`,
+      Home Assistant's light-group rules) over the members whose state is
+      known; a group with none known shows what was last sent to it.
+
+  A command's accepted sends push its light at once; its members (for a
+  group), and every group sharing a bulb with it, follow on the next
+  flush. Real reports mark their bulbs and those bulbs' groups, and a
+  flush `:push_debounce_ms` (200 ms) later pushes each marked light once,
+  bulbs before groups. A push happens only when the state differs from
+  the one last pushed, for the light's current sub-device (key and
+  `device_id`), and never for a light whose on/off is unknown. What was
+  pushed last is kept in an ETS table (`light_states/1`), so a new
+  connection's initial states match it.
 
   Options: `:name`, `:lights` (module, default `Lights`) and `:lights_opts`
   (extra options to its calls, e.g. `server:`), `:members` (`gid ->
@@ -114,11 +134,11 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   `:radio_poll_ms`, `:window_ms` (6 s),
   `:retry_ms`, `:max_retry_ms`, `:stale_ms`, `:followup_gap_ms`,
   `:activity_hold_ms`, `:keepalive_ms` (see "Backlog"), `:max_followups`
-  (10).
+  (10), `:settings` (`-> Store.settings`), `:status` (`-> status`, read
+  once at start, default `TuyaMesh.status/1`), `:push_debounce_ms`, and
+  `:states_table` (`true`, the named table, by default for the registered
+  process; `:unnamed`; or `false`).
   """
-
-  # TODO(4c): reconcile `views` with real reports (Lights report updates,
-  # group aggregation) and push member bulb states after a group command.
 
   use GenServer
 
@@ -127,9 +147,10 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   alias Espex.Proto
   alias UniversalProxy.TuyaBeaconMesh.{Lights, Radio}
   alias UniversalProxy.TuyaMesh
-  alias UniversalProxy.TuyaMesh.{Commands, Presence, Store}
+  alias UniversalProxy.TuyaMesh.{Commands, Entities, GroupState, Presence, Store}
 
   @retryable [:busy, :queue_full]
+  @states_table Module.concat(__MODULE__, States)
 
   @type target :: {:bulb, String.t()} | {:group, 0..254}
   @type command :: %{
@@ -142,6 +163,17 @@ defmodule UniversalProxy.TuyaMesh.Commander do
 
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
+  end
+
+  @doc """
+  The light states last pushed to Home Assistant, for a new connection's
+  initial states. `[]` when no Commander keeps them.
+  """
+  @spec light_states(:ets.table()) :: [Proto.LightStateResponse.t()]
+  def light_states(table \\ @states_table) do
+    for {_target, response} <- :ets.tab2list(table), do: response
+  rescue
+    ArgumentError -> []
   end
 
   @doc "Queues a light command. Never blocks; a no-op when not running."
@@ -172,6 +204,15 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       activity_hold_ms: Keyword.get(opts, :activity_hold_ms, 5_000),
       keepalive_ms: Keyword.get(opts, :keepalive_ms, 2_000),
       max_followups: Keyword.get(opts, :max_followups, 10),
+      settings: Keyword.get(opts, :settings, &Store.settings/0),
+      status: Keyword.get(opts, :status, &TuyaMesh.status/0),
+      push_debounce_ms: Keyword.get(opts, :push_debounce_ms, 200),
+      states: states_table(opts),
+      mesh_groups: %{},
+      reported: %{},
+      pushed: %{},
+      dirty: MapSet.new(),
+      flush: nil,
       next_id: 1,
       jobs: %{},
       views: %{},
@@ -232,8 +273,21 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   def handle_info({:dispatch, token}, %{dispatch: {token, _tref}} = state),
     do: {:noreply, %{state | dispatch: nil} |> dispatch() |> reschedule()}
 
+  # The colour-temperature range or direction changed: every kept light
+  # is encoded again (and its kept initial state with it).
+  def handle_info({:tuya_mesh_store, :settings_changed}, state) do
+    targets = Map.keys(state.views) ++ for(gid <- Map.keys(state.mesh_groups), do: {:group, gid})
+    {:noreply, state |> reconcile() |> mark_dirty(targets) |> arm_flush() |> reschedule()}
+  end
+
   def handle_info({:tuya_mesh_store, _event}, state),
-    do: {:noreply, state |> reconcile() |> reschedule()}
+    do: {:noreply, state |> reconcile() |> arm_flush() |> reschedule()}
+
+  def handle_info({:tuya_mesh_status, status}, state),
+    do: {:noreply, state |> apply_status(status) |> arm_flush()}
+
+  def handle_info({:flush, token}, %{flush: {token, _tref}} = state),
+    do: {:noreply, %{state | flush: nil} |> flush()}
 
   def handle_info(_msg, state), do: {:noreply, state}
 
@@ -491,27 +545,27 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   end
 
   defp followups_for(mac, bulb, job) do
-    {before_ms, before_dps} = Map.get(job.snapshot, mac, {nil, %{}})
-
-    missing =
-      if reported_since?(bulb, before_ms),
-        do: Commands.unconfirmed(job.sent, fresh_dps(Map.get(bulb, :dps), before_dps)),
-        else: job.sent
-
-    Commands.split(missing)
+    before = Map.get(job.snapshot, mac, %{})
+    Commands.split(Commands.unconfirmed(job.sent, reported_since(bulb, before)))
   end
 
-  defp reported_since?(%{last_report_ms: at}, before) when is_integer(at), do: at != before
-  defp reported_since?(_bulb, _before), do: false
+  # The DPs a report carried after the command: Lights stamps each DP a DP
+  # report carries (`dp_reported_at`), and a ping reply none, so a DP is
+  # confirmed only when its stamp moved and its value is the one sent.
+  defp reported_since(%{dps: dps, dp_reported_at: stamps}, before)
+       when is_map(dps) and is_map(stamps) do
+    for {dp, at} <- stamps,
+        is_integer(at),
+        later?(at, Map.fetch(before, dp)),
+        Map.has_key?(dps, dp),
+        into: %{},
+        do: {dp, dps[dp]}
+  end
 
-  # Lights merges partial reports into a bulb's cached DPs, and a ping
-  # reply moves `last_report_ms` too, so only a DP whose value changed since
-  # the command was provably reported after it. One that already held the
-  # wanted value counts as unconfirmed: at worst a redundant frame.
-  defp fresh_dps(dps, before) when is_map(dps),
-    do: Map.reject(dps, fn {id, value} -> Map.fetch(before, id) == {:ok, value} end)
+  defp reported_since(_bulb, _before), do: %{}
 
-  defp fresh_dps(_dps, _before), do: %{}
+  defp later?(_at, :error), do: true
+  defp later?(at, {:ok, before}), do: at > before
 
   defp newer_command?(state, mac, job), do: Map.get(state.touched, mac, 0) > job.id
 
@@ -694,6 +748,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
     )
 
     %{done(state, job) | views: Map.delete(state.views, job.target)}
+    |> forget_pushed([job.target])
   end
 
   # Drops the commands and kept DPs of every light whose id changed.
@@ -709,10 +764,29 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       Logger.info("TuyaMesh.Commander: mesh changed; dropped #{map_size(stale)} commands")
     end
 
-    views =
-      Map.filter(state.views, fn {target, view} -> Map.get(ids, target) == view.device_id end)
+    {views, stale_views} =
+      Map.split_with(state.views, fn {target, view} -> Map.get(ids, target) == view.device_id end)
+
+    stale_pushed =
+      for {target, response} <- state.pushed,
+          Map.get(ids, target) != response.device_id,
+          do: target
+
+    # A light that is still there under a new sub-device (a new mesh can
+    # keep a group's local id and members) gets its state again, derived
+    # from what is still known; so does a group never pushed.
+    renewed =
+      (Map.keys(stale_views) ++ stale_pushed)
+      |> Enum.filter(&Map.has_key?(ids, &1))
+
+    unpushed =
+      for gid <- Map.keys(state.mesh_groups),
+          not Map.has_key?(state.pushed, {:group, gid}),
+          do: {:group, gid}
 
     %{state | jobs: jobs, views: views}
+    |> forget_pushed(stale_pushed)
+    |> mark_dirty(renewed ++ unpushed)
   end
 
   defp read_ids(state) do
@@ -727,7 +801,8 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   # without PubSub it runs unsubscribed, the per-send check still holding.
   defp subscribe(state) do
     Phoenix.PubSub.subscribe(state.pubsub, Store.topic())
-    reconcile(state)
+    Phoenix.PubSub.subscribe(state.pubsub, TuyaMesh.topic())
+    state |> reconcile() |> apply_status(state.status.()) |> arm_flush()
   rescue
     ArgumentError ->
       Logger.warning("TuyaMesh.Commander: PubSub unavailable; not following Store changes")
@@ -768,32 +843,241 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       (view_dps(state, job.target, job.command.device_id) || job.base)
       |> Map.merge(sent)
       |> Map.merge(Commands.committed(job.components, sent))
+      |> Commands.reconcile_components(sent)
 
-    view = %{device_id: job.command.device_id, dps: dps}
+    sent_at = sent_times(Map.get(state.views, job.target), job.command.device_id, sent)
+    view = %{device_id: job.command.device_id, dps: dps, sent_at: sent_at}
     %{state | views: Map.put(state.views, job.target, view)}
   end
 
   defp update_member_view(state, mac, sent, components) do
     case Map.fetch(state.views, {:bulb, mac}) do
       {:ok, view} ->
-        dps = view.dps |> Map.merge(sent) |> Map.merge(Commands.committed(components, sent))
-        %{state | views: Map.put(state.views, {:bulb, mac}, %{view | dps: dps})}
+        dps =
+          view.dps
+          |> Map.merge(sent)
+          |> Map.merge(Commands.committed(components, sent))
+          |> Commands.reconcile_components(sent)
+
+        view = %{view | dps: dps, sent_at: sent_times(view, view.device_id, sent)}
+        %{state | views: Map.put(state.views, {:bulb, mac}, view)}
 
       :error ->
         state
     end
   end
 
+  # When a DP was last set optimistically: a real report only supersedes
+  # it when newer.
+  defp sent_times(%{device_id: id, sent_at: at}, id, sent),
+    do: Map.merge(at, Map.new(sent, fn {dp, _v} -> {dp, now()} end))
+
+  defp sent_times(_view, _id, sent), do: Map.new(sent, fn {dp, _v} -> {dp, now()} end)
+
+  # A command's accepted sends: the light's state now; its members' and
+  # the groups sharing a light with it on the next flush.
   defp push(state, job) do
-    %{key: key, device_id: device_id, settings: settings} = job.command
-    dps = view_dps(state, job.target, device_id) || %{}
+    ids = read_ids(state)
+    state = push_target(state, job.target, job.command.settings, ids)
 
-    case Commands.state_response(dps, settings, key, device_id) do
-      nil -> :ok
-      response -> state.push.(response)
+    related =
+      case job.target do
+        {:bulb, mac} ->
+          groups_of(state, [mac])
+
+        {:group, _gid} ->
+          for(mac <- job.members, do: {:bulb, mac}) ++ groups_of(state, job.members)
+      end
+
+    state |> mark_dirty(related -- [job.target]) |> arm_flush()
+  end
+
+  # ── Light states ─────────────────────────────────────────────────────
+
+  # Real reports from the Resolver's status: a DP the bulb reported after
+  # it was last set here replaces the kept value (see `Commands.reconcile_components/2`).
+  defp apply_status(state, %{bulbs: bulbs} = status) when is_list(bulbs) do
+    ids = read_ids(state)
+
+    groups =
+      Map.new(Map.get(status, :groups, []), fn g -> {g.local_id, Map.get(g, :members, [])} end)
+
+    # A new group, or one whose members changed, is derived again whether
+    # or not anything reported; a removed one is forgotten.
+    changed =
+      for {gid, members} <- groups, Map.get(state.mesh_groups, gid) != members, do: {:group, gid}
+
+    removed =
+      for gid <- Map.keys(state.mesh_groups), not Map.has_key?(groups, gid), do: {:group, gid}
+
+    state =
+      %{state | mesh_groups: groups, views: Map.drop(state.views, removed)}
+      |> forget_pushed(removed)
+      |> mark_dirty(changed)
+
+    {state, macs} =
+      Enum.reduce(bulbs, {state, []}, fn bulb, {state, macs} ->
+        case real_report(state, bulb, Map.get(ids, {:bulb, bulb.mac})) do
+          nil -> {state, macs}
+          {:seen, state} -> {state, macs}
+          state -> {state, [bulb.mac | macs]}
+        end
+      end)
+
+    mark_dirty(state, for(mac <- macs, do: {:bulb, mac}) ++ groups_of(state, macs))
+  end
+
+  defp apply_status(state, _status), do: state
+
+  # Per DP: a DP whose report time (`dp_at`) moved since last seen here is
+  # taken unless it was set here after that report. A ping moves no DP's
+  # time, so it never brings old values back.
+  defp real_report(state, %{mac: mac} = bulb, id) when is_integer(id) do
+    values = Map.get(bulb, :dps) || %{}
+    seen = Map.get(state.reported, mac, %{})
+
+    fresh =
+      for {dp, at} <- Map.get(bulb, :dp_at) || %{},
+          is_integer(dp) and is_integer(at),
+          Map.has_key?(values, dp),
+          later?(at, Map.fetch(seen, dp)),
+          into: %{},
+          do: {dp, at}
+
+    if fresh == %{} do
+      nil
+    else
+      target = {:bulb, mac}
+
+      view =
+        case Map.get(state.views, target) do
+          %{device_id: ^id} = view -> view
+          _none_or_stale -> %{device_id: id, dps: %{}, sent_at: %{}}
+        end
+
+      real =
+        for {dp, at} <- fresh,
+            later?(at, Map.fetch(view.sent_at, dp)),
+            into: %{},
+            do: {dp, values[dp]}
+
+      dps = view.dps |> Map.merge(real) |> Commands.reconcile_components(real)
+      view = %{view | dps: dps, sent_at: Map.drop(view.sent_at, Map.keys(real))}
+      state = %{state | reported: Map.put(state.reported, mac, Map.merge(seen, fresh))}
+
+      if real == %{},
+        do: {:seen, state},
+        else: %{state | views: Map.put(state.views, target, view)}
     end
+  end
 
-    state
+  defp real_report(_state, _bulb, _id), do: nil
+
+  defp groups_of(state, macs) do
+    for {gid, members} <- state.mesh_groups, Enum.any?(macs, &(&1 in members)), do: {:group, gid}
+  end
+
+  defp mark_dirty(state, targets),
+    do: %{state | dirty: MapSet.union(state.dirty, MapSet.new(targets))}
+
+  # Bursts of reports coalesce into one push per light.
+  defp arm_flush(%{flush: nil} = state) do
+    if MapSet.size(state.dirty) == 0 do
+      state
+    else
+      token = make_ref()
+
+      %{
+        state
+        | flush: {token, Process.send_after(self(), {:flush, token}, state.push_debounce_ms)}
+      }
+    end
+  end
+
+  defp arm_flush(state), do: state
+
+  # Bulbs first, so their groups are derived from what was just pushed.
+  defp flush(state) do
+    ids = read_ids(state)
+    settings = state.settings.()
+    {bulbs, groups} = state.dirty |> MapSet.to_list() |> Enum.split_with(&match?({:bulb, _}, &1))
+    state = %{state | dirty: MapSet.new()}
+    Enum.reduce(bulbs ++ groups, state, &push_target(&2, &1, settings, ids))
+  end
+
+  # Pushed only when it differs from what Home Assistant last got, and
+  # only for the light's current sub-device.
+  defp push_target(state, target, settings, ids) do
+    {state, response} = response_for(state, target, settings, Map.get(ids, target), ids)
+
+    cond do
+      response == nil -> state
+      Map.get(state.pushed, target) == response -> state
+      true -> record_push(state, target, response)
+    end
+  end
+
+  defp record_push(state, target, response) do
+    state.push.(response)
+    if state.states, do: :ets.insert(state.states, {target, response})
+    %{state | pushed: Map.put(state.pushed, target, response)}
+  end
+
+  defp forget_pushed(state, targets) do
+    if state.states, do: Enum.each(targets, &:ets.delete(state.states, &1))
+    %{state | pushed: Map.drop(state.pushed, targets)}
+  end
+
+  defp response_for(state, _target, _settings, nil, _ids), do: {state, nil}
+
+  defp response_for(state, {:bulb, _mac} = target, settings, id, _ids) do
+    case view_dps(state, target, id) do
+      nil -> {state, nil}
+      dps -> {state, Commands.state_response(dps, settings, light_key(target), id)}
+    end
+  end
+
+  # A group follows its members (Home Assistant's light-group rules); with
+  # none known yet, what was last sent to it.
+  defp response_for(state, {:group, gid} = target, settings, id, ids) do
+    members =
+      state.mesh_groups
+      |> Map.get(gid, [])
+      |> Enum.map(&view_dps(state, {:bulb, &1}, Map.get(ids, {:bulb, &1})))
+      |> Enum.reject(&is_nil/1)
+
+    state =
+      case GroupState.aggregate(members) do
+        nil ->
+          state
+
+        agg ->
+          dps = with_controls(agg, view_dps(state, target, id))
+          %{state | views: Map.put(state.views, target, %{device_id: id, dps: dps, sent_at: %{}})}
+      end
+
+    case view_dps(state, target, id) do
+      nil -> {state, nil}
+      dps -> {state, Commands.state_response(dps, settings, light_key(target), id)}
+    end
+  end
+
+  # Off says nothing about the mode, colour or brightness: an all-off group
+  # keeps the ones it had, so a later "on" without a mode keeps them too.
+  defp with_controls(%{1 => false} = off, kept) when map_size(off) == 1 and is_map(kept),
+    do: Map.put(kept, 1, false)
+
+  defp with_controls(agg, _kept), do: agg
+
+  defp light_key({:bulb, mac}), do: Entities.key_for(Entities.object_id({:bulb, mac, :light}))
+  defp light_key({:group, gid}), do: Entities.key_for(Entities.object_id({:group, gid, :light}))
+
+  defp states_table(opts) do
+    case Keyword.get(opts, :states_table, Keyword.get(opts, :name, __MODULE__) == __MODULE__) do
+      true -> :ets.new(@states_table, [:named_table, :set, :protected, read_concurrency: true])
+      :unnamed -> :ets.new(__MODULE__, [:set, :protected, read_concurrency: true])
+      _none -> nil
+    end
   end
 
   defp default_push(server, struct) do
@@ -832,7 +1116,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
         for %{mac: mac} = bulb <- bulbs,
             mac in members,
             into: %{},
-            do: {mac, {Map.get(bulb, :last_report_ms), Map.get(bulb, :dps) || %{}}}
+            do: {mac, Map.get(bulb, :dp_reported_at) || %{}}
 
       _error ->
         %{}

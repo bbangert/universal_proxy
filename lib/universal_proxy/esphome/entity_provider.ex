@@ -81,7 +81,8 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
     pubsub: :pubsub,
     update_device_config: :update_device_config,
     disconnect_clients: :disconnect_clients,
-    espex_devices: :espex_devices
+    espex_devices: :espex_devices,
+    push: :mesh_push
   ]
 
   @default_tick_ms 30_000
@@ -552,7 +553,16 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
           subscribe?: Keyword.get(opts, :subscribe, true),
           extra_topics: extra_topics,
           server: Keyword.get(opts, :server, Espex.Server),
-          sources: Map.take(sources, [:mesh_role, :mesh_inventory, :mesh_settings, :mesh_status])
+          sources:
+            Map.take(sources, [
+              :mesh_role,
+              :mesh_inventory,
+              :mesh_settings,
+              :mesh_status,
+              :mesh_device_ids,
+              :mesh_light_states,
+              :mesh_time_synced
+            ])
         ] ++ mesh_build_opts()
     )
   end
@@ -1003,7 +1013,10 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
       mesh_role: &Entities.mesh_role/0,
       mesh_inventory: &Store.inventory_summary/0,
       mesh_settings: &Store.settings/0,
-      mesh_status: &TuyaMesh.status/0
+      mesh_status: &TuyaMesh.status/0,
+      mesh_device_ids: &Store.device_ids/0,
+      mesh_light_states: &Commander.light_states/0,
+      mesh_time_synced: &MeshSync.time_synced?/0
     }
 
     Map.merge(defaults, Map.new(Keyword.get(opts, :sources, [])))

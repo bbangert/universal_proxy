@@ -16,6 +16,8 @@ defmodule UniversalProxy.TuyaMesh.FakeLights do
 
   def put(server, key, value), do: GenServer.call(server, {:put, key, value})
   def report(server, mac, ms), do: GenServer.call(server, {:report, mac, ms})
+  # A DP report at `ms`: Lights merges `dps` into the bulb's.
+  def report_dps(server, mac, ms, dps), do: GenServer.call(server, {:report_dps, mac, ms, dps})
   def pings(server), do: server |> log() |> Enum.map(&elem(&1, 0))
   # `[{mac | :all, at}]`, oldest first.
   def log(server), do: GenServer.call(server, :pings)
@@ -32,6 +34,7 @@ defmodule UniversalProxy.TuyaMesh.FakeLights do
        ping_reply: :ok,
        all_reply: nil,
        heard: %{},
+       dps: %{},
        on_ping: Keyword.get(opts, :on_ping, fn _mac -> :ok end),
        pings: []
      }}
@@ -46,7 +49,16 @@ defmodule UniversalProxy.TuyaMesh.FakeLights do
       state.bulbs
       |> Enum.sort()
       |> Enum.map(fn {mac, last} ->
-        %{mac: mac, last_report_ms: last, heard_ms: later(Map.get(state.heard, mac), last)}
+        {dps, event, stamps} = Map.get(state.dps, mac, {%{}, nil, %{}})
+
+        %{
+          mac: mac,
+          last_report_ms: last,
+          heard_ms: later(Map.get(state.heard, mac), last),
+          dps: dps,
+          dp_reported_at: stamps,
+          last_event: event
+        }
       end)
 
     {:reply, {:ok, bulbs}, state}
@@ -92,6 +104,18 @@ defmodule UniversalProxy.TuyaMesh.FakeLights do
 
   def handle_call({:report, mac, ms}, _from, state),
     do: {:reply, :ok, %{state | bulbs: Map.put(state.bulbs, mac, ms)}}
+
+  def handle_call({:report_dps, mac, ms, dps}, _from, state) do
+    {known, _event, stamps} = Map.get(state.dps, mac, {%{}, nil, %{}})
+    stamps = Map.merge(stamps, Map.new(dps, fn {dp, _v} -> {dp, ms} end))
+
+    {:reply, :ok,
+     %{
+       state
+       | bulbs: Map.put(state.bulbs, mac, ms),
+         dps: Map.put(state.dps, mac, {Map.merge(known, dps), {:dp_report, 7}, stamps})
+     }}
+  end
 
   def handle_call(:pings, _from, state), do: {:reply, Enum.reverse(state.pings), state}
 

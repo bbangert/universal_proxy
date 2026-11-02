@@ -269,6 +269,53 @@ defmodule UniversalProxy.TuyaMesh.Commands do
   end
 
   @doc """
+  Keeps the components (`components/2`) true to `reported`, DPs a bulb
+  reported (already merged into `dps`). The light's mode (DP2 in `dps`)
+  picks the DP that counts: in colour mode, a reported colour whose `v`
+  the kept components don't produce resets them to brightness `v`/100,
+  colour brightness and peak 1; otherwise a reported DP3 sets the
+  brightness. A reported mode (DP2) re-derives them the same way from the
+  new mode's DP, so a switch never keeps the old mode's brightness.
+  Anything else leaves them.
+  """
+  @spec reconcile_components(dps(), dps()) :: dps()
+  def reconcile_components(dps, reported) do
+    # Only the DP of the light's mode says its brightness: a merged report
+    # can carry an old colour while white, or an old DP3 while in colour.
+    # A reported mode (a switch) re-derives it from that mode's DP.
+    mode_reported? = Map.has_key?(reported, 2)
+
+    case {Map.get(dps, 2), Map.get(dps, 11), Map.get(dps, 3)} do
+      {1, <<_h::16, _s, v>>, _dp3} when v in 0..100 ->
+        if Map.has_key?(reported, 11) or mode_reported?,
+          do: colour_components(dps, v),
+          else: dps
+
+      {mode, _colour, dp3} when mode != 1 and is_integer(dp3) ->
+        if Map.has_key?(reported, 3) or mode_reported?,
+          do: Map.put(dps, :brightness, clamp(dp3, 10, 1000) / 1000),
+          else: dps
+
+      _other ->
+        dps
+    end
+  end
+
+  defp colour_components(dps, v) do
+    if components_give?(dps, v),
+      do: dps,
+      else: Map.merge(dps, %{brightness: v / 100, color_brightness: 1.0, peak: 1.0})
+  end
+
+  defp components_give?(%{brightness: b, color_brightness: cb} = dps, v)
+       when is_number(b) and is_number(cb) do
+    peak = Map.get(dps, :peak, 1.0)
+    (b * cb * peak * 100) |> round() |> clamp(1, 100) == clamp(v, 1, 100)
+  end
+
+  defp components_give?(_dps, _v), do: false
+
+  @doc """
   The components that an accepted batch setting `sent` (a DP map) makes
   true on the light: all of them with a colour (DP11), the brightness
   alone with DP3, none otherwise. A component whose DP never went out

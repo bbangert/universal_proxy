@@ -37,7 +37,10 @@ defmodule UniversalProxy.ESPHome.EntityProviderMeshTest do
                role: {:ok, @role},
                inventory: {:ok, summary()},
                settings: Store.default_settings(),
-               status: %{bulbs: []}
+               status: %{bulbs: []},
+               ids: %{{:bulb, @mac1} => 1, {:bulb, @mac2} => 2, {:group, 1} => 3},
+               synced: true,
+               light_states: []
              },
              initial
            )
@@ -51,7 +54,10 @@ defmodule UniversalProxy.ESPHome.EntityProviderMeshTest do
       mesh_role: get.(:role),
       mesh_inventory: get.(:inventory),
       mesh_settings: get.(:settings),
-      mesh_status: get.(:status)
+      mesh_status: get.(:status),
+      mesh_device_ids: get.(:ids),
+      mesh_time_synced: get.(:synced),
+      mesh_light_states: get.(:light_states)
     ]
 
     {sources, put}
@@ -80,7 +86,8 @@ defmodule UniversalProxy.ESPHome.EntityProviderMeshTest do
       disconnect_clients: fn server ->
         send(test, {:espex, :disconnect_clients, server})
         :ok
-      end
+      end,
+      mesh_push: fn _server, struct -> send(test, {:mesh_push, struct}) end
     ]
 
     start_supervised!({EP, Keyword.merge(defaults, opts)})
@@ -169,6 +176,130 @@ defmodule UniversalProxy.ESPHome.EntityProviderMeshTest do
 
       assert %Proto.BinarySensorStateResponse{state: false} =
                Enum.find(states, &(&1.key == key))
+    end
+
+    test "connectivity and last seen are pushed live, with device_id, only on change" do
+      {sources, _put} = start_inputs()
+      pid = start_provider(sources)
+      seen = ~U[2026-11-02 10:00:00Z]
+      status = %{bulbs: [%{mac: @mac1, reachable: true, last_seen: seen}]}
+
+      send(pid, {:tuya_mesh_status, status})
+      conn = Entities.key_for("tuya_dc23530fb34a_connectivity")
+      last = Entities.key_for("tuya_dc23530fb34a_last_seen")
+
+      assert_receive {:mesh_push,
+                      %Proto.BinarySensorStateResponse{key: ^conn, device_id: 1, state: true}}
+
+      assert_receive {:mesh_push,
+                      %Proto.TextSensorStateResponse{
+                        key: ^last,
+                        device_id: 1,
+                        state: "2026-11-02T10:00:00+00:00",
+                        missing_state: false
+                      }}
+
+      send(pid, {:tuya_mesh_status, status})
+      _ = :sys.get_state(pid)
+      refute_received {:mesh_push, _}
+    end
+
+    test "last seen stays hidden until the clock has synchronised" do
+      {sources, put} = start_inputs(%{synced: false})
+      pid = start_provider(sources)
+      seen = ~U[2026-11-02 10:00:00Z]
+      last = Entities.key_for("tuya_dc23530fb34a_last_seen")
+
+      send(pid, {:tuya_mesh_status, %{bulbs: [%{mac: @mac1, reachable: true, last_seen: seen}]}})
+
+      assert_receive {:mesh_push,
+                      %Proto.TextSensorStateResponse{key: ^last, missing_state: true, state: ""}}
+
+      assert %Proto.TextSensorStateResponse{missing_state: true} =
+               Enum.find(GenServer.call(pid, :initial_states), &(&1.key == last))
+
+      # Synchronised: the next check tick shows it.
+      put.(:synced, true)
+      send(pid, :mesh_check)
+
+      assert_receive {:mesh_push,
+                      %Proto.TextSensorStateResponse{key: ^last, missing_state: false}}
+    end
+
+    test "a status built before the sync never shows its 1970 date" do
+      {sources, put} = start_inputs(%{synced: false})
+      pid = start_provider(sources)
+      last = Entities.key_for("tuya_dc23530fb34a_last_seen")
+      heard = System.monotonic_time(:millisecond)
+
+      # Built before the sync: the wall clock it used said 1970.
+      status = %{
+        bulbs: [
+          %{mac: @mac1, reachable: true, last_seen: ~U[1970-01-01 00:00:05Z], last_seen_ms: heard}
+        ]
+      }
+
+      send(pid, {:tuya_mesh_status, status})
+      assert_receive {:mesh_push, %Proto.TextSensorStateResponse{key: ^last, missing_state: true}}
+
+      # The clock syncs; no new status arrives before the check tick.
+      put.(:synced, true)
+      send(pid, :mesh_check)
+
+      assert_receive {:mesh_push,
+                      %Proto.TextSensorStateResponse{
+                        key: ^last,
+                        missing_state: false,
+                        state: shown
+                      }}
+
+      refute shown =~ "1970"
+      assert shown =~ "#{Date.utc_today().year}"
+    end
+
+    test "a catch-up after a PubSub outage pushes what changed meanwhile" do
+      pubsub = :"ep_mesh_catchup_pubsub_#{System.unique_integer([:positive])}"
+
+      {sources, put} =
+        start_inputs(%{status: %{bulbs: [%{mac: @mac1, reachable: true, last_seen: nil}]}})
+
+      pid = start_provider(sources, subscribe: true, pubsub: pubsub)
+      conn = Entities.key_for("tuya_dc23530fb34a_connectivity")
+
+      # Unreachable while nothing was subscribed.
+      put.(:status, %{bulbs: [%{mac: @mac1, reachable: false, last_seen: nil}]})
+      start_supervised!({Phoenix.PubSub, name: pubsub})
+      fire(pid, :resubscribe)
+
+      assert_receive {:mesh_push,
+                      %Proto.BinarySensorStateResponse{key: ^conn, device_id: 1, state: false}}
+    end
+
+    test "no live push for a bulb whose sub-device changed" do
+      {sources, _put} = start_inputs(%{ids: %{{:bulb, @mac1} => 99, {:bulb, @mac2} => 2}})
+      pid = start_provider(sources)
+
+      send(pid, {:tuya_mesh_status, %{bulbs: [%{mac: @mac1, reachable: true, last_seen: nil}]}})
+      _ = :sys.get_state(pid)
+      refute_received {:mesh_push, _}
+    end
+
+    test "initial states carry the Commander's light states for current light entities" do
+      light = Entities.key_for("tuya_dc23530fb34a_light")
+      current = %Proto.LightStateResponse{key: light, device_id: 1, state: true}
+
+      {sources, _put} =
+        start_inputs(%{
+          light_states: [
+            current,
+            %Proto.LightStateResponse{key: light, device_id: 99, state: true},
+            %Proto.LightStateResponse{key: 12_345, device_id: 1, state: true}
+          ]
+        })
+
+      pid = start_provider(sources)
+      lights = for %Proto.LightStateResponse{} = r <- GenServer.call(pid, :initial_states), do: r
+      assert lights == [current]
     end
 
     test "no Bluetooth: no mesh entities, nothing read" do

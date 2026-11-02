@@ -99,6 +99,8 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
             desired: nil,
             source: :none,
             live: %{},
+            status: nil,
+            push: nil,
             pending: nil,
             read_timer: nil,
             read_backoff_ms: @default_retry_ms,
@@ -113,8 +115,11 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
   `mesh_inventory`, `mesh_settings`, `mesh_status` funs), `:reserved_keys`,
   `:on_collision`, `:debounce_ms`, `:retry_ms`, `:check_ms`, `:defer_ms`, and the Espex
   seams `:update_device_config` (`(server, opts) -> :ok | {:error, _}`),
-  `:disconnect_clients` (`(server) -> :ok`) and `:espex_devices`
-  (`(server) -> [Device.t()]`).
+  `:disconnect_clients` (`(server) -> :ok`), `:espex_devices`
+  (`(server) -> [Device.t()]`) and `:push` (`(server, struct) -> any`).
+  Optional sources: `mesh_device_ids` (`-> Store.device_ids/1`),
+  `mesh_light_states` (`-> [LightStateResponse]`, the Commander's) and
+  `mesh_time_synced` (`-> boolean`).
   """
   @spec new(keyword()) :: t()
   def new(opts) do
@@ -133,6 +138,7 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
         Keyword.get(opts, :update_device_config, &Espex.update_device_config/2),
       disconnect_clients: Keyword.get(opts, :disconnect_clients, &Espex.disconnect_clients/1),
       espex_devices: Keyword.get(opts, :espex_devices, &espex_devices/1),
+      push: Keyword.get(opts, :push, &push_state/2),
       debounce_ms: Keyword.get(opts, :debounce_ms, @default_debounce_ms),
       retry_ms: retry_ms,
       check_ms: Keyword.get(opts, :check_ms, @default_check_ms),
@@ -162,7 +168,8 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
         t -> t
       end
 
-    %{t | live: read_live(t)}
+    t = read_status(t)
+    if t.status, do: %{t | live: live_of(t, t.status)}, else: t
   end
 
   @doc """
@@ -208,9 +215,22 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
     end
   end
 
-  @doc "Initial states of the desired build, from the latest live values."
+  @doc """
+  Initial states of the desired build: connectivity and last seen from
+  the latest live values, lights as the Commander last pushed them (only
+  those of a current light entity, same key and sub-device).
+  """
   @spec state_responses(t()) :: [struct()]
-  def state_responses(t), do: Entities.state_responses(t.desired, t.live)
+  def state_responses(t),
+    do: Entities.state_responses(t.desired, t.live) ++ light_states(t)
+
+  defp light_states(t) do
+    lights = for %{type: :light} = e <- t.desired.entities, into: %{}, do: {e.key, e.device_id}
+
+    for %{key: key, device_id: id} = response <- source(t, :mesh_light_states, [], []),
+        Map.get(lights, key) == id,
+        do: response
+  end
 
   @doc "Entity key → target of the desired build."
   @spec keys(t()) :: %{non_neg_integer() => Entities.target()}
@@ -239,7 +259,7 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
   def handle_info({:bluetooth_state, _status}, t), do: {:ok, arm_read(t, t.debounce_ms)}
 
   def handle_info({:tuya_mesh_status, status}, t),
-    do: {:ok, %{t | live: Entities.live_from_status(status)}}
+    do: {:ok, refresh_live(%{t | status: status})}
 
   def handle_info({:mesh_read, token}, %{read_timer: token} = t),
     do: {:ok, read(%{t | read_timer: nil}, true)}
@@ -250,10 +270,12 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
   def handle_info({:mesh_resubscribe, token}, %{sub_timer: token} = t),
     do: {:ok, ensure_subscribed(%{t | sub_timer: nil})}
 
+  # The tick also re-derives the live values, so last seen appears once
+  # the clock has synchronised even with no new status.
   def handle_info(:mesh_check, t) do
     schedule_check(t)
     t = if t.subscribe?, do: ensure_subscribed(t), else: t
-    {:ok, verify_applied(t)}
+    {:ok, t |> verify_applied() |> refresh_live()}
   end
 
   def handle_info({:DOWN, mon, :process, _pid, _reason}, %{pubsub_mon: {_pid2, mon}} = t),
@@ -335,12 +357,104 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
   defp same?(a, b),
     do: a.devices == b.devices and Entities.advertisements(a) == Entities.advertisements(b)
 
-  defp read_live(t) do
-    t.sources.mesh_status.() |> Entities.live_from_status()
+  defp read_status(t) do
+    %{t | status: t.sources.mesh_status.()}
   rescue
-    _e -> t.live
+    _e -> t
   catch
-    :exit, _reason -> t.live
+    :exit, _reason -> t
+  end
+
+  # ── Live values ──────────────────────────────────────────────────────
+
+  # Last seen is hidden (missing_state) until the clock has synchronised:
+  # a pre-sync wall clock would show 1970. It is converted here, with the
+  # current offset, from the status' monotonic `last_seen_ms`, so a status
+  # built before the sync never exposes the date it computed then.
+  defp live_of(t, status) do
+    live = Entities.live_from_status(status)
+
+    if source(t, :mesh_time_synced, [], &time_synced?/0) do
+      seen_ms = last_seen_ms(status)
+
+      Map.new(live, fn {mac, v} ->
+        case Map.fetch(seen_ms, mac) do
+          {:ok, ms} -> {mac, %{v | last_seen: wall_time(ms)}}
+          :error -> {mac, v}
+        end
+      end)
+    else
+      Map.new(live, fn {mac, v} -> {mac, %{v | last_seen: nil}} end)
+    end
+  end
+
+  defp last_seen_ms(%{bulbs: bulbs}) when is_list(bulbs),
+    do: for(%{mac: mac, last_seen_ms: ms} <- bulbs, into: %{}, do: {mac, ms})
+
+  defp last_seen_ms(_status), do: %{}
+
+  defp wall_time(ms) when is_integer(ms) do
+    (ms + System.time_offset(:millisecond))
+    |> DateTime.from_unix!(:millisecond)
+    |> DateTime.truncate(:second)
+  end
+
+  defp wall_time(_ms), do: nil
+
+  # Pushes the connectivity and last-seen states that changed, each for
+  # its bulb's current sub-device only.
+  defp refresh_live(%{status: nil} = t), do: t
+
+  defp refresh_live(t) do
+    live = live_of(t, t.status)
+    changed = for {mac, v} <- live, Map.get(t.live, mac) != v, do: mac
+
+    if changed != [] and t.source != :none do
+      ids = source(t, :mesh_device_ids, [], &Store.device_ids/0)
+
+      entities =
+        for %{target: {:bulb, mac, kind}} = e <- t.desired.entities,
+            kind in [:connectivity, :last_seen],
+            mac in changed,
+            Map.get(ids, {:bulb, mac}) == e.device_id,
+            do: e
+
+      for response <- Entities.state_responses(%{t.desired | entities: entities}, live),
+          do: t.push.(t.server, response)
+    end
+
+    %{t | live: live}
+  end
+
+  @doc """
+  Whether the wall clock has synchronised (`NervesTime.synchronized?/0`);
+  `true` where NervesTime isn't there (host builds).
+  """
+  @spec time_synced?() :: boolean()
+  def time_synced? do
+    # Built at runtime: NervesTime is a target-only dependency.
+    nerves_time = Module.concat(["NervesTime"])
+
+    if Code.ensure_loaded?(nerves_time) and function_exported?(nerves_time, :synchronized?, 0),
+      do: nerves_time.synchronized?() == true,
+      else: true
+  end
+
+  # An optional source: its value, else `default` (a value, or a fun to call).
+  defp source(t, key, args, default) do
+    fun = Map.get(t.sources, key) || default
+    if is_function(fun), do: apply(fun, args), else: fun
+  rescue
+    _e -> if is_function(default), do: apply(default, args), else: default
+  catch
+    :exit, _reason -> if is_function(default), do: apply(default, args), else: default
+  end
+
+  # Espex's registry raises when it isn't started.
+  defp push_state(server, struct) do
+    Espex.push_state(server, struct)
+  rescue
+    ArgumentError -> :ok
   end
 
   # ── Apply ────────────────────────────────────────────────────────────
@@ -482,5 +596,7 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
     end
   end
 
-  defp catch_up(t), do: %{arm_read(t, 0) | live: read_live(t)}
+  # What was missed is pushed: `live` is what the connections were last
+  # given, so the recovered status is compared against it.
+  defp catch_up(t), do: t |> arm_read(0) |> read_status() |> refresh_live()
 end
