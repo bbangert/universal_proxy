@@ -66,6 +66,16 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   Uploads pass the inventory, keys and all, through `replace/3`, so
   `format_status/1` and every call handler redact it (`Redact`).
 
+  ## Reported DPs
+
+  Every status bulb carries `dps`, the DPs Lights has from the bulb's
+  reports (merged per MAC, like last seen, so a restarted Lights that
+  knows none yet never empties them), and `dps_at`, the Lights time
+  (`last_report_ms`, monotonic ms) of the newest DP report seen, or nil.
+  Lights is re-read on every Radio report (debounced), so a new report
+  reaches the broadcast within about 300 ms. Bulbs report only on acked
+  sets and pings (pings carry no DPs).
+
   ## Last seen and reachable
 
   Bulbs never report on their own, only in reply to a ping or an acked
@@ -174,6 +184,8 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
               node_id: non_neg_integer(),
               last_seen: DateTime.t() | nil,
               reachable: boolean(),
+              dps: %{optional(pos_integer()) => term()},
+              dps_at: integer() | nil,
               checking: boolean()
             }
           ],
@@ -229,7 +241,13 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
       bulbs:
         Enum.map(
           inventory.bulbs,
-          &Map.merge(&1, %{last_seen: nil, reachable: false, checking: false})
+          &Map.merge(&1, %{
+            last_seen: nil,
+            reachable: false,
+            checking: false,
+            dps: %{},
+            dps_at: nil
+          })
         ),
       groups: inventory.groups
     }
@@ -275,6 +293,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
       subscribed: nil,
       lights_running: false,
       last_reports: %{},
+      last_dps: %{},
       presence: %{},
       mesh_generation: 0,
       pinger_generation: 0,
@@ -753,7 +772,8 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
         reports =
           Enum.reduce(bulbs, state.last_reports, &put_report(&2, &1.mac, &1.heard_ms))
 
-        prune(%{state | lights_running: true, last_reports: reports})
+        dps = Enum.reduce(bulbs, state.last_dps, &put_dps/2)
+        prune(%{state | lights_running: true, last_reports: reports, last_dps: dps})
 
       {:error, _} ->
         %{state | lights_running: false}
@@ -761,6 +781,21 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   end
 
   # ── Presence ─────────────────────────────────────────────────────────
+
+  # A bulb's DPs and the time of its newest DP report: merged, so a
+  # restarted Lights (no DPs yet) never empties them. The time moves on a
+  # DP report (Lights' last event) or a change in the DPs.
+  defp put_dps(%{mac: mac} = bulb, acc) do
+    {known, at} = Map.get(acc, mac, {%{}, nil})
+    dps = Map.merge(known, Map.get(bulb, :dps) || %{})
+    reported = Map.get(bulb, :last_report_ms)
+
+    fresh? =
+      is_integer(reported) and (at == nil or reported > at) and
+        (match?({:dp_report, _}, Map.get(bulb, :last_event)) or dps != known)
+
+    Map.put(acc, mac, {dps, if(fresh?, do: reported, else: at)})
+  end
 
   # A restarted Lights reports every bulb unheard (nil): never let that
   # overwrite a known time.
@@ -844,13 +879,14 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
     %{
       state
       | last_reports: Map.take(state.last_reports, macs),
+        last_dps: Map.take(state.last_dps, macs),
         presence: Map.take(state.presence, macs)
     }
   end
 
   defp prune(state), do: state
 
-  defp forget_presence(state), do: %{state | last_reports: %{}, presence: %{}}
+  defp forget_presence(state), do: %{state | last_reports: %{}, last_dps: %{}, presence: %{}}
 
   defp bulb_presence(%{mesh: nil}, _last, _presence, _now), do: {false, false}
 
@@ -899,7 +935,15 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
           {reachable, checking} =
             bulb_presence(state, last, Map.get(state.presence, bulb.mac), now)
 
-          Map.merge(bulb, %{last_seen: last_seen(last), reachable: reachable, checking: checking})
+          {dps, dps_at} = Map.get(state.last_dps, bulb.mac, {%{}, nil})
+
+          Map.merge(bulb, %{
+            last_seen: last_seen(last),
+            reachable: reachable,
+            checking: checking,
+            dps: dps,
+            dps_at: dps_at
+          })
         end),
       groups: inventory.groups
     }

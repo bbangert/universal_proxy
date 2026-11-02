@@ -606,6 +606,27 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
       assert %{last_seen: nil, reachable: false} = bulb(ctx, @bulb2)
     end
 
+    test "reported DPs reach the status and survive a Lights restart", ctx do
+      at = now_ms()
+      :ok = FakeLights.report_dps(ctx.lights, @bulb2, at, %{1 => true, 3 => 500})
+      wait_until(fn -> match?(%{dps_at: ^at}, bulb(ctx, @bulb2)) end)
+      assert %{dps: %{1 => true, 3 => 500}} = bulb(ctx, @bulb2)
+      assert %{dps: dps, dps_at: nil} = bulb(ctx, @bulb3)
+      assert dps == %{}
+
+      # A later report merges into what was known.
+      later = at + 10
+      :ok = FakeLights.report_dps(ctx.lights, @bulb2, later, %{3 => 600})
+      wait_until(fn -> match?(%{dps_at: ^later}, bulb(ctx, @bulb2)) end)
+      assert %{dps: %{1 => true, 3 => 600}} = bulb(ctx, @bulb2)
+
+      # A restarted Lights knows no DPs: the status keeps them.
+      :ok = FakeLights.put(ctx.lights, :dps, %{})
+      :ok = FakeLights.put(ctx.lights, :bulbs, %{@bulb2 => nil, @bulb3 => nil})
+      Process.sleep(60)
+      assert %{dps: %{1 => true, 3 => 600}, dps_at: ^later} = bulb(ctx, @bulb2)
+    end
+
     test "a new mesh forgets what the old one heard", ctx do
       :ok = FakeLights.report(ctx.lights, @bulb2, now_ms())
       wait_until(fn -> match?(%{last_seen: %DateTime{}}, bulb(ctx, @bulb2)) end)

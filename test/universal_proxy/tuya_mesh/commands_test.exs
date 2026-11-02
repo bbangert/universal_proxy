@@ -415,6 +415,36 @@ defmodule UniversalProxy.TuyaMesh.CommandsTest do
     end
   end
 
+  describe "reconcile_components/2" do
+    test "a reported colour the kept components produce keeps them" do
+      dps = %{2 => 1, 11 => <<0::16, 100, 25>>, brightness: 0.5, color_brightness: 0.5, peak: 1.0}
+      assert Commands.reconcile_components(dps, %{11 => <<0::16, 100, 25>>}) == dps
+    end
+
+    test "a reported colour they don't produce resets them from its v" do
+      dps = %{2 => 1, 11 => <<0::16, 100, 40>>, brightness: 0.5, color_brightness: 0.5, peak: 1.0}
+
+      assert %{brightness: 0.4, color_brightness: 1.0, peak: 1.0} =
+               Commands.reconcile_components(dps, %{11 => <<0::16, 100, 40>>})
+
+      assert %{brightness: 0.4, color_brightness: 1.0, peak: 1.0} =
+               Commands.reconcile_components(%{11 => <<0::16, 1, 40>>}, %{11 => <<0::16, 1, 40>>})
+    end
+
+    test "a reported DP3 sets the brightness in white mode only" do
+      assert %{brightness: 0.3} =
+               Commands.reconcile_components(%{2 => 0, 3 => 300, brightness: 1.0}, %{3 => 300})
+
+      colour = %{2 => 1, 3 => 300, brightness: 1.0}
+      assert Commands.reconcile_components(colour, %{3 => 300}) == colour
+    end
+
+    test "other reports leave them" do
+      dps = %{1 => true, brightness: 0.2}
+      assert Commands.reconcile_components(dps, %{1 => true}) == dps
+    end
+  end
+
   describe "state_response/4" do
     test "unknown on/off is no state" do
       assert Commands.state_response(%{3 => 500}, @settings, 1, 2) == nil

@@ -269,6 +269,40 @@ defmodule UniversalProxy.TuyaMesh.Commands do
   end
 
   @doc """
+  Keeps the components (`components/2`) true to `reported`, DPs a bulb
+  reported (already merged into `dps`): a reported colour whose `v` the
+  kept components don't produce resets them to brightness `v`/100, colour
+  brightness and peak 1; a reported DP3 in white mode sets the
+  brightness. Anything else leaves them.
+  """
+  @spec reconcile_components(dps(), dps()) :: dps()
+  def reconcile_components(dps, reported) do
+    cond do
+      match?(<<_h::16, _s, _v>>, Map.get(reported, 11)) ->
+        <<_h::16, _s, v>> = reported[11]
+
+        if components_give?(dps, v),
+          do: dps,
+          else:
+            Map.merge(dps, %{brightness: clamp(v, 0, 100) / 100, color_brightness: 1.0, peak: 1.0})
+
+      is_integer(Map.get(reported, 3)) and Map.get(dps, 2) != 1 ->
+        Map.put(dps, :brightness, clamp(reported[3], 10, 1000) / 1000)
+
+      true ->
+        dps
+    end
+  end
+
+  defp components_give?(%{brightness: b, color_brightness: cb} = dps, v)
+       when is_number(b) and is_number(cb) do
+    peak = Map.get(dps, :peak, 1.0)
+    (b * cb * peak * 100) |> round() |> clamp(1, 100) == clamp(v, 1, 100)
+  end
+
+  defp components_give?(_dps, _v), do: false
+
+  @doc """
   The components that an accepted batch setting `sent` (a DP map) makes
   true on the light: all of them with a colour (DP11), the brightness
   alone with DP3, none otherwise. A component whose DP never went out

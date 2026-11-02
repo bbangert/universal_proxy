@@ -143,6 +143,9 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       device_ids: fn -> Agent.get(agent, & &1.ids) end,
       radio_status: fn -> Agent.get(agent, &radio_status/1) end,
       radio_poll_ms: 10,
+      # Status-driven pushes only where a test asks for them.
+      push_debounce_ms: 60_000,
+      settings: fn -> @settings end,
       subscribe: false,
       window_ms: 20,
       retry_ms: 1,
@@ -205,6 +208,64 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
 
   defp now, do: System.monotonic_time(:millisecond)
 
+  @groups [%{local_id: 1, members: [@a, @b, @c]}, %{local_id: 3, members: [@b, @c]}]
+
+  # A Resolver status: `bulbs` as {mac, dps, dps_at}.
+  defp status(bulbs, groups \\ @groups) do
+    %{
+      bulbs: for({mac, dps, at} <- bulbs, do: %{mac: mac, dps: dps, dps_at: at}),
+      groups: groups
+    }
+  end
+
+  defp report(pid, bulbs) do
+    send(pid, {:tuya_mesh_status, status(bulbs)})
+    flushed(pid)
+  end
+
+  # Waits until nothing is waiting to be pushed.
+  defp flushed(pid, deadline \\ System.monotonic_time(:millisecond) + 10_000) do
+    state = :sys.get_state(pid)
+
+    cond do
+      state.flush == nil and MapSet.size(state.dirty) == 0 ->
+        state
+
+      System.monotonic_time(:millisecond) > deadline ->
+        flunk("pushes still pending")
+
+      true ->
+        Process.sleep(5)
+        flushed(pid, deadline)
+    end
+  end
+
+  # Every push so far, by device id, in order.
+  defp pushes(acc \\ []) do
+    receive do
+      {:push, %LightStateResponse{} = r} -> pushes([r | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
+  defp key_of({:bulb, mac}),
+    do:
+      UniversalProxy.TuyaMesh.Entities.key_for(
+        UniversalProxy.TuyaMesh.Entities.object_id({:bulb, mac, :light})
+      )
+
+  defp key_of({:group, gid}),
+    do:
+      UniversalProxy.TuyaMesh.Entities.key_for(
+        UniversalProxy.TuyaMesh.Entities.object_id({:group, gid, :light})
+      )
+
+  defp of(pushed, device_id), do: Enum.filter(pushed, &(&1.device_id == device_id))
+
+  defp last_push(pushed, device_id),
+    do: pushed |> Enum.filter(&(&1.device_id == device_id)) |> List.last()
+
   # The Radio's queue as the test sets it (`:radio_queued`, default empty;
   # `:down` for a Radio that doesn't answer).
   defp radio_status(s) do
@@ -258,7 +319,7 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       assert_receive {:lights, {:set, @a, [brightness: 1000], [ack: true]}}, 2_000
 
       assert_receive {:push, %LightStateResponse{} = r}, 2_000
-      assert %{key: 77, device_id: 5, state: true, brightness: 1.0} = r
+      assert %{device_id: 5, state: true, brightness: 1.0} = r
       assert r.color_mode == :COLOR_MODE_COLOR_TEMPERATURE
       assert r.color_temperature == 370.0
       assert idle(pid).jobs == %{}
@@ -423,6 +484,124 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
     end
   end
 
+  describe "light state" do
+    @on_white %{1 => true, 2 => 0, 3 => 1000, 4 => 0}
+    @off %{1 => false, 2 => 0, 3 => 1000, 4 => 0}
+
+    test "a group command, then member reports: members pushed, groups re-derived" do
+      {pid, _agent} = start(push_debounce_ms: 10)
+      report(pid, [])
+
+      Commander.command(cmd({:group, 1}, on()), pid)
+      idle(pid)
+      flushed(pid)
+      # The group's own optimistic state at once (no member known yet).
+      assert %{state: true} = last_push(pushes(), 6)
+
+      at = now()
+      report(pid, for(mac <- [@a, @b, @c], do: {mac, @on_white, at}))
+      pushed = pushes()
+
+      for id <- [5, 7, 8] do
+        assert %{state: true, brightness: 1.0, color_temperature: 370.0} = last_push(pushed, id)
+      end
+
+      # Group 3 (B, C) is derived too; group 1 already showed on.
+      assert %{state: true} = last_push(pushed, 11)
+      assert key_of({:group, 3}) == last_push(pushed, 11).key
+      assert key_of({:bulb, @a}) == last_push(pushed, 5).key
+    end
+
+    test "overlapping groups stay consistent: 'all' off clears a stale 'on'" do
+      {pid, _agent} = start(push_debounce_ms: 10)
+      at = now()
+      report(pid, for(mac <- [@a, @b, @c], do: {mac, @off, at}))
+      _ = pushes()
+
+      # Group 3 is turned on (optimistic, members follow), then group 1 off.
+      Commander.command(cmd({:group, 3}, on()), pid)
+      idle(pid)
+      flushed(pid)
+      assert %{state: true} = last_push(pushes(), 11)
+
+      Commander.command(cmd({:group, 1}, %Req{has_state: true, state: false}), pid)
+      idle(pid)
+      flushed(pid)
+      pushed = pushes()
+      assert %{state: false} = last_push(pushed, 6)
+      assert %{state: false} = last_push(pushed, 11)
+
+      # The bulbs then report off: nothing changes, nothing more is pushed.
+      later = now() + 1
+      report(pid, for(mac <- [@a, @b, @c], do: {mac, @off, later}))
+      assert pushes() == []
+    end
+
+    test "a real report supersedes only what was set before it" do
+      {pid, _agent} = start(push_debounce_ms: 10)
+      at = now()
+      report(pid, [{@a, @on_white, at}])
+      assert [%{device_id: 5, brightness: 1.0}] = of(pushes(), 5)
+
+      Commander.command(cmd({:bulb, @a}, %Req{has_brightness: true, brightness: 0.5}), pid)
+      idle(pid)
+      assert %{brightness: 0.5} = last_push(pushes(), 5)
+
+      # A report older than the send: its brightness doesn't win.
+      report(pid, [{@a, Map.put(@on_white, 1, true), at + 1}])
+      assert of(pushes(), 5) == []
+
+      # A newer one does.
+      report(pid, [{@a, @on_white, now() + 1}])
+      assert [%{device_id: 5, brightness: 1.0}] = of(pushes(), 5)
+    end
+
+    test "a reported colour resets components its v doesn't match" do
+      {pid, _agent} = start(push_debounce_ms: 10)
+      report(pid, [{@a, %{1 => true, 2 => 1, 11 => <<120::16, 100, 40>>}, now()}])
+
+      assert [%{device_id: 5, brightness: 0.4, color_brightness: 1.0}] = of(pushes(), 5)
+
+      assert %{brightness: 0.4, color_brightness: 1.0, peak: 1.0} =
+               :sys.get_state(pid).views[{:bulb, @a}].dps
+    end
+
+    test "no push for unknown on/off, a stale sub-device, or an unchanged state" do
+      {pid, _agent} = start(push_debounce_ms: 10)
+
+      report(pid, [{@a, %{3 => 500}, now()}, {"FFFFFFFFFFFF", @on_white, now()}])
+      assert pushes() == []
+
+      report(pid, [{@a, @on_white, now()}])
+      assert [_] = of(pushes(), 5)
+      report(pid, [{@a, @on_white, now() + 5}])
+      assert pushes() == []
+    end
+
+    test "a burst of reports is one push per light" do
+      {pid, _agent} = start(push_debounce_ms: 100)
+      at = now()
+
+      for {dps, i} <- Enum.with_index([@off, @on_white, %{@on_white | 3 => 300}]) do
+        send(pid, {:tuya_mesh_status, status([{@a, dps, at + i}])})
+      end
+
+      flushed(pid)
+
+      assert [%{device_id: 5, state: true, brightness: 0.3}] = of(pushes(), 5)
+    end
+
+    test "what was pushed is kept for new connections" do
+      {pid, _agent} = start(push_debounce_ms: 10, states_table: :unnamed)
+      report(pid, [{@a, @on_white, now()}])
+
+      states = Commander.light_states(:sys.get_state(pid).states)
+      assert [%LightStateResponse{state: true}] = of(states, 5)
+      # A's groups were derived from it.
+      assert [%LightStateResponse{state: true}] = of(states, 6)
+    end
+  end
+
   describe "group" do
     test "members that didn't confirm get direct follow-ups; confirmers don't" do
       {pid, _agent} = start(script: %{hears: [@a]})
@@ -433,7 +612,7 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
                      2_000
 
       assert_receive {:lights, {:group_set, 1, [brightness: 1000], [ack: true]}}, 2_000
-      assert_receive {:push, %LightStateResponse{key: 88, device_id: 6, state: true}}, 2_000
+      assert_receive {:push, %LightStateResponse{device_id: 6, state: true}}, 2_000
 
       idle(pid)
       followups = sets()
@@ -772,7 +951,7 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       idle(pid)
 
       assert {@a, [on: true]} in sets()
-      assert_received {:push, %LightStateResponse{key: 77, device_id: 7, state: false}}
+      assert_received {:push, %LightStateResponse{device_id: 7, state: false}}
       refute_received {:push, _}
       assert Map.keys(:sys.get_state(pid).views) == [{:bulb, @b}]
     end
