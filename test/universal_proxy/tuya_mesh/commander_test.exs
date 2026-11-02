@@ -48,6 +48,7 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
     end
 
     defp handle({:set, mac, batch, opts} = req, s) do
+      s = s.on_set.(mac, s)
       send(s.test, {:lights, req})
       send(s.test, {:set_at, mac, System.monotonic_time(:millisecond)})
       {reply, rest} = pop(Map.get(s.set, mac, []))
@@ -120,7 +121,8 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
                clock: 0,
                ids: @ids,
                all_reads: 0,
-               on_all: & &1
+               on_all: & &1,
+               on_set: fn _mac, s -> s end
              },
              script
            )
@@ -523,6 +525,50 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       # and only then the follow-ups the check planned during the hold.
       assert [{@e, _}, {@e, _} | followups] = sets()
       assert length(followups) == 3
+    end
+
+    test "a newer command arriving during a failed send is admitted before the next old frame" do
+      # A's follow-up fails; while that call runs, B is turned off.
+      off = cmd({:bulb, @b}, %Req{has_state: true, state: false})
+
+      on_set = fn
+        @a, %{commander: commander} = s ->
+          Commander.command(off, commander)
+          s
+
+        _mac, s ->
+          s
+      end
+
+      {pid, agent} = start(script: %{set: %{@a => [{:error, :not_ready}]}, on_set: on_set})
+      Agent.update(agent, &Map.put(&1, :commander, pid))
+
+      Commander.command(cmd({:group, 1}, on()), pid)
+      idle(pid)
+
+      followups = sets()
+      assert {@b, [on: false]} in followups
+      refute {@b, [on: true]} in followups
+      assert {@c, [on: true]} in followups
+    end
+
+    test "an expiring command whose light was replaced is abandoned, not pushed" do
+      script = %{group_set: [:ok, {:error, :busy}]}
+
+      {pid, agent} =
+        start(script: script, retry_ms: 10_000, max_retry_ms: 10_000, stale_ms: 200)
+
+      # The first frame is accepted, the second held past the bound.
+      Commander.command(cmd({:group, 1}, warm_full_on()), pid)
+      assert_receive {:lights, {:group_set, 1, [brightness: 1000], _}}, 2_000
+      assert Map.has_key?(:sys.get_state(pid).views, {:group, 1})
+
+      # The mesh is replaced and no Store broadcast reaches us.
+      new_mesh(agent, %{{:group, 1} => 42})
+      idle(pid)
+
+      refute_received {:push, _}
+      refute Map.has_key?(:sys.get_state(pid).views, {:group, 1})
     end
 
     test "a burst of group on/off/on ends in the last state" do

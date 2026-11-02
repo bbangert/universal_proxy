@@ -363,7 +363,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       # A bulb that failed gets none of its later frames either.
       {:error, reason} ->
         Logger.info("TuyaMesh.Commander: direct send to #{mac} failed: #{inspect(reason)}")
-        run(state, %{job | pending: drop_mac(rest, mac)})
+        continue(state, %{job | pending: drop_mac(rest, mac)}, 0)
     end
   end
 
@@ -524,8 +524,10 @@ defmodule UniversalProxy.TuyaMesh.Commander do
 
   # ── Dispatch ─────────────────────────────────────────────────────────
 
-  # One action per dispatch: commands that arrived meanwhile are admitted
-  # (and supersede) before the next frame.
+  # One action per dispatch, and at most one Lights call: commands that
+  # arrived meanwhile (even during that call) are admitted, and supersede,
+  # before the next frame. Every path that has made a call returns here
+  # through `continue/3` rather than trying the next frame itself.
   defp dispatch(state) do
     now = now()
     state = state |> expire(now) |> signal_activity(false)
@@ -604,7 +606,10 @@ defmodule UniversalProxy.TuyaMesh.Commander do
     state.jobs
     |> Map.values()
     |> Enum.filter(&(&1.deadline < now))
-    |> Enum.reduce(state, &expire_job(&2, &1))
+    |> Enum.reduce(state, fn job, state ->
+      # A light that is no longer the one commanded gets no push.
+      if current?(state, job), do: expire_job(state, job), else: abandon(state, job)
+    end)
   end
 
   defp expire_job(state, %{phase: phase} = job) when phase in [:send, :direct] do
