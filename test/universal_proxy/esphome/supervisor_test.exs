@@ -136,6 +136,8 @@ defmodule UniversalProxy.ESPHome.SupervisorTest do
 
       assert devices_of(ESPHomeSupervisor.refresh_devices(opts, fun.())) == live
       assert devices_of(ESPHomeSupervisor.refresh_devices(opts, :error)) == @devices
+      # A provider that doesn't know the mesh yet never empties Espex's list.
+      assert devices_of(ESPHomeSupervisor.refresh_devices(opts, {:error, :unknown})) == @devices
     end
 
     test "the default live source is the running provider (no Bluetooth here: no devices)" do

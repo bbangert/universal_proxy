@@ -151,7 +151,11 @@ defmodule UniversalProxy.TuyaMesh.Store do
 
   `inventory_summary/1` is the key-free view the HA entities are built from:
   the bulbs (MAC, label) and groups (local id, name) with their sub-device
-  ids, read in one call so they always agree.
+  ids, read in one call so they always agree. The bulbs and groups are also
+  stored key-free in the same insert as every inventory, so a stored
+  inventory that stops validating (a schema change in an update, a
+  corrupted record) still has a summary to serve: Home Assistant deletes
+  sub-devices it isn't shown, and the user re-uploading is what fixes it.
 
   `:max_dump_advance` (default and maximum 299, see above) sets the bound.
 
@@ -315,9 +319,11 @@ defmodule UniversalProxy.TuyaMesh.Store do
   @doc """
   The stored inventory without keys, plus every allocated sub-device id
   (see the moduledoc): `{:ok, %{bulbs:, groups:, device_ids:}}`, with empty
-  lists when nothing is stored. `{:error, :invalid_inventory}` for a record
-  that no longer validates and `{:error, :unavailable}` when the Store is
-  down, so a caller can tell "nothing stored" from "can't tell".
+  lists when nothing is stored, and the last stored summary for a record
+  that no longer validates. `{:error, :invalid_inventory}` for such a
+  record without one (written before summaries were stored) and
+  `{:error, :unavailable}` when the Store is down, so a caller can tell
+  "nothing stored" from "can't tell".
   """
   @spec inventory_summary(GenServer.server()) ::
           {:ok, inventory_summary()} | {:error, :invalid_inventory | :unavailable}
@@ -540,15 +546,13 @@ defmodule UniversalProxy.TuyaMesh.Store do
           {:ok, %{bulbs: [], groups: [], device_ids: ids}}
 
         {:valid, inv} ->
-          {:ok,
-           %{
-             bulbs: Enum.map(inv.bulbs, &%{mac: &1.mac, label: &1.label}),
-             groups: Enum.map(inv.groups, &%{local_id: &1.local_id, name: &1.name}),
-             device_ids: ids
-           }}
+          {:ok, Map.put(summary_of(inv), :device_ids, ids)}
 
         {:invalid, _raw} ->
-          {:error, :invalid_inventory}
+          case lookup(state.table, :summary, nil) do
+            %{bulbs: _, groups: _} = summary -> {:ok, Map.put(summary, :device_ids, ids)}
+            _none -> {:error, :invalid_inventory}
+          end
       end
 
     {:reply, reply, state}
@@ -896,8 +900,12 @@ defmodule UniversalProxy.TuyaMesh.Store do
     ids = prune_groups(ids, Enum.map(inv.groups, & &1.local_id))
 
     inserts =
-      [{:inventory, Inventory.to_map(inv)}, {:device_ids, ids}, {:next_device_id, next}] ++
-        extra
+      [
+        {:inventory, Inventory.to_map(inv)},
+        {:summary, summary_of(inv)},
+        {:device_ids, ids},
+        {:next_device_id, next}
+      ] ++ extra
 
     write(state, inserts)
   end
@@ -906,11 +914,25 @@ defmodule UniversalProxy.TuyaMesh.Store do
   defp write_clear(state, floors) do
     ids = state.table |> lookup(:device_ids, %{}) |> prune_groups([])
 
-    inserts = [{:inventory, nil}, {:device_ids, ids}, {:seq_floors, floors}, bump(state.table)]
+    inserts = [
+      {:inventory, nil},
+      {:summary, nil},
+      {:device_ids, ids},
+      {:seq_floors, floors},
+      bump(state.table)
+    ]
 
     with :ok <- write(state, inserts) do
       notify(state)
     end
+  end
+
+  # Key-free by construction: MACs, labels, group ids and names only.
+  defp summary_of(inv) do
+    %{
+      bulbs: Enum.map(inv.bulbs, &%{mac: &1.mac, label: &1.label}),
+      groups: Enum.map(inv.groups, &%{local_id: &1.local_id, name: &1.name})
+    }
   end
 
   # PubSub's registry raises (not exits) when it isn't started.

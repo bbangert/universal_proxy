@@ -76,6 +76,7 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
     debounce_ms: :mesh_debounce_ms,
     retry_ms: :mesh_retry_ms,
     check_ms: :mesh_check_ms,
+    defer_ms: :mesh_defer_ms,
     pubsub: :pubsub,
     update_device_config: :update_device_config,
     disconnect_clients: :disconnect_clients,
@@ -240,8 +241,16 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
 
   # ── EntityProvider callbacks ────────────────────────────────────────
 
+  # `:defer` while the Tuya mesh is unknown (MeshSync, "Never no mesh from
+  # not knowing"): exiting here, in the connection's accept, refuses the
+  # connection, so HA retries instead of deleting the mesh's entities.
   @impl Espex.EntityProvider
-  def list_entities, do: GenServer.call(__MODULE__, :list_entities)
+  def list_entities do
+    case GenServer.call(__MODULE__, :list_entities) do
+      :defer -> exit({:shutdown, :tuya_mesh_unknown})
+      entities -> entities
+    end
+  end
 
   @impl Espex.EntityProvider
   def initial_states, do: GenServer.call(__MODULE__, :initial_states)
@@ -251,9 +260,11 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
 
   @doc """
   The Tuya mesh sub-devices the advertised entities belong to, `{:ok,
-  devices}`, or `:error` when this provider isn't running.
+  devices}`; `{:error, :unknown}` while the mesh couldn't be read yet, and
+  `:error` when this provider isn't running.
   """
-  @spec mesh_devices(GenServer.server()) :: {:ok, [Espex.DeviceConfig.Device.t()]} | :error
+  @spec mesh_devices(GenServer.server()) ::
+          {:ok, [Espex.DeviceConfig.Device.t()]} | {:error, :unknown} | :error
   def mesh_devices(server \\ __MODULE__) do
     GenServer.call(server, :mesh_devices)
   catch
@@ -379,8 +390,14 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
 
   @impl GenServer
   def handle_call(:list_entities, _from, state) do
-    {:reply, advertisements(@specs, state.supported?) ++ MeshSync.advertisements(state.mesh),
-     state}
+    case MeshSync.advertisements(state.mesh) do
+      :defer ->
+        Logger.info("EntityProvider: Tuya mesh not read yet; refusing a connection")
+        {:reply, :defer, state}
+
+      mesh ->
+        {:reply, advertisements(@specs, state.supported?) ++ mesh, state}
+    end
   end
 
   # Returns the last-polled values (seeded at startup) — no source reads on
@@ -391,8 +408,7 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
        MeshSync.state_responses(state.mesh), state}
   end
 
-  def handle_call(:mesh_devices, _from, state),
-    do: {:reply, {:ok, MeshSync.devices(state.mesh)}, state}
+  def handle_call(:mesh_devices, _from, state), do: {:reply, MeshSync.devices(state.mesh), state}
 
   # Exposed for tests that drive a tick deterministically (no reschedule).
   def handle_call(:poll_now, _from, state) do

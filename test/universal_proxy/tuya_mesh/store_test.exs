@@ -554,11 +554,11 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
 
       {:ok, _} = Store.replace(inventory(), [], store)
       assert_received {:write, keys}
-      assert [:inventory, :device_ids, :next_device_id | _] = keys
+      assert [:inventory, :summary, :device_ids, :next_device_id | _] = keys
       refute_received {:write, _}
 
       :ok = Store.clear(store)
-      assert_received {:write, [:inventory, :device_ids, :seq_floors, :revision]}
+      assert_received {:write, [:inventory, :summary, :device_ids, :seq_floors, :revision]}
       refute_received {:write, _}
     end
 
@@ -647,6 +647,22 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
       down = :"down_#{System.unique_integer([:positive])}"
       assert {:error, :unavailable} = Store.inventory_summary(down)
 
+      :ok = :dets.insert(ctx.table, {:inventory, %{"beaconKey" => "nope"}})
+      assert {:error, :invalid_inventory} = Store.inventory_summary(ctx.store)
+    end
+
+    test "a stored inventory that stops validating still serves its last summary", ctx do
+      {:ok, _} = Store.replace(inventory(), [], ctx.store)
+      {:ok, good} = Store.inventory_summary(ctx.store)
+
+      :ok = :dets.insert(ctx.table, {:inventory, %{"beaconKey" => "nope"}})
+      assert {:error, {:invalid, _}} = Store.load(ctx.store)
+      assert {:ok, ^good} = Store.inventory_summary(ctx.store)
+      refute_secrets(:dets.lookup(ctx.table, :summary))
+
+      # A clear drops it with the inventory.
+      :ok = Store.clear(ctx.store, force: true)
+      assert {:ok, %{bulbs: [], groups: []}} = Store.inventory_summary(ctx.store)
       :ok = :dets.insert(ctx.table, {:inventory, %{"beaconKey" => "nope"}})
       assert {:error, :invalid_inventory} = Store.inventory_summary(ctx.store)
     end

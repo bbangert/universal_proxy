@@ -29,6 +29,26 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
   with `desired`: an Espex that restarted on other ones (it read them just
   before a change, or fell back to its init-time ones) gets them applied.
 
+  ## Never "no mesh" from not knowing
+
+  Home Assistant deletes the sub-devices and entities a connection doesn't
+  list, so a build that couldn't be read must never be advertised as an
+  empty one. `source` says where `desired` came from: `:read` (this
+  process read it), `:last_good` (inputs unreadable at start: the last
+  build read in this boot, kept in `:persistent_term` per Espex server so
+  it outlives provider and ESPHome restarts; it is only written when it
+  changes), or `:none` (nothing known yet).
+
+  With `:none`, `devices/1` is `{:error, :unknown}`, so Espex keeps the
+  sub-devices `ESPHome.Supervisor.init/1` started it with
+  (`boot_devices/1`), and `advertisements/1` is `:defer` for up to
+  `:defer_ms` (2 min) from start: the provider then refuses the connection
+  and HA retries, rather than reconcile against a list without the mesh.
+  After that window it advertises what it has (an inventory that can't be
+  read for that long is a fault the user has to fix, and HA must not stay
+  locked out of the device meanwhile). A stored inventory that stops
+  validating is not this case: the Store serves its last key-free summary.
+
   ## Subscriptions
 
   The topics are held for as long as this runs, through PubSub restarts
@@ -53,6 +73,7 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
   @max_retry_ms 30_000
   @default_check_ms 30_000
   @resubscribe_ms 1_000
+  @default_defer_ms 120_000
 
   @type t :: %__MODULE__{}
 
@@ -70,7 +91,10 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
             debounce_ms: @default_debounce_ms,
             retry_ms: @default_retry_ms,
             check_ms: @default_check_ms,
+            defer_ms: @default_defer_ms,
+            defer_until: nil,
             desired: nil,
+            source: :none,
             live: %{},
             pending: nil,
             read_timer: nil,
@@ -84,7 +108,7 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
   New state, nothing read or subscribed yet. `opts`: `:enabled?`,
   `:subscribe?`, `:server`, `:pubsub`, `:extra_topics`, `:sources` (`mesh_role`,
   `mesh_inventory`, `mesh_settings`, `mesh_status` funs), `:reserved_keys`,
-  `:on_collision`, `:debounce_ms`, `:retry_ms`, `:check_ms`, and the Espex
+  `:on_collision`, `:debounce_ms`, `:retry_ms`, `:check_ms`, `:defer_ms`, and the Espex
   seams `:update_device_config` (`(server, opts) -> :ok | {:error, _}`),
   `:disconnect_clients` (`(server) -> :ok`) and `:espex_devices`
   (`(server) -> [Device.t()]`).
@@ -109,6 +133,7 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
       debounce_ms: Keyword.get(opts, :debounce_ms, @default_debounce_ms),
       retry_ms: retry_ms,
       check_ms: Keyword.get(opts, :check_ms, @default_check_ms),
+      defer_ms: Keyword.get(opts, :defer_ms, @default_defer_ms),
       desired: Entities.empty(),
       read_backoff_ms: retry_ms,
       apply_backoff_ms: retry_ms
@@ -126,16 +151,55 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
   def start(t) do
     {t, _added} = if t.subscribe?, do: subscribe(t), else: {t, []}
     schedule_check(t)
-    %{read(t, false) | live: read_live(t)}
+    t = %{t | defer_until: now() + t.defer_ms}
+
+    t =
+      case read(t, false) do
+        %{source: :none} = t -> seed_last_good(t)
+        t -> t
+      end
+
+    %{t | live: read_live(t)}
   end
 
-  @doc "The desired build's sub-devices."
-  @spec devices(t()) :: [Device.t()]
-  def devices(t), do: t.desired.devices
+  @doc """
+  The desired build's sub-devices, or `{:error, :unknown}` when nothing is
+  known yet (see the moduledoc).
+  """
+  @spec devices(t()) :: {:ok, [Device.t()]} | {:error, :unknown}
+  def devices(%__MODULE__{enabled?: false}), do: {:ok, []}
+  def devices(%{source: :none}), do: {:error, :unknown}
+  def devices(t), do: {:ok, t.desired.devices}
 
-  @doc "The desired build's advertisements."
-  @spec advertisements(t()) :: [struct()]
+  @doc """
+  The desired build's advertisements, or `:defer` while nothing is known
+  and the defer window is open (see the moduledoc).
+  """
+  @spec advertisements(t()) :: [struct()] | :defer
+  def advertisements(%{enabled?: true, source: :none} = t) do
+    if now() < t.defer_until, do: :defer, else: Entities.advertisements(t.desired)
+  end
+
   def advertisements(t), do: Entities.advertisements(t.desired)
+
+  @doc """
+  The sub-devices to start Espex with before any provider runs: a fresh
+  read, else the last good build of this boot (`[]` if none). `sources`
+  as for `UniversalProxy.TuyaMesh.Entities.read/2`.
+  """
+  @spec boot_devices(GenServer.server(), map()) :: [Device.t()]
+  def boot_devices(server \\ Espex.Server, sources \\ %{}) do
+    case Entities.read(sources) do
+      {:ok, build} ->
+        build.devices
+
+      :unknown ->
+        case last_good(server) do
+          nil -> []
+          build -> build.devices
+        end
+    end
+  end
 
   @doc "Initial states of the desired build, from the latest live values."
   @spec state_responses(t()) :: [struct()]
@@ -209,7 +273,8 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
            on_collision: t.on_collision
          ) do
       {:ok, build} ->
-        t = %{t | read_backoff_ms: t.retry_ms}
+        t = %{t | read_backoff_ms: t.retry_ms, source: :read}
+        put_last_good(t.server, build)
 
         cond do
           same?(build, t.desired) -> t
@@ -223,6 +288,34 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
         %{arm_read(t, t.read_backoff_ms) | read_backoff_ms: backoff(t.read_backoff_ms)}
     end
   end
+
+  defp last_good_key(server), do: {__MODULE__, :last_good, server}
+
+  defp last_good(server), do: :persistent_term.get(last_good_key(server), nil)
+
+  # A persistent_term write costs a global GC pass when it replaces a term:
+  # only when the build changed.
+  defp put_last_good(server, build) do
+    if last_good(server) != build, do: :persistent_term.put(last_good_key(server), build)
+    :ok
+  end
+
+  defp seed_last_good(t) do
+    case last_good(t.server) do
+      nil ->
+        Logger.warning(
+          "EntityProvider: Tuya mesh unknown at start; deferring Home Assistant connections"
+        )
+
+        t
+
+      build ->
+        Logger.info("EntityProvider: Tuya mesh unknown at start; advertising the last good one")
+        %{t | desired: build, source: :last_good}
+    end
+  end
+
+  defp now, do: System.monotonic_time(:millisecond)
 
   defp same?(a, b),
     do: a.devices == b.devices and Entities.advertisements(a) == Entities.advertisements(b)

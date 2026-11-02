@@ -1,11 +1,14 @@
 defmodule UniversalProxy.ESPHome.EntityProviderMeshTest do
   use ExUnit.Case, async: true
 
+  @moduletag :capture_log
+
   import ExUnit.CaptureLog
 
   alias Espex.DeviceConfig.Device
   alias Espex.Proto
   alias UniversalProxy.ESPHome.EntityProvider, as: EP
+  alias UniversalProxy.ESPHome.EntityProvider.MeshSync
   alias UniversalProxy.TuyaMesh.{Entities, Store}
 
   @mac1 "DC23530FB34A"
@@ -176,10 +179,53 @@ defmodule UniversalProxy.ESPHome.EntityProviderMeshTest do
       assert EP.mesh_devices(pid) == {:ok, []}
     end
 
-    test "an unreadable Store at start advertises no mesh, without crashing" do
+    test "an unreadable Store at start is unknown, never an empty mesh" do
       {sources, _put} = start_inputs(%{inventory: {:error, :unavailable}})
-      pid = start_provider(sources)
-      assert EP.mesh_devices(pid) == {:ok, []}
+
+      capture_log(fn ->
+        pid = start_provider(sources)
+        # Espex keeps its boot devices; HA's connection is refused.
+        assert EP.mesh_devices(pid) == {:error, :unknown}
+        assert GenServer.call(pid, :list_entities) == :defer
+      end)
+    end
+
+    test "after the defer window an unknown mesh stops locking HA out" do
+      {sources, _put} = start_inputs(%{inventory: {:error, :unavailable}})
+
+      capture_log(fn ->
+        pid = start_provider(sources, mesh_defer_ms: 0)
+        assert GenServer.call(pid, :list_entities) == EP.advertisements(EP.specs(), true)
+        assert EP.mesh_devices(pid) == {:error, :unknown}
+      end)
+    end
+
+    test "unknown at start falls back to the last good build of this boot" do
+      server = :"ep_mesh_lastgood_#{System.unique_integer([:positive])}"
+      {sources, put} = start_inputs()
+      first = start_provider(sources, server: server)
+      {:ok, devices} = EP.mesh_devices(first)
+      ads = GenServer.call(first, :list_entities)
+      stop_supervised!(EP)
+
+      put.(:inventory, {:error, :unavailable})
+
+      capture_log(fn ->
+        second = start_provider(sources, server: server)
+        assert EP.mesh_devices(second) == {:ok, devices}
+        assert GenServer.call(second, :list_entities) == ads
+      end)
+
+      # And for the Espex start, before any provider runs.
+      unknown = %{
+        supported?: true,
+        role: fn -> {:ok, @role} end,
+        inventory: fn -> {:error, :unavailable} end,
+        settings: fn -> Store.default_settings() end
+      }
+
+      assert MeshSync.boot_devices(server, unknown) == devices
+      assert MeshSync.boot_devices(:"never_#{System.unique_integer([:positive])}", unknown) == []
     end
   end
 
@@ -496,7 +542,8 @@ defmodule UniversalProxy.ESPHome.EntityProviderMeshTest do
 
       assert %{mesh: %{read_timer: token, read_backoff_ms: 10_000}} = :sys.get_state(pid)
       assert is_reference(token)
-      assert EP.mesh_devices(pid) == {:ok, []}
+      assert EP.mesh_devices(pid) == {:error, :unknown}
+      assert GenServer.call(pid, :list_entities) == :defer
 
       # Still down: retried again, backing off.
       assert %{mesh: %{read_timer: token2, read_backoff_ms: 20_000}} = settle(pid)
@@ -506,6 +553,12 @@ defmodule UniversalProxy.ESPHome.EntityProviderMeshTest do
       put.(:inventory, {:ok, summary()})
       assert %{mesh: %{read_timer: nil, read_backoff_ms: 5_000}} = settle(pid)
       assert {:ok, [_, _, _]} = EP.mesh_devices(pid)
+
+      assert Enum.any?(
+               GenServer.call(pid, :list_entities),
+               &(&1.object_id == "tuya_group_1_light")
+             )
+
       assert espex_calls() == [:update_device_config, :disconnect_clients]
     end
 

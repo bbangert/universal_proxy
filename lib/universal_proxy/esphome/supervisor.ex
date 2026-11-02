@@ -42,8 +42,8 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   }
 
   alias UniversalProxy.Bluetooth.Settings, as: BluetoothSettings
+  alias UniversalProxy.ESPHome.EntityProvider.MeshSync
   alias UniversalProxy.Hardware
-  alias UniversalProxy.TuyaMesh.Entities
   alias UniversalProxy.UART.Store, as: UARTStore
 
   def start_link(init_arg) do
@@ -73,7 +73,7 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   @impl true
   def init(init_arg) do
     opts = if Keyword.keyword?(init_arg), do: init_arg, else: []
-    mesh_devices_fun = Keyword.get(opts, :mesh_devices_fun, &Entities.devices/0)
+    mesh_devices_fun = Keyword.get(opts, :mesh_devices_fun, &MeshSync.boot_devices/0)
     live_devices_fun = Keyword.get(opts, :live_devices_fun, &EntityProvider.mesh_devices/0)
 
     # Seed the persisted PSK into device_config so a previously
@@ -121,9 +121,11 @@ defmodule UniversalProxy.ESPHome.Supervisor do
 
   @doc """
   Starts Espex with the sub-devices `live_devices_fun` gives (`{:ok,
-  devices}`, the provider's), falling back to the ones in `espex_opts`.
+  devices}`, the provider's), falling back to the ones in `espex_opts`
+  when it gives anything else: a provider that doesn't know the mesh yet
+  must not start Espex without it.
   """
-  @spec start_espex(keyword(), (-> {:ok, [Espex.DeviceConfig.Device.t()]} | :error)) ::
+  @spec start_espex(keyword(), (-> {:ok, [Espex.DeviceConfig.Device.t()]} | term())) ::
           Supervisor.on_start()
   def start_espex(espex_opts, live_devices_fun) do
     espex_opts
@@ -132,7 +134,7 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   end
 
   @doc false
-  @spec refresh_devices(keyword(), {:ok, [Espex.DeviceConfig.Device.t()]} | :error) :: keyword()
+  @spec refresh_devices(keyword(), {:ok, [Espex.DeviceConfig.Device.t()]} | term()) :: keyword()
   def refresh_devices(espex_opts, {:ok, devices}),
     do: Keyword.update!(espex_opts, :device_config, &merge_devices(&1, devices))
 
@@ -144,7 +146,7 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   @spec merge_devices(keyword(), [Espex.DeviceConfig.Device.t()]) :: keyword()
   def merge_devices(device_config, devices), do: Keyword.put(device_config, :devices, devices)
 
-  # `Entities.devices/0` never raises, but a supervisor init must not
+  # `MeshSync.boot_devices/0` never raises, but a supervisor init must not
   # fail over sub-devices: none is the safe answer.
   defp mesh_devices(fun) do
     fun.()
