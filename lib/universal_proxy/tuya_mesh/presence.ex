@@ -50,8 +50,8 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   no verdict: the attempt is dropped, the bulb stays due and is tried
   again after the gap, and nothing counts towards the miss limit.
 
-    * A ping refused (`:busy`, `:queue_full`, `:not_ready`,
-      `:not_running`, a timeout, anything but `:ok`): no verdict.
+    * A ping refused (`:busy`, `:queue_full`, `:not_ready`, a timeout,
+      anything but `:ok`): no verdict.
     * `Lights.ping/2` returns `:ok` for a frame merely queued: a command
       can reach the Radio between the idle check and the ping, and then
       the ping waits behind it (or a control send drops it). So right
@@ -78,6 +78,22 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   out but never aired (a cursor gap), or a Radio that hasn't sent a frame
   yet (`last_tx_sn` nil), make one ping fail confirmation for nothing;
   the next one passes.
+
+  ## Settling an uncertain ping
+
+  A ping whose fate is unknown may still air later: a `Lights.ping/2`
+  call that timed out stays in Lights' queue, an `:ok` that couldn't be
+  confirmed may sit queued behind a command, and `{:uncertain, _}` (or
+  `:not_running`, which a Lights crash mid-call also returns) may have gone
+  out. Starting the gap at the attempt would then let the next ping go
+  less than a gap after this one aired. So after any outcome but a
+  confirmed ping or a refusal known to have queued nothing (`:busy`,
+  `:queue_full`, `:not_ready`, `:unknown_bulb`, `:persist_failed`, a
+  refused advertise), the pinger settles first: it waits for a later
+  `Lights.all/1` to return (Lights handles calls in order, so the ping
+  request is done with by then) and then for the Radio to read idle
+  (nothing queued, nothing on air), and the full gap starts from that
+  moment.
 
   ## Budget
 
@@ -154,6 +170,8 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   # Short: the readiness checks run in this loop.
   @radio_timeout 1_000
   @sn_space 65_536
+  # Ping refusals that provably queued nothing for the Radio.
+  @refused [:busy, :queue_full, :not_ready, :unknown_bulb, :persist_failed]
 
   @type bulb :: %{
           last_ms: integer() | nil,
@@ -209,6 +227,9 @@ defmodule UniversalProxy.TuyaMesh.Presence do
       reply_ms: Keyword.get(opts, :reply_ms, @reply_ms),
       bulbs: %{},
       lights_ok: false,
+      # nil, or after an uncertain ping :lights then :radio (see the
+      # moduledoc, "Settling an uncertain ping").
+      settling: nil,
       pending: nil,
       # The predecessor may have just attempted one.
       next_attempt: started + gap_ms,
@@ -261,7 +282,8 @@ defmodule UniversalProxy.TuyaMesh.Presence do
           end)
 
         pending = if state.pending && Map.has_key?(bulbs, state.pending.mac), do: state.pending
-        %{state | bulbs: bulbs, pending: pending, lights_ok: true}
+        settling = if state.settling == :lights, do: :radio, else: state.settling
+        %{state | bulbs: bulbs, pending: pending, lights_ok: true, settling: settling}
 
       {:error, _reason} ->
         %{state | lights_ok: false}
@@ -333,6 +355,15 @@ defmodule UniversalProxy.TuyaMesh.Presence do
     }
   end
 
+  defp maybe_ping(%{settling: :radio} = state) do
+    case radio_idle(state) do
+      {:idle, _sn} -> %{state | settling: nil, next_attempt: state.clock.() + state.gap_ms}
+      _ -> state
+    end
+  end
+
+  defp maybe_ping(%{settling: :lights} = state), do: state
+
   defp maybe_ping(state) do
     now = state.clock.()
 
@@ -344,15 +375,26 @@ defmodule UniversalProxy.TuyaMesh.Presence do
       asked = state.clock.()
       state = %{state | next_attempt: asked + state.gap_ms}
 
-      # Anything but :ok (busy, queue full, not ready, timeout...) is
-      # "try later": the bulb stays due, nothing counts as a miss. So is
-      # an :ok that can't be confirmed on air alone.
-      with :ok <- Lights.ping(mac, server: state.lights),
-           true <- aired_alone?(state, sn) do
-        deadline = state.clock.() + state.reply_ms
-        %{state | pending: %{mac: mac, asked: asked, deadline: deadline}}
-      else
-        _ -> state
+      # Anything but a confirmed ping is "try later": the bulb stays due,
+      # nothing counts as a miss. Unless it provably queued nothing, it may
+      # still air, so the gap waits for it to settle.
+      case Lights.ping(mac, server: state.lights) do
+        :ok ->
+          if aired_alone?(state, sn) do
+            deadline = state.clock.() + state.reply_ms
+            %{state | pending: %{mac: mac, asked: asked, deadline: deadline}}
+          else
+            %{state | settling: :lights}
+          end
+
+        {:error, reason} when reason in @refused ->
+          state
+
+        {:error, {:advertise, _reason}} ->
+          state
+
+        {:error, _uncertain} ->
+          %{state | settling: :lights}
       end
     else
       _ -> state

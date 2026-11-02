@@ -305,12 +305,15 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
       assert pings(ctx) == [@a]
       refute bulb(ctx, @a).pinging
 
+      # It may still air: the gap starts once the Radio has settled.
       :ok = FakeRadio.put(ctx.radio, %{queued: 0})
       at(ctx, 15_000)
       assert bulb(ctx, @a).misses == 0
+      at(ctx, 44_999)
+      assert pings(ctx) == [@a]
 
-      # Still due: tried again after the gap.
-      at(ctx, 30_000)
+      # Still due: tried again a full gap later.
+      at(ctx, 45_000)
       assert pings(ctx) == [@a, @a]
     end
 
@@ -336,10 +339,38 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
 
       at(ctx, 0)
       refute bulb(ctx, @a).pinging
+      # Settled (the Radio idle) at 30 s, the next one a full gap later.
       at(ctx, 30_000)
+      at(ctx, 60_000)
       assert bulb(ctx, @a).pinging
-      at(ctx, 40_000)
+      at(ctx, 70_000)
       assert bulb(ctx, @a).misses == 1
+    end
+
+    test "a ping that timed out and aired late is not followed within a gap", ctx do
+      ctx = start(ctx, macs: [@a, @b])
+      :ok = FakeLights.put(ctx.lights, :ping_reply, {:error, :timeout})
+      at(ctx, 0)
+      assert pings(ctx) == [@a]
+
+      # A command backlog holds it in the Radio's queue...
+      :ok = FakeLights.put(ctx.lights, :ping_reply, :ok)
+      :ok = FakeRadio.put(ctx.radio, %{queued: 1})
+      at(ctx, 5_000)
+      at(ctx, 30_000)
+
+      # ...until it airs at 40 s, well past the old gap.
+      Agent.update(ctx.clock, fn _ -> 40_000 end)
+      :ok = FakeRadio.put(ctx.radio, %{queued: 0})
+      :ok = FakeRadio.air(ctx.radio)
+      at(ctx, 40_000)
+      at(ctx, 45_000)
+      at(ctx, 74_999)
+      assert pings(ctx) == [@a]
+
+      # A full gap after the Radio went idle (45 s); @a is still due.
+      at(ctx, 75_000)
+      assert pings(ctx) == [@a, @a]
     end
 
     test "a receiver lost during the reply window drops the attempt", ctx do
