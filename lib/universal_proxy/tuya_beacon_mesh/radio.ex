@@ -49,6 +49,48 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   On stop it takes any advert off air, stops the receiver and discovery
   and releases the lease. `Bluez.Radio`/`Bluez.Mgmt` are left running.
 
+  ## Wedged controller
+
+  A controller can wedge with every process healthy and every check above
+  passing: discovery on, receiver listening, lease held, no advertising
+  instance registered, yet every advertise is refused by the controller
+  (seen on an RTL8761B after hours of uptime: *LE Set Extended
+  Advertising Enable* failing with `EMLINK`, which MGMT reports as
+  `:failed`). Only advertising shows it, so the radio counts advertise
+  refusals that mean a controller fault (MGMT `:failed` and `:timeout`).
+  Per-frame refusals (`:busy`, `:rotation_busy`, `:rejected`,
+  `:invalid_params`, …) and the uncertain ones (above) neither count nor
+  reset the count; an accepted advertise resets it. After
+  `:wedge_failures` (default 3) in a row, or a run of them spanning more
+  than `:wedge_window_ms` (default 30 s), the controller is declared
+  wedged: `:last_error` becomes `{:controller_wedged, mgmt_status}`, and
+  the radio tears down and goes not ready like any other loss, so sends
+  get `{:error, :not_ready}` until it is back.
+
+  Recovery is the next setup, after `:wedge_retry_ms` (default 5 s,
+  doubling per wedge up to `:max_wedge_retry_ms`, 60 s; reset by an
+  accepted advertise), with a controller reset added: right after the
+  adapter fence passes and before the lease is taken, the adapter is
+  power-cycled (`Adapter1.Powered` false, then true, on
+  `/org/bluez/hci<index>`). The kernel closes the controller on power-off
+  and re-initialises it on power-on, which clears its advertising state.
+  `Bluez.Mgmt` exposes no separate HCI Reset, so there is no stronger
+  in-band step: a wedge that comes back before any advertise was accepted
+  (`:wedge_streak` 2 or more) is logged at error level and sets
+  `:controller_reset_needed`, and the radio keeps power-cycling on the
+  backoff above. Only resetting the transport (for a USB dongle, a port
+  reset or `btusb` unbind/bind) is left, and that is the host's call.
+
+  Hosts reading `status/1`: `:controller_reset_needed` means "reset the
+  controller's transport", and stays set until an advertise is accepted
+  again; `:wedges` / `:recoveries` count wedges detected and power-cycles
+  done since start, and `:last_wedge_at` / `:last_recovery_at` are their
+  UTC times. While recovering, `ready` is false with `last_error`
+  `{:controller_wedged, _}`: show the radio as down, not the bulbs. A
+  frame refused while the controller was failing (before the wedge was
+  declared) is `{:error, {:advertise, :failed}}` and was not transmitted;
+  presence logic should treat it, like `:not_ready`, as no verdict.
+
   ## TX
 
   `send_frame/3` queues a 26-byte frame for `duration_ms` of advertising
@@ -118,6 +160,16 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   # so the caller hears {:uncertain, reason}, not :not_ready.
   @fatal_advertise_errors [:lease_expired, :not_lease_holder, :not_running]
 
+  # MGMT statuses for an advertise the controller itself failed (HCI
+  # command errors the kernel has no specific status for, and HCI command
+  # timeouts), as opposed to a refusal of this frame. See "Wedged
+  # controller".
+  @wedge_advertise_errors [:failed, :timeout]
+  @wedge_failures 3
+  @wedge_window_ms 30_000
+  @wedge_retry_ms 5_000
+  @max_wedge_retry_ms 60_000
+
   # ── Client API ─────────────────────────────────────────────────────────
 
   @doc """
@@ -131,7 +183,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   to #{@max_retry_ms}), `:max_queue` (default #{@max_queue}),
   `:receiver_stop_ms` (how long a stopping receiver may take before it is
   killed, default #{@receiver_stop_ms}), `:health_check_ms` (interval of
-  the health check while ready, default #{@health_check_ms}), and the
+  the health check while ready, default #{@health_check_ms}),
+  `:wedge_failures` (default #{@wedge_failures}), `:wedge_window_ms`
+  (default #{@wedge_window_ms}), `:wedge_retry_ms` (default
+  #{@wedge_retry_ms}) and `:max_wedge_retry_ms` (default
+  #{@max_wedge_retry_ms}) (see "Wedged controller"), and the
   `Bluez.*` implementation
   modules `:bluez_radio`, `:mgmt`, `:rebus`, `:dbus`, `:receiver`
   (defaults are the real ones).
@@ -170,7 +226,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   `{:error, :not_ready}` while setup is pending or being retried (see the
   moduledoc; refused before reaching `Bluez.Mgmt`), `{:error,
   :queue_full}`, `{:error, {:advertise, reason}}` when the adapter
-  refused it, `{:error, :not_running}` when no radio process exists,
+  refused it (with `:failed` or `:timeout` this counts towards declaring
+  the controller wedged, see the moduledoc), `{:error, :not_running}` when no radio process exists,
   `{:error, :bad_frame}` / `{:error, :bad_class}`. Not known either way:
   `{:error, :timeout}`, `{:error, :radio_exited}` (the radio died during
   the call), and `{:error, {:uncertain, reason}}` when `Bluez.Mgmt` or the
@@ -267,8 +324,19 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   sequence number of the last frame the adapter accepted to advertise
   (`:last_tx_sn`, `nil` until one has or after `clear_tx/1`; a frame
   queued, coalesced away or advertised with an uncertain outcome doesn't
-  count). `opts`: `:server`, `:timeout` (default 5000; a radio that
-  doesn't answer in time reads as not running).
+  count).
+
+  Controller health (see "Wedged controller" in the moduledoc):
+  `:advertise_failures` (controller-fault refusals since the last
+  accepted advertise or wedge), `:wedges` (wedges detected since start),
+  `:wedge_streak` (wedges since the last accepted advertise; 0 is
+  healthy), `:recoveries` (power-cycles done), `:last_wedge_at` /
+  `:last_recovery_at` (`DateTime` in UTC, or `nil`), and
+  `:controller_reset_needed` (a power-cycle didn't clear the wedge: the
+  host should reset the controller's transport).
+
+  `opts`: `:server`, `:timeout` (default 5000; a radio that doesn't
+  answer in time reads as not running).
   """
   @spec status(keyword()) :: {:ok, map()} | {:error, :not_running}
   def status(opts \\ []) do
@@ -318,6 +386,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
     # parent's EXIT itself before handle_info sees it.
     Process.flag(:trap_exit, true)
     retry_ms = Keyword.get(opts, :retry_ms, @retry_ms)
+    wedge_retry_ms = Keyword.get(opts, :wedge_retry_ms, @wedge_retry_ms)
 
     state = %{
       adapter_index: Keyword.get(opts, :adapter_index, 0),
@@ -351,7 +420,23 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
       recent_tx: [],
       tx_queue: :queue.new(),
       tx_current: nil,
-      last_tx_sn: nil
+      last_tx_sn: nil,
+      wedge_failures: Keyword.get(opts, :wedge_failures, @wedge_failures),
+      wedge_window_ms: Keyword.get(opts, :wedge_window_ms, @wedge_window_ms),
+      wedge_retry_ms: wedge_retry_ms,
+      max_wedge_retry_ms: Keyword.get(opts, :max_wedge_retry_ms, @max_wedge_retry_ms),
+      wedge_backoff_ms: wedge_retry_ms,
+      # Controller-fault advertise refusals in a row, and when the run began
+      # (monotonic ms).
+      adv_failures: 0,
+      adv_failure_since: nil,
+      wedges: 0,
+      wedge_streak: 0,
+      recoveries: 0,
+      last_wedge_at: nil,
+      last_recovery_at: nil,
+      # Set by a wedge: the next setup power-cycles the adapter.
+      reset_pending: false
     }
 
     {:ok, state, {:continue, :setup}}
@@ -387,6 +472,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   defp setup(state) do
     with {:ok, state} <- connect(state),
          {:ok, state} <- check_adapter(state),
+         {:ok, state} <- reset_controller(state),
          {:ok, state} <- probe_mgmt(state),
          {:ok, state} <- watch_bluez_radio(state),
          {:ok, state} <- acquire(state),
@@ -414,6 +500,10 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
       )
     end
 
+    retry_later(state, reason, quiet)
+  end
+
+  defp retry_later(state, reason, quiet) do
     timer = Process.send_after(self(), :retry_setup, state.backoff_ms)
 
     %{
@@ -568,12 +658,39 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   # Idempotent: setting Powered on a powered adapter is a no-op. It is not
   # undone on teardown, since the adapter is dedicated to this radio.
   defp power_on(state) do
-    body = [@adapter_iface, "Powered", {"b", true}]
-
-    case state.dbus.call(state.conn, adapter_path(state), @props_iface, "Set", "ssv", body) do
+    case set_powered(state, true) do
       {:ok, _} -> {:ok, state}
       {:error, reason} -> {:error, {:power, reason}, state}
     end
+  end
+
+  # After a wedge (see the moduledoc). Runs after the adapter fence, with
+  # no lease held, and only until it succeeds once: a later step failing
+  # doesn't cycle the adapter again. BlueZ answers a Powered Set only once
+  # the kernel has finished closing (or opening) the controller.
+  defp reset_controller(%{reset_pending: false} = state), do: {:ok, state}
+
+  defp reset_controller(state) do
+    with {:off, {:ok, _}} <- {:off, set_powered(state, false)},
+         {:on, {:ok, _}} <- {:on, set_powered(state, true)} do
+      Logger.info("#{inspect(__MODULE__)}: power-cycled hci#{state.adapter_index}")
+
+      {:ok,
+       %{
+         state
+         | reset_pending: false,
+           recoveries: state.recoveries + 1,
+           last_recovery_at: DateTime.utc_now()
+       }}
+    else
+      {:off, {:error, reason}} -> {:error, {:power_cycle, reason}, state}
+      {:on, {:error, reason}} -> {:error, {:power, reason}, state}
+    end
+  end
+
+  defp set_powered(state, on?) do
+    body = [@adapter_iface, "Powered", {"b", on?}]
+    state.dbus.call(state.conn, adapter_path(state), @props_iface, "Set", "ssv", body)
   end
 
   defp start_discovery(state) do
@@ -748,7 +865,14 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
           %{class: class, instance: instance} -> %{class: class, instance: instance}
         end,
       queued: :queue.len(state.tx_queue),
-      last_tx_sn: state.last_tx_sn
+      last_tx_sn: state.last_tx_sn,
+      advertise_failures: state.adv_failures,
+      wedges: state.wedges,
+      wedge_streak: state.wedge_streak,
+      recoveries: state.recoveries,
+      last_wedge_at: state.last_wedge_at,
+      last_recovery_at: state.last_recovery_at,
+      controller_reset_needed: state.wedge_streak >= 2
     }
 
     {:reply, {:ok, status}, state}
@@ -858,16 +982,24 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
         timer = Process.send_after(self(), {:tx_done, token}, job.duration_ms)
         current = Map.merge(job, %{instance: instance, timer: timer, token: token})
 
-        {:ok,
-         %{
-           state
-           | tx_current: current,
-             recent_tx: Enum.take([job.norm | state.recent_tx], @recent_tx_max),
-             last_tx_sn: frame_sn(job.frame)
-         }}
+        state = %{
+          state
+          | tx_current: current,
+            recent_tx: Enum.take([job.norm | state.recent_tx], @recent_tx_max),
+            last_tx_sn: frame_sn(job.frame)
+        }
+
+        {:ok, advertise_accepted(state)}
 
       {:error, reason} when reason in @fatal_advertise_errors ->
         {:error, {:uncertain, reason}, lost(state, {:advertise, reason})}
+
+      {:error, reason} when reason in @wedge_advertise_errors ->
+        Logger.warning(
+          "#{inspect(__MODULE__)}: advertise failed (#{inspect(reason)}), dropping frame"
+        )
+
+        {:error, {:advertise, reason}, controller_fault(state, reason)}
 
       {:error, reason} ->
         Logger.warning(
@@ -880,6 +1012,78 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
 
   # P2 header: hdr, source (2), destination (2), then the sequence number.
   defp frame_sn(<<_hdr, _src::binary-2, _dst::binary-2, sn::16-big, _::binary>>), do: sn
+
+  # ── Wedged controller ────────────────────────────────────────────────
+
+  defp advertise_accepted(%{wedge_streak: 0} = state),
+    do: %{state | adv_failures: 0, adv_failure_since: nil}
+
+  defp advertise_accepted(state) do
+    Logger.info("#{inspect(__MODULE__)}: hci#{state.adapter_index} advertising again")
+
+    %{
+      state
+      | adv_failures: 0,
+        adv_failure_since: nil,
+        wedge_streak: 0,
+        wedge_backoff_ms: state.wedge_retry_ms
+    }
+  end
+
+  defp controller_fault(state, reason) do
+    now = System.monotonic_time(:millisecond)
+    since = state.adv_failure_since || now
+    failures = state.adv_failures + 1
+
+    if failures >= state.wedge_failures or now - since > state.wedge_window_ms,
+      do: wedged(state, reason, failures),
+      else: %{state | adv_failures: failures, adv_failure_since: since}
+  end
+
+  # Torn down like any other loss, but retried on the wedge backoff and
+  # with a power-cycle (reset_controller/1) in the next setup.
+  defp wedged(state, reason, failures) do
+    streak = state.wedge_streak + 1
+    delay = state.wedge_backoff_ms
+    log_wedge(state, reason, failures, streak, delay)
+
+    state = %{
+      teardown(state)
+      | backoff_ms: delay,
+        wedge_backoff_ms: min(delay * 2, state.max_wedge_retry_ms),
+        adv_failures: 0,
+        adv_failure_since: nil,
+        wedges: state.wedges + 1,
+        wedge_streak: streak,
+        last_wedge_at: DateTime.utc_now(),
+        reset_pending: true
+    }
+
+    retry_later(state, {:controller_wedged, reason}, false)
+  end
+
+  defp log_wedge(state, reason, failures, 1, delay) do
+    Logger.error(
+      "#{inspect(__MODULE__)}: hci#{state.adapter_index} controller wedged " <>
+        "(#{failures} advertises failed with #{inspect(reason)}); " <>
+        "power-cycling it in #{delay} ms"
+    )
+  end
+
+  defp log_wedge(state, reason, _failures, 2, delay) do
+    Logger.error(
+      "#{inspect(__MODULE__)}: hci#{state.adapter_index} controller still wedged " <>
+        "(#{inspect(reason)}) after a power-cycle; its transport needs a reset " <>
+        "(USB reset or btusb rebind). Power-cycling again in #{delay} ms"
+    )
+  end
+
+  defp log_wedge(state, reason, _failures, streak, delay) do
+    Logger.warning(
+      "#{inspect(__MODULE__)}: hci#{state.adapter_index} controller wedged " <>
+        "#{streak} times in a row (#{inspect(reason)}); power-cycling again in #{delay} ms"
+    )
+  end
 
   # Takes the current advert off air and starts the next; an advert that
   # won't come off air means the instance (and the lease) can't be trusted,
