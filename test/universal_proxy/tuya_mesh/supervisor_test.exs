@@ -813,6 +813,52 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
     end
   end
 
+  describe "the pinger's frame log" do
+    setup ctx do
+      {:ok, _} = Store.replace(inventory(), [], ctx.store)
+      test_pid = self()
+
+      # A stand-in mesh that reports the Presence options it was given.
+      spec = fn index, mac, presence ->
+        send(test_pid, {:presence_opts, presence})
+        fake_mesh(index, mac)
+      end
+
+      {:ok, spec: spec}
+    end
+
+    defp frames(ctx), do: :sys.get_state(Process.whereis(ctx.names.resolver)).frames
+
+    test "is handed to every mesh's Presence, the same table across meshes", ctx do
+      start_mesh_sup(ctx, mesh_spec_fun: ctx.spec)
+      assert_receive {:presence_opts, first}
+      assert first[:frames] == frames(ctx)
+
+      assert {:ok, :same_mesh} = Resolver.replace(inventory(), [], ctx.names.resolver)
+      assert_receive {:presence_opts, second}
+      assert second[:frames] == first[:frames]
+      assert second[:mesh_generation] > first[:mesh_generation]
+    end
+
+    test "survives a Resolver that stops; one killed leaves it marked unknown", ctx do
+      start_mesh_sup(ctx, mesh_spec_fun: ctx.spec)
+      assert :ets.lookup(frames(ctx), :unknown_until) == []
+      :ets.insert(frames(ctx), {1, 123, :followup})
+
+      # A clean stop (e.g. the Bluez subtree restarting): handed on.
+      :ok = stop_supervised(UniversalProxy.TuyaMesh.Supervisor)
+      start_mesh_sup(ctx, mesh_spec_fun: ctx.spec)
+      assert :ets.lookup(frames(ctx), 1) == [{1, 123, :followup}]
+      assert :ets.lookup(frames(ctx), :unknown_until) == []
+
+      # Killed: its successor can't know the last hour.
+      resolver = Process.whereis(ctx.names.resolver)
+      Process.exit(resolver, :kill)
+      wait_until(fn -> Process.whereis(ctx.names.resolver) not in [nil, resolver] end)
+      assert [{:unknown_until, _}] = :ets.lookup(frames(ctx), :unknown_until)
+    end
+  end
+
   describe "a change keeps what was heard just before it" do
     setup ctx do
       {:ok, _} = Store.replace(inventory(), [], ctx.store)
@@ -965,10 +1011,8 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
         restart.()
         wait_until(fn -> Process.whereis(Presence) not in [nil, old] end)
         state = :sys.get_state(Presence)
-        # Settling (no attempt before a Lights read, an idle Radio and a
-        # gap), with the start-up minute's frame cap counted as spent.
+        # Settling: no attempt before a Lights read, an idle Radio and a gap.
         assert state.settling in [:lights, :radio]
-        assert length(state.sent) == state.per_minute
       end
     end
 

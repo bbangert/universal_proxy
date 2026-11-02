@@ -29,24 +29,35 @@ defmodule UniversalProxy.TuyaMesh.Presence do
       direct ping too goes unanswered for its window (`:reply_ms`, 5 s)
       is it a **miss**.
 
-  Follow-ups go one at a time, oldest unconfirmed first, and among those
-  unconfirmed by the same broadcast, bulbs with misses first. When the
-  frame caps (below) don't fit them all into one cycle, the rest carry
-  over, keeping their place, so every bulb's verdict comes within a
-  bounded time. A bulb's direct follow-ups back off with its misses: none
-  after its first (the second, deciding one comes at the next cycle),
-  then `:direct_backoff_ms` (2 min) after its second, doubling to
+  Follow-ups go one at a time. First the bulbs that may be going silent
+  (a deciding second miss, or a first one from a bulb with no straggling
+  record), oldest unconfirmed first and, from the same broadcast, misses
+  first; then known stragglers; then bulbs already missed twice. What the
+  caps (below) don't fit into one cycle carries over, keeping its place,
+  so every verdict comes within a bounded time.
+
+  A bulb's direct follow-ups back off with its misses: none after its
+  first (the second, deciding one comes at the next cycle), then
+  `:direct_backoff_ms` (2 min) after its second, doubling to
   `:max_direct_backoff_ms` (15 min). It still hears every broadcast, and
   any frame from it, its power-on announce included, confirms it at once:
   misses and backoff clear as soon as `heard_ms` advances.
+
+  A **persistent straggler** (it missed the broadcast and answered the
+  direct ping twice in a row, e.g. a bulb whose `beaconKey` overrides the
+  mesh key and can't open broadcasts) is checked directly every other
+  cycle only, and its `interval_ms` in the snapshot is two cycles, so the
+  Resolver's reachable window for it (2.5 intervals) is 300 s rather than
+  150 s: it is heard about every 120 s, and a check carried over a cycle
+  still fits. The price is that such a bulb going dead is noticed a cycle
+  or two later than the others. Answering a broadcast clears the record.
 
   Every frame (broadcast or direct) is sent only when all of these hold:
 
     * nothing is outstanding (one frame and its reply window at a time);
     * `:min_gap_ms` (5 s) passed since the last attempt, or since an
       uncertain one settled (below);
-    * the frame caps allow it: at most `:max_per_minute` (10) attempts in
-      any 60 s and `:max_per_hour` (240) in any hour;
+    * its budget allows it (see "Budget");
     * `Radio.status/1` reads ready, discovering and listening, with
       nothing on air and nothing queued, so a frame never queues in front
       of, or behind, a command.
@@ -57,27 +68,26 @@ defmodule UniversalProxy.TuyaMesh.Presence do
 
   ## Outage detection
 
-  All of 10 bulbs losing power is noticed within about 2.5 to 3.5
-  minutes. Each needs two misses, so 20 direct pings plus the broadcasts
-  around them, one frame per 5 s slot but at most 10 in any minute. Worst
-  case, the power goes just after a broadcast was answered (t = 0):
+  All of 10 bulbs losing power is noticed in about 2.3 to 3.3 minutes.
+  Each needs two misses, so 20 direct pings plus the broadcasts around
+  them, one frame per 5 s slot, at most 8 follow-ups in any minute (one
+  slot of the 10 stays free for a broadcast). Worst case, the power goes
+  just after a broadcast was answered (t = 0; simulated without jitter):
 
-    * the next broadcast airs by about 66 s (60 s cycle, +10 % jitter)
-      and draws nothing; its window closes at about 71 s;
-    * 9 direct pings fill that minute's cap (71 to 111 s): 9 first misses;
-    * the next broadcast airs once the first frame leaves the 60 s window
-      (about 126 s); then the carried-over tenth bulb's first miss and,
-      as earlier frames leave the window, the other 9's second misses
-      (131 to 176 s, the last decided by about 181 s);
-    * the tenth bulb's second miss follows the third broadcast (about
-      186 s): decided by about 197 s.
+    * the next broadcast airs at 60 s and draws nothing; its window
+      closes at 65 s;
+    * 8 direct pings (65 to 100 s): 8 first misses;
+    * the next broadcast at 120 s; then, as earlier frames leave the
+      minute, the two bulbs left over from the first cycle (their first
+      misses) and the first 6 of the others' second misses: the first
+      bulbs are Not reachable at about 135 s;
+    * the third broadcast at 180 s; the last 4 second misses: the last
+      bulb is Not reachable at about 200 s.
 
-  So the last bulb is Not reachable about 3.3 min after the power went
-  (plus a second or two of tick granularity), the first after about
-  2.3 min; a smaller mesh, or power going just before a broadcast, is
-  faster. The Resolver's reachable window (2.5 cycles) also stops a bulb
-  reading reachable 150 s after it was last heard, before its second
-  miss.
+  So 2.3 to 3.3 min, up to about 3.5 with the cycle's jitter; a smaller
+  mesh, or power going just before a broadcast, is faster. The Resolver's
+  reachable window (2.5 cycles) also stops a bulb reading reachable 150 s
+  after it was last heard, before its second miss.
 
   ## What counts as a miss
 
@@ -129,41 +139,59 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   idle (nothing queued, nothing on air), and the gap starts from that
   moment. An uncertain attempt counts against the caps.
 
-  Every new process starts settling too, and counts a full minute's cap as
-  spent at its start. Lights and the Radio can outlive a pinger (a crash
-  restarts only it), so a predecessor's frame may still be queued and its
-  frames of the last minute are unknown. So the first broadcast goes about
-  a minute after a start.
+  Every new process starts settling too: Lights and the Radio can outlive
+  a pinger (a crash restarts only it), so a predecessor's frame may still
+  be queued.
 
   ## Budget
 
-  The caps bound every case: at most 10 frames in any minute and 240 in
-  any hour, each one sequence number (refused frames hand theirs back)
-  and one advert slot of at least 3 s.
+  At most `:max_per_minute` (10) frames in any 60 s and `:max_per_hour`
+  (240) in any hour, each one sequence number (refused frames hand theirs
+  back) and one advert slot of at least 3 s. Within that:
 
-    * Healthy (10 bulbs): one broadcast a minute plus a direct ping for
-      each of its usual 1 or 2 stragglers, so 2 to 3 frames a minute (120
-      to 180 an hour; 6 to 9 min of airtime, 10 to 15 %). A bulb whose
-      inventory `beaconKey` overrides the mesh key can't open broadcasts,
-      so it is a straggler every cycle.
+    * **Broadcasts are reserved** `:broadcast_reserve` an hour: as many as
+      the shortest jittered cycle allows (60 s - 10 %: 67). Follow-ups
+      never use that share, and always leave one slot of each minute
+      free, so a due broadcast is never held back by follow-ups and every
+      bulb that answers broadcasts stays heard within the Resolver's
+      window, whatever the stragglers do.
+    * **Follow-ups** share the rest of the hour (240 - 67 = 173), paced at
+      most `:max_followups_per_10_min` (30) in any ten minutes, so a
+      heavy straggler load spreads them out instead of spending the hour
+      early: 3 a minute at most, 180 an hour against the 173 cap. An
+      outage's burst (about 20) fits in one ten-minute window.
+
+  What that gives:
+
+    * Healthy (10 bulbs): one broadcast a minute plus 1 or 2 stragglers,
+      2 to 3 frames a minute (120 to 180 an hour; 10 to 15 % airtime);
+      persistent stragglers only every other cycle, so 4 of them add 2 a
+      minute.
     * All dead: one broadcast a minute plus direct pings backed off to 15
       min each, about 100 an hour once the first 20 minutes are past.
-    * The hour cap leaves 60 frames of headroom over the healthy maximum
-      for an outage's burst (about 25 frames). The minute cap is what
-      makes the detection above take 3 minutes rather than 2; at 10 a
-      minute a burst holds at most 30 s of each minute's air, and only
-      while the bulbs it pings aren't answering anything.
+    * At the cap, 240 numbers an hour (5_760 a day). Lights sizes leases
+      for one persist per minute at the observed rate, clamped to at
+      least 32 numbers: at 4 a minute that is one persist every 8 minutes
+      or more (at most about 180 a day), under the one-a-minute budget.
+      The 16-bit counter then moves half its range in under 6 days and
+      wraps in under 12, so an old dump soon reads as ahead of the
+      device's counter; the Store takes a dump's `seq` only as a bounded
+      advance of at most 299 (`UniversalProxy.TuyaMesh.Store`, "Upload
+      seq"), which holds however fast the counter moves.
 
-  At the cap, 240 numbers an hour (5_760 a day). Lights sizes leases for
-  one persist per minute at the observed rate, clamped to at least 32
-  numbers: at 4 numbers a minute that is one persist every 8 minutes or
-  more (at most about 180 a day), under the one-a-minute budget. The
-  16-bit counter then moves half its range in under 6 days and wraps in
-  under 12, so an old dump soon reads as ahead of the device's counter;
-  the Store takes a dump's `seq` only as a bounded advance of at most 299
-  (`UniversalProxy.TuyaMesh.Store`, "Upload seq"), which holds however
-  fast the counter moves: a stale dump can only ever move it forward, and
-  by at most 299.
+  ## Frame log
+
+  The caps count the frames of the last hour from a frame log, an ETS
+  table (`:frames`) that the Resolver owns and passes to every Presence
+  it starts, so a pinger restart or a mesh restart (an upload) keeps the
+  hour's history. Each attempt is logged before its call (a crash inside
+  the call still counts it) and removed again only when the frame was
+  provably refused. A Resolver that stops hands the log to its successor;
+  one that was killed leaves its successor a log that doesn't know the
+  last hour (`unknown_history/3`): the minute's cap counts as spent and
+  only broadcasts go (within their reservation) until an hour has passed.
+  Without `:frames` (tests), a Presence keeps a log of its own, lost with
+  it, and starts with the minute's cap counted as spent.
 
   ## Snapshot
 
@@ -194,9 +222,10 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   crash it.
 
   Options: `:lights`, `:radio` (server names), `:notify`,
-  `:mesh_generation`, `:name`, and the timing above (`:cycle_ms`,
-  `:broadcast_reply_ms`, `:reply_ms`, `:fresh_ms`, `:min_gap_ms`,
-  `:max_per_minute`, `:max_per_hour`, `:direct_backoff_ms`,
+  `:mesh_generation`, `:frames`, `:name`, and the timing above
+  (`:cycle_ms`, `:broadcast_reply_ms`, `:reply_ms`, `:fresh_ms`,
+  `:min_gap_ms`, `:max_per_minute`, `:max_per_hour`, `:broadcast_reserve`,
+  `:max_followups_per_10_min`, `:direct_backoff_ms`,
   `:max_direct_backoff_ms`, `:tick_ms`, `:busy_tick_ms`), plus test seams
   `:clock` (`(-> integer())`, monotonic ms) and `:jitter` (`(interval_ms
   -> offset_ms)`).
@@ -213,11 +242,16 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   @min_gap_ms 5_000
   @max_per_minute 10
   @max_per_hour 240
+  @max_followups_per_10_min 30
+  # A persistent straggler (missed the broadcast, answered the direct ping,
+  # twice in a row) is checked directly every other cycle.
+  @straggler_cycles 2
   @direct_backoff_ms 120_000
   @max_direct_backoff_ms 900_000
   @tick_ms 5_000
   @busy_tick_ms 1_000
   @minute 60_000
+  @ten_minutes 600_000
   @hour 3_600_000
   # Short: the readiness checks run in this loop.
   @radio_timeout 1_000
@@ -247,6 +281,18 @@ defmodule UniversalProxy.TuyaMesh.Presence do
     :exit, _reason -> {:error, :not_running}
   end
 
+  @doc """
+  Marks `table` (a frame log, see "Frame log") as not knowing what was sent
+  before `now`: the minute cap counts as spent, and no follow-up goes
+  until an hour has passed.
+  """
+  @spec unknown_history(:ets.tid() | atom(), integer(), keyword()) :: true
+  def unknown_history(table, now, opts \\ []) do
+    per_minute = Keyword.get(opts, :max_per_minute, @max_per_minute)
+    rows = for _ <- 1..per_minute, do: {System.unique_integer([:monotonic]), now, :unknown}
+    :ets.insert(table, [{:unknown_until, now + @hour} | rows])
+  end
+
   @doc false
   # Runs one tick now: tests drive the schedule with a fake clock.
   @spec poll(GenServer.server()) :: :ok
@@ -259,6 +305,9 @@ defmodule UniversalProxy.TuyaMesh.Presence do
     clock = Keyword.get(opts, :clock, fn -> System.monotonic_time(:millisecond) end)
     started = clock.()
     per_minute = Keyword.get(opts, :max_per_minute, @max_per_minute)
+    per_hour = Keyword.get(opts, :max_per_hour, @max_per_hour)
+    cycle_ms = Keyword.get(opts, :cycle_ms, @cycle_ms)
+    frames = frame_log(Keyword.get(opts, :frames), started, per_minute)
 
     state = %{
       lights: Keyword.get(opts, :lights, Lights),
@@ -268,13 +317,17 @@ defmodule UniversalProxy.TuyaMesh.Presence do
         {Keyword.get(opts, :mesh_generation, 0), System.unique_integer([:monotonic, :positive])},
       clock: clock,
       jitter: Keyword.get(opts, :jitter, &default_jitter/1),
-      cycle_ms: Keyword.get(opts, :cycle_ms, @cycle_ms),
+      cycle_ms: cycle_ms,
       broadcast_reply_ms: Keyword.get(opts, :broadcast_reply_ms, @broadcast_reply_ms),
       reply_ms: Keyword.get(opts, :reply_ms, @reply_ms),
       fresh_ms: Keyword.get(opts, :fresh_ms, @fresh_ms),
       gap_ms: Keyword.get(opts, :min_gap_ms, @min_gap_ms),
       per_minute: per_minute,
-      per_hour: Keyword.get(opts, :max_per_hour, @max_per_hour),
+      per_hour: per_hour,
+      broadcast_reserve:
+        Keyword.get(opts, :broadcast_reserve, min(broadcast_reserve(cycle_ms), per_hour)),
+      followups_per_10_min:
+        Keyword.get(opts, :max_followups_per_10_min, @max_followups_per_10_min),
       backoff_ms: Keyword.get(opts, :direct_backoff_ms, @direct_backoff_ms),
       max_backoff_ms: Keyword.get(opts, :max_direct_backoff_ms, @max_direct_backoff_ms),
       tick_ms: Keyword.get(opts, :tick_ms, @tick_ms),
@@ -287,9 +340,7 @@ defmodule UniversalProxy.TuyaMesh.Presence do
       settling: :lights,
       pending: nil,
       next_attempt: started,
-      # Attempt times of the last hour. A predecessor may have spent this
-      # minute's.
-      sent: List.duplicate(started, per_minute),
+      frames: frames,
       next_broadcast: started,
       pushed: nil,
       timer: nil
@@ -355,7 +406,14 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   end
 
   defp merge(nil, last),
-    do: %{last: last, misses: 0, missed_at: nil, unconfirmed: nil, direct_after: nil}
+    do: %{
+      last: last,
+      misses: 0,
+      missed_at: nil,
+      unconfirmed: nil,
+      direct_after: nil,
+      straggles: 0
+    }
 
   defp merge(bulb, last), do: if(newer?(last, bulb.last), do: heard(bulb, last), else: bulb)
 
@@ -377,7 +435,7 @@ defmodule UniversalProxy.TuyaMesh.Presence do
     cond do
       # A direct ping's reply: refresh already confirmed it (heard/2).
       answered?(state, kind, asked) ->
-        %{state | pending: nil}
+        straggled(%{state | pending: nil}, kind, asked)
 
       # Replies may have gone unheard: no verdict.
       not receiving?(state) ->
@@ -398,6 +456,23 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   defp answered?(state, {:direct, mac}, asked), do: heard_since?(state.bulbs[mac], asked)
   defp answered?(_state, :broadcast, _asked), do: false
 
+  # Missed the broadcast, answered the direct ping. From the second time
+  # in a row it is a persistent straggler (it may never hear broadcasts):
+  # its next direct check skips a cycle.
+  defp straggled(state, {:direct, mac}, asked) do
+    update_in(state.bulbs[mac], fn b ->
+      straggles = b.straggles + 1
+
+      if straggles >= @straggler_cycles,
+        do: %{b | straggles: straggles, direct_after: asked + straggler_backoff(state)},
+        else: %{b | straggles: straggles}
+    end)
+  end
+
+  # Past the next cycle's follow-ups, before the one after.
+  defp straggler_backoff(state),
+    do: state.cycle_ms * (@straggler_cycles - 1) + div(state.cycle_ms, 2)
+
   # The broadcast's non-responders are unconfirmed (unless their direct
   # pings are backed off); a direct ping's silence is a miss.
   defp close_window(state, :broadcast, asked) do
@@ -406,6 +481,7 @@ defmodule UniversalProxy.TuyaMesh.Presence do
     bulbs =
       Map.new(state.bulbs, fn {mac, b} ->
         cond do
+          heard_since?(b, asked) -> {mac, %{b | straggles: 0}}
           heard_since?(b, asked - state.fresh_ms) -> {mac, b}
           b.unconfirmed != nil -> {mac, b}
           b.direct_after != nil and now < b.direct_after -> {mac, b}
@@ -455,7 +531,6 @@ defmodule UniversalProxy.TuyaMesh.Presence do
     with nil <- state.pending,
          true <- state.lights_ok,
          true <- now >= state.next_attempt,
-         true <- within_caps?(state, now),
          {:ok, kind} <- next_frame(state, now),
          {:idle, sn} <- radio_idle(state) do
       send_frame(state, kind, sn)
@@ -464,19 +539,33 @@ defmodule UniversalProxy.TuyaMesh.Presence do
     end
   end
 
+  # A due broadcast within its reservation goes first; a follow-up only
+  # within the follow-up budget (see "Budget").
   defp next_frame(state, now) do
-    if now >= state.next_broadcast do
-      {:ok, :broadcast}
-    else
-      state.bulbs
-      |> Enum.filter(fn {_mac, b} -> b.unconfirmed != nil end)
-      |> Enum.min_by(fn {mac, b} -> {b.unconfirmed, -b.misses, mac} end, fn -> nil end)
-      |> case do
-        {mac, _bulb} -> {:ok, {:direct, mac}}
-        nil -> :none
-      end
+    cond do
+      now >= state.next_broadcast and broadcast_allowed?(state, now) -> {:ok, :broadcast}
+      followup_allowed?(state, now) -> next_followup(state)
+      true -> :none
     end
   end
+
+  # Bulbs that may be going silent first (a deciding second miss, or a
+  # first one from a bulb with no straggling record), oldest unconfirmed
+  # first and, from the same broadcast, misses first; then known
+  # stragglers (they answer direct pings); then bulbs already missed twice.
+  defp next_followup(state) do
+    state.bulbs
+    |> Enum.filter(fn {_mac, b} -> b.unconfirmed != nil end)
+    |> Enum.min_by(fn {mac, b} -> {rank(b), b.unconfirmed, -b.misses, mac} end, fn -> nil end)
+    |> case do
+      {mac, _bulb} -> {:ok, {:direct, mac}}
+      nil -> :none
+    end
+  end
+
+  defp rank(%{misses: misses}) when misses >= 2, do: 2
+  defp rank(%{misses: 0, straggles: straggles}) when straggles > 0, do: 1
+  defp rank(_bulb), do: 0
 
   defp send_frame(state, kind, sn) do
     asked = state.clock.()
@@ -487,13 +576,14 @@ defmodule UniversalProxy.TuyaMesh.Presence do
         do: %{state | next_broadcast: asked + state.cycle_ms + state.jitter.(state.cycle_ms)},
         else: state
 
+    # Logged before the call, so a crash inside it still counts.
+    key = log_frame(state, asked, kind)
+
     # Anything but a confirmed frame is "try later": nothing is unconfirmed
     # or missed. Unless it provably queued nothing it may still air, so it
-    # counts against the caps and the next frame waits for it to settle.
+    # stays counted and the next frame waits for it to settle.
     case call(state, kind) do
       :ok ->
-        state = count(state, asked)
-
         if aired_alone?(state, sn) do
           window = if kind == :broadcast, do: state.broadcast_reply_ms, else: state.reply_ms
           %{state | pending: %{kind: kind, asked: asked, deadline: state.clock.() + window}}
@@ -502,13 +592,15 @@ defmodule UniversalProxy.TuyaMesh.Presence do
         end
 
       {:error, reason} when reason in @refused ->
+        unlog_frame(state, key)
         still_due(state, kind, asked)
 
       {:error, {:advertise, _reason}} ->
+        unlog_frame(state, key)
         still_due(state, kind, asked)
 
       {:error, _uncertain} ->
-        %{count(state, asked) | settling: :lights}
+        %{state | settling: :lights}
     end
   end
 
@@ -519,12 +611,66 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   defp call(state, :broadcast), do: Lights.ping_all(server: state.lights)
   defp call(state, {:direct, mac}), do: Lights.ping(mac, server: state.lights)
 
-  defp count(state, at), do: %{state | sent: [at | Enum.filter(state.sent, &(at - &1 < @hour))]}
+  # ── Frame log ────────────────────────────────────────────────────────
 
-  defp within_caps?(state, now) do
-    Enum.count(state.sent, &(now - &1 < @minute)) < state.per_minute and
-      Enum.count(state.sent, &(now - &1 < @hour)) < state.per_hour
+  # The shared log a Resolver owns, or one of this process's own (lost
+  # with it, so a start counts the minute's cap as spent).
+  defp frame_log(nil, started, per_minute) do
+    table = :ets.new(__MODULE__, [:set, :private])
+    rows = for _ <- 1..per_minute, do: {System.unique_integer([:monotonic]), started, :unknown}
+    :ets.insert(table, rows)
+    table
   end
+
+  defp frame_log(table, _started, _per_minute), do: table
+
+  defp log_frame(state, at, kind) do
+    key = System.unique_integer([:monotonic])
+    :ets.select_delete(state.frames, [{{:_, :"$1", :_}, [{:<, :"$1", at - @hour}], [true]}])
+    :ets.insert(state.frames, {key, at, frame_kind(kind)})
+    key
+  end
+
+  defp unlog_frame(state, key), do: :ets.delete(state.frames, key)
+
+  defp frame_kind(:broadcast), do: :broadcast
+  defp frame_kind({:direct, _mac}), do: :followup
+
+  # Frames of `kinds` (all when nil) sent after `since`.
+  defp frames_since(state, since, kind \\ nil) do
+    guard =
+      case kind do
+        nil -> [{:>, :"$1", since}]
+        kind -> [{:>, :"$1", since}, {:==, :"$2", kind}]
+      end
+
+    :ets.select_count(state.frames, [{{:_, :"$1", :"$2"}, guard, [true]}])
+  end
+
+  defp broadcast_allowed?(state, now) do
+    frames_since(state, now - @minute) < state.per_minute and
+      frames_since(state, now - @hour, :broadcast) < state.broadcast_reserve
+  end
+
+  # One slot of every minute is left for a broadcast; follow-ups share
+  # what the hour's broadcasts don't reserve, paced per ten minutes; none
+  # while the log doesn't know the last hour.
+  defp followup_allowed?(state, now) do
+    not history_unknown?(state, now) and
+      frames_since(state, now - @minute) < state.per_minute - 1 and
+      frames_since(state, now - @hour, :followup) < state.per_hour - state.broadcast_reserve and
+      frames_since(state, now - @ten_minutes, :followup) < state.followups_per_10_min
+  end
+
+  defp history_unknown?(state, now) do
+    case :ets.lookup(state.frames, :unknown_until) do
+      [{:unknown_until, until}] -> now < until
+      [] -> false
+    end
+  end
+
+  # Broadcasts an hour can hold at the shortest jittered cycle (-10 %).
+  defp broadcast_reserve(cycle_ms), do: div(@hour, cycle_ms - div(cycle_ms, 10)) + 1
 
   # ── Radio ────────────────────────────────────────────────────────────
 
@@ -594,11 +740,17 @@ defmodule UniversalProxy.TuyaMesh.Presence do
          last_ms: b.last,
          misses: b.misses,
          missed_at: b.missed_at,
-         interval_ms: state.cycle_ms,
+         interval_ms: interval(state, b),
          pinging: direct == mac
        }}
     end)
   end
+
+  # A persistent straggler is checked every other cycle.
+  defp interval(state, %{straggles: n}) when n >= @straggler_cycles,
+    do: state.cycle_ms * @straggler_cycles
+
+  defp interval(state, _bulb), do: state.cycle_ms
 
   # Uniform in ±10 % of the interval.
   defp default_jitter(ms) do
