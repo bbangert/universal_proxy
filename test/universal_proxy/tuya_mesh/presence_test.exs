@@ -63,6 +63,14 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
     Map.merge(ctx, %{lights: lights, radio: radio, presence: presence, opts: opts})
   end
 
+  # The hold is read with the pinger's clock when it is handled: sync
+  # before the test moves the clock on.
+  defp hold(ctx, ms) do
+    Presence.command_activity(ctx.presence, ms)
+    _ = :sys.get_state(ctx.presence)
+    ctx
+  end
+
   defp stop_all, do: Enum.each([:presence, :lights, :radio], &stop_supervised!/1)
 
   defp flush_pushes do
@@ -110,6 +118,35 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
     :ok = stop_supervised!(:presence)
     Agent.update(ctx.clock, fn _ -> at_ms end)
     %{ctx | presence: start_supervised!({Presence, ctx.opts}, id: :presence)}
+  end
+
+  describe "light command activity" do
+    test "holds off new frames, and a held frame is no attempt", ctx do
+      ctx = start(ctx, replying: [@a, @b, @c])
+
+      # A command arrives just before the broadcast is due.
+      Agent.update(ctx.clock, fn _ -> -@s end)
+      hold(ctx, 5 * @s)
+
+      run(ctx, 0, 3 * @s)
+      assert pings(ctx) == []
+      assert log(ctx) == []
+
+      # More activity extends the hold; a shorter one doesn't shorten it.
+      hold(ctx, 5 * @s)
+      hold(ctx, 1 * @s)
+      run(ctx, 4 * @s, 7 * @s)
+      assert pings(ctx) == []
+
+      # Once the hold has passed the due broadcast goes, and nothing was
+      # unconfirmed or missed meanwhile.
+      at(ctx, 8 * @s)
+      assert pings(ctx) == [:all]
+
+      for mac <- [@a, @b, @c] do
+        assert %{misses: 0} = bulb(ctx, mac)
+      end
+    end
   end
 
   describe "a cycle" do

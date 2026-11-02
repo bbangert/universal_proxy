@@ -9,6 +9,32 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   is one process too, so nothing is lost), and every wait is a timer, so a
   newer command is always handled before the next step of an older one.
 
+  ## Backlog
+
+  Each frame stays on air for at least 3 s and the Radio's queue is short,
+  so a burst of commands outruns it. The backlog is kept here instead: one
+  pending command per light (a newer one replaces it, see "Superseding"),
+  fed to Lights one action per dispatch, so commands arriving meanwhile are
+  handled between frames.
+
+    * **Order:** user frames (a command's batches, and a group's diverted
+      direct sends) go first, oldest command first; a confirmation read
+      next; follow-ups last, one per `:followup_gap_ms` (3 s, about one
+      frame's airtime) so they never queue more than a frame ahead of a
+      new command.
+    * **Capacity:** `{:error, :busy}` or `{:error, :queue_full}` keeps the
+      frame where it is and holds every frame for `:retry_ms` (500 ms),
+      doubling to `:max_retry_ms` (4 s) while the refusals last, back to
+      `:retry_ms` after a frame is accepted. There is no retry count.
+    * **Staleness:** a command still not fully sent `:stale_ms` (45 s)
+      after it arrived is dropped and logged (what went out is still
+      pushed); follow-ups get the same bound from when their pass starts.
+
+  While it has work, and for `:activity_hold_ms` (5 s) after a command
+  arrives, it tells `UniversalProxy.TuyaMesh.Presence` to hold off new
+  pings (`Presence.command_activity/2`), at least every
+  `:keepalive_ms` (2 s).
+
   ## Sends
 
   Every batch is an acked set (`ack: true`): the ack draws a DP report,
@@ -24,9 +50,8 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       DPs, not per-report ones), so a DP that already held that value is
       resent.
 
-  `{:error, :busy}` and `{:error, :queue_full}` are retried after
-  `:retry_ms`, doubling, at most `:max_retries` times; any other error
-  stops the command. A direct send that fails, or runs out of retries,
+  `{:error, :busy}` and `{:error, :queue_full}` wait for capacity (see
+  "Backlog"); any other error stops the command. A direct send that fails
   drops every remaining frame for that bulb.
 
   ## Direct-frame budget
@@ -81,8 +106,10 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   `:device_ids` (`-> map`, default `Store.device_ids/1`), `:pubsub` and
   `:subscribe` (default `true`) for the Store broadcasts, `:push` (`struct
   -> any`, default `Espex.push_state/2` on `:server`), `:server`,
-  `:window_ms` (6 s), `:retry_ms` (500 ms), `:max_retries` (5),
-  `:followup_gap_ms` (2 s), `:max_followups` (10).
+  `:presence` (server, default `Presence`), `:window_ms` (6 s),
+  `:retry_ms`, `:max_retry_ms`, `:stale_ms`, `:followup_gap_ms`,
+  `:activity_hold_ms`, `:keepalive_ms` (see "Backlog"), `:max_followups`
+  (10).
   """
 
   # TODO(4c): reconcile `views` with real reports (Lights report updates,
@@ -95,7 +122,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   alias Espex.Proto
   alias UniversalProxy.TuyaBeaconMesh.Lights
   alias UniversalProxy.TuyaMesh
-  alias UniversalProxy.TuyaMesh.{Commands, Store}
+  alias UniversalProxy.TuyaMesh.{Commands, Presence, Store}
 
   @retryable [:busy, :queue_full]
 
@@ -129,15 +156,25 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       device_ids: Keyword.get(opts, :device_ids, &default_device_ids/0),
       pubsub: Keyword.get(opts, :pubsub, UniversalProxy.PubSub),
       push: Keyword.get(opts, :push, &default_push(server, &1)),
+      presence: Keyword.get(opts, :presence, Presence),
       window_ms: Keyword.get(opts, :window_ms, 6_000),
       retry_ms: Keyword.get(opts, :retry_ms, 500),
-      max_retries: Keyword.get(opts, :max_retries, 5),
-      followup_gap_ms: Keyword.get(opts, :followup_gap_ms, 2_000),
+      max_retry_ms: Keyword.get(opts, :max_retry_ms, 4_000),
+      stale_ms: Keyword.get(opts, :stale_ms, 45_000),
+      followup_gap_ms: Keyword.get(opts, :followup_gap_ms, 3_000),
+      activity_hold_ms: Keyword.get(opts, :activity_hold_ms, 5_000),
+      keepalive_ms: Keyword.get(opts, :keepalive_ms, 2_000),
       max_followups: Keyword.get(opts, :max_followups, 10),
       next_id: 1,
       jobs: %{},
       views: %{},
-      touched: %{}
+      touched: %{},
+      # Frames held until then after a refusal for capacity; the hold
+      # doubles while refusals last.
+      blocked_until: nil,
+      backoff_ms: Keyword.get(opts, :retry_ms, 500),
+      signalled_at: nil,
+      dispatch: nil
     }
 
     if Keyword.get(opts, :subscribe, true),
@@ -154,7 +191,8 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   # must not touch views, members or other jobs.
   def handle_cast({:command, %{target: target, device_id: device_id} = command}, state) do
     if valid?(read_ids(state), target, device_id) do
-      {:noreply, admit(state, command)}
+      state = state |> signal_activity(true) |> admit(command)
+      {:noreply, reschedule(state)}
     else
       Logger.debug(
         "TuyaMesh.Commander: #{describe(target)} command for a stale sub-device; dropped"
@@ -183,14 +221,11 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   end
 
   @impl GenServer
-  def handle_info({:step, target, id}, state) do
-    case Map.get(state.jobs, target) do
-      %{id: ^id} = job -> {:noreply, step(state, job)}
-      _superseded -> {:noreply, state}
-    end
-  end
+  def handle_info({:dispatch, token}, %{dispatch: {token, _tref}} = state),
+    do: {:noreply, %{state | dispatch: nil} |> dispatch() |> reschedule()}
 
-  def handle_info({:tuya_mesh_store, _event}, state), do: {:noreply, reconcile(state)}
+  def handle_info({:tuya_mesh_store, _event}, state),
+    do: {:noreply, state |> reconcile() |> reschedule()}
 
   def handle_info(_msg, state), do: {:noreply, state}
 
@@ -210,13 +245,14 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       phase: :send,
       pending: batches,
       sent: [],
-      attempts: 0,
       members: members,
       snapshot: snapshot(state, target, members),
       sent_at: nil,
       then_check?: false,
       budget: state.max_followups,
-      accepted: %{}
+      accepted: %{},
+      ready_at: now(),
+      deadline: now() + state.stale_ms
     }
 
     macs = if match?({:bulb, _}, target), do: [elem(target, 1)], else: members
@@ -224,8 +260,6 @@ defmodule UniversalProxy.TuyaMesh.Commander do
     # A group command replaces its members' own commands.
     jobs = Map.drop(state.jobs, for(mac <- members, do: {:bulb, mac}))
     touched = Map.merge(state.touched, Map.new(macs, &{&1, id}))
-
-    send(self(), {:step, target, id})
 
     %{
       state
@@ -260,22 +294,22 @@ defmodule UniversalProxy.TuyaMesh.Commander do
 
   defp run(state, %{pending: [{mac, batch} | rest]} = job) do
     if newer_command?(state, mac, job),
-      do: run(state, %{job | pending: drop_mac(rest, mac), attempts: 0}),
+      do: run(state, %{job | pending: drop_mac(rest, mac)}),
       else: direct_send(state, job, mac, batch, rest)
   end
 
   defp send_step(state, %{pending: [batch | rest]} = job) do
     case send_frame(state, job, job.target, batch) do
       :ok ->
-        state = record(state, job, batch)
-        job = %{job | pending: rest, sent: job.sent ++ batch, attempts: 0, sent_at: now()}
+        state = state |> accepted_frame() |> record(job, batch)
+        job = %{job | pending: rest, sent: job.sent ++ batch, sent_at: now()}
         if rest == [], do: sent_all(state, job), else: continue(state, job, 0)
 
       :stale ->
         abandon(state, job)
 
       {:error, reason} when reason in @retryable ->
-        retry(state, job, reason, fn state -> stop_sending(state, job) end)
+        hold(state, job)
 
       {:error, reason} ->
         Logger.info(
@@ -304,7 +338,6 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       | phase: :direct,
         pending: items,
         budget: budget,
-        attempts: 0,
         members: live,
         then_check?: job.sent != []
     }
@@ -318,18 +351,17 @@ defmodule UniversalProxy.TuyaMesh.Commander do
         abandon(state, job)
 
       :ok ->
-        {state, job} = accept(state, job, mac, batch)
-        continue(state, %{job | pending: rest, attempts: 0}, state.followup_gap_ms)
+        {state, job} = state |> accepted_frame() |> accept(job, mac, batch)
+        gap = if job.phase == :followup, do: state.followup_gap_ms, else: 0
+        continue(state, %{job | pending: rest}, gap)
+
+      {:error, reason} when reason in @retryable ->
+        hold(state, job)
 
       # A bulb that failed gets none of its later frames either.
-      {:error, reason} when reason in @retryable ->
-        retry(state, job, reason, fn state ->
-          run(state, %{job | pending: drop_mac(rest, mac), attempts: 0})
-        end)
-
       {:error, reason} ->
         Logger.info("TuyaMesh.Commander: direct send to #{mac} failed: #{inspect(reason)}")
-        run(state, %{job | pending: drop_mac(rest, mac), attempts: 0})
+        run(state, %{job | pending: drop_mac(rest, mac)})
     end
   end
 
@@ -373,19 +405,18 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   defp lights_send(state, {:group, gid}, batch),
     do: state.lights.group_set(gid, batch, [ack: true] ++ state.lights_opts)
 
-  defp retry(state, job, reason, give_up) do
-    if job.attempts < state.max_retries do
-      delay = state.retry_ms * Integer.pow(2, job.attempts)
-      continue(state, %{job | attempts: job.attempts + 1}, delay)
-    else
-      Logger.info(
-        "TuyaMesh.Commander: #{describe(job.target)} still #{inspect(reason)} " <>
-          "after #{job.attempts} retries; giving up"
-      )
+  # No capacity: the frame stays first in line and every frame waits.
+  defp hold(state, job) do
+    state = %{
+      state
+      | blocked_until: now() + state.backoff_ms,
+        backoff_ms: min(state.backoff_ms * 2, state.max_retry_ms)
+    }
 
-      give_up.(state)
-    end
+    %{state | jobs: Map.put(state.jobs, job.target, job)}
   end
+
+  defp accepted_frame(state), do: %{state | blocked_until: nil, backoff_ms: state.retry_ms}
 
   # What went out still counts: pushed, but no follow-ups for the rest.
   defp stop_sending(state, %{sent: []} = job), do: done(state, job)
@@ -420,7 +451,6 @@ defmodule UniversalProxy.TuyaMesh.Commander do
           | phase: :followup,
             pending: items,
             budget: budget,
-            attempts: 0,
             then_check?: false
         })
 
@@ -477,13 +507,121 @@ defmodule UniversalProxy.TuyaMesh.Commander do
 
   defp newer_command?(state, mac, job), do: Map.get(state.touched, mac, 0) > job.id
 
+  # The job's next action is due after `delay`; a confirmation pass gets
+  # its own staleness bound from when it starts.
   defp continue(state, job, delay) do
-    if delay == 0,
-      do: send(self(), {:step, job.target, job.id}),
-      else: Process.send_after(self(), {:step, job.target, job.id}, delay)
+    ready_at = now() + delay
+
+    job =
+      if job.phase == :check,
+        do: %{job | ready_at: ready_at, deadline: ready_at + state.stale_ms},
+        else: %{job | ready_at: ready_at}
 
     %{state | jobs: Map.put(state.jobs, job.target, job)}
   end
+
+  # ── Dispatch ─────────────────────────────────────────────────────────
+
+  # One action per dispatch: commands that arrived meanwhile are admitted
+  # (and supersede) before the next frame.
+  defp dispatch(state) do
+    now = now()
+    state = state |> expire(now) |> signal_activity(false)
+
+    case next_job(state, now) do
+      nil -> state
+      job -> step(state, job)
+    end
+  end
+
+  defp next_job(state, now) do
+    blocked? = state.blocked_until != nil and now < state.blocked_until
+
+    state.jobs
+    |> Map.values()
+    |> Enum.filter(&(&1.ready_at <= now and not (blocked? and frame?(&1))))
+    |> Enum.min_by(&{priority(&1), &1.id}, fn -> nil end)
+  end
+
+  defp priority(%{phase: phase}) when phase in [:send, :direct], do: 0
+  defp priority(%{phase: :check}), do: 1
+  defp priority(%{phase: :followup}), do: 2
+
+  defp frame?(%{phase: :send}), do: true
+  defp frame?(%{phase: phase, pending: [_ | _]}) when phase in [:direct, :followup], do: true
+  defp frame?(_job), do: false
+
+  # The next wake-up: the earliest due action (frames not before the
+  # capacity hold), the earliest staleness bound, and, with work left, the
+  # Presence keepalive.
+  defp reschedule(%{jobs: jobs} = state) when map_size(jobs) == 0, do: arm(state, nil)
+
+  defp reschedule(state) do
+    now = now()
+
+    due =
+      for job <- Map.values(state.jobs) do
+        at = job.ready_at
+        if frame?(job) and state.blocked_until != nil, do: max(at, state.blocked_until), else: at
+      end
+
+    deadlines = for job <- Map.values(state.jobs), do: job.deadline + 1
+    at = Enum.min([now + state.keepalive_ms | due ++ deadlines])
+    arm(state, max(at - now, 0))
+  end
+
+  defp arm(state, delay) do
+    with {_token, tref} <- state.dispatch, do: Process.cancel_timer(tref)
+
+    case delay do
+      nil ->
+        %{state | dispatch: nil}
+
+      ms ->
+        token = make_ref()
+        %{state | dispatch: {token, Process.send_after(self(), {:dispatch, token}, ms)}}
+    end
+  end
+
+  # A command that couldn't be sent in time is dropped: nothing runs
+  # absurdly late. What did go out is still pushed.
+  defp expire(state, now) do
+    state.jobs
+    |> Map.values()
+    |> Enum.filter(&(&1.deadline < now))
+    |> Enum.reduce(state, &expire_job(&2, &1))
+  end
+
+  defp expire_job(state, %{phase: phase} = job) when phase in [:send, :direct] do
+    Logger.info(
+      "TuyaMesh.Commander: #{describe(job.target)} command not sent within " <>
+        "#{state.stale_ms} ms; dropped"
+    )
+
+    if phase == :send,
+      do: stop_sending(state, job),
+      else: finish_direct(state, %{job | then_check?: false})
+  end
+
+  defp expire_job(state, job) do
+    Logger.debug("TuyaMesh.Commander: #{describe(job.target)} follow-ups out of time; dropped")
+    done(state, job)
+  end
+
+  # Presence holds off new pings while there is work (see "Backlog").
+  defp signal_activity(state, force?) do
+    now = now()
+
+    if force? or (state.jobs != %{} and stale_signal?(state, now)) do
+      Presence.command_activity(state.presence, state.activity_hold_ms)
+      %{state | signalled_at: now}
+    else
+      state
+    end
+  end
+
+  defp stale_signal?(%{signalled_at: nil}, _now), do: true
+  defp stale_signal?(state, now), do: now - state.signalled_at >= div(state.keepalive_ms, 2)
 
   defp done(state, job) do
     case Map.get(state.jobs, job.target) do
