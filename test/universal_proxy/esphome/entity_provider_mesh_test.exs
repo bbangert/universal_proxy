@@ -230,22 +230,74 @@ defmodule UniversalProxy.ESPHome.EntityProviderMeshTest do
   end
 
   describe "commands" do
-    test "a mesh light command is acknowledged and changes nothing" do
+    test "a mesh light command goes to the Commander with its device id and settings" do
       {sources, _put} = start_inputs()
-      pid = start_provider(sources)
+      test = self()
+      pid = start_provider(sources, mesh_command: &send(test, {:routed, &1}))
+
+      bulb = %Proto.LightCommandRequest{
+        key: Entities.key_for("tuya_dc23530fb34a_light"),
+        has_state: true,
+        state: true
+      }
+
+      group = %Proto.LightCommandRequest{key: Entities.key_for("tuya_group_1_light")}
+      GenServer.cast(pid, {:command, bulb})
+      GenServer.cast(pid, {:command, group})
+
+      assert_receive {:routed, %{target: {:bulb, @mac1}, device_id: 1, request: ^bulb} = cmd}
+      assert cmd.key == bulb.key
+      assert cmd.settings == Store.default_settings()
+      assert_receive {:routed, %{target: {:group, 1}, device_id: 3, request: ^group}}
+    end
+
+    test "a request naming another sub-device than the current entity's is dropped" do
+      {sources, _put} = start_inputs()
+      test = self()
+      pid = start_provider(sources, mesh_command: &send(test, {:routed, &1}))
+      key = Entities.key_for("tuya_group_1_light")
+
+      # 3 is the group's current sub-device; 9 an old mesh's.
+      GenServer.cast(pid, {:command, %Proto.LightCommandRequest{key: key, device_id: 3}})
+      assert_receive {:routed, %{target: {:group, 1}, device_id: 3}}
+
+      GenServer.cast(pid, {:command, %Proto.LightCommandRequest{key: key, device_id: 9}})
+      _ = :sys.get_state(pid)
+      refute_received {:routed, _}
+    end
+
+    test "unknown keys and non-light mesh entities are not routed" do
+      {sources, _put} = start_inputs()
+      test = self()
+      pid = start_provider(sources, mesh_command: &send(test, {:routed, &1}))
       before = :sys.get_state(pid)
+
+      for key <- [123, Entities.key_for("tuya_dc23530fb34a_connectivity")] do
+        GenServer.cast(pid, {:command, %Proto.LightCommandRequest{key: key, has_state: true}})
+      end
+
+      assert :sys.get_state(pid) == before
+      refute_received {:routed, _}
+    end
+
+    test "routing never waits on the Commander" do
+      {sources, _put} = start_inputs()
+      commander = start_supervised!({UniversalProxy.TuyaMesh.Commander, name: nil})
+      :ok = :sys.suspend(commander)
+
+      pid =
+        start_provider(sources,
+          mesh_command: &UniversalProxy.TuyaMesh.Commander.command(&1, commander)
+        )
 
       key = Entities.key_for("tuya_dc23530fb34a_light")
       GenServer.cast(pid, {:command, %Proto.LightCommandRequest{key: key, has_state: true}})
-      GenServer.cast(pid, {:command, %Proto.LightCommandRequest{key: 123, has_state: true}})
 
-      assert :sys.get_state(pid) == before
-    end
+      # The provider keeps serving while the Commander can't take anything.
+      assert {:ok, _devices} = EP.mesh_devices(pid)
 
-    test "the light command routes to the mesh target" do
-      state = %{keys: %{42 => {:tuya_mesh, {:bulb, @mac1, :light}}}}
-      cmd = %Proto.LightCommandRequest{key: 42}
-      assert {:noreply, ^state} = EP.handle_cast({:command, cmd}, state)
+      assert {:messages, [{:"$gen_cast", {:command, %{target: {:bulb, @mac1}}}}]} =
+               Process.info(commander, :messages)
     end
 
     test "an unencrypted mesh light command is not refused as privileged" do

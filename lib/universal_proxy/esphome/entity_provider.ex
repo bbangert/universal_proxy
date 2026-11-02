@@ -46,8 +46,9 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
   this provider holds its state, forwards it the messages it doesn't
   handle itself, and adds its keys to the command lookup.
   `ESPHome.Supervisor` starts Espex with its sub-devices (`mesh_devices/0`),
-  so a restarted Espex agrees with these entities. Mesh light commands are
-  acknowledged and logged, not acted on yet.
+  so a restarted Espex agrees with these entities. Mesh light commands go
+  to `UniversalProxy.TuyaMesh.Commander` (a cast: this loop never waits on
+  the mesh), with the light's `device_id` and the mesh settings.
 
   ## Testability
 
@@ -70,7 +71,7 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
   alias UniversalProxy.ESPHome.EntityProvider.MeshSync
   alias UniversalProxy.FirmwareUpdate.ConfigStore
   alias UniversalProxy.TuyaMesh
-  alias UniversalProxy.TuyaMesh.{Entities, Store}
+  alias UniversalProxy.TuyaMesh.{Commander, Entities, Store}
 
   @mesh_opts [
     debounce_ms: :mesh_debounce_ms,
@@ -354,7 +355,8 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
       sources: sources,
       keys: key_lookup(),
       last: %{},
-      mesh: mesh_sync(opts, supported?, sources, extra_topics)
+      mesh: mesh_sync(opts, supported?, sources, extra_topics),
+      mesh_command: Keyword.get(opts, :mesh_command, &Commander.command/1)
     }
 
     # Firmware-update progress is event-driven, not poll-driven: a 30 s tick
@@ -506,12 +508,10 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
     {:noreply, state}
   end
 
-  def handle_cast({:command, %Proto.LightCommandRequest{key: key}}, state) do
+  def handle_cast({:command, %Proto.LightCommandRequest{key: key} = request}, state) do
     case Map.get(state.keys, key) do
-      {:tuya_mesh, target} ->
-        Logger.debug(
-          "EntityProvider: Tuya mesh light command for #{inspect(target)} not yet mapped"
-        )
+      {:tuya_mesh, {kind, id, :light}} when kind in [:bulb, :group] ->
+        mesh_light_command(state, {kind, id}, request)
 
       other ->
         Logger.debug("EntityProvider: ignoring light command for key #{inspect(other)}")
@@ -555,6 +555,36 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
           sources: Map.take(sources, [:mesh_role, :mesh_inventory, :mesh_settings, :mesh_status])
         ] ++ mesh_build_opts()
     )
+  end
+
+  # Handed to the Commander, which sends it off this loop. A key outlives
+  # its light (a new mesh reuses local group ids), so a request naming
+  # another sub-device than the current entity's is for a light that is
+  # gone; only the default 0 takes the current one.
+  defp mesh_light_command(state, target, request) do
+    case {MeshSync.entity(state.mesh, request.key), request.device_id} do
+      {%{device_id: id}, requested} when requested in [0, id] ->
+        route_light_command(state, target, request, id)
+
+      {nil, requested} when requested != 0 ->
+        route_light_command(state, target, request, requested)
+
+      {_entity, requested} ->
+        Logger.debug(
+          "EntityProvider: Tuya mesh light command for sub-device #{requested} " <>
+            "doesn't match #{inspect(target)}; dropped"
+        )
+    end
+  end
+
+  defp route_light_command(state, target, request, device_id) do
+    state.mesh_command.(%{
+      target: target,
+      key: request.key,
+      device_id: device_id,
+      settings: MeshSync.settings(state.mesh),
+      request: request
+    })
   end
 
   defp put_mesh(state, mesh) do
