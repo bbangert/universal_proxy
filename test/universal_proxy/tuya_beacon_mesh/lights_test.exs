@@ -309,6 +309,42 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
       assert Enum.map(advertises(), &frame_sn/1) == [100, 102, 103]
     end
 
+    @tag :capture_log
+    test "raw and friendly forms of a DP coalesce by DP ids alone; the latest wins" do
+      stop_supervised!({Radio, 1})
+      start_supervised!(radio_spec(max_queue: 1))
+      wait_until(&radio_ready?/0)
+
+      # On air, so the next frames queue behind it.
+      assert :ok = Lights.set("path light 2", temp: 10)
+      wait_until(fn -> length(advertises()) == 1 end)
+
+      # DP 1 friendly, then raw: one queued frame, keyed by bulb and DP id
+      # only (no value in the key).
+      assert :ok = Lights.set("path light 2", on: true)
+      assert :ok = Lights.set("path light 2", [{1, :bool, false}])
+      assert {:ok, %{queued: 1}} = Radio.status()
+      assert [%{key: {:set, 2, [1]}}] = queued_jobs()
+
+      # DPs {1, 3} are another set: no coalescing, and the queue is full.
+      assert {:error, :queue_full} =
+               Lights.set("path light 2", [{1, :bool, true}, brightness: 500])
+
+      finish_tx()
+      assert frame_dps(List.last(advertises())) == [{1, :bool, false}]
+
+      # The same id set in either order and form coalesces too.
+      assert :ok = Lights.set("path light 2", on: true, brightness: 500)
+      assert :ok = Lights.set("path light 2", [{3, :value, 400}, {1, :bool, false}])
+      assert [%{key: {:set, 2, [1, 3]}}] = queued_jobs()
+
+      finish_tx()
+      assert frame_dps(List.last(advertises())) == [{3, :value, 400}, {1, :bool, false}]
+      # 101 and 103 were replaced in the queue (103 reused the number the
+      # refused send gave back).
+      assert Enum.map(advertises(), &frame_sn/1) == [100, 102, 104]
+    end
+
     test "reload validates first and rolls back when it can't persist", %{persisted: persisted} do
       assert {:error, {:duplicate_node_id, 2, _}} =
                Lights.reload(
@@ -1639,6 +1675,15 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
 
     Crypto.crc8(<<Bitwise.band(hdr, 0xFC)>> <> head <> <<payload_crc>> <> cipher) == crc and
       Crypto.crc8(payload) == payload_crc
+  end
+
+  defp queued_jobs, do: :queue.to_list(:sys.get_state(Radio).tx_queue)
+
+  # The DPs of a unicast set to "path light 2" (its own keys).
+  defp frame_dps(ad) do
+    [<<_hdr, _head::binary-7, _payload_crc, masked::binary-16, _crc>>] = Carrier.frames(ad)
+    cipher = :crypto.exor(masked, Crypto.key_bytes(@beacon_key))
+    cipher |> Crypto.xxtea_decrypt(Crypto.key_bytes("abcdefghijklmnop")) |> Dp.decode()
   end
 
   defp frame_sn(ad) do
