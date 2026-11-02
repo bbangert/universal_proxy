@@ -33,6 +33,15 @@ defmodule UniversalProxy.MixProject do
       listeners: listeners(Mix.target(), Mix.env()),
       start_permanent: Mix.env() == :prod,
       deps: deps(),
+      # cowlib 2.21.0 (the newest release, pulled in via plug_cowboy ->
+      # cowboy) has no upstream fix for EEF-CVE-2026-43966, which is in
+      # cow_http_struct_hd:escape_string/2 (structured-header string
+      # serialisation). Neither universal_proxy nor cowboy/plug_cowboy calls
+      # the affected serialisers with attacker-controlled input. Drop this
+      # once cowlib ships a fix.
+      hex: [
+        ignore_advisories: ["EEF-CVE-2026-43966"]
+      ],
       releases: [{@app, release()}],
       aliases: aliases(),
       dialyzer: [
