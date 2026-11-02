@@ -23,11 +23,11 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   and only when all of these hold:
 
     * no ping is outstanding (one at a time);
-    * `:min_gap_ms` (60 s) passed since the last ping attempt. A new
-      process (a restart of this one, of Lights or the Radio, or of the
-      whole mesh after an upload) starts as if it had just attempted one:
-      its predecessor may have, and no state survives the restart to say
-      when;
+    * `:min_gap_ms` (60 s) passed since the last ping attempt, or since
+      an uncertain one settled (below). A new process (a restart of this
+      one, of Lights or the Radio, or of the whole mesh after an upload)
+      starts settling: its predecessor may have left a ping queued, and
+      no state survives the restart to say so;
     * `Radio.status/1` reads ready, discovering and listening, with
       nothing on air and nothing queued, so a ping never queues in front
       of, or behind, a command.
@@ -40,8 +40,9 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   `:max_interval_ms` (15 min): 2, 2, 4, 8, 15 min. Any report (a ping
   reply, a DP report from an acked command) resets it. A fresh start
   checks every bulb once after `:start_delay_ms` (15 s, jittered; the
-  gap above holds the first attempt to 60 s), or at its last reply plus
-  the base interval when that is later.
+  settling below holds the first attempt to a gap after the first tick
+  that finds the Radio idle, about 65 s), or at its last reply plus the
+  base interval when that is later.
 
   ## What counts as a miss
 
@@ -94,6 +95,12 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   request is done with by then) and then for the Radio to read idle
   (nothing queued, nothing on air), and the full gap starts from that
   moment.
+
+  Every new process starts in this state too. Lights and the Radio can
+  outlive a pinger (a crash restarts only it), so a predecessor's ping may
+  still be in Lights' queue or the Radio's; the first `Lights.all/1` read
+  is after any such request, and the idle Radio after it aired. With no
+  backlog, that makes the first attempt one gap after the first tick.
 
   ## Budget
 
@@ -228,10 +235,11 @@ defmodule UniversalProxy.TuyaMesh.Presence do
       bulbs: %{},
       lights_ok: false,
       # nil, or after an uncertain ping :lights then :radio (see the
-      # moduledoc, "Settling an uncertain ping").
-      settling: nil,
+      # moduledoc, "Settling an uncertain ping"). A new process starts
+      # settling: a predecessor's ping may still be queued.
+      settling: :lights,
       pending: nil,
-      # The predecessor may have just attempted one.
+      # Set again when settling ends.
       next_attempt: started + gap_ms,
       pushed: nil,
       timer: nil

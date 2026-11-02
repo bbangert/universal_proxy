@@ -954,7 +954,7 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
       assert %DateTime{} = bulb.last_seen
     end
 
-    test "a replacement pinger waits a full gap before its first attempt", ctx do
+    test "a replacement pinger starts settling before its first attempt", ctx do
       restarts = [
         fn -> Process.exit(Process.whereis(Presence), :kill) end,
         fn -> {:ok, :same_mesh} = Resolver.replace(inventory(), [], ctx.names.resolver) end
@@ -965,7 +965,9 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
         restart.()
         wait_until(fn -> Process.whereis(Presence) not in [nil, old] end)
         state = :sys.get_state(Presence)
-        assert state.next_attempt == state.started + state.gap_ms
+        # Settling: no attempt before a Lights read, an idle Radio and a gap.
+        assert state.settling in [:lights, :radio]
+        assert state.next_attempt >= state.started + state.gap_ms
       end
     end
 

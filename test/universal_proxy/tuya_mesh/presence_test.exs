@@ -15,8 +15,8 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
     {:ok, clock: clock, now: now}
   end
 
-  # Ticks only when the test polls; no jitter, no start delay. Started a
-  # gap before 0, so the first attempt may go at 0. Every accepted ping
+  # Ticks only when the test polls; no jitter, no start delay. Started and
+  # settled a gap before 0, so the first attempt may go at 0. Every accepted ping
   # airs on the FakeRadio unless `on_ping` (`(mac, radio) -> any`) says
   # otherwise.
   defp start(ctx, opts \\ []) do
@@ -49,12 +49,25 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
 
     presence = start_supervised!({Presence, Keyword.merge(defaults, opts)}, id: :presence)
 
+    # A new pinger settles first (Lights read, Radio idle): done here, a gap
+    # before 0, so the first attempt may go at 0. Its first push is dropped.
+    :ok = Presence.poll(presence)
+    flush_pushes()
+
     Map.merge(ctx, %{
       lights: lights,
       radio: radio,
       presence: presence,
       opts: Keyword.merge(defaults, opts)
     })
+  end
+
+  defp flush_pushes do
+    receive do
+      {:tuya_mesh_presence, _generation, _snapshot} -> flush_pushes()
+    after
+      0 -> :ok
+    end
   end
 
   defp at(ctx, ms) do
@@ -457,22 +470,53 @@ defmodule UniversalProxy.TuyaMesh.PresenceTest do
   end
 
   describe "a replacement" do
-    test "waits a full gap after its start before its first attempt", ctx do
+    test "settles first: a full gap after the Radio is idle, not after its start", ctx do
       ctx = start(ctx, macs: [@a, @b])
       at(ctx, 0)
       assert pings(ctx) == [@a]
 
-      # Restarted (a crash, Lights restarting, an upload) right after.
+      # Restarted (a crash, Lights restarting, an upload) right after, with
+      # the predecessor's ping still on air until 3 s.
       :ok = stop_supervised!(:presence)
       Agent.update(ctx.clock, fn _ -> 1_000 end)
       presence = start_supervised!({Presence, ctx.opts}, id: :presence)
       ctx = %{ctx | presence: presence}
 
       at(ctx, 1_000)
-      at(ctx, 30_999)
+      at(ctx, 5_000)
+      at(ctx, 34_999)
       assert pings(ctx) == [@a]
-      at(ctx, 31_000)
+      at(ctx, 35_000)
       assert pings(ctx) == [@a, @a]
+    end
+
+    test "a predecessor's ping held behind a backlog delays the first attempt", ctx do
+      # The ping is accepted but queued behind a command.
+      held = fn _mac, radio -> FakeRadio.put(radio, %{queued: 1}) end
+      ctx = start(ctx, macs: [@a, @b], on_ping: held)
+      at(ctx, 0)
+      assert pings(ctx) == [@a]
+
+      # The pinger is replaced while it is still queued (Lights lives on).
+      :ok = stop_supervised!(:presence)
+      Agent.update(ctx.clock, fn _ -> 1_000 end)
+      presence = start_supervised!({Presence, ctx.opts}, id: :presence)
+      ctx = %{ctx | presence: presence}
+      at(ctx, 1_000)
+      at(ctx, 31_000)
+
+      # It airs at 40 s, after the replacement's start-up gap would have run.
+      Agent.update(ctx.clock, fn _ -> 40_000 end)
+      :ok = FakeRadio.put(ctx.radio, %{queued: 0})
+      :ok = FakeRadio.air(ctx.radio)
+      at(ctx, 40_000)
+      at(ctx, 45_000)
+      at(ctx, 74_999)
+      assert pings(ctx) == [@a]
+
+      # A full gap after the Radio went idle at 45 s.
+      at(ctx, 75_000)
+      assert length(pings(ctx)) == 2
     end
 
     test "pushes under a later generation, in the mesh generation it was given", ctx do
