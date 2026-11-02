@@ -1,19 +1,24 @@
 defmodule UniversalProxy.TuyaMesh.FakeLights do
   @moduledoc false
-  # Answers `Lights.all/1` and `Lights.ping/2` (both plain calls). Bulbs in
+  # Answers `Lights.all/1`, `Lights.ping/2` and `Lights.ping_all/1` (plain
+  # calls; a broadcast is recorded as `:all` in `pings`). Bulbs in
   # `replying` answer a ping at once: their `last_report_ms` becomes the
-  # clock. Bulbs in `held` answer with a frame Lights holds (a reset
-  # counter): only their `heard_ms` moves. `ping_reply` is what every ping returns; `on_ping` (`mac -> any`)
-  # runs for each accepted one (to air it on a FakeRadio, say). `all_reply`,
-  # when set, replaces `Lights.all/1`'s answer. `heard` (`mac => ms`) adds
-  # frames heard but held (not accepted), as Lights' `heard_ms` does.
+  # clock; those also in `deaf` don't answer broadcasts (a collision).
+  # Bulbs in `held` answer with a frame Lights holds (a reset counter):
+  # only their `heard_ms` moves. `ping_reply` is what every ping returns;
+  # `on_ping` (`mac | :all -> any`) runs for each accepted one (to air it on
+  # a FakeRadio, say). `all_reply`, when set, replaces `Lights.all/1`'s
+  # answer. `heard` (`mac => ms`) adds frames heard but held (not
+  # accepted), as Lights' `heard_ms` does.
   use GenServer
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name))
 
   def put(server, key, value), do: GenServer.call(server, {:put, key, value})
   def report(server, mac, ms), do: GenServer.call(server, {:report, mac, ms})
-  def pings(server), do: GenServer.call(server, :pings)
+  def pings(server), do: server |> log() |> Enum.map(&elem(&1, 0))
+  # `[{mac | :all, at}]`, oldest first.
+  def log(server), do: GenServer.call(server, :pings)
 
   @impl GenServer
   def init(opts) do
@@ -22,6 +27,7 @@ defmodule UniversalProxy.TuyaMesh.FakeLights do
        bulbs: Map.new(Keyword.get(opts, :macs, []), &{&1, nil}),
        replying: MapSet.new(Keyword.get(opts, :replying, [])),
        held: MapSet.new(Keyword.get(opts, :held, [])),
+       deaf: MapSet.new(Keyword.get(opts, :deaf, [])),
        clock: Keyword.get(opts, :clock, fn -> System.monotonic_time(:millisecond) end),
        ping_reply: :ok,
        all_reply: nil,
@@ -47,7 +53,7 @@ defmodule UniversalProxy.TuyaMesh.FakeLights do
   end
 
   def handle_call({:ping, mac}, _from, state) do
-    state = %{state | pings: [mac | state.pings]}
+    state = %{state | pings: [{mac, state.clock.()} | state.pings]}
     if state.ping_reply == :ok, do: state.on_ping.(mac)
 
     state =
@@ -61,8 +67,20 @@ defmodule UniversalProxy.TuyaMesh.FakeLights do
     {:reply, state.ping_reply, state}
   end
 
-  def handle_call({:put, :replying, macs}, _from, state),
-    do: {:reply, :ok, %{state | replying: MapSet.new(macs)}}
+  def handle_call(:ping_all, _from, state) do
+    state = %{state | pings: [{:all, state.clock.()} | state.pings]}
+    if state.ping_reply == :ok, do: state.on_ping.(:all)
+
+    state =
+      if state.ping_reply == :ok,
+        do: Enum.reduce(state.bulbs, state, &answer_broadcast(&2, elem(&1, 0))),
+        else: state
+
+    {:reply, state.ping_reply, state}
+  end
+
+  def handle_call({:put, set, macs}, _from, state) when set in [:replying, :deaf, :held],
+    do: {:reply, :ok, Map.put(state, set, MapSet.new(macs))}
 
   def handle_call({:put, :macs, macs}, _from, state),
     do: {:reply, :ok, %{state | bulbs: Map.new(macs, &{&1, Map.get(state.bulbs, &1)})}}
@@ -76,6 +94,15 @@ defmodule UniversalProxy.TuyaMesh.FakeLights do
     do: {:reply, :ok, %{state | bulbs: Map.put(state.bulbs, mac, ms)}}
 
   def handle_call(:pings, _from, state), do: {:reply, Enum.reverse(state.pings), state}
+
+  defp answer_broadcast(state, mac) do
+    cond do
+      mac in state.deaf -> state
+      mac in state.replying -> %{state | bulbs: Map.put(state.bulbs, mac, state.clock.())}
+      mac in state.held -> %{state | heard: Map.put(state.heard, mac, state.clock.())}
+      true -> state
+    end
+  end
 
   # As in Lights: heard_ms is never behind last_report_ms.
   defp later(nil, b), do: b

@@ -85,9 +85,9 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   (`Store.mesh_fingerprint/1`, a hash of its key, compared on every
   inventory load, so A → B → A forgets twice). It is in memory only
   (monotonic ms within one boot): after a reboot every bulb is "never
-  seen" until it answers, which the pinger's first round (60 s after
-  start, then one bulb a minute) settles, and nothing is written to flash
-  for it.
+  seen" until it answers, which the pinger's first broadcast (seconds
+  after the mesh starts) settles for most bulbs, and nothing is written to
+  flash for it.
 
   Snapshots are ordered by generation, not by arrival (messages from two
   processes have none): the Resolver bumps its mesh generation for every
@@ -107,10 +107,12 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   this boot, has fewer than `:miss_limit` (2) consecutive missed pings,
   and was last heard within `max(:reachable_ms, 2.5 × interval)`, where
   `interval` is the time Presence expects between its checks of that
-  bulb. The window keeps a bulb reachable between scheduled pings and
-  while pinging waits for the radio, so marginal range (a missed ping or
-  two) or a busy queue never flips it alone: only `:miss_limit` misses in
-  a row do. A bulb not reachable yet below `:miss_limit` misses, with
+  bulb: its 60 s cycle, so 150 s (`:reachable_ms`, 2 min, is the floor
+  without a pinger). The window keeps a bulb reachable between checks, a
+  broadcast reply lost to a collision, and a follow-up carried over a
+  cycle, while still tracking reality within a few minutes; a missed
+  direct ping (marginal range) never flips it alone: only `:miss_limit`
+  misses in a row do. A bulb not reachable yet below `:miss_limit` misses, with
   Presence running and the radio ready, is **checking** (a verdict is
   pending), as long as the latest `Lights.all/1` read worked and the
   current pinger has reported the bulb. Idle, nothing is reachable or
@@ -119,7 +121,8 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   Options: `:tuya_adapter`, `:dynsup`, `:name`, and test seams `:store`,
   `:adapters_fun`, `:mesh_spec_fun` (`(index, mac -> child_spec)`, or
   `(index, mac, presence_opts -> child_spec)` to get the Presence options
-  `notify:` and `mesh_generation:`), `:radio`,
+  `notify:`, `mesh_generation:` and `frames:`, the pinger's frame log this
+  process owns, see `UniversalProxy.TuyaMesh.Presence`), `:radio`,
   `:lights`, `:pubsub`, `:retry_ms`, `:restart_ms`, `:tick_ms`,
   `:index_check_ticks` (ticks between adapter re-checks, default 6),
   `:reachable_ms`, `:miss_limit`.
@@ -130,7 +133,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   require Logger
 
   alias UniversalProxy.TuyaBeaconMesh.{Inventory, Lights, Radio}
-  alias UniversalProxy.TuyaMesh.{Mesh, Redact, Store}
+  alias UniversalProxy.TuyaMesh.{Mesh, Presence, Redact, Store}
 
   @topic "tuya_mesh"
   @retry_ms 2_000
@@ -140,7 +143,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   @index_check_ticks 6
   @report_debounce_ms 300
   @resubscribe_ms 1_000
-  @reachable_ms 300_000
+  @reachable_ms 120_000
   @miss_limit 2
   # Stopping the mesh waits for Lights (5 s) and the Radio's teardown (10 s).
   @change_timeout 30_000
@@ -278,7 +281,9 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
       presence_mesh: nil,
       published: nil,
       pubsub_mon: nil,
-      sub_timer: nil
+      sub_timer: nil,
+      frames: frame_log(Keyword.get(opts, :name, __MODULE__)),
+      frames_key: {__MODULE__, :frames, Keyword.get(opts, :name, __MODULE__)}
     }
 
     # The evaluation that follows reads everything fresh: nothing to catch up.
@@ -362,9 +367,41 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   @impl GenServer
   def terminate(_reason, state) do
     _ = halt_mesh(state)
+    save_frame_log(state)
     :ok
   catch
     :exit, _reason -> :ok
+  end
+
+  # ── Frame log ────────────────────────────────────────────────────────
+
+  # The pinger's frame log (`Presence`, "Frame log") outlives pingers and
+  # meshes here. A Resolver that stops hands it on to its successor
+  # through :persistent_term (one write per stop); a successor that finds
+  # none although a Resolver ran before (it was killed) can't know the
+  # last hour, and marks the log so.
+  defp frame_log(name) do
+    table = :ets.new(:tuya_mesh_frames, [:set, :public])
+    now = System.monotonic_time(:millisecond)
+
+    case :persistent_term.get({__MODULE__, :frames, name}, nil) do
+      rows when is_list(rows) ->
+        :ets.insert(table, rows)
+        :persistent_term.erase({__MODULE__, :frames, name})
+
+      nil ->
+        if :persistent_term.get({__MODULE__, :ran, name}, false),
+          do: Presence.unknown_history(table, now),
+          else: :persistent_term.put({__MODULE__, :ran, name}, true)
+    end
+
+    table
+  end
+
+  defp save_frame_log(state) do
+    :persistent_term.put(state.frames_key, :ets.tab2list(state.frames))
+  rescue
+    ArgumentError -> :ok
   end
 
   # Evaluation loads the inventory (keys and all) from the Store, so the
@@ -523,7 +560,12 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   end
 
   defp mesh_spec(%{mesh_spec_fun: fun} = state, index) when is_function(fun, 3),
-    do: fun.(index, state.mac, notify: self(), mesh_generation: state.mesh_generation)
+    do:
+      fun.(index, state.mac,
+        notify: self(),
+        mesh_generation: state.mesh_generation,
+        frames: state.frames
+      )
 
   defp mesh_spec(state, index), do: state.mesh_spec_fun.(index, state.mac)
 

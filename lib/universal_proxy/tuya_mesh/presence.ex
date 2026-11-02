@@ -3,128 +3,230 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   The mesh pinger: keeps every bulb's presence known without starving
   commands.
 
-  Beacon Mesh bulbs never report on their own: they answer a ping (a
-  presence reply) or an acked DP set (a DP report), nothing else. So a
-  bulb nobody commands goes silent, and only a ping tells a live one from
-  a dead one. This process pings, and pushes what it learns to the
-  Resolver, which decides what the status calls reachable.
+  Beacon Mesh bulbs don't report on their own, except once at power-on
+  (an unprompted ping reply): they answer a ping (a presence reply) or an
+  acked DP set (a DP report). So a bulb nobody commands goes silent, and
+  only a ping tells a live one from a dead one. This process pings, and
+  pushes what it learns to the Resolver, which decides what the status
+  calls reachable.
 
   ## Schedule
 
-  Every `:tick_ms` (5 s; `:pending_tick_ms`, 1 s, while a ping is
-  outstanding) it reads `Lights.all/1` (each bulb's `heard_ms`: the last
-  frame from it, including ones Lights holds while re-anchoring a reset
-  counter; kept as the latest seen) and then, at most once, pings the
-  most overdue bulb that is:
+  Every `:cycle_ms` (60 s, jittered by `:jitter`, default ±10 %) it sends
+  one broadcast ping (`Lights.ping_all/1`). Every bulb that hears it
+  should answer, but replies collide: on hardware a broadcast drew 8 or 9
+  of 10, a different bulb missing each time
+  (`docs/protocols/tuya_beacon_mesh.md` §4.9). So a missing reply leaves
+  a bulb **unconfirmed**, not missed:
 
-    * due: its next check time has passed (below);
-    * silent for over `:silence_ms` (60 s), or never heard;
+    * a bulb whose `heard_ms` (the last frame from it, `Lights.all/1`;
+      including ones Lights holds while re-anchoring a reset counter)
+      advanced within the broadcast's reply window (`:broadcast_reply_ms`,
+      5 s), or in the `:fresh_ms` (15 s) before the broadcast, is
+      confirmed;
+    * every other bulb becomes unconfirmed and gets **one** direct
+      `Lights.ping/2` in the follow-up slots after it. Only when that
+      direct ping too goes unanswered for its window (`:reply_ms`, 5 s)
+      is it a **miss**.
 
-  and only when all of these hold:
+  Follow-ups go one at a time, in two classes:
 
-    * no ping is outstanding (one at a time);
-    * `:min_gap_ms` (60 s) passed since the last ping attempt, or since
-      an uncertain one settled (below). A new process (a restart of this
-      one, of Lights or the Radio, or of the whole mesh after an upload)
-      starts settling: its predecessor may have left a ping queued, and
-      no state survives the restart to say so;
+    * **urgent**: a deciding second miss, or, in a **suspected outage**,
+      a check of any bulb not yet missed twice. An outage is suspected
+      when a broadcast drew replies from fewer than half of the bulbs
+      heard in the 10 minutes before it (known stragglers aside, they
+      never answer broadcasts; at least 2 such bulbs), and lasts until a
+      broadcast draws half again. Urgent checks go first, oldest
+      unconfirmed first and, from the same broadcast, misses first.
+    * **routine**: everything else, a bulb that missed one broadcast (a
+      collision, most likely), a persistent straggler's check, a dead
+      bulb's backed-off one. Bulbs below the miss limit go first, by
+      deadline: the moment the bulb's reachable window at the Resolver
+      (2.5 × its `interval_ms`) would run out, or, for a bulb never
+      heard, 5 cycles after it was first seen. So a heard bulb whose
+      window is closing goes before it, but it can't be starved: once
+      that synthetic deadline is the earliest it goes next, so a new bulb
+      that answers direct pings is confirmed within about 5 cycles and one
+      routine spacing of appearing (5.5 min). The retries of bulbs
+      already missed twice go last, with what capacity is left; those
+      recover through broadcasts and their power-on announce anyway.
+
+  What the budget (below) doesn't fit carries over, keeping its place.
+
+  A bulb's direct follow-ups back off with its misses: none after its
+  first (the second, deciding one comes at the next cycle), then
+  `:direct_backoff_ms` (2 min) after its second, doubling to
+  `:max_direct_backoff_ms` (15 min). It still hears every broadcast, and
+  any frame from it, its power-on announce included, confirms it at once:
+  misses and backoff clear as soon as `heard_ms` advances.
+
+  A **persistent straggler** (it missed the broadcast and answered the
+  direct ping twice in a row, e.g. a bulb whose `beaconKey` overrides the
+  mesh key and can't open broadcasts) is checked directly every other
+  cycle at most, and its `interval_ms` in the snapshot is honest about it:
+  two cycles, or, when the routine budget can't serve all stragglers that
+  often, the time it takes to: stragglers (and never-heard bulbs still
+  waiting for their first check) × the routine spacing, against
+  the routine rate less what suspect checks took over the last ten
+  minutes (counted as at least half of it), rounded up to 30 s. 4
+  stragglers: 120 s (window 300 s); 10: 300 s (window 750 s). Deadline
+  order then serves each within that. Outside an outage, such a bulb
+  going dead is noticed a cycle or two later than the others; in a
+  suspected outage its cadence is set aside and it is checked at once.
+  Answering a broadcast clears the record.
+
+  Every frame (broadcast or direct) is sent only when all of these hold:
+
+    * nothing is outstanding (one frame and its reply window at a time);
+    * `:min_gap_ms` (5 s) passed since the last attempt, or since an
+      uncertain one settled (below);
+    * its budget allows it (see "Budget");
     * `Radio.status/1` reads ready, discovering and listening, with
-      nothing on air and nothing queued, so a ping never queues in front
+      nothing on air and nothing queued, so a frame never queues in front
       of, or behind, a command.
 
-  A bulb's next check is its last reply plus its interval, or the missed
-  ping plus its interval, each with `:jitter` added (default ±10 %), so
-  bulbs drift apart instead of lining up. The interval is
-  `:base_interval_ms` (2 min) while the bulb answers; after `n`
-  consecutive missed pings it is `base * 2^(n-1)`, capped at
-  `:max_interval_ms` (15 min): 2, 2, 4, 8, 15 min. Any report (a ping
-  reply, a DP report from an acked command) resets it. A fresh start
-  checks every bulb once after `:start_delay_ms` (15 s, jittered; the
-  settling below holds the first attempt to a gap after the first tick
-  that finds the Radio idle, about 65 s), or at its last reply plus the
-  base interval when that is later.
+  A broadcast that is due goes before follow-ups. Ticks come every
+  `:tick_ms` (5 s), or every `:busy_tick_ms` (1 s) while a frame is
+  outstanding, follow-ups wait, or the pinger is settling.
+
+  ## Outage detection
+
+  All of 10 bulbs losing power is noticed in about 2.3 to 3.3 minutes,
+  whatever routine traffic came before (an hour of rotating broadcast
+  misses, or a straggler warm-up, use routine budget only). Each needs two
+  misses, so 20 urgent direct pings plus the broadcasts around them, one
+  frame per 5 s slot, at most 8 follow-ups in any minute (one slot of the
+  10 stays free for a broadcast). Worst case, the power goes just after a
+  broadcast was answered (t = 0; simulated without jitter):
+
+    * the next broadcast airs at 60 s and draws nothing: an outage is
+      suspected; its window closes at 65 s;
+    * 8 urgent direct pings (65 to 100 s): 8 first misses;
+    * the next broadcast at 120 s; then, as earlier frames leave the
+      minute, the two bulbs left over from the first cycle (their first
+      misses) and the first 6 of the others' second misses: the first
+      bulbs are Not reachable at about 135 s;
+    * the third broadcast at 180 s; the last 4 second misses: the last
+      bulb is Not reachable at about 200 s.
+
+  So 2.3 to 3.3 min, up to about 3.5 with the cycle's jitter; a smaller
+  mesh, or power going just before a broadcast, is faster. The Resolver's
+  reachable window (2.5 cycles) also stops a bulb reading reachable 150 s
+  after it was last heard, before its second miss.
 
   ## What counts as a miss
 
-  A miss is counted only when the ping provably aired alone and the whole
-  reply window passed with a working receiver. Anything uncertain gives
-  no verdict: the attempt is dropped, the bulb stays due and is tried
-  again after the gap, and nothing counts towards the miss limit.
+  A miss is counted only when the direct ping provably aired alone and
+  its whole reply window passed with a working receiver; a bulb becomes
+  unconfirmed only when the broadcast provably aired alone and its window
+  passed the same way. Anything uncertain gives no verdict: nothing is
+  unconfirmed or missed, and the frame is tried again later.
 
-    * A ping refused (`:busy`, `:queue_full`, `:not_ready`, a timeout,
+    * A frame refused (`:busy`, `:queue_full`, `:not_ready`, a timeout,
       anything but `:ok`): no verdict.
-    * `Lights.ping/2` returns `:ok` for a frame merely queued: a command
-      can reach the Radio between the idle check and the ping, and then
-      the ping waits behind it (or a control send drops it). So right
-      after the call, `Radio.status/1` must show the ping on air: the
-      radio still working (as above), something on air, nothing queued,
-      and `last_tx_sn` exactly one past the value read at the idle check.
-      Otherwise no verdict.
-    * The reply window (`:reply_ms`, 10 s) starts when that confirmation
-      is read. A report counts as the reply when it is no older than the
-      moment just before the ping call, so one arriving during the call
-      counts too.
+    * `Lights.ping/2` and `ping_all/1` return `:ok` for a frame merely
+      queued: a command can reach the Radio between the idle check and
+      the call, and then the frame waits behind it (or a control send
+      drops it). So right after the call, `Radio.status/1` must show it on
+      air: the radio still working (as above), something on air, nothing
+      queued, and `last_tx_sn` exactly one past the value read at the idle
+      check. Otherwise no verdict.
+    * The reply window starts when that confirmation is read. A report
+      counts as a reply when it is no older than the moment just before
+      the call, so one arriving during the call counts too.
     * Every tick in the window reads the Radio again: not ready, not
       discovering or not listening drops the attempt (a receiver that was
-      down may have missed the reply).
+      down may have missed the replies).
     * The window closing while `Lights.all/1` fails defers the verdict to
-      the next read that works, which may still show the reply.
+      the next read that works, which may still show the replies.
 
   Residual imprecision, which only core changes could remove: the Radio
   is sampled once a second, so a receiver lost and back inside one second
   goes unseen; `last_tx_sn` one ahead could, in principle, belong to
   another frame if Lights' cursor skipped a number and that frame aired
-  while the ping was dropped, both inside the call; an advert cut short by
+  while ours was dropped, both inside the call; an advert cut short by
   `Radio.stop_tx/1` after the confirmation is not seen. Numbers handed
   out but never aired (a cursor gap), or a Radio that hasn't sent a frame
-  yet (`last_tx_sn` nil), make one ping fail confirmation for nothing;
+  yet (`last_tx_sn` nil), make one frame fail confirmation for nothing;
   the next one passes.
 
-  ## Settling an uncertain ping
+  ## Settling an uncertain frame
 
-  A ping whose fate is unknown may still air later: a `Lights.ping/2`
-  call that timed out stays in Lights' queue, an `:ok` that couldn't be
-  confirmed may sit queued behind a command, and `{:uncertain, _}` (or
-  `:not_running`, which a Lights crash mid-call also returns) may have gone
-  out. Starting the gap at the attempt would then let the next ping go
-  less than a gap after this one aired. So after any outcome but a
-  confirmed ping or a refusal known to have queued nothing (`:busy`,
-  `:queue_full`, `:not_ready`, `:unknown_bulb`, `:persist_failed`, a
-  refused advertise), the pinger settles first: it waits for a later
-  `Lights.all/1` to return (Lights handles calls in order, so the ping
-  request is done with by then) and then for the Radio to read idle
-  (nothing queued, nothing on air), and the full gap starts from that
-  moment.
+  A frame whose fate is unknown may still air later: a call that timed
+  out stays in Lights' queue, an `:ok` that couldn't be confirmed may sit
+  queued behind a command, and `{:uncertain, _}` (or `:not_running`,
+  which a Lights crash mid-call also returns) may have gone out. So after
+  any outcome but a confirmed frame or a refusal known to have queued
+  nothing (`:busy`, `:queue_full`, `:not_ready`, `:unknown_bulb`,
+  `:persist_failed`, a refused advertise), the pinger settles first: it
+  waits for a later `Lights.all/1` to return (Lights handles calls in
+  order, so the request is done with by then), then for the Radio to read
+  idle (nothing queued, nothing on air), and the gap starts from that
+  moment. An uncertain attempt counts against the caps.
 
-  Every new process starts in this state too. Lights and the Radio can
-  outlive a pinger (a crash restarts only it), so a predecessor's ping may
-  still be in Lights' queue or the Radio's; the first `Lights.all/1` read
-  is after any such request, and the idle Radio after it aired. With no
-  backlog, that makes the first attempt one gap after the first tick.
+  Every new process starts settling too: Lights and the Radio can outlive
+  a pinger (a crash restarts only it), so a predecessor's frame may still
+  be queued.
 
   ## Budget
 
-  Every attempt waits `:min_gap_ms` after the previous one, so pings are
-  bounded by `3_600_000 / min_gap_ms` per hour whatever the bulb count:
-  60/hour with the default 60 s. That bound is reached when every bulb
-  answers: each wants a ping every 2 min, so from `base / min_gap` = 2
-  bulbs on, the gap paces them (10 bulbs: one each ~10 min). Dead bulbs
-  cost little: at 15 min each, 4/hour.
+  At most `:max_per_minute` (10) frames in any 60 s and `:max_per_hour`
+  (240) in any hour, each one sequence number (refused frames hand theirs
+  back) and one advert slot of at least 3 s. Within that:
 
-  Each ping takes one sequence number (refused frames hand theirs back)
-  and one advert slot of at least 3 s. At the bound that is 60 numbers
-  (1_440 a day) and 3 min of airtime (5 %) an hour. Lights sizes leases for
-  one persist per minute at the observed rate, clamped to at least 32
-  numbers, so pinging alone causes one persist every 32 min at most (45 a
-  day). It also moves the shared 16-bit counter half its range in about 23
-  days, past which an old dump would compare as ahead: the Store accepts a
-  dump's `seq` only as a bounded advance on its own cursor
-  (`UniversalProxy.TuyaMesh.Store`, "Upload seq"), so that is safe.
+    * **Broadcasts are reserved** `:broadcast_reserve` an hour: as many as
+      the shortest jittered cycle allows (60 s - 10 %: 67). Follow-ups
+      never use that share, and always leave one slot of each minute
+      free, so a due broadcast is never held back by follow-ups and every
+      bulb that answers broadcasts stays heard within the Resolver's
+      window, whatever the stragglers do.
+    * **Follow-ups** share the rest of the hour (240 - 67 = 173).
+    * **Routine** follow-ups leave `:urgent_reserve` (40) of that to
+      urgent ones (at most half of it), so 133 an hour, and are spaced
+      evenly (`:routine_spacing_ms`, the hour / 133, 27 s), so a heavy
+      straggler load never spends the hour early and never starves
+      urgent checks. 2.2 a minute: 10 stragglers each every 300 s, or 2
+      broadcast collisions a minute (20 per 10 min) with room to spare.
+    * **Urgent** follow-ups aren't spaced: an outage's burst (about 20 in
+      3 minutes) only meets the minute cap and the follow-ups' 173 an
+      hour, of which routine ones leave at least 40.
 
-  60 s rather than 30 s: twice the numbers, persists and airtime would buy
-  only a faster first round after a restart (10 bulbs: 10 min instead of
-  5 min to all heard) and checks every 5 min instead of 10 for live bulbs.
-  A dead bulb is still found within about two of its checks either way.
+  What that gives:
+
+    * Healthy (10 bulbs): one broadcast a minute plus 1 or 2 stragglers,
+      2 to 3 frames a minute (120 to 180 an hour; 10 to 15 % airtime);
+      persistent stragglers every other cycle at most, so 4 of them add 2
+      a minute.
+    * All dead: one broadcast a minute plus direct pings backed off to 15
+      min each, about 100 an hour once the first 20 minutes are past.
+    * At the cap, 240 numbers an hour (5_760 a day). Lights sizes leases
+      for one persist per minute at the observed rate, clamped to at
+      least 32 numbers: at 4 a minute that is one persist every 8 minutes
+      or more (at most about 180 a day), under the one-a-minute budget.
+      The 16-bit counter then moves half its range in under 6 days and
+      wraps in under 12, so an old dump soon reads as ahead of the
+      device's counter; the Store takes a dump's `seq` only as a bounded
+      advance of at most 299 (`UniversalProxy.TuyaMesh.Store`, "Upload
+      seq"), which holds however fast the counter moves.
+
+  ## Frame log
+
+  The caps count the frames of the last hour from a frame log, an ETS
+  table (`:frames`) that the Resolver owns and passes to every Presence
+  it starts, so a pinger restart or a mesh restart (an upload) keeps the
+  hour's history. A new Presence also takes from it the time of the last
+  broadcast (the next one comes a cycle after it, not at once: repeated
+  restarts can't spend the broadcasts' reservation early) and which bulbs
+  are persistent stragglers (so a restart doesn't shrink their advertised
+  interval, and with it the Resolver's window, while their last-heard
+  time stays). Each attempt is logged before its call (a crash inside
+  the call still counts it) and removed again only when the frame was
+  provably refused. A Resolver that stops hands the log to its successor;
+  one that was killed leaves its successor a log that doesn't know the
+  last hour (`unknown_history/3`): the minute's cap counts as spent and
+  only broadcasts go (within their reservation) until an hour has passed.
+  Without `:frames` (tests), a Presence keeps a log of its own, lost with
+  it, and starts with the minute's cap counted as spent.
 
   ## Snapshot
 
@@ -137,10 +239,10 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   have no order between them; these numbers do, so the Resolver can drop
   a late snapshot from a pinger already replaced. `snapshot` maps each MAC
   to `t:bulb/0`: the latest report time, the consecutive misses this
-  process counted and when the last missed ping was asked for, the bulb's
-  expected time between checks (`interval_ms`: its interval, or the gap
-  times the bulb count when that is longer), and whether a ping to it is
-  outstanding. Times are monotonic milliseconds from `:clock`.
+  process counted and when the last missed ping was asked for, the time
+  expected between checks of the bulb (`interval_ms`: the cycle), and
+  whether a direct ping to it is outstanding. Times are monotonic
+  milliseconds from `:clock`.
 
   ## Supervision
 
@@ -155,29 +257,50 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   crash it.
 
   Options: `:lights`, `:radio` (server names), `:notify`,
-  `:mesh_generation`, `:name`, and
-  the timing above (`:tick_ms`, `:pending_tick_ms`, `:start_delay_ms`,
-  `:silence_ms`, `:base_interval_ms`, `:max_interval_ms`, `:min_gap_ms`,
-  `:reply_ms`), plus test seams `:clock` (`(-> integer())`, monotonic ms)
-  and `:jitter` (`(interval_ms -> offset_ms)`).
+  `:mesh_generation`, `:frames`, `:name`, and the timing above
+  (`:cycle_ms`, `:broadcast_reply_ms`, `:reply_ms`, `:fresh_ms`,
+  `:min_gap_ms`, `:max_per_minute`, `:max_per_hour`, `:broadcast_reserve`,
+  `:urgent_reserve`, `:routine_spacing_ms`, `:direct_backoff_ms`,
+  `:max_direct_backoff_ms`, `:tick_ms`, `:busy_tick_ms`), plus test seams
+  `:clock` (`(-> integer())`, monotonic ms) and `:jitter` (`(interval_ms
+  -> offset_ms)`).
   """
 
   use GenServer
 
   alias UniversalProxy.TuyaBeaconMesh.{Lights, Radio}
 
+  @cycle_ms 60_000
+  @broadcast_reply_ms 5_000
+  @reply_ms 5_000
+  @fresh_ms 15_000
+  @min_gap_ms 5_000
+  @max_per_minute 10
+  @max_per_hour 240
+  # Follow-ups only urgent checks (deciding misses, a suspected outage's)
+  # may use: an outage's two rounds over 10 bulbs, twice over.
+  @urgent_reserve 40
+  # Recently heard bulbs of which fewer than half answer a broadcast: a
+  # suspected outage.
+  @recent_ms 600_000
+  @interval_step 30_000
+  # A never-heard bulb's check competes by deadline as if its window ran
+  # out this many cycles after it was first seen.
+  @never_heard_cycles 5
+  # A persistent straggler (missed the broadcast, answered the direct ping,
+  # twice in a row) is checked directly every other cycle.
+  @straggler_cycles 2
+  @direct_backoff_ms 120_000
+  @max_direct_backoff_ms 900_000
   @tick_ms 5_000
-  @pending_tick_ms 1_000
-  @start_delay_ms 15_000
-  @silence_ms 60_000
-  @base_interval_ms 120_000
-  @max_interval_ms 900_000
-  @min_gap_ms 60_000
-  @reply_ms 10_000
+  @busy_tick_ms 1_000
+  @minute 60_000
+  @ten_minutes 600_000
+  @hour 3_600_000
   # Short: the readiness checks run in this loop.
   @radio_timeout 1_000
   @sn_space 65_536
-  # Ping refusals that provably queued nothing for the Radio.
+  # Refusals that provably queued nothing for the Radio.
   @refused [:busy, :queue_full, :not_ready, :unknown_bulb, :persist_failed]
 
   @type bulb :: %{
@@ -202,6 +325,18 @@ defmodule UniversalProxy.TuyaMesh.Presence do
     :exit, _reason -> {:error, :not_running}
   end
 
+  @doc """
+  Marks `table` (a frame log, see "Frame log") as not knowing what was sent
+  before `now`: the minute cap counts as spent, and no follow-up goes
+  until an hour has passed.
+  """
+  @spec unknown_history(:ets.tid() | atom(), integer(), keyword()) :: true
+  def unknown_history(table, now, opts \\ []) do
+    per_minute = Keyword.get(opts, :max_per_minute, @max_per_minute)
+    rows = for _ <- 1..per_minute, do: {System.unique_integer([:monotonic]), now, :unknown}
+    :ets.insert(table, [{:unknown_until, now + @hour} | rows])
+  end
+
   @doc false
   # Runs one tick now: tests drive the schedule with a fake clock.
   @spec poll(GenServer.server()) :: :ok
@@ -213,7 +348,10 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   def init(opts) do
     clock = Keyword.get(opts, :clock, fn -> System.monotonic_time(:millisecond) end)
     started = clock.()
-    gap_ms = Keyword.get(opts, :min_gap_ms, @min_gap_ms)
+    per_minute = Keyword.get(opts, :max_per_minute, @max_per_minute)
+    per_hour = Keyword.get(opts, :max_per_hour, @max_per_hour)
+    cycle_ms = Keyword.get(opts, :cycle_ms, @cycle_ms)
+    frames = frame_log(Keyword.get(opts, :frames), started, per_minute)
 
     state = %{
       lights: Keyword.get(opts, :lights, Lights),
@@ -222,30 +360,56 @@ defmodule UniversalProxy.TuyaMesh.Presence do
       generation:
         {Keyword.get(opts, :mesh_generation, 0), System.unique_integer([:monotonic, :positive])},
       clock: clock,
-      started: started,
       jitter: Keyword.get(opts, :jitter, &default_jitter/1),
-      tick_ms: Keyword.get(opts, :tick_ms, @tick_ms),
-      pending_tick_ms: Keyword.get(opts, :pending_tick_ms, @pending_tick_ms),
-      start_delay_ms: Keyword.get(opts, :start_delay_ms, @start_delay_ms),
-      silence_ms: Keyword.get(opts, :silence_ms, @silence_ms),
-      base_ms: Keyword.get(opts, :base_interval_ms, @base_interval_ms),
-      max_ms: Keyword.get(opts, :max_interval_ms, @max_interval_ms),
-      gap_ms: gap_ms,
+      cycle_ms: cycle_ms,
+      broadcast_reply_ms: Keyword.get(opts, :broadcast_reply_ms, @broadcast_reply_ms),
       reply_ms: Keyword.get(opts, :reply_ms, @reply_ms),
+      fresh_ms: Keyword.get(opts, :fresh_ms, @fresh_ms),
+      gap_ms: Keyword.get(opts, :min_gap_ms, @min_gap_ms),
+      per_minute: per_minute,
+      per_hour: per_hour,
+      broadcast_reserve:
+        Keyword.get(opts, :broadcast_reserve, min(broadcast_reserve(cycle_ms), per_hour)),
+      urgent_reserve: Keyword.get(opts, :urgent_reserve, @urgent_reserve),
+      routine_spacing_ms: Keyword.get(opts, :routine_spacing_ms),
+      outage: false,
+      straggler_interval: 0,
+      backoff_ms: Keyword.get(opts, :direct_backoff_ms, @direct_backoff_ms),
+      max_backoff_ms: Keyword.get(opts, :max_direct_backoff_ms, @max_direct_backoff_ms),
+      tick_ms: Keyword.get(opts, :tick_ms, @tick_ms),
+      busy_tick_ms: Keyword.get(opts, :busy_tick_ms, @busy_tick_ms),
       bulbs: %{},
       lights_ok: false,
-      # nil, or after an uncertain ping :lights then :radio (see the
-      # moduledoc, "Settling an uncertain ping"). A new process starts
-      # settling: a predecessor's ping may still be queued.
+      # nil, or :lights then :radio while settling (moduledoc, "Settling an
+      # uncertain frame"). A new process starts settling: a predecessor's
+      # frame may still be queued.
       settling: :lights,
       pending: nil,
-      # Set again when settling ends.
-      next_attempt: started + gap_ms,
+      next_attempt: started,
+      frames: frames,
+      # A predecessor's broadcast still counts: the next is a cycle after it.
+      next_broadcast: next_broadcast(frames, started, cycle_ms),
+      # Stragglers a predecessor learned (see "Frame log"), as written last.
+      remembered: remembered(frames),
       pushed: nil,
       timer: nil
     }
 
-    {:ok, schedule(state)}
+    {:ok, state |> budgets() |> schedule()}
+  end
+
+  # Follow-ups get what the broadcasts' reservation leaves of the hour;
+  # routine ones all but the urgent reserve, spaced evenly over the hour so
+  # it never runs out early (see "Budget").
+  defp budgets(state) do
+    followups = max(state.per_hour - state.broadcast_reserve, 0)
+    routine = followups - min(state.urgent_reserve, div(followups, 2))
+
+    Map.merge(state, %{
+      followup_hour: followups,
+      routine_hour: routine,
+      routine_spacing_ms: state.routine_spacing_ms || spacing(routine)
+    })
   end
 
   @impl GenServer
@@ -258,13 +422,16 @@ defmodule UniversalProxy.TuyaMesh.Presence do
 
   def handle_info(_other, state), do: {:noreply, state}
 
-  # Faster while a ping is outstanding, so the receiver is checked
-  # through its reply window.
   defp schedule(state) do
     with {_token, tref} <- state.timer, do: Process.cancel_timer(tref)
-    ms = if state.pending, do: min(state.tick_ms, state.pending_tick_ms), else: state.tick_ms
+    ms = if busy?(state), do: min(state.tick_ms, state.busy_tick_ms), else: state.tick_ms
     token = make_ref()
     %{state | timer: {token, Process.send_after(self(), {:tick, token}, ms)}}
+  end
+
+  defp busy?(state) do
+    state.pending != nil or state.settling != nil or
+      Enum.any?(state.bulbs, fn {_mac, b} -> b.unconfirmed != nil end)
   end
 
   # ── Tick ─────────────────────────────────────────────────────────────
@@ -273,23 +440,31 @@ defmodule UniversalProxy.TuyaMesh.Presence do
     state
     |> refresh()
     |> resolve_pending()
-    |> maybe_ping()
+    |> then(&%{&1 | straggler_interval: straggler_interval(&1, &1.clock.())})
+    |> maybe_send()
+    |> remember()
     |> push()
   end
 
   # Bulbs come and go with the inventory Lights holds; while Lights is
-  # down the last view is kept and nothing is pinged.
+  # down the last view is kept and nothing is sent.
   defp refresh(state) do
-    now = state.clock.()
-
     case Lights.all(server: state.lights) do
       {:ok, list} ->
+        now = state.clock.()
+
         bulbs =
           Map.new(list, fn %{mac: mac} = bulb ->
-            {mac, merge(Map.get(state.bulbs, mac), bulb.heard_ms, now, state)}
+            old = Map.get(state.bulbs, mac)
+            {mac, merge(old, bulb.heard_ms, Map.get(state.remembered, mac, 0), now)}
           end)
 
-        pending = if state.pending && Map.has_key?(bulbs, state.pending.mac), do: state.pending
+        pending =
+          case state.pending do
+            %{kind: {:direct, mac}} = p -> if Map.has_key?(bulbs, mac), do: p
+            other -> other
+          end
+
         settling = if state.settling == :lights, do: :radio, else: state.settling
         %{state | bulbs: bulbs, pending: pending, lights_ok: true, settling: settling}
 
@@ -298,135 +473,364 @@ defmodule UniversalProxy.TuyaMesh.Presence do
     end
   end
 
-  defp merge(nil, last, now, state) do
-    start = max(now, state.started + state.start_delay_ms + state.jitter.(state.start_delay_ms))
-    due = if last, do: max(start, last + state.base_ms), else: start
-    %{last: last, misses: 0, missed_at: nil, interval: state.base_ms, due: due}
-  end
+  defp merge(nil, last, straggles, now),
+    do: %{
+      last: last,
+      seen: now,
+      misses: 0,
+      missed_at: nil,
+      unconfirmed: nil,
+      direct_after: nil,
+      straggles: straggles
+    }
 
-  defp merge(bulb, last, _now, state) do
-    if newer?(last, bulb.last), do: heard(bulb, last, state), else: bulb
-  end
+  defp merge(bulb, last, _straggles, _now),
+    do: if(newer?(last, bulb.last), do: heard(bulb, last), else: bulb)
 
   defp newer?(nil, _known), do: false
   defp newer?(_last, nil), do: true
   defp newer?(last, known), do: last > known
 
-  # Any report: the bulb is there, back to the base interval.
-  defp heard(bulb, last, state) do
-    %{
-      bulb
-      | last: last,
-        misses: 0,
-        missed_at: nil,
-        interval: state.base_ms,
-        due: last + state.base_ms + state.jitter.(state.base_ms)
-    }
-  end
+  # Any frame from it: the bulb is there; misses and backoff clear.
+  defp heard(bulb, last),
+    do: %{bulb | last: last, misses: 0, missed_at: nil, unconfirmed: nil, direct_after: nil}
+
+  defp heard_since?(%{last: last}, at), do: last != nil and last >= at
+
+  # ── Verdicts ─────────────────────────────────────────────────────────
 
   defp resolve_pending(%{pending: nil} = state), do: state
 
-  defp resolve_pending(%{pending: %{mac: mac, asked: asked, deadline: deadline}} = state) do
-    bulb = Map.fetch!(state.bulbs, mac)
-
+  defp resolve_pending(%{pending: %{kind: kind, asked: asked, deadline: deadline}} = state) do
     cond do
-      # Refresh already reset it (heard/3).
-      bulb.last != nil and bulb.last >= asked ->
-        %{state | pending: nil}
+      # A direct ping's reply: refresh already confirmed it (heard/2).
+      answered?(state, kind, asked) ->
+        straggled(%{state | pending: nil}, kind, asked)
 
-      # The reply may have gone unheard: no verdict.
+      # Replies may have gone unheard: no verdict.
       not receiving?(state) ->
         %{state | pending: nil}
 
-      # The read that would show the reply failed: decide on a later one.
+      # The read that would show the replies failed: decide on a later one.
       not state.lights_ok ->
         state
 
       state.clock.() >= deadline ->
-        %{state | pending: nil, bulbs: Map.put(state.bulbs, mac, missed(bulb, asked, state))}
+        close_window(%{state | pending: nil}, kind, asked)
 
       true ->
         state
     end
   end
 
+  defp answered?(state, {:direct, mac}, asked), do: heard_since?(state.bulbs[mac], asked)
+  defp answered?(_state, :broadcast, _asked), do: false
+
+  # Missed the broadcast, answered the direct ping. From the second time
+  # in a row it is a persistent straggler (it may never hear broadcasts):
+  # its next direct check skips a cycle.
+  defp straggled(state, {:direct, mac}, asked) do
+    update_in(state.bulbs[mac], fn b ->
+      straggles = b.straggles + 1
+
+      if straggles >= @straggler_cycles,
+        do: %{b | straggles: straggles, direct_after: asked + straggler_backoff(state)},
+        else: %{b | straggles: straggles}
+    end)
+  end
+
+  # Past the next cycle's follow-ups, before the one after.
+  defp straggler_backoff(state),
+    do: state.cycle_ms * (@straggler_cycles - 1) + div(state.cycle_ms, 2)
+
+  # The broadcast's non-responders are unconfirmed (unless their direct
+  # pings are backed off); a direct ping's silence is a miss.
+  defp close_window(state, :broadcast, asked) do
+    now = state.clock.()
+    outage = outage?(state, asked)
+
+    bulbs =
+      Map.new(state.bulbs, fn {mac, b} ->
+        cond do
+          heard_since?(b, asked) -> {mac, %{b | straggles: 0}}
+          heard_since?(b, asked - state.fresh_ms) -> {mac, b}
+          b.unconfirmed != nil -> {mac, b}
+          waiting?(b, now, outage) -> {mac, b}
+          true -> {mac, %{b | unconfirmed: asked}}
+        end
+      end)
+
+    %{state | bulbs: bulbs, outage: outage}
+  end
+
+  defp close_window(state, {:direct, mac}, asked),
+    do: %{state | bulbs: Map.update!(state.bulbs, mac, &missed(&1, asked, state))}
+
+  # Backed off: a dead bulb always, a straggler's cadence except in an
+  # outage (then it may be dead too, and is checked at once).
+  defp waiting?(%{direct_after: nil}, _now, _outage), do: false
+  defp waiting?(%{misses: 0}, _now, true), do: false
+  defp waiting?(b, now, _outage), do: now < b.direct_after
+
+  # Fewer than half of the bulbs heard in the last 10 minutes, known
+  # stragglers aside (they never answer broadcasts), answered this one.
+  defp outage?(state, asked) do
+    recent =
+      Enum.filter(state.bulbs, fn {_mac, b} ->
+        b.straggles < @straggler_cycles and heard_since?(b, asked - @recent_ms)
+      end)
+
+    answered = Enum.count(recent, fn {_mac, b} -> heard_since?(b, asked) end)
+    length(recent) >= 2 and answered * 2 < length(recent)
+  end
+
   defp missed(bulb, asked, state) do
     misses = bulb.misses + 1
-    interval = min(state.base_ms * Integer.pow(2, misses - 1), state.max_ms)
 
     %{
       bulb
       | misses: misses,
         missed_at: asked,
-        interval: interval,
-        due: asked + interval + state.jitter.(interval)
+        unconfirmed: nil,
+        direct_after: asked + direct_backoff(misses, state)
     }
   end
 
-  defp maybe_ping(%{settling: :radio} = state) do
+  # None after the first miss (the deciding second comes next cycle), then
+  # the base, doubling, capped.
+  defp direct_backoff(1, _state), do: 0
+
+  defp direct_backoff(misses, state),
+    do: min(state.backoff_ms * Integer.pow(2, misses - 2), state.max_backoff_ms)
+
+  # ── Sending ──────────────────────────────────────────────────────────
+
+  defp maybe_send(%{settling: :radio} = state) do
     case radio_idle(state) do
       {:idle, _sn} -> %{state | settling: nil, next_attempt: state.clock.() + state.gap_ms}
       _ -> state
     end
   end
 
-  defp maybe_ping(%{settling: :lights} = state), do: state
+  defp maybe_send(%{settling: :lights} = state), do: state
 
-  defp maybe_ping(state) do
+  defp maybe_send(state) do
     now = state.clock.()
 
     with nil <- state.pending,
          true <- state.lights_ok,
          true <- now >= state.next_attempt,
-         {:ok, mac} <- next_due(state, now),
+         {:ok, kind, tag} <- next_frame(state, now),
          {:idle, sn} <- radio_idle(state) do
-      asked = state.clock.()
-      state = %{state | next_attempt: asked + state.gap_ms}
-
-      # Anything but a confirmed ping is "try later": the bulb stays due,
-      # nothing counts as a miss. Unless it provably queued nothing, it may
-      # still air, so the gap waits for it to settle.
-      case Lights.ping(mac, server: state.lights) do
-        :ok ->
-          if aired_alone?(state, sn) do
-            deadline = state.clock.() + state.reply_ms
-            %{state | pending: %{mac: mac, asked: asked, deadline: deadline}}
-          else
-            %{state | settling: :lights}
-          end
-
-        {:error, reason} when reason in @refused ->
-          state
-
-        {:error, {:advertise, _reason}} ->
-          state
-
-        {:error, _uncertain} ->
-          %{state | settling: :lights}
-      end
+      send_frame(state, kind, tag, sn)
     else
       _ -> state
     end
   end
 
-  defp next_due(state, now) do
+  # A due broadcast within its reservation goes first; a follow-up only
+  # within the follow-up budget (see "Budget").
+  defp next_frame(state, now) do
+    if now >= state.next_broadcast and broadcast_allowed?(state, now),
+      do: {:ok, :broadcast, :broadcast},
+      else: next_followup(state, now)
+  end
+
+  # Urgent checks first (a deciding second miss, or in a suspected outage
+  # any bulb not yet missed twice), oldest unconfirmed first and, from the
+  # same broadcast, misses first; then routine ones by deadline, the
+  # moment the bulb's reachable window would run out.
+  defp next_followup(state, now) do
+    urgent? = followup_allowed?(state, now, :urgent)
+    routine? = followup_allowed?(state, now, :routine)
+
     state.bulbs
-    |> Enum.filter(fn {_mac, b} -> now >= b.due and silent?(b, now, state) end)
-    |> Enum.min_by(fn {mac, b} -> {b.due, mac} end, fn -> nil end)
+    |> Enum.filter(fn {_mac, b} -> b.unconfirmed != nil end)
+    |> Enum.map(fn {mac, b} -> {mac, b, class(state, b)} end)
+    |> Enum.filter(fn {_mac, _b, class} ->
+      if class == :urgent, do: urgent?, else: routine?
+    end)
+    |> Enum.min_by(fn {mac, b, class} -> order(state, b, class, mac) end, fn -> nil end)
     |> case do
-      {mac, _bulb} -> {:ok, mac}
+      {mac, _b, :urgent} -> {:ok, {:direct, mac}, :urgent}
+      {mac, b, :routine} -> {:ok, {:direct, mac}, routine_tag(b)}
       nil -> :none
     end
   end
 
-  defp silent?(%{last: nil}, _now, _state), do: true
-  defp silent?(%{last: last}, now, state), do: now - last > state.silence_ms
+  defp class(_state, %{misses: 1}), do: :urgent
+  defp class(%{outage: true}, %{misses: 0}), do: :urgent
+  defp class(_state, _bulb), do: :routine
+
+  defp order(_state, b, :urgent, mac), do: {0, b.unconfirmed, -b.misses, mac}
+  # Bulbs below the miss limit by deadline; retries of bulbs already missed
+  # twice only with what is left.
+  defp order(state, b, :routine, mac),
+    do: {1, if(b.misses >= 2, do: 1, else: 0), deadline(state, b), mac}
+
+  # When the Resolver's window for a heard bulb (2.5 intervals) runs out;
+  # a never-heard bulb has none, so it gets a later, synthetic one: it
+  # never jumps a heard bulb whose window is closing, and never waits more
+  # than that for its first check.
+  defp deadline(state, %{last: nil} = b), do: b.seen + @never_heard_cycles * state.cycle_ms
+  defp deadline(state, b), do: b.last + div(interval(state, b) * 5, 2)
+
+  # Routine checks of stragglers and dead bulbs are maintenance; others
+  # (a bulb that just missed a broadcast) suspect. Both count as routine.
+  defp routine_tag(%{misses: 0, straggles: s}) when s < @straggler_cycles, do: :suspect
+  defp routine_tag(_bulb), do: :maintenance
+
+  defp send_frame(state, kind, tag, sn) do
+    asked = state.clock.()
+    state = %{state | next_attempt: asked + state.gap_ms}
+
+    state =
+      if kind == :broadcast,
+        do: %{state | next_broadcast: asked + state.cycle_ms + state.jitter.(state.cycle_ms)},
+        else: state
+
+    # Logged before the call, so a crash inside it still counts.
+    key = log_frame(state, asked, tag)
+
+    # Anything but a confirmed frame is "try later": nothing is unconfirmed
+    # or missed. Unless it provably queued nothing it may still air, so it
+    # stays counted and the next frame waits for it to settle.
+    case call(state, kind) do
+      :ok ->
+        if aired_alone?(state, sn) do
+          window = if kind == :broadcast, do: state.broadcast_reply_ms, else: state.reply_ms
+          %{state | pending: %{kind: kind, asked: asked, deadline: state.clock.() + window}}
+        else
+          %{state | settling: :lights}
+        end
+
+      {:error, reason} when reason in @refused ->
+        unlog_frame(state, key)
+        still_due(state, kind, asked)
+
+      {:error, {:advertise, _reason}} ->
+        unlog_frame(state, key)
+        still_due(state, kind, asked)
+
+      {:error, _uncertain} ->
+        %{state | settling: :lights}
+    end
+  end
+
+  # A refused broadcast stays due; a refused direct ping stays unconfirmed.
+  defp still_due(state, :broadcast, asked), do: %{state | next_broadcast: asked}
+  defp still_due(state, _direct, _asked), do: state
+
+  defp call(state, :broadcast), do: Lights.ping_all(server: state.lights)
+  defp call(state, {:direct, mac}), do: Lights.ping(mac, server: state.lights)
+
+  # ── Frame log ────────────────────────────────────────────────────────
+
+  # The shared log a Resolver owns, or one of this process's own (lost
+  # with it, so a start counts the minute's cap as spent).
+  defp frame_log(nil, started, per_minute) do
+    table = :ets.new(__MODULE__, [:set, :private])
+    rows = for _ <- 1..per_minute, do: {System.unique_integer([:monotonic]), started, :unknown}
+    :ets.insert(table, rows)
+    table
+  end
+
+  defp frame_log(table, _started, _per_minute), do: table
+
+  # Rows are `{key, at, tag}`, tag `:broadcast`, `:urgent`, `:suspect`,
+  # `:maintenance` or `:unknown`.
+  defp log_frame(state, at, tag) do
+    key = System.unique_integer([:monotonic])
+    :ets.select_delete(state.frames, [{{:_, :"$1", :_}, [{:<, :"$1", at - @hour}], [true]}])
+    :ets.insert(state.frames, {key, at, tag})
+    key
+  end
+
+  defp unlog_frame(state, key), do: :ets.delete(state.frames, key)
+
+  defp next_broadcast(frames, started, cycle_ms) do
+    last =
+      :ets.tab2list(frames)
+      |> Enum.flat_map(fn
+        {_key, at, :broadcast} -> [at]
+        _row -> []
+      end)
+      |> Enum.max(fn -> nil end)
+
+    if last, do: last + cycle_ms, else: started
+  end
+
+  defp remembered(frames) do
+    for {{:straggles, mac}, n} <- :ets.tab2list(frames), into: %{}, do: {mac, n}
+  end
+
+  # Writes the straggler record when it changed (the bulbs as Lights read
+  # them last, so bulbs that left drop out).
+  defp remember(%{lights_ok: false} = state), do: state
+
+  defp remember(state) do
+    current = for {mac, b} <- state.bulbs, b.straggles > 0, into: %{}, do: {mac, b.straggles}
+
+    if current == state.remembered do
+      state
+    else
+      :ets.match_delete(state.frames, {{:straggles, :_}, :_})
+      :ets.insert(state.frames, for({mac, n} <- current, do: {{:straggles, mac}, n}))
+      %{state | remembered: current}
+    end
+  end
+
+  @followups [:urgent, :suspect, :maintenance]
+  @routine [:suspect, :maintenance]
+
+  # Frames with a tag in `tags` (all when nil) sent after `since`.
+  defp frames_since(state, since, tags \\ nil) do
+    :ets.tab2list(state.frames)
+    |> Enum.count(fn
+      {_key, at, tag} when is_integer(at) -> at > since and (tags == nil or tag in tags)
+      _marker -> false
+    end)
+  end
+
+  defp broadcast_allowed?(state, now) do
+    frames_since(state, now - @minute) < state.per_minute and
+      frames_since(state, now - @hour, [:broadcast]) < state.broadcast_reserve
+  end
+
+  # One slot of every minute is left for a broadcast; follow-ups share
+  # what the hour's broadcasts don't reserve; routine ones leave the urgent
+  # reserve and are spaced evenly; none while the log doesn't know the last
+  # hour.
+  defp followup_allowed?(state, now, class) do
+    not history_unknown?(state, now) and
+      frames_since(state, now - @minute) < state.per_minute - 1 and
+      frames_since(state, now - @hour, @followups) < state.followup_hour and
+      (class == :urgent or routine_allowed?(state, now))
+  end
+
+  defp routine_allowed?(state, now) do
+    frames_since(state, now - @hour, @routine) < state.routine_hour and
+      frames_since(state, now - state.routine_spacing_ms, @routine) == 0
+  end
+
+  defp spacing(0), do: @hour
+  defp spacing(per_hour), do: div(@hour, per_hour) + 1
+
+  defp history_unknown?(state, now) do
+    case :ets.lookup(state.frames, :unknown_until) do
+      [{:unknown_until, until}] -> now < until
+      [] -> false
+    end
+  end
+
+  # Broadcasts an hour can hold at the shortest jittered cycle (-10 %).
+  defp broadcast_reserve(cycle_ms), do: div(@hour, cycle_ms - div(cycle_ms, 10)) + 1
 
   # ── Radio ────────────────────────────────────────────────────────────
 
   defp radio_status(state), do: Radio.status(server: state.radio, timeout: @radio_timeout)
 
-  # The SN of the last frame aired, read with the idle check: the ping's
+  # The SN of the last frame aired, read with the idle check: the frame's
   # confirmation compares against it.
   defp radio_idle(state) do
     case radio_status(state) do
@@ -438,7 +842,7 @@ defmodule UniversalProxy.TuyaMesh.Presence do
     end
   end
 
-  # The ping is the frame on air and the only one the Radio took since the
+  # Ours is the frame on air and the only one the Radio took since the
   # idle check: nothing queued in front of or behind it.
   defp aired_alone?(state, sn) when is_integer(sn) do
     case radio_status(state) do
@@ -478,8 +882,11 @@ defmodule UniversalProxy.TuyaMesh.Presence do
   end
 
   defp build_snapshot(state) do
-    round_ms = map_size(state.bulbs) * state.gap_ms
-    pending = state.pending && state.pending.mac
+    direct =
+      case state.pending do
+        %{kind: {:direct, mac}} -> mac
+        _ -> nil
+      end
 
     Map.new(state.bulbs, fn {mac, b} ->
       {mac,
@@ -487,10 +894,40 @@ defmodule UniversalProxy.TuyaMesh.Presence do
          last_ms: b.last,
          misses: b.misses,
          missed_at: b.missed_at,
-         interval_ms: max(b.interval, round_ms),
-         pinging: pending == mac
+         interval_ms: interval(state, b),
+         pinging: direct == mac
        }}
     end)
+  end
+
+  # A persistent straggler is checked every other cycle, or less often
+  # when the routine budget can't serve all stragglers that often: the
+  # stragglers between them get the routine rate less what suspect checks
+  # took over the last ten minutes (never counted below half of it).
+  defp interval(state, %{straggles: n}) when n >= @straggler_cycles,
+    do: max(state.cycle_ms * @straggler_cycles, state.straggler_interval)
+
+  defp interval(state, _bulb), do: state.cycle_ms
+
+  # Never-heard bulbs below the miss limit count too: each takes a routine
+  # slot from the stragglers before it is heard.
+  defp straggler_interval(state, now) do
+    stragglers =
+      Enum.count(state.bulbs, fn {_mac, b} ->
+        b.straggles >= @straggler_cycles or (b.last == nil and b.misses < 2)
+      end)
+
+    per_minute = @minute / max(state.routine_spacing_ms, 1)
+    suspects = frames_since(state, now - @ten_minutes, [:suspect]) / 10
+    share = max(per_minute - suspects, per_minute / 2)
+
+    if not Enum.any?(state.bulbs, fn {_mac, b} -> b.straggles >= @straggler_cycles end) or
+         share <= 0 do
+      0
+    else
+      ms = stragglers * @minute / share
+      ceil(ms / @interval_step) * @interval_step
+    end
   end
 
   # Uniform in ±10 % of the interval.
