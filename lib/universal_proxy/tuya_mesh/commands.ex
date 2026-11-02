@@ -20,7 +20,8 @@ defmodule UniversalProxy.TuyaMesh.Commands do
   implied by a colour temperature or RGB in it. Without either, a
   brightness goes where the light's current mode (`current`, a DP map like
   `Lights.status/2`'s `dps`) keeps it: the colour's `v` in colour mode
-  (with the current hue and saturation), else DP3. A colour command
+  (with the current hue and saturation), else DP3. A colour brightness
+  alone sets the colour's `v` the same way in colour mode. A colour command
   without RGB takes the current hue and saturation, and without a
   brightness the current one. The bulbs' colour mode has no separate
   brightness, so DP3 is never sent with a colour.
@@ -161,9 +162,10 @@ defmodule UniversalProxy.TuyaMesh.Commands do
 
   defp brightness_entries(_request), do: []
 
-  # A brightness alone stays in the light's current mode.
+  # A brightness or colour brightness alone stays in the light's current
+  # mode (a colour brightness only means something in colour mode).
   defp keep_mode_entries(request, current) do
-    with true <- brightness?(request),
+    with true <- brightness?(request) or colour_brightness?(request),
          :colour <- current_mode(current),
          {_h, _s} <- current_hs(current) do
       colour_entries(request, current)
@@ -177,13 +179,13 @@ defmodule UniversalProxy.TuyaMesh.Commands do
 
     cond do
       hs == nil ->
-        if brightness?(request) or request.has_color_brightness do
+        if brightness?(request) or colour_brightness?(request) do
           Logger.debug("TuyaMesh.Commands: colour brightness without a known colour; ignored")
         end
 
         []
 
-      request.has_rgb or brightness?(request) or request.has_color_brightness ->
+      request.has_rgb or brightness?(request) or colour_brightness?(request) ->
         {h, s} = hs
         [colour: {h, s, colour_v(request, current)}]
 
@@ -195,15 +197,17 @@ defmodule UniversalProxy.TuyaMesh.Commands do
   defp brightness?(%{has_brightness: true, brightness: b}) when is_number(b), do: true
   defp brightness?(_request), do: false
 
+  defp colour_brightness?(%{has_color_brightness: true, color_brightness: b}) when is_number(b),
+    do: true
+
+  defp colour_brightness?(_request), do: false
+
   # v = brightness × colour brightness × the RGB's largest channel (HA
   # normalises the RGB and sends its largest channel as colour brightness).
   defp colour_v(request, current) do
     master = if brightness?(request), do: request.brightness, else: current_master(current)
 
-    colour =
-      if request.has_color_brightness and is_number(request.color_brightness),
-        do: request.color_brightness,
-        else: 1.0
+    colour = if colour_brightness?(request), do: request.color_brightness, else: 1.0
 
     peak = if request.has_rgb, do: rgb_peak(request), else: 1.0
 

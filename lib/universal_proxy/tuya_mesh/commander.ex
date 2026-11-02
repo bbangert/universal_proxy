@@ -17,22 +17,28 @@ defmodule UniversalProxy.TuyaMesh.Commander do
     * **Bulb:** the batches go out in order with `Lights.set/3`.
     * **Group:** the batches go out with `Lights.group_set/3`. A group
       frame reaches only part of the members (4–9 of 10 on hardware), so
-      after `:window_ms` every member that hasn't reported the DPs since the
-      command (its `last_report_ms` moved and its DPs match) gets one
+      after `:window_ms` every member that hasn't confirmed a DP gets one
       round of direct sets carrying only what it is missing, one every
       `:followup_gap_ms` and at most `:max_followups` frames per command.
+      A DP is confirmed only by a report after the command that changed
+      it to the wanted value (Lights keeps merged DPs, not per-report
+      ones), so a DP that already held that value is resent.
 
   `{:error, :busy}` and `{:error, :queue_full}` are retried after
   `:retry_ms`, doubling, at most `:max_retries` times; any other error
-  stops the command (a follow-up error skips that bulb).
+  stops the command. A follow-up that fails, or runs out of retries,
+  drops every remaining frame for that bulb.
 
   ## Superseding
 
   A newer command for a light replaces the older one's remaining batches,
   retries and follow-ups, so slider drags don't queue up (the Radio
-  already coalesces queued frames for the same light and DPs). A group
-  command also replaces its members' bulb commands, and no follow-up goes
-  to a bulb that got a newer command of its own after the group's.
+  already coalesces queued frames for the same light and DPs). Every bulb
+  carries the id of the latest command that addresses it (its own or a
+  group's). A group command replaces its members' bulb commands; a group
+  never broadcasts again once a member has a newer command (its remaining
+  batches go directly to the other members, or nowhere when every member
+  is superseded), and no follow-up goes to a bulb with a newer command.
 
   ## Optimistic state
 
@@ -149,7 +155,9 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       sent: [],
       attempts: 0,
       members: members,
-      snapshot: snapshot(state, target, members)
+      snapshot: snapshot(state, target, members),
+      sent_at: nil,
+      then_check?: false
     }
 
     macs = if match?({:bulb, _}, target), do: [elem(target, 1)], else: members
@@ -168,11 +176,38 @@ defmodule UniversalProxy.TuyaMesh.Commander do
     }
   end
 
-  defp step(state, %{phase: :send, pending: [batch | rest]} = job) do
+  # Never re-broadcast over a member's newer command (its own, or another
+  # group's): the rest goes to the other members directly.
+  defp step(state, %{phase: :send, target: {:group, _}} = job) do
+    case Enum.filter(job.members, &newer_command?(state, &1, job)) do
+      [] -> send_step(state, job)
+      superseded -> divert(state, job, job.members -- superseded)
+    end
+  end
+
+  defp step(state, %{phase: :send} = job), do: send_step(state, job)
+
+  defp step(state, %{phase: :check} = job), do: check(state, job)
+
+  defp step(state, %{phase: :followup, pending: []} = job) do
+    if job.then_check?,
+      do: continue(state, %{job | phase: :check}, check_delay(state, job)),
+      else: done(state, job)
+  end
+
+  defp step(state, %{phase: :followup, pending: [{mac, batch} | rest]} = job) do
+    if newer_command?(state, mac, job) do
+      step(state, %{job | pending: drop_mac(rest, mac), attempts: 0})
+    else
+      followup(state, job, mac, batch, rest)
+    end
+  end
+
+  defp send_step(state, %{pending: [batch | rest]} = job) do
     case send_batch(state, job.target, batch) do
       :ok ->
         state = record(state, job, batch)
-        job = %{job | pending: rest, sent: job.sent ++ batch, attempts: 0}
+        job = %{job | pending: rest, sent: job.sent ++ batch, attempts: 0, sent_at: now()}
         if rest == [], do: sent_all(state, job), else: continue(state, job, 0)
 
       {:error, reason} when reason in @retryable ->
@@ -187,16 +222,29 @@ defmodule UniversalProxy.TuyaMesh.Commander do
     end
   end
 
-  defp step(state, %{phase: :check} = job), do: check(state, job)
+  # The unsent batches go to `live` members directly; what was broadcast
+  # is still checked after the window.
+  defp divert(state, job, []) do
+    Logger.debug("TuyaMesh.Commander: #{describe(job.target)} superseded on every member")
+    stop_sending(state, job)
+  end
 
-  defp step(state, %{phase: :followup, pending: []} = job), do: done(state, job)
+  defp divert(state, job, live) do
+    Logger.debug("TuyaMesh.Commander: #{describe(job.target)} goes direct to #{length(live)}")
+    remaining = List.flatten(job.pending)
+    state = record(state, %{job | members: live}, remaining)
+    items = for mac <- live, batch <- Commands.split(remaining), do: {mac, batch}
 
-  defp step(state, %{phase: :followup, pending: [{mac, batch} | rest]} = job) do
-    if newer_command?(state, mac, job) do
-      step(state, %{job | pending: rest, attempts: 0})
-    else
-      followup(state, job, mac, batch, rest)
-    end
+    job = %{
+      job
+      | phase: :followup,
+        pending: items,
+        attempts: 0,
+        members: live,
+        then_check?: job.sent != []
+    }
+
+    step(push(state, job), job)
   end
 
   defp followup(state, job, mac, batch, rest) do
@@ -204,16 +252,19 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       :ok ->
         continue(state, %{job | pending: rest, attempts: 0}, state.followup_gap_ms)
 
+      # A bulb that failed gets none of its later frames either.
       {:error, reason} when reason in @retryable ->
         retry(state, job, reason, fn state ->
-          step(state, %{job | pending: rest, attempts: 0})
+          step(state, %{job | pending: drop_mac(rest, mac), attempts: 0})
         end)
 
       {:error, reason} ->
         Logger.info("TuyaMesh.Commander: follow-up to #{mac} failed: #{inspect(reason)}")
-        step(state, %{job | pending: rest, attempts: 0})
+        step(state, %{job | pending: drop_mac(rest, mac), attempts: 0})
     end
   end
+
+  defp drop_mac(items, mac), do: Enum.reject(items, &match?({^mac, _batch}, &1))
 
   defp send_batch(state, {:bulb, mac}, batch),
     do: state.lights.set(mac, batch, [ack: true] ++ state.lights_opts)
@@ -246,6 +297,10 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   defp sent_all(state, job),
     do: continue(push(state, job), %{job | phase: :check, pending: []}, state.window_ms)
 
+  defp check_delay(state, job), do: max(job.sent_at + state.window_ms - now(), 0)
+
+  defp now, do: System.monotonic_time(:millisecond)
+
   # Members that haven't shown the DPs since the command get them directly.
   defp check(state, job) do
     case state.lights.all(state.lights_opts) do
@@ -264,7 +319,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
           )
         end
 
-        step(state, %{job | phase: :followup, pending: followups, attempts: 0})
+        step(state, %{job | phase: :followup, pending: followups, attempts: 0, then_check?: false})
 
       {:error, reason} ->
         Logger.debug("TuyaMesh.Commander: no follow-ups (Lights: #{inspect(reason)})")
@@ -273,9 +328,11 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   end
 
   defp followups_for(mac, bulb, job) do
+    {before_ms, before_dps} = Map.get(job.snapshot, mac, {nil, %{}})
+
     missing =
-      if reported_since?(bulb, Map.get(job.snapshot, mac)),
-        do: Commands.unconfirmed(job.sent, Map.get(bulb, :dps, %{})),
+      if reported_since?(bulb, before_ms),
+        do: Commands.unconfirmed(job.sent, fresh_dps(Map.get(bulb, :dps), before_dps)),
         else: job.sent
 
     for batch <- Commands.split(missing), do: {mac, batch}
@@ -283,6 +340,15 @@ defmodule UniversalProxy.TuyaMesh.Commander do
 
   defp reported_since?(%{last_report_ms: at}, before) when is_integer(at), do: at != before
   defp reported_since?(_bulb, _before), do: false
+
+  # Lights merges partial reports into a bulb's cached DPs, and a ping
+  # reply moves `last_report_ms` too, so only a DP whose value changed since
+  # the command was provably reported after it. One that already held the
+  # wanted value counts as unconfirmed: at worst a redundant frame.
+  defp fresh_dps(dps, before) when is_map(dps),
+    do: Map.reject(dps, fn {id, value} -> Map.fetch(before, id) == {:ok, value} end)
+
+  defp fresh_dps(_dps, _before), do: %{}
 
   defp newer_command?(state, mac, job), do: Map.get(state.touched, mac, 0) > job.id
 
@@ -310,7 +376,9 @@ defmodule UniversalProxy.TuyaMesh.Commander do
     views = Map.update(state.views, job.target, Map.merge(job.base, sent), &Map.merge(&1, sent))
 
     views =
-      Enum.reduce(job.members, views, fn mac, views ->
+      job.members
+      |> Enum.reject(&newer_command?(state, &1, job))
+      |> Enum.reduce(views, fn mac, views ->
         case Map.fetch(views, {:bulb, mac}) do
           {:ok, view} -> Map.put(views, {:bulb, mac}, Map.merge(view, sent))
           :error -> views
@@ -367,7 +435,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
         for %{mac: mac} = bulb <- bulbs,
             mac in members,
             into: %{},
-            do: {mac, Map.get(bulb, :last_report_ms)}
+            do: {mac, {Map.get(bulb, :last_report_ms), Map.get(bulb, :dps) || %{}}}
 
       _error ->
         %{}

@@ -189,6 +189,16 @@ defmodule UniversalProxy.TuyaMesh.CommandsTest do
       assert [[mode: :colour, colour: {60, 100, 25}]] = Commands.batches(req, @settings, colour)
     end
 
+    test "a colour brightness alone updates v in colour mode, keeping hue and saturation" do
+      req = %Req{has_color_brightness: true, color_brightness: 0.5}
+      current = %{2 => 1, 11 => <<120::16, 80, 100>>}
+      assert Commands.batches(req, @settings, current) == [[colour: {120, 80, 50}]]
+
+      # Meaningless outside colour mode, or without a known colour.
+      assert Commands.batches(req, @settings, %{2 => 0, 11 => <<120::16, 80, 100>>}) == []
+      assert Commands.batches(req, @settings, %{2 => 1}) == []
+    end
+
     test "the RGB mode alone switches to colour" do
       req = %Req{has_color_mode: true, color_mode: :COLOR_MODE_RGB}
       assert Commands.batches(req, @settings) == [[mode: :colour]]

@@ -41,7 +41,8 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       send(s.test, {:lights, req})
       {reply, rest} = pop(s.group_set)
       s = %{s | group_set: rest}
-      s = if reply == :ok, do: Enum.reduce(s.hears, s, &report(&2, &1, batch)), else: s
+      hears = if is_function(s.hears, 1), do: s.hears.(batch), else: s.hears
+      s = if reply == :ok, do: Enum.reduce(hears, s, &report(&2, &1, batch)), else: s
       {reply, s}
     end
 
@@ -87,6 +88,7 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       lights_opts: [server: agent],
       members: fn
         1 -> {:ok, [@a, @b, @c]}
+        3 -> {:ok, [@b, @c]}
         _ -> :error
       end,
       push: &send(test, {:push, &1}),
@@ -340,6 +342,103 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       idle(pid)
 
       assert sets() == []
+    end
+
+    test "a busy group retry never turns back on a member a newer command turned off" do
+      {pid, _agent} = start(script: %{group_set: [{:error, :busy}]}, retry_ms: 100)
+
+      Commander.command(cmd({:group, 1}, on()), pid)
+      assert_receive {:lights, {:group_set, 1, [on: true], _}}
+
+      Commander.command(cmd({:bulb, @b}, %Req{has_state: true, state: false}, 99, 7), pid)
+      idle(pid)
+
+      # The retry went direct to the other members, not as a broadcast.
+      refute_received {:lights, {:group_set, 1, _, _}}
+      followups = sets()
+      assert {@b, [on: false]} in followups
+      refute {@b, [on: true]} in followups
+      assert {@a, [on: true]} in followups
+      assert {@c, [on: true]} in followups
+    end
+
+    test "overlapping groups: the latest command wins per bulb" do
+      {pid, _agent} = start(script: %{group_set: [{:error, :busy}]}, retry_ms: 100)
+
+      # Group 1 is A, B, C; group 3 is B, C.
+      Commander.command(cmd({:group, 1}, on()), pid)
+      assert_receive {:lights, {:group_set, 1, [on: true], _}}
+
+      Commander.command(cmd({:group, 3}, %Req{has_state: true, state: false}), pid)
+      idle(pid)
+
+      assert_received {:lights, {:group_set, 3, [on: false], _}}
+      refute_received {:lights, {:group_set, 1, _, _}}
+
+      followups = sets()
+      assert {@a, [on: true]} in followups
+      for mac <- [@b, @c], do: refute({mac, [on: true]} in followups)
+      for mac <- [@b, @c], do: assert({mac, [on: false]} in followups)
+    end
+
+    test "a group superseded on every member sends nothing more" do
+      {pid, _agent} = start(script: %{group_set: [{:error, :busy}]}, retry_ms: 100)
+
+      Commander.command(cmd({:group, 3}, on()), pid)
+      assert_receive {:lights, {:group_set, 3, [on: true], _}}
+
+      Commander.command(cmd({:group, 1}, %Req{has_state: true, state: false}), pid)
+      idle(pid)
+
+      refute_received {:lights, {:group_set, 3, _, _}}
+      refute Enum.any?(sets(), &match?({_mac, [on: true]}, &1))
+    end
+
+    test "a follow-up that fails drops that bulb's later frames" do
+      script = %{set: %{@a => [{:error, :not_ready}]}}
+      {pid, _agent} = start(script: script)
+
+      Commander.command(cmd({:group, 1}, warm_full_on()), pid)
+      idle(pid)
+
+      followups = sets()
+
+      assert [{@a, [on: true, mode: :white, temp: 0]}] =
+               Enum.filter(followups, &match?({@a, _}, &1))
+
+      for mac <- [@b, @c], do: assert({mac, [brightness: 1000]} in followups)
+    end
+
+    test "a follow-up out of retries drops that bulb's later frames" do
+      script = %{set: %{@a => List.duplicate({:error, :busy}, 10)}}
+      {pid, _agent} = start(script: script, max_retries: 2)
+
+      Commander.command(cmd({:group, 1}, warm_full_on()), pid)
+      idle(pid)
+
+      followups = sets()
+      a_frames = Enum.filter(followups, &match?({@a, _}, &1))
+      assert a_frames == List.duplicate({@a, [on: true, mode: :white, temp: 0]}, 3)
+      for mac <- [@b, @c], do: assert({mac, [brightness: 1000]} in followups)
+    end
+
+    test "a cached DP that already matched isn't confirmed by a partial report" do
+      # A's stale cache already shows brightness 1000; it hears only the
+      # first frame, so its report carries on, mode and temp.
+      hears = fn
+        [{:on, _} | _] -> [@a]
+        _other -> []
+      end
+
+      script = %{hears: hears, bulbs: %{@a => %{dps: %{3 => 1000}, last_report_ms: 0}}}
+      {pid, _agent} = start(script: script)
+
+      Commander.command(cmd({:group, 1}, warm_full_on()), pid)
+      idle(pid)
+
+      followups = sets()
+      assert {@a, [brightness: 1000]} in followups
+      refute {@a, [on: true, mode: :white, temp: 0]} in followups
     end
 
     test "unknown members means no follow-ups" do
