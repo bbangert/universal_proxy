@@ -146,7 +146,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   require Logger
 
   alias UniversalProxy.TuyaBeaconMesh.{Inventory, Lights, Radio}
-  alias UniversalProxy.TuyaMesh.{Mesh, Presence, Redact, Store}
+  alias UniversalProxy.TuyaMesh.{Mesh, Presence, Redact, Store, WallClock}
 
   @topic "tuya_mesh"
   @retry_ms 2_000
@@ -289,7 +289,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
       index_check_ticks: Keyword.get(opts, :index_check_ticks, @index_check_ticks),
       reachable_ms: Keyword.get(opts, :reachable_ms, @reachable_ms),
       miss_limit: Keyword.get(opts, :miss_limit, @miss_limit),
-      time_offset_fun: Keyword.get(opts, :time_offset_fun, &monotonic_offset/0),
+      time_offset_fun: Keyword.get(opts, :time_offset_fun, &WallClock.offset_ms/0),
       timer: nil,
       refresh_timer: nil,
       ticks: 0,
@@ -313,8 +313,9 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
       frames_key: {__MODULE__, :frames, Keyword.get(opts, :name, __MODULE__)}
     }
 
-    # The wall clock can step (nerves_time sets it after boot); last_seen is
-    # derived from it, so a step must republish.
+    # The OS clock can step after boot (nerves_time); last_seen is derived
+    # from it. Ticks republish within a few seconds of a step; this covers
+    # an idle mesh (no ticks) once ERTS notices the step.
     :erlang.monitor(:time_offset, :clock_service)
 
     # The evaluation that follows reads everything fresh: nothing to catch up.
@@ -957,7 +958,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
           {dps, dp_at} = Map.get(state.last_dps, bulb.mac, {%{}, %{}})
 
           Map.merge(bulb, %{
-            last_seen: last_seen(last, state.time_offset_fun),
+            last_seen: WallClock.to_datetime(last, state.time_offset_fun),
             last_seen_ms: last,
             reachable: reachable,
             checking: checking,
@@ -969,18 +970,6 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
       groups: inventory.groups
     }
   end
-
-  # Monotonic → wall clock, to the second so a slewing clock doesn't make
-  # every tick look like a change.
-  defp last_seen(nil, _offset_fun), do: nil
-
-  defp last_seen(ms, offset_fun) do
-    (ms + offset_fun.())
-    |> DateTime.from_unix!(:millisecond)
-    |> DateTime.truncate(:second)
-  end
-
-  defp monotonic_offset, do: System.time_offset(:millisecond)
 
   defp publish(state) do
     status = build_status(state)

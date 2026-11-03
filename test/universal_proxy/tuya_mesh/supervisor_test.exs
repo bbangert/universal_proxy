@@ -554,7 +554,7 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
       start_mesh_sup(ctx,
         lights: lights,
         radio: radio,
-        tick_ms: 3_600_000,
+        tick_ms: ctx[:tick_ms] || 3_600_000,
         time_offset_fun: fn -> Agent.get(offset, & &1) end
       )
 
@@ -583,6 +583,21 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
       )
 
       assert_receive {:tuya_mesh_status, %{bulbs: bulbs}}
+      assert %{last_seen: stepped} = Enum.find(bulbs, &(&1.mac == @bulb2))
+      assert DateTime.diff(stepped, before) == div(step_ms, 1000)
+    end
+
+    @tag tick_ms: 30
+    test "a tick picks up an OS clock step that ERTS has not noticed yet", ctx do
+      :ok = FakeLights.report(ctx.lights, @bulb2, System.monotonic_time(:millisecond))
+      before = await_published_last_seen()
+      flush_statuses()
+
+      # No :CHANGE: only the periodic republish can notice the new offset.
+      step_ms = 71 * 86_400_000
+      Agent.update(ctx.offset, fn _ -> step_ms end)
+
+      assert_receive {:tuya_mesh_status, %{bulbs: bulbs}}, 1_000
       assert %{last_seen: stepped} = Enum.find(bulbs, &(&1.mac == @bulb2))
       assert DateTime.diff(stepped, before) == div(step_ms, 1000)
     end
