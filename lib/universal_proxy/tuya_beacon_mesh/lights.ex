@@ -177,9 +177,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
 
   Membership goes to the bulbs as unicast requests: `A1 gg` to join,
   `A2 gg` to leave (localKey, the bulb's own mask), each answered with an
-  A3 group list. `delete_group/2` sends `A2 gg` to every member (and to
-  any other bulb that reported holding the id): that unicast removal is
-  what counts. `dismiss: true` also sends the app's group dismiss (`A2
+  A3 group list. `delete_group/2` sends `A2 gg` to every member and to
+  every other bulb that may hold the id (it reported it, was sent a join,
+  or its removal is unconfirmed): that unicast removal is what counts. `dismiss: true` also sends the app's group dismiss (`A2
   gg` to `FF gg`, mesh key), which is untested on hardware and never
   confirmed.
 
@@ -197,7 +197,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   a time, as `:normal` Radio sends (so they never drop queued light
   commands). A refused frame (`:queue_full`, `:busy`, `:not_ready`, …)
   is retried after `:group_retry_ms`, doubling up to 30 s; one with an
-  uncertain outcome counts as sent. Tracking lives in memory only: a
+  uncertain outcome counts as sent. A same-mesh `reload/2` drops unsent
+  changes its memberships contradict; sent ones stay tracked. Tracking
+  lives in memory only: a
   restarted Lights knows the stored membership but not what the bulbs
   confirmed.
 
@@ -823,7 +825,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
          {:ok, state} <- commit_groups(state, remaining) do
       state = queue_members(state, gid, holders, :remove)
       state = if dismiss?, do: queue_job(state, {gid, :dismiss}), else: state
-      {:reply, :ok, state, {:continue, :pump_groups}}
+      {:reply, :ok, prune_deleted(state), {:continue, :pump_groups}}
     else
       {:error, reason} -> {:reply, {:error, reason}, state}
     end
@@ -1439,14 +1441,14 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
     end
   end
 
-  # A member leaves the inventory group; a bulb that isn't one may only be
-  # sent its tracked removal again.
+  # A member leaves the inventory group; a bulb that isn't one is only
+  # sent the removal again when it may still hold the group.
   defp leave(state, gid, mac) do
     cond do
       mac in Map.get(state.groups, gid, %{members: []}).members ->
         update_members(state, gid, &List.delete(&1, mac))
 
-      match?(%{op: :remove}, state.group_ops[{gid, mac}]) ->
+      mac in may_hold(state, gid) ->
         {:ok, state}
 
       true ->
@@ -1557,10 +1559,22 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
     end)
   end
 
-  # Every bulb that may hold `gid`: its members and any bulb that reported it.
-  defp group_holders(state, gid) do
+  # Every bulb that may hold `gid`: its members and the others may_hold/2 finds.
+  defp group_holders(state, gid),
+    do: Enum.uniq(Map.fetch!(state.groups, gid).members ++ may_hold(state, gid))
+
+  # Bulbs that may hold `gid` whatever the inventory says: one that
+  # reported it, one sent a join (a reload may have dropped the member
+  # since), and one whose removal is not confirmed.
+  defp may_hold(state, gid) do
     reporters = for {mac, %{groups: [_ | _] = ids}} <- state.bulbs, gid in ids, do: mac
-    Enum.uniq(Map.fetch!(state.groups, gid).members ++ reporters)
+
+    tracked =
+      for {{^gid, mac}, %{op: op, state: s}} <- state.group_ops,
+          (op == :add and s != :queued) or (op == :remove and s != :confirmed),
+          do: mac
+
+    Enum.uniq(reporters ++ tracked)
   end
 
   # Leftovers of an earlier group with this id (all confirmed: anything
@@ -1570,11 +1584,19 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   end
 
   # The newest change of a bulb in a group replaces the tracked one; a
-  # timer of the replaced one finds a different ref and is ignored.
+  # timer of the replaced one finds a different ref and is ignored. A
+  # replaced head job's retry budget and backoff belonged to the old
+  # change: the new one starts afresh (the stale retry timer is ignored).
   defp queue_members(state, gid, macs, op) do
     Enum.reduce(macs, state, fn mac, state ->
       key = {gid, mac}
       state = put_in(state.group_ops[key], %{op: op, state: :queued, ref: nil})
+
+      state =
+        if match?([^key | _], state.group_jobs),
+          do: %{state | group_attempts: 0, group_retry: nil},
+          else: state
+
       queue_job(state, key)
     end)
   end
@@ -1718,16 +1740,34 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
     %{state | group_ops: ops}
   end
 
-  # A reload of the same mesh keeps the tracking of bulbs it still has;
-  # another mesh's ids mean nothing here.
+  # A reload of the same mesh keeps the tracking of bulbs it still has,
+  # minus unsent changes the reloaded memberships contradict (a join for a
+  # pair it doesn't have, a leave for one it has). What was sent stays
+  # tracked: the bulb may hold the group (may_hold/2). Another mesh's ids
+  # mean nothing here.
   defp keep_groups(state, true) do
-    ops = Map.filter(state.group_ops, fn {{_gid, mac}, _} -> Map.has_key?(state.bulbs, mac) end)
-    jobs = Enum.filter(state.group_jobs, &(not member_job?(&1) or Map.has_key?(ops, &1)))
+    ops =
+      Map.filter(state.group_ops, fn {{gid, mac}, op} ->
+        Map.has_key?(state.bulbs, mac) and
+          not (op.state == :queued and contradicted?(state, gid, mac, op.op))
+      end)
+
+    jobs =
+      Enum.filter(state.group_jobs, &(not member_job?(&1) or match?(%{state: :queued}, ops[&1])))
+
     %{state | group_ops: ops, group_jobs: jobs}
   end
 
   defp keep_groups(state, false),
     do: %{state | group_ops: %{}, group_jobs: [], group_attempts: 0, group_retry: nil}
+
+  defp contradicted?(state, gid, mac, op) do
+    member? =
+      match?(%{members: members} when is_list(members), state.groups[gid]) and
+        mac in state.groups[gid].members
+
+    if op == :add, do: not member?, else: member?
+  end
 
   defp groups_view(state) do
     by_gid = Enum.group_by(state.group_ops, fn {{gid, _mac}, _op} -> gid end)

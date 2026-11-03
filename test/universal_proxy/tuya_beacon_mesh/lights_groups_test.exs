@@ -308,6 +308,75 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsGroupsTest do
     end
   end
 
+  describe "review fixes" do
+    test "deleting a group whose removals all confirmed leaves nothing tracked" do
+      :ok = Lights.remove_member(1, @mac2)
+      :ok = Lights.remove_member(1, @mac3)
+      inject_report(2, 1, <<0xA3>>, @addr2)
+      inject_report(3, 1, <<0xA3>>, @addr3)
+
+      wait_until(fn ->
+        sync(1, @mac2).state == :confirmed and sync(1, @mac3).state == :confirmed
+      end)
+
+      assert :ok = Lights.delete_group(1)
+      assert {:ok, %{groups: []}} = Lights.groups()
+    end
+
+    @tag retry_ms: 1
+    @tag :capture_log
+    test "a removal that was never sent still makes its bulb a holder on delete" do
+      FakeBluez.fail(:advertise, :busy)
+      :ok = Lights.remove_member(1, @mac3)
+      wait_until(fn -> sync(1, @mac3) == %{op: :remove, state: :unconfirmed} end)
+      FakeBluez.succeed(:advertise)
+
+      assert :ok = Lights.delete_group(1)
+      wait_until(fn -> length(advertises()) == 1 end)
+      finish_tx()
+      sent = Enum.map(advertises(), &open_unicast/1)
+      assert Enum.sort(sent) == [{2, <<0xA2, 1>>}, {3, <<0xA2, 1>>}]
+    end
+
+    @tag retry_ms: 5
+    @tag :capture_log
+    test "a change replacing a retrying one gets its own attempts" do
+      FakeBluez.fail(:advertise, :busy)
+      {:ok, 2} = Lights.create_group("porch", [@mac2])
+      wait_until(fn -> :sys.get_state(Lights).group_attempts == 7 end)
+
+      :ok = Lights.remove_member(2, @mac2)
+      # Sent at once (and refused): its first attempt, not the add's eighth.
+      assert :sys.get_state(Lights).group_attempts == 1
+      assert sync(2, @mac2) == %{op: :remove, state: :pending}
+
+      wait_until(fn -> sync(2, @mac2).state == :unconfirmed end)
+      FakeBluez.succeed(:advertise)
+    end
+
+    test "a same-mesh reload drops unsent changes it contradicts; sent ones stay tracked" do
+      {:ok, 2} = Lights.create_group("a", [@mac2, @mac3])
+      {:ok, 3} = Lights.create_group("b", [@mac2])
+      wait_until(fn -> length(advertises()) == 1 end)
+      assert sync(3, @mac2) == %{op: :add, state: :pending}
+
+      # The reloaded inventory has neither new group.
+      assert :ok = Lights.reload(fixture())
+      assert sync(3, @mac2) == nil
+
+      # Settling an in-flight join frees a slot: the dropped join stays unsent.
+      inject_report(2, 1, <<0xA3, 1, 2>>, @addr2)
+      wait_until(fn -> sync(2, @mac2).state == :confirmed end)
+      finish_tx()
+      Process.sleep(30)
+      refute Enum.any?(advertises(), &(open_unicast(&1) == {2, <<0xA1, 3>>}))
+
+      # Bulb 3 was sent the join to group 2, so it may hold it: removable.
+      assert :ok = Lights.remove_member(2, @mac3)
+      assert sync(2, @mac3) == %{op: :remove, state: :pending}
+    end
+  end
+
   describe "rename_group" do
     test "is local: persisted, nothing sent", %{table: table} do
       assert :ok = Lights.rename_group(1, " garden ")
