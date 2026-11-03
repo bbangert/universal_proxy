@@ -1313,6 +1313,37 @@ defmodule UniversalProxyWeb.TuyaMeshComponentTest do
       assert changes() == [{:rename_group, 1, "porch"}]
     end
 
+    test "an imported name with whitespace saved unchanged sends no rename", %{conn: conn} do
+      start_lights(%{groups: [group(1, " porch ", [@mac2])], slots: %{}})
+      view = mount_tab(conn)
+
+      for input <- [" porch ", "porch"] do
+        click(view, "#tuya-group-1 button[phx-click=rename_group]")
+        view |> group_form(%{name: input}) |> render_submit()
+        refute has_element?(view, "#tuya-group-form")
+      end
+
+      assert changes() == []
+    end
+
+    test "a ticked bulb that fills up stays enabled and is submitted", %{conn: conn} do
+      start_lights(%{groups: [group(1, "path and post", [@mac2])], slots: %{@mac3 => 7}})
+      view = mount_tab(conn)
+      open_new_group(view)
+      view |> group_form(%{name: "porch", members: [@mac3]}) |> render_change()
+
+      FakeLights.update(&%{&1 | slots: %{@mac3 => 8}})
+      push_status(view, TuyaMesh.status())
+      assert render(view) =~ "8/8"
+      assert has_element?(view, "#tuya-group-form input[value=#{@mac3}][checked]")
+      refute has_element?(view, "#tuya-group-form input[value=#{@mac3}][disabled]")
+
+      FakeLights.reply(:create_group, {:error, {:group_slots_full, @mac3}})
+      html = view |> form("#tuya-group-form") |> render_submit()
+      assert changes() == [{:create_group, "porch", [@mac3]}]
+      assert html =~ "post spot 1 already belongs to 8 groups"
+    end
+
     test "the delete dialog returns focus to the groups heading", %{conn: conn} do
       start_lights()
       view = mount_tab(conn)

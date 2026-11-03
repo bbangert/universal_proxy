@@ -501,7 +501,10 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
     # may have renamed it since), or already the current name: nothing to do.
     name = String.trim(form.name)
 
-    if name == form.shown or name == current.name do
+    # Imported names may carry whitespace, so both the raw and the trimmed
+    # input are compared.
+    if form.name in [form.shown, current.name] or
+         name in [String.trim(form.shown), String.trim(current.name)] do
       assign(socket, :group_form, nil)
     else
       case TuyaMesh.rename_group(form.gid, form.name) do
@@ -1299,7 +1302,9 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   attr(:form, :map, required: true)
   attr(:bulbs, :list, required: true)
   attr(:slots, :map, required: true)
-  # Bulbs that may already hold the group: they need no free slot.
+  # Bulbs that may already hold the group: they need no free slot. A ticked
+  # bulb stays enabled even once full (a disabled box isn't submitted, so it
+  # would drop silently); the backend then refuses it with its slot error.
   attr(:holders, :list, required: true)
   attr(:myself, :any, required: true)
 
@@ -1344,7 +1349,10 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
             name="group[members][]"
             value={bulb.mac}
             checked={bulb.mac in @form.selected}
-            disabled={Map.get(@slots, bulb.mac, 0) >= @full and bulb.mac not in @holders}
+            disabled={
+              bulb.mac not in @form.selected and bulb.mac not in @holders and
+                Map.get(@slots, bulb.mac, 0) >= @full
+            }
             class="rounded-sm"
           />
           <span class="flex-1 min-w-0 truncate">{bulb.label || bulb.mac}</span>
