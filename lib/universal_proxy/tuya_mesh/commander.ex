@@ -302,6 +302,11 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   def handle_info({:tuya_mesh_store, :ready}, state),
     do: {:noreply, state |> reconcile() |> resave() |> seed() |> arm_flush() |> reschedule()}
 
+  # The Store may have dropped light states (a clear, another mesh): the
+  # next change is saved again, nothing is restored eagerly.
+  def handle_info({:tuya_mesh_store, :inventory_changed}, state),
+    do: {:noreply, %{state | saved: %{}} |> reconcile() |> arm_flush() |> reschedule()}
+
   def handle_info({:tuya_mesh_store, _event}, state),
     do: {:noreply, state |> reconcile() |> arm_flush() |> reschedule()}
 

@@ -548,19 +548,20 @@ defmodule UniversalProxy.TuyaMesh.Store do
   # The revision is checked in the same call as the write: nothing can land
   # between them.
   defp do_call({:replace, input, opts}, _from, state) do
-    reply =
-      case validate(input) do
-        {:ok, inv} ->
-          if stale?(state.table, opts),
-            do: {:error, {:stale_preview, preview_of(state, inv)}},
-            else: do_replace(state, inv, opts)
+    case validate(input) do
+      {:ok, inv} ->
+        if stale?(state.table, opts) do
+          {:reply, {:error, {:stale_preview, preview_of(state, inv)}}, state}
+        else
+          # Read before the write: a failed one may have landed anyway.
+          over = replacing(state.table, inv)
+          reply = do_replace(state, inv, opts)
+          {:reply, reply, after_replace(state, reply, inv, over)}
+        end
 
-        error ->
-          error
-      end
-
-    {:reply, reply,
-     if(match?({:ok, _}, reply), do: lights_kept(state), else: lights_unsynced(state))}
+      error ->
+        {:reply, error, state}
+    end
   end
 
   defp do_call({:clear, opts}, _from, state) do
@@ -587,7 +588,14 @@ defmodule UniversalProxy.TuyaMesh.Store do
           end
       end
 
-    {:reply, reply, if(reply == :ok, do: lights_kept(state), else: lights_unsynced(state))}
+    state =
+      case reply do
+        :ok -> lights_kept(state)
+        {:error, :write_failed} -> %{lights_unsynced(state) | lights_held: %{}}
+        _not_written -> state
+      end
+
+    {:reply, reply, state}
   end
 
   defp do_call(:inventory_summary, _from, state) do
@@ -992,7 +1000,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
   defp kept_lights(_state, _inv, :other_mesh), do: %{}
 
   defp kept_lights(state, inv, :same_mesh),
-    do: Map.take(current_lights(state), Enum.map(inv.bulbs, & &1.mac))
+    do: Map.take(current_lights(state), macs(inv))
 
   # The held states, written unless nothing changed after all. Compared
   # with the last synced write, not the table: an insert whose sync failed
@@ -1015,6 +1023,29 @@ defmodule UniversalProxy.TuyaMesh.Store do
   # doesn't move the interval).
   defp lights_kept(state),
     do: %{state | lights_held: %{}, lights_synced: lookup(state.table, :light_states, %{})}
+
+  # A write that failed may still have landed (an insert whose sync
+  # failed), so the held states follow the inventory it wrote: a retry
+  # must not bring back states the upload dropped.
+  defp after_replace(state, {:ok, _kind}, _inv, _over), do: lights_kept(state)
+
+  defp after_replace(state, {:error, :write_failed}, inv, over) do
+    held = if over == :same_mesh, do: Map.take(state.lights_held, macs(inv)), else: %{}
+    %{lights_unsynced(state) | lights_held: held}
+  end
+
+  defp after_replace(state, _not_written, _inv, _over), do: state
+
+  # What `do_replace/3` writes over: the stored mesh, or another (none,
+  # an invalid record, a different mesh).
+  defp replacing(table, inv) do
+    case stored(table) do
+      {:valid, stored} -> if same_mesh?(stored, inv), do: :same_mesh, else: :other_mesh
+      _absent_or_invalid -> :other_mesh
+    end
+  end
+
+  defp macs(inv), do: Enum.map(inv.bulbs, & &1.mac)
 
   # A failed write may have left an unsynced insert in the table: nothing
   # is known synced until the next write that is, so it can't be skipped

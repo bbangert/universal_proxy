@@ -927,6 +927,25 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       assert pushes() == []
     end
 
+    test "after an inventory change, the next unchanged state is saved again" do
+      test = self()
+
+      {pid, _agent} =
+        start(push_debounce_ms: 10, save_state: &send(test, {:saved, &1, &2}))
+
+      report(pid, [{@a, @on_white, now()}])
+      assert_received {:saved, @a, _}
+
+      # The Store may have dropped it: nothing is restored eagerly...
+      send(pid, {:tuya_mesh_store, :inventory_changed})
+      flushed(pid)
+      refute_received {:saved, _, _}
+
+      # ...but the next report, the same state, is saved.
+      report(pid, [{@a, @on_white, now() + 1}])
+      assert_received {:saved, @a, %{1 => true}}
+    end
+
     test "a Store that starts late seeds the bulbs still unknown" do
       saved = start_supervised!({Agent, fn -> %{} end}, id: :saved)
 
