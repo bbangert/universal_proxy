@@ -175,6 +175,26 @@ defmodule UniversalProxy.TuyaBeaconMesh.Control do
   end
 
   @doc """
+  Remove the bulb from local group id(s) `groups` (one id or a non-empty
+  list, each `0..254`; ack is an A3 group list).
+  """
+  @spec group_remove(P2.addr(), 0..0xFFFF, byte() | [byte()], key(), key()) :: request()
+  def group_remove(node_id, sn, groups, local_key, beacon_key) do
+    bump_send(P2.group_remove(@phone_addr, node_id, sn, groups, local_key, beacon_key))
+  end
+
+  @doc """
+  Dismiss group `gg` (`0..254`): `A2 gg` to `FF gg`, keyed
+  `(beaconKey, beaconKey)` like every group frame on these bulbs. No ack.
+  **Untested on hardware**: removing each member with `group_remove/5`
+  is the confirmable way (`docs/protocols/tuya_beacon_mesh.md` §4.9).
+  """
+  @spec group_dismiss(byte(), 0..0xFFFF, key()) :: request()
+  def group_dismiss(gg, sn, beacon_key) do
+    bump_send(P2.group_dismiss(@phone_addr, gg, sn, beacon_key, beacon_key))
+  end
+
+  @doc """
   Group DP set to `FFgg`, keyed beaconKey/beaconKey. `gg` is `0..254`:
   255 would make `FF FF`, the mesh broadcast address, not a group.
   `dps` and `opts` as in `set/6`.

@@ -192,6 +192,99 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
     end
   end
 
+  describe "group edits through persist (Lights' group operations)" do
+    setup ctx do
+      {:ok, _} = Store.replace(inventory(), [], ctx.store)
+      :ok
+    end
+
+    defp group(id, name, members),
+      do: %Inventory.Group{local_id: id, name: name, members: members}
+
+    defp summary_groups(store) do
+      {:ok, %{groups: groups}} = Store.inventory_summary(store)
+      groups
+    end
+
+    test "a new group gets a fresh sub-device id; a rename keeps it", ctx do
+      inv = inventory()
+      assert %{{:group, 1} => 3} = Store.device_ids(ctx.store)
+
+      created = %{inv | groups: inv.groups ++ [group(2, "porch", [@mac2])]}
+      assert :ok = Store.persist(created, ctx.store)
+      assert %{{:group, 1} => 3, {:group, 2} => 4} = Store.device_ids(ctx.store)
+
+      renamed = %{created | groups: [hd(created.groups), group(2, "garden", [@mac2, @mac3])]}
+      assert :ok = Store.persist(renamed, ctx.store)
+      assert %{{:group, 2} => 4} = Store.device_ids(ctx.store)
+
+      assert summary_groups(ctx.store) == [
+               %{local_id: 1, name: "path and post"},
+               %{local_id: 2, name: "garden"}
+             ]
+
+      assert {:ok, %Inventory{groups: [_, %{members: [@mac2, @mac3]}]}} = Store.load(ctx.store)
+    end
+
+    test "a deleted group's sub-device id is never reused, not even by its local id", ctx do
+      inv = inventory()
+      assert :ok = Store.persist(%{inv | groups: []}, ctx.store)
+      refute Map.has_key?(Store.device_ids(ctx.store), {:group, 1})
+
+      assert :ok = Store.persist(%{inv | groups: [group(1, "again", [])]}, ctx.store)
+      assert %{{:group, 1} => 4} = Store.device_ids(ctx.store)
+
+      assert :ok =
+               Store.persist(
+                 %{inv | groups: [group(1, "again", []), group(2, "x", [])]},
+                 ctx.store
+               )
+
+      ids = Store.device_ids(ctx.store)
+      assert ids[{:group, 2}] == 5
+      assert ids |> Map.values() |> Enum.uniq() |> length() == map_size(ids)
+
+      # Across a restart too: the counter is persisted.
+      store = restart_store(ctx)
+      :ok = Store.persist(%{inv | groups: [group(3, "y", [])]}, store)
+      assert Store.device_ids(store)[{:group, 3}] == 6
+    end
+
+    test "every group edit bumps the revision; the bulbs and the mesh still can't change", ctx do
+      inv = inventory()
+      {:ok, %{revision: r0}} = Store.preview(inv, ctx.store)
+
+      edited = %{inv | groups: [group(1, "renamed", [@mac2])]}
+      assert :ok = Store.persist(edited, ctx.store)
+      {:ok, %{revision: r1}} = Store.preview(inv, ctx.store)
+      assert r1 == r0 + 1
+
+      # A group edit carried with a bulb change, or for another mesh, is refused whole.
+      assert {:error, :bulbs_changed} =
+               Store.persist(
+                 %{edited | bulbs: tl(inv.bulbs), groups: [group(1, "x", [@mac3])]},
+                 ctx.store
+               )
+
+      relabelled = Enum.map(inv.bulbs, &%{&1 | label: "new " <> &1.label})
+
+      assert {:error, :bulbs_changed} =
+               Store.persist(%{edited | bulbs: relabelled, groups: []}, ctx.store)
+
+      assert {:error, :mesh_changed} =
+               Store.persist(%{other_mesh() | groups: [group(2, "x", [])]}, ctx.store)
+
+      assert {:ok, %Inventory{groups: [%{name: "renamed", members: [@mac2]}]}} =
+               Store.load(ctx.store)
+
+      # A tighten carrying a group change is refused (its seq only).
+      :ok = Store.persist(%{edited | seq: 132}, ctx.store)
+
+      assert {:error, :inventory_changed} =
+               Store.tighten(%{edited | seq: 101, groups: []}, 132, ctx.store)
+    end
+  end
+
   describe "replace and mesh identity" do
     test "classify and preview tell the meshes apart and diff the bulbs", ctx do
       assert Store.classify(inventory(), ctx.store) == :empty

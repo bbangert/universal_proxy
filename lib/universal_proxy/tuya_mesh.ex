@@ -51,11 +51,22 @@ defmodule UniversalProxy.TuyaMesh do
   checking) and groups. No keys. Changes are broadcast on `UniversalProxy.PubSub`
   topic `topic/0` as `{:tuya_mesh_status, status}`.
 
+  ## Groups
+
+  `create_group/3`, `add_member/3`, `remove_member/3`, `delete_group/2`
+  and `rename_group/3` edit the mesh's groups through the running
+  `Lights` (`TuyaBeaconMesh.Lights`, "Groups"): validated, persisted to
+  the Store (which allocates a new group's sub-device id and broadcasts
+  `:inventory_changed`, so Home Assistant follows), then sent to the
+  bulbs. `group_sync/1` reports each member change as `:pending`,
+  `:confirmed` (the bulb's A3 group list agrees) or `:unconfirmed`. They
+  need the mesh running: `{:error, :not_running}` otherwise.
+
   Every function here is safe on any target and while the subsystem is
   down (CLAUDE.md `catch :exit` idiom; a timed-out change is reported as
   `{:error, :timeout}`, since it may still have happened).
 
-  Test seams: `:store` and `:resolver` server names, and `:mesh_processes`
+  Test seams: `:store`, `:resolver` and `:lights` server names, and `:mesh_processes`
   (the names that must all be unregistered before a change bypasses the
   Resolver), in every `opts`.
   """
@@ -168,7 +179,50 @@ defmodule UniversalProxy.TuyaMesh do
   def put_settings(changes, opts \\ []),
     do: Store.put_settings(changes, Keyword.get(opts, :store, Store))
 
+  @doc """
+  Creates a group of `members` (MACs or labels) and returns its local id.
+  Errors include `{:error, :bad_group_name | :duplicate_group_name |
+  :unknown_bulb | :no_free_group_id | {:group_slots_full, mac} |
+  :persist_failed | :not_running}`.
+  """
+  @spec create_group(String.t(), [String.t()], keyword()) :: {:ok, 1..254} | {:error, term()}
+  def create_group(name, members, opts \\ []),
+    do: Lights.create_group(name, members, lights(opts))
+
+  @doc "Adds a bulb to a group (name or local id); re-sends the join for a member."
+  @spec add_member(String.t() | byte(), String.t(), keyword()) :: :ok | {:error, term()}
+  def add_member(group, mac_or_label, opts \\ []),
+    do: Lights.add_member(group, mac_or_label, lights(opts))
+
+  @doc "Removes a bulb from a group; re-sends a tracked removal."
+  @spec remove_member(String.t() | byte(), String.t(), keyword()) :: :ok | {:error, term()}
+  def remove_member(group, mac_or_label, opts \\ []),
+    do: Lights.remove_member(group, mac_or_label, lights(opts))
+
+  @doc """
+  Deletes a group: every bulb that may hold it is sent a removal.
+  `dismiss: true` also sends the (hardware-untested) broadcast dismiss.
+  """
+  @spec delete_group(String.t() | byte(), keyword()) :: :ok | {:error, term()}
+  def delete_group(group, opts \\ []),
+    do: Lights.delete_group(group, lights(opts) ++ Keyword.take(opts, [:dismiss]))
+
+  @doc "Renames a group (nothing is sent to the bulbs)."
+  @spec rename_group(String.t() | byte(), String.t(), keyword()) :: :ok | {:error, term()}
+  def rename_group(group, name, opts \\ []), do: Lights.rename_group(group, name, lights(opts))
+
+  @doc "Groups, per-member change state and per-bulb slot use (`Lights.groups/1`)."
+  @spec group_sync(keyword()) ::
+          {:ok, %{groups: [Lights.group_view()], slots: %{String.t() => non_neg_integer()}}}
+          | {:error, term()}
+  def group_sync(opts \\ []), do: Lights.groups(lights(opts))
+
   # ── Private ──────────────────────────────────────────────────────────
+
+  # Lights' client functions already follow the `catch :exit` idiom
+  # (`{:error, :not_running}`, or `{:error, :timeout}` for a change that may
+  # have happened).
+  defp lights(opts), do: [server: Keyword.get(opts, :lights, Lights)]
 
   defp decode(input) do
     case Inventory.decode(input) do
