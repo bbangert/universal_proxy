@@ -164,44 +164,53 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   sends nothing. The reply comes once the change is persisted; the
   frames follow.
 
-  A new group takes the lowest group id in `1..254` that no inventory
-  group uses, no bulb reported holding (its last A3 group list) and no
-  unfinished membership change uses (`{:error, :no_free_group_id}` when
-  none is left). Id 0 is never allocated: the A3 group list uses 0 for an
-  empty slot, so membership of group 0 could never be confirmed. A bulb
-  holds at most 8 group ids: a change that would put a bulb in a
-  ninth group (inventory memberships, its last reported list and groups
-  it may still hold from an unconfirmed removal, counted together) is
-  refused with `{:error, {:group_slots_full, mac}}` before anything is
-  written or sent.
+  What a bulb **may hold** is one set per bulb: its inventory
+  memberships, its last accepted A3 group list, every join sent to it
+  (even one a reload has since dropped from the inventory) and every
+  removal not yet confirmed. The same set counts its slots, reserves ids,
+  picks delete targets and decides when a deleted group's tracking can go.
+
+  A new group takes the lowest id in `1..254` that no inventory group
+  uses and no bulb may hold (`{:error, :no_free_group_id}` when none is
+  left). Id 0 is never allocated: the A3 list uses 0 for an empty slot,
+  so membership of group 0 could never be confirmed. A bulb holds at
+  most 8 group ids: a change that would make a bulb's set larger than 8
+  is refused with `{:error, {:group_slots_full, mac}}` before anything
+  is written or sent.
 
   Membership goes to the bulbs as unicast requests: `A1 gg` to join,
   `A2 gg` to leave (localKey, the bulb's own mask), each answered with an
-  A3 group list. `delete_group/2` sends `A2 gg` to every member and to
-  every other bulb that may hold the id (it reported it, was sent a join,
-  or its removal is unconfirmed): that unicast removal is what counts. `dismiss: true` also sends the app's group dismiss (`A2
-  gg` to `FF gg`, mesh key), which is untested on hardware and never
-  confirmed.
+  A3 group list. `delete_group/2` sends `A2 gg` to every bulb that may
+  hold the id: that unicast removal is what counts. `dismiss: true` also
+  sends the app's group dismiss (`A2 gg` to `FF gg`, mesh key), which is
+  untested on hardware and never confirmed. A group absent from the
+  inventory stays in `groups/1` (`deleted: true`) until no bulb may hold
+  it.
 
   Each change of one bulb's membership in one group is tracked
   (`groups/1`) as `:pending` (waiting to be sent, or sent), `:confirmed`
   (an accepted A3 report from that bulb shows the expected membership)
   or `:unconfirmed` (no such report within `:group_confirm_ms` of the
-  Radio accepting the frame, or the frame could not be sent after
-  8 attempts). Nothing is assumed: only a report confirms, and a
-  late report still confirms an unconfirmed change. Repeating
-  `add_member/3` for a member, or `remove_member/3` for a tracked
-  removal, sends it again.
+  Radio accepting the frame, or the frame could not be sent after 8
+  attempts). Nothing is assumed: only a report confirms, and a late
+  report still confirms an unconfirmed change. A confirmed join that a
+  newer list no longer shows is unconfirmed again (or forgotten, for a
+  bulb no longer a member). Repeating `add_member/3` for a member, or
+  `remove_member/3` for a bulb that may hold the group, sends it again.
 
   Lights paces these frames itself, at most 2 awaiting confirmation at
   a time, as `:normal` Radio sends (so they never drop queued light
   commands). A refused frame (`:queue_full`, `:busy`, `:not_ready`, …)
-  is retried after `:group_retry_ms`, doubling up to 30 s; one with an
-  uncertain outcome counts as sent. A same-mesh `reload/2` drops unsent
-  changes its memberships contradict; sent ones stay tracked. Tracking
-  lives in memory only: a
-  restarted Lights knows the stored membership but not what the bulbs
-  confirmed.
+  is retried after `:group_retry_ms`, doubling up to 30 s, with a fresh
+  budget for each change that becomes the head of the queue; one with an
+  uncertain outcome counts as sent.
+
+  A same-mesh `reload/2` drops unsent changes its memberships contradict
+  and keeps sent ones tracked. It keeps each bulb's A3 list too (it
+  describes the bulb, not the inventory), unless the bulb's node id or
+  keys changed: a re-paired bulb was reset. Another mesh starts with no
+  tracking. Tracking lives in memory only: a restarted Lights knows the
+  stored membership but not what the bulbs confirmed.
 
   ## Reports
 
@@ -1277,10 +1286,12 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
       :ok ->
         unless same_mesh?, do: clear_old_mesh_tx(state)
 
+        reloaded = if same_mesh?, do: keep_reported(reloaded, state), else: reloaded
+
         reloaded =
           reloaded |> rebase_aired(state, same_mesh?) |> retire_floor() |> keep_groups(same_mesh?)
 
-        {:reply, :ok, reloaded}
+        {:reply, :ok, reloaded, {:continue, :pump_groups}}
 
       {:error, reason} when same_mesh? ->
         state =
@@ -1448,7 +1459,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
       mac in Map.get(state.groups, gid, %{members: []}).members ->
         update_members(state, gid, &List.delete(&1, mac))
 
-      mac in may_hold(state, gid) ->
+      gid in may_hold_groups(state, mac) ->
         {:ok, state}
 
       true ->
@@ -1522,14 +1533,10 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
     end
   end
 
-  # 0 means an empty slot in an A3 list, so it is never allocated.
+  # 0 means an empty slot in an A3 list, so it is never allocated. An id
+  # any bulb may hold stays reserved (may_hold_groups/2).
   defp free_group_id(state) do
-    taken =
-      MapSet.new(
-        Map.keys(state.groups) ++
-          Enum.flat_map(state.bulbs, fn {_mac, b} -> b.groups || [] end) ++
-          for({{gid, _mac}, %{state: s}} <- state.group_ops, s != :confirmed, do: gid)
-      )
+    taken = MapSet.union(MapSet.new(Map.keys(state.groups)), held_anywhere(state))
 
     case Enum.find(1..254, &(not MapSet.member?(taken, &1))) do
       nil -> {:error, :no_free_group_id}
@@ -1537,44 +1544,41 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
     end
   end
 
-  # The group ids a bulb holds or may hold: its inventory memberships, its
-  # last reported list and removals not confirmed yet.
-  defp held_groups(state, mac) do
+  # The one answer to "which group ids may this bulb hold": its inventory
+  # memberships, its last accepted A3 list, joins sent to it (whatever the
+  # inventory says since: a reload may have dropped the membership) and
+  # removals not confirmed. Slot counts, id allocation, delete targets and
+  # pruning all use it, so they never disagree.
+  defp may_hold_groups(state, mac) do
+    member_of = for {gid, %{members: members}} <- state.groups, mac in members, do: gid
     reported = get_in(state.bulbs, [mac, :groups]) || []
 
-    member_of = for {gid, %{members: members}} <- state.groups, mac in members, do: gid
+    tracked =
+      for {{gid, ^mac}, %{op: op, state: s}} <- state.group_ops,
+          (op == :add and s != :queued) or (op == :remove and s != :confirmed),
+          do: gid
 
-    leaving =
-      for {{gid, ^mac}, %{op: :remove, state: s}} <- state.group_ops, s != :confirmed, do: gid
+    MapSet.new(member_of ++ reported ++ tracked)
+  end
 
-    MapSet.new(member_of ++ reported ++ leaving)
+  defp held_anywhere(state) do
+    state.bulbs
+    |> Map.keys()
+    |> Enum.reduce(MapSet.new(), &MapSet.union(&2, may_hold_groups(state, &1)))
   end
 
   defp check_slots(state, macs, gid) do
     Enum.find_value(macs, :ok, fn mac ->
-      held = held_groups(state, mac)
+      held = may_hold_groups(state, mac)
 
       if not MapSet.member?(held, gid) and MapSet.size(held) >= @group_slots,
         do: {:error, {:group_slots_full, mac}}
     end)
   end
 
-  # Every bulb that may hold `gid`: its members and the others may_hold/2 finds.
-  defp group_holders(state, gid),
-    do: Enum.uniq(Map.fetch!(state.groups, gid).members ++ may_hold(state, gid))
-
-  # Bulbs that may hold `gid` whatever the inventory says: one that
-  # reported it, one sent a join (a reload may have dropped the member
-  # since), and one whose removal is not confirmed.
-  defp may_hold(state, gid) do
-    reporters = for {mac, %{groups: [_ | _] = ids}} <- state.bulbs, gid in ids, do: mac
-
-    tracked =
-      for {{^gid, mac}, %{op: op, state: s}} <- state.group_ops,
-          (op == :add and s != :queued) or (op == :remove and s != :confirmed),
-          do: mac
-
-    Enum.uniq(reporters ++ tracked)
+  # Every bulb that may hold `gid` (its members among them).
+  defp group_holders(state, gid) do
+    for {mac, _bulb} <- state.bulbs, gid in may_hold_groups(state, mac), do: mac
   end
 
   # Leftovers of an earlier group with this id (all confirmed: anything
@@ -1701,20 +1705,24 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
 
   # An accepted A3 list from `mac` confirms each of its sent (or timed
   # out) changes it agrees with. One it disagrees with stays as it was: the
-  # list may answer an older request.
+  # list may answer an older request. A confirmed join the list no longer
+  # shows is gone from the bulb (reports are accepted in order, so this
+  # list is newer than the one that confirmed it): unconfirmed again for a
+  # member, forgotten otherwise.
   defp confirm_group_list(state, mac, %{type: 1, sub_cmd: 2, payload: <<0xA3, _::binary>>}, ids) do
-    confirmed =
+    changes =
       for {{gid, ^mac} = key, %{op: op, state: s}} <- state.group_ops,
-          s in [:sent, :unconfirmed],
-          op == :add == gid in ids,
-          do: key
+          change = list_change(op, s, gid in ids, member?(state, gid, mac)),
+          change != :keep,
+          do: {key, change}
 
-    if confirmed == [] do
+    if changes == [] do
       state
     else
       ops =
-        Enum.reduce(confirmed, state.group_ops, fn key, ops ->
-          Map.update!(ops, key, &%{&1 | state: :confirmed, ref: nil})
+        Enum.reduce(changes, state.group_ops, fn
+          {key, :drop}, ops -> Map.delete(ops, key)
+          {key, new}, ops -> Map.update!(ops, key, &%{&1 | state: new, ref: nil})
         end)
 
       pump_groups(prune_deleted(%{state | group_ops: ops}))
@@ -1723,18 +1731,30 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
 
   defp confirm_group_list(state, _mac, _parsed, _ids), do: state
 
-  # A deleted group drops out of tracking once every change of it is
-  # confirmed.
+  defp list_change(op, s, listed?, _member?) when s in [:sent, :unconfirmed] do
+    if op == :add == listed?, do: :confirmed, else: :keep
+  end
+
+  defp list_change(:add, :confirmed, false, true), do: :unconfirmed
+  defp list_change(:add, :confirmed, false, false), do: :drop
+  defp list_change(_op, _s, _listed?, _member?), do: :keep
+
+  defp member?(state, gid, mac) do
+    case state.groups do
+      %{^gid => %{members: members}} -> mac in members
+      _ -> false
+    end
+  end
+
+  # An absent group (deleted, or dropped by a reload) leaves tracking only
+  # once no bulb may hold it (may_hold_groups/2): every change of it is a
+  # confirmed removal, or a join a newer list showed gone.
   defp prune_deleted(state) do
-    open =
-      for {{gid, _}, %{state: s}} <- state.group_ops,
-          s != :confirmed,
-          into: MapSet.new(),
-          do: gid
+    held = held_anywhere(state)
 
     ops =
       Map.reject(state.group_ops, fn {{gid, _}, _} ->
-        not Map.has_key?(state.groups, gid) and not MapSet.member?(open, gid)
+        not Map.has_key?(state.groups, gid) and not MapSet.member?(held, gid)
       end)
 
     %{state | group_ops: ops}
@@ -1743,8 +1763,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   # A reload of the same mesh keeps the tracking of bulbs it still has,
   # minus unsent changes the reloaded memberships contradict (a join for a
   # pair it doesn't have, a leave for one it has). What was sent stays
-  # tracked: the bulb may hold the group (may_hold/2). Another mesh's ids
-  # mean nothing here.
+  # tracked: the bulb may hold the group (may_hold_groups/2). When that
+  # changes the job at the head, the new head starts a fresh retry budget.
+  # Another mesh's ids mean nothing here.
   defp keep_groups(state, true) do
     ops =
       Map.filter(state.group_ops, fn {{gid, mac}, op} ->
@@ -1755,18 +1776,40 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
     jobs =
       Enum.filter(state.group_jobs, &(not member_job?(&1) or match?(%{state: :queued}, ops[&1])))
 
-    %{state | group_ops: ops, group_jobs: jobs}
+    state =
+      if List.first(jobs) == List.first(state.group_jobs),
+        do: state,
+        else: %{state | group_attempts: 0, group_retry: nil}
+
+    prune_deleted(%{state | group_ops: ops, group_jobs: jobs})
   end
 
   defp keep_groups(state, false),
     do: %{state | group_ops: %{}, group_jobs: [], group_attempts: 0, group_retry: nil}
 
   defp contradicted?(state, gid, mac, op) do
-    member? =
-      match?(%{members: members} when is_list(members), state.groups[gid]) and
-        mac in state.groups[gid].members
-
+    member? = member?(state, gid, mac)
     if op == :add, do: not member?, else: member?
+  end
+
+  # A bulb's A3 list describes the bulb, not the inventory, so a same-mesh
+  # reload keeps it, unless the bulb's node id or keys changed: a re-paired
+  # bulb was reset first, and holds no groups.
+  defp keep_reported(reloaded, state) do
+    bulbs =
+      Map.new(reloaded.bulbs, fn {mac, bulb} ->
+        case state.bulbs do
+          %{^mac => %{groups: groups} = old} when is_list(groups) ->
+            if old.node_id == bulb.node_id and Redact.unseal(old.keys) == Redact.unseal(bulb.keys),
+              do: {mac, %{bulb | groups: groups}},
+              else: {mac, bulb}
+
+          _ ->
+            {mac, bulb}
+        end
+      end)
+
+    %{reloaded | bulbs: bulbs}
   end
 
   defp groups_view(state) do
@@ -1789,7 +1832,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
         %{local_id: gid, name: nil, members: [], deleted: true, sync: sync.(gid)}
       end
 
-    slots = Map.new(state.bulbs, fn {mac, _} -> {mac, MapSet.size(held_groups(state, mac))} end)
+    slots =
+      Map.new(state.bulbs, fn {mac, _} -> {mac, MapSet.size(may_hold_groups(state, mac))} end)
+
     %{groups: live ++ deleted, slots: slots}
   end
 

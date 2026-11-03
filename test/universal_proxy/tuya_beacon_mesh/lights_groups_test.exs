@@ -377,6 +377,87 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsGroupsTest do
     end
   end
 
+  describe "what a bulb may hold, across same-mesh reloads" do
+    test "a bulb's A3 list survives a reload, unless it was re-paired (new keys)" do
+      inject_report(2, 1, <<0xA3, 1, 5>>, @addr2)
+      wait_until(fn -> match?({:ok, %{groups: [1, 5]}}, Lights.status(@mac2)) end)
+
+      assert :ok = Lights.reload(fixture())
+      assert {:ok, %{groups: [1, 5]}} = Lights.status(@mac2)
+
+      assert :ok = Lights.reload(repaired())
+      assert {:ok, %{groups: nil}} = Lights.status(@mac2)
+    end
+
+    test "a confirmed join keeps its id reserved after a reload dropped the group" do
+      {:ok, 2} = Lights.create_group("a", [@mac2])
+      inject_report(2, 1, <<0xA3, 1, 2>>, @addr2)
+      wait_until(fn -> sync(2, @mac2).state == :confirmed end)
+
+      # Even without the bulb's list (re-paired keys), the join reserves 2.
+      assert :ok = Lights.reload(repaired())
+      assert {:ok, %{groups: nil}} = Lights.status(@mac2)
+      assert {:ok, 3} = Lights.create_group("b", [])
+    end
+
+    @tag inventory: :seven
+    test "a retained join counts as a slot" do
+      {:ok, 8} = Lights.create_group("eighth", [@mac2])
+      wait_until(fn -> length(advertises()) == 1 end)
+
+      # The reload drops group 8; its join was sent and may have landed.
+      assert :ok = Lights.reload(inventory(:seven))
+      assert {:ok, %{slots: %{@mac2 => 8}}} = Lights.groups()
+      assert {:error, {:group_slots_full, @mac2}} = Lights.create_group("ninth", [@mac2])
+    end
+
+    test "a group a reload dropped stays tracked until its bulbs are known to have left" do
+      {:ok, 2} = Lights.create_group("a", [@mac2])
+      wait_until(fn -> length(advertises()) == 1 end)
+      assert :ok = Lights.reload(fixture())
+
+      # Confirming the join must not forget the group: the bulb holds it.
+      inject_report(2, 1, <<0xA3, 1, 2>>, @addr2)
+      wait_until(fn -> sync(2, @mac2) == %{op: :add, state: :confirmed} end)
+      assert {:ok, %{groups: [_, %{local_id: 2, deleted: true}]}} = Lights.groups()
+
+      :ok = Radio.stop_tx()
+      assert :ok = Lights.remove_member(2, @mac2)
+      wait_until(fn -> Enum.any?(advertises(), &(open_unicast(&1) == {2, <<0xA2, 2>>})) end)
+
+      inject_report(2, 2, <<0xA3, 1>>, @addr2)
+      wait_until(fn -> match?({:ok, %{groups: [%{local_id: 1}]}}, Lights.groups()) end)
+    end
+
+    test "a confirmed join a newer list no longer shows is unconfirmed again" do
+      {:ok, 2} = Lights.create_group("a", [@mac2])
+      inject_report(2, 1, <<0xA3, 1, 2>>, @addr2)
+      wait_until(fn -> sync(2, @mac2).state == :confirmed end)
+
+      inject_report(2, 2, <<0xA3, 1>>, @addr2)
+      wait_until(fn -> sync(2, @mac2) == %{op: :add, state: :unconfirmed} end)
+    end
+
+    @tag retry_ms: 5
+    @tag :capture_log
+    test "a reload that drops the retrying head gives the next job a fresh budget" do
+      FakeBluez.fail(:advertise, :busy)
+      {:ok, 2} = Lights.create_group("a", [@mac2])
+      {:ok, 3} = Lights.create_group("b", [@mac3])
+      wait_until(fn -> :sys.get_state(Lights).group_attempts == 7 end)
+
+      # Group 2 is gone from the reload, group 3 stays.
+      b = %{"localId" => 3, "name" => "b", "members" => [@mac3]}
+      assert :ok = Lights.reload(Map.update!(fixture(), "groups", &(&1 ++ [b])))
+
+      # The surviving join was tried at once, as its own first attempt.
+      assert %{group_attempts: 1, group_jobs: [{3, @mac3}]} = :sys.get_state(Lights)
+      assert sync(3, @mac3) == %{op: :add, state: :pending}
+      assert sync(2, @mac2) == nil
+      FakeBluez.succeed(:advertise)
+    end
+  end
+
   describe "rename_group" do
     test "is local: persisted, nothing sent", %{table: table} do
       assert :ok = Lights.rename_group(1, " garden ")
@@ -527,6 +608,12 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsGroupsTest do
 
   defp inventory(nil), do: fixture()
 
+  # "path light 2" in groups 1..7, so it has one slot left.
+  defp inventory(:seven) do
+    groups = for id <- 1..7, do: %{"localId" => id, "name" => "s#{id}", "members" => [@mac2]}
+    Map.put(fixture(), "groups", groups)
+  end
+
   # Every allocatable id in use.
   defp inventory(:full) do
     groups = for id <- 1..254, do: %{"localId" => id, "name" => "g#{id}", "members" => []}
@@ -546,6 +633,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsGroupsTest do
       end
     end
   end
+
+  # The fixture with "path light 2" re-paired: a new localKey.
+  defp repaired, do: put_in(fixture(), ["bulbs", Access.at(0), "localKey"], "qrstuvwxyzabcdef")
 
   defp writes(table), do: :ets.lookup_element(table, :writes, 2)
   defp last_persisted(table), do: :ets.lookup_element(table, :inv, 2)
