@@ -152,6 +152,55 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   `Bluez.Mgmt` or its lease during the advertise, so the frame may have
   gone out (the Radio re-runs setup).
 
+  ## Groups
+
+  `create_group/3`, `add_member/3`, `remove_member/3`, `delete_group/2`
+  and `rename_group/3` edit the inventory's groups. Each validates first
+  (names: a non-blank string of at most 64 characters after trimming,
+  unique among the groups; members: bulbs by MAC or label), then writes
+  the new inventory through `on_persist`, and only once that returned
+  `:ok` replaces the in-memory inventory and queues radio work, so a
+  failed persist (`{:error, :persist_failed}`) changes nothing. A rename
+  sends nothing. The reply comes once the change is persisted; the
+  frames follow.
+
+  A new group takes the lowest group id in `1..254` that no inventory
+  group uses, no bulb reported holding (its last A3 group list) and no
+  unfinished membership change uses (`{:error, :no_free_group_id}` when
+  none is left). Id 0 is never allocated: the A3 group list uses 0 for an
+  empty slot, so membership of group 0 could never be confirmed. A bulb
+  holds at most 8 group ids: a change that would put a bulb in a
+  ninth group (inventory memberships, its last reported list and groups
+  it may still hold from an unconfirmed removal, counted together) is
+  refused with `{:error, {:group_slots_full, mac}}` before anything is
+  written or sent.
+
+  Membership goes to the bulbs as unicast requests: `A1 gg` to join,
+  `A2 gg` to leave (localKey, the bulb's own mask), each answered with an
+  A3 group list. `delete_group/2` sends `A2 gg` to every member (and to
+  any other bulb that reported holding the id): that unicast removal is
+  what counts. `dismiss: true` also sends the app's group dismiss (`A2
+  gg` to `FF gg`, mesh key), which is untested on hardware and never
+  confirmed.
+
+  Each change of one bulb's membership in one group is tracked
+  (`groups/1`) as `:pending` (waiting to be sent, or sent), `:confirmed`
+  (an accepted A3 report from that bulb shows the expected membership)
+  or `:unconfirmed` (no such report within `:group_confirm_ms` of the
+  Radio accepting the frame, or the frame could not be sent after
+  8 attempts). Nothing is assumed: only a report confirms, and a
+  late report still confirms an unconfirmed change. Repeating
+  `add_member/3` for a member, or `remove_member/3` for a tracked
+  removal, sends it again.
+
+  Lights paces these frames itself, at most 2 awaiting confirmation at
+  a time, as `:normal` Radio sends (so they never drop queued light
+  commands). A refused frame (`:queue_full`, `:busy`, `:not_ready`, …)
+  is retried after `:group_retry_ms`, doubling up to 30 s; one with an
+  uncertain outcome counts as sent. Tracking lives in memory only: a
+  restarted Lights knows the stored membership but not what the bulbs
+  confirmed.
+
   ## Reports
 
   Reports are attributed by **node id → MAC** from the inventory, never
@@ -253,6 +302,12 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   @report_window 9_999
   @group_slots 8
   @resync_reports 3
+  @max_group_name 64
+  @group_confirm_ms 30_000
+  @group_retry_ms 1_000
+  @max_group_retry_ms 30_000
+  @group_send_attempts 8
+  @group_inflight 2
 
   # Radio replies after which the frame provably never went on air, so its
   # sequence number can be handed out again. {:uncertain, _} is not one.
@@ -290,6 +345,12 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
       largest jump known to be accepted; above `:max_lease`);
     * `:clock` — `(-> integer())` monotonic milliseconds (default
       `System.monotonic_time(:millisecond)`; a test seam);
+    * `:group_confirm_ms` — how long a membership change waits for its
+      A3 report after the Radio accepted the frame (default
+      #{@group_confirm_ms}); see "Groups";
+    * `:group_retry_ms` — first retry delay for a group frame the Radio
+      refused (default #{@group_retry_ms}, doubling up to
+      #{@max_group_retry_ms});
     * `:name` — process name (default `#{inspect(__MODULE__)}`).
 
   An option outside those bounds stops the start with `{:error,
@@ -379,6 +440,69 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   @spec reload(Inventory.t() | binary() | map(), keyword()) :: :ok | {:error, term()}
   def reload(input, opts \\ []), do: call(opts, {:reload, Redact.seal(input)})
 
+  @typedoc "Where one bulb's membership change in one group stands (see \"Groups\")."
+  @type sync_state :: :pending | :confirmed | :unconfirmed
+
+  @type group_view :: %{
+          local_id: 0..254,
+          name: String.t() | nil,
+          members: [String.t()],
+          deleted: boolean(),
+          sync: %{String.t() => %{op: :add | :remove, state: sync_state()}}
+        }
+
+  @doc """
+  Creates a group named `name` with `members` (MACs or labels) and sends
+  each member its join request. Returns the allocated group id. `opts`:
+  `:server`. See "Groups".
+  """
+  @spec create_group(String.t(), [String.t()], keyword()) :: {:ok, 1..254} | {:error, term()}
+  def create_group(name, members, opts \\ []), do: call(opts, {:create_group, name, members})
+
+  @doc """
+  Adds a bulb (MAC or label) to a group (name or local id). For a member
+  already, nothing is written and the join request is sent again.
+  """
+  @spec add_member(String.t() | byte(), String.t(), keyword()) :: :ok | {:error, term()}
+  def add_member(group, mac_or_label, opts \\ []),
+    do: call(opts, {:add_member, group, mac_or_label})
+
+  @doc """
+  Removes a bulb from a group and sends it the leave request. For a bulb
+  that is no longer a member but whose removal is tracked (a deleted
+  group's included, by local id), the request is sent again; otherwise
+  `{:error, :not_member}`.
+  """
+  @spec remove_member(String.t() | byte(), String.t(), keyword()) :: :ok | {:error, term()}
+  def remove_member(group, mac_or_label, opts \\ []),
+    do: call(opts, {:remove_member, group, mac_or_label})
+
+  @doc """
+  Deletes a group and sends every bulb that may hold it the leave
+  request. `opts`: `dismiss:` (default `false`) also sends the untested
+  broadcast dismiss; `:server`.
+  """
+  @spec delete_group(String.t() | byte(), keyword()) :: :ok | {:error, term()}
+  def delete_group(group, opts \\ []) do
+    with {:ok, server, opts} <- split_server(opts),
+         do: call_server(server, {:delete_group, group, opts})
+  end
+
+  @doc "Renames a group (local only, nothing is sent)."
+  @spec rename_group(String.t() | byte(), String.t(), keyword()) :: :ok | {:error, term()}
+  def rename_group(group, name, opts \\ []), do: call(opts, {:rename_group, group, name})
+
+  @doc """
+  The groups with their members and each tracked membership change
+  (`sync`, by MAC), plus deleted groups whose removals are not all
+  confirmed yet (`deleted: true`), and how many group slots each bulb
+  holds or may hold (`slots`, by MAC; at most #{@group_slots}). No keys.
+  """
+  @spec groups(keyword()) ::
+          {:ok, %{groups: [group_view()], slots: %{String.t() => non_neg_integer()}}}
+          | {:error, term()}
+  def groups(opts \\ []), do: call(opts, :groups)
+
   # Opts that aren't a keyword list name no server: refused here, before
   # anything is sent.
   defp split_server(opts) do
@@ -425,7 +549,14 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
           attempted: nil,
           tighten_floor: nil,
           aired: before(inv.seq),
-          aired_seen?: false
+          aired_seen?: false,
+          # Membership changes by {gid, mac}, the FIFO of group frames to
+          # send ({gid, mac} or {gid, :dismiss}), the send attempts of its
+          # head and the retry timer (see "Groups").
+          group_ops: %{},
+          group_jobs: [],
+          group_attempts: 0,
+          group_retry: nil
         }
         |> Map.merge(leasing)
         |> load(inv)
@@ -480,6 +611,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
     jump = Keyword.get(opts, :max_jump, Seq.max_jump())
     on_tighten = Keyword.get(opts, :on_tighten)
     clock = Keyword.get(opts, :clock, &monotonic_ms/0)
+    confirm = Keyword.get(opts, :group_confirm_ms, @group_confirm_ms)
+    retry = Keyword.get(opts, :group_retry_ms, @group_retry_ms)
 
     # In order: later checks rely on max_lease having passed.
     checks = [
@@ -488,7 +621,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
       min_lease: fn -> is_integer(min) and min in 1..max end,
       max_jump: fn -> is_integer(jump) and jump > max and jump <= Seq.max_jump() end,
       on_tighten: fn -> is_nil(on_tighten) or is_function(on_tighten, 2) end,
-      clock: fn -> is_function(clock, 0) end
+      clock: fn -> is_function(clock, 0) end,
+      group_confirm_ms: fn -> is_integer(confirm) and confirm > 0 end,
+      group_retry_ms: fn -> is_integer(retry) and retry > 0 end
     ]
 
     case Enum.find(checks, fn {_key, valid?} -> not valid?.() end) do
@@ -503,7 +638,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
            max_lease: max,
            max_jump: jump,
            on_tighten: on_tighten,
-           clock: clock
+           clock: clock,
+           group_confirm_ms: confirm,
+           group_retry_ms: retry
          }}
     end
   end
@@ -526,6 +663,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   @impl GenServer
   def handle_continue(:subscribe, state),
     do: Redact.guard(@label, fn -> {:noreply, subscribe(state)} end)
+
+  def handle_continue(:pump_groups, state),
+    do: Redact.guard(@label, fn -> {:noreply, pump_groups(state)} end)
 
   # Monitor before subscribing so a Radio that dies right after accepting
   # the subscription still delivers its :DOWN.
@@ -640,6 +780,79 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
     end
   end
 
+  defp do_call({:create_group, name, members}, state) do
+    with {:ok, name} <- check_group_name(state, name, nil),
+         {:ok, macs} <- resolve_members(state, members),
+         {:ok, gid} <- free_group_id(state),
+         :ok <- check_slots(state, macs, gid),
+         group = %Inventory.Group{local_id: gid, name: name, members: macs},
+         {:ok, state} <- commit_groups(state, inventory_groups(state) ++ [group]) do
+      state = state |> forget_group(gid) |> queue_members(gid, macs, :add)
+      {:reply, {:ok, gid}, state, {:continue, :pump_groups}}
+    else
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  defp do_call({:add_member, who_group, who}, state) do
+    with {:ok, gid} <- resolve_group_id(state, who_group),
+         {:ok, mac, _bulb} <- resolve(state, who),
+         :ok <- check_slots(state, [mac], gid),
+         {:ok, state} <- update_members(state, gid, &Enum.uniq(&1 ++ [mac])) do
+      {:reply, :ok, queue_members(state, gid, [mac], :add), {:continue, :pump_groups}}
+    else
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  defp do_call({:remove_member, who_group, who}, state) do
+    with {:ok, gid} <- resolve_tracked_group(state, who_group),
+         {:ok, mac, _bulb} <- resolve(state, who),
+         {:ok, state} <- leave(state, gid, mac) do
+      {:reply, :ok, queue_members(state, gid, [mac], :remove), {:continue, :pump_groups}}
+    else
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  defp do_call({:delete_group, who_group, opts}, state) do
+    with {:ok, dismiss?} <- dismiss_opt(opts),
+         {:ok, gid} <- resolve_group_id(state, who_group),
+         holders = group_holders(state, gid),
+         remaining = Enum.reject(inventory_groups(state), &(&1.local_id == gid)),
+         {:ok, state} <- commit_groups(state, remaining) do
+      state = queue_members(state, gid, holders, :remove)
+      state = if dismiss?, do: queue_job(state, {gid, :dismiss}), else: state
+      {:reply, :ok, state, {:continue, :pump_groups}}
+    else
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  defp do_call({:rename_group, who_group, name}, state) do
+    with {:ok, gid} <- resolve_group_id(state, who_group),
+         {:ok, name} <- check_group_name(state, name, gid) do
+      if state.groups[gid].name == name do
+        {:reply, :ok, state}
+      else
+        groups =
+          Enum.map(inventory_groups(state), fn
+            %{local_id: ^gid} = group -> %{group | name: name}
+            group -> group
+          end)
+
+        case commit_groups(state, groups) do
+          {:ok, state} -> {:reply, :ok, state}
+          {:error, reason} -> {:reply, {:error, reason}, state}
+        end
+      end
+    else
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  defp do_call(:groups, state), do: {:reply, {:ok, groups_view(state)}, state}
+
   defp do_call(_unknown, state), do: {:reply, {:error, :unknown_request}, state}
 
   # A builder for transmit/3 that opens the bulb's keys only to build.
@@ -661,6 +874,22 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   end
 
   defp do_info(:resubscribe, %{radio_mon: nil} = state), do: {:noreply, subscribe(state)}
+
+  defp do_info({:group_retry, ref}, %{group_retry: ref} = state),
+    do: {:noreply, pump_groups(%{state | group_retry: nil})}
+
+  defp do_info({:group_confirm_timeout, key, ref}, state) do
+    case state.group_ops do
+      %{^key => %{state: :sent, ref: ^ref} = op} ->
+        {gid, mac} = key
+        Logger.info("TuyaBeaconMesh.Lights: group #{gid} change for #{mac} unconfirmed")
+        state = put_in(state.group_ops[key], %{op | state: :unconfirmed, ref: nil})
+        {:noreply, pump_groups(state)}
+
+      _stale ->
+        {:noreply, state}
+    end
+  end
 
   defp do_info({:DOWN, mon, :process, _pid, reason}, %{radio_mon: mon} = state) do
     {:noreply, retry_subscribe(%{state | radio_mon: nil}, {:radio_down, reason})}
@@ -702,6 +931,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   # the frame may have gone out: that is what makes tightening to the
   # cursor safe.
   defp transmit(state, build, send_opts) do
+    {reply, state} = send_built(state, build, send_opts)
+    {:reply, reply, state}
+  end
+
+  defp send_built(state, build, send_opts) do
     sn = Seq.next(state.seq)
 
     # take_sn/1 hands out the cursor (a new lease starts there), so the
@@ -718,10 +952,10 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
           {:error, _} = error -> {error, state}
         end
 
-      {:reply, reply, retire_floor(state)}
+      {reply, retire_floor(state)}
     else
-      {:error, reason} -> {:reply, {:error, reason}, state}
-      {:error, reason, state} -> {:reply, {:error, reason}, state}
+      {:error, reason} -> {{:error, reason}, state}
+      {:error, reason, state} -> {{:error, reason}, state}
     end
   end
 
@@ -750,7 +984,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
               heard_ms: now
           }
 
-          put_bulb(state, mac, apply_report(bulb, parsed, now))
+          bulb = apply_report(bulb, parsed, now)
+
+          state
+          |> put_bulb(mac, bulb)
+          |> confirm_group_list(mac, parsed, bulb.groups)
 
         # Held for re-anchoring: heard, nothing applied.
         {:hold, resync} ->
@@ -1036,7 +1274,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
     case persist(reloaded) do
       :ok ->
         unless same_mesh?, do: clear_old_mesh_tx(state)
-        {:reply, :ok, reloaded |> rebase_aired(state, same_mesh?) |> retire_floor()}
+
+        reloaded =
+          reloaded |> rebase_aired(state, same_mesh?) |> retire_floor() |> keep_groups(same_mesh?)
+
+        {:reply, :ok, reloaded}
 
       {:error, reason} when same_mesh? ->
         state =
@@ -1156,6 +1398,363 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   end
 
   defp snapshot(state), do: %{Redact.unseal(state.inventory) | seq: Seq.value(state.seq)}
+
+  # ── Groups ───────────────────────────────────────────────────────────
+
+  defp inventory_groups(state), do: Redact.unseal(state.inventory).groups
+
+  # Validated as a whole inventory (Inventory's rules: unique ids and
+  # names, known members) and persisted before anything in state changes,
+  # so a refused or failed write leaves the state as it was. A failed lease
+  # persist may have stored its end, and the store refuses a seq behind
+  # it, so this write proposes that end too (as a reload does).
+  defp commit_groups(state, groups) do
+    with {:ok, inv} <- Inventory.decode(%{Redact.unseal(state.inventory) | groups: groups}) do
+      candidate = %{
+        state
+        | seq: cover_attempted(state.seq, state.attempted),
+          inventory: Redact.seal(inv),
+          groups: Map.new(inv.groups, &{&1.local_id, &1})
+      }
+
+      with :ok <- persist(candidate), do: {:ok, %{candidate | attempted: nil}}
+    end
+  end
+
+  defp update_members(state, gid, fun) do
+    group = Map.fetch!(state.groups, gid)
+
+    case fun.(group.members) do
+      same when same == group.members ->
+        {:ok, state}
+
+      members ->
+        state
+        |> inventory_groups()
+        |> Enum.map(fn
+          %{local_id: ^gid} = g -> %{g | members: members}
+          g -> g
+        end)
+        |> then(&commit_groups(state, &1))
+    end
+  end
+
+  # A member leaves the inventory group; a bulb that isn't one may only be
+  # sent its tracked removal again.
+  defp leave(state, gid, mac) do
+    cond do
+      mac in Map.get(state.groups, gid, %{members: []}).members ->
+        update_members(state, gid, &List.delete(&1, mac))
+
+      match?(%{op: :remove}, state.group_ops[{gid, mac}]) ->
+        {:ok, state}
+
+      true ->
+        {:error, :not_member}
+    end
+  end
+
+  # A trimmed, non-blank UTF-8 name, unique among the other groups.
+  defp check_group_name(state, name, except) when is_binary(name) do
+    trimmed = if String.valid?(name), do: String.trim(name), else: ""
+
+    cond do
+      trimmed == "" or String.length(trimmed) > @max_group_name ->
+        {:error, :bad_group_name}
+
+      Enum.any?(state.groups, fn {id, g} -> id != except and g.name == trimmed end) ->
+        {:error, :duplicate_group_name}
+
+      true ->
+        {:ok, trimmed}
+    end
+  end
+
+  defp check_group_name(_state, _name, _except), do: {:error, :bad_group_name}
+
+  defp resolve_members(state, members) when is_list(members) do
+    if proper_list?(members) do
+      members
+      |> Enum.reduce_while({:ok, []}, fn who, {:ok, acc} ->
+        case resolve(state, who) do
+          {:ok, mac, _bulb} -> {:cont, {:ok, [mac | acc]}}
+          {:error, _} = error -> {:halt, error}
+        end
+      end)
+      |> case do
+        {:ok, macs} -> {:ok, macs |> Enum.reverse() |> Enum.uniq()}
+        error -> error
+      end
+    else
+      {:error, :bad_members}
+    end
+  end
+
+  defp resolve_members(_state, _members), do: {:error, :bad_members}
+
+  defp proper_list?([]), do: true
+  defp proper_list?([_ | rest]), do: proper_list?(rest)
+  defp proper_list?(_improper), do: false
+
+  defp dismiss_opt(opts) do
+    with true <- Keyword.keyword?(opts),
+         [] <- Keyword.keys(opts) -- [:dismiss],
+         dismiss? when is_boolean(dismiss?) <- Keyword.get(opts, :dismiss, false) do
+      {:ok, dismiss?}
+    else
+      _ -> {:error, {:bad_option, :dismiss}}
+    end
+  end
+
+  # A deleted group's id stays usable for remove_member/3 while a change
+  # of it is tracked.
+  defp resolve_tracked_group(state, who) do
+    case resolve_group_id(state, who) do
+      {:ok, gid} ->
+        {:ok, gid}
+
+      {:error, _} = error ->
+        if is_integer(who) and Enum.any?(state.group_ops, &match?({{^who, _}, _}, &1)),
+          do: {:ok, who},
+          else: error
+    end
+  end
+
+  # 0 means an empty slot in an A3 list, so it is never allocated.
+  defp free_group_id(state) do
+    taken =
+      MapSet.new(
+        Map.keys(state.groups) ++
+          Enum.flat_map(state.bulbs, fn {_mac, b} -> b.groups || [] end) ++
+          for({{gid, _mac}, %{state: s}} <- state.group_ops, s != :confirmed, do: gid)
+      )
+
+    case Enum.find(1..254, &(not MapSet.member?(taken, &1))) do
+      nil -> {:error, :no_free_group_id}
+      gid -> {:ok, gid}
+    end
+  end
+
+  # The group ids a bulb holds or may hold: its inventory memberships, its
+  # last reported list and removals not confirmed yet.
+  defp held_groups(state, mac) do
+    reported = get_in(state.bulbs, [mac, :groups]) || []
+
+    member_of = for {gid, %{members: members}} <- state.groups, mac in members, do: gid
+
+    leaving =
+      for {{gid, ^mac}, %{op: :remove, state: s}} <- state.group_ops, s != :confirmed, do: gid
+
+    MapSet.new(member_of ++ reported ++ leaving)
+  end
+
+  defp check_slots(state, macs, gid) do
+    Enum.find_value(macs, :ok, fn mac ->
+      held = held_groups(state, mac)
+
+      if not MapSet.member?(held, gid) and MapSet.size(held) >= @group_slots,
+        do: {:error, {:group_slots_full, mac}}
+    end)
+  end
+
+  # Every bulb that may hold `gid`: its members and any bulb that reported it.
+  defp group_holders(state, gid) do
+    reporters = for {mac, %{groups: [_ | _] = ids}} <- state.bulbs, gid in ids, do: mac
+    Enum.uniq(Map.fetch!(state.groups, gid).members ++ reporters)
+  end
+
+  # Leftovers of an earlier group with this id (all confirmed: anything
+  # else keeps the id from being allocated).
+  defp forget_group(state, gid) do
+    %{state | group_ops: Map.reject(state.group_ops, &match?({{^gid, _}, _}, &1))}
+  end
+
+  # The newest change of a bulb in a group replaces the tracked one; a
+  # timer of the replaced one finds a different ref and is ignored.
+  defp queue_members(state, gid, macs, op) do
+    Enum.reduce(macs, state, fn mac, state ->
+      key = {gid, mac}
+      state = put_in(state.group_ops[key], %{op: op, state: :queued, ref: nil})
+      queue_job(state, key)
+    end)
+  end
+
+  defp queue_job(state, job) do
+    if job in state.group_jobs,
+      do: state,
+      else: %{state | group_jobs: state.group_jobs ++ [job]}
+  end
+
+  # Sends group frames in order while fewer than @group_inflight wait for
+  # their A3; a refused frame stays first and is retried on a timer.
+  defp pump_groups(%{group_retry: nil, group_jobs: [job | rest]} = state) do
+    if member_job?(job) and inflight(state) >= @group_inflight do
+      state
+    else
+      case group_frame(state, job) do
+        :drop ->
+          pump_groups(%{state | group_jobs: rest, group_attempts: 0})
+
+        {:ok, build, send_opts} ->
+          {reply, state} = send_built(state, build, send_opts)
+          group_sent(state, job, rest, reply)
+      end
+    end
+  end
+
+  defp pump_groups(state), do: state
+
+  defp member_job?({_gid, mac}), do: is_binary(mac)
+
+  defp inflight(state), do: Enum.count(state.group_ops, &match?({_, %{state: :sent}}, &1))
+
+  defp group_frame(state, {gid, :dismiss}) do
+    build = fn sn -> {:ok, Control.group_dismiss(gid, sn, mesh_key(state))} end
+    {:ok, build, coalesce: {:group_dismiss, gid}}
+  end
+
+  defp group_frame(state, {gid, mac} = key) do
+    with %{state: :queued, op: op} <- state.group_ops[key],
+         %{} = bulb <- state.bulbs[mac] do
+      build =
+        unicast(bulb, fn sn, local_key, mask ->
+          case op do
+            :add -> {:ok, Control.group_add(bulb.node_id, sn, gid, local_key, mask)}
+            :remove -> {:ok, Control.group_remove(bulb.node_id, sn, gid, local_key, mask)}
+          end
+        end)
+
+      {:ok, build, coalesce: {:group_member, bulb.node_id, gid}}
+    else
+      _ -> :drop
+    end
+  end
+
+  # A frame that may have gone out counts as sent: only its A3 (or the
+  # timeout) settles it. Anything else is retried, then given up.
+  defp group_sent(state, job, rest, reply) do
+    cond do
+      reply == :ok or may_have_aired?(reply) ->
+        state |> mark_sent(job) |> next_job(rest) |> pump_groups()
+
+      state.group_attempts + 1 < @group_send_attempts ->
+        attempts = state.group_attempts + 1
+        delay = min(state.group_retry_ms * Integer.pow(2, attempts - 1), @max_group_retry_ms)
+        ref = make_ref()
+        Process.send_after(self(), {:group_retry, ref}, delay)
+        %{state | group_attempts: attempts, group_retry: ref}
+
+      true ->
+        state |> give_up(job, reply) |> next_job(rest) |> pump_groups()
+    end
+  end
+
+  defp may_have_aired?({:error, :timeout}), do: true
+  defp may_have_aired?({:error, :radio_exited}), do: true
+  defp may_have_aired?({:error, {:uncertain, _}}), do: true
+  defp may_have_aired?(_reply), do: false
+
+  defp next_job(state, rest), do: %{state | group_jobs: rest, group_attempts: 0}
+
+  defp mark_sent(state, {_gid, :dismiss}), do: state
+
+  defp mark_sent(state, key) do
+    ref = make_ref()
+    Process.send_after(self(), {:group_confirm_timeout, key, ref}, state.group_confirm_ms)
+    update_in(state.group_ops[key], &%{&1 | state: :sent, ref: ref})
+  end
+
+  defp give_up(state, {gid, :dismiss}, {:error, reason}) do
+    Logger.info("TuyaBeaconMesh.Lights: group #{gid} dismiss not sent (#{inspect(reason)})")
+    state
+  end
+
+  defp give_up(state, {gid, mac} = key, {:error, reason}) do
+    Logger.info(
+      "TuyaBeaconMesh.Lights: group #{gid} change for #{mac} not sent (#{inspect(reason)})"
+    )
+
+    update_in(state.group_ops[key], &%{&1 | state: :unconfirmed, ref: nil})
+  end
+
+  # An accepted A3 list from `mac` confirms each of its sent (or timed
+  # out) changes it agrees with. One it disagrees with stays as it was: the
+  # list may answer an older request.
+  defp confirm_group_list(state, mac, %{type: 1, sub_cmd: 2, payload: <<0xA3, _::binary>>}, ids) do
+    confirmed =
+      for {{gid, ^mac} = key, %{op: op, state: s}} <- state.group_ops,
+          s in [:sent, :unconfirmed],
+          op == :add == gid in ids,
+          do: key
+
+    if confirmed == [] do
+      state
+    else
+      ops =
+        Enum.reduce(confirmed, state.group_ops, fn key, ops ->
+          Map.update!(ops, key, &%{&1 | state: :confirmed, ref: nil})
+        end)
+
+      pump_groups(prune_deleted(%{state | group_ops: ops}))
+    end
+  end
+
+  defp confirm_group_list(state, _mac, _parsed, _ids), do: state
+
+  # A deleted group drops out of tracking once every change of it is
+  # confirmed.
+  defp prune_deleted(state) do
+    open =
+      for {{gid, _}, %{state: s}} <- state.group_ops,
+          s != :confirmed,
+          into: MapSet.new(),
+          do: gid
+
+    ops =
+      Map.reject(state.group_ops, fn {{gid, _}, _} ->
+        not Map.has_key?(state.groups, gid) and not MapSet.member?(open, gid)
+      end)
+
+    %{state | group_ops: ops}
+  end
+
+  # A reload of the same mesh keeps the tracking of bulbs it still has;
+  # another mesh's ids mean nothing here.
+  defp keep_groups(state, true) do
+    ops = Map.filter(state.group_ops, fn {{_gid, mac}, _} -> Map.has_key?(state.bulbs, mac) end)
+    jobs = Enum.filter(state.group_jobs, &(not member_job?(&1) or Map.has_key?(ops, &1)))
+    %{state | group_ops: ops, group_jobs: jobs}
+  end
+
+  defp keep_groups(state, false),
+    do: %{state | group_ops: %{}, group_jobs: [], group_attempts: 0, group_retry: nil}
+
+  defp groups_view(state) do
+    by_gid = Enum.group_by(state.group_ops, fn {{gid, _mac}, _op} -> gid end)
+    sync = &Map.new(Map.get(by_gid, &1, []), fn {{_, mac}, op} -> {mac, sync_view(op)} end)
+
+    live =
+      for g <- inventory_groups(state) do
+        %{
+          local_id: g.local_id,
+          name: g.name,
+          members: g.members,
+          deleted: false,
+          sync: sync.(g.local_id)
+        }
+      end
+
+    deleted =
+      for gid <- by_gid |> Map.keys() |> Enum.sort(), not Map.has_key?(state.groups, gid) do
+        %{local_id: gid, name: nil, members: [], deleted: true, sync: sync.(gid)}
+      end
+
+    slots = Map.new(state.bulbs, fn {mac, _} -> {mac, MapSet.size(held_groups(state, mac))} end)
+    %{groups: live ++ deleted, slots: slots}
+  end
+
+  defp sync_view(%{op: op, state: s}) when s in [:queued, :sent], do: %{op: op, state: :pending}
+  defp sync_view(%{op: op, state: s}), do: %{op: op, state: s}
 
   # ── Resolve ──────────────────────────────────────────────────────────
 
