@@ -1,5 +1,7 @@
 #include "alsa_pipe_sink.h"
 
+#include "sendspin/client.h"
+
 #include <alsa/asoundlib.h>
 #include <pthread.h>
 #include <sched.h>
@@ -395,10 +397,11 @@ void AlsaPipeSink::playback_loop() {
 
             int64_t delay_us = (static_cast<int64_t>(delay) * INT64_C(1000000))
                                / static_cast<int64_t>(sample_rate_);
-            int64_t now_us =
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch())
-                    .count();
+            // Must be the library's own clock: since upstream #208 the host
+            // clock is CLOCK_MONOTONIC_RAW on Linux, which drifts away from
+            // steady_clock (CLOCK_MONOTONIC) as NTP slews the latter. Stamping
+            // playback times from the wrong domain would skew sync over time.
+            int64_t now_us = sendspin::SendspinClient::now_us();
 
             on_frames_played(static_cast<uint32_t>(offset), now_us + delay_us);
         }
