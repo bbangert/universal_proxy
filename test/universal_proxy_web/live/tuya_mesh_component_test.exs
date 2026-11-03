@@ -1289,6 +1289,50 @@ defmodule UniversalProxyWeb.TuyaMeshComponentTest do
       assert has_element?(view, "#tuya-group-1", "garden")
     end
 
+    test "a rename form keeps the name it showed: another tab's rename isn't undone",
+         %{conn: conn} do
+      start_lights()
+      view = mount_tab(conn)
+      click(view, "#tuya-group-1 button[phx-click=rename_group]")
+
+      FakeLights.update(fn v ->
+        %{v | groups: Enum.map(v.groups, &%{&1 | name: "garden"})}
+      end)
+
+      # Saved as shown: no rename back.
+      view |> group_form(%{name: "path and post"}) |> render_submit()
+      refute has_element?(view, "#tuya-group-form")
+
+      # Typed the name the group already has: nothing to send either.
+      click(view, "#tuya-group-1 button[phx-click=rename_group]")
+      view |> group_form(%{name: " garden "}) |> render_submit()
+      assert changes() == []
+
+      click(view, "#tuya-group-1 button[phx-click=rename_group]")
+      view |> group_form(%{name: "porch"}) |> render_submit()
+      assert changes() == [{:rename_group, 1, "porch"}]
+    end
+
+    test "the delete dialog returns focus to the groups heading", %{conn: conn} do
+      start_lights()
+      view = mount_tab(conn)
+      assert has_element?(view, ~s(#tuya-mesh-groups-title[tabindex="-1"]))
+
+      click(view, "#tuya-group-1 button[phx-click=ask_delete_group]")
+
+      [on_remove] =
+        view
+        |> render()
+        |> LazyHTML.from_fragment()
+        |> LazyHTML.query("#modal-cancel_delete_group")
+        |> LazyHTML.attribute("phx-remove")
+
+      assert on_remove =~ "#tuya-mesh-groups-title"
+
+      click(view, "button[phx-click=confirm_delete_group]")
+      assert has_element?(view, "#tuya-mesh-groups-title")
+    end
+
     test "delete asks first and never sends the dismiss", %{conn: conn} do
       start_lights()
       view = mount_tab(conn)

@@ -438,7 +438,7 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
     form =
       case mode do
         :create -> %{mode: :create, name: "", selected: []}
-        :rename -> %{mode: :rename, gid: group.local_id, name: group.name}
+        :rename -> %{mode: :rename, gid: group.local_id, name: group.name, shown: group.name}
         :members -> %{mode: :members, gid: group.local_id, baseline: group.members}
       end
 
@@ -497,7 +497,11 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   defp save_group_form(socket, %{mode: :rename} = form) do
     current = live_group(socket.assigns.group_sync, form.gid)
 
-    if String.trim(form.name) == current.name do
+    # Unchanged against the name shown when the form opened (another tab
+    # may have renamed it since), or already the current name: nothing to do.
+    name = String.trim(form.name)
+
+    if name == form.shown or name == current.name do
       assign(socket, :group_form, nil)
     else
       case TuyaMesh.rename_group(form.gid, form.name) do
@@ -1103,7 +1107,15 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
     ~H"""
     <div id="tuya-mesh-groups" class="border-t border-border-2 p-[14px_22px]">
       <div class="flex items-center gap-2.5 mb-1.5">
-        <div class="text-[11px] text-fg-3 font-semibold flex-1">Groups</div>
+        <%!-- Focus lands here when a dialog or form whose opener is gone
+             closes (a deleted group takes its Delete button with it). --%>
+        <div
+          id="tuya-mesh-groups-title"
+          tabindex="-1"
+          class="text-[11px] text-fg-3 font-semibold flex-1 outline-none"
+        >
+          Groups
+        </div>
         <.button
           :if={@editable and not match?(%{mode: :create}, @form)}
           size={:sm}
@@ -1382,6 +1394,7 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
       on_close="cancel_delete_group"
       target={@myself}
       title={"Delete the group “#{@group.name}”?"}
+      return_focus="#tuya-mesh-groups-title"
     >
       <:footer>
         <.button variant={:ghost} size={:sm} phx-click="cancel_delete_group" phx-target={@myself}>
