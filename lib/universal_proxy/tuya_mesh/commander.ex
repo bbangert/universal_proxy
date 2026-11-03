@@ -123,6 +123,16 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   pushed last is kept in an ETS table (`light_states/1`), so a new
   connection's initial states match it.
 
+  The bulbs can't be asked for their state, so every known bulb's state
+  DPs (`Commands.state_dps/1`) go to the Store whenever they change, pushed
+  or not (`Store.put_light_state/3`, which throttles its writes). On every
+  (re)subscription and whenever the Store (re)starts, every known bulb is
+  saved again (the Store may have lost held changes), and, then and at
+  start, a bulb with no view yet is seeded from what the Store kept. A seeded view counts as
+  older than anything live: it has no send times and no report cursor,
+  so every DP Lights holds (whatever its report time) and every command
+  replaces it. Its groups are derived from it as usual.
+
   Options: `:name`, `:lights` (module, default `Lights`) and `:lights_opts`
   (extra options to its calls, e.g. `server:`), `:members` (`gid ->
   {:ok, [mac]} | :error`, default from `UniversalProxy.TuyaMesh.status/1`),
@@ -136,7 +146,9 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   `:activity_hold_ms`, `:keepalive_ms` (see "Backlog"), `:max_followups`
   (10), `:settings` (`-> Store.settings`), `:status` (`-> status`, read
   on every (re)subscription, default `TuyaMesh.status/1`),
-  `:push_debounce_ms`, `:resubscribe_ms` (1 s), and
+  `:push_debounce_ms`, `:resubscribe_ms` (1 s), `:saved_states` (`-> %{mac
+  => dps}`, default `Store.light_states/1`), `:save_state` (`(mac, dps) ->
+  any`, default `Store.put_light_state/3`), and
   `:states_table` (`true`, the named table, by default for the registered
   process; `:unnamed`; or `false`).
   """
@@ -210,6 +222,10 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       push_debounce_ms: Keyword.get(opts, :push_debounce_ms, 200),
       resubscribe_ms: Keyword.get(opts, :resubscribe_ms, 1_000),
       states: states_table(opts),
+      saved_states: Keyword.get(opts, :saved_states, &default_saved_states/0),
+      save_state: Keyword.get(opts, :save_state, &default_save_state/2),
+      subscribe?: Keyword.get(opts, :subscribe, true),
+      saved: %{},
       mesh_groups: %{},
       pushed: %{},
       dirty: MapSet.new(),
@@ -227,13 +243,14 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       dispatch: nil
     }
 
-    if Keyword.get(opts, :subscribe, true),
-      do: {:ok, state, {:continue, :subscribe}},
-      else: {:ok, state}
+    {:ok, state, {:continue, :start}}
   end
 
   @impl GenServer
-  def handle_continue(:subscribe, state), do: {:noreply, subscribe(state)}
+  def handle_continue(:start, state) do
+    state = state |> seed() |> arm_flush()
+    {:noreply, if(state.subscribe?, do: subscribe(state), else: state)}
+  end
 
   @impl GenServer
   # Identity is checked first: a command for a light that no longer has
@@ -280,6 +297,15 @@ defmodule UniversalProxy.TuyaMesh.Commander do
     targets = Map.keys(state.views) ++ for(gid <- Map.keys(state.mesh_groups), do: {:group, gid})
     {:noreply, state |> reconcile() |> mark_dirty(targets) |> arm_flush() |> reschedule()}
   end
+
+  # A (re)started Store: it may not have been there to seed from.
+  def handle_info({:tuya_mesh_store, :ready}, state),
+    do: {:noreply, state |> reconcile() |> resave() |> seed() |> arm_flush() |> reschedule()}
+
+  # The Store may have dropped light states (a clear, another mesh): the
+  # next change is saved again, nothing is restored eagerly.
+  def handle_info({:tuya_mesh_store, :inventory_changed}, state),
+    do: {:noreply, %{state | saved: %{}} |> reconcile() |> arm_flush() |> reschedule()}
 
   def handle_info({:tuya_mesh_store, _event}, state),
     do: {:noreply, state |> reconcile() |> arm_flush() |> reschedule()}
@@ -820,7 +846,13 @@ defmodule UniversalProxy.TuyaMesh.Commander do
 
     if added == [],
       do: state,
-      else: state |> reconcile() |> apply_status(state.status.()) |> arm_flush()
+      else:
+        state
+        |> reconcile()
+        |> resave()
+        |> seed()
+        |> apply_status(state.status.())
+        |> arm_flush()
   rescue
     ArgumentError ->
       Logger.debug("TuyaMesh.Commander: PubSub unavailable; retrying")
@@ -1067,8 +1099,8 @@ defmodule UniversalProxy.TuyaMesh.Commander do
 
     cond do
       response == nil -> state
-      Map.get(state.pushed, target) == response -> state
-      true -> record_push(state, target, response)
+      Map.get(state.pushed, target) == response -> save(state, target)
+      true -> state |> record_push(target, response) |> save(target)
     end
   end
 
@@ -1076,6 +1108,60 @@ defmodule UniversalProxy.TuyaMesh.Commander do
     state.push.(response)
     if state.states, do: :ets.insert(state.states, {target, response})
     %{state | pushed: Map.put(state.pushed, target, response)}
+  end
+
+  # Bulbs only (a group is derived from its members again), and whenever
+  # its state DPs changed, even where the response didn't (a colour kept
+  # in white mode, say).
+  defp save(state, {:bulb, mac} = target) do
+    with %{dps: dps} <- Map.get(state.views, target),
+         dps = Commands.state_dps(dps),
+         false <- Map.get(state.saved, mac) == dps do
+      state.save_state.(mac, dps)
+      %{state | saved: Map.put(state.saved, mac, dps)}
+    else
+      _unknown_or_saved -> state
+    end
+  end
+
+  defp save(state, _group), do: state
+
+  # A Store that (re)started, or was out of reach, may hold older states
+  # than the views here (held changes lost in a crash): every bulb whose
+  # state is known is saved again; the Store drops what it already has.
+  defp resave(state) do
+    known = for {{:bulb, _mac} = t, %{dps: dps}} <- state.views, is_boolean(dps[1]), do: t
+    Enum.reduce(known, %{state | saved: %{}}, &save(&2, &1))
+  end
+
+  # The states the Store kept, for bulbs with no view yet (see "Light
+  # state"). With no send times and no report cursor (`:reported`), the
+  # seed loses to every report Lights holds and to every command.
+  defp seed(state) do
+    ids = read_ids(state)
+
+    seeded =
+      for {mac, dps} <- saved_states(state),
+          not Map.has_key?(state.views, {:bulb, mac}),
+          id = Map.get(ids, {:bulb, mac}),
+          is_integer(id),
+          into: %{},
+          do: {{:bulb, mac}, %{device_id: id, dps: dps, sent_at: %{}}}
+
+    macs = for {:bulb, mac} <- Map.keys(seeded), do: mac
+
+    %{state | views: Map.merge(state.views, seeded)}
+    |> mark_dirty(Map.keys(seeded) ++ groups_of(state, macs))
+  end
+
+  defp saved_states(state) do
+    case state.saved_states.() do
+      saved when is_map(saved) ->
+        for {mac, dps} <- saved, is_binary(mac), is_map(dps), dps != %{}, do: {mac, dps}
+
+      _unreadable ->
+        []
+    end
   end
 
   defp forget_pushed(state, targets) do
@@ -1191,6 +1277,10 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   end
 
   defp default_device_ids, do: Store.device_ids()
+
+  defp default_saved_states, do: Store.light_states()
+
+  defp default_save_state(mac, dps), do: Store.put_light_state(mac, dps)
 
   defp describe({:bulb, mac}), do: "bulb #{mac}"
   defp describe({:group, gid}), do: "group #{gid}"

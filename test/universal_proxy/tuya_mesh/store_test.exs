@@ -558,7 +558,10 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
       refute_received {:write, _}
 
       :ok = Store.clear(store)
-      assert_received {:write, [:inventory, :summary, :device_ids, :seq_floors, :revision]}
+
+      assert_received {:write,
+                       [:inventory, :summary, :device_ids, :seq_floors, :light_states, :revision]}
+
       refute_received {:write, _}
     end
 
@@ -916,6 +919,312 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
     test ":sys.get_status shows no keys", ctx do
       {:ok, _} = Store.replace(inventory(), [], ctx.store)
       refute_secrets(:sys.get_status(ctx.store))
+    end
+  end
+
+  describe "light states" do
+    @on %{1 => true, 2 => 0, 3 => 1000, 4 => 0, :brightness => 1.0}
+    @off %{@on | 1 => false}
+
+    # A store whose light-state writes are reported to the test.
+    defp spy_store(ctx, opts \\ []) do
+      test_pid = self()
+      n = System.unique_integer([:positive])
+
+      write_fun = fn table, records ->
+        if Keyword.has_key?(records, :light_states),
+          do: send(test_pid, {:lights_write, Keyword.fetch!(records, :light_states)})
+
+        with :ok <- :dets.insert(table, records), do: :dets.sync(table)
+      end
+
+      path = Keyword.get(opts, :path, Path.join(ctx.tmp_dir, "lights_#{n}.dets"))
+      table = Keyword.get(opts, :table, :"lights_#{n}")
+
+      store =
+        start_store(path, table,
+          id: :lights,
+          write_fun: write_fun,
+          light_state_interval_ms: Keyword.get(opts, :interval, 60_000)
+        )
+
+      {store, path, table}
+    end
+
+    test "round-trip across a restart, without keys", ctx do
+      {:ok, _} = Store.replace(inventory(), [], ctx.store)
+      :ok = Store.put_light_state(@mac2, @on, ctx.store)
+
+      assert Store.light_states(ctx.store) == %{@mac2 => @on}
+      refute_secrets(:dets.lookup(ctx.table, :light_states))
+
+      store = restart_store(ctx)
+      assert Store.light_states(store) == %{@mac2 => @on}
+    end
+
+    test "a change within the interval is held, then written once", ctx do
+      {store, _path, _table} = spy_store(ctx, interval: 300)
+      {:ok, _} = Store.replace(inventory(), [], store)
+      assert_receive {:lights_write, %{}}
+
+      # The first change goes at once (no light state was written yet).
+      :ok = Store.put_light_state(@mac2, @on, store)
+      assert_receive {:lights_write, %{@mac2 => @on}}
+
+      # Three more within the interval: held (and served), then one write.
+      :ok = Store.put_light_state(@mac2, @off, store)
+      :ok = Store.put_light_state(@mac3, @on, store)
+      :ok = Store.put_light_state(@mac3, @off, store)
+      assert Store.light_states(store) == %{@mac2 => @off, @mac3 => @off}
+      refute_receive {:lights_write, _}, 150
+
+      assert_receive {:lights_write, %{@mac2 => @off, @mac3 => @off}}, 1_000
+      refute_receive {:lights_write, _}, 400
+    end
+
+    test "a write whose sync failed is written again, though the table has it", ctx do
+      test_pid = self()
+      failures = :counters.new(1, [])
+      :counters.put(failures, 1, 1)
+      n = System.unique_integer([:positive])
+
+      # The first light-state write inserts, then fails to sync.
+      write_fun = fn table, records ->
+        :ok = :dets.insert(table, records)
+
+        if Keyword.has_key?(records, :light_states) and :counters.get(failures, 1) > 0 and
+             Keyword.fetch!(records, :light_states) != %{} do
+          :counters.sub(failures, 1, 1)
+          {:error, :sync_failed}
+        else
+          if Keyword.has_key?(records, :light_states),
+            do: send(test_pid, {:synced, Keyword.fetch!(records, :light_states)})
+
+          :dets.sync(table)
+        end
+      end
+
+      store =
+        start_store(Path.join(ctx.tmp_dir, "sync_#{n}.dets"), :"sync_#{n}",
+          id: :sync,
+          write_fun: write_fun,
+          light_state_interval_ms: 50
+        )
+
+      {:ok, _} = Store.replace(inventory(), [], store)
+      assert_receive {:synced, %{}}
+
+      :ok = Store.put_light_state(@mac2, @on, store)
+      assert_receive {:synced, %{@mac2 => @on}}, 1_000
+    end
+
+    test "a flip back after a failed sync is still written", ctx do
+      test_pid = self()
+      fail = :counters.new(1, [])
+      n = System.unique_integer([:positive])
+
+      # While `fail` is set, a light-state write inserts, then fails to sync.
+      write_fun = fn table, records ->
+        :ok = :dets.insert(table, records)
+
+        case Keyword.fetch(records, :light_states) do
+          {:ok, lights} when lights != %{} ->
+            if :counters.get(fail, 1) > 0 do
+              :counters.put(fail, 1, 0)
+              send(test_pid, {:sync_failed, lights})
+              {:error, :sync_failed}
+            else
+              send(test_pid, {:synced, lights})
+              :dets.sync(table)
+            end
+
+          _other ->
+            :dets.sync(table)
+        end
+      end
+
+      store =
+        start_store(Path.join(ctx.tmp_dir, "flip_#{n}.dets"), :"flip_#{n}",
+          id: :flip,
+          write_fun: write_fun,
+          light_state_interval_ms: 100
+        )
+
+      {:ok, _} = Store.replace(inventory(), [], store)
+      :ok = Store.put_light_state(@mac2, @on, store)
+      assert_receive {:synced, %{@mac2 => @on}}
+
+      # Off is inserted but not synced; then it flips back to the synced on.
+      :counters.put(fail, 1, 1)
+      :ok = Store.put_light_state(@mac2, @off, store)
+      assert_receive {:sync_failed, %{@mac2 => @off}}, 1_000
+      :ok = Store.put_light_state(@mac2, @on, store)
+
+      assert_receive {:synced, %{@mac2 => @on}}, 1_000
+      assert Store.light_states(store) == %{@mac2 => @on}
+      assert :dets.lookup(:"flip_#{n}", :light_states) == [{:light_states, %{@mac2 => @on}}]
+    end
+
+    # A store whose next inventory write, once `fail` is set, inserts but
+    # fails to sync; light-state writes are reported to the test.
+    defp failing_store(ctx, fail) do
+      test_pid = self()
+      n = System.unique_integer([:positive])
+
+      write_fun = fn table, records ->
+        :ok = :dets.insert(table, records)
+
+        cond do
+          Keyword.has_key?(records, :revision) and :counters.get(fail, 1) > 0 ->
+            :counters.put(fail, 1, 0)
+            {:error, :sync_failed}
+
+          true ->
+            with {:ok, lights} <- Keyword.fetch(records, :light_states),
+                 do: send(test_pid, {:synced, lights})
+
+            :dets.sync(table)
+        end
+      end
+
+      start_store(Path.join(ctx.tmp_dir, "inv_#{n}.dets"), :"inv_#{n}",
+        id: :inv,
+        write_fun: write_fun,
+        light_state_interval_ms: 100
+      )
+    end
+
+    test "an upload of another mesh that failed to sync never brings held states back", ctx do
+      fail = :counters.new(1, [])
+      store = failing_store(ctx, fail)
+      {:ok, _} = Store.replace(inventory(), [], store)
+      :ok = Store.put_light_state(@mac2, @on, store)
+      assert_receive {:synced, %{@mac2 => @on}}
+
+      # Held, then another mesh with the same MACs lands unsynced.
+      :ok = Store.put_light_state(@mac2, @off, store)
+      :counters.put(fail, 1, 1)
+
+      assert {:error, :write_failed} =
+               Store.replace(other_mesh(), [allow_new_mesh: true], store)
+
+      assert Store.light_states(store) == %{}
+      Process.sleep(250)
+      assert Store.light_states(store) == %{}
+      refute_received {:synced, %{@mac2 => _}}
+    end
+
+    test "a failed clear or same-mesh upload keeps no held state it drops", ctx do
+      fail = :counters.new(1, [])
+      store = failing_store(ctx, fail)
+      [_b2, b3] = raw()["bulbs"]
+      {:ok, _} = Store.replace(inventory(), [], store)
+      :ok = Store.put_light_state(@mac2, @on, store)
+      assert_receive {:synced, %{@mac2 => @on}}
+      :ok = Store.put_light_state(@mac2, @off, store)
+      :ok = Store.put_light_state(@mac3, @off, store)
+
+      :counters.put(fail, 1, 1)
+
+      assert {:error, :write_failed} =
+               Store.replace(inventory(%{"bulbs" => [b3], "groups" => []}), [], store)
+
+      assert Store.light_states(store) == %{@mac3 => @off}
+
+      :ok = Store.put_light_state(@mac3, @on, store)
+      :counters.put(fail, 1, 1)
+      assert {:error, :write_failed} = Store.clear(store)
+      assert Store.light_states(store) == %{}
+    end
+
+    test "nothing is written for an unchanged state, a stranger or a bad one", ctx do
+      {store, _path, _table} = spy_store(ctx, interval: 0)
+      {:ok, _} = Store.replace(inventory(), [], store)
+      assert_receive {:lights_write, %{}}
+
+      :ok = Store.put_light_state(@mac2, @on, store)
+      assert_receive {:lights_write, %{@mac2 => @on}}
+
+      :ok = Store.put_light_state(@mac2, @on, store)
+      :ok = Store.put_light_state("FFFFFFFFFFFF", @on, store)
+      :ok = Store.put_light_state(@mac3, %{"localKey" => "abcdefghijklmnop"}, store)
+      :ok = Store.put_light_state(@mac3, %{1 => self()}, store)
+      refute_receive {:lights_write, _}, 100
+      assert Store.light_states(store) == %{@mac2 => @on}
+    end
+
+    test "a change that flips back within the interval writes nothing", ctx do
+      {store, _path, _table} = spy_store(ctx, interval: 200)
+      {:ok, _} = Store.replace(inventory(), [], store)
+      assert_receive {:lights_write, %{}}
+      :ok = Store.put_light_state(@mac2, @on, store)
+      assert_receive {:lights_write, %{@mac2 => @on}}
+
+      :ok = Store.put_light_state(@mac2, @off, store)
+      :ok = Store.put_light_state(@mac2, @on, store)
+      refute_receive {:lights_write, _}, 500
+    end
+
+    test "held changes are written on a clean stop", ctx do
+      {store, path, table} = spy_store(ctx)
+      {:ok, _} = Store.replace(inventory(), [], store)
+      assert_receive {:lights_write, %{}}
+      :ok = Store.put_light_state(@mac2, @on, store)
+      assert_receive {:lights_write, %{@mac2 => @on}}
+
+      :ok = Store.put_light_state(@mac2, @off, store)
+      _ = Store.light_states(store)
+      refute_received {:lights_write, _}
+
+      stop_supervised!(:lights)
+      assert_received {:lights_write, %{@mac2 => @off}}
+
+      {store, _path, _table} = spy_store(ctx, path: path, table: table)
+      assert Store.light_states(store) == %{@mac2 => @off}
+    end
+
+    test "an upload keeps its bulbs' states, held ones included; another mesh drops them", ctx do
+      {store, _path, _table} = spy_store(ctx)
+      {:ok, _} = Store.replace(inventory(), [], store)
+      :ok = Store.put_light_state(@mac2, @on, store)
+      assert_receive {:lights_write, %{@mac2 => @on}}
+      # Held (the interval hasn't passed); the upload writes it.
+      :ok = Store.put_light_state(@mac3, @off, store)
+      _ = Store.light_states(store)
+
+      [_b2, b3] = raw()["bulbs"]
+      {:ok, :same_mesh} = Store.replace(inventory(%{"bulbs" => [b3], "groups" => []}), [], store)
+      assert_receive {:lights_write, %{@mac3 => @off} = kept} when map_size(kept) == 1
+      assert Store.light_states(store) == %{@mac3 => @off}
+
+      # A bulb back in the inventory doesn't get its old state back.
+      {:ok, :same_mesh} = Store.replace(inventory(), [], store)
+      assert Store.light_states(store) == %{@mac3 => @off}
+
+      {:ok, :new_mesh} = Store.replace(other_mesh(), [allow_new_mesh: true], store)
+      assert Store.light_states(store) == %{}
+    end
+
+    test "a persist keeps them; a clear drops them", ctx do
+      {:ok, _} = Store.replace(inventory(), [], ctx.store)
+      :ok = Store.put_light_state(@mac2, @on, ctx.store)
+      assert Store.light_states(ctx.store) == %{@mac2 => @on}
+
+      :ok = Store.persist(%{inventory() | seq: inventory().seq + 1}, ctx.store)
+      assert Store.light_states(ctx.store) == %{@mac2 => @on}
+
+      :ok = Store.clear(ctx.store)
+      assert Store.light_states(ctx.store) == %{}
+
+      # With no inventory, nothing is taken.
+      :ok = Store.put_light_state(@mac2, @on, ctx.store)
+      assert Store.light_states(ctx.store) == %{}
+    end
+
+    test "the API degrades when the store is down" do
+      down = :"no_store_#{System.unique_integer([:positive])}"
+      assert Store.light_states(down) == %{}
+      assert Store.put_light_state(@mac2, @on, down) == :ok
     end
   end
 end
