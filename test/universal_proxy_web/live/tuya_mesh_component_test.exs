@@ -1326,6 +1326,32 @@ defmodule UniversalProxyWeb.TuyaMeshComponentTest do
       assert changes() == []
     end
 
+    test "an unnamed group shows as Group N and can be renamed and deleted", %{conn: conn} do
+      start_lights(%{groups: [group(1, nil, [@mac2])], slots: %{}})
+      view = mount_tab(conn)
+      assert has_element?(view, "#tuya-group-1", "Group 1")
+
+      click(view, "#tuya-group-1 button[phx-click=rename_group]")
+      assert has_element?(view, "#tuya-group-form-name[value='']")
+
+      # Nothing typed: the backend's refusal shows inline, no crash.
+      FakeLights.reply(:rename_group, {:error, :bad_group_name})
+      html = view |> with_target("#tuya-mesh") |> render_submit("save_group_form", %{})
+      assert html =~ "Enter a name of 1 to 64 characters."
+
+      FakeLights.reply(:rename_group, nil)
+      html = view |> group_form(%{name: "porch"}) |> render_submit()
+      assert changes() == [{:rename_group, 1, ""}, {:rename_group, 1, "porch"}]
+      assert html =~ "Group renamed to “porch”."
+
+      FakeLights.update(fn v -> %{v | groups: Enum.map(v.groups, &%{&1 | name: nil})} end)
+      push_status(view, TuyaMesh.status())
+      html = click(view, "#tuya-group-1 button[phx-click=ask_delete_group]")
+      assert html =~ "Delete the group “Group 1”?"
+      html = click(view, "button[phx-click=confirm_delete_group]")
+      assert html =~ "Group “Group 1” deleted."
+    end
+
     test "a ticked bulb that fills up stays enabled and is submitted", %{conn: conn} do
       start_lights(%{groups: [group(1, "path and post", [@mac2])], slots: %{@mac3 => 7}})
       view = mount_tab(conn)

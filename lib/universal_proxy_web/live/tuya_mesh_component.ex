@@ -318,7 +318,7 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
         deleting = %{
           gid: group.local_id,
           device_id: Map.get(socket.assigns.group_ids, group.local_id),
-          name: group.name,
+          name: group_title(group),
           members: length(group.members)
         }
 
@@ -437,9 +437,14 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   defp open_group_form(socket, mode, group) do
     form =
       case mode do
-        :create -> %{mode: :create, name: "", selected: []}
-        :rename -> %{mode: :rename, gid: group.local_id, name: group.name, shown: group.name}
-        :members -> %{mode: :members, gid: group.local_id, baseline: group.members}
+        :create ->
+          %{mode: :create, name: "", selected: []}
+
+        :rename ->
+          %{mode: :rename, gid: group.local_id, name: group.name || "", shown: group.name}
+
+        :members ->
+          %{mode: :members, gid: group.local_id, baseline: group.members}
       end
 
     form =
@@ -499,12 +504,12 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
 
     # Unchanged against the name shown when the form opened (another tab
     # may have renamed it since), or already the current name: nothing to do.
-    name = String.trim(form.name)
+    name = trim_name(form.name)
 
     # Imported names may carry whitespace, so both the raw and the trimmed
     # input are compared.
     if form.name in [form.shown, current.name] or
-         name in [String.trim(form.shown), String.trim(current.name)] do
+         name in [trim_name(form.shown), trim_name(current.name)] do
       assign(socket, :group_form, nil)
     else
       case TuyaMesh.rename_group(form.gid, form.name) do
@@ -1169,7 +1174,7 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
           class="py-2 border-b border-border-2 last:border-b-0"
         >
           <div class="flex items-center gap-2.5 text-sm flex-wrap">
-            <span class="font-semibold">{group.name || "Group #{group.local_id}"}</span>
+            <span class="font-semibold">{group_title(group)}</span>
             <span class="text-[11px] text-fg-3 font-mono">id {group.local_id}</span>
             <span class="text-xs text-fg-3">
               {length(group.members)} {pluralize(length(group.members), "bulb", "bulbs")}
@@ -1222,7 +1227,7 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
           class="py-2 border-b border-border-2 last:border-b-0 text-fg-3"
         >
           <div class="flex items-center gap-2.5 text-sm flex-wrap">
-            <span class="font-semibold">{group.name || "Group #{group.local_id}"}</span>
+            <span class="font-semibold">{group_title(group)}</span>
             <span class="text-[11px] font-mono">id {group.local_id}</span>
             <.badge>Leaving</.badge>
             <div class="flex-1"></div>
@@ -1384,6 +1389,12 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
     </form>
     """
   end
+
+  # Imported groups may have no name (nil).
+  defp group_title(group), do: group.name || "Group #{group.local_id}"
+
+  defp trim_name(name) when is_binary(name), do: String.trim(name)
+  defp trim_name(_none), do: nil
 
   defp editing_group?(%{gid: gid}, gid), do: true
   defp editing_group?(_form, _gid), do: false
