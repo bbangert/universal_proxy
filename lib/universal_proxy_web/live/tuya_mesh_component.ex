@@ -87,7 +87,12 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   may still hold (`deleted: true`) show as "Leaving" with those bulbs,
   and "Retry removal" re-sends `delete_group/1` for their id. Every retry
   and delete first re-reads `group_sync` and acts only if the group (and
-  change) still stands as shown.
+  change) still stands as shown. Rename, member and delete forms are bound
+  to the group's local id and its HA sub-device id (`TuyaMesh.device_ids/0`,
+  never reused), so one whose group was deleted, or replaced by a new group
+  under the same local id, closes on the next refresh and sends nothing.
+  After a partial member save, the form's baseline moves only by its own
+  changes the group now shows.
 
   `group_sync` is re-read on every status update and after every action;
   while any change is pending, it is also polled with `send_update_after/3`
@@ -138,6 +143,9 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
      |> assign_settings(TuyaMesh.settings())
      # `nil` while `Lights` doesn't answer, else `TuyaMesh.group_sync/0`'s map.
      |> assign(:group_sync, fetch_group_sync())
+     # HA sub-device id by group local id: never reused, so it tells a group
+     # from a later one that took its local id.
+     |> assign(:group_ids, fetch_group_ids())
      # The one open group form: `nil`, or `%{mode: :create | :rename |
      # :members, ...}` (see `open_group_form/3`).
      |> assign(:group_form, nil)
@@ -290,9 +298,15 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   def handle_event("group_form_change", params, %{assigns: %{group_form: %{}}} = socket),
     do: {:noreply, assign(socket, :group_form, edit_group_form(socket, params))}
 
+  # The refresh closes a form whose group was deleted or replaced since it
+  # opened: nothing is sent then.
   def handle_event("save_group_form", params, %{assigns: %{group_form: %{}}} = socket) do
-    form = edit_group_form(socket, params)
-    {:noreply, save_group_form(assign(socket, :group_form, form), form)}
+    socket = socket |> assign(:group_form, edit_group_form(socket, params)) |> refresh_groups()
+
+    case socket.assigns.group_form do
+      nil -> {:noreply, assign(socket, :group_error, group_error(:stale_group, socket))}
+      form -> {:noreply, save_group_form(socket, form)}
+    end
   end
 
   def handle_event("ask_delete_group", %{"gid" => gid}, socket) do
@@ -301,7 +315,13 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
         {:noreply, socket}
 
       group ->
-        deleting = %{gid: group.local_id, name: group.name, members: length(group.members)}
+        deleting = %{
+          gid: group.local_id,
+          device_id: Map.get(socket.assigns.group_ids, group.local_id),
+          name: group.name,
+          members: length(group.members)
+        }
+
         {:noreply, assign(socket, deleting: deleting, group_msg: nil, group_error: nil)}
     end
   end
@@ -309,8 +329,8 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   def handle_event("cancel_delete_group", _params, socket),
     do: {:noreply, assign(socket, :deleting, nil)}
 
-  def handle_event("confirm_delete_group", _params, %{assigns: %{deleting: %{} = d}} = socket),
-    do: {:noreply, delete_group(assign(socket, :deleting, nil), d)}
+  def handle_event("confirm_delete_group", _params, %{assigns: %{deleting: %{}}} = socket),
+    do: {:noreply, delete_group(socket)}
 
   def handle_event("retry_member", %{"gid" => gid, "mac" => mac}, socket),
     do: {:noreply, retry_member(refresh_groups(socket), gid, mac)}
@@ -331,22 +351,40 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
     end
   end
 
-  # Re-reads group_sync; a form or confirmation for a group that is gone
-  # closes, and polling resumes while a change is pending.
+  defp fetch_group_ids do
+    for {{:group, gid}, id} <- TuyaMesh.device_ids(), into: %{}, do: {gid, id}
+  end
+
+  # Re-reads group_sync and the group ids; a form or confirmation for a
+  # group that is gone or was replaced (same local id, another sub-device
+  # id) closes, and polling resumes while a change is pending.
   defp refresh_groups(socket) do
     sync = fetch_group_sync()
 
+    socket =
+      assign(socket, group_sync: sync, group_ids: if(sync, do: fetch_group_ids(), else: %{}))
+
     form =
       case socket.assigns.group_form do
-        %{gid: gid} = form -> if live_group(sync, gid), do: form
+        %{gid: _} = form -> if same_group?(socket, form), do: form
         form -> form
       end
 
-    deleting = with %{gid: gid} = d <- socket.assigns.deleting, do: live_group(sync, gid) && d
+    deleting =
+      case socket.assigns.deleting do
+        %{} = d -> if same_group?(socket, d), do: d
+        nil -> nil
+      end
 
     socket
-    |> assign(group_sync: sync, group_form: form, deleting: deleting)
+    |> assign(group_form: form, deleting: deleting)
     |> maybe_poll()
+  end
+
+  # Still the live group the form or dialog was opened on.
+  defp same_group?(socket, %{gid: gid, device_id: device_id}) do
+    live_group(socket.assigns.group_sync, gid) != nil and
+      Map.get(socket.assigns.group_ids, gid) == device_id
   end
 
   defp maybe_poll(%{assigns: %{poll_scheduled: false, group_sync: sync}} = socket) do
@@ -369,7 +407,12 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
 
   # A group of the inventory (not an absent one), by local id or its
   # string form (event params).
-  defp live_group(sync, gid), do: with(%{deleted: false} = g <- find_group(sync, gid), do: g)
+  defp live_group(sync, gid) do
+    case find_group(sync, gid) do
+      %{deleted: false} = group -> group
+      _absent_or_missing -> nil
+    end
+  end
 
   defp find_group(nil, _gid), do: nil
 
@@ -398,6 +441,11 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
         :rename -> %{mode: :rename, gid: group.local_id, name: group.name}
         :members -> %{mode: :members, gid: group.local_id, baseline: group.members}
       end
+
+    form =
+      if group,
+        do: Map.put(form, :device_id, Map.get(socket.assigns.group_ids, group.local_id)),
+        else: form
 
     form =
       form
@@ -449,28 +497,23 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   defp save_group_form(socket, %{mode: :rename} = form) do
     current = live_group(socket.assigns.group_sync, form.gid)
 
-    cond do
-      current == nil ->
-        assign(socket, group_form: nil, group_error: group_error(:unknown_group, socket))
+    if String.trim(form.name) == current.name do
+      assign(socket, :group_form, nil)
+    else
+      case TuyaMesh.rename_group(form.gid, form.name) do
+        :ok ->
+          socket
+          |> assign(group_form: nil)
+          |> assign(
+            :group_msg,
+            "Group renamed to “#{String.trim(form.name)}”. " <>
+              "Home Assistant reconnects briefly to pick up the new name."
+          )
+          |> refresh_groups()
 
-      String.trim(form.name) == current.name ->
-        assign(socket, :group_form, nil)
-
-      true ->
-        case TuyaMesh.rename_group(form.gid, form.name) do
-          :ok ->
-            socket
-            |> assign(group_form: nil)
-            |> assign(
-              :group_msg,
-              "Group renamed to “#{String.trim(form.name)}”. " <>
-                "Home Assistant reconnects briefly to pick up the new name."
-            )
-            |> refresh_groups()
-
-          {:error, reason} ->
-            socket |> refresh_groups() |> form_error(form, reason)
-        end
+        {:error, reason} ->
+          socket |> refresh_groups() |> form_error(form, reason)
+      end
     end
   end
 
@@ -478,44 +521,46 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   # opened, and only where the group still differs (another tab may have
   # made the same change).
   defp save_group_form(socket, %{mode: :members} = form) do
+    group = live_group(socket.assigns.group_sync, form.gid)
+    intended_adds = form.selected -- form.baseline
+    intended_removes = form.baseline -- form.selected
+    adds = Enum.reject(intended_adds, &(&1 in group.members))
+    removes = Enum.filter(intended_removes, &(&1 in group.members))
+
+    results =
+      Enum.map(adds, &{&1, TuyaMesh.add_member(form.gid, &1)}) ++
+        Enum.map(removes, &{&1, TuyaMesh.remove_member(form.gid, &1)})
+
     socket = refresh_groups(socket)
 
-    case live_group(socket.assigns.group_sync, form.gid) do
-      nil ->
-        assign(socket, group_form: nil, group_error: group_error(:unknown_group, socket))
+    case for({mac, {:error, reason}} <- results, do: member_error(socket, mac, reason)) do
+      [] when results == [] ->
+        assign(socket, :group_form, nil)
 
-      group ->
-        adds = Enum.reject(form.selected -- form.baseline, &(&1 in group.members))
-        removes = Enum.filter(form.baseline -- form.selected, &(&1 in group.members))
+      [] ->
+        assign(socket,
+          group_form: nil,
+          group_msg: "Member changes sent. Each bulb's state updates as it confirms."
+        )
 
-        results =
-          Enum.map(adds, &{&1, TuyaMesh.add_member(form.gid, &1)}) ++
-            Enum.map(removes, &{&1, TuyaMesh.remove_member(form.gid, &1)})
+      errors ->
+        # The baseline advances only by this form's own changes that the
+        # group now shows, so saving again retries just the rest and
+        # leaves other bulbs (another tab's edits) alone.
+        members =
+          case live_group(socket.assigns.group_sync, form.gid) do
+            %{members: members} -> members
+            nil -> []
+          end
 
-        socket = refresh_groups(socket)
+        baseline =
+          Enum.uniq(
+            (form.baseline -- Enum.reject(intended_removes, &(&1 in members))) ++
+              Enum.filter(intended_adds, &(&1 in members))
+          )
 
-        case for({mac, {:error, reason}} <- results, do: member_error(socket, mac, reason)) do
-          [] when results == [] ->
-            assign(socket, :group_form, nil)
-
-          [] ->
-            assign(socket,
-              group_form: nil,
-              group_msg: "Member changes sent. Each bulb's state updates as it confirms."
-            )
-
-          errors ->
-            # What went through is the new baseline: saving again only
-            # retries the rest.
-            members =
-              case live_group(socket.assigns.group_sync, form.gid) do
-                %{members: members} -> members
-                nil -> form.baseline
-              end
-
-            text = errors |> Enum.uniq() |> Enum.join(" ")
-            show_form_error(socket, %{form | baseline: members}, :error, text)
-        end
+        text = errors |> Enum.uniq() |> Enum.join(" ")
+        show_form_error(socket, %{form | baseline: baseline}, :error, text)
     end
   end
 
@@ -543,24 +588,31 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   defp member_error(socket, mac, reason),
     do: "#{bulb_label(socket, mac)}: #{group_error(reason, socket)}"
 
-  defp delete_group(socket, %{gid: gid} = deleting) do
+  # The refresh drops the confirmation if its group was deleted or replaced
+  # since it opened: then nothing is sent.
+  defp delete_group(socket) do
     socket = refresh_groups(socket)
 
-    with %{} <- live_group(socket.assigns.group_sync, gid),
-         :ok <- TuyaMesh.delete_group(gid) do
-      socket
-      |> assign(
-        :group_msg,
-        "Group “#{deleting.name}” deleted. Its bulbs are being asked to leave it, " <>
-          "and Home Assistant reconnects briefly to remove it."
-      )
-      |> refresh_groups()
-    else
+    case socket.assigns.deleting do
       nil ->
-        assign(socket, :group_error, group_error(:unknown_group, socket))
+        assign(socket, :group_error, group_error(:stale_group, socket))
 
-      {:error, reason} ->
-        socket |> assign(:group_error, group_error(reason, socket)) |> refresh_groups()
+      deleting ->
+        socket = assign(socket, :deleting, nil)
+
+        case TuyaMesh.delete_group(deleting.gid) do
+          :ok ->
+            socket
+            |> assign(
+              :group_msg,
+              "Group “#{deleting.name}” deleted. Its bulbs are being asked to leave it, " <>
+                "and Home Assistant reconnects briefly to remove it."
+            )
+            |> refresh_groups()
+
+          {:error, reason} ->
+            socket |> assign(:group_error, group_error(reason, socket)) |> refresh_groups()
+        end
     end
   end
 
@@ -974,7 +1026,7 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
         </div>
 
         <.groups_section
-          :if={@group_sync != nil or @status.groups != []}
+          :if={@group_sync != nil or @status.groups != [] or @group_error != nil or @group_msg != nil}
           groups={group_views(@status, @group_sync)}
           editable={@group_sync != nil}
           bulbs={@status.bulbs}
@@ -1910,8 +1962,7 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   # TuyaMesh's group operations.
   defp group_error({:group_slots_full, mac}, socket),
     do:
-      "#{bulb_label(socket, mac)} already belongs to #{@group_slots} groups, the most a bulb can hold. " <>
-        "Nothing was changed."
+      "#{bulb_label(socket, mac)} already belongs to #{@group_slots} groups, the most a bulb can hold."
 
   defp group_error(:bad_group_name, _socket), do: "Enter a name of 1 to 64 characters."
   defp group_error(:duplicate_group_name, _socket), do: "Another group already has that name."
@@ -1920,12 +1971,16 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
     do: "Every group id is in use. Delete a group first."
 
   defp group_error(:not_running, _socket),
-    do: "The mesh isn't running, so groups can't be changed right now. Nothing was changed."
+    do: "The mesh isn't running, so groups can't be changed right now."
 
   defp group_error(:persist_failed, _socket),
-    do: "The change couldn't be saved on this device. Nothing was changed."
+    do: "The change couldn't be saved on this device, so it wasn't made."
 
   defp group_error(:unknown_group, _socket), do: "That group no longer exists."
+
+  defp group_error(:stale_group, _socket),
+    do: "That group was deleted or replaced in the meantime. Nothing was sent."
+
   defp group_error(:unknown_bulb, _socket), do: "That bulb is no longer in the mesh."
   defp group_error(:not_member, _socket), do: "That bulb isn't in the group any more."
   defp group_error(reason, _socket), do: change_error(reason)

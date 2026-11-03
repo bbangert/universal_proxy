@@ -1355,6 +1355,8 @@ defmodule UniversalProxyWeb.TuyaMeshComponentTest do
       html = view |> group_form(%{members: [@mac3]}) |> render_submit()
 
       assert html =~ "post spot 1 already belongs to 8 groups"
+      # The removal went through: no blanket "nothing changed".
+      refute html =~ "Nothing was"
       assert changes() == [{:add_member, 1, @mac3}, {:remove_member, 1, @mac2}]
       assert has_element?(view, "#tuya-group-form")
 
@@ -1362,6 +1364,101 @@ defmodule UniversalProxyWeb.TuyaMeshComponentTest do
       view |> group_form(%{members: [@mac3]}) |> render_submit()
       assert changes() == [{:add_member, 1, @mac3}]
       refute has_element?(view, "#tuya-group-form")
+    end
+
+    test "a partial failure's retry leaves another tab's member alone", %{conn: conn} do
+      [b2, b3] = KeyLeak.json() |> Jason.decode!() |> Map.fetch!("bulbs")
+
+      porch = %{
+        "mac" => "DC2353000001",
+        "localKey" => @new_local_key,
+        "nodeId" => 9,
+        "label" => "porch"
+      }
+
+      {:ok, :same_mesh} = TuyaMesh.upload(json(%{"bulbs" => [b2, b3, porch]}))
+      start_lights(%{groups: [group(1, "path and post", [@mac2])], slots: %{}})
+      view = mount_tab(conn)
+      click(view, "#tuya-group-1 button[phx-click=edit_members]")
+
+      # Another tab adds porch while this form is open.
+      FakeLights.update(fn v ->
+        %{v | groups: Enum.map(v.groups, &%{&1 | members: &1.members ++ ["DC2353000001"]})}
+      end)
+
+      FakeLights.reply(:add_member, {:error, {:group_slots_full, @mac3}})
+      view |> group_form(%{members: [@mac3]}) |> render_submit()
+      assert changes() == [{:add_member, 1, @mac3}, {:remove_member, 1, @mac2}]
+
+      FakeLights.reply(:add_member, nil)
+      view |> group_form(%{members: [@mac3]}) |> render_submit()
+      assert changes() == [{:add_member, 1, @mac3}]
+    end
+
+    test "an editor or confirmation whose group another tab deleted sends nothing",
+         %{conn: conn} do
+      start_lights()
+      view = mount_tab(conn)
+
+      absent = fn v ->
+        groups = Enum.map(v.groups, &%{&1 | name: nil, members: [], deleted: true})
+        %{v | groups: groups}
+      end
+
+      click(view, "#tuya-group-1 button[phx-click=edit_members]")
+      click(view, "#tuya-group-1 button[phx-click=ask_delete_group]")
+      FakeLights.update(absent)
+
+      html = click(view, "button[phx-click=confirm_delete_group]")
+      assert html =~ "That group was deleted or replaced in the meantime."
+      refute html =~ "Delete the group"
+
+      view |> with_target("#tuya-mesh") |> render_submit("save_group_form", %{})
+      assert changes() == []
+    end
+
+    test "a confirmation or form whose group was replaced under the same id sends nothing",
+         %{conn: conn} = ctx do
+      start_lights()
+      view = mount_tab(conn)
+      inv = UniversalProxy.TuyaBeaconMesh.Inventory.decode!(KeyLeak.json())
+
+      # Another tab deletes group 1 and creates a new group that takes id 1
+      # (a new sub-device id), without this tab hearing of it.
+      replace_group_1 = fn ->
+        {:ok, _} = Store.replace(%{inv | groups: []}, [], ctx.store)
+        {:ok, _} = Store.replace(inv, [], ctx.store)
+      end
+
+      click(view, "#tuya-group-1 button[phx-click=ask_delete_group]")
+      replace_group_1.()
+      html = click(view, "button[phx-click=confirm_delete_group]")
+      assert html =~ "That group was deleted or replaced in the meantime."
+
+      click(view, "#tuya-group-1 button[phx-click=rename_group]")
+      replace_group_1.()
+      html = view |> group_form(%{name: "garden"}) |> render_submit()
+      assert html =~ "That group was deleted or replaced in the meantime."
+      assert changes() == []
+
+      # A status update closes a replaced group's dialog straight away.
+      click(view, "#tuya-group-1 button[phx-click=ask_delete_group]")
+      replace_group_1.()
+      refute push_status(view, TuyaMesh.status()) =~ "Delete the group"
+      assert changes() == []
+    end
+
+    test "a failed first group keeps the section and its error on screen", %{conn: conn} do
+      {:ok, :same_mesh} = TuyaMesh.upload(json(%{"groups" => []}))
+      start_lights(%{groups: [], slots: %{}})
+      view = mount_tab(conn)
+      open_new_group(view)
+      FakeLights.reply(:create_group, {:error, :not_running})
+      FakeLights.reply(:groups, {:error, :not_running})
+
+      html = view |> group_form(%{name: "porch", members: [@mac2]}) |> render_submit()
+      assert html =~ "The mesh isn&#39;t running, so groups can&#39;t be changed right now."
+      assert has_element?(view, "#tuya-mesh-groups")
     end
 
     test "sync states per member; Retry re-sends an unconfirmed change", %{conn: conn} do
