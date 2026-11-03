@@ -146,7 +146,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   require Logger
 
   alias UniversalProxy.TuyaBeaconMesh.{Inventory, Lights, Radio}
-  alias UniversalProxy.TuyaMesh.{Mesh, Presence, Redact, Store}
+  alias UniversalProxy.TuyaMesh.{Mesh, Presence, Redact, Store, WallClock}
 
   @topic "tuya_mesh"
   @retry_ms 2_000
@@ -289,6 +289,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
       index_check_ticks: Keyword.get(opts, :index_check_ticks, @index_check_ticks),
       reachable_ms: Keyword.get(opts, :reachable_ms, @reachable_ms),
       miss_limit: Keyword.get(opts, :miss_limit, @miss_limit),
+      time_offset_fun: Keyword.get(opts, :time_offset_fun, &WallClock.offset_ms/0),
       timer: nil,
       refresh_timer: nil,
       ticks: 0,
@@ -311,6 +312,11 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
       frames: frame_log(Keyword.get(opts, :name, __MODULE__)),
       frames_key: {__MODULE__, :frames, Keyword.get(opts, :name, __MODULE__)}
     }
+
+    # The OS clock can step after boot (nerves_time); last_seen is derived
+    # from it. Ticks republish within a few seconds of a step; this covers
+    # an idle mesh (no ticks) once ERTS notices the step.
+    :erlang.monitor(:time_offset, :clock_service)
 
     # The evaluation that follows reads everything fresh: nothing to catch up.
     {state, _added} = subscribe(state)
@@ -513,6 +519,9 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
     state = %{clear_mesh(state) | backoff_ms: state.restart_ms}
     {:noreply, state |> idle(:mesh_exited, true) |> publish()}
   end
+
+  defp do_info({:CHANGE, _ref, :time_offset, :clock_service, _offset}, state),
+    do: {:noreply, publish(state)}
 
   defp do_info(_other, state), do: {:noreply, state}
 
@@ -949,7 +958,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
           {dps, dp_at} = Map.get(state.last_dps, bulb.mac, {%{}, %{}})
 
           Map.merge(bulb, %{
-            last_seen: last_seen(last),
+            last_seen: WallClock.to_datetime(last, state.time_offset_fun),
             last_seen_ms: last,
             reachable: reachable,
             checking: checking,
@@ -960,16 +969,6 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
         end),
       groups: inventory.groups
     }
-  end
-
-  # Monotonic → wall clock, to the second so a slewing clock doesn't make
-  # every tick look like a change.
-  defp last_seen(nil), do: nil
-
-  defp last_seen(ms) do
-    (ms + System.time_offset(:millisecond))
-    |> DateTime.from_unix!(:millisecond)
-    |> DateTime.truncate(:second)
   end
 
   defp publish(state) do

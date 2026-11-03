@@ -541,6 +541,85 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
     end
   end
 
+  describe "wall clock step" do
+    setup ctx do
+      {:ok, _} = Store.replace(inventory(), [], ctx.store)
+      n = System.unique_integer([:positive])
+      lights = :"fake_lights_#{n}"
+      radio = :"fake_radio_#{n}"
+      start_supervised!({FakeLights, name: lights, macs: [@bulb2, @bulb3]}, id: :fake_lights)
+      start_supervised!({FakeRadio, name: radio}, id: :fake_radio)
+      offset = start_supervised!({Agent, fn -> 0 end}, id: :offset)
+
+      start_mesh_sup(ctx,
+        lights: lights,
+        radio: radio,
+        tick_ms: ctx[:tick_ms] || 3_600_000,
+        time_offset_fun: fn -> Agent.get(offset, & &1) end
+      )
+
+      {:ok, lights: lights, offset: offset}
+    end
+
+    test "a time offset change republishes last seen against the new clock", ctx do
+      :ok = FakeLights.report(ctx.lights, @bulb2, System.monotonic_time(:millisecond))
+      # The tick is too far off to poll Lights; a report notice prompts the read.
+      send(Process.whereis(ctx.names.resolver), {:tuya_report, %{}})
+
+      # Waits on the broadcast, not a status call: only a publish can move
+      # what subscribers see.
+      before = await_published_last_seen()
+      flush_statuses()
+
+      # The periodic tick is far off (see setup), so the notification is the
+      # only thing that can publish from here.
+      step_ms = 71 * 86_400_000
+      Agent.update(ctx.offset, fn _ -> step_ms end)
+      refute_receive {:tuya_mesh_status, _}, 100
+
+      send(
+        Process.whereis(ctx.names.resolver),
+        {:CHANGE, make_ref(), :time_offset, :clock_service, step_ms}
+      )
+
+      assert_receive {:tuya_mesh_status, %{bulbs: bulbs}}
+      assert %{last_seen: stepped} = Enum.find(bulbs, &(&1.mac == @bulb2))
+      assert DateTime.diff(stepped, before) == div(step_ms, 1000)
+    end
+
+    @tag tick_ms: 30
+    test "a tick picks up an OS clock step that ERTS has not noticed yet", ctx do
+      :ok = FakeLights.report(ctx.lights, @bulb2, System.monotonic_time(:millisecond))
+      before = await_published_last_seen()
+      flush_statuses()
+
+      # No :CHANGE: only the periodic republish can notice the new offset.
+      step_ms = 71 * 86_400_000
+      Agent.update(ctx.offset, fn _ -> step_ms end)
+
+      assert_receive {:tuya_mesh_status, %{bulbs: bulbs}}, 1_000
+      assert %{last_seen: stepped} = Enum.find(bulbs, &(&1.mac == @bulb2))
+      assert DateTime.diff(stepped, before) == div(step_ms, 1000)
+    end
+
+    defp await_published_last_seen do
+      assert_receive {:tuya_mesh_status, %{bulbs: bulbs}}, 2_000
+
+      case Enum.find(bulbs, &(&1.mac == @bulb2)) do
+        %{last_seen: %DateTime{} = seen} -> seen
+        _ -> await_published_last_seen()
+      end
+    end
+
+    defp flush_statuses do
+      receive do
+        {:tuya_mesh_status, _} -> flush_statuses()
+      after
+        0 -> :ok
+      end
+    end
+  end
+
   describe "last seen and reachability" do
     setup ctx do
       {:ok, _} = Store.replace(inventory(), [], ctx.store)
