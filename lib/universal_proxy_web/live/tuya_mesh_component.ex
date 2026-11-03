@@ -339,10 +339,16 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
           "Colour temperature saved. Home Assistant reconnects briefly to pick up the new range."
         )
 
-      {:error, reason} ->
+      # A reachable Store refused the merge: it holds newer values.
+      {:error, :invalid_settings} ->
         socket
         |> rebase_settings(TuyaMesh.settings())
-        |> assign(:settings_error, change_error(reason))
+        |> assign(:settings_error, change_error(:invalid_settings))
+
+      # Store down or slow: its answer for `settings/0` would be the
+      # defaults, so baseline and form stay exactly as they were.
+      {:error, reason} ->
+        assign(socket, :settings_error, change_error(reason))
     end
   end
 

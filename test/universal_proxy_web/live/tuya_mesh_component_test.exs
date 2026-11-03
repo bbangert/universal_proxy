@@ -980,15 +980,33 @@ defmodule UniversalProxyWeb.TuyaMeshComponentTest do
       refute render(view) =~ "Enter a whole number"
     end
 
-    test "a failed save reports it and keeps the entry", %{conn: conn, store: store} do
+    test "a save while the Store is down keeps form and baseline; the retry sends only the edit",
+         %{conn: conn, tmp_dir: tmp_dir, store: store} do
+      :ok = Store.put_settings(%{min_mireds: 200, max_mireds: 333}, store)
       view = settings_view(conn)
-      change_settings(view, %{warm_k: "3000", cool_k: "5000"})
+      change_settings(view, %{warm_k: "3500", cool_k: "5000"})
       stop_supervised!(Store)
-      _ = store
 
-      html = save_settings(view, %{warm_k: "3000", cool_k: "5000"})
+      html = save_settings(view, %{warm_k: "3500", cool_k: "5000"})
       assert html =~ "The Tuya mesh service isn&#39;t available right now."
-      assert has_element?(view, "input[name='settings[warm_k]'][value='3000']")
+
+      # Not rebased onto the defaults the facade answers with meanwhile.
+      assert has_element?(view, "input[name='settings[warm_k]'][value='3500']")
+      assert has_element?(view, "input[name='settings[cool_k]'][value='5000']")
+      assert has_element?(view, "#{@settings_form} button[type=submit]")
+
+      store =
+        start_supervised!(
+          {Store,
+           enabled: true,
+           table: :"tuya_ui_store_restart_#{System.unique_integer([:positive])}",
+           dets_path: Path.join(tmp_dir, "mesh.dets")}
+        )
+
+      # Another tab moved the cool end meanwhile; the retry only sends warm.
+      :ok = Store.put_settings(%{min_mireds: 180}, store)
+      save_settings(view, %{warm_k: "3500", cool_k: "5000"})
+      assert Store.settings(store) == %{min_mireds: 180, max_mireds: 286, invert: false}
     end
   end
 end
