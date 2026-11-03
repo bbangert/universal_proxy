@@ -831,6 +831,55 @@ defmodule UniversalProxyWeb.TuyaMeshComponentTest do
       assert Store.settings(store) == %{min_mireds: 154, max_mireds: 370, invert: false}
     end
 
+    test "a range the 50 K display rounds is not an edit after saving", %{
+      conn: conn,
+      store: store
+    } do
+      view = settings_view(conn)
+
+      save_settings(view, %{warm_k: "2710", cool_k: "6500"})
+      assert Store.settings(store) == %{min_mireds: 154, max_mireds: 369, invert: false}
+      assert has_element?(view, "input[name='settings[warm_k]'][value='2700']")
+      refute has_element?(view, "#{@settings_form} button[type=submit]")
+
+      # Reloaded, still nothing to save, and an Invert-only save keeps the mireds.
+      view = mount_tab(build_conn())
+      refute has_element?(view, "#{@settings_form} button[type=submit]")
+
+      view |> element("#{@settings_form} button[role=switch]") |> render_click()
+      assert has_element?(view, "#{@settings_form} button[type=submit]")
+      save_settings(view, %{warm_k: "2700", cool_k: "6500"})
+      assert Store.settings(store) == %{min_mireds: 154, max_mireds: 369, invert: true}
+
+      # Typing the displayed value into the other field still converts it.
+      change_settings(view, %{warm_k: "2710", cool_k: "6500"})
+      refute has_element?(view, "#{@settings_form} button[type=submit]")
+      change_settings(view, %{warm_k: "2700", cool_k: "6000"})
+      assert has_element?(view, "#{@settings_form} button[type=submit]")
+    end
+
+    test "two stored endpoints that display alike stay valid and exact",
+         %{conn: conn, store: store} do
+      :ok = Store.put_settings(%{min_mireds: 369, max_mireds: 370}, store)
+      view = settings_view(conn)
+
+      assert has_element?(view, "input[name='settings[warm_k]'][value='2700']")
+      assert has_element?(view, "input[name='settings[cool_k]'][value='2700']")
+      refute render(view) =~ "Must be higher"
+      refute has_element?(view, "#{@settings_form} button[type=submit]")
+
+      view |> element("#{@settings_form} button[role=switch]") |> render_click()
+      refute render(view) =~ "Must be higher"
+      assert has_element?(view, "#{@settings_form} button[type=submit]")
+
+      save_settings(view, %{warm_k: "2700", cool_k: "2700"})
+      assert Store.settings(store) == %{min_mireds: 369, max_mireds: 370, invert: true}
+
+      # Editing one field to the same Kelvin as the other is still an error.
+      html = change_settings(view, %{warm_k: "3000", cool_k: "3000"})
+      assert html =~ "Must be higher than the warm temperature."
+    end
+
     test "the invert toggle round-trips", %{conn: conn, store: store} do
       view = settings_view(conn)
 

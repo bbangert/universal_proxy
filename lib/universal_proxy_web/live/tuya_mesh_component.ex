@@ -58,7 +58,8 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   Shown while an inventory is loaded. The warm and cool ends of the range
   are entered in Kelvin (1000 to 10000, warm below cool) and stored as
   mireds (`round(1_000_000 / K)`, `TuyaMesh.put_settings/1`); the stored
-  mireds are shown back as Kelvin rounded to 50. "Invert" is for bulbs whose
+  mireds are shown back as Kelvin rounded to 50, so a field left as shown
+  keeps its exact stored mired; only an edited field is converted. "Invert" is for bulbs whose
   temperature scale runs the other way. Save is offered only for a valid
   entry that differs from what is stored. A changed range is static info,
   so the proxy re-advertises it and Home Assistant reconnects briefly.
@@ -337,7 +338,7 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   end
 
   defp settings_change(params, stored) do
-    with {:ok, changes} <- parse_settings(params) do
+    with {:ok, changes} <- parse_settings(params, stored) do
       if changes == Map.take(stored, [:min_mireds, :max_mireds, :invert]),
         do: :unchanged,
         else: {:ok, changes}
@@ -347,9 +348,12 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   @min_kelvin 1_000
   @max_kelvin 10_000
 
-  defp parse_settings(params) do
-    warm = parse_kelvin(params["warm_k"])
-    cool = parse_kelvin(params["cool_k"])
+  # Each field resolves to a mired value: its stored one while the text still
+  # equals the Kelvin shown for it (the display is rounded to 50 K, so the
+  # text can't stand for the exact mired), else the entered Kelvin converted.
+  defp parse_settings(params, stored) do
+    warm = effective_mireds(params["warm_k"], stored.max_mireds)
+    cool = effective_mireds(params["cool_k"], stored.min_mireds)
 
     errors =
       Enum.flat_map([warm_k: warm, cool_k: cool], fn
@@ -358,24 +362,40 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
       end)
 
     case {errors, warm, cool} do
-      {[], {:ok, w}, {:ok, c}} -> order_settings(w, c, params["invert"] == "true")
-      _ -> {:error, errors}
+      {[], {:ok, max_mireds}, {:ok, min_mireds}} ->
+        order_settings(max_mireds, min_mireds, params, params["invert"] == "true")
+
+      _ ->
+        {:error, errors}
     end
   end
 
-  defp order_settings(warm, cool, invert) do
-    # Mireds are whole numbers: two close temperatures can round together.
-    {min_mireds, max_mireds} = {kelvin_to_mireds(cool), kelvin_to_mireds(warm)}
+  defp effective_mireds(text, stored_mireds) do
+    text = String.trim(text || "")
 
+    if text == Integer.to_string(mireds_to_kelvin(stored_mireds)),
+      do: {:ok, stored_mireds},
+      else: with({:ok, kelvin} <- parse_kelvin(text), do: {:ok, kelvin_to_mireds(kelvin)})
+  end
+
+  defp order_settings(max_mireds, min_mireds, params, invert) do
     cond do
-      warm >= cool -> {:error, cool_k: "Must be higher than the warm temperature."}
-      min_mireds >= max_mireds -> {:error, cool_k: "Too close to the warm temperature."}
-      true -> {:ok, %{min_mireds: min_mireds, max_mireds: max_mireds, invert: invert}}
+      max_mireds < min_mireds ->
+        {:error, cool_k: "Must be higher than the warm temperature."}
+
+      # Mireds are whole numbers: two close temperatures can round together.
+      max_mireds == min_mireds ->
+        if String.trim(params["warm_k"]) == String.trim(params["cool_k"]),
+          do: {:error, cool_k: "Must be higher than the warm temperature."},
+          else: {:error, cool_k: "Too close to the warm temperature."}
+
+      true ->
+        {:ok, %{min_mireds: min_mireds, max_mireds: max_mireds, invert: invert}}
     end
   end
 
-  defp parse_kelvin(value) do
-    case Integer.parse(String.trim(value || "")) do
+  defp parse_kelvin(value) when is_binary(value) do
+    case Integer.parse(value) do
       {k, ""} when k in @min_kelvin..@max_kelvin -> {:ok, k}
       {_k, ""} -> {:error, "Must be between #{@min_kelvin} and #{@max_kelvin} K."}
       _ -> {:error, "Enter a whole number of Kelvin."}
