@@ -125,14 +125,17 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTransportTest do
     pid =
       start_supervised!(
         {Radio,
-         [
-           transport: FakeTransport,
-           test: self(),
-           control: control,
-           name: name,
-           retry_ms: 20,
-           adapter_address: "aa:bb:cc:dd:ee:01"
-         ] ++ opts}
+         Keyword.merge(
+           [
+             transport: FakeTransport,
+             test: self(),
+             control: control,
+             name: name,
+             retry_ms: 20,
+             adapter_address: "aa:bb:cc:dd:ee:01"
+           ],
+           opts
+         )}
       )
 
     %{radio: name, pid: pid, control: control}
@@ -314,7 +317,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTransportTest do
       assert %{ready: false, last_error: :down} = status!(ctx)
 
       events(ctx, [{:fault, :hardware_error}, {:fault, :hardware_error}, {:fault, :x}])
-      assert %{wedges: 0, advertise_failures: 0} = status!(ctx)
+      assert %{ready: false, wedges: 0, advertise_failures: 0} = status!(ctx)
+      # Held not ready: no retry (60 s away) and no wedge-driven setup.
+      refute_receive {:transport, {:setup, _}}, 100
     end
   end
 
