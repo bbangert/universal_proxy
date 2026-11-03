@@ -394,9 +394,78 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsGroupsTest do
       inject_report(2, 1, <<0xA3, 1, 2>>, @addr2)
       wait_until(fn -> sync(2, @mac2).state == :confirmed end)
 
-      # Even without the bulb's list (re-paired keys), the join reserves 2.
-      assert :ok = Lights.reload(repaired())
+      assert :ok = Lights.reload(fixture())
+      assert {:ok, 3} = Lights.create_group("b", [])
+
+      # Re-paired (new keys), the bulb was factory reset: 2 is free again.
+      b = %{"localId" => 3, "name" => "b", "members" => []}
+      assert :ok = Lights.reload(Map.update!(repaired(), "groups", &(&1 ++ [b])))
       assert {:ok, %{groups: nil}} = Lights.status(@mac2)
+      assert {:ok, 2} = Lights.create_group("c", [])
+    end
+
+    test "a reload keeps former memberships as possible holders until a list omits them" do
+      # No list from either bulb and nothing sent: only the membership.
+      assert :ok = Lights.reload(Map.put(fixture(), "groups", []))
+      assert {:ok, 2} = Lights.create_group("x", [])
+      assert {:ok, %{slots: %{@mac2 => 1, @mac3 => 1}}} = Lights.groups()
+
+      inject_report(2, 1, <<0xA3>>, @addr2)
+      inject_report(3, 1, <<0xA3>>, @addr3)
+      wait_until(fn -> match?({:ok, %{slots: %{@mac2 => 0, @mac3 => 0}}}, Lights.groups()) end)
+      assert {:ok, 1} = Lights.create_group("y", [])
+    end
+
+    test "re-queuing a sent join, then reloading without its group, keeps the bulb a holder" do
+      {:ok, 2} = Lights.create_group("a", [@mac2])
+      {:ok, 3} = Lights.create_group("b", [@mac3])
+      {:ok, 4} = Lights.create_group("c", [@mac2])
+      wait_until(fn -> length(advertises()) == 1 end)
+      assert sync(4, @mac2).state == :pending
+
+      # The repeat puts 2's join back in the queue, and 4's takes its slot.
+      assert :ok = Lights.add_member(2, @mac2)
+      assert {:ok, %{queued: 2}} = Radio.status()
+
+      # The reload drops group 2 and the queued resend with it.
+      groups =
+        for {id, name, members} <- [{3, "b", [@mac3]}, {4, "c", [@mac2]}],
+            do: %{"localId" => id, "name" => name, "members" => members}
+
+      assert :ok = Lights.reload(Map.update!(fixture(), "groups", &(&1 ++ groups)))
+      assert sync(2, @mac2) == nil
+      assert {:ok, 5} = Lights.create_group("d", [])
+    end
+
+    @tag confirm_ms: 100
+    test "a delayed, older list can't release an id across a reload" do
+      {:ok, 2} = Lights.create_group("a", [@mac2])
+      inject_report(2, 10, <<0xA3, 1, 2>>, @addr2)
+      wait_until(fn -> sync(2, @mac2).state == :confirmed end)
+      assert :ok = Lights.reload(fixture())
+
+      # SN 9 is behind the 10 already accepted: held for re-anchoring only.
+      inject_report(2, 9, <<0xA3, 1>>, @addr2)
+      inject_report(3, 1, <<0xA3, 1>>, @addr3)
+      wait_until(fn -> match?({:ok, %{groups: [1]}}, Lights.status(@mac3)) end)
+      assert {:ok, %{groups: [1, 2]}} = Lights.status(@mac2)
+      assert {:ok, 3} = Lights.create_group("b", [])
+
+      # A newer one does, once the join can no longer be on its way.
+      Process.sleep(120)
+      inject_report(2, 11, <<0xA3, 1>>, @addr2)
+      wait_until(fn -> match?({:ok, %{groups: [1]}}, Lights.status(@mac2)) end)
+      assert {:ok, 2} = Lights.create_group("c", [])
+    end
+
+    test "a list omitting a join still on its way doesn't release the id" do
+      {:ok, 2} = Lights.create_group("a", [@mac2])
+      wait_until(fn -> length(advertises()) == 1 end)
+      assert :ok = Lights.reload(fixture())
+
+      # Answering something older: the join may not have reached the bulb.
+      inject_report(2, 1, <<0xA3, 1>>, @addr2)
+      wait_until(fn -> match?({:ok, %{groups: [1]}}, Lights.status(@mac2)) end)
       assert {:ok, 3} = Lights.create_group("b", [])
     end
 
