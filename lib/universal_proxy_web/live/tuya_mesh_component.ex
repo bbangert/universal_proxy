@@ -322,8 +322,13 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
     )
   end
 
+  # Only the keys that differ from this form's baseline are sent, so the
+  # Store's merge keeps newer values another tab saved for the rest.
   defp save_settings(socket, changes) do
-    case TuyaMesh.put_settings(changes) do
+    stored = socket.assigns.stored_settings
+    changed = Map.reject(changes, fn {key, value} -> Map.fetch!(stored, key) == value end)
+
+    case TuyaMesh.put_settings(changed) do
       :ok ->
         socket
         |> assign_settings(TuyaMesh.settings())
@@ -333,7 +338,10 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
         )
 
       {:error, reason} ->
-        assign(socket, :settings_error, change_error(reason))
+        socket
+        |> assign(:stored_settings, TuyaMesh.settings())
+        |> put_settings_form(socket.assigns.settings_params)
+        |> assign(:settings_error, change_error(reason))
     end
   end
 
@@ -1135,6 +1143,11 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
 
   defp change_error(:unavailable),
     do: "The Tuya mesh service isn't available right now. Try again shortly."
+
+  defp change_error(:invalid_settings),
+    do:
+      "That doesn't fit the colour temperature stored now (it may have changed in another tab). " <>
+        "Check the values and save again."
 
   defp change_error(:timeout),
     do:

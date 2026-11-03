@@ -880,6 +880,42 @@ defmodule UniversalProxyWeb.TuyaMeshComponentTest do
       assert html =~ "Must be higher than the warm temperature."
     end
 
+    test "a save sends only what this form changed, keeping another tab's newer values",
+         %{conn: conn, store: store} do
+      {:ok, _} = TuyaMesh.upload(KeyLeak.json())
+      view_a = mount_tab(conn)
+      view_b = mount_tab(build_conn())
+
+      save_settings(view_a, %{warm_k: "3000", cool_k: "5000"})
+      assert Store.settings(store) == %{min_mireds: 200, max_mireds: 333, invert: false}
+
+      # B still holds 2700-6500 and only flips Invert.
+      view_b |> element("#{@settings_form} button[role=switch]") |> render_click()
+      save_settings(view_b, %{warm_k: "2700", cool_k: "6500"})
+      assert Store.settings(store) == %{min_mireds: 200, max_mireds: 333, invert: true}
+
+      # B now shows what is stored.
+      assert has_element?(view_b, "input[name='settings[warm_k]'][value='3000']")
+      assert has_element?(view_b, "input[name='settings[cool_k]'][value='5000']")
+    end
+
+    test "a stale edit that no longer fits the stored range is reported inline",
+         %{conn: conn, store: store} do
+      {:ok, _} = TuyaMesh.upload(KeyLeak.json())
+      view_a = mount_tab(conn)
+      view_b = mount_tab(build_conn())
+
+      # A narrows the range to 4000-4500 K (250 / 222 mireds).
+      save_settings(view_a, %{warm_k: "4000", cool_k: "4500"})
+
+      # B (baseline 2700-6500) changes only the cool end to 3000 K: 333 mireds
+      # is not below the stored warm 250, so the merge is refused.
+      html = save_settings(view_b, %{warm_k: "2700", cool_k: "3000"})
+      assert html =~ "doesn&#39;t fit the colour temperature stored now"
+      assert Store.settings(store) == %{min_mireds: 222, max_mireds: 250, invert: false}
+      assert has_element?(view_b, "input[name='settings[cool_k]'][value='3000']")
+    end
+
     test "the invert toggle round-trips", %{conn: conn, store: store} do
       view = settings_view(conn)
 
