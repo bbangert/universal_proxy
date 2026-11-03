@@ -92,16 +92,18 @@ defmodule UniversalProxy.TuyaMesh.Commander do
 
   ## Membership changes
 
-  A group command's members are resolved when it is admitted (`:members`);
-  a pending one then follows the group's membership as the Resolver's
-  status reports it (each status against the one before, so a status
-  delivered late never undoes the membership the command was admitted
-  with):
+  A group command reaches whoever is in the group when it airs. Its
+  members are resolved when it is admitted (`:members`); a pending one
+  then follows the group's membership as the Resolver's status reports it
+  (each status against the one before, so a status delivered late never
+  undoes the membership the command was admitted with):
 
-    * **Joined:** a bulb that joined gets the group's command as its own
-      bulb command, unless it already has a newer command (its own or
-      another group's). Being the newer one, it replaces the bulb's older
-      pending command.
+    * **Joined:** a bulb that joined gets no direct frame from a command
+      issued before it joined (no diversion, no follow-up), but a
+      broadcast that airs after the join reaches it: the broadcast counts
+      it as a member (the group never broadcasts over its newer command,
+      see "Superseding"), and takes the broadcast into its kept state as
+      the group's latest command for it.
     * **Left:** a bulb that left gets nothing more from the command (its
       planned direct frames are dropped) and no longer takes the group's
       sends into its kept state.
@@ -359,8 +361,9 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       pending: batches,
       sent: [],
       members: members,
-      # The group's membership as last resolved (`members` also drops the
-      # members a diversion skips).
+      # The group's current membership, joiners included, which a
+      # broadcast reaches; `members` are the ones direct frames may go to
+      # (no joiners, and a diversion drops the superseded ones).
       resolved: members,
       snapshot: snapshot(state, target, members),
       sent_at: nil,
@@ -394,7 +397,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   # Never re-broadcast over a member's newer command (its own, or another
   # group's): the rest goes to the other members directly.
   defp run(state, %{phase: :send, target: {:group, _}} = job) do
-    case Enum.filter(job.members, &newer_command?(state, &1, job)) do
+    case Enum.filter(job.resolved, &newer_command?(state, &1, job)) do
       [] -> send_step(state, job)
       superseded -> divert(state, job, job.members -- superseded)
     end
@@ -417,7 +420,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   defp send_step(state, %{pending: [batch | rest]} = job) do
     case send_frame(state, job, job.target, batch) do
       :ok ->
-        state = state |> accepted_frame() |> record(job, batch)
+        state = state |> accepted_frame() |> addressed(job) |> record(job, batch)
         job = %{job | pending: rest, sent: job.sent ++ batch, sent_at: now()}
         if rest == [], do: sent_all(state, job), else: continue(state, job, 0)
 
@@ -623,6 +626,14 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   defp later?(at, {:ok, before}), do: at > before
 
   defp newer_command?(state, mac, job), do: Map.get(state.touched, mac, 0) > job.id
+
+  # A broadcast that aired is the latest command for every current member
+  # it reached (a joiner too), so an older command's follow-up never
+  # overrides it. Never called with a superseded member (see `run/2`).
+  defp addressed(state, %{target: {:group, _}} = job),
+    do: %{state | touched: Map.merge(state.touched, Map.new(job.resolved, &{&1, job.id}))}
+
+  defp addressed(state, _bulb_job), do: state
 
   # The job's next action is due after `delay`; a confirmation pass gets
   # its own staleness bound from when it starts.
@@ -913,9 +924,9 @@ defmodule UniversalProxy.TuyaMesh.Commander do
     sent = Commands.expected(batch)
     state = record_light(state, job, sent)
 
-    ids = if job.members == [], do: %{}, else: read_ids(state)
+    ids = if job.resolved == [], do: %{}, else: read_ids(state)
 
-    job.members
+    job.resolved
     |> Enum.reject(&newer_command?(state, &1, job))
     |> Enum.reduce(state, &update_member_view(&2, &1, sent, job.components, ids))
   end
@@ -989,7 +1000,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
           groups_of(state, [mac])
 
         {:group, _gid} ->
-          for(mac <- job.members, do: {:bulb, mac}) ++ groups_of(state, job.members)
+          for(mac <- job.resolved, do: {:bulb, mac}) ++ groups_of(state, job.resolved)
       end
 
     state |> mark_dirty(related -- [job.target]) |> arm_flush()
@@ -1018,7 +1029,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       %{state | mesh_groups: groups, views: Map.drop(state.views, removed)}
       |> forget_pushed(removed)
       |> mark_dirty(changed)
-      |> regroup(old_groups, groups, ids)
+      |> regroup(old_groups, groups)
 
     {state, macs} =
       Enum.reduce(bulbs, {state, []}, fn bulb, {state, macs} ->
@@ -1091,19 +1102,17 @@ defmodule UniversalProxy.TuyaMesh.Commander do
 
   # Pending group commands follow what changed between the last status
   # and this one (see "Membership changes"); a group first seen now has
-  # nothing to compare. Newest command first, so a bulb that joined
-  # several groups gets the newest of their commands.
-  defp regroup(state, old_groups, groups, ids) do
+  # nothing to compare.
+  defp regroup(state, old_groups, groups) do
     state.jobs
     |> Map.values()
     |> Enum.filter(&match?(%{target: {:group, gid}} when is_map_key(old_groups, gid), &1))
-    |> Enum.sort_by(& &1.id, :desc)
     |> Enum.reduce(state, fn %{target: {:group, gid}} = job, state ->
       before = Map.fetch!(old_groups, gid)
 
       case Map.fetch(groups, gid) do
         {:ok, ^before} -> state
-        {:ok, members} -> regroup_job(state, job, members -- before, before -- members, ids)
+        {:ok, members} -> regroup_job(state, job, members -- before, before -- members)
         :error -> drop_deleted(state, job)
       end
     end)
@@ -1114,7 +1123,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
     done(state, job)
   end
 
-  defp regroup_job(state, job, joined, left, ids) do
+  defp regroup_job(state, job, joined, left) do
     joined = joined -- job.resolved
     left = Enum.filter(left, &(&1 in job.resolved))
 
@@ -1127,13 +1136,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
         pending: drop_macs(job, left)
     }
 
-    state = %{state | jobs: Map.put(state.jobs, job.target, job)}
-
-    # A command for a light that is no longer the one commanded reaches no
-    # new member (the next step abandons it).
-    if valid?(ids, job.target, job.command.device_id),
-      do: Enum.reduce(joined, state, &hand_over(&2, job, &1, ids)),
-      else: state
+    %{state | jobs: Map.put(state.jobs, job.target, job)}
   end
 
   # Direct frames are `{mac, batch}`; a broadcast's pending batches aren't.
@@ -1141,29 +1144,6 @@ defmodule UniversalProxy.TuyaMesh.Commander do
     do: Enum.reject(pending, fn {mac, _batch} -> mac in macs end)
 
   defp drop_macs(%{pending: pending}, _macs), do: pending
-
-  # A joined bulb gets the group's command as its own, unless a newer one
-  # already addresses it.
-  defp hand_over(state, job, mac, ids) do
-    target = {:bulb, mac}
-
-    case Map.get(ids, target) do
-      id when is_integer(id) ->
-        if newer_command?(state, mac, job) do
-          state
-        else
-          Logger.debug(
-            "TuyaMesh.Commander: #{describe(job.target)} command goes to #{mac}, joined"
-          )
-
-          command = %{job.command | target: target, key: light_key(target), device_id: id}
-          admit(state, command)
-        end
-
-      nil ->
-        state
-    end
-  end
 
   defp groups_of(state, macs) do
     for {gid, members} <- state.mesh_groups, Enum.any?(macs, &(&1 in members)), do: {:group, gid}
