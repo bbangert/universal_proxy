@@ -211,6 +211,14 @@ defmodule UniversalProxy.TuyaMesh do
   @spec rename_group(String.t() | byte(), String.t(), keyword()) :: :ok | {:error, term()}
   def rename_group(group, name, opts \\ []), do: Lights.rename_group(group, name, lights(opts))
 
+  @doc """
+  HA sub-device ids by `{:bulb, mac}` and `{:group, local_id}`
+  (`Store.device_ids/1`; `%{}` while the Store is down). A group's id is
+  never reused, so it tells a recreated local id from the group it replaced.
+  """
+  @spec device_ids(keyword()) :: %{Store.device_key() => pos_integer()}
+  def device_ids(opts \\ []), do: Store.device_ids(Keyword.get(opts, :store, Store))
+
   @doc "Groups, per-member change state and per-bulb slot use (`Lights.groups/1`)."
   @spec group_sync(keyword()) ::
           {:ok, %{groups: [Lights.group_view()], slots: %{String.t() => non_neg_integer()}}}
