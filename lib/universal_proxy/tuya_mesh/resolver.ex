@@ -289,6 +289,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
       index_check_ticks: Keyword.get(opts, :index_check_ticks, @index_check_ticks),
       reachable_ms: Keyword.get(opts, :reachable_ms, @reachable_ms),
       miss_limit: Keyword.get(opts, :miss_limit, @miss_limit),
+      time_offset_fun: Keyword.get(opts, :time_offset_fun, &monotonic_offset/0),
       timer: nil,
       refresh_timer: nil,
       ticks: 0,
@@ -311,6 +312,10 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
       frames: frame_log(Keyword.get(opts, :name, __MODULE__)),
       frames_key: {__MODULE__, :frames, Keyword.get(opts, :name, __MODULE__)}
     }
+
+    # The wall clock can step (nerves_time sets it after boot); last_seen is
+    # derived from it, so a step must republish.
+    :erlang.monitor(:time_offset, :clock_service)
 
     # The evaluation that follows reads everything fresh: nothing to catch up.
     {state, _added} = subscribe(state)
@@ -513,6 +518,9 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
     state = %{clear_mesh(state) | backoff_ms: state.restart_ms}
     {:noreply, state |> idle(:mesh_exited, true) |> publish()}
   end
+
+  defp do_info({:CHANGE, _ref, :time_offset, :clock_service, _offset}, state),
+    do: {:noreply, publish(state)}
 
   defp do_info(_other, state), do: {:noreply, state}
 
@@ -949,7 +957,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
           {dps, dp_at} = Map.get(state.last_dps, bulb.mac, {%{}, %{}})
 
           Map.merge(bulb, %{
-            last_seen: last_seen(last),
+            last_seen: last_seen(last, state.time_offset_fun),
             last_seen_ms: last,
             reachable: reachable,
             checking: checking,
@@ -964,13 +972,15 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
 
   # Monotonic → wall clock, to the second so a slewing clock doesn't make
   # every tick look like a change.
-  defp last_seen(nil), do: nil
+  defp last_seen(nil, _offset_fun), do: nil
 
-  defp last_seen(ms) do
-    (ms + System.time_offset(:millisecond))
+  defp last_seen(ms, offset_fun) do
+    (ms + offset_fun.())
     |> DateTime.from_unix!(:millisecond)
     |> DateTime.truncate(:second)
   end
+
+  defp monotonic_offset, do: System.time_offset(:millisecond)
 
   defp publish(state) do
     status = build_status(state)

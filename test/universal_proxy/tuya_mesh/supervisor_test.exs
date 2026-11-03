@@ -541,6 +541,61 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
     end
   end
 
+  describe "wall clock step" do
+    setup ctx do
+      {:ok, _} = Store.replace(inventory(), [], ctx.store)
+      n = System.unique_integer([:positive])
+      lights = :"fake_lights_#{n}"
+      radio = :"fake_radio_#{n}"
+      start_supervised!({FakeLights, name: lights, macs: [@bulb2, @bulb3]}, id: :fake_lights)
+      start_supervised!({FakeRadio, name: radio}, id: :fake_radio)
+      offset = start_supervised!({Agent, fn -> 0 end}, id: :offset)
+
+      start_mesh_sup(ctx,
+        lights: lights,
+        radio: radio,
+        time_offset_fun: fn -> Agent.get(offset, & &1) end
+      )
+
+      {:ok, lights: lights, offset: offset}
+    end
+
+    test "a time offset change republishes last seen against the new clock", ctx do
+      seen_ms = System.monotonic_time(:millisecond)
+      :ok = FakeLights.report(ctx.lights, @bulb2, seen_ms)
+
+      wait_until(fn ->
+        match?(
+          %{last_seen: %DateTime{}},
+          Enum.find(status(ctx).bulbs, &(&1.mac == @bulb2))
+        )
+      end)
+
+      before = Enum.find(status(ctx).bulbs, &(&1.mac == @bulb2)).last_seen
+
+      step_ms = 71 * 86_400_000
+      Agent.update(ctx.offset, fn _ -> step_ms end)
+      flush_statuses()
+
+      send(
+        Process.whereis(ctx.names.resolver),
+        {:CHANGE, make_ref(), :time_offset, :clock_service, step_ms}
+      )
+
+      assert_receive {:tuya_mesh_status, %{bulbs: bulbs}}
+      assert %{last_seen: stepped} = Enum.find(bulbs, &(&1.mac == @bulb2))
+      assert DateTime.diff(stepped, before) == div(step_ms, 1000)
+    end
+
+    defp flush_statuses do
+      receive do
+        {:tuya_mesh_status, _} -> flush_statuses()
+      after
+        0 -> :ok
+      end
+    end
+  end
+
   describe "last seen and reachability" do
     setup ctx do
       {:ok, _} = Store.replace(inventory(), [], ctx.store)
