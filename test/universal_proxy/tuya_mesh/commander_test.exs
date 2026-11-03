@@ -292,6 +292,14 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
     end
   end
 
+  defp flush_activity(n \\ 0) do
+    receive do
+      {:"$gen_cast", {:command_activity, _hold}} -> flush_activity(n + 1)
+    after
+      0 -> n
+    end
+  end
+
   defp refusals(n \\ 0) do
     receive do
       {:lights, :refused} -> refusals(n + 1)
@@ -1662,6 +1670,45 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       assert %{state: true} = last_push(pushes(), 5)
       refute Map.has_key?(:sys.get_state(pid).jobs, {:group, 1})
       idle(pid)
+    end
+
+    test "a group the Store drops mid-diversion still gets its members' taken sends pushed" do
+      script = %{set: %{@b => [{:error, :busy}]}}
+      {pid, agent} = start(script: script, retry_ms: 300, push_debounce_ms: 10)
+      at = now()
+      report(pid, for(mac <- [@a, @b, @c], do: {mac, @off, at}))
+      _ = pushes()
+
+      Commander.command(cmd({:group, 1}, on()), pid)
+      Commander.command(cmd({:bulb, @c}, %Req{has_state: true, state: false}, 99), pid)
+      assert_receive {:lights, {:set, @a, [on: true], _}}, 2_000
+
+      # The Store's change arrives before the Resolver's status.
+      Agent.update(agent, fn s -> %{s | ids: Map.delete(s.ids, {:group, 1})} end)
+      send(pid, {:tuya_mesh_store, :inventory_changed})
+      flushed(pid)
+      assert %{state: true} = last_push(pushes(), 5)
+      refute Map.has_key?(:sys.get_state(pid).jobs, {:group, 1})
+
+      send(pid, {:tuya_mesh_status, status([], [%{local_id: 3, members: [@b, @c]}])})
+      idle(pid)
+    end
+
+    test "statuses during pending work never postpone the Presence keepalive" do
+      {pid, _agent} = start(window_ms: 2_000, keepalive_ms: 100, activity_hold_ms: 250)
+      send(pid, {:tuya_mesh_status, status([])})
+
+      Commander.command(cmd({:group, 1}, on()), pid)
+      assert_receive {:lights, {:group_set, 1, [on: true], _}}, 2_000
+      flush_activity()
+
+      # A status every 20 ms for 600 ms, while the group waits to confirm.
+      for _ <- 1..30 do
+        send(pid, {:tuya_mesh_status, status([])})
+        Process.sleep(20)
+      end
+
+      assert flush_activity() >= 4
     end
 
     test "a bulb that leaves gets none of the command's remaining follow-ups" do

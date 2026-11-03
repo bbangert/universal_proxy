@@ -115,7 +115,9 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       (it and its remaining groups follow on the next flush).
     * **Deleted:** a group gone from the status has its command dropped,
       with its kept and pushed state; its members and their other groups
-      follow on the next flush, as for a bulb that left.
+      follow on the next flush, as for a bulb that left. The same holds
+      when the Store's change (the group's sub-device id gone) drops the
+      command first.
 
   The group's state is derived again from its current members (see
   "Light state") and pushed when that changes it.
@@ -736,7 +738,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
 
   # The next wake-up: the earliest due action (frames not before the
   # capacity hold), the earliest staleness bound, and, with work left, the
-  # Presence keepalive.
+  # Presence keepalive (due `:keepalive_ms` after the last signal).
   defp reschedule(%{jobs: jobs} = state) when map_size(jobs) == 0, do: arm(state, nil)
 
   defp reschedule(state) do
@@ -745,7 +747,11 @@ defmodule UniversalProxy.TuyaMesh.Commander do
     due = for job <- Map.values(state.jobs), do: available_at(state, job)
 
     deadlines = for job <- Map.values(state.jobs), do: job.deadline + 1
-    at = Enum.min([now + state.keepalive_ms | due ++ deadlines])
+
+    # From the last signal, so re-arming (every status does) never
+    # postpones the keepalive past the Presence hold.
+    keepalive = (state.signalled_at || now) + state.keepalive_ms
+    at = Enum.min([keepalive | due ++ deadlines])
     arm(state, max(at - now, 0))
   end
 
@@ -825,6 +831,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
 
     %{done(state, job) | views: Map.delete(state.views, job.target)}
     |> forget_pushed([job.target])
+    |> mark_taken(job.resolved)
   end
 
   # Drops the commands and kept DPs of every light whose id changed.
@@ -860,9 +867,12 @@ defmodule UniversalProxy.TuyaMesh.Commander do
           not Map.has_key?(state.pushed, {:group, gid}),
           do: {:group, gid}
 
+    taken = stale |> Map.values() |> Enum.flat_map(& &1.resolved)
+
     %{state | jobs: jobs, views: views}
     |> forget_pushed(stale_pushed)
     |> mark_dirty(renewed ++ unpushed)
+    |> mark_taken(Enum.uniq(taken))
   end
 
   defp read_ids(state) do
@@ -1135,12 +1145,16 @@ defmodule UniversalProxy.TuyaMesh.Commander do
     state |> done(job) |> mark_taken(job.resolved)
   end
 
-  # Bulbs a job stops tracking may hold sends not pushed yet (pushes come
-  # when a pass ends): they and their groups follow on the next flush.
+  # Bulbs a job stops tracking (a leave, a deleted or stale group) may
+  # hold sends not pushed yet (pushes come when a pass ends): they and
+  # their groups follow on the next flush.
   defp mark_taken(state, []), do: state
 
-  defp mark_taken(state, macs),
-    do: mark_dirty(state, for(mac <- macs, do: {:bulb, mac}) ++ groups_of(state, macs))
+  defp mark_taken(state, macs) do
+    state
+    |> mark_dirty(for(mac <- macs, do: {:bulb, mac}) ++ groups_of(state, macs))
+    |> arm_flush()
+  end
 
   defp regroup_job(state, job, joined, left) do
     joined = joined -- job.resolved
