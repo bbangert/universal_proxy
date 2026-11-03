@@ -64,6 +64,36 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   entry that differs from what is stored. A changed range is static info,
   so the proxy re-advertises it and Home Assistant reconnects briefly.
 
+  ## Groups
+
+  Listed from `TuyaMesh.group_sync/0` while the mesh's `Lights` runs (the
+  editor), else read-only from the status. Groups are addressed by local
+  id, bulbs by MAC.
+
+    * "New group" takes a name and a member checklist and makes one
+      `create_group/2` call on save (one Home Assistant reconnect);
+    * "Rename" and "Delete" (after a confirmation) each make one call,
+      and each also reconnects Home Assistant; the broadcast dismiss is
+      never offered (hardware-untested);
+    * "Edit members" opens a checklist; its save sends only what the user
+      changed against the members shown when it opened, as `add_member/2`
+      and `remove_member/2` calls (no reconnect). A bulb whose 8 group
+      slots are used (`slots`) can't be ticked unless it may already hold
+      the group.
+
+  Each member change shows its state (pending, confirmed, unconfirmed);
+  an unconfirmed one offers "Retry", which sends the same change again
+  (the documented retry). Groups absent from the inventory that some bulb
+  may still hold (`deleted: true`) show as "Leaving" with those bulbs,
+  and "Retry removal" re-sends `delete_group/1` for their id. Every retry
+  and delete first re-reads `group_sync` and acts only if the group (and
+  change) still stands as shown.
+
+  `group_sync` is re-read on every status update and after every action;
+  while any change is pending, it is also polled with `send_update_after/3`
+  every 2 s (`:tuya_group_poll_ms` app env), one timer at a time, and not
+  at all otherwise.
+
   ## Status
 
   The parent subscribes to `TuyaMesh.topic/0` (a LiveComponent can't) and
@@ -106,6 +136,14 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
      |> assign(:notice, nil)
      |> assign(:error, nil)
      |> assign_settings(TuyaMesh.settings())
+     # `nil` while `Lights` doesn't answer, else `TuyaMesh.group_sync/0`'s map.
+     |> assign(:group_sync, fetch_group_sync())
+     # The one open group form: `nil`, or `%{mode: :create | :rename |
+     # :members, ...}` (see `open_group_form/3`).
+     |> assign(:group_form, nil)
+     # `nil`, or `%{gid:, name:}` while the delete confirmation is open.
+     |> assign(:deleting, nil)
+     |> assign(group_msg: nil, group_error: nil, poll_scheduled: false)
      |> allow_upload(:inventory,
        accept: ~w(.json),
        max_entries: 1,
@@ -114,14 +152,20 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   end
 
   @impl true
-  def update(%{status: status}, socket),
-    do: {:ok, assign(socket, status: status, now: socket.assigns.clock.())}
+  def update(%{status: status}, socket) do
+    socket = assign(socket, status: status, now: socket.assigns.clock.())
+    {:ok, refresh_groups(socket)}
+  end
 
   def update(%{now: now}, socket), do: {:ok, assign(socket, :now, now)}
 
+  def update(%{poll_groups: true}, socket),
+    do: {:ok, socket |> assign(:poll_scheduled, false) |> refresh_groups()}
+
   def update(assigns, socket) do
     socket = assign(socket, assigns)
-    {:ok, assign_new(socket, :now, fn -> socket.assigns.clock.() end)}
+    socket = assign_new(socket, :now, fn -> socket.assigns.clock.() end)
+    {:ok, maybe_poll(socket)}
   end
 
   # ── Upload ──────────────────────────────────────────────────────────────
@@ -226,7 +270,354 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
     end
   end
 
+  # ── Groups ──────────────────────────────────────────────────────────────
+
+  def handle_event("new_group", _params, socket),
+    do: {:noreply, open_group_form(socket, :create, nil)}
+
+  def handle_event(event, %{"gid" => gid}, socket) when event in ~w(rename_group edit_members) do
+    mode = if event == "rename_group", do: :rename, else: :members
+
+    case live_group(socket.assigns.group_sync, gid) do
+      nil -> {:noreply, socket}
+      group -> {:noreply, open_group_form(socket, mode, group)}
+    end
+  end
+
+  def handle_event("cancel_group_form", _params, socket),
+    do: {:noreply, assign(socket, :group_form, nil)}
+
+  def handle_event("group_form_change", params, %{assigns: %{group_form: %{}}} = socket),
+    do: {:noreply, assign(socket, :group_form, edit_group_form(socket, params))}
+
+  def handle_event("save_group_form", params, %{assigns: %{group_form: %{}}} = socket) do
+    form = edit_group_form(socket, params)
+    {:noreply, save_group_form(assign(socket, :group_form, form), form)}
+  end
+
+  def handle_event("ask_delete_group", %{"gid" => gid}, socket) do
+    case live_group(socket.assigns.group_sync, gid) do
+      nil ->
+        {:noreply, socket}
+
+      group ->
+        deleting = %{gid: group.local_id, name: group.name, members: length(group.members)}
+        {:noreply, assign(socket, deleting: deleting, group_msg: nil, group_error: nil)}
+    end
+  end
+
+  def handle_event("cancel_delete_group", _params, socket),
+    do: {:noreply, assign(socket, :deleting, nil)}
+
+  def handle_event("confirm_delete_group", _params, %{assigns: %{deleting: %{} = d}} = socket),
+    do: {:noreply, delete_group(assign(socket, :deleting, nil), d)}
+
+  def handle_event("retry_member", %{"gid" => gid, "mac" => mac}, socket),
+    do: {:noreply, retry_member(refresh_groups(socket), gid, mac)}
+
+  def handle_event("retry_removal", %{"gid" => gid}, socket),
+    do: {:noreply, retry_removal(refresh_groups(socket), gid)}
+
   def handle_event(_event, _params, socket), do: {:noreply, socket}
+
+  # ── Group actions ───────────────────────────────────────────────────────
+
+  @group_slots 8
+
+  defp fetch_group_sync do
+    case TuyaMesh.group_sync() do
+      {:ok, sync} -> sync
+      {:error, _reason} -> nil
+    end
+  end
+
+  # Re-reads group_sync; a form or confirmation for a group that is gone
+  # closes, and polling resumes while a change is pending.
+  defp refresh_groups(socket) do
+    sync = fetch_group_sync()
+
+    form =
+      case socket.assigns.group_form do
+        %{gid: gid} = form -> if live_group(sync, gid), do: form
+        form -> form
+      end
+
+    deleting = with %{gid: gid} = d <- socket.assigns.deleting, do: live_group(sync, gid) && d
+
+    socket
+    |> assign(group_sync: sync, group_form: form, deleting: deleting)
+    |> maybe_poll()
+  end
+
+  defp maybe_poll(%{assigns: %{poll_scheduled: false, group_sync: sync}} = socket) do
+    if connected?(socket) and pending?(sync) do
+      send_update_after(socket.assigns.myself, %{poll_groups: true}, poll_ms())
+      assign(socket, :poll_scheduled, true)
+    else
+      socket
+    end
+  end
+
+  defp maybe_poll(socket), do: socket
+
+  defp poll_ms, do: Application.get_env(:universal_proxy, :tuya_group_poll_ms, 2_000)
+
+  defp pending?(nil), do: false
+
+  defp pending?(%{groups: groups}),
+    do: Enum.any?(groups, fn g -> Enum.any?(g.sync, &match?({_, %{state: :pending}}, &1)) end)
+
+  # A group of the inventory (not an absent one), by local id or its
+  # string form (event params).
+  defp live_group(sync, gid), do: with(%{deleted: false} = g <- find_group(sync, gid), do: g)
+
+  defp find_group(nil, _gid), do: nil
+
+  defp find_group(%{groups: groups}, gid) do
+    case parse_gid(gid) do
+      {:ok, id} -> Enum.find(groups, &(&1.local_id == id))
+      :error -> nil
+    end
+  end
+
+  defp parse_gid(gid) when is_integer(gid), do: {:ok, gid}
+
+  defp parse_gid(gid) when is_binary(gid) do
+    case Integer.parse(gid) do
+      {id, ""} -> {:ok, id}
+      _ -> :error
+    end
+  end
+
+  defp parse_gid(_gid), do: :error
+
+  defp open_group_form(socket, mode, group) do
+    form =
+      case mode do
+        :create -> %{mode: :create, name: "", selected: []}
+        :rename -> %{mode: :rename, gid: group.local_id, name: group.name}
+        :members -> %{mode: :members, gid: group.local_id, baseline: group.members}
+      end
+
+    form =
+      form
+      |> Map.put_new(:selected, Map.get(form, :baseline, []))
+      |> Map.merge(%{error: nil, name_error: nil})
+
+    assign(socket, group_form: form, group_msg: nil, group_error: nil)
+  end
+
+  # Only bulbs of the mesh are kept (a checkbox value is client input).
+  defp edit_group_form(socket, params) do
+    params = Map.get(params, "group", %{})
+    form = socket.assigns.group_form
+    known = MapSet.new(socket.assigns.status.bulbs, & &1.mac)
+
+    form =
+      case params do
+        %{"name" => name} when is_binary(name) and is_map_key(form, :name) -> %{form | name: name}
+        _ -> form
+      end
+
+    case params do
+      %{"members" => members} when is_list(members) ->
+        selected = members |> Enum.filter(&MapSet.member?(known, &1)) |> Enum.uniq()
+        %{form | selected: selected}
+
+      _ ->
+        form
+    end
+  end
+
+  defp save_group_form(socket, %{mode: :create} = form) do
+    case TuyaMesh.create_group(form.name, form.selected) do
+      {:ok, _gid} ->
+        socket
+        |> assign(group_form: nil)
+        |> assign(
+          :group_msg,
+          "Group “#{String.trim(form.name)}” created. Its bulbs are being asked to join, " <>
+            "and Home Assistant reconnects briefly to add it."
+        )
+        |> refresh_groups()
+
+      {:error, reason} ->
+        socket |> refresh_groups() |> form_error(form, reason)
+    end
+  end
+
+  defp save_group_form(socket, %{mode: :rename} = form) do
+    current = live_group(socket.assigns.group_sync, form.gid)
+
+    cond do
+      current == nil ->
+        assign(socket, group_form: nil, group_error: group_error(:unknown_group, socket))
+
+      String.trim(form.name) == current.name ->
+        assign(socket, :group_form, nil)
+
+      true ->
+        case TuyaMesh.rename_group(form.gid, form.name) do
+          :ok ->
+            socket
+            |> assign(group_form: nil)
+            |> assign(
+              :group_msg,
+              "Group renamed to “#{String.trim(form.name)}”. " <>
+                "Home Assistant reconnects briefly to pick up the new name."
+            )
+            |> refresh_groups()
+
+          {:error, reason} ->
+            socket |> refresh_groups() |> form_error(form, reason)
+        end
+    end
+  end
+
+  # Only what the user changed against the members shown when the form
+  # opened, and only where the group still differs (another tab may have
+  # made the same change).
+  defp save_group_form(socket, %{mode: :members} = form) do
+    socket = refresh_groups(socket)
+
+    case live_group(socket.assigns.group_sync, form.gid) do
+      nil ->
+        assign(socket, group_form: nil, group_error: group_error(:unknown_group, socket))
+
+      group ->
+        adds = Enum.reject(form.selected -- form.baseline, &(&1 in group.members))
+        removes = Enum.filter(form.baseline -- form.selected, &(&1 in group.members))
+
+        results =
+          Enum.map(adds, &{&1, TuyaMesh.add_member(form.gid, &1)}) ++
+            Enum.map(removes, &{&1, TuyaMesh.remove_member(form.gid, &1)})
+
+        socket = refresh_groups(socket)
+
+        case for({mac, {:error, reason}} <- results, do: member_error(socket, mac, reason)) do
+          [] when results == [] ->
+            assign(socket, :group_form, nil)
+
+          [] ->
+            assign(socket,
+              group_form: nil,
+              group_msg: "Member changes sent. Each bulb's state updates as it confirms."
+            )
+
+          errors ->
+            # What went through is the new baseline: saving again only
+            # retries the rest.
+            members =
+              case live_group(socket.assigns.group_sync, form.gid) do
+                %{members: members} -> members
+                nil -> form.baseline
+              end
+
+            text = errors |> Enum.uniq() |> Enum.join(" ")
+            show_form_error(socket, %{form | baseline: members}, :error, text)
+        end
+    end
+  end
+
+  defp form_error(socket, form, reason) when reason in [:bad_group_name, :duplicate_group_name],
+    do: show_form_error(socket, form, :name_error, group_error(reason, socket))
+
+  defp form_error(socket, form, reason),
+    do: show_form_error(socket, form, :error, group_error(reason, socket))
+
+  # Called after a refresh. A form that is no longer shown (its group gone,
+  # or the editor read-only with Lights down) takes its error to the
+  # section instead.
+  defp show_form_error(socket, form, field, text) do
+    if socket.assigns.group_sync != nil and socket.assigns.group_form != nil do
+      form = Map.merge(form, %{error: nil, name_error: nil}) |> Map.put(field, text)
+      assign(socket, :group_form, form)
+    else
+      assign(socket, group_form: nil, group_error: text)
+    end
+  end
+
+  defp member_error(socket, _mac, {:group_slots_full, _} = reason),
+    do: group_error(reason, socket)
+
+  defp member_error(socket, mac, reason),
+    do: "#{bulb_label(socket, mac)}: #{group_error(reason, socket)}"
+
+  defp delete_group(socket, %{gid: gid} = deleting) do
+    socket = refresh_groups(socket)
+
+    with %{} <- live_group(socket.assigns.group_sync, gid),
+         :ok <- TuyaMesh.delete_group(gid) do
+      socket
+      |> assign(
+        :group_msg,
+        "Group “#{deleting.name}” deleted. Its bulbs are being asked to leave it, " <>
+          "and Home Assistant reconnects briefly to remove it."
+      )
+      |> refresh_groups()
+    else
+      nil ->
+        assign(socket, :group_error, group_error(:unknown_group, socket))
+
+      {:error, reason} ->
+        socket |> assign(:group_error, group_error(reason, socket)) |> refresh_groups()
+    end
+  end
+
+  # Re-sends an unconfirmed change, only while it is still unconfirmed and
+  # still the group's intent (a join for a member, a removal otherwise).
+  defp retry_member(socket, gid, mac) do
+    with %{} = group <- find_group(socket.assigns.group_sync, gid),
+         %{op: op, state: :unconfirmed} <- Map.get(group.sync, mac),
+         true <- op == :add == mac in group.members do
+      result =
+        if op == :add,
+          do: TuyaMesh.add_member(group.local_id, mac),
+          else: TuyaMesh.remove_member(group.local_id, mac)
+
+      case result do
+        :ok ->
+          socket
+          |> assign(group_msg: "Sent again to #{bulb_label(socket, mac)}.", group_error: nil)
+          |> refresh_groups()
+
+        {:error, reason} ->
+          socket
+          |> assign(group_msg: nil, group_error: member_error(socket, mac, reason))
+          |> refresh_groups()
+      end
+    else
+      _ -> socket
+    end
+  end
+
+  defp retry_removal(socket, gid) do
+    case find_group(socket.assigns.group_sync, gid) do
+      %{deleted: true, local_id: id} -> resend_removal(socket, id)
+      _ -> socket
+    end
+  end
+
+  defp resend_removal(socket, gid) do
+    case TuyaMesh.delete_group(gid) do
+      :ok ->
+        socket
+        |> assign(group_msg: "Removal sent again.", group_error: nil)
+        |> refresh_groups()
+
+      {:error, reason} ->
+        socket
+        |> assign(group_msg: nil, group_error: group_error(reason, socket))
+        |> refresh_groups()
+    end
+  end
+
+  defp bulb_label(socket, mac) do
+    case Enum.find(socket.assigns.status.bulbs, &(&1.mac == mac)) do
+      %{label: label} when is_binary(label) -> label
+      _ -> mac
+    end
+  end
 
   # ── Actions ─────────────────────────────────────────────────────────────
 
@@ -582,18 +973,17 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
           <.bulb_row :for={bulb <- @status.bulbs} bulb={bulb} now={@now} />
         </div>
 
-        <div :if={@status.groups != []} class="border-t border-border-2 p-[14px_22px]">
-          <div class="text-[11px] text-fg-3 font-semibold mb-1.5">Groups</div>
-          <div class="flex flex-col gap-1.5">
-            <div :for={group <- @status.groups} class="flex items-center gap-2.5 text-sm flex-wrap">
-              <span class="font-semibold">{group.name || "Group #{group.local_id}"}</span>
-              <span class="text-[11px] text-fg-3 font-mono">id {group.local_id}</span>
-              <span class="text-xs text-fg-3">
-                {length(group.members)} {pluralize(length(group.members), "bulb", "bulbs")}
-              </span>
-            </div>
-          </div>
-        </div>
+        <.groups_section
+          :if={@group_sync != nil or @status.groups != []}
+          groups={group_views(@status, @group_sync)}
+          editable={@group_sync != nil}
+          bulbs={@status.bulbs}
+          slots={if(@group_sync, do: @group_sync.slots, else: %{})}
+          form={@group_form}
+          message={@group_msg}
+          error={@group_error}
+          myself={@myself}
+        />
 
         <.settings_section
           :if={@status.bulbs != []}
@@ -622,7 +1012,344 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
         myself={@myself}
       />
       <.clear_modal :if={@clearing} mode={@clearing} myself={@myself} />
+      <.delete_group_modal :if={@deleting} group={@deleting} myself={@myself} />
     </div>
+    """
+  end
+
+  # The editor's groups, or (Lights not answering) the status's, read-only.
+  defp group_views(_status, %{groups: groups}), do: groups
+
+  defp group_views(status, nil) do
+    for g <- status.groups,
+        do: %{
+          local_id: g.local_id,
+          name: g.name,
+          members: g.members,
+          holders: g.members,
+          deleted: false,
+          sync: %{}
+        }
+  end
+
+  attr(:groups, :list, required: true)
+  attr(:editable, :boolean, required: true)
+  attr(:bulbs, :list, required: true)
+  attr(:slots, :map, required: true)
+  attr(:form, :map, default: nil)
+  attr(:message, :string, default: nil)
+  attr(:error, :string, default: nil)
+  attr(:myself, :any, required: true)
+
+  defp groups_section(assigns) do
+    assigns =
+      assigns
+      |> assign(:live, Enum.reject(assigns.groups, & &1.deleted))
+      |> assign(:leaving, Enum.filter(assigns.groups, & &1.deleted))
+      |> assign(:labels, Map.new(assigns.bulbs, &{&1.mac, &1.label || &1.mac}))
+
+    ~H"""
+    <div id="tuya-mesh-groups" class="border-t border-border-2 p-[14px_22px]">
+      <div class="flex items-center gap-2.5 mb-1.5">
+        <div class="text-[11px] text-fg-3 font-semibold flex-1">Groups</div>
+        <.button
+          :if={@editable and not match?(%{mode: :create}, @form)}
+          size={:sm}
+          phx-click="new_group"
+          phx-target={@myself}
+        >
+          <.icon name={:plus} size={14} /> New group
+        </.button>
+      </div>
+      <div :if={@editable} class="text-xs text-fg-3 mb-2.5">
+        Creating, renaming or deleting a group briefly reconnects Home Assistant.
+        Changing a group's members doesn't.
+      </div>
+      <div :if={not @editable} class="text-xs text-fg-3 mb-2.5">
+        Groups can be edited while the mesh is running.
+      </div>
+
+      <div
+        :if={@message}
+        role="status"
+        class="mb-2.5 p-[10px_12px] rounded-md bg-success-soft text-success text-xs font-medium flex items-start gap-2"
+      >
+        <.icon name={:check} size={14} stroke={2.0} class="mt-px flex-none" />
+        <span class="flex-1">{@message}</span>
+      </div>
+      <div
+        :if={@error}
+        role="alert"
+        class="mb-2.5 p-[10px_12px] rounded-md bg-warning-soft text-warning text-xs font-medium flex items-start gap-2"
+      >
+        <.icon name={:alert} size={14} stroke={2.0} class="mt-px flex-none" />
+        <span class="flex-1">{@error}</span>
+      </div>
+
+      <.group_form
+        :if={@editable and match?(%{mode: :create}, @form)}
+        form={@form}
+        bulbs={@bulbs}
+        slots={@slots}
+        holders={[]}
+        myself={@myself}
+      />
+
+      <div class="flex flex-col">
+        <div
+          :for={group <- @live}
+          id={"tuya-group-#{group.local_id}"}
+          class="py-2 border-b border-border-2 last:border-b-0"
+        >
+          <div class="flex items-center gap-2.5 text-sm flex-wrap">
+            <span class="font-semibold">{group.name || "Group #{group.local_id}"}</span>
+            <span class="text-[11px] text-fg-3 font-mono">id {group.local_id}</span>
+            <span class="text-xs text-fg-3">
+              {length(group.members)} {pluralize(length(group.members), "bulb", "bulbs")}
+            </span>
+            <div :if={@editable} class="flex-1"></div>
+            <div :if={@editable} class="flex items-center gap-2">
+              <.button
+                variant={:ghost}
+                size={:sm}
+                phx-click="edit_members"
+                phx-value-gid={group.local_id}
+                phx-target={@myself}
+              >
+                Edit members
+              </.button>
+              <.button
+                variant={:ghost}
+                size={:sm}
+                phx-click="rename_group"
+                phx-value-gid={group.local_id}
+                phx-target={@myself}
+              >
+                <.icon name={:pencil} size={14} /> Rename
+              </.button>
+              <.button
+                variant={:ghost}
+                size={:sm}
+                phx-click="ask_delete_group"
+                phx-value-gid={group.local_id}
+                phx-target={@myself}
+              >
+                <.icon name={:x} size={14} /> Delete
+              </.button>
+            </div>
+          </div>
+          <.member_states group={group} labels={@labels} editable={@editable} myself={@myself} />
+          <.group_form
+            :if={@editable and editing_group?(@form, group.local_id)}
+            form={@form}
+            bulbs={@bulbs}
+            slots={@slots}
+            holders={group.holders}
+            myself={@myself}
+          />
+        </div>
+
+        <div
+          :for={group <- @leaving}
+          id={"tuya-group-#{group.local_id}"}
+          class="py-2 border-b border-border-2 last:border-b-0 text-fg-3"
+        >
+          <div class="flex items-center gap-2.5 text-sm flex-wrap">
+            <span class="font-semibold">{group.name || "Group #{group.local_id}"}</span>
+            <span class="text-[11px] font-mono">id {group.local_id}</span>
+            <.badge>Leaving</.badge>
+            <div class="flex-1"></div>
+            <.button
+              :if={@editable}
+              variant={:ghost}
+              size={:sm}
+              phx-click="retry_removal"
+              phx-value-gid={group.local_id}
+              phx-target={@myself}
+            >
+              <.icon name={:refresh} size={14} /> Retry removal
+            </.button>
+          </div>
+          <div class="text-xs mt-1">
+            Not in the inventory any more. Still held by
+            {Enum.map_join(group.holders, ", ", &Map.get(@labels, &1, &1))}.
+          </div>
+          <.member_states group={group} labels={@labels} editable={false} myself={@myself} />
+        </div>
+      </div>
+    </div>
+    """
+  end
+
+  attr(:group, :map, required: true)
+  attr(:labels, :map, required: true)
+  attr(:editable, :boolean, required: true)
+  attr(:myself, :any, required: true)
+
+  # Members, and bulbs with a change still tracked in the group; a finished
+  # removal (confirmed, not a member) is no longer listed.
+  defp member_states(assigns) do
+    %{members: members, sync: sync} = assigns.group
+
+    rows =
+      (members ++ Map.keys(sync))
+      |> Enum.uniq()
+      |> Enum.reject(&(&1 not in members and match?(%{op: :remove, state: :confirmed}, sync[&1])))
+      |> Enum.map(&%{mac: &1, label: Map.get(assigns.labels, &1, &1), sync: sync[&1]})
+      |> Enum.sort_by(& &1.label)
+
+    assigns = assign(assigns, :rows, rows)
+
+    ~H"""
+    <div :if={@rows != []} class="flex flex-col gap-1 mt-1.5">
+      <div :for={row <- @rows} class="flex items-center gap-2 text-xs text-fg-2 flex-wrap">
+        <span class="min-w-0 truncate">{row.label}</span>
+        <.badge :if={row.sync} variant={sync_variant(row.sync)}>{sync_label(row.sync)}</.badge>
+        <.button
+          :if={@editable and match?(%{state: :unconfirmed}, row.sync)}
+          variant={:ghost}
+          size={:sm}
+          phx-click="retry_member"
+          phx-value-gid={@group.local_id}
+          phx-value-mac={row.mac}
+          phx-target={@myself}
+        >
+          <.icon name={:refresh} size={14} /> Retry
+        </.button>
+      </div>
+    </div>
+    """
+  end
+
+  defp sync_variant(%{state: :pending}), do: :accent
+  defp sync_variant(%{state: :confirmed}), do: :success
+  defp sync_variant(%{state: :unconfirmed}), do: :warning
+
+  defp sync_label(%{op: :add, state: :pending}), do: "Joining…"
+  defp sync_label(%{op: :add, state: :confirmed}), do: "Confirmed"
+  defp sync_label(%{op: :add, state: :unconfirmed}), do: "Join unconfirmed"
+  defp sync_label(%{op: :remove, state: :pending}), do: "Leaving…"
+  defp sync_label(%{op: :remove, state: :confirmed}), do: "Left"
+  defp sync_label(%{op: :remove, state: :unconfirmed}), do: "Leave unconfirmed"
+
+  attr(:form, :map, required: true)
+  attr(:bulbs, :list, required: true)
+  attr(:slots, :map, required: true)
+  # Bulbs that may already hold the group: they need no free slot.
+  attr(:holders, :list, required: true)
+  attr(:myself, :any, required: true)
+
+  defp group_form(assigns) do
+    assigns =
+      assign(assigns,
+        title: group_form_title(assigns.form.mode),
+        named: assigns.form.mode in [:create, :rename],
+        checklist: assigns.form.mode in [:create, :members],
+        full: @group_slots
+      )
+
+    ~H"""
+    <form
+      id="tuya-group-form"
+      phx-change="group_form_change"
+      phx-submit="save_group_form"
+      phx-target={@myself}
+      class="mt-2.5 mb-2.5 p-[10px_12px] rounded-md bg-sunken"
+    >
+      <div class="text-sm font-semibold mb-1.5">{@title}</div>
+      <.field :if={@named} label="Name" error={@form.name_error}>
+        <.text_input
+          name="group[name]"
+          id="tuya-group-form-name"
+          value={@form.name}
+          aria-label="Group name"
+          autocomplete="off"
+          maxlength="64"
+        />
+      </.field>
+      <fieldset :if={@checklist} class="flex flex-col gap-1.5 mt-2.5">
+        <legend class="text-sm font-medium text-fg-2 mb-1.5">Bulbs</legend>
+        <%!-- Submitted with nothing ticked too, so an empty list means "none". --%>
+        <input type="hidden" name="group[members][]" value="" />
+        <label
+          :for={bulb <- @bulbs}
+          class="flex items-center gap-2 text-sm cursor-pointer"
+        >
+          <input
+            type="checkbox"
+            name="group[members][]"
+            value={bulb.mac}
+            checked={bulb.mac in @form.selected}
+            disabled={Map.get(@slots, bulb.mac, 0) >= @full and bulb.mac not in @holders}
+            class="rounded-sm"
+          />
+          <span class="flex-1 min-w-0 truncate">{bulb.label || bulb.mac}</span>
+          <span class="text-[11px] text-fg-3 font-mono">
+            {Map.get(@slots, bulb.mac, 0)}/{@full}
+          </span>
+        </label>
+        <div :if={@bulbs == []} class="text-xs text-fg-3">No bulbs in the mesh.</div>
+        <div class="text-xs text-fg-3">
+          A bulb holds at most {@full} groups; a full one can't be added.
+        </div>
+      </fieldset>
+      <div
+        :if={@form.error}
+        role="alert"
+        class="mt-2.5 p-[10px_12px] rounded-md bg-warning-soft text-warning text-xs font-medium flex items-start gap-2"
+      >
+        <.icon name={:alert} size={14} stroke={2.0} class="mt-px flex-none" />
+        <span class="flex-1">{@form.error}</span>
+      </div>
+      <div class="flex items-center gap-2 mt-2.5">
+        <.button type="submit" variant={:primary} size={:sm} phx-disable-with="Saving…">
+          {if @form.mode == :create, do: "Create group", else: "Save"}
+        </.button>
+        <.button variant={:ghost} size={:sm} phx-click="cancel_group_form" phx-target={@myself}>
+          Cancel
+        </.button>
+      </div>
+    </form>
+    """
+  end
+
+  defp editing_group?(%{gid: gid}, gid), do: true
+  defp editing_group?(_form, _gid), do: false
+
+  defp group_form_title(:create), do: "New group"
+  defp group_form_title(:rename), do: "Rename group"
+  defp group_form_title(:members), do: "Edit members"
+
+  attr(:group, :map, required: true)
+  attr(:myself, :any, required: true)
+
+  defp delete_group_modal(assigns) do
+    ~H"""
+    <.modal
+      open={true}
+      on_close="cancel_delete_group"
+      target={@myself}
+      title={"Delete the group “#{@group.name}”?"}
+    >
+      <:footer>
+        <.button variant={:ghost} size={:sm} phx-click="cancel_delete_group" phx-target={@myself}>
+          Cancel
+        </.button>
+        <.button
+          variant={:danger}
+          size={:sm}
+          phx-click="confirm_delete_group"
+          phx-target={@myself}
+          phx-disable-with="Deleting…"
+        >
+          Delete group
+        </.button>
+      </:footer>
+      <p class="text-sm text-fg-2 mt-0 mb-0">
+        Its {@group.members} {pluralize(@group.members, "bulb", "bulbs")} are asked to leave it, and
+        Home&nbsp;Assistant removes its light. Home&nbsp;Assistant reconnects briefly.
+      </p>
+    </.modal>
     """
   end
 
@@ -1179,6 +1906,29 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
       "The mesh didn't answer in time. The change may still have been applied: check the status before retrying."
 
   defp change_error(_reason), do: "That didn't work. Try again."
+
+  # TuyaMesh's group operations.
+  defp group_error({:group_slots_full, mac}, socket),
+    do:
+      "#{bulb_label(socket, mac)} already belongs to #{@group_slots} groups, the most a bulb can hold. " <>
+        "Nothing was changed."
+
+  defp group_error(:bad_group_name, _socket), do: "Enter a name of 1 to 64 characters."
+  defp group_error(:duplicate_group_name, _socket), do: "Another group already has that name."
+
+  defp group_error(:no_free_group_id, _socket),
+    do: "Every group id is in use. Delete a group first."
+
+  defp group_error(:not_running, _socket),
+    do: "The mesh isn't running, so groups can't be changed right now. Nothing was changed."
+
+  defp group_error(:persist_failed, _socket),
+    do: "The change couldn't be saved on this device. Nothing was changed."
+
+  defp group_error(:unknown_group, _socket), do: "That group no longer exists."
+  defp group_error(:unknown_bulb, _socket), do: "That bulb is no longer in the mesh."
+  defp group_error(:not_member, _socket), do: "That bulb isn't in the group any more."
+  defp group_error(reason, _socket), do: change_error(reason)
 
   defp inventory_error(:too_large), do: "it is larger than 64 KB."
   defp inventory_error({:invalid_json, pos}), do: "it isn't valid JSON (error at byte #{pos})."
