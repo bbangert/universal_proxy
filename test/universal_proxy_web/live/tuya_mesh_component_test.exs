@@ -913,7 +913,20 @@ defmodule UniversalProxyWeb.TuyaMeshComponentTest do
       html = save_settings(view_b, %{warm_k: "2700", cool_k: "3000"})
       assert html =~ "doesn&#39;t fit the colour temperature stored now"
       assert Store.settings(store) == %{min_mireds: 222, max_mireds: 250, invert: false}
+
+      # B's untouched warm field follows the Store; its edit stays, and is
+      # now flagged against A's range, with nothing to save.
+      assert has_element?(view_b, "input[name='settings[warm_k]'][value='4000']")
       assert has_element?(view_b, "input[name='settings[cool_k]'][value='3000']")
+      assert render(view_b) =~ "Must be higher than the warm temperature."
+      refute has_element?(view_b, "#{@settings_form} button[type=submit]")
+
+      # Correcting only the cool field sends just that key: A's warm stays.
+      html = change_settings(view_b, %{cool_k: "5000"})
+      refute html =~ "Must be higher"
+      assert has_element?(view_b, "#{@settings_form} button[type=submit]")
+      save_settings(view_b, %{warm_k: "4000", cool_k: "5000"})
+      assert Store.settings(store) == %{min_mireds: 200, max_mireds: 250, invert: false}
     end
 
     test "the invert toggle round-trips", %{conn: conn, store: store} do

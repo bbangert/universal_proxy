@@ -290,15 +290,17 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   # (strings); `settings_change` is `{:ok, changes}` for a valid entry that
   # differs from `stored`, `:unchanged`, or `{:error, errors}`.
   defp assign_settings(socket, stored) do
-    params = %{
+    socket
+    |> assign(stored_settings: stored, settings_msg: nil, settings_error: nil)
+    |> put_settings_form(settings_params_for(stored))
+  end
+
+  defp settings_params_for(stored) do
+    %{
       "warm_k" => Integer.to_string(mireds_to_kelvin(stored.max_mireds)),
       "cool_k" => Integer.to_string(mireds_to_kelvin(stored.min_mireds)),
       "invert" => Atom.to_string(stored.invert)
     }
-
-    socket
-    |> assign(stored_settings: stored, settings_msg: nil, settings_error: nil)
-    |> put_settings_form(params)
   end
 
   defp edit_settings(socket, params) do
@@ -339,10 +341,27 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
 
       {:error, reason} ->
         socket
-        |> assign(:stored_settings, TuyaMesh.settings())
-        |> put_settings_form(socket.assigns.settings_params)
+        |> rebase_settings(TuyaMesh.settings())
         |> assign(:settings_error, change_error(reason))
     end
+  end
+
+  # The Store moved on under this form: fields the user hasn't edited (still
+  # as displayed for the old baseline) follow the new stored values, edited
+  # ones keep their text, and everything is validated against the new
+  # baseline, so a retry sends only what was really edited.
+  defp rebase_settings(socket, fresh) do
+    %{stored_settings: old, settings_params: params} = socket.assigns
+    shown = settings_params_for(fresh)
+
+    rebased =
+      Map.new(params, fn {key, value} ->
+        if value == Map.fetch!(settings_params_for(old), key),
+          do: {key, Map.fetch!(shown, key)},
+          else: {key, value}
+      end)
+
+    socket |> assign(:stored_settings, fresh) |> put_settings_form(rebased)
   end
 
   defp settings_change(params, stored) do
