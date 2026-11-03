@@ -90,6 +90,27 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   check drops the stale commands and kept DPs at once (subscribed at
   start; the per-send check is what guarantees it).
 
+  ## Membership changes
+
+  A group command's members are resolved when it is admitted (`:members`);
+  a pending one then follows the group's membership as the Resolver's
+  status reports it (each status against the one before, so a status
+  delivered late never undoes the membership the command was admitted
+  with):
+
+    * **Joined:** a bulb that joined gets the group's command as its own
+      bulb command, unless it already has a newer command (its own or
+      another group's). Being the newer one, it replaces the bulb's older
+      pending command.
+    * **Left:** a bulb that left gets nothing more from the command (its
+      planned direct frames are dropped) and no longer takes the group's
+      sends into its kept state.
+    * **Deleted:** a group gone from the status has its command dropped,
+      with its kept and pushed state.
+
+  The group's state is derived again from its current members (see
+  "Light state") and pushed when that changes it.
+
   ## Light state
 
   This process is the only one that pushes light states to Home
@@ -135,7 +156,8 @@ defmodule UniversalProxy.TuyaMesh.Commander do
 
   Options: `:name`, `:lights` (module, default `Lights`) and `:lights_opts`
   (extra options to its calls, e.g. `server:`), `:members` (`gid ->
-  {:ok, [mac]} | :error`, default from `UniversalProxy.TuyaMesh.status/1`),
+  {:ok, [mac]} | :error`, read at admission, default from
+  `UniversalProxy.TuyaMesh.status/1`; see "Membership changes"),
   `:device_ids` (`-> map`, default `Store.device_ids/1`), `:pubsub` and
   `:subscribe` (default `true`) for the Store broadcasts, `:push` (`struct
   -> any`, default `Espex.push_state/2` on `:server`), `:server`,
@@ -313,7 +335,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   def handle_info(:resubscribe, state), do: {:noreply, state |> subscribe() |> reschedule()}
 
   def handle_info({:tuya_mesh_status, status}, state),
-    do: {:noreply, state |> apply_status(status) |> arm_flush()}
+    do: {:noreply, state |> apply_status(status) |> arm_flush() |> reschedule()}
 
   def handle_info({:flush, token}, %{flush: {token, _tref}} = state),
     do: {:noreply, %{state | flush: nil} |> flush()}
@@ -337,6 +359,9 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       pending: batches,
       sent: [],
       members: members,
+      # The group's membership as last resolved (`members` also drops the
+      # members a diversion skips).
+      resolved: members,
       snapshot: snapshot(state, target, members),
       sent_at: nil,
       then_check?: false,
@@ -976,6 +1001,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   # it was last set here replaces the kept value (see `Commands.reconcile_components/2`).
   defp apply_status(state, %{bulbs: bulbs} = status) when is_list(bulbs) do
     ids = read_ids(state)
+    old_groups = state.mesh_groups
 
     groups =
       Map.new(Map.get(status, :groups, []), fn g -> {g.local_id, Map.get(g, :members, [])} end)
@@ -992,6 +1018,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       %{state | mesh_groups: groups, views: Map.drop(state.views, removed)}
       |> forget_pushed(removed)
       |> mark_dirty(changed)
+      |> regroup(old_groups, groups, ids)
 
     {state, macs} =
       Enum.reduce(bulbs, {state, []}, fn bulb, {state, macs} ->
@@ -1059,6 +1086,84 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   end
 
   defp real_report(_state, _bulb, _id), do: nil
+
+  # ── Membership changes ───────────────────────────────────────────────
+
+  # Pending group commands follow what changed between the last status
+  # and this one (see "Membership changes"); a group first seen now has
+  # nothing to compare. Newest command first, so a bulb that joined
+  # several groups gets the newest of their commands.
+  defp regroup(state, old_groups, groups, ids) do
+    state.jobs
+    |> Map.values()
+    |> Enum.filter(&match?(%{target: {:group, gid}} when is_map_key(old_groups, gid), &1))
+    |> Enum.sort_by(& &1.id, :desc)
+    |> Enum.reduce(state, fn %{target: {:group, gid}} = job, state ->
+      before = Map.fetch!(old_groups, gid)
+
+      case Map.fetch(groups, gid) do
+        {:ok, ^before} -> state
+        {:ok, members} -> regroup_job(state, job, members -- before, before -- members, ids)
+        :error -> drop_deleted(state, job)
+      end
+    end)
+  end
+
+  defp drop_deleted(state, job) do
+    Logger.info("TuyaMesh.Commander: #{describe(job.target)} was deleted; its command dropped")
+    done(state, job)
+  end
+
+  defp regroup_job(state, job, joined, left, ids) do
+    joined = joined -- job.resolved
+    left = Enum.filter(left, &(&1 in job.resolved))
+
+    job = %{
+      job
+      | resolved: (job.resolved ++ joined) -- left,
+        members: job.members -- left,
+        snapshot: Map.drop(job.snapshot, left),
+        accepted: Map.drop(job.accepted, left),
+        pending: drop_macs(job, left)
+    }
+
+    state = %{state | jobs: Map.put(state.jobs, job.target, job)}
+
+    # A command for a light that is no longer the one commanded reaches no
+    # new member (the next step abandons it).
+    if valid?(ids, job.target, job.command.device_id),
+      do: Enum.reduce(joined, state, &hand_over(&2, job, &1, ids)),
+      else: state
+  end
+
+  # Direct frames are `{mac, batch}`; a broadcast's pending batches aren't.
+  defp drop_macs(%{phase: phase, pending: pending}, macs) when phase in [:direct, :followup],
+    do: Enum.reject(pending, fn {mac, _batch} -> mac in macs end)
+
+  defp drop_macs(%{pending: pending}, _macs), do: pending
+
+  # A joined bulb gets the group's command as its own, unless a newer one
+  # already addresses it.
+  defp hand_over(state, job, mac, ids) do
+    target = {:bulb, mac}
+
+    case Map.get(ids, target) do
+      id when is_integer(id) ->
+        if newer_command?(state, mac, job) do
+          state
+        else
+          Logger.debug(
+            "TuyaMesh.Commander: #{describe(job.target)} command goes to #{mac}, joined"
+          )
+
+          command = %{job.command | target: target, key: light_key(target), device_id: id}
+          admit(state, command)
+        end
+
+      nil ->
+        state
+    end
+  end
 
   defp groups_of(state, macs) do
     for {gid, members} <- state.mesh_groups, Enum.any?(macs, &(&1 in members)), do: {:group, gid}
