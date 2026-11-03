@@ -751,4 +751,262 @@ defmodule UniversalProxyWeb.TuyaMeshComponentTest do
       assert Store.load(ctx.store) == {:error, :no_inventory}
     end
   end
+
+  describe "colour temperature" do
+    setup do
+      assign_role()
+      :ok
+    end
+
+    @settings_form "#tuya-mesh-settings"
+
+    defp settings_view(conn) do
+      {:ok, _} = TuyaMesh.upload(KeyLeak.json())
+      mount_tab(conn)
+    end
+
+    defp change_settings(view, params),
+      do: view |> form(@settings_form, settings: params) |> render_change()
+
+    defp save_settings(view, params),
+      do: view |> form(@settings_form, settings: params) |> render_submit()
+
+    test "hidden until an inventory is loaded", %{conn: conn} do
+      view = mount_tab(conn)
+      refute has_element?(view, @settings_form)
+    end
+
+    test "shows the stored range in Kelvin, with nothing to save", %{conn: conn} do
+      view = settings_view(conn)
+
+      assert has_element?(
+               view,
+               "#{@settings_form} input[name='settings[warm_k]'][value='2700']"
+             )
+
+      assert has_element?(
+               view,
+               "#{@settings_form} input[name='settings[cool_k]'][value='6500']"
+             )
+
+      assert has_element?(view, "#{@settings_form} button[role=switch][aria-checked=false]")
+      refute has_element?(view, "#{@settings_form} button[type=submit]")
+      assert render(view) =~ "briefly reconnects Home Assistant"
+    end
+
+    test "a stored non-default range is shown in Kelvin", %{conn: conn, store: store} do
+      :ok = Store.put_settings(%{min_mireds: 200, max_mireds: 333, invert: true}, store)
+      view = settings_view(conn)
+
+      assert has_element?(view, "input[name='settings[warm_k]'][value='3000']")
+      assert has_element?(view, "input[name='settings[cool_k]'][value='5000']")
+      assert has_element?(view, "#{@settings_form} button[role=switch][aria-checked=true]")
+    end
+
+    test "a valid save stores the mireds and offers Save only while different",
+         %{conn: conn, store: store} do
+      view = settings_view(conn)
+
+      change_settings(view, %{warm_k: "3000", cool_k: "5000"})
+      assert has_element?(view, "#{@settings_form} button[type=submit]")
+
+      html = save_settings(view, %{warm_k: "3000", cool_k: "5000"})
+      assert Store.settings(store) == %{min_mireds: 200, max_mireds: 333, invert: false}
+      assert html =~ "Colour temperature saved."
+      assert has_element?(view, "input[name='settings[warm_k]'][value='3000']")
+      refute has_element?(view, "#{@settings_form} button[type=submit]")
+
+      # Back to the stored values: nothing to save again.
+      change_settings(view, %{warm_k: "3000", cool_k: "5100"})
+      assert has_element?(view, "#{@settings_form} button[type=submit]")
+      change_settings(view, %{warm_k: "3000", cool_k: "5000"})
+      refute has_element?(view, "#{@settings_form} button[type=submit]")
+    end
+
+    test "the default range saves back to 370 / 154 mireds", %{conn: conn, store: store} do
+      :ok = Store.put_settings(%{min_mireds: 200, max_mireds: 333}, store)
+      view = settings_view(conn)
+
+      save_settings(view, %{warm_k: "2700", cool_k: "6500"})
+      assert Store.settings(store) == %{min_mireds: 154, max_mireds: 370, invert: false}
+    end
+
+    test "a range the 50 K display rounds is not an edit after saving", %{
+      conn: conn,
+      store: store
+    } do
+      view = settings_view(conn)
+
+      save_settings(view, %{warm_k: "2710", cool_k: "6500"})
+      assert Store.settings(store) == %{min_mireds: 154, max_mireds: 369, invert: false}
+      assert has_element?(view, "input[name='settings[warm_k]'][value='2700']")
+      refute has_element?(view, "#{@settings_form} button[type=submit]")
+
+      # Reloaded, still nothing to save, and an Invert-only save keeps the mireds.
+      view = mount_tab(build_conn())
+      refute has_element?(view, "#{@settings_form} button[type=submit]")
+
+      view |> element("#{@settings_form} button[role=switch]") |> render_click()
+      assert has_element?(view, "#{@settings_form} button[type=submit]")
+      save_settings(view, %{warm_k: "2700", cool_k: "6500"})
+      assert Store.settings(store) == %{min_mireds: 154, max_mireds: 369, invert: true}
+
+      # Typing the displayed value into the other field still converts it.
+      change_settings(view, %{warm_k: "2710", cool_k: "6500"})
+      refute has_element?(view, "#{@settings_form} button[type=submit]")
+      change_settings(view, %{warm_k: "2700", cool_k: "6000"})
+      assert has_element?(view, "#{@settings_form} button[type=submit]")
+    end
+
+    test "two stored endpoints that display alike stay valid and exact",
+         %{conn: conn, store: store} do
+      :ok = Store.put_settings(%{min_mireds: 369, max_mireds: 370}, store)
+      view = settings_view(conn)
+
+      assert has_element?(view, "input[name='settings[warm_k]'][value='2700']")
+      assert has_element?(view, "input[name='settings[cool_k]'][value='2700']")
+      refute render(view) =~ "Must be higher"
+      refute has_element?(view, "#{@settings_form} button[type=submit]")
+
+      view |> element("#{@settings_form} button[role=switch]") |> render_click()
+      refute render(view) =~ "Must be higher"
+      assert has_element?(view, "#{@settings_form} button[type=submit]")
+
+      save_settings(view, %{warm_k: "2700", cool_k: "2700"})
+      assert Store.settings(store) == %{min_mireds: 369, max_mireds: 370, invert: true}
+
+      # Editing one field to the same Kelvin as the other is still an error.
+      html = change_settings(view, %{warm_k: "3000", cool_k: "3000"})
+      assert html =~ "Must be higher than the warm temperature."
+    end
+
+    test "a save sends only what this form changed, keeping another tab's newer values",
+         %{conn: conn, store: store} do
+      {:ok, _} = TuyaMesh.upload(KeyLeak.json())
+      view_a = mount_tab(conn)
+      view_b = mount_tab(build_conn())
+
+      save_settings(view_a, %{warm_k: "3000", cool_k: "5000"})
+      assert Store.settings(store) == %{min_mireds: 200, max_mireds: 333, invert: false}
+
+      # B still holds 2700-6500 and only flips Invert.
+      view_b |> element("#{@settings_form} button[role=switch]") |> render_click()
+      save_settings(view_b, %{warm_k: "2700", cool_k: "6500"})
+      assert Store.settings(store) == %{min_mireds: 200, max_mireds: 333, invert: true}
+
+      # B now shows what is stored.
+      assert has_element?(view_b, "input[name='settings[warm_k]'][value='3000']")
+      assert has_element?(view_b, "input[name='settings[cool_k]'][value='5000']")
+    end
+
+    test "a stale edit that no longer fits the stored range is reported inline",
+         %{conn: conn, store: store} do
+      {:ok, _} = TuyaMesh.upload(KeyLeak.json())
+      view_a = mount_tab(conn)
+      view_b = mount_tab(build_conn())
+
+      # A narrows the range to 4000-4500 K (250 / 222 mireds).
+      save_settings(view_a, %{warm_k: "4000", cool_k: "4500"})
+
+      # B (baseline 2700-6500) changes only the cool end to 3000 K: 333 mireds
+      # is not below the stored warm 250, so the merge is refused.
+      html = save_settings(view_b, %{warm_k: "2700", cool_k: "3000"})
+      assert html =~ "doesn&#39;t fit the colour temperature stored now"
+      assert Store.settings(store) == %{min_mireds: 222, max_mireds: 250, invert: false}
+
+      # B's untouched warm field follows the Store; its edit stays, and is
+      # now flagged against A's range, with nothing to save.
+      assert has_element?(view_b, "input[name='settings[warm_k]'][value='4000']")
+      assert has_element?(view_b, "input[name='settings[cool_k]'][value='3000']")
+      assert render(view_b) =~ "Must be higher than the warm temperature."
+      refute has_element?(view_b, "#{@settings_form} button[type=submit]")
+
+      # Correcting only the cool field sends just that key: A's warm stays.
+      html = change_settings(view_b, %{cool_k: "5000"})
+      refute html =~ "Must be higher"
+      assert has_element?(view_b, "#{@settings_form} button[type=submit]")
+      save_settings(view_b, %{warm_k: "4000", cool_k: "5000"})
+      assert Store.settings(store) == %{min_mireds: 200, max_mireds: 250, invert: false}
+    end
+
+    test "the invert toggle round-trips", %{conn: conn, store: store} do
+      view = settings_view(conn)
+
+      view |> element("#{@settings_form} button[role=switch]") |> render_click()
+      assert has_element?(view, "#{@settings_form} button[role=switch][aria-checked=true]")
+      assert has_element?(view, "#{@settings_form} input[type=hidden][value=true]")
+      assert has_element?(view, "#{@settings_form} button[type=submit]")
+
+      # A text edit keeps the toggled value.
+      change_settings(view, %{warm_k: "2700"})
+      assert has_element?(view, "#{@settings_form} button[role=switch][aria-checked=true]")
+
+      save_settings(view, %{warm_k: "2700", cool_k: "6500"})
+      assert %{invert: true, min_mireds: 154, max_mireds: 370} = Store.settings(store)
+      refute has_element?(view, "#{@settings_form} button[type=submit]")
+
+      # A fresh mount shows it on, and toggling off saves it back.
+      view = mount_tab(build_conn())
+      assert has_element?(view, "#{@settings_form} button[role=switch][aria-checked=true]")
+
+      view |> element("#{@settings_form} button[role=switch]") |> render_click()
+      save_settings(view, %{warm_k: "2700", cool_k: "6500"})
+      assert %{invert: false} = Store.settings(store)
+    end
+
+    test "invalid input shows errors and saves nothing", %{conn: conn, store: store} do
+      view = settings_view(conn)
+      stored = Store.settings(store)
+
+      for {params, message} <- [
+            {%{warm_k: "warm", cool_k: "6500"}, "Enter a whole number of Kelvin."},
+            {%{warm_k: "", cool_k: "6500"}, "Enter a whole number of Kelvin."},
+            {%{warm_k: "2700.5", cool_k: "6500"}, "Enter a whole number of Kelvin."},
+            {%{warm_k: "500", cool_k: "6500"}, "Must be between 1000 and 10000 K."},
+            {%{warm_k: "2700", cool_k: "20000"}, "Must be between 1000 and 10000 K."},
+            {%{warm_k: "5000", cool_k: "5000"}, "Must be higher than the warm temperature."},
+            {%{warm_k: "6500", cool_k: "2700"}, "Must be higher than the warm temperature."},
+            {%{warm_k: "9999", cool_k: "10000"}, "Too close to the warm temperature."}
+          ] do
+        html = change_settings(view, params)
+        assert html =~ message, "#{inspect(params)} should say #{message}"
+        refute has_element?(view, "#{@settings_form} button[type=submit]")
+
+        save_settings(view, params)
+        assert Store.settings(store) == stored
+      end
+
+      change_settings(view, %{warm_k: "2700", cool_k: "6500"})
+      refute render(view) =~ "Enter a whole number"
+    end
+
+    test "a save while the Store is down keeps form and baseline; the retry sends only the edit",
+         %{conn: conn, tmp_dir: tmp_dir, store: store} do
+      :ok = Store.put_settings(%{min_mireds: 200, max_mireds: 333}, store)
+      view = settings_view(conn)
+      change_settings(view, %{warm_k: "3500", cool_k: "5000"})
+      stop_supervised!(Store)
+
+      html = save_settings(view, %{warm_k: "3500", cool_k: "5000"})
+      assert html =~ "The Tuya mesh service isn&#39;t available right now."
+
+      # Not rebased onto the defaults the facade answers with meanwhile.
+      assert has_element?(view, "input[name='settings[warm_k]'][value='3500']")
+      assert has_element?(view, "input[name='settings[cool_k]'][value='5000']")
+      assert has_element?(view, "#{@settings_form} button[type=submit]")
+
+      store =
+        start_supervised!(
+          {Store,
+           enabled: true,
+           table: :"tuya_ui_store_restart_#{System.unique_integer([:positive])}",
+           dets_path: Path.join(tmp_dir, "mesh.dets")}
+        )
+
+      # Another tab moved the cool end meanwhile; the retry only sends warm.
+      :ok = Store.put_settings(%{min_mireds: 180}, store)
+      save_settings(view, %{warm_k: "3500", cool_k: "5000"})
+      assert Store.settings(store) == %{min_mireds: 180, max_mireds: 286, invert: false}
+    end
+  end
 end

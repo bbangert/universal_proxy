@@ -53,6 +53,17 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   (`Inventory.decode/1` names entries by MAC, node id, group id or
   position only). Nothing here logs or inspects the dump.
 
+  ## Colour temperature
+
+  Shown while an inventory is loaded. The warm and cool ends of the range
+  are entered in Kelvin (1000 to 10000, warm below cool) and stored as
+  mireds (`round(1_000_000 / K)`, `TuyaMesh.put_settings/1`); the stored
+  mireds are shown back as Kelvin rounded to 50, so a field left as shown
+  keeps its exact stored mired; only an edited field is converted. "Invert" is for bulbs whose
+  temperature scale runs the other way. Save is offered only for a valid
+  entry that differs from what is stored. A changed range is static info,
+  so the proxy re-advertises it and Home Assistant reconnects briefly.
+
   ## Status
 
   The parent subscribes to `TuyaMesh.topic/0` (a LiveComponent can't) and
@@ -94,6 +105,7 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
      # Result of the last action: `%{title:, preview:}` or `%{title:}`.
      |> assign(:notice, nil)
      |> assign(:error, nil)
+     |> assign_settings(TuyaMesh.settings())
      |> allow_upload(:inventory,
        accept: ~w(.json),
        max_entries: 1,
@@ -195,6 +207,25 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   def handle_event("confirm_force_clear", _params, %{assigns: %{clearing: :force}} = socket),
     do: {:noreply, clear(socket, force: true)}
 
+  # ── Colour temperature ──────────────────────────────────────────────────
+
+  def handle_event("validate_settings", %{"settings" => params}, socket),
+    do: {:noreply, edit_settings(socket, params)}
+
+  def handle_event("toggle_invert", _params, socket) do
+    invert = if socket.assigns.settings_params["invert"] == "true", do: "false", else: "true"
+    {:noreply, edit_settings(socket, %{"invert" => invert})}
+  end
+
+  def handle_event("save_settings", %{"settings" => params}, socket) do
+    socket = edit_settings(socket, params)
+
+    case socket.assigns.settings_change do
+      {:ok, changes} -> {:noreply, save_settings(socket, changes)}
+      _ -> {:noreply, socket}
+    end
+  end
+
   def handle_event(_event, _params, socket), do: {:noreply, socket}
 
   # ── Actions ─────────────────────────────────────────────────────────────
@@ -254,6 +285,158 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   defp new_token, do: Integer.to_string(System.unique_integer([:positive]))
 
   defp adoptable?(preview), do: match?(%{seq: %{reason: :beyond_bound}}, preview)
+
+  # `stored` is what the Store holds; `settings_params` what the form shows
+  # (strings); `settings_change` is `{:ok, changes}` for a valid entry that
+  # differs from `stored`, `:unchanged`, or `{:error, errors}`.
+  defp assign_settings(socket, stored) do
+    socket
+    |> assign(stored_settings: stored, settings_msg: nil, settings_error: nil)
+    |> put_settings_form(settings_params_for(stored))
+  end
+
+  defp settings_params_for(stored) do
+    %{
+      "warm_k" => Integer.to_string(mireds_to_kelvin(stored.max_mireds)),
+      "cool_k" => Integer.to_string(mireds_to_kelvin(stored.min_mireds)),
+      "invert" => Atom.to_string(stored.invert)
+    }
+  end
+
+  defp edit_settings(socket, params) do
+    params = Map.merge(socket.assigns.settings_params, Map.take(params, ~w(warm_k cool_k invert)))
+    socket |> assign(settings_msg: nil, settings_error: nil) |> put_settings_form(params)
+  end
+
+  defp put_settings_form(socket, params) do
+    change = settings_change(params, socket.assigns.stored_settings)
+
+    errors =
+      case change do
+        {:error, errors} -> for {field, msg} <- errors, do: {field, {msg, []}}
+        _ -> []
+      end
+
+    assign(socket,
+      settings_params: params,
+      settings_change: change,
+      settings_form: to_form(params, as: :settings, errors: errors)
+    )
+  end
+
+  # Only the keys that differ from this form's baseline are sent, so the
+  # Store's merge keeps newer values another tab saved for the rest.
+  defp save_settings(socket, changes) do
+    stored = socket.assigns.stored_settings
+    changed = Map.reject(changes, fn {key, value} -> Map.fetch!(stored, key) == value end)
+
+    case TuyaMesh.put_settings(changed) do
+      :ok ->
+        socket
+        |> assign_settings(TuyaMesh.settings())
+        |> assign(
+          :settings_msg,
+          "Colour temperature saved. Home Assistant reconnects briefly to pick up the new range."
+        )
+
+      # A reachable Store refused the merge: it holds newer values.
+      {:error, :invalid_settings} ->
+        socket
+        |> rebase_settings(TuyaMesh.settings())
+        |> assign(:settings_error, change_error(:invalid_settings))
+
+      # Store down or slow: its answer for `settings/0` would be the
+      # defaults, so baseline and form stay exactly as they were.
+      {:error, reason} ->
+        assign(socket, :settings_error, change_error(reason))
+    end
+  end
+
+  # The Store moved on under this form: fields the user hasn't edited (still
+  # as displayed for the old baseline) follow the new stored values, edited
+  # ones keep their text, and everything is validated against the new
+  # baseline, so a retry sends only what was really edited.
+  defp rebase_settings(socket, fresh) do
+    %{stored_settings: old, settings_params: params} = socket.assigns
+    shown = settings_params_for(fresh)
+
+    rebased =
+      Map.new(params, fn {key, value} ->
+        if value == Map.fetch!(settings_params_for(old), key),
+          do: {key, Map.fetch!(shown, key)},
+          else: {key, value}
+      end)
+
+    socket |> assign(:stored_settings, fresh) |> put_settings_form(rebased)
+  end
+
+  defp settings_change(params, stored) do
+    with {:ok, changes} <- parse_settings(params, stored) do
+      if changes == Map.take(stored, [:min_mireds, :max_mireds, :invert]),
+        do: :unchanged,
+        else: {:ok, changes}
+    end
+  end
+
+  @min_kelvin 1_000
+  @max_kelvin 10_000
+
+  # Each field resolves to a mired value: its stored one while the text still
+  # equals the Kelvin shown for it (the display is rounded to 50 K, so the
+  # text can't stand for the exact mired), else the entered Kelvin converted.
+  defp parse_settings(params, stored) do
+    warm = effective_mireds(params["warm_k"], stored.max_mireds)
+    cool = effective_mireds(params["cool_k"], stored.min_mireds)
+
+    errors =
+      Enum.flat_map([warm_k: warm, cool_k: cool], fn
+        {field, {:error, msg}} -> [{field, msg}]
+        _ -> []
+      end)
+
+    case {errors, warm, cool} do
+      {[], {:ok, max_mireds}, {:ok, min_mireds}} ->
+        order_settings(max_mireds, min_mireds, params, params["invert"] == "true")
+
+      _ ->
+        {:error, errors}
+    end
+  end
+
+  defp effective_mireds(text, stored_mireds) do
+    text = String.trim(text || "")
+
+    if text == Integer.to_string(mireds_to_kelvin(stored_mireds)),
+      do: {:ok, stored_mireds},
+      else: with({:ok, kelvin} <- parse_kelvin(text), do: {:ok, kelvin_to_mireds(kelvin)})
+  end
+
+  defp order_settings(max_mireds, min_mireds, params, invert) do
+    cond do
+      max_mireds < min_mireds ->
+        {:error, cool_k: "Must be higher than the warm temperature."}
+
+      # Mireds are whole numbers: two close temperatures can round together.
+      max_mireds == min_mireds ->
+        if String.trim(params["warm_k"]) == String.trim(params["cool_k"]),
+          do: {:error, cool_k: "Must be higher than the warm temperature."},
+          else: {:error, cool_k: "Too close to the warm temperature."}
+
+      true ->
+        {:ok, %{min_mireds: min_mireds, max_mireds: max_mireds, invert: invert}}
+    end
+  end
+
+  defp parse_kelvin(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {k, ""} when k in @min_kelvin..@max_kelvin -> {:ok, k}
+      {_k, ""} -> {:error, "Must be between #{@min_kelvin} and #{@max_kelvin} K."}
+      _ -> {:error, "Enter a whole number of Kelvin."}
+    end
+  end
+
+  defp kelvin_to_mireds(kelvin), do: round(1_000_000 / kelvin)
+  defp mireds_to_kelvin(mireds), do: round(1_000_000 / mireds / 50) * 50
 
   defp clear(socket, opts) do
     case TuyaMesh.clear(opts) do
@@ -411,6 +594,16 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
             </div>
           </div>
         </div>
+
+        <.settings_section
+          :if={@status.bulbs != []}
+          form={@settings_form}
+          invert={@settings_params["invert"] == "true"}
+          can_save={match?({:ok, _}, @settings_change)}
+          message={@settings_msg}
+          error={@settings_error}
+          myself={@myself}
+        />
       </.card>
 
       <.help />
@@ -431,6 +624,96 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
       <.clear_modal :if={@clearing} mode={@clearing} myself={@myself} />
     </div>
     """
+  end
+
+  attr(:form, Phoenix.HTML.Form, required: true)
+  attr(:invert, :boolean, required: true)
+  attr(:can_save, :boolean, required: true)
+  attr(:message, :string, default: nil)
+  attr(:error, :string, default: nil)
+  attr(:myself, :any, required: true)
+
+  defp settings_section(assigns) do
+    ~H"""
+    <.form
+      for={@form}
+      id="tuya-mesh-settings"
+      phx-change="validate_settings"
+      phx-submit="save_settings"
+      phx-target={@myself}
+      class="border-t border-border-2 p-[14px_22px]"
+    >
+      <div class="text-[11px] text-fg-3 font-semibold mb-1.5">Colour temperature</div>
+      <div class="flex items-start gap-3 flex-wrap">
+        <.field label="Warmest (K)" error={field_error(@form[:warm_k])} class="flex-1 min-w-0">
+          <.text_input
+            name={@form[:warm_k].name}
+            id={@form[:warm_k].id}
+            value={@form[:warm_k].value}
+            aria-label="Warmest colour temperature in Kelvin"
+            inputmode="numeric"
+            autocomplete="off"
+            maxlength="5"
+          />
+        </.field>
+        <.field label="Coolest (K)" error={field_error(@form[:cool_k])} class="flex-1 min-w-0">
+          <.text_input
+            name={@form[:cool_k].name}
+            id={@form[:cool_k].id}
+            value={@form[:cool_k].value}
+            aria-label="Coolest colour temperature in Kelvin"
+            inputmode="numeric"
+            autocomplete="off"
+            maxlength="5"
+          />
+        </.field>
+      </div>
+      <div class="flex items-center gap-2.5 mt-2.5">
+        <input type="hidden" name={@form[:invert].name} value={to_string(@invert)} />
+        <.toggle
+          checked={@invert}
+          phx-click="toggle_invert"
+          phx-target={@myself}
+          aria-label="Invert the temperature scale"
+        />
+        <span class="text-sm">Invert</span>
+        <span class="text-xs text-fg-3">
+          Only for bulbs that show warm as cool. Leave off otherwise.
+        </span>
+      </div>
+      <div class="text-xs text-fg-3 mt-2.5">
+        Changing the range briefly reconnects Home Assistant so it re-reads it.
+      </div>
+      <div
+        :if={@message}
+        role="status"
+        class="mt-2.5 p-[10px_12px] rounded-md bg-success-soft text-success text-xs font-medium flex items-start gap-2"
+      >
+        <.icon name={:check} size={14} stroke={2.0} class="mt-px flex-none" />
+        <span class="flex-1">{@message}</span>
+      </div>
+      <div
+        :if={@error}
+        role="alert"
+        class="mt-2.5 p-[10px_12px] rounded-md bg-warning-soft text-warning text-xs font-medium flex items-start gap-2"
+      >
+        <.icon name={:alert} size={14} stroke={2.0} class="mt-px flex-none" />
+        <span class="flex-1">{@error}</span>
+      </div>
+      <div :if={@can_save} class="mt-2.5">
+        <.button type="submit" variant={:primary} size={:sm} phx-disable-with="Saving…">
+          Save
+        </.button>
+      </div>
+    </.form>
+    """
+  end
+
+  defp field_error(field) do
+    case field.errors do
+      [{msg, _opts} | _] -> msg
+      [] -> nil
+    end
   end
 
   attr(:bulb, :map, required: true)
@@ -885,6 +1168,11 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
 
   defp change_error(:unavailable),
     do: "The Tuya mesh service isn't available right now. Try again shortly."
+
+  defp change_error(:invalid_settings),
+    do:
+      "That doesn't fit the colour temperature stored now (it may have changed in another tab). " <>
+        "Check the values and save again."
 
   defp change_error(:timeout),
     do:
