@@ -29,6 +29,11 @@ defmodule UniversalProxy.TuyaMesh.Mesh do
   The Radio gets the role MAC as `:adapter_address`, so it refuses an
   adapter that took over the index (see `TuyaBeaconMesh.Radio`).
 
+  The Radio's transport comes from the `:tuya_mesh_transport` app env:
+  `:auto` (the default: the HCI user channel, falling back to BlueZ),
+  `:user_channel` or `:bluez` (only that one; a debugging escape hatch).
+  A `:transport` in the `:radio` options wins over it.
+
   Options: `:adapter_index` (required), `:adapter_address`, `:radio`,
   `:lights` and `:presence` (keyword lists merged over the defaults; the
   Resolver passes `presence: [notify: self()]`), `:name`.
@@ -36,7 +41,10 @@ defmodule UniversalProxy.TuyaMesh.Mesh do
 
   use Supervisor
 
+  require Logger
+
   alias UniversalProxy.TuyaBeaconMesh.{Lights, Radio}
+  alias UniversalProxy.TuyaBeaconMesh.Radio.Transport
   alias UniversalProxy.TuyaMesh.{Presence, Store}
 
   def start_link(opts) do
@@ -58,7 +66,12 @@ defmodule UniversalProxy.TuyaMesh.Mesh do
 
     radio =
       Keyword.merge(
-        [adapter_index: index, adapter_address: Keyword.get(opts, :adapter_address), name: Radio],
+        [
+          adapter_index: index,
+          adapter_address: Keyword.get(opts, :adapter_address),
+          transport: transports(),
+          name: Radio
+        ],
         Keyword.get(opts, :radio, [])
       )
 
@@ -92,5 +105,25 @@ defmodule UniversalProxy.TuyaMesh.Mesh do
       max_restarts: 5,
       max_seconds: 60
     )
+  end
+
+  @doc false
+  # The Radio's `:transport` for the `:tuya_mesh_transport` app env.
+  @spec transports() :: [module()]
+  def transports do
+    case Application.get_env(:universal_proxy, :tuya_mesh_transport, :auto) do
+      :auto ->
+        [Transport.UserChannel, Transport.Bluez]
+
+      :user_channel ->
+        [Transport.UserChannel]
+
+      :bluez ->
+        [Transport.Bluez]
+
+      other ->
+        Logger.warning("TuyaMesh: unknown :tuya_mesh_transport #{inspect(other)}; using :auto")
+        [Transport.UserChannel, Transport.Bluez]
+    end
   end
 end

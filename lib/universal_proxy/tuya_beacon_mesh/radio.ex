@@ -4,14 +4,17 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   serialises transmissions, and fans received frames out to subscribers.
 
   The controller is reached through a
-  `UniversalProxy.TuyaBeaconMesh.Radio.Transport` (`:transport` option,
-  default `UniversalProxy.TuyaBeaconMesh.Radio.Transport.Bluez`:
-  `bluetoothd` discovery, a raw HCI advert receiver and a `Bluez.Mgmt`
-  advertising lease; its moduledoc has the setup steps and the adapter
-  fence). This module keeps everything that doesn't depend on how the
-  controller is driven: the TX queue and each frame's time on air,
-  `last_tx_sn`, duplicate and echo filtering, the fan-out, setup retries,
-  the health-check timer and wedge detection.
+  `UniversalProxy.TuyaBeaconMesh.Radio.Transport` (`:transport` option).
+  The default is
+  `UniversalProxy.TuyaBeaconMesh.Radio.Transport.UserChannel` (an
+  exclusive HCI user channel), falling back to
+  `UniversalProxy.TuyaBeaconMesh.Radio.Transport.Bluez` (`bluetoothd`
+  discovery, a raw HCI advert receiver and a `Bluez.Mgmt` advertising
+  lease); their moduledocs have the setup steps and the adapter fence.
+  This module keeps everything that doesn't depend on how the controller
+  is driven: the TX queue and each frame's time on air, `last_tx_sn`,
+  duplicate and echo filtering, the fan-out, setup retries, the
+  health-check timer, wedge detection and the transport fallback.
 
   When setup fails, the radio stays up but not ready: whatever the attempt
   got is undone (the transport's `teardown`), the reason is logged once
@@ -33,6 +36,20 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   On stop it takes any advert off air and the transport releases the
   controller.
 
+  ## Transport fallback
+
+  `:transport` is a module or a list of them, in order of preference. The
+  Radio starts with the first one whose `init/1` accepts the options (the
+  user channel needs `:adapter_address`). It moves to the next one, for
+  the rest of its life, when a setup fails in a way the transport calls
+  permanent (`c:UniversalProxy.TuyaBeaconMesh.Radio.Transport.fallback?/1`;
+  for the user channel, anything but the adapter being absent or another
+  adapter under its index): at once while it was never ready, or after
+  `:fallback_failures` (default 5) such failures in a row once it had
+  been. `status/1` shows the transport in use (`:transport`) and the
+  failure that caused the move (`:fallback_reason`, `nil` while on the
+  first choice).
+
   ## Wedged controller
 
   A controller can wedge with every process healthy and every check above
@@ -53,13 +70,14 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
 
   Recovery is the next setup, after `:wedge_retry_ms` (default 5 s,
   doubling per wedge up to `:max_wedge_retry_ms`, 60 s; reset by an
-  accepted advertise), with a controller reset added (Bluez: the adapter
-  is power-cycled right after the adapter fence and before the lease is
-  taken). A wedge that comes back before any advertise was accepted
-  (`:wedge_streak` 2 or more) is logged at error level and sets
-  `:controller_reset_needed`, and the radio keeps resetting on the
-  backoff above. Only resetting the transport (for a USB dongle, a port
-  reset or `btusb` unbind/bind) is left, and that is the host's call.
+  accepted advertise), with a controller reset added (user channel: HCI
+  Reset; Bluez: the adapter is power-cycled right after the adapter fence
+  and before the lease is taken). A wedge that comes back before any
+  advertise was accepted (`:wedge_streak` 2 or more) is logged at error
+  level and sets `:controller_reset_needed`, and the radio keeps
+  resetting on the backoff above. Only resetting the controller's
+  transport (for a USB dongle, a port reset or `btusb` unbind/bind) is
+  left, and that is the host's call.
 
   Hosts reading `status/1`: `:controller_reset_needed` means "reset the
   controller's transport", and stays set until an advertise is accepted
@@ -127,6 +145,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   @wedge_retry_ms 5_000
   @max_wedge_retry_ms 60_000
 
+  @transports [Transport.UserChannel, Transport.Bluez]
+  @fallback_failures 5
+
   # ── Client API ─────────────────────────────────────────────────────────
 
   @doc """
@@ -142,9 +163,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   #{@health_check_ms}), `:wedge_failures` (default #{@wedge_failures}),
   `:wedge_window_ms` (default #{@wedge_window_ms}), `:wedge_retry_ms`
   (default #{@wedge_retry_ms}) and `:max_wedge_retry_ms` (default
-  #{@max_wedge_retry_ms}) (see "Wedged controller"), and `:transport`
-  (default `UniversalProxy.TuyaBeaconMesh.Radio.Transport.Bluez`). The
-  options are passed on to the transport's `init/1` too (the Bluez
+  #{@max_wedge_retry_ms}) (see "Wedged controller"), `:transport` (a
+  module or a list, default `[Transport.UserChannel, Transport.Bluez]`)
+  and `:fallback_failures` (default #{@fallback_failures}) (see "Transport
+  fallback"). The options are passed on to the transport's `init/1` too
+  (the user channel's `:hci_user` and `:hci_user_opts`; the Bluez
   transport's `:bluez_radio`, `:mgmt`, `:rebus`, `:dbus`, `:receiver` and
   `:receiver_stop_ms`).
 
@@ -157,7 +180,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   end
 
   # Teardown can take several seconds when BlueZ is slow; a kill is still
-  # safe (Bluez.Radio ends the lease, the D-Bus connection closes).
+  # safe (Bluez.Radio ends the lease, the D-Bus connection closes, the
+  # user channel's process closes its socket when this one exits).
   def child_spec(opts) do
     %{
       id: {__MODULE__, Keyword.get(opts, :adapter_index, 0)},
@@ -288,10 +312,14 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   `:advertise_failures` (controller-fault refusals since the last
   accepted advertise or wedge), `:wedges` (wedges detected since start),
   `:wedge_streak` (wedges since the last accepted advertise; 0 is
-  healthy), `:recoveries` (power-cycles done), `:last_wedge_at` /
+  healthy), `:recoveries` (controller resets done), `:last_wedge_at` /
   `:last_recovery_at` (`DateTime` in UTC, or `nil`), and
-  `:controller_reset_needed` (a power-cycle didn't clear the wedge: the
-  host should reset the controller's transport).
+  `:controller_reset_needed` (a controller reset didn't clear the wedge:
+  the host should reset the controller's transport).
+
+  Transport (see "Transport fallback"): `:transport` (`:user_channel` or
+  `:bluez`, from the transport), `:fallback_reason`, and whatever else
+  the transport reports (the user channel: `:hci_index`, `:controller`).
 
   `opts`: `:server`, `:timeout` (default 5000; a radio that doesn't
   answer in time reads as not running).
@@ -347,18 +375,28 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
     wedge_retry_ms = Keyword.get(opts, :wedge_retry_ms, @wedge_retry_ms)
     adapter_index = Keyword.get(opts, :adapter_index, 0)
     adapter_address = opts |> Keyword.get(:adapter_address) |> upcase()
-    transport = Keyword.get(opts, :transport, Transport.Bluez)
+    transports = opts |> Keyword.get(:transport, @transports) |> List.wrap()
 
     transport_opts =
       Keyword.merge(opts, adapter_index: adapter_index, adapter_address: adapter_address)
 
-    case transport.init(transport_opts) do
-      {:ok, tstate} ->
+    case init_transport(transports, transport_opts, adapter_index, nil) do
+      {:ok, transport, tstate, fallbacks, fallback_reason} ->
         state = %{
           adapter_index: adapter_index,
           adapter_address: adapter_address,
           transport: transport,
           tstate: tstate,
+          transport_opts: transport_opts,
+          # Transports still to fall back to, and why the Radio left the
+          # first choice (nil while on it).
+          fallbacks: fallbacks,
+          fallback_reason: fallback_reason,
+          fallback_failures: Keyword.get(opts, :fallback_failures, @fallback_failures),
+          # Since the current transport was last ready: setup failures it
+          # calls permanent, and whether it was ever ready.
+          setup_failures: 0,
+          was_ready: false,
           drop_echoes: Keyword.get(opts, :drop_echoes, true),
           max_queue: Keyword.get(opts, :max_queue, @max_queue),
           health_check_ms: Keyword.get(opts, :health_check_ms, @health_check_ms),
@@ -401,6 +439,28 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
     end
   end
 
+  # The first transport whose init accepts the options; a refusal by the
+  # last one stops the start.
+  defp init_transport([transport | rest], opts, index, fallback_reason) do
+    case transport.init(opts) do
+      {:ok, tstate} ->
+        {:ok, transport, tstate, rest, fallback_reason}
+
+      {:error, reason} when rest != [] ->
+        Logger.warning(
+          "#{inspect(__MODULE__)}: hci#{index} can't use #{transport_name(transport)} " <>
+            "(#{inspect(reason)}); using #{transport_name(hd(rest))}"
+        )
+
+        init_transport(rest, opts, index, reason)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp transport_name(module), do: module |> Module.split() |> List.last()
+
   @impl GenServer
   def handle_continue(:setup, state), do: {:noreply, attempt_setup(state)}
 
@@ -418,11 +478,69 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
           | ready: true,
             last_error: nil,
             quiet: false,
-            backoff_ms: state.retry_ms
+            backoff_ms: state.retry_ms,
+            setup_failures: 0,
+            was_ready: true
         })
 
       {:error, reason, state} ->
-        state |> teardown() |> not_ready(reason)
+        state |> teardown() |> setup_failed(reason)
+    end
+  end
+
+  # A failure the transport calls permanent moves to the next transport:
+  # at once before it was ever ready, after a run of them once it was.
+  defp setup_failed(state, reason) do
+    if state.fallbacks != [] and permanent?(state.transport, reason) do
+      failures = state.setup_failures + 1
+      state = %{state | setup_failures: failures}
+
+      if not state.was_ready or failures >= state.fallback_failures,
+        do: fall_back(state, reason),
+        else: not_ready(state, reason)
+    else
+      not_ready(state, reason)
+    end
+  end
+
+  defp permanent?(transport, reason) do
+    Code.ensure_loaded?(transport) and function_exported?(transport, :fallback?, 1) and
+      transport.fallback?(reason)
+  end
+
+  # The next transport starts after the usual first retry delay, which
+  # also gives bluetoothd time to take back a controller the user channel
+  # released. One whose init refuses is skipped.
+  defp fall_back(%{fallbacks: [next | rest]} = state, reason) do
+    case next.init(state.transport_opts) do
+      {:ok, tstate} ->
+        Logger.warning(
+          "#{inspect(__MODULE__)}: hci#{state.adapter_index} #{transport_name(state.transport)} " <>
+            "failed (#{inspect(reason)}); falling back to #{transport_name(next)}"
+        )
+
+        :ok = state.transport.terminate(:fallback, state.tstate)
+
+        state = %{
+          state
+          | transport: next,
+            tstate: tstate,
+            fallbacks: rest,
+            fallback_reason: reason,
+            setup_failures: 0,
+            was_ready: false,
+            backoff_ms: state.retry_ms
+        }
+
+        retry_later(state, reason, false)
+
+      {:error, init_reason} ->
+        Logger.warning(
+          "#{inspect(__MODULE__)}: hci#{state.adapter_index} can't use " <>
+            "#{transport_name(next)} (#{inspect(init_reason)})"
+        )
+
+        setup_failed(%{state | fallbacks: rest}, reason)
     end
   end
 
@@ -452,6 +570,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   end
 
   defp reset_text(:power_cycle), do: "power-cycled"
+  defp reset_text(:hci_reset), do: "reset"
+  defp reset_text(:rebind), do: "re-bound and reset"
   defp reset_text(how), do: "reset (#{inspect(how)})"
 
   # A runtime loss while ready: undo everything and retry from the start
@@ -597,6 +717,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
           %{class: class, instance: instance} -> %{class: class, instance: instance}
         end,
       queued: :queue.len(state.tx_queue),
+      fallback_reason: state.fallback_reason,
       last_tx_sn: state.last_tx_sn,
       advertise_failures: state.adv_failures,
       wedges: state.wedges,
@@ -797,22 +918,22 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
     Logger.error(
       "#{inspect(__MODULE__)}: hci#{state.adapter_index} controller wedged " <>
         "(#{failures} advertises failed with #{inspect(reason)}); " <>
-        "power-cycling it in #{delay} ms"
+        "resetting it in #{delay} ms"
     )
   end
 
   defp log_wedge(state, reason, _failures, 2, delay) do
     Logger.error(
       "#{inspect(__MODULE__)}: hci#{state.adapter_index} controller still wedged " <>
-        "(#{inspect(reason)}) after a power-cycle; its transport needs a reset " <>
-        "(USB reset or btusb rebind). Power-cycling again in #{delay} ms"
+        "(#{inspect(reason)}) after a controller reset; its transport needs a reset " <>
+        "(USB reset or btusb rebind). Resetting it again in #{delay} ms"
     )
   end
 
   defp log_wedge(state, reason, _failures, streak, delay) do
     Logger.warning(
       "#{inspect(__MODULE__)}: hci#{state.adapter_index} controller wedged " <>
-        "#{streak} times in a row (#{inspect(reason)}); power-cycling again in #{delay} ms"
+        "#{streak} times in a row (#{inspect(reason)}); resetting it again in #{delay} ms"
     )
   end
 

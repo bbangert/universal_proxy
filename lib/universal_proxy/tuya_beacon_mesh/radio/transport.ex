@@ -44,6 +44,14 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio.Transport do
       event `c:setup/2` returns; counted in `Radio.status/1`'s
       `:recoveries`).
 
+  ## Fallback
+
+  `Radio`'s `:transport` may list several transports: the first is used,
+  and the Radio moves to the next one (for the rest of its life) when a
+  setup failure that `c:fallback?/1` accepts happens before the transport
+  was ever ready, or `:fallback_failures` times in a row after it was.
+  The transport left behind gets `c:terminate/2` first.
+
   A transport holds no key material: frames reach it already encrypted
   (as advertising data) and leave it as raw 26-byte frames.
   """
@@ -102,10 +110,25 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio.Transport do
 
   @callback handle_info(msg :: term(), t()) :: {:ok, [event()], t()} | :unhandled
 
-  @doc "`:lease_held`, `:discovering` and `:listening` for `Radio.status/1`."
+  @doc """
+  `:lease_held` (the transport holds the controller), `:discovering` and
+  `:listening` for `Radio.status/1`, plus whatever else it reports
+  (`:transport`, controller details; never key material).
+  """
   @callback status(t()) :: %{
-              lease_held: boolean(),
-              discovering: boolean(),
-              listening: boolean()
+              required(:lease_held) => boolean(),
+              required(:discovering) => boolean(),
+              required(:listening) => boolean(),
+              optional(atom()) => term()
             }
+
+  @doc """
+  Whether a failed `c:setup/2` means this transport can't drive this
+  controller at all (as opposed to a transient failure), so a Radio with
+  a fallback transport should move to it. Optional; `false` when not
+  implemented.
+  """
+  @callback fallback?(reason()) :: boolean()
+
+  @optional_callbacks fallback?: 1
 end

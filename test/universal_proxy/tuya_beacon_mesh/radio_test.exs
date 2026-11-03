@@ -48,6 +48,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
   defp radio_spec(opts \\ []) do
     {Radio,
      [
+       transport: UniversalProxy.TuyaBeaconMesh.Radio.Transport.Bluez,
        bluez_radio: FakeBluez.Radio,
        mgmt: FakeBluez.Mgmt,
        rebus: FakeBluez.Rebus,

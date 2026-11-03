@@ -47,3 +47,7 @@ config :universal_proxy, :storage_sys_root, "/tmp/universal_proxy_test_no_block_
 # A crc32 collision between a Tuya mesh entity key and another entity's is
 # logged and skipped in production; tests fail on it instead.
 config :universal_proxy, :tuya_entity_collisions, :raise
+
+# The Tuya mesh Radio's default transport binds a real HCI user channel;
+# host tests drive the BlueZ transport's fakes (or name a transport).
+config :universal_proxy, :tuya_mesh_transport, :bluez

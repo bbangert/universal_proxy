@@ -180,7 +180,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio.Transport.Bluez do
     %{
       lease_held: state.lease != nil and state.bluez_radio.valid?(state.lease),
       discovering: state.discovering,
-      listening: state.rx_name != nil and state.receiver.listening?(state.rx_name)
+      listening: state.rx_name != nil and state.receiver.listening?(state.rx_name),
+      transport: :bluez
     }
   end
 
