@@ -69,7 +69,7 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
   alias Espex.DeviceConfig.Device
   alias UniversalProxy.ESPHome.EntityProvider
   alias UniversalProxy.TuyaMesh
-  alias UniversalProxy.TuyaMesh.{Entities, Store}
+  alias UniversalProxy.TuyaMesh.{Entities, Store, WallClock}
 
   @default_debounce_ms 1_000
   @default_retry_ms 1_000
@@ -369,7 +369,7 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
 
   # Last seen is hidden (missing_state) until the clock has synchronised:
   # a pre-sync wall clock would show 1970. It is converted here, with the
-  # current offset, from the status' monotonic `last_seen_ms`, so a status
+  # current OS-clock offset (see WallClock), from the status' monotonic `last_seen_ms`, so a status
   # built before the sync never exposes the date it computed then.
   defp live_of(t, status) do
     live = Entities.live_from_status(status)
@@ -379,7 +379,7 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
 
       Map.new(live, fn {mac, v} ->
         case Map.fetch(seen_ms, mac) do
-          {:ok, ms} -> {mac, %{v | last_seen: wall_time(ms)}}
+          {:ok, ms} -> {mac, %{v | last_seen: WallClock.to_datetime(ms)}}
           :error -> {mac, v}
         end
       end)
@@ -392,14 +392,6 @@ defmodule UniversalProxy.ESPHome.EntityProvider.MeshSync do
     do: for(%{mac: mac, last_seen_ms: ms} <- bulbs, into: %{}, do: {mac, ms})
 
   defp last_seen_ms(_status), do: %{}
-
-  defp wall_time(ms) when is_integer(ms) do
-    (ms + System.time_offset(:millisecond))
-    |> DateTime.from_unix!(:millisecond)
-    |> DateTime.truncate(:second)
-  end
-
-  defp wall_time(_ms), do: nil
 
   # Pushes the connectivity and last-seen states that changed, each for
   # its bulb's current sub-device only.
