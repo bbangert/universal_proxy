@@ -554,6 +554,7 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
       start_mesh_sup(ctx,
         lights: lights,
         radio: radio,
+        tick_ms: 3_600_000,
         time_offset_fun: fn -> Agent.get(offset, & &1) end
       )
 
@@ -561,21 +562,20 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
     end
 
     test "a time offset change republishes last seen against the new clock", ctx do
-      seen_ms = System.monotonic_time(:millisecond)
-      :ok = FakeLights.report(ctx.lights, @bulb2, seen_ms)
+      :ok = FakeLights.report(ctx.lights, @bulb2, System.monotonic_time(:millisecond))
+      # The tick is too far off to poll Lights; a report notice prompts the read.
+      send(Process.whereis(ctx.names.resolver), {:tuya_report, %{}})
 
-      wait_until(fn ->
-        match?(
-          %{last_seen: %DateTime{}},
-          Enum.find(status(ctx).bulbs, &(&1.mac == @bulb2))
-        )
-      end)
+      # Waits on the broadcast, not a status call: only a publish can move
+      # what subscribers see.
+      before = await_published_last_seen()
+      flush_statuses()
 
-      before = Enum.find(status(ctx).bulbs, &(&1.mac == @bulb2)).last_seen
-
+      # The periodic tick is far off (see setup), so the notification is the
+      # only thing that can publish from here.
       step_ms = 71 * 86_400_000
       Agent.update(ctx.offset, fn _ -> step_ms end)
-      flush_statuses()
+      refute_receive {:tuya_mesh_status, _}, 100
 
       send(
         Process.whereis(ctx.names.resolver),
@@ -585,6 +585,15 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
       assert_receive {:tuya_mesh_status, %{bulbs: bulbs}}
       assert %{last_seen: stepped} = Enum.find(bulbs, &(&1.mac == @bulb2))
       assert DateTime.diff(stepped, before) == div(step_ms, 1000)
+    end
+
+    defp await_published_last_seen do
+      assert_receive {:tuya_mesh_status, %{bulbs: bulbs}}, 2_000
+
+      case Enum.find(bulbs, &(&1.mac == @bulb2)) do
+        %{last_seen: %DateTime{} = seen} -> seen
+        _ -> await_published_last_seen()
+      end
     end
 
     defp flush_statuses do
