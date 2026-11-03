@@ -171,9 +171,12 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   every id an accepted A3 list shows. It shrinks only when an accepted A3
   list omits an id and describes the bulb after our last request for it:
   fresher than the report seen when that request was sent and, for a
-  join, at least `:group_confirm_ms` after it (with no resend queued). The
-  set plus the current memberships counts slots, reserves ids, picks
-  delete targets and decides when a deleted group's tracking can go.
+  join, at least `:group_confirm_ms` after it (with no resend queued). A
+  bulb whose report counter re-anchors (it restarted) drops the sequence
+  numbers from its marks, so any list accepted after that can release,
+  while older lists stay refused by the report window. The set plus the
+  current memberships counts slots, reserves ids, picks delete targets
+  and says which absent groups still exist.
 
   A new group takes the lowest id in `1..254` that no inventory group
   uses and no bulb may hold (`{:error, :no_free_group_id}` when none is
@@ -189,8 +192,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   hold the id: that unicast removal is what counts. `dismiss: true` also
   sends the app's group dismiss (`A2 gg` to `FF gg`, mesh key), which is
   untested on hardware and never confirmed. A group absent from the
-  inventory stays in `groups/1` (`deleted: true`) until no bulb may hold
-  it.
+  inventory (deleted, dropped by a reload, or only ever seen in a bulb's
+  A3 list) exists exactly while some bulb may hold it: it is listed by
+  `groups/1` (`deleted: true`, no name), and `remove_member/3` and
+  `delete_group/2` take its id; its tracking goes once no bulb may hold
+  it, checked after every accepted A3 list.
 
   Each change of one bulb's membership in one group is tracked
   (`groups/1`) as `:pending` (waiting to be sent, or sent), `:confirmed`
@@ -464,6 +470,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
           local_id: 0..254,
           name: String.t() | nil,
           members: [String.t()],
+          holders: [String.t()],
           deleted: boolean(),
           sync: %{String.t() => %{op: :add | :remove, state: sync_state()}}
         }
@@ -485,18 +492,18 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
     do: call(opts, {:add_member, group, mac_or_label})
 
   @doc """
-  Removes a bulb from a group and sends it the leave request. For a bulb
-  that is no longer a member but whose removal is tracked (a deleted
-  group's included, by local id), the request is sent again; otherwise
-  `{:error, :not_member}`.
+  Removes a bulb from a group and sends it the leave request. A bulb that
+  is not a member but may still hold the group (an absent group's
+  included, by local id) is sent it again; otherwise `{:error,
+  :not_member}`.
   """
   @spec remove_member(String.t() | byte(), String.t(), keyword()) :: :ok | {:error, term()}
   def remove_member(group, mac_or_label, opts \\ []),
     do: call(opts, {:remove_member, group, mac_or_label})
 
   @doc """
-  Deletes a group and sends every bulb that may hold it the leave
-  request. `opts`: `dismiss:` (default `false`) also sends the untested
+  Deletes a group (or, by local id, an absent group some bulb may still
+  hold) and sends every bulb that may hold it the leave request. `opts`: `dismiss:` (default `false`) also sends the untested
   broadcast dismiss; `:server`.
   """
   @spec delete_group(String.t() | byte(), keyword()) :: :ok | {:error, term()}
@@ -510,10 +517,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   def rename_group(group, name, opts \\ []), do: call(opts, {:rename_group, group, name})
 
   @doc """
-  The groups with their members and each tracked membership change
-  (`sync`, by MAC), plus deleted groups whose removals are not all
-  confirmed yet (`deleted: true`), and how many group slots each bulb
-  holds or may hold (`slots`, by MAC; at most #{@group_slots}). No keys.
+  The groups with their members, the bulbs that may hold each
+  (`holders`) and each tracked membership change (`sync`, by MAC), plus
+  absent groups some bulb may still hold (`deleted: true`, `name: nil`),
+  and how many group slots each bulb holds or may hold (`slots`, by MAC;
+  at most #{@group_slots}). No keys.
   """
   @spec groups(keyword()) ::
           {:ok, %{groups: [group_view()], slots: %{String.t() => non_neg_integer()}}}
@@ -834,12 +842,13 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
     end
   end
 
+  # An absent group some bulb may still hold is deleted the same way, with
+  # nothing to write.
   defp do_call({:delete_group, who_group, opts}, state) do
     with {:ok, dismiss?} <- dismiss_opt(opts),
-         {:ok, gid} <- resolve_group_id(state, who_group),
+         {:ok, gid} <- resolve_tracked_group(state, who_group),
          holders = group_holders(state, gid),
-         remaining = Enum.reject(inventory_groups(state), &(&1.local_id == gid)),
-         {:ok, state} <- commit_groups(state, remaining) do
+         {:ok, state} <- drop_group(state, gid) do
       state = queue_members(state, gid, holders, :remove)
       state = if dismiss?, do: queue_job(state, {gid, :dismiss}), else: state
       {:reply, :ok, prune_deleted(state), {:continue, :pump_groups}}
@@ -992,8 +1001,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
          bulb = Map.fetch!(state.bulbs, mac),
          {:ok, parsed} <- parse(state, bulb, frame) do
       case check_fresh(bulb, parsed.sn) do
-        :accept ->
+        accepted when accepted in [:accept, :reanchor] ->
           now = state.clock.()
+          bulb = if accepted == :reanchor, do: reanchor_marks(bulb), else: bulb
 
           bulb = %{
             bulb
@@ -1057,7 +1067,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   defp resync_step({prev, count}, sn) do
     cond do
       not fresh?(prev, sn) -> {:hold, {sn, 1}}
-      count + 1 >= @resync_reports -> :accept
+      count + 1 >= @resync_reports -> :reanchor
       true -> {:hold, {sn, count + 1}}
     end
   end
@@ -1529,18 +1539,28 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
     end
   end
 
-  # A deleted group's id stays usable for remove_member/3 while a change
-  # of it is tracked.
+  # An absent group exists while some bulb may hold it: its id stays
+  # usable for remove_member/3 and delete_group/2.
   defp resolve_tracked_group(state, who) do
     case resolve_group_id(state, who) do
       {:ok, gid} ->
         {:ok, gid}
 
       {:error, _} = error ->
-        if is_integer(who) and Enum.any?(state.group_ops, &match?({{^who, _}, _}, &1)),
+        if is_integer(who) and MapSet.member?(held_anywhere(state), who),
           do: {:ok, who},
           else: error
     end
+  end
+
+  defp drop_group(state, gid) do
+    if Map.has_key?(state.groups, gid),
+      do: commit_groups(state, Enum.reject(inventory_groups(state), &(&1.local_id == gid))),
+      else: {:ok, state}
+  end
+
+  defp absent_groups(state) do
+    state |> held_anywhere() |> Enum.reject(&Map.has_key?(state.groups, &1)) |> Enum.sort()
   end
 
   # 0 means an empty slot in an A3 list, so it is never allocated. An id
@@ -1618,6 +1638,20 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
   end
 
   defp track_list(state, _mac, _parsed), do: state
+
+  # A re-anchored report counter makes the sequence numbers in the marks
+  # meaningless, and the bulb restarted since those requests: any list
+  # accepted from here on (stale ones from before stay refused by the
+  # report window) describes it now. A join's time window still applies.
+  defp reanchor_marks(bulb) do
+    held =
+      Map.new(bulb.held, fn
+        {gid, {op, _seen, sent_at}} -> {gid, {op, nil, sent_at}}
+        other -> other
+      end)
+
+    %{bulb | held: held}
+  end
 
   defp released?(nil, _sn, _now, _window), do: true
 
@@ -1782,17 +1816,14 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
           change != :keep,
           do: {key, change}
 
-    if changes == [] do
-      state
-    else
-      ops =
-        Enum.reduce(changes, state.group_ops, fn
-          {key, :drop}, ops -> Map.delete(ops, key)
-          {key, new}, ops -> Map.update!(ops, key, &%{&1 | state: new, ref: nil})
-        end)
+    ops =
+      Enum.reduce(changes, state.group_ops, fn
+        {key, :drop}, ops -> Map.delete(ops, key)
+        {key, new}, ops -> Map.update!(ops, key, &%{&1 | state: new, ref: nil})
+      end)
 
-      pump_groups(prune_deleted(%{state | group_ops: ops}))
-    end
+    # Every accepted list may have released a held id, settled or not.
+    pump_groups(prune_deleted(%{state | group_ops: ops}))
   end
 
   defp confirm_group_list(state, _mac, _parsed, _ids), do: state
@@ -1893,20 +1924,31 @@ defmodule UniversalProxy.TuyaBeaconMesh.Lights do
     by_gid = Enum.group_by(state.group_ops, fn {{gid, _mac}, _op} -> gid end)
     sync = &Map.new(Map.get(by_gid, &1, []), fn {{_, mac}, op} -> {mac, sync_view(op)} end)
 
+    holders = &group_holders(state, &1)
+
     live =
       for g <- inventory_groups(state) do
         %{
           local_id: g.local_id,
           name: g.name,
           members: g.members,
+          holders: holders.(g.local_id),
           deleted: false,
           sync: sync.(g.local_id)
         }
       end
 
+    # Absent groups some bulb may hold, ours or not (no name either way).
     deleted =
-      for gid <- by_gid |> Map.keys() |> Enum.sort(), not Map.has_key?(state.groups, gid) do
-        %{local_id: gid, name: nil, members: [], deleted: true, sync: sync.(gid)}
+      for gid <- absent_groups(state) do
+        %{
+          local_id: gid,
+          name: nil,
+          members: [],
+          holders: holders.(gid),
+          deleted: true,
+          sync: sync.(gid)
+        }
       end
 
     slots =

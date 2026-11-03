@@ -86,7 +86,20 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsGroupsTest do
 
       # Once confirmed, it is free again, and the new group starts clean.
       inject_report(3, 1, <<0xA3, 1>>, @addr3)
-      wait_until(fn -> match?({:ok, %{groups: [%{}, %{}, %{}]}}, Lights.groups()) end)
+
+      # Groups 2 and 3, which bulb 2 holds, show as absent groups.
+      wait_until(fn ->
+        {:ok, %{groups: groups}} = Lights.groups()
+
+        Enum.map(groups, &{&1.local_id, &1.deleted}) == [
+          {1, false},
+          {4, false},
+          {6, false},
+          {2, true},
+          {3, true}
+        ]
+      end)
+
       assert {:ok, 5} = Lights.create_group("d", [])
       assert {:ok, %{groups: groups}} = Lights.groups()
       assert %{local_id: 5, name: "d", sync: sync} = Enum.find(groups, &(&1.local_id == 5))
@@ -300,11 +313,13 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsGroupsTest do
       assert open_payload(dismiss, @beacon_key, @beacon_key) == <<0xA2, 1>>
     end
 
-    test "a tracked removal of a deleted group can be re-sent by its id" do
+    test "a deleted group some bulb may still hold can be removed or deleted again by its id" do
       :ok = Lights.delete_group(1)
       assert :ok = Lights.remove_member(1, @mac2)
       assert {:error, {:bad_option, :dismiss}} = Lights.delete_group(1, dismiss: :yes)
-      assert {:error, :unknown_group} = Lights.delete_group(1)
+      assert :ok = Lights.delete_group(1)
+      assert {:error, :unknown_group} = Lights.delete_group(9)
+      assert {:error, :unknown_group} = Lights.remove_member(9, @mac2)
     end
   end
 
@@ -524,6 +539,71 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsGroupsTest do
       assert sync(3, @mac3) == %{op: :add, state: :pending}
       assert sync(2, @mac2) == nil
       FakeBluez.succeed(:advertise)
+    end
+  end
+
+  describe "absent groups (held, not in the inventory)" do
+    defp absent(gid) do
+      {:ok, %{groups: groups}} = Lights.groups()
+      Enum.find(groups, &(&1.local_id == gid and &1.deleted))
+    end
+
+    test "a group a reload dropped is listed, removable and deletable by id, with no history" do
+      assert :ok = Lights.reload(Map.put(fixture(), "groups", []))
+
+      assert %{name: nil, members: [], holders: holders, sync: sync} = absent(1)
+      assert Enum.sort(holders) == [@mac2, @mac3]
+      assert sync == %{}
+
+      assert :ok = Lights.remove_member(1, @mac2)
+      wait_until(fn -> length(advertises()) == 1 end)
+      assert [{2, <<0xA2, 1>>}] = Enum.map(advertises(), &open_unicast/1)
+
+      :ok = Radio.stop_tx()
+      assert :ok = Lights.delete_group(1)
+      wait_until(fn -> length(advertises()) == 2 end)
+      finish_tx()
+      assert {3, <<0xA2, 1>>} in Enum.map(advertises(), &open_unicast/1)
+
+      inject_report(2, 1, <<0xA3>>, @addr2)
+      inject_report(3, 1, <<0xA3>>, @addr3)
+      wait_until(fn -> absent(1) == nil end)
+      assert {:error, :unknown_group} = Lights.remove_member(1, @mac2)
+    end
+
+    @tag confirm_ms: 50
+    test "a list releasing the last holder drops the group though no change settled" do
+      {:ok, 2} = Lights.create_group("a", [@mac2])
+      wait_until(fn -> length(advertises()) == 1 end)
+      assert :ok = Lights.reload(fixture())
+      wait_until(fn -> sync(2, @mac2) == %{op: :add, state: :unconfirmed} end)
+      Process.sleep(60)
+
+      assert %{holders: [@mac2]} = absent(2)
+      inject_report(2, 1, <<0xA3, 1>>, @addr2)
+      wait_until(fn -> absent(2) == nil end)
+      assert {:ok, 2} = Lights.create_group("b", [])
+    end
+
+    test "after a counter restart, accepted lists release; older ones still don't" do
+      inject_report(2, 30_000, <<0xA3, 1>>, @addr2)
+      wait_until(fn -> match?({:ok, %{groups: [1]}}, Lights.status(@mac2)) end)
+      :ok = Lights.remove_member(1, @mac2)
+      wait_until(fn -> length(advertises()) == 1 end)
+
+      # The bulb's counter restarts: 10, 11, 12 re-anchor it; 12 is a list.
+      inject_report(2, 10, <<0x01>>, @addr2)
+      inject_report(2, 11, <<0x01>>, @addr2)
+      inject_report(2, 12, <<0xA3>>, @addr2)
+      wait_until(fn -> sync(1, @mac2) == %{op: :remove, state: :confirmed} end)
+      assert {:ok, %{slots: %{@mac2 => 0}}} = Lights.groups()
+
+      # A delayed list from before the restart is refused.
+      inject_report(2, 30_001, <<0xA3, 1>>, @addr2)
+      inject_report(3, 1, <<0x01>>, @addr3)
+      wait_until(fn -> match?({:ok, %{last_event: :ping_reply}}, Lights.status(@mac3)) end)
+      assert {:ok, %{groups: []}} = Lights.status(@mac2)
+      assert {:ok, %{slots: %{@mac2 => 0}}} = Lights.groups()
     end
   end
 
