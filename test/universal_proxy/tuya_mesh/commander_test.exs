@@ -1598,6 +1598,72 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       assert sets() == []
     end
 
+    test "admission takes the membership the statuses reported, in order" do
+      {pid, _agent} = start()
+      send(pid, {:tuya_mesh_status, status([])})
+      send(pid, {:tuya_mesh_status, status([], [%{local_id: 1, members: [@a, @b]}])})
+
+      # `:members` would say A, B and C: the statuses, already applied, win.
+      Commander.command(cmd({:group, 1}, on()), pid)
+      assert_receive {:lights, {:group_set, 1, [on: true], _}}, 2_000
+      assert %{members: [@a, @b]} = :sys.get_state(pid).jobs[{:group, 1}]
+
+      send(pid, {:tuya_mesh_status, status([])})
+      idle(pid)
+
+      assert sets() == [{@a, [on: true]}, {@b, [on: true]}]
+    end
+
+    test "a command admitted before any status keeps its members through queued changes" do
+      {pid, _agent} = start(window_ms: 100)
+
+      # Admitted through `:members`, which already read the latest
+      # membership; older statuses (C removed, then back) come after.
+      Commander.command(cmd({:group, 1}, on()), pid)
+      send(pid, {:tuya_mesh_status, status([])})
+      send(pid, {:tuya_mesh_status, status([], [%{local_id: 1, members: [@a, @b]}])})
+      send(pid, {:tuya_mesh_status, status([])})
+      idle(pid)
+
+      assert sets() == [{@a, [on: true]}, {@b, [on: true]}, {@c, [on: true]}]
+    end
+
+    test "a bulb that leaves mid-diversion still gets what it took pushed" do
+      script = %{set: %{@b => [{:error, :busy}]}}
+      {pid, _agent} = start(script: script, retry_ms: 300, push_debounce_ms: 10)
+      at = now()
+      report(pid, for(mac <- [@a, @b, @c], do: {mac, @off, at}))
+      _ = pushes()
+
+      # C's newer command diverts group 1 to A and B; B waits for capacity.
+      Commander.command(cmd({:group, 1}, on()), pid)
+      Commander.command(cmd({:bulb, @c}, %Req{has_state: true, state: false}, 99), pid)
+      assert_receive {:lights, {:set, @a, [on: true], _}}, 2_000
+
+      send(pid, {:tuya_mesh_status, status([], [%{local_id: 1, members: [@b, @c]}])})
+      flushed(pid)
+      assert %{state: true} = last_push(pushes(), 5)
+      idle(pid)
+    end
+
+    test "a group deleted mid-diversion still gets its members' taken sends pushed" do
+      script = %{set: %{@b => [{:error, :busy}]}}
+      {pid, _agent} = start(script: script, retry_ms: 300, push_debounce_ms: 10)
+      at = now()
+      report(pid, for(mac <- [@a, @b, @c], do: {mac, @off, at}))
+      _ = pushes()
+
+      Commander.command(cmd({:group, 1}, on()), pid)
+      Commander.command(cmd({:bulb, @c}, %Req{has_state: true, state: false}, 99), pid)
+      assert_receive {:lights, {:set, @a, [on: true], _}}, 2_000
+
+      send(pid, {:tuya_mesh_status, status([], [%{local_id: 3, members: [@b, @c]}])})
+      flushed(pid)
+      assert %{state: true} = last_push(pushes(), 5)
+      refute Map.has_key?(:sys.get_state(pid).jobs, {:group, 1})
+      idle(pid)
+    end
+
     test "a bulb that leaves gets none of the command's remaining follow-ups" do
       {pid, _agent} = start(followup_gap_ms: 200)
       send(pid, {:tuya_mesh_status, status([])})
