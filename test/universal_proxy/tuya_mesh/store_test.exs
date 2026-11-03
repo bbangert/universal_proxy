@@ -1018,6 +1018,53 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
       assert_receive {:synced, %{@mac2 => @on}}, 1_000
     end
 
+    test "a flip back after a failed sync is still written", ctx do
+      test_pid = self()
+      fail = :counters.new(1, [])
+      n = System.unique_integer([:positive])
+
+      # While `fail` is set, a light-state write inserts, then fails to sync.
+      write_fun = fn table, records ->
+        :ok = :dets.insert(table, records)
+
+        case Keyword.fetch(records, :light_states) do
+          {:ok, lights} when lights != %{} ->
+            if :counters.get(fail, 1) > 0 do
+              :counters.put(fail, 1, 0)
+              send(test_pid, {:sync_failed, lights})
+              {:error, :sync_failed}
+            else
+              send(test_pid, {:synced, lights})
+              :dets.sync(table)
+            end
+
+          _other ->
+            :dets.sync(table)
+        end
+      end
+
+      store =
+        start_store(Path.join(ctx.tmp_dir, "flip_#{n}.dets"), :"flip_#{n}",
+          id: :flip,
+          write_fun: write_fun,
+          light_state_interval_ms: 100
+        )
+
+      {:ok, _} = Store.replace(inventory(), [], store)
+      :ok = Store.put_light_state(@mac2, @on, store)
+      assert_receive {:synced, %{@mac2 => @on}}
+
+      # Off is inserted but not synced; then it flips back to the synced on.
+      :counters.put(fail, 1, 1)
+      :ok = Store.put_light_state(@mac2, @off, store)
+      assert_receive {:sync_failed, %{@mac2 => @off}}, 1_000
+      :ok = Store.put_light_state(@mac2, @on, store)
+
+      assert_receive {:synced, %{@mac2 => @on}}, 1_000
+      assert Store.light_states(store) == %{@mac2 => @on}
+      assert :dets.lookup(:"flip_#{n}", :light_states) == [{:light_states, %{@mac2 => @on}}]
+    end
+
     test "nothing is written for an unchanged state, a stranger or a bad one", ctx do
       {store, _path, _table} = spy_store(ctx, interval: 0)
       {:ok, _} = Store.replace(inventory(), [], store)

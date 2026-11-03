@@ -907,6 +907,26 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       assert Registry.keys(pubsub, pid) != []
     end
 
+    test "a restarted Store gets every known bulb again, changed or not" do
+      test = self()
+
+      {pid, _agent} =
+        start(push_debounce_ms: 10, save_state: &send(test, {:saved, &1, &2}))
+
+      report(pid, [{@a, @on_white, now()}, {@b, %{3 => 500}, now()}])
+      assert_received {:saved, @a, %{1 => true}}
+      refute_received {:saved, _, _}
+
+      # It may have lost a held change in a crash: A goes again, and B,
+      # whose on/off is unknown, doesn't. Nothing is pushed to HA.
+      _ = pushes()
+      send(pid, {:tuya_mesh_store, :ready})
+      flushed(pid)
+      assert_received {:saved, @a, %{1 => true, 3 => 1000}}
+      refute_received {:saved, _, _}
+      assert pushes() == []
+    end
+
     test "a Store that starts late seeds the bulbs still unknown" do
       saved = start_supervised!({Agent, fn -> %{} end}, id: :saved)
 

@@ -521,7 +521,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
       if groups_changed?, do: notify(state)
       {:reply, :ok, lights_kept(state)}
     else
-      {:error, _reason} = error -> {:reply, error, state}
+      {:error, _reason} = error -> {:reply, error, lights_unsynced(state)}
     end
   end
 
@@ -559,7 +559,8 @@ defmodule UniversalProxy.TuyaMesh.Store do
           error
       end
 
-    {:reply, reply, if(match?({:ok, _}, reply), do: lights_kept(state), else: state)}
+    {:reply, reply,
+     if(match?({:ok, _}, reply), do: lights_kept(state), else: lights_unsynced(state))}
   end
 
   defp do_call({:clear, opts}, _from, state) do
@@ -586,7 +587,7 @@ defmodule UniversalProxy.TuyaMesh.Store do
           end
       end
 
-    {:reply, reply, if(reply == :ok, do: lights_kept(state), else: state)}
+    {:reply, reply, if(reply == :ok, do: lights_kept(state), else: lights_unsynced(state))}
   end
 
   defp do_call(:inventory_summary, _from, state) do
@@ -679,9 +680,14 @@ defmodule UniversalProxy.TuyaMesh.Store do
     state = %{state | lights_timer: nil}
 
     case write_lights(state) do
-      {:ok, lights} -> {:noreply, %{lights_written(state) | lights_synced: lights}}
-      :unchanged -> {:noreply, lights_kept(state)}
-      {:error, _reason} -> {:noreply, schedule_lights(%{state | lights_written_at: now()})}
+      {:ok, lights} ->
+        {:noreply, %{lights_written(state) | lights_synced: lights}}
+
+      :unchanged ->
+        {:noreply, %{state | lights_held: %{}}}
+
+      {:error, _reason} ->
+        {:noreply, schedule_lights(%{lights_unsynced(state) | lights_written_at: now()})}
     end
   end
 
@@ -1009,6 +1015,11 @@ defmodule UniversalProxy.TuyaMesh.Store do
   # doesn't move the interval).
   defp lights_kept(state),
     do: %{state | lights_held: %{}, lights_synced: lookup(state.table, :light_states, %{})}
+
+  # A failed write may have left an unsynced insert in the table: nothing
+  # is known synced until the next write that is, so it can't be skipped
+  # as unchanged (a flip back to the last synced state included).
+  defp lights_unsynced(state), do: %{state | lights_synced: :unknown}
 
   # At once when the last light-state write is an interval old, else when
   # it will be. One timer at a time; it finds what is held when it fires.
