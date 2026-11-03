@@ -7,6 +7,10 @@ defmodule UniversalProxy.Application do
 
   @impl true
   def start(_type, _args) do
+    # Drop a known-harmless kernel Bluetooth line (see the module doc).
+    # Harmless on host: no `$kmsg` events exist there.
+    UniversalProxy.KmsgFilter.install()
+
     children =
       [
         # Start the Telemetry supervisor
