@@ -590,6 +590,7 @@ static void dispatch_command(const std::string& line, AlsaPipeSink& sink,
         emit_json(os.str());
     } else if (cmd == "set_muted" && kind == "bool") {
         sink.set_muted(bool_val);
+        player.update_muted(bool_val);
         std::ostringstream os;
         os << "{\"event\":\"mute\",\"value\":" << (bool_val ? "true" : "false") << "}";
         emit_json(os.str());
