@@ -33,8 +33,10 @@ defmodule UniversalProxy.TuyaBeaconMesh do
 
     * `Radio` — TX queue and frame windows, RX fan-out, setup retries and
       wedge detection, over a `Radio.Transport` (default
-      `Radio.Transport.Bluez`: lease, discovery with `DuplicateData: true`;
-      Bluez modules injectable, see `FakeBluez` in tests)
+      `Radio.Transport.UserChannel`, an exclusive HCI user channel, see
+      `FakeHciUser` in tests; falling back to `Radio.Transport.Bluez`:
+      lease, discovery with `DuplicateData: true`; Bluez modules
+      injectable, see `FakeBluez` in tests)
     * `Lights` — inventory-backed controller: set/ping/reset/group_set,
       report attribution by node→MAC, seq persistence callback
 

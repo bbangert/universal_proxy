@@ -44,6 +44,16 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio.Transport do
       event `c:setup/2` returns; counted in `Radio.status/1`'s
       `:recoveries`).
 
+  ## Fallback
+
+  `Radio`'s `:transport` may list several transports: the first is used,
+  and the Radio moves to the next one (for the rest of its life) when a
+  setup failure that `c:fallback?/1` calls permanent (`true`) happens
+  before the transport was ever ready, or after `:fallback_failures`
+  failures in a row it calls permanent or `:transient` (whether or not it
+  was ever ready).
+  The transport left behind gets `c:terminate/2` first.
+
   A transport holds no key material: frames reach it already encrypted
   (as advertising data) and leave it as raw 26-byte frames.
   """
@@ -86,12 +96,18 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio.Transport do
   @callback transmit(t(), ad_bytes :: binary()) ::
               {:ok, instance(), t()} | {:error, transmit_error(), t()}
 
+  @typedoc """
+  Why an advert may still be on air: `:fault` (the controller failed the
+  command; counts towards a wedge) or `:uncertain` (anything else).
+  """
+  @type stop_error :: {:fault | :uncertain, reason()}
+
   @doc """
   Takes `instance` off air. An instance already gone (with the controller)
-  is `:ok`; an error means its state can't be trusted, and the Radio
-  re-runs setup.
+  is `:ok`. On an error its state can't be trusted, and the Radio re-runs
+  setup (after counting a `:fault`, which can declare a wedge).
   """
-  @callback stop_transmit(t(), instance()) :: {:ok, t()} | {:error, reason(), t()}
+  @callback stop_transmit(t(), instance()) :: {:ok, t()} | {:error, stop_error(), t()}
 
   @doc """
   Probes, while ready, what can fail without any message reaching the
@@ -102,10 +118,27 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio.Transport do
 
   @callback handle_info(msg :: term(), t()) :: {:ok, [event()], t()} | :unhandled
 
-  @doc "`:lease_held`, `:discovering` and `:listening` for `Radio.status/1`."
+  @doc """
+  `:lease_held` (the transport holds the controller), `:discovering` and
+  `:listening` for `Radio.status/1`, plus whatever else it reports
+  (`:transport`, controller details; never key material).
+  """
   @callback status(t()) :: %{
-              lease_held: boolean(),
-              discovering: boolean(),
-              listening: boolean()
+              required(:lease_held) => boolean(),
+              required(:discovering) => boolean(),
+              required(:listening) => boolean(),
+              optional(atom()) => term()
             }
+
+  @doc """
+  How a failed `c:setup/2` bears on moving to a fallback transport:
+  `true` — this transport can't drive this controller (move at once if
+  it was never ready); `:transient` — it may be (a busy controller): only
+  a run of them moves; `false` — nothing a fallback would fix (the
+  adapter is absent), and it breaks a run. Optional; `false` when not
+  implemented.
+  """
+  @callback fallback?(reason()) :: boolean() | :transient
+
+  @optional_callbacks fallback?: 1
 end

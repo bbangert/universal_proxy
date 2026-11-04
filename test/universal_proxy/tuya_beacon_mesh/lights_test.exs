@@ -1612,6 +1612,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsTest do
      [
        adapter_index: 1,
        retry_ms: 20,
+       transport: UniversalProxy.TuyaBeaconMesh.Radio.Transport.Bluez,
        bluez_radio: FakeBluez.Radio,
        mgmt: FakeBluez.Mgmt,
        rebus: FakeBluez.Rebus,

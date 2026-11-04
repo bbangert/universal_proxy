@@ -36,6 +36,18 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   `adapter_address`, so it refuses to power, scan or advertise on whatever
   else holds its index, even between two of these checks.
 
+  A Radio on the HCI user channel takes its adapter away from
+  `bluetoothd` while it holds it, so there the adapter reads as gone (or,
+  briefly around a re-bind, moved). The mesh is kept running then: the
+  Radio's status says it holds the channel (`transport: :user_channel`,
+  `lease_held: true`), and the user channel resolves the MAC and checks
+  the controller's own address on every bind, so it can't be driving
+  another adapter. The same holds while the Radio hands the adapter over
+  to its fallback transport (`transport_handoff: true`, bounded by the
+  Radio): `bluetoothd` is still taking it back. The status is read fresh
+  at that point; when the Radio doesn't answer, what the last read said
+  decides.
+
   While idle, the same event re-evaluates at once instead of waiting for
   the retry timer.
 
@@ -298,6 +310,8 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
       inventory: nil,
       inventory_error: nil,
       radio_status: nil,
+      # The Radio's last status said it holds the adapter's user channel.
+      radio_held: false,
       subscribed: nil,
       lights_running: false,
       last_reports: %{},
@@ -652,6 +666,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
       | mesh: nil,
         refresh_timer: nil,
         radio_status: nil,
+        radio_held: false,
         subscribed: nil,
         lights_running: false
     }
@@ -684,15 +699,24 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
           {:ok, ^index} ->
             state
 
-          {:ok, new_index} ->
-            Logger.info("TuyaMesh: #{state.mac} moved to hci#{new_index}; restarting the mesh")
-            state |> stop_mesh() |> evaluate()
+          other ->
+            state = read_radio(state)
 
-          {:error, :adapter_missing} ->
-            Logger.warning("TuyaMesh: #{state.mac} is gone from hci#{index}; stopping the mesh")
-            state |> stop_mesh() |> evaluate()
+            if state.radio_held,
+              do: state,
+              else: adapter_left(state, index, other)
         end
     end
+  end
+
+  defp adapter_left(state, _index, {:ok, new_index}) do
+    Logger.info("TuyaMesh: #{state.mac} moved to hci#{new_index}; restarting the mesh")
+    state |> stop_mesh() |> evaluate()
+  end
+
+  defp adapter_left(state, index, {:error, :adapter_missing}) do
+    Logger.warning("TuyaMesh: #{state.mac} is gone from hci#{index}; stopping the mesh")
+    state |> stop_mesh() |> evaluate()
   end
 
   defp schedule_tick(%{mesh: %{}} = state) do
@@ -771,14 +795,22 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   end
 
   defp read_radio(state) do
-    radio_status =
-      case Radio.status(server: state.radio) do
-        {:ok, s} -> %{ready: s.ready, last_error: s.last_error, queued: s.queued}
-        {:error, reason} -> %{ready: false, last_error: reason, queued: 0}
-      end
+    case Radio.status(server: state.radio) do
+      {:ok, s} ->
+        %{
+          state
+          | radio_status: %{ready: s.ready, last_error: s.last_error, queued: s.queued},
+            radio_held: holds_adapter?(s)
+        }
 
-    %{state | radio_status: radio_status}
+      {:error, reason} ->
+        %{state | radio_status: %{ready: false, last_error: reason, queued: 0}}
+    end
   end
+
+  defp holds_adapter?(%{transport: :user_channel, lease_held: true}), do: true
+  defp holds_adapter?(%{transport_handoff: true}), do: true
+  defp holds_adapter?(_status), do: false
 
   defp read_lights(%{mesh: nil} = state), do: state
 

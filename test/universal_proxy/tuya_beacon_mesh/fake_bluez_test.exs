@@ -2,7 +2,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.FakeBluezTest do
   # Reads module metadata only; touches no FakeBluez state.
   use ExUnit.Case, async: true
 
-  alias UniversalProxy.TuyaBeaconMesh.FakeBluez
+  alias UniversalProxy.TuyaBeaconMesh.{FakeBluez, FakeHciUser}
 
   @stand_ins [
     {FakeBluez.Radio, Bluez.Radio},
@@ -24,6 +24,16 @@ defmodule UniversalProxy.TuyaBeaconMesh.FakeBluezTest do
         assert function_exported?(real, fun, arity),
                "#{inspect(real)}.#{fun}/#{arity} does not exist"
       end
+    end
+  end
+
+  test "FakeHciUser matches Bluez.HciUser's functions and arities" do
+    Code.ensure_loaded!(Bluez.HciUser)
+
+    for {fun, arity} <- FakeHciUser.__info__(:functions),
+        fun not in [:emit | @callbacks] do
+      assert function_exported?(Bluez.HciUser, fun, arity),
+             "Bluez.HciUser.#{fun}/#{arity} does not exist"
     end
   end
 

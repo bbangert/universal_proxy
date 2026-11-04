@@ -5,6 +5,7 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
   import ExUnit.CaptureLog
 
   alias UniversalProxy.TuyaBeaconMesh.{Carrier, Dp, FakeBluez, Inventory, Lights, P2, Radio}
+  alias UniversalProxy.TuyaBeaconMesh.Radio.Transport
   alias UniversalProxy.TuyaMesh.{FakeLights, FakeRadio, Mesh, Presence, Resolver, Store}
 
   @moduletag :tmp_dir
@@ -314,6 +315,79 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
       Process.sleep(100)
       assert mesh_pid(ctx) == nil
       assert %{state: :idle, reason: :adapter_missing} = status(ctx)
+    end
+  end
+
+  describe "a Radio holding the adapter's user channel" do
+    setup ctx do
+      {:ok, _} = Store.replace(inventory(), [], ctx.store)
+      radio = :"fake_radio_#{System.unique_integer([:positive])}"
+
+      start_supervised!(
+        {FakeRadio, name: radio, status: [transport: :user_channel, lease_held: true]},
+        id: :fake_radio
+      )
+
+      start_mesh_sup(ctx, radio: radio, tick_ms: 60_000)
+      assert mesh_index(ctx) == 1
+      {:ok, radio: radio}
+    end
+
+    test "keeps the mesh while bluetoothd no longer lists the adapter", ctx do
+      pid = mesh_pid(ctx)
+      set_adapters(ctx, [adapter(@proxy_mac, 0)])
+      adapters_changed(ctx)
+      _ = status(ctx)
+      assert mesh_pid(ctx) == pid
+      assert %{state: :running, reason: nil} = status(ctx)
+
+      # Listed again under another index (around a re-bind): still kept.
+      set_adapters(ctx, [adapter(@proxy_mac, 0), adapter(@mesh_mac, 4)])
+      adapters_changed(ctx)
+      _ = status(ctx)
+      assert mesh_pid(ctx) == pid
+    end
+
+    test "stops the mesh once the Radio no longer holds it", ctx do
+      :ok = FakeRadio.put(ctx.radio, %{lease_held: false})
+      set_adapters(ctx, [adapter(@proxy_mac, 0)])
+      adapters_changed(ctx)
+
+      wait_until(fn -> mesh_pid(ctx) == nil end, 500)
+      assert %{state: :idle, reason: :adapter_missing} = status(ctx)
+    end
+
+    test "a Radio on the BlueZ transport gets the usual adapter checks", ctx do
+      :ok = FakeRadio.put(ctx.radio, %{transport: :bluez})
+      set_adapters(ctx, [adapter(@proxy_mac, 0)])
+      adapters_changed(ctx)
+      wait_until(fn -> mesh_pid(ctx) == nil end, 500)
+    end
+
+    test "a Radio handing the adapter to its fallback transport keeps the mesh", ctx do
+      pid = mesh_pid(ctx)
+
+      :ok =
+        FakeRadio.put(ctx.radio, %{transport: :bluez, lease_held: false, transport_handoff: true})
+
+      set_adapters(ctx, [adapter(@proxy_mac, 0)])
+      adapters_changed(ctx)
+      _ = status(ctx)
+      assert mesh_pid(ctx) == pid
+
+      # Handoff over and still not listed: gone.
+      :ok = FakeRadio.put(ctx.radio, %{transport_handoff: false})
+      adapters_changed(ctx)
+      wait_until(fn -> mesh_pid(ctx) == nil end, 500)
+    end
+
+    test "a Radio that doesn't answer: its last status decides", ctx do
+      pid = mesh_pid(ctx)
+      stop_supervised!(:fake_radio)
+      set_adapters(ctx, [adapter(@proxy_mac, 0)])
+      adapters_changed(ctx)
+      _ = status(ctx)
+      assert mesh_pid(ctx) == pid
     end
   end
 
@@ -1037,6 +1111,9 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
       %{start: {Radio, :start_link, [radio_opts]}} = radio
       assert radio_opts[:adapter_index] == 2
       assert radio_opts[:adapter_address] == @mesh_mac
+      # config/test.exs forces the BlueZ transport.
+      assert radio_opts[:transport] == [Transport.Bluez]
+      assert radio_opts[:fallback_memory_ms] == 600_000
 
       %{start: {Lights, :start_link, [lights_opts]}} = lights
       assert lights_opts[:on_persist] == (&Store.persist/1)
@@ -1044,6 +1121,52 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
       assert lights_opts[:inventory] == (&Store.load/0)
       # The Store's upload bound is derived from this lease cap.
       assert lights_opts[:max_lease] == Store.lights_max_lease()
+    end
+  end
+
+  describe "the Radio's transport setting" do
+    setup do
+      previous = Application.fetch_env(:universal_proxy, :tuya_mesh_transport)
+
+      on_exit(fn ->
+        case previous do
+          {:ok, value} -> Application.put_env(:universal_proxy, :tuya_mesh_transport, value)
+          :error -> Application.delete_env(:universal_proxy, :tuya_mesh_transport)
+        end
+      end)
+    end
+
+    test "maps :tuya_mesh_transport to the Radio's transports, :auto by default" do
+      for {setting, transports} <- [
+            auto: [Transport.UserChannel, Transport.Bluez],
+            user_channel: [Transport.UserChannel],
+            bluez: [Transport.Bluez]
+          ] do
+        Application.put_env(:universal_proxy, :tuya_mesh_transport, setting)
+        assert Mesh.transports() == transports
+      end
+
+      Application.delete_env(:universal_proxy, :tuya_mesh_transport)
+      assert Mesh.transports() == [Transport.UserChannel, Transport.Bluez]
+
+      Application.put_env(:universal_proxy, :tuya_mesh_transport, :carrier_pigeon)
+
+      log =
+        capture_log(fn ->
+          assert Mesh.transports() == [Transport.UserChannel, Transport.Bluez]
+        end)
+
+      assert log =~ "unknown :tuya_mesh_transport :carrier_pigeon"
+    end
+
+    test "a :transport in the radio options wins" do
+      Application.put_env(:universal_proxy, :tuya_mesh_transport, :auto)
+
+      assert {:ok, {_flags, [radio | _]}} =
+               Mesh.init(adapter_index: 0, radio: [transport: Transport.Bluez])
+
+      %{start: {Radio, :start_link, [radio_opts]}} = radio
+      assert radio_opts[:transport] == Transport.Bluez
     end
   end
 
@@ -1061,6 +1184,7 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
           adapter_index: index,
           adapter_address: mac,
           radio: [
+            transport: UniversalProxy.TuyaBeaconMesh.Radio.Transport.Bluez,
             bluez_radio: FakeBluez.Radio,
             mgmt: FakeBluez.Mgmt,
             rebus: FakeBluez.Rebus,
