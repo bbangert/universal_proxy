@@ -2,7 +2,7 @@ defmodule UniversalProxy.Bluetooth.RadioMonitorTest do
   # async: false — writes the global :persistent_term adapter path.
   use ExUnit.Case, async: false
 
-  alias UniversalProxy.Bluetooth.RadioMonitor
+  alias UniversalProxy.Bluetooth.{HeldRadios, RadioMonitor}
   alias Bluez.{Client, DevicePath}
 
   @pubsub UniversalProxy.PubSub
@@ -142,5 +142,143 @@ defmodule UniversalProxy.Bluetooth.RadioMonitorTest do
     monitor = start_monitor(ctx, roles_fun: fn -> %{@pi_mac => :tuya_mesh} end)
 
     assert [%{address: @pi_mac, role: :tuya_mesh, in_use?: false}] = RadioMonitor.list(monitor)
+  end
+
+  describe "held radios" do
+    setup ctx do
+      add_uart_radio(ctx.root, "hci1", @dongle_mac)
+      registry = :"radio_monitor_held_#{System.unique_integer([:positive])}"
+      start_supervised!({HeldRadios, registry: registry})
+
+      live =
+        start_supervised!(
+          {Agent,
+           fn ->
+             [
+               %{path: "/org/bluez/hci0", address: @pi_mac, name: "raspberrypi", powered: true},
+               %{path: "/org/bluez/hci1", address: @dongle_mac, name: "dongle", powered: true}
+             ]
+           end}
+        )
+
+      {:ok, registry: registry, live: live}
+    end
+
+    defp start_held_monitor(ctx, opts \\ []) do
+      start_monitor(
+        ctx,
+        opts ++
+          [
+            adapters_info_fun: fn -> Agent.get(ctx.live, & &1) end,
+            held_fun: fn -> HeldRadios.list(registry: ctx.registry) end,
+            roles_fun: fn -> %{@dongle_mac => :tuya_mesh} end
+          ]
+      )
+    end
+
+    # A process holding `mac` at `index`, as the mesh Radio does over the
+    # user channel, until killed.
+    defp hold(ctx, mac, index) do
+      test = self()
+
+      pid =
+        spawn(fn ->
+          :ok = HeldRadios.hold(mac, index, registry: ctx.registry, pubsub: @pubsub)
+          send(test, :held)
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive :held
+      pid
+    end
+
+    # bluetoothd drops a held adapter.
+    defp unlist(ctx, hci),
+      do:
+        Agent.update(ctx.live, fn live -> Enum.reject(live, &(&1.path == "/org/bluez/#{hci}")) end)
+
+    test "a held radio keeps its MAC, role and last-known name, never in use", ctx do
+      :persistent_term.put(DevicePath.adapter_path_key(), "/org/bluez/hci1")
+      monitor = start_held_monitor(ctx)
+
+      assert [%{held: nil}, %{hci: "hci1", address: @dongle_mac, held: nil}] =
+               RadioMonitor.list(monitor)
+
+      unlist(ctx, "hci1")
+      hold(ctx, @dongle_mac, 1)
+
+      # The hold's broadcast re-enumerates.
+      assert_receive {:bluetooth_radios, [_, %{hci: "hci1", held: :tuya_mesh}]}, 1_000
+
+      assert [
+               %{hci: "hci0", address: @pi_mac, held: nil},
+               %{
+                 hci: "hci1",
+                 address: @dongle_mac,
+                 name: "dongle",
+                 chip: "Broadcom BCM43438 (CYW43438)",
+                 role: :tuya_mesh,
+                 held: :tuya_mesh,
+                 in_use?: false
+               }
+             ] = RadioMonitor.list(monitor)
+    end
+
+    test "a stale daemon row naming a held MAC loses it: the MAC is listed once", ctx do
+      # bluetoothd still names the dongle, now under hci0, while it is held
+      # at hci1.
+      Agent.update(ctx.live, fn _ ->
+        [%{path: "/org/bluez/hci0", address: @dongle_mac, name: "dongle", powered: true}]
+      end)
+
+      hold(ctx, @dongle_mac, 1)
+      monitor = start_held_monitor(ctx)
+
+      radios = RadioMonitor.list(monitor)
+
+      assert [%{hci: "hci1", held: :tuya_mesh}] =
+               Enum.filter(radios, &(&1.address == @dongle_mac))
+
+      assert %{hci: "hci0", address: nil, role: nil, held: nil} = hd(radios)
+    end
+
+    test "a held index sysfs doesn't show is listed from what was last seen", ctx do
+      monitor = start_held_monitor(ctx)
+      _ = RadioMonitor.list(monitor)
+
+      # Re-enumerated under hci2 before sysfs shows it; the name and chip are
+      # what the MAC last had.
+      unlist(ctx, "hci1")
+      File.rm_rf!(Path.join(ctx.root, "hci1"))
+      hold(ctx, @dongle_mac, 2)
+
+      assert [
+               %{hci: "hci0"},
+               %{
+                 hci: "hci2",
+                 address: @dongle_mac,
+                 name: "dongle",
+                 chip: "Broadcom BCM43438 (CYW43438)",
+                 held: :tuya_mesh
+               }
+             ] = RadioMonitor.refresh(monitor)
+
+      # Never seen before: a minimal row.
+      hold(ctx, "11:22:33:44:55:66", 3)
+
+      assert %{hci: "hci3", chip: "Unknown", name: nil, held: :tuya_mesh} =
+               List.last(RadioMonitor.refresh(monitor))
+    end
+
+    test "a holder exiting re-enumerates (a crash sends no broadcast)", ctx do
+      unlist(ctx, "hci1")
+      pid = hold(ctx, @dongle_mac, 1)
+      monitor = start_held_monitor(ctx)
+      assert [_, %{address: @dongle_mac, held: :tuya_mesh}] = RadioMonitor.list(monitor)
+
+      Process.exit(pid, :kill)
+
+      assert_receive {:bluetooth_radios, [_, %{hci: "hci1", address: nil, held: nil}]}, 1_000
+    end
   end
 end

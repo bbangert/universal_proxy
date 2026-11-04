@@ -505,6 +505,185 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
     end
   end
 
+  describe "held mesh radio" do
+    # hci0 is the mesh radio, held over the user channel: bluetoothd lists
+    # only hci1 until the mesh lets go.
+    setup ctx do
+      :ok = Settings.set_role(ctx.settings, @hci0_mac, :tuya_mesh)
+      :ok = Settings.set_role(ctx.settings, @hci1_mac, :proxy)
+      test = self()
+      entry = %{address: @hci0_mac, index: 0, holder: :tuya_mesh, pid: test}
+      held = start_supervised!({Agent, fn -> [entry] end}, id: :held)
+
+      listed =
+        start_supervised!(
+          {Agent,
+           fn ->
+             [%{path: "/org/bluez/hci1", address: @hci1_mac, name: "dongle", powered: true}]
+           end},
+          id: :listed
+        )
+
+      {:ok, held: held, listed: listed}
+    end
+
+    defp held_opts(ctx, release_fun) do
+      [
+        bluez_child: {RecordingBluez, self()},
+        held_fun: fn -> Agent.get(ctx.held, & &1) end,
+        adapters_info_fun: fn -> Agent.get(ctx.listed, & &1) end,
+        release_mesh_fun: release_fun,
+        handback_poll_ms: 5
+      ]
+    end
+
+    # bluetoothd taking hci0 back `ms` after the mesh released it.
+    defp hand_back(ctx, test, ms) do
+      spawn(fn ->
+        Process.sleep(ms)
+
+        Agent.update(ctx.listed, fn listed ->
+          [%{path: "/org/bluez/hci0", address: @hci0_mac, name: "pi", powered: true} | listed]
+        end)
+
+        send(test, :listed)
+      end)
+    end
+
+    # The next of the ordering events, whatever else is in the mailbox.
+    defp next_event do
+      receive do
+        :released -> :released
+        :listed -> :listed
+        {:bluez_started, _desired, _excluded} -> :bluez_started
+      after
+        2_000 -> :none
+      end
+    end
+
+    test "a restart has the mesh release it and waits for bluetoothd before starting", ctx do
+      test = self()
+
+      release = fn ->
+        send(test, :released)
+        Agent.update(ctx.held, fn _ -> [] end)
+        hand_back(ctx, test, 100)
+        :ok
+      end
+
+      manager = start_manager(ctx, held_opts(ctx, release))
+      assert next_event() == :bluez_started
+
+      log = capture_log(fn -> :ok = Manager.reconcile(manager, restart: true) end)
+
+      assert [next_event(), next_event(), next_event()] == [:released, :listed, :bluez_started]
+      refute log =~ "restarting anyway"
+    end
+
+    test "the wait for bluetoothd is bounded", ctx do
+      test = self()
+
+      release = fn ->
+        send(test, :released)
+        Agent.update(ctx.held, fn _ -> [] end)
+        :ok
+      end
+
+      manager = start_manager(ctx, held_opts(ctx, release) ++ [handback_timeout_ms: 100])
+      assert next_event() == :bluez_started
+
+      started = System.monotonic_time(:millisecond)
+      log = capture_log(fn -> :ok = Manager.reconcile(manager, restart: true) end)
+
+      assert [next_event(), next_event()] == [:released, :bluez_started]
+      assert System.monotonic_time(:millisecond) - started >= 100
+
+      assert log =~
+               "bluetoothd doesn't list #{@hci0_mac} after 100 ms; restarting anyway"
+    end
+
+    test "a release that fails is logged and the restart goes ahead", ctx do
+      manager =
+        start_manager(
+          ctx,
+          held_opts(ctx, fn -> {:error, :timeout} end) ++ [handback_timeout_ms: 50]
+        )
+
+      assert next_event() == :bluez_started
+
+      log = capture_log(fn -> :ok = Manager.reconcile(manager, restart: true) end)
+
+      assert next_event() == :bluez_started
+      assert log =~ "the Tuya mesh didn't release its radio (:timeout); restarting anyway"
+    end
+
+    test "nothing held: no release, no wait", ctx do
+      Agent.update(ctx.held, fn _ -> [] end)
+      test = self()
+
+      manager =
+        start_manager(
+          ctx,
+          held_opts(ctx, fn ->
+            send(test, :released)
+            :ok
+          end)
+        )
+
+      assert next_event() == :bluez_started
+
+      :ok = Manager.reconcile(manager, restart: true)
+
+      assert next_event() == :bluez_started
+      refute_received :released
+    end
+
+    test "a reconcile without a restart never releases", ctx do
+      test = self()
+
+      manager =
+        start_manager(
+          ctx,
+          held_opts(ctx, fn ->
+            send(test, :released)
+            :ok
+          end)
+        )
+
+      assert next_event() == :bluez_started
+
+      :ok = Manager.reconcile(manager)
+
+      assert next_event() == :none
+    end
+
+    test "a stale daemon row under the held index doesn't make it the proxy", ctx do
+      # bluetoothd's cache still names hci0's previous adapter while the mesh
+      # (re)binds it.
+      :persistent_term.put(DevicePath.adapter_path_key(), "/org/bluez/hci0")
+
+      Agent.update(ctx.listed, fn listed ->
+        [
+          %{path: "/org/bluez/hci0", address: "11:22:33:44:55:66", name: "old", powered: true}
+          | listed
+        ]
+      end)
+
+      manager = start_manager(ctx, held_opts(ctx, fn -> :ok end))
+
+      assert %{proxying?: false, adapter: nil} = Manager.status(manager)
+    end
+
+    test "status never names the held index as the proxy adapter", ctx do
+      # The client never claimed: the path is the hci0 default, which the
+      # mesh holds out of bluetoothd's sight.
+      :persistent_term.put(DevicePath.adapter_path_key(), "/org/bluez/hci0")
+      manager = start_manager(ctx, held_opts(ctx, fn -> :ok end))
+
+      assert %{proxying?: false, adapter: nil} = Manager.status(manager)
+    end
+  end
+
   describe "adapter claim settling" do
     test "rebroadcasts status when the Client announces an adapter change", ctx do
       # Stands in for Bluez.Client's live Adapter1 view, which is empty

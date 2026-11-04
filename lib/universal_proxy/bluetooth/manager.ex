@@ -36,6 +36,25 @@ defmodule UniversalProxy.Bluetooth.Manager do
   start (`UniversalProxy.Bluetooth.bluez_spec/1`), so `mgmt: true` is only
   there while a mesh radio is assigned.
 
+  ## Held mesh radio
+
+  A radio the Tuya mesh holds over the HCI user channel
+  (`UniversalProxy.Bluetooth.HeldRadios`) is gone from `bluetoothd` until
+  the mesh closes the channel. The mesh runs inside the Bluez subtree, so
+  a restart would release it anyway, but only as the old subtree is torn
+  down, racing the old `bluetoothd`'s exit. So a `reconcile(restart:
+  true)` with a radio held first has the mesh release it
+  (`UniversalProxy.TuyaMesh.release_radio/1`, which returns once the mesh
+  is down and keeps it from starting again), then waits until
+  `bluetoothd` lists every released MAC again and none is held (polled
+  every `:handback_poll_ms`, 50 ms, for at most `:handback_timeout_ms`,
+  3 s; about 200 ms on hardware). Only then is the subtree stopped and
+  started for the new settings. A release that fails or a wait that runs
+  out is logged and the restart goes ahead: tearing the subtree down
+  still closes the channel.
+
+  While held, `status/0` never names that radio as the proxy adapter.
+
   ## Broadcasts
 
   The full status map (`status/0` shape) is published on
@@ -64,16 +83,19 @@ defmodule UniversalProxy.Bluetooth.Manager do
   `start_link/1` accepts `:name`, `:settings` (Settings server ref),
   `:dynamic_supervisor`, `:bluez_child` (a fixed child spec started under
   it, overriding the per-start one), `:bluez_spec_fun` (builds the per-start
-  spec from `[tuya_adapter: mac | nil]`), `:sysfs_root`, `:pubsub`, and
-  `:esphome_restart_fun` (the pausedness-flip reaction) — production
-  defaults wire the real modules; tests substitute fixtures and stubs.
+  spec from `[tuya_adapter: mac | nil]`), `:sysfs_root`, `:pubsub`,
+  `:esphome_restart_fun` (the pausedness-flip reaction), and for the held
+  mesh radio `:held_fun` (`HeldRadios.list/0`), `:release_mesh_fun`
+  (`TuyaMesh.release_radio/0`), `:handback_timeout_ms` and
+  `:handback_poll_ms` — production defaults wire the real modules; tests
+  substitute fixtures and stubs.
   """
 
   use GenServer
   require Logger
 
   alias Bluez.DevicePath
-  alias UniversalProxy.Bluetooth.{Radios, Settings}
+  alias UniversalProxy.Bluetooth.{HeldRadios, Radios, Settings}
 
   # Delay before re-binding the monitor after the subtree dies — the
   # DynamicSupervisor restarts a :permanent child immediately, so one tick
@@ -94,6 +116,16 @@ defmodule UniversalProxy.Bluetooth.Manager do
   # already in use") and sits adapterless until the Client's :no_adapter
   # loop bounces the subtree (~10 s). This pause makes switches clean.
   @restart_settle_ms 1_500
+
+  # See "Held mesh radio". bluetoothd took a released index back in
+  # ~200 ms on hardware.
+  @handback_timeout_ms 3_000
+  @handback_poll_ms 50
+
+  # A restart can wait for the mesh to release its radio (the Resolver's
+  # own bound is 30 s), then for bluetoothd, then stops and starts the
+  # subtree: longer than GenServer.call's default 5 s.
+  @restart_call_timeout 60_000
 
   def start_link(opts \\ []) do
     gen_opts =
@@ -131,8 +163,13 @@ defmodule UniversalProxy.Bluetooth.Manager do
 
   # `reconcile(restart: true)` — a lone keyword list is the opts, not the
   # server (default-arg filling would otherwise bind it to `server`).
-  def reconcile(opts, []) when is_list(opts), do: GenServer.call(__MODULE__, {:reconcile, opts})
-  def reconcile(server, opts), do: GenServer.call(server, {:reconcile, opts})
+  def reconcile(opts, []) when is_list(opts), do: reconcile(__MODULE__, opts)
+
+  def reconcile(server, opts),
+    do: GenServer.call(server, {:reconcile, opts}, call_timeout(opts))
+
+  defp call_timeout(opts),
+    do: if(Keyword.get(opts, :restart, false), do: @restart_call_timeout, else: 5_000)
 
   @impl GenServer
   def init(opts) do
@@ -147,6 +184,11 @@ defmodule UniversalProxy.Bluetooth.Manager do
       start_retry_ms: Keyword.get(opts, :start_retry_ms, @start_retry_ms),
       restart_settle_ms: Keyword.get(opts, :restart_settle_ms, @restart_settle_ms),
       esphome_restart_fun: Keyword.get(opts, :esphome_restart_fun, &restart_esphome/0),
+      held_fun: Keyword.get(opts, :held_fun, &HeldRadios.list/0),
+      release_mesh_fun:
+        Keyword.get(opts, :release_mesh_fun, &UniversalProxy.TuyaMesh.release_radio/0),
+      handback_timeout_ms: Keyword.get(opts, :handback_timeout_ms, @handback_timeout_ms),
+      handback_poll_ms: Keyword.get(opts, :handback_poll_ms, @handback_poll_ms),
       audio_role_supported_fun:
         Keyword.get(
           opts,
@@ -162,6 +204,8 @@ defmodule UniversalProxy.Bluetooth.Manager do
     # See "Broadcasts" in the moduledoc: the adapter claim lands after a
     # reconcile's broadcast, so rebroadcast when the Client announces it.
     Phoenix.PubSub.subscribe(state.pubsub, Bluez.Client.adapters_topic())
+    # A held radio can't be the proxy adapter (status/0).
+    Phoenix.PubSub.subscribe(state.pubsub, HeldRadios.topic())
 
     {:ok, state, {:continue, :reconcile}}
   end
@@ -263,6 +307,11 @@ defmodule UniversalProxy.Bluetooth.Manager do
     {:noreply, state}
   end
 
+  def handle_info({:bluetooth_held_changed}, state) do
+    broadcast(state)
+    {:noreply, state}
+  end
+
   def handle_info(_other, state), do: {:noreply, state}
 
   # ── reconcile ────────────────────────────────────────────────────────────
@@ -277,6 +326,7 @@ defmodule UniversalProxy.Bluetooth.Manager do
         start_bluez(state, config)
 
       restart? ->
+        :ok = hand_back_held(state)
         state = stop_bluez(state)
         # Blocking the Manager here is fine: radio switches are rare,
         # explicit user actions, and the caller waits anyway.
@@ -333,6 +383,60 @@ defmodule UniversalProxy.Bluetooth.Manager do
     end
   end
 
+  # See "Held mesh radio" in the moduledoc.
+  defp hand_back_held(state) do
+    case state.held_fun.() do
+      [] ->
+        :ok
+
+      held ->
+        macs = Enum.map(held, & &1.address)
+
+        Logger.info(
+          "Bluetooth.Manager: the Tuya mesh holds #{Enum.join(macs, ", ")}; " <>
+            "releasing it before the restart"
+        )
+
+        case state.release_mesh_fun.() do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            Logger.warning(
+              "Bluetooth.Manager: the Tuya mesh didn't release its radio " <>
+                "(#{inspect(reason)}); restarting anyway"
+            )
+        end
+
+        deadline = System.monotonic_time(:millisecond) + state.handback_timeout_ms
+        await_handback(state, macs, deadline)
+    end
+  end
+
+  defp await_handback(state, macs, deadline) do
+    listed = MapSet.new(state.adapters_info_fun.(), &upcase(Map.get(&1, :address)))
+    held = MapSet.new(state.held_fun.(), & &1.address)
+    pending = Enum.reject(macs, &(MapSet.member?(listed, &1) and not MapSet.member?(held, &1)))
+
+    cond do
+      pending == [] ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        Logger.warning(
+          "Bluetooth.Manager: bluetoothd doesn't list #{Enum.join(pending, ", ")} after " <>
+            "#{state.handback_timeout_ms} ms; restarting anyway"
+        )
+
+      true ->
+        Process.sleep(state.handback_poll_ms)
+        await_handback(state, macs, deadline)
+    end
+  end
+
+  defp upcase(mac) when is_binary(mac), do: String.upcase(mac)
+  defp upcase(other), do: other
+
   # Sweep ALL children rather than just the tracked pid: after a crash the
   # DynamicSupervisor restarts the subtree under a pid we may not have
   # re-bound yet, and a stale-pid terminate_child would silently leave the
@@ -382,22 +486,29 @@ defmodule UniversalProxy.Bluetooth.Manager do
   #
   # `:mesh` when nothing but the excluded mesh radio can be relaying: the path
   # names it (the client never claims it, so that's the hci0 default or a
-  # stale earlier claim), or the path names a radio that's gone and the mesh
-  # radio is all that's left. build_status/1 reports no adapter instead.
+  # stale earlier claim; while the mesh holds it, by its held index), or the
+  # path names a radio that's gone and the mesh radio is all that's left.
+  # build_status/1 reports no adapter instead.
   defp adapter_status(state, running?, tuya_adapter) do
     if running? do
       path = DevicePath.adapter_path()
       hci = Path.basename(path)
       live = state.adapters_info_fun.()
 
-      case Enum.find(live, &(&1.path == path)) do
-        %{address: address} when is_binary(address) and address == tuya_adapter ->
+      # A held index is the mesh's whatever bluetoothd still caches for it.
+      held? = Enum.any?(state.held_fun.(), &("hci#{&1.index}" == hci))
+
+      case {held?, Enum.find(live, &(&1.path == path))} do
+        {true, _row} ->
           :mesh
 
-        %{address: address, name: name} ->
+        {false, %{address: address}} when is_binary(address) and address == tuya_adapter ->
+          :mesh
+
+        {false, %{address: address, name: name}} ->
           %{hci: hci, address: address, name: name}
 
-        nil ->
+        {false, nil} ->
           if only_mesh_left?(live, tuya_adapter),
             do: :mesh,
             else: %{hci: hci, address: nil, name: nil}

@@ -117,6 +117,25 @@ defmodule UniversalProxyWeb.BluetoothLiveTest do
     refute html =~ "In use"
   end
 
+  test "a radio the Tuya mesh holds renders identified, as in use by the mesh", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/bluetooth")
+
+    html =
+      inject_radios(view, [
+        radio(%{held: :tuya_mesh, role: :tuya_mesh, bus: :usb, name: nil}),
+        radio(%{hci: "hci1", address: "11:22:33:44:55:66", held: nil})
+      ])
+
+    assert html =~ "In use by Tuya mesh"
+    assert html =~ "AA:BB:CC:DD:EE:FF"
+    # Still has its role picker, so the role can be changed while held.
+    assert has_element?(view, ~s(button[phx-value-mac="AA:BB:CC:DD:EE:FF"][phx-value-role="off"]))
+    assert html =~ "USB Bluetooth adapter"
+
+    # Not held: no badge.
+    refute inject_radios(view, [radio(%{held: nil})]) =~ "In use by Tuya mesh"
+  end
+
   test "role-paused status renders Paused with the assign-a-radio hint", %{conn: conn} do
     {:ok, view, _html} = live(conn, "/bluetooth")
 

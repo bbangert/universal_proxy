@@ -391,6 +391,69 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
     end
   end
 
+  describe "a MAC recorded in HeldRadios" do
+    setup ctx do
+      {:ok, _} = Store.replace(inventory(), [], ctx.store)
+      registry = :"tuya_held_#{System.unique_integer([:positive])}"
+      start_supervised!({UniversalProxy.Bluetooth.HeldRadios, registry: registry})
+      # No Radio answers here: only the registry says the adapter is held.
+      start_mesh_sup(ctx, held_radios: [registry: registry], tick_ms: 60_000)
+      assert mesh_index(ctx) == 1
+      {:ok, registry: registry}
+    end
+
+    test "keeps the mesh while bluetoothd no longer lists the adapter", ctx do
+      opts = [registry: ctx.registry, pubsub: ctx.pubsub]
+      :ok = UniversalProxy.Bluetooth.HeldRadios.hold(@mesh_mac, 1, opts)
+      pid = mesh_pid(ctx)
+
+      set_adapters(ctx, [adapter(@proxy_mac, 0)])
+      adapters_changed(ctx)
+      _ = status(ctx)
+      assert mesh_pid(ctx) == pid
+
+      # No longer held and still not listed: gone.
+      :ok = UniversalProxy.Bluetooth.HeldRadios.release(@mesh_mac, opts)
+      adapters_changed(ctx)
+      wait_until(fn -> mesh_pid(ctx) == nil end, 500)
+      assert %{state: :idle, reason: :adapter_missing} = status(ctx)
+    end
+  end
+
+  describe "releasing the radio" do
+    setup ctx do
+      {:ok, _} = Store.replace(inventory(), [], ctx.store)
+      start_mesh_sup(ctx)
+      assert mesh_index(ctx) == 1
+      :ok
+    end
+
+    test "stops the mesh before replying and keeps it stopped for the hold", ctx do
+      pid = mesh_pid(ctx)
+      ref = Process.monitor(pid)
+
+      assert :ok = Resolver.release(ctx.names.resolver, hold_ms: 300)
+      assert_received {:DOWN, ^ref, :process, ^pid, _}
+      assert %{state: :idle, reason: :released} = status(ctx)
+      assert_receive {:tuya_mesh_status, %{reason: :released}}
+
+      # The adapter coming back (bluetoothd took it) doesn't restart it, nor
+      # do the retry timers.
+      adapters_changed(ctx)
+      Process.sleep(100)
+      assert mesh_pid(ctx) == nil
+
+      # The hold ends: started again.
+      wait_until(fn -> is_pid(mesh_pid(ctx)) end, 1_000)
+      assert %{state: :running} = status(ctx)
+    end
+
+    test "the facade's release is exit-safe" do
+      assert UniversalProxy.TuyaMesh.release_radio(resolver: :no_such_resolver) ==
+               {:error, :not_running}
+    end
+  end
+
   describe "subscriptions and inventory changes" do
     setup ctx do
       {:ok, _} = Store.replace(inventory(), [], ctx.store)

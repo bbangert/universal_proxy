@@ -47,14 +47,25 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio.Transport.UserChannel do
   going down a loss; the next setup binds again by MAC. Messages from an
   earlier channel's process are ignored.
 
-  Options: `:hci_user` (default `Bluez.HciUser`, a test seam) and
-  `:hci_user_opts` (merged into its start options).
+  ## Held radio
+
+  While bound to the right controller (from the BD_ADDR check until the
+  channel is closed) the Radio's process holds the MAC in
+  `UniversalProxy.Bluetooth.HeldRadios`, with the index, so the host still
+  lists the adapter `bluetoothd` no longer sees. The entry is dropped when
+  the channel goes (closed, unplugged, its process down, the Radio
+  stopping) and with the Radio's process if it crashes.
+
+  Options: `:hci_user` (default `Bluez.HciUser`, a test seam),
+  `:hci_user_opts` (merged into its start options) and `:held_radios`
+  (`HeldRadios` options, a test seam).
   """
 
   @behaviour UniversalProxy.TuyaBeaconMesh.Radio.Transport
 
   require Logger
 
+  alias UniversalProxy.Bluetooth.HeldRadios
   alias UniversalProxy.TuyaBeaconMesh.{Carrier, Radio}
 
   @event_mask 0x20001FFFFFFFFFFF
@@ -74,6 +85,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio.Transport.UserChannel do
          address: address,
          hci_user: Keyword.get(opts, :hci_user, Bluez.HciUser),
          hci_user_opts: Keyword.get(opts, :hci_user_opts, []),
+         held_radios: Keyword.get(opts, :held_radios, []),
          server: nil,
          mon: nil,
          index: nil,
@@ -295,7 +307,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio.Transport.UserChannel do
   defp check_address(t) do
     case t.hci_user.read_bd_addr(t.server) do
       {:ok, address} when address == t.address ->
-        {:ok, t}
+        {:ok, hold(t)}
 
       {:ok, address} ->
         {:error, {:wrong_adapter, mac(address)}, forget(t)}
@@ -335,7 +347,18 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio.Transport.UserChannel do
   # The channel's process is gone or going: nothing of it is kept.
   defp gone(t) do
     if t.mon, do: Process.demonitor(t.mon, [:flush])
+    # Unconditional: a failed init step returns the state from before the
+    # hold, and release/2 only drops this process's own entry.
+    :ok = HeldRadios.release(mac(t.address), t.held_radios)
     %{t | server: nil, mon: nil, index: nil, scanning: false, advertising: false}
+  end
+
+  defp hold(t) do
+    with {:error, :held_elsewhere} <- HeldRadios.hold(mac(t.address), t.index, t.held_radios) do
+      Logger.warning("#{inspect(Radio)}: #{mac(t.address)} is already recorded as held")
+    end
+
+    t
   end
 
   defp log_dropped(t, count) do

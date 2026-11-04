@@ -39,14 +39,27 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   A Radio on the HCI user channel takes its adapter away from
   `bluetoothd` while it holds it, so there the adapter reads as gone (or,
   briefly around a re-bind, moved). The mesh is kept running then: the
-  Radio's status says it holds the channel (`transport: :user_channel`,
-  `lease_held: true`), and the user channel resolves the MAC and checks
-  the controller's own address on every bind, so it can't be driving
-  another adapter. The same holds while the Radio hands the adapter over
-  to its fallback transport (`transport_handoff: true`, bounded by the
-  Radio): `bluetoothd` is still taking it back. The status is read fresh
-  at that point; when the Radio doesn't answer, what the last read said
-  decides.
+  MAC is recorded in `UniversalProxy.Bluetooth.HeldRadios` (by the
+  Radio's process, from the BD_ADDR check until the channel closes), or
+  the Radio's status says it holds the channel (`transport:
+  :user_channel`, `lease_held: true`), and the user channel resolves the
+  MAC and checks the controller's own address on every bind, so it can't
+  be driving another adapter. The same holds while the Radio hands the
+  adapter over to its fallback transport (`transport_handoff: true`,
+  bounded by the Radio): `bluetoothd` is still taking it back. The status
+  is read fresh at that point; when the Radio doesn't answer, what the
+  last read said decides.
+
+  ## Releasing the radio
+
+  `release/2` stops the mesh, which closes a user channel and so hands
+  the adapter back to `bluetoothd`, and keeps it stopped (`reason:
+  :released`) for `:hold_ms` (default 30 s) instead of starting it again
+  as soon as the adapter reappears. `UniversalProxy.Bluetooth.Manager`
+  calls it before restarting the Bluez subtree (a role change), so the
+  adapter is back with `bluetoothd` before the new subtree claims radios.
+  The hold only matters when no restart follows; then the mesh starts
+  again when it ends.
 
   While idle, the same event re-evaluates at once instead of waiting for
   the retry timer.
@@ -150,13 +163,14 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   process owns, see `UniversalProxy.TuyaMesh.Presence`), `:radio`,
   `:lights`, `:pubsub`, `:retry_ms`, `:restart_ms`, `:tick_ms`,
   `:index_check_ticks` (ticks between adapter re-checks, default 6),
-  `:reachable_ms`, `:miss_limit`.
+  `:reachable_ms`, `:miss_limit`, `:held_radios` (`HeldRadios` options).
   """
 
   use GenServer
 
   require Logger
 
+  alias UniversalProxy.Bluetooth.HeldRadios
   alias UniversalProxy.TuyaBeaconMesh.{Inventory, Lights, Radio}
   alias UniversalProxy.TuyaMesh.{Mesh, Presence, Redact, Store, WallClock}
 
@@ -173,6 +187,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   # Stopping the mesh waits for Lights (5 s) and the Radio's teardown (10 s).
   @change_timeout 30_000
   @shutdown 20_000
+  @release_hold_ms 30_000
 
   @type reason ::
           :no_role
@@ -183,6 +198,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
           | :lone_radio
           | :start_failed
           | :mesh_exited
+          | :released
           | :not_running
 
   @type status :: %{
@@ -236,6 +252,21 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   def clear(server \\ __MODULE__, opts \\ []),
     do: GenServer.call(server, {:clear, opts}, @change_timeout)
 
+  @doc """
+  Stops the mesh and keeps it stopped for `:hold_ms` (default
+  #{@release_hold_ms}), see "Releasing the radio". Returns once the mesh
+  (and so its radio) is down. `opts`: `:hold_ms`, `:timeout` (default
+  #{@change_timeout}). Exits when not running.
+  """
+  @spec release(GenServer.server(), keyword()) :: :ok
+  def release(server \\ __MODULE__, opts \\ []),
+    do:
+      GenServer.call(
+        server,
+        {:release, Keyword.get(opts, :hold_ms, @release_hold_ms)},
+        Keyword.get(opts, :timeout, @change_timeout)
+      )
+
   @doc false
   # The status shape for when no Resolver runs (`UniversalProxy.TuyaMesh`'s
   # fallback): idle, inventory from `load_result`, nothing live.
@@ -285,6 +316,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
       dynsup: Keyword.fetch!(opts, :dynsup),
       store: Keyword.get(opts, :store, Store),
       adapters_fun: Keyword.get(opts, :adapters_fun, &Bluez.Client.adapters_info/0),
+      held_radios: Keyword.get(opts, :held_radios, []),
       mesh_spec_fun:
         Keyword.get(
           opts,
@@ -304,6 +336,8 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
       time_offset_fun: Keyword.get(opts, :time_offset_fun, &WallClock.offset_ms/0),
       timer: nil,
       refresh_timer: nil,
+      # Armed by release/2: the mesh stays stopped until it fires.
+      release_timer: nil,
       ticks: 0,
       mesh: nil,
       reason: nil,
@@ -470,6 +504,13 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
     {:reply, reply, %{state | backoff_ms: state.retry_ms} |> evaluate() |> publish()}
   end
 
+  defp do_call({:release, hold_ms}, _from, state) do
+    state = state |> stop_mesh() |> cancel_release()
+    Logger.info("TuyaMesh: mesh released its radio for #{hold_ms} ms")
+    state = %{state | release_timer: arm(:resume, hold_ms)} |> idle(:released, false)
+    {:reply, :ok, publish(state)}
+  end
+
   defp do_call({:clear, opts}, _from, state) do
     state = stop_mesh(state)
     reply = Store.clear(state.store, opts)
@@ -484,6 +525,11 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   # already delivered when its timer was cancelled is recognised and dropped.
   defp do_info({:evaluate, token}, %{timer: {token, _}} = state),
     do: {:noreply, %{state | timer: nil} |> evaluate() |> publish()}
+
+  defp do_info({:resume, token}, %{release_timer: {token, _}} = state) do
+    state = %{state | release_timer: nil, backoff_ms: state.retry_ms}
+    {:noreply, state |> evaluate() |> publish()}
+  end
 
   defp do_info({:tick, token}, %{timer: {token, _}, mesh: %{}} = state) do
     # The catch-up can stop the mesh (its adapter left while the PubSub was
@@ -546,6 +592,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   defp adapters_changed(state), do: %{state | backoff_ms: state.retry_ms} |> evaluate()
 
   defp evaluate(%{mesh: %{}} = state), do: state
+  defp evaluate(%{release_timer: {_token, _tref}} = state), do: idle(state, :released, false)
 
   defp evaluate(state) do
     state = state |> cancel_timer() |> load_inventory()
@@ -702,7 +749,7 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
           other ->
             state = read_radio(state)
 
-            if state.radio_held,
+            if state.radio_held or HeldRadios.held?(state.mac, state.held_radios),
               do: state,
               else: adapter_left(state, index, other)
         end
@@ -724,6 +771,13 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   end
 
   defp schedule_tick(state), do: state
+
+  defp cancel_release(%{release_timer: {_token, tref}} = state) do
+    Process.cancel_timer(tref)
+    %{state | release_timer: nil}
+  end
+
+  defp cancel_release(state), do: state
 
   defp cancel_timer(%{timer: nil} = state), do: state
 

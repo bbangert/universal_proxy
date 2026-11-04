@@ -914,6 +914,10 @@ defmodule UniversalProxyWeb.BluetoothLive do
           <span class="text-sm font-semibold">{radio_name(@radio)}</span>
           <span :if={@radio.chip} class="text-xs text-fg-3">{@radio.chip}</span>
           <.badge :if={@role == :proxy and @proxying?} variant={:success} dot>In use</.badge>
+          <%!-- Out of bluetoothd's sight while the mesh holds it (HCI user channel). --%>
+          <.badge :if={@radio[:held] == :tuya_mesh} variant={:success} dot>
+            In use by Tuya mesh
+          </.badge>
           <.badge
             :if={@role == :audio and @paired_count > 0}
             variant={:neutral}

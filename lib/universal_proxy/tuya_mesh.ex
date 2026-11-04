@@ -225,6 +225,24 @@ defmodule UniversalProxy.TuyaMesh do
           | {:error, term()}
   def group_sync(opts \\ []), do: Lights.groups(lights(opts))
 
+  @doc """
+  Stops the mesh and keeps it stopped for a while, so its radio goes back
+  to `bluetoothd` before a Bluez subtree restart (see the Resolver's
+  "Releasing the radio"). `opts`: `:resolver`, `:hold_ms`, `:timeout`.
+  `{:error, :not_running}` without a Resolver, `{:error, :timeout}` when it
+  didn't finish in time (the mesh may still be stopping).
+  """
+  @spec release_radio(keyword()) :: :ok | {:error, :not_running | :timeout}
+  def release_radio(opts \\ []) do
+    Resolver.release(
+      Keyword.get(opts, :resolver, Resolver),
+      Keyword.take(opts, [:hold_ms, :timeout])
+    )
+  catch
+    :exit, {:timeout, _} -> {:error, :timeout}
+    :exit, _reason -> {:error, :not_running}
+  end
+
   # ── Private ──────────────────────────────────────────────────────────
 
   # Lights' client functions already follow the `catch :exit` idiom
