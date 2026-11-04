@@ -130,9 +130,11 @@ defmodule Circuits.CEC.Adapter.Follower do
     if pa == ctx.phys_addr, do: {[], []}, else: {[], [{:active_source, false}]}
   end
 
-  # <User Control Released> belongs to whoever handles the press.
+  # <User Control Released> also belongs to whoever handles the press.
   defp handled?(:user_control_released, ctx),
-    do: MapSet.member?(ctx.handled, :user_control_pressed)
+    do:
+      MapSet.member?(ctx.handled, :user_control_released) or
+        MapSet.member?(ctx.handled, :user_control_pressed)
 
   defp handled?(name, ctx), do: MapSet.member?(ctx.handled, name)
 
@@ -145,7 +147,8 @@ defmodule Circuits.CEC.Adapter.Follower do
 
   # Replies need a logical address to send from. Directed replies go only
   # to a directed message for us from a registered device: a reply to
-  # Unregistered (15) would be a broadcast.
+  # Unregistered (15) would be a broadcast. A broadcast <Active Source>
+  # reaches everyone, so it answers a request from 15 too.
   defp sendable?(_reply, _msg, %{la: nil}), do: false
   defp sendable?({@broadcast, {:active_source, _pa}}, _msg, _ctx), do: true
 

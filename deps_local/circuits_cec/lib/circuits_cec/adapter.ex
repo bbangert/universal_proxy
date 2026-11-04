@@ -47,8 +47,12 @@ defmodule Circuits.CEC.Adapter do
   | `<Give Deck Status>`, `<Play>`, `<Deck Control>`, `<User Control Pressed/Released>` | nothing if a subscriber handles them (`subscribe(adapter, handle: [...])`), otherwise `<Feature Abort>` |
   | any other directed request | `<Feature Abort>` (unrecognized opcode, or invalid operand when too short) |
 
-  Broadcasts, `<Feature Abort>`, reports and messages from Unregistered
-  are never answered. The kernel answers `<Get CEC Version>`, `<Give
+  `<Feature Abort>` and reports are never answered, and neither is
+  anything else with a directed answer when it was broadcast or came from
+  Unregistered (15), since a directed message to 15 would be a broadcast.
+  The two answers that are broadcasts (`<Active Source>` for `<Request
+  Active Source>` and `<Set Stream Path>`) go out whoever asked, as
+  v4l-utils' `cec-follower` does. The kernel answers `<Get CEC Version>`, `<Give
   Physical Address>`, `<Give OSD Name>`, `<Give Device Vendor ID>`,
   `<Abort>` and `<Give Features>` itself, so the adapter doesn't.
 
@@ -200,8 +204,9 @@ defmodule Circuits.CEC.Adapter do
 
   `handle:` lists the opcodes this subscriber acts on, from
   `:give_deck_status`, `:play`, `:deck_control` and
-  `:user_control_pressed` (which includes `:user_control_released`). The
-  adapter Feature-Aborts those only while no subscriber handles them.
+  `:user_control_pressed` (which includes `:user_control_released`), or
+  `:user_control_released` on its own. The adapter Feature-Aborts those
+  only while no subscriber handles them.
   Subscribing again replaces the list; other opcodes raise `ArgumentError`.
   """
   @spec subscribe(adapter(), keyword()) :: :ok
@@ -381,6 +386,7 @@ defmodule Circuits.CEC.Adapter do
       claim: :pending,
       phys_addr: @invalid_pa,
       log_addr_mask: 0,
+      generation: 0,
       active_source?: false,
       last_standby: nil,
       receiver: :unknown,
@@ -702,8 +708,19 @@ defmodule Circuits.CEC.Adapter do
   # The one place physical/logical addresses change. Becoming configured
   # starts the receiver poll and resumes a waiting One Touch Play; losing
   # the physical address ends being the active source.
+  #
+  # Losing the configuration, or a new physical address, starts a new
+  # generation: results of transmits from an earlier one still answer
+  # their callers but no longer change what the adapter believes.
   defp set_addresses(state, pa, mask) do
     was = configured?(state)
+
+    state =
+      if (was and not configured?(%{state | phys_addr: pa, log_addr_mask: mask})) or
+           pa != state.phys_addr,
+         do: %{state | generation: state.generation + 1},
+         else: state
+
     state = %{state | phys_addr: pa, log_addr_mask: mask}
     now = configured?(state)
 
@@ -776,7 +793,8 @@ defmodule Circuits.CEC.Adapter do
       payload: payload,
       reply: reply,
       timeout: timeout,
-      fallback?: false
+      fallback?: false,
+      stale?: false
     }
   end
 
@@ -838,6 +856,8 @@ defmodule Circuits.CEC.Adapter do
     state
   end
 
+  defp job_effect(state, %{stale?: true}, _result), do: state
+
   defp job_effect(state, %{payload: {:active_source, _}}, :ok),
     do: emit_state(%{state | active_source?: true})
 
@@ -866,7 +886,13 @@ defmodule Circuits.CEC.Adapter do
         {:ok, id, transport} ->
           timer = Process.send_after(self(), {:tx_deadline, ref}, timeout + state.tx_deadline)
 
-          tx = %{seq: nil, reply?: reply_op != 0, cont: cont, timer: timer}
+          tx = %{
+            seq: nil,
+            reply?: reply_op != 0,
+            cont: cont,
+            timer: timer,
+            generation: state.generation
+          }
 
           {:ok,
            %{
@@ -904,9 +930,10 @@ defmodule Circuits.CEC.Adapter do
   defp reply_opcode(op) when is_integer(op) and op in 1..0xFF, do: {:ok, op}
 
   defp reply_opcode(op) when is_atom(op) do
+    # 0 would tell the kernel not to wait for a reply at all.
     case Message.opcode(op) do
-      nil -> {:error, {:invalid_message, op}}
-      byte -> {:ok, byte}
+      byte when is_integer(byte) and byte in 1..0xFF -> {:ok, byte}
+      _none -> {:error, {:invalid_message, op}}
     end
   rescue
     FunctionClauseError -> {:error, {:invalid_message, op}}
@@ -1018,9 +1045,19 @@ defmodule Circuits.CEC.Adapter do
             do: bump(state, :tx_errors),
             else: state
 
-        continue(state, tx.cont, result)
+        cont = if tx.generation == state.generation, do: tx.cont, else: stale(tx.cont)
+        continue(state, cont, result)
     end
   end
+
+  # What is left of a continuation from an earlier generation: callers
+  # still get their result, but there is no receiver fallback and no
+  # change to the active source or receiver state.
+  defp stale({:job, job}), do: {:job, %{job | fallback?: false, stale?: true}}
+  defp stale({:press, job}), do: {:press, %{job | fallback?: false, stale?: true}}
+  defp stale({:otp, id, step}), do: {:otp_stale, id, step}
+  defp stale(:receiver_poll), do: :ignore
+  defp stale(:follower), do: :follower
 
   defp continue(state, {:job, job}, result), do: finish_job(state, job, result)
 
@@ -1047,6 +1084,12 @@ defmodule Circuits.CEC.Adapter do
   end
 
   defp continue(state, {:otp, id, step}, result), do: otp_step(state, id, step, result)
+
+  defp continue(state, {:otp_stale, id, :active_source}, result),
+    do: otp_step(state, id, :active_source_stale, result)
+
+  defp continue(state, {:otp_stale, id, step}, result), do: otp_step(state, id, step, result)
+  defp continue(state, :ignore, _result), do: state
 
   defp continue(state, :follower, :ok), do: state
 
@@ -1194,6 +1237,10 @@ defmodule Circuits.CEC.Adapter do
         otp_system_audio(state)
 
       {:active_source, :active_source} ->
+        otp_finish(state, result)
+
+      # Sent before an unplug: it went out, but doesn't make us active now.
+      {:active_source_stale, :active_source} ->
         otp_finish(state, result)
 
       {:system_audio_mode, :system_audio_mode} ->

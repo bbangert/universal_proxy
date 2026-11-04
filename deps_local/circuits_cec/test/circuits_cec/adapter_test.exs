@@ -64,8 +64,10 @@ defmodule Circuits.CEC.AdapterTest do
         _ -> :default
       end
 
-      %{adapter: adapter} = start(responder: responder)
-      assert_stopped(adapter, {:shutdown, {:s_mode, :ebusy}})
+      %{fake: fake, adapter: adapter} = start(responder: responder, ready: :manual)
+      ref = Process.monitor(adapter)
+      :ok = Fake.inject(fake, {:ready, Struct.encode_caps(capabilities: [:transmit])})
+      assert_receive {:DOWN, ^ref, :process, ^adapter, {:shutdown, {:s_mode, :ebusy}}}
     end
 
     test "skips the connector query without the capability" do
@@ -173,13 +175,17 @@ defmodule Circuits.CEC.AdapterTest do
     end
 
     test "stops normally when the device doesn't exist" do
-      %{adapter: adapter} = start(ready: {:open_error, :enoent})
-      assert_stopped(adapter, :normal)
+      %{fake: fake, adapter: adapter} = start(ready: :manual)
+      ref = Process.monitor(adapter)
+      :ok = Fake.inject(fake, {:open_error, :enoent})
+      assert_receive {:DOWN, ^ref, :process, ^adapter, :normal}
     end
 
     test "stops with a shutdown for other open errors" do
-      %{adapter: adapter} = start(ready: {:open_error, :eacces})
-      assert_stopped(adapter, {:shutdown, {:open_error, :eacces}})
+      %{fake: fake, adapter: adapter} = start(ready: :manual)
+      ref = Process.monitor(adapter)
+      :ok = Fake.inject(fake, {:open_error, :eacces})
+      assert_receive {:DOWN, ^ref, :process, ^adapter, {:shutdown, {:open_error, :eacces}}}
     end
 
     test "fails to start without a helper" do
@@ -461,6 +467,18 @@ defmodule Circuits.CEC.AdapterTest do
                Adapter.request(adapter, 0, :give_device_power_status, 0x100)
     end
 
+    test ":feature_abort is not a reply opcode" do
+      %{fake: fake, adapter: adapter} = configured(tx_deadline_ms: 30)
+
+      assert Adapter.request(adapter, 0, :give_device_power_status, :feature_abort) ==
+               {:error, {:invalid_message, :feature_abort}}
+
+      assert Adapter.request(adapter, 0, :give_device_power_status, 0) ==
+               {:error, {:invalid_message, 0}}
+
+      assert length(transmits(fake)) == 1
+    end
+
     test "a reply can't be requested for a broadcast or a poll" do
       %{adapter: adapter} = configured()
 
@@ -633,6 +651,17 @@ defmodule Circuits.CEC.AdapterTest do
       assert length(transmits(fake)) == 2
     end
 
+    test "broadcast answers also go to requests from Unregistered" do
+      %{fake: fake, adapter: adapter} = configured()
+      active(fake, adapter)
+
+      receive_msg(fake, <<0xFF, 0x85>>)
+      assert {_seq, %Message{to: 15, body: {:active_source, @pa}}} = nth_tx(fake, 3)
+
+      receive_msg(fake, <<0xFF, 0x86, 0x10, 0x00>>)
+      assert {_seq, %Message{to: 15, body: {:active_source, @pa}}} = nth_tx(fake, 4)
+    end
+
     test "answers Request Active Source only while active" do
       %{fake: fake, adapter: adapter} = configured()
 
@@ -686,6 +715,18 @@ defmodule Circuits.CEC.AdapterTest do
       receive_msg(fake, <<0x0F, 0x36>>)
       wait_until(fn -> not Adapter.info(adapter).active_source? end)
       assert Adapter.info(adapter).last_standby == 0
+      assert length(transmits(fake)) == 2
+    end
+
+    test "a subscriber can claim releases alone" do
+      %{fake: fake, adapter: adapter} = configured()
+      :ok = Adapter.subscribe(adapter, handle: [:user_control_released])
+
+      receive_msg(fake, <<0x04, 0x45>>)
+      assert_receive {:cec, @device, {:message, %Message{body: :user_control_released}}}
+      receive_msg(fake, <<0x04, 0x44, 0x44>>)
+
+      assert {_seq, %Message{body: {:feature_abort, :user_control_pressed, _}}} = nth_tx(fake, 2)
       assert length(transmits(fake)) == 2
     end
 
@@ -940,6 +981,60 @@ defmodule Circuits.CEC.AdapterTest do
     end
   end
 
+  ## Results from an earlier configuration
+
+  describe "results from before an unplug" do
+    test "an Active Source sent before the unplug doesn't make us active again" do
+      %{fake: fake, adapter: adapter} = configured()
+
+      task = Task.async(fn -> Adapter.active_source(adapter) end)
+      {seq, _as} = nth_tx(fake, 2)
+      replug(fake, adapter)
+
+      complete(fake, seq, tx_status: 0x01)
+      assert Task.await(task) == :ok
+      refute Adapter.info(adapter).active_source?
+    end
+
+    test "nor does a One Touch Play's" do
+      %{fake: fake, adapter: adapter} = configured()
+
+      task = Task.async(fn -> Adapter.one_touch_play(adapter) end)
+      {seq, _ivo} = nth_tx(fake, 2)
+      complete(fake, seq, tx_status: 0x01)
+      {seq, %Message{body: {:active_source, _}}} = nth_tx(fake, 3)
+      replug(fake, adapter)
+
+      complete(fake, seq, tx_status: 0x01)
+      assert Task.await(task) == :ok
+      refute Adapter.info(adapter).active_source?
+    end
+
+    test "an old receiver poll doesn't overwrite the new receiver state" do
+      %{fake: fake, adapter: adapter} = configured(receiver: :pending)
+      {old, _poll} = nth_tx(fake, 1)
+      replug(fake, adapter)
+      {_new, %Message{body: :poll}} = nth_tx(fake, 2)
+
+      complete(fake, old, tx_status: 0x24)
+      assert Adapter.info(adapter).receiver == :unknown
+    end
+
+    test "an old :receiver NACK neither falls back nor marks the receiver absent" do
+      %{fake: fake, adapter: adapter} = configured(receiver: :present)
+
+      task = Task.async(fn -> Adapter.give_power_status(adapter, :receiver) end)
+      {seq, %Message{to: 5}} = nth_tx(fake, 2)
+      replug(fake, adapter)
+      {_poll, %Message{body: :poll}} = nth_tx(fake, 3)
+
+      complete(fake, seq, tx_status: 0x24)
+      assert Task.await(task) == {:error, :nack}
+      assert Adapter.info(adapter).receiver == :unknown
+      assert length(transmits(fake)) == 3
+    end
+  end
+
   ## Receiver
 
   describe "receiver" do
@@ -1162,6 +1257,14 @@ defmodule Circuits.CEC.AdapterTest do
     :ok = Task.await(task)
   end
 
+  # Unplug and replug at the same address; the kernel re-claims.
+  defp replug(fake, adapter) do
+    state_change(fake, 0xFFFF, 0)
+    wait_until(fn -> not Adapter.info(adapter).configured? end)
+    state_change(fake, @pa, @mask)
+    wait_until(fn -> Adapter.info(adapter).configured? end)
+  end
+
   defp g_log(log_addrs) do
     fn
       :g_log -> {:ok, log_addrs}
@@ -1220,11 +1323,6 @@ defmodule Circuits.CEC.AdapterTest do
       Struct.encode_event(event: :state_change, phys_addr: pa, log_addr_mask: mask, flags: flags)
 
     :ok = Fake.inject(fake, {:event, event})
-  end
-
-  defp assert_stopped(pid, reason) do
-    ref = Process.monitor(pid)
-    assert_receive {:DOWN, ^ref, :process, ^pid, ^reason}
   end
 
   defp wait_until(fun, timeout \\ 1_000) do
