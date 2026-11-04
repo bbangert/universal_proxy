@@ -740,6 +740,21 @@ defmodule UniversalProxy.Audio.PlayerTest do
       refute :sys.get_state(pid).volume_external
     end
 
+    test "state follows the binary's ack even when the setter was not called" do
+      pid = start_player!()
+      assert_receive {:sendspin_state, @key, %{event: "started"}}, 2_000
+      refute :sys.get_state(pid).volume_external
+
+      # Bypasses set_volume_external/2, so only the ack can update the state.
+      :ok = Player.__send_command__(pid, %{cmd: "set_volume_external", value: true})
+      assert_receive {:sendspin_state, @key, %{event: "volume_external", value: true}}, 1_000
+      assert :sys.get_state(pid).volume_external
+
+      :ok = Player.__send_command__(pid, %{cmd: "set_volume_external", value: false})
+      assert_receive {:sendspin_state, @key, %{event: "volume_external", value: false}}, 1_000
+      refute :sys.get_state(pid).volume_external
+    end
+
     test "volume and mute are still reported while external" do
       pid = start_player!()
       assert_receive {:sendspin_state, @key, %{event: "started"}}, 2_000
