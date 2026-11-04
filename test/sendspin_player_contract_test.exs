@@ -336,6 +336,58 @@ defmodule SendspinPlayerContractTest do
     assert next_event(port) == %{"event" => "mute", "value" => false}
   end
 
+  test "set_volume_external command acks the mode in both directions", %{port: port} do
+    send_command(port, ~s({"cmd":"set_volume_external","value":true}))
+    assert next_event(port) == %{"event" => "volume_external", "value" => true}
+
+    send_command(port, ~s({"cmd":"set_volume_external","value":false}))
+    assert next_event(port) == %{"event" => "volume_external", "value" => false}
+  end
+
+  test "--external-volume emits the volume_external ack at startup", %{tmp_dir: tmp_dir} do
+    port =
+      spawn_player(
+        state_dir: Path.join(tmp_dir, "external"),
+        ws_port: @ws_port + 2,
+        extra: ["--external-volume"]
+      )
+
+    os_pid =
+      case Port.info(port, :os_pid) do
+        {:os_pid, pid} -> pid
+        _ -> nil
+      end
+
+    on_exit(fn -> shutdown_os_process(os_pid) end)
+
+    assert_started_event(port)
+    assert_volume_event(port)
+    assert next_event(port) == %{"event" => "volume_external", "value" => true}
+    assert_static_delay_event(port)
+  end
+
+  test "set_volume_external with a missing or non-boolean value is rejected", %{port: port} do
+    send_command(port, ~s({"cmd":"set_volume_external"}))
+    send_command(port, ~s({"cmd":"set_volume_external","value":1}))
+    send_command(port, ~s({"cmd":"set_volume_external","value":"true"}))
+
+    # Commands are handled in order, so if any of the above had acked, that
+    # event would arrive before this one.
+    send_command(port, ~s({"cmd":"set_volume","value":42}))
+    assert next_event(port) == %{"event" => "volume", "value" => 42}
+  end
+
+  test "volume and mute are still reported while external-volume mode is on", %{port: port} do
+    send_command(port, ~s({"cmd":"set_volume_external","value":true}))
+    assert next_event(port) == %{"event" => "volume_external", "value" => true}
+
+    send_command(port, ~s({"cmd":"set_volume","value":35}))
+    assert next_event(port) == %{"event" => "volume", "value" => 35}
+
+    send_command(port, ~s({"cmd":"set_muted","value":true}))
+    assert next_event(port) == %{"event" => "mute", "value" => true}
+  end
+
   test "shutdown command exits cleanly within a few seconds", %{port: port} do
     send_command(port, ~s({"cmd":"shutdown"}))
 

@@ -200,7 +200,13 @@ void AlsaPipeSink::set_volume(uint8_t volume) {
 
 void AlsaPipeSink::set_muted(bool muted) { muted_.store(muted); }
 
+void AlsaPipeSink::set_volume_external(bool external) {
+    volume_external_.store(external);
+}
+
 void AlsaPipeSink::apply_volume(uint8_t* data, size_t length) {
+    if (volume_external_.load()) return;
+
     const uint8_t vol = volume_.load();
     const bool muted  = muted_.load();
     if (!muted && vol >= 100) return;

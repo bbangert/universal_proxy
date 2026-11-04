@@ -9,8 +9,8 @@ defmodule UniversalProxy.Audio.Player do
     * A `Port` opened with `{:spawn_executable, binary_path}` and
       `{:line, 4096}` packet mode — stdout JSON events arrive as
       `{port, {:data, {:eol, line}}}` messages.
-    * Stdin commands (`set_volume`, `set_muted`, `shutdown`) written
-      via `Port.command/2` as line-delimited JSON.
+    * Stdin commands (`set_volume`, `set_muted`, `set_volume_external`,
+      `shutdown`) written via `Port.command/2` as line-delimited JSON.
     * The `MdnsLite` service advertisement for `_sendspin._tcp` so
       Sendspin servers can discover this player. Registered only once
       the binary reports `listening` (WebSocket listener bound), NOT
@@ -46,6 +46,7 @@ defmodule UniversalProxy.Audio.Player do
       {"event":"time_sync","error_us":42.3}
       {"event":"volume","value":80}
       {"event":"mute","value":false}
+      {"event":"volume_external","value":true}
       {"event":"static_delay","value":200}
       {"event":"error","kind":"alsa_configure","msg":"..."}
       {"event":"error","kind":"pairing_token","msg":"..."}
@@ -55,7 +56,17 @@ defmodule UniversalProxy.Audio.Player do
 
       {"cmd":"set_volume","value":75}
       {"cmd":"set_muted","value":true}
+      {"cmd":"set_volume_external","value":true}
       {"cmd":"shutdown"}
+
+  ## External volume
+
+  In external-volume mode an outboard stage (an HDMI-CEC receiver) is the
+  only volume/mute stage: the binary plays at unity gain, while volume
+  and mute are still tracked, reported to the Sendspin server and
+  emitted as `volume`/`mute` events exactly as in software mode. Start
+  in it with the `:volume_external` option (passed as
+  `--external-volume`), toggle it with `set_volume_external/2`.
 
   The binary also writes its Sendspin pairing token to `pairing_token`
   in the state dir (see `state_dir/1`); that secret never appears on
@@ -123,6 +134,7 @@ defmodule UniversalProxy.Audio.Player do
     reannounce_delays_ms: [],
     mdns_retry_ms: @mdns_retry_ms,
     mdns_failures: 0,
+    volume_external: false,
     last_event: %{},
     os_pid: nil
   ]
@@ -149,6 +161,7 @@ defmodule UniversalProxy.Audio.Player do
           reannounce_delays_ms: [non_neg_integer()],
           mdns_retry_ms: pos_integer(),
           mdns_failures: non_neg_integer(),
+          volume_external: boolean(),
           last_event: map(),
           os_pid: pos_integer() | nil
         }
@@ -177,6 +190,19 @@ defmodule UniversalProxy.Audio.Player do
   @spec set_muted(GenServer.server(), boolean()) :: :ok
   def set_muted(server, muted?) when is_boolean(muted?) do
     GenServer.call(server, {:set_muted, muted?})
+  end
+
+  @doc """
+  Push `{"cmd":"set_volume_external","value":true|false}` to the
+  binary's stdin. While on, the binary applies no software volume or
+  mute but keeps tracking and reporting both; off resumes software
+  scaling at the current values. The binary acks with a
+  `volume_external` event. The mode is kept for this player's lifetime
+  only — a respawned player starts from its `:volume_external` option.
+  """
+  @spec set_volume_external(GenServer.server(), boolean()) :: :ok
+  def set_volume_external(server, external?) when is_boolean(external?) do
+    GenServer.call(server, {:set_volume_external, external?})
   end
 
   @doc """
@@ -226,6 +252,7 @@ defmodule UniversalProxy.Audio.Player do
     device_name_fun = Keyword.get(opts, :device_name_fun, &default_device_name/0)
     mac_address_fun = Keyword.get(opts, :mac_address_fun, &default_mac_address/0)
     state_dir = Keyword.get(opts, :state_dir) || state_dir(config)
+    volume_external = Keyword.get(opts, :volume_external, false)
 
     state = %__MODULE__{
       key: key,
@@ -237,7 +264,8 @@ defmodule UniversalProxy.Audio.Player do
       mdns_module: mdns_module,
       device_name_fun: device_name_fun,
       mac_address_fun: mac_address_fun,
-      state_dir: state_dir
+      state_dir: state_dir,
+      volume_external: volume_external
     }
 
     if File.exists?(binary_path) do
@@ -306,6 +334,11 @@ defmodule UniversalProxy.Audio.Player do
     {:reply, :ok, state}
   end
 
+  def handle_call({:set_volume_external, external?}, _from, state) do
+    send_command(state, {:set_volume_external, external?})
+    {:reply, :ok, %{state | volume_external: external?}}
+  end
+
   def handle_call(:last_event, _from, state) do
     {:reply, state.last_event, state}
   end
@@ -326,7 +359,7 @@ defmodule UniversalProxy.Audio.Player do
     # server) but values aren't atomised by `:atoms`, only keys.
     case Jason.decode(line, keys: :atoms) do
       {:ok, %{event: _} = event} ->
-        state = maybe_register_mdns(state, event)
+        state = state |> maybe_register_mdns(event) |> track_volume_external(event)
         broadcast_state(state, event)
         {:noreply, %{state | last_event: event}}
 
@@ -501,6 +534,13 @@ defmodule UniversalProxy.Audio.Player do
 
   defp maybe_register_mdns(state, _event), do: state
 
+  # The binary's ack is the source of truth for the mode it is in.
+  defp track_volume_external(state, %{event: "volume_external", value: external?})
+       when is_boolean(external?),
+       do: %{state | volume_external: external?}
+
+  defp track_volume_external(state, _event), do: state
+
   # On success, anchor the §8.3 reannounce burst here so its
   # cache-priming fires after the record actually exists. On failure
   # (MdnsLite down or mid-restart) schedule a retry: `listening` is a
@@ -566,6 +606,8 @@ defmodule UniversalProxy.Audio.Player do
       "--log-level",
       "info"
     ]
+
+    base = if state.volume_external, do: base ++ ["--external-volume"], else: base
 
     # Sendspin servers display device_info as "Vendor / Product" (Music
     # Assistant's player list). Pass the node name (which carries the
@@ -645,6 +687,10 @@ defmodule UniversalProxy.Audio.Player do
 
   defp send_command(state, {:set_muted, muted?}) when is_boolean(muted?) do
     send_raw(state, [~s({"cmd":"set_muted","value":), to_string(muted?), ~s(})])
+  end
+
+  defp send_command(state, {:set_volume_external, external?}) when is_boolean(external?) do
+    send_raw(state, [~s({"cmd":"set_volume_external","value":), to_string(external?), ~s(})])
   end
 
   defp send_command(state, :shutdown) do
