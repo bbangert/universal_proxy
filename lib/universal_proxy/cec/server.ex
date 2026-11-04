@@ -93,6 +93,7 @@ defmodule UniversalProxy.Cec.Server do
   defstruct adapters: %{},
             procs: %{},
             errors: %{},
+            versions: %{},
             enumerate: nil,
             output_lookup: nil,
             transport: Circuits.CEC.Transport.Port,
@@ -129,13 +130,23 @@ defmodule UniversalProxy.Cec.Server do
     do: GenServer.call(__MODULE__, {:adapter_for_card, card_index})
 
   @doc """
+  The receiver cache's version: it changes whenever the receiver reports
+  its status or the cache is cleared. Read it before a command whose
+  outcome goes to `note_receiver/4`.
+  """
+  @spec receiver_version(String.t()) :: non_neg_integer()
+  def receiver_version(dev), do: GenServer.call(__MODULE__, {:receiver_version, dev})
+
+  @doc """
   Record what a command delivered to `to` did to the far end. Applied only
   when `to` is the receiver right now (`:receiver`, or its logical address)
-  or a broadcast.
+  or a broadcast, and when nothing has changed the cache since `version`
+  (`receiver_version/1` before the command): the command's result reaches
+  this server after the adapter's own events, so a newer report wins.
   """
-  @spec note_receiver(String.t(), Adapter.target(), map()) :: :ok
-  def note_receiver(dev, to, partial) when is_map(partial),
-    do: GenServer.cast(__MODULE__, {:note_receiver, dev, to, partial})
+  @spec note_receiver(String.t(), Adapter.target(), non_neg_integer(), map()) :: :ok
+  def note_receiver(dev, to, version, partial) when is_map(partial),
+    do: GenServer.cast(__MODULE__, {:note_receiver, dev, to, version, partial})
 
   @doc "Re-run discovery now (tests, or after a manual cable swap)."
   @spec rescan() :: :ok
@@ -181,13 +192,17 @@ defmodule UniversalProxy.Cec.Server do
 
   def handle_call(:rescan, _from, state), do: {:reply, :ok, scan(state)}
 
+  def handle_call({:receiver_version, dev}, _from, state),
+    do: {:reply, Map.get(state.versions, dev, 0), state}
+
   @impl true
-  def handle_cast({:note_receiver, dev, to, partial}, state) do
+  def handle_cast({:note_receiver, dev, to, version, partial}, state) do
     case Map.fetch(state.adapters, dev) do
       {:ok, adapter} ->
-        if reaches_receiver?(to, receiver_target(state, adapter)),
-          do: {:noreply, update_receiver(state, dev, partial)},
-          else: {:noreply, state}
+        if version == Map.get(state.versions, dev, 0) and
+             reaches_receiver?(to, receiver_target(state, adapter)),
+           do: {:noreply, update_receiver(state, dev, partial)},
+           else: {:noreply, state}
 
       :error ->
         {:noreply, state}
@@ -450,18 +465,29 @@ defmodule UniversalProxy.Cec.Server do
     }
   end
 
-  # Updates what is known about the link. When that moves the receiver
-  # target (the receiver went away, or is back), the cached status belonged
-  # to the other device and is dropped.
+  # Updates what is known about the link. When the link changes (a new
+  # receiver target, physical address, configuration, or the adapter
+  # stopping or starting), the device answering at the receiver's address
+  # may be a different one, so the cached status is dropped.
   defp update_link(state, dev, fun) do
-    update_adapter(state, dev, fn adapter ->
-      updated = fun.(adapter)
+    case Map.fetch(state.adapters, dev) do
+      {:ok, adapter} ->
+        updated = fun.(adapter)
 
-      if receiver_target(state, updated) == receiver_target(state, adapter),
-        do: updated,
-        else: %{updated | receiver: @unknown_receiver}
-    end)
+        if link(state, updated) == link(state, adapter),
+          do: put_adapter(state, updated),
+          else: state |> put_adapter(%{updated | receiver: @unknown_receiver}) |> bump(dev)
+
+      :error ->
+        state
+    end
   end
+
+  defp link(state, adapter) do
+    {receiver_target(state, adapter), adapter.phys_addr, adapter.configured?, adapter.running?}
+  end
+
+  defp bump(state, dev), do: %{state | versions: Map.update(state.versions, dev, 1, &(&1 + 1))}
 
   defp reaches_receiver?(:receiver, _target), do: true
   defp reaches_receiver?(:broadcast, _target), do: true
@@ -482,16 +508,16 @@ defmodule UniversalProxy.Cec.Server do
   defp receiver_target(state, _adapter), do: state.receiver_la
 
   defp apply_message(state, dev, %Message{from: la, body: {:report_power_status, power}}, la),
-    do: update_receiver(state, dev, %{power: power(power)})
+    do: report(state, dev, %{power: power(power)})
 
   defp apply_message(state, dev, %Message{from: la, body: {:report_audio_status, m, v}}, la),
-    do: update_receiver(state, dev, audio_status(m, v))
+    do: report(state, dev, audio_status(m, v))
 
   defp apply_message(state, dev, %Message{to: 15, body: :standby}, _la),
-    do: update_receiver(state, dev, %{power: :standby})
+    do: report(state, dev, %{power: :standby})
 
   defp apply_message(state, dev, %Message{from: la, body: :standby}, la),
-    do: update_receiver(state, dev, %{power: :standby})
+    do: report(state, dev, %{power: :standby})
 
   defp apply_message(state, _dev, _message, _la), do: state
 
@@ -509,6 +535,8 @@ defmodule UniversalProxy.Cec.Server do
     do: %{volume: volume, muted: muted}
 
   def audio_status(muted, _volume), do: %{volume: nil, muted: muted}
+
+  defp report(state, dev, partial), do: state |> update_receiver(dev, partial) |> bump(dev)
 
   defp update_receiver(state, dev, partial) do
     update_adapter(state, dev, fn adapter ->

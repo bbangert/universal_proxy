@@ -258,6 +258,23 @@ defmodule UniversalProxy.Cec.ServerTest do
       wait_until(fn -> receiver().power == :to_standby end)
     end
 
+    test "a power report that beats the Standby result is not overwritten", %{fake: fake} do
+      configure(fake, :present)
+
+      task = Task.async(fn -> Cec.standby(@dev) end)
+      {seq, %Message{to: 5, body: :standby}} = nth_tx(fake, 2)
+
+      # The caller resumes only after the receiver's own report is recorded.
+      :erlang.suspend_process(task.pid)
+      ack(fake, seq)
+      receive_msg(fake, <<0x54, 0x90, 0x01>>)
+      wait_until(fn -> receiver().power == :standby end)
+      :erlang.resume_process(task.pid)
+
+      assert Task.await(task) == :ok
+      assert receiver().power == :standby
+    end
+
     test "a NACKed Standby is an error and leaves the receiver cache alone", %{fake: fake} do
       configure(fake, :present)
 
@@ -275,6 +292,25 @@ defmodule UniversalProxy.Cec.ServerTest do
   end
 
   describe "hotplug" do
+    test "a replug forgets the previous receiver's status", %{fake: fake} do
+      configure(fake, :present)
+      receive_msg(fake, <<0x54, 0x7A, 0x21>>)
+      wait_until(fn -> receiver().volume == 33 end)
+
+      state_change(fake, 0xFFFF, 0)
+      wait_until(fn -> match?({:ok, %{configured?: false}}, Server.get_adapter(@dev)) end)
+      assert %{volume: nil, muted: nil} = receiver()
+
+      state_change(fake, @pa, @mask)
+      {seq, %Message{to: 5, body: :poll}} = nth_tx(fake, 2)
+      ack(fake, seq)
+      wait_until(fn -> match?({:ok, %{configured?: true}}, Server.get_adapter(@dev)) end)
+
+      receive_msg(fake, <<0x54, 0x90, 0x00>>)
+      wait_until(fn -> receiver().power == :on end)
+      assert %{power: :on, volume: nil, muted: nil} = receiver()
+    end
+
     test "an unplugged adapter is stopped on the next scan, and replug starts exactly one", %{
       fake: fake,
       agent: agent

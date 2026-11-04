@@ -96,9 +96,10 @@ defmodule UniversalProxy.Cec do
   @spec standby(dev(), keyword()) :: :ok | {:error, error()}
   def standby(dev, opts \\ []) do
     to = to(opts)
+    version = receiver_version(dev)
 
     with :ok <- with_adapter(dev, &Adapter.standby(&1, to, call_opts(opts))) do
-      Server.note_receiver(dev, to, %{power: :to_standby})
+      if version, do: Server.note_receiver(dev, to, version, %{power: :to_standby})
       :ok
     end
   end
@@ -149,6 +150,12 @@ defmodule UniversalProxy.Cec do
   end
 
   # ── private ───────────────────────────────────────────────────────────
+
+  defp receiver_version(dev) do
+    Server.receiver_version(dev)
+  catch
+    :exit, _ -> nil
+  end
 
   defp to(opts) do
     case Keyword.fetch(opts, :to) do
