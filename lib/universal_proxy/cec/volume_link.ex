@@ -7,7 +7,13 @@ defmodule UniversalProxy.Cec.VolumeLink do
   running, the receiver is present, on and reporting a volume, and the
   output's `cec_volume` setting is on (`UniversalProxy.Cec.volume_link?/2`).
   It stays linked until the receiver reports standby, the adapter or the
-  output goes away, or the setting is turned off. A receiver record that is
+  output goes away, the setting is turned off, or the receiver stops
+  answering: `:fail_unlink` (3) polls or runs in a row failing outright
+  (no reply, a timeout; a run that stalled still read the volume back, so it
+  isn't one). An output linked to a silent receiver would otherwise stay at
+  unity gain. Such an adapter relinks only once a probe gets an answer
+  again, not on `Cec.Server`'s record, which still holds the last report.
+  A receiver record that is
   merely cleared (`UniversalProxy.Cec.Server` drops it when the HDMI link
   changes) keeps the link and the last known values until the next poll.
 
@@ -48,8 +54,8 @@ defmodule UniversalProxy.Cec.VolumeLink do
   `:list_adapters`, `:list_outputs`, `:set_volume_external` (key, bool),
   `:update_config` (key, map), `:set_volume` (dev, target), `:set_muted`
   (dev, bool), `:audio_status` (dev), `:power_status` (dev), `:pubsub`,
-  `:task_supervisor`, `:default` (the `volume_link` default) and the
-  `:poll_ms`, `:probe_ms` and `:settle_ms` intervals.
+  `:task_supervisor`, `:default` (the `volume_link` default), `:fail_unlink`
+  and the `:poll_ms`, `:probe_ms` and `:settle_ms` intervals.
   """
 
   use GenServer
@@ -65,6 +71,7 @@ defmodule UniversalProxy.Cec.VolumeLink do
   @default_poll_ms 3_000
   @default_probe_ms 10_000
   @default_settle_ms 1_000
+  @default_fail_unlink 3
   @echo_ttl_ms 5_000
   @fields [:volume, :muted]
 
@@ -74,11 +81,13 @@ defmodule UniversalProxy.Cec.VolumeLink do
             busy: %{},
             timers: %{},
             power_at: %{},
+            lost: MapSet.new(),
             funs: %{},
             default: true,
             poll_ms: @default_poll_ms,
             probe_ms: @default_probe_ms,
             settle_ms: @default_settle_ms,
+            fail_unlink: @default_fail_unlink,
             pubsub: @pubsub,
             task_sup: UniversalProxy.TaskSupervisor
 
@@ -119,6 +128,7 @@ defmodule UniversalProxy.Cec.VolumeLink do
       poll_ms: Keyword.get(opts, :poll_ms, Keyword.get(env, :volume_poll_ms, @default_poll_ms)),
       probe_ms: Keyword.get(opts, :probe_ms, @default_probe_ms),
       settle_ms: Keyword.get(opts, :settle_ms, @default_settle_ms),
+      fail_unlink: Keyword.get(opts, :fail_unlink, @default_fail_unlink),
       pubsub: Keyword.get(opts, :pubsub, @pubsub),
       task_sup: Keyword.get(opts, :task_supervisor, UniversalProxy.TaskSupervisor)
     }
@@ -239,7 +249,7 @@ defmodule UniversalProxy.Cec.VolumeLink do
     state =
       Enum.reduce(candidates, state, fn {dev, key}, acc ->
         if not Map.has_key?(acc.links, dev) and key not in linked_keys(acc) and
-             linkable?(acc.adapters[dev]),
+             not MapSet.member?(acc.lost, dev) and linkable?(acc.adapters[dev]),
            do: link(acc, dev, key),
            else: acc
       end)
@@ -286,7 +296,8 @@ defmodule UniversalProxy.Cec.VolumeLink do
       shown: %{volume: nil, muted: nil},
       pending: %{},
       echoes: [],
-      quiet_until: nil
+      quiet_until: nil,
+      failures: 0
     }
 
     state = put_in(state.links[dev], link)
@@ -546,23 +557,27 @@ defmodule UniversalProxy.Cec.VolumeLink do
         do: state,
         else: put_in(state.power_at[dev], System.monotonic_time(:millisecond))
 
+    answered? = answered?(power) and answered?(audio)
+
     state =
       case audio do
         {:ok, %{} = status} -> receiver_report(state, dev, status)
         _ -> state
       end
 
-    next(state, dev)
+    state
+    |> poll_outcome(dev, answered?, power, audio)
+    |> next(dev)
   end
 
   defp job_done(state, dev, {:step, targets, status, error}) do
     if error, do: log_step_error(dev, targets, status, error)
-    step_ended(state, dev, status)
+    step_ended(state, dev, status, error in [nil, :no_progress, :press_limit])
   end
 
-  defp job_done(state, dev, _crashed), do: step_ended(state, dev, nil)
+  defp job_done(state, dev, _crashed), do: step_ended(state, dev, nil, false)
 
-  defp step_ended(state, dev, status) do
+  defp step_ended(state, dev, status, answered?) do
     case state.links[dev] do
       nil ->
         next(state, dev)
@@ -571,9 +586,56 @@ defmodule UniversalProxy.Cec.VolumeLink do
         quiet_until = System.monotonic_time(:millisecond) + state.settle_ms
         receiver = Map.merge(link.receiver, known(status || %{}))
         state = put_in(state.links[dev], %{link | receiver: receiver, quiet_until: quiet_until})
-        next(state, dev)
+        state |> count_answer(dev, answered?) |> next(dev)
     end
   end
+
+  # `:skipped` is a request not made this time.
+  defp answered?(:skipped), do: true
+  defp answered?({:ok, _}), do: true
+  defp answered?(_failed), do: false
+
+  defp poll_outcome(state, dev, answered?, power, audio) do
+    cond do
+      Map.has_key?(state.links, dev) ->
+        count_answer(state, dev, answered?)
+
+      MapSet.member?(state.lost, dev) and answered? and match?({:ok, :on}, power) ->
+        found_again(state, dev, audio)
+
+      true ->
+        state
+    end
+  end
+
+  defp count_answer(state, dev, true), do: put_in(state.links[dev].failures, 0)
+
+  defp count_answer(state, dev, false) do
+    failures = state.links[dev].failures + 1
+
+    if failures >= state.fail_unlink do
+      Logger.warning("CEC volume link: receiver on #{dev} stopped answering (#{failures} tries)")
+      %{unlink(state, dev) | lost: MapSet.put(state.lost, dev)}
+    else
+      put_in(state.links[dev].failures, failures)
+    end
+  end
+
+  # A lost receiver answered a probe: relink from what it just said (the
+  # record Cec.Server broadcasts may not have caught up yet).
+  defp found_again(state, dev, {:ok, %{volume: volume} = status}) when is_integer(volume) do
+    Logger.info("CEC volume link: receiver on #{dev} answers again")
+
+    adapters =
+      Map.update!(state.adapters, dev, fn adapter ->
+        merged = receiver(adapter) |> Map.merge(known(status)) |> Map.put(:power, :on)
+        Map.put(adapter, :receiver, merged)
+      end)
+
+    evaluate(%{state | lost: MapSet.delete(state.lost, dev), adapters: adapters})
+  end
+
+  defp found_again(state, _dev, _audio), do: state
 
   # After any job: run what was requested meanwhile, else show the
   # receiver's state and go back to polling.
