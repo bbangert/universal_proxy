@@ -6,7 +6,7 @@ defmodule UniversalProxy.BluetoothTest do
   use ExUnit.Case, async: false
 
   alias UniversalProxy.Bluetooth
-  alias UniversalProxy.Bluetooth.{AudioManager, Manager, RadioMonitor, Settings}
+  alias UniversalProxy.Bluetooth.{AudioManager, HeldRadios, Manager, RadioMonitor, Settings}
   alias Bluez.DevicePath
 
   @pubsub UniversalProxy.PubSub
@@ -20,6 +20,17 @@ defmodule UniversalProxy.BluetoothTest do
     use Agent
 
     def start_link(_opts), do: Agent.start_link(fn -> :ok end)
+  end
+
+  defmodule RecordingBluez do
+    @moduledoc false
+    # Tells the test the adapter terms each subtree start sees.
+    def child_spec(test), do: %{id: __MODULE__, start: {__MODULE__, :start_link, [test]}}
+
+    def start_link(test) do
+      send(test, {:bluez_started, DevicePath.desired_adapter(), DevicePath.excluded_adapters()})
+      Agent.start_link(fn -> :ok end)
+    end
   end
 
   # AudioManager ops for the bond-cleanup ordering test: one speaker bonded to
@@ -407,6 +418,188 @@ defmodule UniversalProxy.BluetoothTest do
       assert_received {:removed, ^speaker}
       [{_, pid_after, _, _}] = DynamicSupervisor.which_children(dynsup)
       assert pid_after != pid_before
+    end
+  end
+
+  describe "a radio the Tuya mesh holds over the user channel" do
+    @hci2_mac "11:22:33:44:55:66"
+
+    defp adapter_entry(hci, mac),
+      do: %{path: "/org/bluez/#{hci}", address: mac, name: "radio-#{hci}", powered: true}
+
+    # hci0 is the mesh radio, held (so bluetoothd lists only hci1 and hci2);
+    # hci1 proxies. The Manager's release reaches the holder, which lets go
+    # and has "bluetoothd" list hci0 again 50 ms later.
+    setup do
+      tmp = Path.join(System.tmp_dir!(), "bt_held_test_#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf(tmp) end)
+      sysfs = Path.join(tmp, "sysfs")
+
+      for {hci, mac} <- [{"hci0", @hci0_mac}, {"hci1", @hci1_mac}, {"hci2", @hci2_mac}],
+          do: add_radio(sysfs, hci, mac)
+
+      start_supervised!(HeldRadios)
+      start_supervised!({Settings, table: @table, dets_path: Path.join(tmp, "s.dets")})
+      :ok = Settings.set_role(@hci0_mac, :tuya_mesh)
+      :ok = Settings.set_role(@hci1_mac, :proxy)
+
+      listed =
+        start_supervised!(
+          {Agent, fn -> [adapter_entry("hci1", @hci1_mac), adapter_entry("hci2", @hci2_mac)] end},
+          id: :listed
+        )
+
+      holder = start_holder(listed)
+      dynsup = start_supervised!({DynamicSupervisor, strategy: :one_for_one})
+      test = self()
+
+      start_supervised!(
+        {Manager,
+         dynamic_supervisor: dynsup,
+         bluez_child: {RecordingBluez, test},
+         sysfs_root: sysfs,
+         pubsub: @pubsub,
+         restart_settle_ms: 0,
+         esphome_restart_fun: fn -> :ok end,
+         adapters_info_fun: fn -> Agent.get(listed, & &1) end,
+         handback_poll_ms: 5,
+         release_mesh_fun: fn ->
+           send(test, :release_asked)
+           send(holder, {:release, self()})
+
+           receive do
+             :unheld -> :ok
+           after
+             1_000 -> {:error, :timeout}
+           end
+         end}
+      )
+
+      start_supervised!(
+        {RadioMonitor,
+         sysfs_root: sysfs, pubsub: @pubsub, adapters_info_fun: fn -> Agent.get(listed, & &1) end}
+      )
+
+      _ = Manager.status()
+      _ = RadioMonitor.list()
+      assert_receive {:bluez_started, @hci1_mac, [@hci0_mac]}
+
+      %{dynsup: dynsup, holder: holder}
+    end
+
+    defp start_holder(listed) do
+      test = self()
+
+      pid =
+        spawn(fn ->
+          :ok = HeldRadios.hold(@hci0_mac, 0)
+          send(test, :held)
+
+          receive do
+            {:release, from} ->
+              :ok = HeldRadios.release(@hci0_mac)
+              send(test, :released)
+              send(from, :unheld)
+              Process.sleep(50)
+              Agent.update(listed, &[adapter_entry("hci0", @hci0_mac) | &1])
+              send(test, :listed)
+          end
+
+          Process.sleep(:infinity)
+        end)
+
+      on_exit(fn -> Process.exit(pid, :kill) end)
+      assert_receive :held
+      pid
+    end
+
+    defp subtree(dynsup) do
+      [{_, pid, _, _}] = DynamicSupervisor.which_children(dynsup)
+      pid
+    end
+
+    defp next_event do
+      receive do
+        :released -> :released
+        :listed -> :listed
+        {:bluez_started, _desired, _excluded} -> :bluez_started
+      after
+        2_000 -> :none
+      end
+    end
+
+    test "is listed with its MAC, the mesh role and the held state, once" do
+      radios = Bluetooth.list_radios()
+
+      assert [
+               %{
+                 hci: "hci0",
+                 address: @hci0_mac,
+                 role: :tuya_mesh,
+                 held: :tuya_mesh,
+                 in_use?: false
+               },
+               %{hci: "hci1", address: @hci1_mac, role: :proxy, held: nil},
+               %{hci: "hci2", address: @hci2_mac, held: nil}
+             ] = radios
+
+      assert Enum.count(radios, &(&1.address == @hci0_mac)) == 1
+    end
+
+    test "setting :tuya_mesh again is a no-op", %{dynsup: dynsup} do
+      pid = subtree(dynsup)
+
+      assert Bluetooth.set_role(String.downcase(@hci0_mac), :tuya_mesh) == :ok
+
+      assert subtree(dynsup) == pid
+      refute_received :release_asked
+      assert HeldRadios.held?(@hci0_mac)
+    end
+
+    test "moving the mesh to another radio releases the held one first" do
+      assert Bluetooth.set_role(@hci2_mac, :tuya_mesh) == :ok
+
+      assert [next_event(), next_event()] == [:released, :listed]
+      assert_receive {:bluez_started, @hci1_mac, [@hci2_mac]}
+
+      assert Settings.get().roles == %{
+               @hci0_mac => :off,
+               @hci1_mac => :proxy,
+               @hci2_mac => :tuya_mesh
+             }
+    end
+
+    test "a new role releases it first: Bluez starts only once bluetoothd has it back" do
+      assert Bluetooth.set_role(@hci0_mac, :proxy) == :ok
+
+      assert [next_event(), next_event(), next_event()] == [:released, :listed, :bluez_started]
+      assert Settings.get().roles == %{@hci0_mac => :proxy}
+      assert :persistent_term.get(DevicePath.excluded_adapters_key()) == []
+
+      # bluetoothd's again: identified by the daemon, no longer held.
+      assert %{address: @hci0_mac, role: :proxy, held: nil} =
+               Enum.find(Bluetooth.list_radios(), &(&1.hci == "hci0"))
+    end
+
+    test "another radio's role change that restarts nothing leaves the mesh alone",
+         %{dynsup: dynsup} do
+      pid = subtree(dynsup)
+
+      assert Bluetooth.set_role(@hci2_mac, :audio) == :ok
+
+      assert subtree(dynsup) == pid
+      refute_received :release_asked
+      assert HeldRadios.held?(@hci0_mac)
+      assert %{held: :tuya_mesh, role: :tuya_mesh} = hd(Bluetooth.list_radios())
+    end
+
+    test "another radio's role change that restarts the subtree keeps the mesh radio excluded" do
+      assert Bluetooth.set_role(@hci1_mac, :off) == :ok
+
+      # The restart tears the mesh down with the subtree, so it is released
+      # first; the new subtree still leaves hci0 to the mesh.
+      assert [next_event(), next_event()] == [:released, :listed]
+      assert_receive {:bluez_started, nil, [@hci0_mac]}
     end
   end
 end

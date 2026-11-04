@@ -293,11 +293,14 @@ defmodule UniversalProxy.Bluetooth do
   The known radios (cached, ≤ 5 s old):
 
       [%{hci:, address:, name:, chip:, bus:, detail:, bt_version:,
-         ble?:, bredr?:, in_use?:, role:}]
+         ble?:, bredr?:, in_use?:, role:, held:}]
 
   `role` is the radio's stored role (`nil` when unassigned or the address
   is unknown). `in_use?` marks only the radio the proxy stack claimed, so a
-  `:tuya_mesh` radio is never `in_use?`. `[]` on non-BT targets or before
+  `:tuya_mesh` radio is never `in_use?`. `held` is `:tuya_mesh` while the
+  mesh holds the radio over the HCI user channel, out of `bluetoothd`'s
+  sight; the row still carries its MAC and role
+  (`UniversalProxy.Bluetooth.HeldRadios`). `[]` on non-BT targets or before
   the monitor is up.
   """
   @spec list_radios() :: [map()]
@@ -447,6 +450,15 @@ defmodule UniversalProxy.Bluetooth do
   HA-facing feature flags follow — pausing really stops the proxy, resuming
   re-advertises it.
 
+  A radio the mesh holds over the HCI user channel is invisible to
+  `bluetoothd` until the mesh lets go, but it is still listed
+  (`list_radios/0`), so its role can be changed like any other. Before
+  any restart the Manager has the mesh release it and waits (bounded) for
+  `bluetoothd` to list it again (`Manager`, "Held mesh radio"); only then
+  does the new subtree start and claim radios for the new roles. Setting
+  `:tuya_mesh` on the radio that already has it is `:ok` and changes
+  nothing.
+
   Note the sequence here is multi-step under one `catch :exit` (see
   CLAUDE.md's documented tradeoff): if the Manager wedges *after* the
   settings write and bond-forget committed, the caller sees
@@ -468,14 +480,21 @@ defmodule UniversalProxy.Bluetooth do
   def set_role(mac, :tuya_mesh) when is_binary(mac) do
     normalized = String.upcase(mac)
 
-    with :ok <- check_mesh_radio(normalized), do: do_set_role(normalized, :tuya_mesh)
+    # Already the mesh radio: nothing to check or restart, also while the
+    # mesh holds it out of the radio list's reach.
+    if roles().tuya_mesh == normalized do
+      :ok
+    else
+      with :ok <- check_mesh_radio(normalized), do: do_set_role(normalized, :tuya_mesh)
+    end
   end
 
   def set_role(mac, role) when is_binary(mac), do: do_set_role(mac, role)
 
   # The mesh radio must be present and leave at least one other radio. An
   # empty list (monitor down, daemon not answering) can't confirm the MAC, and
-  # an unchecked one would still demote the real mesh radio, so refuse.
+  # an unchecked one would still demote the real mesh radio, so refuse. A
+  # radio the mesh holds is listed with its MAC (RadioMonitor), so it counts.
   defp check_mesh_radio(mac) do
     case list_radios() do
       [] ->
@@ -577,6 +596,11 @@ defmodule UniversalProxy.Bluetooth do
         # finds a live table. Duplicate keys: N connections fan out under the
         # single `:subscribers` key.
         {Registry, keys: :duplicate, name: BluetoothScanner.registry_name()},
+
+        # Radios the app took from bluetoothd (the mesh's user channel).
+        # Before the subtree, whose mesh Radio registers in it, and the
+        # Manager and RadioMonitor, which read it.
+        UniversalProxy.Bluetooth.HeldRadios,
 
         # Persisted user settings. Before the Manager, which reads them to
         # decide whether to bring the BlueZ stack up.

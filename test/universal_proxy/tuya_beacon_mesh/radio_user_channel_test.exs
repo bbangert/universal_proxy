@@ -5,6 +5,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioUserChannelTest do
 
   import ExUnit.CaptureLog
 
+  alias UniversalProxy.Bluetooth.HeldRadios
   alias UniversalProxy.TuyaBeaconMesh.{Carrier, FakeBluez, FakeHciUser, Inventory, P2, Radio}
   alias UniversalProxy.TuyaBeaconMesh.Radio.Transport
   alias UniversalProxy.TuyaMesh.KeyLeak
@@ -735,6 +736,69 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioUserChannelTest do
         :ok = Radio.send_frame(frame(1), 40, server: ctx.radio)
         assert [_ad] = for({:advertise, data, _} <- FakeBluez.calls(), do: data)
       end)
+    end
+  end
+
+  describe "held radio" do
+    setup do
+      n = System.unique_integer([:positive])
+      registry = :"uc_held_#{n}"
+      pubsub = :"uc_held_pubsub_#{n}"
+      start_supervised!({HeldRadios, registry: registry})
+      start_supervised!({Phoenix.PubSub, name: pubsub})
+      :ok = Phoenix.PubSub.subscribe(pubsub, HeldRadios.topic())
+      {:ok, held: [registry: registry, pubsub: pubsub]}
+    end
+
+    defp held(ctx), do: HeldRadios.list(registry: ctx.held[:registry])
+
+    test "bound to the right controller, the Radio holds its MAC under the index", ctx do
+      radio = ready!(start_radio(held_radios: ctx.held, adapter_address: String.downcase(@mac)))
+      pid = radio.pid
+
+      assert_receive {:bluetooth_held_changed}
+      assert held(ctx) == [%{address: @mac, index: 0, holder: :tuya_mesh, pid: pid}]
+      KeyLeak.refute_keys(held(ctx))
+
+      # Stopping hands the controller back and drops the hold.
+      stop_supervised!({Radio, 0})
+      assert_receive {:bluetooth_held_changed}
+      assert held(ctx) == []
+    end
+
+    @tag :capture_log
+    test "another controller under the index is never recorded as held", ctx do
+      radio = start_radio([held_radios: ctx.held], %{bd_addr: 0x112233445566})
+      server = bound!(radio)
+
+      assert_receive {:hci, ^server, :closed}
+      refute_received {:bluetooth_held_changed}
+      assert held(ctx) == []
+    end
+
+    @tag :capture_log
+    test "an unplug drops the hold until the channel is bound again", ctx do
+      radio = ready!(start_radio(held_radios: ctx.held))
+      assert_receive {:bluetooth_held_changed}
+
+      set(radio, :start, {:error, {:resolve, :not_found}})
+      :ok = FakeHciUser.emit(radio.server, {:closed, :epipe})
+      assert_receive {:bluetooth_held_changed}, 1_000
+      assert held(ctx) == []
+
+      clear(radio, :start)
+      ready!(radio)
+      assert [%{address: @mac}] = held(ctx)
+    end
+
+    @tag :capture_log
+    test "a crashed Radio holds nothing", ctx do
+      radio = ready!(start_radio(held_radios: ctx.held))
+      pid = radio.pid
+      assert [%{pid: ^pid}] = held(ctx)
+
+      Process.exit(pid, :kill)
+      assert Enum.all?(held(ctx), &(&1.pid != pid))
     end
   end
 

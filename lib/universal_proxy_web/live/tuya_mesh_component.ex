@@ -1905,6 +1905,10 @@ defmodule UniversalProxyWeb.TuyaMeshComponent do
   defp idle_hint(:start_failed), do: "The mesh failed to start. Retrying."
   defp idle_hint(:mesh_exited), do: "The mesh stopped unexpectedly. Restarting shortly."
   defp idle_hint(:not_running), do: "The mesh service isn't running."
+
+  defp idle_hint(:released),
+    do: "The mesh radio is being handed back to Bluetooth for a role change."
+
   defp idle_hint(_reason), do: "The mesh isn't running."
 
   defp radio_line(%{ready: true}), do: "Radio ready."

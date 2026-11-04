@@ -763,6 +763,9 @@ defmodule UniversalProxyWeb.TuyaMeshComponentTest do
       }
 
       assert push_status(view, missing) =~ "Mesh dongle not found."
+
+      assert push_status(view, %{missing | reason: :released}) =~
+               "The mesh radio is being handed back to Bluetooth for a role change."
     end
 
     test "a bulb reads Checking until the pinger concludes", %{conn: conn} do
