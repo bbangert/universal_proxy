@@ -42,6 +42,15 @@ defmodule UniversalProxyWeb.AudioLive do
   Assistant — never the other way around. `:pairing` status therefore renders
   one of: the "Allow pairing" button (offer pending, no window), an active
   "waiting" state (window open), or the PIN (once derived).
+
+  ## HDMI-CEC
+
+  An output whose ALSA card is paired with a CEC adapter
+  (`UniversalProxy.Cec.list_adapters/0`) shows the receiver's status as a
+  pill, kept current by `{:cec_adapters, adapters}` on
+  `UniversalProxy.Cec.topic/0`, and an auto-wake toggle (the output's
+  `cec_auto_wake` setting). Outputs on unpaired cards, and every output on
+  a build without CEC, show neither.
   """
 
   use UniversalProxyWeb, :live_view
@@ -67,6 +76,7 @@ defmodule UniversalProxyWeb.AudioLive do
   alias UniversalProxy.Audio.Input
   alias UniversalProxy.Bluetooth
   alias UniversalProxy.Bluetooth.AudioManager
+  alias UniversalProxy.Cec
   alias UniversalProxyWeb.OpaqueKey
 
   # How long a Bluetooth output keeps a "Reconnecting" placeholder card
@@ -101,6 +111,7 @@ defmodule UniversalProxyWeb.AudioLive do
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:input_added")
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:input_removed")
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:input_state")
+      Phoenix.PubSub.subscribe(UniversalProxy.PubSub, Cec.topic())
     end
 
     {:ok,
@@ -112,6 +123,8 @@ defmodule UniversalProxyWeb.AudioLive do
      # joining AudioManager.list_headphones (mac→adapter) with the radio
      # list (adapter→hci); refreshed on output/BT-connection changes.
      |> assign(:bt_meta, build_bt_meta())
+     # ALSA card index → CEC pill, for outputs whose card has an adapter.
+     |> assign(:cec, cec_by_card(Cec.list_adapters()))
      # mac → %{name} placeholders shown while a dropped BT device is
      # reconnecting (keyed by device MAC). Empty on non-BT targets.
      |> assign(:reconnecting, %{})
@@ -234,6 +247,25 @@ defmodule UniversalProxyWeb.AudioLive do
     end
   end
 
+  def handle_event("toggle_cec_auto_wake", %{"id" => id}, socket) do
+    with {:ok, key} <- decode_key(id),
+         {:ok, output} <- fetch_output(socket, id) do
+      case Audio.update_config(key, %{cec_auto_wake: not Cec.auto_wake?(output)}) do
+        :ok ->
+          {:noreply, socket}
+
+        {:error, reason} ->
+          Logger.warning(
+            "Audio CEC auto-wake toggle failed for #{inspect(key)}: #{inspect(reason)}"
+          )
+
+          {:noreply, socket}
+      end
+    else
+      _ -> {:noreply, socket}
+    end
+  end
+
   def handle_event("toggle_more", %{"id" => id}, socket) do
     {:noreply,
      socket
@@ -346,6 +378,12 @@ defmodule UniversalProxyWeb.AudioLive do
     end
   end
 
+  # Assigning an equal map is a no-op for change tracking, so adapter
+  # updates that don't change any pill (a receiver timestamp) cost nothing.
+  def handle_info({:cec_adapters, adapters}, socket) when is_list(adapters) do
+    {:noreply, assign(socket, :cec, cec_by_card(adapters))}
+  end
+
   def handle_info({:sendspin_input_added, input}, socket) do
     {:noreply,
      update(socket, :inputs, &Map.put(&1, encode_key(input.key), build_input_card(input)))}
@@ -396,6 +434,7 @@ defmodule UniversalProxyWeb.AudioLive do
           battery={get_in(@bt_meta, [output.bt_mac, :battery])}
           more_open?={MapSet.member?(@more_open, id)}
           pairing={Map.get(@pairing_tokens, id)}
+          cec={Map.get(@cec, output.card_index)}
         />
         <.reconnecting_card :for={{mac, info} <- active_reconnecting(@reconnecting, @outputs)} name={info.name} mac={mac} />
       </div>
@@ -619,6 +658,7 @@ defmodule UniversalProxyWeb.AudioLive do
   attr(:battery, :integer, default: nil)
   attr(:more_open?, :boolean, required: true)
   attr(:pairing, :any, default: nil)
+  attr(:cec, :map, default: nil)
 
   # Single player card. Layout is a vertical flex with three logical
   # blocks:
@@ -699,6 +739,9 @@ defmodule UniversalProxyWeb.AudioLive do
               </.badge>
               <.battery_pill :if={is_integer(@battery)} level={@battery} />
             </div>
+            <div :if={@cec} class="flex items-center gap-1.5 mt-2 flex-wrap">
+              <.cec_pill status={@cec} id={"cec-#{@id}"} />
+            </div>
           </div>
           <.badge variant={@status.variant} dot>{@status.label}</.badge>
         </div>
@@ -770,6 +813,21 @@ defmodule UniversalProxyWeb.AudioLive do
         >
           <.icon name={:more} size={16} />
         </button>
+      </div>
+
+      <%!-- HDMI-CEC auto-wake: only on outputs paired with an adapter --%>
+      <div
+        :if={@cec}
+        class="flex items-center gap-3 pt-3 pr-5 pb-3 pl-[22px] border-t border-border-2 bg-sunken"
+      >
+        <.toggle
+          checked={Cec.auto_wake?(@output)}
+          phx-click="toggle_cec_auto_wake"
+          phx-value-id={@id}
+          id={"cec-auto-wake-#{@id}"}
+          aria-label="Wake the receiver when playback starts"
+        />
+        <span class="text-sm text-fg-2">Auto-wake receiver on playback</span>
       </div>
 
       <%!-- Disclosure: card index, client id and pairing token, each
@@ -1139,7 +1197,8 @@ defmodule UniversalProxyWeb.AudioLive do
       # (the `{name, nil, nil}` key shape alone is NOT unique — onboard
       # ALSA cards key that way too).
       bt?: bt_output?(output),
-      bt_mac: if(bt_output?(output), do: bt_key_mac(output.key), else: nil)
+      bt_mac: if(bt_output?(output), do: bt_key_mac(output.key), else: nil),
+      cec_auto_wake: Map.get(output, :cec_auto_wake)
     }
   end
 
@@ -1163,6 +1222,9 @@ defmodule UniversalProxyWeb.AudioLive do
 
       {:enabled, e}, acc when is_boolean(e) ->
         %{acc | enabled: e}
+
+      {:cec_auto_wake, v}, acc when is_boolean(v) or is_nil(v) ->
+        %{acc | cec_auto_wake: v}
 
       {:sendspin_client_id, id}, acc when is_binary(id) ->
         %{acc | client_id: id}

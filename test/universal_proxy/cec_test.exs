@@ -21,6 +21,15 @@ defmodule UniversalProxy.CecTest do
     end
   end
 
+  test "auto_wake?/2: the output's setting wins, else the default" do
+    assert Cec.auto_wake?(%{cec_auto_wake: false}, true) == false
+    assert Cec.auto_wake?(%{cec_auto_wake: true}, false) == true
+    assert Cec.auto_wake?(%{cec_auto_wake: nil}, false) == false
+    assert Cec.auto_wake?(%{}, true) == true
+    # The env default (config.exs: auto_wake: true).
+    assert Cec.auto_wake?(%{}) == true
+  end
+
   describe "with an adapter that doesn't answer" do
     setup do
       start_supervised!({Registry, keys: :unique, name: Supervisor.registry()})
