@@ -58,9 +58,10 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
 
   With `:fallback_memory_ms` (default 0, off) the move outlives this
   process: a Radio started for the same `:adapter_address` within that
-  time starts on the transport it moved to (logged, with the same
-  `:fallback_reason`), so a host that restarts the Radio can't loop
-  through the failing transport again.
+  time, with the same `:transport` chain, starts on the transport it
+  moved to last (logged, with the same `:fallback_reason`), so a host
+  that restarts the Radio can't loop through the failing transports
+  again.
 
   ## Wedged controller
 
@@ -390,11 +391,11 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
     wedge_retry_ms = Keyword.get(opts, :wedge_retry_ms, @wedge_retry_ms)
     adapter_index = Keyword.get(opts, :adapter_index, 0)
     adapter_address = opts |> Keyword.get(:adapter_address) |> upcase()
-    transports = opts |> Keyword.get(:transport, @transports) |> List.wrap()
+    chain = opts |> Keyword.get(:transport, @transports) |> List.wrap()
     memory_ms = Keyword.get(opts, :fallback_memory_ms, 0)
 
     {transports, remembered} =
-      remembered_fallback(transports, adapter_address, adapter_index, memory_ms)
+      remembered_fallback(chain, adapter_address, adapter_index, memory_ms)
 
     transport_opts =
       Keyword.merge(opts, adapter_index: adapter_index, adapter_address: adapter_address)
@@ -407,6 +408,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
           transport: transport,
           tstate: tstate,
           transport_opts: transport_opts,
+          # The configured transports, in order (the fallback memory's key).
+          transport_chain: chain,
           # Transports still to fall back to, and why the Radio left the
           # first choice (nil while on it).
           fallbacks: fallbacks,
@@ -486,35 +489,34 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
 
   defp memory_key(address), do: {__MODULE__, :fallback, address}
 
-  # A move to another transport made for this address within
-  # `memory_ms`, by an earlier Radio: start where it ended up.
-  defp remembered_fallback([first | rest] = transports, address, index, memory_ms)
-       when is_binary(address) and memory_ms > 0 and rest != [] do
-    case :persistent_term.get(memory_key(address), nil) do
-      {at, ^first, reason} ->
-        age = System.monotonic_time(:millisecond) - at
+  # Where an earlier Radio for this address, with the same chain, ended
+  # up within `memory_ms`: start there (a position in the chain, so a
+  # second fallback is resumed too).
+  defp remembered_fallback(chain, address, index, memory_ms)
+       when is_binary(address) and memory_ms > 0 do
+    with {at, ^chain, position, reason} when position in 1..(length(chain) - 1)//1 <-
+           :persistent_term.get(memory_key(address), nil),
+         age when age < memory_ms <- System.monotonic_time(:millisecond) - at do
+      resumed = Enum.drop(chain, position)
 
-        if age < memory_ms do
-          Logger.warning(
-            "#{inspect(__MODULE__)}: hci#{index} #{transport_name(first)} failed " <>
-              "#{div(age, 1_000)} s ago (#{inspect(reason)}); starting on #{transport_name(hd(rest))}"
-          )
+      Logger.warning(
+        "#{inspect(__MODULE__)}: hci#{index} fell back to #{transport_name(hd(resumed))} " <>
+          "#{div(age, 1_000)} s ago (#{inspect(reason)}); starting on it"
+      )
 
-          {rest, reason}
-        else
-          {transports, nil}
-        end
-
-      _none ->
-        {transports, nil}
+      {resumed, reason}
+    else
+      _none_or_stale -> {chain, nil}
     end
   end
 
-  defp remembered_fallback(transports, _address, _index, _memory_ms), do: {transports, nil}
+  defp remembered_fallback(chain, _address, _index, _memory_ms), do: {chain, nil}
 
+  # The transport now in use, as its position in the chain.
   defp remember_fallback(%{fallback_memory_ms: ms, adapter_address: address} = state, reason)
        when ms > 0 and is_binary(address) do
-    entry = {System.monotonic_time(:millisecond), state.transport, reason}
+    position = length(state.transport_chain) - length(state.fallbacks) - 1
+    entry = {System.monotonic_time(:millisecond), state.transport_chain, position, reason}
     :persistent_term.put(memory_key(address), entry)
   end
 
@@ -587,7 +589,6 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
         )
 
         :ok = state.transport.terminate(:fallback, state.tstate)
-        remember_fallback(state, reason)
 
         state = %{
           state
@@ -601,6 +602,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
             backoff_ms: state.retry_ms
         }
 
+        remember_fallback(state, reason)
         retry_later(state, reason, false)
 
       {:error, init_reason} ->

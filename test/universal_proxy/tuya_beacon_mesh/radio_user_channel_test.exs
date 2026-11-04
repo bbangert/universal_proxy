@@ -49,6 +49,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioUserChannelTest do
     end
 
     @impl true
+    def fallback?(:stub_down), do: true
+
+    @impl true
     def setup(%{fail: true} = state, _reset?), do: {:error, :stub_down, state, []}
     def setup(state, _reset?), do: {:ok, state, []}
     @impl true
@@ -66,6 +69,36 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioUserChannelTest do
     @impl true
     def status(_state),
       do: %{lease_held: true, discovering: true, listening: true, transport: :stub}
+  end
+
+  defmodule LastTransport do
+    @moduledoc false
+    # Always up; reports `transport: :last`.
+    @behaviour UniversalProxy.TuyaBeaconMesh.Radio.Transport
+
+    @impl true
+    def init(opts) do
+      send(opts[:test_pid], {:last, :init})
+      {:ok, %{}}
+    end
+
+    @impl true
+    def setup(state, _reset?), do: {:ok, state, []}
+    @impl true
+    def teardown(state), do: state
+    @impl true
+    def terminate(_reason, _state), do: :ok
+    @impl true
+    def transmit(state, _ad), do: {:ok, 1, state}
+    @impl true
+    def stop_transmit(state, _instance), do: {:ok, state}
+    @impl true
+    def health_check(_state), do: :ok
+    @impl true
+    def handle_info(_msg, _state), do: :unhandled
+    @impl true
+    def status(_state),
+      do: %{lease_held: true, discovering: true, listening: true, transport: :last}
   end
 
   defp captured do
@@ -487,6 +520,54 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioUserChannelTest do
       assert %{ready: false} = status!(ctx)
     end
 
+    test "the memory resumes a second fallback, for the same chain only" do
+      mac = "02:00:00:00:00:02"
+      on_exit(fn -> :persistent_term.erase({Radio, :fallback, mac}) end)
+      chain = [Transport.UserChannel, StubTransport, LastTransport]
+
+      opts = [
+        transport: chain,
+        stub_fail: true,
+        adapter_address: mac,
+        fallback_memory_ms: 60_000
+      ]
+
+      log =
+        capture_log(fn ->
+          ctx = start_radio(opts, %{start: {:error, {:bind, :ebusy}}})
+          wait_until(fn -> match?(%{transport: :last, ready: true}, status!(ctx)) end)
+          assert %{fallback_reason: :stub_down} = status!(ctx)
+          stop_supervised!({Radio, 0})
+          stop_supervised!(:control)
+          flush_inits()
+
+          # Restarted: straight onto the last transport, with its reason.
+          ctx = start_radio(opts)
+          wait_until(fn -> status!(ctx).ready end)
+          assert %{transport: :last, fallback_reason: :stub_down} = status!(ctx)
+          refute_received {:hci, nil, {:start, _, _}}
+          refute_received {:stub, :init}
+          stop_supervised!({Radio, 0})
+          stop_supervised!(:control)
+
+          # Another chain doesn't use it.
+          ctx = start_radio(Keyword.put(opts, :transport, [Transport.UserChannel, LastTransport]))
+          wait_until(fn -> status!(ctx).ready end)
+          assert %{transport: :user_channel, fallback_reason: nil} = status!(ctx)
+        end)
+
+      assert log =~ "fell back to LastTransport 0 s ago (:stub_down); starting on it"
+    end
+
+    defp flush_inits do
+      receive do
+        {tag, _} when tag in [:hci, :stub, :last] -> flush_inits()
+        {:hci, _, _} -> flush_inits()
+      after
+        0 -> :ok
+      end
+    end
+
     test "with a memory, a fallback outlives the Radio" do
       mac = "02:00:00:00:00:01"
 
@@ -515,7 +596,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioUserChannelTest do
           assert %{transport: :user_channel} = status!(ctx)
         end)
 
-      assert log =~ "UserChannel failed 0 s ago ({:bind, :ebusy}); starting on StubTransport"
+      assert log =~ "fell back to StubTransport 0 s ago ({:bind, :ebusy}); starting on it"
       # One bind from the first Radio, none from the second, one from the third.
       assert_received {:hci, nil, {:start, ^address, _}}
       assert_received {:hci, nil, {:start, ^address, _}}
