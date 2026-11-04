@@ -85,14 +85,45 @@ defmodule UniversalProxy.Cec.Enumerate do
     end
   end
 
-  # Resolved path of `<class dir>/device`; sysfs links are relative, so
-  # expand against the link's own directory.
+  # Real path of `<class dir>/device`. Class entries are themselves symlinks
+  # into `/sys/devices/...` and the `device` link is relative to that real
+  # directory, so every component has to be resolved (a lexical
+  # `Path.expand/2` lands somewhere else entirely).
   defp device_node(class_dir) do
     link = Path.join(class_dir, "device")
 
     case File.read_link(link) do
-      {:ok, target} -> Path.expand(target, class_dir)
+      {:ok, _} -> realpath(link)
       _ -> nil
+    end
+  end
+
+  @max_links 40
+
+  defp realpath(path) do
+    ["/" | parts] = path |> Path.absname() |> Path.split()
+    resolve(parts, "/", 0)
+  end
+
+  defp resolve([], resolved, _links), do: resolved
+  defp resolve(["." | rest], resolved, links), do: resolve(rest, resolved, links)
+  defp resolve([".." | rest], resolved, links), do: resolve(rest, Path.dirname(resolved), links)
+
+  defp resolve([part | rest], resolved, links) do
+    candidate = Path.join(resolved, part)
+
+    case File.read_link(candidate) do
+      {:ok, _target} when links >= @max_links ->
+        nil
+
+      {:ok, target} ->
+        case Path.split(target) do
+          ["/" | parts] -> resolve(parts ++ rest, "/", links + 1)
+          parts -> resolve(parts ++ rest, resolved, links + 1)
+        end
+
+      {:error, _} ->
+        resolve(rest, candidate, links)
     end
   end
 end
