@@ -11,13 +11,33 @@ defmodule UniversalProxy.Cec.VolumeTest do
   alias UniversalProxy.Cec
 
   @dev "/dev/cec0"
+  @key {"vc4-hdmi", nil, nil}
   @adapter_info %{dev: @dev, index: 0, hdmi_device: "fef00700.hdmi", card_index: 1}
 
   # Transmit 1 is configure/2's receiver poll.
   @first_tx 2
 
-  setup do
+  setup context do
     fake = start_supervised!({Fake, []})
+    test = self()
+
+    # A volume link over the real adapter, for one HDMI output on card 1.
+    volume_link =
+      if context[:volume_link] do
+        [
+          list_outputs: fn -> [%{key: @key, card_index: 1, volume: 50, muted: false}] end,
+          set_volume_external: fn key, external? -> send(test, {:external, key, external?}) end,
+          update_config: fn key, params ->
+            send(test, {:update_config, key, params})
+            {:ok, nil}
+          end,
+          poll_ms: 50,
+          probe_ms: 50,
+          hotplug_grace_ms: 0
+        ]
+      else
+        []
+      end
 
     start_supervised!(
       {Cec.Supervisor,
@@ -27,7 +47,8 @@ defmodule UniversalProxy.Cec.VolumeTest do
        enumerate: fn -> %{@dev => @adapter_info} end,
        output_lookup: fn _ -> :error end,
        receiver_la: 5,
-       scan_interval_ms: 60_000}
+       scan_interval_ms: 60_000,
+       volume_link: volume_link}
     )
 
     configure(fake, :present)
@@ -312,6 +333,69 @@ defmodule UniversalProxy.Cec.VolumeTest do
 
       assert Task.await(task) == {:ok, %{volume: 20, muted: true}}
       refute_tx(fake, n)
+    end
+  end
+
+  describe "explicit destinations" do
+    test "a NACK at an explicit address isn't retried at the TV", %{fake: fake} do
+      task = Task.async(fn -> Cec.audio_status(@dev, to: 5) end)
+      {seq, %Message{to: 5, body: :give_audio_status}} = nth_tx(fake, @first_tx)
+      nack(fake, seq)
+      assert Task.await(task) == {:error, :nack}
+
+      task = Task.async(fn -> Cec.set_volume(@dev, 30, to: 5) end)
+      n = status(fake, @first_tx + 1, 20)
+      {seq, %Message{to: 5, body: {:user_control_pressed, :volume_up}}} = nth_tx(fake, n)
+      nack(fake, seq)
+
+      assert Task.await(task) == {:error, {:nack, %{volume: 20, muted: false, step: 1}}}
+      refute_tx(fake, n + 1)
+      assert {:ok, %{receiver_presence: :present}} = Cec.Server.get_adapter(@dev)
+    end
+
+    test "an explicit address is used while the adapter holds the receiver absent",
+         %{fake: fake} do
+      # A `:receiver` press the receiver NACKs: retried at the TV, and from
+      # then on the adapter sends `:receiver` commands there.
+      task = Task.async(fn -> Cec.volume_up(@dev) end)
+      {seq, %Message{to: 5}} = nth_tx(fake, @first_tx)
+      nack(fake, seq)
+      {seq, %Message{to: 0}} = nth_tx(fake, @first_tx + 1)
+      ack(fake, seq)
+      {seq, %Message{to: 0, body: :user_control_released}} = nth_tx(fake, @first_tx + 2)
+      ack(fake, seq)
+      assert Task.await(task) == :ok
+
+      wait_until(fn ->
+        match?({:ok, %{receiver_presence: :absent}}, Cec.Server.get_adapter(@dev))
+      end)
+
+      task = Task.async(fn -> Cec.set_volume(@dev, 21, to: 5) end)
+      n = status(fake, @first_tx + 3, 20)
+      n = press(fake, n, :volume_up, 21)
+      assert Task.await(task) == {:ok, %{volume: 21, muted: false, step: 1}}
+      refute_tx(fake, n)
+    end
+  end
+
+  describe "a volume link on the bus" do
+    @tag volume_link: true
+    test "links at the receiver's address and never asks the TV", %{fake: fake} do
+      # Probed at the receiver's address once it is present.
+      {seq, %Message{to: 5, body: :give_device_power_status}} = nth_tx(fake, @first_tx)
+      reply(fake, seq, <<0x54, 0x90, 0x00>>)
+      n = status(fake, @first_tx + 1, 20)
+      assert_receive {:external, @key, true}, 1_000
+
+      # Every poll the receiver NACKs counts (each asks for the power status
+      # and the audio status); none goes to the TV.
+      for i <- 0..5 do
+        {seq, %Message{to: 5}} = nth_tx(fake, n + i)
+        nack(fake, seq)
+      end
+
+      assert_receive {:external, @key, false}, 1_000
+      assert Enum.all?(transmits(fake), fn {_seq, %Message{to: to}} -> to == 5 end)
     end
   end
 

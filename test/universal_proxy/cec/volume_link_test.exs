@@ -56,13 +56,25 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
           {:ok, current}
         end
       end,
+      # Each CEC call also reports its destination as `{:to, call, la}`.
       set_volume: fn dev, target, walk_opts ->
+        {to, walk_opts} = Keyword.pop(walk_opts, :to)
+        send(test, {:to, :set_volume, to})
         send(test, {:walk_opts, walk_opts})
         cec(test, {:set_volume, dev, target})
       end,
-      set_muted: &cec(test, {:set_muted, &1, &2}),
-      audio_status: &cec(test, {:audio_status, &1}),
-      power_status: &cec(test, {:power_status, &1}),
+      set_muted: fn dev, muted, opts ->
+        send(test, {:to, :set_muted, opts[:to]})
+        cec(test, {:set_muted, dev, muted})
+      end,
+      audio_status: fn dev, opts ->
+        send(test, {:to, :audio_status, opts[:to]})
+        cec(test, {:audio_status, dev})
+      end,
+      power_status: fn dev, opts ->
+        send(test, {:to, :power_status, opts[:to]})
+        cec(test, {:power_status, dev})
+      end,
       poll_ms: 60_000,
       probe_ms: 60_000,
       settle_ms: 0,
@@ -187,12 +199,13 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
       assert_receive {:external, @key, true}
 
       adapters(pubsub, [Map.put(adapter(), :configured?, false)])
-      adapters(pubsub, [Map.put(adapter(), :receiver_presence, :absent)])
+      adapters(pubsub, [absent(adapter())])
 
-      poll_now(pid)
-      poll_now(pid)
+      # Asked at its own address, it NACKs.
+      failed_poll(pid, first: true, error: :nack)
+      failed_poll(pid, error: :nack)
       refute_receive {:external, @key, false}
-      poll_now(pid)
+      failed_poll(pid, error: :nack)
       assert_receive {:external, @key, false}
     end
 
@@ -202,16 +215,32 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
       assert_receive {:update_config, @key, _}
 
       # Absent: the record now describes the TV, which isn't followed.
-      absent = adapter(%{volume: 70}) |> Map.put(:receiver_presence, :absent)
-      adapters(pubsub, [absent])
+      adapters(pubsub, [absent(adapter(%{volume: 70}))])
       refute_receive {:update_config, _, _}
 
-      poll_now(pid)
-      poll_now(pid)
-      refute_receive {:cec, _, _}
+      failed_poll(pid, first: true, error: :nack)
+      failed_poll(pid, error: :nack)
       refute_receive {:external, @key, false}
 
+      failed_poll(pid, error: :nack)
+      assert_receive {:external, @key, false}
+    end
+
+    test "the TV's standby, recorded while the receiver is absent, doesn't unlink",
+         %{pid: pid, pubsub: pubsub} do
+      assert_receive {:external, @key, true}
+      adapters(pubsub, [absent(adapter(%{power: :standby}))])
+      refute_receive {:external, @key, false}
+      assert VolumeLink.links(pid) == %{@dev => @key}
+    end
+
+    test "a standby the receiver itself reports to a poll unlinks", %{pid: pid, pubsub: pubsub} do
+      assert_receive {:external, @key, true}
+      adapters(pubsub, [absent(adapter())])
+
       poll_now(pid)
+      reply(assert_cec({:power_status, @dev}), {:ok, :standby})
+      reply(assert_cec({:audio_status, @dev}), {:ok, %{volume: 20, muted: false}})
       assert_receive {:external, @key, false}
     end
 
@@ -275,8 +304,115 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
     end
   end
 
+  describe "addressing the receiver" do
+    setup :linked
+
+    test "every command goes to the receiver's address, even once the adapter holds it absent",
+         %{pid: pid, pubsub: pubsub} do
+      poll_now(pid)
+      assert_receive {:to, :power_status, 5}
+      reply(assert_cec({:power_status, @dev}), {:ok, :on})
+      assert_receive {:to, :audio_status, 5}
+      reply(assert_cec({:audio_status, @dev}), {:ok, %{volume: 20, muted: false}})
+      idle(pid)
+
+      player_event(pubsub, @key, :muted, true)
+      player_event(pubsub, @key, :volume, 35)
+      assert_receive {:to, :set_muted, 5}
+      mute = assert_cec({:set_muted, @dev, true})
+
+      # Mid-run the adapter loses the receiver: `:receiver` would be the TV.
+      adapters(pubsub, [absent(adapter())])
+      reply(mute, {:ok, %{volume: 20, muted: true}})
+      assert_receive {:to, :set_volume, 5}
+      reply(assert_cec({:set_volume, @dev, 35}), {:ok, %{volume: 35, muted: true}})
+      idle(pid)
+
+      poll_now(pid)
+      assert_receive {:to, :audio_status, 5}
+      refute_receive {:to, _, 0}
+    end
+
+    test "a receiver found at another address is another one: a poll for the old one is dropped",
+         %{pid: pid, pubsub: pubsub} do
+      poll_now(pid)
+      power = assert_cec({:power_status, @dev})
+
+      adapters(pubsub, [%{adapter() | receiver_target: 6}])
+      assert_receive {:external, @key, false}
+      # The record describes the new receiver, which links at its address.
+      assert_receive {:external, @key, true}
+      assert_receive {:update_config, @key, %{volume: 20, muted: false}}
+
+      reply(power, {:ok, :on})
+      reply(assert_cec({:audio_status, @dev}), {:ok, %{volume: 70, muted: false}})
+      idle(pid)
+      refute_receive {:update_config, _, _}
+
+      poll_now(pid)
+      assert_receive {:to, :power_status, 6}
+    end
+
+    test "a walk for a receiver that changed address is stopped, its result dropped",
+         %{pubsub: pubsub} do
+      player_event(pubsub, @key, :volume, 35)
+      walk = assert_cec({:set_volume, @dev, 35})
+
+      adapters(pubsub, [%{adapter() | receiver_target: 6}])
+      assert_receive {:external, @key, false}
+      assert_receive {:external, @key, true}
+      assert_receive {:update_config, @key, %{volume: 20, muted: false}}
+
+      reply(walk, {:ok, %{volume: 35, muted: false}})
+      refute_receive {:update_config, _, _}
+    end
+
+    test "a lost receiver is probed at its address and relinks with no reconfigure",
+         %{pid: pid, pubsub: pubsub} do
+      adapters(pubsub, [absent(adapter())])
+      failed_poll(pid, first: true, error: :nack)
+      failed_poll(pid, error: :nack)
+      failed_poll(pid, error: :nack)
+      assert_receive {:external, @key, false}
+
+      # The adapter still holds it absent; the probe asks it directly.
+      poll_now(pid)
+      assert_receive {:to, :power_status, 5}
+      reply(assert_cec({:power_status, @dev}), {:ok, :on})
+      assert_receive {:to, :audio_status, 5}
+      reply(assert_cec({:audio_status, @dev}), {:ok, %{volume: 33, muted: true}})
+
+      assert_receive {:external, @key, true}
+      assert_receive {:update_config, @key, %{volume: 33, muted: true}}
+      assert VolumeLink.links(pid) == %{@dev => @key}
+
+      # Linked again at the same address, while the adapter still says absent.
+      idle(pid)
+      poll_now(pid)
+      assert_receive {:to, :audio_status, 5}
+    end
+  end
+
   describe "output to receiver" do
     setup :linked
+
+    @tag echo: false
+    test "a request repeating a late echo still counts while a run is under way",
+         %{pid: pid, pubsub: pubsub} do
+      player_event(pubsub, @key, :volume, 35)
+      walk = assert_cec({:set_volume, @dev, 35})
+      player_event(pubsub, @key, :volume, 40)
+
+      # The adoption's echo arrives late, then someone asks for 20.
+      player_event(pubsub, @key, :volume, 20)
+      player_event(pubsub, @key, :volume, 20)
+      _ = :sys.get_state(pid)
+
+      reply(walk, {:ok, %{volume: 35, muted: false}})
+      reply(assert_cec({:set_volume, @dev, 20}), {:ok, %{volume: 20, muted: false}})
+      idle(pid)
+      refute_receive {:cec, _, {:set_volume, _, 40}}
+    end
 
     test "a player volume steps the receiver; nothing is written back when it lands",
          %{pubsub: pubsub} do
@@ -1046,6 +1182,7 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
       card_index: 1,
       running?: true,
       receiver_presence: :present,
+      receiver_target: 5,
       receiver:
         Map.merge(
           %{power: :on, volume: 20, muted: false, updated_at: DateTime.utc_now()},
@@ -1053,6 +1190,10 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
         )
     }
   end
+
+  # The adapter holding the receiver absent: `:receiver` commands, and
+  # Cec.Server's record, are the TV's.
+  defp absent(adapter), do: %{adapter | receiver_presence: :absent, receiver_target: 0}
 
   defp output(extra \\ %{}) do
     Map.merge(
