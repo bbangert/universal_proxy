@@ -43,6 +43,12 @@ range -- without needing a dedicated ESPHome microcontroller for each one.
   [Sendspin](https://github.com/Sendspin/sendspin-cpp) player for synchronized
   multi-room audio. USB sound cards appear in their physical USB slot in the web
   UI. See [docs/plans/10_sendspin_audio.md](docs/plans/10_sendspin_audio.md).
+- **HDMI-CEC receiver control** -- on `rpi0_2`, `rpi3`, `rpi4` and `rpi5`, the
+  Pi is a CEC playback device on each HDMI port (native `/dev/cecN` access via
+  the in-repo `circuits_cec` library, no `cec-ctl`). A Sendspin stream starting
+  on an HDMI output sends One Touch Play, so an AV receiver (or TV) in standby
+  wakes and switches to the Pi's input first. `UniversalProxy.Cec` also exposes
+  standby, power/volume status and volume/mute key presses from IEx.
 - **Bluetooth-audio transmitter control** -- FlooGoo FMA120 and Sennheiser
   BTD 700 dongles get full control drawers in the web UI (see
   [Supported USB devices](#supported-usb-devices))
@@ -264,6 +270,7 @@ lib/
     bluetooth/             # Bluetooth lifecycle: Settings, Manager, RadioMonitor, Stats, Radios
     bluez/                 # BlueZ/D-Bus stack: Client (scanner), Gatt, Agent, DeviceCache
     audio/                 # Sendspin audio: Enumerate, per-output Server/Store, Player
+    cec/                   # HDMI-CEC: Enumerate (cecN <-> ALSA card), Server, Supervisor
     firmware_update/       # In-app firmware update flow
     storage/               # USB backup drive: mount, capacity, opt-in SMB share (smbd)
     esphome/               # ESPHome Native API adapters + Supervisor

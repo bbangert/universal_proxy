@@ -153,8 +153,8 @@ defmodule UniversalProxy.MixProject do
       # Native HDMI-CEC over /dev/cecN (C port helper + Elixir codecs), kept
       # in-repo until it is extracted to its own package. Its helper builds
       # into _build/<target>_<env>/lib/circuits_cec/priv, per target, so no
-      # host or foreign-arch binary can reach the firmware. Nothing in the
-      # app starts it yet.
+      # host or foreign-arch binary can reach the firmware. Used by
+      # UniversalProxy.Cec.
       {:circuits_cec, path: "deps_local/circuits_cec"},
 
       # blue_heron (the vendored raw-HCI fork) has been retired on rpi3 in

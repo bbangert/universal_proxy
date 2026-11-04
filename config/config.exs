@@ -72,6 +72,23 @@ config :logger, :console,
   format: "$time $metadata[$level] $message\n",
   metadata: [:request_id]
 
+# HDMI-CEC control of the AV receiver / TV on a Pi's HDMI link (see
+# `UniversalProxy.Cec`). Off here; config/target.exs turns it on for firmware.
+# `:receiver_la` is the CEC logical address commands go to (5 = Audio System,
+# i.e. the AVR; the TV at 0 when nothing answers there). `:osd_name` is what
+# the TV/AVR shows for our input (at most 14 bytes). `:system_audio_mode`
+# also sends <System Audio Mode Request> on wake, which some AVRs need but
+# which can take audio away from the TV. `:transport` is the
+# `Circuits.CEC.Transport` (tests use the library's fake).
+config :universal_proxy, UniversalProxy.Cec,
+  enabled: false,
+  osd_name: "UniversalProxy",
+  auto_wake: true,
+  receiver_la: 5,
+  system_audio_mode: false,
+  scan_interval_ms: 10_000,
+  transport: Circuits.CEC.Transport.Port
+
 # Import environment specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.
 import_config "#{config_env()}.exs"
