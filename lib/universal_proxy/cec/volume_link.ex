@@ -10,7 +10,8 @@ defmodule UniversalProxy.Cec.VolumeLink do
   output goes away, the setting is turned off, or the receiver stops
   answering: `:fail_unlink` (3) polls or runs in a row that the receiver
   didn't acknowledge or reply to (`:nack`, `:timeout`, `:max_retries`, or a
-  crashed run), or answered without a volume (`:unknown_volume`). An output
+  crashed run), or answered without a volume (`:unknown_volume`, or a
+  Feature Abort of `<Give Audio Status>`). An output
   linked to a receiver it can't control would otherwise stay at unity
   gain. Errors on our side of the bus (`:not_configured` while the
   adapter re-acquires its address after a hotplug, `:busy`,
@@ -54,7 +55,10 @@ defmodule UniversalProxy.Cec.VolumeLink do
   is expected (for a few seconds); expected events, and events repeating
   the value already shown, never start a run. An expected echo still says
   what the player shows now (it may land after a newer request), so the
-  receiver's state is written back over it if they differ.
+  receiver's state is written back over it if they differ. A freshly
+  spawned player's startup snapshot (tagged by `UniversalProxy.Audio.Player`)
+  is handled the same way: it is what the player started with, not a
+  request, so a hotplug's `--initial-volume` never moves the receiver.
 
   Runs and polls are this process's own jobs, under `:task_supervisor`
   (`UniversalProxy.Cec.Supervisor`'s, so a subtree restart ends them).
@@ -72,7 +76,7 @@ defmodule UniversalProxy.Cec.VolumeLink do
   `:update_config` (key, map), `:set_volume` (dev, target, opts), `:set_muted`
   (dev, bool), `:audio_status` (dev), `:power_status` (dev), `:pubsub`,
   `:task_supervisor`, `:default` (the `volume_link` default), `:fail_unlink`
-  and the `:poll_ms`, `:probe_ms` and `:settle_ms` intervals.
+  and the `:poll_ms`, `:probe_ms`, `:settle_ms` and `:echo_ttl_ms` intervals.
   """
 
   use GenServer
@@ -89,7 +93,7 @@ defmodule UniversalProxy.Cec.VolumeLink do
   @default_probe_ms 10_000
   @default_settle_ms 1_000
   @default_fail_unlink 3
-  @echo_ttl_ms 5_000
+  @default_echo_ttl_ms 5_000
   @fields [:volume, :muted]
 
   defstruct adapters: %{},
@@ -106,6 +110,7 @@ defmodule UniversalProxy.Cec.VolumeLink do
             probe_ms: @default_probe_ms,
             settle_ms: @default_settle_ms,
             fail_unlink: @default_fail_unlink,
+            echo_ttl_ms: @default_echo_ttl_ms,
             pubsub: @pubsub,
             task_sup: UniversalProxy.Cec.TaskSupervisor
 
@@ -147,6 +152,7 @@ defmodule UniversalProxy.Cec.VolumeLink do
       probe_ms: Keyword.get(opts, :probe_ms, @default_probe_ms),
       settle_ms: Keyword.get(opts, :settle_ms, @default_settle_ms),
       fail_unlink: Keyword.get(opts, :fail_unlink, @default_fail_unlink),
+      echo_ttl_ms: Keyword.get(opts, :echo_ttl_ms, @default_echo_ttl_ms),
       pubsub: Keyword.get(opts, :pubsub, @pubsub),
       task_sup: Keyword.get(opts, :task_supervisor, UniversalProxy.Cec.TaskSupervisor)
     }
@@ -201,6 +207,18 @@ defmodule UniversalProxy.Cec.VolumeLink do
 
   def handle_info({:sendspin_output_removed, %{key: key}}, state) do
     {:noreply, evaluate(%{state | outputs: Map.delete(state.outputs, key)})}
+  end
+
+  # A freshly spawned player's startup snapshot (`Audio.Player`'s
+  # `startup: true`): what it was started with, not a request.
+  def handle_info({:sendspin_state, key, %{event: "volume", value: v, startup: true}}, state)
+      when is_integer(v) and v in 0..100 do
+    {:noreply, state |> note_output(key, %{volume: v}) |> shows(key, :volume, v)}
+  end
+
+  def handle_info({:sendspin_state, key, %{event: "mute", value: m, startup: true}}, state)
+      when is_boolean(m) do
+    {:noreply, state |> note_output(key, %{muted: m}) |> shows(key, :muted, m)}
   end
 
   def handle_info({:sendspin_state, key, %{event: "volume", value: v}}, state)
@@ -390,14 +408,26 @@ defmodule UniversalProxy.Cec.VolumeLink do
     end
   end
 
+  defp shows(state, key, field, value) do
+    case link_for_key(state, key) do
+      nil -> state
+      {dev, link} -> showing(state, dev, link, field, value)
+    end
+  end
+
+  # What the player shows now without anyone asking for it (an echo, even
+  # one that arrived after a newer request, or a startup snapshot): written
+  # back over once the receiver's state is known.
+  defp showing(state, dev, link, field, value) do
+    link = put_in(link.shown[field], value)
+    state = put_in(state.links[dev], link)
+    if busy_step?(state, dev), do: state, else: sync_output(state, dev)
+  end
+
   defp link_intent(state, dev, link, field, value) do
     case take_echo(link, field, value) do
       {:echo, link} ->
-        # What the player shows now, even if it arrived after a newer
-        # request: written back over once the receiver's state is known.
-        link = put_in(link.shown[field], value)
-        state = put_in(state.links[dev], link)
-        if busy_step?(state, dev), do: state, else: sync_output(state, dev)
+        showing(state, dev, link, field, value)
 
       {:none, %{shown: %{^field => ^value}} = link} ->
         put_in(state.links[dev], link)
@@ -425,17 +455,15 @@ defmodule UniversalProxy.Cec.VolumeLink do
     end
   end
 
-  # Receivers move several units per press, so a volume within half a step
-  # of the target is the nearest one reachable (`Cec.set_volume/3` settles
-  # there): asking again would only press back and forth. One above the
-  # ceiling is never there yet.
+  # Receivers move several units per press, so the target may not be
+  # reachable: there is when `Cec.set_volume/3`'s own walk would stop, so
+  # asking again doesn't press back and forth.
   defp reached?(state, dev, :volume, target) do
     link = state.links[dev]
     volume = link.receiver.volume
-    max = ceiling(state, link.key)
 
-    is_integer(volume) and (max == nil or volume <= max) and
-      2 * abs(target - volume) <= (link.step || 1)
+    is_integer(volume) and
+      Cec.next_key(volume, link.step || 1, target, ceiling(state, link.key) || 100) == nil
   end
 
   defp reached?(state, dev, :muted, muted), do: state.links[dev].receiver.muted == muted
@@ -572,13 +600,14 @@ defmodule UniversalProxy.Cec.VolumeLink do
     # Not written means not shown: the next sync tries again.
     case safe(fn -> state.funs.update_config.(link.key, diff) end, {:error, :unavailable}) do
       :ok ->
-        deadline = System.monotonic_time(:millisecond) + @echo_ttl_ms
-        echoes = for {field, value} <- diff, do: {field, value, deadline}
+        now = System.monotonic_time(:millisecond)
+        echoes = for {field, value} <- diff, do: {field, value, now + state.echo_ttl_ms}
 
+        # Pruned here too: with no player running, no event ever prunes.
         put_in(state.links[dev], %{
           link
           | shown: Map.merge(link.shown, diff),
-            echoes: link.echoes ++ echoes
+            echoes: live_echoes(link.echoes, now) ++ echoes
         })
 
       error ->
@@ -588,14 +617,15 @@ defmodule UniversalProxy.Cec.VolumeLink do
   end
 
   defp take_echo(link, field, value) do
-    now = System.monotonic_time(:millisecond)
-    echoes = Enum.filter(link.echoes, fn {_f, _v, deadline} -> deadline > now end)
+    echoes = live_echoes(link.echoes, System.monotonic_time(:millisecond))
 
     case Enum.split_while(echoes, &(not match?({^field, ^value, _}, &1))) do
       {before, [_echo | rest]} -> {:echo, %{link | echoes: before ++ rest}}
       {_all, []} -> {:none, %{link | echoes: echoes}}
     end
   end
+
+  defp live_echoes(echoes, now), do: Enum.filter(echoes, fn {_f, _v, until} -> until > now end)
 
   # ── polling ───────────────────────────────────────────────────────────
 
@@ -695,7 +725,7 @@ defmodule UniversalProxy.Cec.VolumeLink do
 
   defp job_done(state, dev, {:step, targets, status, error}) do
     if error, do: log_step_error(dev, targets, status, error)
-    step_ended(state, dev, status, step_outcome(error))
+    step_ended(state, dev, status, step_outcome(error, status))
   end
 
   defp job_done(state, dev, _crashed), do: step_ended(state, dev, nil, {:silent, :crashed})
@@ -735,10 +765,18 @@ defmodule UniversalProxy.Cec.VolumeLink do
     end
   end
 
-  # A stall or the press limit came with a readback.
-  defp step_outcome(error) when error in [nil, :no_progress, :press_limit], do: :answered
+  # A stall or the press limit came with a readback, which has to carry a
+  # volume (a mute-only run's may not). A run's only requests are audio
+  # status reads, so a Feature Abort is a receiver refusing to report it.
+  defp step_outcome(error, status) when error in [nil, :no_progress, :press_limit] do
+    if match?(%{volume: volume} when is_integer(volume), status),
+      do: :answered,
+      else: {:silent, :unknown_volume}
+  end
 
-  defp step_outcome(error),
+  defp step_outcome(:feature_abort, _status), do: {:silent, :unknown_volume}
+
+  defp step_outcome(error, _status),
     do: if(receiver_silent?(error), do: {:silent, error}, else: :local)
 
   # `:timeout` is also what a request that got no reply returns. A
@@ -747,6 +785,7 @@ defmodule UniversalProxy.Cec.VolumeLink do
     do: reason in [:nack, :timeout, :max_retries, :unknown_volume]
 
   defp no_volume({:ok, %{volume: nil}}), do: {:error, :unknown_volume}
+  defp no_volume({:error, :feature_abort}), do: {:error, :unknown_volume}
   defp no_volume(audio), do: audio
 
   defp after_poll(state, dev, outcome, power, audio) do
