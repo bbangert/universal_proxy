@@ -12,7 +12,8 @@ defmodule UniversalProxy.TuyaBeaconMesh do
 
   1. The key dump is validated by `Inventory.decode/1` (see
      `test/fixtures/tuya_beacon_mesh/example_inventory.json`).
-  2. Start `Radio` on a dedicated adapter index (injectable `Bluez.*`).
+  2. Start `Radio` on a dedicated adapter index (injectable transport;
+     the default Bluez one has injectable `Bluez.*` modules).
   3. Start `Lights` with a loader for the stored inventory (read on every
      start, so a restart resumes from the persisted `seq`) and the radio;
      pass `on_persist:` to write the advanced `seq` back to Settings (and
@@ -30,8 +31,10 @@ defmodule UniversalProxy.TuyaBeaconMesh do
 
   Processes:
 
-    * `Radio` — lease, discovery (`DuplicateData: true`), TX queue, RX fan-out
-      (Bluez modules injectable; see `FakeBluez` in tests)
+    * `Radio` — TX queue and frame windows, RX fan-out, setup retries and
+      wedge detection, over a `Radio.Transport` (default
+      `Radio.Transport.Bluez`: lease, discovery with `DuplicateData: true`;
+      Bluez modules injectable, see `FakeBluez` in tests)
     * `Lights` — inventory-backed controller: set/ping/reset/group_set,
       report attribution by node→MAC, seq persistence callback
 
