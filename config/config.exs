@@ -79,11 +79,16 @@ config :logger, :console,
 # the TV/AVR shows for our input (at most 14 bytes). `:system_audio_mode`
 # also sends <System Audio Mode Request> on wake, which some AVRs need but
 # which can take audio away from the TV. `:transport` is the
-# `Circuits.CEC.Transport` (tests use the library's fake).
+# `Circuits.CEC.Transport` (tests use the library's fake). `:volume_link` is
+# the default for outputs without a `cec_volume` setting: their volume follows
+# the receiver's (`UniversalProxy.Cec.VolumeLink`), which is read every
+# `:volume_poll_ms` while linked.
 config :universal_proxy, UniversalProxy.Cec,
   enabled: false,
   osd_name: "UniversalProxy",
   auto_wake: true,
+  volume_link: true,
+  volume_poll_ms: 3_000,
   receiver_la: 5,
   system_audio_mode: false,
   scan_interval_ms: 10_000,

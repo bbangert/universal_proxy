@@ -102,6 +102,25 @@ defmodule UniversalProxy.Cec do
     |> Keyword.get(:auto_wake, true)
   end
 
+  @doc """
+  Whether this audio output's volume follows its receiver's
+  (`UniversalProxy.Cec.VolumeLink`). The output's own `cec_volume`
+  setting wins; an output without one follows `default`, the
+  `volume_link` env key (`true` unless configured otherwise).
+  """
+  @spec volume_link?(map(), boolean()) :: boolean()
+  def volume_link?(output, default \\ default_volume_link())
+  def volume_link?(%{cec_volume: value}, _default) when is_boolean(value), do: value
+  def volume_link?(_output, default), do: default
+
+  @doc false
+  @spec default_volume_link() :: boolean()
+  def default_volume_link do
+    :universal_proxy
+    |> Application.get_env(__MODULE__, [])
+    |> Keyword.get(:volume_link, true)
+  end
+
   @doc "True when the subsystem is running and this build has the CEC helper."
   @spec available?() :: boolean()
   def available? do

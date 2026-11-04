@@ -1,0 +1,632 @@
+defmodule UniversalProxy.Cec.VolumeLink do
+  @moduledoc """
+  Keeps an HDMI audio output's volume and mute in step with the receiver
+  that plays it, both ways.
+
+  An output is *linked* while the CEC adapter paired with its ALSA card is
+  running, the receiver is present, on and reporting a volume, and the
+  output's `cec_volume` setting is on (`UniversalProxy.Cec.volume_link?/2`).
+  It stays linked until the receiver reports standby, the adapter or the
+  output goes away, or the setting is turned off. A receiver record that is
+  merely cleared (`UniversalProxy.Cec.Server` drops it when the HDMI link
+  changes) keeps the link and the last known values until the next poll.
+
+    * **Linking** puts the output's player in external-volume mode
+      (`UniversalProxy.Audio.set_volume_external/2`: unity gain, volume and
+      mute still reported) and adopts the receiver's volume and mute into
+      the output. The receiver wins: the stored software volume is never
+      sent to it. **Unlinking** turns external mode off again, and software
+      volume resumes at the last value shown.
+    * **Output to receiver**: a player `volume` or `mute` event (from the
+      Sendspin server or `UniversalProxy.Audio.update_config/2`) steps the
+      receiver there with `UniversalProxy.Cec.set_volume/3` and
+      `set_muted/3`, in a task, one run per adapter at a time. The volume
+      is capped at the output's `cec_volume_max`. A value that arrives
+      during a run is applied when it ends (latest wins). Once nothing is
+      left to do, whatever the receiver ended at is written back to the
+      output if it differs (the cap, a stall, a failure), so the server and
+      the UI never show a volume the receiver isn't at.
+    * **Receiver to output**: receivers don't report knob or remote changes
+      by themselves, so a linked receiver is asked for its audio status
+      every `:poll_ms` while no run is in progress; any report
+      `UniversalProxy.Cec.Server` records counts as well. A change is
+      written to the output as is (the cap only limits requests). Reports
+      during a run and for `:settle_ms` after it are the run's own steps
+      and are ignored.
+
+  Each value written to the output comes back once as a player event, and
+  is expected (for a few seconds); expected events, and events repeating
+  the value already shown, never start a run.
+
+  Receivers report neither power nor volume until asked, so an adapter
+  whose output could link is probed every `:probe_ms` (power status, then
+  audio status once it is on). The replies reach `Cec.Server`, and its
+  `{:cec_adapters, _}` broadcast links the output. A linked receiver's power
+  is checked at the same pace.
+
+  Dependencies are injectable through `start_link/1` for host tests:
+  `:list_adapters`, `:list_outputs`, `:set_volume_external` (key, bool),
+  `:update_config` (key, map), `:set_volume` (dev, target), `:set_muted`
+  (dev, bool), `:audio_status` (dev), `:power_status` (dev), `:pubsub`,
+  `:task_supervisor`, `:default` (the `volume_link` default) and the
+  `:poll_ms`, `:probe_ms` and `:settle_ms` intervals.
+  """
+
+  use GenServer
+
+  require Logger
+
+  alias UniversalProxy.{Audio, Cec}
+
+  @pubsub UniversalProxy.PubSub
+  @state_topic "sendspin:state"
+  @added_topic "sendspin:output_added"
+  @removed_topic "sendspin:output_removed"
+  @default_poll_ms 3_000
+  @default_probe_ms 10_000
+  @default_settle_ms 1_000
+  @echo_ttl_ms 5_000
+  @fields [:volume, :muted]
+
+  defstruct adapters: %{},
+            outputs: %{},
+            links: %{},
+            busy: %{},
+            timers: %{},
+            power_at: %{},
+            funs: %{},
+            default: true,
+            poll_ms: @default_poll_ms,
+            probe_ms: @default_probe_ms,
+            settle_ms: @default_settle_ms,
+            pubsub: @pubsub,
+            task_sup: UniversalProxy.TaskSupervisor
+
+  # ── API ───────────────────────────────────────────────────────────────
+
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts \\ []) do
+    case Keyword.get(opts, :name, __MODULE__) do
+      nil -> GenServer.start_link(__MODULE__, opts)
+      name -> GenServer.start_link(__MODULE__, opts, name: name)
+    end
+  end
+
+  @doc "Output keys currently linked, by adapter device path."
+  @spec links(GenServer.server()) :: %{String.t() => Audio.key()}
+  def links(server \\ __MODULE__), do: GenServer.call(server, :links)
+
+  # ── GenServer ─────────────────────────────────────────────────────────
+
+  @impl true
+  def init(opts) do
+    env = Application.get_env(:universal_proxy, Cec, [])
+
+    funs = %{
+      list_adapters: Keyword.get(opts, :list_adapters, &Cec.list_adapters/0),
+      list_outputs: Keyword.get(opts, :list_outputs, &Audio.list_outputs/0),
+      set_volume_external: Keyword.get(opts, :set_volume_external, &Audio.set_volume_external/2),
+      update_config: Keyword.get(opts, :update_config, &Audio.update_config/2),
+      set_volume: Keyword.get(opts, :set_volume, &Cec.set_volume(&1, &2)),
+      set_muted: Keyword.get(opts, :set_muted, &Cec.set_muted(&1, &2)),
+      audio_status: Keyword.get(opts, :audio_status, &Cec.audio_status(&1)),
+      power_status: Keyword.get(opts, :power_status, &Cec.power_status(&1))
+    }
+
+    state = %__MODULE__{
+      funs: funs,
+      default: Keyword.get(opts, :default, Keyword.get(env, :volume_link, true)),
+      poll_ms: Keyword.get(opts, :poll_ms, Keyword.get(env, :volume_poll_ms, @default_poll_ms)),
+      probe_ms: Keyword.get(opts, :probe_ms, @default_probe_ms),
+      settle_ms: Keyword.get(opts, :settle_ms, @default_settle_ms),
+      pubsub: Keyword.get(opts, :pubsub, @pubsub),
+      task_sup: Keyword.get(opts, :task_supervisor, UniversalProxy.TaskSupervisor)
+    }
+
+    for topic <- [Cec.topic(), @state_topic, @added_topic, @removed_topic] do
+      Phoenix.PubSub.subscribe(state.pubsub, topic)
+    end
+
+    {:ok, state, {:continue, :init}}
+  end
+
+  # Subscribed first, then read, so no change slips between the two. A
+  # restarted link finds players a previous incarnation left in external
+  # mode; those that don't link now are handed back their volume.
+  @impl true
+  def handle_continue(:init, state) do
+    outputs =
+      for output <- safe(state.funs.list_outputs, []), into: %{}, do: {output.key, output}
+
+    state =
+      %{state | outputs: outputs, adapters: by_dev(safe(state.funs.list_adapters, []))}
+      |> evaluate()
+
+    linked = linked_keys(state)
+
+    for {key, %{volume_external: true}} <- outputs, key not in linked do
+      safe(fn -> state.funs.set_volume_external.(key, false) end, :ok)
+    end
+
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_call(:links, _from, state) do
+    {:reply, Map.new(state.links, fn {dev, link} -> {dev, link.key} end), state}
+  end
+
+  @impl true
+  def handle_info({:cec_adapters, adapters}, state) when is_list(adapters) do
+    new = by_dev(adapters)
+    state = Enum.reduce(state.links, state, &broadcast_report(&2, elem(&1, 0), new))
+    {:noreply, evaluate(%{state | adapters: new})}
+  end
+
+  def handle_info({:sendspin_output_added, %{key: key} = output}, state) do
+    if key in linked_keys(state) do
+      safe(fn -> state.funs.set_volume_external.(key, true) end, :ok)
+    end
+
+    {:noreply, evaluate(%{state | outputs: Map.put(state.outputs, key, output)})}
+  end
+
+  def handle_info({:sendspin_output_removed, %{key: key}}, state) do
+    {:noreply, evaluate(%{state | outputs: Map.delete(state.outputs, key)})}
+  end
+
+  def handle_info({:sendspin_state, key, %{event: "volume", value: v}}, state)
+      when is_integer(v) and v in 0..100 do
+    {:noreply, state |> note_output(key, %{volume: v}) |> intent(key, :volume, v)}
+  end
+
+  def handle_info({:sendspin_state, key, %{event: "mute", value: m}}, state)
+      when is_boolean(m) do
+    {:noreply, state |> note_output(key, %{muted: m}) |> intent(key, :muted, m)}
+  end
+
+  def handle_info({:sendspin_state, _key, %{event: _}}, state), do: {:noreply, state}
+
+  # A configuration write (the `cec_volume` setting among them).
+  def handle_info({:sendspin_state, key, partial}, state) when is_map(partial) do
+    {:noreply, state |> note_output(key, partial) |> evaluate()}
+  end
+
+  def handle_info({:poll, dev}, state) do
+    state = %{state | timers: Map.delete(state.timers, dev)}
+
+    if Map.has_key?(candidates(state), dev) and not Map.has_key?(state.busy, dev),
+      do: {:noreply, start_poll(state, dev)},
+      else: {:noreply, state}
+  end
+
+  def handle_info({ref, result}, state) when is_reference(ref) do
+    case busy_dev(state, ref) do
+      nil ->
+        {:noreply, state}
+
+      dev ->
+        Process.demonitor(ref, [:flush])
+        {:noreply, job_done(%{state | busy: Map.delete(state.busy, dev)}, dev, result)}
+    end
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
+    case busy_dev(state, ref) do
+      nil ->
+        {:noreply, state}
+
+      dev ->
+        Logger.warning("CEC volume link: #{dev} task crashed: #{inspect(reason)}")
+        {:noreply, job_done(%{state | busy: Map.delete(state.busy, dev)}, dev, :crashed)}
+    end
+  end
+
+  def handle_info(_other, state), do: {:noreply, state}
+
+  # ── linking ───────────────────────────────────────────────────────────
+
+  # Unlink what no longer qualifies, link what newly does, and keep each
+  # candidate adapter's poll scheduled.
+  defp evaluate(state) do
+    candidates = candidates(state)
+
+    state =
+      Enum.reduce(state.links, state, fn {dev, link}, acc ->
+        if keep?(acc, dev, link, candidates), do: acc, else: unlink(acc, dev)
+      end)
+
+    state =
+      Enum.reduce(candidates, state, fn {dev, key}, acc ->
+        if not Map.has_key?(acc.links, dev) and key not in linked_keys(acc) and
+             linkable?(acc.adapters[dev]),
+           do: link(acc, dev, key),
+           else: acc
+      end)
+
+    schedule_all(state, candidates)
+  end
+
+  # Adapters whose receiver could carry an output's volume: `%{dev => key}`.
+  defp candidates(state) do
+    for {dev, %{running?: true, receiver_presence: :present, card_index: card}} <- state.adapters,
+        is_integer(card),
+        key <- List.wrap(output_for_card(state, card)),
+        into: %{},
+        do: {dev, key}
+  end
+
+  defp output_for_card(state, card) do
+    state.outputs
+    |> Enum.sort()
+    |> Enum.find_value(fn {key, output} ->
+      if Map.get(output, :card_index) == card and Cec.volume_link?(output, state.default),
+        do: key
+    end)
+  end
+
+  defp keep?(state, dev, link, candidates) do
+    Map.get(candidates, dev) == link.key and
+      receiver(state.adapters[dev]).power not in [:standby, :to_standby]
+  end
+
+  defp linkable?(adapter) do
+    %{power: power, volume: volume} = receiver(adapter)
+    power == :on and is_integer(volume)
+  end
+
+  defp link(state, dev, key) do
+    %{volume: volume, muted: muted} = receiver(state.adapters[dev])
+    Logger.info("CEC volume link: #{inspect(key)} follows the receiver on #{dev} (#{volume})")
+    safe(fn -> state.funs.set_volume_external.(key, true) end, :ok)
+
+    link = %{
+      key: key,
+      receiver: %{volume: volume, muted: muted},
+      shown: %{volume: nil, muted: nil},
+      pending: %{},
+      echoes: [],
+      quiet_until: nil
+    }
+
+    state = put_in(state.links[dev], link)
+    push(state, dev, known(link.receiver))
+  end
+
+  defp unlink(state, dev) do
+    %{key: key} = state.links[dev]
+    Logger.info("CEC volume link: #{inspect(key)} no longer follows the receiver on #{dev}")
+    safe(fn -> state.funs.set_volume_external.(key, false) end, :ok)
+    %{state | links: Map.delete(state.links, dev)}
+  end
+
+  defp linked_keys(state), do: for({_dev, %{key: key}} <- state.links, do: key)
+
+  defp link_for_key(state, key), do: Enum.find(state.links, fn {_dev, l} -> l.key == key end)
+
+  # ── output → receiver ─────────────────────────────────────────────────
+
+  defp intent(state, key, field, value) do
+    case link_for_key(state, key) do
+      nil -> state
+      {dev, link} -> link_intent(state, dev, link, field, value)
+    end
+  end
+
+  defp link_intent(state, dev, link, field, value) do
+    case take_echo(link, field, value) do
+      {:echo, link} ->
+        put_in(state.links[dev], link)
+
+      {:none, %{shown: %{^field => ^value}} = link} ->
+        put_in(state.links[dev], link)
+
+      {:none, link} ->
+        link = put_in(link.shown[field], value)
+        state = put_in(state.links[dev], link)
+        request(state, dev, field, target(state, link.key, field, value))
+    end
+  end
+
+  defp target(state, key, :volume, volume) do
+    case state.outputs |> Map.get(key, %{}) |> Map.get(:cec_volume_max) do
+      max when is_integer(max) -> min(volume, max)
+      _ -> volume
+    end
+  end
+
+  defp target(_state, _key, :muted, muted), do: muted
+
+  defp request(state, dev, field, target) do
+    link = state.links[dev]
+
+    cond do
+      match?({_ref, :step}, state.busy[dev]) ->
+        put_in(state.links[dev].pending[field], target)
+
+      target != link.receiver[field] ->
+        state = put_in(state.links[dev].pending[field], target)
+        if Map.has_key?(state.busy, dev), do: state, else: start_step(state, dev)
+
+      true ->
+        state = update_in(state.links[dev].pending, &Map.delete(&1, field))
+        sync_output(state, dev)
+    end
+  end
+
+  # The pending targets the receiver isn't at yet.
+  defp todo(link) do
+    for {field, target} <- link.pending,
+        target != link.receiver[field],
+        into: %{},
+        do: {field, target}
+  end
+
+  defp start_step(state, dev) do
+    link = state.links[dev]
+    targets = todo(link)
+    state = put_in(state.links[dev].pending, %{})
+
+    if targets == %{} do
+      sync_output(state, dev)
+    else
+      %{set_volume: set_volume, set_muted: set_muted} = state.funs
+
+      task =
+        Task.Supervisor.async_nolink(state.task_sup, fn ->
+          step(set_volume, set_muted, dev, targets)
+        end)
+
+      %{state | busy: Map.put(state.busy, dev, {task.ref, :step})}
+    end
+  end
+
+  # Runs in the task: mute first (one or two presses), then the walk.
+  defp step(set_volume, set_muted, dev, targets) do
+    {status, error} =
+      case Map.fetch(targets, :muted) do
+        {:ok, muted} -> step_result(set_muted.(dev, muted))
+        :error -> {nil, nil}
+      end
+
+    case {error, Map.fetch(targets, :volume)} do
+      {nil, {:ok, volume}} ->
+        {volume_status, volume_error} = step_result(set_volume.(dev, volume))
+        {:step, targets, merge_status(status, volume_status), volume_error}
+
+      _ ->
+        {:step, targets, status, error}
+    end
+  end
+
+  defp step_result({:ok, status}), do: {status, nil}
+  defp step_result({:error, {kind, status}}) when is_map(status), do: {status, kind}
+  defp step_result({:error, reason}), do: {nil, reason}
+
+  defp merge_status(nil, status), do: status
+  defp merge_status(status, nil), do: status
+  defp merge_status(a, b), do: Map.merge(a, known(b))
+
+  # ── receiver → output ─────────────────────────────────────────────────
+
+  # A report Cec.Server recorded: new when its timestamp moved.
+  defp broadcast_report(state, dev, new_adapters) do
+    old = receiver(state.adapters[dev])
+    new = receiver(new_adapters[dev])
+
+    if new.updated_at != nil and new.updated_at != old.updated_at and
+         not quiet?(state.links[dev]),
+       do: receiver_report(state, dev, new),
+       else: state
+  end
+
+  defp quiet?(%{quiet_until: nil}), do: false
+  defp quiet?(%{quiet_until: until}), do: System.monotonic_time(:millisecond) < until
+
+  defp receiver_report(state, dev, report) do
+    case state.links[dev] do
+      nil ->
+        state
+
+      link ->
+        if match?({_ref, :step}, state.busy[dev]) do
+          state
+        else
+          receiver = Map.merge(link.receiver, known(Map.take(report, @fields)))
+          state = put_in(state.links[dev].receiver, receiver)
+          sync_output(state, dev)
+        end
+    end
+  end
+
+  # Write the receiver's state to the output where it differs from what
+  # the output shows, except fields with a request still to run.
+  defp sync_output(state, dev) do
+    link = state.links[dev]
+
+    diff =
+      for field <- @fields,
+          not Map.has_key?(link.pending, field),
+          value <- [link.receiver[field]],
+          value != nil,
+          value != link.shown[field],
+          into: %{},
+          do: {field, value}
+
+    push(state, dev, diff)
+  end
+
+  defp push(state, _dev, diff) when diff == %{}, do: state
+
+  defp push(state, dev, diff) do
+    link = state.links[dev]
+
+    case safe(fn -> state.funs.update_config.(link.key, diff) end, {:error, :unavailable}) do
+      :ok -> :ok
+      error -> Logger.debug("CEC volume link: update #{inspect(link.key)}: #{inspect(error)}")
+    end
+
+    deadline = System.monotonic_time(:millisecond) + @echo_ttl_ms
+    echoes = for {field, value} <- diff, do: {field, value, deadline}
+
+    put_in(state.links[dev], %{
+      link
+      | shown: Map.merge(link.shown, diff),
+        echoes: link.echoes ++ echoes
+    })
+  end
+
+  defp take_echo(link, field, value) do
+    now = System.monotonic_time(:millisecond)
+    echoes = Enum.filter(link.echoes, fn {_f, _v, deadline} -> deadline > now end)
+
+    case Enum.split_while(echoes, &(not match?({^field, ^value, _}, &1))) do
+      {before, [_echo | rest]} -> {:echo, %{link | echoes: before ++ rest}}
+      {_all, []} -> {:none, %{link | echoes: echoes}}
+    end
+  end
+
+  # ── polling ───────────────────────────────────────────────────────────
+
+  defp schedule_all(state, candidates) do
+    {keep, drop} = Map.split(state.timers, Map.keys(candidates))
+    Enum.each(drop, fn {_dev, timer} -> Process.cancel_timer(timer) end)
+    state = %{state | timers: keep}
+    Enum.reduce(Map.keys(candidates), state, &schedule(&2, &1))
+  end
+
+  defp schedule(state, dev) do
+    cond do
+      Map.has_key?(state.busy, dev) or Map.has_key?(state.timers, dev) ->
+        state
+
+      not Map.has_key?(candidates(state), dev) ->
+        state
+
+      true ->
+        delay =
+          cond do
+            Map.has_key?(state.links, dev) -> state.poll_ms
+            Map.has_key?(state.power_at, dev) -> state.probe_ms
+            true -> 0
+          end
+
+        timer = Process.send_after(self(), {:poll, dev}, delay)
+        %{state | timers: Map.put(state.timers, dev, timer)}
+    end
+  end
+
+  defp start_poll(state, dev) do
+    linked? = Map.has_key?(state.links, dev)
+    now = System.monotonic_time(:millisecond)
+
+    check_power? =
+      case Map.fetch(state.power_at, dev) do
+        {:ok, at} -> not linked? or now - at >= state.probe_ms
+        :error -> true
+      end
+
+    %{audio_status: audio_status, power_status: power_status} = state.funs
+
+    task =
+      Task.Supervisor.async_nolink(state.task_sup, fn ->
+        power = if check_power?, do: power_status.(dev), else: :skipped
+        audio = if linked? or power == {:ok, :on}, do: audio_status.(dev), else: :skipped
+        {:poll, power, audio}
+      end)
+
+    %{state | busy: Map.put(state.busy, dev, {task.ref, :poll})}
+  end
+
+  # ── job results ───────────────────────────────────────────────────────
+
+  defp job_done(state, dev, {:poll, power, audio}) do
+    state =
+      if power == :skipped,
+        do: state,
+        else: put_in(state.power_at[dev], System.monotonic_time(:millisecond))
+
+    state =
+      case audio do
+        {:ok, %{} = status} -> receiver_report(state, dev, status)
+        _ -> state
+      end
+
+    next(state, dev)
+  end
+
+  defp job_done(state, dev, {:step, targets, status, error}) do
+    if error, do: log_step_error(dev, targets, status, error)
+    step_ended(state, dev, status)
+  end
+
+  defp job_done(state, dev, _crashed), do: step_ended(state, dev, nil)
+
+  defp step_ended(state, dev, status) do
+    case state.links[dev] do
+      nil ->
+        next(state, dev)
+
+      link ->
+        quiet_until = System.monotonic_time(:millisecond) + state.settle_ms
+        receiver = Map.merge(link.receiver, known(status || %{}))
+        state = put_in(state.links[dev], %{link | receiver: receiver, quiet_until: quiet_until})
+        next(state, dev)
+    end
+  end
+
+  # After any job: run what was requested meanwhile, else show the
+  # receiver's state and go back to polling.
+  defp next(state, dev) do
+    case state.links[dev] do
+      nil ->
+        schedule(state, dev)
+
+      link ->
+        if todo(link) == %{} do
+          state = put_in(state.links[dev].pending, %{})
+          state |> sync_output(dev) |> schedule(dev)
+        else
+          start_step(state, dev)
+        end
+    end
+  end
+
+  defp log_step_error(dev, targets, status, error) do
+    at = if status, do: " at #{inspect(known(status))}", else: ""
+
+    Logger.info(
+      "CEC volume link: #{dev} stopped short of #{inspect(targets)}#{at}: #{inspect(error)}"
+    )
+  end
+
+  # ── helpers ───────────────────────────────────────────────────────────
+
+  defp note_output(state, key, partial) do
+    case Map.fetch(state.outputs, key) do
+      {:ok, output} -> put_in(state.outputs[key], Map.merge(output, Map.delete(partial, :event)))
+      :error -> state
+    end
+  end
+
+  defp busy_dev(state, ref) do
+    Enum.find_value(state.busy, fn {dev, {r, _kind}} -> if r == ref, do: dev end)
+  end
+
+  defp by_dev(adapters), do: Map.new(adapters, &{&1.dev, &1})
+
+  @unknown %{power: :unknown, volume: nil, muted: nil, updated_at: nil}
+
+  defp receiver(%{receiver: receiver}) when is_map(receiver), do: Map.merge(@unknown, receiver)
+  defp receiver(_adapter), do: @unknown
+
+  defp known(status) do
+    for {field, value} <- Map.take(status, @fields), value != nil, into: %{}, do: {field, value}
+  end
+
+  defp safe(fun, default) do
+    fun.()
+  catch
+    :exit, _ -> default
+  end
+end

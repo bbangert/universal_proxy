@@ -538,6 +538,22 @@ defmodule UniversalProxy.Cec.ServerTest do
     assert Process.alive?(Process.whereis(Server))
   end
 
+  test "the subtree runs the volume link unless told not to" do
+    assert is_pid(Process.whereis(UniversalProxy.Cec.VolumeLink))
+
+    stop_supervised!(Supervisor)
+
+    start_supervised!(
+      {Supervisor,
+       enabled: true,
+       volume_link: false,
+       enumerate: fn -> %{} end,
+       output_lookup: fn _ -> :error end}
+    )
+
+    assert Process.whereis(UniversalProxy.Cec.VolumeLink) == nil
+  end
+
   test "the subtree is ignored unless enabled" do
     assert Supervisor.start_link() == :ignore
   end
