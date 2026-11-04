@@ -45,20 +45,32 @@ defmodule Circuits.CEC.AdapterTest do
       assert info.configured? == false
     end
 
-    test "shares the follower role when another process is the exclusive follower" do
+    test "is an initiator only while another process is the exclusive follower" do
       responder = fn
         {:s_mode, 0x21} -> {:error, :ebusy}
         _ -> :default
       end
 
-      %{fake: fake, adapter: adapter} = start(responder: responder)
-      wait_until(fn -> Adapter.info(adapter).ready? end)
+      %{fake: fake, adapter: adapter} = configured(responder: responder)
 
-      assert {:s_mode, 0x11} in requests(fake)
-      assert %{follower: :shared, claim: :claimed} = Adapter.info(adapter)
+      assert {:s_mode, 0x01} in requests(fake)
+      refute {:s_mode, 0x11} in requests(fake)
+      assert %{follower: :unavailable, claim: :claimed} = Adapter.info(adapter)
+
+      # No follower duties: the other follower answers. Transmits still work.
+      :ok = Adapter.subscribe(adapter)
+      receive_msg(fake, <<0x04, 0x8F>>)
+      receive_msg(fake, <<0x04, 0x89>>)
+      assert_receive {:cec, @device, {:message, %Message{body: {:unknown, 0x89, _}}}}
+      assert length(transmits(fake)) == 1
+
+      task = Task.async(fn -> Adapter.image_view_on(adapter) end)
+      {seq, %Message{from: @la, body: :image_view_on}} = nth_tx(fake, 2)
+      complete(fake, seq, tx_status: 0x01)
+      assert Task.await(task) == :ok
     end
 
-    test "stops when it can't be a follower at all" do
+    test "stops when it can't set any mode" do
       responder = fn
         {:s_mode, _} -> {:error, :ebusy}
         _ -> :default
@@ -123,6 +135,28 @@ defmodule Circuits.CEC.AdapterTest do
 
       assert Struct.decode_log_addrs(clear).num_log_addrs == 0
       assert %{num_log_addrs: 1, osd_name: "Pi"} = Struct.decode_log_addrs(claim)
+    end
+
+    test "a claim with other flags counts as a different claim" do
+      for {flags, kept?} <- [{0, false}, {0x03, false}, {0x01, true}, {0x09, true}] do
+        claim =
+          Struct.encode_log_addrs(
+            num_log_addrs: 1,
+            cec_version: 5,
+            vendor_id: 0xFFFFFFFF,
+            osd_name: "Pi",
+            primary_device_type: [4],
+            log_addr_type: [3],
+            flags: flags
+          )
+
+        %{adapter: adapter} = start(osd_name: "Pi", responder: g_log(claim))
+        wait_until(fn -> Adapter.info(adapter).ready? end)
+        expected = if kept?, do: :kept, else: :claimed
+        assert Adapter.info(adapter).claim == expected, "flags #{flags}"
+        stop_supervised!({Adapter, @device})
+        stop_supervised!(Fake)
+      end
     end
 
     test "a renamed OSD name counts as a different claim" do
@@ -662,6 +696,24 @@ defmodule Circuits.CEC.AdapterTest do
       assert {_seq, %Message{to: 15, body: {:active_source, @pa}}} = nth_tx(fake, 4)
     end
 
+    test "as Unregistered, a broadcast never gets a directed answer" do
+      %{fake: fake, adapter: adapter} = start()
+      wait_until(fn -> Adapter.info(adapter).ready? end)
+      initial_state(fake, @pa, 0x8000)
+      wait_until(fn -> Adapter.info(adapter).log_addrs == [15] end)
+      {seq, %Message{from: 15, to: 5, body: :poll}} = nth_tx(fake, 1)
+      complete(fake, seq, tx_status: 0x24)
+      active(fake, adapter)
+
+      receive_msg(fake, <<0x0F, 0x8F>>)
+      receive_msg(fake, <<0x0F, 0x8D, 0x00>>)
+      receive_msg(fake, <<0x0F, 0x89>>)
+      receive_msg(fake, <<0x0F, 0x85>>)
+
+      assert {_seq, %Message{from: 15, to: 15, body: {:active_source, @pa}}} = nth_tx(fake, 3)
+      assert length(transmits(fake)) == 3
+    end
+
     test "answers Request Active Source only while active" do
       %{fake: fake, adapter: adapter} = configured()
 
@@ -900,6 +952,35 @@ defmodule Circuits.CEC.AdapterTest do
 
       complete(fake, seq, tx_status: 0x01)
       assert Task.await(task) == :ok
+    end
+
+    test "an unplug during Image View On waits for the address to come back" do
+      %{fake: fake, adapter: adapter} = configured()
+
+      task = Task.async(fn -> Adapter.one_touch_play(adapter, wait_ms: 1_000) end)
+      {seq, %Message{body: :image_view_on}} = nth_tx(fake, 2)
+      state_change(fake, 0xFFFF, 0)
+      wait_until(fn -> not Adapter.info(adapter).configured? end)
+      %{id: old_id} = :sys.get_state(adapter).otp
+
+      complete(fake, seq, tx_status: 0x01)
+      refute Task.yield(task, 30)
+
+      # A timeout from an earlier wait doesn't end this one.
+      send(adapter, {:otp_timeout, old_id})
+      refute Task.yield(task, 30)
+
+      state_change(fake, @pa, @mask)
+
+      {seq, %Message{from: @la, body: {:active_source, @pa}}} =
+        wait_until(fn -> find_tx(fake, &match?(%Message{body: {:active_source, _}}, &1)) end)
+
+      complete(fake, seq, tx_status: 0x01)
+      assert Task.await(task) == :ok
+
+      assert length(
+               Enum.filter(transmits(fake), &match?({_, %Message{body: :image_view_on}, _}, &1))
+             ) == 1
     end
 
     test "System Audio Mode Request is opt-in" do

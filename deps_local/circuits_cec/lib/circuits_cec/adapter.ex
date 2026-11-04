@@ -20,9 +20,13 @@ defmodule Circuits.CEC.Adapter do
   ## Bring-up
 
   1. Open the device and read its capabilities.
-  2. Set the mode to initiator + exclusive follower. If another process is
-     already the exclusive follower (`EBUSY`), fall back to a shared
-     follower (`info(adapter).follower == :shared`).
+  2. Set the mode to initiator + exclusive follower. If another process
+     (libcec, Kodi, `cec-follower`) is already the exclusive follower
+     (`EBUSY`), the kernel sends every received message to it alone, so
+     the adapter becomes an initiator only (`info(adapter).follower ==
+     :unavailable`): transmits work, but there are no follower duties and
+     subscribers see only replies to our own requests. Restart the
+     adapter once the other follower is gone.
   3. Claim a Playback logical address (CEC 1.4, no vendor ID, OSD name
      from `:osd_name`, falling back to Unregistered if 4, 8 and 11 are
      taken). A claim that already matches is kept, so restarting the
@@ -121,7 +125,8 @@ defmodule Circuits.CEC.Adapter do
   @osd_name_max 14
 
   @mode_exclusive 0x21
-  @mode_shared 0x11
+  @mode_initiator 0x01
+  @claim_flags [:allow_unreg_fallback]
 
   @type adapter :: GenServer.server()
 
@@ -328,7 +333,8 @@ defmodule Circuits.CEC.Adapter do
   adapter sends that, waits up to `:wait_ms` (default 10 s) to be
   configured and then sends `<Active Source>`. With `:system_audio_mode`
   (default: the adapter's option) it then sends `<System Audio Mode
-  Request>` to the receiver.
+  Request>` to the receiver. If hotplug drops while `<Image View On>` is
+  out, it waits for the address again the same way.
 
   Returns `:ok` once `<Active Source>` went out, or the error that stopped
   it (`:not_configured` if the wait ran out). Concurrent calls share one
@@ -588,17 +594,19 @@ defmodule Circuits.CEC.Adapter do
 
   defp on_reply(:mode_exclusive, {:ok, _}, state), do: {:ok, after_mode(state, :exclusive)}
 
+  # A plain follower would get nothing while another filehandle is the
+  # exclusive follower, so don't pretend to be one.
   defp on_reply(:mode_exclusive, {:error, :ebusy}, state) do
     Logger.warning(
-      "CEC #{state.device}: another process is the exclusive follower; sharing the follower role"
+      "CEC #{state.device}: another process is the exclusive follower; transmitting only"
     )
 
-    {:ok, send_internal(state, {:s_mode, @mode_shared}, :mode_shared)}
+    {:ok, send_internal(state, {:s_mode, @mode_initiator}, :mode_initiator)}
   end
 
-  defp on_reply(:mode_shared, {:ok, _}, state), do: {:ok, after_mode(state, :shared)}
+  defp on_reply(:mode_initiator, {:ok, _}, state), do: {:ok, after_mode(state, :unavailable)}
 
-  defp on_reply(mode, {:error, errno}, state) when mode in [:mode_exclusive, :mode_shared] do
+  defp on_reply(mode, {:error, errno}, state) when mode in [:mode_exclusive, :mode_initiator] do
     Logger.warning("CEC #{state.device}: can't set the follower mode (#{inspect(errno)})")
     {:stop, {:shutdown, {:s_mode, errno}}, state}
   end
@@ -660,10 +668,12 @@ defmodule Circuits.CEC.Adapter do
     end
   end
 
+  # Flags beyond the three settable ones (CONFIG_FAILED) are kernel output.
   defp our_claim?(state, las) do
     las.num_log_addrs == 1 and hd(las.log_addr_type) == Struct.log_addr_type(:playback) and
       hd(las.primary_device_type) == Message.device_type(:playback) and las.cec_version == 5 and
-      las.vendor_id == 0xFFFFFFFF and las.osd_name == state.osd_name
+      las.vendor_id == 0xFFFFFFFF and las.osd_name == state.osd_name and
+      (las.flags &&& 0x07) == Struct.flags_value(:log_addrs, @claim_flags)
   end
 
   defp claim_struct(state) do
@@ -675,7 +685,7 @@ defmodule Circuits.CEC.Adapter do
       primary_device_type: [Message.device_type(:playback)],
       log_addr_type: [Struct.log_addr_type(:playback)],
       all_device_types: [Struct.all_device_type(:playback)],
-      flags: [:allow_unreg_fallback]
+      flags: @claim_flags
     )
   end
 
@@ -1117,6 +1127,8 @@ defmodule Circuits.CEC.Adapter do
     end
   end
 
+  defp follow(%{follower: :unavailable} = state, _message), do: state
+
   defp follow(state, message) do
     ctx = %{
       la: our_la(state),
@@ -1203,8 +1215,14 @@ defmodule Circuits.CEC.Adapter do
   end
 
   defp otp_active_source(state) do
-    state = put_in(state.otp.stage, :active_source)
-    otp_tx(state, @broadcast, {:active_source, state.phys_addr}, nil, nil, :active_source)
+    if configured?(state) do
+      state = put_in(state.otp.stage, :active_source)
+      otp_tx(state, @broadcast, {:active_source, state.phys_addr}, nil, nil, :active_source)
+    else
+      # Hotplug dropped while Image View On was out: wait for the claim
+      # again. A new id keeps an earlier wait's timeout from ending this one.
+      otp_wait(%{state | otp: %{state.otp | id: make_ref(), ivo_sent?: true}})
+    end
   end
 
   defp otp_tx(state, to, body, reply, from_la, step) do

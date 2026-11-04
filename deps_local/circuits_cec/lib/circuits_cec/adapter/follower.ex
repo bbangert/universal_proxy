@@ -152,6 +152,10 @@ defmodule Circuits.CEC.Adapter.Follower do
   defp sendable?(_reply, _msg, %{la: nil}), do: false
   defp sendable?({@broadcast, {:active_source, _pa}}, _msg, _ctx), do: true
 
+  # As Unregistered (15) our own address is the broadcast address, so the
+  # destination check alone would let a broadcast through.
   defp sendable?({_to, _body}, msg, ctx),
-    do: msg.to == ctx.la and msg.from != @unregistered and msg.from != ctx.la
+    do:
+      msg.to != @broadcast and msg.to == ctx.la and msg.from != @unregistered and
+        msg.from != ctx.la
 end
