@@ -17,6 +17,7 @@ defmodule UniversalProxyWeb.OverviewLive do
   alias UniversalProxy.Bluetooth
   alias UniversalProxy.Bluetooth.AudioManager
   alias UniversalProxy.BTD700
+  alias UniversalProxy.Cec
   alias UniversalProxy.FMA120
   alias UniversalProxy.Hardware
   alias UniversalProxy.Storage
@@ -65,6 +66,8 @@ defmodule UniversalProxyWeb.OverviewLive do
         # USB backup drives: attach/detach, mount, share and capacity all
         # arrive as one full state map on this topic.
         Phoenix.PubSub.subscribe(UniversalProxy.PubSub, storage().topic())
+        # HDMI-CEC receiver status for the HDMI outputs' pills.
+        Phoenix.PubSub.subscribe(UniversalProxy.PubSub, Cec.topic())
         :timer.send_interval(@refresh_interval, self(), :refresh)
         {History.packets_per_minute(), reconcile_throughputs(%{}, ports)}
       else
@@ -86,6 +89,7 @@ defmodule UniversalProxyWeb.OverviewLive do
      |> assign(:usb_hubs, Hardware.usb_hubs())
      |> assign(:audio_outputs, build_audio_index(Audio.list_outputs()))
      |> assign(:audio_inputs, build_audio_index(Audio.Input.list_inputs()))
+     |> assign(:cec, cec_by_card(Cec.list_adapters()))
      |> assign(:bt_radios, Bluetooth.list_radios())
      |> assign(:bt_headphones, AudioManager.list_headphones())
      |> assign(:storage, storage().state())
@@ -613,6 +617,10 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   def handle_info({:bt_audio, _kind, _mac, _payload}, socket), do: {:noreply, socket}
 
+  def handle_info({:cec_adapters, adapters}, socket) when is_list(adapters) do
+    {:noreply, assign(socket, :cec, cec_by_card(adapters))}
+  end
+
   def handle_info({:sendspin_output_added, output}, socket) do
     {:noreply, update(socket, :audio_outputs, &Map.put(&1, output.key, output))}
   end
@@ -1030,6 +1038,7 @@ defmodule UniversalProxyWeb.OverviewLive do
       <.audio_outputs_card
         :if={map_size(@audio_outputs) > 0 or @bt_disconnected != []}
         outputs={@audio_outputs}
+        cec={@cec}
         bt_disconnected={@bt_disconnected}
         bt_radios={@bt_radios}
       />
@@ -3196,6 +3205,7 @@ defmodule UniversalProxyWeb.OverviewLive do
 
   # ── Audio outputs summary (links to /audio) ───────────────────────────
   attr(:outputs, :map, required: true)
+  attr(:cec, :map, default: %{})
   attr(:bt_disconnected, :list, default: [])
   attr(:bt_radios, :list, default: [])
 
@@ -3230,6 +3240,7 @@ defmodule UniversalProxyWeb.OverviewLive do
         <.audio_summary_row
           :for={{out, last?} <- with_last(@sorted)}
           out={out}
+          cec={Map.get(@cec, out.card_index)}
           last?={last? and @bt_disconnected == []}
         />
         <.bt_disconnected_row
@@ -3283,6 +3294,7 @@ defmodule UniversalProxyWeb.OverviewLive do
   end
 
   attr(:out, :map, required: true)
+  attr(:cec, :map, default: nil)
   attr(:last?, :boolean, required: true)
 
   # Five-column grid: tint spine | speaker tile | name + alsa path |
@@ -3334,6 +3346,7 @@ defmodule UniversalProxyWeb.OverviewLive do
           >
             <.icon name={:pause} size={10} stroke={2.4} /> Paused
           </span>
+          <.cec_pill :if={@cec} status={@cec} />
         </div>
         <div class="text-[11px] text-fg-3 mt-0.5">
           <span class="font-mono">{@out.alsa_device}</span> · <span>{@out.card_name}</span>

@@ -15,8 +15,13 @@ defmodule UniversalProxy.Audio.Store do
         client_id: String.t(),
         volume: 0..100,
         muted: boolean(),
-        static_delay_ms: 0..5000
+        static_delay_ms: 0..5000,
+        cec_auto_wake: boolean() | nil
       }
+
+  `cec_auto_wake` is the HDMI-CEC auto-wake choice for this output (wake
+  the receiver when a stream starts); `nil` until the user sets it, which
+  means the `UniversalProxy.Cec` `auto_wake` default applies.
 
   `client_id` is generated once per output the first time it is sighted
   and persists across reboots. It is no longer the Sendspin `client_id`:
@@ -53,7 +58,8 @@ defmodule UniversalProxy.Audio.Store do
           client_id: String.t(),
           volume: 0..100,
           muted: boolean(),
-          static_delay_ms: 0..5000
+          static_delay_ms: 0..5000,
+          cec_auto_wake: boolean() | nil
         }
 
   # -- Client API --
@@ -205,7 +211,8 @@ defmodule UniversalProxy.Audio.Store do
       client_id: pick(params, existing, :client_id, &generate_client_id/0),
       volume: clamp_volume(pick(params, existing, :volume, 50)),
       muted: !!pick(params, existing, :muted, false),
-      static_delay_ms: clamp_static_delay(pick(params, existing, :static_delay_ms, 0))
+      static_delay_ms: clamp_static_delay(pick(params, existing, :static_delay_ms, 0)),
+      cec_auto_wake: tri_state(pick(params, existing, :cec_auto_wake, nil))
     }
   end
 
@@ -248,6 +255,9 @@ defmodule UniversalProxy.Audio.Store do
   defp clamp_volume(v) when is_integer(v) and v < 0, do: 0
   defp clamp_volume(v) when is_integer(v) and v > 100, do: 100
   defp clamp_volume(_), do: 50
+
+  defp tri_state(v) when is_boolean(v), do: v
+  defp tri_state(_), do: nil
 
   # Server-adjustable static output delay (multi-room sync). The sendspin
   # library caps this at 5000 ms (`MAX_STATIC_DELAY_MS`); mirror that here.

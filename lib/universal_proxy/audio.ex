@@ -37,7 +37,8 @@ defmodule UniversalProxy.Audio do
 
   @doc """
   Update one or more configuration fields. Accepted keys:
-  `:friendly_name`, `:volume`, `:muted`. Anything else is silently
+  `:friendly_name`, `:volume`, `:muted`, `:cec_auto_wake` (a boolean, or
+  `nil` to fall back to the CEC default). Anything else is silently
   dropped. Returns `{:error, :not_found}` if the output isn't
   currently present, or `{:error, reason}` if DETS rejects the write.
   """

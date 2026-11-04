@@ -12,6 +12,8 @@ defmodule UniversalProxyWeb.Components.Audio do
 
   use Phoenix.Component
 
+  import UniversalProxyWeb.Components.UI, only: [badge: 1]
+
   @type status :: %{label: String.t(), variant: atom(), tint_var: String.t()}
 
   @doc """
@@ -168,6 +170,89 @@ defmodule UniversalProxyWeb.Components.Audio do
       <span class="audio-eq__bar"></span>
       <span class="audio-eq__bar"></span>
       <span class="audio-eq__bar"></span>
+    </span>
+    """
+  end
+
+  # ── HDMI-CEC receiver pill ────────────────────────────────────────────
+
+  @typedoc "What the CEC pill on an HDMI output shows."
+  @type cec_status :: %{label: String.t(), variant: atom(), title: String.t() | nil}
+
+  @doc """
+  Index `UniversalProxy.Cec.list_adapters/0` by ALSA card index, projected
+  to the pill each paired output shows. Adapters without a card pairing
+  are left out, so an output only gets a pill when its card is paired.
+  """
+  @spec cec_by_card([map()]) :: %{non_neg_integer() => cec_status()}
+  def cec_by_card(adapters) when is_list(adapters) do
+    for %{card_index: card} = adapter <- adapters, is_integer(card), into: %{} do
+      {card, cec_status(adapter)}
+    end
+  end
+
+  @doc """
+  The pill for one CEC adapter record: a crash backoff, the adapter being
+  down or unconfigured, or else the power state of whatever answers as the
+  receiver (the TV when no receiver is on the bus).
+  """
+  @spec cec_status(map()) :: cec_status()
+  def cec_status(%{running?: false, backoff: %{crashes: crashes, retry_in_ms: ms}}) do
+    %{
+      label: "CEC retrying",
+      variant: :warning,
+      title:
+        "CEC adapter crashed #{crashes} #{plural(crashes, "time")}; retrying in #{retry_label(ms)}"
+    }
+  end
+
+  def cec_status(%{running?: true, configured?: true} = adapter) do
+    {device, title} =
+      case adapter.receiver_presence do
+        :absent -> {"TV", "No receiver on the HDMI-CEC bus; the TV is controlled instead"}
+        _ -> {"Receiver", nil}
+      end
+
+    case adapter.receiver.power do
+      :on ->
+        %{label: device <> " on", variant: :success, title: title}
+
+      :to_on ->
+        %{label: device <> " waking", variant: :accent, title: title}
+
+      power when power in [:standby, :to_standby] ->
+        %{label: device <> " standby", variant: :neutral, title: title}
+
+      _ ->
+        %{label: device, variant: :neutral, title: title}
+    end
+  end
+
+  def cec_status(_adapter) do
+    %{
+      label: "CEC unavailable",
+      variant: :neutral,
+      title: "The HDMI-CEC adapter isn't connected to the bus"
+    }
+  end
+
+  defp plural(1, word), do: word
+  defp plural(_n, word), do: word <> "s"
+
+  defp retry_label(ms) when ms < 1_000, do: "#{ms} ms"
+  defp retry_label(ms) when ms < 60_000, do: "#{div(ms, 1_000)} s"
+  defp retry_label(ms), do: "#{div(ms, 60_000)} min"
+
+  @doc "Small badge with an HDMI output's CEC receiver status."
+  attr(:status, :map, required: true)
+  attr(:id, :string, default: nil)
+
+  def cec_pill(assigns) do
+    ~H"""
+    <span id={@id} title={@status.title} class="inline-flex">
+      <.badge variant={@status.variant} dot class="!text-[10px] !px-1.5 !py-px">
+        {@status.label}
+      </.badge>
     </span>
     """
   end

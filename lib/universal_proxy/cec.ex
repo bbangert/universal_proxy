@@ -43,6 +43,14 @@ defmodule UniversalProxy.Cec do
 
   @ui_keys %{power_on: :power_on_function, power_off: :power_off_function}
 
+  @doc """
+  PubSub topic (on `UniversalProxy.PubSub`) carrying `{:cec_event, dev,
+  event}` for every adapter event and `{:cec_adapters, adapters}` (the
+  `list_adapters/0` result) whenever a record changes.
+  """
+  @spec topic() :: String.t()
+  defdelegate topic(), to: Server
+
   @doc "All CEC adapters with what is known about them and their receiver."
   @spec list_adapters() :: [Server.adapter()]
   def list_adapters do
@@ -65,6 +73,23 @@ defmodule UniversalProxy.Cec do
   """
   @spec info(dev()) :: {:ok, map()} | {:error, error()}
   def info(dev), do: with_adapter(dev, &{:ok, Adapter.info(&1)})
+
+  @doc """
+  Whether a stream starting on this audio output wakes its receiver (One
+  Touch Play). The output's own `cec_auto_wake` setting wins; an output
+  without one follows `default`, the `auto_wake` env key (`true` unless
+  configured otherwise).
+  """
+  @spec auto_wake?(map(), boolean()) :: boolean()
+  def auto_wake?(output, default \\ default_auto_wake())
+  def auto_wake?(%{cec_auto_wake: value}, _default) when is_boolean(value), do: value
+  def auto_wake?(_output, default), do: default
+
+  defp default_auto_wake do
+    :universal_proxy
+    |> Application.get_env(__MODULE__, [])
+    |> Keyword.get(:auto_wake, true)
+  end
 
   @doc "True when the subsystem is running and this build has the CEC helper."
   @spec available?() :: boolean()

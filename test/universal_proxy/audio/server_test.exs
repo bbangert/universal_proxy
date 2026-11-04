@@ -709,6 +709,14 @@ defmodule UniversalProxy.Audio.ServerTest do
       assert persisted.enabled == true
     end
 
+    test "persists and broadcasts cec_auto_wake", %{server: server, store: store} do
+      :ok = Server.update_config(server, @hp_key, %{cec_auto_wake: false})
+
+      assert_receive {:sendspin_state, @hp_key, %{cec_auto_wake: false}}
+      assert {:ok, %{cec_auto_wake: false}} = Store.get_config(store, @hp_key)
+      assert {:ok, %{cec_auto_wake: false}} = Server.get_output(server, @hp_key)
+    end
+
     test "returns {:error, :not_found} for unknown output", %{server: server} do
       assert {:error, :not_found} =
                Server.update_config(server, {"missing", nil, nil}, %{friendly_name: "x"})

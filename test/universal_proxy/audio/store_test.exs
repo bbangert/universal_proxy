@@ -61,6 +61,18 @@ defmodule UniversalProxy.Audio.StoreTest do
       assert String.match?(cfg.client_id, ~r/^[0-9a-f]{32}$/)
     end
 
+    test "cec_auto_wake is unset until saved, then kept as a boolean", %{server: server} do
+      :ok = Store.save_config(server, @key, %{})
+      assert {:ok, %{cec_auto_wake: nil}} = Store.get_config(server, @key)
+
+      :ok = Store.save_config(server, @key, %{cec_auto_wake: false})
+      :ok = Store.save_config(server, @key, %{volume: 10})
+      assert {:ok, %{cec_auto_wake: false}} = Store.get_config(server, @key)
+
+      :ok = Store.save_config(server, @key, %{"cec_auto_wake" => "yes"})
+      assert {:ok, %{cec_auto_wake: nil}} = Store.get_config(server, @key)
+    end
+
     test "round-trips and clamps static_delay_ms (0..5000)", %{server: server} do
       :ok = Store.save_config(server, @key, %{static_delay_ms: 250})
       assert {:ok, %{static_delay_ms: 250}} = Store.get_config(server, @key)

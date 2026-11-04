@@ -32,7 +32,7 @@ defmodule UniversalProxy.Cec.ServerTest do
        transport_opts: [fake: fake],
        enumerate: fn -> Agent.get(agent, & &1) end,
        output_lookup: fn
-         @output_key -> {:ok, %{card_index: 1}}
+         @output_key -> {:ok, Map.merge(%{card_index: 1}, Map.get(context, :output, %{}))}
          _ -> :error
        end,
        auto_wake: Map.get(context, :auto_wake, true),
@@ -77,6 +77,31 @@ defmodule UniversalProxy.Cec.ServerTest do
       configure(fake)
       assert_receive {:cec_event, @dev, {:state, %{configured?: true, phys_addr: @pa}}}
     end
+
+    test "broadcasts the adapter list when a record changes", %{fake: fake} do
+      Phoenix.PubSub.subscribe(@pubsub, Cec.topic())
+      configure(fake, :present)
+
+      assert_receive {:cec_adapters,
+                      [%{dev: @dev, configured?: true, receiver_presence: :present}]}
+
+      receive_msg(fake, <<0x54, 0x90, 0x01>>)
+      assert_receive {:cec_adapters, [%{receiver: %{power: :standby}}]}
+
+      # An event that changes no record broadcasts no list.
+      flush_adapters()
+      receive_msg(fake, <<0x04, 0x90, 0x01>>)
+      assert_receive {:cec_event, @dev, {:message, %Message{from: 0}}}
+      refute_receive {:cec_adapters, _}, 50
+    end
+
+    test "a crashed adapter's backoff is broadcast", %{fake: fake} do
+      configure(fake)
+      Phoenix.PubSub.subscribe(@pubsub, Cec.topic())
+      :ok = Fake.inject(fake, {:exit, 1})
+
+      assert_receive {:cec_adapters, [%{running?: false, backoff: %{crashes: 1}}]}
+    end
   end
 
   describe "auto-wake" do
@@ -103,6 +128,21 @@ defmodule UniversalProxy.Cec.ServerTest do
       stream_start(@output_key)
       Process.sleep(100)
       assert length(transmits(fake)) == 1
+    end
+
+    @tag output: %{cec_auto_wake: false}
+    test "is off for an output whose cec_auto_wake is false", %{fake: fake} do
+      configure(fake)
+      stream_start(@output_key)
+      Process.sleep(100)
+      assert length(transmits(fake)) == 1
+    end
+
+    @tag auto_wake: false, output: %{cec_auto_wake: true}
+    test "an output's cec_auto_wake: true overrides auto_wake: false", %{fake: fake} do
+      configure(fake)
+      stream_start(@output_key)
+      assert {_seq, %Message{to: 0, body: :image_view_on}} = nth_tx(fake, 2)
     end
   end
 
@@ -505,6 +545,14 @@ defmodule UniversalProxy.Cec.ServerTest do
         Server.get_adapter(@dev)
       )
     end)
+  end
+
+  defp flush_adapters do
+    receive do
+      {:cec_adapters, _} -> flush_adapters()
+    after
+      50 -> :ok
+    end
   end
 
   defp receiver do

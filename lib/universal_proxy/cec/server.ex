@@ -18,8 +18,10 @@ defmodule UniversalProxy.Cec.Server do
   Subscribed to the Sendspin state topic: a `stream_start` on an output
   whose ALSA card is paired with an adapter runs One Touch Play on it (Image
   View On, then Active Source), waking a receiver in standby and switching
-  it to the Pi's input before audio reaches the link. `auto_wake: false` in
-  the `UniversalProxy.Cec` env turns it off.
+  it to the Pi's input before audio reaches the link. Each output's
+  `cec_auto_wake` setting (`UniversalProxy.Audio.update_config/2`) turns it
+  on or off for that output; an output that has none follows `auto_wake` in
+  the `UniversalProxy.Cec` env (default `true`).
 
   ## The receiver
 
@@ -46,7 +48,8 @@ defmodule UniversalProxy.Cec.Server do
 
   Every adapter event is re-broadcast on `topic/0` as
   `{:cec_event, dev, event}` (the events are described in
-  `Circuits.CEC.Adapter`).
+  `Circuits.CEC.Adapter`), and whenever a record changes the whole
+  `list_adapters/0` result follows as `{:cec_adapters, adapters}`.
 
   Dependencies are injectable through `start_link/1` options so host tests
   run without sysfs or `/dev/cecN`: `:enumerate` (a 0-arity fun),
@@ -199,7 +202,7 @@ defmodule UniversalProxy.Cec.Server do
 
   @impl true
   def handle_call(:list_adapters, _from, state) do
-    {:reply, state.adapters |> Map.values() |> Enum.sort_by(& &1.index), state}
+    {:reply, sorted_adapters(state), state}
   end
 
   def handle_call({:get_adapter, dev}, _from, state),
@@ -208,7 +211,7 @@ defmodule UniversalProxy.Cec.Server do
   def handle_call({:adapter_for_card, card_index}, _from, state),
     do: {:reply, find_by_card(state, card_index), state}
 
-  def handle_call(:rescan, _from, state), do: {:reply, :ok, scan(state)}
+  def handle_call(:rescan, _from, state), do: {:reply, :ok, state |> scan() |> publish(state)}
 
   def handle_call({:receiver_version, dev}, _from, state),
     do: {:reply, Map.get(state.versions, dev, 0), state}
@@ -219,7 +222,7 @@ defmodule UniversalProxy.Cec.Server do
       {:ok, adapter} ->
         if version == Map.get(state.versions, dev, 0) and
              reaches_receiver?(to, receiver_target(state, adapter)),
-           do: {:noreply, update_receiver(state, dev, partial)},
+           do: {:noreply, state |> update_receiver(dev, partial) |> publish(state)},
            else: {:noreply, state}
 
       :error ->
@@ -230,27 +233,27 @@ defmodule UniversalProxy.Cec.Server do
   @impl true
   def handle_info(:scan, state) do
     Process.send_after(self(), :scan, state.scan_ms)
-    {:noreply, scan(state)}
+    {:noreply, state |> scan() |> publish(state)}
   end
 
   # A Sendspin stream starting on an HDMI output: wake + select the receiver.
   def handle_info({:sendspin_state, key, %{event: "stream_start"}}, state) do
-    if state.auto_wake, do: auto_wake(state, key)
+    auto_wake(state, key)
     {:noreply, state}
   end
 
   def handle_info({:sendspin_state, _key, _event}, state), do: {:noreply, state}
 
   def handle_info({:cec, dev, event}, state) do
-    state = apply_event(state, dev, event)
+    new_state = apply_event(state, dev, event)
     Phoenix.PubSub.broadcast(state.pubsub, @events_topic, {:cec_event, dev, event})
-    {:noreply, state}
+    {:noreply, publish(new_state, state)}
   end
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
     case Enum.find(state.procs, fn {_dev, {_pid, r}} -> r == ref end) do
       nil -> {:noreply, state}
-      {dev, _proc} -> {:noreply, adapter_down(state, dev, reason)}
+      {dev, _proc} -> {:noreply, state |> adapter_down(dev, reason) |> publish(state)}
     end
   end
 
@@ -258,15 +261,18 @@ defmodule UniversalProxy.Cec.Server do
     state = %{state | restart_timers: Map.delete(state.restart_timers, dev)}
 
     if Map.has_key?(state.adapters, dev),
-      do: {:noreply, ensure_started(state, dev)},
+      do: {:noreply, state |> ensure_started(dev) |> publish(state)},
       else: {:noreply, state}
   end
 
   # Up for :stable_ms since it started: earlier crashes no longer count.
   def handle_info({:stable, dev, pid}, state) do
     case state.procs do
-      %{^dev => {^pid, _ref}} -> {:noreply, update_adapter(state, dev, &%{&1 | backoff: nil})}
-      _ -> {:noreply, state}
+      %{^dev => {^pid, _ref}} ->
+        {:noreply, state |> update_adapter(dev, &%{&1 | backoff: nil}) |> publish(state)}
+
+      _ ->
+        {:noreply, state}
     end
   end
 
@@ -485,7 +491,8 @@ defmodule UniversalProxy.Cec.Server do
   # ── auto-wake ─────────────────────────────────────────────────────────
 
   # The output lookup is a call into Audio.Server, so it runs in the task
-  # with a snapshot of the card pairing rather than in this server.
+  # with a snapshot of the card pairing rather than in this server. The
+  # output's own auto-wake setting is read from the same lookup.
   defp auto_wake(state, key) do
     cards =
       for {dev, %{card_index: card, running?: true}} <- state.adapters,
@@ -495,15 +502,21 @@ defmodule UniversalProxy.Cec.Server do
 
     if cards != %{} do
       lookup = state.output_lookup
-      _ = Task.Supervisor.start_child(state.task_sup, fn -> wake(lookup, cards, key) end)
+      default = state.auto_wake
+
+      _ =
+        Task.Supervisor.start_child(state.task_sup, fn ->
+          wake(lookup, cards, key, default)
+        end)
     end
 
     :ok
   end
 
-  defp wake(lookup, cards, key) do
-    with {:ok, %{card_index: card}} <- safe_lookup(lookup, key),
-         {:ok, dev} <- Map.fetch(cards, card) do
+  defp wake(lookup, cards, key, default) do
+    with {:ok, %{card_index: card} = output} <- safe_lookup(lookup, key),
+         {:ok, dev} <- Map.fetch(cards, card),
+         true <- UniversalProxy.Cec.auto_wake?(output, default) do
       Logger.info("CEC: stream starting on card #{card}; One Touch Play via #{dev}")
 
       case UniversalProxy.Cec.one_touch_play(dev) do
@@ -636,6 +649,17 @@ defmodule UniversalProxy.Cec.Server do
       :error -> state
     end
   end
+
+  # Broadcasts the adapter list when a callback changed any record.
+  defp publish(new, old) do
+    if new.adapters != old.adapters do
+      Phoenix.PubSub.broadcast(new.pubsub, @events_topic, {:cec_adapters, sorted_adapters(new)})
+    end
+
+    new
+  end
+
+  defp sorted_adapters(state), do: state.adapters |> Map.values() |> Enum.sort_by(& &1.index)
 
   defp put_adapter(state, adapter),
     do: %{state | adapters: Map.put(state.adapters, adapter.dev, adapter)}
