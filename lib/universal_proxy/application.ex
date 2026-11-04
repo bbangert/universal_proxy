@@ -55,6 +55,13 @@ defmodule UniversalProxy.Application do
         # `goodbye_for_type("_sendspin._tcp")` is type-wide, so it has to run
         # before any source service is registered.
         UniversalProxy.Audio.Input.Supervisor,
+        # HDMI-CEC: one native Circuits.CEC.Adapter per /dev/cecN, for
+        # receiver wake/select/volume over the HDMI link. AFTER
+        # Audio.Supervisor: it subscribes to the Sendspin state topic and
+        # runs One Touch Play on `stream_start` for HDMI outputs. Returns
+        # `:ignore` unless `UniversalProxy.Cec` has `enabled: true`
+        # (targets only), so host/test never open a CEC device.
+        UniversalProxy.Cec.Supervisor,
         # USB backup storage settings (DETS): per-drive share opt-in and the
         # generated Samba credentials. Top level, outside Storage.Supervisor,
         # so a crash in that subtree never closes the DETS file — the same
