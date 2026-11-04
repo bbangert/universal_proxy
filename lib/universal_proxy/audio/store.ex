@@ -196,7 +196,7 @@ defmodule UniversalProxy.Audio.Store do
   # rename per output via the UI; until they do, "bcm2835 Headphones"
   # is more informative than a synthesised slot. The one exception is
   # the Pi's KMS HDMI audio card, whose ALSA name is the driver name
-  # (`vc4-hdmi`, or `vc4-hdmi-0`/`-1` on the two-port Pi 4): that
+  # (`vc4-hdmi`, or `vc4-hdmi-0`/`-1` on the two-port Pi 4 and Pi 5): that
   # becomes "HDMI" / "HDMI 0" / "HDMI 1" — see `default_friendly_name/1`.
   defp merge_defaults(existing, params, {slot_sub, _vid, _pid}) do
     %{
