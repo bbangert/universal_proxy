@@ -49,8 +49,12 @@ defmodule UniversalProxyWeb.AudioLive do
   (`UniversalProxy.Cec.list_adapters/0`) shows the receiver's status as a
   pill, kept current by `{:cec_adapters, adapters}` on
   `UniversalProxy.Cec.topic/0`, and an auto-wake toggle (the output's
-  `cec_auto_wake` setting). Outputs on unpaired cards, and every output on
-  a build without CEC, show neither.
+  `cec_auto_wake` setting). A second row holds the "Control receiver
+  volume" toggle (`cec_volume`) and, while it is on, the optional
+  "Max volume" ceiling (`cec_volume_max`); a "Receiver" badge beside the
+  volume number marks an output whose slider is currently driving the
+  receiver (`volume_external`). Outputs on unpaired cards, and every
+  output on a build without CEC, show none of this.
   """
 
   use UniversalProxyWeb, :live_view
@@ -257,6 +261,46 @@ defmodule UniversalProxyWeb.AudioLive do
         {:error, reason} ->
           Logger.warning(
             "Audio CEC auto-wake toggle failed for #{inspect(key)}: #{inspect(reason)}"
+          )
+
+          {:noreply, socket}
+      end
+    else
+      _ -> {:noreply, socket}
+    end
+  end
+
+  def handle_event("toggle_cec_volume", %{"id" => id}, socket) do
+    with {:ok, key} <- decode_key(id),
+         {:ok, output} <- fetch_output(socket, id) do
+      case Audio.update_config(key, %{cec_volume: not Cec.volume_link?(output)}) do
+        :ok ->
+          {:noreply, socket}
+
+        {:error, reason} ->
+          Logger.warning(
+            "Audio CEC volume-link toggle failed for #{inspect(key)}: #{inspect(reason)}"
+          )
+
+          {:noreply, socket}
+      end
+    else
+      _ -> {:noreply, socket}
+    end
+  end
+
+  # Empty input clears the ceiling; anything unparseable is ignored; numbers
+  # clamp to 1..100.
+  def handle_event("set_cec_volume_max", %{"key" => id, "value" => value}, socket) do
+    with {:ok, key} <- decode_key(id),
+         {:ok, ceiling} <- parse_ceiling(value) do
+      case Audio.update_config(key, %{cec_volume_max: ceiling}) do
+        :ok ->
+          {:noreply, socket}
+
+        {:error, reason} ->
+          Logger.warning(
+            "Audio CEC volume ceiling update failed for #{inspect(key)}: #{inspect(reason)}"
           )
 
           {:noreply, socket}
@@ -790,6 +834,13 @@ defmodule UniversalProxyWeb.AudioLive do
               aria-label={"Volume for #{@output.friendly_name}"}
             />
           </form>
+          <span
+            :if={@output.volume_external}
+            id={"volume-external-#{@id}"}
+            title="This slider controls the receiver's volume"
+          >
+            <.badge variant={:neutral} class="!text-[10px] !px-1.5 !py-px">Receiver</.badge>
+          </span>
           <div class="text-md font-semibold font-mono tabular-nums text-fg-1 min-w-9 text-right">
             {@output.volume}
           </div>
@@ -828,6 +879,45 @@ defmodule UniversalProxyWeb.AudioLive do
           aria-label="Wake the receiver when playback starts"
         />
         <span class="text-sm text-fg-2">Auto-wake receiver on playback</span>
+      </div>
+
+      <%!-- HDMI-CEC volume link, with an optional ceiling while it is on --%>
+      <div
+        :if={@cec}
+        class="flex items-center gap-3 pt-3 pr-5 pb-3 pl-[22px] border-t border-border-2 bg-sunken"
+      >
+        <.toggle
+          checked={Cec.volume_link?(@output)}
+          phx-click="toggle_cec_volume"
+          phx-value-id={@id}
+          id={"cec-volume-#{@id}"}
+          aria-label="Use the receiver's volume for this output"
+        />
+        <span class="text-sm text-fg-2">Control receiver volume</span>
+        <div class="flex-1"></div>
+        <form
+          :if={Cec.volume_link?(@output)}
+          id={"cec-volume-form-#{@id}"}
+          phx-change="set_cec_volume_max"
+          phx-submit="set_cec_volume_max"
+          class="flex items-center gap-2"
+        >
+          <input type="hidden" name="key" value={@id} />
+          <label for={"cec-volume-max-#{@id}"} class="text-sm text-fg-2">Max volume</label>
+          <input
+            type="number"
+            id={"cec-volume-max-#{@id}"}
+            name="value"
+            min="1"
+            max="100"
+            value={@output.cec_volume_max}
+            placeholder="None"
+            phx-debounce="blur"
+            class="w-14 px-2 py-1 text-sm text-right font-mono tabular-nums text-fg-1 bg-surface
+                   border border-border-1 rounded-sm focus:border-accent focus:outline-none
+                   transition-colors"
+          />
+        </form>
       </div>
 
       <%!-- Disclosure: card index, client id and pairing token, each
@@ -1198,7 +1288,10 @@ defmodule UniversalProxyWeb.AudioLive do
       # ALSA cards key that way too).
       bt?: bt_output?(output),
       bt_mac: if(bt_output?(output), do: bt_key_mac(output.key), else: nil),
-      cec_auto_wake: Map.get(output, :cec_auto_wake)
+      cec_auto_wake: Map.get(output, :cec_auto_wake),
+      cec_volume: Map.get(output, :cec_volume),
+      cec_volume_max: Map.get(output, :cec_volume_max),
+      volume_external: Map.get(output, :volume_external, false)
     }
   end
 
@@ -1225,6 +1318,15 @@ defmodule UniversalProxyWeb.AudioLive do
 
       {:cec_auto_wake, v}, acc when is_boolean(v) or is_nil(v) ->
         %{acc | cec_auto_wake: v}
+
+      {:cec_volume, v}, acc when is_boolean(v) or is_nil(v) ->
+        %{acc | cec_volume: v}
+
+      {:cec_volume_max, v}, acc when is_integer(v) or is_nil(v) ->
+        %{acc | cec_volume_max: v}
+
+      {:volume_external, v}, acc when is_boolean(v) ->
+        %{acc | volume_external: v}
 
       {:sendspin_client_id, id}, acc when is_binary(id) ->
         %{acc | client_id: id}
@@ -1284,6 +1386,19 @@ defmodule UniversalProxyWeb.AudioLive do
       channels: as_integer(Map.get(partial, :channels)),
       bit_depth: as_integer(Map.get(partial, :bit_depth))
     }
+  end
+
+  defp parse_ceiling(value) do
+    case value |> to_string() |> String.trim() do
+      "" ->
+        {:ok, nil}
+
+      trimmed ->
+        case Integer.parse(trimmed) do
+          {n, ""} -> {:ok, n |> max(1) |> min(100)}
+          _ -> :error
+        end
+    end
   end
 
   defp as_integer(v) when is_integer(v), do: v
