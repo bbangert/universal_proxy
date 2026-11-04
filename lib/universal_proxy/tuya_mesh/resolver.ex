@@ -42,8 +42,11 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
   Radio's status says it holds the channel (`transport: :user_channel`,
   `lease_held: true`), and the user channel resolves the MAC and checks
   the controller's own address on every bind, so it can't be driving
-  another adapter. The status is read fresh at that point; when the Radio
-  doesn't answer, what the last read said decides.
+  another adapter. The same holds while the Radio hands the adapter over
+  to its fallback transport (`transport_handoff: true`, bounded by the
+  Radio): `bluetoothd` is still taking it back. The status is read fresh
+  at that point; when the Radio doesn't answer, what the last read said
+  decides.
 
   While idle, the same event re-evaluates at once instead of waiting for
   the retry timer.
@@ -797,13 +800,17 @@ defmodule UniversalProxy.TuyaMesh.Resolver do
         %{
           state
           | radio_status: %{ready: s.ready, last_error: s.last_error, queued: s.queued},
-            radio_held: match?(%{transport: :user_channel, lease_held: true}, s)
+            radio_held: holds_adapter?(s)
         }
 
       {:error, reason} ->
         %{state | radio_status: %{ready: false, last_error: reason, queued: 0}}
     end
   end
+
+  defp holds_adapter?(%{transport: :user_channel, lease_held: true}), do: true
+  defp holds_adapter?(%{transport_handoff: true}), do: true
+  defp holds_adapter?(_status), do: false
 
   defp read_lights(%{mesh: nil} = state), do: state
 

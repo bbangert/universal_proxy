@@ -11,7 +11,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.FakeHciUser do
   success, keyed by function name: `:start` → `{:error, reason}`,
   `:bd_addr` → the address Read BD_ADDR answers (default the bound
   `:address`), `:index` (default 0), and any command name → its
-  result). A result `{:close, reply, reason}` replies `reply`, then sends
+  result; `{name, first_arg}` keys one variant, e.g.
+  `{:le_set_advertising_enable, false}`). A list is a queue of results,
+  one per call. A result `{:close, reply, reason}` replies `reply`, then sends
   the owner `{:closed, reason}` and stops, as the real server does for a
   command that timed out in flight.
 
@@ -107,7 +109,17 @@ defmodule UniversalProxy.TuyaBeaconMesh.FakeHciUser do
     :exit, _reason -> {:error, :closed}
   end
 
-  defp control(control, key), do: Agent.get(control, &Map.get(&1, key))
+  # A list is a queue of results, one per call (then success); anything
+  # else is returned on every call.
+  defp control(control, key) do
+    Agent.get_and_update(control, fn map ->
+      case Map.get(map, key) do
+        [next | rest] -> {next, Map.put(map, key, rest)}
+        [] -> {nil, map}
+        value -> {value, map}
+      end
+    end)
+  end
 
   # ── Server ───────────────────────────────────────────────────────────
 
@@ -142,7 +154,14 @@ defmodule UniversalProxy.TuyaBeaconMesh.FakeHciUser do
   def handle_call({:command, name, args}, _from, state) do
     tell(state, List.to_tuple([name | args]))
 
-    case control(state.control, name) do
+    # `{name, first_arg}` (e.g. `{:le_set_advertising_enable, false}`)
+    # before `name`.
+    key =
+      if args != [] and control?(state.control, {name, hd(args)}),
+        do: {name, hd(args)},
+        else: name
+
+    case control(state.control, key) do
       nil -> {:reply, default(name), state}
       result -> reply(result, state)
     end
@@ -191,6 +210,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.FakeHciUser do
   defp default(:le_read_local_supported_features), do: {:ok, 0x665FBD}
   defp default(:le_read_num_supported_adv_sets), do: {:ok, 4}
   defp default(_name), do: :ok
+
+  defp control?(control, key), do: Agent.get(control, &Map.has_key?(&1, key))
 
   defp tell(state, call), do: send(state.test, {:hci, self(), call})
   defp notify(state, event), do: send(state.owner, {:bluez_hci_user, self(), event})

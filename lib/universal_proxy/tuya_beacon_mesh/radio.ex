@@ -50,6 +50,18 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   failure that caused the move (`:fallback_reason`, `nil` while on the
   first choice).
 
+  From the move until the new transport is first ready, but for at most
+  `:handoff_ms` (default 10 s), `status/1`'s `:transport_handoff` is
+  true: the controller is between owners (the user channel just released
+  it, `bluetoothd` is taking it back), so a host shouldn't read its
+  absence as the adapter leaving.
+
+  With `:fallback_memory_ms` (default 0, off) the move outlives this
+  process: a Radio started for the same `:adapter_address` within that
+  time starts on the transport it moved to (logged, with the same
+  `:fallback_reason`), so a host that restarts the Radio can't loop
+  through the failing transport again.
+
   ## Wedged controller
 
   A controller can wedge with every process healthy and every check above
@@ -147,6 +159,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
 
   @transports [Transport.UserChannel, Transport.Bluez]
   @fallback_failures 5
+  @handoff_ms 10_000
 
   # ── Client API ─────────────────────────────────────────────────────────
 
@@ -165,8 +178,9 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   (default #{@wedge_retry_ms}) and `:max_wedge_retry_ms` (default
   #{@max_wedge_retry_ms}) (see "Wedged controller"), `:transport` (a
   module or a list, default `[Transport.UserChannel, Transport.Bluez]`)
-  and `:fallback_failures` (default #{@fallback_failures}) (see "Transport
-  fallback"). The options are passed on to the transport's `init/1` too
+  `:fallback_failures` (default #{@fallback_failures}), `:handoff_ms`
+  (default #{@handoff_ms}) and `:fallback_memory_ms` (default 0) (see
+  "Transport fallback"). The options are passed on to the transport's `init/1` too
   (the user channel's `:hci_user` and `:hci_user_opts`; the Bluez
   transport's `:bluez_radio`, `:mgmt`, `:rebus`, `:dbus`, `:receiver` and
   `:receiver_stop_ms`).
@@ -318,7 +332,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   the host should reset the controller's transport).
 
   Transport (see "Transport fallback"): `:transport` (`:user_channel` or
-  `:bluez`, from the transport), `:fallback_reason`, and whatever else
+  `:bluez`, from the transport), `:fallback_reason`,
+  `:transport_handoff`, and whatever else
   the transport reports (the user channel: `:hci_index`, `:controller`).
 
   `opts`: `:server`, `:timeout` (default 5000; a radio that doesn't
@@ -376,11 +391,15 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
     adapter_index = Keyword.get(opts, :adapter_index, 0)
     adapter_address = opts |> Keyword.get(:adapter_address) |> upcase()
     transports = opts |> Keyword.get(:transport, @transports) |> List.wrap()
+    memory_ms = Keyword.get(opts, :fallback_memory_ms, 0)
+
+    {transports, remembered} =
+      remembered_fallback(transports, adapter_address, adapter_index, memory_ms)
 
     transport_opts =
       Keyword.merge(opts, adapter_index: adapter_index, adapter_address: adapter_address)
 
-    case init_transport(transports, transport_opts, adapter_index, nil) do
+    case init_transport(transports, transport_opts, adapter_index, remembered) do
       {:ok, transport, tstate, fallbacks, fallback_reason} ->
         state = %{
           adapter_index: adapter_index,
@@ -393,6 +412,10 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
           fallbacks: fallbacks,
           fallback_reason: fallback_reason,
           fallback_failures: Keyword.get(opts, :fallback_failures, @fallback_failures),
+          fallback_memory_ms: memory_ms,
+          handoff_ms: Keyword.get(opts, :handoff_ms, @handoff_ms),
+          # When the last move to another transport happened (monotonic ms).
+          fallback_at: nil,
           # Since the current transport was last ready: setup failures it
           # calls permanent, and whether it was ever ready.
           setup_failures: 0,
@@ -461,6 +484,49 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
 
   defp transport_name(module), do: module |> Module.split() |> List.last()
 
+  defp memory_key(address), do: {__MODULE__, :fallback, address}
+
+  # A move to another transport made for this address within
+  # `memory_ms`, by an earlier Radio: start where it ended up.
+  defp remembered_fallback([first | rest] = transports, address, index, memory_ms)
+       when is_binary(address) and memory_ms > 0 and rest != [] do
+    case :persistent_term.get(memory_key(address), nil) do
+      {at, ^first, reason} ->
+        age = System.monotonic_time(:millisecond) - at
+
+        if age < memory_ms do
+          Logger.warning(
+            "#{inspect(__MODULE__)}: hci#{index} #{transport_name(first)} failed " <>
+              "#{div(age, 1_000)} s ago (#{inspect(reason)}); starting on #{transport_name(hd(rest))}"
+          )
+
+          {rest, reason}
+        else
+          {transports, nil}
+        end
+
+      _none ->
+        {transports, nil}
+    end
+  end
+
+  defp remembered_fallback(transports, _address, _index, _memory_ms), do: {transports, nil}
+
+  defp remember_fallback(%{fallback_memory_ms: ms, adapter_address: address} = state, reason)
+       when ms > 0 and is_binary(address) do
+    entry = {System.monotonic_time(:millisecond), state.transport, reason}
+    :persistent_term.put(memory_key(address), entry)
+  end
+
+  defp remember_fallback(_state, _reason), do: :ok
+
+  defp handoff?(%{fallback_at: nil}), do: false
+
+  defp handoff?(state),
+    do:
+      not state.was_ready and
+        System.monotonic_time(:millisecond) - state.fallback_at < state.handoff_ms
+
   @impl GenServer
   def handle_continue(:setup, state), do: {:noreply, attempt_setup(state)}
 
@@ -489,7 +555,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   end
 
   # A failure the transport calls permanent moves to the next transport:
-  # at once before it was ever ready, after a run of them once it was.
+  # at once before it was ever ready, after a run of them in a row once it
+  # was. Any other failure (the adapter absent) breaks the run.
   defp setup_failed(state, reason) do
     if state.fallbacks != [] and permanent?(state.transport, reason) do
       failures = state.setup_failures + 1
@@ -499,7 +566,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
         do: fall_back(state, reason),
         else: not_ready(state, reason)
     else
-      not_ready(state, reason)
+      not_ready(%{state | setup_failures: 0}, reason)
     end
   end
 
@@ -520,6 +587,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
         )
 
         :ok = state.transport.terminate(:fallback, state.tstate)
+        remember_fallback(state, reason)
 
         state = %{
           state
@@ -527,6 +595,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
             tstate: tstate,
             fallbacks: rest,
             fallback_reason: reason,
+            fallback_at: System.monotonic_time(:millisecond),
             setup_failures: 0,
             was_ready: false,
             backoff_ms: state.retry_ms
@@ -718,6 +787,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
         end,
       queued: :queue.len(state.tx_queue),
       fallback_reason: state.fallback_reason,
+      transport_handoff: handoff?(state),
       last_tx_sn: state.last_tx_sn,
       advertise_failures: state.adv_failures,
       wedges: state.wedges,
@@ -940,10 +1010,22 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   # Takes the current advert off air and starts the next; an advert that
   # won't come off air means the transport's state can't be trusted, so
   # the radio re-runs setup, whose teardown releases the controller.
+  # A controller fault counts towards a wedge first (which may already
+  # tear down); re-running setup is forced either way.
   defp stop_and_continue(state) do
     case stop_current(state) do
-      {:ok, state} -> maybe_start_next(state)
-      {{:error, reason}, state} -> lost(state, {:stop_advertising, reason})
+      {:ok, state} ->
+        maybe_start_next(state)
+
+      {{:error, {:fault, reason}}, state} ->
+        Logger.warning(
+          "#{inspect(__MODULE__)}: taking an advert off air failed (#{inspect(reason)})"
+        )
+
+        state |> controller_fault(reason) |> lost({:stop_advertising, reason})
+
+      {{:error, {_uncertain, reason}}, state} ->
+        lost(state, {:stop_advertising, reason})
     end
   end
 

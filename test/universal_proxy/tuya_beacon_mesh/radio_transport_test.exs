@@ -251,9 +251,20 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTransportTest do
       wait_until(fn -> status!(ctx).ready end)
     end
 
+    @tag :capture_log
+    test "a controller fault while taking an advert off air counts towards a wedge" do
+      ctx = ready!(start_radio(wedge_failures: 2, wedge_retry_ms: 60_000, retry_ms: 60_000))
+      set(ctx, :stop_transmit, {:fault, :hci_status})
+      :ok = Radio.send_frame(frame(1), 60_000, server: ctx.radio)
+      :ok = Radio.stop_tx(server: ctx.radio)
+
+      assert %{ready: false, last_error: {:stop_advertising, :hci_status}, advertise_failures: 1} =
+               status!(ctx)
+    end
+
     test "an advert that won't come off air re-runs setup" do
       ctx = ready!(start_radio())
-      set(ctx, :stop_transmit, :stuck)
+      set(ctx, :stop_transmit, {:uncertain, :stuck})
       :ok = Radio.send_frame(frame(1), 60_000, server: ctx.radio)
 
       capture_log(fn -> :ok = Radio.stop_tx(server: ctx.radio) end)

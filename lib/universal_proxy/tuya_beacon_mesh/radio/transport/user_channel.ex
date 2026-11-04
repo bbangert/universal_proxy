@@ -36,8 +36,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio.Transport.UserChannel do
   channel, so the next setup resets the controller in place.
 
   A frame is LE Set Advertising Data then LE Set Advertising Enable;
-  stopping it is Enable false. A non-zero HCI status or a timeout is a
-  controller fault; a closed channel is uncertain (the frame may have
+  stopping it is Enable false. A non-zero HCI status or a timeout (also
+  while stopping a frame) is a controller fault; a closed channel is uncertain (the frame may have
   aired) and its `{:closed, reason}` notice is reported as a loss.
 
   Events from `Bluez.HciUser`: advertising reports become `{:report, ...}`
@@ -179,7 +179,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio.Transport.UserChannel do
     case t.hci_user.le_set_advertising_enable(t.server, false) do
       :ok -> {:ok, %{t | advertising: false}}
       {:error, :closed} -> {:ok, %{t | advertising: false}}
-      {:error, reason} -> {:error, reason, t}
+      {:error, reason} -> {:error, {:fault, reason}, t}
     end
   end
 

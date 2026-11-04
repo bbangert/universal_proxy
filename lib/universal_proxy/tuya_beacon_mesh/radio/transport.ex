@@ -94,12 +94,18 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio.Transport do
   @callback transmit(t(), ad_bytes :: binary()) ::
               {:ok, instance(), t()} | {:error, transmit_error(), t()}
 
+  @typedoc """
+  Why an advert may still be on air: `:fault` (the controller failed the
+  command; counts towards a wedge) or `:uncertain` (anything else).
+  """
+  @type stop_error :: {:fault | :uncertain, reason()}
+
   @doc """
   Takes `instance` off air. An instance already gone (with the controller)
-  is `:ok`; an error means its state can't be trusted, and the Radio
-  re-runs setup.
+  is `:ok`. On an error its state can't be trusted, and the Radio re-runs
+  setup (after counting a `:fault`, which can declare a wedge).
   """
-  @callback stop_transmit(t(), instance()) :: {:ok, t()} | {:error, reason(), t()}
+  @callback stop_transmit(t(), instance()) :: {:ok, t()} | {:error, stop_error(), t()}
 
   @doc """
   Probes, while ready, what can fail without any message reaching the

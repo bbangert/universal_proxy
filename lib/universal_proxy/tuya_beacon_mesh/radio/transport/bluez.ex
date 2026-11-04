@@ -9,6 +9,14 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio.Transport.Bluez do
   infrastructure the host supervises, and the Radio never starts or links
   them. Setup:
 
+    * with `:adapter_address`, finds the index the adapter sits under now
+      in `Bluez.Client.adapters_info/0` (`:adapters_fun`), since the
+      `:adapter_index` it was started with can be stale (the user-channel
+      transport it fell back from may have re-bound the adapter after a
+      re-enumeration). An address missing from a non-empty list fails
+      setup with `{:adapter_missing, address}`; an empty list (Client
+      down, daemon not answering) keeps the index, which the fence below
+      still checks;
     * opens its own system-bus connection (kept across retries) and, when
       `:adapter_address` is given, checks that `/org/bluez/hci<index>` is
       still that adapter (`Adapter1.Address`). An index is reused when a
@@ -82,6 +90,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio.Transport.Bluez do
        dbus: Keyword.get(opts, :dbus, Bluez.DBus),
        receiver: Keyword.get(opts, :receiver, Bluez.AdvertReceiver),
        receiver_stop_ms: Keyword.get(opts, :receiver_stop_ms, @receiver_stop_ms),
+       adapters_fun: Keyword.get(opts, :adapters_fun, &Bluez.Client.adapters_info/0),
        radio_mon: nil,
        lease: nil,
        conn: nil,
@@ -97,7 +106,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio.Transport.Bluez do
   # reported even when a later step fails, so it isn't repeated.
   @impl true
   def setup(state, reset?) do
-    with {:ok, state} <- connect(state),
+    with {:ok, state} <- resolve_index(state),
+         {:ok, state} <- connect(state),
          {:ok, state} <- check_adapter(state),
          {:ok, state, events} <- reset_controller(state, reset?) do
       case bring_up(state) do
@@ -162,7 +172,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio.Transport.Bluez do
     case state.mgmt.stop_advertising(state.lease, instance) do
       :ok -> {:ok, state}
       {:error, :unknown_instance} -> {:ok, state}
-      {:error, reason} -> {:error, reason, state}
+      # Never counted towards a wedge: only refused advertises are.
+      {:error, reason} -> {:error, {:uncertain, reason}, state}
     end
   end
 
@@ -181,7 +192,8 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio.Transport.Bluez do
       lease_held: state.lease != nil and state.bluez_radio.valid?(state.lease),
       discovering: state.discovering,
       listening: state.rx_name != nil and state.receiver.listening?(state.rx_name),
-      transport: :bluez
+      transport: :bluez,
+      hci_index: state.adapter_index
     }
   end
 
@@ -212,6 +224,28 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio.Transport.Bluez do
   def handle_info(_msg, _state), do: :unhandled
 
   # ── Setup steps ──────────────────────────────────────────────────────
+
+  defp resolve_index(%{adapter_address: nil} = state), do: {:ok, state}
+
+  defp resolve_index(state) do
+    case state.adapters_fun.() do
+      [] ->
+        {:ok, state}
+
+      adapters ->
+        with %{path: path} <- Enum.find(adapters, &listed_as?(&1, state.adapter_address)),
+             {:ok, index} <- Bluez.Hci.adapter_index(path) do
+          {:ok, %{state | adapter_index: index}}
+        else
+          _missing -> {:error, {:adapter_missing, state.adapter_address}, state}
+        end
+    end
+  end
+
+  defp listed_as?(%{address: address}, mac) when is_binary(address),
+    do: String.upcase(address) == mac
+
+  defp listed_as?(_adapter, _mac), do: false
 
   # The connection is bound to the Radio process (rebus closes it when it
   # exits) but not linked, so it is monitored instead.

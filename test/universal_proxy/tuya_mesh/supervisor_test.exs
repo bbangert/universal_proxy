@@ -364,6 +364,23 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
       wait_until(fn -> mesh_pid(ctx) == nil end, 500)
     end
 
+    test "a Radio handing the adapter to its fallback transport keeps the mesh", ctx do
+      pid = mesh_pid(ctx)
+
+      :ok =
+        FakeRadio.put(ctx.radio, %{transport: :bluez, lease_held: false, transport_handoff: true})
+
+      set_adapters(ctx, [adapter(@proxy_mac, 0)])
+      adapters_changed(ctx)
+      _ = status(ctx)
+      assert mesh_pid(ctx) == pid
+
+      # Handoff over and still not listed: gone.
+      :ok = FakeRadio.put(ctx.radio, %{transport_handoff: false})
+      adapters_changed(ctx)
+      wait_until(fn -> mesh_pid(ctx) == nil end, 500)
+    end
+
     test "a Radio that doesn't answer: its last status decides", ctx do
       pid = mesh_pid(ctx)
       stop_supervised!(:fake_radio)
@@ -1096,6 +1113,7 @@ defmodule UniversalProxy.TuyaMesh.SupervisorTest do
       assert radio_opts[:adapter_address] == @mesh_mac
       # config/test.exs forces the BlueZ transport.
       assert radio_opts[:transport] == [Transport.Bluez]
+      assert radio_opts[:fallback_memory_ms] == 600_000
 
       %{start: {Lights, :start_link, [lights_opts]}} = lights
       assert lights_opts[:on_persist] == (&Store.persist/1)

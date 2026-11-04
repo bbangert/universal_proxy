@@ -39,16 +39,17 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioUserChannelTest do
 
   defmodule StubTransport do
     @moduledoc false
-    # Always up; reports `transport: :stub`.
+    # Up unless started with `stub_fail: true`; reports `transport: :stub`.
     @behaviour UniversalProxy.TuyaBeaconMesh.Radio.Transport
 
     @impl true
     def init(opts) do
       send(opts[:test_pid], {:stub, :init})
-      {:ok, %{test: opts[:test_pid]}}
+      {:ok, %{test: opts[:test_pid], fail: Keyword.get(opts, :stub_fail, false)}}
     end
 
     @impl true
+    def setup(%{fail: true} = state, _reset?), do: {:error, :stub_down, state, []}
     def setup(state, _reset?), do: {:ok, state, []}
     @impl true
     def teardown(state), do: state
@@ -244,6 +245,32 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioUserChannelTest do
     end
   end
 
+  describe "stopping a frame" do
+    @tag :capture_log
+    test "an HCI status while disabling counts as a controller fault" do
+      ctx = ready!(start_radio(wedge_failures: 1, wedge_retry_ms: 60_000))
+      set(ctx, {:le_set_advertising_enable, false}, {:error, {:status, 0x0C}})
+      :ok = Radio.send_frame(frame(1), 20, server: ctx.radio)
+
+      wait_until(fn -> not status!(ctx).ready end)
+
+      assert %{last_error: {:controller_wedged, {:status, 0x0C}}, wedges: 1, wedge_streak: 1} =
+               status!(ctx)
+    end
+
+    @tag :capture_log
+    test "below the wedge threshold it is counted, and setup re-runs" do
+      ctx = ready!(start_radio(retry_ms: 60_000))
+      set(ctx, {:le_set_advertising_enable, false}, {:error, :timeout})
+      :ok = Radio.send_frame(frame(1), 20, server: ctx.radio)
+
+      wait_until(fn -> not status!(ctx).ready end)
+
+      assert %{last_error: {:stop_advertising, :timeout}, advertise_failures: 1, wedges: 0} =
+               status!(ctx)
+    end
+  end
+
   describe "reports" do
     test "advertising reports become frames through the Carrier, other AD ignored" do
       ctx = ready!(start_radio())
@@ -375,6 +402,126 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioUserChannelTest do
   end
 
   describe "transport fallback" do
+    @tag :capture_log
+    test "an absent adapter breaks a run of bind failures" do
+      ctx =
+        ready!(
+          start_radio(transport: [Transport.UserChannel, StubTransport], fallback_failures: 2)
+        )
+
+      busy = {:error, {:bind, :ebusy}}
+      absent = {:error, {:resolve, :not_found}}
+      set(ctx, :start, [busy, absent, busy, absent, busy])
+      :ok = FakeHciUser.emit(ctx.server, {:closed, :epipe})
+
+      wait_until(fn -> status!(ctx).ready end, 5_000)
+      refute_received {:stub, :init}
+      assert %{transport: :user_channel, fallback_reason: nil} = status!(ctx)
+    end
+
+    @tag :capture_log
+    test "BlueZ takes the index the MAC sits under now, not the one the Radio started with" do
+      FakeBluez.ensure_started()
+      FakeBluez.reset()
+      FakeBluez.set_address(3, @mac)
+
+      adapters = fn ->
+        [
+          %{path: "/org/bluez/hci0", address: "11:22:33:44:55:66"},
+          %{path: "/org/bluez/hci3", address: @mac}
+        ]
+      end
+
+      ctx =
+        start_radio(
+          [
+            transport: [Transport.UserChannel, Transport.Bluez],
+            fallback_failures: 1,
+            adapter_index: 0,
+            adapters_fun: adapters,
+            bluez_radio: FakeBluez.Radio,
+            mgmt: FakeBluez.Mgmt,
+            rebus: FakeBluez.Rebus,
+            dbus: FakeBluez.DBus,
+            receiver: FakeBluez.Receiver
+          ],
+          %{index: 3}
+        )
+
+      ctx = ready!(ctx)
+      assert %{transport: :user_channel, hci_index: 3} = status!(ctx)
+
+      # Re-enumerated as hci3 behind the Radio's back, then the channel fails.
+      set(ctx, :start, {:error, {:bind, :ebusy}})
+      :ok = FakeHciUser.emit(ctx.server, {:closed, :epipe})
+      wait_until(fn -> match?(%{transport: :bluez, ready: true}, status!(ctx)) end)
+
+      assert %{hci_index: 3, fallback_reason: {:bind, :ebusy}} = status!(ctx)
+      paths = for {:dbus_path, path, _member} <- FakeBluez.calls(), uniq: true, do: path
+      assert paths == ["/org/bluez/hci3"]
+    end
+
+    @tag :capture_log
+    test "the handoff to the next transport shows in the status until it is ready" do
+      ctx =
+        start_radio([transport: [Transport.UserChannel, StubTransport], retry_ms: 200], %{
+          start: {:error, {:bind, :ebusy}}
+        })
+
+      wait_until(fn -> status!(ctx).transport == :stub end)
+      assert %{ready: false, transport_handoff: true} = status!(ctx)
+      wait_until(fn -> status!(ctx).ready end)
+      assert %{transport_handoff: false} = status!(ctx)
+    end
+
+    @tag :capture_log
+    test "the handoff is bounded" do
+      ctx =
+        start_radio(
+          [transport: [Transport.UserChannel, StubTransport], stub_fail: true, handoff_ms: 50],
+          %{start: {:error, {:bind, :ebusy}}}
+        )
+
+      wait_until(fn -> status!(ctx).transport == :stub end)
+      wait_until(fn -> not status!(ctx).transport_handoff end)
+      assert %{ready: false} = status!(ctx)
+    end
+
+    test "with a memory, a fallback outlives the Radio" do
+      mac = "02:00:00:00:00:01"
+
+      on_exit(fn -> :persistent_term.erase({Radio, :fallback, mac}) end)
+      opts = [transport: [Transport.UserChannel, StubTransport], adapter_address: mac]
+      address = mac |> String.replace(":", "") |> String.to_integer(16)
+
+      log =
+        capture_log(fn ->
+          ctx =
+            start_radio(opts ++ [fallback_memory_ms: 60_000], %{start: {:error, {:bind, :ebusy}}})
+
+          wait_until(fn -> status!(ctx).transport == :stub end)
+          stop_supervised!({Radio, 0})
+          stop_supervised!(:control)
+
+          ctx = start_radio(opts ++ [fallback_memory_ms: 60_000])
+          wait_until(fn -> status!(ctx).ready end)
+          assert %{transport: :stub, fallback_reason: {:bind, :ebusy}} = status!(ctx)
+          stop_supervised!({Radio, 0})
+          stop_supervised!(:control)
+
+          # Without one, the next Radio tries the user channel again.
+          ctx = start_radio(opts)
+          wait_until(fn -> status!(ctx).ready end)
+          assert %{transport: :user_channel} = status!(ctx)
+        end)
+
+      assert log =~ "UserChannel failed 0 s ago ({:bind, :ebusy}); starting on StubTransport"
+      # One bind from the first Radio, none from the second, one from the third.
+      assert_received {:hci, nil, {:start, ^address, _}}
+      assert_received {:hci, nil, {:start, ^address, _}}
+      refute_received {:hci, nil, {:start, ^address, _}}
+    end
+
     @tag :capture_log
     test "without an adapter address the next transport is used from the start" do
       ctx = start_radio(adapter_address: nil, transport: [Transport.UserChannel, StubTransport])

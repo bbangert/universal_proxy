@@ -856,6 +856,37 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioTest do
     end
 
     @tag :capture_log
+    @tag :capture_log
+    test "with the adapter list, setup follows the MAC to its current index" do
+      FakeBluez.set_address(2, @mesh)
+
+      list = [
+        %{path: "/org/bluez/hci2", address: @mesh},
+        %{path: "/org/bluez/hci0", address: @intruder}
+      ]
+
+      start_supervised!(
+        radio_spec(adapter_index: 1, adapter_address: @mesh, adapters_fun: fn -> list end)
+      )
+
+      wait_until(&ready?/0)
+      assert %{hci_index: 2} = status!()
+      assert {:dbus_path, "/org/bluez/hci2", "StartDiscovery"} in FakeBluez.calls()
+      refute Enum.any?(FakeBluez.calls(), &match?({:dbus_path, "/org/bluez/hci1", _}, &1))
+    end
+
+    @tag :capture_log
+    test "a MAC missing from a non-empty adapter list fails setup before touching any adapter" do
+      list = [%{path: "/org/bluez/hci0", address: @intruder}]
+
+      start_supervised!(
+        radio_spec(adapter_index: 1, adapter_address: @mesh, adapters_fun: fn -> list end)
+      )
+
+      wait_until(fn -> match?(%{last_error: {:adapter_missing, _}}, status!()) end)
+      assert Enum.filter(FakeBluez.calls(), &match?({:dbus_path, _, _}, &1)) == []
+    end
+
     test "an index taken over by another adapter is never power-cycled" do
       FakeBluez.set_address(1, @mesh)
 

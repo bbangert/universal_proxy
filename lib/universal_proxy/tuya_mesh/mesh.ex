@@ -32,7 +32,9 @@ defmodule UniversalProxy.TuyaMesh.Mesh do
   The Radio's transport comes from the `:tuya_mesh_transport` app env:
   `:auto` (the default: the HCI user channel, falling back to BlueZ),
   `:user_channel` or `:bluez` (only that one; a debugging escape hatch).
-  A `:transport` in the `:radio` options wins over it.
+  A `:transport` in the `:radio` options wins over it. A fallback is
+  remembered for 10 min (`fallback_memory_ms`), so a mesh restarted
+  meanwhile starts on BlueZ straight away.
 
   Options: `:adapter_index` (required), `:adapter_address`, `:radio`,
   `:lights` and `:presence` (keyword lists merged over the defaults; the
@@ -42,6 +44,8 @@ defmodule UniversalProxy.TuyaMesh.Mesh do
   use Supervisor
 
   require Logger
+
+  @fallback_memory_ms 600_000
 
   alias UniversalProxy.TuyaBeaconMesh.{Lights, Radio}
   alias UniversalProxy.TuyaBeaconMesh.Radio.Transport
@@ -70,6 +74,9 @@ defmodule UniversalProxy.TuyaMesh.Mesh do
           adapter_index: index,
           adapter_address: Keyword.get(opts, :adapter_address),
           transport: transports(),
+          # A fallback survives this subtree restarting the Radio, so it
+          # can't loop through a failing user channel.
+          fallback_memory_ms: @fallback_memory_ms,
           name: Radio
         ],
         Keyword.get(opts, :radio, [])
