@@ -190,15 +190,11 @@ defmodule UniversalProxy.MixProject do
       {:nerves_system_bbb, "~> 2.31", runtime: false, targets: :bbb},
       {:nerves_system_mangopi_mq_pro, "~> 0.18", runtime: false, targets: :mangopi_mq_pro},
       {:nerves_system_qemu_aarch64, "~> 0.5", runtime: false, targets: :qemu_aarch64},
-      # Pin nerves_system_br to what the stock systems above require exactly
-      # (bbb 2.31.1 / mangopi_mq_pro 0.18.1 / qemu_aarch64 0.5.1 -> br 1.35.3,
-      # Buildroot 2026.08.1, OTP 29.1.2). The override is needed because the
-      # custom systems (@up_systems_tag v0.1.11) still declare br 1.34.3.
-      # Those targets use prebuilt artifacts, whose download checksum covers
-      # only the system's own files and whose rel2fw.sh comes from the
-      # artifact, so they are unaffected by this pin. Building a custom
-      # system from source would use this br version, though — bump the
-      # custom systems to br 1.35.x when cutting the next @up_systems_tag.
+      # Pin nerves_system_br to the version every system here requires
+      # exactly: the stock bbb 2.31.1 / mangopi_mq_pro 0.18.1 / qemu_aarch64
+      # 0.5.1 and the custom systems at @up_systems_tag v0.1.12 all declare
+      # br 1.35.3 (Buildroot 2026.08.1, OTP 29.1.2). Bump it together with
+      # the systems; mix will refuse to resolve if they disagree.
       {:nerves_system_br, "1.35.3", runtime: false, override: true}
     ] ++ up_nerves_systems()
   end
@@ -212,7 +208,7 @@ defmodule UniversalProxy.MixProject do
   # required (host must be linux/x86_64). rpi/rpi2 have no onboard BT but
   # support USB BT dongles; x86_64 omits the Pi-only BT firmware package. One
   # pinned tag for all of them — bump @up_systems_tag to cut a new release.
-  @up_systems_tag "v0.1.11"
+  @up_systems_tag "v0.1.12"
   @up_systems_targets [:rpi, :rpi0, :rpi0_2, :rpi2, :rpi3, :rpi4, :rpi5, :x86_64]
 
   defp up_nerves_systems do
