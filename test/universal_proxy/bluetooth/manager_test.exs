@@ -657,6 +657,23 @@ defmodule UniversalProxy.Bluetooth.ManagerTest do
       assert next_event() == :none
     end
 
+    test "a stale daemon row under the held index doesn't make it the proxy", ctx do
+      # bluetoothd's cache still names hci0's previous adapter while the mesh
+      # (re)binds it.
+      :persistent_term.put(DevicePath.adapter_path_key(), "/org/bluez/hci0")
+
+      Agent.update(ctx.listed, fn listed ->
+        [
+          %{path: "/org/bluez/hci0", address: "11:22:33:44:55:66", name: "old", powered: true}
+          | listed
+        ]
+      end)
+
+      manager = start_manager(ctx, held_opts(ctx, fn -> :ok end))
+
+      assert %{proxying?: false, adapter: nil} = Manager.status(manager)
+    end
+
     test "status never names the held index as the proxy adapter", ctx do
       # The client never claimed: the path is the hci0 default, which the
       # mesh holds out of bluetoothd's sight.

@@ -86,8 +86,6 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio.Transport.UserChannel do
          hci_user: Keyword.get(opts, :hci_user, Bluez.HciUser),
          hci_user_opts: Keyword.get(opts, :hci_user_opts, []),
          held_radios: Keyword.get(opts, :held_radios, []),
-         # The MAC is recorded in HeldRadios (see the moduledoc).
-         held: false,
          server: nil,
          mon: nil,
          index: nil,
@@ -349,27 +347,19 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio.Transport.UserChannel do
   # The channel's process is gone or going: nothing of it is kept.
   defp gone(t) do
     if t.mon, do: Process.demonitor(t.mon, [:flush])
-    t = unhold(t)
+    # Unconditional: a failed init step returns the state from before the
+    # hold, and release/2 only drops this process's own entry.
+    :ok = HeldRadios.release(mac(t.address), t.held_radios)
     %{t | server: nil, mon: nil, index: nil, scanning: false, advertising: false}
   end
 
   defp hold(t) do
-    case HeldRadios.hold(mac(t.address), t.index, t.held_radios) do
-      :ok ->
-        %{t | held: true}
-
-      {:error, :held_elsewhere} ->
-        Logger.warning("#{inspect(Radio)}: #{mac(t.address)} is already recorded as held")
-        t
+    with {:error, :held_elsewhere} <- HeldRadios.hold(mac(t.address), t.index, t.held_radios) do
+      Logger.warning("#{inspect(Radio)}: #{mac(t.address)} is already recorded as held")
     end
-  end
 
-  defp unhold(%{held: true} = t) do
-    :ok = HeldRadios.release(mac(t.address), t.held_radios)
-    %{t | held: false}
+    t
   end
-
-  defp unhold(t), do: t
 
   defp log_dropped(t, count) do
     now = System.monotonic_time(:millisecond)

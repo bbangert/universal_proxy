@@ -495,18 +495,21 @@ defmodule UniversalProxy.Bluetooth.Manager do
       hci = Path.basename(path)
       live = state.adapters_info_fun.()
 
-      held = state.held_fun.()
+      # A held index is the mesh's whatever bluetoothd still caches for it.
+      held? = Enum.any?(state.held_fun.(), &("hci#{&1.index}" == hci))
 
-      case Enum.find(live, &(&1.path == path)) do
-        %{address: address} when is_binary(address) and address == tuya_adapter ->
+      case {held?, Enum.find(live, &(&1.path == path))} do
+        {true, _row} ->
           :mesh
 
-        %{address: address, name: name} ->
+        {false, %{address: address}} when is_binary(address) and address == tuya_adapter ->
+          :mesh
+
+        {false, %{address: address, name: name}} ->
           %{hci: hci, address: address, name: name}
 
-        nil ->
-          # A held index is the mesh's, out of bluetoothd's sight.
-          if only_mesh_left?(live, tuya_adapter) or Enum.any?(held, &("hci#{&1.index}" == hci)),
+        {false, nil} ->
+          if only_mesh_left?(live, tuya_adapter),
             do: :mesh,
             else: %{hci: hci, address: nil, name: nil}
       end

@@ -777,6 +777,35 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioUserChannelTest do
     end
 
     @tag :capture_log
+    test "a setup failing after BD_ADDR that closes the channel drops the hold", ctx do
+      # A timed-out step closes the channel; no retry within the test.
+      radio =
+        start_radio([held_radios: ctx.held, retry_ms: 60_000], %{
+          read_local_version: [{:error, :timeout}]
+        })
+
+      server = bound!(radio)
+      assert_receive {:hci, ^server, :closed}, 1_000
+      assert %{ready: false} = status!(radio)
+      assert held(ctx) == []
+    end
+
+    @tag :capture_log
+    test "falling back after a post-BD_ADDR failure drops the hold", ctx do
+      radio =
+        start_radio(
+          [held_radios: ctx.held, transport: [Transport.UserChannel, StubTransport]],
+          %{le_read_local_supported_features: {:error, {:status, 0x01}}}
+        )
+
+      server = bound!(radio)
+      assert_receive {:stub, :init}, 1_000
+      assert_receive {:hci, ^server, :closed}, 1_000
+      wait_until(fn -> status!(radio).transport == :stub end)
+      assert held(ctx) == []
+    end
+
+    @tag :capture_log
     test "an unplug drops the hold until the channel is bound again", ctx do
       radio = ready!(start_radio(held_radios: ctx.held))
       assert_receive {:bluetooth_held_changed}
