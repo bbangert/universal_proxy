@@ -544,29 +544,6 @@ defmodule UniversalProxy.Cec.ServerTest do
 
   ## Helpers
 
-  # Brings the adapter up at @pa / logical address 4 and settles the
-  # receiver poll: :absent (NACK) or :present (ACK).
-  defp configure(fake, receiver \\ :absent) do
-    wait_until(fn ->
-      match?({:ok, %{ready?: true, claim: :claimed}}, Cec.info(@dev))
-    end)
-
-    state_change(fake, @pa, @mask)
-    {seq, %Message{to: 5, body: :poll}} = nth_tx(fake, 1)
-
-    case receiver do
-      :present -> ack(fake, seq)
-      :absent -> nack(fake, seq)
-    end
-
-    wait_until(fn ->
-      match?(
-        {:ok, %{configured?: true, receiver_presence: ^receiver}},
-        Server.get_adapter(@dev)
-      )
-    end)
-  end
-
   defp flush_adapters do
     receive do
       {:cec_adapters, _} -> flush_adapters()

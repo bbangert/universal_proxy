@@ -114,6 +114,34 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
     assert html =~ "Searching"
   end
 
+  test "binary volume and mute events move the volume bar", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/")
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:output_added",
+      {:sendspin_output_added, sample_output()}
+    )
+
+    assert render(view) =~ "width: 50%"
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:state",
+      {:sendspin_state, @hp_key, %{event: "volume", value: 73}}
+    )
+
+    assert render(view) =~ "width: 73%"
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:state",
+      {:sendspin_state, @hp_key, %{event: "mute", value: true}}
+    )
+
+    assert render(view) =~ "MUTE"
+  end
+
   test "a connected Bluetooth output renders in the audio summary", %{conn: conn} do
     {:ok, view, _html} = live(conn, "/")
 

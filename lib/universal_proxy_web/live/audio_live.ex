@@ -1253,6 +1253,19 @@ defmodule UniversalProxyWeb.AudioLive do
       {:event, "shutdown"}, acc ->
         %{acc | connection: :disconnected, stream: nil}
 
+      # A Sendspin server (Music Assistant) changed the player's volume/mute.
+      {:event, "volume"}, acc ->
+        case Map.get(partial, :value) do
+          v when is_integer(v) -> %{acc | volume: v |> max(0) |> min(100)}
+          _ -> acc
+        end
+
+      {:event, "mute"}, acc ->
+        case Map.get(partial, :value) do
+          m when is_boolean(m) -> %{acc | muted: m}
+          _ -> acc
+        end
+
       _other, acc ->
         acc
     end)

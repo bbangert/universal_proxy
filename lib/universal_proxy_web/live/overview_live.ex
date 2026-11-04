@@ -701,6 +701,18 @@ defmodule UniversalProxyWeb.OverviewLive do
     {:noreply, update_audio_output(socket, key, %{muted: muted})}
   end
 
+  # The same fields as binary events, when a Sendspin server (Music
+  # Assistant) changes them.
+  def handle_info({:sendspin_state, key, %{event: "volume", value: volume}}, socket)
+      when is_integer(volume) do
+    {:noreply, update_audio_output(socket, key, %{volume: volume |> max(0) |> min(100)})}
+  end
+
+  def handle_info({:sendspin_state, key, %{event: "mute", value: muted}}, socket)
+      when is_boolean(muted) do
+    {:noreply, update_audio_output(socket, key, %{muted: muted})}
+  end
+
   def handle_info({:sendspin_state, _key, _partial}, socket), do: {:noreply, socket}
 
   # Merge an FMA120 control-state partial into the cached per-device state.

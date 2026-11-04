@@ -40,8 +40,19 @@ defmodule UniversalProxy.Cec do
   @type dev :: String.t()
   @type power :: Server.power()
   @type error :: :cec_unavailable | :no_such_adapter | :timeout | Adapter.error()
+  @typedoc "The receiver's volume (0..100, nil if it won't say) and mute state."
+  @type audio_status :: %{volume: 0..100 | nil, muted: boolean()}
+  @typedoc "Why `set_volume/3` stopped short; a status is the last readback."
+  @type step_error ::
+          :unknown_volume | {:no_progress, audio_status()} | {:press_limit, audio_status()}
 
   @ui_keys %{power_on: :power_on_function, power_off: :power_off_function}
+
+  # Consecutive presses that bring the volume no closer before giving up.
+  @stall_presses 2
+  # Presses allowed on top of the distance to the target, and the cap.
+  @press_slack 5
+  @press_cap 100 + @press_slack
 
   @doc """
   PubSub topic (on `UniversalProxy.PubSub`) carrying `{:cec_event, dev,
@@ -142,12 +153,54 @@ defmodule UniversalProxy.Cec do
   end
 
   @doc "Ask the receiver for its volume (0..100, or nil if it won't say) and mute state."
-  @spec audio_status(dev(), keyword()) ::
-          {:ok, %{volume: 0..100 | nil, muted: boolean()}} | {:error, error()}
+  @spec audio_status(dev(), keyword()) :: {:ok, audio_status()} | {:error, error()}
   def audio_status(dev, opts \\ []) do
     with {:ok, %{volume: volume, muted: muted}} <-
            with_adapter(dev, &Adapter.give_audio_status(&1, to(opts), call_opts(opts))) do
       {:ok, Server.audio_status(muted, volume)}
+    end
+  end
+
+  @doc """
+  Step the receiver's volume to `target` (0..100) with volume-up/down key
+  presses, reading the status back after each one: back-to-back presses
+  without a readback in between get dropped. Runs in the caller's
+  process, one adapter call at a time, so a long walk holds neither
+  `Cec.Server` nor the adapter between calls.
+
+  Stepping only: receivers commonly Feature-Abort `<Set Audio Volume
+  Level>`, and one that accepts it sends no reply, so probing for it
+  costs a full reply timeout.
+
+  `{:ok, status}` once the receiver reports `target`, or with the first
+  readback past it when the receiver's step is coarser than one (the
+  caller compares). Stops with `{:error, {:no_progress, status}}` after
+  #{@stall_presses} presses in a row bring it no closer, and with
+  `{:error, {:press_limit, status}}` after `:max_presses` (default: the
+  distance plus #{@press_slack}); `status` is the last readback.
+  `{:error, :unknown_volume}` when the receiver won't report a volume.
+  Takes the `user_control/3` and `audio_status/2` options.
+  """
+  @spec set_volume(dev(), 0..100, keyword()) ::
+          {:ok, audio_status()} | {:error, error() | step_error()}
+  def set_volume(dev, target, opts \\ []) when is_integer(target) and target in 0..100 do
+    with {:ok, %{volume: volume} = status} <- known_volume(audio_status(dev, opts)) do
+      default = min(abs(target - volume) + @press_slack, @press_cap)
+      presses = Keyword.get(opts, :max_presses, default)
+      step_volume(dev, target, status, abs(target - volume), presses, 0, opts)
+    end
+  end
+
+  @doc """
+  Bring the receiver's mute to `wanted`. Mute is a toggle key, so it is
+  pressed only while the reported state differs, each press read back,
+  at most twice (one retry for a dropped press). Returns the last status
+  read; the caller compares its `muted` with `wanted`.
+  """
+  @spec set_muted(dev(), boolean(), keyword()) :: {:ok, audio_status()} | {:error, error()}
+  def set_muted(dev, wanted, opts \\ []) when is_boolean(wanted) do
+    with {:ok, status} <- audio_status(dev, opts) do
+      toggle_mute(dev, wanted, status, 2, opts)
     end
   end
 
@@ -175,6 +228,49 @@ defmodule UniversalProxy.Cec do
   end
 
   # ── private ───────────────────────────────────────────────────────────
+
+  defp step_volume(_dev, target, %{volume: target} = status, _best, _left, _stalled, _opts),
+    do: {:ok, status}
+
+  defp step_volume(_dev, _target, status, _best, _left, @stall_presses, _opts),
+    do: {:error, {:no_progress, status}}
+
+  defp step_volume(_dev, _target, status, _best, 0, _stalled, _opts),
+    do: {:error, {:press_limit, status}}
+
+  defp step_volume(dev, target, %{volume: volume}, best, left, stalled, opts) do
+    key = if target > volume, do: :volume_up, else: :volume_down
+
+    with :ok <- user_control(dev, key, opts),
+         {:ok, %{volume: now} = status} <- known_volume(audio_status(dev, opts)) do
+      distance = abs(target - now)
+
+      cond do
+        # Overshot: the next press would only cross back.
+        now != target and target > volume != target > now ->
+          {:ok, status}
+
+        distance < best ->
+          step_volume(dev, target, status, distance, left - 1, 0, opts)
+
+        true ->
+          step_volume(dev, target, status, best, left - 1, stalled + 1, opts)
+      end
+    end
+  end
+
+  defp known_volume({:ok, %{volume: nil}}), do: {:error, :unknown_volume}
+  defp known_volume(result), do: result
+
+  defp toggle_mute(_dev, wanted, %{muted: wanted} = status, _presses, _opts), do: {:ok, status}
+  defp toggle_mute(_dev, _wanted, status, 0, _opts), do: {:ok, status}
+
+  defp toggle_mute(dev, wanted, _status, presses, opts) do
+    with :ok <- mute(dev, opts),
+         {:ok, status} <- audio_status(dev, opts) do
+      toggle_mute(dev, wanted, status, presses - 1, opts)
+    end
+  end
 
   defp receiver_version(dev) do
     Server.receiver_version(dev)
