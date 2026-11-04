@@ -630,6 +630,38 @@ defmodule UniversalProxyWeb.AudioLiveTest do
     assert html =~ "Searching"
   end
 
+  test "binary volume and mute events move the slider live", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/audio")
+
+    Phoenix.PubSub.broadcast(
+      @pubsub,
+      "sendspin:output_added",
+      {:sendspin_output_added, sample_output()}
+    )
+
+    assert render(view) =~ "--vol: 50;"
+
+    broadcast_state = fn partial ->
+      Phoenix.PubSub.broadcast(@pubsub, "sendspin:state", {:sendspin_state, @hp_key, partial})
+    end
+
+    broadcast_state.(%{event: "volume", value: 73})
+    html = render(view)
+    assert html =~ "--vol: 73;"
+    assert html =~ ~s|title="Mute"|
+
+    # Out-of-range values are clamped; malformed ones are ignored.
+    broadcast_state.(%{event: "volume", value: 150})
+    assert render(view) =~ "--vol: 100;"
+    broadcast_state.(%{event: "volume", value: "loud"})
+    assert render(view) =~ "--vol: 100;"
+
+    broadcast_state.(%{event: "mute", value: true})
+    assert render(view) =~ ~s|title="Unmute"|
+    broadcast_state.(%{event: "mute", value: false})
+    assert render(view) =~ ~s|title="Mute"|
+  end
+
   test "renders the Disabled badge when an output is not enabled", %{conn: conn} do
     {:ok, view, _html} = live(conn, "/audio")
 
