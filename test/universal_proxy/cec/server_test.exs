@@ -107,12 +107,18 @@ defmodule UniversalProxy.Cec.ServerTest do
     test "status counts only when the receiver sent it", %{fake: fake} do
       configure(fake, :present)
 
+      Phoenix.PubSub.subscribe(@pubsub, Server.topic())
+
       # From the TV (0): its own power, audio and a directed Standby.
       receive_msg(fake, <<0x04, 0x90, 0x01>>)
       receive_msg(fake, <<0x04, 0x7A, 0xD0>>)
       receive_msg(fake, <<0x04, 0x36>>)
-      # From the receiver (5): power on, volume 33 unmuted. Events arrive in
-      # order, so once these are recorded the TV's have been seen too.
+
+      # The Server re-broadcasts each event after applying it.
+      assert_receive {:cec_event, @dev, {:message, %Message{from: 0, body: :standby}}}
+      assert %{power: :unknown, volume: nil, muted: nil, updated_at: nil} = receiver()
+
+      # From the receiver (5): power on, volume 33 unmuted.
       receive_msg(fake, <<0x54, 0x90, 0x00>>)
       receive_msg(fake, <<0x54, 0x7A, 0x21>>)
 
@@ -156,7 +162,60 @@ defmodule UniversalProxy.Cec.ServerTest do
       reply(fake, seq, <<0x54, 0x90, 0x02>>)
       assert Task.await(task) == {:ok, :to_on}
 
+      wait_until(fn -> receiver().power == :to_on end)
       assert %{power: :to_on, volume: 5, muted: true} = receiver()
+    end
+
+    test "status queried from another device leaves the receiver's alone", %{fake: fake} do
+      configure(fake, :present)
+      Phoenix.PubSub.subscribe(@pubsub, Server.topic())
+
+      task = Task.async(fn -> Cec.power_status(@dev, to: :tv) end)
+      {seq, %Message{to: 0, body: :give_device_power_status}} = nth_tx(fake, 2)
+      reply(fake, seq, <<0x04, 0x90, 0x01>>)
+      assert Task.await(task) == {:ok, :standby}
+
+      task = Task.async(fn -> Cec.audio_status(@dev, to: :tv) end)
+      {seq, %Message{to: 0, body: :give_audio_status}} = nth_tx(fake, 3)
+      reply(fake, seq, <<0x04, 0x7A, 0xD0>>)
+      assert Task.await(task) == {:ok, %{volume: 80, muted: true}}
+
+      assert_receive {:cec_event, @dev,
+                      {:message, %Message{from: 0, body: {:report_audio_status, _, _}}}}
+
+      assert %{power: :unknown, volume: nil, muted: nil, updated_at: nil} = receiver()
+    end
+
+    test "receiver_la is a per-call destination override", %{fake: fake} do
+      configure(fake, :present)
+
+      task = Task.async(fn -> Cec.standby(@dev, receiver_la: 0) end)
+      {seq, %Message{to: 0, body: :standby}} = nth_tx(fake, 2)
+      ack(fake, seq)
+      assert Task.await(task) == :ok
+    end
+
+    test "the cache is cleared when commands move from the receiver to the TV", %{fake: fake} do
+      configure(fake, :present)
+      receive_msg(fake, <<0x54, 0x7A, 0x21>>)
+      wait_until(fn -> receiver().volume == 33 end)
+
+      # The receiver NACKs a key press, so the adapter retries at the TV.
+      task = Task.async(fn -> Cec.volume_up(@dev) end)
+      {seq, %Message{to: 5, body: {:user_control_pressed, :volume_up}}} = nth_tx(fake, 2)
+      nack(fake, seq)
+      {seq, %Message{to: 0, body: {:user_control_pressed, :volume_up}}} = nth_tx(fake, 3)
+      ack(fake, seq)
+      {seq, %Message{to: 0, body: :user_control_released}} = nth_tx(fake, 4)
+      ack(fake, seq)
+      assert Task.await(task) == :ok
+
+      wait_until(fn -> match?({:ok, %{receiver_presence: :absent}}, Server.get_adapter(@dev)) end)
+      assert %{volume: nil, muted: nil} = receiver()
+
+      receive_msg(fake, <<0x04, 0x90, 0x01>>)
+      wait_until(fn -> receiver().power == :standby end)
+      assert %{power: :standby, volume: nil, muted: nil} = receiver()
     end
 
     test "a key press is pressed and released at the receiver", %{fake: fake} do
@@ -178,6 +237,24 @@ defmodule UniversalProxy.Cec.ServerTest do
       ack(fake, seq)
 
       assert Task.await(task) == :ok
+      wait_until(fn -> receiver().power == :to_standby end)
+    end
+
+    test "a Standby to another device leaves the receiver's power alone", %{fake: fake} do
+      configure(fake, :present)
+
+      task = Task.async(fn -> Cec.standby(@dev, to: :tv) end)
+      {seq, %Message{to: 0, body: :standby}} = nth_tx(fake, 2)
+      ack(fake, seq)
+      assert Task.await(task) == :ok
+      assert %{power: :unknown, updated_at: nil} = receiver()
+
+      # A broadcast reaches the receiver too.
+      task = Task.async(fn -> Cec.standby(@dev, to: :broadcast) end)
+      {seq, %Message{to: 15, body: :standby}} = nth_tx(fake, 3)
+      ack(fake, seq)
+      assert Task.await(task) == :ok
+
       wait_until(fn -> receiver().power == :to_standby end)
     end
 

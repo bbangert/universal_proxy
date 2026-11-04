@@ -14,8 +14,10 @@ defmodule UniversalProxy.Cec do
 
   Commands go to the receiver (logical address 5 by default, the
   `:receiver_la` config) and fall back to the TV (0) when nothing answers
-  there. `:to` overrides the destination (`:tv`, `:audio_system`, a logical
-  address).
+  there. `:to` overrides the destination (`:tv`, `:audio_system`,
+  `:broadcast`, a logical address); without it, a per-call `:receiver_la`
+  does the same. The receiver record in `list_adapters/0` only reflects
+  what the current receiver itself reported.
 
   When the subsystem is off (host, `enabled: false`, or not started yet)
   every function degrades to a harmless default, `{:error,
@@ -93,20 +95,23 @@ defmodule UniversalProxy.Cec do
   @doc "Put the receiver into standby (directed, not the broadcast that would also hit the TV)."
   @spec standby(dev(), keyword()) :: :ok | {:error, error()}
   def standby(dev, opts \\ []) do
-    with :ok <- with_adapter(dev, &Adapter.standby(&1, to(opts), call_opts(opts))) do
-      Server.note_receiver(dev, %{power: :to_standby})
+    to = to(opts)
+
+    with :ok <- with_adapter(dev, &Adapter.standby(&1, to, call_opts(opts))) do
+      Server.note_receiver(dev, to, %{power: :to_standby})
       :ok
     end
   end
 
-  @doc "Ask the receiver for its power state; also recorded on the adapter."
+  @doc """
+  Ask the receiver for its power state. The reply is recorded on the
+  adapter when it comes from the receiver.
+  """
   @spec power_status(dev(), keyword()) :: {:ok, power()} | {:error, error()}
   def power_status(dev, opts \\ []) do
     with {:ok, power} <-
            with_adapter(dev, &Adapter.give_power_status(&1, to(opts), call_opts(opts))) do
-      power = Server.power(power)
-      Server.note_receiver(dev, %{power: power})
-      {:ok, power}
+      {:ok, Server.power(power)}
     end
   end
 
@@ -116,9 +121,7 @@ defmodule UniversalProxy.Cec do
   def audio_status(dev, opts \\ []) do
     with {:ok, %{volume: volume, muted: muted}} <-
            with_adapter(dev, &Adapter.give_audio_status(&1, to(opts), call_opts(opts))) do
-      status = Server.audio_status(muted, volume)
-      Server.note_receiver(dev, status)
-      {:ok, status}
+      {:ok, Server.audio_status(muted, volume)}
     end
   end
 
@@ -147,7 +150,13 @@ defmodule UniversalProxy.Cec do
 
   # ── private ───────────────────────────────────────────────────────────
 
-  defp to(opts), do: Keyword.get(opts, :to, :receiver)
+  defp to(opts) do
+    case Keyword.fetch(opts, :to) do
+      {:ok, to} -> to
+      :error -> Keyword.get(opts, :receiver_la, :receiver)
+    end
+  end
+
   defp call_opts(opts), do: Keyword.take(opts, [:call_timeout, :timeout])
 
   defp with_adapter(dev, fun) when is_binary(dev) do

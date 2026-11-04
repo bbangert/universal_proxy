@@ -65,6 +65,7 @@ defmodule UniversalProxy.Cec.Server do
   @default_restart_ms 1_000
   @default_osd_name "UniversalProxy"
   @tv 0
+  @unknown_receiver %{power: :unknown, volume: nil, muted: nil, updated_at: nil}
 
   @type power :: :on | :standby | :to_on | :to_standby | :unknown
 
@@ -127,10 +128,14 @@ defmodule UniversalProxy.Cec.Server do
   def adapter_for_card(card_index),
     do: GenServer.call(__MODULE__, {:adapter_for_card, card_index})
 
-  @doc "Record something learned about the far end (from a command's result)."
-  @spec note_receiver(String.t(), map()) :: :ok
-  def note_receiver(dev, partial) when is_map(partial),
-    do: GenServer.cast(__MODULE__, {:note_receiver, dev, partial})
+  @doc """
+  Record what a command delivered to `to` did to the far end. Applied only
+  when `to` is the receiver right now (`:receiver`, or its logical address)
+  or a broadcast.
+  """
+  @spec note_receiver(String.t(), Adapter.target(), map()) :: :ok
+  def note_receiver(dev, to, partial) when is_map(partial),
+    do: GenServer.cast(__MODULE__, {:note_receiver, dev, to, partial})
 
   @doc "Re-run discovery now (tests, or after a manual cable swap)."
   @spec rescan() :: :ok
@@ -177,8 +182,16 @@ defmodule UniversalProxy.Cec.Server do
   def handle_call(:rescan, _from, state), do: {:reply, :ok, scan(state)}
 
   @impl true
-  def handle_cast({:note_receiver, dev, partial}, state) do
-    {:noreply, update_receiver(state, dev, partial)}
+  def handle_cast({:note_receiver, dev, to, partial}, state) do
+    case Map.fetch(state.adapters, dev) do
+      {:ok, adapter} ->
+        if reaches_receiver?(to, receiver_target(state, adapter)),
+          do: {:noreply, update_receiver(state, dev, partial)},
+          else: {:noreply, state}
+
+      :error ->
+        {:noreply, state}
+    end
   end
 
   @impl true
@@ -263,7 +276,7 @@ defmodule UniversalProxy.Cec.Server do
       configured?: false,
       active_source?: false,
       receiver_presence: :unknown,
-      receiver: %{power: :unknown, volume: nil, muted: nil, updated_at: nil}
+      receiver: @unknown_receiver
     })
   end
 
@@ -321,7 +334,7 @@ defmodule UniversalProxy.Cec.Server do
     try do
       :ok = Adapter.subscribe(pid)
       info = Adapter.info(pid)
-      update_adapter(state, dev, &apply_summary(&1, info))
+      update_link(state, dev, &apply_summary(&1, info))
     catch
       :exit, _ -> state
     end
@@ -337,7 +350,7 @@ defmodule UniversalProxy.Cec.Server do
       Logger.info("CEC: adapter #{dev} stopped (#{inspect(reason)})")
     end
 
-    update_adapter(state, dev, fn adapter ->
+    update_link(state, dev, fn adapter ->
       %{
         adapter
         | running?: false,
@@ -415,7 +428,7 @@ defmodule UniversalProxy.Cec.Server do
   # ── state updates ─────────────────────────────────────────────────────
 
   defp apply_event(state, dev, {:state, summary}),
-    do: update_adapter(state, dev, &apply_summary(&1, summary))
+    do: update_link(state, dev, &apply_summary(&1, summary))
 
   defp apply_event(state, dev, {:message, %Message{} = message}) do
     case Map.fetch(state.adapters, dev) do
@@ -436,6 +449,32 @@ defmodule UniversalProxy.Cec.Server do
         receiver_presence: summary.receiver
     }
   end
+
+  # Updates what is known about the link. When that moves the receiver
+  # target (the receiver went away, or is back), the cached status belonged
+  # to the other device and is dropped.
+  defp update_link(state, dev, fun) do
+    update_adapter(state, dev, fn adapter ->
+      updated = fun.(adapter)
+
+      if receiver_target(state, updated) == receiver_target(state, adapter),
+        do: updated,
+        else: %{updated | receiver: @unknown_receiver}
+    end)
+  end
+
+  defp reaches_receiver?(:receiver, _target), do: true
+  defp reaches_receiver?(:broadcast, _target), do: true
+  defp reaches_receiver?(15, _target), do: true
+  defp reaches_receiver?(la, target) when is_integer(la), do: la == target
+
+  defp reaches_receiver?(name, target) when is_atom(name) do
+    Message.logical_address(name) in [target, 15]
+  rescue
+    FunctionClauseError -> false
+  end
+
+  defp reaches_receiver?(_to, _target), do: false
 
   # Where `:receiver` commands go right now (mirrors the adapter's rule).
   defp receiver_target(%{receiver_la: nil}, _adapter), do: @tv
