@@ -8,14 +8,18 @@ defmodule UniversalProxy.Cec.VolumeLink do
   output's `cec_volume` setting is on (`UniversalProxy.Cec.volume_link?/2`).
   It stays linked until the receiver reports standby, the adapter or the
   output goes away, the setting is turned off, or the receiver stops
-  answering: `:fail_unlink` (3) polls or runs in a row failing outright
-  (no reply, a timeout; a run that stalled still read the volume back, so it
-  isn't one). An output linked to a silent receiver would otherwise stay at
-  unity gain. Such an adapter relinks only once a probe gets an answer
-  again, not on `Cec.Server`'s record, which still holds the last report.
-  A receiver record that is
-  merely cleared (`UniversalProxy.Cec.Server` drops it when the HDMI link
-  changes) keeps the link and the last known values until the next poll.
+  answering: `:fail_unlink` (3) polls or runs in a row that the receiver
+  didn't acknowledge or reply to (`:nack`, `:timeout`, `:max_retries`, or a
+  crashed run). An output linked to a silent receiver would otherwise stay
+  at unity gain. Errors on our side of the bus (`:not_configured` while the
+  adapter re-acquires its address after a hotplug, `:busy`,
+  `:cec_unavailable`, ...) say nothing about the receiver and leave the
+  count alone; a stalled run read the volume back, so it counts as an
+  answer. A silent receiver's adapter relinks only once a probe gets an
+  answer again, not on `Cec.Server`'s record, which still holds the last
+  report. A receiver record that is merely cleared
+  (`UniversalProxy.Cec.Server` drops it when the HDMI link changes) keeps
+  the link and the last known values until the next poll.
 
     * **Linking** puts the output's player in external-volume mode
       (`UniversalProxy.Audio.set_volume_external/2`: unity gain, volume and
@@ -243,7 +247,10 @@ defmodule UniversalProxy.Cec.VolumeLink do
 
     state =
       Enum.reduce(state.links, state, fn {dev, link}, acc ->
-        if keep?(acc, dev, link, candidates), do: acc, else: unlink(acc, dev)
+        case unlink_reason(acc, dev, link, candidates) do
+          nil -> acc
+          reason -> unlink(acc, dev, reason)
+        end
       end)
 
     state =
@@ -275,9 +282,21 @@ defmodule UniversalProxy.Cec.VolumeLink do
     end)
   end
 
-  defp keep?(state, dev, link, candidates) do
-    Map.get(candidates, dev) == link.key and
-      receiver(state.adapters[dev]).power not in [:standby, :to_standby]
+  # Why a link no longer holds, or nil while it does.
+  defp unlink_reason(state, dev, link, candidates) do
+    adapter = state.adapters[dev]
+    output = state.outputs[link.key]
+
+    cond do
+      adapter == nil -> "adapter gone"
+      not Map.get(adapter, :running?, false) -> "adapter stopped"
+      Map.get(adapter, :receiver_presence) != :present -> "receiver absent"
+      output == nil -> "output gone"
+      not Cec.volume_link?(output, state.default) -> "setting off"
+      Map.get(candidates, dev) != link.key -> "output changed"
+      receiver(adapter).power in [:standby, :to_standby] -> "standby"
+      true -> nil
+    end
   end
 
   defp linkable?(adapter) do
@@ -297,16 +316,20 @@ defmodule UniversalProxy.Cec.VolumeLink do
       pending: %{},
       echoes: [],
       quiet_until: nil,
-      failures: 0
+      failures: []
     }
 
     state = put_in(state.links[dev], link)
     push(state, dev, known(link.receiver))
   end
 
-  defp unlink(state, dev) do
+  defp unlink(state, dev, reason) do
     %{key: key} = state.links[dev]
-    Logger.info("CEC volume link: #{inspect(key)} no longer follows the receiver on #{dev}")
+
+    Logger.info(
+      "CEC volume link: #{inspect(key)} no longer follows the receiver on #{dev} (#{reason})"
+    )
+
     safe(fn -> state.funs.set_volume_external.(key, false) end, :ok)
     %{state | links: Map.delete(state.links, dev)}
   end
@@ -557,7 +580,7 @@ defmodule UniversalProxy.Cec.VolumeLink do
         do: state,
         else: put_in(state.power_at[dev], System.monotonic_time(:millisecond))
 
-    answered? = answered?(power) and answered?(audio)
+    outcome = poll_outcome([power, audio])
 
     state =
       case audio do
@@ -566,18 +589,18 @@ defmodule UniversalProxy.Cec.VolumeLink do
       end
 
     state
-    |> poll_outcome(dev, answered?, power, audio)
+    |> after_poll(dev, outcome, power, audio)
     |> next(dev)
   end
 
   defp job_done(state, dev, {:step, targets, status, error}) do
     if error, do: log_step_error(dev, targets, status, error)
-    step_ended(state, dev, status, error in [nil, :no_progress, :press_limit])
+    step_ended(state, dev, status, step_outcome(error))
   end
 
-  defp job_done(state, dev, _crashed), do: step_ended(state, dev, nil, false)
+  defp job_done(state, dev, _crashed), do: step_ended(state, dev, nil, {:silent, :crashed})
 
-  defp step_ended(state, dev, status, answered?) do
+  defp step_ended(state, dev, status, outcome) do
     case state.links[dev] do
       nil ->
         next(state, dev)
@@ -586,21 +609,39 @@ defmodule UniversalProxy.Cec.VolumeLink do
         quiet_until = System.monotonic_time(:millisecond) + state.settle_ms
         receiver = Map.merge(link.receiver, known(status || %{}))
         state = put_in(state.links[dev], %{link | receiver: receiver, quiet_until: quiet_until})
-        state |> count_answer(dev, answered?) |> next(dev)
+        state |> count_outcome(dev, outcome) |> next(dev)
     end
   end
 
-  # `:skipped` is a request not made this time.
-  defp answered?(:skipped), do: true
-  defp answered?({:ok, _}), do: true
-  defp answered?(_failed), do: false
+  # What a poll or run says about the receiver: `:answered`, `{:silent,
+  # reason}` when the receiver didn't acknowledge or reply, or `:local` when
+  # our own adapter couldn't ask (no logical address while it re-acquires
+  # one after a hotplug, queue full, subsystem down), which says nothing
+  # about the receiver and leaves the count alone.
+  defp poll_outcome(results) do
+    errors = for {:error, reason} <- results, do: reason
 
-  defp poll_outcome(state, dev, answered?, power, audio) do
+    case Enum.find(errors, &receiver_silent?/1) do
+      nil -> if errors == [], do: :answered, else: :local
+      reason -> {:silent, reason}
+    end
+  end
+
+  # A stall or the press limit came with a readback.
+  defp step_outcome(error) when error in [nil, :no_progress, :press_limit], do: :answered
+
+  defp step_outcome(error),
+    do: if(receiver_silent?(error), do: {:silent, error}, else: :local)
+
+  # `:timeout` is also what a request that got no reply returns.
+  defp receiver_silent?(reason), do: reason in [:nack, :timeout, :max_retries]
+
+  defp after_poll(state, dev, outcome, power, audio) do
     cond do
       Map.has_key?(state.links, dev) ->
-        count_answer(state, dev, answered?)
+        count_outcome(state, dev, outcome)
 
-      MapSet.member?(state.lost, dev) and answered? and match?({:ok, :on}, power) ->
+      MapSet.member?(state.lost, dev) and outcome == :answered and match?({:ok, :on}, power) ->
         found_again(state, dev, audio)
 
       true ->
@@ -608,17 +649,26 @@ defmodule UniversalProxy.Cec.VolumeLink do
     end
   end
 
-  defp count_answer(state, dev, true), do: put_in(state.links[dev].failures, 0)
+  defp count_outcome(state, dev, :answered), do: put_in(state.links[dev].failures, [])
+  defp count_outcome(state, _dev, :local), do: state
 
-  defp count_answer(state, dev, false) do
-    failures = state.links[dev].failures + 1
+  defp count_outcome(state, dev, {:silent, reason}) do
+    failures = [reason | state.links[dev].failures]
 
-    if failures >= state.fail_unlink do
-      Logger.warning("CEC volume link: receiver on #{dev} stopped answering (#{failures} tries)")
-      %{unlink(state, dev) | lost: MapSet.put(state.lost, dev)}
+    if length(failures) >= state.fail_unlink do
+      reason = "receiver stopped answering: #{describe_failures(failures)}"
+      %{unlink(state, dev, reason) | lost: MapSet.put(state.lost, dev)}
     else
       put_in(state.links[dev].failures, failures)
     end
+  end
+
+  # `[:timeout, :nack, :nack]` (newest first) -> ":nack ×2, :timeout ×1".
+  defp describe_failures(failures) do
+    failures
+    |> Enum.reverse()
+    |> Enum.chunk_by(& &1)
+    |> Enum.map_join(", ", fn [reason | _] = run -> "#{inspect(reason)} ×#{length(run)}" end)
   end
 
   # A lost receiver answered a probe: relink from what it just said (the

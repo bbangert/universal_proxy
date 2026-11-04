@@ -444,6 +444,50 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
       assert VolumeLink.links(pid) == %{@dev => @key}
     end
 
+    test "our own adapter's errors (:not_configured after a hotplug) don't count",
+         %{pid: pid} do
+      failed_poll(pid, first: true, error: :not_configured)
+
+      for _ <- 1..4, do: failed_poll(pid, error: :not_configured)
+
+      refute_receive {:external, @key, false}
+      assert VolumeLink.links(pid) == %{@dev => @key}
+    end
+
+    test "three NACKs unlink", %{pid: pid} do
+      failed_poll(pid, first: true, error: :nack)
+      failed_poll(pid, error: :nack)
+      refute_receive {:external, @key, false}
+
+      failed_poll(pid, error: :nack)
+      assert_receive {:external, @key, false}
+    end
+
+    test "in a mix only the receiver's silences count", %{pid: pid} do
+      failed_poll(pid, first: true, error: :nack)
+      failed_poll(pid, error: :not_configured)
+      failed_poll(pid, error: :timeout)
+      failed_poll(pid, error: :busy)
+      failed_poll(pid, error: :cec_unavailable)
+      refute_receive {:external, @key, false}
+
+      failed_poll(pid, error: :nack)
+      assert_receive {:external, @key, false}
+    end
+
+    test "a run our own adapter couldn't send doesn't count", %{pid: pid, pubsub: pubsub} do
+      failed_poll(pid, first: true)
+      failed_poll(pid)
+
+      player_event(pubsub, @key, :volume, 60)
+      reply(assert_cec({:set_volume, @dev, 60}), {:error, :not_configured})
+      idle(pid)
+      refute_receive {:external, @key, false}
+
+      failed_poll(pid)
+      assert_receive {:external, @key, false}
+    end
+
     @tag fail_unlink: 1
     test "the threshold is configurable", %{pid: pid} do
       failed_poll(pid, first: true)
@@ -523,9 +567,10 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
   # A linked receiver's poll that gets no answer. The first one also
   # checks power.
   defp failed_poll(pid, opts \\ []) do
+    error = {:error, Keyword.get(opts, :error, :timeout)}
     send(pid, {:poll, @dev})
-    if opts[:first], do: reply(assert_cec({:power_status, @dev}), {:error, :timeout})
-    reply(assert_cec({:audio_status, @dev}), {:error, :timeout})
+    if opts[:first], do: reply(assert_cec({:power_status, @dev}), error)
+    reply(assert_cec({:audio_status, @dev}), error)
     idle(pid)
   end
 
