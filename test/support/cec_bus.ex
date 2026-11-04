@@ -13,6 +13,32 @@ defmodule UniversalProxy.CecBus do
   @tx_ok 0x01
   @tx_nack 0x24
 
+  @doc """
+  Brings `dev`'s adapter up at physical address 1.0.0.0 / logical address
+  4 and settles the receiver poll (the first transmit): `:absent` (NACK)
+  or `:present` (ACK).
+  """
+  def configure(fake, receiver \\ :absent, dev \\ "/dev/cec0") do
+    wait_until(fn ->
+      match?({:ok, %{ready?: true, claim: :claimed}}, UniversalProxy.Cec.info(dev))
+    end)
+
+    state_change(fake, 0x1000, 0x10)
+    {seq, %Message{to: 5, body: :poll}} = nth_tx(fake, 1)
+
+    case receiver do
+      :present -> ack(fake, seq)
+      :absent -> nack(fake, seq)
+    end
+
+    wait_until(fn ->
+      match?(
+        {:ok, %{configured?: true, receiver_presence: ^receiver}},
+        UniversalProxy.Cec.Server.get_adapter(dev)
+      )
+    end)
+  end
+
   @doc "Requests the adapter made, oldest first."
   def requests(fake), do: for({_id, request} <- Fake.requests(fake), do: request)
 

@@ -40,8 +40,24 @@ defmodule UniversalProxy.Cec do
   @type dev :: String.t()
   @type power :: Server.power()
   @type error :: :cec_unavailable | :no_such_adapter | :timeout | Adapter.error()
+  @typedoc "The receiver's volume (0..100, nil if it won't say) and mute state."
+  @type audio_status :: %{volume: 0..100 | nil, muted: boolean()}
+  @typedoc """
+  A `set_volume/3` readback plus `step`, the volume change one key press
+  was last seen to make (see `set_volume/3`'s `:step`).
+  """
+  @type volume_result :: %{volume: 0..100, muted: boolean(), step: pos_integer()}
+  @typedoc "Why `set_volume/3` stopped short; a result is the last readback."
+  @type step_error ::
+          :unknown_volume | {:no_progress, volume_result()} | {:press_limit, volume_result()}
 
   @ui_keys %{power_on: :power_on_function, power_off: :power_off_function}
+
+  # Consecutive presses that bring the volume no closer before giving up.
+  @stall_presses 2
+  # Presses allowed on top of the distance to the target, and the cap.
+  @press_slack 5
+  @press_cap 100 + @press_slack
 
   @doc """
   PubSub topic (on `UniversalProxy.PubSub`) carrying `{:cec_event, dev,
@@ -142,12 +158,85 @@ defmodule UniversalProxy.Cec do
   end
 
   @doc "Ask the receiver for its volume (0..100, or nil if it won't say) and mute state."
-  @spec audio_status(dev(), keyword()) ::
-          {:ok, %{volume: 0..100 | nil, muted: boolean()}} | {:error, error()}
+  @spec audio_status(dev(), keyword()) :: {:ok, audio_status()} | {:error, error()}
   def audio_status(dev, opts \\ []) do
     with {:ok, %{volume: volume, muted: muted}} <-
            with_adapter(dev, &Adapter.give_audio_status(&1, to(opts), call_opts(opts))) do
       {:ok, Server.audio_status(muted, volume)}
+    end
+  end
+
+  @doc """
+  Step the receiver's volume towards `target` (0..100) with volume-up/down
+  key presses, reading the status back after each one: back-to-back
+  presses without a readback in between get dropped. Runs in the caller's
+  process, one adapter call at a time, so a long walk holds neither
+  `Cec.Server` nor the adapter between calls.
+
+  Stepping only: receivers commonly Feature-Abort `<Set Audio Volume
+  Level>`, and one that accepts it sends no reply, so probing for it
+  costs a full reply timeout.
+
+  One press usually moves the reported volume by more than one (3 is
+  common), so not every target is reachable. The walk settles on the
+  nearest reachable value: it presses only while a press of the current
+  step is expected to land strictly closer to `target`, then returns
+  `{:ok, result}`; the caller compares `result.volume` with what it asked
+  for. The step is learned from the readbacks, the last non-zero change
+  one press made (a readback of 0 or 100 may be clipped and doesn't
+  count), and comes back as `result.step` so the caller can pass it in
+  next time.
+
+  Options, besides those of `user_control/3` and `audio_status/2`:
+
+    * `:step` - the receiver's step from an earlier run, so the first
+      press is already planned (default: 1 until a press is observed).
+    * `:max` - a ceiling (0..100). `target` is clamped to it, volume-up
+      is never pressed when it would land above it, and a receiver found
+      above it (it started there, or a first press of an unknown step
+      overshot) is stepped down until it is not; an `{:ok, result}` is
+      never above it.
+    * `:max_presses` - the press bound (default: the distance plus
+      #{@press_slack}).
+
+  Stops with `{:error, {:no_progress, result}}` after #{@stall_presses}
+  presses in a row don't move the volume the pressed way, and with
+  `{:error, {:press_limit, result}}` at `:max_presses`; `result` is the
+  last readback. `{:error, :unknown_volume}` when the receiver won't
+  report a volume.
+  """
+  @spec set_volume(dev(), 0..100, keyword()) ::
+          {:ok, volume_result()} | {:error, error() | step_error()}
+  def set_volume(dev, target, opts \\ []) when is_integer(target) and target in 0..100 do
+    ceiling = Keyword.get(opts, :max, 100)
+    step = Keyword.get(opts, :step, 1)
+
+    unless ceiling in 0..100 and is_integer(step) and step > 0 do
+      raise ArgumentError,
+            "expected :max in 0..100 and a positive integer :step, " <>
+              "got: #{inspect(max: ceiling, step: step)}"
+    end
+
+    target = min(target, ceiling)
+
+    with {:ok, %{volume: volume} = status} <- known_volume(audio_status(dev, opts)) do
+      default = min(abs(target - volume) + @press_slack, @press_cap)
+      presses = Keyword.get(opts, :max_presses, default)
+      walk = %{dev: dev, target: target, ceiling: ceiling, opts: opts}
+      step_volume(walk, Map.put(status, :step, step), presses, 0)
+    end
+  end
+
+  @doc """
+  Bring the receiver's mute to `wanted`. Mute is a toggle key, so it is
+  pressed only while the reported state differs, each press read back,
+  at most twice (one retry for a dropped press). Returns the last status
+  read; the caller compares its `muted` with `wanted`.
+  """
+  @spec set_muted(dev(), boolean(), keyword()) :: {:ok, audio_status()} | {:error, error()}
+  def set_muted(dev, wanted, opts \\ []) when is_boolean(wanted) do
+    with {:ok, status} <- audio_status(dev, opts) do
+      toggle_mute(dev, wanted, status, 2, opts)
     end
   end
 
@@ -175,6 +264,61 @@ defmodule UniversalProxy.Cec do
   end
 
   # ── private ───────────────────────────────────────────────────────────
+
+  defp step_volume(walk, %{volume: volume, step: step} = result, left, stalled) do
+    case next_key(volume, step, walk.target, walk.ceiling) do
+      nil -> {:ok, result}
+      _key when stalled >= @stall_presses -> {:error, {:no_progress, result}}
+      _key when left <= 0 -> {:error, {:press_limit, result}}
+      key -> press_and_read(walk, key, result, left, stalled)
+    end
+  end
+
+  defp press_and_read(walk, key, %{volume: volume, step: step}, left, stalled) do
+    with :ok <- user_control(walk.dev, key, walk.opts),
+         {:ok, %{volume: now} = status} <- known_volume(audio_status(walk.dev, walk.opts)) do
+      moved = now - volume
+      stalled = if moved_towards?(key, moved), do: 0, else: stalled + 1
+      result = Map.put(status, :step, learn_step(step, moved, now))
+      step_volume(walk, result, left - 1, stalled)
+    end
+  end
+
+  # Above the ceiling only a step down will do; otherwise press only when
+  # one step (clipped to 0..100, as receivers do) lands strictly closer.
+  defp next_key(volume, _step, _target, ceiling) when volume > ceiling, do: :volume_down
+
+  defp next_key(volume, step, target, ceiling) do
+    up = min(volume + step, 100)
+    down = max(volume - step, 0)
+    distance = abs(target - volume)
+
+    cond do
+      up <= ceiling and abs(target - up) < distance -> :volume_up
+      abs(target - down) < distance -> :volume_down
+      true -> nil
+    end
+  end
+
+  defp moved_towards?(:volume_up, moved), do: moved > 0
+  defp moved_towards?(:volume_down, moved), do: moved < 0
+
+  defp learn_step(step, 0, _now), do: step
+  defp learn_step(step, _moved, now) when now in [0, 100], do: step
+  defp learn_step(_step, moved, _now), do: abs(moved)
+
+  defp known_volume({:ok, %{volume: nil}}), do: {:error, :unknown_volume}
+  defp known_volume(result), do: result
+
+  defp toggle_mute(_dev, wanted, %{muted: wanted} = status, _presses, _opts), do: {:ok, status}
+  defp toggle_mute(_dev, _wanted, status, 0, _opts), do: {:ok, status}
+
+  defp toggle_mute(dev, wanted, _status, presses, opts) do
+    with :ok <- mute(dev, opts),
+         {:ok, status} <- audio_status(dev, opts) do
+      toggle_mute(dev, wanted, status, presses - 1, opts)
+    end
+  end
 
   defp receiver_version(dev) do
     Server.receiver_version(dev)
