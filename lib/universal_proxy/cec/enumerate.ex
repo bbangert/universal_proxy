@@ -4,14 +4,20 @@ defmodule UniversalProxy.Cec.Enumerate do
   card of the same HDMI port.
 
   The vc4 driver registers both the CEC adapter and the HDMI ALSA card on the
-  HDMI port's platform device, so `/sys/class/cec/cecN/device` and
-  `/sys/class/sound/cardM/device` resolve to the same node (e.g.
-  `fef00700.hdmi` for HDMI0 on a Pi 4). That shared node is the pairing key;
-  the resulting `card_index` lines up with `UniversalProxy.Audio.Enumerate`'s
-  `:card_index` so a Sendspin output can be mapped to its CEC adapter.
+  HDMI port's platform device (e.g. `fef00700.hdmi` for HDMI0 on a Pi 4).
+  That shared node is the pairing key; the resulting `card_index` lines up
+  with `UniversalProxy.Audio.Enumerate`'s `:card_index` so a Sendspin output
+  can be mapped to its CEC adapter.
 
-  Roots are overridable (`:sys_root`, `:sound_sys_root`, `:dev_root`) for
-  host-side tests. Never raises: any failure yields `%{}`.
+  Adapters are discovered under both sysfs layouts, de-duplicated by name:
+
+    * `/sys/class/cec/cecN` (older kernels) - the owning device is the
+      `device` link inside the entry.
+    * `/sys/bus/cec/devices/cecN` (kernel 6.18, which has no `/sys/class/cec`)
+      - the entry resolves to `<owner>/cecN`, so the owner is its parent.
+
+  Roots are overridable (`:class_root`, `:bus_root`, `:sound_sys_root`,
+  `:dev_root`) for host-side tests. Never raises: any failure yields `%{}`.
   """
 
   require Logger
@@ -29,19 +35,24 @@ defmodule UniversalProxy.Cec.Enumerate do
   @doc "Adapters keyed by device path, e.g. `%{\"/dev/cec0\" => %{...}}`."
   @spec list(keyword()) :: %{String.t() => adapter()}
   def list(opts \\ []) do
-    sys_root = Keyword.get(opts, :sys_root, "/sys/class/cec")
+    class_root = Keyword.get(opts, :class_root, "/sys/class/cec")
+    bus_root = Keyword.get(opts, :bus_root, "/sys/bus/cec/devices")
     sound_root = Keyword.get(opts, :sound_sys_root, "/sys/class/sound")
     dev_root = Keyword.get(opts, :dev_root, "/dev")
 
     cards = cards_by_device(sound_root)
 
-    sys_root
-    |> entries(@cec_re)
-    |> Enum.reduce(%{}, fn {name, index}, acc ->
+    [{class_root, &device_node/1}, {bus_root, &parent_node/1}]
+    |> Enum.flat_map(fn {root, owner_fun} ->
+      for {name, index} <- entries(root, @cec_re),
+          do: {name, index, Path.join(root, name), owner_fun}
+    end)
+    |> Enum.uniq_by(fn {name, _index, _path, _owner_fun} -> name end)
+    |> Enum.reduce(%{}, fn {name, index, path, owner_fun}, acc ->
       dev = Path.join(dev_root, name)
 
       if File.exists?(dev) do
-        node = device_node(Path.join(sys_root, name))
+        node = owner_fun.(path)
 
         Map.put(acc, dev, %{
           dev: dev,
@@ -95,6 +106,14 @@ defmodule UniversalProxy.Cec.Enumerate do
     case File.read_link(link) do
       {:ok, _} -> realpath(link)
       _ -> nil
+    end
+  end
+
+  # Bus layout: the entry resolves to `<owner>/cecN`.
+  defp parent_node(entry) do
+    case realpath(entry) do
+      nil -> nil
+      real -> Path.dirname(real)
     end
   end
 
