@@ -42,7 +42,7 @@ defmodule UniversalProxy.Cec.VolumeTest do
       n = press(fake, n, :volume_up, 21)
       n = press(fake, n, :volume_up, 22)
 
-      assert Task.await(task) == {:ok, %{volume: 22, muted: false}}
+      assert Task.await(task) == {:ok, %{volume: 22, muted: false, step: 1}}
       refute_tx(fake, n)
     end
 
@@ -53,7 +53,7 @@ defmodule UniversalProxy.Cec.VolumeTest do
       n = press(fake, n, :volume_down, 19)
       n = press(fake, n, :volume_down, 18)
 
-      assert Task.await(task) == {:ok, %{volume: 18, muted: false}}
+      assert Task.await(task) == {:ok, %{volume: 18, muted: false, step: 1}}
       refute_tx(fake, n)
     end
 
@@ -61,7 +61,7 @@ defmodule UniversalProxy.Cec.VolumeTest do
       task = Task.async(fn -> Cec.set_volume(@dev, 20) end)
       n = status(fake, @first_tx, 20)
 
-      assert Task.await(task) == {:ok, %{volume: 20, muted: false}}
+      assert Task.await(task) == {:ok, %{volume: 20, muted: false, step: 1}}
       refute_tx(fake, n)
     end
 
@@ -72,7 +72,7 @@ defmodule UniversalProxy.Cec.VolumeTest do
       n = press(fake, n, :volume_up, 20)
       _ = press(fake, n, :volume_up, 21)
 
-      assert Task.await(task) == {:ok, %{volume: 21, muted: false}}
+      assert Task.await(task) == {:ok, %{volume: 21, muted: false, step: 1}}
     end
 
     test "stops after two presses in a row make no progress", %{fake: fake} do
@@ -83,17 +83,18 @@ defmodule UniversalProxy.Cec.VolumeTest do
       n = press(fake, n, :volume_up, 21)
       n = press(fake, n, :volume_up, 21)
 
-      assert Task.await(task) == {:error, {:no_progress, %{volume: 21, muted: false}}}
+      assert Task.await(task) == {:error, {:no_progress, %{volume: 21, muted: false, step: 1}}}
       refute_tx(fake, n)
     end
 
-    test "a coarse step that passes the target stops there", %{fake: fake} do
+    test "a coarse step that passes the target stops when going back is no closer",
+         %{fake: fake} do
       task = Task.async(fn -> Cec.set_volume(@dev, 21) end)
 
       n = status(fake, @first_tx, 20)
       n = press(fake, n, :volume_up, 22)
 
-      assert Task.await(task) == {:ok, %{volume: 22, muted: false}}
+      assert Task.await(task) == {:ok, %{volume: 22, muted: false, step: 2}}
       refute_tx(fake, n)
     end
 
@@ -104,7 +105,7 @@ defmodule UniversalProxy.Cec.VolumeTest do
       n = press(fake, n, :volume_up, 21)
       n = press(fake, n, :volume_up, 22)
 
-      assert Task.await(task) == {:error, {:press_limit, %{volume: 22, muted: false}}}
+      assert Task.await(task) == {:error, {:press_limit, %{volume: 22, muted: false, step: 1}}}
       refute_tx(fake, n)
     end
 
@@ -128,6 +129,117 @@ defmodule UniversalProxy.Cec.VolumeTest do
       complete(fake, seq, tx_status: 0x01, rx_status: 0x04)
 
       assert Task.await(task) == {:error, :feature_abort}
+    end
+  end
+
+  describe "set_volume/3 with a step-3 receiver" do
+    test "a known step that can't get closer presses nothing", %{fake: fake} do
+      task = Task.async(fn -> Cec.set_volume(@dev, 25, step: 3) end)
+      n = status(fake, @first_tx, 24)
+
+      assert Task.await(task) == {:ok, %{volume: 24, muted: false, step: 3}}
+      refute_tx(fake, n)
+    end
+
+    test "settles on the nearest reachable value past the target", %{fake: fake} do
+      task = Task.async(fn -> Cec.set_volume(@dev, 26) end)
+
+      n = status(fake, @first_tx, 24)
+      n = press(fake, n, :volume_up, 27)
+
+      assert Task.await(task) == {:ok, %{volume: 27, muted: false, step: 3}}
+      refute_tx(fake, n)
+    end
+
+    test "the step is learned from the first press and plans the rest", %{fake: fake} do
+      task = Task.async(fn -> Cec.set_volume(@dev, 29) end)
+
+      n = status(fake, @first_tx, 21)
+      n = press(fake, n, :volume_up, 24)
+      n = press(fake, n, :volume_up, 27)
+      n = press(fake, n, :volume_up, 30)
+
+      assert Task.await(task) == {:ok, %{volume: 30, muted: false, step: 3}}
+      refute_tx(fake, n)
+    end
+
+    test "an unknown step that overshoots comes back to the nearer side", %{fake: fake} do
+      task = Task.async(fn -> Cec.set_volume(@dev, 25) end)
+
+      n = status(fake, @first_tx, 24)
+      n = press(fake, n, :volume_up, 27)
+      n = press(fake, n, :volume_down, 24)
+
+      assert Task.await(task) == {:ok, %{volume: 24, muted: false, step: 3}}
+      refute_tx(fake, n)
+    end
+
+    test "a step from an earlier run is kept when nothing is pressed", %{fake: fake} do
+      task = Task.async(fn -> Cec.set_volume(@dev, 24, step: 3) end)
+      n = status(fake, @first_tx, 24)
+
+      assert Task.await(task) == {:ok, %{volume: 24, muted: false, step: 3}}
+      refute_tx(fake, n)
+    end
+
+    test "a press that lands on a rail doesn't teach the step", %{fake: fake} do
+      task = Task.async(fn -> Cec.set_volume(@dev, 100, step: 3) end)
+
+      n = status(fake, @first_tx, 98)
+      n = press(fake, n, :volume_up, 100)
+
+      assert Task.await(task) == {:ok, %{volume: 100, muted: false, step: 3}}
+      refute_tx(fake, n)
+    end
+  end
+
+  describe "set_volume/3 with :max" do
+    test "never presses up past the ceiling", %{fake: fake} do
+      task = Task.async(fn -> Cec.set_volume(@dev, 30, max: 25, step: 3) end)
+      n = status(fake, @first_tx, 24)
+
+      assert Task.await(task) == {:ok, %{volume: 24, muted: false, step: 3}}
+      refute_tx(fake, n)
+    end
+
+    test "an unknown step that overshoots the ceiling steps back under it", %{fake: fake} do
+      task = Task.async(fn -> Cec.set_volume(@dev, 30, max: 25) end)
+
+      n = status(fake, @first_tx, 24)
+      n = press(fake, n, :volume_up, 27)
+      n = press(fake, n, :volume_down, 24)
+
+      assert Task.await(task) == {:ok, %{volume: 24, muted: false, step: 3}}
+      refute_tx(fake, n)
+    end
+
+    test "starting above the ceiling steps down even past the nearest value",
+         %{fake: fake} do
+      task = Task.async(fn -> Cec.set_volume(@dev, 25, max: 25, step: 3) end)
+
+      n = status(fake, @first_tx, 26)
+      n = press(fake, n, :volume_down, 23)
+
+      assert Task.await(task) == {:ok, %{volume: 23, muted: false, step: 3}}
+      refute_tx(fake, n)
+    end
+
+    test "starting above the ceiling with a target below it walks to the target",
+         %{fake: fake} do
+      task = Task.async(fn -> Cec.set_volume(@dev, 20, max: 25) end)
+
+      n = status(fake, @first_tx, 30)
+      n = press(fake, n, :volume_down, 27)
+      n = press(fake, n, :volume_down, 24)
+      n = press(fake, n, :volume_down, 21)
+
+      assert Task.await(task) == {:ok, %{volume: 21, muted: false, step: 3}}
+      refute_tx(fake, n)
+    end
+
+    test "rejects a bad :max or :step" do
+      assert_raise ArgumentError, fn -> Cec.set_volume(@dev, 20, max: 101) end
+      assert_raise ArgumentError, fn -> Cec.set_volume(@dev, 20, step: 0) end
     end
   end
 
