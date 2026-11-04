@@ -330,11 +330,11 @@ defmodule Circuits.CEC.Adapter do
   Configured: `<Image View On>` to the TV, then `<Active Source>`. Without
   a physical address (a sink that dropped hotplug in standby), only
   `<Image View On>` from Unregistered to the TV is possible, so the
-  adapter sends that, waits up to `:wait_ms` (default 10 s) to be
-  configured and then sends `<Active Source>`. With `:system_audio_mode`
-  (default: the adapter's option) it then sends `<System Audio Mode
-  Request>` to the receiver. If hotplug drops while `<Image View On>` is
-  out, it waits for the address again the same way.
+  adapter sends that, waits to be configured and then sends `<Active
+  Source>`. With `:system_audio_mode` (default: the adapter's option) it
+  then sends `<System Audio Mode Request>` to the receiver. If hotplug
+  drops while `<Image View On>` is out, it waits for the address again.
+  `:wait_ms` (default 10 s) bounds all of the run's waiting together.
 
   Returns `:ok` once `<Active Source>` went out, or the error that stopped
   it (`:not_configured` if the wait ran out). Concurrent calls share one
@@ -628,8 +628,8 @@ defmodule Circuits.CEC.Adapter do
 
   defp on_reply(:claim_set, {:ok, body}, state) do
     las = Struct.decode_log_addrs(body)
-    state = %{state | claim: :claimed, ready?: true}
-    {:ok, set_addresses(state, state.phys_addr, las.log_addr_mask)}
+    state = %{state | log_addr_mask: las.log_addr_mask}
+    {:ok, set_claim(state, :claimed)}
   end
 
   defp on_reply(step, {:error, errno}, state) when step in [:claim_clear, :claim_set] do
@@ -657,7 +657,7 @@ defmodule Circuits.CEC.Adapter do
     cond do
       our_claim?(state, las) ->
         Logger.debug("CEC #{state.device}: keeping the existing playback claim")
-        %{state | claim: :kept, ready?: true}
+        set_claim(state, :kept)
 
       las.num_log_addrs == 0 ->
         send_internal(state, {:s_log, claim_struct(state)}, :claim_set)
@@ -722,27 +722,34 @@ defmodule Circuits.CEC.Adapter do
   # Losing the configuration, or a new physical address, starts a new
   # generation: results of transmits from an earlier one still answer
   # their callers but no longer change what the adapter believes.
-  defp set_addresses(state, pa, mask) do
-    was = configured?(state)
+  #
+  # Being configured also needs the claim checked (kept or replaced): a
+  # mask seen before that may belong to a configuration we are about to
+  # clear.
+  defp set_addresses(state, pa, mask),
+    do: transition(state, %{state | phys_addr: pa, log_addr_mask: mask})
 
-    state =
-      if (was and not configured?(%{state | phys_addr: pa, log_addr_mask: mask})) or
-           pa != state.phys_addr,
-         do: %{state | generation: state.generation + 1},
-         else: state
+  defp set_claim(state, claim), do: transition(state, %{state | claim: claim, ready?: true})
 
-    state = %{state | phys_addr: pa, log_addr_mask: mask}
-    now = configured?(state)
+  defp transition(old, new) do
+    was = configured?(old)
+    now = configured?(new)
 
-    state =
+    # We only ever announced the old address, so we aren't the active
+    # source at a new one.
+    new =
+      if (was and not now) or new.phys_addr != old.phys_addr,
+        do: %{new | generation: new.generation + 1, active_source?: false},
+        else: new
+
+    new =
       cond do
-        now and not was -> on_configured(state)
-        was and not now -> %{state | receiver: :unknown}
-        true -> state
+        now and not was -> on_configured(new)
+        was and not now -> %{new | receiver: :unknown}
+        true -> new
       end
 
-    state = if Message.valid_pa?(pa), do: state, else: %{state | active_source?: false}
-    emit_state(state)
+    emit_state(new)
   end
 
   defp on_configured(state) do
@@ -751,7 +758,10 @@ defmodule Circuits.CEC.Adapter do
     |> otp_configured()
   end
 
-  defp configured?(state), do: Message.valid_pa?(state.phys_addr) and state.log_addr_mask != 0
+  defp configured?(state) do
+    Message.valid_pa?(state.phys_addr) and state.log_addr_mask != 0 and
+      state.claim in [:kept, :claimed]
+  end
 
   defp log_addrs(mask), do: for(la <- 0..15, (mask >>> la &&& 1) == 1, do: la)
 
@@ -1109,9 +1119,11 @@ defmodule Circuits.CEC.Adapter do
   end
 
   # Fails every waiting caller, e.g. when the device goes away.
+  # One Touch Play first: its continuations would otherwise finish it with
+  # whatever they make of the failed transmit.
   defp fail_all(state, reason) do
-    state = Enum.reduce(Map.keys(state.txs), state, &complete_tx(&2, &1, {:error, reason}))
-    if state.otp, do: otp_finish(state, {:error, reason}), else: state
+    state = if state.otp, do: otp_finish(state, {:error, reason}), else: state
+    Enum.reduce(Map.keys(state.txs), state, &complete_tx(&2, &1, {:error, reason}))
   end
 
   ## Received messages
@@ -1173,7 +1185,7 @@ defmodule Circuits.CEC.Adapter do
       stage: nil,
       ivo_sent?: false,
       timer: nil,
-      wait: Keyword.get(opts, :wait_ms, @otp_wait),
+      deadline: now_ms() + Keyword.get(opts, :wait_ms, @otp_wait),
       sam?: Keyword.get(opts, :system_audio_mode, state.system_audio_mode)
     }
 
@@ -1196,8 +1208,9 @@ defmodule Circuits.CEC.Adapter do
     end
   end
 
+  # Every wait in a run shares the run's one deadline.
   defp otp_wait(%{otp: otp} = state) do
-    timer = Process.send_after(self(), {:otp_timeout, otp.id}, otp.wait)
+    timer = Process.send_after(self(), {:otp_timeout, otp.id}, max(otp.deadline - now_ms(), 0))
     %{state | otp: %{otp | stage: :waiting, timer: timer}}
   end
 
@@ -1360,6 +1373,8 @@ defmodule Circuits.CEC.Adapter do
 
   defp caps_info(caps),
     do: %{caps | capabilities: Struct.flags(:caps, caps.capabilities)}
+
+  defp now_ms, do: System.monotonic_time(:millisecond)
 
   defp bump(state, counter),
     do: %{state | counters: Map.update!(state.counters, counter, &(&1 + 1))}

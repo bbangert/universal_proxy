@@ -137,6 +137,81 @@ defmodule Circuits.CEC.AdapterTest do
       assert %{num_log_addrs: 1, osd_name: "Pi"} = Struct.decode_log_addrs(claim)
     end
 
+    test "a mask in the initial state isn't ours until the claim is checked" do
+      responder = fn
+        :g_log -> :noreply
+        _ -> :default
+      end
+
+      foreign =
+        Struct.encode_log_addrs(
+          log_addr: [@la],
+          log_addr_mask: @mask,
+          num_log_addrs: 1,
+          cec_version: 5,
+          osd_name: "Kodi",
+          primary_device_type: [4],
+          log_addr_type: [3]
+        )
+
+      %{fake: fake, adapter: adapter} = start(responder: responder)
+      initial_state(fake, @pa, @mask)
+      {id, :g_log} = wait_until(fn -> List.keyfind(Fake.requests(fake), :g_log, 1) end)
+
+      task = Task.async(fn -> Adapter.one_touch_play(adapter, wait_ms: 1_000) end)
+      refute Task.yield(task, 30)
+      refute Adapter.info(adapter).configured?
+      assert transmits(fake) == []
+
+      # The foreign claim is replaced; ours is configured by the next event.
+      :ok = Fake.reply(fake, id, {:ok, foreign})
+      wait_until(fn -> Adapter.info(adapter).claim == :claimed end)
+      refute Adapter.info(adapter).configured?
+      assert transmits(fake) == []
+
+      state_change(fake, @pa, @mask)
+
+      {seq, %Message{from: @la, body: :image_view_on}} =
+        wait_until(fn -> find_tx(fake, &match?(%Message{body: :image_view_on}, &1)) end)
+
+      complete(fake, seq, tx_status: 0x01)
+
+      {seq, _as} =
+        wait_until(fn -> find_tx(fake, &match?(%Message{body: {:active_source, _}}, &1)) end)
+
+      complete(fake, seq, tx_status: 0x01)
+      assert Task.await(task) == :ok
+    end
+
+    test "a kept claim is configured as soon as it is checked" do
+      ours =
+        Struct.encode_log_addrs(
+          log_addr: [@la],
+          log_addr_mask: @mask,
+          num_log_addrs: 1,
+          cec_version: 5,
+          vendor_id: 0xFFFFFFFF,
+          osd_name: "Pi",
+          primary_device_type: [4],
+          log_addr_type: [3],
+          flags: 1
+        )
+
+      responder = fn
+        :g_log -> :noreply
+        _ -> :default
+      end
+
+      %{fake: fake, adapter: adapter} = start(osd_name: "Pi", responder: responder)
+      initial_state(fake, @pa, @mask)
+      {id, :g_log} = wait_until(fn -> List.keyfind(Fake.requests(fake), :g_log, 1) end)
+      refute Adapter.info(adapter).configured?
+
+      :ok = Fake.reply(fake, id, {:ok, ours})
+      assert {_seq, %Message{from: @la, to: 5, body: :poll}} = nth_tx(fake, 1)
+      assert %{claim: :kept, configured?: true} = Adapter.info(adapter)
+    end
+
     test "a claim with other flags counts as a different claim" do
       for {flags, kept?} <- [{0, false}, {0x03, false}, {0x01, true}, {0x09, true}] do
         claim =
@@ -954,6 +1029,29 @@ defmodule Circuits.CEC.AdapterTest do
       assert Task.await(task) == :ok
     end
 
+    test "the wait is one budget for the whole run" do
+      %{fake: fake, adapter: adapter} = start()
+      wait_until(fn -> Adapter.info(adapter).ready? end)
+      initial_state(fake, @pa, 0)
+
+      started = System.monotonic_time(:millisecond)
+      task = Task.async(fn -> Adapter.one_touch_play(adapter, wait_ms: 300) end)
+      Process.sleep(150)
+
+      # Configured late, then unplugged while Image View On is out.
+      state_change(fake, @pa, @mask)
+
+      {seq, _ivo} =
+        wait_until(fn -> find_tx(fake, &match?(%Message{body: :image_view_on}, &1)) end)
+
+      state_change(fake, 0xFFFF, 0)
+      wait_until(fn -> not Adapter.info(adapter).configured? end)
+      complete(fake, seq, tx_status: 0x01)
+
+      assert Task.await(task) == {:error, :not_configured}
+      assert System.monotonic_time(:millisecond) - started < 420
+    end
+
     test "an unplug during Image View On waits for the address to come back" do
       %{fake: fake, adapter: adapter} = configured()
 
@@ -981,6 +1079,20 @@ defmodule Circuits.CEC.AdapterTest do
       assert length(
                Enum.filter(transmits(fake), &match?({_, %Message{body: :image_view_on}, _}, &1))
              ) == 1
+    end
+
+    test "closing during the System Audio Mode Request fails the run" do
+      %{fake: fake, adapter: adapter} = configured(receiver: :present)
+
+      task = Task.async(fn -> Adapter.one_touch_play(adapter, system_audio_mode: true) end)
+      {seq, _ivo} = nth_tx(fake, 2)
+      complete(fake, seq, tx_status: 0x01)
+      {seq, _as} = nth_tx(fake, 3)
+      complete(fake, seq, tx_status: 0x01)
+      {_seq, %Message{body: {:system_audio_mode_request, _}}} = nth_tx(fake, 4)
+
+      :ok = Fake.inject(fake, :gone)
+      assert Task.await(task) == {:error, :closed}
     end
 
     test "System Audio Mode Request is opt-in" do
@@ -1065,6 +1177,21 @@ defmodule Circuits.CEC.AdapterTest do
   ## Results from an earlier configuration
 
   describe "results from before an unplug" do
+    test "a new physical address ends being the active source" do
+      %{fake: fake, adapter: adapter} = configured()
+      active(fake, adapter)
+
+      # Dropped events can hide the unplug: only the new address shows.
+      state_change(fake, 0x2000, @mask)
+      wait_until(fn -> Adapter.info(adapter).phys_addr == 0x2000 end)
+      refute Adapter.info(adapter).active_source?
+
+      receive_msg(fake, <<0x0F, 0x85>>)
+      receive_msg(fake, <<0x04, 0x8F>>)
+      assert {_seq, %Message{body: {:report_power_status, :on}}} = nth_tx(fake, 3)
+      assert length(transmits(fake)) == 3
+    end
+
     test "an Active Source sent before the unplug doesn't make us active again" do
       %{fake: fake, adapter: adapter} = configured()
 
