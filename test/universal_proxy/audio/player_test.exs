@@ -738,6 +738,8 @@ defmodule UniversalProxy.Audio.PlayerTest do
       :ok = Player.set_volume(pid, 60)
       assert_receive {:sendspin_state, @key, %{event: "volume", value: 60} = volume}, 1_000
       refute Map.has_key?(volume, :startup)
+      # Every volume/mute event names the player process it came from.
+      assert volume.player == pid
 
       :ok = Player.set_muted(pid, true)
       assert_receive {:sendspin_state, @key, %{event: "mute", value: true} = mute}, 1_000

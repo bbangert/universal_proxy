@@ -66,7 +66,11 @@ defmodule UniversalProxy.Audio.Player do
   that command's echo: what the player was spawned with, not a change
   from the Sendspin server or the UI. Both are broadcast with
   `startup: true` so subscribers acting on volume changes
-  (`UniversalProxy.Cec.VolumeLink`) can tell them apart.
+  (`UniversalProxy.Cec.VolumeLink`) can tell them apart. Every `volume`
+  and `mute` event also carries `player: pid` (this process), so an echo
+  can be matched to the player a command was sent to
+  (`UniversalProxy.Audio.update_config_forwarded/2`) and told apart from
+  a previous player's.
 
   ## External volume
 
@@ -562,6 +566,8 @@ defmodule UniversalProxy.Audio.Player do
   defp tag_startup(state, event), do: {state, event}
 
   defp tag_startup(state, event, field) do
+    event = Map.put(event, :player, self())
+
     if field in state.startup,
       do: {%{state | startup: List.delete(state.startup, field)}, Map.put(event, :startup, true)},
       else: {state, event}

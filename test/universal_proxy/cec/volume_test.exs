@@ -117,6 +117,14 @@ defmodule UniversalProxy.Cec.VolumeTest do
       assert Task.await(task) == {:error, :unknown_volume}
     end
 
+    test "a first readback that fails is a bare error", %{fake: fake} do
+      task = Task.async(fn -> Cec.set_volume(@dev, 30) end)
+      {seq, %Message{to: 5, body: :give_audio_status}} = nth_tx(fake, @first_tx)
+      complete(fake, seq, tx_status: 0x01, rx_status: 0x04)
+
+      assert Task.await(task) == {:error, :feature_abort}
+    end
+
     test "a failed readback mid-walk is returned", %{fake: fake} do
       task = Task.async(fn -> Cec.set_volume(@dev, 30) end)
 
@@ -128,7 +136,40 @@ defmodule UniversalProxy.Cec.VolumeTest do
       {seq, %Message{body: :give_audio_status}} = nth_tx(fake, n + 2)
       complete(fake, seq, tx_status: 0x01, rx_status: 0x04)
 
-      assert Task.await(task) == {:error, :feature_abort}
+      assert Task.await(task) ==
+               {:error, {:feature_abort, %{volume: 20, muted: false, step: 1}}}
+    end
+
+    test "a failure after some progress returns where the walk got to", %{fake: fake} do
+      task = Task.async(fn -> Cec.set_volume(@dev, 30) end)
+
+      n = status(fake, @first_tx, 20)
+      n = press(fake, n, :volume_up, 21)
+      {seq, %Message{body: {:user_control_pressed, :volume_up}}} = nth_tx(fake, n)
+      ack(fake, seq)
+      {seq, _} = nth_tx(fake, n + 1)
+      ack(fake, seq)
+      {seq, %Message{body: :give_audio_status}} = nth_tx(fake, n + 2)
+      complete(fake, seq, tx_status: 0x01, rx_status: 0x04)
+
+      assert Task.await(task) ==
+               {:error, {:feature_abort, %{volume: 21, muted: false, step: 1}}}
+    end
+
+    test "a readback without a volume mid-walk is unknown_volume with the last result",
+         %{fake: fake} do
+      task = Task.async(fn -> Cec.set_volume(@dev, 30) end)
+
+      n = status(fake, @first_tx, 20)
+      {seq, _} = nth_tx(fake, n)
+      ack(fake, seq)
+      {seq, _} = nth_tx(fake, n + 1)
+      ack(fake, seq)
+      {seq, %Message{body: :give_audio_status}} = nth_tx(fake, n + 2)
+      reply(fake, seq, <<0x54, 0x7A, 0x7F>>)
+
+      assert Task.await(task) ==
+               {:error, {:unknown_volume, %{volume: 20, muted: false, step: 1}}}
     end
   end
 
