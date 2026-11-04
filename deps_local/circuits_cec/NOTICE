@@ -1,0 +1,12 @@
+circuits_cec is open-source software licensed under the Apache License,
+Version 2.0 (LICENSES/Apache-2.0.txt).
+
+Copyright 2026 Ben Bangert.
+
+c_src/linux/cec.h is the Linux kernel's include/uapi/linux/cec.h (v6.18),
+vendored unmodified. It is dual-licensed "(GPL-2.0 WITH Linux-syscall-note)
+OR BSD-3-Clause" and is used here under BSD-3-Clause
+(LICENSES/BSD-3-Clause.txt):
+
+  Copyright 2016 Cisco Systems, Inc. and/or its affiliates. All rights
+  reserved.

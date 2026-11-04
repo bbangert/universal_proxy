@@ -1,0 +1,17 @@
+version = 1
+
+# Files without their own SPDX header. c_src/linux/cec.h carries the
+# kernel's header; see NOTICE.
+[[annotations]]
+path = [
+  "lib/**",
+  "test/**",
+  "mix.exs",
+  "mix.lock",
+  "NOTICE",
+  ".formatter.exs",
+  ".gitignore"
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "2026 Ben Bangert"
+SPDX-License-Identifier = "Apache-2.0"
