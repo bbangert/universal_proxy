@@ -2,6 +2,10 @@ defmodule Circuits.CEC do
   @moduledoc """
   HDMI-CEC on Linux through the kernel CEC API (`/dev/cecN`).
 
+  `Circuits.CEC.Adapter` is the entry point: one process per adapter that
+  claims a Playback logical address, acts as the CEC follower, and
+  transmits with typed results.
+
   The ioctls are run by `cec_port`, a small C helper started as an Erlang
   port, which only moves raw kernel structs. Everything else is Elixir:
 
