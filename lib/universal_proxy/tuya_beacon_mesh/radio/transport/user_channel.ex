@@ -124,9 +124,17 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio.Transport.UserChannel do
     end
   end
 
+  # A controller bluetoothd is still configuring (just added, e.g. at boot
+  # or after a replug or another holder's release) answers MGMT Busy or
+  # refuses the bind for a while: worth retrying before giving the
+  # channel up. A control socket that can't be opened never gets better.
   @impl true
   def fallback?({:resolve, :not_found}), do: false
   def fallback?({:wrong_adapter, _address}), do: false
+  def fallback?({:resolve, {:control_socket, _reason}}), do: true
+  def fallback?({:resolve, _reason}), do: :transient
+  def fallback?({:power_off, _reason}), do: :transient
+  def fallback?({:bind, :ebusy}), do: :transient
   def fallback?(_reason), do: true
 
   # Keeps the channel: the next setup resets the controller on it.

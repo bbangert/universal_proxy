@@ -43,10 +43,13 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
   user channel needs `:adapter_address`). It moves to the next one, for
   the rest of its life, when a setup fails in a way the transport calls
   permanent (`c:UniversalProxy.TuyaBeaconMesh.Radio.Transport.fallback?/1`;
-  for the user channel, anything but the adapter being absent or another
-  adapter under its index): at once while it was never ready, or after
-  `:fallback_failures` (default 5) such failures in a row once it had
-  been. `status/1` shows the transport in use (`:transport`) and the
+  for the user channel, a failure after the bind or a control socket that
+  can't be opened) while it was never ready, or after
+  `:fallback_failures` (default 5) failures in a row that are permanent
+  or transient (for the user channel, the controller busy: MGMT Busy on
+  the power-off, or the bind refused, while `bluetoothd` is still
+  configuring a just-added adapter). The adapter being absent, or another
+  adapter under its index, never moves it and breaks a run. `status/1` shows the transport in use (`:transport`) and the
   failure that caused the move (`:fallback_reason`, `nil` while on the
   first choice).
 
@@ -556,25 +559,29 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio do
     end
   end
 
-  # A failure the transport calls permanent moves to the next transport:
-  # at once before it was ever ready, after a run of them in a row once it
-  # was. Any other failure (the adapter absent) breaks the run.
+  # A failure the transport calls permanent moves to the next transport at
+  # once before it was ever ready; otherwise a run of permanent or
+  # transient ones does. Any other failure (the adapter absent) breaks the
+  # run.
   defp setup_failed(state, reason) do
-    if state.fallbacks != [] and permanent?(state.transport, reason) do
-      failures = state.setup_failures + 1
-      state = %{state | setup_failures: failures}
+    case state.fallbacks != [] and fallback_class(state.transport, reason) do
+      class when class in [true, :transient] ->
+        failures = state.setup_failures + 1
+        state = %{state | setup_failures: failures}
 
-      if not state.was_ready or failures >= state.fallback_failures,
-        do: fall_back(state, reason),
-        else: not_ready(state, reason)
-    else
-      not_ready(%{state | setup_failures: 0}, reason)
+        if (class == true and not state.was_ready) or failures >= state.fallback_failures,
+          do: fall_back(state, reason),
+          else: not_ready(state, reason)
+
+      _other ->
+        not_ready(%{state | setup_failures: 0}, reason)
     end
   end
 
-  defp permanent?(transport, reason) do
-    Code.ensure_loaded?(transport) and function_exported?(transport, :fallback?, 1) and
-      transport.fallback?(reason)
+  defp fallback_class(transport, reason) do
+    if Code.ensure_loaded?(transport) and function_exported?(transport, :fallback?, 1),
+      do: transport.fallback?(reason),
+      else: false
   end
 
   # The next transport starts after the usual first retry delay, which

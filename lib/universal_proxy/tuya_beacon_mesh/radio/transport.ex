@@ -48,8 +48,10 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio.Transport do
 
   `Radio`'s `:transport` may list several transports: the first is used,
   and the Radio moves to the next one (for the rest of its life) when a
-  setup failure that `c:fallback?/1` accepts happens before the transport
-  was ever ready, or `:fallback_failures` times in a row after it was.
+  setup failure that `c:fallback?/1` calls permanent (`true`) happens
+  before the transport was ever ready, or after `:fallback_failures`
+  failures in a row it calls permanent or `:transient` (whether or not it
+  was ever ready).
   The transport left behind gets `c:terminate/2` first.
 
   A transport holds no key material: frames reach it already encrypted
@@ -129,12 +131,14 @@ defmodule UniversalProxy.TuyaBeaconMesh.Radio.Transport do
             }
 
   @doc """
-  Whether a failed `c:setup/2` means this transport can't drive this
-  controller at all (as opposed to a transient failure), so a Radio with
-  a fallback transport should move to it. Optional; `false` when not
+  How a failed `c:setup/2` bears on moving to a fallback transport:
+  `true` — this transport can't drive this controller (move at once if
+  it was never ready); `:transient` — it may be (a busy controller): only
+  a run of them moves; `false` — nothing a fallback would fix (the
+  adapter is absent), and it breaks a run. Optional; `false` when not
   implemented.
   """
-  @callback fallback?(reason()) :: boolean()
+  @callback fallback?(reason()) :: boolean() | :transient
 
   @optional_callbacks fallback?: 1
 end

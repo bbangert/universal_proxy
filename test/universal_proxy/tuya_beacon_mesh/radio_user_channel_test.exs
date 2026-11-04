@@ -498,7 +498,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioUserChannelTest do
     test "the handoff to the next transport shows in the status until it is ready" do
       ctx =
         start_radio([transport: [Transport.UserChannel, StubTransport], retry_ms: 200], %{
-          start: {:error, {:bind, :ebusy}}
+          start: {:error, {:bind, :eperm}}
         })
 
       wait_until(fn -> status!(ctx).transport == :stub end)
@@ -512,7 +512,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioUserChannelTest do
       ctx =
         start_radio(
           [transport: [Transport.UserChannel, StubTransport], stub_fail: true, handoff_ms: 50],
-          %{start: {:error, {:bind, :ebusy}}}
+          %{start: {:error, {:bind, :eperm}}}
         )
 
       wait_until(fn -> status!(ctx).transport == :stub end)
@@ -534,7 +534,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioUserChannelTest do
 
       log =
         capture_log(fn ->
-          ctx = start_radio(opts, %{start: {:error, {:bind, :ebusy}}})
+          ctx = start_radio(opts, %{start: {:error, {:bind, :eperm}}})
           wait_until(fn -> match?(%{transport: :last, ready: true}, status!(ctx)) end)
           assert %{fallback_reason: :stub_down} = status!(ctx)
           stop_supervised!({Radio, 0})
@@ -578,7 +578,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioUserChannelTest do
       log =
         capture_log(fn ->
           ctx =
-            start_radio(opts ++ [fallback_memory_ms: 60_000], %{start: {:error, {:bind, :ebusy}}})
+            start_radio(opts ++ [fallback_memory_ms: 60_000], %{start: {:error, {:bind, :eperm}}})
 
           wait_until(fn -> status!(ctx).transport == :stub end)
           stop_supervised!({Radio, 0})
@@ -586,7 +586,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioUserChannelTest do
 
           ctx = start_radio(opts ++ [fallback_memory_ms: 60_000])
           wait_until(fn -> status!(ctx).ready end)
-          assert %{transport: :stub, fallback_reason: {:bind, :ebusy}} = status!(ctx)
+          assert %{transport: :stub, fallback_reason: {:bind, :eperm}} = status!(ctx)
           stop_supervised!({Radio, 0})
           stop_supervised!(:control)
 
@@ -596,7 +596,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioUserChannelTest do
           assert %{transport: :user_channel} = status!(ctx)
         end)
 
-      assert log =~ "fell back to StubTransport 0 s ago ({:bind, :ebusy}); starting on it"
+      assert log =~ "fell back to StubTransport 0 s ago ({:bind, :eperm}); starting on it"
       # One bind from the first Radio, none from the second, one from the third.
       assert_received {:hci, nil, {:start, ^address, _}}
       assert_received {:hci, nil, {:start, ^address, _}}
@@ -616,14 +616,49 @@ defmodule UniversalProxy.TuyaBeaconMesh.RadioUserChannelTest do
         capture_log(fn ->
           ctx =
             start_radio([transport: [Transport.UserChannel, StubTransport]], %{
-              start: {:error, {:bind, :ebusy}}
+              start: {:error, {:bind, :eperm}}
             })
 
           wait_until(fn -> status!(ctx).ready end)
-          assert %{transport: :stub, fallback_reason: {:bind, :ebusy}} = status!(ctx)
+          assert %{transport: :stub, fallback_reason: {:bind, :eperm}} = status!(ctx)
         end)
 
-      assert log =~ "UserChannel failed ({:bind, :ebusy}); falling back to StubTransport"
+      assert log =~ "UserChannel failed ({:bind, :eperm}); falling back to StubTransport"
+    end
+
+    @tag :capture_log
+    test "a controller bluetoothd is still configuring is retried, not fallen back from" do
+      mac = "02:00:00:00:00:03"
+      on_exit(fn -> :persistent_term.erase({Radio, :fallback, mac}) end)
+      busy = {:error, {:power_off, :busy}}
+
+      ctx =
+        start_radio(
+          [
+            transport: [Transport.UserChannel, StubTransport],
+            adapter_address: mac,
+            fallback_memory_ms: 60_000
+          ],
+          %{start: [busy, busy, busy]}
+        )
+
+      wait_until(fn -> status!(ctx).ready end)
+      assert %{transport: :user_channel, fallback_reason: nil} = status!(ctx)
+      refute_received {:stub, :init}
+      assert :persistent_term.get({Radio, :fallback, mac}, nil) == nil
+    end
+
+    @tag :capture_log
+    test "a controller that stays busy falls back after a run of attempts" do
+      ctx =
+        start_radio([transport: [Transport.UserChannel, StubTransport], fallback_failures: 3], %{
+          start: {:error, {:power_off, :busy}}
+        })
+
+      for _ <- 1..3, do: assert_receive({:hci, nil, {:start, @addr, _}}, 1_000)
+      wait_until(fn -> status!(ctx).ready end)
+      assert %{transport: :stub, fallback_reason: {:power_off, :busy}} = status!(ctx)
+      refute_received {:hci, nil, {:start, _, _}}
     end
 
     @tag :capture_log
