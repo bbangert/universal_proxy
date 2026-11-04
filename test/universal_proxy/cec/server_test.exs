@@ -375,7 +375,7 @@ defmodule UniversalProxy.Cec.ServerTest do
       log =
         capture_log(fn ->
           for delay <- [10, 20, 40, 40] do
-            pid = wait_until(&adapter_pid/0)
+            pid = attached_adapter(fake)
             :ok = Fake.inject(fake, {:exit, 1})
             wait_until(fn -> adapter_pid() != pid end)
             assert {:ok, %{backoff: %{retry_in_ms: ^delay}}} = Server.get_adapter(@dev)
@@ -394,7 +394,7 @@ defmodule UniversalProxy.Cec.ServerTest do
     @tag stable_ms: 100
     test "an adapter that stays up resets the backoff", %{fake: fake} do
       for _ <- 1..2 do
-        pid = wait_until(&adapter_pid/0)
+        pid = attached_adapter(fake)
         :ok = Fake.inject(fake, {:exit, 1})
         wait_until(fn -> adapter_pid() not in [nil, pid] end)
       end
@@ -402,7 +402,7 @@ defmodule UniversalProxy.Cec.ServerTest do
       assert {:ok, %{backoff: %{crashes: 2}}} = Server.get_adapter(@dev)
       wait_until(fn -> match?({:ok, %{backoff: nil}}, Server.get_adapter(@dev)) end)
 
-      pid = adapter_pid()
+      pid = attached_adapter(fake)
       :ok = Fake.inject(fake, {:exit, 1})
       wait_until(fn -> adapter_pid() not in [nil, pid] end)
       assert {:ok, %{backoff: %{crashes: 1, retry_in_ms: 10}}} = Server.get_adapter(@dev)
@@ -410,7 +410,7 @@ defmodule UniversalProxy.Cec.ServerTest do
 
     @tag restart_ms: 60_000
     test "a scan doesn't cut a backoff short", %{fake: fake} do
-      pid = wait_until(&adapter_pid/0)
+      pid = attached_adapter(fake)
       ref = Process.monitor(pid)
       :ok = Fake.inject(fake, {:exit, 1})
       assert_receive {:DOWN, ^ref, :process, ^pid, {:port_exit, 1}}
@@ -421,7 +421,7 @@ defmodule UniversalProxy.Cec.ServerTest do
     end
 
     test "a device that went away is no crash", %{fake: fake} do
-      pid = wait_until(&adapter_pid/0)
+      pid = attached_adapter(fake)
       :ok = Fake.inject(fake, :gone)
       wait_until(fn -> match?({:ok, %{running?: false}}, Server.get_adapter(@dev)) end)
       :ok = Server.rescan()
@@ -578,6 +578,12 @@ defmodule UniversalProxy.Cec.ServerTest do
   defp receiver do
     {:ok, %{receiver: receiver}} = Server.get_adapter(@dev)
     receiver
+  end
+
+  # The adapter registers its name before `init/1` opens the transport, and
+  # the fake drops events until it has an owner. Inject only once it has.
+  defp attached_adapter(fake) do
+    wait_until(fn -> (pid = adapter_pid()) && Fake.owner(fake) == pid && pid end)
   end
 
   defp adapter_pid do
