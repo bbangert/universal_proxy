@@ -86,9 +86,18 @@ defmodule Circuits.CEC.Transport.FakeTest do
     refute Fake.closed?(fake)
     assert :ok = Fake.close(t)
     assert Fake.closed?(fake)
+    assert Fake.send_request(t, :caps) == {:error, :closed}
+    refute_received {Fake, _, _}
 
     stop_supervised!(Fake)
     assert :ok = Fake.close(t)
+  end
+
+  test "a transport from an earlier open is closed", %{fake: fake} do
+    stale = opened(fake)
+    t = opened(fake)
+    assert Fake.send_request(stale, :caps) == {:error, :closed}
+    assert {:ok, _id, _t} = Fake.send_request(t, :caps)
   end
 
   test "other messages are :unknown", %{fake: fake} do

@@ -98,8 +98,11 @@ defmodule Circuits.CEC.Transport.Fake do
 
   def send_request(%__MODULE__{} = t, request) do
     id = t.next_id
-    :ok = GenServer.call(t.server, {:request, t.ref, id, request})
-    {:ok, id, %{t | next_id: if(id == 0xFFFF, do: 1, else: id + 1)}}
+
+    case GenServer.call(t.server, {:request, t.ref, id, request}) do
+      :ok -> {:ok, id, %{t | next_id: if(id == 0xFFFF, do: 1, else: id + 1)}}
+      {:error, :closed} -> {:error, :closed}
+    end
   end
 
   @impl Circuits.CEC.Transport
@@ -154,6 +157,9 @@ defmodule Circuits.CEC.Transport.Fake do
     {:reply, :ok, state}
   end
 
+  def handle_call({:request, _ref, _id, _request}, _from, %{closed?: true} = state),
+    do: {:reply, {:error, :closed}, state}
+
   def handle_call({:request, ref, id, request}, _from, %{ref: ref} = state) do
     state = %{state | requests: [{id, request} | state.requests]}
 
@@ -167,8 +173,9 @@ defmodule Circuits.CEC.Transport.Fake do
     {:reply, :ok, state}
   end
 
-  # A request through a transport from an earlier open/2: drop it.
-  def handle_call({:request, _ref, _id, _request}, _from, state), do: {:reply, :ok, state}
+  # A request through a transport from an earlier open/2.
+  def handle_call({:request, _ref, _id, _request}, _from, state),
+    do: {:reply, {:error, :closed}, state}
 
   def handle_call({:inject, event}, _from, state) do
     deliver(state, event)

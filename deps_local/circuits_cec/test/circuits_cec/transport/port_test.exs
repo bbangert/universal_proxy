@@ -136,6 +136,7 @@ defmodule Circuits.CEC.Transport.PortTest do
       {:os_pid, pid} = Port.info(t.port, :os_pid)
       assert :ok = Transport.close(t)
       assert eventually(fn -> not File.exists?("/proc/#{pid}") end)
+      assert Transport.send_request(t, :caps) == {:error, :closed}
       assert :ok = Transport.close(t)
     end
 
