@@ -771,7 +771,7 @@ defmodule UniversalProxy.Audio.PlayerTest do
     test "rejects a non-boolean" do
       pid = start_player!()
 
-      assert_raise FunctionClauseError, fn -> Player.set_volume_external(pid, 1) end
+      assert_raise FunctionClauseError, fn -> apply(Player, :set_volume_external, [pid, 1]) end
     end
 
     test "a player started with :volume_external starts the binary in that mode" do
