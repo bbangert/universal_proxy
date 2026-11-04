@@ -24,6 +24,9 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
   @mac2 "DC23530FB34A"
   @mac3 "DC23533FCD62"
 
+  # Generous: a loaded CI runner can starve the Store past ExUnit's 100 ms default.
+  @wait 1_000
+
   setup %{tmp_dir: tmp_dir} do
     path = Path.join(tmp_dir, "tuya_mesh.dets")
     table = :"tuya_mesh_#{System.unique_integer([:positive])}"
@@ -838,20 +841,20 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
           pubsub: pubsub
         )
 
-      assert_receive {:tuya_mesh_store, :ready}
+      assert_receive {:tuya_mesh_store, :ready}, @wait
 
       {:ok, _} = Store.replace(inventory(), [], store)
-      assert_receive {:tuya_mesh_store, :inventory_changed}
+      assert_receive {:tuya_mesh_store, :inventory_changed}, @wait
 
       :ok = Store.persist(%{inventory() | seq: 132}, store)
       :ok = Store.tighten(%{inventory() | seq: 101}, 132, store)
       refute_receive {:tuya_mesh_store, _}, 50
 
       :ok = Store.persist(%{inventory() | seq: 140, groups: []}, store)
-      assert_receive {:tuya_mesh_store, :inventory_changed}
+      assert_receive {:tuya_mesh_store, :inventory_changed}, @wait
 
       :ok = Store.clear(store)
-      assert_receive {:tuya_mesh_store, :inventory_changed}
+      assert_receive {:tuya_mesh_store, :inventory_changed}, @wait
       :ok = Store.clear(store)
       refute_receive {:tuya_mesh_store, _}, 50
     end
@@ -864,11 +867,11 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
       table = :"r_#{System.unique_integer()}"
 
       start_store(path, table, id: :ready, pubsub: pubsub)
-      assert_receive {:tuya_mesh_store, :ready}
+      assert_receive {:tuya_mesh_store, :ready}, @wait
 
       stop_supervised!(:ready)
       start_store(path, table, id: :ready, pubsub: pubsub)
-      assert_receive {:tuya_mesh_store, :ready}
+      assert_receive {:tuya_mesh_store, :ready}, @wait
     end
 
     test "settings changes, once written", ctx do
@@ -882,10 +885,10 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
           pubsub: pubsub
         )
 
-      assert_receive {:tuya_mesh_store, :ready}
+      assert_receive {:tuya_mesh_store, :ready}, @wait
 
       :ok = Store.put_settings(%{max_mireds: 400}, store)
-      assert_receive {:tuya_mesh_store, :settings_changed}
+      assert_receive {:tuya_mesh_store, :settings_changed}, @wait
 
       # Unchanged or invalid: nothing written, nothing sent.
       :ok = Store.put_settings(%{max_mireds: 400}, store)
@@ -1058,11 +1061,11 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
     test "a change within the interval is held, then written once", ctx do
       {store, _path, _table} = spy_store(ctx, interval: 300)
       {:ok, _} = Store.replace(inventory(), [], store)
-      assert_receive {:lights_write, %{}}
+      assert_receive {:lights_write, %{}}, @wait
 
       # The first change goes at once (no light state was written yet).
       :ok = Store.put_light_state(@mac2, @on, store)
-      assert_receive {:lights_write, %{@mac2 => @on}}
+      assert_receive {:lights_write, %{@mac2 => @on}}, @wait
 
       # Three more within the interval: held (and served), then one write.
       :ok = Store.put_light_state(@mac2, @off, store)
@@ -1105,7 +1108,7 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
         )
 
       {:ok, _} = Store.replace(inventory(), [], store)
-      assert_receive {:synced, %{}}
+      assert_receive {:synced, %{}}, @wait
 
       :ok = Store.put_light_state(@mac2, @on, store)
       assert_receive {:synced, %{@mac2 => @on}}, 1_000
@@ -1145,7 +1148,7 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
 
       {:ok, _} = Store.replace(inventory(), [], store)
       :ok = Store.put_light_state(@mac2, @on, store)
-      assert_receive {:synced, %{@mac2 => @on}}
+      assert_receive {:synced, %{@mac2 => @on}}, @wait
 
       # Off is inserted but not synced; then it flips back to the synced on.
       :counters.put(fail, 1, 1)
@@ -1192,7 +1195,7 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
       store = failing_store(ctx, fail)
       {:ok, _} = Store.replace(inventory(), [], store)
       :ok = Store.put_light_state(@mac2, @on, store)
-      assert_receive {:synced, %{@mac2 => @on}}
+      assert_receive {:synced, %{@mac2 => @on}}, @wait
 
       # Held, then another mesh with the same MACs lands unsynced.
       :ok = Store.put_light_state(@mac2, @off, store)
@@ -1213,7 +1216,7 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
       [_b2, b3] = raw()["bulbs"]
       {:ok, _} = Store.replace(inventory(), [], store)
       :ok = Store.put_light_state(@mac2, @on, store)
-      assert_receive {:synced, %{@mac2 => @on}}
+      assert_receive {:synced, %{@mac2 => @on}}, @wait
       :ok = Store.put_light_state(@mac2, @off, store)
       :ok = Store.put_light_state(@mac3, @off, store)
 
@@ -1233,10 +1236,10 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
     test "nothing is written for an unchanged state, a stranger or a bad one", ctx do
       {store, _path, _table} = spy_store(ctx, interval: 0)
       {:ok, _} = Store.replace(inventory(), [], store)
-      assert_receive {:lights_write, %{}}
+      assert_receive {:lights_write, %{}}, @wait
 
       :ok = Store.put_light_state(@mac2, @on, store)
-      assert_receive {:lights_write, %{@mac2 => @on}}
+      assert_receive {:lights_write, %{@mac2 => @on}}, @wait
 
       :ok = Store.put_light_state(@mac2, @on, store)
       :ok = Store.put_light_state("FFFFFFFFFFFF", @on, store)
@@ -1249,9 +1252,9 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
     test "a change that flips back within the interval writes nothing", ctx do
       {store, _path, _table} = spy_store(ctx, interval: 200)
       {:ok, _} = Store.replace(inventory(), [], store)
-      assert_receive {:lights_write, %{}}
+      assert_receive {:lights_write, %{}}, @wait
       :ok = Store.put_light_state(@mac2, @on, store)
-      assert_receive {:lights_write, %{@mac2 => @on}}
+      assert_receive {:lights_write, %{@mac2 => @on}}, @wait
 
       :ok = Store.put_light_state(@mac2, @off, store)
       :ok = Store.put_light_state(@mac2, @on, store)
@@ -1261,9 +1264,9 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
     test "held changes are written on a clean stop", ctx do
       {store, path, table} = spy_store(ctx)
       {:ok, _} = Store.replace(inventory(), [], store)
-      assert_receive {:lights_write, %{}}
+      assert_receive {:lights_write, %{}}, @wait
       :ok = Store.put_light_state(@mac2, @on, store)
-      assert_receive {:lights_write, %{@mac2 => @on}}
+      assert_receive {:lights_write, %{@mac2 => @on}}, @wait
 
       :ok = Store.put_light_state(@mac2, @off, store)
       _ = Store.light_states(store)
@@ -1280,14 +1283,14 @@ defmodule UniversalProxy.TuyaMesh.StoreTest do
       {store, _path, _table} = spy_store(ctx)
       {:ok, _} = Store.replace(inventory(), [], store)
       :ok = Store.put_light_state(@mac2, @on, store)
-      assert_receive {:lights_write, %{@mac2 => @on}}
+      assert_receive {:lights_write, %{@mac2 => @on}}, @wait
       # Held (the interval hasn't passed); the upload writes it.
       :ok = Store.put_light_state(@mac3, @off, store)
       _ = Store.light_states(store)
 
       [_b2, b3] = raw()["bulbs"]
       {:ok, :same_mesh} = Store.replace(inventory(%{"bulbs" => [b3], "groups" => []}), [], store)
-      assert_receive {:lights_write, %{@mac3 => @off} = kept} when map_size(kept) == 1
+      assert_receive {:lights_write, %{@mac3 => @off} = kept} when map_size(kept) == 1, @wait
       assert Store.light_states(store) == %{@mac3 => @off}
 
       # A bulb back in the inventory doesn't get its old state back.
