@@ -15,7 +15,10 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
     start_supervised!({Phoenix.PubSub, name: pubsub})
     test = self()
 
-    adapters = [adapter(Map.get(context, :receiver, %{}))]
+    adapters = [
+      Map.merge(adapter(Map.get(context, :receiver, %{})), Map.get(context, :adapter, %{}))
+    ]
+
     outputs = [output(Map.get(context, :output, %{}))]
     echo? = Map.get(context, :echo, true)
     # The first `update_fails` writes fail, like Audio.update_config/2 with
@@ -242,6 +245,65 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
       reply(assert_cec({:power_status, @dev}), {:ok, :standby})
       reply(assert_cec({:audio_status, @dev}), {:ok, %{volume: 20, muted: false}})
       assert_receive {:external, @key, false}
+      idle(pid)
+
+      # Back on, with the adapter still holding it absent: the probe at its
+      # last address finds it.
+      poll_now(pid)
+      assert_receive {:to, :power_status, 5}
+      reply(assert_cec({:power_status, @dev}), {:ok, :on})
+      reply(assert_cec({:audio_status, @dev}), {:ok, %{volume: 25, muted: false}})
+      assert_receive {:external, @key, true}
+      assert_receive {:update_config, @key, %{volume: 25, muted: false}}
+      assert VolumeLink.links(pid) == %{@dev => @key}
+    end
+
+    test "an absent receiver's output turned off and on again relinks through a probe",
+         %{pid: pid, pubsub: pubsub} do
+      assert_receive {:external, @key, true}
+      adapters(pubsub, [absent(adapter())])
+
+      state(pubsub, %{cec_volume: false})
+      assert_receive {:external, @key, false}
+      state(pubsub, %{cec_volume: true})
+
+      # Probed at once (never probed before), at its last address.
+      assert_receive {:to, :power_status, 5}
+      refute_receive {:external, @key, true}
+      reply(assert_cec({:power_status, @dev}), {:ok, :on})
+      reply(assert_cec({:audio_status, @dev}), {:ok, %{volume: 25, muted: false}})
+      assert_receive {:external, @key, true}
+      assert VolumeLink.links(pid) == %{@dev => @key}
+    end
+
+    @tag adapter: %{receiver_presence: :absent, receiver_target: 0},
+         receiver: %{power: :unknown, volume: nil, updated_at: nil}
+    test "a receiver absent at boot is probed at the configured address and links when it answers",
+         %{pid: pid} do
+      # Absent while the adapter configured: still asked, at 5, not the TV.
+      assert_receive {:to, :power_status, 5}
+      reply(assert_cec({:power_status, @dev}), {:error, :nack})
+      idle(pid)
+      refute_receive {:external, _, _}
+
+      # It comes online later, with no HDMI reconfigure.
+      poll_now(pid)
+      assert_receive {:to, :power_status, 5}
+      reply(assert_cec({:power_status, @dev}), {:ok, :on})
+      assert_receive {:to, :audio_status, 5}
+      reply(assert_cec({:audio_status, @dev}), {:ok, %{volume: 30, muted: false}})
+      assert_receive {:external, @key, true}
+      assert_receive {:update_config, @key, %{volume: 30, muted: false}}
+      assert VolumeLink.links(pid) == %{@dev => @key}
+    end
+
+    @tag adapter: %{receiver_presence: :absent, receiver_target: 0},
+         receiver: %{power: :unknown, volume: nil, updated_at: nil}
+    test "a receiver that answers in standby isn't linked", %{pid: pid} do
+      reply(assert_cec({:power_status, @dev}), {:ok, :standby})
+      idle(pid)
+      refute_receive {:cec, _, {:audio_status, _}}
+      assert VolumeLink.links(pid) == %{}
     end
 
     test "turning the output's cec_volume off unlinks it, on links it again", %{pubsub: pubsub} do
@@ -711,9 +773,9 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
 
     @tag player: nil, echo: false
     test "writes no player received expect no echo", %{pid: pid, pubsub: pubsub} do
-      assert :sys.get_state(pid).links[@dev].echoes == []
+      assert echoes(pid) == []
       knob(pid, 30)
-      assert :sys.get_state(pid).links[@dev].echoes == []
+      assert echoes(pid) == []
 
       # So a later request for 30 is one, not taken for that write's echo.
       player_event(pubsub, @key, :volume, 40)
@@ -727,13 +789,13 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
     test "a new player's startup snapshot drops the old player's expected echoes",
          %{pid: pid, pubsub: pubsub, player: player} do
       knob(pid, 30)
-      assert [_ | _] = :sys.get_state(pid).links[@dev].echoes
+      assert [_ | _] = echoes(pid)
 
       # :p1 died before echoing; :p2 is spawned with the stored 30.
       Agent.update(player, fn _ -> :p2 end)
       startup_event(pubsub, :volume, 30, :p2)
       idle(pid)
-      assert :sys.get_state(pid).links[@dev].echoes == []
+      assert echoes(pid) == []
 
       player_event(pubsub, @key, :volume, 40, :p2)
       reply(assert_cec({:set_volume, @dev, 40}), {:ok, %{volume: 40, muted: false}})
@@ -776,6 +838,26 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
       assert_receive {:update_config, @key, %{volume: 35}}
       idle(pid)
       refute_receive {:cec, _, _}
+    end
+
+    @tag echo: false
+    test "an echo still due when the output relinks is an echo, not a request",
+         %{pid: pid, pubsub: pubsub} do
+      # A knob change written back as 52, then a request the receiver reaches.
+      knob(pid, 52)
+      player_event(pubsub, @key, :volume, 45)
+      reply(assert_cec({:set_volume, @dev, 45}), {:ok, %{volume: 45, muted: false}})
+      idle(pid)
+
+      # Off and on again before the 52's echo arrives.
+      state(pubsub, %{cec_volume: false})
+      assert_receive {:external, @key, false}
+      state(pubsub, %{cec_volume: true})
+      assert_receive {:external, @key, true}
+
+      player_event(pubsub, @key, :volume, 52)
+      _ = :sys.get_state(pid)
+      refute_receive {:cec, _, {:set_volume, _, 52}}
     end
 
     @tag echo: false
@@ -1102,7 +1184,7 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
     @tag echo: false, echo_ttl_ms: 0
     test "expected echoes no player answers don't pile up", %{pid: pid} do
       for volume <- [30, 40, 50], do: knob(pid, volume)
-      assert [%{field: :volume, value: 50}] = :sys.get_state(pid).links[@dev].echoes
+      assert [%{field: :volume, value: 50}] = echoes(pid)
     end
 
     test "a walk that got somewhere before failing reconciles to where it got",
@@ -1194,6 +1276,8 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
   # The adapter holding the receiver absent: `:receiver` commands, and
   # Cec.Server's record, are the TV's.
   defp absent(adapter), do: %{adapter | receiver_presence: :absent, receiver_target: 0}
+
+  defp echoes(pid), do: Map.get(:sys.get_state(pid).echoes, @key, [])
 
   defp output(extra \\ %{}) do
     Map.merge(
