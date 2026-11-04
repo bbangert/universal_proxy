@@ -480,6 +480,41 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
     end
   end
 
+  describe "echoes that will never come" do
+    setup :linked
+
+    @tag output: %{enabled: false}, echo: false
+    test "writes to a disabled output (no player) expect no echo", %{pid: pid, pubsub: pubsub} do
+      assert :sys.get_state(pid).links[@dev].echoes == []
+      knob(pid, 30)
+      assert :sys.get_state(pid).links[@dev].echoes == []
+
+      # So a later request for 30 is one, not taken for that write's echo.
+      player_event(pubsub, @key, :volume, 40)
+      reply(assert_cec({:set_volume, @dev, 40}), {:ok, %{volume: 40, muted: false}})
+      idle(pid)
+      player_event(pubsub, @key, :volume, 30)
+      reply(assert_cec({:set_volume, @dev, 30}), {:ok, %{volume: 30, muted: false}})
+    end
+
+    @tag echo: false
+    test "a new player's startup snapshot drops the old player's expected echoes",
+         %{pid: pid, pubsub: pubsub} do
+      knob(pid, 30)
+      assert [_ | _] = :sys.get_state(pid).links[@dev].echoes
+
+      startup_event(pubsub, :volume, 30)
+      idle(pid)
+      assert :sys.get_state(pid).links[@dev].echoes == []
+
+      player_event(pubsub, @key, :volume, 40)
+      reply(assert_cec({:set_volume, @dev, 40}), {:ok, %{volume: 40, muted: false}})
+      idle(pid)
+      player_event(pubsub, @key, :volume, 30)
+      reply(assert_cec({:set_volume, @dev, 30}), {:ok, %{volume: 30, muted: false}})
+    end
+  end
+
   describe "the player's startup snapshot" do
     setup :linked
 
@@ -790,6 +825,19 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
     test "expected echoes no player answers don't pile up", %{pid: pid} do
       for volume <- [30, 40, 50], do: knob(pid, volume)
       assert [{:volume, 50, _}] = :sys.get_state(pid).links[@dev].echoes
+    end
+
+    test "when a run is the last failure, the receiver's state is written back first",
+         %{pid: pid, pubsub: pubsub} do
+      failed_poll(pid, first: true)
+      failed_poll(pid)
+
+      player_event(pubsub, @key, :volume, 60)
+      reply(assert_cec({:set_volume, @dev, 60}), {:error, :timeout})
+
+      # Software volume resumes at 20, where the receiver was, not at 60.
+      assert_receive {:update_config, @key, %{volume: 20}}
+      assert_receive {:external, @key, false}
     end
 
     @tag fail_unlink: 1

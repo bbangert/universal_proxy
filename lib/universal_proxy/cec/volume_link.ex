@@ -211,14 +211,18 @@ defmodule UniversalProxy.Cec.VolumeLink do
 
   # A freshly spawned player's startup snapshot (`Audio.Player`'s
   # `startup: true`): what it was started with, not a request.
+  # A new player echoes nothing written to the one before it, so the
+  # snapshot also drops what was expected.
   def handle_info({:sendspin_state, key, %{event: "volume", value: v, startup: true}}, state)
       when is_integer(v) and v in 0..100 do
-    {:noreply, state |> note_output(key, %{volume: v}) |> shows(key, :volume, v)}
+    {:noreply,
+     state |> note_output(key, %{volume: v}) |> forget_echoes(key) |> shows(key, :volume, v)}
   end
 
   def handle_info({:sendspin_state, key, %{event: "mute", value: m, startup: true}}, state)
       when is_boolean(m) do
-    {:noreply, state |> note_output(key, %{muted: m}) |> shows(key, :muted, m)}
+    {:noreply,
+     state |> note_output(key, %{muted: m}) |> forget_echoes(key) |> shows(key, :muted, m)}
   end
 
   def handle_info({:sendspin_state, key, %{event: "volume", value: v}}, state)
@@ -405,6 +409,13 @@ defmodule UniversalProxy.Cec.VolumeLink do
     case link_for_key(state, key) do
       nil -> state
       {dev, link} -> link_intent(state, dev, link, field, value)
+    end
+  end
+
+  defp forget_echoes(state, key) do
+    case link_for_key(state, key) do
+      nil -> state
+      {dev, _link} -> put_in(state.links[dev].echoes, [])
     end
   end
 
@@ -601,7 +612,12 @@ defmodule UniversalProxy.Cec.VolumeLink do
     case safe(fn -> state.funs.update_config.(link.key, diff) end, {:error, :unavailable}) do
       :ok ->
         now = System.monotonic_time(:millisecond)
-        echoes = for {field, value} <- diff, do: {field, value, now + state.echo_ttl_ms}
+
+        # Only a running player echoes a write; a disabled output has none.
+        echoes =
+          if player_running?(state, link.key),
+            do: for({field, value} <- diff, do: {field, value, now + state.echo_ttl_ms}),
+            else: []
 
         # Pruned here too: with no player running, no event ever prunes.
         put_in(state.links[dev], %{
@@ -615,6 +631,9 @@ defmodule UniversalProxy.Cec.VolumeLink do
         state
     end
   end
+
+  defp player_running?(state, key),
+    do: state.outputs |> Map.get(key, %{}) |> Map.get(:enabled, true) == true
 
   defp take_echo(link, field, value) do
     echoes = live_echoes(link.echoes, System.monotonic_time(:millisecond))
@@ -809,6 +828,11 @@ defmodule UniversalProxy.Cec.VolumeLink do
 
     if length(failures) >= state.fail_unlink do
       reason = "receiver stopped answering: #{describe_failures(failures)}"
+
+      # Software volume resumes at what the output shows: make that the
+      # receiver's last known state, not a request it never reached.
+      state = put_in(state.links[dev].pending, %{})
+      state = sync_output(state, dev)
       %{unlink(state, dev, reason) | lost: MapSet.put(state.lost, dev)}
     else
       put_in(state.links[dev].failures, failures)
