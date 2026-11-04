@@ -418,6 +418,25 @@ defmodule UniversalProxy.Audio.ServerTest do
                Store.get_config(store, usb_key)
     end
 
+    test "Pi HDMI card's default friendly_name is the friendly HDMI name",
+         %{server: server, store: store} do
+      EnumerateStub.set(%{
+        @hdmi_key => %{
+          card_index: 1,
+          alsa_device: "plughw:1,0",
+          card_name: "vc4-hdmi",
+          usb_port: nil
+        }
+      })
+
+      :ok = Server.check_now(server)
+
+      assert_receive {:sendspin_output_added, output}
+      assert output.key == @hdmi_key
+      assert output.friendly_name == "HDMI"
+      assert {:ok, %{friendly_name: "HDMI"}} = Store.get_config(store, @hdmi_key)
+    end
+
     test "first sighting of a persisted (renamed) card keeps the user's name", %{store: store} do
       usb_key = {"1-1.3", 0x0BDA, 0x4E27}
       :ok = Store.save_config(store, usb_key, %{friendly_name: "Living Room DAC"})
@@ -615,8 +634,10 @@ defmodule UniversalProxy.Audio.ServerTest do
       assert_receive {:sendspin_output_added, _}
 
       [first, second] = Server.list_outputs(server)
-      assert first.card_name == "bcm2835 Headphones"
-      assert second.card_name == "vc4-hdmi"
+      assert {first.friendly_name, first.card_name} == {"HDMI", "vc4-hdmi"}
+
+      assert {second.friendly_name, second.card_name} ==
+               {"bcm2835 Headphones", "bcm2835 Headphones"}
 
       assert {:ok, hp} = Server.get_output(server, @hp_key)
       assert hp.card_name == "bcm2835 Headphones"
