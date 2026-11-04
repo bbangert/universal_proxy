@@ -17,6 +17,8 @@ defmodule UniversalProxyWeb.CecUiTest do
   import Phoenix.ConnTest
   import UniversalProxy.AudioFixtures
 
+  alias UniversalProxy.Audio.Server, as: AudioServer
+  alias UniversalProxy.Audio.Store, as: AudioStore
   alias UniversalProxy.Cec
   alias UniversalProxyWeb.Components.Audio, as: AudioComponents
 
@@ -58,6 +60,7 @@ defmodule UniversalProxyWeb.CecUiTest do
         configured?: true,
         active_source?: false,
         receiver_presence: :present,
+        receiver_target: 5,
         receiver: %{power: :on, volume: nil, muted: nil, updated_at: nil},
         backoff: nil
       },
@@ -111,8 +114,16 @@ defmodule UniversalProxyWeb.CecUiTest do
         {adapter(%{receiver: receiver(:standby)}), "Receiver standby"},
         {adapter(%{receiver: receiver(:to_standby)}), "Receiver standby"},
         {adapter(%{receiver: receiver(:to_on)}), "Receiver waking"},
-        {adapter(%{receiver_presence: :absent, receiver: receiver(:unknown)}), "TV"},
-        {adapter(%{receiver_presence: :absent, receiver: receiver(:on)}), "TV on"},
+        {adapter(%{receiver_presence: :absent, receiver_target: 0, receiver: receiver(:unknown)}),
+         "TV"},
+        {adapter(%{receiver_presence: :absent, receiver_target: 0, receiver: receiver(:on)}),
+         "TV on"},
+        # receiver_la: nil targets the TV whatever the presence poll says.
+        {adapter(%{
+           receiver_presence: :unknown,
+           receiver_target: 0,
+           receiver: receiver(:standby)
+         }), "TV standby"},
         {adapter(%{configured?: false, receiver: receiver(:unknown)}), "CEC unavailable"},
         {adapter(%{running?: false, configured?: false}), "CEC unavailable"}
       ]
@@ -171,13 +182,12 @@ defmodule UniversalProxyWeb.CecUiTest do
       assert view |> element(toggle) |> render() =~ ~s(aria-checked="false")
     end
 
-    test "clicking the toggle writes the flipped setting", %{conn: conn} do
+    test "a refused toggle write is logged and the page survives", %{conn: conn} do
       view = audio_with_hdmi(conn)
       put_adapters([adapter(%{})])
 
       # Audio.Server has no outputs on host (NullEnumerate), so the write is
-      # refused as not_found; persistence is covered by the Audio.Server
-      # tests. The handler must survive it.
+      # refused as not_found. The successful path is tested below.
       log =
         capture_log(fn ->
           view |> element("#cec-auto-wake-#{encode(@hdmi_key)}") |> render_click()
@@ -186,6 +196,71 @@ defmodule UniversalProxyWeb.CecUiTest do
       assert log =~ "CEC auto-wake toggle failed"
       assert log =~ ":not_found"
       assert render(view) =~ "Auto-wake receiver"
+    end
+  end
+
+  describe "Audio tab with a tracked HDMI output" do
+    defmodule HdmiEnumerate do
+      @moduledoc false
+      # The one output this block's Audio.Server sees.
+      def safe do
+        %{
+          {"vc4-hdmi", nil, nil} => %{
+            card_index: 1,
+            alsa_device: "plughw:1,0",
+            card_name: "vc4-hdmi",
+            usb_port: nil
+          }
+        }
+      end
+    end
+
+    # Swaps the app's Audio.Server (NullEnumerate on host) for one that
+    # tracks an HDMI output, on a throwaway store, so the toggle's write
+    # really lands. The app's Server is restarted afterwards.
+    setup do
+      path =
+        Path.join(System.tmp_dir!(), "cec_ui_test_#{System.unique_integer([:positive])}.dets")
+
+      :ok = Supervisor.terminate_child(UniversalProxy.Audio.Supervisor, AudioServer)
+
+      on_exit(fn ->
+        _ = Supervisor.restart_child(UniversalProxy.Audio.Supervisor, AudioServer)
+        File.rm(path)
+      end)
+
+      store =
+        start_supervised!({AudioStore, name: nil, table: :cec_ui_test_store, dets_path: path})
+
+      start_supervised!(
+        {AudioServer,
+         name: AudioServer,
+         store: store,
+         enumerate_module: HdmiEnumerate,
+         start_timer: false,
+         player_supervisor: nil,
+         mdns_discovery: nil,
+         mdns_module: nil}
+      )
+
+      :ok = AudioServer.check_now()
+      {:ok, store: store}
+    end
+
+    test "successive clicks persist false, then true", %{conn: conn, store: store} do
+      {:ok, view, _html} = live(conn, "/audio")
+      put_adapters([adapter(%{})])
+      toggle = "#cec-auto-wake-#{encode(@hdmi_key)}"
+
+      assert view |> element(toggle) |> render() =~ ~s(aria-checked="true")
+
+      view |> element(toggle) |> render_click()
+      assert {:ok, %{cec_auto_wake: false}} = AudioStore.get_config(store, @hdmi_key)
+      assert view |> element(toggle) |> render() =~ ~s(aria-checked="false")
+
+      view |> element(toggle) |> render_click()
+      assert {:ok, %{cec_auto_wake: true}} = AudioStore.get_config(store, @hdmi_key)
+      assert view |> element(toggle) |> render() =~ ~s(aria-checked="true")
     end
   end
 
@@ -199,7 +274,10 @@ defmodule UniversalProxyWeb.CecUiTest do
       put_adapters([adapter(%{receiver: receiver(:standby)})])
       assert render(view) =~ "Receiver standby"
 
-      put_adapters([adapter(%{receiver_presence: :absent, receiver: receiver(:unknown)})])
+      put_adapters([
+        adapter(%{receiver_presence: :absent, receiver_target: 0, receiver: receiver(:unknown)})
+      ])
+
       html = render(view)
       assert html =~ "the TV is controlled instead"
       refute html =~ "Receiver standby"
@@ -260,7 +338,16 @@ defmodule UniversalProxyWeb.CecUiTest do
 
       assert %{label: "TV standby", variant: :neutral} =
                AudioComponents.cec_status(
-                 adapter(%{receiver_presence: :absent, receiver: receiver(:standby)})
+                 adapter(%{
+                   receiver_presence: :absent,
+                   receiver_target: 0,
+                   receiver: receiver(:standby)
+                 })
+               )
+
+      assert %{label: "TV on", title: "No receiver" <> _} =
+               AudioComponents.cec_status(
+                 adapter(%{receiver_presence: :present, receiver_target: 0})
                )
 
       assert %{label: "Receiver", variant: :neutral} =

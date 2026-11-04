@@ -36,6 +36,7 @@ defmodule UniversalProxy.Cec.ServerTest do
          _ -> :error
        end,
        auto_wake: Map.get(context, :auto_wake, true),
+       receiver_la: Map.get(context, :receiver_la, 5),
        scan_interval_ms: 60_000,
        restart_ms: Map.get(context, :restart_ms, 10),
        restart_max_ms: Map.get(context, :restart_max_ms, 40),
@@ -70,6 +71,25 @@ defmodule UniversalProxy.Cec.ServerTest do
       assert {:ok, %{dev: @dev}} = Server.adapter_for_card(1)
       assert :error = Server.adapter_for_card(0)
       assert {:ok, %{follower: :exclusive, power_status: :on}} = Cec.info(@dev)
+    end
+
+    test "the record names the receiver's address, or the TV's without one", %{fake: fake} do
+      configure(fake, :present)
+      assert {:ok, %{receiver_target: 5}} = Server.get_adapter(@dev)
+    end
+
+    test "with no receiver on the bus the target is the TV", %{fake: fake} do
+      configure(fake, :absent)
+      assert {:ok, %{receiver_target: 0}} = Server.get_adapter(@dev)
+    end
+
+    @tag receiver_la: nil
+    test "with receiver_la: nil the target is the TV before any poll" do
+      wait_until(fn ->
+        match?({:ok, %{running?: true, receiver_presence: :unknown}}, Server.get_adapter(@dev))
+      end)
+
+      assert {:ok, %{receiver_target: 0}} = Server.get_adapter(@dev)
     end
 
     test "re-broadcasts adapter events on the CEC topic", %{fake: fake} do

@@ -26,8 +26,9 @@ defmodule UniversalProxy.Cec.Server do
   ## The receiver
 
   Commands address the receiver (`:receiver_la`, default 5), or the TV
-  (logical address 0) once the adapter has found no device at that address.
-  Power and audio status are recorded only when they come from that device:
+  (logical address 0) once the adapter has found no device at that address
+  or when `:receiver_la` is `nil`; the record's `receiver_target` is the
+  address in use. Power and audio status are recorded only when they come from that device:
   a TV answering a power query reports its own state. A broadcast
   `<Standby>` puts every device in standby; a directed one counts only when
   it comes from the receiver.
@@ -98,6 +99,7 @@ defmodule UniversalProxy.Cec.Server do
           configured?: boolean(),
           active_source?: boolean(),
           receiver_presence: :present | :absent | :unknown,
+          receiver_target: 0..15,
           receiver: receiver(),
           backoff: backoff() | nil
         }
@@ -661,8 +663,12 @@ defmodule UniversalProxy.Cec.Server do
 
   defp sorted_adapters(state), do: state.adapters |> Map.values() |> Enum.sort_by(& &1.index)
 
-  defp put_adapter(state, adapter),
-    do: %{state | adapters: Map.put(state.adapters, adapter.dev, adapter)}
+  # `receiver_target` is derived on every write so the record always
+  # names the device `receiver` describes (0 when it is the TV).
+  defp put_adapter(state, adapter) do
+    adapter = Map.put(adapter, :receiver_target, receiver_target(state, adapter))
+    %{state | adapters: Map.put(state.adapters, adapter.dev, adapter)}
+  end
 
   defp find_by_card(_state, nil), do: :error
 

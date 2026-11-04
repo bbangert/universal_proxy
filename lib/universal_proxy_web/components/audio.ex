@@ -208,10 +208,9 @@ defmodule UniversalProxyWeb.Components.Audio do
 
   def cec_status(%{running?: true, configured?: true} = adapter) do
     {device, title} =
-      case adapter.receiver_presence do
-        :absent -> {"TV", "No receiver on the HDMI-CEC bus; the TV is controlled instead"}
-        _ -> {"Receiver", nil}
-      end
+      if adapter.receiver_target == 0,
+        do: {"TV", "No receiver on the HDMI-CEC bus; the TV is controlled instead"},
+        else: {"Receiver", nil}
 
     case adapter.receiver.power do
       :on ->
