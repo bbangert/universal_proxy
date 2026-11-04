@@ -61,6 +61,7 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
       probe_ms: 60_000,
       settle_ms: 0,
       fail_unlink: Map.get(context, :fail_unlink, 3),
+      echo_ttl_ms: Map.get(context, :echo_ttl_ms, 5_000),
       default: true
     ]
 
@@ -450,6 +451,67 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
     end
   end
 
+  describe "reaching the target" do
+    setup :linked
+
+    test "a press that clips to 0 or 100 isn't skipped as out of reach",
+         %{pid: pid, pubsub: pubsub} do
+      learn_step_3(pid, pubsub)
+
+      knob(pid, 1)
+      player_event(pubsub, @key, :volume, 0)
+      reply(assert_cec({:set_volume, @dev, 0}), {:ok, %{volume: 0, muted: false, step: 3}})
+      idle(pid)
+
+      knob(pid, 99)
+      player_event(pubsub, @key, :volume, 100)
+      reply(assert_cec({:set_volume, @dev, 100}), {:ok, %{volume: 100, muted: false, step: 3}})
+    end
+
+    test "a target between two reachable volumes is reached at the nearer one",
+         %{pid: pid, pubsub: pubsub} do
+      learn_step_3(pid, pubsub)
+
+      # 7 -> 6 (one step down: 4) wouldn't get closer.
+      knob(pid, 7)
+      player_event(pubsub, @key, :volume, 6)
+      assert_receive {:update_config, @key, %{volume: 7}}
+      refute_receive {:cec, _, _}
+    end
+  end
+
+  describe "the player's startup snapshot" do
+    setup :linked
+
+    @tag echo: false
+    test "a delayed binary's --initial-volume doesn't move the receiver", %{pubsub: pubsub} do
+      # The player was spawned (hotplug) before the link adopted 20; its
+      # binary reports the volume it was started with only now.
+      startup_event(pubsub, :volume, 50)
+      assert_receive {:update_config, @key, %{volume: 20}}
+
+      # Then the adoption's echo (and the write-back's).
+      player_event(pubsub, @key, :volume, 20)
+      player_event(pubsub, @key, :volume, 20)
+      refute_receive {:cec, _, _}
+      refute_receive {:update_config, _, _}
+    end
+
+    @tag echo: false
+    test "a startup mute echo doesn't mute the receiver", %{pubsub: pubsub} do
+      startup_event(pubsub, :muted, true)
+      assert_receive {:update_config, @key, %{muted: false}}
+      player_event(pubsub, @key, :muted, false)
+      refute_receive {:cec, _, _}
+    end
+
+    test "a startup snapshot matching the receiver writes nothing", %{pubsub: pubsub} do
+      startup_event(pubsub, :volume, 20)
+      refute_receive {:update_config, _, _}
+      refute_receive {:cec, _, _}
+    end
+  end
+
   describe "receiver to output" do
     setup :linked
 
@@ -697,6 +759,39 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
       assert VolumeLink.links(pid) == %{}
     end
 
+    test "a mute-only run reading back no volume counts as a failure",
+         %{pid: pid, pubsub: pubsub} do
+      failed_poll(pid, first: true)
+
+      player_event(pubsub, @key, :muted, true)
+      reply(assert_cec({:set_muted, @dev, true}), {:ok, %{volume: nil, muted: true}})
+      idle(pid)
+      refute_receive {:external, @key, false}
+
+      player_event(pubsub, @key, :muted, false)
+      reply(assert_cec({:set_muted, @dev, false}), {:ok, %{volume: nil, muted: false}})
+      assert_receive {:external, @key, false}
+    end
+
+    test "a Feature Abort of the audio status counts as a failure", %{pid: pid} do
+      poll_now(pid)
+      reply(assert_cec({:power_status, @dev}), {:ok, :on})
+      reply(assert_cec({:audio_status, @dev}), {:error, :feature_abort})
+      idle(pid)
+
+      failed_poll(pid, error: :feature_abort)
+      refute_receive {:external, @key, false}
+
+      failed_poll(pid, error: :feature_abort)
+      assert_receive {:external, @key, false}
+    end
+
+    @tag echo: false, echo_ttl_ms: 0
+    test "expected echoes no player answers don't pile up", %{pid: pid} do
+      for volume <- [30, 40, 50], do: knob(pid, volume)
+      assert [{:volume, 50, _}] = :sys.get_state(pid).links[@dev].echoes
+    end
+
     @tag fail_unlink: 1
     test "the threshold is configurable", %{pid: pid} do
       failed_poll(pid, first: true)
@@ -772,6 +867,32 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
   end
 
   defp reply(task, result), do: send(task, {:reply, result})
+
+  # A walk that teaches the link a step of 3.
+  defp learn_step_3(pid, pubsub) do
+    player_event(pubsub, @key, :volume, 23)
+    reply(assert_cec({:set_volume, @dev, 23}), {:ok, %{volume: 23, muted: false, step: 3}})
+    idle(pid)
+  end
+
+  # The receiver's knob moves to `volume`, found by a poll.
+  defp knob(pid, volume) do
+    poll_now(pid)
+    state = :sys.get_state(pid)
+
+    if not Map.has_key?(state.power_at, @dev),
+      do: reply(assert_cec({:power_status, @dev}), {:ok, :on})
+
+    reply(assert_cec({:audio_status, @dev}), {:ok, %{volume: volume, muted: false}})
+    assert_receive {:update_config, @key, %{volume: ^volume}}
+    idle(pid)
+  end
+
+  defp startup_event(pubsub, field, value) do
+    event = if field == :muted, do: "mute", else: to_string(field)
+    message = {:sendspin_state, @key, %{event: event, value: value, startup: true}}
+    Phoenix.PubSub.broadcast(pubsub, "sendspin:state", message)
+  end
 
   # Fires the poll timer currently armed for the adapter.
   defp poll_now(pid) do

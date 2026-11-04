@@ -303,11 +303,18 @@ defmodule UniversalProxy.Cec do
     end
   end
 
-  # Above the ceiling only a step down will do; otherwise press only when
-  # one step (clipped to 0..100, as receivers do) lands strictly closer.
-  defp next_key(volume, _step, _target, ceiling) when volume > ceiling, do: :volume_down
+  @doc """
+  The key `set_volume/3` would press next with the receiver at `volume`,
+  a press moving it by `step`, walking to `target` under `ceiling`; `nil`
+  when it would stop there, i.e. `volume` is the nearest reachable one.
+  Above the ceiling only a step down will do; otherwise a key is pressed
+  only when one step (clipped to 0..100, as receivers do) lands strictly
+  closer.
+  """
+  @spec next_key(0..100, pos_integer(), 0..100, 0..100) :: :volume_up | :volume_down | nil
+  def next_key(volume, _step, _target, ceiling) when volume > ceiling, do: :volume_down
 
-  defp next_key(volume, step, target, ceiling) do
+  def next_key(volume, step, target, ceiling) do
     up = min(volume + step, 100)
     down = max(volume - step, 0)
     distance = abs(target - volume)
