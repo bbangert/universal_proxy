@@ -112,7 +112,8 @@ defmodule UniversalProxy.Audio.Server do
 
   @doc """
   Update one or more configuration fields for an output. Accepted keys:
-  `:friendly_name`, `:volume`, `:muted`, `:cec_auto_wake`. Broadcasts a `:sendspin_state`
+  `:friendly_name`, `:volume`, `:muted`, `:cec_auto_wake`, `:cec_volume`,
+  `:cec_volume_max`. Broadcasts a `:sendspin_state`
   message with the merged result. Returns `{:error, :not_found}` if
   the output isn't tracked or `{:error, reason}` if the DETS write
   fails.
@@ -135,6 +136,22 @@ defmodule UniversalProxy.Audio.Server do
   def set_enabled(server \\ __MODULE__, {slot_sub, _vid, _pid} = key, enabled?)
       when is_binary(slot_sub) and is_boolean(enabled?) do
     GenServer.call(server, {:set_enabled, key, enabled?})
+  end
+
+  @doc """
+  Put an output's player in or out of external-volume mode (see
+  `UniversalProxy.Audio.Player.set_volume_external/2`). The flag lives
+  in this server only, never in DETS: it is applied to the running player
+  and to every player spawned for the output while it is set, and dropped
+  when the output goes away or this server restarts. A change is
+  broadcast as `%{volume_external: bool}`. Returns `{:error, :not_found}`
+  if the output isn't tracked.
+  """
+  @spec set_volume_external(GenServer.server(), key(), boolean()) ::
+          :ok | {:error, :not_found}
+  def set_volume_external(server \\ __MODULE__, {slot_sub, _vid, _pid} = key, external?)
+      when is_binary(slot_sub) and is_boolean(external?) do
+    GenServer.call(server, {:set_volume_external, key, external?})
   end
 
   @doc """
@@ -205,6 +222,9 @@ defmodule UniversalProxy.Audio.Server do
       #            last_error: String.t() | nil,
       #            sendspin_client_id: String.t() | nil}}
       connection_state: %{},
+      # Outputs whose players run in external-volume mode
+      # (`set_volume_external/3`). Runtime only.
+      volume_external: MapSet.new(),
       # Debounce flag: a `sound` uevent schedules one delayed
       # `:check_hotplug` and sets this; the burst of sub-device uevents a
       # single card emits then coalesces into that one re-enumeration.
@@ -278,7 +298,7 @@ defmodule UniversalProxy.Audio.Server do
     rows =
       state.outputs
       |> Map.values()
-      |> Enum.map(&merge_connection_state(&1, state.connection_state))
+      |> Enum.map(&present(&1, state))
       |> Enum.sort_by(& &1.friendly_name)
 
     {:reply, rows, state}
@@ -287,7 +307,7 @@ defmodule UniversalProxy.Audio.Server do
   def handle_call({:get_output, key}, _from, state) do
     case Map.fetch(state.outputs, key) do
       {:ok, output} ->
-        {:reply, {:ok, merge_connection_state(output, state.connection_state)}, state}
+        {:reply, {:ok, present(output, state)}, state}
 
       :error ->
         {:reply, :error, state}
@@ -374,6 +394,26 @@ defmodule UniversalProxy.Audio.Server do
     else
       :error -> {:reply, {:error, :not_found}, state}
       {:error, _reason} = err -> {:reply, err, state}
+    end
+  end
+
+  def handle_call({:set_volume_external, key, external?}, _from, state) do
+    cond do
+      not Map.has_key?(state.outputs, key) ->
+        {:reply, {:error, :not_found}, state}
+
+      MapSet.member?(state.volume_external, key) == external? ->
+        {:reply, :ok, state}
+
+      true ->
+        set =
+          if external?,
+            do: MapSet.put(state.volume_external, key),
+            else: MapSet.delete(state.volume_external, key)
+
+        player_call(state, key, &state.player_module.set_volume_external(&1, external?))
+        broadcast_state(key, %{volume_external: external?})
+        {:reply, :ok, %{state | volume_external: set}}
     end
   end
 
@@ -625,7 +665,8 @@ defmodule UniversalProxy.Audio.Server do
     state = %{
       state
       | binary_missing: binary_missing_after,
-        connection_state: connection_state_after
+        connection_state: connection_state_after,
+        volume_external: MapSet.difference(state.volume_external, removed)
     }
 
     # Update state with new outputs map, then sync player processes
@@ -696,7 +737,14 @@ defmodule UniversalProxy.Audio.Server do
 
   defp hardware_fields(output), do: Map.take(output, @hardware_keys)
 
-  @allowed_update_keys [:friendly_name, :volume, :muted, :cec_auto_wake]
+  @allowed_update_keys [
+    :friendly_name,
+    :volume,
+    :muted,
+    :cec_auto_wake,
+    :cec_volume,
+    :cec_volume_max
+  ]
 
   defp sanitize_update(params), do: Params.take(params, @allowed_update_keys)
 
@@ -863,7 +911,8 @@ defmodule UniversalProxy.Audio.Server do
       key: key,
       config: merged,
       mdns_port: mdns_port,
-      server_url: server_url
+      server_url: server_url,
+      volume_external: MapSet.member?(state.volume_external, key)
     ]
 
     case DynamicSupervisor.start_child(
@@ -947,6 +996,19 @@ defmodule UniversalProxy.Audio.Server do
   # double as the presence check — a call that didn't ask to change
   # `:volume` shouldn't re-push the cached value.
   defp forward_to_player(state, key, normalized) do
+    player_call(state, key, fn pid ->
+      if Map.has_key?(normalized, :volume) do
+        state.player_module.set_volume(pid, normalized.volume)
+      end
+
+      if Map.has_key?(normalized, :muted) do
+        state.player_module.set_muted(pid, normalized.muted)
+      end
+    end)
+  end
+
+  # Runs `fun` with the output's player pid, if one is running.
+  defp player_call(state, key, fun) do
     case Map.fetch(state.players, key) do
       {:ok, %{pid: pid}} ->
         # The player can die between `Map.fetch` and the `GenServer.call`
@@ -955,14 +1017,7 @@ defmodule UniversalProxy.Audio.Server do
         # the whole audio subsystem. Swallow the exit; the next
         # hotplug poll will respawn the player.
         try do
-          if Map.has_key?(normalized, :volume) do
-            state.player_module.set_volume(pid, normalized.volume)
-          end
-
-          if Map.has_key?(normalized, :muted) do
-            state.player_module.set_muted(pid, normalized.muted)
-          end
-
+          _ = fun.(pid)
           :ok
         catch
           :exit, reason ->
@@ -1044,9 +1099,13 @@ defmodule UniversalProxy.Audio.Server do
     end
   end
 
-  defp merge_connection_state(output, connection_state) do
-    live = Map.get(connection_state, output.key, @default_live_state)
-    Map.merge(output, live)
+  # The output as callers see it: config plus live player state.
+  defp present(output, state) do
+    live = Map.get(state.connection_state, output.key, @default_live_state)
+
+    output
+    |> Map.merge(live)
+    |> Map.put(:volume_external, MapSet.member?(state.volume_external, output.key))
   end
 
   defp current_server_url(state) do

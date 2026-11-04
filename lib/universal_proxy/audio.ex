@@ -37,14 +37,31 @@ defmodule UniversalProxy.Audio do
 
   @doc """
   Update one or more configuration fields. Accepted keys:
-  `:friendly_name`, `:volume`, `:muted`, `:cec_auto_wake` (a boolean, or
-  `nil` to fall back to the CEC default). Anything else is silently
-  dropped. Returns `{:error, :not_found}` if the output isn't
-  currently present, or `{:error, reason}` if DETS rejects the write.
+  `:friendly_name`, `:volume`, `:muted`, `:cec_auto_wake` and
+  `:cec_volume` (a boolean, or `nil` to fall back to the CEC default),
+  `:cec_volume_max` (1..100, or `nil` for no cap on the volume sent to
+  the receiver). Anything else is silently dropped. Returns `{:error,
+  :not_found}` if the output isn't currently present, or `{:error,
+  reason}` if DETS rejects the write.
   """
   @spec update_config(key(), map()) :: :ok | {:error, :not_found | term()}
   def update_config({_, _, _} = key, params) when is_map(params) do
     Server.update_config(key, params)
+  end
+
+  @doc """
+  Hand an output's volume and mute to an outboard stage (`true`: the
+  player plays at unity gain but keeps tracking and reporting both) or
+  take them back (`false`). Not persisted: kept until the output goes
+  away or the audio subsystem restarts, and applied to players respawned
+  meanwhile. `{:error, :not_found}` if the output isn't present,
+  `{:error, :unavailable}` while the audio subsystem is down.
+  """
+  @spec set_volume_external(key(), boolean()) :: :ok | {:error, :not_found | :unavailable}
+  def set_volume_external({_, _, _} = key, external?) when is_boolean(external?) do
+    Server.set_volume_external(key, external?)
+  catch
+    :exit, _ -> {:error, :unavailable}
   end
 
   @doc """
