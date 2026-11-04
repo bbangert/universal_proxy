@@ -150,6 +150,13 @@ defmodule UniversalProxy.MixProject do
       # announce-on-add API that would let us drop this fork.
       {:mdns_lite, path: "deps_local/mdns_lite", override: true},
 
+      # Native HDMI-CEC over /dev/cecN (C port helper + Elixir codecs), kept
+      # in-repo until it is extracted to its own package. Its helper builds
+      # into _build/<target>_<env>/lib/circuits_cec/priv, per target, so no
+      # host or foreign-arch binary can reach the firmware. Nothing in the
+      # app starts it yet.
+      {:circuits_cec, path: "deps_local/circuits_cec"},
+
       # blue_heron (the vendored raw-HCI fork) has been retired on rpi3 in
       # favour of the kernel BlueZ stack (`UniversalProxy.Bluez`): the two
       # cannot coexist on one chip, and blue_heron crash-loops at boot without

@@ -5,6 +5,8 @@
       files: %{
         included: [
           "lib/",
+          # Our own in-repo library (deps_local/mdns_lite is upstream code).
+          "deps_local/circuits_cec/lib/",
           "src/",
           "web/",
           "apps/*/lib/",

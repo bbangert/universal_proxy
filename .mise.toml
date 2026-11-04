@@ -9,6 +9,11 @@ MIX_TARGET = "rpi3"
 description = "Run tests with MIX_TARGET=host"
 run = "MIX_TARGET=host mix test"
 
+[tasks.test-circuits-cec]
+description = "Run the in-repo circuits_cec library's own tests (CI runs them too)"
+dir = "deps_local/circuits_cec"
+run = "MIX_TARGET=host mix deps.get && MIX_TARGET=host mix test"
+
 [tasks.firmware]
 description = "Build firmware for a target: mise run firmware -- rpi3"
 # Clean ALL per-target player binaries first: a foreign-arch binary left in
