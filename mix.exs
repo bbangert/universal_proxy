@@ -193,9 +193,11 @@ defmodule UniversalProxy.MixProject do
       # Pin nerves_system_br to the version every system here requires
       # exactly: the stock bbb 2.31.1 / mangopi_mq_pro 0.18.1 / qemu_aarch64
       # 0.5.1 and the custom systems at @up_systems_tag v0.1.12 all declare
-      # br 1.35.3 (Buildroot 2026.08.1, OTP 29.1.2). Bump it together with
-      # the systems; mix will refuse to resolve if they disagree.
-      {:nerves_system_br, "1.35.3", runtime: false, override: true}
+      # br 1.35.3 (Buildroot 2026.08.1, OTP 29.1.2). Deliberately not an
+      # override: if a system update ever requires a different br, dependency
+      # resolution fails instead of silently building against this pin. Bump
+      # it together with the systems.
+      {:nerves_system_br, "1.35.3", runtime: false}
     ] ++ up_nerves_systems()
   end
 
