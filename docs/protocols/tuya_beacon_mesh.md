@@ -366,8 +366,8 @@ request.
 | Reset | 2000 | 3000 | 2000 | yes |
 | Ping | 2000 | 3000 | 2000 for 1 device, else 5000 | yes |
 | Pair | 2000 per round | — | 2000 | yes |
-| Group add/remove | 5000 | 5000 (add) | 5000 | yes |
-| Dismiss group | 2000 | — | — | no |
+| Group add/remove | 5000 | 5000 | 5000 | yes, a group list |
+| Dismiss group | 2000 | 3000 | — | no |
 
 A type-0 request (pair, reset, group) cancels queued type-2 requests (DP,
 ping). Normal DP sets are not retried.
@@ -423,6 +423,16 @@ is right for these bulbs.
   bulbs never learn a distinct groupKey, even though the app nominally keys
   group frames with one. A bulb is added to a group with the unicast `A1 gg`
   request (§4.3) and holds at most 8 group IDs.
+- **Group management** (`Lights.create_group/3`, `add_member/3`,
+  `remove_member/3`, `delete_group/2`, `rename_group/3`) sends the unicast
+  `A1 gg` / `A2 gg` requests and counts a change as confirmed only when an
+  A3 group list from that bulb shows it; no list within the confirmation
+  timeout leaves it *unconfirmed*, never assumed done. Group IDs are
+  allocated from 1: the A3 list uses 0 for an empty slot, so a group 0
+  could never be confirmed. Deleting a group sends `A2 gg` to every member
+  (the confirmable source of truth); the broadcast dismiss (`A2 gg` to
+  `FF gg`, beaconKey/beaconKey) is sent only on request and is
+  **untested** on hardware.
 - **Reports** arrive as type 1, subCmd 7, addressed to `8000` or `8001`, and
   are unmasked and decrypted with the beaconKey (§4.6).
 - **Broadcast ping** (`FF FF`, beaconKey as both key and mask, 5000 ms

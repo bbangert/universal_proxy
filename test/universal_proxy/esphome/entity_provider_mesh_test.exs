@@ -9,7 +9,8 @@ defmodule UniversalProxy.ESPHome.EntityProviderMeshTest do
   alias Espex.Proto
   alias UniversalProxy.ESPHome.EntityProvider, as: EP
   alias UniversalProxy.ESPHome.EntityProvider.MeshSync
-  alias UniversalProxy.TuyaMesh.{Entities, Store}
+  alias UniversalProxy.TuyaBeaconMesh.Inventory
+  alias UniversalProxy.TuyaMesh.{Entities, KeyLeak, Store}
 
   @mac1 "DC23530FB34A"
   @mac2 "DC23533FCD62"
@@ -275,6 +276,22 @@ defmodule UniversalProxy.ESPHome.EntityProviderMeshTest do
                       %Proto.BinarySensorStateResponse{key: ^conn, device_id: 1, state: false}}
     end
 
+    test "a change held back by an identity blip is pushed once it is back" do
+      {sources, put} = start_inputs(%{ids: %{}})
+      pid = start_provider(sources)
+      conn = Entities.key_for("tuya_dc23530fb34a_connectivity")
+
+      send(pid, {:tuya_mesh_status, %{bulbs: [%{mac: @mac1, reachable: false, last_seen: nil}]}})
+      _ = :sys.get_state(pid)
+      refute_received {:mesh_push, _}
+
+      put.(:ids, %{{:bulb, @mac1} => 1, {:bulb, @mac2} => 2, {:group, 1} => 3})
+      send(pid, :mesh_check)
+
+      assert_receive {:mesh_push,
+                      %Proto.BinarySensorStateResponse{key: ^conn, device_id: 1, state: false}}
+    end
+
     test "no live push for a bulb whose sub-device changed" do
       {sources, _put} = start_inputs(%{ids: %{{:bulb, @mac1} => 99, {:bulb, @mac2} => 2}})
       pid = start_provider(sources)
@@ -454,6 +471,81 @@ defmodule UniversalProxy.ESPHome.EntityProviderMeshTest do
   end
 
   describe "reconnect on change" do
+    @tag :tmp_dir
+    test "group create, rename and delete written through the Store's persist reach Espex",
+         %{tmp_dir: tmp_dir} do
+      pubsub = :"ep_mesh_store_pubsub_#{System.unique_integer([:positive])}"
+      start_supervised!({Phoenix.PubSub, name: pubsub})
+
+      store =
+        start_supervised!(
+          {Store,
+           name: nil,
+           enabled: true,
+           pubsub: pubsub,
+           table: :"ep_mesh_store_#{System.unique_integer([:positive])}",
+           dets_path: Path.join(tmp_dir, "mesh.dets")},
+          id: :mesh_store
+        )
+
+      inv = Inventory.decode!(KeyLeak.json())
+      {:ok, _} = Store.replace(inv, [], store)
+
+      {sources, _put} = start_inputs()
+
+      sources =
+        Keyword.merge(sources,
+          mesh_inventory: fn -> Store.inventory_summary(store) end,
+          mesh_device_ids: fn -> Store.device_ids(store) end
+        )
+
+      pid = start_provider(sources, subscribe: true, pubsub: pubsub)
+      settle(pid)
+      _ = espex_calls()
+
+      group_light = fn ->
+        pid
+        |> GenServer.call(:list_entities)
+        |> Enum.find(&(&1.object_id == "tuya_group_2_light"))
+      end
+
+      # Create: a new sub-device (a fresh id) and its light, one reconnect.
+      porch = %Inventory.Group{local_id: 2, name: "porch", members: [@mac1]}
+      :ok = Store.persist(%{inv | groups: inv.groups ++ [porch]}, store)
+      settle(pid)
+
+      assert_received {:espex, :update_device_config, _, [devices: devices]}
+      assert %Device{id: 4} = Enum.find(devices, &(&1.name == "porch"))
+      assert_received {:espex, :disconnect_clients, _}
+      assert espex_calls() == []
+      assert %{device_id: 4, name: "Light"} = group_light.()
+
+      # Rename: same sub-device and entity, new name, one reconnect.
+      garden = %{porch | name: "garden"}
+      :ok = Store.persist(%{inv | groups: inv.groups ++ [garden]}, store)
+      settle(pid)
+
+      assert_received {:espex, :update_device_config, _, [devices: devices]}
+      assert %Device{id: 4, name: "garden"} = Enum.find(devices, &(&1.id == 4))
+      assert_received {:espex, :disconnect_clients, _}
+      assert %{device_id: 4, name: "Light"} = group_light.()
+
+      # A member change alone touches neither.
+      :ok =
+        Store.persist(%{inv | groups: inv.groups ++ [%{garden | members: [@mac1, @mac2]}]}, store)
+
+      settle(pid)
+      assert espex_calls() == []
+
+      # Delete: the sub-device and its light go.
+      :ok = Store.persist(inv, store)
+      settle(pid)
+      assert_received {:espex, :update_device_config, _, [devices: devices]}
+      refute Enum.any?(devices, &(&1.id == 4))
+      assert_received {:espex, :disconnect_clients, _}
+      assert group_light.() == nil
+    end
+
     test "an inventory change updates the device config then disconnects, exactly once" do
       {sources, put} = start_inputs()
       pid = start_provider(sources)

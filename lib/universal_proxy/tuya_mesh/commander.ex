@@ -90,6 +90,38 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   check drops the stale commands and kept DPs at once (subscribed at
   start; the per-send check is what guarantees it).
 
+  ## Membership changes
+
+  A group command reaches whoever is in the group when it airs. Its
+  members are resolved when it is admitted, from the membership the
+  Resolver's statuses last reported here; a pending one then follows each
+  later status's change against the one before. Admission and changes
+  come from the one status stream, in order, so no older status can
+  post-date the membership a command was admitted with. A group no
+  status has reported yet is resolved through `:members` instead, and
+  that command keeps those members (a status already queued may be older
+  than that read); a deletion still stops it at its next frame (its
+  sub-device id is gone, see "Mesh identity").
+
+    * **Joined:** a bulb that joined gets no direct frame from a command
+      issued before it joined (no diversion, no follow-up), but a
+      broadcast that airs after the join reaches it: the broadcast counts
+      it as a member (the group never broadcasts over its newer command,
+      see "Superseding"), and takes the broadcast into its kept state as
+      the group's latest command for it.
+    * **Left:** a bulb that left gets nothing more from the command (its
+      planned direct frames are dropped) and no longer takes the group's
+      sends into its kept state; what it already took is still pushed
+      (it and its remaining groups follow on the next flush).
+    * **Deleted:** a group gone from the status has its command dropped,
+      with its kept and pushed state; its members and their other groups
+      follow on the next flush, as for a bulb that left. The same holds
+      when the Store's change (the group's sub-device id gone) drops the
+      command first.
+
+  The group's state is derived again from its current members (see
+  "Light state") and pushed when that changes it.
+
   ## Light state
 
   This process is the only one that pushes light states to Home
@@ -123,9 +155,21 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   pushed last is kept in an ETS table (`light_states/1`), so a new
   connection's initial states match it.
 
+  The bulbs can't be asked for their state, so every known bulb's state
+  DPs (`Commands.state_dps/1`) go to the Store whenever they change, pushed
+  or not (`Store.put_light_state/3`, which throttles its writes). On every
+  (re)subscription and whenever the Store (re)starts, every known bulb is
+  saved again (the Store may have lost held changes), and, then and at
+  start, a bulb with no view yet is seeded from what the Store kept. A seeded view counts as
+  older than anything live: it has no send times and no report cursor,
+  so every DP Lights holds (whatever its report time) and every command
+  replaces it. Its groups are derived from it as usual.
+
   Options: `:name`, `:lights` (module, default `Lights`) and `:lights_opts`
   (extra options to its calls, e.g. `server:`), `:members` (`gid ->
-  {:ok, [mac]} | :error`, default from `UniversalProxy.TuyaMesh.status/1`),
+  {:ok, [mac]} | :error`, read at admission for a group no status has
+  reported yet, default from `UniversalProxy.TuyaMesh.status/1`; see
+  "Membership changes"),
   `:device_ids` (`-> map`, default `Store.device_ids/1`), `:pubsub` and
   `:subscribe` (default `true`) for the Store broadcasts, `:push` (`struct
   -> any`, default `Espex.push_state/2` on `:server`), `:server`,
@@ -135,7 +179,10 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   `:retry_ms`, `:max_retry_ms`, `:stale_ms`, `:followup_gap_ms`,
   `:activity_hold_ms`, `:keepalive_ms` (see "Backlog"), `:max_followups`
   (10), `:settings` (`-> Store.settings`), `:status` (`-> status`, read
-  once at start, default `TuyaMesh.status/1`), `:push_debounce_ms`, and
+  on every (re)subscription, default `TuyaMesh.status/1`),
+  `:push_debounce_ms`, `:resubscribe_ms` (1 s), `:saved_states` (`-> %{mac
+  => dps}`, default `Store.light_states/1`), `:save_state` (`(mac, dps) ->
+  any`, default `Store.put_light_state/3`), and
   `:states_table` (`true`, the named table, by default for the registered
   process; `:unnamed`; or `false`).
   """
@@ -207,9 +254,13 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       settings: Keyword.get(opts, :settings, &Store.settings/0),
       status: Keyword.get(opts, :status, &TuyaMesh.status/0),
       push_debounce_ms: Keyword.get(opts, :push_debounce_ms, 200),
+      resubscribe_ms: Keyword.get(opts, :resubscribe_ms, 1_000),
       states: states_table(opts),
+      saved_states: Keyword.get(opts, :saved_states, &default_saved_states/0),
+      save_state: Keyword.get(opts, :save_state, &default_save_state/2),
+      subscribe?: Keyword.get(opts, :subscribe, true),
+      saved: %{},
       mesh_groups: %{},
-      reported: %{},
       pushed: %{},
       dirty: MapSet.new(),
       flush: nil,
@@ -226,13 +277,14 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       dispatch: nil
     }
 
-    if Keyword.get(opts, :subscribe, true),
-      do: {:ok, state, {:continue, :subscribe}},
-      else: {:ok, state}
+    {:ok, state, {:continue, :start}}
   end
 
   @impl GenServer
-  def handle_continue(:subscribe, state), do: {:noreply, subscribe(state)}
+  def handle_continue(:start, state) do
+    state = state |> seed() |> arm_flush()
+    {:noreply, if(state.subscribe?, do: subscribe(state), else: state)}
+  end
 
   @impl GenServer
   # Identity is checked first: a command for a light that no longer has
@@ -256,7 +308,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   defp admit(state, %{target: target, request: request} = command) do
     state = drop_stale_view(state, target, command.device_id)
     base = base_dps(state, target)
-    current = view_dps(state, target, command.device_id) || base
+    current = known(view_dps(state, target, command.device_id)) || base
 
     case Commands.batches(request, command.settings, current) do
       [] ->
@@ -280,11 +332,22 @@ defmodule UniversalProxy.TuyaMesh.Commander do
     {:noreply, state |> reconcile() |> mark_dirty(targets) |> arm_flush() |> reschedule()}
   end
 
+  # A (re)started Store: it may not have been there to seed from.
+  def handle_info({:tuya_mesh_store, :ready}, state),
+    do: {:noreply, state |> reconcile() |> resave() |> seed() |> arm_flush() |> reschedule()}
+
+  # The Store may have dropped light states (a clear, another mesh): the
+  # next change is saved again, nothing is restored eagerly.
+  def handle_info({:tuya_mesh_store, :inventory_changed}, state),
+    do: {:noreply, %{state | saved: %{}} |> reconcile() |> arm_flush() |> reschedule()}
+
   def handle_info({:tuya_mesh_store, _event}, state),
     do: {:noreply, state |> reconcile() |> arm_flush() |> reschedule()}
 
+  def handle_info(:resubscribe, state), do: {:noreply, state |> subscribe() |> reschedule()}
+
   def handle_info({:tuya_mesh_status, status}, state),
-    do: {:noreply, state |> apply_status(status) |> arm_flush()}
+    do: {:noreply, state |> apply_status(status) |> arm_flush() |> reschedule()}
 
   def handle_info({:flush, token}, %{flush: {token, _tref}} = state),
     do: {:noreply, %{state | flush: nil} |> flush()}
@@ -296,7 +359,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   defp start_job(state, command, base, components, batches) do
     id = state.next_id
     target = command.target
-    members = members(state, target)
+    {members, follows?} = members(state, target)
 
     job = %{
       id: id,
@@ -308,6 +371,12 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       pending: batches,
       sent: [],
       members: members,
+      # The group's current membership, joiners included, which a
+      # broadcast reaches; `members` are the ones direct frames may go to
+      # (no joiners, and a diversion drops the superseded ones).
+      resolved: members,
+      # Members from the status stream: later statuses' changes apply.
+      follows?: follows?,
       snapshot: snapshot(state, target, members),
       sent_at: nil,
       then_check?: false,
@@ -340,7 +409,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   # Never re-broadcast over a member's newer command (its own, or another
   # group's): the rest goes to the other members directly.
   defp run(state, %{phase: :send, target: {:group, _}} = job) do
-    case Enum.filter(job.members, &newer_command?(state, &1, job)) do
+    case Enum.filter(job.resolved, &newer_command?(state, &1, job)) do
       [] -> send_step(state, job)
       superseded -> divert(state, job, job.members -- superseded)
     end
@@ -363,7 +432,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   defp send_step(state, %{pending: [batch | rest]} = job) do
     case send_frame(state, job, job.target, batch) do
       :ok ->
-        state = state |> accepted_frame() |> record(job, batch)
+        state = state |> accepted_frame() |> addressed(job) |> record(job, batch)
         job = %{job | pending: rest, sent: job.sent ++ batch, sent_at: now()}
         if rest == [], do: sent_all(state, job), else: continue(state, job, 0)
 
@@ -430,7 +499,8 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   # A diverted batch a member accepted: kept for that member, and for the
   # group once the diversion is over.
   defp accept(state, %{phase: :direct} = job, mac, batch) do
-    state = update_member_view(state, mac, Commands.expected(batch), job.components)
+    ids = read_ids(state)
+    state = update_member_view(state, mac, Commands.expected(batch), job.components, ids)
     {state, %{job | accepted: Map.update(job.accepted, mac, batch, &(&1 ++ batch))}}
   end
 
@@ -569,6 +639,14 @@ defmodule UniversalProxy.TuyaMesh.Commander do
 
   defp newer_command?(state, mac, job), do: Map.get(state.touched, mac, 0) > job.id
 
+  # A broadcast that aired is the latest command for every current member
+  # it reached (a joiner too), so an older command's follow-up never
+  # overrides it. Never called with a superseded member (see `run/2`).
+  defp addressed(state, %{target: {:group, _}} = job),
+    do: %{state | touched: Map.merge(state.touched, Map.new(job.resolved, &{&1, job.id}))}
+
+  defp addressed(state, _bulb_job), do: state
+
   # The job's next action is due after `delay`; a confirmation pass gets
   # its own staleness bound from when it starts.
   defp continue(state, job, delay) do
@@ -660,7 +738,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
 
   # The next wake-up: the earliest due action (frames not before the
   # capacity hold), the earliest staleness bound, and, with work left, the
-  # Presence keepalive.
+  # Presence keepalive (due `:keepalive_ms` after the last signal).
   defp reschedule(%{jobs: jobs} = state) when map_size(jobs) == 0, do: arm(state, nil)
 
   defp reschedule(state) do
@@ -669,7 +747,11 @@ defmodule UniversalProxy.TuyaMesh.Commander do
     due = for job <- Map.values(state.jobs), do: available_at(state, job)
 
     deadlines = for job <- Map.values(state.jobs), do: job.deadline + 1
-    at = Enum.min([now + state.keepalive_ms | due ++ deadlines])
+
+    # From the last signal, so re-arming (every status does) never
+    # postpones the keepalive past the Presence hold.
+    keepalive = (state.signalled_at || now) + state.keepalive_ms
+    at = Enum.min([keepalive | due ++ deadlines])
     arm(state, max(at - now, 0))
   end
 
@@ -749,6 +831,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
 
     %{done(state, job) | views: Map.delete(state.views, job.target)}
     |> forget_pushed([job.target])
+    |> mark_taken(job.resolved)
   end
 
   # Drops the commands and kept DPs of every light whose id changed.
@@ -784,9 +867,12 @@ defmodule UniversalProxy.TuyaMesh.Commander do
           not Map.has_key?(state.pushed, {:group, gid}),
           do: {:group, gid}
 
+    taken = stale |> Map.values() |> Enum.flat_map(& &1.resolved)
+
     %{state | jobs: jobs, views: views}
     |> forget_pushed(stale_pushed)
     |> mark_dirty(renewed ++ unpushed)
+    |> mark_taken(Enum.uniq(taken))
   end
 
   defp read_ids(state) do
@@ -799,13 +885,34 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   # Once, at start. The subscription links this process to the PubSub
   # registry, so a registry restart restarts it and it subscribes afresh;
   # without PubSub it runs unsubscribed, the per-send check still holding.
+  # Retried every `:resubscribe_ms` while PubSub is down (its lifecycle is
+  # independent of this process). Topics already held are skipped: the
+  # registry is :duplicate and would deliver twice. Whatever was broadcast
+  # meanwhile is lost, so every (re)subscription reads a fresh status. A
+  # subscription links this process to the registry: a registry restart
+  # restarts it, and it subscribes afresh.
   defp subscribe(state) do
-    Phoenix.PubSub.subscribe(state.pubsub, Store.topic())
-    Phoenix.PubSub.subscribe(state.pubsub, TuyaMesh.topic())
-    state |> reconcile() |> apply_status(state.status.()) |> arm_flush()
+    held = Registry.keys(state.pubsub, self())
+
+    added =
+      for topic <- [Store.topic(), TuyaMesh.topic()], topic not in held do
+        :ok = Phoenix.PubSub.subscribe(state.pubsub, topic)
+        topic
+      end
+
+    if added == [],
+      do: state,
+      else:
+        state
+        |> reconcile()
+        |> resave()
+        |> seed()
+        |> apply_status(state.status.())
+        |> arm_flush()
   rescue
     ArgumentError ->
-      Logger.warning("TuyaMesh.Commander: PubSub unavailable; not following Store changes")
+      Logger.debug("TuyaMesh.Commander: PubSub unavailable; retrying")
+      Process.send_after(self(), :resubscribe, state.resubscribe_ms)
       state
   end
 
@@ -813,6 +920,10 @@ defmodule UniversalProxy.TuyaMesh.Commander do
 
   # A kept view belongs to one sub-device: another id's is never used
   # (without Store broadcasts, a replaced mesh's would linger).
+  # A view with no values yet (only send times) knows nothing.
+  defp known(dps) when dps == %{}, do: nil
+  defp known(dps), do: dps
+
   defp view_dps(state, target, device_id) do
     case Map.get(state.views, target) do
       %{device_id: ^device_id, dps: dps} -> dps
@@ -833,25 +944,41 @@ defmodule UniversalProxy.TuyaMesh.Commander do
     sent = Commands.expected(batch)
     state = record_light(state, job, sent)
 
-    job.members
+    ids = if job.resolved == [], do: %{}, else: read_ids(state)
+
+    job.resolved
     |> Enum.reject(&newer_command?(state, &1, job))
-    |> Enum.reduce(state, &update_member_view(&2, &1, sent, job.components))
+    |> Enum.reduce(state, &update_member_view(&2, &1, sent, job.components, ids))
   end
 
   defp record_light(state, job, sent) do
     dps =
-      (view_dps(state, job.target, job.command.device_id) || job.base)
+      (known(view_dps(state, job.target, job.command.device_id)) || job.base)
       |> Map.merge(sent)
       |> Map.merge(Commands.committed(job.components, sent))
       |> Commands.reconcile_components(sent)
 
-    sent_at = sent_times(Map.get(state.views, job.target), job.command.device_id, sent)
-    view = %{device_id: job.command.device_id, dps: dps, sent_at: sent_at}
+    id = job.command.device_id
+
+    view =
+      case Map.get(state.views, job.target) do
+        %{device_id: ^id} = view -> %{view | dps: dps, sent_at: sent_times(view, id, sent)}
+        _none_or_stale -> %{device_id: id, dps: dps, sent_at: sent_times(nil, id, sent)}
+      end
+
     %{state | views: Map.put(state.views, job.target, view)}
   end
 
-  defp update_member_view(state, mac, sent, components) do
-    case Map.fetch(state.views, {:bulb, mac}) do
+  # A member whose state isn't known yet still gets the send times (and
+  # no values), so a report older than the group's send can't win later.
+  defp update_member_view(state, mac, sent, components, ids) do
+    target = {:bulb, mac}
+
+    case Map.fetch(state.views, target) do
+      {:ok, %{dps: dps} = view} when dps == %{} ->
+        view = %{view | sent_at: sent_times(view, view.device_id, sent)}
+        %{state | views: Map.put(state.views, target, view)}
+
       {:ok, view} ->
         dps =
           view.dps
@@ -860,10 +987,17 @@ defmodule UniversalProxy.TuyaMesh.Commander do
           |> Commands.reconcile_components(sent)
 
         view = %{view | dps: dps, sent_at: sent_times(view, view.device_id, sent)}
-        %{state | views: Map.put(state.views, {:bulb, mac}, view)}
+        %{state | views: Map.put(state.views, target, view)}
 
       :error ->
-        state
+        case Map.get(ids, target) do
+          id when is_integer(id) ->
+            view = %{device_id: id, dps: %{}, sent_at: sent_times(nil, id, sent)}
+            %{state | views: Map.put(state.views, target, view)}
+
+          nil ->
+            state
+        end
     end
   end
 
@@ -886,7 +1020,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
           groups_of(state, [mac])
 
         {:group, _gid} ->
-          for(mac <- job.members, do: {:bulb, mac}) ++ groups_of(state, job.members)
+          for(mac <- job.resolved, do: {:bulb, mac}) ++ groups_of(state, job.resolved)
       end
 
     state |> mark_dirty(related -- [job.target]) |> arm_flush()
@@ -898,6 +1032,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   # it was last set here replaces the kept value (see `Commands.reconcile_components/2`).
   defp apply_status(state, %{bulbs: bulbs} = status) when is_list(bulbs) do
     ids = read_ids(state)
+    old_groups = state.mesh_groups
 
     groups =
       Map.new(Map.get(status, :groups, []), fn g -> {g.local_id, Map.get(g, :members, [])} end)
@@ -914,6 +1049,7 @@ defmodule UniversalProxy.TuyaMesh.Commander do
       %{state | mesh_groups: groups, views: Map.drop(state.views, removed)}
       |> forget_pushed(removed)
       |> mark_dirty(changed)
+      |> regroup(old_groups, groups)
 
     {state, macs} =
       Enum.reduce(bulbs, {state, []}, fn bulb, {state, macs} ->
@@ -932,9 +1068,22 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   # Per DP: a DP whose report time (`dp_at`) moved since last seen here is
   # taken unless it was set here after that report. A ping moves no DP's
   # time, so it never brings old values back.
+  #
+  # The cursor (when each DP was last seen, `:reported`) lives in the bulb's
+  # view, so it goes wherever the view goes: a view dropped and built again
+  # (an identity blip, say, then a group send's send times) starts with
+  # none, and the retained DPs are taken again.
   defp real_report(state, %{mac: mac} = bulb, id) when is_integer(id) do
     values = Map.get(bulb, :dps) || %{}
-    seen = Map.get(state.reported, mac, %{})
+    target = {:bulb, mac}
+
+    view =
+      case Map.get(state.views, target) do
+        %{device_id: ^id} = view -> view
+        _none_or_stale -> %{device_id: id, dps: %{}, sent_at: %{}}
+      end
+
+    seen = Map.get(view, :reported, %{})
 
     fresh =
       for {dp, at} <- Map.get(bulb, :dp_at) || %{},
@@ -947,14 +1096,6 @@ defmodule UniversalProxy.TuyaMesh.Commander do
     if fresh == %{} do
       nil
     else
-      target = {:bulb, mac}
-
-      view =
-        case Map.get(state.views, target) do
-          %{device_id: ^id} = view -> view
-          _none_or_stale -> %{device_id: id, dps: %{}, sent_at: %{}}
-        end
-
       real =
         for {dp, at} <- fresh,
             later?(at, Map.fetch(view.sent_at, dp)),
@@ -962,16 +1103,80 @@ defmodule UniversalProxy.TuyaMesh.Commander do
             do: {dp, values[dp]}
 
       dps = view.dps |> Map.merge(real) |> Commands.reconcile_components(real)
-      view = %{view | dps: dps, sent_at: Map.drop(view.sent_at, Map.keys(real))}
-      state = %{state | reported: Map.put(state.reported, mac, Map.merge(seen, fresh))}
 
-      if real == %{},
-        do: {:seen, state},
-        else: %{state | views: Map.put(state.views, target, view)}
+      view =
+        Map.merge(view, %{
+          dps: dps,
+          sent_at: Map.drop(view.sent_at, Map.keys(real)),
+          reported: Map.merge(seen, fresh)
+        })
+
+      state = %{state | views: Map.put(state.views, target, view)}
+      if real == %{}, do: {:seen, state}, else: state
     end
   end
 
   defp real_report(_state, _bulb, _id), do: nil
+
+  # ── Membership changes ───────────────────────────────────────────────
+
+  # Pending group commands follow what changed between the last status
+  # and this one (see "Membership changes"); a group first seen now has
+  # nothing to compare.
+  defp regroup(state, old_groups, groups) do
+    state.jobs
+    |> Map.values()
+    |> Enum.filter(
+      &match?(%{target: {:group, gid}, follows?: true} when is_map_key(old_groups, gid), &1)
+    )
+    |> Enum.reduce(state, fn %{target: {:group, gid}} = job, state ->
+      before = Map.fetch!(old_groups, gid)
+
+      case Map.fetch(groups, gid) do
+        {:ok, ^before} -> state
+        {:ok, members} -> regroup_job(state, job, members -- before, before -- members)
+        :error -> drop_deleted(state, job)
+      end
+    end)
+  end
+
+  defp drop_deleted(state, job) do
+    Logger.info("TuyaMesh.Commander: #{describe(job.target)} was deleted; its command dropped")
+    state |> done(job) |> mark_taken(job.resolved)
+  end
+
+  # Bulbs a job stops tracking (a leave, a deleted or stale group) may
+  # hold sends not pushed yet (pushes come when a pass ends): they and
+  # their groups follow on the next flush.
+  defp mark_taken(state, []), do: state
+
+  defp mark_taken(state, macs) do
+    state
+    |> mark_dirty(for(mac <- macs, do: {:bulb, mac}) ++ groups_of(state, macs))
+    |> arm_flush()
+  end
+
+  defp regroup_job(state, job, joined, left) do
+    joined = joined -- job.resolved
+    left = Enum.filter(left, &(&1 in job.resolved))
+
+    job = %{
+      job
+      | resolved: (job.resolved ++ joined) -- left,
+        members: job.members -- left,
+        snapshot: Map.drop(job.snapshot, left),
+        accepted: Map.drop(job.accepted, left),
+        pending: drop_macs(job, left)
+    }
+
+    mark_taken(%{state | jobs: Map.put(state.jobs, job.target, job)}, left)
+  end
+
+  # Direct frames are `{mac, batch}`; a broadcast's pending batches aren't.
+  defp drop_macs(%{phase: phase, pending: pending}, macs) when phase in [:direct, :followup],
+    do: Enum.reject(pending, fn {mac, _batch} -> mac in macs end)
+
+  defp drop_macs(%{pending: pending}, _macs), do: pending
 
   defp groups_of(state, macs) do
     for {gid, members} <- state.mesh_groups, Enum.any?(macs, &(&1 in members)), do: {:group, gid}
@@ -1012,8 +1217,8 @@ defmodule UniversalProxy.TuyaMesh.Commander do
 
     cond do
       response == nil -> state
-      Map.get(state.pushed, target) == response -> state
-      true -> record_push(state, target, response)
+      Map.get(state.pushed, target) == response -> save(state, target)
+      true -> state |> record_push(target, response) |> save(target)
     end
   end
 
@@ -1021,6 +1226,60 @@ defmodule UniversalProxy.TuyaMesh.Commander do
     state.push.(response)
     if state.states, do: :ets.insert(state.states, {target, response})
     %{state | pushed: Map.put(state.pushed, target, response)}
+  end
+
+  # Bulbs only (a group is derived from its members again), and whenever
+  # its state DPs changed, even where the response didn't (a colour kept
+  # in white mode, say).
+  defp save(state, {:bulb, mac} = target) do
+    with %{dps: dps} <- Map.get(state.views, target),
+         dps = Commands.state_dps(dps),
+         false <- Map.get(state.saved, mac) == dps do
+      state.save_state.(mac, dps)
+      %{state | saved: Map.put(state.saved, mac, dps)}
+    else
+      _unknown_or_saved -> state
+    end
+  end
+
+  defp save(state, _group), do: state
+
+  # A Store that (re)started, or was out of reach, may hold older states
+  # than the views here (held changes lost in a crash): every bulb whose
+  # state is known is saved again; the Store drops what it already has.
+  defp resave(state) do
+    known = for {{:bulb, _mac} = t, %{dps: dps}} <- state.views, is_boolean(dps[1]), do: t
+    Enum.reduce(known, %{state | saved: %{}}, &save(&2, &1))
+  end
+
+  # The states the Store kept, for bulbs with no view yet (see "Light
+  # state"). With no send times and no report cursor (`:reported`), the
+  # seed loses to every report Lights holds and to every command.
+  defp seed(state) do
+    ids = read_ids(state)
+
+    seeded =
+      for {mac, dps} <- saved_states(state),
+          not Map.has_key?(state.views, {:bulb, mac}),
+          id = Map.get(ids, {:bulb, mac}),
+          is_integer(id),
+          into: %{},
+          do: {{:bulb, mac}, %{device_id: id, dps: dps, sent_at: %{}}}
+
+    macs = for {:bulb, mac} <- Map.keys(seeded), do: mac
+
+    %{state | views: Map.merge(state.views, seeded)}
+    |> mark_dirty(Map.keys(seeded) ++ groups_of(state, macs))
+  end
+
+  defp saved_states(state) do
+    case state.saved_states.() do
+      saved when is_map(saved) ->
+        for {mac, dps} <- saved, is_binary(mac), is_map(dps), dps != %{}, do: {mac, dps}
+
+      _unreadable ->
+        []
+    end
   end
 
   defp forget_pushed(state, targets) do
@@ -1089,19 +1348,31 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   # ── Inputs ───────────────────────────────────────────────────────────
 
   # A bulb first commanded starts from the DPs it last reported.
-  defp base_dps(%{views: views} = state, {:bulb, mac} = target)
-       when not is_map_key(views, target) do
-    case state.lights.status(mac, state.lights_opts) do
-      {:ok, %{dps: dps}} when is_map(dps) -> dps
-      _other -> %{}
+  defp base_dps(state, {:bulb, mac} = target) do
+    case Map.get(state.views, target) do
+      %{dps: dps} when dps != %{} ->
+        %{}
+
+      _unknown ->
+        case state.lights.status(mac, state.lights_opts) do
+          {:ok, %{dps: dps}} when is_map(dps) -> dps
+          _other -> %{}
+        end
     end
   end
 
   defp base_dps(_state, _target), do: %{}
 
-  defp members(_state, {:bulb, _mac}), do: []
+  defp members(_state, {:bulb, _mac}), do: {[], false}
 
   defp members(state, {:group, gid}) do
+    case Map.fetch(state.mesh_groups, gid) do
+      {:ok, macs} -> {macs, true}
+      :error -> {read_members(state, gid), false}
+    end
+  end
+
+  defp read_members(state, gid) do
     case state.members.(gid) do
       {:ok, macs} when is_list(macs) -> macs
       _unknown -> []
@@ -1131,6 +1402,10 @@ defmodule UniversalProxy.TuyaMesh.Commander do
   end
 
   defp default_device_ids, do: Store.device_ids()
+
+  defp default_saved_states, do: Store.light_states()
+
+  defp default_save_state(mac, dps), do: Store.put_light_state(mac, dps)
 
   defp describe({:bulb, mac}), do: "bulb #{mac}"
   defp describe({:group, gid}), do: "group #{gid}"

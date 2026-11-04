@@ -49,6 +49,8 @@ defmodule UniversalProxy.TuyaMesh.Commands do
   @max_bytes 16
 
   @dp_ids %{on: 1, mode: 2, brightness: 3, temp: 4, colour: 11}
+  # What `state_response/4` reads.
+  @state_keys [1, 2, 3, 4, 11, :brightness, :color_brightness, :peak]
 
   @type entry ::
           {:on, boolean()}
@@ -448,6 +450,10 @@ defmodule UniversalProxy.TuyaMesh.Commands do
   defp clamp(v, lo, hi), do: v |> max(lo) |> min(hi)
 
   # ── State ────────────────────────────────────────────────────────────
+
+  @doc "The part of `dps` a light state is derived from (`state_response/4`)."
+  @spec state_dps(dps()) :: dps()
+  def state_dps(dps), do: Map.take(dps, @state_keys)
 
   @doc """
   The `LightStateResponse` for a light whose DPs are `dps`, or `nil` while

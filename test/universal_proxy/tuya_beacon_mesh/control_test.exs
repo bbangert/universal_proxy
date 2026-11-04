@@ -176,6 +176,27 @@ defmodule UniversalProxy.TuyaBeaconMesh.ControlTest do
     assert {:error, {:bad_group, "1"}} = Control.group_set("1", @sn, [on: true], @beacon_key)
   end
 
+  test "group membership requests are unicast A1/A2 frames, answered with a group list" do
+    {add, send_ms, 5000, :group_list} = Control.group_add(@node, @sn, 7, @local_key, @beacon_key)
+    assert send_ms == 5000
+    assert <<0x0B, 0x80, 0x01, 0x00, 0x02, _::binary>> = add
+    assert open_frame(add, @local_key, @beacon_key) == {0x01, pad(<<0xA1, 7>>)}
+
+    {remove, _, _, :group_list} =
+      Control.group_remove(@node, @sn, [7, 9], @local_key, @beacon_key)
+
+    assert <<0x0B, 0x80, 0x01, 0x00, 0x02, _::binary>> = remove
+    assert open_frame(remove, @local_key, @beacon_key) == {0x01, pad(<<0xA2, 7, 9>>)}
+  end
+
+  test "group_dismiss goes to FF gg, keyed beaconKey/beaconKey, with no ack" do
+    {frame, send_ms, 0, :none} = Control.group_dismiss(7, @sn, @beacon_key)
+    assert send_ms >= 3_000
+    assert <<0x13, 0x80, 0x01, 0xFF, 0x07, _::binary>> = frame
+    assert open_frame(frame, @beacon_key, @beacon_key) == {0x01, pad(<<0xA2, 7>>)}
+    assert_raise ArgumentError, fn -> Control.group_dismiss(255, @sn, @beacon_key) end
+  end
+
   test "friendly_dps bounds" do
     for bad <- [
           brightness: 9,

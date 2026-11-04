@@ -24,6 +24,106 @@ defmodule UniversalProxyWeb.TuyaMeshComponentTest do
 
   @moduletag :tmp_dir
 
+  defmodule FakeLights do
+    @moduledoc """
+    Stands in for `TuyaBeaconMesh.Lights` under its registered name (the
+    facade's default): answers the group calls from a `group_sync`-shaped
+    view, reports each request to the test as `{:lights_call, request}`,
+    and replies with `reply/2`'s override for a kind of request while one
+    is set. Without one, changes apply to the view with every touched
+    member `:pending`.
+    """
+    use GenServer
+
+    @name UniversalProxy.TuyaBeaconMesh.Lights
+
+    def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: @name)
+
+    def child_spec(opts), do: %{id: __MODULE__, start: {__MODULE__, :start_link, [opts]}}
+
+    @doc "Sets (or, with `nil`, clears) the reply for one kind of request."
+    def reply(kind, reply), do: GenServer.call(@name, {:fake_reply, kind, reply})
+
+    def update(fun), do: GenServer.call(@name, {:fake_update, fun})
+
+    @impl GenServer
+    def init(opts), do: {:ok, %{test: opts[:test], view: opts[:view], replies: %{}}}
+
+    @impl GenServer
+    def handle_call({:fake_reply, kind, reply}, _from, state),
+      do: {:reply, :ok, put_in(state.replies[kind], reply)}
+
+    def handle_call({:fake_update, fun}, _from, state),
+      do: {:reply, :ok, %{state | view: fun.(state.view)}}
+
+    def handle_call(:groups, _from, state) do
+      send(state.test, {:lights_call, :groups})
+      {:reply, state.replies[:groups] || {:ok, state.view}, state}
+    end
+
+    def handle_call(request, _from, state) do
+      send(state.test, {:lights_call, request})
+
+      case state.replies[elem(request, 0)] do
+        nil ->
+          {reply, view} = apply_change(request, state.view)
+          {:reply, reply, %{state | view: view}}
+
+        reply ->
+          {:reply, reply, state}
+      end
+    end
+
+    defp apply_change({:create_group, name, members}, view) do
+      gid = view.groups |> Enum.map(& &1.local_id) |> Enum.max(fn -> 0 end) |> Kernel.+(1)
+
+      group = %{
+        local_id: gid,
+        name: String.trim(name),
+        members: members,
+        holders: members,
+        deleted: false,
+        sync: Map.new(members, &{&1, %{op: :add, state: :pending}})
+      }
+
+      {{:ok, gid}, %{view | groups: view.groups ++ [group]}}
+    end
+
+    defp apply_change({:add_member, gid, mac}, view),
+      do: {:ok, edit(view, gid, &member(&1, mac, :add))}
+
+    defp apply_change({:remove_member, gid, mac}, view),
+      do: {:ok, edit(view, gid, &member(&1, mac, :remove))}
+
+    defp apply_change({:rename_group, gid, name}, view),
+      do: {:ok, edit(view, gid, &%{&1 | name: String.trim(name)})}
+
+    defp apply_change({:delete_group, gid, _opts}, view) do
+      leave = fn g ->
+        sync = Map.new(g.holders, &{&1, %{op: :remove, state: :pending}})
+        %{g | name: nil, members: [], deleted: true, sync: sync}
+      end
+
+      {:ok, edit(view, gid, leave)}
+    end
+
+    defp apply_change(_request, view), do: {{:error, :unknown_request}, view}
+
+    defp edit(view, gid, fun),
+      do: %{view | groups: Enum.map(view.groups, &if(&1.local_id == gid, do: fun.(&1), else: &1))}
+
+    defp member(g, mac, op) do
+      members = if op == :add, do: Enum.uniq(g.members ++ [mac]), else: g.members -- [mac]
+
+      %{
+        g
+        | members: members,
+          holders: Enum.uniq(g.holders ++ [mac]),
+          sync: Map.put(g.sync, mac, %{op: op, state: :pending})
+      }
+    end
+  end
+
   setup %{tmp_dir: tmp_dir} do
     n = System.unique_integer([:positive])
 
@@ -749,6 +849,851 @@ defmodule UniversalProxyWeb.TuyaMeshComponentTest do
       assert html =~ "Inventory cleared."
 
       assert Store.load(ctx.store) == {:error, :no_inventory}
+    end
+  end
+
+  describe "colour temperature" do
+    setup do
+      assign_role()
+      :ok
+    end
+
+    @settings_form "#tuya-mesh-settings"
+
+    defp settings_view(conn) do
+      {:ok, _} = TuyaMesh.upload(KeyLeak.json())
+      mount_tab(conn)
+    end
+
+    defp change_settings(view, params),
+      do: view |> form(@settings_form, settings: params) |> render_change()
+
+    defp save_settings(view, params),
+      do: view |> form(@settings_form, settings: params) |> render_submit()
+
+    test "hidden until an inventory is loaded", %{conn: conn} do
+      view = mount_tab(conn)
+      refute has_element?(view, @settings_form)
+    end
+
+    test "shows the stored range in Kelvin, with nothing to save", %{conn: conn} do
+      view = settings_view(conn)
+
+      assert has_element?(
+               view,
+               "#{@settings_form} input[name='settings[warm_k]'][value='2700']"
+             )
+
+      assert has_element?(
+               view,
+               "#{@settings_form} input[name='settings[cool_k]'][value='6500']"
+             )
+
+      assert has_element?(view, "#{@settings_form} button[role=switch][aria-checked=false]")
+      refute has_element?(view, "#{@settings_form} button[type=submit]")
+      assert render(view) =~ "briefly reconnects Home Assistant"
+    end
+
+    test "a stored non-default range is shown in Kelvin", %{conn: conn, store: store} do
+      :ok = Store.put_settings(%{min_mireds: 200, max_mireds: 333, invert: true}, store)
+      view = settings_view(conn)
+
+      assert has_element?(view, "input[name='settings[warm_k]'][value='3000']")
+      assert has_element?(view, "input[name='settings[cool_k]'][value='5000']")
+      assert has_element?(view, "#{@settings_form} button[role=switch][aria-checked=true]")
+    end
+
+    test "a valid save stores the mireds and offers Save only while different",
+         %{conn: conn, store: store} do
+      view = settings_view(conn)
+
+      change_settings(view, %{warm_k: "3000", cool_k: "5000"})
+      assert has_element?(view, "#{@settings_form} button[type=submit]")
+
+      html = save_settings(view, %{warm_k: "3000", cool_k: "5000"})
+      assert Store.settings(store) == %{min_mireds: 200, max_mireds: 333, invert: false}
+      assert html =~ "Colour temperature saved."
+      assert has_element?(view, "input[name='settings[warm_k]'][value='3000']")
+      refute has_element?(view, "#{@settings_form} button[type=submit]")
+
+      # Back to the stored values: nothing to save again.
+      change_settings(view, %{warm_k: "3000", cool_k: "5100"})
+      assert has_element?(view, "#{@settings_form} button[type=submit]")
+      change_settings(view, %{warm_k: "3000", cool_k: "5000"})
+      refute has_element?(view, "#{@settings_form} button[type=submit]")
+    end
+
+    test "the default range saves back to 370 / 154 mireds", %{conn: conn, store: store} do
+      :ok = Store.put_settings(%{min_mireds: 200, max_mireds: 333}, store)
+      view = settings_view(conn)
+
+      save_settings(view, %{warm_k: "2700", cool_k: "6500"})
+      assert Store.settings(store) == %{min_mireds: 154, max_mireds: 370, invert: false}
+    end
+
+    test "a range the 50 K display rounds is not an edit after saving", %{
+      conn: conn,
+      store: store
+    } do
+      view = settings_view(conn)
+
+      save_settings(view, %{warm_k: "2710", cool_k: "6500"})
+      assert Store.settings(store) == %{min_mireds: 154, max_mireds: 369, invert: false}
+      assert has_element?(view, "input[name='settings[warm_k]'][value='2700']")
+      refute has_element?(view, "#{@settings_form} button[type=submit]")
+
+      # Reloaded, still nothing to save, and an Invert-only save keeps the mireds.
+      view = mount_tab(build_conn())
+      refute has_element?(view, "#{@settings_form} button[type=submit]")
+
+      view |> element("#{@settings_form} button[role=switch]") |> render_click()
+      assert has_element?(view, "#{@settings_form} button[type=submit]")
+      save_settings(view, %{warm_k: "2700", cool_k: "6500"})
+      assert Store.settings(store) == %{min_mireds: 154, max_mireds: 369, invert: true}
+
+      # Typing the displayed value into the other field still converts it.
+      change_settings(view, %{warm_k: "2710", cool_k: "6500"})
+      refute has_element?(view, "#{@settings_form} button[type=submit]")
+      change_settings(view, %{warm_k: "2700", cool_k: "6000"})
+      assert has_element?(view, "#{@settings_form} button[type=submit]")
+    end
+
+    test "two stored endpoints that display alike stay valid and exact",
+         %{conn: conn, store: store} do
+      :ok = Store.put_settings(%{min_mireds: 369, max_mireds: 370}, store)
+      view = settings_view(conn)
+
+      assert has_element?(view, "input[name='settings[warm_k]'][value='2700']")
+      assert has_element?(view, "input[name='settings[cool_k]'][value='2700']")
+      refute render(view) =~ "Must be higher"
+      refute has_element?(view, "#{@settings_form} button[type=submit]")
+
+      view |> element("#{@settings_form} button[role=switch]") |> render_click()
+      refute render(view) =~ "Must be higher"
+      assert has_element?(view, "#{@settings_form} button[type=submit]")
+
+      save_settings(view, %{warm_k: "2700", cool_k: "2700"})
+      assert Store.settings(store) == %{min_mireds: 369, max_mireds: 370, invert: true}
+
+      # Editing one field to the same Kelvin as the other is still an error.
+      html = change_settings(view, %{warm_k: "3000", cool_k: "3000"})
+      assert html =~ "Must be higher than the warm temperature."
+    end
+
+    test "a save sends only what this form changed, keeping another tab's newer values",
+         %{conn: conn, store: store} do
+      {:ok, _} = TuyaMesh.upload(KeyLeak.json())
+      view_a = mount_tab(conn)
+      view_b = mount_tab(build_conn())
+
+      save_settings(view_a, %{warm_k: "3000", cool_k: "5000"})
+      assert Store.settings(store) == %{min_mireds: 200, max_mireds: 333, invert: false}
+
+      # B still holds 2700-6500 and only flips Invert.
+      view_b |> element("#{@settings_form} button[role=switch]") |> render_click()
+      save_settings(view_b, %{warm_k: "2700", cool_k: "6500"})
+      assert Store.settings(store) == %{min_mireds: 200, max_mireds: 333, invert: true}
+
+      # B now shows what is stored.
+      assert has_element?(view_b, "input[name='settings[warm_k]'][value='3000']")
+      assert has_element?(view_b, "input[name='settings[cool_k]'][value='5000']")
+    end
+
+    test "a stale edit that no longer fits the stored range is reported inline",
+         %{conn: conn, store: store} do
+      {:ok, _} = TuyaMesh.upload(KeyLeak.json())
+      view_a = mount_tab(conn)
+      view_b = mount_tab(build_conn())
+
+      # A narrows the range to 4000-4500 K (250 / 222 mireds).
+      save_settings(view_a, %{warm_k: "4000", cool_k: "4500"})
+
+      # B (baseline 2700-6500) changes only the cool end to 3000 K: 333 mireds
+      # is not below the stored warm 250, so the merge is refused.
+      html = save_settings(view_b, %{warm_k: "2700", cool_k: "3000"})
+      assert html =~ "doesn&#39;t fit the colour temperature stored now"
+      assert Store.settings(store) == %{min_mireds: 222, max_mireds: 250, invert: false}
+
+      # B's untouched warm field follows the Store; its edit stays, and is
+      # now flagged against A's range, with nothing to save.
+      assert has_element?(view_b, "input[name='settings[warm_k]'][value='4000']")
+      assert has_element?(view_b, "input[name='settings[cool_k]'][value='3000']")
+      assert render(view_b) =~ "Must be higher than the warm temperature."
+      refute has_element?(view_b, "#{@settings_form} button[type=submit]")
+
+      # Correcting only the cool field sends just that key: A's warm stays.
+      html = change_settings(view_b, %{cool_k: "5000"})
+      refute html =~ "Must be higher"
+      assert has_element?(view_b, "#{@settings_form} button[type=submit]")
+      save_settings(view_b, %{warm_k: "4000", cool_k: "5000"})
+      assert Store.settings(store) == %{min_mireds: 200, max_mireds: 250, invert: false}
+    end
+
+    test "the invert toggle round-trips", %{conn: conn, store: store} do
+      view = settings_view(conn)
+
+      view |> element("#{@settings_form} button[role=switch]") |> render_click()
+      assert has_element?(view, "#{@settings_form} button[role=switch][aria-checked=true]")
+      assert has_element?(view, "#{@settings_form} input[type=hidden][value=true]")
+      assert has_element?(view, "#{@settings_form} button[type=submit]")
+
+      # A text edit keeps the toggled value.
+      change_settings(view, %{warm_k: "2700"})
+      assert has_element?(view, "#{@settings_form} button[role=switch][aria-checked=true]")
+
+      save_settings(view, %{warm_k: "2700", cool_k: "6500"})
+      assert %{invert: true, min_mireds: 154, max_mireds: 370} = Store.settings(store)
+      refute has_element?(view, "#{@settings_form} button[type=submit]")
+
+      # A fresh mount shows it on, and toggling off saves it back.
+      view = mount_tab(build_conn())
+      assert has_element?(view, "#{@settings_form} button[role=switch][aria-checked=true]")
+
+      view |> element("#{@settings_form} button[role=switch]") |> render_click()
+      save_settings(view, %{warm_k: "2700", cool_k: "6500"})
+      assert %{invert: false} = Store.settings(store)
+    end
+
+    test "invalid input shows errors and saves nothing", %{conn: conn, store: store} do
+      view = settings_view(conn)
+      stored = Store.settings(store)
+
+      for {params, message} <- [
+            {%{warm_k: "warm", cool_k: "6500"}, "Enter a whole number of Kelvin."},
+            {%{warm_k: "", cool_k: "6500"}, "Enter a whole number of Kelvin."},
+            {%{warm_k: "2700.5", cool_k: "6500"}, "Enter a whole number of Kelvin."},
+            {%{warm_k: "500", cool_k: "6500"}, "Must be between 1000 and 10000 K."},
+            {%{warm_k: "2700", cool_k: "20000"}, "Must be between 1000 and 10000 K."},
+            {%{warm_k: "5000", cool_k: "5000"}, "Must be higher than the warm temperature."},
+            {%{warm_k: "6500", cool_k: "2700"}, "Must be higher than the warm temperature."},
+            {%{warm_k: "9999", cool_k: "10000"}, "Too close to the warm temperature."}
+          ] do
+        html = change_settings(view, params)
+        assert html =~ message, "#{inspect(params)} should say #{message}"
+        refute has_element?(view, "#{@settings_form} button[type=submit]")
+
+        save_settings(view, params)
+        assert Store.settings(store) == stored
+      end
+
+      change_settings(view, %{warm_k: "2700", cool_k: "6500"})
+      refute render(view) =~ "Enter a whole number"
+    end
+
+    test "a save while the Store is down keeps form and baseline; the retry sends only the edit",
+         %{conn: conn, tmp_dir: tmp_dir, store: store} do
+      :ok = Store.put_settings(%{min_mireds: 200, max_mireds: 333}, store)
+      view = settings_view(conn)
+      change_settings(view, %{warm_k: "3500", cool_k: "5000"})
+      stop_supervised!(Store)
+
+      html = save_settings(view, %{warm_k: "3500", cool_k: "5000"})
+      assert html =~ "The Tuya mesh service isn&#39;t available right now."
+
+      # Not rebased onto the defaults the facade answers with meanwhile.
+      assert has_element?(view, "input[name='settings[warm_k]'][value='3500']")
+      assert has_element?(view, "input[name='settings[cool_k]'][value='5000']")
+      assert has_element?(view, "#{@settings_form} button[type=submit]")
+
+      store =
+        start_supervised!(
+          {Store,
+           enabled: true,
+           table: :"tuya_ui_store_restart_#{System.unique_integer([:positive])}",
+           dets_path: Path.join(tmp_dir, "mesh.dets")}
+        )
+
+      # Another tab moved the cool end meanwhile; the retry only sends warm.
+      :ok = Store.put_settings(%{min_mireds: 180}, store)
+      save_settings(view, %{warm_k: "3500", cool_k: "5000"})
+      assert Store.settings(store) == %{min_mireds: 180, max_mireds: 286, invert: false}
+    end
+  end
+
+  describe "groups" do
+    @mac2 "DC23530FB34A"
+    @mac3 "DC23533FCD62"
+
+    setup do
+      assign_role()
+      {:ok, _} = TuyaMesh.upload(KeyLeak.json())
+      Application.put_env(:universal_proxy, :tuya_group_poll_ms, 30)
+      on_exit(fn -> Application.delete_env(:universal_proxy, :tuya_group_poll_ms) end)
+      :ok
+    end
+
+    defp start_lights(view \\ initial_view()) do
+      start_supervised!({FakeLights, test: self(), view: view})
+    end
+
+    defp initial_view do
+      %{
+        groups: [group(1, "path and post", [@mac2, @mac3])],
+        slots: %{@mac2 => 1, @mac3 => 1}
+      }
+    end
+
+    defp group(gid, name, members, sync \\ %{}) do
+      %{
+        local_id: gid,
+        name: name,
+        members: members,
+        holders: members,
+        deleted: false,
+        sync: sync
+      }
+    end
+
+    # Every call but the reads.
+    defp changes do
+      receive do
+        {:lights_call, :groups} -> changes()
+        {:lights_call, request} -> [request | changes()]
+      after
+        0 -> []
+      end
+    end
+
+    defp click(view, selector), do: view |> element(selector) |> render_click()
+
+    defp open_new_group(view), do: click(view, "button[phx-click=new_group]")
+
+    defp group_form(view, params), do: form(view, "#tuya-group-form", group: params)
+
+    test "without Lights the groups are listed read-only", %{conn: conn} do
+      view = mount_tab(conn)
+      html = render(view)
+      assert html =~ "path and post"
+      assert html =~ "Groups can be edited while the mesh is running."
+      refute has_element?(view, "button[phx-click=new_group]")
+      refute has_element?(view, "button[phx-click=edit_members]")
+      refute html =~ "briefly reconnects Home Assistant."
+    end
+
+    test "Lights stopping turns the editor read-only", %{conn: conn} do
+      start_lights()
+      view = mount_tab(conn)
+      assert has_element?(view, "button[phx-click=new_group]")
+
+      assert render(view) =~
+               "Creating, renaming or deleting a group briefly reconnects Home Assistant."
+
+      stop_supervised!(FakeLights)
+      html = push_status(view, TuyaMesh.status())
+      assert html =~ "Groups can be edited while the mesh is running."
+      assert html =~ "path and post"
+      refute has_element?(view, "button[phx-click=new_group]")
+    end
+
+    test "create sends one call with the name and the ticked bulbs", %{conn: conn} do
+      start_lights()
+      view = mount_tab(conn)
+
+      html = open_new_group(view)
+      assert html =~ "New group"
+      assert has_element?(view, "#tuya-group-form input[name='group[name]']")
+      refute has_element?(view, "button[phx-click=new_group]")
+
+      view |> group_form(%{name: "porch", members: [@mac2]}) |> render_change()
+      _ = changes()
+      html = view |> group_form(%{name: "  porch "}) |> render_submit()
+
+      assert changes() == [{:create_group, "  porch ", [@mac2]}]
+      assert html =~ "Group “porch” created."
+      assert html =~ "Home Assistant reconnects briefly"
+      refute has_element?(view, "#tuya-group-form")
+      assert has_element?(view, "#tuya-group-2", "porch")
+      assert has_element?(view, "#tuya-group-2", "Joining…")
+      refute_secrets(render(view))
+    end
+
+    test "create errors are shown in the form, which stays open", %{conn: conn} do
+      start_lights()
+      view = mount_tab(conn)
+      open_new_group(view)
+
+      cases = [
+        {{:error, :duplicate_group_name}, "Another group already has that name."},
+        {{:error, :bad_group_name}, "Enter a name of 1 to 64 characters."},
+        {{:error, {:group_slots_full, @mac3}},
+         "post spot 1 already belongs to 8 groups, the most a bulb can hold."},
+        {{:error, :no_free_group_id}, "Every group id is in use."},
+        {{:error, :persist_failed}, "couldn&#39;t be saved on this device"},
+        {{:error, :not_running}, "The mesh isn&#39;t running"},
+        {{:error, :timeout}, "may still have been applied"}
+      ]
+
+      for {reply, text} <- cases do
+        FakeLights.reply(:create_group, reply)
+        html = view |> group_form(%{name: "path and post", members: [@mac3]}) |> render_submit()
+        assert html =~ text, inspect(reply)
+        assert has_element?(view, "#tuya-group-form")
+      end
+
+      assert length(changes()) == length(cases)
+    end
+
+    test "a failure that leaves the editor read-only is shown in the section", %{conn: conn} do
+      start_lights()
+      view = mount_tab(conn)
+      open_new_group(view)
+      FakeLights.reply(:create_group, {:error, :not_running})
+      FakeLights.reply(:groups, {:error, :not_running})
+
+      html = view |> group_form(%{name: "porch", members: [@mac2]}) |> render_submit()
+      assert html =~ "The mesh isn&#39;t running, so groups can&#39;t be changed right now."
+      assert html =~ "Groups can be edited while the mesh is running."
+      refute has_element?(view, "#tuya-group-form")
+    end
+
+    test "a bulb with all 8 slots used can't be ticked unless it holds the group",
+         %{conn: conn} do
+      start_lights(%{
+        groups: [group(1, "path and post", [@mac3]), group(2, "spare", [])],
+        slots: %{@mac2 => 3, @mac3 => 8}
+      })
+
+      view = mount_tab(conn)
+      open_new_group(view)
+      assert has_element?(view, "#tuya-group-form input[value=#{@mac3}][disabled]")
+      refute has_element?(view, "#tuya-group-form input[value=#{@mac2}][disabled]")
+      assert render(view) =~ "8/8"
+      assert render(view) =~ "3/8"
+
+      # Group 1 holds it already: it stays editable there.
+      click(view, "#tuya-group-1 button[phx-click=edit_members]")
+      refute has_element?(view, "#tuya-group-form input[value=#{@mac3}][disabled]")
+
+      click(view, "#tuya-group-2 button[phx-click=edit_members]")
+      assert has_element?(view, "#tuya-group-form input[value=#{@mac3}][disabled]")
+    end
+
+    test "rename sends one call; an unchanged name sends none", %{conn: conn} do
+      start_lights()
+      view = mount_tab(conn)
+
+      click(view, "#tuya-group-1 button[phx-click=rename_group]")
+      assert has_element?(view, "#tuya-group-1 #tuya-group-form input[value='path and post']")
+      view |> group_form(%{name: "path and post"}) |> render_submit()
+      refute has_element?(view, "#tuya-group-form")
+
+      click(view, "#tuya-group-1 button[phx-click=rename_group]")
+      FakeLights.reply(:rename_group, {:error, :duplicate_group_name})
+      html = view |> group_form(%{name: "taken"}) |> render_submit()
+      assert html =~ "Another group already has that name."
+
+      FakeLights.reply(:rename_group, nil)
+      html = view |> group_form(%{name: "garden"}) |> render_submit()
+      assert changes() == [{:rename_group, 1, "taken"}, {:rename_group, 1, "garden"}]
+      assert html =~ "Group renamed to “garden”."
+      assert has_element?(view, "#tuya-group-1", "garden")
+    end
+
+    test "a rename form keeps the name it showed: another tab's rename isn't undone",
+         %{conn: conn} do
+      start_lights()
+      view = mount_tab(conn)
+      click(view, "#tuya-group-1 button[phx-click=rename_group]")
+
+      FakeLights.update(fn v ->
+        %{v | groups: Enum.map(v.groups, &%{&1 | name: "garden"})}
+      end)
+
+      # Saved as shown: no rename back.
+      view |> group_form(%{name: "path and post"}) |> render_submit()
+      refute has_element?(view, "#tuya-group-form")
+
+      # Typed the name the group already has: nothing to send either.
+      click(view, "#tuya-group-1 button[phx-click=rename_group]")
+      view |> group_form(%{name: " garden "}) |> render_submit()
+      assert changes() == []
+
+      click(view, "#tuya-group-1 button[phx-click=rename_group]")
+      view |> group_form(%{name: "porch"}) |> render_submit()
+      assert changes() == [{:rename_group, 1, "porch"}]
+    end
+
+    test "an imported name with whitespace saved unchanged sends no rename", %{conn: conn} do
+      start_lights(%{groups: [group(1, " porch ", [@mac2])], slots: %{}})
+      view = mount_tab(conn)
+
+      for input <- [" porch ", "porch"] do
+        click(view, "#tuya-group-1 button[phx-click=rename_group]")
+        view |> group_form(%{name: input}) |> render_submit()
+        refute has_element?(view, "#tuya-group-form")
+      end
+
+      assert changes() == []
+    end
+
+    test "an unnamed group shows as Group N and can be renamed and deleted", %{conn: conn} do
+      start_lights(%{groups: [group(1, nil, [@mac2])], slots: %{}})
+      view = mount_tab(conn)
+      assert has_element?(view, "#tuya-group-1", "Group 1")
+
+      click(view, "#tuya-group-1 button[phx-click=rename_group]")
+      assert has_element?(view, "#tuya-group-form-name[value='']")
+
+      # Nothing typed: the backend's refusal shows inline, no crash.
+      FakeLights.reply(:rename_group, {:error, :bad_group_name})
+      html = view |> with_target("#tuya-mesh") |> render_submit("save_group_form", %{})
+      assert html =~ "Enter a name of 1 to 64 characters."
+
+      FakeLights.reply(:rename_group, nil)
+      html = view |> group_form(%{name: "porch"}) |> render_submit()
+      assert changes() == [{:rename_group, 1, ""}, {:rename_group, 1, "porch"}]
+      assert html =~ "Group renamed to “porch”."
+
+      FakeLights.update(fn v -> %{v | groups: Enum.map(v.groups, &%{&1 | name: nil})} end)
+      push_status(view, TuyaMesh.status())
+      html = click(view, "#tuya-group-1 button[phx-click=ask_delete_group]")
+      assert html =~ "Delete the group “Group 1”?"
+      html = click(view, "button[phx-click=confirm_delete_group]")
+      assert html =~ "Group “Group 1” deleted."
+    end
+
+    test "a ticked bulb that fills up stays enabled and is submitted", %{conn: conn} do
+      start_lights(%{groups: [group(1, "path and post", [@mac2])], slots: %{@mac3 => 7}})
+      view = mount_tab(conn)
+      open_new_group(view)
+      view |> group_form(%{name: "porch", members: [@mac3]}) |> render_change()
+
+      FakeLights.update(&%{&1 | slots: %{@mac3 => 8}})
+      push_status(view, TuyaMesh.status())
+      assert render(view) =~ "8/8"
+      assert has_element?(view, "#tuya-group-form input[value=#{@mac3}][checked]")
+      refute has_element?(view, "#tuya-group-form input[value=#{@mac3}][disabled]")
+
+      FakeLights.reply(:create_group, {:error, {:group_slots_full, @mac3}})
+      html = view |> form("#tuya-group-form") |> render_submit()
+      assert changes() == [{:create_group, "porch", [@mac3]}]
+      assert html =~ "post spot 1 already belongs to 8 groups"
+    end
+
+    test "the delete dialog returns focus to the groups heading", %{conn: conn} do
+      start_lights()
+      view = mount_tab(conn)
+      assert has_element?(view, ~s(#tuya-mesh-groups-title[tabindex="-1"]))
+
+      click(view, "#tuya-group-1 button[phx-click=ask_delete_group]")
+
+      [on_remove] =
+        view
+        |> render()
+        |> LazyHTML.from_fragment()
+        |> LazyHTML.query("#modal-cancel_delete_group")
+        |> LazyHTML.attribute("phx-remove")
+
+      assert on_remove =~ "#tuya-mesh-groups-title"
+
+      click(view, "button[phx-click=confirm_delete_group]")
+      assert has_element?(view, "#tuya-mesh-groups-title")
+    end
+
+    test "delete asks first and never sends the dismiss", %{conn: conn} do
+      start_lights()
+      view = mount_tab(conn)
+
+      html = click(view, "#tuya-group-1 button[phx-click=ask_delete_group]")
+      assert html =~ "Delete the group “path and post”?"
+      assert html =~ "Its 2 bulbs are asked to leave it"
+      html = click(view, "button[phx-click=cancel_delete_group]")
+      refute html =~ "Delete the group"
+      assert changes() == []
+
+      click(view, "#tuya-group-1 button[phx-click=ask_delete_group]")
+      html = click(view, "button[phx-click=confirm_delete_group]")
+      assert changes() == [{:delete_group, 1, []}]
+      assert html =~ "Group “path and post” deleted."
+      refute html =~ "Delete the group"
+
+      # The fake keeps it as an absent group its bulbs may still hold.
+      assert has_element?(view, "#tuya-group-1", "Leaving")
+      refute has_element?(view, "#tuya-group-1 button[phx-click=edit_members]")
+    end
+
+    test "a repeated delete confirm does nothing", %{conn: conn} do
+      start_lights()
+      view = mount_tab(conn)
+      click(view, "#tuya-group-1 button[phx-click=ask_delete_group]")
+      click(view, "button[phx-click=confirm_delete_group]")
+      view |> with_target("#tuya-mesh") |> render_click("confirm_delete_group", %{})
+      assert changes() == [{:delete_group, 1, []}]
+    end
+
+    test "member edits send only the changes, as add and remove calls", %{conn: conn} do
+      start_lights(%{
+        groups: [group(1, "path and post", [@mac2])],
+        slots: %{@mac2 => 1, @mac3 => 0}
+      })
+
+      view = mount_tab(conn)
+      click(view, "#tuya-group-1 button[phx-click=edit_members]")
+      assert has_element?(view, "#tuya-group-form input[value=#{@mac2}][checked]")
+
+      html = view |> group_form(%{members: [@mac3]}) |> render_submit()
+      assert changes() == [{:add_member, 1, @mac3}, {:remove_member, 1, @mac2}]
+      assert html =~ "Member changes sent."
+      refute has_element?(view, "#tuya-group-form")
+      assert has_element?(view, "#tuya-group-1", "Joining…")
+      assert has_element?(view, "#tuya-group-1", "Leaving…")
+
+      # Saved unchanged: nothing is sent.
+      click(view, "#tuya-group-1 button[phx-click=edit_members]")
+      view |> group_form(%{members: [@mac3]}) |> render_submit()
+      assert changes() == []
+    end
+
+    test "a refused member change keeps the form, retrying only what failed", %{conn: conn} do
+      start_lights(%{
+        groups: [group(1, "path and post", [@mac2])],
+        slots: %{@mac2 => 1, @mac3 => 7}
+      })
+
+      view = mount_tab(conn)
+      click(view, "#tuya-group-1 button[phx-click=edit_members]")
+      FakeLights.reply(:add_member, {:error, {:group_slots_full, @mac3}})
+      html = view |> group_form(%{members: [@mac3]}) |> render_submit()
+
+      assert html =~ "post spot 1 already belongs to 8 groups"
+      # The removal went through: no blanket "nothing changed".
+      refute html =~ "Nothing was"
+      assert changes() == [{:add_member, 1, @mac3}, {:remove_member, 1, @mac2}]
+      assert has_element?(view, "#tuya-group-form")
+
+      FakeLights.reply(:add_member, nil)
+      view |> group_form(%{members: [@mac3]}) |> render_submit()
+      assert changes() == [{:add_member, 1, @mac3}]
+      refute has_element?(view, "#tuya-group-form")
+    end
+
+    test "a partial failure's retry leaves another tab's member alone", %{conn: conn} do
+      [b2, b3] = KeyLeak.json() |> Jason.decode!() |> Map.fetch!("bulbs")
+
+      porch = %{
+        "mac" => "DC2353000001",
+        "localKey" => @new_local_key,
+        "nodeId" => 9,
+        "label" => "porch"
+      }
+
+      {:ok, :same_mesh} = TuyaMesh.upload(json(%{"bulbs" => [b2, b3, porch]}))
+      start_lights(%{groups: [group(1, "path and post", [@mac2])], slots: %{}})
+      view = mount_tab(conn)
+      click(view, "#tuya-group-1 button[phx-click=edit_members]")
+
+      # Another tab adds porch while this form is open.
+      FakeLights.update(fn v ->
+        %{v | groups: Enum.map(v.groups, &%{&1 | members: &1.members ++ ["DC2353000001"]})}
+      end)
+
+      FakeLights.reply(:add_member, {:error, {:group_slots_full, @mac3}})
+      view |> group_form(%{members: [@mac3]}) |> render_submit()
+      assert changes() == [{:add_member, 1, @mac3}, {:remove_member, 1, @mac2}]
+
+      FakeLights.reply(:add_member, nil)
+      view |> group_form(%{members: [@mac3]}) |> render_submit()
+      assert changes() == [{:add_member, 1, @mac3}]
+    end
+
+    test "an editor or confirmation whose group another tab deleted sends nothing",
+         %{conn: conn} do
+      start_lights()
+      view = mount_tab(conn)
+
+      absent = fn v ->
+        groups = Enum.map(v.groups, &%{&1 | name: nil, members: [], deleted: true})
+        %{v | groups: groups}
+      end
+
+      click(view, "#tuya-group-1 button[phx-click=edit_members]")
+      click(view, "#tuya-group-1 button[phx-click=ask_delete_group]")
+      FakeLights.update(absent)
+
+      html = click(view, "button[phx-click=confirm_delete_group]")
+      assert html =~ "That group was deleted or replaced in the meantime."
+      refute html =~ "Delete the group"
+
+      view |> with_target("#tuya-mesh") |> render_submit("save_group_form", %{})
+      assert changes() == []
+    end
+
+    test "a confirmation or form whose group was replaced under the same id sends nothing",
+         %{conn: conn} = ctx do
+      start_lights()
+      view = mount_tab(conn)
+      inv = UniversalProxy.TuyaBeaconMesh.Inventory.decode!(KeyLeak.json())
+
+      # Another tab deletes group 1 and creates a new group that takes id 1
+      # (a new sub-device id), without this tab hearing of it.
+      replace_group_1 = fn ->
+        {:ok, _} = Store.replace(%{inv | groups: []}, [], ctx.store)
+        {:ok, _} = Store.replace(inv, [], ctx.store)
+      end
+
+      click(view, "#tuya-group-1 button[phx-click=ask_delete_group]")
+      replace_group_1.()
+      html = click(view, "button[phx-click=confirm_delete_group]")
+      assert html =~ "That group was deleted or replaced in the meantime."
+
+      click(view, "#tuya-group-1 button[phx-click=rename_group]")
+      replace_group_1.()
+      html = view |> group_form(%{name: "garden"}) |> render_submit()
+      assert html =~ "That group was deleted or replaced in the meantime."
+      assert changes() == []
+
+      # A status update closes a replaced group's dialog straight away.
+      click(view, "#tuya-group-1 button[phx-click=ask_delete_group]")
+      replace_group_1.()
+      refute push_status(view, TuyaMesh.status()) =~ "Delete the group"
+      assert changes() == []
+    end
+
+    test "a failed first group keeps the section and its error on screen", %{conn: conn} do
+      {:ok, :same_mesh} = TuyaMesh.upload(json(%{"groups" => []}))
+      start_lights(%{groups: [], slots: %{}})
+      view = mount_tab(conn)
+      open_new_group(view)
+      FakeLights.reply(:create_group, {:error, :not_running})
+      FakeLights.reply(:groups, {:error, :not_running})
+
+      html = view |> group_form(%{name: "porch", members: [@mac2]}) |> render_submit()
+      assert html =~ "The mesh isn&#39;t running, so groups can&#39;t be changed right now."
+      assert has_element?(view, "#tuya-mesh-groups")
+    end
+
+    test "sync states per member; Retry re-sends an unconfirmed change", %{conn: conn} do
+      sync = %{
+        @mac2 => %{op: :add, state: :confirmed},
+        @mac3 => %{op: :add, state: :unconfirmed}
+      }
+
+      start_lights(%{groups: [group(1, "path and post", [@mac2, @mac3], sync)], slots: %{}})
+      view = mount_tab(conn)
+
+      assert has_element?(view, "#tuya-group-1", "Confirmed")
+      assert has_element?(view, "#tuya-group-1", "Join unconfirmed")
+
+      assert has_element?(
+               view,
+               "#tuya-group-1 button[phx-click=retry_member][phx-value-mac=#{@mac3}]"
+             )
+
+      refute has_element?(
+               view,
+               "#tuya-group-1 button[phx-click=retry_member][phx-value-mac=#{@mac2}]"
+             )
+
+      html = click(view, "#tuya-group-1 button[phx-click=retry_member]")
+      assert changes() == [{:add_member, 1, @mac3}]
+      assert html =~ "Sent again to post spot 1."
+      assert has_element?(view, "#tuya-group-1", "Joining…")
+    end
+
+    test "an unconfirmed removal retries as a removal; a stale retry sends nothing",
+         %{conn: conn} do
+      sync = %{@mac3 => %{op: :remove, state: :unconfirmed}}
+      start_lights(%{groups: [group(1, "path and post", [@mac2], sync)], slots: %{}})
+      view = mount_tab(conn)
+
+      assert has_element?(view, "#tuya-group-1", "Leave unconfirmed")
+      click(view, "#tuya-group-1 button[phx-click=retry_member]")
+      assert changes() == [{:remove_member, 1, @mac3}]
+
+      # Already pending again: a queued second click is dropped.
+      view
+      |> with_target("#tuya-mesh")
+      |> render_click("retry_member", %{"gid" => "1", "mac" => @mac3})
+
+      assert changes() == []
+    end
+
+    test "absent groups show as Leaving with their holders until pruned", %{conn: conn} do
+      leaving = %{
+        group(7, nil, [], %{@mac2 => %{op: :remove, state: :unconfirmed}})
+        | deleted: true,
+          holders: [@mac2]
+      }
+
+      start_lights(%{groups: [group(1, "path and post", [@mac3]), leaving], slots: %{}})
+      view = mount_tab(conn)
+
+      assert has_element?(view, "#tuya-group-7", "Group 7")
+      assert has_element?(view, "#tuya-group-7", "Leaving")
+      assert has_element?(view, "#tuya-group-7", "Still held by path light 2")
+      refute has_element?(view, "#tuya-group-7 button[phx-click=edit_members]")
+      refute has_element?(view, "#tuya-group-7 button[phx-click=retry_member]")
+
+      html = click(view, "#tuya-group-7 button[phx-click=retry_removal]")
+      assert changes() == [{:delete_group, 7, []}]
+      assert html =~ "Removal sent again."
+
+      FakeLights.update(fn v -> %{v | groups: Enum.reject(v.groups, & &1.deleted)} end)
+      refute push_status(view, TuyaMesh.status()) =~ "Group 7"
+    end
+
+    test "polls only while a change is pending", %{conn: conn} do
+      start_lights()
+      view = mount_tab(conn)
+      _ = render(view)
+      flush_reads()
+      Process.sleep(150)
+      refute_received {:lights_call, :groups}
+
+      open_new_group(view)
+      view |> group_form(%{name: "porch", members: [@mac2]}) |> render_submit()
+
+      # Pending: polled again on its own, without a status change.
+      flush_reads()
+      assert_receive {:lights_call, :groups}, 500
+      assert_receive {:lights_call, :groups}, 500
+
+      FakeLights.update(fn v ->
+        groups =
+          Enum.map(v.groups, fn g ->
+            %{g | sync: Map.new(g.sync, fn {m, s} -> {m, %{s | state: :confirmed}} end)}
+          end)
+
+        %{v | groups: groups}
+      end)
+
+      assert_receive {:lights_call, :groups}, 500
+      _ = render(view)
+      flush_reads()
+      Process.sleep(150)
+      refute_received {:lights_call, :groups}
+      assert has_element?(view, "#tuya-group-2", "Confirmed")
+    end
+
+    test "a change already pending at mount is polled", %{conn: conn} do
+      sync = %{@mac2 => %{op: :add, state: :pending}}
+      start_lights(%{groups: [group(1, "path and post", [@mac2], sync)], slots: %{}})
+      view = mount_tab(conn)
+      _ = render(view)
+      flush_reads()
+      assert_receive {:lights_call, :groups}, 500
+      assert_receive {:lights_call, :groups}, 500
+    end
+
+    test "a crafted form event can't add fields the open form lacks", %{conn: conn} do
+      start_lights()
+      view = mount_tab(conn)
+      click(view, "#tuya-group-1 button[phx-click=edit_members]")
+
+      view
+      |> with_target("#tuya-mesh")
+      |> render_change("group_form_change", %{"group" => %{"name" => "x", "members" => ["nope"]}})
+
+      view |> with_target("#tuya-mesh") |> render_submit("save_group_form", %{})
+      assert changes() == [{:remove_member, 1, @mac2}, {:remove_member, 1, @mac3}]
+    end
+
+    defp flush_reads do
+      receive do
+        {:lights_call, :groups} -> flush_reads()
+      after
+        0 -> :ok
+      end
     end
   end
 end

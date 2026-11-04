@@ -292,6 +292,14 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
     end
   end
 
+  defp flush_activity(n \\ 0) do
+    receive do
+      {:"$gen_cast", {:command_activity, _hold}} -> flush_activity(n + 1)
+    after
+      0 -> n
+    end
+  end
+
   defp refusals(n \\ 0) do
     receive do
       {:lights, :refused} -> refusals(n + 1)
@@ -699,6 +707,94 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       idle(pid)
     end
 
+    test "a view dropped by an identity blip is rebuilt from the retained report" do
+      {pid, agent} = start(push_debounce_ms: 10, states_table: :unnamed)
+      at = now()
+      report(pid, [{@a, @on_white, at}])
+      assert [_] = of(Commander.light_states(:sys.get_state(pid).states), 5)
+
+      # The Store briefly answers without any sub-device.
+      Agent.update(agent, &%{&1 | ids: %{}})
+      send(pid, {:tuya_mesh_store, :inventory_changed})
+      flushed(pid)
+      refute Map.has_key?(:sys.get_state(pid).views, {:bulb, @a})
+
+      # Back; the Resolver's next status carries the same retained stamps.
+      Agent.update(agent, &%{&1 | ids: @ids})
+      send(pid, {:tuya_mesh_store, :inventory_changed})
+      report(pid, [{@a, @on_white, at}])
+
+      assert [%LightStateResponse{state: true}] =
+               of(Commander.light_states(:sys.get_state(pid).states), 5)
+    end
+
+    test "a member's report older than a group send never wins, even before it is known" do
+      {pid, _agent} = start(push_debounce_ms: 10)
+      report(pid, [])
+      before = now()
+
+      Commander.command(cmd({:group, 1}, on()), pid)
+      idle(pid)
+      flushed(pid)
+      assert %{state: true} = last_push(pushes(), 6)
+
+      # A's off report, sent before the group's on, arrives late.
+      report(pid, [{@a, @off, before - 1}])
+      assert of(pushes(), 5) == []
+      assert of(pushes(), 6) == []
+
+      # A report after the send is taken.
+      report(pid, [{@a, @off, now() + 1}])
+      pushed = pushes()
+      assert %{state: false} = last_push(pushed, 5)
+      assert %{state: false} = last_push(pushed, 6)
+    end
+
+    test "a member's report older than a diverted direct send never wins, even before it is known" do
+      script = %{group_set: [{:error, :busy}]}
+      {pid, _agent} = start(push_debounce_ms: 10, script: script, retry_ms: 100)
+      report(pid, [])
+      before = now()
+
+      Commander.command(cmd({:group, 1}, on()), pid)
+      assert_receive {:lights, {:group_set, 1, [on: true], _}}, 2_000
+      Commander.command(cmd({:bulb, @b}, %Req{has_state: true, state: false}, 99, 7), pid)
+      idle(pid)
+      flushed(pid)
+      assert {@a, [on: true]} in sets()
+      _ = pushes()
+
+      # A's off report, sent before the diverted on, arrives late.
+      report(pid, [{@a, @off, before - 1}])
+      assert of(pushes(), 5) == []
+      refute Map.has_key?(:sys.get_state(pid).views[{:bulb, @a}].dps, 1)
+
+      report(pid, [{@a, @off, now() + 1}])
+      assert %{state: false} = last_push(pushes(), 5)
+    end
+
+    test "a view rebuilt by a group send after an identity blip takes the retained report" do
+      {pid, agent} = start(push_debounce_ms: 10)
+      at = now()
+      report(pid, [{@a, @on_white, at}])
+
+      Agent.update(agent, &%{&1 | ids: %{}})
+      send(pid, {:tuya_mesh_store, :inventory_changed})
+      flushed(pid)
+      refute Map.has_key?(:sys.get_state(pid).views, {:bulb, @a})
+
+      # Back, and a group send stamps A before the Resolver's next status.
+      Agent.update(agent, &%{&1 | ids: @ids})
+      send(pid, {:tuya_mesh_store, :inventory_changed})
+      Commander.command(cmd({:group, 1}, on()), pid)
+      idle(pid)
+      assert :sys.get_state(pid).views[{:bulb, @a}].dps == %{}
+
+      # The same retained stamps: every DP the send didn't touch is taken.
+      report(pid, [{@a, @on_white, at}])
+      assert %{2 => 0, 3 => 1000, 4 => 0} = :sys.get_state(pid).views[{:bulb, @a}].dps
+    end
+
     test "what was pushed is kept for new connections" do
       {pid, _agent} = start(push_debounce_ms: 10, states_table: :unnamed)
       report(pid, [{@a, @on_white, now()}])
@@ -707,6 +803,208 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       assert [%LightStateResponse{state: true}] = of(states, 5)
       # A's groups were derived from it.
       assert [%LightStateResponse{state: true}] = of(states, 6)
+    end
+  end
+
+  describe "saved light states" do
+    @on_white %{1 => true, 2 => 0, 3 => 1000, 4 => 0}
+    @off %{1 => false, 2 => 0, 3 => 1000, 4 => 0}
+
+    test "seed the initial states at start, groups derived from them" do
+      saved = %{@a => @on_white, @b => @off, "FFFFFFFFFFFF" => @on_white}
+
+      {pid, _agent} =
+        start(push_debounce_ms: 10, states_table: :unnamed, saved_states: fn -> saved end)
+
+      # The groups come with the first status (no bulb reported yet).
+      report(pid, [])
+      states = Commander.light_states(:sys.get_state(pid).states)
+
+      assert [%{state: true, brightness: 1.0}] = of(states, 5)
+      assert [%{state: false}] = of(states, 7)
+      # Group 1 (A, B, C): A on; group 3 (B, C): B off, C unknown.
+      assert [%{state: true}] = of(states, 6)
+      assert [%{state: false}] = of(states, 11)
+      # No sub-device, no state.
+      assert length(states) == 4
+    end
+
+    test "a seed loses to any report Lights holds, however old its stamps" do
+      {pid, _agent} =
+        start(push_debounce_ms: 10, saved_states: fn -> %{@a => %{@on_white | 3 => 500}} end)
+
+      flushed(pid)
+      assert [%{state: true, brightness: 0.5}] = of(pushes(), 5)
+
+      # Only DP1 reported, stamped long before the seed was read: taken,
+      # the seeded brightness kept.
+      report(pid, [{@a, %{1 => false}, -1_000_000}])
+      assert [%{state: false, brightness: 0.5}] = of(pushes(), 5)
+    end
+
+    test "a seed loses to a command, which starts from it" do
+      {pid, _agent} = start(push_debounce_ms: 10, saved_states: fn -> %{@a => @off} end)
+      flushed(pid)
+      assert [%{state: false}] = of(pushes(), 5)
+
+      Commander.command(cmd({:bulb, @a}, on()), pid)
+      # Known from the seed: only DP1 goes, and Lights isn't asked.
+      assert_receive {:lights, {:set, @a, [on: true], _}}, 2_000
+      refute_received {:lights, {:status, @a}}
+      idle(pid)
+      assert %{state: true, brightness: 1.0} = last_push(pushes(), 5)
+    end
+
+    test "every pushed bulb state is saved, its state DPs only; groups aren't" do
+      test = self()
+
+      {pid, _agent} =
+        start(push_debounce_ms: 10, save_state: &send(test, {:saved, &1, &2}))
+
+      report(pid, [{@a, Map.put(@on_white, 21, 3), now()}])
+      assert last_push(pushes(), 6)
+
+      assert_received {:saved, @a, %{1 => true, 2 => 0, 3 => 1000, 4 => 0} = saved}
+      refute Map.has_key?(saved, 21)
+      refute_received {:saved, _, _}
+
+      # An unchanged state isn't pushed, so not saved again.
+      report(pid, [{@a, @on_white, now() + 1}])
+      refute_received {:saved, _, _}
+    end
+
+    test "a state DP change the response doesn't show is saved too" do
+      test = self()
+
+      {pid, _agent} =
+        start(push_debounce_ms: 10, save_state: &send(test, {:saved, &1, &2}))
+
+      white = Map.put(@on_white, 11, <<120::16, 100, 100>>)
+      report(pid, [{@a, white, now()}])
+      assert [_] = of(pushes(), 5)
+      assert_received {:saved, @a, %{11 => <<120::16, 100, 100>>}}
+
+      # A new colour while white: the same response, a new state.
+      report(pid, [{@a, %{11 => <<240::16, 100, 100>>}, now() + 1}])
+      assert of(pushes(), 5) == []
+      assert_received {:saved, @a, %{2 => 0, 11 => <<240::16, 100, 100>>}}
+    end
+
+    test "a subscription that comes late seeds what the Store kept meanwhile" do
+      pubsub = :"commander_seed_pubsub_#{System.unique_integer([:positive])}"
+      saved = start_supervised!({Agent, fn -> %{} end}, id: :saved)
+
+      {pid, _agent} =
+        start(
+          push_debounce_ms: 10,
+          subscribe: true,
+          pubsub: pubsub,
+          resubscribe_ms: 20,
+          status: fn -> status([]) end,
+          saved_states: fn -> Agent.get(saved, & &1) end
+        )
+
+      # Started, nothing seeded; the Store comes up (its :ready unheard)
+      # while PubSub is down.
+      _ = :sys.get_state(pid)
+      Agent.update(saved, fn _ -> %{@b => @off} end)
+      refute_receive {:push, _}, 50
+      start_supervised!({Phoenix.PubSub, name: pubsub}, id: :seed_pubsub)
+
+      assert_receive {:push, %LightStateResponse{device_id: 7, state: false}}, 2_000
+      assert Registry.keys(pubsub, pid) != []
+    end
+
+    test "a restarted Store gets every known bulb again, changed or not" do
+      test = self()
+
+      {pid, _agent} =
+        start(push_debounce_ms: 10, save_state: &send(test, {:saved, &1, &2}))
+
+      report(pid, [{@a, @on_white, now()}, {@b, %{3 => 500}, now()}])
+      assert_received {:saved, @a, %{1 => true}}
+      refute_received {:saved, _, _}
+
+      # It may have lost a held change in a crash: A goes again, and B,
+      # whose on/off is unknown, doesn't. Nothing is pushed to HA.
+      _ = pushes()
+      send(pid, {:tuya_mesh_store, :ready})
+      flushed(pid)
+      assert_received {:saved, @a, %{1 => true, 3 => 1000}}
+      refute_received {:saved, _, _}
+      assert pushes() == []
+    end
+
+    test "after an inventory change, the next unchanged state is saved again" do
+      test = self()
+
+      {pid, _agent} =
+        start(push_debounce_ms: 10, save_state: &send(test, {:saved, &1, &2}))
+
+      report(pid, [{@a, @on_white, now()}])
+      assert_received {:saved, @a, _}
+
+      # The Store may have dropped it: nothing is restored eagerly...
+      send(pid, {:tuya_mesh_store, :inventory_changed})
+      flushed(pid)
+      refute_received {:saved, _, _}
+
+      # ...but the next report, the same state, is saved.
+      report(pid, [{@a, @on_white, now() + 1}])
+      assert_received {:saved, @a, %{1 => true}}
+    end
+
+    test "a Store that starts late seeds the bulbs still unknown" do
+      saved = start_supervised!({Agent, fn -> %{} end}, id: :saved)
+
+      {pid, _agent} =
+        start(push_debounce_ms: 10, saved_states: fn -> Agent.get(saved, & &1) end)
+
+      at = now()
+      report(pid, [{@a, @on_white, at}])
+      assert [%{state: true}] = of(pushes(), 5)
+
+      Agent.update(saved, fn _ -> %{@a => @off, @b => @off} end)
+      send(pid, {:tuya_mesh_store, :ready})
+      flushed(pid)
+
+      # A has a view already; B is seeded.
+      pushed = pushes()
+      assert of(pushed, 5) == []
+      assert [%{state: false}] = of(pushed, 7)
+    end
+  end
+
+  describe "subscriptions" do
+    test "a PubSub down at start is retried, then a fresh status is read" do
+      pubsub = :"commander_late_pubsub_#{System.unique_integer([:positive])}"
+      test = self()
+
+      {pid, _agent} =
+        start(
+          subscribe: true,
+          pubsub: pubsub,
+          resubscribe_ms: 20,
+          status: fn ->
+            send(test, :status_read)
+            status([])
+          end
+        )
+
+      refute_received :status_read
+      start_supervised!({Phoenix.PubSub, name: pubsub}, id: :late_pubsub)
+
+      assert_receive :status_read, 2_000
+      _ = :sys.get_state(pid)
+
+      topics = Registry.keys(pubsub, pid) |> Enum.sort()
+
+      assert topics ==
+               Enum.sort([UniversalProxy.TuyaMesh.Store.topic(), UniversalProxy.TuyaMesh.topic()])
+
+      # Retries stop once subscribed: never held twice.
+      Process.sleep(60)
+      assert Registry.keys(pubsub, pid) |> Enum.sort() == topics
     end
   end
 
@@ -1228,6 +1526,245 @@ defmodule UniversalProxy.TuyaMesh.CommanderTest do
       idle(pid)
       assert sets() == []
       assert :sys.get_state(pid).jobs == %{}
+    end
+  end
+
+  describe "membership changes" do
+    # A joins group 3.
+    @joined [%{local_id: 1, members: [@a, @b, @c]}, %{local_id: 3, members: [@b, @c, @a]}]
+
+    test "a bulb that joins after a broadcast aired gets nothing from it" do
+      {pid, _agent} = start(script: %{hears: [@b, @c]}, window_ms: 200)
+      send(pid, {:tuya_mesh_status, status([])})
+
+      Commander.command(cmd({:group, 3}, on()), pid)
+      assert_receive {:lights, {:group_set, 3, [on: true], _}}, 2_000
+
+      send(pid, {:tuya_mesh_status, status([], @joined)})
+      idle(pid)
+
+      assert sets() == []
+    end
+
+    test "a joiner takes a broadcast that airs after it joined, with no direct frame" do
+      {pid, agent} = start(script: %{hears: [@b, @c]})
+      send(pid, {:tuya_mesh_status, status([])})
+
+      Agent.update(agent, &Map.put(&1, :refuse_until, now() + 200))
+      Commander.command(cmd({:group, 3}, on()), pid)
+      assert_receive {:lights, :refused}, 2_000
+
+      send(pid, {:tuya_mesh_status, status([], @joined)})
+      idle(pid)
+
+      assert_received {:lights, {:group_set, 3, [on: true], _}}
+      assert sets() == []
+      assert %{sent_at: %{1 => _}} = :sys.get_state(pid).views[{:bulb, @a}]
+    end
+
+    test "a joiner with a newer command of its own keeps a pending broadcast off the air" do
+      {pid, agent} = start()
+      send(pid, {:tuya_mesh_status, status([])})
+
+      Agent.update(agent, &Map.put(&1, :refuse_until, now() + 200))
+      Commander.command(cmd({:group, 3}, on()), pid)
+      Commander.command(cmd({:bulb, @a}, %Req{has_state: true, state: false}, 99), pid)
+      assert_receive {:lights, :refused}, 2_000
+
+      send(pid, {:tuya_mesh_status, status([], @joined)})
+      idle(pid)
+
+      # Group 3 goes to its other members directly; A only gets its own.
+      refute_received {:lights, {:group_set, _, _, _}}
+      followups = sets()
+      assert {@a, [on: false]} in followups
+      refute {@a, [on: true]} in followups
+      assert {@b, [on: true]} in followups
+      assert {@c, [on: true]} in followups
+    end
+
+    test "a broadcast a joiner took is never overridden by an older group's follow-up" do
+      hears = fn
+        [on: true] -> []
+        _off -> [@a, @b, @c]
+      end
+
+      {pid, agent} = start(script: %{hears: hears}, window_ms: 300)
+      send(pid, {:tuya_mesh_status, status([])})
+
+      Commander.command(cmd({:group, 1}, on()), pid)
+      assert_receive {:lights, {:group_set, 1, [on: true], _}}, 2_000
+
+      # Group 3's newer "off" waits for capacity while A joins it.
+      Agent.update(agent, &Map.put(&1, :refuse_until, now() + 100))
+      Commander.command(cmd({:group, 3}, %Req{has_state: true, state: false}), pid)
+      assert_receive {:lights, :refused}, 2_000
+      send(pid, {:tuya_mesh_status, status([], @joined)})
+      idle(pid)
+
+      assert_received {:lights, {:group_set, 3, [on: false], _}}
+      assert sets() == []
+    end
+
+    test "admission takes the membership the statuses reported, in order" do
+      {pid, _agent} = start()
+      send(pid, {:tuya_mesh_status, status([])})
+      send(pid, {:tuya_mesh_status, status([], [%{local_id: 1, members: [@a, @b]}])})
+
+      # `:members` would say A, B and C: the statuses, already applied, win.
+      Commander.command(cmd({:group, 1}, on()), pid)
+      assert_receive {:lights, {:group_set, 1, [on: true], _}}, 2_000
+      assert %{members: [@a, @b]} = :sys.get_state(pid).jobs[{:group, 1}]
+
+      send(pid, {:tuya_mesh_status, status([])})
+      idle(pid)
+
+      assert sets() == [{@a, [on: true]}, {@b, [on: true]}]
+    end
+
+    test "a command admitted before any status keeps its members through queued changes" do
+      {pid, _agent} = start(window_ms: 100)
+
+      # Admitted through `:members`, which already read the latest
+      # membership; older statuses (C removed, then back) come after.
+      Commander.command(cmd({:group, 1}, on()), pid)
+      send(pid, {:tuya_mesh_status, status([])})
+      send(pid, {:tuya_mesh_status, status([], [%{local_id: 1, members: [@a, @b]}])})
+      send(pid, {:tuya_mesh_status, status([])})
+      idle(pid)
+
+      assert sets() == [{@a, [on: true]}, {@b, [on: true]}, {@c, [on: true]}]
+    end
+
+    test "a bulb that leaves mid-diversion still gets what it took pushed" do
+      script = %{set: %{@b => [{:error, :busy}]}}
+      {pid, _agent} = start(script: script, retry_ms: 300, push_debounce_ms: 10)
+      at = now()
+      report(pid, for(mac <- [@a, @b, @c], do: {mac, @off, at}))
+      _ = pushes()
+
+      # C's newer command diverts group 1 to A and B; B waits for capacity.
+      Commander.command(cmd({:group, 1}, on()), pid)
+      Commander.command(cmd({:bulb, @c}, %Req{has_state: true, state: false}, 99), pid)
+      assert_receive {:lights, {:set, @a, [on: true], _}}, 2_000
+
+      send(pid, {:tuya_mesh_status, status([], [%{local_id: 1, members: [@b, @c]}])})
+      flushed(pid)
+      assert %{state: true} = last_push(pushes(), 5)
+      idle(pid)
+    end
+
+    test "a group deleted mid-diversion still gets its members' taken sends pushed" do
+      script = %{set: %{@b => [{:error, :busy}]}}
+      {pid, _agent} = start(script: script, retry_ms: 300, push_debounce_ms: 10)
+      at = now()
+      report(pid, for(mac <- [@a, @b, @c], do: {mac, @off, at}))
+      _ = pushes()
+
+      Commander.command(cmd({:group, 1}, on()), pid)
+      Commander.command(cmd({:bulb, @c}, %Req{has_state: true, state: false}, 99), pid)
+      assert_receive {:lights, {:set, @a, [on: true], _}}, 2_000
+
+      send(pid, {:tuya_mesh_status, status([], [%{local_id: 3, members: [@b, @c]}])})
+      flushed(pid)
+      assert %{state: true} = last_push(pushes(), 5)
+      refute Map.has_key?(:sys.get_state(pid).jobs, {:group, 1})
+      idle(pid)
+    end
+
+    test "a group the Store drops mid-diversion still gets its members' taken sends pushed" do
+      script = %{set: %{@b => [{:error, :busy}]}}
+      {pid, agent} = start(script: script, retry_ms: 300, push_debounce_ms: 10)
+      at = now()
+      report(pid, for(mac <- [@a, @b, @c], do: {mac, @off, at}))
+      _ = pushes()
+
+      Commander.command(cmd({:group, 1}, on()), pid)
+      Commander.command(cmd({:bulb, @c}, %Req{has_state: true, state: false}, 99), pid)
+      assert_receive {:lights, {:set, @a, [on: true], _}}, 2_000
+
+      # The Store's change arrives before the Resolver's status.
+      Agent.update(agent, fn s -> %{s | ids: Map.delete(s.ids, {:group, 1})} end)
+      send(pid, {:tuya_mesh_store, :inventory_changed})
+      flushed(pid)
+      assert %{state: true} = last_push(pushes(), 5)
+      refute Map.has_key?(:sys.get_state(pid).jobs, {:group, 1})
+
+      send(pid, {:tuya_mesh_status, status([], [%{local_id: 3, members: [@b, @c]}])})
+      idle(pid)
+    end
+
+    test "statuses during pending work never postpone the Presence keepalive" do
+      {pid, _agent} = start(window_ms: 2_000, keepalive_ms: 100, activity_hold_ms: 250)
+      send(pid, {:tuya_mesh_status, status([])})
+
+      Commander.command(cmd({:group, 1}, on()), pid)
+      assert_receive {:lights, {:group_set, 1, [on: true], _}}, 2_000
+      flush_activity()
+
+      # A status every 20 ms for 600 ms, while the group waits to confirm.
+      for _ <- 1..30 do
+        send(pid, {:tuya_mesh_status, status([])})
+        Process.sleep(20)
+      end
+
+      assert flush_activity() >= 4
+    end
+
+    test "a bulb that leaves gets none of the command's remaining follow-ups" do
+      {pid, _agent} = start(followup_gap_ms: 200)
+      send(pid, {:tuya_mesh_status, status([])})
+
+      Commander.command(cmd({:group, 1}, on()), pid)
+      assert_receive {:lights, {:set, @a, [on: true], _}}, 2_000
+
+      send(pid, {:tuya_mesh_status, status([], [%{local_id: 1, members: [@a, @b]}])})
+      assert %{members: [@a, @b], pending: pending} = :sys.get_state(pid).jobs[{:group, 1}]
+      refute Enum.any?(pending, &match?({@c, _}, &1))
+      idle(pid)
+
+      assert sets() == [{@b, [on: true]}]
+    end
+
+    test "a deleted group's pending command is dropped with its state" do
+      {pid, _agent} = start(window_ms: 200, push_debounce_ms: 10)
+      send(pid, {:tuya_mesh_status, status([])})
+
+      Commander.command(cmd({:group, 1}, on()), pid)
+      assert_receive {:lights, {:group_set, 1, [on: true], _}}, 2_000
+      assert_receive {:push, %LightStateResponse{device_id: 6, state: true}}, 2_000
+      assert Map.has_key?(:sys.get_state(pid).pushed, {:group, 1})
+
+      send(pid, {:tuya_mesh_status, status([], [%{local_id: 3, members: [@b, @c]}])})
+      state = :sys.get_state(pid)
+      assert state.jobs == %{}
+      refute Map.has_key?(state.views, {:group, 1})
+      refute Map.has_key?(state.pushed, {:group, 1})
+
+      Process.sleep(300)
+      assert sets() == []
+    end
+
+    test "the group is derived from its new members, and a pending send skips the old ones" do
+      {pid, agent} = start(script: %{hears: [@b, @c]}, push_debounce_ms: 10)
+      at = now()
+      report(pid, [{@a, @on_white, at}, {@b, @off, at}, {@c, @off, at}])
+      assert %{state: true} = last_push(pushes(), 6)
+
+      # Group 1's "off" waits for capacity while A leaves the group.
+      Agent.update(agent, &Map.put(&1, :refuse_until, now() + 300))
+      Commander.command(cmd({:group, 1}, %Req{has_state: true, state: false}), pid)
+      assert_receive {:lights, :refused}, 2_000
+
+      send(pid, {:tuya_mesh_status, status([], [%{local_id: 1, members: [@b, @c]}])})
+      flushed(pid)
+      assert %{members: [@b, @c]} = :sys.get_state(pid).jobs[{:group, 1}]
+      assert [%{state: false}] = of(pushes(), 6)
+
+      idle(pid)
+      assert_received {:lights, {:group_set, 1, [on: false], _}}
+      assert %{1 => true} = :sys.get_state(pid).views[{:bulb, @a}].dps
+      refute Enum.any?(pushes(), &(&1.device_id == 5))
     end
   end
 end

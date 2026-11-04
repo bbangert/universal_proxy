@@ -272,6 +272,19 @@ defmodule UniversalProxy.TuyaMeshTest do
     end
   end
 
+  describe "group operations without a running mesh" do
+    test "every one is {:error, :not_running}, never an exit", ctx do
+      opts = Keyword.put(ctx.opts, :lights, :"tuya_facade_lights_#{ctx.n}")
+
+      assert {:error, :not_running} = TuyaMesh.create_group("porch", ["path light 2"], opts)
+      assert {:error, :not_running} = TuyaMesh.add_member(1, "path light 2", opts)
+      assert {:error, :not_running} = TuyaMesh.remove_member(1, "path light 2", opts)
+      assert {:error, :not_running} = TuyaMesh.delete_group(1, [dismiss: true] ++ opts)
+      assert {:error, :not_running} = TuyaMesh.rename_group(1, "garden", opts)
+      assert {:error, :not_running} = TuyaMesh.group_sync(opts)
+    end
+  end
+
   describe "with a running mesh subtree" do
     setup ctx do
       adapters = [
