@@ -126,6 +126,18 @@ defmodule UniversalProxy.Audio.Server do
   end
 
   @doc """
+  `update_config/3`, but `{:ok, player}` names the `Audio.Player` a volume
+  or mute change was handed to, the one that will echo it as an event
+  (`nil` when no player is running or the call changed neither).
+  """
+  @spec update_config_forwarded(GenServer.server(), key(), map()) ::
+          {:ok, pid() | nil} | {:error, :not_found | term()}
+  def update_config_forwarded(server \\ __MODULE__, {slot_sub, _vid, _pid} = key, params)
+      when is_binary(slot_sub) and is_map(params) do
+    GenServer.call(server, {:update_config_forwarded, key, params})
+  end
+
+  @doc """
   Toggle the `enabled` flag for an output. Phase 3 wires this into
   player-process lifecycle; Phase 1 just persists and broadcasts.
   Returns `{:error, :not_found}` if the output isn't tracked or
@@ -325,50 +337,15 @@ defmodule UniversalProxy.Audio.Server do
   end
 
   def handle_call({:update_config, key, params}, _from, state) do
-    with {:ok, existing} <- Map.fetch(state.outputs, key),
-         update = sanitize_update(params),
-         :ok <- Store.save_config(state.store, key, update),
-         {:ok, saved} <- Store.get_config(state.store, key) do
-      merged = merge(key, hardware_fields(existing), saved)
-      state1 = put_in(state.outputs[key], merged)
+    case apply_config(state, key, params) do
+      {:ok, _player, state} -> {:reply, :ok, state}
+      {:error, _reason} = err -> {:reply, err, state}
+    end
+  end
 
-      # Normalize the payload before forwarding/broadcasting. Values
-      # come from `merged` (post `Store.merge_defaults` /
-      # `clamp_volume` / `!!`), so subscribers and the player can
-      # never see caller-supplied garbage like `%{volume: "77"}`.
-      # `update` is still the presence check so calls that didn't
-      # ask to change a field don't re-send the cached value.
-      normalized = Map.take(merged, Map.keys(update))
-
-      state2 =
-        cond do
-          rename?(existing, merged) and merged.enabled ->
-            # The binary's `--name` and mDNS TXT `name=` are baked in
-            # at spawn time and there's no `set_name` stdin command.
-            # The only way to propagate a rename is to restart the
-            # player; the new instance gets the new name as a fresh
-            # CLI arg and re-registers mDNS. ~5 s audio gap is
-            # acceptable since renames are user-initiated and rare.
-            state1 |> stop_player(key) |> start_player(merged)
-
-          rename?(existing, merged) ->
-            # Output is disabled. Stop any stale player (defensive —
-            # toggle_player should already have done this on the
-            # `set_enabled(_, false)` that disabled it) but don't
-            # spawn a fresh one. Spawning a player for an output the
-            # user just disabled would broadcast it via mDNS again
-            # and stream audio they explicitly turned off.
-            stop_player(state1, key)
-
-          true ->
-            forward_to_player(state1, key, normalized)
-            state1
-        end
-
-      broadcast_state(key, normalized)
-      {:reply, :ok, state2}
-    else
-      :error -> {:reply, {:error, :not_found}, state}
+  def handle_call({:update_config_forwarded, key, params}, _from, state) do
+    case apply_config(state, key, params) do
+      {:ok, player, state} -> {:reply, {:ok, player}, state}
       {:error, _reason} = err -> {:reply, err, state}
     end
   end
@@ -577,6 +554,68 @@ defmodule UniversalProxy.Audio.Server do
   def handle_info(_msg, state), do: {:noreply, state}
 
   # -- Private --
+
+  # Persists a config update, forwards it to the player or restarts the
+  # player for a rename, and broadcasts it. Returns the player a volume or
+  # mute change was handed to (and that will echo it), or nil.
+  defp apply_config(state, key, params) do
+    with {:ok, existing} <- Map.fetch(state.outputs, key),
+         update = sanitize_update(params),
+         :ok <- Store.save_config(state.store, key, update),
+         {:ok, saved} <- Store.get_config(state.store, key) do
+      merged = merge(key, hardware_fields(existing), saved)
+      state1 = put_in(state.outputs[key], merged)
+
+      # Normalize the payload before forwarding/broadcasting. Values
+      # come from `merged` (post `Store.merge_defaults` /
+      # `clamp_volume` / `!!`), so subscribers and the player can
+      # never see caller-supplied garbage like `%{volume: "77"}`.
+      # `update` is still the presence check so calls that didn't
+      # ask to change a field don't re-send the cached value.
+      normalized = Map.take(merged, Map.keys(update))
+
+      state2 =
+        cond do
+          rename?(existing, merged) and merged.enabled ->
+            # The binary's `--name` and mDNS TXT `name=` are baked in
+            # at spawn time and there's no `set_name` stdin command.
+            # The only way to propagate a rename is to restart the
+            # player; the new instance gets the new name as a fresh
+            # CLI arg and re-registers mDNS. ~5 s audio gap is
+            # acceptable since renames are user-initiated and rare.
+            state1 |> stop_player(key) |> start_player(merged)
+
+          rename?(existing, merged) ->
+            # Output is disabled. Stop any stale player (defensive —
+            # toggle_player should already have done this on the
+            # `set_enabled(_, false)` that disabled it) but don't
+            # spawn a fresh one. Spawning a player for an output the
+            # user just disabled would broadcast it via mDNS again
+            # and stream audio they explicitly turned off.
+            stop_player(state1, key)
+
+          true ->
+            forward_to_player(state1, key, normalized)
+            state1
+        end
+
+      # The player a volume or mute change was handed to (and will echo).
+      player =
+        with true <- Map.has_key?(normalized, :volume) or Map.has_key?(normalized, :muted),
+             false <- rename?(existing, merged),
+             %{pid: pid} <- state2.players[key] do
+          pid
+        else
+          _ -> nil
+        end
+
+      broadcast_state(key, normalized)
+      {:ok, player, state2}
+    else
+      :error -> {:error, :not_found}
+      {:error, _reason} = err -> err
+    end
+  end
 
   # Schedule one debounced re-enumeration. Shared by the kernel-uevent and
   # Bluetooth-connection triggers: `hotplug_pending` coalesces a burst (a

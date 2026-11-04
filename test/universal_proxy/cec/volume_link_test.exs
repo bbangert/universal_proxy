@@ -23,6 +23,9 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
     update_fails = :counters.new(1, [])
     :counters.put(update_fails, 1, Map.get(context, :update_fails, 0))
     task_sup = start_supervised!(Task.Supervisor)
+    # The player process writes reach (nil: none running); tests swap it to
+    # model a respawn.
+    player = start_supervised!({Agent, fn -> Map.get(context, :player, :p1) end})
 
     opts = [
       name: nil,
@@ -34,20 +37,23 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
         send(test, {:external, key, external?})
         :ok
       end,
-      # Like Audio.update_config/2: the player echoes each value it is given.
-      # Echoes go out before the test hears of the write, so they reach the
-      # link ahead of anything the test sends in response.
+      # Like Audio.update_config_forwarded/2: the player a write reaches
+      # echoes each value. Echoes go out before the test hears of the write,
+      # so they reach the link ahead of anything the test sends in response.
       update_config: fn key, params ->
+        current = Agent.get(player, & &1)
+
         if :counters.get(update_fails, 1) > 0 do
           :counters.sub(update_fails, 1, 1)
           send(test, {:update_config, key, params})
           {:error, :unavailable}
         else
-          if echo?,
-            do: for({field, value} <- params, do: player_event(pubsub, key, field, value))
+          if echo? and current != nil do
+            for {field, value} <- params, do: player_event(pubsub, key, field, value, current)
+          end
 
           send(test, {:update_config, key, params})
-          :ok
+          {:ok, current}
         end
       end,
       set_volume: fn dev, target, walk_opts ->
@@ -62,11 +68,12 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
       settle_ms: 0,
       fail_unlink: Map.get(context, :fail_unlink, 3),
       echo_ttl_ms: Map.get(context, :echo_ttl_ms, 5_000),
+      hotplug_grace_ms: Map.get(context, :hotplug_grace_ms, 60_000),
       default: true
     ]
 
     pid = start_supervised!({VolumeLink, opts})
-    {:ok, pid: pid, pubsub: pubsub}
+    {:ok, pid: pid, pubsub: pubsub, player: player}
   end
 
   describe "linking" do
@@ -114,14 +121,97 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
       assert VolumeLink.links(pid) == %{@dev => @key}
     end
 
-    test "a stopped adapter or an absent receiver unlinks", %{pubsub: pubsub} do
+    test "a stopped adapter unlinks", %{pubsub: pubsub} do
       assert_receive {:external, @key, true}
       adapters(pubsub, [Map.put(adapter(), :running?, false)])
       assert_receive {:external, @key, false}
+    end
 
-      adapters(pubsub, [adapter()])
+    test "an HDMI hotplug's reconfigure doesn't unlink", %{pid: pid, pubsub: pubsub} do
       assert_receive {:external, @key, true}
+      cleared = %{power: :unknown, volume: nil, muted: nil, updated_at: nil}
+
+      # The adapter loses its address and the receiver record...
+      adapters(pubsub, [
+        adapter(cleared) |> Map.put(:configured?, false) |> Map.put(:receiver_presence, :unknown)
+      ])
+
+      # ...is asked nothing meanwhile...
+      poll_now(pid)
+      refute_receive {:cec, _, _}
+
+      # ...reclaims it, polls for the receiver, finds it.
+      adapters(pubsub, [Map.put(adapter(cleared), :receiver_presence, :unknown)])
+      poll_now(pid)
+      refute_receive {:cec, _, _}
+      adapters(pubsub, [adapter(cleared)])
+
+      poll_now(pid)
+      reply(assert_cec({:power_status, @dev}), {:ok, :on})
+      reply(assert_cec({:audio_status, @dev}), {:ok, %{volume: 20, muted: false}})
+      idle(pid)
+
+      refute_receive {:external, @key, false}
+      assert VolumeLink.links(pid) == %{@dev => @key}
+    end
+
+    test "a receiver absent right after a hotplug is waited for, and so are requests",
+         %{pid: pid, pubsub: pubsub} do
+      assert_receive {:external, @key, true}
+      assert_receive {:update_config, @key, _}
+
+      adapters(pubsub, [Map.put(adapter(), :configured?, false)])
+      adapters(pubsub, [Map.put(adapter(), :receiver_presence, :unknown)])
+
+      # The adapter's own poll finds the receiver still renegotiating.
       adapters(pubsub, [Map.put(adapter(), :receiver_presence, :absent)])
+      player_event(pubsub, @key, :volume, 35)
+
+      for _ <- 1..5, do: poll_now(pid)
+      idle(pid)
+      refute_receive {:cec, _, _}
+      refute_receive {:external, @key, false}
+      refute_receive {:update_config, _, _}
+
+      # Found again: the held request runs.
+      adapters(pubsub, [adapter()])
+      reply(assert_cec({:set_volume, @dev, 35}), {:ok, %{volume: 35, muted: false}})
+      idle(pid)
+      refute_receive {:external, @key, false}
+      assert VolumeLink.links(pid) == %{@dev => @key}
+    end
+
+    @tag hotplug_grace_ms: 0
+    test "a receiver still absent after the hotplug grace unlinks through the failure count",
+         %{pubsub: pubsub, pid: pid} do
+      assert_receive {:external, @key, true}
+
+      adapters(pubsub, [Map.put(adapter(), :configured?, false)])
+      adapters(pubsub, [Map.put(adapter(), :receiver_presence, :absent)])
+
+      poll_now(pid)
+      poll_now(pid)
+      refute_receive {:external, @key, false}
+      poll_now(pid)
+      assert_receive {:external, @key, false}
+    end
+
+    test "a receiver that stays absent unlinks through the failure count",
+         %{pid: pid, pubsub: pubsub} do
+      assert_receive {:external, @key, true}
+      assert_receive {:update_config, @key, _}
+
+      # Absent: the record now describes the TV, which isn't followed.
+      absent = adapter(%{volume: 70}) |> Map.put(:receiver_presence, :absent)
+      adapters(pubsub, [absent])
+      refute_receive {:update_config, _, _}
+
+      poll_now(pid)
+      poll_now(pid)
+      refute_receive {:cec, _, _}
+      refute_receive {:external, @key, false}
+
+      poll_now(pid)
       assert_receive {:external, @key, false}
     end
 
@@ -483,8 +573,8 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
   describe "echoes that will never come" do
     setup :linked
 
-    @tag output: %{enabled: false}, echo: false
-    test "writes to a disabled output (no player) expect no echo", %{pid: pid, pubsub: pubsub} do
+    @tag player: nil, echo: false
+    test "writes no player received expect no echo", %{pid: pid, pubsub: pubsub} do
       assert :sys.get_state(pid).links[@dev].echoes == []
       knob(pid, 30)
       assert :sys.get_state(pid).links[@dev].echoes == []
@@ -499,19 +589,71 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
 
     @tag echo: false
     test "a new player's startup snapshot drops the old player's expected echoes",
-         %{pid: pid, pubsub: pubsub} do
+         %{pid: pid, pubsub: pubsub, player: player} do
       knob(pid, 30)
       assert [_ | _] = :sys.get_state(pid).links[@dev].echoes
 
-      startup_event(pubsub, :volume, 30)
+      # :p1 died before echoing; :p2 is spawned with the stored 30.
+      Agent.update(player, fn _ -> :p2 end)
+      startup_event(pubsub, :volume, 30, :p2)
       idle(pid)
       assert :sys.get_state(pid).links[@dev].echoes == []
 
-      player_event(pubsub, @key, :volume, 40)
+      player_event(pubsub, @key, :volume, 40, :p2)
       reply(assert_cec({:set_volume, @dev, 40}), {:ok, %{volume: 40, muted: false}})
       idle(pid)
-      player_event(pubsub, @key, :volume, 30)
+      player_event(pubsub, @key, :volume, 30, :p2)
       reply(assert_cec({:set_volume, @dev, 30}), {:ok, %{volume: 30, muted: false}})
+    end
+
+    @tag echo: false
+    test "an old player's echo is a request from the new one's point of view",
+         %{pid: pid, pubsub: pubsub} do
+      knob(pid, 30)
+
+      # A value equal to an expected echo, but from another player.
+      player_event(pubsub, @key, :volume, 40, :p1)
+      reply(assert_cec({:set_volume, @dev, 40}), {:ok, %{volume: 40, muted: false}})
+      idle(pid)
+      player_event(pubsub, @key, :volume, 30, :p2)
+      reply(assert_cec({:set_volume, @dev, 30}), {:ok, %{volume: 30, muted: false}})
+    end
+
+    # Hotplug: the player was spawned (and got the adoption's 20) before
+    # the link saw its startup snapshot of 50.
+    @tag echo: false
+    test "the snapshot keeps the current player's expectations, through a request",
+         %{pid: pid, pubsub: pubsub} do
+      startup_event(pubsub, :volume, 50)
+      assert_receive {:update_config, @key, %{volume: 20}}
+      startup_event(pubsub, :muted, false)
+
+      player_event(pubsub, @key, :volume, 35)
+      walk = assert_cec({:set_volume, @dev, 35})
+
+      # The adoption's echoes and the correction's arrive mid-walk.
+      player_event(pubsub, @key, :volume, 20)
+      player_event(pubsub, @key, :muted, false)
+      player_event(pubsub, @key, :volume, 20)
+      reply(walk, {:ok, %{volume: 35, muted: false}})
+
+      assert_receive {:update_config, @key, %{volume: 35}}
+      idle(pid)
+      refute_receive {:cec, _, _}
+    end
+
+    @tag echo: false
+    test "two identical writes expect two echoes", %{pid: pid, pubsub: pubsub} do
+      startup_event(pubsub, :volume, 50)
+      assert_receive {:update_config, @key, %{volume: 20}}
+
+      player_event(pubsub, @key, :volume, 20)
+      knob(pid, 30)
+      # The correction's echo, after the knob moved the receiver to 30.
+      player_event(pubsub, @key, :volume, 20)
+      assert_receive {:update_config, @key, %{volume: 30}}
+      idle(pid)
+      refute_receive {:cec, _, _}
     end
   end
 
@@ -824,7 +966,42 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
     @tag echo: false, echo_ttl_ms: 0
     test "expected echoes no player answers don't pile up", %{pid: pid} do
       for volume <- [30, 40, 50], do: knob(pid, volume)
-      assert [{:volume, 50, _}] = :sys.get_state(pid).links[@dev].echoes
+      assert [%{field: :volume, value: 50}] = :sys.get_state(pid).links[@dev].echoes
+    end
+
+    test "a walk that got somewhere before failing reconciles to where it got",
+         %{pid: pid, pubsub: pubsub} do
+      player_event(pubsub, @key, :volume, 60)
+
+      reply(
+        assert_cec({:set_volume, @dev, 60}),
+        {:error, {:timeout, %{volume: 52, muted: false, step: 1}}}
+      )
+
+      assert_receive {:update_config, @key, %{volume: 52}}
+      idle(pid)
+
+      # ...and it counted as a failure: two more and the link goes, at 52.
+      failed_poll(pid, first: true)
+      refute_receive {:external, @key, false}
+      failed_poll(pid)
+      assert_receive {:external, @key, false}
+    end
+
+    test "when a walk that got somewhere is the last failure, that is written back",
+         %{pid: pid, pubsub: pubsub} do
+      failed_poll(pid, first: true)
+      failed_poll(pid)
+
+      player_event(pubsub, @key, :volume, 60)
+
+      reply(
+        assert_cec({:set_volume, @dev, 60}),
+        {:error, {:timeout, %{volume: 52, muted: false, step: 1}}}
+      )
+
+      assert_receive {:update_config, @key, %{volume: 52}}
+      assert_receive {:external, @key, false}
     end
 
     test "when a run is the last failure, the receiver's state is written back first",
@@ -890,9 +1067,9 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
   defp state(pubsub, partial),
     do: Phoenix.PubSub.broadcast(pubsub, "sendspin:state", {:sendspin_state, @key, partial})
 
-  defp player_event(pubsub, key, field, value) do
+  defp player_event(pubsub, key, field, value, player \\ :p1) do
     event = if field == :muted, do: "mute", else: to_string(field)
-    message = {:sendspin_state, key, %{event: event, value: value}}
+    message = {:sendspin_state, key, %{event: event, value: value, player: player}}
     Phoenix.PubSub.broadcast(pubsub, "sendspin:state", message)
   end
 
@@ -936,9 +1113,12 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
     idle(pid)
   end
 
-  defp startup_event(pubsub, field, value) do
+  defp startup_event(pubsub, field, value, player \\ :p1) do
     event = if field == :muted, do: "mute", else: to_string(field)
-    message = {:sendspin_state, @key, %{event: event, value: value, startup: true}}
+
+    message =
+      {:sendspin_state, @key, %{event: event, value: value, startup: true, player: player}}
+
     Phoenix.PubSub.broadcast(pubsub, "sendspin:state", message)
   end
 

@@ -47,9 +47,16 @@ defmodule UniversalProxy.Cec do
   was last seen to make (see `set_volume/3`'s `:step`).
   """
   @type volume_result :: %{volume: 0..100, muted: boolean(), step: pos_integer()}
-  @typedoc "Why `set_volume/3` stopped short; a result is the last readback."
+  @typedoc """
+  Why `set_volume/3` stopped short. With a result (the last readback),
+  the walk had read the volume at least once: a stall, the press limit, or
+  a press or readback that failed with the reason given.
+  """
   @type step_error ::
-          :unknown_volume | {:no_progress, volume_result()} | {:press_limit, volume_result()}
+          :unknown_volume
+          | {:no_progress, volume_result()}
+          | {:press_limit, volume_result()}
+          | {error() | :unknown_volume, volume_result()}
 
   @ui_keys %{power_on: :power_on_function, power_off: :power_off_function}
 
@@ -221,8 +228,11 @@ defmodule UniversalProxy.Cec do
   Stops with `{:error, {:no_progress, result}}` after #{@stall_presses}
   presses in a row don't move the volume the pressed way, and with
   `{:error, {:press_limit, result}}` at `:max_presses`; `result` is the
-  last readback. `{:error, :unknown_volume}` when the receiver won't
-  report a volume.
+  last readback. A press or readback that fails after the first readback
+  gives `{:error, {reason, result}}` the same way, so the caller knows
+  where the walk got to (`:unknown_volume` when a readback had no
+  volume). Failing before any readback, the error is bare:
+  `{:error, :unknown_volume}` when the receiver won't report a volume.
   """
   @spec set_volume(dev(), 0..100, keyword()) ::
           {:ok, volume_result()} | {:error, error() | step_error()}
@@ -293,13 +303,15 @@ defmodule UniversalProxy.Cec do
     end
   end
 
-  defp press_and_read(walk, key, %{volume: volume, step: step}, left, stalled) do
+  defp press_and_read(walk, key, %{volume: volume, step: step} = last, left, stalled) do
     with :ok <- user_control(walk.dev, key, walk.opts),
          {:ok, %{volume: now} = status} <- known_volume(audio_status(walk.dev, walk.opts)) do
       moved = now - volume
       stalled = if moved_towards?(key, moved), do: 0, else: stalled + 1
       result = Map.put(status, :step, learn_step(step, moved, now))
       step_volume(walk, result, left - 1, stalled)
+    else
+      {:error, reason} -> {:error, {reason, last}}
     end
   end
 

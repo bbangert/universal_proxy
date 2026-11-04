@@ -1085,6 +1085,25 @@ defmodule UniversalProxy.Audio.ServerTest do
       assert List.last(PlayerStubCalls.calls()) == {:start_volume_external, @hp_key, false}
     end
 
+    test "update_config_forwarded names the player a volume or mute change went to", %{
+      server: server,
+      player_sup: sup
+    } do
+      [{_, player, _, _}] = DynamicSupervisor.which_children(sup)
+
+      assert {:ok, ^player} = Server.update_config_forwarded(server, @hp_key, %{volume: 30})
+      assert {:set_volume, @hp_key, 30} in PlayerStubCalls.calls()
+      assert {:ok, ^player} = Server.update_config_forwarded(server, @hp_key, %{muted: true})
+      assert {:ok, nil} = Server.update_config_forwarded(server, @hp_key, %{cec_volume: false})
+
+      :ok = Server.set_enabled(server, @hp_key, false)
+      assert {:ok, nil} = Server.update_config_forwarded(server, @hp_key, %{volume: 40})
+      assert {:ok, %{volume: 40}} = Server.get_output(server, @hp_key)
+
+      assert {:error, :not_found} =
+               Server.update_config_forwarded(server, {"missing", nil, nil}, %{volume: 1})
+    end
+
     test "update_config with muted forwards to set_muted", %{server: server} do
       :ok = Server.update_config(server, @hp_key, %{muted: true})
       assert_receive {:sendspin_state, @hp_key, %{muted: true}}

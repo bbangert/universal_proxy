@@ -50,6 +50,20 @@ defmodule UniversalProxy.Audio do
   end
 
   @doc """
+  `update_config/2`, but `{:ok, player}` names the player process a volume
+  or mute change was handed to; it reports that value back as a
+  `volume`/`mute` event carrying `player: pid` (`nil` when no player is
+  running). `{:error, :unavailable}` while the audio subsystem is down.
+  """
+  @spec update_config_forwarded(key(), map()) ::
+          {:ok, pid() | nil} | {:error, :not_found | :unavailable | term()}
+  def update_config_forwarded({_, _, _} = key, params) when is_map(params) do
+    Server.update_config_forwarded(key, params)
+  catch
+    :exit, _ -> {:error, :unavailable}
+  end
+
+  @doc """
   Hand an output's volume and mute to an outboard stage (`true`: the
   player plays at unity gain but keeps tracking and reporting both) or
   take them back (`false`). Not persisted: kept until the output goes
