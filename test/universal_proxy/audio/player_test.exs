@@ -682,6 +682,7 @@ defmodule UniversalProxy.Audio.PlayerTest do
 
       :ok = Player.set_volume(pid, 80)
       :ok = Player.set_muted(pid, true)
+      :ok = Player.set_volume_external(pid, true)
 
       # GenServer.stop sends shutdown JSON then closes the port,
       # which flushes our recorder's `cat` to disk.
@@ -691,6 +692,7 @@ defmodule UniversalProxy.Audio.PlayerTest do
 
       assert ~s({"cmd":"set_volume","value":80}) in lines
       assert ~s({"cmd":"set_muted","value":true}) in lines
+      assert ~s({"cmd":"set_volume_external","value":true}) in lines
       assert ~s({"cmd":"shutdown"}) in lines
     end
   end
@@ -721,6 +723,54 @@ defmodule UniversalProxy.Audio.PlayerTest do
       # event. assert_receive selectively matches the mute event in
       # the mailbox.
       assert_receive {:sendspin_state, @key, %{event: "mute", value: true}}, 2_000
+    end
+  end
+
+  describe "set_volume_external/2" do
+    test "writes JSON to stdin and the binary's ack is broadcast" do
+      pid = start_player!()
+      assert_receive {:sendspin_state, @key, %{event: "started"}}, 2_000
+
+      :ok = Player.set_volume_external(pid, true)
+      assert_receive {:sendspin_state, @key, %{event: "volume_external", value: true}}, 1_000
+      assert :sys.get_state(pid).volume_external
+
+      :ok = Player.set_volume_external(pid, false)
+      assert_receive {:sendspin_state, @key, %{event: "volume_external", value: false}}, 1_000
+      refute :sys.get_state(pid).volume_external
+    end
+
+    test "volume and mute are still reported while external" do
+      pid = start_player!()
+      assert_receive {:sendspin_state, @key, %{event: "started"}}, 2_000
+
+      :ok = Player.set_volume_external(pid, true)
+      assert_receive {:sendspin_state, @key, %{event: "volume_external", value: true}}, 1_000
+
+      :ok = Player.set_volume(pid, 35)
+      :ok = Player.set_muted(pid, true)
+      assert_receive {:sendspin_state, @key, %{event: "volume", value: 35}}, 1_000
+      assert_receive {:sendspin_state, @key, %{event: "mute", value: true}}, 1_000
+    end
+
+    test "rejects a non-boolean" do
+      pid = start_player!()
+
+      assert_raise FunctionClauseError, fn -> Player.set_volume_external(pid, 1) end
+    end
+
+    test "a player started with :volume_external starts the binary in that mode" do
+      # Players never reopen their port; a respawn is a fresh player, so
+      # the mode survives a restart only through this option.
+      pid = start_player!(volume_external: true)
+
+      assert_receive {:sendspin_state, @key, %{event: "volume_external", value: true}}, 2_000
+      assert "--external-volume" in Player.__cli_args__(:sys.get_state(pid))
+    end
+
+    test "--external-volume is omitted by default" do
+      refute "--external-volume" in Player.__cli_args__(cli_state([]))
+      assert "--external-volume" in Player.__cli_args__(cli_state(volume_external: true))
     end
   end
 

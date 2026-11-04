@@ -167,6 +167,7 @@ The flags must match what `UniversalProxy.Audio.Player` passes — see the
 | `--mdns-port INT`          | no       | Local WebSocket listener port (default 8928) |
 | `--initial-volume 0..100`  | no       | Startup volume (default 50)                  |
 | `--initial-static-delay-ms 0..5000` | no | Startup static output delay for multi-room sync; the server can adjust it at runtime (`static_delay` event reports changes for persistence). Default 0 |
+| `--external-volume`        | no       | Start in external-volume mode (see *Stdin commands*) |
 | `--log-level STR`          | no       | `none\|error\|warn\|info\|debug\|verbose`    |
 | `--help` / `-h`            | no       | Print usage and exit                         |
 | `--version` / `-V`         | no       | Print version and exit                       |
@@ -187,6 +188,7 @@ changes, and on errors.
 {"event":"time_sync","error_us":42.3}     // only at log-level >= debug
 {"event":"volume","value":80}
 {"event":"mute","value":false}
+{"event":"volume_external","value":true}  // ack of set_volume_external / --external-volume
 {"event":"error","kind":"alsa_configure","msg":"..."}
 {"event":"error","kind":"pairing_token","msg":"..."}  // non-fatal; token itself never on stdout
 {"event":"shutdown"}
@@ -265,11 +267,18 @@ window.
 ```jsonc
 {"cmd":"set_volume","value":75}
 {"cmd":"set_muted","value":true}
+{"cmd":"set_volume_external","value":true}
 {"cmd":"shutdown"}
 ```
 
 The parser is strict on shape but lenient on whitespace. Unknown commands are
 ignored silently.
+
+`set_volume_external` hands volume to an outboard stage (an AVR driven over
+HDMI-CEC). While it is on, the sink writes samples at unity gain and never
+mutes them. Volume and mute are still stored, reported to the server and
+emitted as `volume`/`mute` events exactly as in software mode. Turning it off resumes software scaling at the stored values. Default
+off; `--external-volume` starts in it.
 
 ## Cross-target compilation
 

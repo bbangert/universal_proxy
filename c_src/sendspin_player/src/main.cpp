@@ -10,7 +10,9 @@
 // from upstream:
 //   • CLI args via getopt_long instead of INI config file
 //   • JSON status events on stdout instead of stderr free-form logs
-//   • JSON commands on stdin for runtime volume/mute/shutdown
+//   • JSON commands on stdin for runtime volume/mute/shutdown, plus an
+//     external-volume mode where an outboard stage (an AVR over HDMI-CEC)
+//     owns attenuation and the sink stays at unity gain
 //   • Sets SendspinClientConfig::server_port from --mdns-port to bind a
 //     non-default WebSocket port so multiple players can coexist
 //   • Persists the library's identity and pairing state under --state-dir
@@ -238,6 +240,7 @@ struct Options {
     int mdns_port = DEFAULT_WS_PORT;
     int initial_volume = 50;
     int initial_static_delay_ms = 0;
+    bool external_volume = false;
     std::string log_level = "info";
 };
 
@@ -270,6 +273,10 @@ static void print_usage(const char* prog) {
         "                        The server (e.g. Music Assistant) can adjust this at\n"
         "                        runtime for multi-room sync; report changes back via\n"
         "                        the `static_delay` stdout event to persist them.\n"
+        "  --external-volume     Start in external-volume mode: no software volume\n"
+        "                        or mute is applied (unity gain), but volume/mute\n"
+        "                        are still tracked and reported. Toggle at runtime\n"
+        "                        with the `set_volume_external` stdin command.\n"
         "  --log-level STR       none|error|warn|info|debug|verbose (default: info).\n"
         "  -h, --help            Show this help.\n"
         "  -V, --version         Show version.\n",
@@ -293,6 +300,7 @@ static bool parse_args(int argc, char** argv, Options& opts) {
         {"mdns-port",      required_argument, nullptr, 'p'},
         {"initial-volume", required_argument, nullptr, 'v'},
         {"initial-static-delay-ms", required_argument, nullptr, 'D'},
+        {"external-volume", no_argument,  nullptr, 'E'},
         {"log-level",      required_argument, nullptr, 'l'},
         {"help",           no_argument,       nullptr, 'h'},
         {"version",        no_argument,       nullptr, 'V'},
@@ -326,6 +334,7 @@ static bool parse_args(int argc, char** argv, Options& opts) {
                     return false;
                 }
                 break;
+            case 'E': opts.external_volume = true; break;
             case 'l': opts.log_level = optarg; break;
             case 'h': print_usage(argv[0]); std::exit(0);
             case 'V': std::fprintf(stdout, "sendspin_player %s\n", VERSION); std::exit(0);
@@ -379,6 +388,7 @@ static bool parse_log_level(const std::string& s, LogLevel& level) {
 //   {"cmd":"shutdown"}
 //   {"cmd":"set_volume","value":75}
 //   {"cmd":"set_muted","value":true}
+//   {"cmd":"set_volume_external","value":true}
 //
 // Whitespace is allowed between tokens but the structure is fixed. Hand-
 // rolled instead of pulling in nlohmann/json because (a) the wire format
@@ -467,10 +477,11 @@ private:
 
 // Returns true on a well-formed line. `value_kind` is "" (no value),
 // "int", or "bool" — the dispatcher uses it to enforce per-command
-// value shapes (set_volume requires int, set_muted requires bool,
-// shutdown requires no value). Without this, the value-less and
-// wrong-type cases would silently land in `int_val == 0` / `bool_val
-// == false` and be processed as if the operator had asked for 0.
+// value shapes (set_volume requires int, set_muted and
+// set_volume_external require bool, shutdown requires no value).
+// Without this, the value-less and wrong-type cases would silently land
+// in `int_val == 0` / `bool_val == false` and be processed as if the
+// operator had asked for 0.
 static bool parse_command(const std::string& line, std::string& cmd,
                           std::string& value_kind,
                           int& int_val, bool& bool_val) {
@@ -552,6 +563,13 @@ private:
 
 }  // namespace
 
+static void emit_volume_external(bool external) {
+    std::ostringstream os;
+    os << "{\"event\":\"volume_external\",\"value\":"
+       << (external ? "true" : "false") << "}";
+    emit_json(os.str());
+}
+
 // Dispatches a single parsed command line. Silently ignores lines that
 // don't match a known cmd shape — BEAM is the sole writer so a malformed
 // frame is a programmer bug, not user input we need to surface.
@@ -575,6 +593,11 @@ static void dispatch_command(const std::string& line, AlsaPipeSink& sink,
         std::ostringstream os;
         os << "{\"event\":\"mute\",\"value\":" << (bool_val ? "true" : "false") << "}";
         emit_json(os.str());
+    } else if (cmd == "set_volume_external" && kind == "bool") {
+        // Only the sink's gain stage changes: the stored volume/mute and
+        // what the server is told about them are untouched either way.
+        sink.set_volume_external(bool_val);
+        emit_volume_external(bool_val);
     } else if (cmd == "shutdown" && kind.empty()) {
         g_running.store(false);
     }
@@ -868,6 +891,11 @@ int main(int argc, char* argv[]) {
         std::ostringstream os;
         os << "{\"event\":\"volume\",\"value\":" << opts.initial_volume << "}";
         emit_json(os.str());
+    }
+
+    if (opts.external_volume) {
+        audio_sink.set_volume_external(true);
+        emit_volume_external(true);
     }
 
     {

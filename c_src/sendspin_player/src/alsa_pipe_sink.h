@@ -48,6 +48,12 @@ class AlsaPipeSink {
     /// Set mute state.
     void set_muted(bool muted);
 
+    /// External volume mode: an outboard stage (e.g. an AVR over HDMI-CEC)
+    /// owns volume and mute. While on, samples pass through at unity gain
+    /// and unmuted; set_volume()/set_muted() still store their values, so
+    /// turning the mode off resumes software scaling at the latest ones.
+    void set_volume_external(bool external);
+
     /// Set ALSA device name (e.g. "plughw:1,0"). Must be called before the
     /// first configure(). Empty string uses the system default device.
     void set_device(const std::string& device);
@@ -89,6 +95,7 @@ class AlsaPipeSink {
     // ---- Volume (written by network thread, read by playback thread) ----
     std::atomic<uint8_t> volume_{100};
     std::atomic<bool> muted_{false};
+    std::atomic<bool> volume_external_{false};
 
     void apply_volume(uint8_t* data, size_t length);
 };

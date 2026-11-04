@@ -8,12 +8,15 @@ Player tests need to drive.
 
   startup       → {"event":"started","version":...,"port":...,"name":...,"alsa_device":...}
                   {"event":"volume","value":<initial_volume>}
+                  {"event":"volume_external","value":true} (only with --external-volume)
                   {"event":"static_delay","value":<initial_static_delay_ms>}
                   (writes <state-dir>/pairing_token, 0600; never printed)
                   {"event":"listening","port":...,"client_id":...}
   stdin commands → stdout events
     {"cmd":"set_volume","value":N} → {"event":"volume","value":N}
     {"cmd":"set_muted","value":B}  → {"event":"mute","value":B}
+    {"cmd":"set_volume_external","value":B} → {"event":"volume_external","value":B}
+                                   (non-bool value dropped, like the real binary)
     {"cmd":"shutdown"}             → {"event":"shutdown"} + exit 0
     {"cmd":"force_exit"}           → exit 7 (test-only; no event)
 
@@ -83,6 +86,7 @@ def main():
     p.add_argument("--mdns-port", type=int, default=0)
     p.add_argument("--initial-volume", type=int, default=50)
     p.add_argument("--initial-static-delay-ms", type=int, default=0)
+    p.add_argument("--external-volume", action="store_true")
     p.add_argument("--log-level", default="info")
     args = p.parse_args()
 
@@ -112,6 +116,9 @@ def main():
     # Real binary emits a separate `volume` event after `started` to
     # publish the initial volume (main.cpp:642-649).
     emit({"event": "volume", "value": args.initial_volume})
+
+    if args.external_volume:
+        emit({"event": "volume_external", "value": True})
 
     # ...and a `static_delay` event publishing the server-adjustable static
     # output delay (the real binary reports get_output_delay_ms()).
@@ -149,6 +156,9 @@ def main():
             emit({"event": "volume", "value": cmd.get("value")})
         elif kind == "set_muted":
             emit({"event": "mute", "value": cmd.get("value")})
+        elif kind == "set_volume_external":
+            if isinstance(cmd.get("value"), bool):
+                emit({"event": "volume_external", "value": cmd["value"]})
         elif kind == "shutdown":
             emit({"event": "shutdown"})
             return 0
