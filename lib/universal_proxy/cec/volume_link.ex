@@ -10,8 +10,9 @@ defmodule UniversalProxy.Cec.VolumeLink do
   output goes away, the setting is turned off, or the receiver stops
   answering: `:fail_unlink` (3) polls or runs in a row that the receiver
   didn't acknowledge or reply to (`:nack`, `:timeout`, `:max_retries`, or a
-  crashed run). An output linked to a silent receiver would otherwise stay
-  at unity gain. Errors on our side of the bus (`:not_configured` while the
+  crashed run), or answered without a volume (`:unknown_volume`). An output
+  linked to a receiver it can't control would otherwise stay at unity
+  gain. Errors on our side of the bus (`:not_configured` while the
   adapter re-acquires its address after a hotplug, `:busy`,
   `:cec_unavailable`, ...) say nothing about the receiver and leave the
   count alone; a stalled run read the volume back, so it counts as an
@@ -26,13 +27,14 @@ defmodule UniversalProxy.Cec.VolumeLink do
       mute still reported) and adopts the receiver's volume and mute into
       the output. The receiver wins: the stored software volume is never
       sent to it. **Unlinking** turns external mode off again, and software
-      volume resumes at the last value shown.
+      volume resumes at the last value shown; a run in progress is stopped.
     * **Output to receiver**: a player `volume` or `mute` event (from the
       Sendspin server or `UniversalProxy.Audio.update_config/2`) steps the
       receiver there with `UniversalProxy.Cec.set_volume/3` and
       `set_muted/3`, in a task, one run per adapter at a time. The volume
       is capped at the output's `cec_volume_max`. A value that arrives
-      during a run is applied when it ends (latest wins). Once nothing is
+      during a run or a poll is applied when it ends, against what the
+      receiver then reports (latest wins). Once nothing is
       left to do, whatever the receiver ended at is written back to the
       output if it differs (the cap, a stall, a failure), so the server and
       the UI never show a volume the receiver isn't at.
@@ -46,7 +48,14 @@ defmodule UniversalProxy.Cec.VolumeLink do
 
   Each value written to the output comes back once as a player event, and
   is expected (for a few seconds); expected events, and events repeating
-  the value already shown, never start a run.
+  the value already shown, never start a run. An expected echo still says
+  what the player shows now (it may land after a newer request), so the
+  receiver's state is written back over it if they differ.
+
+  Runs and polls are this process's own jobs, under `:task_supervisor`
+  (`UniversalProxy.Cec.Supervisor`'s, so a subtree restart ends them).
+  Each carries the generation of the link it was started for, and results
+  for an earlier link are dropped.
 
   Receivers report neither power nor volume until asked, so an adapter
   whose output could link is probed every `:probe_ms` (power status, then
@@ -86,6 +95,7 @@ defmodule UniversalProxy.Cec.VolumeLink do
             timers: %{},
             power_at: %{},
             lost: MapSet.new(),
+            gen: 0,
             funs: %{},
             default: true,
             poll_ms: @default_poll_ms,
@@ -93,7 +103,7 @@ defmodule UniversalProxy.Cec.VolumeLink do
             settle_ms: @default_settle_ms,
             fail_unlink: @default_fail_unlink,
             pubsub: @pubsub,
-            task_sup: UniversalProxy.TaskSupervisor
+            task_sup: UniversalProxy.Cec.TaskSupervisor
 
   # ── API ───────────────────────────────────────────────────────────────
 
@@ -134,7 +144,7 @@ defmodule UniversalProxy.Cec.VolumeLink do
       settle_ms: Keyword.get(opts, :settle_ms, @default_settle_ms),
       fail_unlink: Keyword.get(opts, :fail_unlink, @default_fail_unlink),
       pubsub: Keyword.get(opts, :pubsub, @pubsub),
-      task_sup: Keyword.get(opts, :task_supervisor, UniversalProxy.TaskSupervisor)
+      task_sup: Keyword.get(opts, :task_supervisor, UniversalProxy.Cec.TaskSupervisor)
     }
 
     for topic <- [Cec.topic(), @state_topic, @added_topic, @removed_topic] do
@@ -206,33 +216,41 @@ defmodule UniversalProxy.Cec.VolumeLink do
     {:noreply, state |> note_output(key, partial) |> evaluate()}
   end
 
-  def handle_info({:poll, dev}, state) do
-    state = %{state | timers: Map.delete(state.timers, dev)}
+  # Only the timer currently armed for `dev` counts: a cancelled one may
+  # already have delivered its message.
+  def handle_info({:poll, dev, token}, state) do
+    case state.timers do
+      %{^dev => {^token, _timer}} ->
+        state = %{state | timers: Map.delete(state.timers, dev)}
 
-    if Map.has_key?(candidates(state), dev) and not Map.has_key?(state.busy, dev),
-      do: {:noreply, start_poll(state, dev)},
-      else: {:noreply, state}
+        if Map.has_key?(candidates(state), dev) and not Map.has_key?(state.busy, dev),
+          do: {:noreply, start_poll(state, dev)},
+          else: {:noreply, state}
+
+      _ ->
+        {:noreply, state}
+    end
   end
 
   def handle_info({ref, result}, state) when is_reference(ref) do
-    case busy_dev(state, ref) do
+    case busy_job(state, ref) do
       nil ->
         {:noreply, state}
 
-      dev ->
+      {dev, job} ->
         Process.demonitor(ref, [:flush])
-        {:noreply, job_done(%{state | busy: Map.delete(state.busy, dev)}, dev, result)}
+        {:noreply, job_done(%{state | busy: Map.delete(state.busy, dev)}, dev, job, result)}
     end
   end
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
-    case busy_dev(state, ref) do
+    case busy_job(state, ref) do
       nil ->
         {:noreply, state}
 
-      dev ->
+      {dev, job} ->
         Logger.warning("CEC volume link: #{dev} task crashed: #{inspect(reason)}")
-        {:noreply, job_done(%{state | busy: Map.delete(state.busy, dev)}, dev, :crashed)}
+        {:noreply, job_done(%{state | busy: Map.delete(state.busy, dev)}, dev, job, :crashed)}
     end
   end
 
@@ -309,8 +327,11 @@ defmodule UniversalProxy.Cec.VolumeLink do
     Logger.info("CEC volume link: #{inspect(key)} follows the receiver on #{dev} (#{volume})")
     safe(fn -> state.funs.set_volume_external.(key, true) end, :ok)
 
+    gen = state.gen + 1
+
     link = %{
       key: key,
+      gen: gen,
       receiver: %{volume: volume, muted: muted},
       shown: %{volume: nil, muted: nil},
       pending: %{},
@@ -319,7 +340,7 @@ defmodule UniversalProxy.Cec.VolumeLink do
       failures: []
     }
 
-    state = put_in(state.links[dev], link)
+    state = %{state | gen: gen, links: Map.put(state.links, dev, link)}
     push(state, dev, known(link.receiver))
   end
 
@@ -331,7 +352,23 @@ defmodule UniversalProxy.Cec.VolumeLink do
     )
 
     safe(fn -> state.funs.set_volume_external.(key, false) end, :ok)
-    %{state | links: Map.delete(state.links, dev)}
+    stop_run(%{state | links: Map.delete(state.links, dev)}, dev)
+  end
+
+  # A run keeps pressing keys towards a target nobody wants any more: end
+  # it. Each press and its readback is one adapter call, which completes
+  # by itself, so the walk stops between calls. Polls only read, and their
+  # results are dropped by generation.
+  defp stop_run(state, dev) do
+    case state.busy[dev] do
+      %{kind: :step, ref: ref, pid: pid} ->
+        Process.demonitor(ref, [:flush])
+        _ = Task.Supervisor.terminate_child(state.task_sup, pid)
+        %{state | busy: Map.delete(state.busy, dev)}
+
+      _ ->
+        state
+    end
   end
 
   defp linked_keys(state), do: for({_dev, %{key: key}} <- state.links, do: key)
@@ -350,7 +387,11 @@ defmodule UniversalProxy.Cec.VolumeLink do
   defp link_intent(state, dev, link, field, value) do
     case take_echo(link, field, value) do
       {:echo, link} ->
-        put_in(state.links[dev], link)
+        # What the player shows now, even if it arrived after a newer
+        # request: written back over once the receiver's state is known.
+        link = put_in(link.shown[field], value)
+        state = put_in(state.links[dev], link)
+        if busy_step?(state, dev), do: state, else: sync_output(state, dev)
 
       {:none, %{shown: %{^field => ^value}} = link} ->
         put_in(state.links[dev], link)
@@ -375,12 +416,13 @@ defmodule UniversalProxy.Cec.VolumeLink do
     link = state.links[dev]
 
     cond do
-      match?({_ref, :step}, state.busy[dev]) ->
+      # Compared with the receiver once the job ends, against its readback.
+      Map.has_key?(state.busy, dev) ->
         put_in(state.links[dev].pending[field], target)
 
       target != link.receiver[field] ->
         state = put_in(state.links[dev].pending[field], target)
-        if Map.has_key?(state.busy, dev), do: state, else: start_step(state, dev)
+        start_step(state, dev)
 
       true ->
         state = update_in(state.links[dev].pending, &Map.delete(&1, field))
@@ -411,7 +453,7 @@ defmodule UniversalProxy.Cec.VolumeLink do
           step(set_volume, set_muted, dev, targets)
         end)
 
-      %{state | busy: Map.put(state.busy, dev, {task.ref, :step})}
+      put_job(state, dev, task, :step)
     end
   end
 
@@ -463,7 +505,7 @@ defmodule UniversalProxy.Cec.VolumeLink do
         state
 
       link ->
-        if match?({_ref, :step}, state.busy[dev]) do
+        if busy_step?(state, dev) do
           state
         else
           receiver = Map.merge(link.receiver, known(Map.take(report, @fields)))
@@ -495,19 +537,22 @@ defmodule UniversalProxy.Cec.VolumeLink do
   defp push(state, dev, diff) do
     link = state.links[dev]
 
+    # Not written means not shown: the next sync tries again.
     case safe(fn -> state.funs.update_config.(link.key, diff) end, {:error, :unavailable}) do
-      :ok -> :ok
-      error -> Logger.debug("CEC volume link: update #{inspect(link.key)}: #{inspect(error)}")
+      :ok ->
+        deadline = System.monotonic_time(:millisecond) + @echo_ttl_ms
+        echoes = for {field, value} <- diff, do: {field, value, deadline}
+
+        put_in(state.links[dev], %{
+          link
+          | shown: Map.merge(link.shown, diff),
+            echoes: link.echoes ++ echoes
+        })
+
+      error ->
+        Logger.debug("CEC volume link: update #{inspect(link.key)}: #{inspect(error)}")
+        state
     end
-
-    deadline = System.monotonic_time(:millisecond) + @echo_ttl_ms
-    echoes = for {field, value} <- diff, do: {field, value, deadline}
-
-    put_in(state.links[dev], %{
-      link
-      | shown: Map.merge(link.shown, diff),
-        echoes: link.echoes ++ echoes
-    })
   end
 
   defp take_echo(link, field, value) do
@@ -524,7 +569,7 @@ defmodule UniversalProxy.Cec.VolumeLink do
 
   defp schedule_all(state, candidates) do
     {keep, drop} = Map.split(state.timers, Map.keys(candidates))
-    Enum.each(drop, fn {_dev, timer} -> Process.cancel_timer(timer) end)
+    Enum.each(drop, fn {_dev, {_token, timer}} -> Process.cancel_timer(timer) end)
     state = %{state | timers: keep}
     Enum.reduce(Map.keys(candidates), state, &schedule(&2, &1))
   end
@@ -545,8 +590,9 @@ defmodule UniversalProxy.Cec.VolumeLink do
             true -> 0
           end
 
-        timer = Process.send_after(self(), {:poll, dev}, delay)
-        %{state | timers: Map.put(state.timers, dev, timer)}
+        token = make_ref()
+        timer = Process.send_after(self(), {:poll, dev, token}, delay)
+        %{state | timers: Map.put(state.timers, dev, {token, timer})}
     end
   end
 
@@ -569,10 +615,32 @@ defmodule UniversalProxy.Cec.VolumeLink do
         {:poll, power, audio}
       end)
 
-    %{state | busy: Map.put(state.busy, dev, {task.ref, :poll})}
+    put_job(state, dev, task, :poll)
   end
 
+  defp put_job(state, dev, %Task{ref: ref, pid: pid}, kind) do
+    job = %{ref: ref, pid: pid, kind: kind, gen: link_gen(state, dev)}
+    %{state | busy: Map.put(state.busy, dev, job)}
+  end
+
+  defp link_gen(state, dev) do
+    case state.links[dev] do
+      %{gen: gen} -> gen
+      nil -> nil
+    end
+  end
+
+  defp busy_step?(state, dev), do: match?(%{kind: :step}, state.busy[dev])
+
   # ── job results ───────────────────────────────────────────────────────
+
+  # A job started for an earlier link (or before this one) says nothing
+  # about the current one.
+  defp job_done(state, dev, %{gen: gen}, result) do
+    if gen == link_gen(state, dev),
+      do: job_done(state, dev, result),
+      else: next(state, dev)
+  end
 
   defp job_done(state, dev, {:poll, power, audio}) do
     state =
@@ -580,7 +648,7 @@ defmodule UniversalProxy.Cec.VolumeLink do
         do: state,
         else: put_in(state.power_at[dev], System.monotonic_time(:millisecond))
 
-    outcome = poll_outcome([power, audio])
+    outcome = poll_outcome([power, no_volume(audio)])
 
     state =
       case audio do
@@ -633,8 +701,13 @@ defmodule UniversalProxy.Cec.VolumeLink do
   defp step_outcome(error),
     do: if(receiver_silent?(error), do: {:silent, error}, else: :local)
 
-  # `:timeout` is also what a request that got no reply returns.
-  defp receiver_silent?(reason), do: reason in [:nack, :timeout, :max_retries]
+  # `:timeout` is also what a request that got no reply returns. A
+  # receiver that answers without a volume can't be followed either.
+  defp receiver_silent?(reason),
+    do: reason in [:nack, :timeout, :max_retries, :unknown_volume]
+
+  defp no_volume({:ok, %{volume: nil}}), do: {:error, :unknown_volume}
+  defp no_volume(audio), do: audio
 
   defp after_poll(state, dev, outcome, power, audio) do
     cond do
@@ -673,16 +746,18 @@ defmodule UniversalProxy.Cec.VolumeLink do
 
   # A lost receiver answered a probe: relink from what it just said (the
   # record Cec.Server broadcasts may not have caught up yet).
+  # Only for a device still a candidate: the probe may finish after its
+  # adapter (or output) went away.
   defp found_again(state, dev, {:ok, %{volume: volume} = status}) when is_integer(volume) do
-    Logger.info("CEC volume link: receiver on #{dev} answers again")
-
-    adapters =
-      Map.update!(state.adapters, dev, fn adapter ->
-        merged = receiver(adapter) |> Map.merge(known(status)) |> Map.put(:power, :on)
-        Map.put(adapter, :receiver, merged)
-      end)
-
-    evaluate(%{state | lost: MapSet.delete(state.lost, dev), adapters: adapters})
+    if Map.has_key?(candidates(state), dev) do
+      Logger.info("CEC volume link: receiver on #{dev} answers again")
+      adapter = state.adapters[dev]
+      merged = adapter |> receiver() |> Map.merge(known(status)) |> Map.put(:power, :on)
+      adapters = Map.put(state.adapters, dev, Map.put(adapter, :receiver, merged))
+      evaluate(%{state | lost: MapSet.delete(state.lost, dev), adapters: adapters})
+    else
+      state
+    end
   end
 
   defp found_again(state, _dev, _audio), do: state
@@ -721,8 +796,8 @@ defmodule UniversalProxy.Cec.VolumeLink do
     end
   end
 
-  defp busy_dev(state, ref) do
-    Enum.find_value(state.busy, fn {dev, {r, _kind}} -> if r == ref, do: dev end)
+  defp busy_job(state, ref) do
+    Enum.find(state.busy, fn {_dev, job} -> job.ref == ref end)
   end
 
   defp by_dev(adapters), do: Map.new(adapters, &{&1.dev, &1})

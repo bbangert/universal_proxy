@@ -18,10 +18,16 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
     adapters = [adapter(Map.get(context, :receiver, %{}))]
     outputs = [output(Map.get(context, :output, %{}))]
     echo? = Map.get(context, :echo, true)
+    # The first `update_fails` writes fail, like Audio.update_config/2 with
+    # the audio subsystem down.
+    update_fails = :counters.new(1, [])
+    :counters.put(update_fails, 1, Map.get(context, :update_fails, 0))
+    task_sup = start_supervised!(Task.Supervisor)
 
     opts = [
       name: nil,
       pubsub: pubsub,
+      task_supervisor: task_sup,
       list_adapters: fn -> adapters end,
       list_outputs: fn -> outputs end,
       set_volume_external: fn key, external? ->
@@ -31,8 +37,16 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
       # Like Audio.update_config/2: the player echoes each value it is given.
       update_config: fn key, params ->
         send(test, {:update_config, key, params})
-        if echo?, do: for({field, value} <- params, do: player_event(pubsub, key, field, value))
-        :ok
+
+        if :counters.get(update_fails, 1) > 0 do
+          :counters.sub(update_fails, 1, 1)
+          {:error, :unavailable}
+        else
+          if echo?,
+            do: for({field, value} <- params, do: player_event(pubsub, key, field, value))
+
+          :ok
+        end
       end,
       set_volume: &cec(test, {:set_volume, &1, &2}),
       set_muted: &cec(test, {:set_muted, &1, &2}),
@@ -280,16 +294,75 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
     end
 
     @tag echo: false
-    test "an echo arriving after a newer request isn't taken for one", %{pubsub: pubsub} do
+    test "an echo arriving after a newer request isn't taken for one, but is corrected",
+         %{pubsub: pubsub} do
+      player_event(pubsub, @key, :volume, 60)
+      reply(assert_cec({:set_volume, @dev, 60}), {:error, {:no_progress, %{volume: 52}}})
+      assert_receive {:update_config, @key, %{volume: 52}}
+
+      # The player took 45 from the server, then our 52: it shows 52 now.
+      player_event(pubsub, @key, :volume, 45)
+      player_event(pubsub, @key, :volume, 52)
+      reply(assert_cec({:set_volume, @dev, 45}), {:ok, %{volume: 45, muted: false}})
+      assert_receive {:update_config, @key, %{volume: 45}}
+      refute_receive {:cec, _, _}
+    end
+
+    @tag echo: false
+    test "a late echo while idle is corrected at once", %{pubsub: pubsub} do
       player_event(pubsub, @key, :volume, 60)
       reply(assert_cec({:set_volume, @dev, 60}), {:error, {:no_progress, %{volume: 52}}})
       assert_receive {:update_config, @key, %{volume: 52}}
 
       player_event(pubsub, @key, :volume, 45)
-      player_event(pubsub, @key, :volume, 52)
       reply(assert_cec({:set_volume, @dev, 45}), {:ok, %{volume: 45, muted: false}})
+      refute_receive {:update_config, _, _}
+
+      player_event(pubsub, @key, :volume, 52)
+      assert_receive {:update_config, @key, %{volume: 45}}
+      refute_receive {:cec, _, _}
+    end
+
+    test "turning the setting off stops the run; a relink doesn't pick it up",
+         %{pubsub: pubsub} do
+      player_event(pubsub, @key, :volume, 60)
+      task = assert_cec({:set_volume, @dev, 60})
+      ref = Process.monitor(task)
+
+      state(pubsub, %{cec_volume: false})
+      assert_receive {:external, @key, false}
+      assert_receive {:DOWN, ^ref, :process, ^task, _}
+
+      state(pubsub, %{cec_volume: true})
+      assert_receive {:external, @key, true}
+      assert_receive {:update_config, @key, %{volume: 20, muted: false}}
       refute_receive {:cec, _, _}
       refute_receive {:update_config, _, _}
+    end
+
+    test "a request back to the cached volume during a poll still runs against its readback",
+         %{pid: pid, pubsub: pubsub} do
+      poll_now(pid)
+      reply(assert_cec({:power_status, @dev}), {:ok, :on})
+      poll = assert_cec({:audio_status, @dev})
+
+      player_event(pubsub, @key, :volume, 35)
+      player_event(pubsub, @key, :volume, 20)
+
+      # The knob moved meanwhile: the latest request (20) still wins.
+      reply(poll, {:ok, %{volume: 30, muted: false}})
+      reply(assert_cec({:set_volume, @dev, 20}), {:ok, %{volume: 20, muted: false}})
+      refute_receive {:update_config, _, %{volume: 30}}
+      refute_receive {:cec, _, _}
+    end
+
+    @tag update_fails: 1
+    test "a failed write to the output is retried by the next sync", %{pid: pid} do
+      # The adoption write failed (setup :linked saw it): nothing is shown yet.
+      poll_now(pid)
+      reply(assert_cec({:power_status, @dev}), {:ok, :on})
+      reply(assert_cec({:audio_status, @dev}), {:ok, %{volume: 20, muted: false}})
+      assert_receive {:update_config, @key, %{volume: 20, muted: false}}
     end
 
     test "unlinked outputs' volume events are ignored", %{pubsub: pubsub} do
@@ -304,7 +377,7 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
     @tag output: %{cec_volume_max: 30}
     test "a knob change found by polling is written to the output, uncapped",
          %{pid: pid} do
-      send(pid, {:poll, @dev})
+      poll_now(pid)
       reply(assert_cec({:power_status, @dev}), {:ok, :on})
       reply(assert_cec({:audio_status, @dev}), {:ok, %{volume: 45, muted: false}})
       assert_receive {:update_config, @key, %{volume: 45}}
@@ -314,12 +387,12 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
     end
 
     test "the next poll skips the power check", %{pid: pid} do
-      send(pid, {:poll, @dev})
+      poll_now(pid)
       reply(assert_cec({:power_status, @dev}), {:ok, :on})
       reply(assert_cec({:audio_status, @dev}), {:ok, %{volume: 20, muted: false}})
 
       idle(pid)
-      send(pid, {:poll, @dev})
+      poll_now(pid)
       reply(assert_cec({:audio_status, @dev}), {:ok, %{volume: 20, muted: true}})
       assert_receive {:update_config, @key, %{muted: true}}
     end
@@ -328,19 +401,19 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
       player_event(pubsub, @key, :volume, 35)
       task = assert_cec({:set_volume, @dev, 35})
 
-      send(pid, {:poll, @dev})
+      poll_now(pid)
       refute_receive {:cec, _, _}
 
       reply(task, {:ok, %{volume: 35, muted: false}})
       idle(pid)
-      send(pid, {:poll, @dev})
+      poll_now(pid)
       reply(assert_cec({:power_status, @dev}), {:ok, :on})
       reply(assert_cec({:audio_status, @dev}), {:ok, %{volume: 35, muted: false}})
       refute_receive {:update_config, _, _}
     end
 
     test "a request made while a poll runs is stepped after it", %{pid: pid, pubsub: pubsub} do
-      send(pid, {:poll, @dev})
+      poll_now(pid)
       reply(assert_cec({:power_status, @dev}), {:ok, :on})
       poll = assert_cec({:audio_status, @dev})
 
@@ -350,6 +423,28 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
       reply(poll, {:ok, %{volume: 20, muted: false}})
       reply(assert_cec({:set_volume, @dev, 35}), {:ok, %{volume: 35, muted: false}})
       refute_receive {:update_config, _, _}
+    end
+
+    test "a poll's result for an earlier link is dropped", %{pid: pid, pubsub: pubsub} do
+      poll_now(pid)
+      reply(assert_cec({:power_status, @dev}), {:ok, :on})
+      poll = assert_cec({:audio_status, @dev})
+
+      state(pubsub, %{cec_volume: false})
+      assert_receive {:external, @key, false}
+      state(pubsub, %{cec_volume: true})
+      assert_receive {:external, @key, true}
+      assert_receive {:update_config, @key, %{volume: 20, muted: false}}
+
+      reply(poll, {:ok, %{volume: 45, muted: false}})
+      idle(pid)
+      refute_receive {:update_config, _, _}
+      assert VolumeLink.links(pid) == %{@dev => @key}
+    end
+
+    test "a poll message from a timer no longer armed is ignored", %{pid: pid} do
+      send(pid, {:poll, @dev, make_ref()})
+      refute_receive {:cec, _, _}
     end
 
     test "Cec.Server's receiver reports count outside a run and are ignored during one",
@@ -389,7 +484,7 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
       failed_poll(pid, first: true)
       failed_poll(pid)
 
-      send(pid, {:poll, @dev})
+      poll_now(pid)
       reply(assert_cec({:audio_status, @dev}), {:ok, %{volume: 20, muted: false}})
       idle(pid)
 
@@ -436,7 +531,7 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
       adapters(pubsub, [adapter()])
       refute_receive {:external, @key, true}
 
-      send(pid, {:poll, @dev})
+      poll_now(pid)
       reply(assert_cec({:power_status, @dev}), {:ok, :on})
       reply(assert_cec({:audio_status, @dev}), {:ok, %{volume: 33, muted: false}})
       assert_receive {:external, @key, true}
@@ -486,6 +581,41 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
 
       failed_poll(pid)
       assert_receive {:external, @key, false}
+    end
+
+    test "answers without a volume count as failures", %{pid: pid} do
+      poll_now(pid)
+      reply(assert_cec({:power_status, @dev}), {:ok, :on})
+      reply(assert_cec({:audio_status, @dev}), {:ok, %{volume: nil, muted: false}})
+      idle(pid)
+
+      for _ <- 1..2 do
+        poll_now(pid)
+        reply(assert_cec({:audio_status, @dev}), {:ok, %{volume: nil, muted: false}})
+        idle(pid)
+      end
+
+      assert_receive {:external, @key, false}
+    end
+
+    test "a probe finishing after its adapter went away is ignored",
+         %{pid: pid, pubsub: pubsub} do
+      failed_poll(pid, first: true, error: :nack)
+      failed_poll(pid, error: :nack)
+      failed_poll(pid, error: :nack)
+      assert_receive {:external, @key, false}
+
+      poll_now(pid)
+      reply(assert_cec({:power_status, @dev}), {:ok, :on})
+      probe = assert_cec({:audio_status, @dev})
+
+      adapters(pubsub, [])
+      reply(probe, {:ok, %{volume: 33, muted: false}})
+      idle(pid)
+
+      assert Process.alive?(pid)
+      refute_receive {:external, @key, true}
+      assert VolumeLink.links(pid) == %{}
     end
 
     @tag fail_unlink: 1
@@ -564,11 +694,19 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
 
   defp reply(task, result), do: send(task, {:reply, result})
 
+  # Fires the poll timer currently armed for the adapter.
+  defp poll_now(pid) do
+    case :sys.get_state(pid).timers do
+      %{@dev => {token, _timer}} -> send(pid, {:poll, @dev, token})
+      _ -> flunk("no poll armed")
+    end
+  end
+
   # A linked receiver's poll that gets no answer. The first one also
   # checks power.
   defp failed_poll(pid, opts \\ []) do
     error = {:error, Keyword.get(opts, :error, :timeout)}
-    send(pid, {:poll, @dev})
+    poll_now(pid)
     if opts[:first], do: reply(assert_cec({:power_status, @dev}), error)
     reply(assert_cec({:audio_status, @dev}), error)
     idle(pid)
