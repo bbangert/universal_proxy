@@ -304,6 +304,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsGroupsTest do
       # The dismiss isn't confirmable, so it doesn't wait behind the two.
       assert :ok = Lights.delete_group(1, dismiss: true)
       wait_until(fn -> length(advertises()) == 1 end)
+      pumped()
       assert {:ok, %{queued: 2}} = Radio.status()
       finish_tx()
       finish_tx()
@@ -440,6 +441,7 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsGroupsTest do
 
       # The repeat puts 2's join back in the queue, and 4's takes its slot.
       assert :ok = Lights.add_member(2, @mac2)
+      pumped()
       assert {:ok, %{queued: 2}} = Radio.status()
 
       # The reload drops group 2 and the queued resend with it.
@@ -827,6 +829,10 @@ defmodule UniversalProxy.TuyaBeaconMesh.LightsGroupsTest do
     send(Process.whereis(Radio), {:tx_done, token})
     wait_until(fn -> length(advertises()) > before end)
   end
+
+  # Group calls reply before Lights sends the frames they queue (a
+  # continuation); the next call into Lights is handled after it ends.
+  defp pumped, do: {:ok, _} = Lights.all()
 
   defp advertises, do: for({:advertise, data, _opts} <- FakeBluez.calls(), do: data)
 
