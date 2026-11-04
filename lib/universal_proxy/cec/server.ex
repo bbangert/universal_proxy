@@ -33,10 +33,16 @@ defmodule UniversalProxy.Cec.Server do
   ## Adapter lifecycle
 
   Adapters are `:temporary` children of the `DynamicSupervisor`, named in
-  the `Registry` by device path and monitored here. One that crashes is
-  restarted after `:restart_ms`. One that stopped because its device went
-  away or couldn't be opened is started again by the next scan that still
-  lists the device.
+  the `Registry` by device path and monitored here, so a scan can never
+  race the `DynamicSupervisor` into starting a second adapter under the
+  same name. One that crashes is restarted after a per-device backoff:
+  `:restart_ms` (1 s), doubling on each further crash up to
+  `:restart_max_ms` (5 min), and forgotten once the adapter has stayed up
+  for `:stable_ms` (60 s). A crash is logged the first time, when its
+  reason changes and on each retry at the cap; the record's `backoff`
+  shows the crash count, current delay and last reason. One that stopped
+  because its device went away or couldn't be opened is started again by
+  the next scan that still lists the device.
 
   Every adapter event is re-broadcast on `topic/0` as
   `{:cec_event, dev, event}` (the events are described in
@@ -63,6 +69,8 @@ defmodule UniversalProxy.Cec.Server do
   @events_topic "cec:events"
   @default_scan_ms 10_000
   @default_restart_ms 1_000
+  @default_restart_max_ms 300_000
+  @default_stable_ms 60_000
   @default_osd_name "UniversalProxy"
   @tv 0
   @unknown_receiver %{power: :unknown, volume: nil, muted: nil, updated_at: nil}
@@ -87,13 +95,17 @@ defmodule UniversalProxy.Cec.Server do
           configured?: boolean(),
           active_source?: boolean(),
           receiver_presence: :present | :absent | :unknown,
-          receiver: receiver()
+          receiver: receiver(),
+          backoff: backoff() | nil
         }
+
+  @type backoff :: %{crashes: pos_integer(), retry_in_ms: pos_integer(), reason: term()}
 
   defstruct adapters: %{},
             procs: %{},
             errors: %{},
             versions: %{},
+            restart_timers: %{},
             enumerate: nil,
             output_lookup: nil,
             transport: Circuits.CEC.Transport.Port,
@@ -104,6 +116,8 @@ defmodule UniversalProxy.Cec.Server do
             system_audio_mode: false,
             scan_ms: @default_scan_ms,
             restart_ms: @default_restart_ms,
+            restart_max_ms: @default_restart_max_ms,
+            stable_ms: @default_stable_ms,
             pubsub: @pubsub,
             task_sup: UniversalProxy.TaskSupervisor
 
@@ -130,8 +144,9 @@ defmodule UniversalProxy.Cec.Server do
     do: GenServer.call(__MODULE__, {:adapter_for_card, card_index})
 
   @doc """
-  The receiver cache's version: it changes whenever the receiver reports
-  its status or the cache is cleared. Read it before a command whose
+  The receiver's power version: it changes whenever the receiver reports
+  its power state (including a `<Standby>` it sends) or the cache is
+  cleared, but not on audio reports. Read it before a command whose power
   outcome goes to `note_receiver/4`.
   """
   @spec receiver_version(String.t()) :: non_neg_integer()
@@ -140,9 +155,10 @@ defmodule UniversalProxy.Cec.Server do
   @doc """
   Record what a command delivered to `to` did to the far end. Applied only
   when `to` is the receiver right now (`:receiver`, or its logical address)
-  or a broadcast, and when nothing has changed the cache since `version`
-  (`receiver_version/1` before the command): the command's result reaches
-  this server after the adapter's own events, so a newer report wins.
+  or a broadcast, and when no power report or cache clear has happened
+  since `version` (`receiver_version/1` before the command): the command's
+  result reaches this server after the adapter's own events, so a newer
+  power report wins.
   """
   @spec note_receiver(String.t(), Adapter.target(), non_neg_integer(), map()) :: :ok
   def note_receiver(dev, to, version, partial) when is_map(partial),
@@ -170,6 +186,8 @@ defmodule UniversalProxy.Cec.Server do
       system_audio_mode: get.(:system_audio_mode, false),
       scan_ms: get.(:scan_interval_ms, @default_scan_ms),
       restart_ms: get.(:restart_ms, @default_restart_ms),
+      restart_max_ms: get.(:restart_max_ms, @default_restart_max_ms),
+      stable_ms: get.(:stable_ms, @default_stable_ms),
       pubsub: Keyword.get(opts, :pubsub, @pubsub),
       task_sup: Keyword.get(opts, :task_supervisor, UniversalProxy.TaskSupervisor)
     }
@@ -237,9 +255,19 @@ defmodule UniversalProxy.Cec.Server do
   end
 
   def handle_info({:restart, dev}, state) do
+    state = %{state | restart_timers: Map.delete(state.restart_timers, dev)}
+
     if Map.has_key?(state.adapters, dev),
       do: {:noreply, ensure_started(state, dev)},
       else: {:noreply, state}
+  end
+
+  # Up for :stable_ms since it started: earlier crashes no longer count.
+  def handle_info({:stable, dev, pid}, state) do
+    case state.procs do
+      %{^dev => {^pid, _ref}} -> {:noreply, update_adapter(state, dev, &%{&1 | backoff: nil})}
+      _ -> {:noreply, state}
+    end
   end
 
   def handle_info(_other, state), do: {:noreply, state}
@@ -291,12 +319,16 @@ defmodule UniversalProxy.Cec.Server do
       configured?: false,
       active_source?: false,
       receiver_presence: :unknown,
-      receiver: @unknown_receiver
+      receiver: @unknown_receiver,
+      backoff: nil
     })
   end
 
+  # A device waiting out a crash backoff isn't started early by a scan.
   defp ensure_started(state, dev) do
-    if Map.has_key?(state.procs, dev), do: state, else: start_adapter(state, dev)
+    if Map.has_key?(state.procs, dev) or Map.has_key?(state.restart_timers, dev),
+      do: state,
+      else: start_adapter(state, dev)
   end
 
   defp start_adapter(state, dev) do
@@ -345,6 +377,7 @@ defmodule UniversalProxy.Cec.Server do
     }
 
     state = update_adapter(state, dev, &%{&1 | running?: true})
+    Process.send_after(self(), {:stable, dev, pid}, state.stable_ms)
 
     try do
       :ok = Adapter.subscribe(pid)
@@ -358,12 +391,13 @@ defmodule UniversalProxy.Cec.Server do
   defp adapter_down(state, dev, reason) do
     state = %{state | procs: Map.delete(state.procs, dev)}
 
-    if crash?(reason) do
-      Logger.warning("CEC: adapter #{dev} crashed (#{inspect(reason)}); restarting")
-      Process.send_after(self(), {:restart, dev}, state.restart_ms)
-    else
-      Logger.info("CEC: adapter #{dev} stopped (#{inspect(reason)})")
-    end
+    state =
+      if crash?(reason) do
+        schedule_restart(state, dev, reason)
+      else
+        Logger.info("CEC: adapter #{dev} stopped (#{inspect(reason)})")
+        state
+      end
 
     update_link(state, dev, fn adapter ->
       %{
@@ -377,6 +411,45 @@ defmodule UniversalProxy.Cec.Server do
       }
     end)
   end
+
+  defp schedule_restart(state, dev, reason) do
+    prev = state.adapters |> Map.get(dev, %{}) |> Map.get(:backoff)
+    key = crash_key(reason)
+
+    backoff =
+      case prev do
+        nil -> %{crashes: 1, retry_in_ms: state.restart_ms, reason: key}
+        %{} -> next_backoff(prev, key, state.restart_max_ms)
+      end
+
+    cond do
+      prev == nil or prev.reason != key ->
+        Logger.warning(
+          "CEC: adapter #{dev} crashed (#{inspect(reason)}); restarting in #{backoff.retry_in_ms} ms"
+        )
+
+      backoff.retry_in_ms >= state.restart_max_ms ->
+        Logger.warning(
+          "CEC: adapter #{dev} still crashing (#{backoff.crashes} times, last " <>
+            "#{inspect(key)}); retrying every #{backoff.retry_in_ms} ms"
+        )
+
+      true ->
+        Logger.debug("CEC: adapter #{dev} crashed again; restarting in #{backoff.retry_in_ms} ms")
+    end
+
+    timer = Process.send_after(self(), {:restart, dev}, backoff.retry_in_ms)
+    state = %{state | restart_timers: Map.put(state.restart_timers, dev, timer)}
+    update_adapter(state, dev, &%{&1 | backoff: backoff})
+  end
+
+  defp next_backoff(prev, key, max) do
+    %{crashes: prev.crashes + 1, retry_in_ms: min(prev.retry_in_ms * 2, max), reason: key}
+  end
+
+  # Stack traces differ between otherwise identical crashes.
+  defp crash_key({reason, stack}) when is_list(stack), do: reason
+  defp crash_key(reason), do: reason
 
   defp crash?(:normal), do: false
   defp crash?(:shutdown), do: false
@@ -395,11 +468,17 @@ defmodule UniversalProxy.Cec.Server do
         :ok
     end
 
+    case Map.fetch(state.restart_timers, dev) do
+      {:ok, timer} -> _ = Process.cancel_timer(timer)
+      :error -> :ok
+    end
+
     %{
       state
       | adapters: Map.delete(state.adapters, dev),
         procs: Map.delete(state.procs, dev),
-        errors: Map.delete(state.errors, dev)
+        errors: Map.delete(state.errors, dev),
+        restart_timers: Map.delete(state.restart_timers, dev)
     }
   end
 
@@ -510,8 +589,10 @@ defmodule UniversalProxy.Cec.Server do
   defp apply_message(state, dev, %Message{from: la, body: {:report_power_status, power}}, la),
     do: report(state, dev, %{power: power(power)})
 
+  # Audio status doesn't move the power version: it doesn't supersede a
+  # pending Standby's power transition.
   defp apply_message(state, dev, %Message{from: la, body: {:report_audio_status, m, v}}, la),
-    do: report(state, dev, audio_status(m, v))
+    do: update_receiver(state, dev, audio_status(m, v))
 
   defp apply_message(state, dev, %Message{to: 15, body: :standby}, _la),
     do: report(state, dev, %{power: :standby})

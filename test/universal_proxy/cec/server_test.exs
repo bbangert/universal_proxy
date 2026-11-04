@@ -4,6 +4,7 @@ defmodule UniversalProxy.Cec.ServerTest do
 
   @moduletag :capture_log
 
+  import ExUnit.CaptureLog
   import UniversalProxy.CecBus
 
   alias Circuits.CEC.{Message, Struct}
@@ -36,7 +37,9 @@ defmodule UniversalProxy.Cec.ServerTest do
        end,
        auto_wake: Map.get(context, :auto_wake, true),
        scan_interval_ms: 60_000,
-       restart_ms: 10}
+       restart_ms: Map.get(context, :restart_ms, 10),
+       restart_max_ms: Map.get(context, :restart_max_ms, 40),
+       stable_ms: Map.get(context, :stable_ms, 60_000)}
     )
 
     {:ok, fake: fake, agent: agent}
@@ -275,6 +278,22 @@ defmodule UniversalProxy.Cec.ServerTest do
       assert receiver().power == :standby
     end
 
+    test "an audio report during a Standby doesn't cancel the Standby's power", %{fake: fake} do
+      configure(fake, :present)
+
+      task = Task.async(fn -> Cec.standby(@dev) end)
+      {seq, %Message{to: 5, body: :standby}} = nth_tx(fake, 2)
+
+      :erlang.suspend_process(task.pid)
+      ack(fake, seq)
+      receive_msg(fake, <<0x54, 0x7A, 0x21>>)
+      wait_until(fn -> receiver().volume == 33 end)
+      :erlang.resume_process(task.pid)
+
+      assert Task.await(task) == :ok
+      wait_until(fn -> receiver().power == :to_standby end)
+    end
+
     test "a NACKed Standby is an error and leaves the receiver cache alone", %{fake: fake} do
       configure(fake, :present)
 
@@ -288,6 +307,66 @@ defmodule UniversalProxy.Cec.ServerTest do
       assert Task.await(task) == {:error, :nack}
       assert %{power: :unknown, updated_at: nil} = receiver()
       assert {:ok, %{receiver_presence: :absent}} = Server.get_adapter(@dev)
+    end
+  end
+
+  describe "crash backoff" do
+    test "a crashing adapter is restarted with growing, capped delays", %{fake: fake} do
+      log =
+        capture_log(fn ->
+          for delay <- [10, 20, 40, 40] do
+            pid = wait_until(&adapter_pid/0)
+            :ok = Fake.inject(fake, {:exit, 1})
+            wait_until(fn -> adapter_pid() != pid end)
+            assert {:ok, %{backoff: %{retry_in_ms: ^delay}}} = Server.get_adapter(@dev)
+          end
+        end)
+
+      assert {:ok, %{backoff: %{crashes: 4, reason: {:port_exit, 1}}}} =
+               Server.get_adapter(@dev)
+
+      # Logged on the first crash and again only at the cap.
+      assert length(Regex.scan(~r/adapter \/dev\/cec0 crashed/, log)) == 1
+      assert log =~ "still crashing"
+      wait_until(&adapter_pid/0)
+    end
+
+    @tag stable_ms: 100
+    test "an adapter that stays up resets the backoff", %{fake: fake} do
+      for _ <- 1..2 do
+        pid = wait_until(&adapter_pid/0)
+        :ok = Fake.inject(fake, {:exit, 1})
+        wait_until(fn -> adapter_pid() not in [nil, pid] end)
+      end
+
+      assert {:ok, %{backoff: %{crashes: 2}}} = Server.get_adapter(@dev)
+      wait_until(fn -> match?({:ok, %{backoff: nil}}, Server.get_adapter(@dev)) end)
+
+      pid = adapter_pid()
+      :ok = Fake.inject(fake, {:exit, 1})
+      wait_until(fn -> adapter_pid() not in [nil, pid] end)
+      assert {:ok, %{backoff: %{crashes: 1, retry_in_ms: 10}}} = Server.get_adapter(@dev)
+    end
+
+    @tag restart_ms: 60_000
+    test "a scan doesn't cut a backoff short", %{fake: fake} do
+      pid = wait_until(&adapter_pid/0)
+      ref = Process.monitor(pid)
+      :ok = Fake.inject(fake, {:exit, 1})
+      assert_receive {:DOWN, ^ref, :process, ^pid, {:port_exit, 1}}
+      wait_until(fn -> match?({:ok, %{running?: false}}, Server.get_adapter(@dev)) end)
+
+      :ok = Server.rescan()
+      assert adapter_pid() == nil
+    end
+
+    test "a device that went away is no crash", %{fake: fake} do
+      pid = wait_until(&adapter_pid/0)
+      :ok = Fake.inject(fake, :gone)
+      wait_until(fn -> match?({:ok, %{running?: false}}, Server.get_adapter(@dev)) end)
+      :ok = Server.rescan()
+      assert adapter_pid() not in [nil, pid]
+      assert {:ok, %{backoff: nil}} = Server.get_adapter(@dev)
     end
   end
 
