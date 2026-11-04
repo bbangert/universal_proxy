@@ -114,6 +114,40 @@ jobs:
       - run: mix deps.get
       - run: mix test --warnings-as-errors
 
+  # The in-repo circuits_cec library (deps_local/circuits_cec) is its own Mix
+  # project: the app only compiles it as a dependency, so its tests, format
+  # and dialyzer run here. Its test env also builds the stubbed-ioctl helper
+  # that the host tests drive.
+  circuits-cec:
+    name: circuits_cec
+    runs-on: ubuntu-latest
+    env:
+      MIX_ENV: test
+    defaults:
+      run:
+        working-directory: deps_local/circuits_cec
+    steps:
+      - uses: actions/checkout@v7
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+      - uses: actions/cache@v6
+        with:
+          path: |
+            deps_local/circuits_cec/deps
+            deps_local/circuits_cec/_build
+          key: ${{ runner.os }}-circuits-cec-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('deps_local/circuits_cec/mix.lock') }}
+          restore-keys: ${{ runner.os }}-circuits-cec-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+      - run: mix deps.get
+      - run: mix format --check-formatted
+      # The golden structs must still be what the vendored header lays out.
+      - run: cc -std=c11 -Wall -I c_src -o "$RUNNER_TEMP/gen_golden" test/fixtures/gen_golden.c
+      - run: '"$RUNNER_TEMP/gen_golden" | diff -u test/fixtures/golden.txt -'
+      - run: mix compile --warnings-as-errors
+      - run: mix test --warnings-as-errors
+      - run: MIX_ENV=dev mix dialyzer --format github
+
   dialyzer:
     name: Dialyzer
     runs-on: ubuntu-latest
