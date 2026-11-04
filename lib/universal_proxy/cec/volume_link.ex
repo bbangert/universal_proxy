@@ -34,7 +34,11 @@ defmodule UniversalProxy.Cec.VolumeLink do
       `set_muted/3`, in a task, one run per adapter at a time. The volume
       is capped at the output's `cec_volume_max`. A value that arrives
       during a run or a poll is applied when it ends, against what the
-      receiver then reports (latest wins). Once nothing is
+      receiver then reports (latest wins). Receivers commonly move several
+      units per press: each walk gets the step the previous one learned
+      and the cap, and settles on the nearest reachable volume, so a
+      target within half a step of the receiver's volume counts as
+      reached. Once nothing is
       left to do, whatever the receiver ended at is written back to the
       output if it differs (the cap, a stall, a failure), so the server and
       the UI never show a volume the receiver isn't at.
@@ -65,7 +69,7 @@ defmodule UniversalProxy.Cec.VolumeLink do
 
   Dependencies are injectable through `start_link/1` for host tests:
   `:list_adapters`, `:list_outputs`, `:set_volume_external` (key, bool),
-  `:update_config` (key, map), `:set_volume` (dev, target), `:set_muted`
+  `:update_config` (key, map), `:set_volume` (dev, target, opts), `:set_muted`
   (dev, bool), `:audio_status` (dev), `:power_status` (dev), `:pubsub`,
   `:task_supervisor`, `:default` (the `volume_link` default), `:fail_unlink`
   and the `:poll_ms`, `:probe_ms` and `:settle_ms` intervals.
@@ -130,7 +134,7 @@ defmodule UniversalProxy.Cec.VolumeLink do
       list_outputs: Keyword.get(opts, :list_outputs, &Audio.list_outputs/0),
       set_volume_external: Keyword.get(opts, :set_volume_external, &Audio.set_volume_external/2),
       update_config: Keyword.get(opts, :update_config, &Audio.update_config/2),
-      set_volume: Keyword.get(opts, :set_volume, &Cec.set_volume(&1, &2)),
+      set_volume: Keyword.get(opts, :set_volume, &Cec.set_volume/3),
       set_muted: Keyword.get(opts, :set_muted, &Cec.set_muted(&1, &2)),
       audio_status: Keyword.get(opts, :audio_status, &Cec.audio_status(&1)),
       power_status: Keyword.get(opts, :power_status, &Cec.power_status(&1))
@@ -337,7 +341,9 @@ defmodule UniversalProxy.Cec.VolumeLink do
       pending: %{},
       echoes: [],
       quiet_until: nil,
-      failures: []
+      failures: [],
+      # The receiver's volume step, as `Cec.set_volume/3` learned it.
+      step: nil
     }
 
     state = %{state | gen: gen, links: Map.put(state.links, dev, link)}
@@ -404,23 +410,43 @@ defmodule UniversalProxy.Cec.VolumeLink do
   end
 
   defp target(state, key, :volume, volume) do
-    case state.outputs |> Map.get(key, %{}) |> Map.get(:cec_volume_max) do
-      max when is_integer(max) -> min(volume, max)
-      _ -> volume
+    case ceiling(state, key) do
+      nil -> volume
+      max -> min(volume, max)
     end
   end
 
   defp target(_state, _key, :muted, muted), do: muted
 
-  defp request(state, dev, field, target) do
-    link = state.links[dev]
+  defp ceiling(state, key) do
+    case state.outputs |> Map.get(key, %{}) |> Map.get(:cec_volume_max) do
+      max when is_integer(max) -> max
+      _ -> nil
+    end
+  end
 
+  # Receivers move several units per press, so a volume within half a step
+  # of the target is the nearest one reachable (`Cec.set_volume/3` settles
+  # there): asking again would only press back and forth. One above the
+  # ceiling is never there yet.
+  defp reached?(state, dev, :volume, target) do
+    link = state.links[dev]
+    volume = link.receiver.volume
+    max = ceiling(state, link.key)
+
+    is_integer(volume) and (max == nil or volume <= max) and
+      2 * abs(target - volume) <= (link.step || 1)
+  end
+
+  defp reached?(state, dev, :muted, muted), do: state.links[dev].receiver.muted == muted
+
+  defp request(state, dev, field, target) do
     cond do
       # Compared with the receiver once the job ends, against its readback.
       Map.has_key?(state.busy, dev) ->
         put_in(state.links[dev].pending[field], target)
 
-      target != link.receiver[field] ->
+      not reached?(state, dev, field, target) ->
         state = put_in(state.links[dev].pending[field], target)
         start_step(state, dev)
 
@@ -431,22 +457,24 @@ defmodule UniversalProxy.Cec.VolumeLink do
   end
 
   # The pending targets the receiver isn't at yet.
-  defp todo(link) do
-    for {field, target} <- link.pending,
-        target != link.receiver[field],
+  defp todo(state, dev) do
+    for {field, target} <- state.links[dev].pending,
+        not reached?(state, dev, field, target),
         into: %{},
         do: {field, target}
   end
 
   defp start_step(state, dev) do
     link = state.links[dev]
-    targets = todo(link)
+    targets = todo(state, dev)
     state = put_in(state.links[dev].pending, %{})
 
     if targets == %{} do
       sync_output(state, dev)
     else
       %{set_volume: set_volume, set_muted: set_muted} = state.funs
+      walk_opts = walk_opts(link.step, ceiling(state, link.key))
+      set_volume = &set_volume.(&1, &2, walk_opts)
 
       task =
         Task.Supervisor.async_nolink(state.task_sup, fn ->
@@ -455,6 +483,10 @@ defmodule UniversalProxy.Cec.VolumeLink do
 
       put_job(state, dev, task, :step)
     end
+  end
+
+  defp walk_opts(step, max) do
+    Enum.reject([step: step, max: max], fn {_key, value} -> value == nil end)
   end
 
   # Runs in the task: mute first (one or two presses), then the walk.
@@ -481,7 +513,7 @@ defmodule UniversalProxy.Cec.VolumeLink do
 
   defp merge_status(nil, status), do: status
   defp merge_status(status, nil), do: status
-  defp merge_status(a, b), do: Map.merge(a, known(b))
+  defp merge_status(a, b), do: Map.merge(a, Map.reject(b, fn {_key, value} -> value == nil end))
 
   # ── receiver → output ─────────────────────────────────────────────────
 
@@ -676,7 +708,15 @@ defmodule UniversalProxy.Cec.VolumeLink do
       link ->
         quiet_until = System.monotonic_time(:millisecond) + state.settle_ms
         receiver = Map.merge(link.receiver, known(status || %{}))
-        state = put_in(state.links[dev], %{link | receiver: receiver, quiet_until: quiet_until})
+
+        step =
+          case status do
+            %{step: step} when is_integer(step) and step > 0 -> step
+            _ -> link.step
+          end
+
+        link = %{link | receiver: receiver, quiet_until: quiet_until, step: step}
+        state = put_in(state.links[dev], link)
         state |> count_outcome(dev, outcome) |> next(dev)
     end
   end
@@ -769,8 +809,8 @@ defmodule UniversalProxy.Cec.VolumeLink do
       nil ->
         schedule(state, dev)
 
-      link ->
-        if todo(link) == %{} do
+      _link ->
+        if todo(state, dev) == %{} do
           state = put_in(state.links[dev].pending, %{})
           state |> sync_output(dev) |> schedule(dev)
         else

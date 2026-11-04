@@ -35,20 +35,25 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
         :ok
       end,
       # Like Audio.update_config/2: the player echoes each value it is given.
+      # Echoes go out before the test hears of the write, so they reach the
+      # link ahead of anything the test sends in response.
       update_config: fn key, params ->
-        send(test, {:update_config, key, params})
-
         if :counters.get(update_fails, 1) > 0 do
           :counters.sub(update_fails, 1, 1)
+          send(test, {:update_config, key, params})
           {:error, :unavailable}
         else
           if echo?,
             do: for({field, value} <- params, do: player_event(pubsub, key, field, value))
 
+          send(test, {:update_config, key, params})
           :ok
         end
       end,
-      set_volume: &cec(test, {:set_volume, &1, &2}),
+      set_volume: fn dev, target, walk_opts ->
+        send(test, {:walk_opts, walk_opts})
+        cec(test, {:set_volume, dev, target})
+      end,
       set_muted: &cec(test, {:set_muted, &1, &2}),
       audio_status: &cec(test, {:audio_status, &1}),
       power_status: &cec(test, {:power_status, &1}),
@@ -251,7 +256,8 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
     test "a crashed run writes back the last known receiver volume", %{pubsub: pubsub} do
       player_event(pubsub, @key, :volume, 60)
       reply(assert_cec({:set_volume, @dev, 60}), :raise)
-      assert_receive {:update_config, @key, %{volume: 20}}
+      # The crash report is logged first, which is slow under a loaded suite.
+      assert_receive {:update_config, @key, %{volume: 20}}, 1_000
       refute_receive {:cec, _, _}
     end
 
@@ -363,6 +369,79 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
       reply(assert_cec({:power_status, @dev}), {:ok, :on})
       reply(assert_cec({:audio_status, @dev}), {:ok, %{volume: 20, muted: false}})
       assert_receive {:update_config, @key, %{volume: 20, muted: false}}
+    end
+
+    test "a step-3 receiver settles on the nearest volume, written back; asking again doesn't re-run",
+         %{pubsub: pubsub} do
+      player_event(pubsub, @key, :volume, 25)
+      assert_receive {:walk_opts, []}
+      reply(assert_cec({:set_volume, @dev, 25}), {:ok, %{volume: 24, muted: false, step: 3}})
+      assert_receive {:update_config, @key, %{volume: 24}}
+      refute_receive {:cec, _, _}
+
+      # 24 is as close to 25 as this receiver gets: shown back, not walked.
+      player_event(pubsub, @key, :volume, 25)
+      assert_receive {:update_config, @key, %{volume: 24}}
+      refute_receive {:cec, _, _}
+    end
+
+    @tag output: %{cec_volume_max: 30}
+    test "the ceiling is passed to the walk", %{pubsub: pubsub} do
+      player_event(pubsub, @key, :volume, 50)
+      assert_receive {:walk_opts, [max: 30]}
+      reply(assert_cec({:set_volume, @dev, 30}), {:ok, %{volume: 30, muted: false, step: 1}})
+    end
+
+    test "the learned step is passed to the next walk, and forgotten on relink",
+         %{pid: pid, pubsub: pubsub} do
+      player_event(pubsub, @key, :volume, 35)
+      assert_receive {:walk_opts, []}
+      reply(assert_cec({:set_volume, @dev, 35}), {:ok, %{volume: 35, muted: false, step: 3}})
+      idle(pid)
+
+      player_event(pubsub, @key, :volume, 50)
+      assert_receive {:walk_opts, [step: 3]}
+
+      reply(
+        assert_cec({:set_volume, @dev, 50}),
+        {:error, {:no_progress, %{volume: 44, muted: false, step: 2}}}
+      )
+
+      assert_receive {:update_config, @key, %{volume: 44}}
+      idle(pid)
+
+      # A stall's result carries the step too.
+      player_event(pubsub, @key, :volume, 30)
+      assert_receive {:walk_opts, [step: 2]}
+      reply(assert_cec({:set_volume, @dev, 30}), {:ok, %{volume: 30, muted: false, step: 2}})
+      idle(pid)
+
+      state(pubsub, %{cec_volume: false})
+      assert_receive {:external, @key, false}
+      state(pubsub, %{cec_volume: true})
+      assert_receive {:external, @key, true}
+
+      player_event(pubsub, @key, :volume, 40)
+      assert_receive {:walk_opts, []}
+    end
+
+    @tag output: %{cec_volume_max: 26}
+    test "a volume within half a step of the target but above the ceiling isn't reached",
+         %{pid: pid, pubsub: pubsub} do
+      player_event(pubsub, @key, :volume, 26)
+      reply(assert_cec({:set_volume, @dev, 26}), {:ok, %{volume: 26, muted: false, step: 3}})
+      idle(pid)
+
+      # The knob takes it to 27, above the ceiling.
+      poll_now(pid)
+      reply(assert_cec({:power_status, @dev}), {:ok, :on})
+      reply(assert_cec({:audio_status, @dev}), {:ok, %{volume: 27, muted: false}})
+      assert_receive {:update_config, @key, %{volume: 27}}
+
+      player_event(pubsub, @key, :volume, 30)
+      assert_receive {:walk_opts, [step: 3, max: 26]}
+      reply(assert_cec({:set_volume, @dev, 26}), {:ok, %{volume: 24, muted: false, step: 3}})
+      assert_receive {:update_config, @key, %{volume: 24}}
     end
 
     test "unlinked outputs' volume events are ignored", %{pubsub: pubsub} do
