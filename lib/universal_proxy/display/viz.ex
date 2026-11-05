@@ -86,9 +86,17 @@ defmodule UniversalProxy.Display.Viz do
   Adds a frame that arrived at `now` (monotonic ms). Frames come ahead of
   their display time by `lead_ms` (0 when absent), so each is due at
   `now + lead_ms`. Keeps at most `max` frames, dropping the oldest.
+
+  A `viz_clear` replaces everything still waiting (`buffer_clear/1`) and
+  is due at once, so no frame queued before it paints stale bars later.
   """
   @spec buffer_push(buffer(), map(), integer(), pos_integer()) :: buffer()
-  def buffer_push(buffer, frame, now, max \\ @buffer_max) do
+  def buffer_push(buffer, frame, now, max \\ @buffer_max)
+
+  def buffer_push(buffer, %{event: "viz_clear"} = clear, now, _max),
+    do: [{now, clear} | buffer_clear(buffer)]
+
+  def buffer_push(buffer, frame, now, max) do
     lead =
       case Map.get(frame, :lead_ms) do
         ms when is_integer(ms) and ms > 0 -> ms
@@ -97,6 +105,10 @@ defmodule UniversalProxy.Display.Viz do
 
     Enum.take([{now + lead, frame} | buffer], max)
   end
+
+  @doc "Drops every frame still waiting."
+  @spec buffer_clear(buffer()) :: buffer()
+  def buffer_clear(_buffer), do: []
 
   @doc """
   The frame to paint at `now`: the newest one already due, with older due

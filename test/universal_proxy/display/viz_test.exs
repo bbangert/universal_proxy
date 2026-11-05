@@ -76,6 +76,17 @@ defmodule UniversalProxy.Display.VizTest do
       assert {%{bins: [5]}, []} = Viz.buffer_take(Viz.buffer_push([], frame(5, -3), 0), 0)
     end
 
+    test "a clear drops frames still waiting, so nothing stale paints after it" do
+      buffer =
+        []
+        |> Viz.buffer_push(frame(1, 100), 0)
+        |> Viz.buffer_push(%{event: "viz_clear"}, 50)
+
+      assert {%{event: "viz_clear"}, waiting} = Viz.buffer_take(buffer, 50)
+      assert {nil, []} = Viz.buffer_take(waiting, 150)
+      assert Viz.buffer_clear([{1, %{bins: [1]}}]) == []
+    end
+
     test "holds at most max frames, dropping the oldest" do
       buffer = Enum.reduce(1..12, [], &Viz.buffer_push(&2, frame(&1, 1_000), &1))
       assert length(buffer) == 8
