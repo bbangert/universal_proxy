@@ -25,23 +25,27 @@ defmodule UniversalProxy.Cec.ServerTest do
     fake = start_supervised!({Fake, []})
     agent = start_supervised!({Agent, fn -> %{@dev => @adapter_info} end})
 
-    start_supervised!(
-      {Supervisor,
-       enabled: true,
-       transport: Fake,
-       transport_opts: [fake: fake],
-       enumerate: fn -> Agent.get(agent, & &1) end,
-       output_lookup: fn
-         @output_key -> {:ok, Map.merge(%{card_index: 1}, Map.get(context, :output, %{}))}
-         _ -> :error
-       end,
-       auto_wake: Map.get(context, :auto_wake, true),
-       receiver_la: Map.get(context, :receiver_la, 5),
-       scan_interval_ms: 60_000,
-       restart_ms: Map.get(context, :restart_ms, 10),
-       restart_max_ms: Map.get(context, :restart_max_ms, 40),
-       stable_ms: Map.get(context, :stable_ms, 60_000)}
-    )
+    start_supervised!({
+      Supervisor,
+      # TV polling is off unless a test turns it on, so transmit
+      # numbers count only what a test is about.
+      enabled: true,
+      transport: Fake,
+      transport_opts: [fake: fake],
+      enumerate: fn -> Agent.get(agent, & &1) end,
+      output_lookup: fn
+        @output_key -> {:ok, Map.merge(%{card_index: 1}, Map.get(context, :output, %{}))}
+        _ -> :error
+      end,
+      auto_wake: Map.get(context, :auto_wake, true),
+      receiver_la: Map.get(context, :receiver_la, 5),
+      scan_interval_ms: 60_000,
+      restart_ms: Map.get(context, :restart_ms, 10),
+      restart_max_ms: Map.get(context, :restart_max_ms, 40),
+      stable_ms: Map.get(context, :stable_ms, 60_000),
+      tv_presence: Map.get(context, :tv_presence, false),
+      tv_timings: Map.get(context, :tv_timings, %{})
+    })
 
     {:ok, fake: fake, agent: agent}
   end
@@ -568,6 +572,238 @@ defmodule UniversalProxy.Cec.ServerTest do
 
   test "the subtree is ignored unless enabled" do
     assert Supervisor.start_link() == :ignore
+  end
+
+  describe "TV presence" do
+    @describetag tv_presence: true
+    @describetag tv_timings: %{
+                   first_check: 60_000,
+                   nack_retries: [20, 20, 20],
+                   idle: 60_000,
+                   present: 60_000
+                 }
+
+    test "a TV that acknowledges its poll is present", %{fake: fake} do
+      Phoenix.PubSub.subscribe(@pubsub, Cec.topic())
+      configure(fake)
+      assert {:ok, %{tv_presence: :unknown}} = Server.get_adapter(@dev)
+
+      {seq, %Message{to: 0, body: :poll}} = nth_tx(fake, 2)
+      ack(fake, seq)
+
+      assert_receive {:cec_event, @dev, {:tv_poll, :present}}
+      assert_receive {:cec_adapters, [%{tv_presence: :present}]}
+    end
+
+    test "absent only after a second NACK, then present when it answers", %{fake: fake} do
+      configure(fake)
+      {seq, %Message{to: 0, body: :poll}} = nth_tx(fake, 2)
+      nack(fake, seq)
+
+      # The NACK set the 5 s retry (20 ms here): one NACK is no proof.
+      {seq, %Message{to: 0, body: :poll}} = nth_tx(fake, 3)
+      assert {:ok, %{tv_presence: :unknown}} = Server.get_adapter(@dev)
+      nack(fake, seq)
+      wait_until(fn -> match?({:ok, %{tv_presence: :absent}}, Server.get_adapter(@dev)) end)
+
+      {seq, %Message{to: 0, body: :poll}} = nth_tx(fake, 4)
+      ack(fake, seq)
+      wait_until(fn -> match?({:ok, %{tv_presence: :present}}, Server.get_adapter(@dev)) end)
+    end
+
+    @tag tv_timings: %{first_check: 60_000, nack_retries: [20, 20], idle: 60_000, present: 20}
+    test "a present TV that stops answering (standby) needs two NACKs", %{fake: fake} do
+      configure(fake)
+      {seq, %Message{to: 0, body: :poll}} = nth_tx(fake, 2)
+      ack(fake, seq)
+      wait_until(fn -> match?({:ok, %{tv_presence: :present}}, Server.get_adapter(@dev)) end)
+
+      # The 12-minute recheck (20 ms here) NACKs: still present.
+      {seq, %Message{to: 0, body: :poll}} = nth_tx(fake, 3)
+      nack(fake, seq)
+      {seq, %Message{to: 0, body: :poll}} = nth_tx(fake, 4)
+      assert {:ok, %{tv_presence: :present}} = Server.get_adapter(@dev)
+
+      nack(fake, seq)
+      wait_until(fn -> match?({:ok, %{tv_presence: :absent}}, Server.get_adapter(@dev)) end)
+    end
+
+    @tag tv_timings: %{first_check: 60_000, nack_retries: [20], idle: 60_000, present: 20}
+    test "a bus error leaves the presence alone", %{fake: fake} do
+      configure(fake)
+      {seq, %Message{to: 0, body: :poll}} = nth_tx(fake, 2)
+      ack(fake, seq)
+      wait_until(fn -> match?({:ok, %{tv_presence: :present}}, Server.get_adapter(@dev)) end)
+
+      Phoenix.PubSub.subscribe(@pubsub, Cec.topic())
+      {seq, %Message{to: 0, body: :poll}} = nth_tx(fake, 3)
+      # Arbitration lost.
+      complete(fake, seq, tx_status: 0x02)
+      assert_receive {:cec_event, @dev, {:tv_poll, :unknown}}
+      assert {:ok, %{tv_presence: :present}} = Server.get_adapter(@dev)
+    end
+
+    test "unknown while unconfigured, polled again on the next configure", %{fake: fake} do
+      configure(fake)
+      {seq, %Message{to: 0, body: :poll}} = nth_tx(fake, 2)
+      ack(fake, seq)
+      wait_until(fn -> match?({:ok, %{tv_presence: :present}}, Server.get_adapter(@dev)) end)
+
+      state_change(fake, 0xFFFF, 0)
+      wait_until(fn -> match?({:ok, %{tv_presence: :unknown}}, Server.get_adapter(@dev)) end)
+
+      state_change(fake, @pa, @mask)
+      {seq, %Message{to: 5, body: :poll}} = nth_tx(fake, 3)
+      nack(fake, seq)
+      {seq, %Message{to: 0, body: :poll}} = nth_tx(fake, 4)
+      ack(fake, seq)
+      wait_until(fn -> match?({:ok, %{tv_presence: :present}}, Server.get_adapter(@dev)) end)
+    end
+
+    test "an adapter crash forgets the TV", %{fake: fake} do
+      configure(fake)
+      {seq, %Message{to: 0, body: :poll}} = nth_tx(fake, 2)
+      ack(fake, seq)
+      wait_until(fn -> match?({:ok, %{tv_presence: :present}}, Server.get_adapter(@dev)) end)
+
+      Phoenix.PubSub.subscribe(@pubsub, Cec.topic())
+      :ok = Fake.inject(fake, {:exit, 1})
+      assert_receive {:cec_adapters, [%{running?: false, tv_presence: :unknown}]}
+    end
+  end
+
+  describe "remote keys" do
+    # <User Control Pressed> Up, TV to Playback 1.
+    @up <<0x04, 0x44, 0x01>>
+
+    test "unclaimed keys are Feature-Aborted", %{fake: fake} do
+      configure(fake)
+      receive_msg(fake, @up)
+
+      assert {_seq, %Message{from: 4, to: 0, body: {:feature_abort, :user_control_pressed, _}}} =
+               await_tx(fake, &match?(%Message{body: {:feature_abort, _, _}}, &1))
+
+      refute_received {:cec_key, _, _}
+    end
+
+    test "claimed keys reach the claimer instead", %{fake: fake} do
+      configure(fake)
+      :ok = Cec.claim_keys(@dev)
+      _ = Server.list_adapters()
+
+      receive_msg(fake, @up)
+      assert_receive {:cec_key, @dev, :up}
+
+      # <Play> forward and <Deck Control> skip forward.
+      receive_msg(fake, <<0x04, 0x41, 0x24>>)
+      assert_receive {:cec_key, @dev, :play}
+      receive_msg(fake, <<0x04, 0x42, 0x01>>)
+      assert_receive {:cec_key, @dev, :forward}
+      receive_msg(fake, <<0x04, 0x44, 0x61>>)
+      assert_receive {:cec_key, @dev, :play_pause}
+
+      # Nothing answered: only the receiver poll went out.
+      assert [{1, %Message{to: 5, body: :poll}}] = transmits(fake)
+    end
+
+    test "a held key fires once; a release ends it", %{fake: fake} do
+      configure(fake)
+      :ok = Cec.claim_keys(@dev)
+      _ = Server.list_adapters()
+
+      receive_msg(fake, @up)
+      receive_msg(fake, @up)
+      receive_msg(fake, @up)
+      assert_receive {:cec_key, @dev, :up}
+      refute_receive {:cec_key, @dev, :up}, 50
+
+      receive_msg(fake, <<0x04, 0x45>>)
+      receive_msg(fake, @up)
+      assert_receive {:cec_key, @dev, :up}
+    end
+
+    test "keys for another device are not ours", %{fake: fake} do
+      configure(fake)
+      :ok = Cec.claim_keys(@dev)
+      _ = Server.list_adapters()
+
+      receive_msg(fake, <<0x08, 0x44, 0x01>>)
+      receive_msg(fake, <<0x04, 0x44, 0x21>>)
+      refute_receive {:cec_key, _, _}, 50
+    end
+
+    test "release_keys/1 brings the Feature Abort back", %{fake: fake} do
+      configure(fake)
+      :ok = Cec.claim_keys(@dev)
+      :ok = Cec.release_keys(@dev)
+      _ = Server.list_adapters()
+
+      receive_msg(fake, @up)
+      await_tx(fake, &match?(%Message{body: {:feature_abort, _, _}}, &1))
+      refute_received {:cec_key, _, _}
+    end
+
+    test "a claimer that exits gives the keys back to the adapter", %{fake: fake} do
+      configure(fake)
+      claimer = spawn(fn -> Process.sleep(:infinity) end)
+      :ok = Cec.claim_keys(@dev, claimer)
+      wait_until(fn -> Map.has_key?(:sys.get_state(Server).key_handlers, @dev) end)
+
+      Process.exit(claimer, :kill)
+      wait_until(fn -> :sys.get_state(Server).key_handlers == %{} end)
+
+      receive_msg(fake, @up)
+      await_tx(fake, &match?(%Message{body: {:feature_abort, _, _}}, &1))
+    end
+
+    test "a new claim replaces the old one", %{fake: fake} do
+      configure(fake)
+      test = self()
+
+      other =
+        spawn(fn ->
+          receive do
+            msg -> send(test, {:other, msg})
+          end
+        end)
+
+      :ok = Cec.claim_keys(@dev, other)
+      :ok = Cec.claim_keys(@dev)
+      _ = Server.list_adapters()
+
+      receive_msg(fake, @up)
+      assert_receive {:cec_key, @dev, :up}
+      refute_receive {:other, _}, 50
+    end
+
+    test "the claim survives an adapter restart", %{fake: fake} do
+      configure(fake)
+      :ok = Cec.claim_keys(@dev)
+      _ = Server.list_adapters()
+      original = attached_adapter(fake)
+
+      :ok = Fake.inject(fake, {:exit, 1})
+      wait_until(fn -> adapter_pid() not in [nil, original] end)
+      attached_adapter(fake)
+      wait_until(fn -> match?({:ok, %{claim: :kept}}, Cec.info(@dev)) end)
+      state_change(fake, @pa, @mask)
+      wait_until(fn -> match?({:ok, %{configured?: true}}, Server.get_adapter(@dev)) end)
+      sent = length(transmits(fake))
+
+      receive_msg(fake, @up)
+      assert_receive {:cec_key, @dev, :up}
+
+      refute Enum.any?(
+               Enum.drop(transmits(fake), sent),
+               &match?({_, %Message{body: {:feature_abort, _, _}}}, &1)
+             )
+    end
+
+    test "claim_keys/2 and release_keys/1 are no-ops with the subsystem off" do
+      stop_supervised!(Supervisor)
+      assert :ok = Cec.claim_keys(@dev)
+      assert :ok = Cec.release_keys(@dev)
+    end
   end
 
   ## Helpers

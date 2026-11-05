@@ -9,7 +9,7 @@ defmodule Circuits.CEC.Adapter do
       `request/5` and the helpers built on them),
     * answers the messages a playback device must answer (below),
     * tracks the physical address, logical address, whether we are the
-      active source and whether an audio receiver is on the bus,
+      active source and whether an audio receiver and a TV are on the bus,
     * runs One Touch Play (`one_touch_play/2`),
     * and tells subscribers (`subscribe/2`) what it receives.
 
@@ -77,6 +77,17 @@ defmodule Circuits.CEC.Adapter do
   (logical address 0) once it doesn't answer: a `:receiver` call NACKed
   by the receiver is retried once at the TV.
 
+  ## The TV
+
+  With `:tv_poll` (default `true`) the adapter also polls the TV (logical
+  address 0) after every configure, and `poll_tv/1` polls it again on
+  demand. `tv` in `t:state/0` is the last conclusive answer: `:present`
+  when it acknowledged, `:absent` on a NACK, `:unknown` until then and
+  whenever the adapter is unconfigured. A single NACK is no proof (a TV
+  still booting, or in deep standby, doesn't answer), so every poll result
+  also goes to subscribers as a `{:tv_poll, presence}` event (`:unknown`
+  for a bus error) for them to apply their own hysteresis.
+
   ## Subscribers
 
   Subscribers receive `{:cec, device, event}`, where `event` is
@@ -84,6 +95,7 @@ defmodule Circuits.CEC.Adapter do
     * `{:message, %Circuits.CEC.Message{}}` - every message received from
       the bus, including replies to our requests,
     * `{:state, state}` - when `t:state/0` changes,
+    * `{:tv_poll, presence}` - the result of each TV poll (see The TV),
     * `{:lost_msgs, count}` - the kernel dropped received messages,
     * `:gone` - the device went away; the adapter stops.
 
@@ -107,6 +119,7 @@ defmodule Circuits.CEC.Adapter do
       `nil` sends `:receiver` calls to the TV)
     * `:system_audio_mode` - send `<System Audio Mode Request>` to the
       receiver in One Touch Play (default `false`)
+    * `:tv_poll` - poll the TV after every configure (default `true`)
     * `:tx_deadline_ms` - how long past its reply timeout a transmit may
       take before it fails with `:timeout` (default 4100: the kernel's
       2.1 s transmit timeout plus 2 s). Callers of a slower adapter pass a
@@ -187,12 +200,14 @@ defmodule Circuits.CEC.Adapter do
           log_addrs: [Message.logical_address()],
           configured?: boolean(),
           active_source?: boolean(),
-          receiver: presence()
+          receiver: presence(),
+          tv: presence()
         }
 
   @type event ::
           {:message, Message.t()}
           | {:state, state()}
+          | {:tv_poll, presence()}
           | {:lost_msgs, non_neg_integer()}
           | :gone
 
@@ -361,6 +376,14 @@ defmodule Circuits.CEC.Adapter do
     call(adapter, {:one_touch_play, Keyword.take(opts, [:wait_ms, :system_audio_mode])}, timeout)
   end
 
+  @doc """
+  Polls the TV (logical address 0) once, unless the adapter is
+  unconfigured or a TV poll is already out. The result updates `tv` and
+  goes to subscribers as `{:tv_poll, presence}`.
+  """
+  @spec poll_tv(adapter()) :: :ok
+  def poll_tv(adapter), do: GenServer.cast(adapter, :poll_tv)
+
   @doc "The logical address `:receiver` calls go to right now."
   @spec receiver(adapter()) :: Message.logical_address()
   def receiver(adapter), do: GenServer.call(adapter, :receiver)
@@ -414,6 +437,9 @@ defmodule Circuits.CEC.Adapter do
       active_source?: false,
       last_standby: nil,
       receiver: :unknown,
+      tv: :unknown,
+      tv_poll?: Keyword.get(opts, :tv_poll, true),
+      tv_polling?: false,
       reqs: %{},
       txs: %{},
       seqs: %{},
@@ -481,6 +507,9 @@ defmodule Circuits.CEC.Adapter do
   def handle_call({:one_touch_play, opts}, from, state) do
     {:noreply, otp_join(state, from, opts)}
   end
+
+  @impl GenServer
+  def handle_cast(:poll_tv, state), do: {:noreply, poll_tv_now(state)}
 
   @impl GenServer
   def handle_info({:tx_deadline, ref}, state) do
@@ -848,7 +877,7 @@ defmodule Circuits.CEC.Adapter do
     new =
       cond do
         now and not was -> on_configured(new)
-        was and not now -> %{new | receiver: :unknown}
+        was and not now -> %{new | receiver: :unknown, tv: :unknown}
         true -> new
       end
 
@@ -858,6 +887,7 @@ defmodule Circuits.CEC.Adapter do
   defp on_configured(state) do
     state
     |> poll_receiver()
+    |> poll_tv_on_configure()
     |> otp_configured()
   end
 
@@ -897,6 +927,27 @@ defmodule Circuits.CEC.Adapter do
     end
 
     emit_state(%{state | receiver: presence})
+  end
+
+  ## TV
+
+  defp poll_tv_on_configure(%{tv_poll?: false} = state), do: state
+  defp poll_tv_on_configure(state), do: poll_tv_now(state)
+
+  defp poll_tv_now(state) do
+    if configured?(state) and not state.tv_polling? do
+      case start_tx(state, @tv, :poll, nil, 0, nil, :tv_poll) do
+        {:ok, state} -> %{state | tv_polling?: true}
+        {:error, _reason, state} -> state
+      end
+    else
+      state
+    end
+  end
+
+  defp set_tv(state, presence) do
+    if state.tv != presence, do: Logger.info("CEC #{state.device}: TV is #{presence}")
+    emit_state(%{state | tv: presence})
   end
 
   # An acknowledged transmit or a reply means a device holds the address;
@@ -1164,7 +1215,7 @@ defmodule Circuits.CEC.Adapter do
         state = %{state | txs: txs, seqs: Map.delete(state.seqs, tx.seq)}
 
         state =
-          if match?({:error, _}, result) and tx.cont != :receiver_poll,
+          if match?({:error, _}, result) and tx.cont not in [:receiver_poll, :tv_poll],
             do: bump(state, :tx_errors),
             else: state
 
@@ -1180,6 +1231,7 @@ defmodule Circuits.CEC.Adapter do
   defp stale({:press, job}), do: {:press, %{job | fallback?: false, stale?: true}}
   defp stale({:otp, id, step}), do: {:otp_stale, id, step}
   defp stale(:receiver_poll), do: :ignore
+  defp stale(:tv_poll), do: :tv_poll_stale
   defp stale(:follower), do: :follower
 
   defp continue(state, {:job, job}, result), do: finish_job(state, job, result)
@@ -1205,6 +1257,23 @@ defmodule Circuits.CEC.Adapter do
       presence -> set_receiver(state, presence)
     end
   end
+
+  defp continue(state, :tv_poll, result) do
+    state = %{state | tv_polling?: false}
+
+    case presence(result) do
+      nil ->
+        notify(state, {:tv_poll, :unknown})
+        state
+
+      presence ->
+        state = set_tv(state, presence)
+        notify(state, {:tv_poll, presence})
+        state
+    end
+  end
+
+  defp continue(state, :tv_poll_stale, _result), do: %{state | tv_polling?: false}
 
   defp continue(state, {:otp, id, step}, result), do: otp_step(state, id, step, result)
 
@@ -1446,7 +1515,8 @@ defmodule Circuits.CEC.Adapter do
       log_addrs: if(configured?(state), do: log_addrs(state.log_addr_mask), else: []),
       configured?: configured?(state),
       active_source?: state.active_source?,
-      receiver: state.receiver
+      receiver: state.receiver,
+      tv: state.tv
     }
   end
 

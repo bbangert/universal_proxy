@@ -33,6 +33,26 @@ defmodule UniversalProxy.Cec.Server do
   `<Standby>` puts every device in standby; a directed one counts only when
   it comes from the receiver.
 
+  ## The TV
+
+  Each adapter polls the TV (logical address 0) when it becomes
+  configured; `UniversalProxy.Cec.TvPresence` turns those and the rechecks
+  this server schedules into the record's `tv_presence` (`:present`,
+  `:absent` or `:unknown`, with a 2-NACK rule). `tv_presence: false` turns
+  the polling off; `:tv_timings` overrides the reducer's delays.
+
+  ## Remote keys
+
+  `claim_keys/2` routes the TV remote's keys on one adapter to a process
+  as `{:cec_key, dev, key}` (see `UniversalProxy.Cec.Keys`). The server
+  subscribes to the adapter with `handle: [:user_control_pressed, :play,
+  :deck_control]`, so the adapter stops Feature-Aborting them, and
+  re-subscribes that way whenever the adapter restarts. When the claimer
+  exits or calls `release_keys/1`, the subscription drops the handles and
+  the adapter answers those opcodes with `<Feature Abort>` again. Only keys
+  sent to our logical address count, and only one process holds an
+  adapter's keys: a new claim replaces the previous one.
+
   ## Adapter lifecycle
 
   Adapters are `:temporary` children of the `DynamicSupervisor`, named in
@@ -65,7 +85,7 @@ defmodule UniversalProxy.Cec.Server do
   require Logger
 
   alias Circuits.CEC.{Adapter, Message}
-  alias UniversalProxy.Cec.Enumerate
+  alias UniversalProxy.Cec.{Enumerate, Keys, TvPresence}
   alias UniversalProxy.Cec.Supervisor, as: CecSupervisor
 
   @pubsub UniversalProxy.PubSub
@@ -78,6 +98,7 @@ defmodule UniversalProxy.Cec.Server do
   @default_osd_name "UniversalProxy"
   @tv 0
   @unknown_receiver %{power: :unknown, volume: nil, muted: nil, updated_at: nil}
+  @key_opcodes [:user_control_pressed, :play, :deck_control]
 
   @type power :: :on | :standby | :to_on | :to_standby | :unknown
 
@@ -99,6 +120,7 @@ defmodule UniversalProxy.Cec.Server do
           configured?: boolean(),
           active_source?: boolean(),
           receiver_presence: :present | :absent | :unknown,
+          tv_presence: TvPresence.presence(),
           receiver_target: 0..15,
           receiver: receiver(),
           backoff: backoff() | nil
@@ -111,6 +133,12 @@ defmodule UniversalProxy.Cec.Server do
             errors: %{},
             versions: %{},
             restart_timers: %{},
+            key_handlers: %{},
+            held_keys: %{},
+            tv: %{},
+            tv_timers: %{},
+            tv_enabled: true,
+            tv_timings: %{},
             enumerate: nil,
             output_lookup: nil,
             transport: Circuits.CEC.Transport.Port,
@@ -169,6 +197,19 @@ defmodule UniversalProxy.Cec.Server do
   def note_receiver(dev, to, version, partial) when is_map(partial),
     do: GenServer.cast(__MODULE__, {:note_receiver, dev, to, version, partial})
 
+  @doc """
+  Sends the TV remote's keys on `dev` to `pid` as `{:cec_key, dev, key}`
+  until `pid` exits or `release_keys/1`. Idempotent; replaces another
+  process's claim. See "Remote keys" above.
+  """
+  @spec claim_keys(String.t(), pid()) :: :ok
+  def claim_keys(dev, pid) when is_binary(dev) and is_pid(pid),
+    do: GenServer.cast(__MODULE__, {:claim_keys, dev, pid})
+
+  @doc "Drops the key claim on `dev`; the adapter Feature-Aborts the keys again."
+  @spec release_keys(String.t()) :: :ok
+  def release_keys(dev) when is_binary(dev), do: GenServer.cast(__MODULE__, {:release_keys, dev})
+
   @doc "Re-run discovery now (tests, or after a manual cable swap)."
   @spec rescan() :: :ok
   def rescan, do: GenServer.call(__MODULE__, :rescan)
@@ -193,6 +234,8 @@ defmodule UniversalProxy.Cec.Server do
       restart_ms: get.(:restart_ms, @default_restart_ms),
       restart_max_ms: get.(:restart_max_ms, @default_restart_max_ms),
       stable_ms: get.(:stable_ms, @default_stable_ms),
+      tv_enabled: get.(:tv_presence, true),
+      tv_timings: get.(:tv_timings, %{}),
       pubsub: Keyword.get(opts, :pubsub, @pubsub),
       task_sup: Keyword.get(opts, :task_supervisor, UniversalProxy.TaskSupervisor)
     }
@@ -219,6 +262,31 @@ defmodule UniversalProxy.Cec.Server do
     do: {:reply, Map.get(state.versions, dev, 0), state}
 
   @impl true
+  def handle_cast({:claim_keys, dev, pid}, state) do
+    case Map.get(state.key_handlers, dev) do
+      %{pid: ^pid} ->
+        {:noreply, state}
+
+      previous ->
+        if previous, do: Process.demonitor(previous.ref, [:flush])
+        handler = %{pid: pid, ref: Process.monitor(pid)}
+        state = %{state | key_handlers: Map.put(state.key_handlers, dev, handler)}
+        {:noreply, state |> reset_keys(dev) |> apply_handles(dev)}
+    end
+  end
+
+  def handle_cast({:release_keys, dev}, state) do
+    case Map.pop(state.key_handlers, dev) do
+      {nil, _handlers} ->
+        {:noreply, state}
+
+      {handler, handlers} ->
+        Process.demonitor(handler.ref, [:flush])
+        state = %{state | key_handlers: handlers}
+        {:noreply, state |> reset_keys(dev) |> apply_handles(dev)}
+    end
+  end
+
   def handle_cast({:note_receiver, dev, to, version, partial}, state) do
     case Map.fetch(state.adapters, dev) do
       {:ok, adapter} ->
@@ -247,15 +315,26 @@ defmodule UniversalProxy.Cec.Server do
   def handle_info({:sendspin_state, _key, _event}, state), do: {:noreply, state}
 
   def handle_info({:cec, dev, event}, state) do
-    new_state = apply_event(state, dev, event)
+    new_state = state |> deliver_key(dev, event) |> apply_event(dev, event)
     Phoenix.PubSub.broadcast(state.pubsub, @events_topic, {:cec_event, dev, event})
     {:noreply, publish(new_state, state)}
   end
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
     case Enum.find(state.procs, fn {_dev, {_pid, r}} -> r == ref end) do
-      nil -> {:noreply, state}
+      nil -> {:noreply, key_handler_down(state, ref)}
       {dev, _proc} -> {:noreply, state |> adapter_down(dev, reason) |> publish(state)}
+    end
+  end
+
+  def handle_info({:tv_recheck, dev, token}, state) do
+    case state.tv_timers do
+      %{^dev => {_timer, ^token}} ->
+        state = %{state | tv_timers: Map.delete(state.tv_timers, dev)}
+        {:noreply, state |> tv_step(dev, &TvPresence.recheck/1) |> publish(state)}
+
+      _ ->
+        {:noreply, state}
     end
   end
 
@@ -327,6 +406,7 @@ defmodule UniversalProxy.Cec.Server do
       configured?: false,
       active_source?: false,
       receiver_presence: :unknown,
+      tv_presence: :unknown,
       receiver: @unknown_receiver,
       backoff: nil
     })
@@ -348,7 +428,8 @@ defmodule UniversalProxy.Cec.Server do
       osd_name: state.osd_name,
       power_status: :on,
       receiver_la: state.receiver_la,
-      system_audio_mode: state.system_audio_mode
+      system_audio_mode: state.system_audio_mode,
+      tv_poll: state.tv_enabled
     ]
 
     spec = Supervisor.child_spec({Adapter, opts}, restart: :temporary)
@@ -375,6 +456,8 @@ defmodule UniversalProxy.Cec.Server do
 
   # The adapter may have emitted its state before we subscribed, so seed
   # the record from `info/1`. If it dies meanwhile, the DOWN cleans up.
+  # Subscribing with the key handles re-applies a key claim to a restarted
+  # adapter.
   defp attach(state, dev, pid) do
     ref = Process.monitor(pid)
 
@@ -388,9 +471,12 @@ defmodule UniversalProxy.Cec.Server do
     Process.send_after(self(), {:stable, dev, pid}, state.stable_ms)
 
     try do
-      :ok = Adapter.subscribe(pid)
+      :ok = Adapter.subscribe(pid, handle: handles_for(state, dev))
       info = Adapter.info(pid)
-      update_link(state, dev, &apply_summary(&1, info))
+
+      state
+      |> update_link(dev, &apply_summary(&1, info))
+      |> tv_step(dev, &TvPresence.link(&1, info.configured?, info.phys_addr))
     catch
       :exit, _ -> state
     end
@@ -407,7 +493,9 @@ defmodule UniversalProxy.Cec.Server do
         state
       end
 
-    update_link(state, dev, fn adapter ->
+    state
+    |> reset_keys(dev)
+    |> update_link(dev, fn adapter ->
       %{
         adapter
         | running?: false,
@@ -418,6 +506,7 @@ defmodule UniversalProxy.Cec.Server do
           receiver_presence: :unknown
       }
     end)
+    |> tv_step(dev, &TvPresence.link(&1, false, nil))
   end
 
   defp schedule_restart(state, dev, reason) do
@@ -481,9 +570,13 @@ defmodule UniversalProxy.Cec.Server do
       :error -> :ok
     end
 
+    state = cancel_tv_timer(state, dev)
+
     %{
       state
       | adapters: Map.delete(state.adapters, dev),
+        tv: Map.delete(state.tv, dev),
+        held_keys: Map.delete(state.held_keys, dev),
         procs: Map.delete(state.procs, dev),
         errors: Map.delete(state.errors, dev),
         restart_timers: Map.delete(state.restart_timers, dev)
@@ -536,8 +629,14 @@ defmodule UniversalProxy.Cec.Server do
 
   # ── state updates ─────────────────────────────────────────────────────
 
-  defp apply_event(state, dev, {:state, summary}),
-    do: update_link(state, dev, &apply_summary(&1, summary))
+  defp apply_event(state, dev, {:state, summary}) do
+    state
+    |> update_link(dev, &apply_summary(&1, summary))
+    |> tv_step(dev, &TvPresence.link(&1, summary.configured?, summary.phys_addr))
+  end
+
+  defp apply_event(state, dev, {:tv_poll, presence}),
+    do: tv_step(state, dev, &TvPresence.observe(&1, presence))
 
   defp apply_event(state, dev, {:message, %Message{} = message}) do
     case Map.fetch(state.adapters, dev) do
@@ -558,6 +657,109 @@ defmodule UniversalProxy.Cec.Server do
         receiver_presence: summary.receiver
     }
   end
+
+  # ── TV presence ───────────────────────────────────────────────────────
+
+  # Runs one reducer step for `dev`, copies the presence into its record
+  # and carries out the step's effects.
+  defp tv_step(%{tv_enabled: false} = state, _dev, _fun), do: state
+
+  defp tv_step(state, dev, fun) do
+    if Map.has_key?(state.adapters, dev) do
+      tv = Map.get_lazy(state.tv, dev, fn -> TvPresence.new(state.tv_timings) end)
+      {tv, effects} = fun.(tv)
+
+      state =
+        %{state | tv: Map.put(state.tv, dev, tv)}
+        |> update_adapter(dev, &%{&1 | tv_presence: tv.presence})
+
+      Enum.reduce(effects, state, &tv_effect(&2, dev, &1))
+    else
+      state
+    end
+  end
+
+  defp tv_effect(state, dev, :poll) do
+    case Map.fetch(state.procs, dev) do
+      {:ok, {pid, _ref}} -> Adapter.poll_tv(pid)
+      :error -> :ok
+    end
+
+    state
+  end
+
+  defp tv_effect(state, dev, :cancel), do: cancel_tv_timer(state, dev)
+
+  defp tv_effect(state, dev, {:recheck_in, ms}) do
+    state = cancel_tv_timer(state, dev)
+    token = make_ref()
+    timer = Process.send_after(self(), {:tv_recheck, dev, token}, ms)
+    %{state | tv_timers: Map.put(state.tv_timers, dev, {timer, token})}
+  end
+
+  defp cancel_tv_timer(state, dev) do
+    case Map.pop(state.tv_timers, dev) do
+      {nil, _timers} ->
+        state
+
+      {{timer, _token}, timers} ->
+        _ = Process.cancel_timer(timer)
+        %{state | tv_timers: timers}
+    end
+  end
+
+  # ── remote keys ───────────────────────────────────────────────────────
+
+  defp handles_for(state, dev),
+    do: if(Map.has_key?(state.key_handlers, dev), do: @key_opcodes, else: [])
+
+  defp apply_handles(state, dev) do
+    case Map.fetch(state.procs, dev) do
+      {:ok, {pid, _ref}} ->
+        try do
+          :ok = Adapter.subscribe(pid, handle: handles_for(state, dev))
+        catch
+          :exit, _ -> :ok
+        end
+
+      :error ->
+        :ok
+    end
+
+    state
+  end
+
+  defp key_handler_down(state, ref) do
+    case Enum.find(state.key_handlers, fn {_dev, handler} -> handler.ref == ref end) do
+      nil ->
+        state
+
+      {dev, _handler} ->
+        state = %{state | key_handlers: Map.delete(state.key_handlers, dev)}
+        state |> reset_keys(dev) |> apply_handles(dev)
+    end
+  end
+
+  defp reset_keys(state, dev), do: %{state | held_keys: Map.delete(state.held_keys, dev)}
+
+  # Keys sent to our logical address go to the claimer, repeats dropped.
+  defp deliver_key(state, dev, {:message, %Message{} = message}) do
+    with %{pid: pid} <- Map.get(state.key_handlers, dev),
+         {:ok, %{logical_address: la}} when is_integer(la) <- Map.fetch(state.adapters, dev),
+         true <- message.to == la,
+         kind when kind != :ignore <- Keys.classify(message.body) do
+      now = System.monotonic_time(:millisecond)
+      {key, held} = Keys.step(Map.get(state.held_keys, dev), kind, now)
+      if key, do: send(pid, {:cec_key, dev, key})
+      %{state | held_keys: Map.put(state.held_keys, dev, held)}
+    else
+      _ -> state
+    end
+  end
+
+  defp deliver_key(state, _dev, _event), do: state
+
+  # ── link ──────────────────────────────────────────────────────────────
 
   # Updates what is known about the link. When the link changes (a new
   # receiver target, physical address, configuration, or the adapter

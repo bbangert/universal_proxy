@@ -1448,6 +1448,93 @@ defmodule Circuits.CEC.AdapterTest do
     end
   end
 
+  ## TV
+
+  describe "tv" do
+    test "is polled after configure, after the receiver" do
+      %{fake: fake, adapter: adapter} = configured(tv_poll: true)
+      :ok = Adapter.subscribe(adapter)
+      assert Adapter.info(adapter).tv == :unknown
+
+      {seq, %Message{from: @la, to: 0, body: :poll}} = nth_tx(fake, 2)
+      complete(fake, seq, tx_status: 0x01)
+
+      assert_receive {:cec, @device, {:tv_poll, :present}}
+      assert_receive {:cec, @device, {:state, %{tv: :present}}}
+      assert %{tv: :present, counters: %{tx_errors: 0}} = Adapter.info(adapter)
+    end
+
+    test "a NACK is absent, a bus error says nothing; each result is an event" do
+      %{fake: fake, adapter: adapter} = configured(tv_poll: true)
+      :ok = Adapter.subscribe(adapter)
+
+      {seq, %Message{to: 0, body: :poll}} = nth_tx(fake, 2)
+      complete(fake, seq, tx_status: 0x24)
+      assert_receive {:cec, @device, {:tv_poll, :absent}}
+      assert_received {:cec, @device, {:state, %{tv: :absent}}}
+
+      # A second NACK changes no state, but is still reported.
+      :ok = Adapter.poll_tv(adapter)
+      {seq, %Message{to: 0, body: :poll}} = nth_tx(fake, 3)
+      complete(fake, seq, tx_status: 0x24)
+      assert_receive {:cec, @device, {:tv_poll, :absent}}
+      refute_received {:cec, @device, {:state, _}}
+
+      :ok = Adapter.poll_tv(adapter)
+      {seq, %Message{to: 0, body: :poll}} = nth_tx(fake, 4)
+      complete(fake, seq, tx_status: 0x02)
+      assert_receive {:cec, @device, {:tv_poll, :unknown}}
+      assert %{tv: :absent, counters: %{tx_errors: 0}} = Adapter.info(adapter)
+    end
+
+    test "only one TV poll is out at a time" do
+      %{fake: fake, adapter: adapter} = configured(tv_poll: true)
+      {_seq, %Message{to: 0, body: :poll}} = nth_tx(fake, 2)
+
+      :ok = Adapter.poll_tv(adapter)
+      _ = Adapter.info(adapter)
+      assert length(transmits(fake)) == 2
+    end
+
+    test "poll_tv/1 does nothing while unconfigured" do
+      %{fake: fake, adapter: adapter} = start(tv_poll: true)
+      wait_until(fn -> Adapter.info(adapter).ready? end)
+
+      :ok = Adapter.poll_tv(adapter)
+      _ = Adapter.info(adapter)
+      assert transmits(fake) == []
+    end
+
+    test "is unknown again once unconfigured, and polled again on the next configure" do
+      %{fake: fake, adapter: adapter} = configured(tv_poll: true)
+      {seq, %Message{to: 0, body: :poll}} = nth_tx(fake, 2)
+      complete(fake, seq, tx_status: 0x01)
+      wait_until(fn -> Adapter.info(adapter).tv == :present end)
+
+      replug(fake, adapter)
+      {_seq, %Message{to: 0, body: :poll}} = nth_tx(fake, 4)
+      assert Adapter.info(adapter).tv == :unknown
+    end
+
+    test "a result from before an unplug is dropped" do
+      %{fake: fake, adapter: adapter} = configured(tv_poll: true)
+      :ok = Adapter.subscribe(adapter)
+      {seq, %Message{to: 0, body: :poll}} = nth_tx(fake, 2)
+
+      state_change(fake, 0xFFFF, 0)
+      wait_until(fn -> not Adapter.info(adapter).configured? end)
+      complete(fake, seq, tx_status: 0x01)
+
+      _ = Adapter.info(adapter)
+      refute_received {:cec, @device, {:tv_poll, _}}
+      assert Adapter.info(adapter).tv == :unknown
+
+      # The stale result freed the slot for the next poll.
+      state_change(fake, @pa, @mask)
+      {_seq, %Message{to: 0, body: :poll}} = nth_tx(fake, 4)
+    end
+  end
+
   ## Lifecycle
 
   describe "lifecycle" do
@@ -1529,8 +1616,11 @@ defmodule Circuits.CEC.AdapterTest do
 
   ## Helpers
 
+  # The TV poll is off unless a test turns it on, so transmit numbers
+  # count only what a test is about.
   defp start(opts \\ []) do
     {fake_opts, opts} = Keyword.split(opts, [:responder, :ready, :caps, :phys_addr])
+    opts = Keyword.put_new(opts, :tv_poll, false)
     fake = start_supervised!({Fake, fake_opts})
 
     adapter =
