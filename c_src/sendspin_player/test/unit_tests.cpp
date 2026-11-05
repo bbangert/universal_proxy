@@ -4,6 +4,8 @@
 #include "artwork_store.h"
 #include "display_roles.h"
 #include "json_out.h"
+#include "pcm_tap.h"
+#include "pcm_tap_writer.h"
 #include "sha256.h"
 #include "started_event.h"
 #include "viz_gate.h"
@@ -12,7 +14,9 @@
 #include <cstdlib>
 #include <filesystem>
 #include <atomic>
+#include <chrono>
 #include <limits>
+#include <random>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -272,6 +276,245 @@ static void test_viz_gate() {
     }
 }
 
+// ---- PCM tap ----
+
+using pcm_tap::Reader;
+using Status = pcm_tap::Reader::Status;
+
+static std::string tap_path(const char* name) {
+    return (fs::temp_directory_path() /
+            ("sendspin_pcm_tap_" + std::string(name) + "_" + std::to_string(::getpid())))
+        .string();
+}
+
+// Stereo frames whose samples encode their absolute frame index.
+static void fill_indexed(std::vector<int16_t>& buf, uint64_t first, uint32_t frames) {
+    buf.resize(size_t{frames} * 2);
+    for (uint32_t i = 0; i < frames; i++) {
+        uint64_t f = first + i;
+        buf[size_t{i} * 2] = static_cast<int16_t>(f & 0x7fff);
+        buf[size_t{i} * 2 + 1] = static_cast<int16_t>((f >> 15) & 0x7fff);
+    }
+}
+
+static bool is_frame(const int16_t* s, uint64_t f) {
+    return s[0] == static_cast<int16_t>(f & 0x7fff) &&
+           s[1] == static_cast<int16_t>((f >> 15) & 0x7fff);
+}
+
+static void test_pcm_tap_layout() {
+    CHECK(pcm_tap::samples_offset(1024) == 24640);
+    CHECK(pcm_tap::file_bytes(65536, 1024) == 24640 + 65536 * 4);
+    std::string path = tap_path("layout");
+    std::string err;
+    auto w = pcm_tap::Writer::open(path, err);
+    CHECK(w != nullptr);
+    CHECK(fs::file_size(path) == pcm_tap::file_bytes(65536, 1024));
+    CHECK(pcm_tap::Writer::open(path, err, 1000, 16) == nullptr);
+    Reader r;
+    CHECK(r.open(path.c_str()));
+    Reader::Info info;
+    CHECK(r.format(info) && info.sample_rate == 0);
+    std::vector<int16_t> out(64 * 2);
+    CHECK(r.read_latest(64, out.data()) == Status::NoData);
+    CHECK(!r.open("/nonexistent/pcm_tap"));
+    fs::remove(path);
+}
+
+static void test_pcm_tap_convert() {
+    int16_t out[8];
+    // S16_LE stereo: unchanged.
+    const int16_t s16[] = {1, -2, 300, -400};
+    CHECK(pcm_tap::to_s16_stereo(reinterpret_cast<const uint8_t*>(s16), 2, 16, 2, out));
+    CHECK(out[0] == 1 && out[1] == -2 && out[2] == 300 && out[3] == -400);
+    // S24_3LE stereo: the top 16 bits.
+    const uint8_t s24[] = {0x56, 0x34, 0x12, 0xff, 0xff, 0xff, 0x00, 0x00, 0x80, 0xff, 0xff, 0x7f};
+    CHECK(pcm_tap::to_s16_stereo(s24, 2, 24, 2, out));
+    CHECK(out[0] == 0x1234 && out[1] == -1 && out[2] == INT16_MIN && out[3] == INT16_MAX);
+    // S32_LE stereo.
+    const int32_t s32[] = {0x12345678, -65536, INT32_MIN, INT32_MAX};
+    CHECK(pcm_tap::to_s16_stereo(reinterpret_cast<const uint8_t*>(s32), 2, 32, 2, out));
+    CHECK(out[0] == 0x1234 && out[1] == -1 && out[2] == INT16_MIN && out[3] == INT16_MAX);
+    // Mono is duplicated; a third channel is dropped.
+    const int16_t mono[] = {7, -8};
+    CHECK(pcm_tap::to_s16_stereo(reinterpret_cast<const uint8_t*>(mono), 2, 16, 1, out));
+    CHECK(out[0] == 7 && out[1] == 7 && out[2] == -8 && out[3] == -8);
+    const uint8_t s24x3[] = {0, 1, 0, 0, 2, 0, 0, 3, 0};
+    CHECK(pcm_tap::to_s16_stereo(s24x3, 1, 24, 3, out));
+    CHECK(out[0] == 1 && out[1] == 2);
+    CHECK(!pcm_tap::to_s16_stereo(s24, 1, 8, 2, out));
+    CHECK(!pcm_tap::to_s16_stereo(s24, 1, 16, 0, out));
+}
+
+static void test_pcm_tap_wraparound() {
+    std::string path = tap_path("wrap");
+    std::string err;
+    auto w = pcm_tap::Writer::open(path, err, 256, 8);
+    CHECK(w != nullptr);
+    Reader r;
+    CHECK(r.open(path.c_str()));
+    std::vector<int16_t> chunk;
+    std::vector<int16_t> out(200 * 2);
+    uint64_t f = 0;
+    for (int i = 0; i < 40; i++) {
+        // 100 frames per chunk, 100 us apart at 1 MHz: frame f plays at f.
+        fill_indexed(chunk, f, 100);
+        f += 100;
+        w->commit(1, 1'000'000, chunk.data(), 100, static_cast<int64_t>(f - 1));
+        Reader::Info info;
+        if (f >= 200) {
+            CHECK(r.read_latest(200, out.data(), &info) == Status::Ok);
+            CHECK(info.end_frame == f);
+            bool ok = true;
+            for (uint32_t k = 0; k < 200; k++) ok = ok && is_frame(&out[k * 2], f - 200 + k);
+            CHECK(ok);
+        }
+    }
+    // Past the 256-frame ring (but within the 8 records): overwritten.
+    CHECK(r.read_ending_at(static_cast<int64_t>(f - 1 - 300), 100, out.data()) == Status::Retry);
+    // Mid-chunk lookup across the slot wrap.
+    CHECK(r.read_ending_at(static_cast<int64_t>(f - 1 - 50), 150, out.data()) == Status::Ok);
+    CHECK(is_frame(&out[149 * 2], f - 1 - 50) && is_frame(&out[0], f - 50 - 150));
+    // A chunk larger than the ring keeps its newest frames.
+    fill_indexed(chunk, f, 300);
+    w->commit(1, 1'000'000, chunk.data(), 300, static_cast<int64_t>(f + 299));
+    CHECK(r.read_latest(256, out.data()) == Status::Ok);
+    CHECK(is_frame(&out[0], f + 44) && is_frame(&out[255 * 2], f + 299));
+    fs::remove(path);
+}
+
+static void test_pcm_tap_time_lookup() {
+    std::string path = tap_path("time");
+    std::string err;
+    auto w = pcm_tap::Writer::open(path, err);
+    Reader r;
+    CHECK(w != nullptr && r.open(path.c_str()));
+    // 480-frame (10 ms) chunks at 48 kHz; chunk k's last frame plays at
+    // base + (k + 1) * 10 ms.
+    const int64_t base = 5'000'000;
+    std::vector<int16_t> chunk;
+    for (uint64_t k = 0; k < 10; k++) {
+        fill_indexed(chunk, k * 480, 480);
+        w->commit(7, 48000, chunk.data(), 480, base + static_cast<int64_t>(k + 1) * 10'000);
+    }
+    std::vector<int16_t> out(1024 * 2);
+    Reader::Info info;
+    // 5 ms (240 frames) before chunk 3's end.
+    CHECK(r.read_ending_at(base + 40'000 - 5'000, 1024, out.data(), &info) == Status::Ok);
+    CHECK(info.sample_rate == 48000 && info.end_frame == 4 * 480 - 240);
+    CHECK(is_frame(&out[1023 * 2], 4 * 480 - 241) && is_frame(&out[0], 4 * 480 - 240 - 1024));
+    // Exactly a chunk's end.
+    CHECK(r.read_ending_at(base + 70'000, 576, out.data(), &info) == Status::Ok);
+    CHECK(info.end_frame == 7 * 480);
+    // Later than anything written, or before the first chunk began.
+    CHECK(r.read_ending_at(base + 100'001, 576, out.data()) == Status::NoData);
+    CHECK(r.read_ending_at(base - 1, 576, out.data()) == Status::NoData);
+    // The window reaches back before frame 0: zero-filled.
+    CHECK(r.read_ending_at(base + 10'000, 1024, out.data(), &info) == Status::Ok);
+    CHECK(info.end_frame == 480 && out[0] == 0 && out[(1024 - 480) * 2 - 1] == 0);
+    CHECK(is_frame(&out[(1024 - 480) * 2], 0) && is_frame(&out[1023 * 2], 479));
+    fs::remove(path);
+}
+
+static void test_pcm_tap_epochs() {
+    std::string path = tap_path("epoch");
+    std::string err;
+    auto w = pcm_tap::Writer::open(path, err);
+    Reader r;
+    CHECK(w != nullptr && r.open(path.c_str()));
+    std::vector<int16_t> chunk;
+    std::vector<int16_t> out(600 * 2);
+    Reader::Info info;
+
+    fill_indexed(chunk, 0, 480);
+    w->commit(1, 48000, chunk.data(), 480, 10'000);
+    CHECK(r.read_latest(480, out.data(), &info) == Status::Ok);
+    const uint32_t e1 = info.epoch;
+
+    // Format change: a new epoch at the new rate. The old stream's data
+    // is gone, and the new one's window starts at its first frame.
+    fill_indexed(chunk, 480, 441);
+    w->commit(2, 44100, chunk.data(), 441, 20'000);
+    CHECK(r.format(info) && info.epoch == e1 + 1 && info.sample_rate == 44100);
+    CHECK(r.read_ending_at(10'000, 100, out.data()) == Status::NoData);
+    CHECK(r.read_latest(600, out.data(), &info) == Status::Ok);
+    CHECK(info.epoch == e1 + 1 && out[0] == 0 && out[(600 - 441) * 2 - 1] == 0);
+    CHECK(is_frame(&out[(600 - 441) * 2], 480) && is_frame(&out[599 * 2], 920));
+
+    // A flush (same rate, new stream) also bumps it, before any data.
+    w->begin_stream(3, 44100);
+    CHECK(r.format(info) && info.epoch == e1 + 2);
+    CHECK(r.read_latest(100, out.data()) == Status::NoData);
+
+    // No stream: no data. Reopening keeps the counters and bumps again.
+    w->end_stream();
+    CHECK(r.format(info) && info.epoch == e1 + 3 && info.sample_rate == 0);
+    w.reset();
+    w = pcm_tap::Writer::open(path, err);
+    CHECK(w != nullptr && w->epoch() == e1 + 4);
+    fill_indexed(chunk, 921, 100);
+    w->commit(1, 48000, chunk.data(), 100, 30'000);
+    CHECK(r.read_latest(100, out.data(), &info) == Status::Ok);
+    CHECK(info.epoch == e1 + 5 && info.end_frame == 1021 && is_frame(&out[0], 921));
+    fs::remove(path);
+}
+
+// A writer laps a small ring as fast as it can while a reader checks that
+// every read it accepts is exactly the frames it asked for.
+static void test_pcm_tap_no_torn_reads() {
+    std::string path = tap_path("torn");
+    std::string err;
+    auto w = pcm_tap::Writer::open(path, err, 256, 16);
+    Reader r;
+    CHECK(w != nullptr && r.open(path.c_str()));
+
+    std::atomic<bool> stop{false};
+    std::thread writer([&] {
+        std::vector<int16_t> chunk;
+        std::mt19937 rng(1);
+        uint64_t f = 0;
+        for (uint64_t i = 0; !stop.load(std::memory_order_relaxed); i++) {
+            uint32_t n = 1 + rng() % 97;
+            fill_indexed(chunk, f, n);
+            f += n;
+            // 1 MHz: frame f plays at time f.
+            w->commit(1, 1'000'000, chunk.data(), n, static_cast<int64_t>(f - 1));
+            if (i % 64 == 0) std::this_thread::sleep_for(std::chrono::microseconds(20));
+        }
+    });
+
+    std::vector<int16_t> out(64 * 2);
+    std::mt19937 rng(2);
+    uint64_t ok = 0, retry = 0, none = 0, bad = 0;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (std::chrono::steady_clock::now() < deadline || ok < 1000) {
+        Reader::Info info;
+        if (r.read_latest(1, out.data(), &info) != Status::Ok || info.end_frame < 256) continue;
+        int64_t t = static_cast<int64_t>(info.end_frame - 1) - static_cast<int64_t>(rng() % 160);
+        switch (r.read_ending_at(t, 64, out.data(), &info)) {
+            case Status::Ok: {
+                ok++;
+                bool good = info.end_frame == static_cast<uint64_t>(t) + 1;
+                for (uint32_t k = 0; k < 64; k++)
+                    good = good && is_frame(&out[k * 2], static_cast<uint64_t>(t) - 63 + k);
+                if (!good) bad++;
+                break;
+            }
+            case Status::Retry: retry++; break;
+            case Status::NoData: none++; break;
+        }
+        if (std::chrono::steady_clock::now() > deadline + std::chrono::seconds(10)) break;
+    }
+    stop.store(true);
+    writer.join();
+    std::printf("pcm_tap race: %llu ok, %llu retry, %llu no data\n",
+                static_cast<unsigned long long>(ok), static_cast<unsigned long long>(retry),
+                static_cast<unsigned long long>(none));
+    CHECK(ok >= 1000);
+    CHECK(bad == 0);
+    fs::remove(path);
+}
+
 int main() {
     test_probe_pairs();
     test_sha256();
@@ -280,6 +523,12 @@ int main() {
     test_metadata_budget();
     test_artwork_store();
     test_viz_gate();
+    test_pcm_tap_layout();
+    test_pcm_tap_convert();
+    test_pcm_tap_wraparound();
+    test_pcm_tap_time_lookup();
+    test_pcm_tap_epochs();
+    test_pcm_tap_no_torn_reads();
     if (g_failures == 0) std::printf("OK\n");
     return g_failures == 0 ? 0 : 1;
 }

@@ -21,6 +21,8 @@
 //     the BEAM side to show on demand; it never goes to stdout or stderr
 //   • --display-roles adds the metadata/controller/color/artwork/visualizer
 //     roles for the HDMI TV UI (display_roles.h)
+//   • --pcm-tap-path + the `pcm_tap` command copy the played PCM into an
+//     mmap'd ring for the visualizer renderer (pcm_tap.h)
 //
 // Licensed under the Apache License, Version 2.0.
 
@@ -47,6 +49,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <poll.h>
@@ -102,6 +105,7 @@ struct Options {
     int initial_static_delay_ms = 0;
     bool external_volume = false;
     DisplayRolesOptions display;
+    std::string pcm_tap_path;
     std::string log_level = "info";
 };
 
@@ -151,6 +155,8 @@ static void print_usage(const char* prog) {
         "  --viz-rate HZ         Visualizer frames per second, 1-60 (default: 20).\n"
         "  --viz-offset-ms N     Deliver visualizer frames this far ahead of their\n"
         "                        display time, 0-1000 (default: 0).\n"
+        "  --pcm-tap-path PATH   File the `pcm_tap` command maps the PCM tap ring\n"
+        "                        at (see README). Without it `pcm_tap` fails.\n"
         "  --log-level STR       none|error|warn|info|debug|verbose (default: info).\n"
         "  -h, --help            Show this help.\n"
         "  -V, --version         Show version.\n",
@@ -182,6 +188,7 @@ static bool parse_args(int argc, char** argv, Options& opts) {
         {"viz-bins",       required_argument, nullptr, 'B'},
         {"viz-rate",       required_argument, nullptr, 'F'},
         {"viz-offset-ms",  required_argument, nullptr, 'O'},
+        {"pcm-tap-path",   required_argument, nullptr, 'T'},
         {"log-level",      required_argument, nullptr, 'l'},
         {"help",           no_argument,       nullptr, 'h'},
         {"version",        no_argument,       nullptr, 'V'},
@@ -249,6 +256,7 @@ static bool parse_args(int argc, char** argv, Options& opts) {
                     return false;
                 }
                 break;
+            case 'T': opts.pcm_tap_path = optarg; break;
             case 'l': opts.log_level = optarg; break;
             case 'h': print_usage(argv[0]); std::exit(0);
             case 'V': std::fprintf(stdout, "sendspin_player %s\n", VERSION); std::exit(0);
@@ -335,6 +343,7 @@ static bool parse_log_level(const std::string& s, LogLevel& level) {
 //   {"cmd":"set_volume_external","value":true}
 //   {"cmd":"controller","value":3}        (--display-roles only)
 //   {"cmd":"viz_enable","value":true}     (--display-roles only)
+//   {"cmd":"pcm_tap","value":true}
 //
 // Whitespace is allowed between tokens but the structure is fixed. Hand-
 // rolled instead of pulling in nlohmann/json because (a) the wire format
@@ -516,11 +525,42 @@ static void emit_volume_external(bool external) {
     emit_json(os.str());
 }
 
+static void emit_pcm_tap(bool on) {
+    emit_json(on ? "{\"event\":\"pcm_tap\",\"value\":true}"
+                 : "{\"event\":\"pcm_tap\",\"value\":false}");
+}
+
+// `pcm_tap` on: map the ring at --pcm-tap-path and hand it to the sink
+// (file creation and mmap happen here, never on the playback thread).
+// Off: the sink stops writing, then the ring is unmapped; the file stays.
+static void handle_pcm_tap(bool on, AlsaPipeSink& sink, const std::string& path) {
+    if (!on) {
+        sink.set_pcm_tap(nullptr);
+        emit_pcm_tap(false);
+        return;
+    }
+    if (sink.pcm_tap_enabled()) {
+        emit_pcm_tap(true);
+        return;
+    }
+    std::string err = "no --pcm-tap-path";
+    std::unique_ptr<pcm_tap::Writer> tap;
+    if (!path.empty()) tap = pcm_tap::Writer::open(path, err);
+    if (!tap) {
+        emit_json("{\"event\":\"pcm_tap\",\"value\":false,\"ok\":false,\"error\":\"" +
+                  json_escape(err) + "\"}");
+        return;
+    }
+    sink.set_pcm_tap(std::move(tap));
+    emit_pcm_tap(true);
+}
+
 // Dispatches a single parsed command line. Silently ignores lines that
 // don't match a known cmd shape — BEAM is the sole writer so a malformed
 // frame is a programmer bug, not user input we need to surface.
 static void dispatch_command(const std::string& line, AlsaPipeSink& sink,
-                             PlayerRole& player, DisplayRoles& display) {
+                             PlayerRole& player, DisplayRoles& display,
+                             const std::string& pcm_tap_path) {
     std::string cmd;
     std::string kind;
     int int_val = 0;
@@ -547,6 +587,8 @@ static void dispatch_command(const std::string& line, AlsaPipeSink& sink,
         // what the server is told about them are untouched either way.
         sink.set_volume_external(bool_val);
         emit_volume_external(bool_val);
+    } else if (cmd == "pcm_tap" && kind == "bool") {
+        handle_pcm_tap(bool_val, sink, pcm_tap_path);
     } else if (cmd == "shutdown" && kind.empty()) {
         g_running.store(false);
     }
@@ -902,7 +944,7 @@ int main(int argc, char* argv[]) {
 
         bool stdin_eof = false;
         for (auto& line : stdin_poller.poll_lines(stdin_eof)) {
-            dispatch_command(line, audio_sink, player, display);
+            dispatch_command(line, audio_sink, player, display, opts.pcm_tap_path);
         }
         if (stdin_eof) g_running.store(false);
 
