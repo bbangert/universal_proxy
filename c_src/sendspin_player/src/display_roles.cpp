@@ -317,6 +317,7 @@ void DisplayRoles::Visualizer::emit_frame(int64_t client_timestamp,
                                           const std::vector<uint16_t>* bins) {
     const int64_t now = SendspinClient::now_us();
     if (!due(now)) return;
+    const uint64_t generation = gate.begin();
 
     std::ostringstream os;
     // Relative only: the client clock (CLOCK_MONOTONIC_RAW) is not the
@@ -339,7 +340,7 @@ void DisplayRoles::Visualizer::emit_frame(int64_t client_timestamp,
         }
     }
     os << "]}";
-    emit_json(os.str());
+    gate.emit_if_current(generation, os.str());
 }
 
 void DisplayRoles::Visualizer::on_loudness(int64_t client_timestamp, uint16_t value) {
@@ -354,16 +355,17 @@ void DisplayRoles::Visualizer::on_spectrum(int64_t client_timestamp,
 }
 
 void DisplayRoles::Visualizer::on_visualizer_stream_start(const ServerVisualizerStreamObject& s) {
+    gate.boundary();
     has_spectrum.store(std::find(s.types.begin(), s.types.end(), VisualizerDataType::SPECTRUM) !=
                        s.types.end());
 }
 
 void DisplayRoles::Visualizer::on_visualizer_stream_end() {
     loudness.store(0);
-    emit_json("{\"event\":\"viz_clear\"}");
+    gate.boundary("{\"event\":\"viz_clear\"}");
 }
 
 void DisplayRoles::Visualizer::on_visualizer_stream_clear() {
     loudness.store(0);
-    emit_json("{\"event\":\"viz_clear\"}");
+    gate.boundary("{\"event\":\"viz_clear\"}");
 }

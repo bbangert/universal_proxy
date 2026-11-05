@@ -8,6 +8,8 @@
 #pragma once
 
 #include "artwork_store.h"
+#include "json_out.h"
+#include "viz_gate.h"
 
 #include "sendspin/client.h"
 #include "sendspin/artwork_role.h"
@@ -99,6 +101,7 @@ private:
         std::atomic<bool> enabled{false};
         std::atomic<bool> has_spectrum{true};
         std::atomic<uint16_t> loudness{0};
+        VizGate gate{emit_json};
         // Drain-thread only.
         int64_t last_emit_us = 0;
 

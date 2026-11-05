@@ -6,11 +6,14 @@
 #include "json_out.h"
 #include "sha256.h"
 #include "started_event.h"
+#include "viz_gate.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <atomic>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -168,12 +171,58 @@ static void test_artwork_store() {
     fs::remove_all(dir);
 }
 
+static void test_viz_gate() {
+    std::vector<std::string> out;
+    VizGate gate([&](const std::string& line) { out.push_back(line); });
+
+    // A frame begun before a clear is dropped, even if written after it.
+    uint64_t g = gate.begin();
+    gate.boundary("clear");
+    CHECK(!gate.emit_if_current(g, "stale"));
+    CHECK(out == std::vector<std::string>{"clear"});
+
+    // Frames begun after the clear go through; a silent boundary (stream
+    // start) also drops frames begun before it.
+    CHECK(gate.emit_if_current(gate.begin(), "fresh"));
+    g = gate.begin();
+    gate.boundary();
+    CHECK(!gate.emit_if_current(g, "stale2"));
+    CHECK((out == std::vector<std::string>{"clear", "fresh"}));
+
+    // Concurrent: once the clear is written, no frame begun before it follows.
+    std::vector<std::string> lines;
+    std::mutex lines_mtx;
+    VizGate racy([&](const std::string& line) {
+        std::lock_guard<std::mutex> lock(lines_mtx);
+        lines.push_back(line);
+    });
+    std::atomic<bool> stop{false};
+    std::thread drain([&] {
+        while (!stop.load()) {
+            uint64_t gen = racy.begin();
+            racy.emit_if_current(gen, "frame:" + std::to_string(gen));
+        }
+    });
+    for (int i = 0; i < 200; i++) racy.boundary("clear:" + std::to_string(i + 1));
+    stop.store(true);
+    drain.join();
+    uint64_t current = 0;
+    for (const auto& line : lines) {
+        if (line.rfind("clear:", 0) == 0) {
+            current = std::stoull(line.substr(6));
+        } else {
+            CHECK(std::stoull(line.substr(6)) == current);
+        }
+    }
+}
+
 int main() {
     test_sha256();
     test_sanitize_text();
     test_started_budget();
     test_metadata_budget();
     test_artwork_store();
+    test_viz_gate();
     if (g_failures == 0) std::printf("OK\n");
     return g_failures == 0 ? 0 : 1;
 }
