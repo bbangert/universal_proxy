@@ -2,9 +2,11 @@
 
 #include <alsa/asoundlib.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <map>
+#include <sstream>
 #include <string>
 #include <string_view>
 
@@ -36,20 +38,26 @@ bool starts_with(std::string_view s, std::string_view prefix) {
 }
 
 
-// Whether the HDMI sink behind `hw_device` ("hw:<card>,<dev>") takes 24-bit
-// LPCM, from the ELD the kernel exposes at /proc/asound/card<N>/eld#<D>.0:
-// some `sadN_coding_type` is LPCM and its `sadN_bits` lists 24. Anything
-// unreadable (another device naming, no ELD, no sink) counts as no.
-bool eld_lpcm_24bit(const std::string& hw_device) {
+// The sample rates at which the HDMI sink behind `hw_device`
+// ("hw:<card>,<dev>") takes 24-bit LPCM, from the ELD the kernel exposes at
+// /proc/asound/card<N>/eld#<D>.0. Rates and sample sizes pair up per Short
+// Audio Descriptor, so a rate counts only when one LPCM descriptor lists
+// both it and 24 bits. Anything unreadable (another device naming, no ELD,
+// no sink) yields none.
+std::vector<uint32_t> eld_lpcm_24bit_rates(const std::string& hw_device) {
     unsigned card = 0, dev = 0;
-    if (std::sscanf(hw_device.c_str(), "hw:%u,%u", &card, &dev) != 2) return false;
+    if (std::sscanf(hw_device.c_str(), "hw:%u,%u", &card, &dev) != 2) return {};
 
     std::ifstream eld("/proc/asound/card" + std::to_string(card) + "/eld#" +
                       std::to_string(dev) + ".0");
-    if (!eld) return false;
+    if (!eld) return {};
 
-    std::map<std::string, bool> lpcm;      // "sadN" -> coding type is LPCM
-    std::map<std::string, bool> has_24;    // "sadN" -> bits list 24
+    struct Sad {
+        bool lpcm = false;
+        bool has_24 = false;
+        std::vector<uint32_t> rates;
+    };
+    std::map<std::string, Sad> sads;  // keyed by "sadN"
     std::string line;
     while (std::getline(eld, line)) {
         auto key_end = line.find_first_of(" \t");
@@ -57,16 +65,29 @@ bool eld_lpcm_24bit(const std::string& hw_device) {
         std::string key = line.substr(0, key_end);
         auto underscore = key.find('_');
         if (underscore == std::string::npos) continue;
-        std::string sad = key.substr(0, underscore);
+        Sad& sad = sads[key.substr(0, underscore)];
         std::string field = key.substr(underscore + 1);
+        // Values look like "[0x14e0] 32000 44100 48000"; the list follows ']'.
         std::string value = line.substr(key_end);
-        if (field == "coding_type") lpcm[sad] = value.find("LPCM") != std::string::npos;
-        if (field == "bits") has_24[sad] = (value + " ").find(" 24 ") != std::string::npos;
+        auto list = value.find(']');
+        std::istringstream items(list == std::string::npos ? value : value.substr(list + 1));
+        if (field == "coding_type") {
+            sad.lpcm = value.find("LPCM") != std::string::npos;
+        } else if (field == "bits") {
+            for (unsigned bits; items >> bits;) sad.has_24 = sad.has_24 || bits == 24;
+        } else if (field == "rates") {
+            for (uint32_t rate; items >> rate;) sad.rates.push_back(rate);
+        }
     }
-    for (const auto& [sad, is_lpcm] : lpcm) {
-        if (is_lpcm && has_24[sad]) return true;
+
+    std::vector<uint32_t> rates;
+    for (const auto& [name, sad] : sads) {
+        if (!sad.lpcm || !sad.has_24) continue;
+        for (uint32_t rate : sad.rates) {
+            if (std::find(rates.begin(), rates.end(), rate) == rates.end()) rates.push_back(rate);
+        }
     }
-    return false;
+    return rates;
 }
 
 }  // namespace
@@ -117,14 +138,22 @@ ProbedCaps probe_caps(const std::string& hw_device) {
     // HDMI on the Pi (vc4-hdmi) accepts only IEC958 subframes at hw:, so
     // none of the linear formats above test true. Playback goes through
     // plughw:, which packs linear samples into subframes. A subframe carries
-    // up to 24 bits, but that says nothing about the sink, so 24-bit is only
-    // advertised when the sink's ELD lists 24-bit LPCM; otherwise 16-bit.
-    // Never 32, which a subframe would truncate. The rates tested above are
-    // already limited to what the ELD allows.
+    // up to 24 bits, but that says nothing about the sink: every probed rate
+    // (already limited to the ELD's) gets 16-bit, and 24-bit only at the
+    // rates an LPCM descriptor in the ELD pairs with 24 bits. Never 32, which
+    // a subframe would truncate. These pairs replace the rates x depths
+    // cross product.
     if (caps.bit_depths.empty() &&
         snd_pcm_hw_params_test_format(pcm, hw, SND_PCM_FORMAT_IEC958_SUBFRAME_LE) == 0) {
+        std::vector<uint32_t> rates_24 = eld_lpcm_24bit_rates(hw_device);
         caps.bit_depths = {16};
-        if (eld_lpcm_24bit(hw_device)) caps.bit_depths.push_back(24);
+        for (uint32_t rate : caps.rates) caps.pairs.emplace_back(rate, uint8_t{16});
+        for (uint32_t rate : caps.rates) {
+            if (std::find(rates_24.begin(), rates_24.end(), rate) != rates_24.end()) {
+                caps.pairs.emplace_back(rate, uint8_t{24});
+            }
+        }
+        if (caps.pairs.size() > caps.rates.size()) caps.bit_depths.push_back(24);
     }
 
     snd_pcm_close(pcm);

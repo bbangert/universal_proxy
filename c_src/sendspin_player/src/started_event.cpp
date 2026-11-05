@@ -36,18 +36,24 @@ std::vector<AudioSupportedFormatObject> build_audio_formats(const ProbedCaps& ca
 
     if (!caps.ok) return formats;
 
-    // Cross-product of probed rates × probed depths, for FLAC + PCM only.
+    // Probed rates × probed depths (or the probe's exact pairs), for FLAC +
+    // PCM only.
     // Opus is hard-locked to 16-bit in the decoder (decoder.cpp:174), so it
     // never receives hi-res entries. Skip the {44100,48000} × 16-bit corner
     // the floor already covers to keep the advertised list dupe-free.
     // Channels stay stereo — channel-count probing is out of scope.
-    for (uint8_t depth : caps.bit_depths) {
-        for (uint32_t rate : caps.rates) {
-            bool in_floor = (depth == 16 && (rate == 44100 || rate == 48000));
-            if (in_floor) continue;
-            formats.push_back({SendspinCodecFormat::FLAC, 2, rate, depth});
-            formats.push_back({SendspinCodecFormat::PCM,  2, rate, depth});
+    // When the probe returned exact pairs (HDMI), advertise only those.
+    std::vector<std::pair<uint32_t, uint8_t>> pairs = caps.pairs;
+    if (pairs.empty()) {
+        for (uint8_t depth : caps.bit_depths) {
+            for (uint32_t rate : caps.rates) pairs.emplace_back(rate, depth);
         }
+    }
+    for (const auto& [rate, depth] : pairs) {
+        bool in_floor = (depth == 16 && (rate == 44100 || rate == 48000));
+        if (in_floor) continue;
+        formats.push_back({SendspinCodecFormat::FLAC, 2, rate, depth});
+        formats.push_back({SendspinCodecFormat::PCM,  2, rate, depth});
     }
 
     return formats;

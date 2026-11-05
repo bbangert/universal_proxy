@@ -91,6 +91,28 @@ static void test_started_budget() {
     CHECK(started_json(info).find("\"name\":\"Living Room \xC3\xA9\"") != std::string::npos);
 }
 
+// An IEC958 (HDMI) probe hands back exact (rate, depth) pairs; only those
+// are advertised, not the rates x depths cross product.
+static void test_probe_pairs() {
+    ProbedCaps caps;
+    caps.rates = {44100, 48000, 192000};
+    caps.bit_depths = {16, 24};
+    caps.pairs = {{44100, 16}, {48000, 16}, {192000, 16}, {44100, 24}, {48000, 24}};
+    caps.ok = true;
+
+    auto formats = build_audio_formats(caps);
+    auto has = [&](uint32_t rate, uint8_t depth) {
+        for (const auto& f : formats) {
+            if (f.sample_rate == rate && f.bit_depth == depth) return true;
+        }
+        return false;
+    };
+    CHECK(has(192000, 16));
+    CHECK(has(48000, 24));
+    CHECK(!has(192000, 24));
+    CHECK(formats.size() == 5 + 2 * 3);  // floor + FLAC/PCM for 192@16, 44.1@24, 48@24
+}
+
 static void test_metadata_budget() {
     std::string hostile = wide(64) + std::string(300, '"');
     ServerMetadataStateObject m;
@@ -251,6 +273,7 @@ static void test_viz_gate() {
 }
 
 int main() {
+    test_probe_pairs();
     test_sha256();
     test_sanitize_text();
     test_started_budget();
