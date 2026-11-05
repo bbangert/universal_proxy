@@ -297,6 +297,26 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
       assert VolumeLink.links(pid) == %{@dev => @key}
     end
 
+    @tag adapter: %{configured?: false, receiver_presence: :unknown},
+         receiver: %{power: :unknown, volume: nil, updated_at: nil}
+    test "an unconfigured adapter is retried at the probe pace, not in a loop", %{pid: pid} do
+      assert next_poll_in(pid) > 1_000
+      refute_receive {:to, _, _}
+
+      poll_now(pid)
+      assert next_poll_in(pid) > 1_000
+      refute_receive {:to, _, _}
+    end
+
+    @tag adapter: %{receiver_presence: :absent, receiver_target: 0},
+         receiver: %{power: :unknown, volume: nil, updated_at: nil}
+    test "a first probe that crashes isn't retried at once", %{pid: pid} do
+      reply(assert_cec({:power_status, @dev}), :raise)
+      idle(pid)
+      assert next_poll_in(pid) > 1_000
+      refute_receive {:cec, _, _}
+    end
+
     @tag adapter: %{receiver_presence: :absent, receiver_target: 0},
          receiver: %{power: :unknown, volume: nil, updated_at: nil}
     test "a receiver that answers in standby isn't linked", %{pid: pid} do
@@ -922,6 +942,19 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
       refute_receive {:cec, _, _}
     end
 
+    @tag output: %{cec_volume_max: 30}
+    test "asking for the volume shown above the ceiling steps the receiver down to it",
+         %{pid: pid, pubsub: pubsub} do
+      knob(pid, 45)
+      refute_receive {:cec, _, _}
+
+      # An explicit request for what is shown (the Audio page, the server).
+      player_event(pubsub, @key, :volume, 45)
+      assert_receive {:walk_opts, [max: 30]}
+      reply(assert_cec({:set_volume, @dev, 30}), {:ok, %{volume: 30, muted: false, step: 1}})
+      assert_receive {:update_config, @key, %{volume: 30}}
+    end
+
     test "the next poll skips the power check", %{pid: pid} do
       poll_now(pid)
       reply(assert_cec({:power_status, @dev}), {:ok, :on})
@@ -1327,8 +1360,8 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
 
   # The receiver's knob moves to `volume`, found by a poll.
   defp knob(pid, volume) do
-    poll_now(pid)
     state = :sys.get_state(pid)
+    poll_now(pid)
 
     if not Map.has_key?(state.power_at, @dev),
       do: reply(assert_cec({:power_status, @dev}), {:ok, :on})
@@ -1345,6 +1378,14 @@ defmodule UniversalProxy.Cec.VolumeLinkTest do
       {:sendspin_state, @key, %{event: event, value: value, startup: true, player: player}}
 
     Phoenix.PubSub.broadcast(pubsub, "sendspin:state", message)
+  end
+
+  # Milliseconds until the adapter's armed poll fires.
+  defp next_poll_in(pid) do
+    %{@dev => {_token, timer}} = :sys.get_state(pid).timers
+    ms = Process.read_timer(timer)
+    assert is_integer(ms), "the poll already fired"
+    ms
   end
 
   # Fires the poll timer currently armed for the adapter.

@@ -468,7 +468,9 @@ defmodule UniversalProxy.Cec.VolumeLink do
       state
       | gen: gen,
         links: Map.put(state.links, dev, link),
-        las: Map.put(state.las, dev, la)
+        las: Map.put(state.las, dev, la),
+        # The new link's first poll checks this receiver's power.
+        power_at: Map.delete(state.power_at, dev)
     }
 
     push(state, dev, known(link.receiver))
@@ -550,18 +552,26 @@ defmodule UniversalProxy.Cec.VolumeLink do
       {true, link} ->
         showing(state, dev, link, field, value)
 
-      # Repeating what is shown asks for nothing, unless a run or a held
-      # request may be taking the receiver elsewhere: what is shown can be
-      # a late echo, not where the receiver is headed.
-      {false, %{shown: %{^field => ^value}}}
-      when not is_map_key(state.busy, dev) and not is_map_key(link.pending, field) ->
-        state
-
       {false, link} ->
-        link = put_in(link.shown[field], value)
-        state = put_in(state.links[dev], link)
-        request(state, dev, field, target(state, link.key, field, value))
+        target = target(state, link.key, field, value)
+
+        if repeat?(state, dev, link, field, value, target) do
+          state
+        else
+          link = put_in(link.shown[field], value)
+          state = put_in(state.links[dev], link)
+          request(state, dev, field, target)
+        end
     end
+  end
+
+  # Repeating what is shown asks for nothing, unless the cap lowers it
+  # (the receiver was turned past the cap by hand), or a run or a held
+  # request may be taking the receiver elsewhere: what is shown can be a
+  # late echo, not where the receiver is headed.
+  defp repeat?(state, dev, link, field, value, target) do
+    Map.get(link.shown, field) == value and target == value and
+      not Map.has_key?(state.busy, dev) and not Map.has_key?(link.pending, field)
   end
 
   defp target(state, key, :volume, volume) do
@@ -794,10 +804,13 @@ defmodule UniversalProxy.Cec.VolumeLink do
         state
 
       true ->
+        # Only an adapter never probed, and able to send, is probed at
+        # once; anything else waiting on the adapter retries at the probe
+        # pace (an unconfigured one would otherwise spin).
         delay =
           cond do
             Map.has_key?(state.links, dev) -> state.poll_ms
-            Map.has_key?(state.power_at, dev) -> state.probe_ms
+            Map.has_key?(state.power_at, dev) or not configured?(state, dev) -> state.probe_ms
             true -> 0
           end
 
@@ -877,6 +890,10 @@ defmodule UniversalProxy.Cec.VolumeLink do
 
     %{audio_status: audio_status, power_status: power_status} = state.funs
     opts = [to: receiver_la(state, dev)]
+
+    # Set when asked, not only when answered: a probe that crashes or is
+    # dropped as stale still isn't retried at once.
+    state = if check_power?, do: put_in(state.power_at[dev], now), else: state
 
     task =
       Task.Supervisor.async_nolink(state.task_sup, fn ->
