@@ -36,6 +36,16 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
   reports no `capacity` (no drive mounted); the binary sensor always has
   a real value (`false` when off/no drive).
 
+  ## TV display mode select
+
+  With the TV UI on (`UniversalProxy.Display.ui?/0`) a "TV display mode"
+  select (`UniversalProxy.Display.Mode`) is advertised as a primary
+  control. Its state follows `UniversalProxy.Display.mode/0`, pushed as
+  soon as `UniversalProxy.Display.topic/0` reports a change rather than on
+  the poll tick; a command is checked against the frozen options before
+  it reaches `UniversalProxy.Display.set_mode/1`. With the UI off it is
+  neither advertised nor polled, and commands for it are ignored.
+
   ## Tuya mesh entities
 
   On Bluetooth targets the mesh's bulbs and groups are advertised too, as
@@ -65,8 +75,9 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
 
   alias Espex.Proto
 
-  alias UniversalProxy.{Audio, Bluetooth, FirmwareUpdate, Storage, System}
+  alias UniversalProxy.{Audio, Bluetooth, Display, FirmwareUpdate, Storage, System}
   alias UniversalProxy.Bluetooth.{RadioMonitor, Stats}
+  alias UniversalProxy.Display.Mode
   alias UniversalProxy.ESPHome.Clients
   alias UniversalProxy.ESPHome.EntityProvider.MeshSync
   alias UniversalProxy.FirmwareUpdate.ConfigStore
@@ -228,6 +239,17 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
       name: "Firmware Update",
       device_class: "firmware",
       category: :ENTITY_CATEGORY_CONFIG
+    },
+    # TV UI mode on the HDMI output (`display: true`: only while the TV UI
+    # is on). object_id, name and options are frozen once HA adopts it.
+    %{
+      object_id: Mode.object_id(),
+      type: :select,
+      name: Mode.name(),
+      options: Mode.options(),
+      icon: "mdi:television",
+      category: :ENTITY_CATEGORY_NONE,
+      display: true
     }
   ]
 
@@ -336,23 +358,23 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
   @impl GenServer
   def init(opts) do
     supported? = Keyword.get(opts, :supported?, default_supported?())
+    display? = Keyword.get(opts, :display?, Display.ui?())
     subscribe? = Keyword.get(opts, :subscribe, true)
     pubsub = Keyword.get(opts, :pubsub, UniversalProxy.PubSub)
     sources = build_sources(opts)
 
     # With the mesh, MeshSync holds the subscriptions through PubSub
-    # restarts (the firmware-progress one too, when it is on the same
-    # PubSub). A subscription links this process to the registry, whose
-    # restart would otherwise kill it, and Espex with it.
-    mesh_subscribes? = supported? and subscribe?
-    fw_by_mesh? = mesh_subscribes? and FirmwareUpdate.pubsub() == pubsub
-    if mesh_subscribes?, do: Process.flag(:trap_exit, true)
-    extra_topics = if fw_by_mesh?, do: [FirmwareUpdate.topic()], else: []
+    # restarts (the firmware-progress and display ones too, when they are on
+    # the same PubSub). A subscription links this process to the registry,
+    # whose restart would otherwise kill it, and Espex with it.
+    if supported? and subscribe?, do: Process.flag(:trap_exit, true)
+    {extra_topics, direct} = event_topics(supported? and subscribe?, subscribe?, display?, pubsub)
 
     state = %{
       server: Keyword.get(opts, :server, Espex.Server),
       tick_ms: Keyword.get(opts, :tick_ms, @default_tick_ms),
       supported?: supported?,
+      display?: display?,
       sources: sources,
       keys: key_lookup(),
       last: %{},
@@ -360,11 +382,11 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
       mesh_command: Keyword.get(opts, :mesh_command, &Commander.command/1)
     }
 
-    # Firmware-update progress is event-driven, not poll-driven: a 30 s tick
-    # would render HA's progress bar useless during an install. Subscribing is
-    # best-effort — PubSub may not be up yet during a supervised restart, and
-    # the poll tick still backstops the entity either way.
-    if subscribe? and not fw_by_mesh?, do: subscribe_fw_progress()
+    # Firmware-update progress and the TV display mode are event-driven, not
+    # poll-driven: a 30 s tick would render HA's progress bar useless during
+    # an install. Subscribing is best-effort — PubSub may not be up yet during
+    # a supervised restart, and the poll tick still backstops the entities.
+    Enum.each(direct, &subscribe_events/1)
 
     # Before any client can connect (Espex starts after this provider), and
     # without telling Espex: it is started with these sub-devices.
@@ -386,7 +408,7 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
     # because this provider starts before Espex (rest_for_one), the Espex
     # registry may not exist — pushing would raise. The first scheduled tick
     # does the first real diff-push once Espex is up.
-    new_state = %{state | last: read_values(state.sources, state.supported?, state.last)}
+    new_state = %{state | last: read_all(state)}
     schedule(new_state.tick_ms)
     {:noreply, new_state}
   end
@@ -399,7 +421,7 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
         {:reply, :defer, state}
 
       mesh ->
-        {:reply, advertisements(@specs, state.supported?) ++ mesh, state}
+        {:reply, advertisements(@specs, state.supported?, state.display?) ++ mesh, state}
     end
   end
 
@@ -407,7 +429,7 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
   # the connection-accept path. Values may be up to one tick stale.
   def handle_call(:initial_states, _from, state) do
     {:reply,
-     state_responses(@specs, state.last, state.supported?) ++
+     state_responses(@specs, state.last, state.supported?, state.display?) ++
        MeshSync.state_responses(state.mesh), state}
   end
 
@@ -456,6 +478,12 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
     end
   end
 
+  # TV display mode changes (remote, HA, persisted mode at boot): push the
+  # select now instead of on the next tick.
+  def handle_info({:display_mode, mode}, %{display?: true} = state) do
+    {:noreply, push_value(state, Mode.object_id(), display_option(mode))}
+  end
+
   def handle_info(msg, state) do
     case MeshSync.handle_info(msg, state.mesh) do
       {:ok, mesh} -> {:noreply, put_mesh(state, mesh)}
@@ -465,7 +493,7 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
 
   # Read every source, push only changed values, and return the new state.
   defp do_poll(state) do
-    values = read_values(state.sources, state.supported?, state.last)
+    values = read_all(state)
 
     for {object_id, value} <- changed(state.last, values) do
       case state_response_for(spec_for(object_id), value) do
@@ -475,6 +503,28 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
     end
 
     %{state | last: values}
+  end
+
+  defp read_all(state) do
+    values = read_values(state.sources, state.supported?, state.last)
+
+    if state.display?,
+      do: Map.put(values, Mode.object_id(), read_display_mode(state.sources)),
+      else: values
+  end
+
+  # Pushes one entity's value if it changed, and remembers it.
+  defp push_value(state, object_id, value) do
+    if Map.get(state.last, object_id, :__unset__) == value do
+      state
+    else
+      case state_response_for(spec_for(object_id), value) do
+        nil -> :ok
+        struct -> push(state.server, struct)
+      end
+
+      %{state | last: Map.put(state.last, object_id, value)}
+    end
   end
 
   # Tolerate the Espex registry being momentarily unavailable (e.g. during a
@@ -521,6 +571,19 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
     {:noreply, state}
   end
 
+  def handle_cast({:command, %Proto.SelectCommandRequest{key: key, state: option}}, state) do
+    object_id = Mode.object_id()
+
+    case Map.get(state.keys, key) do
+      ^object_id when state.display? ->
+        {:noreply, set_display_mode(state, option)}
+
+      other ->
+        Logger.debug("EntityProvider: ignoring select command for key #{inspect(other)}")
+        {:noreply, state}
+    end
+  end
+
   def handle_cast({:command, other}, state) do
     Logger.debug("EntityProvider: ignoring unknown command #{inspect(other)}")
     {:noreply, state}
@@ -529,6 +592,33 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
   def handle_cast(other, state) do
     Logger.debug("EntityProvider: ignoring unexpected cast #{inspect(other)}")
     {:noreply, state}
+  end
+
+  # ── TV display mode ─────────────────────────────────────────────────
+
+  # espex doesn't check a select command against the advertised options.
+  # Echo the mode that holds afterwards, so HA always ends up showing the
+  # real one (the PubSub push that follows is then a no-op).
+  defp set_display_mode(state, option) do
+    if option in Mode.options() do
+      case safe(fn -> state.sources.display_set_mode.(option) end, {:error, :unavailable}) do
+        :ok -> :ok
+        error -> Logger.info("EntityProvider: TV display mode not set: #{inspect(error)}")
+      end
+    else
+      Logger.warning("EntityProvider: ignoring invalid TV display mode #{inspect(option)}")
+    end
+
+    push_value(state, Mode.object_id(), read_display_mode(state.sources))
+  end
+
+  defp read_display_mode(sources), do: display_option(safe(sources.display_mode, nil))
+
+  defp display_option(mode) do
+    case Mode.parse(mode) do
+      {:ok, mode} -> Mode.to_option(mode)
+      :error -> nil
+    end
   end
 
   # ── Tuya mesh ───────────────────────────────────────────────────────
@@ -630,12 +720,13 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
 
   @doc """
   Build the `ListEntities*Response` advertisement structs for all specs,
-  dropping Bluetooth entities when `supported?` is false.
+  dropping Bluetooth entities when `supported?` is false and the TV UI's
+  entities when `display?` is false.
   """
-  @spec advertisements([map()], boolean()) :: [struct()]
-  def advertisements(specs, supported?) do
+  @spec advertisements([map()], boolean(), boolean()) :: [struct()]
+  def advertisements(specs, supported?, display? \\ false) do
     specs
-    |> visible(supported?)
+    |> visible(supported?, display?)
     |> Enum.map(&advertisement/1)
   end
 
@@ -684,6 +775,18 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
     }
   end
 
+  defp advertisement(%{type: :select} = s) do
+    %Proto.ListEntitiesSelectResponse{
+      object_id: s.object_id,
+      key: key_for(s.object_id),
+      name: s.name,
+      icon: Map.get(s, :icon, ""),
+      options: s.options,
+      entity_category: Map.get(s, :category, :ENTITY_CATEGORY_NONE),
+      disabled_by_default: Map.get(s, :disabled_by_default, false)
+    }
+  end
+
   defp advertisement(%{type: :update} = s) do
     %Proto.ListEntitiesUpdateResponse{
       object_id: s.object_id,
@@ -701,10 +804,10 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
   Build `*StateResponse` structs for every stateful (non-button) visible
   entity from a `%{object_id => value}` map. Used by `initial_states/0`.
   """
-  @spec state_responses([map()], map(), boolean()) :: [struct()]
-  def state_responses(specs, values, supported?) do
+  @spec state_responses([map()], map(), boolean(), boolean()) :: [struct()]
+  def state_responses(specs, values, supported?, display? \\ false) do
     specs
-    |> visible(supported?)
+    |> visible(supported?, display?)
     |> Enum.reject(&(&1.type == :button))
     |> Enum.map(&state_response_for(&1, Map.get(values, &1.object_id)))
     |> Enum.reject(&is_nil/1)
@@ -748,6 +851,14 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
       title: Map.get(v, :title, ""),
       release_summary: Map.get(v, :release_summary, ""),
       release_url: Map.get(v, :release_url, "")
+    }
+  end
+
+  defp state_response_for(%{type: :select} = s, value) do
+    %Proto.SelectStateResponse{
+      key: key_for(s.object_id),
+      state: value || "",
+      missing_state: is_nil(value)
     }
   end
 
@@ -926,8 +1037,12 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
 
   # ── Helpers ─────────────────────────────────────────────────────────
 
-  defp visible(specs, true), do: specs
-  defp visible(specs, false), do: Enum.reject(specs, &Map.get(&1, :bt, false))
+  defp visible(specs, supported?, display?) do
+    Enum.reject(specs, fn spec ->
+      (Map.get(spec, :bt, false) and not supported?) or
+        (Map.get(spec, :display, false) and not display?)
+    end)
+  end
 
   defp spec_for(object_id), do: Enum.find(@specs, &(&1.object_id == object_id))
 
@@ -972,17 +1087,31 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
 
   defp schedule(tick_ms), do: Process.send_after(self(), :poll, tick_ms)
 
+  # The event topics this provider follows, split into those MeshSync holds
+  # for it (`by_mesh?`: it runs the mesh, on the same PubSub) and those
+  # subscribed directly, as `{pubsub, topic}`.
+  defp event_topics(_by_mesh?, false = _subscribe?, _display?, _pubsub), do: {[], []}
+
+  defp event_topics(by_mesh?, true, display?, pubsub) do
+    wanted =
+      [{FirmwareUpdate.pubsub(), FirmwareUpdate.topic()}] ++
+        if display?, do: [{pubsub, Display.topic()}], else: []
+
+    {held, direct} = Enum.split_with(wanted, fn {on, _topic} -> by_mesh? and on == pubsub end)
+    {Enum.map(held, &elem(&1, 1)), direct}
+  end
+
   # Best-effort: Phoenix.PubSub.subscribe/2 delegates to Registry.register/3,
   # which RAISES ArgumentError when the registry isn't started (host tests, or
   # a supervised restart racing this provider) rather than exiting — so rescue
   # that specifically, per the project convention. Losing the subscription only
-  # costs live progress, not correctness: the poll tick still refreshes the
+  # costs live updates, not correctness: the poll tick still refreshes the
   # entity. Anything else is a real bug and must not be swallowed here.
-  defp subscribe_fw_progress do
-    Phoenix.PubSub.subscribe(FirmwareUpdate.pubsub(), FirmwareUpdate.topic())
+  defp subscribe_events({pubsub, topic}) do
+    Phoenix.PubSub.subscribe(pubsub, topic)
   rescue
     e in ArgumentError ->
-      Logger.debug("EntityProvider: firmware-progress subscribe failed: #{Exception.message(e)}")
+      Logger.debug("EntityProvider: #{topic} subscribe failed: #{Exception.message(e)}")
       :ok
   end
 
@@ -1016,7 +1145,9 @@ defmodule UniversalProxy.ESPHome.EntityProvider do
       mesh_status: &TuyaMesh.status/0,
       mesh_device_ids: &Store.device_ids/0,
       mesh_light_states: &Commander.light_states/0,
-      mesh_time_synced: &MeshSync.time_synced?/0
+      mesh_time_synced: &MeshSync.time_synced?/0,
+      display_mode: &Display.mode/0,
+      display_set_mode: &Display.set_mode/1
     }
 
     Map.merge(defaults, Map.new(Keyword.get(opts, :sources, [])))

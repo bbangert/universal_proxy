@@ -12,7 +12,7 @@ defmodule UniversalProxy.Display.Renderer do
     * `UniversalProxy.Display.Renderer.Emerge` — Skia on DRM/KMS via Emerge,
       compiled only on the Pi HDMI targets.
 
-  `push/2` and `set_display/2` are asynchronous messages: callers never block
+  `push/2`, `set_display/2` and `set_viz/2` are asynchronous messages: callers never block
   on the renderer. `set_display(handle, :off)` blanks the screen without
   turning the display output off (a black frame on Emerge), since the HDMI
   output also carries audio and CEC.
@@ -22,6 +22,13 @@ defmodule UniversalProxy.Display.Renderer do
 
   @typedoc "A running viewport, as returned by `c:start/2`."
   @type handle :: term()
+
+  @typedoc """
+  A visualizer source for `c:set_viz/2`: the PubSub `topic` the frames are
+  broadcast on (`{:sendspin_viz, key, frame}`), the output `key` they come
+  from and how the screen shows them (`:strip` or `:full`).
+  """
+  @type viz :: %{topic: String.t(), key: term(), mode: :strip | :full}
 
   @doc "Whether this renderer can drive a display on this system right now."
   @callback available?() :: boolean()
@@ -38,6 +45,12 @@ defmodule UniversalProxy.Display.Renderer do
 
   @doc "Turns the display output on or off (blank) without stopping the viewport."
   @callback set_display(handle(), :on | :off) :: :ok
+
+  @doc """
+  Starts (`viz`) or stops (`nil`) feeding live visualizer frames into the
+  `{:bars, _, _}` node keyed `"viz"` of the shown spec.
+  """
+  @callback set_viz(handle(), viz() | nil) :: :ok
 
   @doc "Stops the viewport."
   @callback stop(handle()) :: :ok

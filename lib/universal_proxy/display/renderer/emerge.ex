@@ -29,6 +29,9 @@ if Code.ensure_loaded?(Emerge) do
       * `:image_dirs` — directories image paths may come from (default
         `["/tmp/up_display"]`, created if missing).
       * `:spec` — the first `UniversalProxy.Display.Spec` to show.
+      * `:viz_tick_ms` — visualizer redraw period (default 50).
+      * `:owner` — a pid told about visualizer tier changes as
+        `{:viewport_viz_tier, viewport, tier}`.
     """
 
     @behaviour UniversalProxy.Display.Renderer
@@ -49,8 +52,10 @@ if Code.ensure_loaded?(Emerge) do
       with {:ok, config} <- config(opts) do
         spec = Keyword.get_lazy(opts, :spec, fn -> Spec.now_playing() end)
 
-        child =
-          Supervisor.child_spec({Viewport, [config: config, spec: spec]}, restart: :temporary)
+        viewport_opts =
+          [config: config, spec: spec] ++ Keyword.take(opts, [:viz_tick_ms, :owner])
+
+        child = Supervisor.child_spec({Viewport, viewport_opts}, restart: :temporary)
 
         DynamicSupervisor.start_child(supervisor, child)
       end
@@ -65,6 +70,12 @@ if Code.ensure_loaded?(Emerge) do
     @impl true
     def set_display(viewport, power) when power in [:on, :off] do
       send(viewport, {:display_power, power})
+      :ok
+    end
+
+    @impl true
+    def set_viz(viewport, viz) do
+      send(viewport, {:display_viz, viz})
       :ok
     end
 

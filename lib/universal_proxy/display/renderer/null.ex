@@ -22,5 +22,8 @@ defmodule UniversalProxy.Display.Renderer.Null do
   def set_display(_handle, _power), do: :ok
 
   @impl true
+  def set_viz(_handle, _viz), do: :ok
+
+  @impl true
   def stop(_handle), do: :ok
 end

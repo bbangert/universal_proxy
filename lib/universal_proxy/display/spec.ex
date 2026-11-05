@@ -153,6 +153,36 @@ defmodule UniversalProxy.Display.Spec do
     {:bars, attrs, Enum.map(heights, &clamp_unit/1)}
   end
 
+  @doc """
+  Replaces the heights of every `{:bars, attrs, _}` node keyed `key` with
+  `heights` (clamped like `bars/2`). The node keeps its bar count:
+  `heights` is cut or zero-padded to it, so the layout never changes.
+  """
+  @spec put_bars(t(), String.t(), [number()]) :: t()
+  def put_bars({:bars, attrs, current} = node, key, heights) do
+    if Keyword.get(attrs, :key) == key do
+      count = length(current)
+      fitted = heights |> Enum.take(count) |> Enum.map(&clamp_unit/1)
+      {:bars, attrs, fitted ++ zero_bars(count - length(fitted))}
+    else
+      node
+    end
+  end
+
+  def put_bars({tag, attrs, children}, key, heights) when tag in [:column, :row, :stack],
+    do: {tag, attrs, Enum.map(children, &put_bars(&1, key, heights))}
+
+  def put_bars(node, _key, _heights), do: node
+
+  @doc "Whether `spec` has a `{:bars, _, _}` node keyed `key`."
+  @spec has_bars?(t(), String.t()) :: boolean()
+  def has_bars?({:bars, attrs, _heights}, key), do: Keyword.get(attrs, :key) == key
+
+  def has_bars?({tag, _attrs, children}, key) when tag in [:column, :row, :stack],
+    do: Enum.any?(children, &has_bars?(&1, key))
+
+  def has_bars?(_node, _key), do: false
+
   @doc "An all-black screen, drawn while the display is blanked."
   @spec blank() :: t()
   def blank, do: {:column, [width: :fill, height: :fill, background: {0, 0, 0}], []}

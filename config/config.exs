@@ -97,11 +97,19 @@ config :universal_proxy, UniversalProxy.Cec,
 # TV UI on a Pi's HDMI output (see `UniversalProxy.Display`). Off here;
 # config/target.exs turns it on, with the Emerge renderer, for the Pi HDMI
 # targets only. `:renderer` is a `UniversalProxy.Display.Renderer` module.
-# `:autostart` shows the placeholder screen at boot when a DRM card exists.
+#
+# `:ui` is the TV UI's single on switch (keep it in step with
+# `UniversalProxy.Audio.DisplayRoles`' `:enabled`): with it on, the display
+# follows the HDMI output's player, claims the TV remote's CEC keys, starts
+# its viewport by itself and advertises the "TV display mode" select to
+# Home Assistant. With it off the subsystem stays dormant (viewport by hand
+# only). `:idle_ms` / `:party_idle_ms` are the idle-blank timeouts.
 config :universal_proxy, UniversalProxy.Display,
   enabled: false,
   renderer: UniversalProxy.Display.Renderer.Null,
-  autostart: false
+  ui: false,
+  idle_ms: 120_000,
+  party_idle_ms: 600_000
 
 # Sendspin display roles (metadata, controller, color, artwork, visualizer)
 # for the HDMI TV UI, carried by one HDMI output's player (see

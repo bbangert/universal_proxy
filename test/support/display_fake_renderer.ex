@@ -32,6 +32,12 @@ defmodule UniversalProxy.Display.FakeRenderer do
   end
 
   @impl true
+  def set_viz(viewport, viz) do
+    send(Agent.get(viewport, & &1), {:fake_renderer, :set_viz, viewport, viz})
+    :ok
+  end
+
+  @impl true
   def stop(viewport) do
     send(Agent.get(viewport, & &1), {:fake_renderer, :stop, viewport})
     Agent.stop(viewport)
