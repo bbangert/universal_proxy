@@ -195,18 +195,9 @@ if display_target? do
   # is always compiled in, so `drm: [:raster, :opengl]` fetches the single
   # `drm_opengl` NIF, which serves both `renderer: [api: :raster]` (CPU KMS
   # dumb buffers) and `:opengl`/`:auto` (GLES2 via GBM/EGL, falling back to
-  # raster if GL fails to start). But that NIF has libgbm.so.1 as a hard
-  # NEEDED, so it will not load on a rootfs without Mesa: rpi4/rpi5 ship
-  # Mesa; rpi3/rpi0_2 do not yet, so they get the GPU-free `drm` NIF (raster
-  # only) unless UP_DISPLAY_GL=1 is set for a build against a Mesa-enabled
-  # system. Mix recompiles emerge when this changes, but the previous
-  # variant's .so stays in _build/<target>_<env>/lib/emerge/priv/native and
-  # would ship too: `mix deps.clean emerge --build` after switching.
-  display_gl? =
-    Mix.target() in [:rpi4, :rpi5] or System.get_env("UP_DISPLAY_GL") in ["1", "true"]
-
-  config :emerge,
-    compiled_backends: [drm: if(display_gl?, do: [:raster, :opengl], else: [:raster])]
+  # raster if GL fails to start). It needs libgbm.so.1, which all four
+  # display systems ship (Mesa on rpi0_2/rpi3 since systems v0.1.14).
+  config :emerge, compiled_backends: [drm: [:raster, :opengl]]
 
   # `autostart: false` while the spike benchmarks drive the viewport by hand
   # (see `UniversalProxy.Display.Bench`).
