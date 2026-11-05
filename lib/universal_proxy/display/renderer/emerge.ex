@@ -14,12 +14,13 @@ if Code.ensure_loaded?(Emerge) do
       * `:card` — the DRM card path. Default: the first `/dev/dri/card*`
         with a connected HDMI connector.
       * `:connector` — connector name. Default: the first connected HDMI one.
-      * `:mode` — `nil` (default: Emerge picks, steered by
-        `:preferred_size`), `:preferred` (the TV's preferred mode),
+      * `:mode` — `nil` (default: the advertised mode closest to
+        `:preferred_size`, chosen here the way Emerge would, so the size is
+        known up front), `:preferred` (the TV's preferred mode),
         `{width, height}` (the highest refresh at that size),
         `{width, height, refresh_hz}` (the nearest refresh) or an Emerge
         mode id string.
-      * `:preferred_size` — `{width, height}` hint for automatic selection.
+      * `:preferred_size` — `{width, height}` wanted for the default mode.
       * `:layer_cache_mb` — paint-layer cache budget in MiB (Emerge's default
         is 640). `:cache` — `:auto` (default: on for GPU, off for explicit
         raster), `true` or `false`.
@@ -43,7 +44,7 @@ if Code.ensure_loaded?(Emerge) do
 
     alias Emerge.UI
     alias Emerge.UI.{Align, Background, Border, Color, Font, Nearby, Size, Space, Svg, Transform}
-    alias UniversalProxy.Display.{Spec, State, Viewport}
+    alias UniversalProxy.Display.{OutputMode, Spec, State, Viewport}
 
     @mib 1024 * 1024
     @default_image_dirs ["/tmp/up_display"]
@@ -124,7 +125,8 @@ if Code.ensure_loaded?(Emerge) do
     @spec config(keyword()) :: {:ok, Emerge.Config.t()} | {:error, term()}
     def config(opts) do
       with {:ok, card, output} <- select_output(opts),
-           {:ok, mode} <- select_mode(output, Keyword.get(opts, :mode)) do
+           {:ok, mode} <-
+             select_mode(output, Keyword.get(opts, :mode), Keyword.get(opts, :preferred_size)) do
         image_dirs = Keyword.get(opts, :image_dirs, @default_image_dirs)
         Enum.each(image_dirs, &File.mkdir_p/1)
 
@@ -134,7 +136,7 @@ if Code.ensure_loaded?(Emerge) do
              card: card,
              connector: output.name,
              mode: mode,
-             preferred_size: if(mode, do: nil, else: Keyword.get(opts, :preferred_size))
+             preferred_size: nil
            },
            renderer: %Emerge.Config.Renderer{
              api: Keyword.get(opts, :api, :auto),
@@ -304,8 +306,13 @@ if Code.ensure_loaded?(Emerge) do
 
     defp pick_output(outputs, name), do: Enum.find(outputs, &(&1.name == name))
 
-    defp select_mode(_output, nil), do: {:ok, nil}
-    defp select_mode(_output, id) when is_binary(id), do: {:ok, id}
+    # Always an explicit mode, so the output size is known before Emerge
+    # starts (see `UniversalProxy.Display.OutputMode`).
+    defp select_mode(output, nil, preferred_size),
+      do: found(output, :auto, OutputMode.choose(output.modes, preferred_size))
+
+    defp select_mode(_output, id, _preferred_size) when is_binary(id), do: {:ok, id}
+    defp select_mode(output, wanted, _preferred_size), do: select_mode(output, wanted)
 
     defp select_mode(output, :preferred) do
       found(output, :preferred, Enum.find(output.modes, & &1.preferred))

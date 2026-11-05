@@ -38,8 +38,9 @@ if Code.ensure_loaded?(Emerge) do
 
     ## Output size
 
-    The DRM backend reports the mode it set as a resize; the viewport tells
-    the `:owner` as `{:viewport_size, pid, {width, height}}`.
+    At mount the viewport tells the `:owner` the pinned mode's size as
+    `{:viewport_size, pid, {width, height}}`, and again whenever the DRM
+    backend reports a resize (a hotplug modeset).
 
     Start options: `:config` (an `%Emerge.Config{}`), `:spec`, `:viz_tick_ms`,
     `:viz_buffer` and `:owner`.
@@ -49,7 +50,7 @@ if Code.ensure_loaded?(Emerge) do
 
     require Logger
 
-    alias UniversalProxy.Display.{Renderer, Spec, Viz}
+    alias UniversalProxy.Display.{OutputMode, Renderer, Spec, Viz}
 
     @pubsub UniversalProxy.PubSub
     @viz_key "viz"
@@ -63,11 +64,20 @@ if Code.ensure_loaded?(Emerge) do
     @impl Viewport
     def mount(opts) do
       config = Keyword.fetch!(opts, :config)
+      owner = Keyword.get(opts, :owner)
+
+      # The pinned mode's size; Emerge's own first resize report is emitted
+      # before input subscriptions are live and never arrives.
+      with %{output: %{mode: mode}} <- config,
+           {_w, _h} = size <- OutputMode.size(mode),
+           true <- is_pid(owner) do
+        send(owner, {:viewport_size, self(), size})
+      end
 
       state = %{
         spec: Keyword.fetch!(opts, :spec),
         power: :on,
-        owner: Keyword.get(opts, :owner),
+        owner: owner,
         tick_ms: Keyword.get(opts, :viz_tick_ms, @default_tick_ms),
         buffer_max: Keyword.get(opts, :viz_buffer, @default_buffer),
         meter: nil,
