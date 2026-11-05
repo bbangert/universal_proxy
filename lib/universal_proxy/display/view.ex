@@ -30,9 +30,14 @@ defmodule UniversalProxy.Display.View do
 
   The focus ring on the transport controls shows only while a CEC TV is
   known to be there, since only a CEC remote can move it.
+
+  Burn-in care: every block on a screen is shifted by the same few pixels
+  (`UniversalProxy.Display.Drift`, a pure function of `:now`) every few
+  minutes, inside the overscan margins. Idle screens blank to black
+  (`UniversalProxy.Display.Model`).
   """
 
-  alias UniversalProxy.Display.{Model, Progress, Spec, TextFit, Theme}
+  alias UniversalProxy.Display.{Drift, Model, Progress, Spec, TextFit, Theme}
 
   @default_size {1280, 720}
   @default_bars 32
@@ -46,8 +51,10 @@ defmodule UniversalProxy.Display.View do
     * `:size` — `{width, height}` to use until the viewport reports one
       (default `{1280, 720}`).
     * `:bars` — visualizer bar count (default 32).
-    * `:now` — monotonic ms the progress position is extrapolated to
-      (default: the metadata's arrival, i.e. no extrapolation).
+    * `:now` — monotonic ms the progress position is extrapolated to and
+      the burn-in drift is taken at (default: the metadata's arrival, and
+      no drift).
+    * `:drift_period_ms` — how often the drift moves (default 3 min).
   """
   @spec render(Model.t(), keyword()) :: Spec.t()
   def render(%Model{} = model, opts \\ []) do
@@ -64,17 +71,29 @@ defmodule UniversalProxy.Display.View do
 
   @doc """
   Milliseconds after `:now` (an option, as for `render/2`) at which the
-  rendered screen changes with time alone, or `nil` when it doesn't: the
-  next whole second of a playing track's progress.
+  rendered screen changes with time alone, or `nil` when it doesn't (a
+  black frame, or no `:now`): the next whole second of a playing track's
+  progress, or the next burn-in drift step.
   """
   @spec next_refresh(Model.t(), keyword()) :: pos_integer() | nil
   def next_refresh(%Model{} = model, opts \\ []) do
-    case Model.screen(model) do
-      {:now_playing, _overlay} ->
-        model |> progress(Keyword.get(opts, :now)) |> Progress.next_tick_ms()
+    now = Keyword.get(opts, :now)
 
-      _other ->
+    case {Model.screen(model), now} do
+      {:blank, _now} ->
         nil
+
+      {_screen, nil} ->
+        nil
+
+      {screen, now} ->
+        drift = Drift.next_change_ms(now, drift_period(opts))
+
+        tick =
+          if match?({:now_playing, _overlay}, screen),
+            do: model |> progress(now) |> Progress.next_tick_ms()
+
+        if tick, do: min(tick, drift), else: drift
     end
   end
 
@@ -104,11 +123,14 @@ defmodule UniversalProxy.Display.View do
        ]}
 
     {:column, root_attrs(ctx),
-     [
-       {:row, [key: "top", width: :fill, height: {:px, top_height}, spacing: ctx.margin_x],
-        [artwork(model, art_size, ctx), text_block]},
-       viz_bars(ctx, strip_height)
-     ]}
+     drift(
+       [
+         {:row, [key: "top", width: :fill, height: {:px, top_height}, spacing: ctx.margin_x],
+          [artwork(model, art_size, ctx), text_block]},
+         viz_bars(ctx, strip_height)
+       ],
+       ctx
+     )}
   end
 
   defp visualizer(model, ctx) do
@@ -120,11 +142,14 @@ defmodule UniversalProxy.Display.View do
       |> Enum.join(" — ")
 
     {:column, root_attrs(ctx),
-     [
-       line(ctx, "title", title, ctx.content_w, 30, color: ctx.theme.muted),
-       {:column, [key: "viz-area", width: :fill, height: :fill, align_y: :bottom],
-        [viz_bars(ctx, round(ctx.height * 0.7))]}
-     ]}
+     drift(
+       [
+         line(ctx, "title", title, ctx.content_w, 30, color: ctx.theme.muted),
+         {:column, [key: "viz-area", width: :fill, height: :fill, align_y: :bottom],
+          [viz_bars(ctx, round(ctx.height * 0.7))]}
+       ],
+       ctx
+     )}
   end
 
   defp party_card(model, ctx) do
@@ -132,38 +157,44 @@ defmodule UniversalProxy.Display.View do
     qr_size = round(ctx.height * 0.5)
 
     {:column, root_attrs(ctx) ++ [align_x: :center],
-     [
-       {:column, [key: "party", align_x: :center, align_y: :center, spacing: ctx.margin],
-        [
-          line(ctx, "party-title", Map.get(party, :name) || "Party Mode", ctx.content_w, 48,
-            color: ctx.theme.foreground,
-            bold: true
-          ),
-          qr(party, qr_size, ctx),
-          line(
-            ctx,
-            "party-caption",
-            Map.get(party, :caption) || Map.get(party, :url, ""),
-            ctx.content_w,
-            26,
-            color: ctx.theme.muted
-          )
-        ]}
-     ]}
+     drift(
+       [
+         {:column, [key: "party", align_x: :center, align_y: :center, spacing: ctx.margin],
+          [
+            line(ctx, "party-title", Map.get(party, :name) || "Party Mode", ctx.content_w, 48,
+              color: ctx.theme.foreground,
+              bold: true
+            ),
+            qr(party, qr_size, ctx),
+            line(
+              ctx,
+              "party-caption",
+              Map.get(party, :caption) || Map.get(party, :url, ""),
+              ctx.content_w,
+              26,
+              color: ctx.theme.muted
+            )
+          ]}
+       ],
+       ctx
+     )}
   end
 
   defp message_card(title, detail, ctx) do
     {:column, root_attrs(ctx),
-     [
-       {:column, [key: "message", align_x: :center, align_y: :center, spacing: px(ctx, 16)],
-        [
-          line(ctx, "message-title", title, ctx.content_w, 44,
-            color: ctx.theme.foreground,
-            bold: true
-          ),
-          line(ctx, "message-detail", detail, ctx.content_w, 26, color: ctx.theme.muted)
-        ]}
-     ]}
+     drift(
+       [
+         {:column, [key: "message", align_x: :center, align_y: :center, spacing: px(ctx, 16)],
+          [
+            line(ctx, "message-title", title, ctx.content_w, 44,
+              color: ctx.theme.foreground,
+              bold: true
+            ),
+            line(ctx, "message-detail", detail, ctx.content_w, 26, color: ctx.theme.muted)
+          ]}
+       ],
+       ctx
+     )}
   end
 
   defp with_overlay(content, false, _model, _ctx), do: content
@@ -179,22 +210,25 @@ defmodule UniversalProxy.Display.View do
          height: :fill,
          padding: {ctx.margin, ctx.margin_x, ctx.margin, ctx.margin_x}
        ],
-       [
-         {:column,
-          [
-            key: "qr-corner",
-            align_x: :right,
-            align_y: :top,
-            spacing: px(ctx, 8),
-            padding: px(ctx, 10),
-            background: ctx.theme.track,
-            rounded: px(ctx, 10)
-          ],
-          [
-            qr(model.party, size, ctx),
-            text("qr-hint", "Join the party", px(ctx, 20), ctx.theme.foreground)
-          ]}
-       ]}
+       drift(
+         [
+           {:column,
+            [
+              key: "qr-corner",
+              align_x: :right,
+              align_y: :top,
+              spacing: px(ctx, 8),
+              padding: px(ctx, 10),
+              background: ctx.theme.track,
+              rounded: px(ctx, 10)
+            ],
+            [
+              qr(model.party, size, ctx),
+              text("qr-hint", "Join the party", px(ctx, 20), ctx.theme.foreground)
+            ]}
+         ],
+         ctx
+       )}
 
     {:stack, [key: "overlay-stack", width: :fill, height: :fill], [content, corner]}
   end
@@ -392,6 +426,18 @@ defmodule UniversalProxy.Display.View do
     ]
   end
 
+  # Shifts each block by the current burn-in offset (a paint-only move).
+  defp drift(nodes, %{drift: {0, 0}}), do: nodes
+
+  defp drift(nodes, ctx) do
+    Enum.map(nodes, fn
+      {tag, attrs, content} -> {tag, attrs ++ [move: ctx.drift], content}
+      other -> other
+    end)
+  end
+
+  defp drift_period(opts), do: Keyword.get(opts, :drift_period_ms) || Drift.default_period_ms()
+
   # ── Context ──────────────────────────────────────────────────────────
 
   defp context(model, opts) do
@@ -410,7 +456,8 @@ defmodule UniversalProxy.Display.View do
       content_h: height - 2 * margin,
       bars: Keyword.get(opts, :bars) || @default_bars,
       now: Keyword.get(opts, :now),
-      theme: Theme.from_palette(model.color)
+      theme: Theme.from_palette(model.color),
+      drift: Drift.offset(Keyword.get(opts, :now), 4 * height / 720, drift_period(opts))
     }
   end
 

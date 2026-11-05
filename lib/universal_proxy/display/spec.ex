@@ -27,7 +27,7 @@ defmodule UniversalProxy.Display.Spec do
 
   `:padding` is one number for every side or `{top, right, bottom, left}`.
   `:border` is `{width, color}`; its width counts towards the element's
-  size.
+  size. `:move` is a `{dx, dy}` paint-only shift (no relayout).
 
   Colours are `{r, g, b}` or `{r, g, b, alpha}` with bytes `0..255` and
   `alpha` in `0.0..1.0`. A `:background` or `:font_color` may also be
@@ -55,6 +55,7 @@ defmodule UniversalProxy.Display.Spec do
           | {:rounded, number()}
           | {:border, {number(), color()}}
           | {:alpha, float()}
+          | {:move, {number(), number()}}
           | {:image_fit, :cover | :contain}
           | {:key, String.t()}
           | {:bar_width, number()}

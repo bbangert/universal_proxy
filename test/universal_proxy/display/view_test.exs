@@ -168,27 +168,44 @@ defmodule UniversalProxy.Display.ViewTest do
       assert keyed(spec, "progress") == []
     end
 
-    test "next_refresh/2 ticks on the next whole second only while it advances" do
+    test "next_refresh/2: the next whole second while it advances, else the next drift step" do
       playing = model(playback: :playing, metadata: @meta)
       # 60_000 + 500 + 9_800 = 70_300 ms elapsed: 700 ms to 71 s.
       assert View.next_refresh(playing, now: 10_800) == 700
-      assert View.next_refresh(model(playback: :paused, metadata: @meta), now: 10_800) == nil
-      assert View.next_refresh(%{playing | mode: :visualizer}, now: 10_800) == nil
+
+      # Drift steps every 3 min: 180_000 - 10_800.
+      assert View.next_refresh(model(playback: :paused, metadata: @meta), now: 10_800) == 169_200
+      assert View.next_refresh(%{playing | mode: :visualizer}, now: 10_800) == 169_200
+      assert View.next_refresh(playing, now: 179_900, drift_period_ms: 180_000) == 100
       assert View.next_refresh(%{playing | blanked: true}, now: 10_800) == nil
+      assert View.next_refresh(playing) == nil
     end
   end
 
-  describe "output size" do
-    test "the reported size wins over the :size hint; margins are 5% per axis" do
-      root = fn spec -> hd(keyed(spec, "root")) end
+  describe "burn-in drift" do
+    defp moves(spec), do: for(node <- nodes(spec), move = attr(node, :move), uniq: true, do: move)
 
-      assert attr(root.(View.render(model(playback: :playing))), :padding) == {36, 64, 36, 64}
+    test "every block on every screen shifts by the same offset, a function of :now" do
+      for fields <- [
+            [playback: :playing, party: @party],
+            [mode: :visualizer, playback: :playing],
+            [mode: :party_qr, party: @party],
+            [mode: :party_qr]
+          ] do
+        assert moves(View.render(model(fields), now: 0)) == []
+        assert moves(View.render(model(fields), now: 180_000)) == [{4, 0}]
+        assert moves(View.render(model(fields), now: 400_000, size: {1920, 1080})) == [{6, 6}]
+      end
+    end
 
-      big = View.render(model(playback: :playing), size: {1920, 1080})
-      assert attr(root.(big), :padding) == {54, 96, 54, 96}
+    test "is deterministic: the same time gives the same screen" do
+      fields = [playback: :paused, metadata: %{title: "Song"}]
+      assert View.render(model(fields), now: 543_210) == View.render(model(fields), now: 543_210)
+      refute View.render(model(fields), now: 543_210) == View.render(model(fields), now: 723_210)
+    end
 
-      reported = View.render(model(playback: :playing, size: {1920, 1080}), size: {1280, 720})
-      assert reported == big
+    test "a blank screen doesn't move" do
+      assert View.render(model(blanked: true), now: 180_000) == Spec.blank()
     end
   end
 

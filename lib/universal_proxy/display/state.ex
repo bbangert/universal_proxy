@@ -43,7 +43,8 @@ defmodule UniversalProxy.Display.State do
   `:idle`, `:retry` or `:stable`); a stale `gen` is ignored. While a
   viewport runs, a `{:display_clock, ref}` timer redraws the screen when
   it changes with time alone (`UniversalProxy.Display.View.next_refresh/2`:
-  the progress bar, once a second while playing).
+  the progress bar, once a second while playing, and the burn-in drift
+  every few minutes).
 
   ## With the UI off (`ui: false`, the default)
 
@@ -79,6 +80,8 @@ defmodule UniversalProxy.Display.State do
 
   alias UniversalProxy.{Audio, Cec, Display}
   alias UniversalProxy.Display.{Binding, Mode, Model, Spec, View, Viz}
+
+  @max_clock_ms 3_600_000
 
   @model_keys [:idle_ms, :party_idle_ms, :restart_ms, :restart_max_ms, :stable_ms]
   @viewport_keys [:layer_cache_mb, :preferred_size, :viz_tick_ms, :image_dirs]
@@ -321,6 +324,9 @@ defmodule UniversalProxy.Display.State do
         cancel_clock(state)
 
       ms ->
+        # An early wake-up only redraws the same screen.
+        ms = min(ms, @max_clock_ms)
+
         case state.clock do
           {_ref, due} when due <= now + ms ->
             state

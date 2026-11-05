@@ -260,6 +260,7 @@ if Code.ensure_loaded?(Emerge) do
       do: [Border.width(width), Border.color(paint(color))]
 
     defp attr(:alpha, alpha), do: Transform.alpha(alpha)
+    defp attr(:move, {dx, dy}), do: [Transform.move_x(dx), Transform.move_y(dy)]
     defp attr(:image_fit, fit), do: UI.image_fit(fit)
     defp attr(:key, key), do: UI.key(key)
 

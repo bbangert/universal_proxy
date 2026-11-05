@@ -88,25 +88,26 @@ defmodule UniversalProxy.Display.StateTest do
     }
 
     state =
-      start_supervised!(
-        {State,
-         name: :"#{inspect(__MODULE__)}.#{context.test}",
-         ui: true,
-         renderer: FakeRenderer,
-         viewport_supervisor: context.sup,
-         dri_dir: context.dri_dir,
-         viewport_opts: [test_pid: test],
-         view_opts: [bars: 8],
-         model_opts:
-           Keyword.merge(
-             [idle_ms: 60_000, restart_ms: 1, restart_max_ms: 4, stable_ms: 60_000],
-             Keyword.get(opts, :model_opts, [])
-           ),
-         pubsub: pubsub,
-         task_supervisor: tasks,
-         audio: audio,
-         cec: cec}
-      )
+      start_supervised!({
+        State,
+        # No burn-in drift step during a test.
+        name: :"#{inspect(__MODULE__)}.#{context.test}",
+        ui: true,
+        renderer: FakeRenderer,
+        viewport_supervisor: context.sup,
+        dri_dir: context.dri_dir,
+        viewport_opts: [test_pid: test],
+        view_opts: [bars: 8, drift_period_ms: 1_000_000_000_000],
+        model_opts:
+          Keyword.merge(
+            [idle_ms: 60_000, restart_ms: 1, restart_max_ms: 4, stable_ms: 60_000],
+            Keyword.get(opts, :model_opts, [])
+          ),
+        pubsub: pubsub,
+        task_supervisor: tasks,
+        audio: audio,
+        cec: cec
+      })
 
     # Past the start-up continue.
     _ = :sys.get_state(state)
@@ -281,7 +282,7 @@ defmodule UniversalProxy.Display.StateTest do
   end
 
   describe "progress clock" do
-    test "a playing track's progress redraws about once a second; pausing stops it",
+    test "a playing track's progress redraws about once a second; pausing stops that",
          context do
       ctx = start_ui(context)
       viewport = viewport!(ctx)
@@ -315,7 +316,11 @@ defmodule UniversalProxy.Display.StateTest do
         {:sendspin_display, @key, 2, %{event: "group", playback_state: "paused"}}
       )
 
-      assert %{clock: nil} = :sys.get_state(ctx.state)
+      # Paused: no more per-second redraws; only the burn-in drift wakes it.
+      flush_pushes(viewport)
+      refute_receive {:fake_renderer, :push, ^viewport, _spec}, 1_200
+      assert %{clock: {_ref, due}} = :sys.get_state(ctx.state)
+      assert due - System.monotonic_time(:millisecond) > 60_000
     end
   end
 
