@@ -119,6 +119,23 @@ defmodule UniversalProxy.Audio.StoreTest do
       assert {:ok, %{cec_volume_max: nil}} = Store.get_config(server, @key)
     end
 
+    test "display_mode keeps a TV display mode option, nil otherwise", %{server: server} do
+      :ok = Store.save_config(server, @key, %{})
+      assert {:ok, %{display_mode: nil}} = Store.get_config(server, @key)
+
+      :ok = Store.save_config(server, @key, %{display_mode: "Off"})
+      :ok = Store.save_config(server, @key, %{volume: 10})
+      assert {:ok, %{display_mode: "Off"}} = Store.get_config(server, @key)
+
+      for bad <- ["off", :off, "Bogus", 3] do
+        :ok = Store.save_config(server, @key, %{display_mode: bad})
+        assert {:ok, %{display_mode: nil}} = Store.get_config(server, @key)
+      end
+
+      :ok = Store.save_config(server, @key, %{"display_mode" => "Party QR"})
+      assert {:ok, %{display_mode: "Party QR"}} = Store.get_config(server, @key)
+    end
+
     test "round-trips and clamps static_delay_ms (0..5000)", %{server: server} do
       :ok = Store.save_config(server, @key, %{static_delay_ms: 250})
       assert {:ok, %{static_delay_ms: 250}} = Store.get_config(server, @key)
@@ -236,6 +253,20 @@ defmodule UniversalProxy.Audio.StoreTest do
       assert cfg.friendly_name == "Persisted"
       assert cfg.volume == 75
       assert cfg.client_id == original_id
+    end
+
+    test "a TV display mode of Off survives a restart", %{dets_path: path} do
+      :ok = stop_supervised(UniversalProxy.Audio.Store)
+      hdmi = {"vc4-hdmi", nil, nil}
+
+      pid = start_supervised!({Store, name: nil, table: @table, dets_path: path}, id: :first)
+      :ok = Store.save_config(pid, hdmi, %{display_mode: "Off"})
+      :ok = stop_supervised(:first)
+
+      reopened =
+        start_supervised!({Store, name: nil, table: @table, dets_path: path}, id: :second)
+
+      assert {:ok, %{display_mode: "Off"}} = Store.get_config(reopened, hdmi)
     end
   end
 end

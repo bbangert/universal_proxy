@@ -113,7 +113,7 @@ defmodule UniversalProxy.Audio.Server do
   @doc """
   Update one or more configuration fields for an output. Accepted keys:
   `:friendly_name`, `:volume`, `:muted`, `:cec_auto_wake`, `:cec_volume`,
-  `:cec_volume_max`. Broadcasts a `:sendspin_state`
+  `:cec_volume_max`, `:display_mode`. Broadcasts a `:sendspin_state`
   message with the merged result. Returns `{:error, :not_found}` if
   the output isn't tracked or `{:error, reason}` if the DETS write
   fails.
@@ -814,7 +814,8 @@ defmodule UniversalProxy.Audio.Server do
     :muted,
     :cec_auto_wake,
     :cec_volume,
-    :cec_volume_max
+    :cec_volume_max,
+    :display_mode
   ]
 
   defp sanitize_update(params), do: Params.take(params, @allowed_update_keys)

@@ -18,7 +18,8 @@ defmodule UniversalProxy.Audio.Store do
         static_delay_ms: 0..5000,
         cec_auto_wake: boolean() | nil,
         cec_volume: boolean() | nil,
-        cec_volume_max: 1..100 | nil
+        cec_volume_max: 1..100 | nil,
+        display_mode: String.t() | nil
       }
 
   `cec_auto_wake` is the HDMI-CEC auto-wake choice for this output (wake
@@ -28,6 +29,9 @@ defmodule UniversalProxy.Audio.Store do
   receiver's (`UniversalProxy.Cec.VolumeLink`), `nil` meaning the
   `volume_link` default. `cec_volume_max` caps the volume sent to the
   receiver (`nil`: no cap); values outside 1..100 are clamped into it.
+  `display_mode` is the TV UI mode the user last picked for an HDMI
+  output (one of `UniversalProxy.Display.Mode.options/0`; `nil` until
+  picked, and anything else is stored as `nil`).
 
   `client_id` is generated once per output the first time it is sighted
   and persists across reboots. It is no longer the Sendspin `client_id`:
@@ -50,6 +54,7 @@ defmodule UniversalProxy.Audio.Store do
   require Logger
 
   alias UniversalProxy.Audio.Params
+  alias UniversalProxy.Display.Mode
 
   @default_table :audio_outputs
 
@@ -67,7 +72,8 @@ defmodule UniversalProxy.Audio.Store do
           static_delay_ms: 0..5000,
           cec_auto_wake: boolean() | nil,
           cec_volume: boolean() | nil,
-          cec_volume_max: 1..100 | nil
+          cec_volume_max: 1..100 | nil,
+          display_mode: String.t() | nil
         }
 
   # -- Client API --
@@ -222,7 +228,8 @@ defmodule UniversalProxy.Audio.Store do
       static_delay_ms: clamp_static_delay(pick(params, existing, :static_delay_ms, 0)),
       cec_auto_wake: tri_state(pick(params, existing, :cec_auto_wake, nil)),
       cec_volume: tri_state(pick(params, existing, :cec_volume, nil)),
-      cec_volume_max: clamp_ceiling(pick(params, existing, :cec_volume_max, nil))
+      cec_volume_max: clamp_ceiling(pick(params, existing, :cec_volume_max, nil)),
+      display_mode: display_mode(pick(params, existing, :display_mode, nil))
     }
   end
 
@@ -295,6 +302,12 @@ defmodule UniversalProxy.Audio.Store do
 
   defp clamp_ceiling(v) when is_integer(v), do: v |> max(1) |> min(100)
   defp clamp_ceiling(_), do: nil
+
+  defp display_mode(v) when is_binary(v) do
+    if v in Mode.options(), do: v
+  end
+
+  defp display_mode(_), do: nil
 
   # Server-adjustable static output delay (multi-room sync). The sendspin
   # library caps this at 5000 ms (`MAX_STATIC_DELAY_MS`); mirror that here.

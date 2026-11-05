@@ -40,9 +40,10 @@ defmodule UniversalProxy.Audio do
   `:friendly_name`, `:volume`, `:muted`, `:cec_auto_wake` and
   `:cec_volume` (a boolean, or `nil` to fall back to the CEC default),
   `:cec_volume_max` (1..100, or `nil` for no cap on the volume sent to
-  the receiver). Anything else is silently dropped. Returns `{:error,
-  :not_found}` if the output isn't currently present, or `{:error,
-  reason}` if DETS rejects the write.
+  the receiver), `:display_mode` (an HDMI output's TV UI mode, one of
+  `UniversalProxy.Display.Mode.options/0`, or `nil`). Anything else is
+  silently dropped. Returns `{:error, :not_found}` if the output isn't
+  currently present, or `{:error, reason}` if DETS rejects the write.
   """
   @spec update_config(key(), map()) :: :ok | {:error, :not_found | term()}
   def update_config({_, _, _} = key, params) when is_map(params) do

@@ -743,6 +743,15 @@ defmodule UniversalProxy.Audio.ServerTest do
       assert {:ok, %{cec_volume_max: nil}} = Server.get_output(server, @hp_key)
     end
 
+    test "persists and broadcasts the TV display mode", %{server: server, store: store} do
+      :ok = Server.update_config(server, @hp_key, %{display_mode: "Off"})
+
+      assert_receive {:sendspin_state, @hp_key, %{display_mode: "Off"}}
+      assert {:ok, %{display_mode: "Off"}} = Store.get_config(store, @hp_key)
+      assert {:ok, %{display_mode: "Off"}} = Server.get_output(server, @hp_key)
+      assert Enum.any?(Server.list_outputs(server), &(&1[:display_mode] == "Off"))
+    end
+
     test "returns {:error, :not_found} for unknown output", %{server: server} do
       assert {:error, :not_found} =
                Server.update_config(server, {"missing", nil, nil}, %{friendly_name: "x"})
