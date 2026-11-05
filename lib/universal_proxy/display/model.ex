@@ -136,6 +136,7 @@ defmodule UniversalProxy.Display.Model do
           seq: non_neg_integer(),
           metadata: map() | nil,
           metadata_at: integer() | nil,
+          progress_frozen: boolean(),
           controller: map() | nil,
           group: map() | nil,
           color: map() | nil,
@@ -162,6 +163,7 @@ defmodule UniversalProxy.Display.Model do
             seq: 0,
             metadata: nil,
             metadata_at: nil,
+            progress_frozen: false,
             controller: nil,
             group: nil,
             color: nil,
@@ -247,15 +249,28 @@ defmodule UniversalProxy.Display.Model do
     reconcile(m, reanchor(m, next, now), effects, opts)
   end
 
-  # A playback change without new metadata (a group pause/resume) moves
-  # the progress anchor to the position reached so far: a pause freezes it
-  # there instead of jumping back to the last metadata's position, and a
-  # resume continues from it without counting the paused time.
+  # Leaving playback without new metadata (a pause or stream end the
+  # player didn't re-time) freezes the progress where it got to, instead of
+  # it jumping back to the last metadata's position; entering playback
+  # continues from such a frozen anchor without counting the paused time.
+  # Metadata with its own timing (fresh from the server, or re-timed by the
+  # player) is used as it is.
   defp reanchor(%{playback: old, metadata: meta}, %{playback: new, metadata: meta} = next, now)
-       when old != new and is_map(meta),
-       do: %{next | metadata: Progress.anchor(meta, now, old == :playing)}
+       when old != new and is_map(meta) do
+    cond do
+      old == :playing ->
+        %{next | metadata: Progress.anchor(meta, now, true), progress_frozen: true}
 
-  defp reanchor(_old, next, _now), do: next
+      new == :playing and next.progress_frozen ->
+        %{next | metadata: Progress.anchor(meta, now, false), progress_frozen: false}
+
+      true ->
+        next
+    end
+  end
+
+  defp reanchor(%{metadata: meta}, %{metadata: meta} = next, _now), do: next
+  defp reanchor(_old, next, _now), do: %{next | progress_frozen: false}
 
   # Each clause returns {model, effects, opts}; `opts[:restart_idle]`
   # restarts the idle timer even when its kind is unchanged (activity).

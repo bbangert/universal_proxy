@@ -81,6 +81,43 @@ defmodule UniversalProxy.Display.ModelTest do
       assert elapsed(at(resumed, [{50_000, {:display_event, 5, fresh}}]), 50_000) == 1_000
     end
 
+    test "fresh metadata keeps its own timing when playback starts" do
+      metadata = %{
+        event: "metadata",
+        received_at: 0,
+        progress: %{
+          track_progress: 10_000,
+          track_duration: 200_000,
+          playback_speed: 1000,
+          progress_age_ms: 500
+        }
+      }
+
+      m = at(ready(), [{0, {:display_event, 1, metadata}}, {0, {:stream, :start}}])
+      assert elapsed(m, 0) == 10_500
+      assert elapsed(m, 1_000) == 11_500
+    end
+
+    test "a late snapshot of a pause the player re-timed shows the frozen position" do
+      # What Audio.Player caches after a group pause: position re-based, speed 0.
+      snapshot = %{
+        metadata: %{
+          received_at: 10_000,
+          progress: %{
+            track_progress: 20_000,
+            track_duration: 200_000,
+            playback_speed: 0,
+            progress_age_ms: 0
+          }
+        },
+        group: %{playback_state: "paused"}
+      }
+
+      m = at(Model.new(), [{0, {:bound, @binding, nil}}, {60_000, {:snapshot, 9, snapshot}}])
+      assert m.playback == :paused
+      assert elapsed(m, 90_000) == 20_000
+    end
+
     test "stream end/start re-anchor too" do
       metadata = %{
         event: "metadata",

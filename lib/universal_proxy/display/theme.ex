@@ -15,8 +15,10 @@ defmodule UniversalProxy.Display.Theme do
       until it has, else the default accent.
     * `:muted` — secondary text, the foreground blended towards the
       background (kept at 4.5:1).
-    * `:track` — the progress bar track; `:focus_fill` — a focused
-      control's fill.
+    * `:track` — the progress bar track (and the party caption's card),
+      kept at 4.5:1 with the foreground and 3:1 with the accent;
+      `:focus_fill` — a focused control's fill, kept at 3:1 with the
+      foreground icon. Either falls back to the background.
 
   Every colour is an opaque `{r, g, b}`: translucency costs a read-back on
   the vc4 GPU and far more on CPU raster.
@@ -63,8 +65,8 @@ defmodule UniversalProxy.Display.Theme do
       foreground: foreground,
       muted: muted(foreground, background),
       accent: accent,
-      track: blend(foreground, background, 0.82),
-      focus_fill: blend(accent, background, 0.7)
+      track: track(foreground, accent, background),
+      focus_fill: focus_fill(foreground, accent, background)
     }
   end
 
@@ -117,6 +119,26 @@ defmodule UniversalProxy.Display.Theme do
       |> Enum.map(&lighten(&1, background, 8))
       |> Enum.find(&(&1 && contrast(&1, background) >= @accent_contrast)) ||
       readable(@accent, background, @accent_contrast, @white)
+  end
+
+  # The progress track carries the accent fill and the party caption's
+  # text; the lightest tint that keeps both readable, else the background.
+  defp track(foreground, accent, background) do
+    Enum.find(
+      Enum.map([0.82, 0.88, 0.94], &blend(foreground, background, &1)),
+      background,
+      &(contrast(foreground, &1) >= @text_contrast and
+          contrast(accent, &1) >= @accent_contrast)
+    )
+  end
+
+  # A focused control's fill sits under its foreground-coloured icon.
+  defp focus_fill(foreground, accent, background) do
+    Enum.find(
+      Enum.map([0.7, 0.8, 0.9], &blend(accent, background, &1)),
+      background,
+      &(contrast(foreground, &1) >= @accent_contrast)
+    )
   end
 
   defp lighten(_color, _background, 0), do: nil

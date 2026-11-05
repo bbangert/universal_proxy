@@ -1122,6 +1122,61 @@ defmodule UniversalProxy.Audio.PlayerTest do
     end
 
     @tag :tmp_dir
+    test "a group pause/resume re-times the cached metadata for late subscribers",
+         %{tmp_dir: tmp_dir} do
+      pid = start_display_player!(tmp_dir)
+
+      emit = fn event ->
+        :ok = Player.__send_command__(pid, %{cmd: "emit_event", event: event})
+      end
+
+      emit.(%{
+        event: "metadata",
+        title: "Song",
+        progress: %{
+          track_progress: 10_000,
+          track_duration: 200_000,
+          playback_speed: 1000,
+          progress_age_ms: 0
+        }
+      })
+
+      display_event("metadata")
+      emit.(%{event: "group", playback_state: "playing"})
+      display_event("group")
+      Process.sleep(300)
+
+      # Pause: the position reached so far, frozen, published before the group.
+      emit.(%{event: "group", playback_state: "paused"})
+      {mseq, paused} = display_event("metadata")
+      {gseq, _} = display_event("group")
+      assert gseq == mseq + 1
+      assert %{playback_speed: 0, progress_age_ms: 0, track_progress: at} = paused.progress
+      assert at >= 10_300 and at < 12_000
+      assert paused.title == "Song"
+
+      # A late subscriber (a restarted TV UI) still sees the frozen position.
+      Process.sleep(200)
+
+      assert {^gseq, %{metadata: snap, group: %{playback_state: "paused"}}} =
+               Player.display_snapshot(pid)
+
+      assert snap.progress.track_progress == at
+      assert snap.progress.playback_speed == 0
+
+      # Resume: the same position, the speed back, the paused time not counted.
+      emit.(%{event: "group", playback_state: "playing"})
+      {_, resumed} = display_event("metadata")
+      display_event("group")
+      assert %{playback_speed: 1000, track_progress: ^at} = resumed.progress
+
+      # Same state again, or a group with no metadata change: nothing re-timed.
+      emit.(%{event: "group", playback_state: "playing"})
+      display_event("group")
+      refute_received {:sendspin_display, @key, _, %{event: "metadata"}}
+    end
+
+    @tag :tmp_dir
     test "viz frames go to the per-output viz topic, only while enabled", %{tmp_dir: tmp_dir} do
       pid = start_display_player!(tmp_dir)
       before = Player.last_event(pid)

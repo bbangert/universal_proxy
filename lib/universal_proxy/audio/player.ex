@@ -92,6 +92,11 @@ defmodule UniversalProxy.Audio.Player do
   `System.monotonic_time(:millisecond)` it was read at: the current track
   position is `track_progress + (progress_age_ms + now - received_at) *
   playback_speed / 1000`, capped at `track_duration` when that is non-zero.
+  A group `playback_state` change into or out of `"playing"` without new
+  metadata (the server re-sends none on a pause) first publishes the cached
+  metadata re-timed at the position reached: `track_progress` that
+  position, `progress_age_ms` 0, `playback_speed` 0 while not playing and
+  the earlier speed again on resume.
   A lost server connection also publishes `{"event":"group_clear"}` (made
   here; the binary has no group clear) when a group was known.
 
@@ -145,6 +150,7 @@ defmodule UniversalProxy.Audio.Player do
   require Logger
 
   alias UniversalProxy.Audio.Store
+  alias UniversalProxy.Display.Progress
   alias UniversalProxy.ESPHome.ConfigStore
 
   @pubsub UniversalProxy.PubSub
@@ -225,6 +231,7 @@ defmodule UniversalProxy.Audio.Player do
     display_roles: nil,
     display: %{},
     display_seq: 0,
+    resume_speed: nil,
     discarding: false
   ]
 
@@ -257,6 +264,7 @@ defmodule UniversalProxy.Audio.Player do
           display_roles: UniversalProxy.Audio.DisplayRoles.player_opts() | nil,
           display: %{optional(atom()) => map()},
           display_seq: non_neg_integer(),
+          resume_speed: pos_integer() | nil,
           discarding: boolean()
         }
 
@@ -542,7 +550,7 @@ defmodule UniversalProxy.Audio.Player do
         {:noreply, state}
 
       {:ok, %{event: kind} = event} when kind in @display_events ->
-        {:noreply, handle_display_event(state, event)}
+        {:noreply, state |> retime_progress(event) |> handle_display_event(event)}
 
       {:ok, %{event: _} = event} ->
         state = state |> maybe_register_mdns(event) |> track_volume_external(event)
@@ -1294,6 +1302,50 @@ defmodule UniversalProxy.Audio.Player do
 
     %{state | display_seq: seq, display: display}
   end
+
+  # A group pause/resume the server sends without new metadata: re-time the
+  # cached metadata's progress first (position reached so far, speed 0
+  # while not playing, the speed back on resume) and publish it as a
+  # metadata event, so subscribers and later snapshots agree on where the
+  # track is.
+  defp retime_progress(
+         %{display: %{metadata: %{progress: %{} = progress} = metadata, group: %{} = group}} =
+           state,
+         %{event: "group", playback_state: new}
+       )
+       when is_binary(new) do
+    old = Map.get(group, :playback_state)
+    {speed, resume_speed} = retimed_speed(old, new, Map.get(progress, :playback_speed), state)
+
+    case speed && Progress.at(metadata, System.monotonic_time(:millisecond), old == "playing") do
+      %{elapsed_ms: elapsed} ->
+        progress =
+          Map.merge(progress, %{
+            track_progress: elapsed,
+            playback_speed: speed,
+            progress_age_ms: 0
+          })
+
+        %{state | resume_speed: resume_speed}
+        |> handle_display_event(%{metadata | progress: progress})
+
+      _none ->
+        state
+    end
+  end
+
+  defp retime_progress(state, _event), do: state
+
+  # {speed to publish (nil: no re-time), speed to restore on resume}.
+  defp retimed_speed("playing", new, speed, state) when new != "playing",
+    do: {0, if(positive?(speed), do: speed, else: state.resume_speed)}
+
+  defp retimed_speed(old, "playing", speed, state) when old not in [nil, "playing"],
+    do: {if(positive?(speed), do: speed, else: state.resume_speed || 1000), nil}
+
+  defp retimed_speed(_old, _new, _speed, state), do: {nil, state.resume_speed}
+
+  defp positive?(n), do: is_integer(n) and n > 0
 
   defp broadcast_viz(%__MODULE__{config: %{client_id: id}} = state, event) when is_binary(id) do
     Phoenix.PubSub.broadcast(state.pubsub, viz_topic(id), {:sendspin_viz, state.key, event})
