@@ -439,7 +439,8 @@ defmodule Circuits.CEC.Adapter do
       receiver: :unknown,
       tv: :unknown,
       tv_poll?: Keyword.get(opts, :tv_poll, true),
-      tv_polling?: false,
+      tv_inflight: nil,
+      tv_repoll?: false,
       reqs: %{},
       txs: %{},
       seqs: %{},
@@ -934,14 +935,25 @@ defmodule Circuits.CEC.Adapter do
   defp poll_tv_on_configure(%{tv_poll?: false} = state), do: state
   defp poll_tv_on_configure(state), do: poll_tv_now(state)
 
+  # One TV poll at a time. A request while a poll from an earlier
+  # generation is still out (unplugged and configured again meanwhile)
+  # runs once that stale poll completes, since its result won't count.
   defp poll_tv_now(state) do
-    if configured?(state) and not state.tv_polling? do
-      case start_tx(state, @tv, :poll, nil, 0, nil, :tv_poll) do
-        {:ok, state} -> %{state | tv_polling?: true}
-        {:error, _reason, state} -> state
-      end
-    else
-      state
+    cond do
+      not configured?(state) ->
+        state
+
+      state.tv_inflight == nil ->
+        case start_tx(state, @tv, :poll, nil, 0, nil, :tv_poll) do
+          {:ok, state} -> %{state | tv_inflight: state.generation}
+          {:error, _reason, state} -> state
+        end
+
+      state.tv_inflight != state.generation ->
+        %{state | tv_repoll?: true}
+
+      true ->
+        state
     end
   end
 
@@ -1259,7 +1271,7 @@ defmodule Circuits.CEC.Adapter do
   end
 
   defp continue(state, :tv_poll, result) do
-    state = %{state | tv_polling?: false}
+    state = %{state | tv_inflight: nil}
 
     case presence(result) do
       nil ->
@@ -1273,7 +1285,10 @@ defmodule Circuits.CEC.Adapter do
     end
   end
 
-  defp continue(state, :tv_poll_stale, _result), do: %{state | tv_polling?: false}
+  defp continue(state, :tv_poll_stale, _result) do
+    state = %{state | tv_inflight: nil}
+    if state.tv_repoll?, do: poll_tv_now(%{state | tv_repoll?: false}), else: state
+  end
 
   defp continue(state, {:otp, id, step}, result), do: otp_step(state, id, step, result)
 

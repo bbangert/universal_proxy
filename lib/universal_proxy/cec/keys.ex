@@ -20,7 +20,12 @@ defmodule UniversalProxy.Cec.Keys do
   | `:fast_forward`, `:rewind` | Fast Forward/Rewind (0x49/0x48), `<Play>` fast forward/reverse |
   | `:red`, `:green`, `:yellow`, `:blue` | F2-F4, F1 (0x72, 0x73, 0x74, 0x71) |
 
-  Anything else (numbers, channel keys, ...) is dropped.
+  Play Function (0x60) may carry a Play Mode operand; it then maps like
+  `<Play>` with that mode (still → `:pause`, fast forward → `:fast_forward`,
+  ...), still as a press. Without one it is `:play`.
+
+  Anything else (numbers, channel keys, reverse or slow play, ...) is
+  dropped.
 
   Keys fire on the press. A held key makes the TV repeat `<User Control
   Pressed>` every 200-450 ms, usually without a release in between, so a
@@ -29,6 +34,8 @@ defmodule UniversalProxy.Cec.Keys do
   `<User Control Released>` ends the hold. `<Play>` and `<Deck Control>`
   are one-shot commands and always fire.
   """
+
+  alias Circuits.CEC.Message
 
   @type key ::
           :select
@@ -100,11 +107,23 @@ defmodule UniversalProxy.Cec.Keys do
   """
   @spec classify(term()) :: {:press, key()} | {:command, key()} | :release | :ignore
   def classify({:user_control_pressed, cmd}), do: lookup(@ui_keys, cmd, :press)
+
+  def classify({:user_control_pressed, :play_function, <<mode, _::binary>>}),
+    do: lookup(@play_modes, play_mode(mode), :press)
+
   def classify({:user_control_pressed, cmd, _extra}), do: lookup(@ui_keys, cmd, :press)
   def classify(:user_control_released), do: :release
   def classify({:play, mode}), do: lookup(@play_modes, mode, :command)
   def classify({:deck_control, mode}), do: lookup(@deck_modes, mode, :command)
   def classify(_body), do: :ignore
+
+  # The Play Mode operand as `<Play>` names it, from the library's table.
+  defp play_mode(byte) do
+    case Message.decode(<<0x04, Message.opcode(:play), byte>>) do
+      {:ok, %Message{body: {:play, mode}}} -> mode
+      _other -> nil
+    end
+  end
 
   defp lookup(table, name, kind) do
     case Map.fetch(table, name) do

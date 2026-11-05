@@ -1516,6 +1516,26 @@ defmodule Circuits.CEC.AdapterTest do
       assert Adapter.info(adapter).tv == :unknown
     end
 
+    test "a configure while an earlier poll is out polls once that poll completes" do
+      %{fake: fake, adapter: adapter} = configured(tv_poll: true)
+      :ok = Adapter.subscribe(adapter)
+      {stale, %Message{to: 0, body: :poll}} = nth_tx(fake, 2)
+
+      replug(fake, adapter)
+      {seq, %Message{to: 5, body: :poll}} = nth_tx(fake, 3)
+      complete(fake, seq, tx_status: 0x24)
+      _ = Adapter.info(adapter)
+      assert length(transmits(fake)) == 3
+
+      complete(fake, stale, tx_status: 0x01)
+      {seq, %Message{to: 0, body: :poll}} = nth_tx(fake, 4)
+      refute_received {:cec, @device, {:tv_poll, _}}
+
+      complete(fake, seq, tx_status: 0x01)
+      assert_receive {:cec, @device, {:tv_poll, :present}}
+      assert Adapter.info(adapter).tv == :present
+    end
+
     test "a result from before an unplug is dropped" do
       %{fake: fake, adapter: adapter} = configured(tv_poll: true)
       :ok = Adapter.subscribe(adapter)

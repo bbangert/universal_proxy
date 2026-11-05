@@ -38,8 +38,18 @@ defmodule UniversalProxy.Cec.KeysTest do
     end
   end
 
-  test "a press with extra operands is the same key" do
-    assert Keys.classify(body(<<0x44, 0x60, 0x01>>)) == {:press, :play}
+  test "Play Function's Play Mode operand maps like <Play>, as a press" do
+    assert Keys.classify(body(<<0x44, 0x60>>)) == {:press, :play}
+    assert Keys.classify(body(<<0x44, 0x60, 0x24>>)) == {:press, :play}
+    assert Keys.classify(body(<<0x44, 0x60, 0x25>>)) == {:press, :pause}
+    assert Keys.classify(body(<<0x44, 0x60, 0x05>>)) == {:press, :fast_forward}
+    assert Keys.classify(body(<<0x44, 0x60, 0x0B>>)) == {:press, :rewind}
+    assert Keys.classify(body(<<0x44, 0x60, 0x20>>)) == :ignore
+    assert Keys.classify(body(<<0x44, 0x60, 0xEE>>)) == :ignore
+  end
+
+  test "other keys ignore extra operands" do
+    assert Keys.classify(body(<<0x44, 0x01, 0x00>>)) == {:press, :up}
   end
 
   test "<Play> and <Deck Control> are one-shot commands" do
