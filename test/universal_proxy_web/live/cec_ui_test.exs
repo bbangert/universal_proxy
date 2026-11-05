@@ -77,6 +77,12 @@ defmodule UniversalProxyWeb.CecUiTest do
   defp put_adapters(adapters),
     do: Phoenix.PubSub.broadcast(@pubsub, Cec.topic(), {:cec_adapters, adapters})
 
+  defp broadcast_state(partial) do
+    Phoenix.PubSub.broadcast(@pubsub, "sendspin:state", {:sendspin_state, @hdmi_key, partial})
+  end
+
+  defp ceiling_form(view), do: form(view, "form[phx-change=set_cec_volume_max]")
+
   defp encode(key), do: key |> :erlang.term_to_binary() |> Base.url_encode64(padding: false)
 
   defp audio_with_hdmi(conn) do
@@ -95,6 +101,8 @@ defmodule UniversalProxyWeb.CecUiTest do
 
       refute html =~ "cec-"
       refute html =~ "Auto-wake receiver"
+      refute html =~ "Control receiver volume"
+      refute html =~ "Max volume"
       refute html =~ "Receiver"
     end
 
@@ -103,6 +111,7 @@ defmodule UniversalProxyWeb.CecUiTest do
       put_adapters([adapter(%{card_index: 7})])
 
       refute render(view) =~ "Auto-wake receiver"
+      refute render(view) =~ "Control receiver volume"
       refute has_element?(view, "#cec-#{encode(@hdmi_key)}")
     end
 
@@ -180,6 +189,82 @@ defmodule UniversalProxyWeb.CecUiTest do
       )
 
       assert view |> element(toggle) |> render() =~ ~s(aria-checked="false")
+    end
+
+    test "the volume-link toggle shows the output's setting", %{conn: conn} do
+      view = audio_with_hdmi(conn)
+      refute has_element?(view, "#cec-volume-#{encode(@hdmi_key)}")
+
+      put_adapters([adapter(%{})])
+      toggle = "#cec-volume-#{encode(@hdmi_key)}"
+      assert render(view) =~ "Control receiver volume"
+
+      # Unset: the env default (true).
+      assert view |> element(toggle) |> render() =~ ~s(aria-checked="true")
+
+      broadcast_state(%{cec_volume: false})
+      assert view |> element(toggle) |> render() =~ ~s(aria-checked="false")
+    end
+
+    test "the ceiling input follows the link toggle and the stored ceiling", %{conn: conn} do
+      view = audio_with_hdmi(conn)
+      put_adapters([adapter(%{})])
+      input = "#cec-volume-max-#{encode(@hdmi_key)}"
+
+      assert has_element?(view, input)
+      refute view |> element(input) |> render() =~ "value="
+
+      broadcast_state(%{cec_volume_max: 40})
+      assert view |> element(input) |> render() =~ ~s(value="40")
+
+      broadcast_state(%{cec_volume: false})
+      refute has_element?(view, input)
+      refute render(view) =~ "Max volume"
+
+      broadcast_state(%{cec_volume: true})
+      assert has_element?(view, input)
+    end
+
+    test "the Receiver badge follows volume_external broadcasts", %{conn: conn} do
+      view = audio_with_hdmi(conn)
+      put_adapters([adapter(%{})])
+      badge = "#volume-external-#{encode(@hdmi_key)}"
+
+      refute has_element?(view, badge)
+
+      broadcast_state(%{volume_external: true})
+      assert view |> element(badge) |> render() =~ "Receiver"
+
+      broadcast_state(%{volume_external: false})
+      refute has_element?(view, badge)
+    end
+
+    test "the Receiver badge starts from the output's volume_external", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/audio")
+      add_output(hdmi_output(%{volume_external: true}))
+
+      assert has_element?(view, "#volume-external-#{encode(@hdmi_key)}")
+    end
+
+    test "a refused volume-link write is logged and the page survives", %{conn: conn} do
+      view = audio_with_hdmi(conn)
+      put_adapters([adapter(%{})])
+
+      log =
+        capture_log(fn ->
+          view |> element("#cec-volume-#{encode(@hdmi_key)}") |> render_click()
+        end)
+
+      assert log =~ "CEC volume-link toggle failed"
+      assert log =~ ":not_found"
+
+      log =
+        capture_log(fn ->
+          view |> ceiling_form() |> render_change(%{value: "30"})
+        end)
+
+      assert log =~ "CEC volume ceiling update failed"
+      assert render(view) =~ "Control receiver volume"
     end
 
     test "a refused toggle write is logged and the page survives", %{conn: conn} do
@@ -261,6 +346,80 @@ defmodule UniversalProxyWeb.CecUiTest do
       view |> element(toggle) |> render_click()
       assert {:ok, %{cec_auto_wake: true}} = AudioStore.get_config(store, @hdmi_key)
       assert view |> element(toggle) |> render() =~ ~s(aria-checked="true")
+    end
+  end
+
+  describe "Audio tab volume link with a tracked HDMI output" do
+    alias UniversalProxyWeb.CecUiTest.HdmiEnumerate
+
+    setup do
+      path =
+        Path.join(System.tmp_dir!(), "cec_vol_test_#{System.unique_integer([:positive])}.dets")
+
+      :ok = Supervisor.terminate_child(UniversalProxy.Audio.Supervisor, AudioServer)
+
+      on_exit(fn ->
+        _ = Supervisor.restart_child(UniversalProxy.Audio.Supervisor, AudioServer)
+        File.rm(path)
+      end)
+
+      store =
+        start_supervised!({AudioStore, name: nil, table: :cec_vol_test_store, dets_path: path})
+
+      start_supervised!(
+        {AudioServer,
+         name: AudioServer,
+         store: store,
+         enumerate_module: HdmiEnumerate,
+         start_timer: false,
+         player_supervisor: nil,
+         mdns_discovery: nil,
+         mdns_module: nil}
+      )
+
+      :ok = AudioServer.check_now()
+      {:ok, store: store}
+    end
+
+    test "successive clicks persist false, then true", %{conn: conn, store: store} do
+      {:ok, view, _html} = live(conn, "/audio")
+      put_adapters([adapter(%{})])
+      toggle = "#cec-volume-#{encode(@hdmi_key)}"
+
+      assert view |> element(toggle) |> render() =~ ~s(aria-checked="true")
+
+      view |> element(toggle) |> render_click()
+      assert {:ok, %{cec_volume: false}} = AudioStore.get_config(store, @hdmi_key)
+      assert view |> element(toggle) |> render() =~ ~s(aria-checked="false")
+      refute has_element?(view, "#cec-volume-max-#{encode(@hdmi_key)}")
+
+      view |> element(toggle) |> render_click()
+      assert {:ok, %{cec_volume: true}} = AudioStore.get_config(store, @hdmi_key)
+      assert view |> element(toggle) |> render() =~ ~s(aria-checked="true")
+    end
+
+    test "the ceiling saves, clamps, and clears on empty", %{conn: conn, store: store} do
+      {:ok, view, _html} = live(conn, "/audio")
+      put_adapters([adapter(%{})])
+      input = "#cec-volume-max-#{encode(@hdmi_key)}"
+
+      view |> ceiling_form() |> render_change(%{value: "35"})
+      assert {:ok, %{cec_volume_max: 35}} = AudioStore.get_config(store, @hdmi_key)
+      assert view |> element(input) |> render() =~ ~s(value="35")
+
+      view |> ceiling_form() |> render_change(%{value: "250"})
+      assert {:ok, %{cec_volume_max: 100}} = AudioStore.get_config(store, @hdmi_key)
+
+      view |> ceiling_form() |> render_change(%{value: "0"})
+      assert {:ok, %{cec_volume_max: 1}} = AudioStore.get_config(store, @hdmi_key)
+
+      # Garbage is ignored, the stored ceiling stays.
+      view |> ceiling_form() |> render_change(%{value: "abc"})
+      assert {:ok, %{cec_volume_max: 1}} = AudioStore.get_config(store, @hdmi_key)
+
+      view |> ceiling_form() |> render_change(%{value: ""})
+      assert {:ok, %{cec_volume_max: nil}} = AudioStore.get_config(store, @hdmi_key)
+      refute view |> element(input) |> render() =~ "value="
     end
   end
 
