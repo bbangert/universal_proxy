@@ -46,7 +46,7 @@ defmodule UniversalProxy.Display.Model do
   it chose) is kept in `size`, which the view scales its layout to.
   """
 
-  alias UniversalProxy.Display.Mode
+  alias UniversalProxy.Display.{Mode, Progress}
 
   @focus_order [:prev, :play_pause, :next]
 
@@ -244,8 +244,18 @@ defmodule UniversalProxy.Display.Model do
   @spec handle(t(), event(), integer()) :: {t(), [effect()]}
   def handle(%__MODULE__{} = m, event, now) do
     {next, effects, opts} = apply_event(m, event, now)
-    reconcile(m, next, effects, opts)
+    reconcile(m, reanchor(m, next, now), effects, opts)
   end
+
+  # A playback change without new metadata (a group pause/resume) moves
+  # the progress anchor to the position reached so far: a pause freezes it
+  # there instead of jumping back to the last metadata's position, and a
+  # resume continues from it without counting the paused time.
+  defp reanchor(%{playback: old, metadata: meta}, %{playback: new, metadata: meta} = next, now)
+       when old != new and is_map(meta),
+       do: %{next | metadata: Progress.anchor(meta, now, old == :playing)}
+
+  defp reanchor(_old, next, _now), do: next
 
   # Each clause returns {model, effects, opts}; `opts[:restart_idle]`
   # restarts the idle timer even when its kind is unchanged (activity).

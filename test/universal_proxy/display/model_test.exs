@@ -1,7 +1,7 @@
 defmodule UniversalProxy.Display.ModelTest do
   use ExUnit.Case, async: true
 
-  alias UniversalProxy.Display.Model
+  alias UniversalProxy.Display.{Model, Progress}
 
   @key {"vc4-hdmi", nil, nil}
   @binding %{key: @key, client_id: "c0ffee", cec_dev: "/dev/cec0"}
@@ -33,6 +33,68 @@ defmodule UniversalProxy.Display.ModelTest do
 
   defp schedules(effects, timer),
     do: for({:schedule, ^timer, gen, ms} <- effects, do: {gen, ms})
+
+  describe "progress across a group pause/resume (no new metadata)" do
+    defp at(model, events),
+      do: Enum.reduce(events, model, fn {now, e}, m -> elem(Model.handle(m, e, now), 0) end)
+
+    defp elapsed(model, now),
+      do: Progress.at(model.metadata, now, model.playback == :playing).elapsed_ms
+
+    test "a pause freezes where it got to; a resume continues from there" do
+      metadata = %{
+        event: "metadata",
+        title: "Song",
+        received_at: 0,
+        progress: %{
+          track_progress: 10_000,
+          track_duration: 200_000,
+          playback_speed: 1000,
+          progress_age_ms: 0
+        }
+      }
+
+      m =
+        at(ready(), [
+          {0, {:display_event, 1, metadata}},
+          {0, {:display_event, 2, %{event: "group", playback_state: "playing"}}}
+        ])
+
+      assert elapsed(m, 10_000) == 20_000
+
+      paused = at(m, [{10_000, {:display_event, 3, %{event: "group", playback_state: "paused"}}}])
+      assert elapsed(paused, 10_000) == 20_000
+      assert elapsed(paused, 40_000) == 20_000
+
+      resumed =
+        at(paused, [{40_000, {:display_event, 4, %{event: "group", playback_state: "playing"}}}])
+
+      assert elapsed(resumed, 45_000) == 25_000
+
+      # New metadata replaces the anchor.
+      fresh = %{
+        metadata
+        | received_at: 50_000,
+          progress: %{metadata.progress | track_progress: 1_000}
+      }
+
+      assert elapsed(at(resumed, [{50_000, {:display_event, 5, fresh}}]), 50_000) == 1_000
+    end
+
+    test "stream end/start re-anchor too" do
+      metadata = %{
+        event: "metadata",
+        received_at: 0,
+        progress: %{track_progress: 0, track_duration: 0, playback_speed: 1000}
+      }
+
+      m = at(ready(), [{0, {:display_event, 1, metadata}}, {0, {:stream, :start}}])
+      m = at(m, [{5_000, {:stream, :end}}])
+      assert elapsed(m, 9_000) == 5_000
+      m = at(m, [{9_000, {:stream, :start}}])
+      assert elapsed(m, 10_000) == 6_000
+    end
+  end
 
   describe "screen/1 priority (P5)" do
     for {label, fields, screen} <- [

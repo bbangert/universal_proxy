@@ -47,6 +47,24 @@ defmodule UniversalProxy.Display.Progress do
 
   def at(_metadata, _now, _playing?), do: nil
 
+  @doc """
+  `metadata` with its progress re-based on the position at `now` (as
+  `at/3` gives it with `playing?`): `track_progress` is that position,
+  `progress_age_ms` 0 and `received_at` `now`. Metadata without progress
+  is returned unchanged.
+  """
+  @spec anchor(map(), integer(), boolean()) :: map()
+  def anchor(metadata, now, playing?) do
+    case at(metadata, now, playing?) do
+      %{elapsed_ms: elapsed} ->
+        progress = %{metadata.progress | track_progress: elapsed} |> Map.put(:progress_age_ms, 0)
+        metadata |> Map.put(:progress, progress) |> Map.put(:received_at, now)
+
+      nil ->
+        metadata
+    end
+  end
+
   @doc "The played fraction `0.0..1.0` (`0.0` without a duration)."
   @spec fraction(t()) :: float()
   def fraction(%{elapsed_ms: e, duration_ms: d}) when is_integer(d), do: min(e / d, 1.0)
