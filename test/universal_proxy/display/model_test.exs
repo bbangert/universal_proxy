@@ -287,6 +287,15 @@ defmodule UniversalProxy.Display.ModelTest do
       assert model.metadata.title == "New"
     end
 
+    test "a cleared group (lost server connection) stops playback" do
+      {model, effects} =
+        Model.handle(playing(), {:display_event, 2_000, %{event: "group_clear"}}, 0)
+
+      assert model.group == nil and model.playback == :stopped
+      assert [{_gen, 120_000}] = schedules(effects, :idle)
+      assert {:viz, nil} in effects
+    end
+
     test "the snapshot's group sets playback" do
       model =
         run!(Model.new(), [
@@ -483,6 +492,35 @@ defmodule UniversalProxy.Display.ModelTest do
       {model, effects} = Model.handle(model, {:viewport, :down, :boom}, 0)
       assert model.viewport.status == :failed
       assert [{_gen, 8_000}] = schedules(effects, :retry)
+    end
+
+    test "starts on the bound output's own connector, and follows it to another port" do
+      model =
+        run!(Model.new(), [
+          {:bound, Map.put(@binding, :hdmi_port, 0), nil},
+          {:display_available, true}
+        ])
+
+      assert model.viewport.port == 0
+      model = run!(model, [{:viewport, :started}])
+
+      {model, effects} =
+        Model.handle(
+          model,
+          {:bound, Map.merge(@binding, %{key: {"vc4-hdmi-1", nil, nil}, hdmi_port: 1}), nil},
+          0
+        )
+
+      assert [:stop_viewport, {:start_viewport, rung}] =
+               Enum.filter(effects, &(&1 == :stop_viewport or match?({:start_viewport, _}, &1)))
+
+      assert rung[:connector] == "HDMI-A-2"
+      assert model.viewport.status == :starting
+
+      # Same port again: nothing moves.
+      model = run!(model, [{:viewport, :started}])
+      {_model, effects} = Model.handle(model, {:bound, %{model.binding | cec_dev: nil}, nil}, 0)
+      refute :stop_viewport in effects
     end
 
     test "a crash takes the visualizer off" do

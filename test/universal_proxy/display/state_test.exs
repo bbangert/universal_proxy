@@ -73,6 +73,8 @@ defmodule UniversalProxy.Display.StateTest do
       update_config: fn key, params -> send(test, {:audio, :update_config, key, params}) end
     }
 
+    audio = Map.merge(audio, Keyword.get(opts, :audio, %{}))
+
     cec = %{
       list_adapters: fn -> Agent.get(world, & &1.adapters) end,
       claim_keys: fn dev, pid ->
@@ -388,6 +390,70 @@ defmodule UniversalProxy.Display.StateTest do
 
       broadcast(ctx, "cec:events", {:cec_adapters, [@adapter]})
       assert_receive {:fake_renderer, :start, _}
+    end
+  end
+
+  describe "ordering" do
+    test "audio calls run one at a time, in order, without blocking State", context do
+      test = self()
+
+      update_config = fn key, params ->
+        if params.display_mode == "Visualizer", do: Process.sleep(150)
+        send(test, {:audio, :update_config, key, params})
+      end
+
+      ctx = start_ui(context, audio: %{update_config: update_config})
+
+      :ok = GenServer.call(ctx.state, {:set_mode, :visualizer})
+      :ok = GenServer.call(ctx.state, {:set_mode, :off})
+      # Still responsive while the first call is in flight.
+      assert %{mode: :off} = GenServer.call(ctx.state, :status)
+
+      assert_receive {:audio, :update_config, @key, %{display_mode: mode}}, 1_000
+      assert mode == "Visualizer"
+      assert_receive {:audio, :update_config, @key, %{display_mode: "Off"}}, 1_000
+    end
+
+    test "a rebind while playing ends with the new output's visualizer on", context do
+      ctx =
+        start_ui(context, snapshot: {3, %{group: %{event: "group", playback_state: "playing"}}})
+
+      started!()
+      playing(ctx)
+      assert_receive {:fake_renderer, :set_viz, _, %{topic: "sendspin:viz:c0"}}
+
+      # No HDMI port, so the viewport stays where it is.
+      other = %{@output | key: {"usb-dac", 1, 2}, client_id: "c1", card_index: 5}
+      Agent.update(ctx.world, &%{&1 | outputs: [Map.delete(@output, :display_roles), other]})
+      broadcast(ctx, "sendspin:output_added", {:sendspin_output_added, other})
+      _ = model(ctx)
+
+      assert model(ctx).viz == :strip
+      assert last_set_viz() == %{topic: "sendspin:viz:c1", key: other.key, mode: :strip}
+    end
+  end
+
+  describe "connector" do
+    test "the viewport drives the bound output's connector and follows a rebind", context do
+      ctx = start_ui(context)
+      assert started!()[:connector] == "HDMI-A-1"
+      first = GenServer.call(ctx.state, :viewport)
+
+      other = %{@output | key: {"vc4-hdmi-1", nil, nil}, client_id: "c1"}
+      Agent.update(ctx.world, &%{&1 | outputs: [Map.delete(@output, :display_roles), other]})
+      broadcast(ctx, "sendspin:output_added", {:sendspin_output_added, other})
+
+      assert_receive {:fake_renderer, :stop, ^first}
+      assert started!()[:connector] == "HDMI-A-2"
+      assert %{lifecycle: %{status: :running, port: 1}} = GenServer.call(ctx.state, :status)
+    end
+  end
+
+  defp last_set_viz(last \\ :none) do
+    receive do
+      {:fake_renderer, :set_viz, _viewport, viz} -> last_set_viz(viz)
+    after
+      100 -> last
     end
   end
 

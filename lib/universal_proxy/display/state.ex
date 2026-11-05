@@ -24,10 +24,15 @@ defmodule UniversalProxy.Display.State do
   valid again (the TV is back). Screens come from
   `UniversalProxy.Display.View`.
 
-  Controller commands, visualizer on/off and mode persistence run in
-  `UniversalProxy.TaskSupervisor` tasks: they are calls into the audio
-  subsystem, which must never stall this loop. The player pid is never
-  cached. Mode changes are broadcast on `UniversalProxy.Display.topic/0`
+  Controller commands, visualizer on/off and mode persistence are calls
+  into the audio subsystem, which must never stall this loop: they run as
+  `UniversalProxy.TaskSupervisor` tasks, one at a time in the order the
+  model asked for them (a later "Off" must never be overtaken by an
+  earlier "Visualizer"). The player pid is never cached.
+
+  Events an effect produces (a snapshot's contents, a viewport that
+  started) are handled after the rest of the current transition's
+  effects, so they always build on its final state. Mode changes are broadcast on `UniversalProxy.Display.topic/0`
   as `{:display_mode, mode}`.
 
   Timers fire as `{:display_timer, timer, gen}` messages (`timer` is
@@ -109,6 +114,9 @@ defmodule UniversalProxy.Display.State do
         ),
       outputs: [],
       adapters: [],
+      jobs: :queue.new(),
+      job: nil,
+      follow_ups: [],
       pubsub: Keyword.get(opts, :pubsub, UniversalProxy.PubSub),
       task_sup: Keyword.get(opts, :task_supervisor, UniversalProxy.TaskSupervisor),
       audio: Map.merge(default_audio(), Map.new(Keyword.get(opts, :audio, %{}))),
@@ -183,6 +191,16 @@ defmodule UniversalProxy.Display.State do
     if state.ui,
       do: {:noreply, dispatch(state, {:viewport, :down, reason})},
       else: {:noreply, state}
+  end
+
+  def handle_info({ref, _result}, %{job: ref} = state) when is_reference(ref) do
+    Process.demonitor(ref, [:flush])
+    {:noreply, next_job(%{state | job: nil})}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{job: ref} = state) do
+    Logger.warning("[Display] audio call failed: #{inspect(reason)}")
+    {:noreply, next_job(%{state | job: nil})}
   end
 
   def handle_info(_msg, %{ui: false} = state), do: {:noreply, state}
@@ -272,8 +290,14 @@ defmodule UniversalProxy.Display.State do
 
   defp dispatch(state, event) do
     {model, effects} = Model.handle(state.model, event, System.monotonic_time(:millisecond))
-    Enum.reduce(effects, %{state | model: model}, &run_effect/2)
+    state = Enum.reduce(effects, %{state | model: model}, &run_effect/2)
+
+    # Events the effects produced, after all of this transition's effects.
+    {follow_ups, state} = Map.get_and_update(state, :follow_ups, &{&1, []})
+    follow_ups |> Enum.reverse() |> Enum.reduce(state, &dispatch(&2, &1))
   end
+
+  defp follow_up(state, event), do: %{state | follow_ups: [event | state.follow_ups]}
 
   defp run_effect(:render, state) do
     spec = View.render(state.model, state.view_opts)
@@ -334,7 +358,7 @@ defmodule UniversalProxy.Display.State do
   defp run_effect({:snapshot, key}, state) do
     if bound?(state, key) do
       {seq, snapshot} = state.audio.display_snapshot.(key)
-      dispatch(state, {:snapshot, seq, snapshot})
+      follow_up(state, {:snapshot, seq, snapshot})
     else
       state
     end
@@ -345,13 +369,15 @@ defmodule UniversalProxy.Display.State do
 
     case start_viewport(%{state | spec: spec}, Keyword.put(rung, :owner, self())) do
       {{:ok, _handle}, state} ->
-        dispatch(state, {:viewport, :started})
+        follow_up(state, {:viewport, :started})
 
       {{:error, reason}, state} ->
         Logger.warning("[Display] viewport did not start: #{inspect(reason)}")
-        dispatch(state, {:viewport, :start_failed, reason})
+        follow_up(state, {:viewport, :start_failed, reason})
     end
   end
+
+  defp run_effect(:stop_viewport, state), do: stop_viewport(state)
 
   defp run_effect({:schedule, timer, gen, ms}, state) do
     Process.send_after(self(), {:display_timer, timer, gen}, ms)
@@ -364,21 +390,35 @@ defmodule UniversalProxy.Display.State do
 
   defp viz_source(_state, _viz), do: nil
 
-  # Runs the job `build.(key, audio)` returns in a task, when bound.
+  # Queues the job `build.(key, audio)` returns, when bound.
   defp with_key(state, build) do
     case state.model.binding do
-      %{key: key} -> run_task(state, build.(key, state.audio))
-      nil -> :ok
+      %{key: key} -> next_job(%{state | jobs: :queue.in(build.(key, state.audio), state.jobs)})
+      nil -> state
     end
-
-    state
   end
 
-  defp run_task(state, fun) do
-    Task.Supervisor.start_child(state.task_sup, fun)
-  catch
-    :exit, reason -> Logger.warning("[Display] task not started: #{inspect(reason)}")
+  # Starts the next queued audio job unless one is running. One at a time,
+  # so the audio subsystem sees them in order.
+  defp next_job(%{job: nil} = state) do
+    case :queue.out(state.jobs) do
+      {{:value, fun}, jobs} ->
+        state = %{state | jobs: jobs}
+
+        try do
+          %{state | job: Task.Supervisor.async_nolink(state.task_sup, fun).ref}
+        catch
+          :exit, reason ->
+            Logger.warning("[Display] audio call not started: #{inspect(reason)}")
+            next_job(state)
+        end
+
+      {:empty, _jobs} ->
+        state
+    end
   end
+
+  defp next_job(state), do: state
 
   # ── Binding ──────────────────────────────────────────────────────────
 

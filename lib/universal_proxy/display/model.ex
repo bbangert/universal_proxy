@@ -72,7 +72,8 @@ defmodule UniversalProxy.Display.Model do
   @type binding :: %{
           required(:key) => UniversalProxy.Audio.key(),
           required(:client_id) => String.t() | nil,
-          required(:cec_dev) => String.t() | nil
+          required(:cec_dev) => String.t() | nil,
+          optional(:hdmi_port) => non_neg_integer() | nil
         }
   @type timer :: :idle | :retry | :stable
 
@@ -84,7 +85,8 @@ defmodule UniversalProxy.Display.Model do
           crashes: non_neg_integer(),
           crash_key: term(),
           delay_ms: pos_integer() | nil,
-          reason: term()
+          reason: term(),
+          port: non_neg_integer() | nil
         }
 
   @type event ::
@@ -114,6 +116,7 @@ defmodule UniversalProxy.Display.Model do
           | {:release_keys, String.t()}
           | {:snapshot, UniversalProxy.Audio.key()}
           | {:start_viewport, keyword()}
+          | :stop_viewport
           | {:schedule, timer(), non_neg_integer(), non_neg_integer()}
 
   @type t :: %__MODULE__{
@@ -170,7 +173,8 @@ defmodule UniversalProxy.Display.Model do
               crashes: 0,
               crash_key: nil,
               delay_ms: nil,
-              reason: nil
+              reason: nil,
+              port: nil
             },
             config: @defaults
 
@@ -253,7 +257,8 @@ defmodule UniversalProxy.Display.Model do
         m = if same_key?, do: %{m | binding: binding}, else: clear_player(%{m | binding: binding})
         {m, mode_effects} = adopt_mode(m, persisted, same_key?)
         snapshot = if same_key?, do: [], else: [{:snapshot, binding.key}]
-        {m, mode_effects ++ snapshot, []}
+        {m, move_effects} = follow_port(m)
+        {m, mode_effects ++ snapshot ++ move_effects, []}
     end
   end
 
@@ -284,6 +289,7 @@ defmodule UniversalProxy.Display.Model do
       "controller_state" -> {%{m | controller: event}, [], []}
       "controller_clear" -> {%{m | controller: nil}, [], []}
       "group" -> playback_from_group(%{m | group: event}, event)
+      "group_clear" -> set_playback(%{m | group: nil}, :stopped)
       "color" -> {%{m | color: event}, [], []}
       "color_clear" -> {%{m | color: nil}, [], []}
       "artwork" -> {put_artwork(m, event), [], []}
@@ -498,10 +504,32 @@ defmodule UniversalProxy.Display.Model do
 
   # ── Viewport lifecycle ───────────────────────────────────────────────
 
+  # The viewport drives the bound output's own connector (HDMI port N is
+  # DRM connector HDMI-A-<N+1>); with no port known the renderer picks the
+  # first connected HDMI connector.
   defp start_viewport(m) do
+    port = bound_port(m)
     rung = Enum.at(cfg(m, :ladder), m.viewport.rung, [])
-    {put_vp(m, status: :starting, gen: m.viewport.gen + 1), [{:start_viewport, rung}], []}
+    rung = if port, do: Keyword.put(rung, :connector, "HDMI-A-#{port + 1}"), else: rung
+
+    {put_vp(m, status: :starting, gen: m.viewport.gen + 1, port: port), [{:start_viewport, rung}],
+     []}
   end
+
+  # A running viewport on another port than the bound output's moves there.
+  defp follow_port(m) do
+    port = bound_port(m)
+
+    if m.viewport.status == :running and port != nil and port != m.viewport.port do
+      {m, effects, []} = start_viewport(m)
+      {m, [:stop_viewport | effects]}
+    else
+      {m, []}
+    end
+  end
+
+  defp bound_port(%{binding: %{hdmi_port: port}}) when is_integer(port), do: port
+  defp bound_port(_model), do: nil
 
   defp crash?(:normal), do: false
   defp crash?(:shutdown), do: false

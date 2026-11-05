@@ -16,7 +16,7 @@ defmodule UniversalProxy.Display.BindingTest do
     outputs = [@usb, @hdmi0, Map.put(@hdmi1, :display_roles, true)]
 
     assert Binding.resolve(outputs, @adapters) ==
-             %{key: @hdmi1.key, client_id: "h1", cec_dev: "/dev/cec1"}
+             %{key: @hdmi1.key, client_id: "h1", cec_dev: "/dev/cec1", hdmi_port: 1}
   end
 
   test "falls back to the lowest-numbered HDMI output without roles" do

@@ -162,7 +162,8 @@ if Code.ensure_loaded?(Emerge) do
         )
 
         if state.owner, do: send(state.owner, {:viewport_viz_tier, self(), tier})
-        sync_viz(%{state | tier: tier})
+        # At :off the bars are cleared and the ticks stop: draw that once.
+        %{state | tier: tier} |> sync_viz() |> Viewport.rerender()
       else
         state
       end

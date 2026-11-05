@@ -26,7 +26,8 @@ defmodule UniversalProxy.Display.Binding do
         %{
           key: output.key,
           client_id: output_client_id(output),
-          cec_dev: cec_dev(Map.get(output, :card_index), adapters)
+          cec_dev: cec_dev(Map.get(output, :card_index), adapters),
+          hdmi_port: Store.hdmi_port(output.key)
         }
     end
   end
