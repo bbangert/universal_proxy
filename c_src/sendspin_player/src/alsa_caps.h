@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -17,6 +18,11 @@
 // kernel mishandles, so a real test-open against the configuration space is
 // the only authoritative source. See plan/scratchpad for #64.
 //
+// A device that only takes IEC958 subframes (Pi HDMI) reports 16-bit at
+// every probed rate, plus 24-bit at the rates an LPCM descriptor in the
+// sink's ELD pairs with 24 bits, since `plughw:` packs linear samples into
+// subframes (see `ProbedCaps::pairs`).
+//
 // This is a distinct concern from `AlsaPipeSink` (long-lived playback open);
 // the probe is a transient open/close that runs once at startup.
 
@@ -25,6 +31,10 @@
 struct ProbedCaps {
     std::vector<uint32_t> rates;      ///< accepted sample rates (Hz)
     std::vector<uint8_t> bit_depths;  ///< accepted bit depths (16 / 24 / 32)
+    /// When non-empty, the exact (rate, depth) combinations to advertise,
+    /// replacing the rates x bit_depths cross product (IEC958/HDMI sinks,
+    /// whose ELD pairs rates with sample sizes per descriptor).
+    std::vector<std::pair<uint32_t, uint8_t>> pairs;
     bool ok = false;                  ///< false ⇒ use baseline floor
 };
 
