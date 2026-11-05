@@ -94,6 +94,15 @@ config :universal_proxy, UniversalProxy.Cec,
   scan_interval_ms: 10_000,
   transport: Circuits.CEC.Transport.Port
 
+# TV UI on a Pi's HDMI output (see `UniversalProxy.Display`). Off here;
+# config/target.exs turns it on, with the Emerge renderer, for the Pi HDMI
+# targets only. `:renderer` is a `UniversalProxy.Display.Renderer` module.
+# `:autostart` shows the placeholder screen at boot when a DRM card exists.
+config :universal_proxy, UniversalProxy.Display,
+  enabled: false,
+  renderer: UniversalProxy.Display.Renderer.Null,
+  autostart: false
+
 # Import environment specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.
 import_config "#{config_env()}.exs"

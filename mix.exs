@@ -16,6 +16,9 @@ defmodule UniversalProxy.MixProject do
     :rpi5,
     :x86_64
   ]
+  # Targets with a Pi HDMI output driven by `UniversalProxy.Display`. Keep in
+  # sync with `display_targets` in config/target.exs.
+  @display_targets [:rpi0_2, :rpi3, :rpi4, :rpi5]
 
   def project do
     [
@@ -188,6 +191,13 @@ defmodule UniversalProxy.MixProject do
       # 0.1.0. The host wires it via the `UniversalProxy.FirmwareUpdate`
       # facade, which stays in-app.
       {:nerves_github_updater, "~> 0.2"},
+
+      # Native GUI (Skia, DRM/KMS) for the TV "now playing" screen on the
+      # HDMI output (`UniversalProxy.Display`). Pi HDMI targets only: the
+      # precompiled NIF is downloaded per target, so host and the other
+      # targets never fetch or compile it. Which NIF variant is fetched is
+      # chosen by `config :emerge, compiled_backends:` in config/target.exs.
+      {:emerge, "~> 0.5.1", targets: @display_targets},
 
       # Dependencies for specific targets
       # NOTE: It's generally low risk and recommended to follow minor version

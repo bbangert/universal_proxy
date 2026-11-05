@@ -51,8 +51,21 @@ config :nerves_runtime,
 # https://github.com/nerves-project/erlinit/ for more information on
 # configuring erlinit.
 
+# Targets whose Pi HDMI output can show the TV UI (`UniversalProxy.Display`,
+# rendered with Emerge). Keep in sync with `@display_targets` in mix.exs,
+# which limits the `:emerge` dependency to the same targets.
+display_targets = [:rpi0_2, :rpi3, :rpi4, :rpi5]
+display_target? = Mix.target() in display_targets
+
 # Advance the system clock on devices without real-time clocks.
-config :nerves, :erlinit, update_clock: true
+#
+# On the display targets, also turn off Mesa's on-disk shader cache so GL
+# rendering never writes cache files to the SD card. (`env` is a repeatable
+# erlinit option; this adds to the system's own `-e` lines.)
+config :nerves,
+       :erlinit,
+       [update_clock: true] ++
+         if(display_target?, do: [env: "MESA_SHADER_CACHE_DISABLE=true"], else: [])
 
 # Configure the device for SSH IEx prompt access and firmware updates
 #
@@ -172,6 +185,42 @@ config :universal_proxy,
 # vc4 HDMI CEC driver. A target without it has no /dev/cecN, so the
 # subsystem finds no adapters and starts nothing.
 config :universal_proxy, UniversalProxy.Cec, enabled: true
+
+# TV UI on the Pi HDMI output (`UniversalProxy.Display`), display targets only.
+# Every other target leaves the subsystem off (config.exs) and has no
+# `:emerge` dependency, so `:emerge` is configured only where it exists.
+if display_target? do
+  # Emerge only knows stock Nerves systems; on our custom systems it would
+  # default to a headless-only NIF, so pick the variant explicitly. CPU raster
+  # is always compiled in, so `drm: [:raster, :opengl]` fetches the single
+  # `drm_opengl` NIF, which serves both `renderer: [api: :raster]` (CPU KMS
+  # dumb buffers) and `:opengl`/`:auto` (GLES2 via GBM/EGL, falling back to
+  # raster if GL fails to start). But that NIF has libgbm.so.1 as a hard
+  # NEEDED, so it will not load on a rootfs without Mesa: rpi4/rpi5 ship
+  # Mesa; rpi3/rpi0_2 do not yet, so they get the GPU-free `drm` NIF (raster
+  # only) unless UP_DISPLAY_GL=1 is set for a build against a Mesa-enabled
+  # system. Mix recompiles emerge when this changes, but the previous
+  # variant's .so stays in _build/<target>_<env>/lib/emerge/priv/native and
+  # would ship too: `mix deps.clean emerge --build` after switching.
+  display_gl? =
+    Mix.target() in [:rpi4, :rpi5] or System.get_env("UP_DISPLAY_GL") in ["1", "true"]
+
+  config :emerge,
+    compiled_backends: [drm: if(display_gl?, do: [:raster, :opengl], else: [:raster])]
+
+  # `autostart: false` while the spike benchmarks drive the viewport by hand
+  # (see `UniversalProxy.Display.Bench`).
+  config :universal_proxy, UniversalProxy.Display,
+    enabled: true,
+    renderer: UniversalProxy.Display.Renderer.Emerge,
+    autostart: false,
+    # Emerge's paint-layer cache defaults to 640 MiB, far above the CMA
+    # pool GL render targets come from; the 512 MB/1 GB boards get less.
+    layer_cache_mb: if(Mix.target() in [:rpi3, :rpi0_2], do: 48, else: 128),
+    # Ask for 720p on the A53 boards, where 1080p CPU raster is the main
+    # frame-budget risk (an automatic-selection hint, not a pinned mode).
+    preferred_size: if(Mix.target() in [:rpi3, :rpi0_2], do: {1280, 720}, else: nil)
+end
 
 # Import target specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.

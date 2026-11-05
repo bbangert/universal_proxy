@@ -62,6 +62,11 @@ defmodule UniversalProxy.Application do
         # `:ignore` unless `UniversalProxy.Cec` has `enabled: true`
         # (targets only), so host/test never open a CEC device.
         UniversalProxy.Cec.Supervisor,
+        # TV UI on the Pi HDMI output (State + the viewport's
+        # DynamicSupervisor). AFTER Audio and Cec, whose state it will follow.
+        # Returns `:ignore` unless `UniversalProxy.Display` has
+        # `enabled: true` (Pi HDMI targets only), so host/test never touch DRM.
+        UniversalProxy.Display.Supervisor,
         # USB backup storage settings (DETS): per-drive share opt-in and the
         # generated Samba credentials. Top level, outside Storage.Supervisor,
         # so a crash in that subtree never closes the DETS file — the same
