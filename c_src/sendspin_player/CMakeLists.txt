@@ -24,14 +24,16 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "" FORCE)
 set(SENDSPIN_CPP_REF "9a15c83f06718fdb10130e56383c6379313e6d69" # post-v0.9.5 (main @ #216)
     CACHE STRING "sendspin-cpp commit SHA to pin" FORCE)
 
-# Trim sendspin-cpp to just the player role. Other roles ship dead code on a
-# device that only plays audio and cost compile time on slower cross-targets.
+# The player role, plus the display roles (controller, metadata, color,
+# artwork, visualizer) the HDMI TV UI consumes. One binary serves every
+# output: the display roles are only registered at runtime when the BEAM
+# passes --display-roles, so other outputs advertise the player role alone.
 set(SENDSPIN_ENABLE_PLAYER     ON  CACHE BOOL "" FORCE)
-set(SENDSPIN_ENABLE_CONTROLLER OFF CACHE BOOL "" FORCE)
-set(SENDSPIN_ENABLE_METADATA   OFF CACHE BOOL "" FORCE)
-set(SENDSPIN_ENABLE_COLOR      OFF CACHE BOOL "" FORCE)
-set(SENDSPIN_ENABLE_ARTWORK    OFF CACHE BOOL "" FORCE)
-set(SENDSPIN_ENABLE_VISUALIZER OFF CACHE BOOL "" FORCE)
+set(SENDSPIN_ENABLE_CONTROLLER ON  CACHE BOOL "" FORCE)
+set(SENDSPIN_ENABLE_METADATA   ON  CACHE BOOL "" FORCE)
+set(SENDSPIN_ENABLE_COLOR      ON  CACHE BOOL "" FORCE)
+set(SENDSPIN_ENABLE_ARTWORK    ON  CACHE BOOL "" FORCE)
+set(SENDSPIN_ENABLE_VISUALIZER ON  CACHE BOOL "" FORCE)
 # Added upstream in v0.9.x and defaulted ON: the source (audio capture) role
 # and its Opus encoder. We only play audio, so the role is off; the codec
 # option stays ON because our advertised formats include Opus (see
@@ -101,6 +103,11 @@ add_executable(sendspin_player
     src/alsa_pipe_sink.cpp
     src/alsa_caps.cpp
     src/file_persistence.cpp
+    src/json_out.cpp
+    src/display_roles.cpp
+    src/artwork_store.cpp
+    src/started_event.cpp
+    src/sha256.cpp
 )
 
 target_link_libraries(sendspin_player
@@ -116,3 +123,18 @@ target_include_directories(sendspin_player PRIVATE src)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(sendspin_player PRIVATE -Wall -Wextra)
 endif()
+
+# Host unit tests for the pure helpers (JSON budget, artwork retention,
+# SHA-256). Not part of the default build; test/sendspin_player_unit_test.exs
+# builds and runs it.
+add_executable(sendspin_player_unit_tests EXCLUDE_FROM_ALL
+    test/unit_tests.cpp
+    src/json_out.cpp
+    src/display_roles.cpp
+    src/artwork_store.cpp
+    src/started_event.cpp
+    src/sha256.cpp
+)
+target_link_libraries(sendspin_player_unit_tests PRIVATE sendspin pthread)
+target_compile_features(sendspin_player_unit_tests PRIVATE cxx_std_20)
+target_include_directories(sendspin_player_unit_tests PRIVATE src)

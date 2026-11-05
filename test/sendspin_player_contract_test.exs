@@ -388,6 +388,92 @@ defmodule SendspinPlayerContractTest do
     assert next_event(port) == %{"event" => "mute", "value" => true}
   end
 
+  test "without --display-roles, display commands are dropped", %{port: port, started: started} do
+    refute Map.has_key?(started, "display_roles")
+
+    send_command(port, ~s({"cmd":"controller","value":3}))
+    send_command(port, ~s({"cmd":"viz_enable","value":true}))
+    send_command(port, ~s({"cmd":"set_volume","value":42}))
+    assert next_event(port) == %{"event" => "volume", "value" => 42}
+  end
+
+  test "--display-roles registers the roles and handles display commands", %{tmp_dir: tmp_dir} do
+    art = Path.join(tmp_dir, "art/nested")
+
+    port =
+      spawn_player(
+        state_dir: Path.join(tmp_dir, "display"),
+        ws_port: @ws_port + 9,
+        extra: [
+          "--display-roles",
+          "--artwork-dir",
+          art,
+          "--artwork-size",
+          "320x320",
+          "--viz-bins",
+          "16",
+          "--viz-rate",
+          "30",
+          "--viz-offset-ms",
+          "100"
+        ]
+      )
+
+    os_pid =
+      case Port.info(port, :os_pid) do
+        {:os_pid, pid} -> pid
+        _ -> nil
+      end
+
+    on_exit(fn -> shutdown_os_process(os_pid) end)
+
+    assert %{"display_roles" => true} = assert_started_event(port)
+    assert File.dir?(art)
+    assert_volume_event(port)
+    assert_static_delay_event(port)
+    assert_listening_event(port)
+
+    # No server connected: the controller role refuses, and says so.
+    send_command(port, ~s({"cmd":"controller","value":3}))
+
+    assert next_event(port) == %{
+             "event" => "controller_result",
+             "command" => "next",
+             "ok" => false
+           }
+
+    # Only PLAY..PREVIOUS (0..4) as an int; anything else is dropped.
+    send_command(port, ~s({"cmd":"controller","value":5}))
+    send_command(port, ~s({"cmd":"controller","value":-1}))
+    send_command(port, ~s({"cmd":"controller","value":true}))
+    send_command(port, ~s({"cmd":"viz_enable","value":1}))
+    send_command(port, ~s({"cmd":"viz_enable","value":true}))
+    assert next_event(port) == %{"event" => "viz_enable", "value" => true}
+
+    send_command(port, ~s({"cmd":"set_volume","value":42}))
+    assert next_event(port) == %{"event" => "volume", "value" => 42}
+  end
+
+  test "rejects out-of-range display options" do
+    for {args, n} <- [
+          {["--viz-bins", "0"], 7},
+          {["--viz-bins", "129"], 8},
+          {["--viz-rate", "61"], 9},
+          {["--viz-offset-ms", "-1"], 10},
+          {["--artwork-size", "480"], 11},
+          {["--artwork-size", "8x480"], 12}
+        ] do
+      port =
+        spawn_player(
+          state_dir: Path.join(System.tmp_dir!(), "sendspin_contract_bad_#{n}"),
+          ws_port: @ws_port + 10 + n,
+          extra: ["--display-roles" | args]
+        )
+
+      assert wait_for_exit(port) != 0, "expected #{inspect(args)} to be rejected"
+    end
+  end
+
   test "shutdown command exits cleanly within a few seconds", %{port: port} do
     send_command(port, ~s({"cmd":"shutdown"}))
 

@@ -47,7 +47,7 @@ defmodule UniversalProxy.Audio.Server do
 
   require Logger
 
-  alias UniversalProxy.Audio.{MdnsDiscovery, Params, Player, Store}
+  alias UniversalProxy.Audio.{DisplayRoles, MdnsDiscovery, Params, Player, Store}
 
   @pubsub UniversalProxy.PubSub
   @hotplug_interval 5_000
@@ -178,6 +178,16 @@ defmodule UniversalProxy.Audio.Server do
   end
 
   @doc """
+  The pid of an output's running player, or `:error` when the output has
+  none (absent, disabled, or between a crash and its respawn). Callers
+  must not cache it: players are respawned with fresh pids.
+  """
+  @spec player_pid(GenServer.server(), key()) :: {:ok, pid()} | :error
+  def player_pid(server \\ __MODULE__, {slot_sub, _vid, _pid} = key) when is_binary(slot_sub) do
+    GenServer.call(server, {:player_pid, key})
+  end
+
+  @doc """
   Force a hotplug poll synchronously. Tests use this to avoid waiting
   on the periodic timer.
   """
@@ -201,6 +211,12 @@ defmodule UniversalProxy.Audio.Server do
     player_module = Keyword.get(opts, :player_module, Player)
     mdns_discovery = Keyword.get(opts, :mdns_discovery, MdnsDiscovery)
     mdns_module = Keyword.get(opts, :mdns_module, MdnsLite)
+
+    display_roles =
+      Keyword.merge(DisplayRoles.config(), Keyword.get(opts, :display_roles, []))
+
+    hdmi_status_fun =
+      Keyword.get(opts, :hdmi_status_fun, &DisplayRoles.connector_status/1)
 
     state = %{
       enumerate_module: enumerate_module,
@@ -237,6 +253,14 @@ defmodule UniversalProxy.Audio.Server do
       # Outputs whose players run in external-volume mode
       # (`set_volume_external/3`). Runtime only.
       volume_external: MapSet.new(),
+      # Sendspin display roles for the HDMI TV UI (`Audio.DisplayRoles`):
+      # config, and the HDMI port → DRM connector status reader.
+      display_roles: display_roles,
+      hdmi_status_fun: hdmi_status_fun,
+      # The output whose player was last given the display roles. It keeps
+      # them across respawns while it is present, whatever the connectors
+      # say by then, so a respawn never leaves the feed with no player.
+      display_owner: nil,
       # Debounce flag: a `sound` uevent schedules one delayed
       # `:check_hotplug` and sets this; the burst of sub-device uevents a
       # single card emits then coalesces into that one re-enumeration.
@@ -323,6 +347,13 @@ defmodule UniversalProxy.Audio.Server do
 
       :error ->
         {:reply, :error, state}
+    end
+  end
+
+  def handle_call({:player_pid, key}, _from, state) do
+    case Map.fetch(state.players, key) do
+      {:ok, %{pid: pid}} -> {:reply, {:ok, pid}, state}
+      :error -> {:reply, :error, state}
     end
   end
 
@@ -724,6 +755,7 @@ defmodule UniversalProxy.Audio.Server do
       |> stop_players(removed)
       |> start_players_for_enabled(merged_adds)
       |> respawn_missing_players()
+      |> transfer_display_roles(removed)
 
     Enum.each(merged_adds, &broadcast_added/1)
     Enum.each(removed, &broadcast_removed/1)
@@ -946,12 +978,15 @@ defmodule UniversalProxy.Audio.Server do
     key = merged.key
     server_url = current_server_url(state)
 
+    display_roles = display_roles_for(state, merged)
+
     opts = [
       key: key,
       config: merged,
       mdns_port: mdns_port,
       server_url: server_url,
-      volume_external: MapSet.member?(state.volume_external, key)
+      volume_external: MapSet.member?(state.volume_external, key),
+      display_roles: display_roles
     ]
 
     case DynamicSupervisor.start_child(
@@ -960,8 +995,14 @@ defmodule UniversalProxy.Audio.Server do
          ) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
+        state = if display_roles, do: %{state | display_owner: key}, else: state
 
-        put_in(state.players[key], %{pid: pid, monitor: ref, mdns_port: mdns_port})
+        put_in(state.players[key], %{
+          pid: pid,
+          monitor: ref,
+          mdns_port: mdns_port,
+          display_roles: display_roles != nil
+        })
 
       {:error, {:binary_missing, path}} ->
         # Binary not built for this target (or stripped from priv/).
@@ -980,6 +1021,44 @@ defmodule UniversalProxy.Audio.Server do
         Logger.error("Audio.Player start failed for #{inspect(key)}: #{inspect(reason)}")
 
         state
+    end
+  end
+
+  # The display roles go to one output (plan P3): the owner while it is
+  # present, else the HDMI output `DisplayRoles.choose/2` picks. Ownership
+  # is sticky so a respawn gives them back to the same output; the
+  # `--display-roles` hello is fixed per binary, so moving them means a
+  # respawn (see `transfer_display_roles/2`).
+  defp display_roles_for(%{display_roles: cfg} = state, merged) do
+    if Keyword.fetch!(cfg, :enabled) and display_owner(state) == merged.key do
+      DisplayRoles.player_opts(merged, cfg)
+    end
+  end
+
+  defp display_owner(%{display_owner: owner, outputs: outputs} = state) do
+    if owner != nil and Map.has_key?(outputs, owner),
+      do: owner,
+      else: DisplayRoles.choose(Map.values(outputs), state.hdmi_status_fun)
+  end
+
+  # The owner output went away: its player is gone with it. Respawn the new
+  # choice's player, if one is running without the roles, so the feed moves
+  # there instead of waiting for that player's next unrelated respawn.
+  defp transfer_display_roles(%{display_owner: owner} = state, removed) do
+    if owner != nil and MapSet.member?(removed, owner) do
+      state = %{state | display_owner: nil}
+      new_owner = display_owner(state)
+
+      case state.players[new_owner] do
+        %{display_roles: false} ->
+          merged = Map.fetch!(state.outputs, new_owner)
+          state |> stop_player(new_owner) |> start_player(merged)
+
+        _ ->
+          state
+      end
+    else
+      state
     end
   end
 
@@ -1145,6 +1224,7 @@ defmodule UniversalProxy.Audio.Server do
     output
     |> Map.merge(live)
     |> Map.put(:volume_external, MapSet.member?(state.volume_external, output.key))
+    |> Map.put(:display_roles, get_in(state.players, [output.key, :display_roles]) == true)
   end
 
   defp current_server_url(state) do

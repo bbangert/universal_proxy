@@ -20,6 +20,18 @@ Player tests need to drive.
     {"cmd":"shutdown"}             → {"event":"shutdown"} + exit 0
     {"cmd":"force_exit"}           → exit 7 (test-only; no event)
 
+  with --display-roles (dropped otherwise, like the real binary):
+    {"cmd":"controller","value":0..4} → {"event":"controller_result","command":..,"ok":true}
+    {"cmd":"viz_enable","value":B}    → {"event":"viz_enable","value":B}
+    {"cmd":"emit_display"}  → metadata, controller_state, group, color, and an
+                              artwork event whose file is written to
+                              --artwork-dir as <sha256>.jpg (test-only)
+    {"cmd":"emit_viz"}      → one viz frame of --viz-bins bins, only while
+                              viz_enable is on (test-only)
+
+  test-only, any mode:
+    {"cmd":"emit_event","event":{...}} → that event, verbatim
+
 Unknown commands are silently dropped, matching the real binary's
 parse_command behaviour.
 
@@ -27,6 +39,7 @@ No external dependencies. sys.stdout is explicitly flushed after every
 write so the BEAM port sees events line-by-line.
 """
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -44,6 +57,8 @@ FAKE_CLIENT_ID = "ZmFrZS1zZW5kc3Bpbi1wbGF5ZXItaWQtMzJieXRlcyE"
 # chars, 2 mapped to 9). Like the real one it is only ever written to
 # <state-dir>/pairing_token, never to stdout/stderr.
 FAKE_PAIRING_TOKEN = "SP:0" + ("FAKETOKEN" * 12)[:103]
+
+CONTROLLER_COMMANDS = ["play", "pause", "stop", "next", "previous"]
 
 
 def write_pairing_token(state_dir):
@@ -64,6 +79,37 @@ def write_pairing_token(state_dir):
 def emit(event):
     sys.stdout.write(json.dumps(event) + "\n")
     sys.stdout.flush()
+
+
+def emit_display(args, seq):
+    """The display events a real server session produces, in a plausible
+    order. The artwork bytes are written like the real binary does:
+    content-named, via a dot-temp and rename."""
+    emit({"event": "metadata", "title": "Fake Song", "artist": "Fake Artist",
+          "album_artist": "Fake Artist", "album": "Fake Album", "year": 2001,
+          "track": 3, "progress": {"track_progress": 1000,
+                                   "track_duration": 200000,
+                                   "playback_speed": 1000,
+                                   "progress_age_ms": 250}})
+    emit({"event": "controller_state",
+          "supported_commands": ["play", "pause", "stop", "next", "previous"],
+          "volume": 40, "muted": False, "repeat": "off", "shuffle": False})
+    emit({"event": "group", "playback_state": "playing",
+          "group_id": "fake-group", "group_name": "Fake Group"})
+    emit({"event": "color", "background_dark": [10, 20, 30], "primary": [200, 40, 40]})
+    if args.artwork_dir:
+        data = ("fake-jpeg-%d" % seq).encode()
+        sha = hashlib.sha256(data).hexdigest()
+        path = os.path.join(args.artwork_dir, sha + ".jpg")
+        tmp = os.path.join(args.artwork_dir, "." + sha + ".jpg.tmp")
+        os.makedirs(args.artwork_dir, exist_ok=True)
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+        width, height = (int(v) for v in args.artwork_size.split("x"))
+        emit({"event": "artwork", "slot": 0, "path": path, "format": "jpeg",
+              "width": width, "height": height, "bytes": len(data), "seq": seq,
+              "lateness_ms": 0})
 
 
 def main():
@@ -87,6 +133,13 @@ def main():
     p.add_argument("--initial-volume", type=int, default=50)
     p.add_argument("--initial-static-delay-ms", type=int, default=0)
     p.add_argument("--external-volume", action="store_true")
+    p.add_argument("--display-roles", action="store_true")
+    p.add_argument("--artwork-dir", default="")
+    p.add_argument("--artwork-size", default="480x480")
+    p.add_argument("--artwork-keep", type=int, default=8)
+    p.add_argument("--viz-bins", type=int, default=32)
+    p.add_argument("--viz-rate", type=int, default=20)
+    p.add_argument("--viz-offset-ms", type=int, default=0)
     p.add_argument("--log-level", default="info")
     args = p.parse_args()
 
@@ -100,14 +153,19 @@ def main():
     # name, alsa_device (see c_src/sendspin_player/src/main.cpp:626-633).
     # state_dir, mdns_port (the CLI arg, same as port here), server,
     # and initial_volume are NOT echoed on `started`.
-    emit({
+    started = {
         "event": "started",
         "version": FAKE_VERSION,
         "port": args.mdns_port,
         "name": args.name,
         "product": args.product,
         "alsa_device": args.alsa_device,
-    })
+    }
+    if args.display_roles:
+        started["display_roles"] = True
+    emit(started)
+    viz_enabled = False
+    artwork_seq = 0
 
     # Like the real binary, write the pairing token after start() and
     # before the initial `volume` event.
@@ -167,6 +225,26 @@ def main():
             # event). Drives the `:exit_status` handling path in
             # Audio.Player.
             return 7
+        elif kind == "emit_event" and isinstance(cmd.get("event"), dict):
+            emit(cmd["event"])
+        elif not args.display_roles:
+            continue
+        elif kind == "controller":
+            value = cmd.get("value")
+            if type(value) is int and 0 <= value < len(CONTROLLER_COMMANDS):
+                emit({"event": "controller_result",
+                      "command": CONTROLLER_COMMANDS[value], "ok": True})
+        elif kind == "viz_enable":
+            if isinstance(cmd.get("value"), bool):
+                viz_enabled = cmd["value"]
+                emit({"event": "viz_enable", "value": viz_enabled})
+        elif kind == "emit_display":
+            artwork_seq += 1
+            emit_display(args, artwork_seq)
+        elif kind == "emit_viz":
+            if viz_enabled:
+                emit({"event": "viz", "lead_ms": args.viz_offset_ms, "loudness": 128,
+                      "bins": [(i * 8) % 256 for i in range(args.viz_bins)]})
         # Unknown commands: ignore, like the real binary.
 
     return 0

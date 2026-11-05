@@ -66,6 +66,7 @@ defmodule UniversalProxy.Audio.ServerTest do
       # respawned player received the NEW friendly_name (a regression
       # that restarted with stale config would otherwise pass).
       record({:started, key, mdns_port, config})
+      record({:start_display_roles, key, Keyword.get(opts, :display_roles)})
       record({:start_volume_external, key, Keyword.get(opts, :volume_external)})
       {:ok, %{key: key}}
     end
@@ -1702,6 +1703,200 @@ defmodule UniversalProxy.Audio.ServerTest do
           do_eventually(check, deadline)
         end
       end
+    end
+  end
+
+  describe "display roles (plan P3)" do
+    @hdmi0_key {"vc4-hdmi-0", nil, nil}
+    @hdmi1_key {"vc4-hdmi-1", nil, nil}
+
+    setup do
+      start_supervised!(PlayerStubCalls, id: :player_stub_calls)
+      :ok
+    end
+
+    defp start_display_server!(status_fun, outputs) do
+      player_sup =
+        start_supervised!({DynamicSupervisor, strategy: :one_for_one, name: nil},
+          id: :display_player_sup
+        )
+
+      path =
+        Path.join(
+          System.tmp_dir!(),
+          "audio_server_display_#{System.unique_integer([:positive])}.dets"
+        )
+
+      on_exit(fn -> File.rm(path) end)
+
+      store =
+        start_supervised!({Store, name: nil, table: :display_store, dets_path: path},
+          id: :display_store
+        )
+
+      server =
+        start_supervised!(
+          {Server,
+           name: nil,
+           store: store,
+           enumerate_module: EnumerateStub,
+           start_timer: false,
+           player_supervisor: player_sup,
+           player_module: PlayerStub,
+           mdns_discovery: nil,
+           mdns_module: nil,
+           display_roles: [enabled: true, artwork_root: "/tmp/up_artwork_test"],
+           hdmi_status_fun: status_fun},
+          id: :display_server
+        )
+
+      EnumerateStub.set(outputs)
+      :ok = Server.check_now(server)
+      server
+    end
+
+    defp hdmi_hardware(card_index, name) do
+      %{card_index: card_index, alsa_device: "hw:#{card_index},0", card_name: name, usb_port: nil}
+    end
+
+    defp display_roles_by_key do
+      for {:start_display_roles, key, roles} <- PlayerStubCalls.calls(),
+          into: %{},
+          do: {key, roles}
+    end
+
+    test "only the HDMI output gets display roles, pointed at its own artwork dir" do
+      server =
+        start_display_server!(fn _port -> :unknown end, %{
+          @hp_key => hp_hardware(),
+          @hdmi_key => hdmi_hardware(1, "vc4-hdmi")
+        })
+
+      roles = display_roles_by_key()
+      assert roles[@hp_key] == nil
+
+      {:ok, %{client_id: client_id}} = Server.get_output(server, @hdmi_key)
+
+      assert %{
+               artwork_dir: dir,
+               artwork_size: {480, 480},
+               viz_bins: 32,
+               viz_rate: 20,
+               viz_offset_ms: 100
+             } = roles[@hdmi_key]
+
+      assert dir == Path.join("/tmp/up_artwork_test", client_id)
+
+      assert %{display_roles: true} =
+               Enum.find(Server.list_outputs(server), &(&1.key == @hdmi_key))
+
+      assert %{display_roles: false} =
+               Enum.find(Server.list_outputs(server), &(&1.key == @hp_key))
+    end
+
+    test "prefers HDMI 0 when connected, else the first connected port" do
+      outputs = %{
+        @hdmi0_key => hdmi_hardware(1, "vc4-hdmi-0"),
+        @hdmi1_key => hdmi_hardware(2, "vc4-hdmi-1")
+      }
+
+      _server =
+        start_display_server!(
+          fn port -> if port == 1, do: :connected, else: :disconnected end,
+          outputs
+        )
+
+      roles = display_roles_by_key()
+      assert roles[@hdmi0_key] == nil
+      assert %{artwork_dir: _} = roles[@hdmi1_key]
+    end
+
+    test "a respawn never gives the roles to a second player" do
+      outputs = %{
+        @hdmi0_key => hdmi_hardware(1, "vc4-hdmi-0"),
+        @hdmi1_key => hdmi_hardware(2, "vc4-hdmi-1")
+      }
+
+      # HDMI 1 is connected at boot; by the time HDMI 1's player is
+      # respawned... the choice would flip to HDMI 0, but HDMI 1 still runs
+      # with the roles, so HDMI 0's respawn must not take them too.
+      {:ok, status} = Agent.start_link(fn -> %{0 => :disconnected, 1 => :connected} end)
+      server = start_display_server!(fn port -> Agent.get(status, & &1[port]) end, outputs)
+      assert %{artwork_dir: _} = display_roles_by_key()[@hdmi1_key]
+
+      Agent.update(status, fn _ -> %{0 => :connected, 1 => :connected} end)
+      {:ok, hdmi0} = Server.player_pid(server, @hdmi0_key)
+      ref = Process.monitor(hdmi0)
+      Process.exit(hdmi0, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^hdmi0, :killed}
+      :ok = Server.check_now(server)
+
+      starts =
+        for {:start_display_roles, @hdmi0_key, roles} <- PlayerStubCalls.calls(), do: roles
+
+      assert starts == [nil, nil]
+    end
+
+    test "the owner keeps the roles across its own respawn after the preference flips" do
+      outputs = %{
+        @hdmi0_key => hdmi_hardware(1, "vc4-hdmi-0"),
+        @hdmi1_key => hdmi_hardware(2, "vc4-hdmi-1")
+      }
+
+      {:ok, status} = Agent.start_link(fn -> %{0 => :disconnected, 1 => :connected} end)
+      server = start_display_server!(fn port -> Agent.get(status, & &1[port]) end, outputs)
+      assert %{artwork_dir: _} = display_roles_by_key()[@hdmi1_key]
+
+      # HDMI 0 is now preferred, but HDMI 1 (and its TV) still owns the feed:
+      # its respawn must come back with the roles, or no player has them.
+      Agent.update(status, fn _ -> %{0 => :connected, 1 => :connected} end)
+      {:ok, hdmi1} = Server.player_pid(server, @hdmi1_key)
+      ref = Process.monitor(hdmi1)
+      Process.exit(hdmi1, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^hdmi1, :killed}
+      :ok = Server.check_now(server)
+
+      starts =
+        for {:start_display_roles, @hdmi1_key, roles} <- PlayerStubCalls.calls(), do: roles
+
+      assert [%{artwork_dir: _}, %{artwork_dir: _}] = starts
+
+      assert [%{key: @hdmi1_key}] =
+               Enum.filter(Server.list_outputs(server), & &1.display_roles)
+    end
+
+    test "the roles move, by a respawn, when the owner output goes away" do
+      outputs = %{
+        @hdmi0_key => hdmi_hardware(1, "vc4-hdmi-0"),
+        @hdmi1_key => hdmi_hardware(2, "vc4-hdmi-1")
+      }
+
+      server =
+        start_display_server!(
+          fn port -> if port == 1, do: :connected, else: :unknown end,
+          outputs
+        )
+
+      assert %{artwork_dir: _} = display_roles_by_key()[@hdmi1_key]
+      {:ok, old_hdmi0} = Server.player_pid(server, @hdmi0_key)
+
+      EnumerateStub.set(Map.delete(outputs, @hdmi1_key))
+      :ok = Server.check_now(server)
+
+      starts =
+        for {:start_display_roles, @hdmi0_key, roles} <- PlayerStubCalls.calls(), do: roles
+
+      assert [nil, %{artwork_dir: _}] = starts
+      assert {:ok, new_hdmi0} = Server.player_pid(server, @hdmi0_key)
+      assert new_hdmi0 != old_hdmi0
+      assert [%{key: @hdmi0_key}] = Enum.filter(Server.list_outputs(server), & &1.display_roles)
+    end
+
+    test "player_pid/2 names the running player, :error otherwise" do
+      server = start_display_server!(fn _ -> :unknown end, %{@hp_key => hp_hardware()})
+      assert {:ok, pid} = Server.player_pid(server, @hp_key)
+      assert is_pid(pid)
+      assert :error = Server.player_pid(server, {"missing", nil, nil})
     end
   end
 

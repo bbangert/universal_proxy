@@ -59,6 +59,49 @@ defmodule UniversalProxy.Audio.Player do
       {"cmd":"set_volume_external","value":true}
       {"cmd":"shutdown"}
 
+  ## Display roles
+
+  Started with the `:display_roles` option (see
+  `UniversalProxy.Audio.DisplayRoles`), the binary also takes the Sendspin
+  metadata, controller, color, artwork and visualizer roles and emits:
+
+      {"event":"metadata","title":"..","artist":"..","album_artist":"..","album":"..","year":1999,"track":3,"progress":{"track_progress":1234,"track_duration":200000,"playback_speed":1000,"progress_age_ms":0}}
+      {"event":"metadata_clear"}
+      {"event":"controller_state","supported_commands":["play","pause","next"],"volume":40,"muted":false,"repeat":"off","shuffle":false}
+      {"event":"controller_clear"}
+      {"event":"controller_result","command":"next","ok":true}
+      {"event":"group","playback_state":"playing","group_id":"..","group_name":".."}
+      {"event":"group_clear"}   (made by this process on a lost connection)
+      {"event":"color","background_dark":[20,20,30],"primary":[200,40,40]}
+      {"event":"color_clear"}
+      {"event":"artwork","slot":0,"path":"/tmp/up_artwork/<id>/<sha256>.jpg","format":"jpeg","width":480,"height":480,"bytes":51234,"seq":7,"lateness_ms":3}
+      {"event":"artwork_clear","slot":0}
+      {"event":"viz_enable","value":true}
+      {"event":"viz","lead_ms":98,"loudness":180,"bins":[0,12,255]}
+      {"event":"viz_clear"}
+
+  Optional text fields and colors are left out when the server sends none.
+  Visualizer values are 0..255; `lead_ms` is how far ahead of its display
+  time the frame arrived. Viz frames are only emitted while enabled with
+  `viz_enable/2` (off at start).
+
+  These never reach `"sendspin:state"` or `last_event/1`. Display events
+  are broadcast on `"sendspin:display"` as `{:sendspin_display, key, seq,
+  event}`, `seq` increasing per player, and the latest of each kind is
+  kept for `display_snapshot/1`. Each carries `received_at`, the
+  `System.monotonic_time(:millisecond)` it was read at: the current track
+  position is `track_progress + (progress_age_ms + now - received_at) *
+  playback_speed / 1000`, capped at `track_duration` when that is non-zero.
+  A lost server connection also publishes `{"event":"group_clear"}` (made
+  here; the binary has no group clear) when a group was known.
+
+  The binary owns the artwork dir's retention (the last `artwork_keep`
+  displayed files); this process only empties the dir before it starts. `viz`/`viz_clear` go to the per-output
+  topic `viz_topic/1` as `{:sendspin_viz, key, frame}`. Commands:
+
+      {"cmd":"controller","value":3}   (see controller/2)
+      {"cmd":"viz_enable","value":true}
+
   ## Startup snapshot
 
   The binary's first `volume` event reports its `--initial-volume`, and
@@ -86,7 +129,7 @@ defmodule UniversalProxy.Audio.Player do
   stdout, so it never reaches PubSub or the logs.
   `UniversalProxy.Audio.pairing_token/1` reads it on demand.
 
-  Each event is broadcast on PubSub topic `"sendspin:state"` as
+  Every other event is broadcast on PubSub topic `"sendspin:state"` as
   `{:sendspin_state, key, event_map}` so `LiveView` (Phase 4) and the
   `Audio.Server` cache can stay in sync without polling.
   """
@@ -106,7 +149,35 @@ defmodule UniversalProxy.Audio.Player do
 
   @pubsub UniversalProxy.PubSub
   @topic_state "sendspin:state"
+  @topic_display "sendspin:display"
   @shutdown_grace_ms 500
+
+  # The `event` values the binary emits for the display roles. Classified
+  # here so they bypass `"sendspin:state"` and `last_event`.
+  @display_events ~w(metadata metadata_clear controller_state controller_clear
+                     controller_result group color color_clear artwork artwork_clear
+                     viz_enable)
+  @viz_events ~w(viz viz_clear)
+
+  # Snapshot slot each display event fills (`{:put, slot}`) or empties
+  # (`{:delete, slot}`); kinds not listed are broadcast only.
+  @snapshot_ops %{
+    "metadata" => {:put, :metadata},
+    "metadata_clear" => {:delete, :metadata},
+    "controller_state" => {:put, :controller_state},
+    "controller_clear" => {:delete, :controller_state},
+    "group" => {:put, :group},
+    "group_clear" => {:delete, :group},
+    "color" => {:put, :color},
+    "color_clear" => {:delete, :color},
+    "artwork" => {:put, :artwork},
+    "artwork_clear" => {:delete, :artwork}
+  }
+
+  # `controller/2` commands → the binary's SendspinControllerCommand value.
+  @controller_commands %{play: 0, pause: 1, stop: 2, next: 3, previous: 4}
+
+  @artwork_file_re ~r/\A\.?[0-9a-f]{64}\.(jpg|png)(\.tmp)?\z/
 
   # RFC 6762 §8.3 announces. We call `MdnsLite.announce_all/0` (added
   # in our vendored fork) to emit proper multicast response packets
@@ -150,7 +221,11 @@ defmodule UniversalProxy.Audio.Player do
     volume_external: false,
     startup: [:volume],
     last_event: %{},
-    os_pid: nil
+    os_pid: nil,
+    display_roles: nil,
+    display: %{},
+    display_seq: 0,
+    discarding: false
   ]
 
   @type t :: %__MODULE__{
@@ -178,8 +253,14 @@ defmodule UniversalProxy.Audio.Player do
           volume_external: boolean(),
           startup: [:volume | :muted],
           last_event: map(),
-          os_pid: pos_integer() | nil
+          os_pid: pos_integer() | nil,
+          display_roles: UniversalProxy.Audio.DisplayRoles.player_opts() | nil,
+          display: %{optional(atom()) => map()},
+          display_seq: non_neg_integer(),
+          discarding: boolean()
         }
+
+  @type controller_command :: :play | :pause | :stop | :next | :previous
 
   # -- Client API --
 
@@ -228,6 +309,47 @@ defmodule UniversalProxy.Audio.Player do
   @spec last_event(GenServer.server()) :: map()
   def last_event(server), do: GenServer.call(server, :last_event)
 
+  @doc """
+  The latest display state for a late subscriber: `{seq, snapshot}`, where
+  `snapshot` maps `:metadata`, `:controller_state`, `:group`, `:color` and
+  `:artwork` to the last such event (absent once cleared) and `seq` is
+  the `seq` of the last display broadcast. Subscribe to
+  `"sendspin:display"` first, then drop queued events with a `seq` at or
+  below this one.
+  """
+  @spec display_snapshot(GenServer.server()) :: {non_neg_integer(), map()}
+  def display_snapshot(server), do: GenServer.call(server, :display_snapshot)
+
+  @doc """
+  Send a transport command to the Sendspin server through the controller
+  role. The binary reports the outcome as a `controller_result` display
+  event (`ok: false` when the server does not currently support the
+  command or no server is connected). `{:error, :display_roles_disabled}`
+  for a player started without display roles.
+  """
+  @spec controller(GenServer.server(), controller_command()) ::
+          :ok | {:error, :display_roles_disabled}
+  def controller(server, command) when is_map_key(@controller_commands, command) do
+    GenServer.call(server, {:controller, command})
+  end
+
+  @doc """
+  Turn the visualizer frame stream on or off (off at start). The role
+  stays subscribed with the server; this only stops the binary emitting
+  frames nobody is showing. Acked with a `viz_enable` display event.
+  """
+  @spec viz_enable(GenServer.server(), boolean()) :: :ok | {:error, :display_roles_disabled}
+  def viz_enable(server, enabled?) when is_boolean(enabled?) do
+    GenServer.call(server, {:viz_enable, enabled?})
+  end
+
+  @doc """
+  The PubSub topic a player's visualizer frames go to, named by the
+  output's `Audio.Store` `client_id`.
+  """
+  @spec viz_topic(String.t()) :: String.t()
+  def viz_topic(client_id) when is_binary(client_id), do: "sendspin:viz:" <> client_id
+
   @doc false
   # Test seam: send an arbitrary JSON command to the binary's stdin.
   # Used by `Audio.PlayerTest` to drive the fake binary's
@@ -268,6 +390,7 @@ defmodule UniversalProxy.Audio.Player do
     mac_address_fun = Keyword.get(opts, :mac_address_fun, &default_mac_address/0)
     state_dir = Keyword.get(opts, :state_dir) || state_dir(config)
     volume_external = Keyword.get(opts, :volume_external, false)
+    display_roles = Keyword.get(opts, :display_roles)
 
     state = %__MODULE__{
       key: key,
@@ -280,10 +403,12 @@ defmodule UniversalProxy.Audio.Player do
       device_name_fun: device_name_fun,
       mac_address_fun: mac_address_fun,
       state_dir: state_dir,
-      volume_external: volume_external
+      volume_external: volume_external,
+      display_roles: display_roles
     }
 
     if File.exists?(binary_path) do
+      prepare_artwork_dir(display_roles)
       port = open_port(state)
       # Port.info/2 returns `nil` if the port closed between open and
       # this call — happens when the binary exits immediately (bad arg,
@@ -362,6 +487,25 @@ defmodule UniversalProxy.Audio.Player do
     {:reply, state.last_event, state}
   end
 
+  def handle_call(:display_snapshot, _from, state) do
+    {:reply, {state.display_seq, state.display}, state}
+  end
+
+  def handle_call({cmd, _arg}, _from, %{display_roles: nil} = state)
+      when cmd in [:controller, :viz_enable] do
+    {:reply, {:error, :display_roles_disabled}, state}
+  end
+
+  def handle_call({:controller, command}, _from, state) do
+    send_command(state, {:controller, Map.fetch!(@controller_commands, command)})
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:viz_enable, enabled?}, _from, state) do
+    send_command(state, {:viz_enable, enabled?})
+    {:reply, :ok, state}
+  end
+
   @impl true
   def handle_cast({:__send_command__, cmd}, state) do
     send_command(state, cmd)
@@ -369,19 +513,42 @@ defmodule UniversalProxy.Audio.Player do
   end
 
   @impl true
+  # A line longer than the port's 4096-byte line buffer arrives as
+  # `:noeol` fragments ending in one `:eol` tail. The binary never emits
+  # one (it caps lines below that), so the whole line is dropped rather
+  # than misparsed from its tail.
+  def handle_info({port, {:data, {:noeol, _chunk}}}, %{port: port} = state) do
+    unless state.discarding do
+      Logger.warning("Audio.Player #{inspect(state.key)} dropped an oversize stdout line")
+    end
+
+    {:noreply, %{state | discarding: true}}
+  end
+
+  def handle_info({port, {:data, {:eol, _tail}}}, %{port: port, discarding: true} = state) do
+    {:noreply, %{state | discarding: false}}
+  end
+
   def handle_info({port, {:data, {:eol, line}}}, %{port: port} = state) do
     # `keys: :atoms` (NOT `:atoms!`) — interns unknown keys. The C++
     # binary's `emit_json` call sites are the only producers and their
-    # key set is statically defined in `c_src/sendspin_player/src/main.cpp`,
+    # key set is statically defined in `c_src/sendspin_player/src/`,
     # so the keyspace is finite and code-controlled. Values can be
     # network-derived (codec strings, error messages from the Sendspin
     # server) but values aren't atomised by `:atoms`, only keys.
     case Jason.decode(line, keys: :atoms) do
+      {:ok, %{event: kind} = event} when kind in @viz_events ->
+        broadcast_viz(state, event)
+        {:noreply, state}
+
+      {:ok, %{event: kind} = event} when kind in @display_events ->
+        {:noreply, handle_display_event(state, event)}
+
       {:ok, %{event: _} = event} ->
         state = state |> maybe_register_mdns(event) |> track_volume_external(event)
         {state, event} = tag_startup(state, event)
         broadcast_state(state, event)
-        {:noreply, %{state | last_event: event}}
+        {:noreply, forget_group(%{state | last_event: event}, event)}
 
       {:ok, _other} ->
         Logger.debug("Audio.Player #{inspect(state.key)} got non-event JSON: #{line}")
@@ -640,6 +807,7 @@ defmodule UniversalProxy.Audio.Player do
     ]
 
     base = if state.volume_external, do: base ++ ["--external-volume"], else: base
+    base = base ++ display_args(state.display_roles)
 
     # Sendspin servers display device_info as "Vendor / Product" (Music
     # Assistant's player list). Pass the node name (which carries the
@@ -723,6 +891,14 @@ defmodule UniversalProxy.Audio.Player do
 
   defp send_command(state, {:set_volume_external, external?}) when is_boolean(external?) do
     send_raw(state, [~s({"cmd":"set_volume_external","value":), to_string(external?), ~s(})])
+  end
+
+  defp send_command(state, {:controller, value}) when is_integer(value) do
+    send_raw(state, [~s({"cmd":"controller","value":), Integer.to_string(value), ~s(})])
+  end
+
+  defp send_command(state, {:viz_enable, enabled?}) when is_boolean(enabled?) do
+    send_raw(state, [~s({"cmd":"viz_enable","value":), to_string(enabled?), ~s(})])
   end
 
   defp send_command(state, :shutdown) do
@@ -1075,6 +1251,83 @@ defmodule UniversalProxy.Audio.Player do
 
   defp broadcast_state(%__MODULE__{key: key, pubsub: pubsub}, event) do
     Phoenix.PubSub.broadcast(pubsub, @topic_state, {:sendspin_state, key, event})
+  end
+
+  # -- Display roles --
+
+  defp display_args(nil), do: []
+
+  defp display_args(%{artwork_size: {w, h}} = d) do
+    [
+      "--display-roles",
+      "--artwork-dir",
+      d.artwork_dir,
+      "--artwork-size",
+      "#{w}x#{h}",
+      "--artwork-keep",
+      Integer.to_string(d.artwork_keep),
+      "--viz-bins",
+      Integer.to_string(d.viz_bins),
+      "--viz-rate",
+      Integer.to_string(d.viz_rate),
+      "--viz-offset-ms",
+      Integer.to_string(d.viz_offset_ms)
+    ]
+  end
+
+  defp handle_display_event(state, %{event: kind} = event) do
+    seq = state.display_seq + 1
+    event = Map.put(event, :received_at, System.monotonic_time(:millisecond))
+
+    display =
+      case Map.get(@snapshot_ops, kind) do
+        {:put, slot} -> Map.put(state.display, slot, event)
+        {:delete, slot} -> Map.delete(state.display, slot)
+        nil -> state.display
+      end
+
+    Phoenix.PubSub.broadcast(
+      state.pubsub,
+      @topic_display,
+      {:sendspin_display, state.key, seq, event}
+    )
+
+    %{state | display_seq: seq, display: display}
+  end
+
+  defp broadcast_viz(%__MODULE__{config: %{client_id: id}} = state, event) when is_binary(id) do
+    Phoenix.PubSub.broadcast(state.pubsub, viz_topic(id), {:sendspin_viz, state.key, event})
+  end
+
+  defp broadcast_viz(_state, _event), do: :ok
+
+  # The library clears the role state itself on a lost connection, but the
+  # group state has no clear of its own: publish one, sequenced like any
+  # display event, so subscribers and the snapshot agree.
+  defp forget_group(%{display: %{group: _}} = state, %{event: "disconnected"}),
+    do: handle_display_event(state, %{event: "group_clear"})
+
+  defp forget_group(state, _event), do: state
+
+  # Remove artwork left by a previous instance, so the dir only ever holds
+  # files this player reported.
+  defp prepare_artwork_dir(nil), do: :ok
+
+  defp prepare_artwork_dir(%{artwork_dir: dir}) do
+    case File.mkdir_p(dir) do
+      :ok ->
+        dir |> artwork_files() |> Enum.each(&File.rm(Path.join(dir, &1)))
+
+      {:error, reason} ->
+        Logger.warning("Audio.Player could not create artwork dir #{dir}: #{inspect(reason)}")
+    end
+  end
+
+  defp artwork_files(dir) do
+    case File.ls(dir) do
+      {:ok, names} -> Enum.filter(names, &Regex.match?(@artwork_file_re, &1))
+      {:error, _} -> []
+    end
   end
 
   defp force_kill(%__MODULE__{os_pid: nil}), do: :ok

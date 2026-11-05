@@ -239,6 +239,30 @@ defmodule UniversalProxy.Audio.Store do
 
   def default_friendly_name(slot_sub), do: slot_sub
 
+  @doc """
+  Whether an output (key or `slot_sub`) is the Pi's KMS HDMI audio card:
+  `vc4-hdmi`, or `vc4-hdmi-0`/`-1` on the two-port Pi 4 and Pi 5.
+  """
+  @spec hdmi?(output_key() | slot_sub()) :: boolean()
+  def hdmi?(key_or_slot_sub), do: hdmi_port(key_or_slot_sub) != nil
+
+  @doc """
+  The HDMI port number of an HDMI output (`vc4-hdmi` is port 0), or `nil`
+  for any other output.
+  """
+  @spec hdmi_port(output_key() | slot_sub()) :: non_neg_integer() | nil
+  def hdmi_port({slot_sub, _vid, _pid}), do: hdmi_port(slot_sub)
+  def hdmi_port("vc4-hdmi"), do: 0
+
+  def hdmi_port("vc4-hdmi-" <> port) do
+    case Integer.parse(port) do
+      {n, ""} when n >= 0 -> n
+      _ -> nil
+    end
+  end
+
+  def hdmi_port(_), do: nil
+
   # Uses presence checks (via `Params.has_key?/2`) rather than `||`
   # chaining so that explicit `false` values (e.g. `enabled: false`,
   # `muted: false`) are persisted instead of being silently overridden
