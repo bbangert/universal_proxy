@@ -1,15 +1,27 @@
-// Orders visualizer frames against stream clear/end. The drain thread
-// builds a frame outside any lock; if the main thread clears the stream
-// meanwhile, writing that frame after the clear would redraw stale bars.
-// A generation counter, bumped and checked under one mutex together with
-// the write, drops any frame begun before the latest clear.
+// Orders visualizer frames (drain thread) against stream boundaries and
+// viz_enable (main thread), all under one mutex together with the write:
+// once a `viz_clear` or a `viz_enable:false` ack is written, no frame that
+// belongs before it can follow.
+//
+// The listener API carries no stream id, so a frame is bound to its stream
+// by its delivery time (display time minus display_offset_ms, client
+// clock). At the pinned sendspin-cpp the drain thread's last stale check
+// passes a frame no earlier than 1 ms before that delivery time, and the
+// library marks a stream end/clear stale before it queues the matching
+// listener callback to the main loop. A frame that was current at the
+// check is therefore due before the boundary callback runs + 1 ms, so any
+// frame due within BOUNDARY_MARGIN_US of the latest boundary is dropped —
+// however late its callback reaches us. The cost is that a new stream's
+// frames due within that margin of its start are dropped too.
 //
 // Licensed under the Apache License, Version 2.0.
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <string>
 
@@ -17,33 +29,46 @@ class VizGate {
 public:
     using Emit = std::function<void(const std::string&)>;
 
+    static constexpr int64_t BOUNDARY_MARGIN_US = 2000;
+
     explicit VizGate(Emit emit) : emit_(std::move(emit)) {}
 
-    // Drain thread, before building a frame.
-    uint64_t begin() const {
-        std::lock_guard<std::mutex> lock(mtx_);
-        return generation_;
-    }
+    // Lock-free hint for skipping frame construction; emit_frame re-checks.
+    bool enabled() const { return enabled_.load(std::memory_order_relaxed); }
 
-    // Drain thread: writes the frame unless the stream was cleared, ended or
-    // restarted since begin(). Returns whether it was written.
-    bool emit_if_current(uint64_t generation, const std::string& line) {
+    // Drain thread: writes `line` if frames are enabled and the frame, due
+    // at `deliver_at_us`, is from after the latest boundary.
+    bool emit_frame(int64_t deliver_at_us, const std::string& line) {
         std::lock_guard<std::mutex> lock(mtx_);
-        if (generation != generation_) return false;
+        if (!enabled_.load(std::memory_order_relaxed)) return false;
+        if (boundary_us_ != NO_BOUNDARY && deliver_at_us <= boundary_us_ + BOUNDARY_MARGIN_US) {
+            return false;
+        }
         emit_(line);
         return true;
     }
 
-    // Main thread: a stream boundary. Every frame begun before it is
-    // dropped; `line` (if not empty) is written in the same critical section.
-    void boundary(const std::string& line = {}) {
+    // Main thread: a stream start, end or clear at `now_us`; `line` (if
+    // any) is written in the same critical section.
+    void boundary(int64_t now_us, const std::string& line = {}) {
         std::lock_guard<std::mutex> lock(mtx_);
-        ++generation_;
+        boundary_us_ = now_us;
         if (!line.empty()) emit_(line);
     }
 
+    // Main thread: viz_enable, with its ack written in the same critical
+    // section.
+    void set_enabled(bool enabled, const std::string& ack_line) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        enabled_.store(enabled, std::memory_order_relaxed);
+        emit_(ack_line);
+    }
+
 private:
+    static constexpr int64_t NO_BOUNDARY = std::numeric_limits<int64_t>::min();
+
     Emit emit_;
-    mutable std::mutex mtx_;
-    uint64_t generation_ = 0;
+    std::mutex mtx_;
+    std::atomic<bool> enabled_{false};
+    int64_t boundary_us_ = NO_BOUNDARY;
 };

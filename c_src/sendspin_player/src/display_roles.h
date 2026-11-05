@@ -98,7 +98,6 @@ private:
 
     struct Visualizer : sendspin::VisualizerRoleListener {
         const DisplayRolesOptions* opts = nullptr;
-        std::atomic<bool> enabled{false};
         std::atomic<bool> has_spectrum{true};
         std::atomic<uint16_t> loudness{0};
         VizGate gate{emit_json};

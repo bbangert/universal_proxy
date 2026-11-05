@@ -171,10 +171,9 @@ bool DisplayRoles::handle_command(const std::string& cmd, const std::string& kin
     }
 
     if (cmd == "viz_enable" && kind == "bool") {
-        visualizer_.enabled.store(bool_val);
         std::ostringstream os;
         os << "{\"event\":\"viz_enable\",\"value\":" << (bool_val ? "true" : "false") << '}';
-        emit_json(os.str());
+        visualizer_.gate.set_enabled(bool_val, os.str());
         return true;
     }
 
@@ -317,7 +316,6 @@ void DisplayRoles::Visualizer::emit_frame(int64_t client_timestamp,
                                           const std::vector<uint16_t>* bins) {
     const int64_t now = SendspinClient::now_us();
     if (!due(now)) return;
-    const uint64_t generation = gate.begin();
 
     std::ostringstream os;
     // Relative only: the client clock (CLOCK_MONOTONIC_RAW) is not the
@@ -340,32 +338,32 @@ void DisplayRoles::Visualizer::emit_frame(int64_t client_timestamp,
         }
     }
     os << "]}";
-    gate.emit_if_current(generation, os.str());
+    gate.emit_frame(client_timestamp - static_cast<int64_t>(opts->viz_offset_ms) * 1000, os.str());
 }
 
 void DisplayRoles::Visualizer::on_loudness(int64_t client_timestamp, uint16_t value) {
     loudness.store(value);
     // With spectrum, the spectrum frame carries the latest loudness.
-    if (enabled.load() && !has_spectrum.load()) emit_frame(client_timestamp, nullptr);
+    if (gate.enabled() && !has_spectrum.load()) emit_frame(client_timestamp, nullptr);
 }
 
 void DisplayRoles::Visualizer::on_spectrum(int64_t client_timestamp,
                                            const std::vector<uint16_t>& bins) {
-    if (enabled.load()) emit_frame(client_timestamp, &bins);
+    if (gate.enabled()) emit_frame(client_timestamp, &bins);
 }
 
 void DisplayRoles::Visualizer::on_visualizer_stream_start(const ServerVisualizerStreamObject& s) {
-    gate.boundary();
+    gate.boundary(SendspinClient::now_us());
     has_spectrum.store(std::find(s.types.begin(), s.types.end(), VisualizerDataType::SPECTRUM) !=
                        s.types.end());
 }
 
 void DisplayRoles::Visualizer::on_visualizer_stream_end() {
     loudness.store(0);
-    gate.boundary("{\"event\":\"viz_clear\"}");
+    gate.boundary(SendspinClient::now_us(), "{\"event\":\"viz_clear\"}");
 }
 
 void DisplayRoles::Visualizer::on_visualizer_stream_clear() {
     loudness.store(0);
-    gate.boundary("{\"event\":\"viz_clear\"}");
+    gate.boundary(SendspinClient::now_us(), "{\"event\":\"viz_clear\"}");
 }

@@ -287,7 +287,11 @@ max-pooled to `--viz-bins` if the server sends more. `lead_ms` is relative
 (display time minus now on the client clock), never an absolute
 timestamp. The library has no runtime switch for the visualizer
 subscription (its stream config is fixed in `client/state`), so
-`viz_enable` gates only what this binary writes.
+`viz_enable` gates only what this binary writes. Frames are written under one lock
+with `viz_clear` and the `viz_enable` ack (`viz_gate.h`): no frame follows
+a `viz_enable:false` ack, and none due before the latest stream
+start/end/clear (plus 2 ms) is written, which binds each frame to its
+stream by its delivery time since the listener API carries no stream id.
 
 ## Identity and admission
 

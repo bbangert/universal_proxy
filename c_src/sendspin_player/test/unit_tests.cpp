@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <atomic>
+#include <limits>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -172,46 +173,79 @@ static void test_artwork_store() {
 }
 
 static void test_viz_gate() {
-    std::vector<std::string> out;
+    using Lines = std::vector<std::string>;
+    Lines out;
     VizGate gate([&](const std::string& line) { out.push_back(line); });
 
-    // A frame begun before a clear is dropped, even if written after it.
-    uint64_t g = gate.begin();
-    gate.boundary("clear");
-    CHECK(!gate.emit_if_current(g, "stale"));
-    CHECK(out == std::vector<std::string>{"clear"});
+    // Off until enabled; the ack is written with the switch.
+    CHECK(!gate.emit_frame(5'000, "before-enable"));
+    gate.set_enabled(true, "ack:true");
+    CHECK(gate.emit_frame(5'000, "f1"));
 
-    // Frames begun after the clear go through; a silent boundary (stream
-    // start) also drops frames begun before it.
-    CHECK(gate.emit_if_current(gate.begin(), "fresh"));
-    g = gate.begin();
-    gate.boundary();
-    CHECK(!gate.emit_if_current(g, "stale2"));
-    CHECK((out == std::vector<std::string>{"clear", "fresh"}));
+    // Thread 1: a frame that passed the enabled() hint, then paused while
+    // the main thread acked the disable, is dropped: nothing follows the ack.
+    CHECK(gate.enabled());
+    gate.set_enabled(false, "ack:false");
+    CHECK(!gate.emit_frame(6'000, "in-flight"));
+    CHECK((out == Lines{"ack:true", "f1", "ack:false"}));
+    gate.set_enabled(true, "ack:true");
 
-    // Concurrent: once the clear is written, no frame begun before it follows.
-    std::vector<std::string> lines;
+    // Thread 2: the clear is written before the old stream's last frame even
+    // reaches the gate (the library delivered it after its final stale check).
+    // That frame was due before the boundary, so it is dropped however late
+    // it arrives; a frame due after the boundary goes through.
+    gate.boundary(10'000, "clear");
+    CHECK(!gate.emit_frame(9'500, "stale-old-stream"));
+    CHECK(!gate.emit_frame(10'000 + VizGate::BOUNDARY_MARGIN_US, "at-margin"));
+    CHECK(gate.emit_frame(10'000 + VizGate::BOUNDARY_MARGIN_US + 1, "new-stream"));
+    CHECK((out == Lines{"ack:true", "f1", "ack:false", "ack:true", "clear", "new-stream"}));
+
+    // A silent boundary (stream start) moves the cut too.
+    gate.boundary(20'000);
+    CHECK(!gate.emit_frame(19'000, "stale"));
+
+    // Concurrent: frames due on the drain thread's clock race clears and
+    // disables on another thread. Every frame written after a clear is due
+    // after it, and nothing is written between a disable ack and the next
+    // enable ack.
+    Lines lines;
     std::mutex lines_mtx;
     VizGate racy([&](const std::string& line) {
         std::lock_guard<std::mutex> lock(lines_mtx);
         lines.push_back(line);
     });
+    std::atomic<int64_t> clock{0};
     std::atomic<bool> stop{false};
+    racy.set_enabled(true, "on");
     std::thread drain([&] {
         while (!stop.load()) {
-            uint64_t gen = racy.begin();
-            racy.emit_if_current(gen, "frame:" + std::to_string(gen));
+            int64_t due = clock.fetch_add(1) * 10;
+            if (racy.enabled()) racy.emit_frame(due, "frame:" + std::to_string(due));
         }
     });
-    for (int i = 0; i < 200; i++) racy.boundary("clear:" + std::to_string(i + 1));
+    for (int i = 0; i < 300; i++) {
+        int64_t now = clock.load() * 10;
+        if (i % 3 == 2) {
+            racy.set_enabled(false, "off");
+            racy.set_enabled(true, "on");
+        } else {
+            racy.boundary(now, "clear:" + std::to_string(now));
+        }
+    }
     stop.store(true);
     drain.join();
-    uint64_t current = 0;
+    int64_t cut = std::numeric_limits<int64_t>::min();
+    bool on = false;
     for (const auto& line : lines) {
-        if (line.rfind("clear:", 0) == 0) {
-            current = std::stoull(line.substr(6));
+        if (line == "on") {
+            on = true;
+        } else if (line == "off") {
+            on = false;
+        } else if (line.rfind("clear:", 0) == 0) {
+            cut = std::stoll(line.substr(6));
         } else {
-            CHECK(std::stoull(line.substr(6)) == current);
+            CHECK(on);
+            CHECK(std::stoll(line.substr(6)) > cut + VizGate::BOUNDARY_MARGIN_US);
         }
     }
 }
