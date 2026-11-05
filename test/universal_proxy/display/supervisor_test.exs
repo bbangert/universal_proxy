@@ -34,7 +34,7 @@ defmodule UniversalProxy.Display.SupervisorTest do
     start_supervised!(
       {DisplaySupervisor,
        names ++
-         [enabled: true, renderer: Null, autostart: true, dri_dir: context.tmp_dir]}
+         [enabled: true, renderer: Null, ui: false, dri_dir: context.tmp_dir]}
     )
 
     assert %{running: true, renderer: Null, display_card: false, viewport: nil} =
@@ -52,7 +52,7 @@ defmodule UniversalProxy.Display.SupervisorTest do
          [
            enabled: true,
            renderer: FakeRenderer,
-           autostart: false,
+           ui: false,
            viewport_opts: [test_pid: self()]
          ]}
     )

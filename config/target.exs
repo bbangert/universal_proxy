@@ -199,12 +199,17 @@ if display_target? do
   # display systems ship (Mesa on rpi0_2/rpi3 since systems v0.1.14).
   config :emerge, compiled_backends: [drm: [:raster, :opengl]]
 
-  # `autostart: false` while the spike benchmarks drive the viewport by hand
-  # (see `UniversalProxy.Display.Bench`).
+  # `ui: false` keeps the TV UI dormant (no CEC key claims, no viewport, no
+  # HA select) until it ships: then `ui: true` here goes on together with
+  # `UniversalProxy.Audio.DisplayRoles` `enabled: true` below.
   config :universal_proxy, UniversalProxy.Display,
     enabled: true,
     renderer: UniversalProxy.Display.Renderer.Emerge,
-    autostart: false,
+    ui: false,
+    # Visualizer redraw period: 20 Hz on the A53 boards, 30 Hz on rpi4/rpi5.
+    viz_tick_ms: if(Mix.target() in [:rpi3, :rpi0_2], do: 50, else: 33),
+    # Images the renderer may load: the Sendspin artwork dir (tmpfs).
+    image_dirs: ["/tmp/up_display", "/tmp/up_artwork"],
     # Emerge's paint-layer cache defaults to 640 MiB, far above the CMA
     # pool GL render targets come from; the 512 MB/1 GB boards get less.
     layer_cache_mb: if(Mix.target() in [:rpi3, :rpi0_2], do: 48, else: 128),
@@ -214,7 +219,8 @@ if display_target? do
 end
 
 # Sendspin display roles on the HDMI output's player, for the targets that
-# will drive a TV UI. Still off (config.exs) until the TV UI ships: once on,
+# will drive a TV UI. Still off (config.exs) until the TV UI ships, and then
+# turned on together with `UniversalProxy.Display` `ui: true` above: once on,
 # Music Assistant streams visualizer data for that player all the time.
 # Artwork lives on tmpfs.
 if Mix.target() in [:rpi0_2, :rpi3, :rpi4, :rpi5] do
