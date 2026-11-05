@@ -22,9 +22,12 @@ if Code.ensure_loaded?(Emerge) do
     ## Visualizer
 
     The viewport subscribes to the visualizer topic only while it has a
-    source and the screen is on. Each frame message only replaces the latest
-    frame; a tick (`:viz_tick_ms`, 50 ms by default) draws it, so frames
-    arriving faster than the screen redraws are dropped rather than queued.
+    source and the screen is on. Frames arrive `lead_ms` ahead of the audio
+    they belong to, so each waits in a small bounded buffer
+    (`UniversalProxy.Display.Viz.buffer_push/4`) until it is due; a tick
+    (`:viz_tick_ms`, 50 ms by default) draws the newest due frame and drops
+    older ones, so frames arriving faster than the screen redraws are
+    dropped rather than queued.
     When the mailbox backs up anyway, it steps down a
     `UniversalProxy.Display.Viz` tier (full → reduced → pulse → off),
     logs it, and tells the `:owner` (if any) as `{:viewport_viz_tier, pid,
@@ -61,6 +64,7 @@ if Code.ensure_loaded?(Emerge) do
         viz: nil,
         subscribed: nil,
         tier: :full,
+        pending: [],
         frame: nil,
         frame_at: nil,
         heights: [],
@@ -90,15 +94,16 @@ if Code.ensure_loaded?(Emerge) do
       {:noreply, state |> sync_viz() |> Viewport.rerender()}
     end
 
-    def handle_info({:sendspin_viz, key, frame}, %{subscribed: %{key: key}} = state),
-      do: {:noreply, %{state | frame: frame, frame_at: now_ms()}}
+    def handle_info({:sendspin_viz, key, frame}, %{subscribed: %{key: key}} = state)
+        when is_map(frame),
+        do: {:noreply, %{state | pending: Viz.buffer_push(state.pending, frame, now_ms())}}
 
     def handle_info(:viz_tick, %{subscribed: nil} = state),
       do: {:noreply, %{state | tick_ref: nil}}
 
     def handle_info(:viz_tick, state) do
       state = %{state | tick_ref: schedule_tick(state.tick_ms), ticks: state.ticks + 1}
-      state = maybe_degrade(state)
+      state = state |> maybe_degrade() |> take_due_frame()
 
       if state.subscribed && rem(state.ticks, Viz.tick_divisor(state.tier)) == 0 do
         {:noreply, redraw_bars(state)}
@@ -124,11 +129,22 @@ if Code.ensure_loaded?(Emerge) do
       else
         if state.subscribed, do: Phoenix.PubSub.unsubscribe(@pubsub, state.subscribed.topic)
         if wanted, do: Phoenix.PubSub.subscribe(@pubsub, wanted.topic)
-        state = %{state | subscribed: wanted, frame: nil, frame_at: nil, heights: []}
+        state = %{state | subscribed: wanted, pending: [], frame: nil, frame_at: nil, heights: []}
 
         if wanted && is_nil(state.tick_ref),
           do: %{state | tick_ref: schedule_tick(state.tick_ms)},
           else: state
+      end
+    end
+
+    # Every tick, so frames that came due on a skipped (lower tier) tick are
+    # superseded rather than drawn late.
+    defp take_due_frame(state) do
+      now = now_ms()
+
+      case Viz.buffer_take(state.pending, now) do
+        {nil, pending} -> %{state | pending: pending}
+        {frame, pending} -> %{state | pending: pending, frame: frame, frame_at: now}
       end
     end
 

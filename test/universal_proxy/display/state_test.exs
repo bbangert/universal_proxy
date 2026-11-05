@@ -313,6 +313,32 @@ defmodule UniversalProxy.Display.StateTest do
     end
   end
 
+  describe "TV presence" do
+    test "a binding made after start-up takes its adapter's known presence", context do
+      ctx = start_ui(context, outputs: [])
+      assert %{binding: nil, tv_presence: :unknown} = GenServer.call(ctx.state, :status)
+
+      Agent.update(ctx.world, &%{&1 | outputs: [@output]})
+      broadcast(ctx, "sendspin:output_added", {:sendspin_output_added, @output})
+
+      assert %{binding: %{cec_dev: "/dev/cec0"}, tv_presence: :present} =
+               GenServer.call(ctx.state, :status)
+    end
+
+    test "moving to another adapter drops the previous TV's presence", context do
+      cec1 = %{@adapter | dev: "/dev/cec1", card_index: 2, tv_presence: :unknown}
+      ctx = start_ui(context, adapters: [@adapter, cec1])
+      assert %{tv_presence: :present} = GenServer.call(ctx.state, :status)
+
+      other = %{@output | key: {"vc4-hdmi-1", nil, nil}, client_id: "c1", card_index: 2}
+      Agent.update(ctx.world, &%{&1 | outputs: [Map.delete(@output, :display_roles), other]})
+      broadcast(ctx, "sendspin:state", {:sendspin_state, other.key, %{event: "listening"}})
+
+      assert %{binding: %{cec_dev: "/dev/cec1"}, tv_presence: :unknown} =
+               GenServer.call(ctx.state, :status)
+    end
+  end
+
   describe "remote keys" do
     test "keys on the claimed adapter drive the player through a task", context do
       ctx = context |> start_ui() |> playing()

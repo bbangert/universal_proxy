@@ -364,6 +364,16 @@ defmodule UniversalProxy.Display.ModelTest do
       assert effects == [{:release_keys, "/dev/cec0"}, {:claim_keys, "/dev/cec1"}]
     end
 
+    test "another adapter forgets the previous TV's presence; the same one keeps it" do
+      model = run!(ready(), [{:tv_presence, :present}])
+      kept = run!(model, [{:bound, %{@binding | client_id: "other"}, nil}])
+      assert kept.tv_presence == :present
+
+      moved = run!(model, [{:bound, %{@binding | cec_dev: "/dev/cec1"}, nil}])
+      assert moved.tv_presence == :unknown
+      assert run!(model, [{:bound, nil, nil}]).tv_presence == :unknown
+    end
+
     test "losing the output clears now playing and releases the keys" do
       model = run!(playing(), [{:display_event, 2, %{event: "metadata", title: "T"}}])
       {model, effects} = Model.handle(model, {:bound, nil, nil}, 0)

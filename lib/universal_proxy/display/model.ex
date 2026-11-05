@@ -250,9 +250,10 @@ defmodule UniversalProxy.Display.Model do
         {m, [], []}
 
       is_nil(binding) ->
-        {clear_player(%{m | binding: nil}), [], []}
+        {clear_player(%{forget_tv(m, binding) | binding: nil}), [], []}
 
       true ->
+        m = forget_tv(m, binding)
         same_key? = match?(%{key: key} when key == binding.key, m.binding)
         m = if same_key?, do: %{m | binding: binding}, else: clear_player(%{m | binding: binding})
         {m, mode_effects} = adopt_mode(m, persisted, same_key?)
@@ -515,6 +516,15 @@ defmodule UniversalProxy.Display.Model do
     {put_vp(m, status: :starting, gen: m.viewport.gen + 1, port: port), [{:start_viewport, rung}],
      []}
   end
+
+  # Another CEC adapter (or none) means another TV: what was known about
+  # the old one doesn't carry over.
+  defp forget_tv(m, binding) do
+    if cec_dev(m.binding) == cec_dev(binding), do: m, else: %{m | tv_presence: :unknown}
+  end
+
+  defp cec_dev(%{cec_dev: dev}), do: dev
+  defp cec_dev(_binding), do: nil
 
   # A running viewport on another port than the bound output's moves there.
   defp follow_port(m) do

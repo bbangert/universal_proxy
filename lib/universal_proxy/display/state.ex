@@ -146,7 +146,6 @@ defmodule UniversalProxy.Display.State do
   def handle_continue(:start_ui, state) do
     state = %{state | adapters: state.cec.list_adapters.(), outputs: state.audio.list_outputs.()}
     state = rebind(state)
-    state = tv_presence(state, bound_adapter(state))
     {:noreply, dispatch(state, {:display_available, display_available?(state)})}
   end
 
@@ -271,8 +270,6 @@ defmodule UniversalProxy.Display.State do
 
     # A Cec.Server restart drops the claim; claiming again is idempotent.
     if state.model.claimed && new, do: state.cec.claim_keys.(state.model.claimed, self())
-
-    state = tv_presence(state, new)
 
     if new && Binding.valid_phys_addr?(new.phys_addr) &&
          not Binding.valid_phys_addr?(old && old.phys_addr) do
@@ -444,9 +441,12 @@ defmodule UniversalProxy.Display.State do
 
   # ── Binding ──────────────────────────────────────────────────────────
 
+  # Also (re)applies the bound adapter's cached TV presence: a new binding
+  # starts from :unknown in the model.
   defp rebind(state) do
     binding = Binding.resolve(state.outputs, state.adapters)
-    dispatch(state, {:bound, binding, persisted_mode(state.outputs, binding)})
+    state = dispatch(state, {:bound, binding, persisted_mode(state.outputs, binding)})
+    tv_presence(state, bound_adapter(state))
   end
 
   defp refresh_outputs(state), do: %{state | outputs: state.audio.list_outputs.()}

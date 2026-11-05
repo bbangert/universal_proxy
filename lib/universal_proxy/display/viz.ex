@@ -18,6 +18,11 @@ defmodule UniversalProxy.Display.Viz do
   @type tier :: :full | :reduced | :pulse | :off
   @type frame :: map() | nil
 
+  @typedoc "Frames waiting for their display time, newest first: `{due_ms, frame}`."
+  @type buffer :: [{integer(), map()}]
+
+  @buffer_max 8
+
   @tiers [:full, :reduced, :pulse, :off]
 
   @doc "The tiers, best first."
@@ -74,6 +79,36 @@ defmodule UniversalProxy.Display.Viz do
       last = max(div((i + 1) * n, count) - 1, first)
       peak = Enum.max(for j <- first..last, do: elem(values, j))
       peak / 255
+    end
+  end
+
+  @doc """
+  Adds a frame that arrived at `now` (monotonic ms). Frames come ahead of
+  their display time by `lead_ms` (0 when absent), so each is due at
+  `now + lead_ms`. Keeps at most `max` frames, dropping the oldest.
+  """
+  @spec buffer_push(buffer(), map(), integer(), pos_integer()) :: buffer()
+  def buffer_push(buffer, frame, now, max \\ @buffer_max) do
+    lead =
+      case Map.get(frame, :lead_ms) do
+        ms when is_integer(ms) and ms > 0 -> ms
+        _other -> 0
+      end
+
+    Enum.take([{now + lead, frame} | buffer], max)
+  end
+
+  @doc """
+  The frame to paint at `now`: the newest one already due, with older due
+  frames discarded (`nil` while none is due), and the frames still waiting.
+  """
+  @spec buffer_take(buffer(), integer()) :: {map() | nil, buffer()}
+  def buffer_take(buffer, now) do
+    {due, waiting} = Enum.split_with(buffer, fn {due_ms, _frame} -> due_ms <= now end)
+
+    case due do
+      [{_due_ms, frame} | _older] -> {frame, waiting}
+      [] -> {nil, waiting}
     end
   end
 
