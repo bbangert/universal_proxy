@@ -1,7 +1,7 @@
 defmodule UniversalProxy.Display.ViewTest do
   use ExUnit.Case, async: true
 
-  alias UniversalProxy.Display.{Model, Spec, View}
+  alias UniversalProxy.Display.{Model, Spec, Theme, View}
 
   @party %{url: "https://ma.example/party", name: "Garden party"}
 
@@ -63,18 +63,26 @@ defmodule UniversalProxy.Display.ViewTest do
       assert "Nothing playing" in texts(View.render(model([])))
     end
 
-    test "the play/pause control says what Select would do" do
-      assert "Pause" in texts(View.render(model(playback: :playing)))
-      assert "Play" in texts(View.render(model(playback: :paused)))
+    test "the play/pause control shows what Select would do" do
+      icon = fn fields ->
+        [{:icon, _, name}] = keyed(View.render(model(fields)), "ctl-play_pause-icon")
+        name
+      end
+
+      assert icon.(playback: :playing) == :pause
+      assert icon.(playback: :paused) == :play
     end
 
-    test "the focus ring shows only while a CEC TV is present" do
+    test "the focus ring shows only while a CEC TV is present, without moving anything" do
+      theme = Theme.default()
+
       ringed = fn fields ->
         spec = View.render(model([playback: :playing] ++ fields))
 
         for id <- ["ctl-prev", "ctl-play_pause", "ctl-next"],
             [node] = keyed(spec, id),
-            attr(node, :background),
+            {_width, color} = attr(node, :border),
+            color == theme.accent,
             do: id
       end
 
@@ -82,21 +90,91 @@ defmodule UniversalProxy.Display.ViewTest do
       assert ringed.(tv_presence: :present, focus: :prev) == ["ctl-prev"]
       assert ringed.(tv_presence: :absent, focus: :next) == []
       assert ringed.(tv_presence: :unknown, focus: :next) == []
+
+      widths = fn fields ->
+        spec = View.render(model([playback: :playing] ++ fields))
+
+        for id <- ["ctl-prev", "ctl-play_pause", "ctl-next"],
+            do: keyed(spec, id) |> hd() |> attr(:border) |> elem(0)
+      end
+
+      assert widths.(tv_presence: :present, focus: :next) == widths.(tv_presence: :absent)
     end
 
-    test "uses the color@v1 palette, falling back to the default" do
+    test "themes from the color@v1 palette, falling back to the default" do
       spec =
         View.render(
-          model(playback: :playing, color: %{background_dark: [1, 2, 3], primary: [9, 8, 7]})
+          model(
+            playback: :playing,
+            color: %{
+              background_dark: [10, 20, 30],
+              on_dark: [250, 250, 240],
+              primary: [255, 120, 40]
+            }
+          )
         )
 
-      assert [root | _] = keyed(spec, "root")
-      assert attr(root, :background) == {1, 2, 3}
-      assert [bars] = keyed(spec, "viz")
-      assert attr(bars, :color) == {9, 8, 7}
+      assert attr(hd(keyed(spec, "root")), :background) == {10, 20, 30}
+      assert attr(hd(keyed(spec, "title")), :font_color) == {250, 250, 240}
+      assert attr(hd(keyed(spec, "viz")), :color) == {255, 120, 40}
 
       spec = View.render(model(playback: :playing, color: %{background_dark: [999, 0, 0]}))
-      assert attr(hd(keyed(spec, "root")), :background) == {12, 14, 22}
+      assert attr(hd(keyed(spec, "root")), :background) == Theme.default().background
+    end
+
+    test "long titles are cut with an ellipsis" do
+      title = String.duplicate("Very long song title ", 12)
+      spec = View.render(model(playback: :playing, metadata: %{title: title}))
+      assert [{:text, _, shown}] = keyed(spec, "title")
+      assert String.ends_with?(shown, "…")
+      assert String.length(shown) < String.length(title)
+    end
+
+    test "the album line carries the year" do
+      spec = View.render(model(playback: :playing, metadata: %{album: "Record", year: 1999}))
+      assert "Record (1999)" in texts(spec)
+    end
+  end
+
+  describe "progress" do
+    @meta %{
+      title: "Song",
+      received_at: 1_000,
+      progress: %{
+        track_progress: 60_000,
+        track_duration: 200_000,
+        playback_speed: 1000,
+        progress_age_ms: 500
+      }
+    }
+
+    test "elapsed and total, extrapolated to :now, with a proportional fill" do
+      spec = View.render(model(playback: :playing, metadata: @meta), now: 11_000)
+      assert ["1:10"] = for({:text, _, s} <- keyed(spec, "elapsed"), do: s)
+      assert ["3:20"] = for({:text, _, s} <- keyed(spec, "duration"), do: s)
+
+      [track] = keyed(spec, "progress-track")
+      [fill] = keyed(spec, "progress-fill")
+      {:px, track_width} = attr(track, :width)
+      {:px, fill_width} = attr(fill, :width)
+      assert_in_delta fill_width / track_width, 70_500 / 200_000, 0.01
+    end
+
+    test "paused doesn't advance; no progress, no bar" do
+      spec = View.render(model(playback: :paused, metadata: @meta), now: 61_000)
+      assert ["1:00"] = for({:text, _, s} <- keyed(spec, "elapsed"), do: s)
+
+      spec = View.render(model(playback: :playing, metadata: %{title: "Song"}))
+      assert keyed(spec, "progress") == []
+    end
+
+    test "next_refresh/2 ticks on the next whole second only while it advances" do
+      playing = model(playback: :playing, metadata: @meta)
+      # 60_000 + 500 + 9_800 = 70_300 ms elapsed: 700 ms to 71 s.
+      assert View.next_refresh(playing, now: 10_800) == 700
+      assert View.next_refresh(model(playback: :paused, metadata: @meta), now: 10_800) == nil
+      assert View.next_refresh(%{playing | mode: :visualizer}, now: 10_800) == nil
+      assert View.next_refresh(%{playing | blanked: true}, now: 10_800) == nil
     end
   end
 

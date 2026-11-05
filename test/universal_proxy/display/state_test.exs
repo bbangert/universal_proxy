@@ -125,6 +125,14 @@ defmodule UniversalProxy.Display.StateTest do
 
   defp texts(_node), do: []
 
+  defp flush_pushes(viewport) do
+    receive do
+      {:fake_renderer, :push, ^viewport, _spec} -> flush_pushes(viewport)
+    after
+      50 -> :ok
+    end
+  end
+
   # The next viewport start's options.
   defp started! do
     assert_receive {:fake_renderer, :start, opts}
@@ -269,6 +277,45 @@ defmodule UniversalProxy.Display.StateTest do
       # Another process's (a stale viewport's) report is ignored.
       send(ctx.state, {:viewport_size, self(), {1280, 720}})
       assert GenServer.call(ctx.state, :status).size == {1920, 1080}
+    end
+  end
+
+  describe "progress clock" do
+    test "a playing track's progress redraws about once a second; pausing stops it",
+         context do
+      ctx = start_ui(context)
+      viewport = viewport!(ctx)
+      playing(ctx)
+
+      metadata = %{
+        event: "metadata",
+        title: "Song",
+        received_at: System.monotonic_time(:millisecond) - 10_000,
+        progress: %{
+          track_progress: 0,
+          track_duration: 100_000,
+          playback_speed: 1000,
+          progress_age_ms: 0
+        }
+      }
+
+      flush_pushes(viewport)
+      broadcast(ctx, "sendspin:display", {:sendspin_display, @key, 1, metadata})
+      assert_receive {:fake_renderer, :push, ^viewport, spec}
+      assert "Song" in texts(spec) and "0:10" in texts(spec)
+      assert %{clock: {_ref, _due}} = :sys.get_state(ctx.state)
+
+      flush_pushes(viewport)
+      assert_receive {:fake_renderer, :push, ^viewport, spec}, 1_500
+      assert "0:11" in texts(spec) or "0:12" in texts(spec)
+
+      broadcast(
+        ctx,
+        "sendspin:display",
+        {:sendspin_display, @key, 2, %{event: "group", playback_state: "paused"}}
+      )
+
+      assert %{clock: nil} = :sys.get_state(ctx.state)
     end
   end
 

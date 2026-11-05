@@ -40,7 +40,10 @@ defmodule UniversalProxy.Display.State do
   first report, for the configured `:preferred_size`).
 
   Timers fire as `{:display_timer, timer, gen}` messages (`timer` is
-  `:idle`, `:retry` or `:stable`); a stale `gen` is ignored.
+  `:idle`, `:retry` or `:stable`); a stale `gen` is ignored. While a
+  viewport runs, a `{:display_clock, ref}` timer redraws the screen when
+  it changes with time alone (`UniversalProxy.Display.View.next_refresh/2`:
+  the progress bar, once a second while playing).
 
   ## With the UI off (`ui: false`, the default)
 
@@ -122,6 +125,7 @@ defmodule UniversalProxy.Display.State do
       job: nil,
       follow_ups: [],
       viz_on: nil,
+      clock: nil,
       pubsub: Keyword.get(opts, :pubsub, UniversalProxy.PubSub),
       task_sup: Keyword.get(opts, :task_supervisor, UniversalProxy.TaskSupervisor),
       audio: Map.merge(default_audio(), Map.new(Keyword.get(opts, :audio, %{}))),
@@ -233,6 +237,9 @@ defmodule UniversalProxy.Display.State do
   def handle_info({:display_timer, timer, gen}, state),
     do: {:noreply, dispatch(state, {:timer, timer, gen})}
 
+  def handle_info({:display_clock, ref}, %{clock: {ref, _due}} = state),
+    do: {:noreply, arm_clock(run_effect(:render, %{state | clock: nil}))}
+
   def handle_info({:display_party, party}, state),
     do: {:noreply, dispatch(state, {:party, party})}
 
@@ -294,18 +301,50 @@ defmodule UniversalProxy.Display.State do
   # ── Model plumbing ───────────────────────────────────────────────────
 
   defp dispatch(state, event) do
-    {model, effects} = Model.handle(state.model, event, System.monotonic_time(:millisecond))
+    {model, effects} = Model.handle(state.model, event, now_ms())
     state = Enum.reduce(effects, %{state | model: model}, &run_effect/2)
 
     # Events the effects produced, after all of this transition's effects.
     {follow_ups, state} = Map.get_and_update(state, :follow_ups, &{&1, []})
-    follow_ups |> Enum.reverse() |> Enum.reduce(state, &dispatch(&2, &1))
+    follow_ups |> Enum.reverse() |> Enum.reduce(state, &dispatch(&2, &1)) |> arm_clock()
   end
+
+  # The screen also changes with time alone (the progress clock): one timer
+  # redraws it when `View.next_refresh/2` says so. An earlier pending
+  # wake-up is kept, so a stream of events can't keep pushing it out.
+  defp arm_clock(%{viewport: nil} = state), do: cancel_clock(state)
+
+  defp arm_clock(state) do
+    now = now_ms()
+
+    case View.next_refresh(state.model, view_opts(state, now)) do
+      nil ->
+        cancel_clock(state)
+
+      ms ->
+        case state.clock do
+          {_ref, due} when due <= now + ms ->
+            state
+
+          _other ->
+            state = cancel_clock(state)
+            ref = make_ref()
+            Process.send_after(self(), {:display_clock, ref}, ms)
+            %{state | clock: {ref, now + ms}}
+        end
+    end
+  end
+
+  defp cancel_clock(state), do: %{state | clock: nil}
+
+  defp view_opts(state, now), do: Keyword.put(state.view_opts, :now, now)
+
+  defp now_ms, do: System.monotonic_time(:millisecond)
 
   defp follow_up(state, event), do: %{state | follow_ups: [event | state.follow_ups]}
 
   defp run_effect(:render, state) do
-    spec = View.render(state.model, state.view_opts)
+    spec = View.render(state.model, view_opts(state, now_ms()))
 
     if state.viewport && spec != state.spec,
       do: state.renderer.push(state.viewport.handle, spec)
@@ -370,7 +409,7 @@ defmodule UniversalProxy.Display.State do
   end
 
   defp run_effect({:start_viewport, rung}, state) do
-    spec = View.render(state.model, state.view_opts)
+    spec = View.render(state.model, view_opts(state, now_ms()))
 
     case start_viewport(%{state | spec: spec}, Keyword.put(rung, :owner, self())) do
       {{:ok, _handle}, state} ->

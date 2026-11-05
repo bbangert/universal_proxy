@@ -16,6 +16,8 @@ defmodule UniversalProxy.Display.Spec do
     * `{:text, attrs, string}`
     * `{:image, attrs, path}` — an absolute path to a PNG/JPEG file. The
       renderer only loads files under the directories it allows.
+    * `{:icon, attrs, name}` — one of the bundled monochrome icons
+      (`t:icon/0`), tinted with the `:color` attr.
     * `{:bars, attrs, heights}` — a row of bars, bottom-aligned, each height a
       fraction `0.0..1.0` of the `:max_height` attr. `bar_mode: :height`
       (default) sizes each bar; `bar_mode: :offset` keeps every bar full
@@ -24,6 +26,8 @@ defmodule UniversalProxy.Display.Spec do
     * `:none` — renders nothing.
 
   `:padding` is one number for every side or `{top, right, bottom, left}`.
+  `:border` is `{width, color}`; its width counts towards the element's
+  size.
 
   Colours are `{r, g, b}` or `{r, g, b, alpha}` with bytes `0..255` and
   `alpha` in `0.0..1.0`. A `:background` or `:font_color` may also be
@@ -49,6 +53,7 @@ defmodule UniversalProxy.Display.Spec do
           | {:align_x, :left | :center | :right}
           | {:align_y, :top | :center | :bottom}
           | {:rounded, number()}
+          | {:border, {number(), color()}}
           | {:alpha, float()}
           | {:image_fit, :cover | :contain}
           | {:key, String.t()}
@@ -58,10 +63,14 @@ defmodule UniversalProxy.Display.Spec do
           | {:bar_mode, :height | :offset}
   @type attrs :: [attr()]
 
+  @typedoc "The bundled icons (`priv/display/icons/<name>.svg`)."
+  @type icon :: :previous | :play | :pause | :next
+
   @type t ::
           {:column | :row | :stack, attrs(), [t()]}
           | {:text, attrs(), String.t()}
           | {:image, attrs(), Path.t()}
+          | {:icon, attrs(), icon()}
           | {:bars, attrs(), [float()]}
           | :none
 

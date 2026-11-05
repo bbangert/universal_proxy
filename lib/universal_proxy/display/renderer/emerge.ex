@@ -28,6 +28,7 @@ if Code.ensure_loaded?(Emerge) do
         `:log` also logs a summary every ~5 s.
       * `:image_dirs` — directories image paths may come from (default
         `["/tmp/up_display"]`, created if missing).
+      * `:image_cache_mb` — decoded-image cache budget in MiB (default 32).
       * `:spec` — the first `UniversalProxy.Display.Spec` to show.
       * `:viz_tick_ms` — visualizer redraw period (default 50).
       * `:owner` — a pid told about visualizer tier changes as
@@ -36,13 +37,27 @@ if Code.ensure_loaded?(Emerge) do
 
     @behaviour UniversalProxy.Display.Renderer
 
+    use Emerge.Assets.Path, otp_app: :universal_proxy
+
     alias Emerge.UI
-    alias Emerge.UI.{Align, Background, Border, Color, Font, Nearby, Size, Space, Transform}
+    alias Emerge.UI.{Align, Background, Border, Color, Font, Nearby, Size, Space, Svg, Transform}
     alias UniversalProxy.Display.{Spec, State, Viewport}
 
     @mib 1024 * 1024
     @default_image_dirs ["/tmp/up_display"]
+    # Decoded images kept (every track's cover is a new file): Emerge's
+    # default of 256 MiB / 256 entries would hold hours of covers.
+    @image_cache_mb 32
+    @image_cache_entries 24
     @bar_attrs [:bar_width, :max_height, :color, :bar_mode]
+
+    # Checked at compile time (`~m`): a missing icon fails the build.
+    @icons %{
+      previous: ~m"display/icons/previous.svg",
+      play: ~m"display/icons/play.svg",
+      pause: ~m"display/icons/pause.svg",
+      next: ~m"display/icons/next.svg"
+    }
 
     @impl true
     def available?, do: Code.ensure_loaded?(EmergeSkia.Native) and State.display_card?()
@@ -129,8 +144,10 @@ if Code.ensure_loaded?(Emerge) do
            input: %Emerge.Config.Input{events: [:resize]},
            assets: %Emerge.Config.Assets{
              otp_app: :universal_proxy,
+             # A 480x480 cover drawn smaller is decoded at the drawn size.
              decode_at_size: true,
-             runtime_paths: %Emerge.Config.RuntimePaths{enabled: true, allowlist: image_dirs}
+             runtime_paths: %Emerge.Config.RuntimePaths{enabled: true, allowlist: image_dirs},
+             cache: image_cache(Keyword.get(opts, :image_cache_mb, @image_cache_mb))
            },
            diagnostics: diagnostics_config(Keyword.get(opts, :diagnostics, false))
          }}
@@ -155,6 +172,11 @@ if Code.ensure_loaded?(Emerge) do
     def tree({:text, attrs, string}), do: UI.el(attrs(attrs), UI.text(string))
 
     def tree({:image, attrs, path}), do: UI.image(attrs(attrs), {:path, path})
+
+    def tree({:icon, attrs, name}) do
+      tint = attrs |> Keyword.get(:color, {255, 255, 255}) |> paint()
+      UI.svg([Svg.color(tint) | attrs(attrs)], Map.fetch!(@icons, name))
+    end
 
     def tree({:bars, attrs, heights}) do
       key = Keyword.get(attrs, :key, "bars")
@@ -207,7 +229,9 @@ if Code.ensure_loaded?(Emerge) do
     end
 
     defp attrs(attrs) do
-      for {key, value} <- attrs, key not in @bar_attrs, do: attr(key, value)
+      attrs
+      |> Enum.reject(fn {key, _value} -> key in @bar_attrs end)
+      |> Enum.flat_map(fn {key, value} -> List.wrap(attr(key, value)) end)
     end
 
     defp attr(:width, length), do: Size.width(size_value(length))
@@ -229,6 +253,10 @@ if Code.ensure_loaded?(Emerge) do
     defp attr(:align_y, :center), do: Align.center_y()
     defp attr(:align_y, :bottom), do: Align.align_bottom()
     defp attr(:rounded, radius), do: Border.rounded(radius)
+
+    defp attr(:border, {width, color}),
+      do: [Border.width(width), Border.color(paint(color))]
+
     defp attr(:alpha, alpha), do: Transform.alpha(alpha)
     defp attr(:image_fit, fit), do: UI.image_fit(fit)
     defp attr(:key, key), do: UI.key(key)
@@ -325,6 +353,10 @@ if Code.ensure_loaded?(Emerge) do
         enabled: Keyword.get(opts, :cache, :auto),
         paint_layer: paint_layer
       }
+    end
+
+    defp image_cache(mb) do
+      %Emerge.Config.AssetCache{max_entries: @image_cache_entries, max_bytes: round(mb * @mib)}
     end
 
     defp diagnostics_config(true), do: %Emerge.Config.Diagnostics{stats: true}
