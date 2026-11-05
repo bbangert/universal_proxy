@@ -87,16 +87,99 @@ defmodule UniversalProxy.Display.VizTest do
       assert Viz.buffer_clear([{1, %{bins: [1]}}]) == []
     end
 
-    test "holds at most max frames, dropping the oldest" do
+    test "a full buffer drops the new frame, keeping the next-due ones" do
       buffer = Enum.reduce(1..12, [], &Viz.buffer_push(&2, frame(&1, 1_000), &1))
       assert length(buffer) == 8
-      assert Enum.map(buffer, fn {_due, f} -> hd(f.bins) end) == Enum.to_list(12..5//-1)
-      assert length(Viz.buffer_push(buffer, frame(13), 0, 3)) == 3
+      assert Enum.map(buffer, fn {_due, f} -> hd(f.bins) end) == Enum.to_list(8..1//-1)
+      assert {%{bins: [1]}, _waiting} = Viz.buffer_take(buffer, 1_001)
+      assert length(Viz.buffer_push(buffer, frame(13), 0, 3)) == 8
+    end
+
+    test "sized by buffer_cap/2, a long lead keeps every frame until it is due" do
+      # 500 ms ahead at 30 fps: 15 frames in flight; the old fixed cap of 8
+      # dropped the next-due ones and the bars went flat.
+      cap = Viz.buffer_cap(500, 30)
+      assert cap >= 16
+
+      {drawn, _buffer} =
+        Enum.reduce(0..89, {[], []}, fn i, {drawn, buffer} ->
+          now = i * 33
+          buffer = Viz.buffer_push(buffer, frame(i, 500), now, cap)
+
+          case Viz.buffer_take(buffer, now) do
+            {nil, buffer} -> {drawn, buffer}
+            {%{bins: [n]}, buffer} -> {[n | drawn], buffer}
+          end
+        end)
+
+      drawn = Enum.reverse(drawn)
+      assert length(drawn) >= 70
+      assert drawn == Enum.to_list(hd(drawn)..List.last(drawn))
+    end
+
+    test "a bogus lead waits at most 5 s" do
+      buffer = Viz.buffer_push([], frame(1, 3_600_000), 0)
+      assert {%{bins: [1]}, []} = Viz.buffer_take(buffer, 5_000)
     end
   end
 
-  test "decay/2 shrinks heights and snaps tiny ones to zero" do
-    assert Viz.decay([1.0, 0.012], 0.5) == [0.5, 0.0]
+  describe "buffer_cap/2" do
+    test "one lead time of frames plus headroom, at least 8, at most 3 s worth" do
+      assert Viz.buffer_cap(100, 20) == 8
+      assert Viz.buffer_cap(500, 30) == 19
+      assert Viz.buffer_cap(1_000, 20) == 24
+      assert Viz.buffer_cap(60_000, 20) == 60
+      assert Viz.buffer_cap(0, 30) == 8
+      assert Viz.buffer_cap(nil, nil) == 8
+    end
+  end
+
+  describe "meter" do
+    defp run(meter, steps), do: Enum.reduce(steps, meter, &Viz.step(&2, &1, 50))
+
+    test "a peak is taken at once, held, then falls steadily, never below the input" do
+      m = Viz.step(Viz.meter(2), [1.0, 0.5], 50)
+      assert m.levels == [1.0, 0.5]
+
+      # Held for 150 ms (3 ticks of 50 ms) …
+      m = run(m, List.duplicate([0.2, 0.0], 3))
+      assert m.levels == [1.0, 0.5]
+
+      # … then falls 2.0 heights/s: 0.1 per 50 ms tick, floored at the input.
+      m = Viz.step(m, [0.2, 0.0], 50)
+      assert_in_delta hd(m.levels), 0.9, 1.0e-9
+      m = run(m, List.duplicate([0.2, 0.0], 20))
+      assert m.levels == [0.2, 0.0]
+    end
+
+    test "near-silent input settles every bar to zero after 1.5 s, then nothing changes" do
+      m = Viz.step(Viz.meter(3), [0.8, 0.5, 0.3], 50)
+      refute Viz.settled?(m)
+
+      m = run(m, List.duplicate([0.02, 0.01, 0.0], 29))
+      refute Viz.settled?(m)
+      assert Enum.any?(m.levels, &(&1 > 0.0))
+
+      m = Viz.step(m, [0.02, 0.01, 0.0], 50)
+      m = run(m, List.duplicate([0.02, 0.01, 0.0], 12))
+      assert m.levels == [0.0, 0.0, 0.0]
+      assert Viz.settled?(m)
+      assert Viz.step(m, [0.02, 0.0, 0.01], 50) == m
+      assert Viz.step(m, nil, 50) == m
+    end
+
+    test "no frame (nil) is silence; sound wakes a settled meter" do
+      m = Viz.meter(2)
+      assert Viz.settled?(m)
+      m = Viz.step(m, [0.6, 0.0], 50)
+      assert m.levels == [0.6, 0.0]
+      refute Viz.settled?(m)
+    end
+
+    test "fits the input to the bar count and clamps it" do
+      assert Viz.step(Viz.meter(3), [2.0], 50).levels == [1.0, 0.0, 0.0]
+      assert Viz.step(Viz.meter(1), [0.5, 0.9], 50).levels == [0.5]
+    end
   end
 
   describe "Spec.put_bars/3" do

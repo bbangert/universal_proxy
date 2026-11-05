@@ -192,6 +192,61 @@ defmodule UniversalProxy.Display.ViewTest do
     end
   end
 
+  describe "element budget" do
+    @meta %{
+      title: "Song",
+      artist: "Band",
+      album: "Record",
+      year: 1999,
+      received_at: 0,
+      progress: %{track_progress: 1, track_duration: 2_000, playback_speed: 1000}
+    }
+
+    for size <- [{1280, 720}, {1920, 1080}],
+        {label, fields} <- [
+          {"Now Playing", [playback: :playing, tv_presence: :present]},
+          {"Now Playing with the party overlay", [playback: :playing, party: @party]},
+          {"Visualizer with the party overlay",
+           [mode: :visualizer, playback: :playing, party: @party]},
+          {"the party QR", [mode: :party_qr, party: @party]},
+          {"party off", [mode: :party_qr]}
+        ] do
+      test "#{label} at #{elem(size, 0)}x#{elem(size, 1)} stays within 150 elements at 48 bars" do
+        fields =
+          [metadata: @meta, artwork: %{path: "/tmp/a.jpg"}] ++ unquote(Macro.escape(fields))
+
+        spec = View.render(model(fields), size: unquote(Macro.escape(size)), bars: 48)
+        assert Spec.element_count(spec) <= 150
+      end
+    end
+
+    test "layout boxes scale with the output size" do
+      sizes = fn size ->
+        spec = View.render(model(playback: :playing, metadata: @meta), size: size, bars: 48)
+        [art] = keyed(spec, "art")
+        [track] = keyed(spec, "progress-track")
+        [bars] = keyed(spec, "viz")
+        {:px, art_px} = attr(art, :width)
+        {:px, track_px} = attr(track, :width)
+        {:px, bars_px} = attr(bars, :width)
+
+        {art_px, track_px, bars_px, attr(bars, :max_height),
+         attr(hd(keyed(spec, "title")), :font_size)}
+      end
+
+      small = sizes.({1280, 720})
+      big = sizes.({1920, 1080})
+
+      for {s, b} <- Enum.zip(Tuple.to_list(small), Tuple.to_list(big)),
+          do: assert_in_delta(b / s, 1.5, 0.02)
+
+      # Everything fits inside the 5% margins.
+      {art, track, bars, _h, _font} = big
+      assert bars == 1920 - 2 * 96
+      assert art + 96 + track == bars
+    end
+  end
+
   describe "visualizer bars" do
     test "a fixed-size, paint-only row of zeroed bars, sized by the :bars option" do
       for fields <- [[playback: :playing], [mode: :visualizer, playback: :playing]] do

@@ -23,11 +23,14 @@ if Code.ensure_loaded?(Emerge) do
 
     The viewport subscribes to the visualizer topic only while it has a
     source and the screen is on. Frames arrive `lead_ms` ahead of the audio
-    they belong to, so each waits in a small bounded buffer
-    (`UniversalProxy.Display.Viz.buffer_push/4`) until it is due; a tick
-    (`:viz_tick_ms`, 50 ms by default) draws the newest due frame and drops
-    older ones, so frames arriving faster than the screen redraws are
-    dropped rather than queued.
+    they belong to, so each waits in a bounded buffer
+    (`UniversalProxy.Display.Viz.buffer_push/4`, `:viz_buffer` frames,
+    sized with `Viz.buffer_cap/2`) until it is due; a tick (`:viz_tick_ms`,
+    50 ms by default) draws the newest due frame and drops older ones, so
+    frames arriving faster than the screen redraws are dropped rather than
+    queued. Bars move through a `Viz` meter (peak hold, steady fall); once
+    it has settled after silence the bars stop changing and nothing is
+    redrawn.
     When the mailbox backs up anyway, it steps down a
     `UniversalProxy.Display.Viz` tier (full → reduced → pulse → off),
     logs it, and tells the `:owner` (if any) as `{:viewport_viz_tier, pid,
@@ -38,8 +41,8 @@ if Code.ensure_loaded?(Emerge) do
     The DRM backend reports the mode it set as a resize; the viewport tells
     the `:owner` as `{:viewport_size, pid, {width, height}}`.
 
-    Start options: `:config` (an `%Emerge.Config{}`), `:spec`, `:viz_tick_ms`
-    and `:owner`.
+    Start options: `:config` (an `%Emerge.Config{}`), `:spec`, `:viz_tick_ms`,
+    `:viz_buffer` and `:owner`.
     """
 
     use Emerge
@@ -51,11 +54,11 @@ if Code.ensure_loaded?(Emerge) do
     @pubsub UniversalProxy.PubSub
     @viz_key "viz"
     @default_tick_ms 50
+    @default_buffer 8
     # Mailbox length at a tick that counts as falling behind.
     @backlog 50
-    # Frames older than this are silence: the bars decay instead.
-    @silence_ms 200
-    @decay 0.6
+    # A frame older than this is no input (silence) for the meter.
+    @stale_ms 200
 
     @impl Viewport
     def mount(opts) do
@@ -66,6 +69,8 @@ if Code.ensure_loaded?(Emerge) do
         power: :on,
         owner: Keyword.get(opts, :owner),
         tick_ms: Keyword.get(opts, :viz_tick_ms, @default_tick_ms),
+        buffer_max: Keyword.get(opts, :viz_buffer, @default_buffer),
+        meter: nil,
         viz: nil,
         subscribed: nil,
         tier: :full,
@@ -101,7 +106,9 @@ if Code.ensure_loaded?(Emerge) do
 
     def handle_info({:sendspin_viz, key, frame}, %{subscribed: %{key: key}} = state)
         when is_map(frame),
-        do: {:noreply, %{state | pending: Viz.buffer_push(state.pending, frame, now_ms())}}
+        do:
+          {:noreply,
+           %{state | pending: Viz.buffer_push(state.pending, frame, now_ms(), state.buffer_max)}}
 
     def handle_info(:viz_tick, %{subscribed: nil} = state),
       do: {:noreply, %{state | tick_ref: nil}}
@@ -144,7 +151,16 @@ if Code.ensure_loaded?(Emerge) do
       else
         if state.subscribed, do: Phoenix.PubSub.unsubscribe(@pubsub, state.subscribed.topic)
         if wanted, do: Phoenix.PubSub.subscribe(@pubsub, wanted.topic)
-        state = %{state | subscribed: wanted, pending: [], frame: nil, frame_at: nil, heights: []}
+
+        state = %{
+          state
+          | subscribed: wanted,
+            pending: [],
+            frame: nil,
+            frame_at: nil,
+            heights: [],
+            meter: nil
+        }
 
         if wanted && is_nil(state.tick_ref),
           do: %{state | tick_ref: schedule_tick(state.tick_ms)},
@@ -164,19 +180,24 @@ if Code.ensure_loaded?(Emerge) do
     end
 
     defp redraw_bars(state) do
-      heights =
-        cond do
-          state.frame_at && now_ms() - state.frame_at <= @silence_ms ->
-            Viz.heights(state.frame, state.tier, bar_count(state.spec))
+      count = bar_count(state.spec)
 
-          state.heights == [] ->
-            []
+      targets =
+        if state.frame_at && now_ms() - state.frame_at <= @stale_ms,
+          do: Viz.heights(state.frame, state.tier, count)
 
-          true ->
-            Viz.decay(state.heights, @decay)
+      meter =
+        case state.meter do
+          %{levels: levels} = meter when length(levels) == count -> meter
+          _none -> Viz.meter(count)
         end
 
-      if heights == state.heights,
+      meter = Viz.step(meter, targets, state.tick_ms * Viz.tick_divisor(state.tier))
+      heights = meter.levels
+      state = %{state | meter: meter}
+
+      # Unchanged bars (a settled meter) draw nothing new.
+      if heights == state.heights or (state.heights == [] and Viz.settled?(meter)),
         do: state,
         else: Viewport.rerender(%{state | heights: heights})
     end

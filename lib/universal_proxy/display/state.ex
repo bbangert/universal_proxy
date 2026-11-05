@@ -60,7 +60,8 @@ defmodule UniversalProxy.Display.State do
     * `:dri_dir` — where DRM cards appear (default `"/dev/dri"`).
     * `:viewport_opts` — default `start/2` options for the renderer.
       Default: the configured `:layer_cache_mb`, `:preferred_size`,
-      `:viz_tick_ms` and `:image_dirs`.
+      `:viz_tick_ms` and `:image_dirs`, and a `:viz_buffer` sized for the
+      display roles' `:viz_offset_ms` and `:viz_rate`.
     * `:spec` — the first screen in manual mode (default: `Spec.now_playing/1`).
     * `:model_opts` — `UniversalProxy.Display.Model.new/1` options
       (default: the configured `:idle_ms`, `:party_idle_ms`, `:restart_ms`,
@@ -77,7 +78,7 @@ defmodule UniversalProxy.Display.State do
   require Logger
 
   alias UniversalProxy.{Audio, Cec, Display}
-  alias UniversalProxy.Display.{Binding, Mode, Model, Spec, View}
+  alias UniversalProxy.Display.{Binding, Mode, Model, Spec, View, Viz}
 
   @model_keys [:idle_ms, :party_idle_ms, :restart_ms, :restart_max_ms, :stable_ms]
   @viewport_keys [:layer_cache_mb, :preferred_size, :viz_tick_ms, :image_dirs]
@@ -108,9 +109,7 @@ defmodule UniversalProxy.Display.State do
         Keyword.get(opts, :viewport_supervisor, Display.Supervisor.viewport_supervisor()),
       dri_dir: Keyword.get(opts, :dri_dir, "/dev/dri"),
       viewport_opts:
-        Keyword.get_lazy(opts, :viewport_opts, fn ->
-          config |> Keyword.take(@viewport_keys) |> drop_nil()
-        end),
+        Keyword.get_lazy(opts, :viewport_opts, fn -> default_viewport_opts(config) end),
       view_opts: Keyword.get_lazy(opts, :view_opts, fn -> default_view_opts(config) end),
       spec: Keyword.get_lazy(opts, :spec, fn -> Spec.now_playing() end),
       viewport: nil,
@@ -580,6 +579,19 @@ defmodule UniversalProxy.Display.State do
   end
 
   # ── Defaults ─────────────────────────────────────────────────────────
+
+  # The visualizer buffer holds one lead time of frames at the player's rate.
+  defp default_viewport_opts(config) do
+    roles = Audio.DisplayRoles.config()
+
+    config
+    |> Keyword.take(@viewport_keys)
+    |> drop_nil()
+    |> Keyword.put_new(
+      :viz_buffer,
+      Viz.buffer_cap(roles[:viz_offset_ms], roles[:viz_rate])
+    )
+  end
 
   defp default_view_opts(config) do
     [

@@ -194,6 +194,20 @@ defmodule UniversalProxy.Display.Spec do
 
   def has_bars?(_node, _key), do: false
 
+  @doc """
+  How many renderer elements `spec` becomes (the per-tick tree work scales
+  with it): a text is a framing element plus its text leaf, bars are their
+  row plus one element per bar.
+  """
+  @spec element_count(t()) :: pos_integer()
+  def element_count({:text, _attrs, _string}), do: 2
+  def element_count({:bars, _attrs, heights}), do: 1 + length(heights)
+
+  def element_count({tag, _attrs, children}) when tag in [:column, :row, :stack],
+    do: Enum.reduce(children, 1, &(element_count(&1) + &2))
+
+  def element_count(_leaf), do: 1
+
   @doc "An all-black screen, drawn while the display is blanked."
   @spec blank() :: t()
   def blank, do: {:column, [width: :fill, height: :fill, background: {0, 0, 0}], []}

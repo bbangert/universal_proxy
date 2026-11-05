@@ -31,6 +31,8 @@ if Code.ensure_loaded?(Emerge) do
       * `:image_cache_mb` — decoded-image cache budget in MiB (default 32).
       * `:spec` — the first `UniversalProxy.Display.Spec` to show.
       * `:viz_tick_ms` — visualizer redraw period (default 50).
+      * `:viz_buffer` — how many early visualizer frames may wait for their
+        display time (default 8; see `UniversalProxy.Display.Viz.buffer_cap/2`).
       * `:owner` — a pid told about visualizer tier changes as
         `{:viewport_viz_tier, viewport, tier}`.
     """
@@ -68,7 +70,7 @@ if Code.ensure_loaded?(Emerge) do
         spec = Keyword.get_lazy(opts, :spec, fn -> Spec.now_playing() end)
 
         viewport_opts =
-          [config: config, spec: spec] ++ Keyword.take(opts, [:viz_tick_ms, :owner])
+          [config: config, spec: spec] ++ Keyword.take(opts, [:viz_tick_ms, :viz_buffer, :owner])
 
         child = Supervisor.child_spec({Viewport, viewport_opts}, restart: :temporary)
 
