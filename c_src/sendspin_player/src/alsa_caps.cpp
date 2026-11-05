@@ -2,6 +2,10 @@
 
 #include <alsa/asoundlib.h>
 
+#include <cstdio>
+#include <fstream>
+#include <map>
+#include <string>
 #include <string_view>
 
 namespace {
@@ -29,6 +33,40 @@ constexpr FormatCandidate kCandidateFormats[] = {
 
 bool starts_with(std::string_view s, std::string_view prefix) {
     return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
+}
+
+
+// Whether the HDMI sink behind `hw_device` ("hw:<card>,<dev>") takes 24-bit
+// LPCM, from the ELD the kernel exposes at /proc/asound/card<N>/eld#<D>.0:
+// some `sadN_coding_type` is LPCM and its `sadN_bits` lists 24. Anything
+// unreadable (another device naming, no ELD, no sink) counts as no.
+bool eld_lpcm_24bit(const std::string& hw_device) {
+    unsigned card = 0, dev = 0;
+    if (std::sscanf(hw_device.c_str(), "hw:%u,%u", &card, &dev) != 2) return false;
+
+    std::ifstream eld("/proc/asound/card" + std::to_string(card) + "/eld#" +
+                      std::to_string(dev) + ".0");
+    if (!eld) return false;
+
+    std::map<std::string, bool> lpcm;      // "sadN" -> coding type is LPCM
+    std::map<std::string, bool> has_24;    // "sadN" -> bits list 24
+    std::string line;
+    while (std::getline(eld, line)) {
+        auto key_end = line.find_first_of(" \t");
+        if (key_end == std::string::npos || !starts_with(line, "sad")) continue;
+        std::string key = line.substr(0, key_end);
+        auto underscore = key.find('_');
+        if (underscore == std::string::npos) continue;
+        std::string sad = key.substr(0, underscore);
+        std::string field = key.substr(underscore + 1);
+        std::string value = line.substr(key_end);
+        if (field == "coding_type") lpcm[sad] = value.find("LPCM") != std::string::npos;
+        if (field == "bits") has_24[sad] = (value + " ").find(" 24 ") != std::string::npos;
+    }
+    for (const auto& [sad, is_lpcm] : lpcm) {
+        if (is_lpcm && has_24[sad]) return true;
+    }
+    return false;
 }
 
 }  // namespace
@@ -78,13 +116,15 @@ ProbedCaps probe_caps(const std::string& hw_device) {
 
     // HDMI on the Pi (vc4-hdmi) accepts only IEC958 subframes at hw:, so
     // none of the linear formats above test true. Playback goes through
-    // plughw:, which packs linear samples into subframes, and a subframe
-    // carries up to 24 bits of audio: advertise 16 and 24 (never 32, which
-    // would be truncated). The rates tested above are already limited to
-    // what the sink's ELD allows.
+    // plughw:, which packs linear samples into subframes. A subframe carries
+    // up to 24 bits, but that says nothing about the sink, so 24-bit is only
+    // advertised when the sink's ELD lists 24-bit LPCM; otherwise 16-bit.
+    // Never 32, which a subframe would truncate. The rates tested above are
+    // already limited to what the ELD allows.
     if (caps.bit_depths.empty() &&
         snd_pcm_hw_params_test_format(pcm, hw, SND_PCM_FORMAT_IEC958_SUBFRAME_LE) == 0) {
-        caps.bit_depths = {16, 24};
+        caps.bit_depths = {16};
+        if (eld_lpcm_24bit(hw_device)) caps.bit_depths.push_back(24);
     }
 
     snd_pcm_close(pcm);

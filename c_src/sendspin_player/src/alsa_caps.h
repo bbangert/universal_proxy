@@ -17,8 +17,9 @@
 // kernel mishandles, so a real test-open against the configuration space is
 // the only authoritative source. See plan/scratchpad for #64.
 //
-// A device that only takes IEC958 subframes (Pi HDMI) reports 16 and
-// 24-bit, since `plughw:` packs linear samples into subframes.
+// A device that only takes IEC958 subframes (Pi HDMI) reports 16-bit, and
+// 24-bit when the sink's ELD lists 24-bit LPCM, since `plughw:` packs
+// linear samples into subframes.
 //
 // This is a distinct concern from `AlsaPipeSink` (long-lived playback open);
 // the probe is a transient open/close that runs once at startup.
