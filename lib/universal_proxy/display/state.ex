@@ -117,6 +117,7 @@ defmodule UniversalProxy.Display.State do
       jobs: :queue.new(),
       job: nil,
       follow_ups: [],
+      viz_on: nil,
       pubsub: Keyword.get(opts, :pubsub, UniversalProxy.PubSub),
       task_sup: Keyword.get(opts, :task_supervisor, UniversalProxy.TaskSupervisor),
       audio: Map.merge(default_audio(), Map.new(Keyword.get(opts, :audio, %{}))),
@@ -336,7 +337,7 @@ defmodule UniversalProxy.Display.State do
   end
 
   defp run_effect({:viz, viz}, state) do
-    state = with_key(state, fn key, audio -> fn -> audio.viz_enable.(key, viz != nil) end end)
+    state = player_viz(state, viz != nil)
 
     if state.viewport do
       state.renderer.set_viz(state.viewport.handle, viz_source(state, viz))
@@ -390,13 +391,34 @@ defmodule UniversalProxy.Display.State do
 
   defp viz_source(_state, _viz), do: nil
 
+  # Visualizer frames on (the bound output's player) or off. `viz_on` is the
+  # output last turned on, so after the binding moved, "off" still reaches
+  # the player that is actually emitting frames.
+  defp player_viz(state, on?) do
+    bound = state.model.binding && state.model.binding.key
+    old = state.viz_on
+
+    state =
+      if old && (not on? or old != bound),
+        do: enqueue(state, viz_job(state.audio, old, false)),
+        else: state
+
+    if on? && bound,
+      do: %{enqueue(state, viz_job(state.audio, bound, true)) | viz_on: bound},
+      else: %{state | viz_on: nil}
+  end
+
+  defp viz_job(audio, key, on?), do: fn -> audio.viz_enable.(key, on?) end
+
   # Queues the job `build.(key, audio)` returns, when bound.
   defp with_key(state, build) do
     case state.model.binding do
-      %{key: key} -> next_job(%{state | jobs: :queue.in(build.(key, state.audio), state.jobs)})
+      %{key: key} -> enqueue(state, build.(key, state.audio))
       nil -> state
     end
   end
+
+  defp enqueue(state, fun), do: next_job(%{state | jobs: :queue.in(fun, state.jobs)})
 
   # Starts the next queued audio job unless one is running. One at a time,
   # so the audio subsystem sees them in order.

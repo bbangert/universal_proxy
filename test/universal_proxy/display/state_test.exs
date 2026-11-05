@@ -431,6 +431,23 @@ defmodule UniversalProxy.Display.StateTest do
       assert model(ctx).viz == :strip
       assert last_set_viz() == %{topic: "sendspin:viz:c1", key: other.key, mode: :strip}
     end
+
+    test "a binding move turns the old player's visualizer off, the new one's on", context do
+      ctx =
+        start_ui(context, snapshot: {3, %{group: %{event: "group", playback_state: "playing"}}})
+
+      started!()
+      playing(ctx)
+      assert_receive {:audio, :viz_enable, @key, true}
+
+      other = %{@output | key: {"usb-dac", 1, 2}, client_id: "c1", card_index: 5}
+      Agent.update(ctx.world, &%{&1 | outputs: [Map.delete(@output, :display_roles), other]})
+      broadcast(ctx, "sendspin:output_added", {:sendspin_output_added, other})
+
+      assert_receive {:audio, :viz_enable, @key, false}
+      assert_receive {:audio, :viz_enable, {"usb-dac", 1, 2}, true}
+      refute_receive {:audio, :viz_enable, _, _}
+    end
   end
 
   describe "connector" do
