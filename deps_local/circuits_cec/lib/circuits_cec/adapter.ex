@@ -32,6 +32,15 @@ defmodule Circuits.CEC.Adapter do
      taken). A claim that already matches is kept, so restarting the
      adapter causes no bus traffic; a different one is cleared first.
 
+  The kernel claims in the background and gives up for good when a claim
+  transmit fails (vc4 times them out while the HDMI CRTC is off): it keeps
+  the configuration but no logical address, and only tries again on a
+  physical-address change. So while our claim is in place, the physical
+  address is valid and no logical address came of it, the adapter clears
+  and re-sets the configuration, first after `:reclaim_ms` and then at
+  doubling intervals up to `:reclaim_max_ms`. A foreign configuration
+  found there is left alone.
+
   The physical address is never set: the HDMI driver sets it from the
   EDID. When the cable is unplugged (or the sink drops hotplug in
   standby) the kernel drops the logical address, and when the physical
@@ -102,6 +111,9 @@ defmodule Circuits.CEC.Adapter do
       take before it fails with `:timeout` (default 4100: the kernel's
       2.1 s transmit timeout plus 2 s). Callers of a slower adapter pass a
       matching `:call_timeout`.
+    * `:reclaim_ms`, `:reclaim_max_ms` - the first and the longest wait
+      before re-claiming a logical address the kernel failed to get
+      (default 5 s and 60 s; see Bring-up)
   """
 
   use GenServer, restart: :transient
@@ -121,6 +133,8 @@ defmodule Circuits.CEC.Adapter do
   @reply_timeout 1_000
   @tx_deadline 4_100
   @otp_wait 10_000
+  @reclaim 5_000
+  @reclaim_max 60_000
   @max_orphans 16
   @osd_name_max 14
 
@@ -384,6 +398,10 @@ defmodule Circuits.CEC.Adapter do
       receiver_la: Keyword.get(opts, :receiver_la, 5),
       system_audio_mode: Keyword.get(opts, :system_audio_mode, false),
       tx_deadline: Keyword.get(opts, :tx_deadline_ms, @tx_deadline),
+      reclaim_first: Keyword.get(opts, :reclaim_ms, @reclaim),
+      reclaim_max: Keyword.get(opts, :reclaim_max_ms, @reclaim_max),
+      reclaim_delay: Keyword.get(opts, :reclaim_ms, @reclaim),
+      reclaim_timer: nil,
       caps: nil,
       connector: nil,
       ready?: false,
@@ -480,6 +498,20 @@ defmodule Circuits.CEC.Adapter do
   end
 
   def handle_info({:otp_timeout, _id}, state), do: {:noreply, state}
+
+  def handle_info({:reclaim, token}, %{reclaim_timer: {_timer, token}} = state) do
+    state = %{state | reclaim_timer: nil}
+
+    if needs_reclaim?(state) do
+      delay = min(state.reclaim_delay * 2, state.reclaim_max)
+      state = %{state | reclaim_delay: delay}
+      {:noreply, state |> send_internal(:g_log, {:g_log, :reclaim}) |> arm_reclaim()}
+    else
+      {:noreply, arm_reclaim(state)}
+    end
+  end
+
+  def handle_info({:reclaim, _token}, state), do: {:noreply, state}
 
   def handle_info({:DOWN, ref, :process, pid, _reason}, state) do
     case state.subs do
@@ -617,7 +649,12 @@ defmodule Circuits.CEC.Adapter do
   defp on_reply({:g_log, purpose}, {:ok, body}, state) do
     las = Struct.decode_log_addrs(body)
     state = set_addresses(state, state.phys_addr, las.log_addr_mask)
-    if purpose == :claim, do: {:ok, claim(state, las)}, else: {:ok, state}
+
+    case purpose do
+      :claim -> {:ok, claim(state, las)}
+      :reclaim -> {:ok, reclaim(state, las)}
+      _other -> {:ok, state}
+    end
   end
 
   defp on_reply(:g_phys, {:ok, body}, state),
@@ -635,6 +672,22 @@ defmodule Circuits.CEC.Adapter do
   defp on_reply(step, {:error, errno}, state) when step in [:claim_clear, :claim_set] do
     Logger.warning("CEC #{state.device}: can't claim a logical address (#{inspect(errno)})")
     {:ok, %{state | claim: {:error, errno}, ready?: true}}
+  end
+
+  defp on_reply(:reclaim_clear, {:ok, _}, state),
+    do: {:ok, send_internal(state, {:s_log, claim_struct(state)}, :reclaim_set)}
+
+  defp on_reply(:reclaim_set, {:ok, body}, state) do
+    las = Struct.decode_log_addrs(body)
+    {:ok, set_claim(%{state | log_addr_mask: las.log_addr_mask}, :claimed)}
+  end
+
+  # EBUSY: the kernel is configuring right now. Either way the claim we
+  # had stays in place and the next check tries again.
+  defp on_reply(step, {:error, errno}, state) when step in [:reclaim_clear, :reclaim_set] do
+    level = if errno == :ebusy, do: :debug, else: :warning
+    Logger.log(level, "CEC #{state.device}: re-claim failed (#{inspect(errno)})")
+    {:ok, state}
   end
 
   defp on_reply({:g_log, :claim}, {:error, errno}, state) do
@@ -668,12 +721,62 @@ defmodule Circuits.CEC.Adapter do
     end
   end
 
-  # Flags beyond the three settable ones (CONFIG_FAILED) are kernel output.
+  # Only the three settable flags count; the kernel may add others.
   defp our_claim?(state, las) do
     las.num_log_addrs == 1 and hd(las.log_addr_type) == Struct.log_addr_type(:playback) and
       hd(las.primary_device_type) == Message.device_type(:playback) and las.cec_version == 5 and
       las.vendor_id == 0xFFFFFFFF and las.osd_name == state.osd_name and
       (las.flags &&& 0x07) == Struct.flags_value(:log_addrs, @claim_flags)
+  end
+
+  # A claim of ours that the kernel holds without a logical address is
+  # cleared and set again, which makes the kernel run the claim anew.
+  defp reclaim(state, las) do
+    cond do
+      not needs_reclaim?(state) ->
+        state
+
+      las.num_log_addrs == 0 ->
+        Logger.info("CEC #{state.device}: no logical-address configuration; claiming again")
+        send_internal(state, {:s_log, claim_struct(state)}, :reclaim_set)
+
+      our_claim?(state, las) ->
+        Logger.info("CEC #{state.device}: the claim got no logical address; claiming again")
+        send_internal(state, {:s_log, Struct.encode_log_addrs([])}, :reclaim_clear)
+
+      true ->
+        Logger.debug("CEC #{state.device}: a foreign configuration replaced ours; leaving it")
+        state
+    end
+  end
+
+  defp needs_reclaim?(state) do
+    state.ready? and not state.stopping? and state.claim in [:kept, :claimed] and
+      Message.valid_pa?(state.phys_addr) and state.log_addr_mask == 0
+  end
+
+  # Armed while a re-claim may be needed; disarmed (and the backoff reset)
+  # once it isn't.
+  defp arm_reclaim(state) do
+    cond do
+      not needs_reclaim?(state) ->
+        cancel_reclaim(%{state | reclaim_delay: state.reclaim_first})
+
+      state.reclaim_timer == nil ->
+        token = make_ref()
+        timer = Process.send_after(self(), {:reclaim, token}, state.reclaim_delay)
+        %{state | reclaim_timer: {timer, token}}
+
+      true ->
+        state
+    end
+  end
+
+  defp cancel_reclaim(%{reclaim_timer: nil} = state), do: state
+
+  defp cancel_reclaim(%{reclaim_timer: {timer, _token}} = state) do
+    _ = Process.cancel_timer(timer)
+    %{state | reclaim_timer: nil}
   end
 
   defp claim_struct(state) do
@@ -749,7 +852,7 @@ defmodule Circuits.CEC.Adapter do
         true -> new
       end
 
-    emit_state(new)
+    new |> arm_reclaim() |> emit_state()
   end
 
   defp on_configured(state) do
