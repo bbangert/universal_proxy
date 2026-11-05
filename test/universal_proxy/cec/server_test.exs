@@ -538,6 +538,34 @@ defmodule UniversalProxy.Cec.ServerTest do
     assert Process.alive?(Process.whereis(Server))
   end
 
+  test "the subtree runs the volume link unless told not to" do
+    link = Process.whereis(UniversalProxy.Cec.VolumeLink)
+    assert is_pid(link)
+
+    # Its jobs run under the subtree's own Task.Supervisor, so a subtree
+    # restart ends them.
+    task_sup = Process.whereis(Supervisor.task_supervisor())
+    assert :sys.get_state(link).task_sup == Supervisor.task_supervisor()
+
+    assert Enum.any?(
+             Elixir.Supervisor.which_children(Supervisor),
+             &match?({_id, ^task_sup, :supervisor, [Task.Supervisor]}, &1)
+           )
+
+    stop_supervised!(Supervisor)
+    refute Process.alive?(task_sup)
+
+    start_supervised!(
+      {Supervisor,
+       enabled: true,
+       volume_link: false,
+       enumerate: fn -> %{} end,
+       output_lookup: fn _ -> :error end}
+    )
+
+    assert Process.whereis(UniversalProxy.Cec.VolumeLink) == nil
+  end
+
   test "the subtree is ignored unless enabled" do
     assert Supervisor.start_link() == :ignore
   end

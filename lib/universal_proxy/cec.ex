@@ -47,9 +47,16 @@ defmodule UniversalProxy.Cec do
   was last seen to make (see `set_volume/3`'s `:step`).
   """
   @type volume_result :: %{volume: 0..100, muted: boolean(), step: pos_integer()}
-  @typedoc "Why `set_volume/3` stopped short; a result is the last readback."
+  @typedoc """
+  Why `set_volume/3` stopped short. With a result (the last readback),
+  the walk had read the volume at least once: a stall, the press limit, or
+  a press or readback that failed with the reason given.
+  """
   @type step_error ::
-          :unknown_volume | {:no_progress, volume_result()} | {:press_limit, volume_result()}
+          :unknown_volume
+          | {:no_progress, volume_result()}
+          | {:press_limit, volume_result()}
+          | {error() | :unknown_volume, volume_result()}
 
   @ui_keys %{power_on: :power_on_function, power_off: :power_off_function}
 
@@ -105,6 +112,25 @@ defmodule UniversalProxy.Cec do
     :universal_proxy
     |> Application.get_env(__MODULE__, [])
     |> Keyword.get(:auto_wake, true)
+  end
+
+  @doc """
+  Whether this audio output's volume follows its receiver's
+  (`UniversalProxy.Cec.VolumeLink`). The output's own `cec_volume`
+  setting wins; an output without one follows `default`, the
+  `volume_link` env key (`true` unless configured otherwise).
+  """
+  @spec volume_link?(map(), boolean()) :: boolean()
+  def volume_link?(output, default \\ default_volume_link())
+  def volume_link?(%{cec_volume: value}, _default) when is_boolean(value), do: value
+  def volume_link?(_output, default), do: default
+
+  @doc false
+  @spec default_volume_link() :: boolean()
+  def default_volume_link do
+    :universal_proxy
+    |> Application.get_env(__MODULE__, [])
+    |> Keyword.get(:volume_link, true)
   end
 
   @doc "True when the subsystem is running and this build has the CEC helper."
@@ -202,8 +228,11 @@ defmodule UniversalProxy.Cec do
   Stops with `{:error, {:no_progress, result}}` after #{@stall_presses}
   presses in a row don't move the volume the pressed way, and with
   `{:error, {:press_limit, result}}` at `:max_presses`; `result` is the
-  last readback. `{:error, :unknown_volume}` when the receiver won't
-  report a volume.
+  last readback. A press or readback that fails after the first readback
+  gives `{:error, {reason, result}}` the same way, so the caller knows
+  where the walk got to (`:unknown_volume` when a readback had no
+  volume). Failing before any readback, the error is bare:
+  `{:error, :unknown_volume}` when the receiver won't report a volume.
   """
   @spec set_volume(dev(), 0..100, keyword()) ::
           {:ok, volume_result()} | {:error, error() | step_error()}
@@ -274,21 +303,30 @@ defmodule UniversalProxy.Cec do
     end
   end
 
-  defp press_and_read(walk, key, %{volume: volume, step: step}, left, stalled) do
+  defp press_and_read(walk, key, %{volume: volume, step: step} = last, left, stalled) do
     with :ok <- user_control(walk.dev, key, walk.opts),
          {:ok, %{volume: now} = status} <- known_volume(audio_status(walk.dev, walk.opts)) do
       moved = now - volume
       stalled = if moved_towards?(key, moved), do: 0, else: stalled + 1
       result = Map.put(status, :step, learn_step(step, moved, now))
       step_volume(walk, result, left - 1, stalled)
+    else
+      {:error, reason} -> {:error, {reason, last}}
     end
   end
 
-  # Above the ceiling only a step down will do; otherwise press only when
-  # one step (clipped to 0..100, as receivers do) lands strictly closer.
-  defp next_key(volume, _step, _target, ceiling) when volume > ceiling, do: :volume_down
+  @doc """
+  The key `set_volume/3` would press next with the receiver at `volume`,
+  a press moving it by `step`, walking to `target` under `ceiling`; `nil`
+  when it would stop there, i.e. `volume` is the nearest reachable one.
+  Above the ceiling only a step down will do; otherwise a key is pressed
+  only when one step (clipped to 0..100, as receivers do) lands strictly
+  closer.
+  """
+  @spec next_key(0..100, pos_integer(), 0..100, 0..100) :: :volume_up | :volume_down | nil
+  def next_key(volume, _step, _target, ceiling) when volume > ceiling, do: :volume_down
 
-  defp next_key(volume, step, target, ceiling) do
+  def next_key(volume, step, target, ceiling) do
     up = min(volume + step, 100)
     down = max(volume - step, 0)
     distance = abs(target - volume)

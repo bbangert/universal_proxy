@@ -59,6 +59,19 @@ defmodule UniversalProxy.Audio.Player do
       {"cmd":"set_volume_external","value":true}
       {"cmd":"shutdown"}
 
+  ## Startup snapshot
+
+  The binary's first `volume` event reports its `--initial-volume`, and
+  the first `mute` event after a startup `set_muted` (see `init/1`) is
+  that command's echo: what the player was spawned with, not a change
+  from the Sendspin server or the UI. Both are broadcast with
+  `startup: true` so subscribers acting on volume changes
+  (`UniversalProxy.Cec.VolumeLink`) can tell them apart. Every `volume`
+  and `mute` event also carries `player: pid` (this process), so an echo
+  can be matched to the player a command was sent to
+  (`UniversalProxy.Audio.update_config_forwarded/2`) and told apart from
+  a previous player's.
+
   ## External volume
 
   In external-volume mode an outboard stage (an HDMI-CEC receiver) is the
@@ -135,6 +148,7 @@ defmodule UniversalProxy.Audio.Player do
     mdns_retry_ms: @mdns_retry_ms,
     mdns_failures: 0,
     volume_external: false,
+    startup: [:volume],
     last_event: %{},
     os_pid: nil
   ]
@@ -162,6 +176,7 @@ defmodule UniversalProxy.Audio.Player do
           mdns_retry_ms: pos_integer(),
           mdns_failures: non_neg_integer(),
           volume_external: boolean(),
+          startup: [:volume | :muted],
           last_event: map(),
           os_pid: pos_integer() | nil
         }
@@ -309,9 +324,13 @@ defmodule UniversalProxy.Audio.Player do
       # stdin right after the port is open so the binary's default
       # (unmuted) doesn't briefly play before the BEAM tells it the
       # truth. Volume is already covered by `--initial-volume`.
-      if Map.get(config, :muted, false) do
-        send_command(new_state, {:set_muted, true})
-      end
+      new_state =
+        if Map.get(config, :muted, false) do
+          send_command(new_state, {:set_muted, true})
+          %{new_state | startup: [:muted | new_state.startup]}
+        else
+          new_state
+        end
 
       {:ok, new_state}
     else
@@ -360,6 +379,7 @@ defmodule UniversalProxy.Audio.Player do
     case Jason.decode(line, keys: :atoms) do
       {:ok, %{event: _} = event} ->
         state = state |> maybe_register_mdns(event) |> track_volume_external(event)
+        {state, event} = tag_startup(state, event)
         broadcast_state(state, event)
         {:noreply, %{state | last_event: event}}
 
@@ -540,6 +560,18 @@ defmodule UniversalProxy.Audio.Player do
        do: %{state | volume_external: external?}
 
   defp track_volume_external(state, _event), do: state
+
+  defp tag_startup(state, %{event: "volume"} = event), do: tag_startup(state, event, :volume)
+  defp tag_startup(state, %{event: "mute"} = event), do: tag_startup(state, event, :muted)
+  defp tag_startup(state, event), do: {state, event}
+
+  defp tag_startup(state, event, field) do
+    event = Map.put(event, :player, self())
+
+    if field in state.startup,
+      do: {%{state | startup: List.delete(state.startup, field)}, Map.put(event, :startup, true)},
+      else: {state, event}
+  end
 
   # On success, anchor the §8.3 reannounce burst here so its
   # cache-priming fires after the record actually exists. On failure

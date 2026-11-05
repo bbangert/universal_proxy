@@ -49,6 +49,9 @@ defmodule UniversalProxy.Audio.ServerTest do
     def set_muted(pid, value) when is_boolean(value),
       do: GenServer.call(pid, {:set_muted, value})
 
+    def set_volume_external(pid, value) when is_boolean(value),
+      do: GenServer.call(pid, {:set_volume_external, value})
+
     @impl true
     def init(opts) do
       # Trap exits — must match Audio.Player so DynamicSupervisor's
@@ -63,6 +66,7 @@ defmodule UniversalProxy.Audio.ServerTest do
       # respawned player received the NEW friendly_name (a regression
       # that restarted with stale config would otherwise pass).
       record({:started, key, mdns_port, config})
+      record({:start_volume_external, key, Keyword.get(opts, :volume_external)})
       {:ok, %{key: key}}
     end
 
@@ -74,6 +78,11 @@ defmodule UniversalProxy.Audio.ServerTest do
 
     def handle_call({:set_muted, v}, _from, state) do
       record({:set_muted, state.key, v})
+      {:reply, :ok, state}
+    end
+
+    def handle_call({:set_volume_external, v}, _from, state) do
+      record({:set_volume_external, state.key, v})
       {:reply, :ok, state}
     end
 
@@ -717,6 +726,22 @@ defmodule UniversalProxy.Audio.ServerTest do
       assert {:ok, %{cec_auto_wake: false}} = Server.get_output(server, @hp_key)
     end
 
+    test "persists and broadcasts cec_volume and a clamped cec_volume_max", %{
+      server: server,
+      store: store
+    } do
+      :ok = Server.update_config(server, @hp_key, %{cec_volume: false, cec_volume_max: 140})
+
+      assert_receive {:sendspin_state, @hp_key, %{cec_volume: false, cec_volume_max: 100}}
+      assert {:ok, %{cec_volume: false, cec_volume_max: 100}} = Store.get_config(store, @hp_key)
+
+      assert {:ok, %{cec_volume: false, cec_volume_max: 100}} =
+               Server.get_output(server, @hp_key)
+
+      :ok = Server.update_config(server, @hp_key, %{cec_volume_max: nil})
+      assert {:ok, %{cec_volume_max: nil}} = Server.get_output(server, @hp_key)
+    end
+
     test "returns {:error, :not_found} for unknown output", %{server: server} do
       assert {:error, :not_found} =
                Server.update_config(server, {"missing", nil, nil}, %{friendly_name: "x"})
@@ -990,6 +1015,93 @@ defmodule UniversalProxy.Audio.ServerTest do
 
       assert_receive {:sendspin_state, @hp_key, %{volume: 50}}
       refute_receive {:sendspin_state, @hp_key, %{volume: "77"}}, 100
+    end
+
+    test "set_volume_external forwards to the running player, once per change", %{
+      server: server
+    } do
+      assert {:ok, %{volume_external: false}} = Server.get_output(server, @hp_key)
+
+      :ok = Server.set_volume_external(server, @hp_key, true)
+      assert_receive {:sendspin_state, @hp_key, %{volume_external: true}}
+      :ok = Server.set_volume_external(server, @hp_key, true)
+      refute_receive {:sendspin_state, @hp_key, %{volume_external: _}}, 50
+
+      assert Enum.count(PlayerStubCalls.calls(), &(&1 == {:set_volume_external, @hp_key, true})) ==
+               1
+
+      assert {:ok, %{volume_external: true}} = Server.get_output(server, @hp_key)
+      assert [%{volume_external: true}] = Server.list_outputs(server)
+
+      :ok = Server.set_volume_external(server, @hp_key, false)
+      assert_receive {:sendspin_state, @hp_key, %{volume_external: false}}
+      assert {:set_volume_external, @hp_key, false} in PlayerStubCalls.calls()
+
+      assert {:error, :not_found} =
+               Server.set_volume_external(server, {"missing", nil, nil}, true)
+    end
+
+    test "a respawned player starts in external-volume mode while it is set", %{
+      server: server,
+      player_sup: sup
+    } do
+      assert {:start_volume_external, @hp_key, false} in PlayerStubCalls.calls()
+      :ok = Server.set_volume_external(server, @hp_key, true)
+
+      [{_, pid, _, _}] = DynamicSupervisor.which_children(sup)
+      ref = Process.monitor(pid)
+      Process.exit(pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
+      eventually(fn -> :sys.get_state(server).hotplug_pending end, 1_000)
+      send(server, :check_hotplug)
+
+      eventually(
+        fn ->
+          List.last(PlayerStubCalls.calls()) == {:start_volume_external, @hp_key, true}
+        end,
+        1_000
+      )
+    end
+
+    test "the external-volume flag is dropped when the output goes away", %{server: server} do
+      :ok = Server.set_volume_external(server, @hp_key, true)
+
+      EnumerateStub.set(%{})
+      :ok = Server.check_now(server)
+      assert_receive {:sendspin_output_removed, %{key: @hp_key}}
+
+      EnumerateStub.set(%{
+        @hp_key => %{
+          card_index: 0,
+          alsa_device: "plughw:0,0",
+          card_name: "bcm2835 Headphones",
+          usb_port: nil
+        }
+      })
+
+      :ok = Server.check_now(server)
+      assert_receive {:sendspin_output_added, %{key: @hp_key}}
+      assert {:ok, %{volume_external: false}} = Server.get_output(server, @hp_key)
+      assert List.last(PlayerStubCalls.calls()) == {:start_volume_external, @hp_key, false}
+    end
+
+    test "update_config_forwarded names the player a volume or mute change went to", %{
+      server: server,
+      player_sup: sup
+    } do
+      [{_, player, _, _}] = DynamicSupervisor.which_children(sup)
+
+      assert {:ok, ^player} = Server.update_config_forwarded(server, @hp_key, %{volume: 30})
+      assert {:set_volume, @hp_key, 30} in PlayerStubCalls.calls()
+      assert {:ok, ^player} = Server.update_config_forwarded(server, @hp_key, %{muted: true})
+      assert {:ok, nil} = Server.update_config_forwarded(server, @hp_key, %{cec_volume: false})
+
+      :ok = Server.set_enabled(server, @hp_key, false)
+      assert {:ok, nil} = Server.update_config_forwarded(server, @hp_key, %{volume: 40})
+      assert {:ok, %{volume: 40}} = Server.get_output(server, @hp_key)
+
+      assert {:error, :not_found} =
+               Server.update_config_forwarded(server, {"missing", nil, nil}, %{volume: 1})
     end
 
     test "update_config with muted forwards to set_muted", %{server: server} do

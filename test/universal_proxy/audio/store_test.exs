@@ -73,6 +73,40 @@ defmodule UniversalProxy.Audio.StoreTest do
       assert {:ok, %{cec_auto_wake: nil}} = Store.get_config(server, @key)
     end
 
+    test "cec_volume is unset until saved, then kept as a boolean", %{server: server} do
+      :ok = Store.save_config(server, @key, %{})
+      assert {:ok, %{cec_volume: nil}} = Store.get_config(server, @key)
+
+      :ok = Store.save_config(server, @key, %{cec_volume: false})
+      :ok = Store.save_config(server, @key, %{volume: 10})
+      assert {:ok, %{cec_volume: false}} = Store.get_config(server, @key)
+
+      :ok = Store.save_config(server, @key, %{cec_volume: nil})
+      assert {:ok, %{cec_volume: nil}} = Store.get_config(server, @key)
+    end
+
+    test "cec_volume_max is nil (no cap) or clamped to 1..100", %{server: server} do
+      :ok = Store.save_config(server, @key, %{})
+      assert {:ok, %{cec_volume_max: nil}} = Store.get_config(server, @key)
+
+      :ok = Store.save_config(server, @key, %{cec_volume_max: 60})
+      :ok = Store.save_config(server, @key, %{volume: 10})
+      assert {:ok, %{cec_volume_max: 60}} = Store.get_config(server, @key)
+
+      :ok = Store.save_config(server, @key, %{cec_volume_max: 250})
+      assert {:ok, %{cec_volume_max: 100}} = Store.get_config(server, @key)
+
+      :ok = Store.save_config(server, @key, %{cec_volume_max: 0})
+      assert {:ok, %{cec_volume_max: 1}} = Store.get_config(server, @key)
+
+      :ok = Store.save_config(server, @key, %{cec_volume_max: "50"})
+      assert {:ok, %{cec_volume_max: nil}} = Store.get_config(server, @key)
+
+      :ok = Store.save_config(server, @key, %{cec_volume_max: 40})
+      :ok = Store.save_config(server, @key, %{cec_volume_max: nil})
+      assert {:ok, %{cec_volume_max: nil}} = Store.get_config(server, @key)
+    end
+
     test "round-trips and clamps static_delay_ms (0..5000)", %{server: server} do
       :ok = Store.save_config(server, @key, %{static_delay_ms: 250})
       assert {:ok, %{static_delay_ms: 250}} = Store.get_config(server, @key)

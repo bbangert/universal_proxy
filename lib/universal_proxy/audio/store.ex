@@ -16,12 +16,18 @@ defmodule UniversalProxy.Audio.Store do
         volume: 0..100,
         muted: boolean(),
         static_delay_ms: 0..5000,
-        cec_auto_wake: boolean() | nil
+        cec_auto_wake: boolean() | nil,
+        cec_volume: boolean() | nil,
+        cec_volume_max: 1..100 | nil
       }
 
   `cec_auto_wake` is the HDMI-CEC auto-wake choice for this output (wake
   the receiver when a stream starts); `nil` until the user sets it, which
   means the `UniversalProxy.Cec` `auto_wake` default applies.
+  `cec_volume` likewise chooses whether the output's volume follows the
+  receiver's (`UniversalProxy.Cec.VolumeLink`), `nil` meaning the
+  `volume_link` default. `cec_volume_max` caps the volume sent to the
+  receiver (`nil`: no cap); values outside 1..100 are clamped into it.
 
   `client_id` is generated once per output the first time it is sighted
   and persists across reboots. It is no longer the Sendspin `client_id`:
@@ -59,7 +65,9 @@ defmodule UniversalProxy.Audio.Store do
           volume: 0..100,
           muted: boolean(),
           static_delay_ms: 0..5000,
-          cec_auto_wake: boolean() | nil
+          cec_auto_wake: boolean() | nil,
+          cec_volume: boolean() | nil,
+          cec_volume_max: 1..100 | nil
         }
 
   # -- Client API --
@@ -212,7 +220,9 @@ defmodule UniversalProxy.Audio.Store do
       volume: clamp_volume(pick(params, existing, :volume, 50)),
       muted: !!pick(params, existing, :muted, false),
       static_delay_ms: clamp_static_delay(pick(params, existing, :static_delay_ms, 0)),
-      cec_auto_wake: tri_state(pick(params, existing, :cec_auto_wake, nil))
+      cec_auto_wake: tri_state(pick(params, existing, :cec_auto_wake, nil)),
+      cec_volume: tri_state(pick(params, existing, :cec_volume, nil)),
+      cec_volume_max: clamp_ceiling(pick(params, existing, :cec_volume_max, nil))
     }
   end
 
@@ -258,6 +268,9 @@ defmodule UniversalProxy.Audio.Store do
 
   defp tri_state(v) when is_boolean(v), do: v
   defp tri_state(_), do: nil
+
+  defp clamp_ceiling(v) when is_integer(v), do: v |> max(1) |> min(100)
+  defp clamp_ceiling(_), do: nil
 
   # Server-adjustable static output delay (multi-room sync). The sendspin
   # library caps this at 5000 ms (`MAX_STATIC_DELAY_MS`); mirror that here.

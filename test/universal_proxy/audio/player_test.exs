@@ -722,7 +722,37 @@ defmodule UniversalProxy.Audio.PlayerTest do
       # `started` event + initial-volume event + our follow-up mute
       # event. assert_receive selectively matches the mute event in
       # the mailbox.
-      assert_receive {:sendspin_state, @key, %{event: "mute", value: true}}, 2_000
+      assert_receive {:sendspin_state, @key, %{event: "mute", value: true, startup: true}},
+                     2_000
+    end
+
+    test "tags the startup snapshot (initial volume, startup mute echo), and nothing after" do
+      pid = start_player!(config: Map.put(config(), :muted, true))
+
+      assert_receive {:sendspin_state, @key, %{event: "volume", value: 60, startup: true}},
+                     2_000
+
+      assert_receive {:sendspin_state, @key, %{event: "mute", value: true, startup: true}},
+                     1_000
+
+      :ok = Player.set_volume(pid, 60)
+      assert_receive {:sendspin_state, @key, %{event: "volume", value: 60} = volume}, 1_000
+      refute Map.has_key?(volume, :startup)
+      # Every volume/mute event names the player process it came from.
+      assert volume.player == pid
+
+      :ok = Player.set_muted(pid, true)
+      assert_receive {:sendspin_state, @key, %{event: "mute", value: true} = mute}, 1_000
+      refute Map.has_key?(mute, :startup)
+    end
+
+    test "without a startup mute, the first mute event is not a snapshot" do
+      pid = start_player!()
+      assert_receive {:sendspin_state, @key, %{event: "volume", startup: true}}, 2_000
+
+      :ok = Player.set_muted(pid, true)
+      assert_receive {:sendspin_state, @key, %{event: "mute", value: true} = mute}, 1_000
+      refute Map.has_key?(mute, :startup)
     end
   end
 
