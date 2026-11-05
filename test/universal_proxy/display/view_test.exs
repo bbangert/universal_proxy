@@ -100,6 +100,20 @@ defmodule UniversalProxy.Display.ViewTest do
     end
   end
 
+  describe "output size" do
+    test "the reported size wins over the :size hint; margins are 5% per axis" do
+      root = fn spec -> hd(keyed(spec, "root")) end
+
+      assert attr(root.(View.render(model(playback: :playing))), :padding) == {36, 64, 36, 64}
+
+      big = View.render(model(playback: :playing), size: {1920, 1080})
+      assert attr(root.(big), :padding) == {54, 96, 54, 96}
+
+      reported = View.render(model(playback: :playing, size: {1920, 1080}), size: {1280, 720})
+      assert reported == big
+    end
+  end
+
   describe "visualizer bars" do
     test "a fixed-size, paint-only row of zeroed bars, sized by the :bars option" do
       for fields <- [[playback: :playing], [mode: :visualizer, playback: :playing]] do

@@ -124,6 +124,9 @@ if Code.ensure_loaded?(Emerge) do
              raster_present: Keyword.get(opts, :raster_present, :auto),
              cache: cache_config(opts)
            },
+           # The DRM backends report the chosen mode's size as a resize,
+           # which the viewport passes on to its owner.
+           input: %Emerge.Config.Input{events: [:resize]},
            assets: %Emerge.Config.Assets{
              otp_app: :universal_proxy,
              decode_at_size: true,
@@ -209,6 +212,10 @@ if Code.ensure_loaded?(Emerge) do
 
     defp attr(:width, length), do: Size.width(size_value(length))
     defp attr(:height, length), do: Size.height(size_value(length))
+
+    defp attr(:padding, {top, right, bottom, left}),
+      do: Space.padding_each(top, right, bottom, left)
+
     defp attr(:padding, n), do: Space.padding(n)
     defp attr(:spacing, n), do: Space.spacing(n)
     defp attr(:background, paint), do: Background.color(paint(paint))

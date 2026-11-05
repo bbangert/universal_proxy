@@ -33,6 +33,11 @@ if Code.ensure_loaded?(Emerge) do
     logs it, and tells the `:owner` (if any) as `{:viewport_viz_tier, pid,
     tier}`; at `:off` it unsubscribes. A new source starts at `:full` again.
 
+    ## Output size
+
+    The DRM backend reports the mode it set as a resize; the viewport tells
+    the `:owner` as `{:viewport_size, pid, {width, height}}`.
+
     Start options: `:config` (an `%Emerge.Config{}`), `:spec`, `:viz_tick_ms`
     and `:owner`.
     """
@@ -113,6 +118,16 @@ if Code.ensure_loaded?(Emerge) do
     end
 
     def handle_info(_message, state), do: {:noreply, state}
+
+    # The output size (the DRM mode Emerge chose, again after a hotplug
+    # modeset): the owner lays its screens out for it.
+    @impl Viewport
+    def handle_input({:resize, {width, height, _scale}}, state) do
+      if state.owner, do: send(state.owner, {:viewport_size, self(), {width, height}})
+      {:noreply, state}
+    end
+
+    def handle_input(_event, state), do: {:noreply, state}
 
     # ── Visualizer ─────────────────────────────────────────────────────
 

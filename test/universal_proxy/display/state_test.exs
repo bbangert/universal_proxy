@@ -255,6 +255,23 @@ defmodule UniversalProxy.Display.StateTest do
     end
   end
 
+  describe "output size" do
+    test "the viewport's reported size re-lays the screen out", context do
+      ctx = start_ui(context)
+      viewport = viewport!(ctx)
+
+      send(ctx.state, {:viewport_size, viewport, {1920, 1080}})
+      assert_receive {:fake_renderer, :push, ^viewport, spec}
+      assert {:column, attrs, _} = spec
+      assert attrs[:padding] == {54, 96, 54, 96}
+      assert GenServer.call(ctx.state, :status).size == {1920, 1080}
+
+      # Another process's (a stale viewport's) report is ignored.
+      send(ctx.state, {:viewport_size, self(), {1280, 720}})
+      assert GenServer.call(ctx.state, :status).size == {1920, 1080}
+    end
+  end
+
   describe "player events" do
     test "display events for the bound output redraw; others are ignored", context do
       ctx = start_ui(context)

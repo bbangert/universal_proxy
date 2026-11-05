@@ -41,7 +41,9 @@ defmodule UniversalProxy.Display.Model do
   The model also tracks the renderer: start when a display is available,
   back off 1 s → 5 min on start errors and crashes (reset after
   `stable_ms` up), retry at once when the HDMI link comes back, and step
-  down the renderer `ladder` after `crash_limit` identical crashes.
+  down the renderer `ladder` after `crash_limit` identical crashes. The
+  output size the viewport reports (`{:viewport_size, {w, h}}`, the mode
+  it chose) is kept in `size`, which the view scales its layout to.
   """
 
   alias UniversalProxy.Display.Mode
@@ -76,6 +78,7 @@ defmodule UniversalProxy.Display.Model do
           optional(:hdmi_port) => non_neg_integer() | nil
         }
   @type timer :: :idle | :retry | :stable
+  @type size :: {pos_integer(), pos_integer()}
 
   @type vp_status :: :idle | :headless | :starting | :running | :backoff | :failed
   @type viewport :: %{
@@ -103,6 +106,7 @@ defmodule UniversalProxy.Display.Model do
           | {:display_available, boolean()}
           | {:viewport, :started}
           | {:viewport, :start_failed | :down, term()}
+          | {:viewport_size, size()}
           | :hdmi_link_up
 
   @type effect ::
@@ -141,6 +145,7 @@ defmodule UniversalProxy.Display.Model do
           power: :on | :off,
           viz: viz(),
           claimed: String.t() | nil,
+          size: size() | nil,
           viewport: viewport(),
           config: map()
         }
@@ -166,6 +171,7 @@ defmodule UniversalProxy.Display.Model do
             power: :on,
             viz: nil,
             claimed: nil,
+            size: nil,
             viewport: %{
               status: :idle,
               gen: 0,
@@ -396,6 +402,11 @@ defmodule UniversalProxy.Display.Model do
       true -> backoff(put_vp(m, delay_ms: nil), reason)
     end
   end
+
+  # The output size the running viewport reports (the mode it chose).
+  defp apply_event(m, {:viewport_size, {w, h} = size}, _now)
+       when is_integer(w) and w > 0 and is_integer(h) and h > 0,
+       do: {%{m | size: size}, [], []}
 
   defp apply_event(m, :hdmi_link_up, _now) do
     if m.viewport.status in [:backoff, :failed],
@@ -668,7 +679,7 @@ defmodule UniversalProxy.Display.Model do
   # Everything `UniversalProxy.Display.View` draws from.
   defp render_key(m) do
     {screen(m), m.focus, m.tv_presence, m.playback, m.metadata, m.controller, m.color, m.artwork,
-     m.party, m.group && Map.get(m.group, :group_name)}
+     m.party, m.group && Map.get(m.group, :group_name), m.size}
   end
 
   defp cfg(m, key), do: Map.fetch!(m.config, key)

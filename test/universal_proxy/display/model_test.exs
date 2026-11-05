@@ -429,6 +429,15 @@ defmodule UniversalProxy.Display.ModelTest do
       assert gen == model.viewport.gen
     end
 
+    test "the reported output size is kept and redraws once per change" do
+      {model, effects} = Model.handle(ready(), {:viewport_size, {1920, 1080}}, 0)
+      assert model.size == {1920, 1080}
+      assert :render in effects
+
+      assert {^model, []} = Model.handle(model, {:viewport_size, {1920, 1080}}, 0)
+      assert {^model, []} = Model.handle(model, {:viewport_size, {0, 1080}}, 0)
+    end
+
     test "start errors back off 1 s doubling to the cap; the retry timer starts again" do
       delays =
         Enum.map_reduce(1..5, starting(), fn _, model ->

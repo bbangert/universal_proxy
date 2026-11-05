@@ -36,9 +36,10 @@ defmodule UniversalProxy.Display.View do
   @controls [prev: "Previous", play_pause: nil, next: "Next"]
 
   @doc """
-  The spec for `model`. Options: `:size` (`{width, height}` the layout is
-  scaled to, default `{1280, 720}`) and `:bars` (visualizer bar count,
-  default 32).
+  The spec for `model`, laid out for the output size the viewport reported
+  (`model.size`). Options: `:size` (`{width, height}` to use until the
+  viewport reports one, default `{1280, 720}`) and `:bars` (visualizer bar
+  count, default 32).
   """
   @spec render(Model.t(), keyword()) :: Spec.t()
   def render(%Model{} = model, opts \\ []) do
@@ -73,7 +74,7 @@ defmodule UniversalProxy.Display.View do
 
     {:column, root_attrs(ctx),
      [
-       {:row, [key: "top", width: :fill, height: :fill, spacing: ctx.margin],
+       {:row, [key: "top", width: :fill, height: :fill, spacing: ctx.margin_x],
         [artwork(model, art_size, ctx), text_block]},
        viz_bars(ctx, round(ctx.height * 0.16))
      ]}
@@ -196,7 +197,7 @@ defmodule UniversalProxy.Display.View do
   end
 
   defp viz_bars(ctx, max_height) do
-    area = ctx.width - 2 * ctx.margin
+    area = ctx.width - 2 * ctx.margin_x
     spacing = max(px(ctx, 4), 1)
     bar_width = max(div(area - spacing * (ctx.bars - 1), ctx.bars), 1)
 
@@ -237,7 +238,7 @@ defmodule UniversalProxy.Display.View do
       key: "root",
       width: :fill,
       height: :fill,
-      padding: ctx.margin,
+      padding: {ctx.margin, ctx.margin_x, ctx.margin, ctx.margin_x},
       spacing: ctx.margin,
       background: ctx.bg
     ]
@@ -246,12 +247,14 @@ defmodule UniversalProxy.Display.View do
   # ── Context ──────────────────────────────────────────────────────────
 
   defp context(model, opts) do
-    {width, height} = Keyword.get(opts, :size) || @default_size
+    {width, height} = model.size || Keyword.get(opts, :size) || @default_size
 
     %{
       width: width,
       height: height,
       unit: height / 720,
+      # Overscan-safe: 5% of each axis on every side.
+      margin_x: round(width * 0.05),
       margin: round(height * 0.05),
       bars: Keyword.get(opts, :bars) || @default_bars,
       bg: palette(model.color, :background_dark, @background),

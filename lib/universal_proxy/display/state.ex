@@ -35,6 +35,10 @@ defmodule UniversalProxy.Display.State do
   effects, so they always build on its final state. Mode changes are broadcast on `UniversalProxy.Display.topic/0`
   as `{:display_mode, mode}`.
 
+  The viewport reports the output size it got as `{:viewport_size,
+  viewport, {w, h}}`; screens are laid out for that size (before the
+  first report, for the configured `:preferred_size`).
+
   Timers fire as `{:display_timer, timer, gen}` messages (`timer` is
   `:idle`, `:retry` or `:stable`); a stale `gen` is ignored.
 
@@ -234,6 +238,9 @@ defmodule UniversalProxy.Display.State do
 
   def handle_info({:viewport_viz_tier, _pid, tier}, state),
     do: {:noreply, %{state | viz_tier: tier}}
+
+  def handle_info({:viewport_size, handle, size}, %{viewport: %{handle: handle}} = state),
+    do: {:noreply, dispatch(state, {:viewport_size, size})}
 
   def handle_info(_msg, state), do: {:noreply, state}
 
@@ -525,6 +532,7 @@ defmodule UniversalProxy.Display.State do
         keys_claimed: m.claimed,
         viz: m.viz,
         viz_tier: state.viz_tier,
+        size: m.size,
         lifecycle: m.viewport
       })
     else

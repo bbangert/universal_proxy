@@ -23,6 +23,8 @@ defmodule UniversalProxy.Display.Spec do
       offset, so height changes need no relayout.
     * `:none` — renders nothing.
 
+  `:padding` is one number for every side or `{top, right, bottom, left}`.
+
   Colours are `{r, g, b}` or `{r, g, b, alpha}` with bytes `0..255` and
   `alpha` in `0.0..1.0`. A `:background` or `:font_color` may also be
   `{:gradient, [color, ...], angle_degrees}` (0 points right, 90 down).
@@ -38,7 +40,7 @@ defmodule UniversalProxy.Display.Spec do
   @type attr ::
           {:width, length()}
           | {:height, length()}
-          | {:padding, number()}
+          | {:padding, number() | {number(), number(), number(), number()}}
           | {:spacing, number()}
           | {:background, paint()}
           | {:font_size, number()}
