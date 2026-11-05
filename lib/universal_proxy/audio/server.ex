@@ -47,7 +47,7 @@ defmodule UniversalProxy.Audio.Server do
 
   require Logger
 
-  alias UniversalProxy.Audio.{MdnsDiscovery, Params, Player, Store}
+  alias UniversalProxy.Audio.{DisplayRoles, MdnsDiscovery, Params, Player, Store}
 
   @pubsub UniversalProxy.PubSub
   @hotplug_interval 5_000
@@ -178,6 +178,16 @@ defmodule UniversalProxy.Audio.Server do
   end
 
   @doc """
+  The pid of an output's running player, or `:error` when the output has
+  none (absent, disabled, or between a crash and its respawn). Callers
+  must not cache it: players are respawned with fresh pids.
+  """
+  @spec player_pid(GenServer.server(), key()) :: {:ok, pid()} | :error
+  def player_pid(server \\ __MODULE__, {slot_sub, _vid, _pid} = key) when is_binary(slot_sub) do
+    GenServer.call(server, {:player_pid, key})
+  end
+
+  @doc """
   Force a hotplug poll synchronously. Tests use this to avoid waiting
   on the periodic timer.
   """
@@ -201,6 +211,12 @@ defmodule UniversalProxy.Audio.Server do
     player_module = Keyword.get(opts, :player_module, Player)
     mdns_discovery = Keyword.get(opts, :mdns_discovery, MdnsDiscovery)
     mdns_module = Keyword.get(opts, :mdns_module, MdnsLite)
+
+    display_roles =
+      Keyword.merge(DisplayRoles.config(), Keyword.get(opts, :display_roles, []))
+
+    hdmi_status_fun =
+      Keyword.get(opts, :hdmi_status_fun, &DisplayRoles.connector_status/1)
 
     state = %{
       enumerate_module: enumerate_module,
@@ -237,6 +253,10 @@ defmodule UniversalProxy.Audio.Server do
       # Outputs whose players run in external-volume mode
       # (`set_volume_external/3`). Runtime only.
       volume_external: MapSet.new(),
+      # Sendspin display roles for the HDMI TV UI (`Audio.DisplayRoles`):
+      # config, and the HDMI port → DRM connector status reader.
+      display_roles: display_roles,
+      hdmi_status_fun: hdmi_status_fun,
       # Debounce flag: a `sound` uevent schedules one delayed
       # `:check_hotplug` and sets this; the burst of sub-device uevents a
       # single card emits then coalesces into that one re-enumeration.
@@ -323,6 +343,13 @@ defmodule UniversalProxy.Audio.Server do
 
       :error ->
         {:reply, :error, state}
+    end
+  end
+
+  def handle_call({:player_pid, key}, _from, state) do
+    case Map.fetch(state.players, key) do
+      {:ok, %{pid: pid}} -> {:reply, {:ok, pid}, state}
+      :error -> {:reply, :error, state}
     end
   end
 
@@ -946,12 +973,15 @@ defmodule UniversalProxy.Audio.Server do
     key = merged.key
     server_url = current_server_url(state)
 
+    display_roles = display_roles_for(state, merged)
+
     opts = [
       key: key,
       config: merged,
       mdns_port: mdns_port,
       server_url: server_url,
-      volume_external: MapSet.member?(state.volume_external, key)
+      volume_external: MapSet.member?(state.volume_external, key),
+      display_roles: display_roles
     ]
 
     case DynamicSupervisor.start_child(
@@ -961,7 +991,12 @@ defmodule UniversalProxy.Audio.Server do
       {:ok, pid} ->
         ref = Process.monitor(pid)
 
-        put_in(state.players[key], %{pid: pid, monitor: ref, mdns_port: mdns_port})
+        put_in(state.players[key], %{
+          pid: pid,
+          monitor: ref,
+          mdns_port: mdns_port,
+          display_roles: display_roles != nil
+        })
 
       {:error, {:binary_missing, path}} ->
         # Binary not built for this target (or stripped from priv/).
@@ -980,6 +1015,21 @@ defmodule UniversalProxy.Audio.Server do
         Logger.error("Audio.Player start failed for #{inspect(key)}: #{inspect(reason)}")
 
         state
+    end
+  end
+
+  # The display roles go to the HDMI output `DisplayRoles.choose/2` picks
+  # (plan P3), and to no output while another running player already has
+  # them, so at most one binary ever advertises them.
+  defp display_roles_for(%{display_roles: cfg} = state, merged) do
+    key = merged.key
+
+    other_has_roles? =
+      Enum.any?(state.players, fn {k, p} -> k != key and Map.get(p, :display_roles, false) end)
+
+    if Keyword.fetch!(cfg, :enabled) and not other_has_roles? and
+         DisplayRoles.choose(Map.values(state.outputs), state.hdmi_status_fun) == key do
+      DisplayRoles.player_opts(merged, cfg)
     end
   end
 
@@ -1145,6 +1195,7 @@ defmodule UniversalProxy.Audio.Server do
     output
     |> Map.merge(live)
     |> Map.put(:volume_external, MapSet.member?(state.volume_external, output.key))
+    |> Map.put(:display_roles, get_in(state.players, [output.key, :display_roles]) == true)
   end
 
   defp current_server_url(state) do

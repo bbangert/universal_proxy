@@ -103,6 +103,18 @@ config :universal_proxy, UniversalProxy.Display,
   renderer: UniversalProxy.Display.Renderer.Null,
   autostart: false
 
+# Sendspin display roles (metadata, controller, color, artwork, visualizer)
+# for the HDMI TV UI, carried by one HDMI output's player (see
+# `UniversalProxy.Audio.DisplayRoles`). Off here; config/target.exs turns it
+# on for the display targets. `:artwork_root` defaults to the system tmp dir.
+config :universal_proxy, UniversalProxy.Audio.DisplayRoles,
+  enabled: false,
+  artwork_size: {480, 480},
+  artwork_keep: 8,
+  viz_bins: 32,
+  viz_rate: 20,
+  viz_offset_ms: 100
+
 # Import environment specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.
 import_config "#{config_env()}.exs"

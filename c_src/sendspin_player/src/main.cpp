@@ -19,6 +19,8 @@
 //     (file_persistence.h) and reports the derived client_id on stdout
 //   • Writes the Pairing PSK token to <state-dir>/pairing_token (0600) for
 //     the BEAM side to show on demand; it never goes to stdout or stderr
+//   • --display-roles adds the metadata/controller/color/artwork/visualizer
+//     roles for the HDMI TV UI (display_roles.h)
 //
 // Licensed under the Apache License, Version 2.0.
 
@@ -27,7 +29,9 @@
 
 #include "alsa_pipe_sink.h"
 #include "alsa_caps.h"
+#include "display_roles.h"
 #include "file_persistence.h"
+#include "json_out.h"
 
 #include <algorithm>
 #include <atomic>
@@ -58,88 +62,8 @@ static constexpr const char* VERSION = "0.1.0";
 static constexpr int DEFAULT_WS_PORT = 8928;
 
 static std::atomic<bool> g_running{true};
-static std::mutex g_stdout_mtx;
 
 static void signal_handler(int /*sig*/) { g_running.store(false); }
-
-// ---------------------------------------------------------------------------
-// JSON helpers
-// ---------------------------------------------------------------------------
-
-// Validates that `s` is well-formed UTF-8 per RFC 3629 / Unicode 16.0:
-// 1-byte (ASCII), 2-byte (C2–DF + cont), 3-byte (E0–EF + 2 cont),
-// 4-byte (F0–F4 + 3 cont). Rejects overlong forms, surrogate pairs,
-// and bytes >= 0xF5. Used at argv ingress so json_escape never emits a
-// malformed line that the BEAM-side Jason decoder would raise on.
-static bool is_valid_utf8(const std::string& s) {
-    size_t i = 0;
-    while (i < s.size()) {
-        unsigned char c = static_cast<unsigned char>(s[i]);
-        size_t needed = 0;
-        if (c < 0x80) {
-            i++;
-            continue;
-        }
-        if ((c & 0xE0) == 0xC0) {
-            if (c < 0xC2) return false;  // overlong 2-byte
-            needed = 1;
-        } else if ((c & 0xF0) == 0xE0) {
-            needed = 2;
-        } else if ((c & 0xF8) == 0xF0) {
-            if (c > 0xF4) return false;  // beyond U+10FFFF
-            needed = 3;
-        } else {
-            return false;
-        }
-        if (i + needed >= s.size()) return false;
-        for (size_t j = 1; j <= needed; j++) {
-            if ((static_cast<unsigned char>(s[i + j]) & 0xC0) != 0x80) return false;
-        }
-        // Reject surrogate halves (U+D800..U+DFFF) and overlong 3-byte forms.
-        if (needed == 2) {
-            unsigned char c1 = static_cast<unsigned char>(s[i + 1]);
-            if (c == 0xE0 && c1 < 0xA0) return false;  // overlong
-            if (c == 0xED && c1 >= 0xA0) return false;  // surrogate
-        }
-        if (needed == 3) {
-            unsigned char c1 = static_cast<unsigned char>(s[i + 1]);
-            if (c == 0xF0 && c1 < 0x90) return false;  // overlong
-            if (c == 0xF4 && c1 >= 0x90) return false;  // beyond U+10FFFF
-        }
-        i += needed + 1;
-    }
-    return true;
-}
-
-static std::string json_escape(const std::string& s) {
-    std::string out;
-    out.reserve(s.size() + 8);
-    for (char c : s) {
-        switch (c) {
-            case '"':  out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n";  break;
-            case '\r': out += "\\r";  break;
-            case '\t': out += "\\t";  break;
-            default:
-                if (static_cast<unsigned char>(c) < 0x20) {
-                    char buf[8];
-                    std::snprintf(buf, sizeof(buf), "\\u%04x",
-                                  static_cast<unsigned char>(c));
-                    out += buf;
-                } else {
-                    out += c;
-                }
-        }
-    }
-    return out;
-}
-
-static void emit_json(const std::string& line) {
-    std::lock_guard<std::mutex> lock(g_stdout_mtx);
-    std::cout << line << '\n';
-    std::cout.flush();
-}
 
 static const char* codec_name(SendspinCodecFormat c) {
     switch (c) {
@@ -226,6 +150,13 @@ static bool parse_int(std::string_view sv, int& out) {
     return true;
 }
 
+// "WxH" (e.g. 480x480).
+static bool parse_size(std::string_view sv, int& w, int& h) {
+    size_t x = sv.find('x');
+    if (x == std::string_view::npos) return false;
+    return parse_int(sv.substr(0, x), w) && parse_int(sv.substr(x + 1), h);
+}
+
 // ---------------------------------------------------------------------------
 // CLI options
 // ---------------------------------------------------------------------------
@@ -241,6 +172,7 @@ struct Options {
     int initial_volume = 50;
     int initial_static_delay_ms = 0;
     bool external_volume = false;
+    DisplayRolesOptions display;
     std::string log_level = "info";
 };
 
@@ -277,6 +209,17 @@ static void print_usage(const char* prog) {
         "                        or mute is applied (unity gain), but volume/mute\n"
         "                        are still tracked and reported. Toggle at runtime\n"
         "                        with the `set_volume_external` stdin command.\n"
+        "  --display-roles       Also take the metadata, controller, color, artwork\n"
+        "                        and visualizer roles and report them as display\n"
+        "                        events (see README). Off: player role only.\n"
+        "  --artwork-dir PATH    Write displayed artwork here as <sha256>.<jpg|png>\n"
+        "                        (created 0755). Without it no artwork role.\n"
+        "  --artwork-size WxH    Artwork size the server scales to (default: 480x480,\n"
+        "                        each 16-2048).\n"
+        "  --viz-bins N          Visualizer spectrum bins, 1-128 (default: 32).\n"
+        "  --viz-rate HZ         Visualizer frames per second, 1-60 (default: 20).\n"
+        "  --viz-offset-ms N     Deliver visualizer frames this far ahead of their\n"
+        "                        display time, 0-1000 (default: 0).\n"
         "  --log-level STR       none|error|warn|info|debug|verbose (default: info).\n"
         "  -h, --help            Show this help.\n"
         "  -V, --version         Show version.\n",
@@ -301,6 +244,12 @@ static bool parse_args(int argc, char** argv, Options& opts) {
         {"initial-volume", required_argument, nullptr, 'v'},
         {"initial-static-delay-ms", required_argument, nullptr, 'D'},
         {"external-volume", no_argument,  nullptr, 'E'},
+        {"display-roles",  no_argument,       nullptr, 'R'},
+        {"artwork-dir",    required_argument, nullptr, 'A'},
+        {"artwork-size",   required_argument, nullptr, 'Z'},
+        {"viz-bins",       required_argument, nullptr, 'B'},
+        {"viz-rate",       required_argument, nullptr, 'F'},
+        {"viz-offset-ms",  required_argument, nullptr, 'O'},
         {"log-level",      required_argument, nullptr, 'l'},
         {"help",           no_argument,       nullptr, 'h'},
         {"version",        no_argument,       nullptr, 'V'},
@@ -335,6 +284,33 @@ static bool parse_args(int argc, char** argv, Options& opts) {
                 }
                 break;
             case 'E': opts.external_volume = true; break;
+            case 'R': opts.display.enabled = true; break;
+            case 'A': opts.display.artwork_dir = optarg; break;
+            case 'Z':
+                if (!parse_size(optarg, opts.display.artwork_width,
+                                opts.display.artwork_height)) {
+                    std::fprintf(stderr, "Error: --artwork-size must be WxH\n");
+                    return false;
+                }
+                break;
+            case 'B':
+                if (!parse_int(optarg, opts.display.viz_bins)) {
+                    std::fprintf(stderr, "Error: --viz-bins must be an integer\n");
+                    return false;
+                }
+                break;
+            case 'F':
+                if (!parse_int(optarg, opts.display.viz_rate)) {
+                    std::fprintf(stderr, "Error: --viz-rate must be an integer\n");
+                    return false;
+                }
+                break;
+            case 'O':
+                if (!parse_int(optarg, opts.display.viz_offset_ms)) {
+                    std::fprintf(stderr, "Error: --viz-offset-ms must be an integer\n");
+                    return false;
+                }
+                break;
             case 'l': opts.log_level = optarg; break;
             case 'h': print_usage(argv[0]); std::exit(0);
             case 'V': std::fprintf(stdout, "sendspin_player %s\n", VERSION); std::exit(0);
@@ -361,12 +337,38 @@ static bool parse_args(int argc, char** argv, Options& opts) {
         std::fprintf(stderr, "Error: --initial-static-delay-ms must be 0-5000\n");
         return false;
     }
+    if (opts.display.artwork_width < 16 || opts.display.artwork_width > 2048 ||
+        opts.display.artwork_height < 16 || opts.display.artwork_height > 2048) {
+        std::fprintf(stderr, "Error: --artwork-size dimensions must be 16-2048\n");
+        return false;
+    }
+    if (opts.display.viz_bins < 1 || opts.display.viz_bins > 128) {
+        std::fprintf(stderr, "Error: --viz-bins must be 1-128\n");
+        return false;
+    }
+    if (opts.display.viz_rate < 1 || opts.display.viz_rate > 60) {
+        std::fprintf(stderr, "Error: --viz-rate must be 1-60\n");
+        return false;
+    }
+    if (opts.display.viz_offset_ms < 0 || opts.display.viz_offset_ms > 1000) {
+        std::fprintf(stderr, "Error: --viz-offset-ms must be 0-1000\n");
+        return false;
+    }
+    // The path is echoed in every `artwork` event; keep those lines short.
+    if (opts.display.artwork_dir.size() > 512) {
+        std::fprintf(stderr, "Error: --artwork-dir is longer than 512 bytes\n");
+        return false;
+    }
+    while (opts.display.artwork_dir.size() > 1 && opts.display.artwork_dir.back() == '/') {
+        opts.display.artwork_dir.pop_back();
+    }
     // UTF-8 gate before any field flows into a stdout JSON event.
     if (!require_utf8("--name", opts.name)) return false;
     if (!require_utf8("--product", opts.product)) return false;
     if (!require_utf8("--mac", opts.mac)) return false;
     if (!require_utf8("--alsa-device", opts.alsa_device)) return false;
     if (!require_utf8("--server", opts.server)) return false;
+    if (!require_utf8("--artwork-dir", opts.display.artwork_dir)) return false;
     return true;
 }
 
@@ -389,6 +391,8 @@ static bool parse_log_level(const std::string& s, LogLevel& level) {
 //   {"cmd":"set_volume","value":75}
 //   {"cmd":"set_muted","value":true}
 //   {"cmd":"set_volume_external","value":true}
+//   {"cmd":"controller","value":3}        (--display-roles only)
+//   {"cmd":"viz_enable","value":true}     (--display-roles only)
 //
 // Whitespace is allowed between tokens but the structure is fixed. Hand-
 // rolled instead of pulling in nlohmann/json because (a) the wire format
@@ -574,12 +578,14 @@ static void emit_volume_external(bool external) {
 // don't match a known cmd shape — BEAM is the sole writer so a malformed
 // frame is a programmer bug, not user input we need to surface.
 static void dispatch_command(const std::string& line, AlsaPipeSink& sink,
-                             PlayerRole& player) {
+                             PlayerRole& player, DisplayRoles& display) {
     std::string cmd;
     std::string kind;
     int int_val = 0;
     bool bool_val = false;
     if (!parse_command(line, cmd, kind, int_val, bool_val)) return;
+
+    if (display.handle_command(cmd, kind, int_val, bool_val)) return;
 
     if (cmd == "set_volume" && kind == "int") {
         auto v = static_cast<uint8_t>(std::clamp(int_val, 0, 100));
@@ -674,6 +680,14 @@ struct PlayerListener : PlayerRoleListener {
 };
 
 struct ClientListener : SendspinClientListener {
+    const SendspinClient* client = nullptr;
+    const DisplayRoles* display = nullptr;
+
+    void on_group_update(const GroupUpdateObject& /*delta*/) override {
+        // The library has merged the delta by now; report the full state.
+        if (client != nullptr && display != nullptr) display->emit_group(*client);
+    }
+
     void on_time_sync_updated(float error) override {
         if (SendspinClient::get_log_level() >= LogLevel::DEBUG) {
             std::ostringstream os;
@@ -752,6 +766,9 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Declared before the client so its role listeners outlive it.
+    DisplayRoles display(opts.display);
+
     SendspinClientConfig client_config;
     client_config.name = opts.name;
     // opts.mdns_port is validated 1–65535 in parse_args, so the narrowing
@@ -802,6 +819,7 @@ int main(int argc, char* argv[]) {
     // inside the sync task; we only enable + report it.
     player_config.initial_output_delay_ms = static_cast<uint16_t>(opts.initial_static_delay_ms);
     auto& player = client.add_player(std::move(player_config));
+    display.attach(client);
 
     AlsaPipeSink audio_sink;
     if (!opts.alsa_device.empty()) {
@@ -814,6 +832,8 @@ int main(int argc, char* argv[]) {
     };
 
     ClientListener client_listener;
+    client_listener.client = &client;
+    client_listener.display = &display;
     NetworkProvider network_provider;
     player.set_listener(&player_listener);
     // Advertise the static delay as server-adjustable; without this the
@@ -841,7 +861,9 @@ int main(int argc, char* argv[]) {
            << "\"product\":\""
            << json_escape(opts.product.empty() ? "sendspin_player" : opts.product) << "\","
            << "\"alsa_device\":\"" << json_escape(opts.alsa_device) << "\","
-           << "\"formats\":" << formats_to_json(audio_formats) << "}";
+           << "\"formats\":" << formats_to_json(audio_formats);
+        if (display.enabled()) os << ",\"display_roles\":true";
+        os << "}";
         emit_json(os.str());
     }
 
@@ -941,7 +963,7 @@ int main(int argc, char* argv[]) {
 
         bool stdin_eof = false;
         for (auto& line : stdin_poller.poll_lines(stdin_eof)) {
-            dispatch_command(line, audio_sink, player);
+            dispatch_command(line, audio_sink, player, display);
         }
         if (stdin_eof) g_running.store(false);
 

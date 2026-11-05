@@ -23,6 +23,9 @@ c_src/sendspin_player/
 └── src/
     ├── alsa_pipe_sink.h     vendored from LeoLTM/sendspin-armv6
     ├── alsa_pipe_sink.cpp   vendored from LeoLTM/sendspin-armv6
+    ├── display_roles.{h,cpp} ours — display roles (--display-roles)
+    ├── json_out.{h,cpp}     ours — JSON escaping + the guarded stdout writer
+    ├── sha256.{h,cpp}       ours — artwork file names
     └── main.cpp             ours — CLI args + JSON stdout/stdin
 ```
 
@@ -168,6 +171,12 @@ The flags must match what `UniversalProxy.Audio.Player` passes — see the
 | `--initial-volume 0..100`  | no       | Startup volume (default 50)                  |
 | `--initial-static-delay-ms 0..5000` | no | Startup static output delay for multi-room sync; the server can adjust it at runtime (`static_delay` event reports changes for persistence). Default 0 |
 | `--external-volume`        | no       | Start in external-volume mode (see *Stdin commands*) |
+| `--display-roles`          | no       | Also take the metadata, controller, color, artwork and visualizer roles (see *Display roles*). Without it only the player role is registered |
+| `--artwork-dir PATH`       | no       | Where displayed artwork is written (created `0755`). Without it, no artwork role |
+| `--artwork-size WxH`       | no       | Size the server scales artwork to, each 16..2048 (default `480x480`) |
+| `--viz-bins 1..128`        | no       | Visualizer spectrum bins (default 32) |
+| `--viz-rate 1..60`         | no       | Visualizer frames per second (default 20) |
+| `--viz-offset-ms 0..1000`  | no       | Deliver visualizer frames this far ahead of their display time (default 0) |
 | `--log-level STR`          | no       | `none\|error\|warn\|info\|debug\|verbose`    |
 | `--help` / `-h`            | no       | Print usage and exit                         |
 | `--version` / `-V`         | no       | Print version and exit                       |
@@ -191,8 +200,14 @@ changes, and on errors.
 {"event":"volume_external","value":true}  // ack of set_volume_external / --external-volume
 {"event":"error","kind":"alsa_configure","msg":"..."}
 {"event":"error","kind":"pairing_token","msg":"..."}  // non-fatal; token itself never on stdout
+{"event":"error","kind":"oversize_line","msg":"..."}  // a line over the cap was dropped (a bug)
 {"event":"shutdown"}
 ```
+
+Every line is capped at 3072 bytes (the BEAM reads with `{:line, 4096}`);
+a longer one is not written and the `oversize_line` error is emitted
+instead. Server-supplied text (titles, group names) is sanitized and cut
+to fit well under the cap.
 
 The `started` event's `formats` array is the menu of audio formats advertised
 to the Sendspin server (the server picks one and encodes to it). It always
@@ -211,6 +226,49 @@ advertisement on this event: Music Assistant's discovery connect is one-shot
 listener is up hands MA a connection-refused that orphans the player until
 the mDNS record next flaps. It also carries the Sendspin `client_id` (see
 below), which `Audio.Player` advertises as the TXT `client_id` entry.
+
+## Display roles
+
+With `--display-roles` the binary also registers the metadata, controller,
+color, artwork (one album slot, JPEG at `--artwork-size`, when
+`--artwork-dir` is given) and visualizer (spectrum + loudness) roles, and
+`started` carries `"display_roles":true`. The BEAM passes it to the one
+HDMI output that drives the TV UI (`UniversalProxy.Audio.DisplayRoles`).
+Extra events:
+
+```jsonc
+{"event":"metadata","title":"..","artist":"..","album_artist":"..","album":"..","year":1999,"track":3,"progress":{"track_progress":1234,"track_duration":200000,"playback_speed":1000}}
+{"event":"metadata_clear"}
+{"event":"controller_state","supported_commands":["play","pause","next"],"volume":40,"muted":false,"repeat":"off","shuffle":false} // + "seek_max_ms" when known
+{"event":"controller_clear"}
+{"event":"controller_result","command":"next","ok":true}   // reply to the controller command
+{"event":"group","playback_state":"playing","group_id":"..","group_name":".."}
+{"event":"color","background_dark":[20,20,30],"primary":[200,40,40]} // also background_light, accent, on_dark, on_light
+{"event":"color_clear"}
+{"event":"artwork","slot":0,"path":"<dir>/<sha256>.jpg","format":"jpeg","width":480,"height":480,"bytes":51234,"seq":7,"lateness_ms":3}
+{"event":"artwork_clear","slot":0}
+{"event":"viz_enable","value":true}                         // ack of viz_enable
+{"event":"viz","lead_ms":98,"loudness":180,"bins":[0,12,255]}
+{"event":"viz_clear"}                                       // visualizer stream ended or cleared
+```
+
+Fields the server leaves out are omitted. `metadata`, `controller_state`,
+`color` and `artwork`/`artwork_clear` fire on the main loop at the
+server's timestamp. Artwork bytes are written on the library's decode
+thread to `<artwork-dir>/<sha256>.<jpg|png>` via a dot-temp and rename;
+the `artwork` event follows at display time (`seq` counts decoded images;
+`width`/`height` are the requested size, which the server must deliver
+exactly). The binary never deletes artwork files; `Audio.Player` prunes
+the dir.
+
+`viz` frames come from the visualizer's drain thread, `--viz-offset-ms`
+ahead of their display time, only while `viz_enable` is on (off at start).
+Values are 0..255 (the library's 0..65535 shifted down); `bins` are
+max-pooled to `--viz-bins` if the server sends more. `lead_ms` is relative
+(display time minus now on the client clock), never an absolute
+timestamp. The library has no runtime switch for the visualizer
+subscription (its stream config is fixed in `client/state`), so
+`viz_enable` gates only what this binary writes.
 
 ## Identity and admission
 
@@ -268,8 +326,16 @@ window.
 {"cmd":"set_volume","value":75}
 {"cmd":"set_muted","value":true}
 {"cmd":"set_volume_external","value":true}
+{"cmd":"controller","value":3}      // --display-roles only
+{"cmd":"viz_enable","value":true}   // --display-roles only
 {"cmd":"shutdown"}
 ```
+
+`controller` sends a transport command through the controller role. The
+value is sendspin-cpp's `SendspinControllerCommand`: 0 play, 1 pause, 2
+stop, 3 next, 4 previous (others are dropped). The reply is a
+`controller_result` event, `ok: false` when the library refused it (not in
+the server's `supported_commands`, or no server connected).
 
 The parser is strict on shape but lenient on whitespace. Unknown commands are
 ignored silently.

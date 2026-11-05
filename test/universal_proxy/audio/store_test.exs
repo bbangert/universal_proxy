@@ -40,6 +40,18 @@ defmodule UniversalProxy.Audio.StoreTest do
       assert Store.default_friendly_name("bcm2835 Headphones") == "bcm2835 Headphones"
     end
 
+    test "hdmi?/1 and hdmi_port/1 recognise the KMS HDMI cards only" do
+      assert Store.hdmi_port({"vc4-hdmi", nil, nil}) == 0
+      assert Store.hdmi_port("vc4-hdmi-0") == 0
+      assert Store.hdmi_port("vc4-hdmi-1") == 1
+      assert Store.hdmi?({"vc4-hdmi-1", nil, nil})
+
+      for other <- ["vc4-hdmi-x", "vc4-hdmi-", "bcm2835 Headphones", "USB Audio"] do
+        assert Store.hdmi_port(other) == nil
+        refute Store.hdmi?({other, nil, nil})
+      end
+    end
+
     test "a persisted friendly_name wins over the HDMI default", %{server: server} do
       key = {"vc4-hdmi", nil, nil}
       :ok = Store.save_config(server, key, %{friendly_name: "Living room AVR"})

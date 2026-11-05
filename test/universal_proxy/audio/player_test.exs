@@ -976,6 +976,281 @@ defmodule UniversalProxy.Audio.PlayerTest do
     end
   end
 
+  describe "display roles" do
+    @display_kinds ~w(metadata metadata_clear controller_state controller_clear
+                      controller_result group color color_clear artwork artwork_clear
+                      viz_enable viz viz_clear)
+
+    setup do
+      :ok = Phoenix.PubSub.subscribe(@pubsub, "sendspin:display")
+      :ok = Phoenix.PubSub.subscribe(@pubsub, Player.viz_topic(config().client_id))
+      :ok
+    end
+
+    defp display_opts(dir, overrides \\ %{}) do
+      Map.merge(
+        %{
+          artwork_dir: dir,
+          artwork_size: {320, 240},
+          artwork_keep: 8,
+          viz_bins: 4,
+          viz_rate: 20,
+          viz_offset_ms: 100
+        },
+        overrides
+      )
+    end
+
+    defp start_display_player!(dir, overrides \\ %{}) do
+      pid = start_player!(display_roles: display_opts(dir, overrides))
+      assert_receive {:sendspin_state, @key, %{event: "started", display_roles: true}}, 2_000
+      assert_receive {:sendspin_state, @key, %{event: "listening"}}, 2_000
+      pid
+    end
+
+    defp display_event(kind) do
+      assert_receive {:sendspin_display, @key, seq, %{event: ^kind} = event}, 1_000
+      {seq, event}
+    end
+
+    defp refute_display_kinds_on_state do
+      for kind <- @display_kinds do
+        refute_received {:sendspin_state, _, %{event: ^kind}}
+      end
+    end
+
+    test "passes the display flags only with the :display_roles option" do
+      refute "--display-roles" in Player.__cli_args__(cli_state([]))
+
+      args = Player.__cli_args__(cli_state(display_roles: display_opts("/tmp/up_art/x")))
+
+      assert Enum.drop_while(args, &(&1 != "--display-roles")) |> Enum.take(11) == [
+               "--display-roles",
+               "--artwork-dir",
+               "/tmp/up_art/x",
+               "--artwork-size",
+               "320x240",
+               "--viz-bins",
+               "4",
+               "--viz-rate",
+               "20",
+               "--viz-offset-ms",
+               "100"
+             ]
+    end
+
+    @tag :tmp_dir
+    test "display events go to sendspin:display with rising seq, never sendspin:state or last_event",
+         %{tmp_dir: tmp_dir} do
+      pid = start_display_player!(tmp_dir)
+      before = Player.last_event(pid)
+      assert %{event: "listening"} = before
+
+      :ok = Player.__send_command__(pid, %{cmd: "emit_display"})
+
+      {s1, metadata} = display_event("metadata")
+      {s2, _} = display_event("controller_state")
+      {s3, _} = display_event("group")
+      {s4, _} = display_event("color")
+      {s5, artwork} = display_event("artwork")
+
+      assert [s1, s2, s3, s4, s5] == Enum.to_list(s1..(s1 + 4))
+      assert metadata.title == "Fake Song"
+      assert %{track_progress: 1000, playback_speed: 1000} = metadata.progress
+      assert Path.dirname(artwork.path) == tmp_dir
+      assert File.exists?(artwork.path)
+      assert %{width: 320, height: 240, slot: 0} = artwork
+
+      refute_display_kinds_on_state()
+      assert Player.last_event(pid) == before
+
+      assert {^s5, snapshot} = Player.display_snapshot(pid)
+
+      assert Map.keys(snapshot) |> Enum.sort() == [
+               :artwork,
+               :color,
+               :controller_state,
+               :group,
+               :metadata
+             ]
+
+      assert snapshot.metadata == metadata
+    end
+
+    @tag :tmp_dir
+    test "clear events empty their snapshot slot; disconnected forgets the group",
+         %{tmp_dir: tmp_dir} do
+      pid = start_display_player!(tmp_dir)
+      :ok = Player.__send_command__(pid, %{cmd: "emit_display"})
+      display_event("artwork")
+
+      :ok = Player.__send_command__(pid, %{cmd: "emit_event", event: %{event: "metadata_clear"}})
+
+      :ok =
+        Player.__send_command__(pid, %{
+          cmd: "emit_event",
+          event: %{event: "artwork_clear", slot: 0}
+        })
+
+      {seq, _} = display_event("artwork_clear")
+      assert {^seq, snapshot} = Player.display_snapshot(pid)
+      assert Map.keys(snapshot) |> Enum.sort() == [:color, :controller_state, :group]
+
+      :ok = Player.__send_command__(pid, %{cmd: "emit_event", event: %{event: "disconnected"}})
+      assert_receive {:sendspin_state, @key, %{event: "disconnected"}}, 1_000
+      assert {^seq, snapshot} = Player.display_snapshot(pid)
+      refute Map.has_key?(snapshot, :group)
+    end
+
+    @tag :tmp_dir
+    test "viz frames go to the per-output viz topic, only while enabled", %{tmp_dir: tmp_dir} do
+      pid = start_display_player!(tmp_dir)
+      before = Player.last_event(pid)
+
+      # Disabled at start: the binary emits nothing.
+      :ok = Player.__send_command__(pid, %{cmd: "emit_viz"})
+      :ok = Player.viz_enable(pid, true)
+      {seq, %{value: true}} = display_event("viz_enable")
+      refute_received {:sendspin_viz, _, _}
+
+      :ok = Player.__send_command__(pid, %{cmd: "emit_viz"})
+
+      assert_receive {:sendspin_viz, @key, %{event: "viz", lead_ms: 100, bins: bins}}, 1_000
+      assert length(bins) == 4
+
+      :ok = Player.__send_command__(pid, %{cmd: "emit_event", event: %{event: "viz_clear"}})
+      assert_receive {:sendspin_viz, @key, %{event: "viz_clear"}}, 1_000
+
+      refute_display_kinds_on_state()
+      refute_received {:sendspin_display, _, _, %{event: "viz"}}
+      assert Player.last_event(pid) == before
+      # Viz traffic neither advances the display seq nor enters the snapshot.
+      assert {^seq, %{}} = Player.display_snapshot(pid)
+    end
+
+    @tag :tmp_dir
+    test "controller/2 round-trips through the binary", %{tmp_dir: tmp_dir} do
+      pid = start_display_player!(tmp_dir)
+
+      for command <- [:play, :pause, :stop, :next, :previous] do
+        :ok = Player.controller(pid, command)
+        name = Atom.to_string(command)
+        assert {_, %{command: ^name, ok: true}} = display_event("controller_result")
+      end
+
+      assert {_, snapshot} = Player.display_snapshot(pid)
+      refute Map.has_key?(snapshot, :controller_result)
+      refute_display_kinds_on_state()
+    end
+
+    test "controller/2 and viz_enable/2 refuse a player without display roles" do
+      pid = start_player!()
+      assert_receive {:sendspin_state, @key, %{event: "started"} = started}, 2_000
+      refute Map.has_key?(started, :display_roles)
+
+      assert {:error, :display_roles_disabled} = Player.controller(pid, :next)
+      assert {:error, :display_roles_disabled} = Player.viz_enable(pid, true)
+      assert {0, %{}} = Player.display_snapshot(pid)
+      assert_raise FunctionClauseError, fn -> apply(Player, :controller, [pid, :volume]) end
+    end
+
+    @tag :tmp_dir
+    test "controller and viz_enable commands use the fixed field order", %{tmp_dir: tmp_dir} do
+      uniq = System.unique_integer([:positive])
+      log = Path.join(tmp_dir, "stdin_#{uniq}.log")
+      recorder = Path.join(tmp_dir, "recorder_#{uniq}.sh")
+
+      File.write!(recorder, """
+      #!/bin/sh
+      echo '{"event":"started","version":"0.0.0-fake","port":19002,"name":"x","alsa_device":"x"}'
+      cat > "#{log}"
+      """)
+
+      File.chmod!(recorder, 0o755)
+
+      pid =
+        start_player!(
+          binary_path: recorder,
+          mdns_port: 19_002,
+          display_roles: display_opts(Path.join(tmp_dir, "art"))
+        )
+
+      assert_receive {:sendspin_state, @key, %{event: "started"}}, 2_000
+
+      :ok = Player.controller(pid, :next)
+      :ok = Player.controller(pid, :play)
+      :ok = Player.viz_enable(pid, true)
+      :ok = GenServer.stop(pid, :normal, 2_000)
+
+      lines = log |> File.read!() |> String.split("\n", trim: true)
+
+      assert ~s({"cmd":"controller","value":3}) in lines
+      assert ~s({"cmd":"controller","value":0}) in lines
+      assert ~s({"cmd":"viz_enable","value":true}) in lines
+    end
+
+    test "an oversize stdout line is dropped whole and parsing resumes" do
+      pid = start_player!()
+      assert_receive {:sendspin_state, @key, %{event: "listening"}}, 2_000
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          big = %{event: "volume", value: 1, pad: String.duplicate("x", 6_000)}
+          :ok = Player.__send_command__(pid, %{cmd: "emit_event", event: big})
+          :ok = Player.set_volume(pid, 44)
+          assert_receive {:sendspin_state, @key, %{event: "volume", value: 44}}, 1_000
+        end)
+
+      assert log =~ "dropped an oversize stdout line"
+      refute log =~ "could not decode line"
+      refute_received {:sendspin_state, @key, %{event: "volume", value: 1}}
+      assert %{event: "volume", value: 44} = Player.last_event(pid)
+    end
+
+    @tag :tmp_dir
+    test "artwork: the dir is wiped at start, the last N reported files are kept, stale orphans swept",
+         %{tmp_dir: tmp_dir} do
+      sha_name = fn tag -> Base.encode16(:crypto.hash(:sha256, tag), case: :lower) <> ".jpg" end
+      stale = Path.join(tmp_dir, sha_name.("previous-instance"))
+      unrelated = Path.join(tmp_dir, "not-artwork.txt")
+      File.write!(stale, "x")
+      File.write!(unrelated, "x")
+
+      pid = start_display_player!(tmp_dir, %{artwork_keep: 2})
+      refute File.exists?(stale)
+      assert File.exists?(unrelated)
+
+      paths =
+        for _ <- 1..3 do
+          :ok = Player.__send_command__(pid, %{cmd: "emit_display"})
+          {_, %{path: path}} = display_event("artwork")
+          path
+        end
+
+      [first, second, third] = paths
+      refute File.exists?(first)
+      assert File.exists?(second)
+      assert File.exists?(third)
+
+      # Written by the binary but never reported: swept only once stale.
+      old_orphan = Path.join(tmp_dir, sha_name.("old-orphan"))
+      new_orphan = Path.join(tmp_dir, sha_name.("new-orphan"))
+      File.write!(old_orphan, "x")
+      File.write!(new_orphan, "x")
+      File.touch!(old_orphan, System.os_time(:second) - 120)
+
+      :ok = Player.__send_command__(pid, %{cmd: "emit_display"})
+      {_, %{path: fourth}} = display_event("artwork")
+
+      refute File.exists?(old_orphan)
+      assert File.exists?(new_orphan)
+      assert File.exists?(fourth)
+      assert File.exists?(third)
+      refute File.exists?(second)
+      assert File.exists?(unrelated)
+    end
+  end
+
   # Poll a predicate every 10 ms until it returns true or the timeout
   # elapses. Used in lieu of a fixed `Process.sleep` so the test
   # finishes as soon as the scheduled timers have fired, not after a

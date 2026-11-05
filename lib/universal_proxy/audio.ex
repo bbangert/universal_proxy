@@ -13,7 +13,7 @@ defmodule UniversalProxy.Audio do
   `{card_name, nil, nil}` (e.g. `{"bcm2835 Headphones", nil, nil}`).
   """
 
-  alias UniversalProxy.Audio.{PairingToken, Server, Store}
+  alias UniversalProxy.Audio.{PairingToken, Player, Server, Store}
 
   @typedoc """
   Composite identifier for an audio output:
@@ -86,6 +86,64 @@ defmodule UniversalProxy.Audio do
   @spec set_enabled(key(), boolean()) :: :ok | {:error, :not_found | term()}
   def set_enabled({_, _, _} = key, enabled?) when is_boolean(enabled?) do
     Server.set_enabled(key, enabled?)
+  end
+
+  @doc """
+  Send a transport command (`:play`, `:pause`, `:stop`, `:next`,
+  `:previous`) through the controller role of an output's player. Only
+  the output carrying the display roles (`list_outputs/0` shows
+  `display_roles: true`) has one. The outcome arrives as a
+  `controller_result` event on `"sendspin:display"`.
+
+  `{:error, :not_found}` when the output has no running player,
+  `{:error, :display_roles_disabled}` when its player has no display
+  roles, `{:error, :unavailable}` while the audio subsystem or the player
+  is down or wedged (the `catch :exit` idiom: a timeout reads the same).
+  """
+  @spec controller(key(), Player.controller_command()) ::
+          :ok | {:error, :not_found | :display_roles_disabled | :unavailable}
+  def controller({_, _, _} = key, command) do
+    with_player(key, &Player.controller(&1, command))
+  end
+
+  @doc """
+  Turn an output player's visualizer frames (`viz_topic/1`) on or off.
+  Same results as `controller/2`.
+  """
+  @spec viz_enable(key(), boolean()) ::
+          :ok | {:error, :not_found | :display_roles_disabled | :unavailable}
+  def viz_enable({_, _, _} = key, enabled?) when is_boolean(enabled?) do
+    with_player(key, &Player.viz_enable(&1, enabled?))
+  end
+
+  @doc """
+  The latest display state of an output's player as `{seq, snapshot}`
+  (see `UniversalProxy.Audio.Player.display_snapshot/1`); `{0, %{}}` when
+  it has no running player or the audio subsystem is down.
+  """
+  @spec display_snapshot(key()) :: {non_neg_integer(), map()}
+  def display_snapshot({_, _, _} = key) do
+    case with_player(key, &Player.display_snapshot/1) do
+      {seq, snapshot} when is_integer(seq) and is_map(snapshot) -> {seq, snapshot}
+      {:error, _} -> {0, %{}}
+    end
+  end
+
+  @doc """
+  The PubSub topic an output's visualizer frames are broadcast on, from
+  its `client_id` (as in `list_outputs/0`).
+  """
+  @spec viz_topic(String.t()) :: String.t()
+  defdelegate viz_topic(client_id), to: Player
+
+  # The pid is looked up per call, never cached: players respawn.
+  defp with_player(key, fun) do
+    case Server.player_pid(key) do
+      {:ok, pid} -> fun.(pid)
+      :error -> {:error, :not_found}
+    end
+  catch
+    :exit, _ -> {:error, :unavailable}
   end
 
   @doc """

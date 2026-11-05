@@ -222,6 +222,14 @@ if display_target? do
     preferred_size: if(Mix.target() in [:rpi3, :rpi0_2], do: {1280, 720}, else: nil)
 end
 
+# Sendspin display roles on the HDMI output's player, for the targets that
+# drive a TV UI. Artwork lives on tmpfs.
+if Mix.target() in [:rpi0_2, :rpi3, :rpi4, :rpi5] do
+  config :universal_proxy, UniversalProxy.Audio.DisplayRoles,
+    enabled: true,
+    artwork_root: "/tmp/up_artwork"
+end
+
 # Import target specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.
 # Uncomment to use target specific configurations
