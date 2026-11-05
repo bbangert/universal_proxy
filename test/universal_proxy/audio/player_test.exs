@@ -7,6 +7,7 @@ defmodule UniversalProxy.Audio.PlayerTest do
   use ExUnit.Case, async: false
 
   alias UniversalProxy.Audio.Player
+  alias UniversalProxy.Display.Progress
 
   @pubsub UniversalProxy.PubSub
   @fake_binary Path.expand("../../support/fake_sendspin_player.py", __DIR__)
@@ -1171,6 +1172,49 @@ defmodule UniversalProxy.Audio.PlayerTest do
       assert %{playback_speed: 1000, track_progress: ^at} = resumed.progress
 
       # Same state again, or a group with no metadata change: nothing re-timed.
+      emit.(%{event: "group", playback_state: "playing"})
+      display_event("group")
+      refute_received {:sendspin_display, @key, _, %{event: "metadata"}}
+    end
+
+    @tag :tmp_dir
+    test "server metadata that arrives while stopped keeps its timing when playback starts",
+         %{tmp_dir: tmp_dir} do
+      pid = start_display_player!(tmp_dir)
+
+      emit = fn event ->
+        :ok = Player.__send_command__(pid, %{cmd: "emit_event", event: event})
+      end
+
+      emit.(%{event: "group", playback_state: "stopped"})
+      display_event("group")
+
+      emit.(%{
+        event: "metadata",
+        progress: %{
+          track_progress: 10_000,
+          track_duration: 200_000,
+          playback_speed: 1000,
+          progress_age_ms: 500
+        }
+      })
+
+      {_, metadata} = display_event("metadata")
+      emit.(%{event: "group", playback_state: "playing"})
+      {seq, _} = display_event("group")
+      refute_received {:sendspin_display, @key, _, %{event: "metadata"}}
+
+      assert {^seq, %{metadata: snap}} = Player.display_snapshot(pid)
+      assert snap == metadata
+      assert Progress.at(snap, snap.received_at, true).elapsed_ms == 10_500
+
+      # A pause then re-bases it; new server metadata while paused drops
+      # that frozen anchor again.
+      emit.(%{event: "group", playback_state: "paused"})
+      {_, %{progress: %{playback_speed: 0}}} = display_event("metadata")
+      display_event("group")
+      emit.(%{event: "metadata", progress: %{metadata.progress | playback_speed: 1000}})
+      display_event("metadata")
       emit.(%{event: "group", playback_state: "playing"})
       display_event("group")
       refute_received {:sendspin_display, @key, _, %{event: "metadata"}}

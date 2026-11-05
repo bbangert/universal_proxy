@@ -96,7 +96,8 @@ defmodule UniversalProxy.Audio.Player do
   metadata (the server re-sends none on a pause) first publishes the cached
   metadata re-timed at the position reached: `track_progress` that
   position, `progress_age_ms` 0, `playback_speed` 0 while not playing and
-  the earlier speed again on resume.
+  the earlier speed again on resume (only for a position this process
+  froze: metadata the server sent since keeps its own timing).
   A lost server connection also publishes `{"event":"group_clear"}` (made
   here; the binary has no group clear) when a group was known.
 
@@ -231,7 +232,7 @@ defmodule UniversalProxy.Audio.Player do
     display_roles: nil,
     display: %{},
     display_seq: 0,
-    resume_speed: nil,
+    frozen_speed: nil,
     discarding: false
   ]
 
@@ -264,7 +265,7 @@ defmodule UniversalProxy.Audio.Player do
           display_roles: UniversalProxy.Audio.DisplayRoles.player_opts() | nil,
           display: %{optional(atom()) => map()},
           display_seq: non_neg_integer(),
-          resume_speed: pos_integer() | nil,
+          frozen_speed: pos_integer() | nil,
           discarding: boolean()
         }
 
@@ -550,7 +551,8 @@ defmodule UniversalProxy.Audio.Player do
         {:noreply, state}
 
       {:ok, %{event: kind} = event} when kind in @display_events ->
-        {:noreply, state |> retime_progress(event) |> handle_display_event(event)}
+        {:noreply,
+         state |> forget_frozen(event) |> retime_progress(event) |> handle_display_event(event)}
 
       {:ok, %{event: _} = event} ->
         state = state |> maybe_register_mdns(event) |> track_volume_external(event)
@@ -1315,7 +1317,7 @@ defmodule UniversalProxy.Audio.Player do
        )
        when is_binary(new) do
     old = Map.get(group, :playback_state)
-    {speed, resume_speed} = retimed_speed(old, new, Map.get(progress, :playback_speed), state)
+    {speed, frozen_speed} = retimed_speed(old, new, Map.get(progress, :playback_speed), state)
 
     case speed && Progress.at(metadata, System.monotonic_time(:millisecond), old == "playing") do
       %{elapsed_ms: elapsed} ->
@@ -1326,7 +1328,7 @@ defmodule UniversalProxy.Audio.Player do
             progress_age_ms: 0
           })
 
-        %{state | resume_speed: resume_speed}
+        %{state | frozen_speed: frozen_speed}
         |> handle_display_event(%{metadata | progress: progress})
 
       _none ->
@@ -1336,14 +1338,23 @@ defmodule UniversalProxy.Audio.Player do
 
   defp retime_progress(state, _event), do: state
 
-  # {speed to publish (nil: no re-time), speed to restore on resume}.
+  defp forget_frozen(state, %{event: kind}) when kind in ["metadata", "metadata_clear"],
+    do: %{state | frozen_speed: nil}
+
+  defp forget_frozen(state, _event), do: state
+
+  # {speed to publish (nil: no re-time), the new `frozen_speed`}.
+  # `frozen_speed` is set only while the cached metadata is a frozen
+  # position this process made, and holds the speed to restore; server
+  # metadata clears it, so its own timing is never re-based on resume.
   defp retimed_speed("playing", new, speed, state) when new != "playing",
-    do: {0, if(positive?(speed), do: speed, else: state.resume_speed)}
+    do: {0, if(positive?(speed), do: speed, else: state.frozen_speed || 1000)}
 
-  defp retimed_speed(old, "playing", speed, state) when old not in [nil, "playing"],
-    do: {if(positive?(speed), do: speed, else: state.resume_speed || 1000), nil}
+  defp retimed_speed(old, "playing", _speed, %{frozen_speed: frozen})
+       when old not in [nil, "playing"] and is_integer(frozen),
+       do: {frozen, nil}
 
-  defp retimed_speed(_old, _new, _speed, state), do: {nil, state.resume_speed}
+  defp retimed_speed(_old, _new, _speed, state), do: {nil, state.frozen_speed}
 
   defp positive?(n), do: is_integer(n) and n > 0
 
