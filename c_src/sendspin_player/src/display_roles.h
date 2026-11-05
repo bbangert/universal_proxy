@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include "artwork_store.h"
+
 #include "sendspin/client.h"
 #include "sendspin/artwork_role.h"
 #include "sendspin/color_role.h"
@@ -14,10 +16,9 @@
 #include "sendspin/metadata_role.h"
 #include "sendspin/visualizer_role.h"
 
-#include <array>
 #include <atomic>
 #include <cstdint>
-#include <mutex>
+#include <memory>
 #include <string>
 
 struct DisplayRolesOptions {
@@ -27,12 +28,18 @@ struct DisplayRolesOptions {
     std::string artwork_dir;
     int artwork_width = 480;
     int artwork_height = 480;
+    // Displayed artwork files kept in artwork_dir; older ones are deleted.
+    int artwork_keep = 8;
     int viz_bins = 32;
     int viz_rate = 20;
     // Visualizer callbacks fire this far ahead of each frame's display
     // time; it shows up as the frame's `lead_ms`.
     int viz_offset_ms = 0;
 };
+
+// The `metadata` event line. `progress_age_ms` is how long ago, on the
+// client clock, the progress position held.
+std::string metadata_json(const sendspin::ServerMetadataStateObject& m, int64_t progress_age_ms);
 
 class DisplayRoles {
 public:
@@ -56,6 +63,7 @@ public:
 
 private:
     struct Metadata : sendspin::MetadataRoleListener {
+        const sendspin::SendspinClient* client = nullptr;
         void on_metadata(const sendspin::ServerMetadataStateObject& m) override;
         void on_metadata_clear() override;
     };
@@ -70,25 +78,20 @@ private:
         void on_color_clear() override;
     };
 
+    // Every slot is ack-gated (require_frame_done): the library holds the
+    // next image's decode until the current delivery is acked, so a decode
+    // can never overwrite the pending image between its display deadline
+    // and the on_image_display() that reads it.
     struct Artwork : sendspin::ArtworkRoleListener {
-        static constexpr size_t SLOTS = 4;
-        struct Pending {
-            bool valid = false;
-            std::string path;
-            const char* format = "";
-            size_t bytes = 0;
-            uint64_t seq = 0;
-        };
-
         const DisplayRolesOptions* opts = nullptr;
-        std::mutex mtx;
-        std::array<Pending, SLOTS> pending{};
-        uint64_t next_seq = 0;
+        sendspin::ArtworkRole* role = nullptr;
+        std::unique_ptr<ArtworkStore> store;
 
         void on_image_decode(uint8_t slot, const uint8_t* data, size_t length,
                              sendspin::SendspinImageFormat format) override;
         void on_image_display(uint8_t slot, uint32_t lateness_ms) override;
         void on_image_clear(uint8_t slot) override;
+        void emit_clear(uint8_t slot);
     };
 
     struct Visualizer : sendspin::VisualizerRoleListener {

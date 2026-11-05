@@ -89,7 +89,8 @@ def emit_display(args, seq):
           "album_artist": "Fake Artist", "album": "Fake Album", "year": 2001,
           "track": 3, "progress": {"track_progress": 1000,
                                    "track_duration": 200000,
-                                   "playback_speed": 1000}})
+                                   "playback_speed": 1000,
+                                   "progress_age_ms": 250}})
     emit({"event": "controller_state",
           "supported_commands": ["play", "pause", "stop", "next", "previous"],
           "volume": 40, "muted": False, "repeat": "off", "shuffle": False})
@@ -135,6 +136,7 @@ def main():
     p.add_argument("--display-roles", action="store_true")
     p.add_argument("--artwork-dir", default="")
     p.add_argument("--artwork-size", default="480x480")
+    p.add_argument("--artwork-keep", type=int, default=8)
     p.add_argument("--viz-bins", type=int, default=32)
     p.add_argument("--viz-rate", type=int, default=20)
     p.add_argument("--viz-offset-ms", type=int, default=0)

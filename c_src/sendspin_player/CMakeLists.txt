@@ -105,6 +105,8 @@ add_executable(sendspin_player
     src/file_persistence.cpp
     src/json_out.cpp
     src/display_roles.cpp
+    src/artwork_store.cpp
+    src/started_event.cpp
     src/sha256.cpp
 )
 
@@ -121,3 +123,18 @@ target_include_directories(sendspin_player PRIVATE src)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(sendspin_player PRIVATE -Wall -Wextra)
 endif()
+
+# Host unit tests for the pure helpers (JSON budget, artwork retention,
+# SHA-256). Not part of the default build; test/sendspin_player_unit_test.exs
+# builds and runs it.
+add_executable(sendspin_player_unit_tests EXCLUDE_FROM_ALL
+    test/unit_tests.cpp
+    src/json_out.cpp
+    src/display_roles.cpp
+    src/artwork_store.cpp
+    src/started_event.cpp
+    src/sha256.cpp
+)
+target_link_libraries(sendspin_player_unit_tests PRIVATE sendspin pthread)
+target_compile_features(sendspin_player_unit_tests PRIVATE cxx_std_20)
+target_include_directories(sendspin_player_unit_tests PRIVATE src)

@@ -65,12 +65,13 @@ defmodule UniversalProxy.Audio.Player do
   `UniversalProxy.Audio.DisplayRoles`), the binary also takes the Sendspin
   metadata, controller, color, artwork and visualizer roles and emits:
 
-      {"event":"metadata","title":"..","artist":"..","album_artist":"..","album":"..","year":1999,"track":3,"progress":{"track_progress":1234,"track_duration":200000,"playback_speed":1000}}
+      {"event":"metadata","title":"..","artist":"..","album_artist":"..","album":"..","year":1999,"track":3,"progress":{"track_progress":1234,"track_duration":200000,"playback_speed":1000,"progress_age_ms":0}}
       {"event":"metadata_clear"}
       {"event":"controller_state","supported_commands":["play","pause","next"],"volume":40,"muted":false,"repeat":"off","shuffle":false}
       {"event":"controller_clear"}
       {"event":"controller_result","command":"next","ok":true}
       {"event":"group","playback_state":"playing","group_id":"..","group_name":".."}
+      {"event":"group_clear"}   (made by this process on a lost connection)
       {"event":"color","background_dark":[20,20,30],"primary":[200,40,40]}
       {"event":"color_clear"}
       {"event":"artwork","slot":0,"path":"/tmp/up_artwork/<id>/<sha256>.jpg","format":"jpeg","width":480,"height":480,"bytes":51234,"seq":7,"lateness_ms":3}
@@ -87,7 +88,15 @@ defmodule UniversalProxy.Audio.Player do
   These never reach `"sendspin:state"` or `last_event/1`. Display events
   are broadcast on `"sendspin:display"` as `{:sendspin_display, key, seq,
   event}`, `seq` increasing per player, and the latest of each kind is
-  kept for `display_snapshot/1`. `viz`/`viz_clear` go to the per-output
+  kept for `display_snapshot/1`. Each carries `received_at`, the
+  `System.monotonic_time(:millisecond)` it was read at: the current track
+  position is `track_progress + (progress_age_ms + now - received_at) *
+  playback_speed / 1000`, capped at `track_duration` when that is non-zero.
+  A lost server connection also publishes `{"event":"group_clear"}` (made
+  here; the binary has no group clear) when a group was known.
+
+  The binary owns the artwork dir's retention (the last `artwork_keep`
+  displayed files); this process only empties the dir before it starts. `viz`/`viz_clear` go to the per-output
   topic `viz_topic/1` as `{:sendspin_viz, key, frame}`. Commands:
 
       {"cmd":"controller","value":3}   (see controller/2)
@@ -158,6 +167,7 @@ defmodule UniversalProxy.Audio.Player do
     "controller_state" => {:put, :controller_state},
     "controller_clear" => {:delete, :controller_state},
     "group" => {:put, :group},
+    "group_clear" => {:delete, :group},
     "color" => {:put, :color},
     "color_clear" => {:delete, :color},
     "artwork" => {:put, :artwork},
@@ -167,9 +177,6 @@ defmodule UniversalProxy.Audio.Player do
   # `controller/2` commands → the binary's SendspinControllerCommand value.
   @controller_commands %{play: 0, pause: 1, stop: 2, next: 3, previous: 4}
 
-  # Artwork files the binary wrote but never reported (a superseded or
-  # cancelled image) are swept once they are this old.
-  @artwork_orphan_age_s 60
   @artwork_file_re ~r/\A\.?[0-9a-f]{64}\.(jpg|png)(\.tmp)?\z/
 
   # RFC 6762 §8.3 announces. We call `MdnsLite.announce_all/0` (added
@@ -218,7 +225,6 @@ defmodule UniversalProxy.Audio.Player do
     display_roles: nil,
     display: %{},
     display_seq: 0,
-    artwork_kept: [],
     discarding: false
   ]
 
@@ -251,7 +257,6 @@ defmodule UniversalProxy.Audio.Player do
           display_roles: UniversalProxy.Audio.DisplayRoles.player_opts() | nil,
           display: %{optional(atom()) => map()},
           display_seq: non_neg_integer(),
-          artwork_kept: [String.t()],
           discarding: boolean()
         }
 
@@ -543,7 +548,7 @@ defmodule UniversalProxy.Audio.Player do
         state = state |> maybe_register_mdns(event) |> track_volume_external(event)
         {state, event} = tag_startup(state, event)
         broadcast_state(state, event)
-        {:noreply, %{state | last_event: event} |> forget_group(event)}
+        {:noreply, forget_group(%{state | last_event: event}, event)}
 
       {:ok, _other} ->
         Logger.debug("Audio.Player #{inspect(state.key)} got non-event JSON: #{line}")
@@ -1259,6 +1264,8 @@ defmodule UniversalProxy.Audio.Player do
       d.artwork_dir,
       "--artwork-size",
       "#{w}x#{h}",
+      "--artwork-keep",
+      Integer.to_string(d.artwork_keep),
       "--viz-bins",
       Integer.to_string(d.viz_bins),
       "--viz-rate",
@@ -1270,6 +1277,7 @@ defmodule UniversalProxy.Audio.Player do
 
   defp handle_display_event(state, %{event: kind} = event) do
     seq = state.display_seq + 1
+    event = Map.put(event, :received_at, System.monotonic_time(:millisecond))
 
     display =
       case Map.get(@snapshot_ops, kind) do
@@ -1278,15 +1286,13 @@ defmodule UniversalProxy.Audio.Player do
         nil -> state.display
       end
 
-    state = track_artwork(%{state | display_seq: seq, display: display}, event)
-
     Phoenix.PubSub.broadcast(
       state.pubsub,
       @topic_display,
       {:sendspin_display, state.key, seq, event}
     )
 
-    state
+    %{state | display_seq: seq, display: display}
   end
 
   defp broadcast_viz(%__MODULE__{config: %{client_id: id}} = state, event) when is_binary(id) do
@@ -1296,9 +1302,10 @@ defmodule UniversalProxy.Audio.Player do
   defp broadcast_viz(_state, _event), do: :ok
 
   # The library clears the role state itself on a lost connection, but the
-  # group state has no clear of its own.
-  defp forget_group(state, %{event: "disconnected"}),
-    do: %{state | display: Map.delete(state.display, :group)}
+  # group state has no clear of its own: publish one, sequenced like any
+  # display event, so subscribers and the snapshot agree.
+  defp forget_group(%{display: %{group: _}} = state, %{event: "disconnected"}),
+    do: handle_display_event(state, %{event: "group_clear"})
 
   defp forget_group(state, _event), do: state
 
@@ -1314,39 +1321,6 @@ defmodule UniversalProxy.Audio.Player do
       {:error, reason} ->
         Logger.warning("Audio.Player could not create artwork dir #{dir}: #{inspect(reason)}")
     end
-  end
-
-  # Keeps the last `artwork_keep` reported files and deletes the rest of
-  # what the binary wrote into the dir: older reported files at once,
-  # never-reported ones (superseded before display) once they are stale.
-  defp track_artwork(
-         %{display_roles: %{artwork_dir: dir, artwork_keep: keep}} = state,
-         %{event: "artwork", path: path}
-       )
-       when is_binary(path) do
-    if Path.dirname(path) == dir do
-      {kept, dropped} = Enum.split([path | List.delete(state.artwork_kept, path)], keep)
-      Enum.each(dropped, &File.rm/1)
-      sweep_orphans(dir, kept)
-      %{state | artwork_kept: kept}
-    else
-      state
-    end
-  end
-
-  defp track_artwork(state, _event), do: state
-
-  defp sweep_orphans(dir, kept) do
-    cutoff = System.os_time(:second) - @artwork_orphan_age_s
-
-    for name <- artwork_files(dir),
-        path = Path.join(dir, name),
-        path not in kept,
-        match?({:ok, %File.Stat{mtime: m}} when m < cutoff, File.stat(path, time: :posix)) do
-      File.rm(path)
-    end
-
-    :ok
   end
 
   defp artwork_files(dir) do

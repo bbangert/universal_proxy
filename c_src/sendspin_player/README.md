@@ -24,9 +24,13 @@ c_src/sendspin_player/
     ├── alsa_pipe_sink.h     vendored from LeoLTM/sendspin-armv6
     ├── alsa_pipe_sink.cpp   vendored from LeoLTM/sendspin-armv6
     ├── display_roles.{h,cpp} ours — display roles (--display-roles)
+    ├── artwork_store.{h,cpp} ours — artwork files and their retention
+    ├── started_event.{h,cpp} ours — advertised formats + the `started` line
     ├── json_out.{h,cpp}     ours — JSON escaping + the guarded stdout writer
     ├── sha256.{h,cpp}       ours — artwork file names
     └── main.cpp             ours — CLI args + JSON stdout/stdin
+test/unit_tests.cpp          host unit tests (target sendspin_player_unit_tests,
+                             run by test/sendspin_player_unit_test.exs)
 ```
 
 ## Vendoring
@@ -174,6 +178,7 @@ The flags must match what `UniversalProxy.Audio.Player` passes — see the
 | `--display-roles`          | no       | Also take the metadata, controller, color, artwork and visualizer roles (see *Display roles*). Without it only the player role is registered |
 | `--artwork-dir PATH`       | no       | Where displayed artwork is written (created `0755`). Without it, no artwork role |
 | `--artwork-size WxH`       | no       | Size the server scales artwork to, each 16..2048 (default `480x480`) |
+| `--artwork-keep 1..64`     | no       | Displayed artwork files kept in `--artwork-dir` (default 8) |
 | `--viz-bins 1..128`        | no       | Visualizer spectrum bins (default 32) |
 | `--viz-rate 1..60`         | no       | Visualizer frames per second (default 20) |
 | `--viz-offset-ms 0..1000`  | no       | Deliver visualizer frames this far ahead of their display time (default 0) |
@@ -204,10 +209,14 @@ changes, and on errors.
 {"event":"shutdown"}
 ```
 
-Every line is capped at 3072 bytes (the BEAM reads with `{:line, 4096}`);
+Every line is capped at 4000 bytes (the BEAM reads with `{:line, 4096}`);
 a longer one is not written and the `oversize_line` error is emitted
-instead. Server-supplied text (titles, group names) is sanitized and cut
-to fit well under the cap.
+instead. Every emitter bounds its own size so that never happens to a
+valid event: `started` echoes `name`/`product`/`alsa_device` sanitized
+and cut to 128 bytes each (worst case with the full hi-res format menu is
+about 3.4 KB), and server-supplied text (titles, group names) is
+sanitized and cut to 256/128 bytes. The unit tests check both worst
+cases.
 
 The `started` event's `formats` array is the menu of audio formats advertised
 to the Sendspin server (the server picks one and encodes to it). It always
@@ -237,7 +246,7 @@ HDMI output that drives the TV UI (`UniversalProxy.Audio.DisplayRoles`).
 Extra events:
 
 ```jsonc
-{"event":"metadata","title":"..","artist":"..","album_artist":"..","album":"..","year":1999,"track":3,"progress":{"track_progress":1234,"track_duration":200000,"playback_speed":1000}}
+{"event":"metadata","title":"..","artist":"..","album_artist":"..","album":"..","year":1999,"track":3,"progress":{"track_progress":1234,"track_duration":200000,"playback_speed":1000,"progress_age_ms":0}}
 {"event":"metadata_clear"}
 {"event":"controller_state","supported_commands":["play","pause","next"],"volume":40,"muted":false,"repeat":"off","shuffle":false} // + "seek_max_ms" when known
 {"event":"controller_clear"}
@@ -254,12 +263,22 @@ Extra events:
 
 Fields the server leaves out are omitted. `metadata`, `controller_state`,
 `color` and `artwork`/`artwork_clear` fire on the main loop at the
-server's timestamp. Artwork bytes are written on the library's decode
-thread to `<artwork-dir>/<sha256>.<jpg|png>` via a dot-temp and rename;
-the `artwork` event follows at display time (`seq` counts decoded images;
+server's timestamp. `track_progress` is the position at that timestamp;
+`progress_age_ms` is how long before the event that was on the client
+clock (non-zero when the update was delivered late), so the current
+position is `track_progress + (progress_age_ms + elapsed) *
+playback_speed / 1000`.
+
+Artwork bytes are written on the library's decode thread to
+`<artwork-dir>/<sha256>.<jpg|png>` via a dot-temp and rename; the
+`artwork` event follows at display time (`seq` counts decoded images;
 `width`/`height` are the requested size, which the server must deliver
-exactly). The binary never deletes artwork files; `Audio.Player` prunes
-the dir.
+exactly). The slot is ack-gated (`require_frame_done`, acked with
+`frame_done()` after each `artwork`/`artwork_clear`), so the library holds
+the next image's decode until the current one is shown. The binary owns
+retention: it keeps the last `--artwork-keep` displayed files, deletes a
+decoded image superseded before its display, and never deletes a file
+that is pending display again (same content, same name).
 
 `viz` frames come from the visualizer's drain thread, `--viz-offset-ms`
 ahead of their display time, only while `viz_enable` is on (off at start).

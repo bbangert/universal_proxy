@@ -1837,6 +1837,61 @@ defmodule UniversalProxy.Audio.ServerTest do
       assert starts == [nil, nil]
     end
 
+    test "the owner keeps the roles across its own respawn after the preference flips" do
+      outputs = %{
+        @hdmi0_key => hdmi_hardware(1, "vc4-hdmi-0"),
+        @hdmi1_key => hdmi_hardware(2, "vc4-hdmi-1")
+      }
+
+      {:ok, status} = Agent.start_link(fn -> %{0 => :disconnected, 1 => :connected} end)
+      server = start_display_server!(fn port -> Agent.get(status, & &1[port]) end, outputs)
+      assert %{artwork_dir: _} = display_roles_by_key()[@hdmi1_key]
+
+      # HDMI 0 is now preferred, but HDMI 1 (and its TV) still owns the feed:
+      # its respawn must come back with the roles, or no player has them.
+      Agent.update(status, fn _ -> %{0 => :connected, 1 => :connected} end)
+      {:ok, hdmi1} = Server.player_pid(server, @hdmi1_key)
+      ref = Process.monitor(hdmi1)
+      Process.exit(hdmi1, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^hdmi1, :killed}
+      :ok = Server.check_now(server)
+
+      starts =
+        for {:start_display_roles, @hdmi1_key, roles} <- PlayerStubCalls.calls(), do: roles
+
+      assert [%{artwork_dir: _}, %{artwork_dir: _}] = starts
+
+      assert [%{key: @hdmi1_key}] =
+               Enum.filter(Server.list_outputs(server), & &1.display_roles)
+    end
+
+    test "the roles move, by a respawn, when the owner output goes away" do
+      outputs = %{
+        @hdmi0_key => hdmi_hardware(1, "vc4-hdmi-0"),
+        @hdmi1_key => hdmi_hardware(2, "vc4-hdmi-1")
+      }
+
+      server =
+        start_display_server!(
+          fn port -> if port == 1, do: :connected, else: :unknown end,
+          outputs
+        )
+
+      assert %{artwork_dir: _} = display_roles_by_key()[@hdmi1_key]
+      {:ok, old_hdmi0} = Server.player_pid(server, @hdmi0_key)
+
+      EnumerateStub.set(Map.delete(outputs, @hdmi1_key))
+      :ok = Server.check_now(server)
+
+      starts =
+        for {:start_display_roles, @hdmi0_key, roles} <- PlayerStubCalls.calls(), do: roles
+
+      assert [nil, %{artwork_dir: _}] = starts
+      assert {:ok, new_hdmi0} = Server.player_pid(server, @hdmi0_key)
+      assert new_hdmi0 != old_hdmi0
+      assert [%{key: @hdmi0_key}] = Enum.filter(Server.list_outputs(server), & &1.display_roles)
+    end
+
     test "player_pid/2 names the running player, :error otherwise" do
       server = start_display_server!(fn _ -> :unknown end, %{@hp_key => hp_hardware()})
       assert {:ok, pid} = Server.player_pid(server, @hp_key)

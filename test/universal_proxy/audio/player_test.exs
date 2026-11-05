@@ -1024,12 +1024,14 @@ defmodule UniversalProxy.Audio.PlayerTest do
 
       args = Player.__cli_args__(cli_state(display_roles: display_opts("/tmp/up_art/x")))
 
-      assert Enum.drop_while(args, &(&1 != "--display-roles")) |> Enum.take(11) == [
+      assert Enum.drop_while(args, &(&1 != "--display-roles")) |> Enum.take(13) == [
                "--display-roles",
                "--artwork-dir",
                "/tmp/up_art/x",
                "--artwork-size",
                "320x240",
+               "--artwork-keep",
+               "8",
                "--viz-bins",
                "4",
                "--viz-rate",
@@ -1056,7 +1058,15 @@ defmodule UniversalProxy.Audio.PlayerTest do
 
       assert [s1, s2, s3, s4, s5] == Enum.to_list(s1..(s1 + 4))
       assert metadata.title == "Fake Song"
-      assert %{track_progress: 1000, playback_speed: 1000} = metadata.progress
+
+      assert %{track_progress: 1000, playback_speed: 1000, progress_age_ms: 250} =
+               metadata.progress
+
+      # Every display event carries the BEAM monotonic time it was read at,
+      # the reference for extrapolating the track position.
+      now = System.monotonic_time(:millisecond)
+      assert is_integer(metadata.received_at) and metadata.received_at <= now
+      assert artwork.received_at >= metadata.received_at
       assert Path.dirname(artwork.path) == tmp_dir
       assert File.exists?(artwork.path)
       assert %{width: 320, height: 240, slot: 0} = artwork
@@ -1096,10 +1106,19 @@ defmodule UniversalProxy.Audio.PlayerTest do
       assert {^seq, snapshot} = Player.display_snapshot(pid)
       assert Map.keys(snapshot) |> Enum.sort() == [:color, :controller_state, :group]
 
+      # An already-subscribed consumer hears about the group going away as a
+      # sequenced display event, and the snapshot agrees.
       :ok = Player.__send_command__(pid, %{cmd: "emit_event", event: %{event: "disconnected"}})
       assert_receive {:sendspin_state, @key, %{event: "disconnected"}}, 1_000
-      assert {^seq, snapshot} = Player.display_snapshot(pid)
+      {clear_seq, _} = display_event("group_clear")
+      assert clear_seq == seq + 1
+      assert {^clear_seq, snapshot} = Player.display_snapshot(pid)
       refute Map.has_key?(snapshot, :group)
+
+      # Nothing to clear the second time.
+      :ok = Player.__send_command__(pid, %{cmd: "emit_event", event: %{event: "disconnected"}})
+      assert_receive {:sendspin_state, @key, %{event: "disconnected"}}, 1_000
+      refute_receive {:sendspin_display, @key, _, %{event: "group_clear"}}, 100
     end
 
     @tag :tmp_dir
@@ -1208,46 +1227,29 @@ defmodule UniversalProxy.Audio.PlayerTest do
     end
 
     @tag :tmp_dir
-    test "artwork: the dir is wiped at start, the last N reported files are kept, stale orphans swept",
+    test "the artwork dir is emptied of artwork files before the binary starts",
          %{tmp_dir: tmp_dir} do
       sha_name = fn tag -> Base.encode16(:crypto.hash(:sha256, tag), case: :lower) <> ".jpg" end
       stale = Path.join(tmp_dir, sha_name.("previous-instance"))
+      stale_tmp = Path.join(tmp_dir, "." <> sha_name.("half-written") <> ".tmp")
       unrelated = Path.join(tmp_dir, "not-artwork.txt")
-      File.write!(stale, "x")
-      File.write!(unrelated, "x")
+      for path <- [stale, stale_tmp, unrelated], do: File.write!(path, "x")
 
-      pid = start_display_player!(tmp_dir, %{artwork_keep: 2})
+      pid = start_display_player!(tmp_dir)
       refute File.exists?(stale)
+      refute File.exists?(stale_tmp)
       assert File.exists?(unrelated)
 
+      # Retention is the binary's (--artwork-keep); the player deletes
+      # nothing the binary reports.
       paths =
-        for _ <- 1..3 do
+        for _ <- 1..10 do
           :ok = Player.__send_command__(pid, %{cmd: "emit_display"})
           {_, %{path: path}} = display_event("artwork")
           path
         end
 
-      [first, second, third] = paths
-      refute File.exists?(first)
-      assert File.exists?(second)
-      assert File.exists?(third)
-
-      # Written by the binary but never reported: swept only once stale.
-      old_orphan = Path.join(tmp_dir, sha_name.("old-orphan"))
-      new_orphan = Path.join(tmp_dir, sha_name.("new-orphan"))
-      File.write!(old_orphan, "x")
-      File.write!(new_orphan, "x")
-      File.touch!(old_orphan, System.os_time(:second) - 120)
-
-      :ok = Player.__send_command__(pid, %{cmd: "emit_display"})
-      {_, %{path: fourth}} = display_event("artwork")
-
-      refute File.exists?(old_orphan)
-      assert File.exists?(new_orphan)
-      assert File.exists?(fourth)
-      assert File.exists?(third)
-      refute File.exists?(second)
-      assert File.exists?(unrelated)
+      assert Enum.all?(paths, &File.exists?/1)
     end
   end
 

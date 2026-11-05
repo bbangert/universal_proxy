@@ -10,8 +10,10 @@
 
 // The BEAM reads stdout with `{:line, 4096}`: a longer line arrives split
 // into fragments that Audio.Player discards. emit_json refuses anything
-// past this budget (well under 4096) and reports the drop instead.
-inline constexpr size_t MAX_EMIT_LINE_BYTES = 3072;
+// past this budget (under 4096 with the newline) and reports the drop
+// instead. Every emitter bounds what it echoes so a valid line never gets
+// near it (the unit tests check the largest `started` and `metadata`).
+inline constexpr size_t MAX_EMIT_LINE_BYTES = 4000;
 
 // RFC 3629 well-formedness (no overlongs, surrogates or > U+10FFFF).
 bool is_valid_utf8(const std::string& s);

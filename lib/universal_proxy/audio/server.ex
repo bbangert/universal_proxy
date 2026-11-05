@@ -257,6 +257,10 @@ defmodule UniversalProxy.Audio.Server do
       # config, and the HDMI port → DRM connector status reader.
       display_roles: display_roles,
       hdmi_status_fun: hdmi_status_fun,
+      # The output whose player was last given the display roles. It keeps
+      # them across respawns while it is present, whatever the connectors
+      # say by then, so a respawn never leaves the feed with no player.
+      display_owner: nil,
       # Debounce flag: a `sound` uevent schedules one delayed
       # `:check_hotplug` and sets this; the burst of sub-device uevents a
       # single card emits then coalesces into that one re-enumeration.
@@ -751,6 +755,7 @@ defmodule UniversalProxy.Audio.Server do
       |> stop_players(removed)
       |> start_players_for_enabled(merged_adds)
       |> respawn_missing_players()
+      |> transfer_display_roles(removed)
 
     Enum.each(merged_adds, &broadcast_added/1)
     Enum.each(removed, &broadcast_removed/1)
@@ -990,6 +995,7 @@ defmodule UniversalProxy.Audio.Server do
          ) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
+        state = if display_roles, do: %{state | display_owner: key}, else: state
 
         put_in(state.players[key], %{
           pid: pid,
@@ -1018,18 +1024,41 @@ defmodule UniversalProxy.Audio.Server do
     end
   end
 
-  # The display roles go to the HDMI output `DisplayRoles.choose/2` picks
-  # (plan P3), and to no output while another running player already has
-  # them, so at most one binary ever advertises them.
+  # The display roles go to one output (plan P3): the owner while it is
+  # present, else the HDMI output `DisplayRoles.choose/2` picks. Ownership
+  # is sticky so a respawn gives them back to the same output; the
+  # `--display-roles` hello is fixed per binary, so moving them means a
+  # respawn (see `transfer_display_roles/2`).
   defp display_roles_for(%{display_roles: cfg} = state, merged) do
-    key = merged.key
-
-    other_has_roles? =
-      Enum.any?(state.players, fn {k, p} -> k != key and Map.get(p, :display_roles, false) end)
-
-    if Keyword.fetch!(cfg, :enabled) and not other_has_roles? and
-         DisplayRoles.choose(Map.values(state.outputs), state.hdmi_status_fun) == key do
+    if Keyword.fetch!(cfg, :enabled) and display_owner(state) == merged.key do
       DisplayRoles.player_opts(merged, cfg)
+    end
+  end
+
+  defp display_owner(%{display_owner: owner, outputs: outputs} = state) do
+    if owner != nil and Map.has_key?(outputs, owner),
+      do: owner,
+      else: DisplayRoles.choose(Map.values(outputs), state.hdmi_status_fun)
+  end
+
+  # The owner output went away: its player is gone with it. Respawn the new
+  # choice's player, if one is running without the roles, so the feed moves
+  # there instead of waiting for that player's next unrelated respawn.
+  defp transfer_display_roles(%{display_owner: owner} = state, removed) do
+    if owner != nil and MapSet.member?(removed, owner) do
+      state = %{state | display_owner: nil}
+      new_owner = display_owner(state)
+
+      case state.players[new_owner] do
+        %{display_roles: false} ->
+          merged = Map.fetch!(state.outputs, new_owner)
+          state |> stop_player(new_owner) |> start_player(merged)
+
+        _ ->
+          state
+      end
+    else
+      state
     end
   end
 

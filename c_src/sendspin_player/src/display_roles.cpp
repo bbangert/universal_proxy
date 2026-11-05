@@ -1,7 +1,6 @@
 #include "display_roles.h"
 
 #include "json_out.h"
-#include "sha256.h"
 
 #include "sendspin/types.h"
 
@@ -9,10 +8,8 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
-#include <fcntl.h>
 #include <sstream>
 #include <sys/stat.h>
-#include <unistd.h>
 #include <utility>
 
 using namespace sendspin;
@@ -82,27 +79,6 @@ bool make_dir(const std::string& dir) {
     return ::stat(dir.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
 }
 
-bool write_file_atomic(const std::string& tmp, const std::string& dest, const uint8_t* data,
-                       size_t len) {
-    int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (fd < 0) return false;
-    bool ok = true;
-    while (len > 0) {
-        ssize_t n = ::write(fd, data, len);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            ok = false;
-            break;
-        }
-        data += n;
-        len -= static_cast<size_t>(n);
-    }
-    if (::close(fd) != 0) ok = false;
-    if (ok && ::rename(tmp.c_str(), dest.c_str()) != 0) ok = false;
-    if (!ok) ::unlink(tmp.c_str());
-    return ok;
-}
-
 }  // namespace
 
 DisplayRoles::DisplayRoles(DisplayRolesOptions opts) : opts_(std::move(opts)) {
@@ -113,6 +89,7 @@ DisplayRoles::DisplayRoles(DisplayRolesOptions opts) : opts_(std::move(opts)) {
 void DisplayRoles::attach(SendspinClient& client) {
     if (!opts_.enabled) return;
 
+    metadata_.client = &client;
     client.add_metadata().set_listener(&metadata_);
 
     controller_ = &client.add_controller();
@@ -134,8 +111,12 @@ void DisplayRoles::attach(SendspinClient& client) {
         slot.width = static_cast<uint16_t>(opts_.artwork_width);
         slot.height = static_cast<uint16_t>(opts_.artwork_height);
         slot.max_image_bytes = ARTWORK_MAX_IMAGE_BYTES;
+        slot.require_frame_done = true;
         cfg.preferred_formats = {slot};
-        client.add_artwork(std::move(cfg)).set_listener(&artwork_);
+        artwork_.store = std::make_unique<ArtworkStore>(
+            opts_.artwork_dir, static_cast<size_t>(opts_.artwork_keep));
+        artwork_.role = &client.add_artwork(std::move(cfg));
+        artwork_.role->set_listener(&artwork_);
     }
 
     VisualizerRoleConfig viz;
@@ -202,7 +183,7 @@ bool DisplayRoles::handle_command(const std::string& cmd, const std::string& kin
 
 // -- Metadata ---------------------------------------------------------------
 
-void DisplayRoles::Metadata::on_metadata(const ServerMetadataStateObject& m) {
+std::string metadata_json(const ServerMetadataStateObject& m, int64_t progress_age_ms) {
     std::ostringstream os;
     os << "{\"event\":\"metadata\"";
     put_text(os, "title", m.title, MAX_TEXT_BYTES);
@@ -214,10 +195,24 @@ void DisplayRoles::Metadata::on_metadata(const ServerMetadataStateObject& m) {
     if (m.progress) {
         os << ",\"progress\":{\"track_progress\":" << m.progress->track_progress
            << ",\"track_duration\":" << m.progress->track_duration
-           << ",\"playback_speed\":" << m.progress->playback_speed << '}';
+           << ",\"playback_speed\":" << m.progress->playback_speed
+           << ",\"progress_age_ms\":" << progress_age_ms << '}';
     }
     os << '}';
-    emit_json(os.str());
+    return os.str();
+}
+
+// track_progress is the position at the server's `timestamp`. The library
+// normally delivers the update on that timestamp, but one delivered late
+// (or before time sync) is older; the age lets a consumer extrapolate from
+// the right instant with playback_speed.
+void DisplayRoles::Metadata::on_metadata(const ServerMetadataStateObject& m) {
+    int64_t age_ms = 0;
+    if (client != nullptr) {
+        int64_t at = client->get_client_time(m.timestamp);
+        if (at != 0) age_ms = std::max<int64_t>(0, (SendspinClient::now_us() - at) / 1000);
+    }
+    emit_json(metadata_json(m, age_ms));
 }
 
 void DisplayRoles::Metadata::on_metadata_clear() {
@@ -267,55 +262,38 @@ void DisplayRoles::Color::on_color_clear() { emit_json("{\"event\":\"color_clear
 
 // -- Artwork ----------------------------------------------------------------
 
-// Decode thread. The encoded bytes go to a content-named file (written to a
-// dot-temp and renamed, so a reader never sees a partial image); the event
-// waits for on_image_display so it lands at the server's timestamp.
+// Decode thread. The bytes go to a content-named file; the event waits for
+// on_image_display so it lands at the server's timestamp.
 void DisplayRoles::Artwork::on_image_decode(uint8_t slot, const uint8_t* data, size_t length,
                                             SendspinImageFormat format) {
-    if (slot >= SLOTS) return;
-    const bool png = format == SendspinImageFormat::PNG;
-    const char* ext = png ? "png" : "jpg";
-    std::string sha = sha256_hex(data, length);
-    std::string path = opts->artwork_dir + "/" + sha + "." + ext;
-    std::string tmp = opts->artwork_dir + "/." + sha + "." + ext + ".tmp";
-    bool ok = write_file_atomic(tmp, path, data, length);
-    if (!ok) {
-        std::fprintf(stderr, "sendspin_player: failed to write artwork %s: %s\n", path.c_str(),
-                     std::strerror(errno));
-    }
-
-    std::lock_guard<std::mutex> lock(mtx);
-    Pending& p = pending[slot];
-    p.valid = ok;
-    p.path = std::move(path);
-    p.format = png ? "png" : "jpeg";
-    p.bytes = length;
-    p.seq = ++next_seq;
+    store->stage(slot, data, length, format == SendspinImageFormat::PNG);
 }
 
 void DisplayRoles::Artwork::on_image_display(uint8_t slot, uint32_t lateness_ms) {
-    if (slot >= SLOTS) return;
-    Pending p;
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        p = std::exchange(pending[slot], Pending{});
-    }
-    if (!p.valid) {
+    ArtworkStore::Image img = store->take(slot);
+    if (!img.valid) {
         // The image could not be written: drop whatever was shown rather
         // than leave the previous track's art up.
-        on_image_clear(slot);
-        return;
+        emit_clear(slot);
+    } else {
+        std::ostringstream os;
+        os << "{\"event\":\"artwork\",\"slot\":" << static_cast<int>(slot) << ",\"path\":\""
+           << json_escape(img.path) << "\",\"format\":\"" << img.format
+           << "\",\"width\":" << opts->artwork_width << ",\"height\":" << opts->artwork_height
+           << ",\"bytes\":" << img.bytes << ",\"seq\":" << img.seq
+           << ",\"lateness_ms\":" << lateness_ms << '}';
+        emit_json(os.str());
     }
-    std::ostringstream os;
-    os << "{\"event\":\"artwork\",\"slot\":" << static_cast<int>(slot) << ",\"path\":\""
-       << json_escape(p.path) << "\",\"format\":\"" << p.format
-       << "\",\"width\":" << opts->artwork_width << ",\"height\":" << opts->artwork_height
-       << ",\"bytes\":" << p.bytes << ",\"seq\":" << p.seq << ",\"lateness_ms\":" << lateness_ms
-       << '}';
-    emit_json(os.str());
+    // Presentation is instant (the BEAM takes it from here), so ack now.
+    role->frame_done(slot);
 }
 
 void DisplayRoles::Artwork::on_image_clear(uint8_t slot) {
+    emit_clear(slot);
+    role->frame_done(slot);
+}
+
+void DisplayRoles::Artwork::emit_clear(uint8_t slot) {
     std::ostringstream os;
     os << "{\"event\":\"artwork_clear\",\"slot\":" << static_cast<int>(slot) << '}';
     emit_json(os.str());

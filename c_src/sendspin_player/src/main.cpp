@@ -32,6 +32,7 @@
 #include "display_roles.h"
 #include "file_persistence.h"
 #include "json_out.h"
+#include "started_event.h"
 
 #include <algorithm>
 #include <atomic>
@@ -64,78 +65,6 @@ static constexpr int DEFAULT_WS_PORT = 8928;
 static std::atomic<bool> g_running{true};
 
 static void signal_handler(int /*sig*/) { g_running.store(false); }
-
-static const char* codec_name(SendspinCodecFormat c) {
-    switch (c) {
-        case SendspinCodecFormat::FLAC: return "flac";
-        case SendspinCodecFormat::OPUS: return "opus";
-        case SendspinCodecFormat::PCM:  return "pcm";
-        case SendspinCodecFormat::UNSUPPORTED: return "unsupported";
-    }
-    return "unknown";
-}
-
-// ---------------------------------------------------------------------------
-// Advertised audio formats
-// ---------------------------------------------------------------------------
-
-// Build the list of formats advertised to the Sendspin server. Negotiation
-// is 100% server-driven (the server picks from this menu and encodes to the
-// chosen format before streaming), so this list is the only lever for
-// enabling hi-res output.
-//
-// The first five entries are the unconditional baseline floor — exactly what
-// was advertised before per-device probing existed. Keeping them present
-// always means a probe failure (or a non-card device) silently degrades to
-// today's behaviour rather than going silent. Hi-res entries are layered on
-// top only when the probe succeeds.
-static std::vector<AudioSupportedFormatObject> build_audio_formats(const ProbedCaps& caps) {
-    std::vector<AudioSupportedFormatObject> formats = {
-        {SendspinCodecFormat::FLAC, 2, 44100, 16},
-        {SendspinCodecFormat::FLAC, 2, 48000, 16},
-        {SendspinCodecFormat::OPUS, 2, 48000, 16},
-        {SendspinCodecFormat::PCM,  2, 44100, 16},
-        {SendspinCodecFormat::PCM,  2, 48000, 16},
-    };
-
-    if (!caps.ok) return formats;
-
-    // Cross-product of probed rates × probed depths, for FLAC + PCM only.
-    // Opus is hard-locked to 16-bit in the decoder (decoder.cpp:174), so it
-    // never receives hi-res entries. Skip the {44100,48000} × 16-bit corner
-    // the floor already covers to keep the advertised list dupe-free.
-    // Channels stay stereo — channel-count probing is out of scope.
-    for (uint8_t depth : caps.bit_depths) {
-        for (uint32_t rate : caps.rates) {
-            bool in_floor = (depth == 16 && (rate == 44100 || rate == 48000));
-            if (in_floor) continue;
-            formats.push_back({SendspinCodecFormat::FLAC, 2, rate, depth});
-            formats.push_back({SendspinCodecFormat::PCM,  2, rate, depth});
-        }
-    }
-
-    return formats;
-}
-
-// Serialize the advertised formats as a JSON array for the `started` event.
-// This makes the advertised menu — otherwise visible only in the WS
-// client/hello — observable on stdout for the contract test, the LiveView
-// UI, and hardware validation.
-static std::string formats_to_json(const std::vector<AudioSupportedFormatObject>& formats) {
-    std::ostringstream os;
-    os << '[';
-    bool first = true;
-    for (const auto& f : formats) {
-        if (!first) os << ',';
-        first = false;
-        os << "{\"codec\":\"" << codec_name(f.codec) << "\","
-           << "\"channels\":" << static_cast<unsigned>(f.channels) << ","
-           << "\"rate\":" << f.sample_rate << ","
-           << "\"bit_depth\":" << static_cast<unsigned>(f.bit_depth) << "}";
-    }
-    os << ']';
-    return os.str();
-}
 
 // ---------------------------------------------------------------------------
 // Integer parsing (overflow-checked, replaces std::atoi)
@@ -216,6 +145,8 @@ static void print_usage(const char* prog) {
         "                        (created 0755). Without it no artwork role.\n"
         "  --artwork-size WxH    Artwork size the server scales to (default: 480x480,\n"
         "                        each 16-2048).\n"
+        "  --artwork-keep N      Displayed artwork files kept in --artwork-dir,\n"
+        "                        1-64 (default: 8); older ones are deleted.\n"
         "  --viz-bins N          Visualizer spectrum bins, 1-128 (default: 32).\n"
         "  --viz-rate HZ         Visualizer frames per second, 1-60 (default: 20).\n"
         "  --viz-offset-ms N     Deliver visualizer frames this far ahead of their\n"
@@ -247,6 +178,7 @@ static bool parse_args(int argc, char** argv, Options& opts) {
         {"display-roles",  no_argument,       nullptr, 'R'},
         {"artwork-dir",    required_argument, nullptr, 'A'},
         {"artwork-size",   required_argument, nullptr, 'Z'},
+        {"artwork-keep",   required_argument, nullptr, 'K'},
         {"viz-bins",       required_argument, nullptr, 'B'},
         {"viz-rate",       required_argument, nullptr, 'F'},
         {"viz-offset-ms",  required_argument, nullptr, 'O'},
@@ -290,6 +222,12 @@ static bool parse_args(int argc, char** argv, Options& opts) {
                 if (!parse_size(optarg, opts.display.artwork_width,
                                 opts.display.artwork_height)) {
                     std::fprintf(stderr, "Error: --artwork-size must be WxH\n");
+                    return false;
+                }
+                break;
+            case 'K':
+                if (!parse_int(optarg, opts.display.artwork_keep)) {
+                    std::fprintf(stderr, "Error: --artwork-keep must be an integer\n");
                     return false;
                 }
                 break;
@@ -340,6 +278,10 @@ static bool parse_args(int argc, char** argv, Options& opts) {
     if (opts.display.artwork_width < 16 || opts.display.artwork_width > 2048 ||
         opts.display.artwork_height < 16 || opts.display.artwork_height > 2048) {
         std::fprintf(stderr, "Error: --artwork-size dimensions must be 16-2048\n");
+        return false;
+    }
+    if (opts.display.artwork_keep < 1 || opts.display.artwork_keep > 64) {
+        std::fprintf(stderr, "Error: --artwork-keep must be 1-64\n");
         return false;
     }
     if (opts.display.viz_bins < 1 || opts.display.viz_bins > 128) {
@@ -853,18 +795,15 @@ int main(int argc, char* argv[]) {
     client.set_unpaired_access_enabled(true);
 
     {
-        std::ostringstream os;
-        os << "{\"event\":\"started\","
-           << "\"version\":\"" << VERSION << "\","
-           << "\"port\":" << opts.mdns_port << ","
-           << "\"name\":\"" << json_escape(opts.name) << "\","
-           << "\"product\":\""
-           << json_escape(opts.product.empty() ? "sendspin_player" : opts.product) << "\","
-           << "\"alsa_device\":\"" << json_escape(opts.alsa_device) << "\","
-           << "\"formats\":" << formats_to_json(audio_formats);
-        if (display.enabled()) os << ",\"display_roles\":true";
-        os << "}";
-        emit_json(os.str());
+        StartedInfo info;
+        info.version = VERSION;
+        info.port = opts.mdns_port;
+        info.name = opts.name;
+        info.product = opts.product.empty() ? "sendspin_player" : opts.product;
+        info.alsa_device = opts.alsa_device;
+        info.formats = audio_formats;
+        info.display_roles = display.enabled();
+        emit_json(started_json(info));
     }
 
     // A false return means a role failed to start (thread spawn, ring
