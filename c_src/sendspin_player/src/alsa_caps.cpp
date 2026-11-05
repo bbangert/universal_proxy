@@ -76,6 +76,17 @@ ProbedCaps probe_caps(const std::string& hw_device) {
         }
     }
 
+    // HDMI on the Pi (vc4-hdmi) accepts only IEC958 subframes at hw:, so
+    // none of the linear formats above test true. Playback goes through
+    // plughw:, which packs linear samples into subframes, and a subframe
+    // carries up to 24 bits of audio: advertise 16 and 24 (never 32, which
+    // would be truncated). The rates tested above are already limited to
+    // what the sink's ELD allows.
+    if (caps.bit_depths.empty() &&
+        snd_pcm_hw_params_test_format(pcm, hw, SND_PCM_FORMAT_IEC958_SUBFRAME_LE) == 0) {
+        caps.bit_depths = {16, 24};
+    }
+
     snd_pcm_close(pcm);
 
     // An empty result is indistinguishable from a failed probe to the
