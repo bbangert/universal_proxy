@@ -32,6 +32,10 @@ defmodule UniversalProxy.Cec do
       UniversalProxy.Cec.one_touch_play("/dev/cec0") #=> :ok  (receiver wakes, selects our input)
       UniversalProxy.Cec.volume_up("/dev/cec0")
       UniversalProxy.Cec.standby("/dev/cec0")
+
+  Each adapter record also carries `tv_presence` (`:present`, `:absent`
+  or `:unknown`; see `UniversalProxy.Cec.TvPresence`), and
+  `claim_keys/2` hands the TV remote's keys to a process.
   """
 
   alias Circuits.CEC.Adapter
@@ -132,6 +136,28 @@ defmodule UniversalProxy.Cec do
     |> Application.get_env(__MODULE__, [])
     |> Keyword.get(:volume_link, true)
   end
+
+  @doc """
+  Routes the TV remote's keys on `dev` to `pid` (default: the caller) as
+  `{:cec_key, dev, key}` messages, `key` being one of
+  `t:UniversalProxy.Cec.Keys.key/0` (`:select`, `:up`, `:play_pause`,
+  ...; see `UniversalProxy.Cec.Keys`). While claimed, the adapter no
+  longer Feature-Aborts `<User Control Pressed>`, `<Play>` and `<Deck
+  Control>`; the claim survives adapter restarts and ends when `pid` exits
+  or `release_keys/1` is called. Keys only arrive while the TV sends them
+  to us, i.e. while the Pi is the active source.
+
+  Idempotent, and a no-op (`:ok`) while the subsystem is off: a cast to a
+  server that isn't running is dropped, so callers re-claim on the
+  `{:cec_adapters, _}` updates that list `dev`.
+  """
+  @spec claim_keys(dev(), pid()) :: :ok
+  def claim_keys(dev, pid \\ self()) when is_binary(dev) and is_pid(pid),
+    do: Server.claim_keys(dev, pid)
+
+  @doc "Ends the key claim on `dev` (see `claim_keys/2`). A no-op while the subsystem is off."
+  @spec release_keys(dev()) :: :ok
+  def release_keys(dev) when is_binary(dev), do: Server.release_keys(dev)
 
   @doc "True when the subsystem is running and this build has the CEC helper."
   @spec available?() :: boolean()

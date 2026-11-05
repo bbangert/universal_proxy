@@ -48,6 +48,7 @@ defmodule UniversalProxy.Cec.VolumeTest do
        output_lookup: fn _ -> :error end,
        receiver_la: 5,
        scan_interval_ms: 60_000,
+       tv_presence: false,
        volume_link: volume_link}
     )
 

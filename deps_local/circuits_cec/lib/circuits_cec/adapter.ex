@@ -9,7 +9,7 @@ defmodule Circuits.CEC.Adapter do
       `request/5` and the helpers built on them),
     * answers the messages a playback device must answer (below),
     * tracks the physical address, logical address, whether we are the
-      active source and whether an audio receiver is on the bus,
+      active source and whether an audio receiver and a TV are on the bus,
     * runs One Touch Play (`one_touch_play/2`),
     * and tells subscribers (`subscribe/2`) what it receives.
 
@@ -31,6 +31,15 @@ defmodule Circuits.CEC.Adapter do
      from `:osd_name`, falling back to Unregistered if 4, 8 and 11 are
      taken). A claim that already matches is kept, so restarting the
      adapter causes no bus traffic; a different one is cleared first.
+
+  The kernel claims in the background and gives up for good when a claim
+  transmit fails (vc4 times them out while the HDMI CRTC is off): it keeps
+  the configuration but no logical address, and only tries again on a
+  physical-address change. So while our claim is in place, the physical
+  address is valid and no logical address came of it, the adapter clears
+  and re-sets the configuration, first after `:reclaim_ms` and then at
+  doubling intervals up to `:reclaim_max_ms`. A foreign configuration
+  found there is left alone.
 
   The physical address is never set: the HDMI driver sets it from the
   EDID. When the cable is unplugged (or the sink drops hotplug in
@@ -68,6 +77,17 @@ defmodule Circuits.CEC.Adapter do
   (logical address 0) once it doesn't answer: a `:receiver` call NACKed
   by the receiver is retried once at the TV.
 
+  ## The TV
+
+  With `:tv_poll` (default `true`) the adapter also polls the TV (logical
+  address 0) after every configure, and `poll_tv/1` polls it again on
+  demand. `tv` in `t:state/0` is the last conclusive answer: `:present`
+  when it acknowledged, `:absent` on a NACK, `:unknown` until then and
+  whenever the adapter is unconfigured. A single NACK is no proof (a TV
+  still booting, or in deep standby, doesn't answer), so every poll result
+  also goes to subscribers as a `{:tv_poll, presence}` event (`:unknown`
+  for a bus error) for them to apply their own hysteresis.
+
   ## Subscribers
 
   Subscribers receive `{:cec, device, event}`, where `event` is
@@ -75,6 +95,7 @@ defmodule Circuits.CEC.Adapter do
     * `{:message, %Circuits.CEC.Message{}}` - every message received from
       the bus, including replies to our requests,
     * `{:state, state}` - when `t:state/0` changes,
+    * `{:tv_poll, presence}` - the result of each TV poll (see The TV),
     * `{:lost_msgs, count}` - the kernel dropped received messages,
     * `:gone` - the device went away; the adapter stops.
 
@@ -98,10 +119,14 @@ defmodule Circuits.CEC.Adapter do
       `nil` sends `:receiver` calls to the TV)
     * `:system_audio_mode` - send `<System Audio Mode Request>` to the
       receiver in One Touch Play (default `false`)
+    * `:tv_poll` - poll the TV after every configure (default `true`)
     * `:tx_deadline_ms` - how long past its reply timeout a transmit may
       take before it fails with `:timeout` (default 4100: the kernel's
       2.1 s transmit timeout plus 2 s). Callers of a slower adapter pass a
       matching `:call_timeout`.
+    * `:reclaim_ms`, `:reclaim_max_ms` - the first and the longest wait
+      before re-claiming a logical address the kernel failed to get
+      (default 5 s and 60 s; see Bring-up)
   """
 
   use GenServer, restart: :transient
@@ -121,6 +146,8 @@ defmodule Circuits.CEC.Adapter do
   @reply_timeout 1_000
   @tx_deadline 4_100
   @otp_wait 10_000
+  @reclaim 5_000
+  @reclaim_max 60_000
   @max_orphans 16
   @osd_name_max 14
 
@@ -173,12 +200,14 @@ defmodule Circuits.CEC.Adapter do
           log_addrs: [Message.logical_address()],
           configured?: boolean(),
           active_source?: boolean(),
-          receiver: presence()
+          receiver: presence(),
+          tv: presence()
         }
 
   @type event ::
           {:message, Message.t()}
           | {:state, state()}
+          | {:tv_poll, presence()}
           | {:lost_msgs, non_neg_integer()}
           | :gone
 
@@ -347,6 +376,14 @@ defmodule Circuits.CEC.Adapter do
     call(adapter, {:one_touch_play, Keyword.take(opts, [:wait_ms, :system_audio_mode])}, timeout)
   end
 
+  @doc """
+  Polls the TV (logical address 0) once, unless the adapter is
+  unconfigured or a TV poll is already out. The result updates `tv` and
+  goes to subscribers as `{:tv_poll, presence}`.
+  """
+  @spec poll_tv(adapter()) :: :ok
+  def poll_tv(adapter), do: GenServer.cast(adapter, :poll_tv)
+
   @doc "The logical address `:receiver` calls go to right now."
   @spec receiver(adapter()) :: Message.logical_address()
   def receiver(adapter), do: GenServer.call(adapter, :receiver)
@@ -384,6 +421,10 @@ defmodule Circuits.CEC.Adapter do
       receiver_la: Keyword.get(opts, :receiver_la, 5),
       system_audio_mode: Keyword.get(opts, :system_audio_mode, false),
       tx_deadline: Keyword.get(opts, :tx_deadline_ms, @tx_deadline),
+      reclaim_first: Keyword.get(opts, :reclaim_ms, @reclaim),
+      reclaim_max: Keyword.get(opts, :reclaim_max_ms, @reclaim_max),
+      reclaim_delay: Keyword.get(opts, :reclaim_ms, @reclaim),
+      reclaim_timer: nil,
       caps: nil,
       connector: nil,
       ready?: false,
@@ -396,6 +437,10 @@ defmodule Circuits.CEC.Adapter do
       active_source?: false,
       last_standby: nil,
       receiver: :unknown,
+      tv: :unknown,
+      tv_poll?: Keyword.get(opts, :tv_poll, true),
+      tv_inflight: nil,
+      tv_repoll?: false,
       reqs: %{},
       txs: %{},
       seqs: %{},
@@ -465,6 +510,9 @@ defmodule Circuits.CEC.Adapter do
   end
 
   @impl GenServer
+  def handle_cast(:poll_tv, state), do: {:noreply, poll_tv_now(state)}
+
+  @impl GenServer
   def handle_info({:tx_deadline, ref}, state) do
     if Map.has_key?(state.txs, ref) do
       Logger.warning("CEC #{state.device}: no transmit result before the deadline")
@@ -480,6 +528,20 @@ defmodule Circuits.CEC.Adapter do
   end
 
   def handle_info({:otp_timeout, _id}, state), do: {:noreply, state}
+
+  def handle_info({:reclaim, token}, %{reclaim_timer: {_timer, token}} = state) do
+    state = %{state | reclaim_timer: nil}
+
+    if needs_reclaim?(state) do
+      delay = min(state.reclaim_delay * 2, state.reclaim_max)
+      state = %{state | reclaim_delay: delay}
+      {:noreply, state |> send_internal(:g_log, {:g_log, :reclaim}) |> arm_reclaim()}
+    else
+      {:noreply, arm_reclaim(state)}
+    end
+  end
+
+  def handle_info({:reclaim, _token}, state), do: {:noreply, state}
 
   def handle_info({:DOWN, ref, :process, pid, _reason}, state) do
     case state.subs do
@@ -617,7 +679,12 @@ defmodule Circuits.CEC.Adapter do
   defp on_reply({:g_log, purpose}, {:ok, body}, state) do
     las = Struct.decode_log_addrs(body)
     state = set_addresses(state, state.phys_addr, las.log_addr_mask)
-    if purpose == :claim, do: {:ok, claim(state, las)}, else: {:ok, state}
+
+    case purpose do
+      :claim -> {:ok, claim(state, las)}
+      :reclaim -> {:ok, reclaim(state, las)}
+      _other -> {:ok, state}
+    end
   end
 
   defp on_reply(:g_phys, {:ok, body}, state),
@@ -635,6 +702,22 @@ defmodule Circuits.CEC.Adapter do
   defp on_reply(step, {:error, errno}, state) when step in [:claim_clear, :claim_set] do
     Logger.warning("CEC #{state.device}: can't claim a logical address (#{inspect(errno)})")
     {:ok, %{state | claim: {:error, errno}, ready?: true}}
+  end
+
+  defp on_reply(:reclaim_clear, {:ok, _}, state),
+    do: {:ok, send_internal(state, {:s_log, claim_struct(state)}, :reclaim_set)}
+
+  defp on_reply(:reclaim_set, {:ok, body}, state) do
+    las = Struct.decode_log_addrs(body)
+    {:ok, set_claim(%{state | log_addr_mask: las.log_addr_mask}, :claimed)}
+  end
+
+  # EBUSY: the kernel is configuring right now. Either way the claim we
+  # had stays in place and the next check tries again.
+  defp on_reply(step, {:error, errno}, state) when step in [:reclaim_clear, :reclaim_set] do
+    level = if errno == :ebusy, do: :debug, else: :warning
+    Logger.log(level, "CEC #{state.device}: re-claim failed (#{inspect(errno)})")
+    {:ok, state}
   end
 
   defp on_reply({:g_log, :claim}, {:error, errno}, state) do
@@ -668,12 +751,62 @@ defmodule Circuits.CEC.Adapter do
     end
   end
 
-  # Flags beyond the three settable ones (CONFIG_FAILED) are kernel output.
+  # Only the three settable flags count; the kernel may add others.
   defp our_claim?(state, las) do
     las.num_log_addrs == 1 and hd(las.log_addr_type) == Struct.log_addr_type(:playback) and
       hd(las.primary_device_type) == Message.device_type(:playback) and las.cec_version == 5 and
       las.vendor_id == 0xFFFFFFFF and las.osd_name == state.osd_name and
       (las.flags &&& 0x07) == Struct.flags_value(:log_addrs, @claim_flags)
+  end
+
+  # A claim of ours that the kernel holds without a logical address is
+  # cleared and set again, which makes the kernel run the claim anew.
+  defp reclaim(state, las) do
+    cond do
+      not needs_reclaim?(state) ->
+        state
+
+      las.num_log_addrs == 0 ->
+        Logger.info("CEC #{state.device}: no logical-address configuration; claiming again")
+        send_internal(state, {:s_log, claim_struct(state)}, :reclaim_set)
+
+      our_claim?(state, las) ->
+        Logger.info("CEC #{state.device}: the claim got no logical address; claiming again")
+        send_internal(state, {:s_log, Struct.encode_log_addrs([])}, :reclaim_clear)
+
+      true ->
+        Logger.debug("CEC #{state.device}: a foreign configuration replaced ours; leaving it")
+        state
+    end
+  end
+
+  defp needs_reclaim?(state) do
+    state.ready? and not state.stopping? and state.claim in [:kept, :claimed] and
+      Message.valid_pa?(state.phys_addr) and state.log_addr_mask == 0
+  end
+
+  # Armed while a re-claim may be needed; disarmed (and the backoff reset)
+  # once it isn't.
+  defp arm_reclaim(state) do
+    cond do
+      not needs_reclaim?(state) ->
+        cancel_reclaim(%{state | reclaim_delay: state.reclaim_first})
+
+      state.reclaim_timer == nil ->
+        token = make_ref()
+        timer = Process.send_after(self(), {:reclaim, token}, state.reclaim_delay)
+        %{state | reclaim_timer: {timer, token}}
+
+      true ->
+        state
+    end
+  end
+
+  defp cancel_reclaim(%{reclaim_timer: nil} = state), do: state
+
+  defp cancel_reclaim(%{reclaim_timer: {timer, _token}} = state) do
+    _ = Process.cancel_timer(timer)
+    %{state | reclaim_timer: nil}
   end
 
   defp claim_struct(state) do
@@ -745,16 +878,17 @@ defmodule Circuits.CEC.Adapter do
     new =
       cond do
         now and not was -> on_configured(new)
-        was and not now -> %{new | receiver: :unknown}
+        was and not now -> %{new | receiver: :unknown, tv: :unknown}
         true -> new
       end
 
-    emit_state(new)
+    new |> arm_reclaim() |> emit_state()
   end
 
   defp on_configured(state) do
     state
     |> poll_receiver()
+    |> poll_tv_on_configure()
     |> otp_configured()
   end
 
@@ -794,6 +928,38 @@ defmodule Circuits.CEC.Adapter do
     end
 
     emit_state(%{state | receiver: presence})
+  end
+
+  ## TV
+
+  defp poll_tv_on_configure(%{tv_poll?: false} = state), do: state
+  defp poll_tv_on_configure(state), do: poll_tv_now(state)
+
+  # One TV poll at a time. A request while a poll from an earlier
+  # generation is still out (unplugged and configured again meanwhile)
+  # runs once that stale poll completes, since its result won't count.
+  defp poll_tv_now(state) do
+    cond do
+      not configured?(state) ->
+        state
+
+      state.tv_inflight == nil ->
+        case start_tx(state, @tv, :poll, nil, 0, nil, :tv_poll) do
+          {:ok, state} -> %{state | tv_inflight: state.generation}
+          {:error, _reason, state} -> state
+        end
+
+      state.tv_inflight != state.generation ->
+        %{state | tv_repoll?: true}
+
+      true ->
+        state
+    end
+  end
+
+  defp set_tv(state, presence) do
+    if state.tv != presence, do: Logger.info("CEC #{state.device}: TV is #{presence}")
+    emit_state(%{state | tv: presence})
   end
 
   # An acknowledged transmit or a reply means a device holds the address;
@@ -1061,7 +1227,7 @@ defmodule Circuits.CEC.Adapter do
         state = %{state | txs: txs, seqs: Map.delete(state.seqs, tx.seq)}
 
         state =
-          if match?({:error, _}, result) and tx.cont != :receiver_poll,
+          if match?({:error, _}, result) and tx.cont not in [:receiver_poll, :tv_poll],
             do: bump(state, :tx_errors),
             else: state
 
@@ -1077,6 +1243,7 @@ defmodule Circuits.CEC.Adapter do
   defp stale({:press, job}), do: {:press, %{job | fallback?: false, stale?: true}}
   defp stale({:otp, id, step}), do: {:otp_stale, id, step}
   defp stale(:receiver_poll), do: :ignore
+  defp stale(:tv_poll), do: :tv_poll_stale
   defp stale(:follower), do: :follower
 
   defp continue(state, {:job, job}, result), do: finish_job(state, job, result)
@@ -1101,6 +1268,26 @@ defmodule Circuits.CEC.Adapter do
       nil -> state
       presence -> set_receiver(state, presence)
     end
+  end
+
+  defp continue(state, :tv_poll, result) do
+    state = %{state | tv_inflight: nil}
+
+    case presence(result) do
+      nil ->
+        notify(state, {:tv_poll, :unknown})
+        state
+
+      presence ->
+        state = set_tv(state, presence)
+        notify(state, {:tv_poll, presence})
+        state
+    end
+  end
+
+  defp continue(state, :tv_poll_stale, _result) do
+    state = %{state | tv_inflight: nil}
+    if state.tv_repoll?, do: poll_tv_now(%{state | tv_repoll?: false}), else: state
   end
 
   defp continue(state, {:otp, id, step}, result), do: otp_step(state, id, step, result)
@@ -1343,7 +1530,8 @@ defmodule Circuits.CEC.Adapter do
       log_addrs: if(configured?(state), do: log_addrs(state.log_addr_mask), else: []),
       configured?: configured?(state),
       active_source?: state.active_source?,
-      receiver: state.receiver
+      receiver: state.receiver,
+      tv: state.tv
     }
   end
 
