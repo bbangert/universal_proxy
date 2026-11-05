@@ -13,7 +13,9 @@ defmodule UniversalProxy.Display.Renderer do
       compiled only on the Pi HDMI targets.
 
   `push/2` and `set_display/2` are asynchronous messages: callers never block
-  on the renderer.
+  on the renderer. `set_display(handle, :off)` blanks the screen without
+  turning the display output off (a black frame on Emerge), since the HDMI
+  output also carries audio and CEC.
   """
 
   alias UniversalProxy.Display.Spec

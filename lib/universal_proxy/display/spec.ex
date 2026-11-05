@@ -153,6 +153,10 @@ defmodule UniversalProxy.Display.Spec do
     {:bars, attrs, Enum.map(heights, &clamp_unit/1)}
   end
 
+  @doc "An all-black screen, drawn while the display is blanked."
+  @spec blank() :: t()
+  def blank, do: {:column, [width: :fill, height: :fill, background: {0, 0, 0}], []}
+
   @doc "`count` bars of height `0.0`."
   @spec zero_bars(non_neg_integer()) :: [float()]
   def zero_bars(count) when is_integer(count) and count >= 0, do: List.duplicate(0.0, count)

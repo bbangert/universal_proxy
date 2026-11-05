@@ -10,7 +10,7 @@ if Code.ensure_loaded?(Emerge) do
 
       * `:api` — `:auto` (default; GL with a raster fallback at start when
         the NIF has GL), `:raster` (CPU drawing into KMS dumb buffers) or
-        `:opengl`. On/off (`set_display/2`) needs an explicit API.
+        `:opengl`.
       * `:card` — the DRM card path. Default: the first `/dev/dri/card*`
         with a connected HDMI connector.
       * `:connector` — connector name. Default: the first connected HDMI one.
