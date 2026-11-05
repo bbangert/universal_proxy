@@ -1,7 +1,7 @@
 defmodule UniversalProxy.Display.ViewTest do
   use ExUnit.Case, async: true
 
-  alias UniversalProxy.Display.{Model, Spec, View}
+  alias UniversalProxy.Display.{Model, Spec, Theme, View}
 
   @party %{url: "https://ma.example/party", name: "Garden party"}
 
@@ -63,18 +63,26 @@ defmodule UniversalProxy.Display.ViewTest do
       assert "Nothing playing" in texts(View.render(model([])))
     end
 
-    test "the play/pause control says what Select would do" do
-      assert "Pause" in texts(View.render(model(playback: :playing)))
-      assert "Play" in texts(View.render(model(playback: :paused)))
+    test "the play/pause control shows what Select would do" do
+      icon = fn fields ->
+        [{:icon, _, name}] = keyed(View.render(model(fields)), "ctl-play_pause-icon")
+        name
+      end
+
+      assert icon.(playback: :playing) == :pause
+      assert icon.(playback: :paused) == :play
     end
 
-    test "the focus ring shows only while a CEC TV is present" do
+    test "the focus ring shows only while a CEC TV is present, without moving anything" do
+      theme = Theme.default()
+
       ringed = fn fields ->
         spec = View.render(model([playback: :playing] ++ fields))
 
         for id <- ["ctl-prev", "ctl-play_pause", "ctl-next"],
             [node] = keyed(spec, id),
-            attr(node, :background),
+            {_width, color} = attr(node, :border),
+            color == theme.accent,
             do: id
       end
 
@@ -82,21 +90,177 @@ defmodule UniversalProxy.Display.ViewTest do
       assert ringed.(tv_presence: :present, focus: :prev) == ["ctl-prev"]
       assert ringed.(tv_presence: :absent, focus: :next) == []
       assert ringed.(tv_presence: :unknown, focus: :next) == []
+
+      widths = fn fields ->
+        spec = View.render(model([playback: :playing] ++ fields))
+
+        for id <- ["ctl-prev", "ctl-play_pause", "ctl-next"],
+            do: keyed(spec, id) |> hd() |> attr(:border) |> elem(0)
+      end
+
+      assert widths.(tv_presence: :present, focus: :next) == widths.(tv_presence: :absent)
     end
 
-    test "uses the color@v1 palette, falling back to the default" do
+    test "themes from the color@v1 palette, falling back to the default" do
       spec =
         View.render(
-          model(playback: :playing, color: %{background_dark: [1, 2, 3], primary: [9, 8, 7]})
+          model(
+            playback: :playing,
+            color: %{
+              background_dark: [10, 20, 30],
+              on_dark: [250, 250, 240],
+              primary: [255, 120, 40]
+            }
+          )
         )
 
-      assert [root | _] = keyed(spec, "root")
-      assert attr(root, :background) == {1, 2, 3}
-      assert [bars] = keyed(spec, "viz")
-      assert attr(bars, :color) == {9, 8, 7}
+      assert attr(hd(keyed(spec, "root")), :background) == {10, 20, 30}
+      assert attr(hd(keyed(spec, "title")), :font_color) == {250, 250, 240}
+      assert attr(hd(keyed(spec, "viz")), :color) == {255, 120, 40}
 
       spec = View.render(model(playback: :playing, color: %{background_dark: [999, 0, 0]}))
-      assert attr(hd(keyed(spec, "root")), :background) == {12, 14, 22}
+      assert attr(hd(keyed(spec, "root")), :background) == Theme.default().background
+    end
+
+    test "long titles are cut with an ellipsis" do
+      title = String.duplicate("Very long song title ", 12)
+      spec = View.render(model(playback: :playing, metadata: %{title: title}))
+      assert [{:text, _, shown}] = keyed(spec, "title")
+      assert String.ends_with?(shown, "…")
+      assert String.length(shown) < String.length(title)
+    end
+
+    test "the album line carries the year" do
+      spec = View.render(model(playback: :playing, metadata: %{album: "Record", year: 1999}))
+      assert "Record (1999)" in texts(spec)
+    end
+  end
+
+  describe "progress" do
+    @meta %{
+      title: "Song",
+      received_at: 1_000,
+      progress: %{
+        track_progress: 60_000,
+        track_duration: 200_000,
+        playback_speed: 1000,
+        progress_age_ms: 500
+      }
+    }
+
+    test "elapsed and total, extrapolated to :now, with a proportional fill" do
+      spec = View.render(model(playback: :playing, metadata: @meta), now: 11_000)
+      assert ["1:10"] = for({:text, _, s} <- keyed(spec, "elapsed"), do: s)
+      assert ["3:20"] = for({:text, _, s} <- keyed(spec, "duration"), do: s)
+
+      [track] = keyed(spec, "progress-track")
+      [fill] = keyed(spec, "progress-fill")
+      {:px, track_width} = attr(track, :width)
+      {:px, fill_width} = attr(fill, :width)
+      assert_in_delta fill_width / track_width, 70_500 / 200_000, 0.01
+    end
+
+    test "paused doesn't advance; no progress, no bar" do
+      spec = View.render(model(playback: :paused, metadata: @meta), now: 61_000)
+      assert ["1:00"] = for({:text, _, s} <- keyed(spec, "elapsed"), do: s)
+
+      spec = View.render(model(playback: :playing, metadata: %{title: "Song"}))
+      assert keyed(spec, "progress") == []
+    end
+
+    test "next_refresh/2: the next whole second while it advances, else the next drift step" do
+      playing = model(playback: :playing, metadata: @meta)
+      # 60_000 + 500 + 9_800 = 70_300 ms elapsed: 700 ms to 71 s.
+      assert View.next_refresh(playing, now: 10_800) == 700
+
+      # Drift steps every 3 min: 180_000 - 10_800.
+      assert View.next_refresh(model(playback: :paused, metadata: @meta), now: 10_800) == 169_200
+      assert View.next_refresh(%{playing | mode: :visualizer}, now: 10_800) == 169_200
+      assert View.next_refresh(playing, now: 179_900, drift_period_ms: 180_000) == 100
+      assert View.next_refresh(%{playing | blanked: true}, now: 10_800) == nil
+      assert View.next_refresh(playing) == nil
+    end
+  end
+
+  describe "burn-in drift" do
+    defp moves(spec), do: for(node <- nodes(spec), move = attr(node, :move), uniq: true, do: move)
+
+    test "every block on every screen shifts by the same offset, a function of :now" do
+      for fields <- [
+            [playback: :playing, party: @party],
+            [mode: :visualizer, playback: :playing],
+            [mode: :party_qr, party: @party],
+            [mode: :party_qr]
+          ] do
+        assert moves(View.render(model(fields), now: 0)) == []
+        assert moves(View.render(model(fields), now: 180_000)) == [{4, 0}]
+        assert moves(View.render(model(fields), now: 400_000, size: {1920, 1080})) == [{6, 6}]
+      end
+    end
+
+    test "is deterministic: the same time gives the same screen" do
+      fields = [playback: :paused, metadata: %{title: "Song"}]
+      assert View.render(model(fields), now: 543_210) == View.render(model(fields), now: 543_210)
+      refute View.render(model(fields), now: 543_210) == View.render(model(fields), now: 723_210)
+    end
+
+    test "a blank screen doesn't move" do
+      assert View.render(model(blanked: true), now: 180_000) == Spec.blank()
+    end
+  end
+
+  describe "element budget" do
+    @meta %{
+      title: "Song",
+      artist: "Band",
+      album: "Record",
+      year: 1999,
+      received_at: 0,
+      progress: %{track_progress: 1, track_duration: 2_000, playback_speed: 1000}
+    }
+
+    for size <- [{1280, 720}, {1920, 1080}],
+        {label, fields} <- [
+          {"Now Playing", [playback: :playing, tv_presence: :present]},
+          {"Now Playing with the party overlay", [playback: :playing, party: @party]},
+          {"Visualizer with the party overlay",
+           [mode: :visualizer, playback: :playing, party: @party]},
+          {"the party QR", [mode: :party_qr, party: @party]},
+          {"party off", [mode: :party_qr]}
+        ] do
+      test "#{label} at #{elem(size, 0)}x#{elem(size, 1)} stays within 150 elements at 48 bars" do
+        fields =
+          [metadata: @meta, artwork: %{path: "/tmp/a.jpg"}] ++ unquote(Macro.escape(fields))
+
+        spec = View.render(model(fields), size: unquote(Macro.escape(size)), bars: 48)
+        assert Spec.element_count(spec) <= 150
+      end
+    end
+
+    test "layout boxes scale with the output size" do
+      sizes = fn size ->
+        spec = View.render(model(playback: :playing, metadata: @meta), size: size, bars: 48)
+        [art] = keyed(spec, "art")
+        [track] = keyed(spec, "progress-track")
+        [bars] = keyed(spec, "viz")
+        {:px, art_px} = attr(art, :width)
+        {:px, track_px} = attr(track, :width)
+        {:px, bars_px} = attr(bars, :width)
+
+        {art_px, track_px, bars_px, attr(bars, :max_height),
+         attr(hd(keyed(spec, "title")), :font_size)}
+      end
+
+      small = sizes.({1280, 720})
+      big = sizes.({1920, 1080})
+
+      for {s, b} <- Enum.zip(Tuple.to_list(small), Tuple.to_list(big)),
+          do: assert_in_delta(b / s, 1.5, 0.02)
+
+      # Everything fits inside the 5% margins.
+      {art, track, bars, _h, _font} = big
+      assert bars == 1920 - 2 * 96
+      assert art + 96 + track == bars
     end
   end
 
