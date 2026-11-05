@@ -104,12 +104,25 @@ config :universal_proxy, UniversalProxy.Cec,
 # its viewport by itself and advertises the "TV display mode" select to
 # Home Assistant. With it off the subsystem stays dormant (viewport by hand
 # only). `:idle_ms` / `:party_idle_ms` are the idle-blank timeouts.
+#
+# `:milkdrop` turns on the MilkDrop visualizer (`UniversalProxy.MilkDrop`):
+# it has effect only on rpi3/rpi4/rpi5 and stays false until the mode is
+# validated on hardware.
 config :universal_proxy, UniversalProxy.Display,
   enabled: false,
   renderer: UniversalProxy.Display.Renderer.Null,
   ui: false,
+  milkdrop: false,
   idle_ms: 120_000,
   party_idle_ms: 600_000
+
+# The MilkDrop preset pack the device downloads on first use
+# (`UniversalProxy.MilkDrop.Pack`): a release asset pinned by version, URL
+# and SHA-256. No pack is published yet, so nothing is pinned.
+config :universal_proxy, UniversalProxy.MilkDrop.Pack,
+  version: nil,
+  url: nil,
+  sha256: nil
 
 # Sendspin display roles (metadata, controller, color, artwork, visualizer)
 # for the HDMI TV UI, carried by one HDMI output's player (see

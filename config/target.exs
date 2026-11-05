@@ -206,6 +206,8 @@ if display_target? do
     enabled: true,
     renderer: UniversalProxy.Display.Renderer.Emerge,
     ui: false,
+    # MilkDrop visualizer (rpi3/rpi4/rpi5 only; see config.exs).
+    milkdrop: false,
     # Visualizer redraw period: 20 Hz on the A53 boards, 30 Hz on rpi4/rpi5.
     viz_tick_ms: if(Mix.target() in [:rpi3, :rpi0_2], do: 50, else: 33),
     # Images the renderer may load: the Sendspin artwork dir (tmpfs).
