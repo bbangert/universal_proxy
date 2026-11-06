@@ -315,7 +315,8 @@ def build(args):
     if sweep:
         sources_line.append(f"device sweep ({sum(1 for p in staged if p in sweep)} presets)")
     if trial:
-        sources_line.append(f"frame_ms from the vc4 shader trial ({sum(1 for p in staged if p in trial)})")
+        with_ms = sum(1 for e in doc["presets"] if "frame_ms" in e["rpi3"])
+        sources_line.append(f"frame_ms (vc4 warp+comp GPU time) from the shader trial for {with_ms} presets")
     rpi3_source = " + ".join(sources_line) or f"none measured; every preset starts at {args.default_rung}"
     report.step("manifest", presets=checked["presets"], high_frequency=checked["high_frequency"],
                 rpi3_skip=checked["rpi3_skip"], swept=sum(1 for p in staged if p in sweep),
