@@ -799,6 +799,59 @@ defmodule UniversalProxy.Audio.PlayerTest do
       assert_receive {:sendspin_state, @key, %{event: "mute", value: true}}, 1_000
     end
 
+    test "the tap goes off when its owner is killed" do
+      pid = start_player!(pcm_tap_path: "/run/up-pcm-test")
+      assert_receive {:sendspin_state, @key, %{event: "started"}}, 2_000
+      owner = spawn(fn -> Process.sleep(:infinity) end)
+
+      :ok = Player.pcm_tap(pid, true, owner)
+      assert_receive {:sendspin_state, @key, %{event: "pcm_tap", value: true}}, 1_000
+
+      Process.exit(owner, :kill)
+      assert_receive {:sendspin_state, @key, %{event: "pcm_tap", value: false}}, 1_000
+      assert %{enabled: false} = Player.pcm_tap_status(pid)
+      assert :sys.get_state(pid).pcm_tap_lease == nil
+    end
+
+    test "an enable from a new owner replaces the lease" do
+      pid = start_player!(pcm_tap_path: "/run/up-pcm-test")
+      assert_receive {:sendspin_state, @key, %{event: "started"}}, 2_000
+      old = spawn(fn -> Process.sleep(:infinity) end)
+      new = spawn(fn -> Process.sleep(:infinity) end)
+
+      :ok = Player.pcm_tap(pid, true, old)
+      assert_receive {:sendspin_state, @key, %{event: "pcm_tap", value: true}}, 1_000
+      :ok = Player.pcm_tap(pid, true, new)
+      assert_receive {:sendspin_state, @key, %{event: "pcm_tap", value: true}}, 1_000
+      assert {^new, _ref} = :sys.get_state(pid).pcm_tap_lease
+
+      # The old owner neither turns it off nor takes it down with it.
+      :ok = Player.pcm_tap(pid, false, old)
+      Process.exit(old, :kill)
+      refute_receive {:sendspin_state, @key, %{event: "pcm_tap", value: false}}, 200
+      assert %{enabled: true} = Player.pcm_tap_status(pid)
+
+      Process.exit(new, :kill)
+      assert_receive {:sendspin_state, @key, %{event: "pcm_tap", value: false}}, 1_000
+      assert :sys.get_state(pid).pcm_tap_lease == nil
+    end
+
+    test "an off from the holder ends the lease" do
+      pid = start_player!(pcm_tap_path: "/run/up-pcm-test")
+      assert_receive {:sendspin_state, @key, %{event: "started"}}, 2_000
+      owner = spawn(fn -> Process.sleep(:infinity) end)
+
+      :ok = Player.pcm_tap(pid, true, owner)
+      :ok = Player.pcm_tap(pid, false, owner)
+      assert :sys.get_state(pid).pcm_tap_lease == nil
+      assert_receive {:sendspin_state, @key, %{event: "pcm_tap", value: true}}, 1_000
+      assert_receive {:sendspin_state, @key, %{event: "pcm_tap", value: false}}, 1_000
+
+      # Its later death sends no second off.
+      Process.exit(owner, :kill)
+      refute_receive {:sendspin_state, @key, %{event: "pcm_tap"}}, 200
+    end
+
     test "rejects a non-boolean" do
       pid = start_player!()
 
@@ -820,7 +873,7 @@ defmodule UniversalProxy.Audio.PlayerTest do
     end
   end
 
-  describe "pcm_tap/2" do
+  describe "pcm_tap/3" do
     test "the binary gets --pcm-tap-path, under the tmp dir on the host" do
       pid = start_player!()
       assert_receive {:sendspin_state, @key, %{event: "started"}}, 2_000
@@ -844,11 +897,11 @@ defmodule UniversalProxy.Audio.PlayerTest do
       pid = start_player!(pcm_tap_path: "/run/up-pcm-test")
       assert_receive {:sendspin_state, @key, %{event: "started"}}, 2_000
 
-      :ok = Player.pcm_tap(pid, true)
+      :ok = Player.pcm_tap(pid, true, self())
       assert_receive {:sendspin_state, @key, %{event: "pcm_tap", value: true}}, 1_000
       assert %{path: "/run/up-pcm-test", enabled: true} = Player.pcm_tap_status(pid)
 
-      :ok = Player.pcm_tap(pid, false)
+      :ok = Player.pcm_tap(pid, false, self())
       assert_receive {:sendspin_state, @key, %{event: "pcm_tap", value: false}}, 1_000
       assert %{enabled: false} = Player.pcm_tap_status(pid)
     end
@@ -859,7 +912,7 @@ defmodule UniversalProxy.Audio.PlayerTest do
 
       log =
         ExUnit.CaptureLog.capture_log(fn ->
-          :ok = Player.pcm_tap(pid, true)
+          :ok = Player.pcm_tap(pid, true, self())
 
           assert_receive {:sendspin_state, @key, %{event: "pcm_tap", value: false, ok: false}},
                          1_000
@@ -873,7 +926,7 @@ defmodule UniversalProxy.Audio.PlayerTest do
 
     test "rejects a non-boolean" do
       pid = start_player!()
-      assert_raise FunctionClauseError, fn -> apply(Player, :pcm_tap, [pid, 1]) end
+      assert_raise FunctionClauseError, fn -> apply(Player, :pcm_tap, [pid, 1, self()]) end
     end
 
     @tag :tmp_dir
@@ -892,8 +945,8 @@ defmodule UniversalProxy.Audio.PlayerTest do
       pid = start_player!(binary_path: recorder, mdns_port: 19_003)
       assert_receive {:sendspin_state, @key, %{event: "started"}}, 2_000
 
-      :ok = Player.pcm_tap(pid, true)
-      :ok = Player.pcm_tap(pid, false)
+      :ok = Player.pcm_tap(pid, true, self())
+      :ok = Player.pcm_tap(pid, false, self())
       :ok = GenServer.stop(pid, :normal, 2_000)
 
       lines = log |> File.read!() |> String.split("\n", trim: true)

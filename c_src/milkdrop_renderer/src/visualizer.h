@@ -52,8 +52,11 @@ public:
     // pixel, so vc4's draw-time backend compile happens here). The playing
     // preset, a running blend and the screen are untouched.
     LoadResult preload(const std::string& path);
-    // Starts a blend (or a cut) to the preloaded preset.
-    bool activate(bool smooth);
+    // Starts a blend (or a cut) to the preloaded preset. False if none was
+    // preloaded or the switch failed: projectM then discarded it and the
+    // playing preset (and any blend) runs on; `message` is what the
+    // load-result callback reported for the failure ("" if nothing).
+    bool activate(bool smooth, std::string& message);
     void discard();
 
     void add_pcm(const int16_t* stereo, uint32_t frames);

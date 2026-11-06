@@ -26,13 +26,22 @@ std::optional<Resolution> parse_resolution(std::string_view s);
 
 struct DisplayMode {
     Resolution size;
-    double refresh = 60.0;  // Hz
+    // Hz; none ("WxH") means whatever the output runs at that size (see
+    // choose_mode in output_select.h).
+    std::optional<double> refresh;
 
+    // The refresh to pace at when there is no display to ask (the
+    // headless and simulated check modes).
+    double refresh_or_default() const { return refresh.value_or(60.0); }
     std::string str() const;
 };
 
-// "WxH@Hz" or "WxH" (60 Hz).
+// "WxH@Hz" or "WxH" (no refresh).
 std::optional<DisplayMode> parse_mode(std::string_view s);
+
+// A DRM connector name as the kernel builds it ("HDMI-A-1"): 1..32 of
+// [A-Za-z0-9-].
+bool valid_connector_name(std::string_view s);
 
 // "WxH,WxH,..." highest first, 1..8 rungs, each strictly smaller in area
 // than the one before.
@@ -48,6 +57,8 @@ struct Options {
     bool high_frequency = false;
     std::string locked;
     std::string pcm_ring;
+    // The connector to present on ("" = the first connected HDMI one).
+    std::string connector;
 
     // Tuning and test knobs, not passed by the BEAM.
     std::string card = "/dev/dri/card0";

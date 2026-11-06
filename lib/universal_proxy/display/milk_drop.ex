@@ -23,18 +23,31 @@ defmodule UniversalProxy.Display.MilkDrop do
     * however this process ends (stopped, its owner gone, crashed or
       killed), SIGKILLs a renderer still running `:kill_grace_ms` later;
     * when shut down by its supervisor (application teardown, a restart of
-      the task supervisor), SIGKILLs a still-running renderer before it
-      exits, within its shutdown budget.
+      the task supervisor), SIGKILLs a still-running renderer and waits up
+      to 1 s for it to be gone before it exits, within its shutdown budget.
+      A supervisor that restarts its children only once they are down (the
+      display subtree) thus restarts them with the renderer gone.
+
+  Once the renderer process is confirmed gone (its exit status arrived, or
+  `/proc/<os_pid>` is gone or a zombie, after the grace period and SIGKILL
+  if needed), the owner gets `{:milkdrop_reaped, pid}`; until then it may
+  still hold DRM master. Not sent when the renderer could not be confirmed
+  gone within 1 s of its SIGKILL, nor on a supervisor shutdown.
 
   If the reaper dies while the renderer runs, this process SIGKILLs the
-  renderer, reports `{:milkdrop_exit, pid, :reaper_down}` and stops with
-  `{:shutdown, :reaper_down}`.
+  renderer, reports `{:milkdrop_exit, pid, :reaper_down}` (then
+  `{:milkdrop_reaped, pid}` once it is gone, waiting up to 1 s) and stops
+  with `{:shutdown, :reaper_down}`.
 
   ## Options
 
     * `:owner` — pid to report to (default: the caller);
-    * `:mode` — `%{width:, height:, refresh:}`, the output mode to keep
-      (required);
+    * `:mode` — `%{width:, height:}`, the output size to present at, with
+      an optional `:refresh` (Hz) to pin as well (required; see `--mode`);
+    * `:card` — the DRM card node to present on (`"/dev/dri/card1"`;
+      default: the renderer's, `/dev/dri/card0`);
+    * `:connector` — the DRM connector to present on (`"HDMI-A-1"`;
+      default: the renderer's first connected HDMI connector);
     * `:pack_dir`, `:pack_version` — the extracted pack and its version
       (required; the version keys persisted skips);
     * `:ladder` — internal resolutions, highest first (default
@@ -56,13 +69,19 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   ## Renderer CLI contract
 
-      milkdrop_renderer --mode 1280x720@60 --pack-dir DIR
+      milkdrop_renderer --mode 1280x720[@60] --pack-dir DIR
                         --ladder 640x360,480x270 --rotate-s 20
                         --skip-file PATH
                         [--high-frequency] [--locked FILE] [--pcm-ring PATH]
+                        [--card /dev/dri/card1] [--connector HDMI-A-1]
 
-    * `--mode` — the CRTC mode to present on (reused without a modeset when
-      it is already current);
+    * `--mode` — the CRTC mode to present on. `WxH` keeps the mode the CRTC
+      scans out when the renderer opens the card if it is that size,
+      whatever its refresh (no modeset), else the connector's preferred
+      (or highest-refresh) mode at that size; `WxH@Hz` also pins the
+      refresh (within 0.5 Hz);
+    * `--card` — the DRM card node to open (default `/dev/dri/card0`);
+    * `--connector` — the connector to present on; it must be connected;
     * `--pack-dir` — the extracted pack; `manifest.json` at its root;
     * `--ladder` — comma-separated internal-resolution rungs, highest
       first; the renderer steps down per preset and skips past the last;
@@ -80,8 +99,8 @@ defmodule UniversalProxy.Display.MilkDrop do
 
     * `{"cmd":"take"}` — become DRM master, commit `--mode` and present;
     * `{"cmd":"release"}` — stop flipping, close the framebuffer (keeping
-      the scanout), drop master; card0 stays open;
-    * `{"cmd":"exit"}` — close card0, report `exiting`, exit 0;
+      the scanout), drop master; the card stays open;
+    * `{"cmd":"exit"}` — close the card, report `exiting`, exit 0;
     * `{"cmd":"next"}`, `{"cmd":"prev"}` — change preset (with history);
     * `{"cmd":"lock"}`, `{"cmd":"unlock"}` — hold / resume rotation on the
       current preset;
@@ -90,8 +109,10 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   Events (stdout), forwarded with atom keys and an atom `:event`:
 
-    * `{"event":"prepared"}` — GL is up and the first preset warmed, not
-      yet master;
+    * `{"event":"prepared","mode":M,"connector":C,"mode_source":S,...}` —
+      GL is up and the first preset warmed, not yet master; `mode` is the
+      chosen `WxH@Hz`, `mode_source` how it was chosen (`crtc`: no
+      modeset);
     * `{"event":"presenting"}` — `take` done, frames are on screen;
     * `{"event":"released"}` — `release` done, master dropped;
     * `{"event":"preset","file":F,"locked":B,...}` — preset `F` is showing;
@@ -141,8 +162,17 @@ defmodule UniversalProxy.Display.MilkDrop do
   }
 
   @resolution_re ~r/\A[1-9]\d{0,4}x[1-9]\d{0,4}\z/
+  @connector_re ~r/\A[A-Za-z0-9-]{1,32}\z/
+  # How long a SIGKILLed renderer may take to disappear before giving up
+  # on confirming it, and how often /proc is looked at meanwhile.
+  @kill_confirm_ms 1_000
+  @reap_poll_ms 20
 
-  @type mode :: %{width: pos_integer(), height: pos_integer(), refresh: number()}
+  @type mode :: %{
+          required(:width) => pos_integer(),
+          required(:height) => pos_integer(),
+          optional(:refresh) => number() | nil
+        }
 
   # -- Client API --
 
@@ -167,11 +197,11 @@ defmodule UniversalProxy.Display.MilkDrop do
   @spec take(GenServer.server()) :: :ok
   def take(server), do: command(server, %{cmd: "take"})
 
-  @doc "Stop presenting and drop DRM master, keeping card0 open."
+  @doc "Stop presenting and drop DRM master, keeping the card open."
   @spec release(GenServer.server()) :: :ok
   def release(server), do: command(server, %{cmd: "release"})
 
-  @doc "Ask the renderer to close card0 and exit."
+  @doc "Ask the renderer to close the card and exit."
   @spec exit(GenServer.server()) :: :ok
   def exit(server), do: command(server, %{cmd: "exit"})
 
@@ -228,8 +258,8 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   @doc """
   The renderer's argv (see "Renderer CLI contract") for `config`: `:mode`,
-  `:pack_dir`, `:ladder`, `:skip_file`, `:settings` and an optional
-  `:ring_path`.
+  `:pack_dir`, `:ladder`, `:skip_file`, `:settings` and the optional
+  `:ring_path`, `:card` and `:connector`.
   """
   @spec args(map()) :: [String.t()]
   def args(%{mode: mode, pack_dir: pack_dir, ladder: ladder, skip_file: skip_file} = config) do
@@ -243,7 +273,9 @@ defmodule UniversalProxy.Display.MilkDrop do
       ["--skip-file", skip_file],
       if(settings.include_high_frequency, do: ["--high-frequency"], else: []),
       if(settings.locked, do: ["--locked", settings.locked], else: []),
-      if(config[:ring_path], do: ["--pcm-ring", config.ring_path], else: [])
+      if(config[:ring_path], do: ["--pcm-ring", config.ring_path], else: []),
+      if(config[:card], do: ["--card", config.card], else: []),
+      if(config[:connector], do: ["--connector", config.connector], else: [])
     ]
     |> Enum.concat()
   end
@@ -263,6 +295,8 @@ defmodule UniversalProxy.Display.MilkDrop do
       pack_dir: Keyword.fetch!(opts, :pack_dir),
       ladder: Keyword.get_lazy(opts, :ladder, &default_ladder/0),
       ring_path: Keyword.get(opts, :ring_path),
+      card: Keyword.get(opts, :card),
+      connector: Keyword.get(opts, :connector),
       settings: settings,
       skip_file:
         Keyword.get_lazy(opts, :skip_file, fn ->
@@ -280,7 +314,7 @@ defmodule UniversalProxy.Display.MilkDrop do
 
     with :ok <- validate(config),
          :ok <- write_skip_file(config.skip_file, skipped),
-         {:ok, reaper} <- start_reaper(task_sup, kill_grace_ms, config.skip_file),
+         {:ok, reaper} <- start_reaper(task_sup, owner, kill_grace_ms, config.skip_file),
          {:ok, port} <- open_port(binary, args(config)) do
       os_pid = os_pid(port)
       send(reaper, if(os_pid, do: {:os_pid, os_pid}, else: :renderer_exited))
@@ -355,11 +389,16 @@ defmodule UniversalProxy.Display.MilkDrop do
     {:stop, :normal, state}
   end
 
-  # Nothing would clean up after this process any more.
+  # Nothing would clean up after this process any more, so the renderer is
+  # killed and awaited (briefly) here, and the owner told it was reaped.
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{reaper_ref: ref} = state) do
     Logger.warning("MilkDrop reaper went down (#{inspect(reason)}); killing the renderer")
     if state.os_pid, do: kill(state.os_pid)
     send(state.owner, {:milkdrop_exit, self(), :reaper_down})
+
+    if is_nil(state.os_pid) or await_gone(state.os_pid, @kill_confirm_ms) == :gone,
+      do: send(state.owner, {:milkdrop_reaped, self()})
+
     {:stop, {:shutdown, :reaper_down}, state}
   end
 
@@ -450,21 +489,44 @@ defmodule UniversalProxy.Display.MilkDrop do
     cond do
       not valid_mode?(config.mode) -> {:error, {:invalid_mode, config.mode}}
       not valid_ladder?(config.ladder) -> {:error, {:invalid_ladder, config.ladder}}
+      not valid_card?(config.card) -> {:error, {:invalid_card, config.card}}
+      not valid_connector?(config.connector) -> {:error, {:invalid_connector, config.connector}}
       true -> :ok
     end
   end
 
-  defp valid_mode?(%{width: w, height: h, refresh: r}),
-    do: is_integer(w) and w > 0 and is_integer(h) and h > 0 and is_number(r) and r > 0
+  defp valid_mode?(%{width: w, height: h} = mode)
+       when is_integer(w) and w > 0 and is_integer(h) and h > 0 do
+    case Map.get(mode, :refresh) do
+      nil -> true
+      r -> is_number(r) and r > 0
+    end
+  end
 
   defp valid_mode?(_mode), do: false
+
+  defp valid_card?(nil), do: true
+
+  defp valid_card?(path) when is_binary(path),
+    do: Path.type(path) == :absolute and not String.contains?(path, ["\n", "\r", <<0>>])
+
+  defp valid_card?(_path), do: false
+
+  defp valid_connector?(nil), do: true
+  defp valid_connector?(name) when is_binary(name), do: name =~ @connector_re
+  defp valid_connector?(_name), do: false
 
   defp valid_ladder?([_ | _] = ladder),
     do: Enum.all?(ladder, &(is_binary(&1) and &1 =~ @resolution_re))
 
   defp valid_ladder?(_ladder), do: false
 
-  defp format_mode(%{width: w, height: h, refresh: r}), do: "#{w}x#{h}@#{format_refresh(r)}"
+  defp format_mode(%{width: w, height: h} = mode) do
+    case Map.get(mode, :refresh) do
+      nil -> "#{w}x#{h}"
+      r -> "#{w}x#{h}@#{format_refresh(r)}"
+    end
+  end
 
   defp format_refresh(r) when is_integer(r), do: Integer.to_string(r)
   defp format_refresh(r) when is_float(r), do: :erlang.float_to_binary(r, [:short])
@@ -512,10 +574,11 @@ defmodule UniversalProxy.Display.MilkDrop do
   # one that does not exit on EOF would keep DRM master, so it is SIGKILLed
   # after a grace period if its pid is still alive. `:renderer_exited`
   # (sent before the server stops) means there is nothing to kill, so a
-  # recycled pid is not. It traps exits so that its supervisor's shutdown
-  # kills a still-running renderer rather than abandoning it. It also
-  # deletes the skip file, last, once the renderer is dead or gone.
-  defp start_reaper(task_sup, grace_ms, skip_file) do
+  # recycled pid is not. Once the renderer is known gone the owner is told
+  # (`{:milkdrop_reaped, server}`). It traps exits so that its supervisor's
+  # shutdown kills a still-running renderer rather than abandoning it. It
+  # also deletes the skip file, last, once the renderer is dead or gone.
+  defp start_reaper(task_sup, owner, grace_ms, skip_file) do
     server = self()
 
     case Task.Supervisor.start_child(
@@ -524,7 +587,8 @@ defmodule UniversalProxy.Display.MilkDrop do
              Process.flag(:trap_exit, true)
 
              try do
-               reap(Process.monitor(server), grace_ms)
+               if reap(Process.monitor(server), grace_ms) == :gone,
+                 do: send(owner, {:milkdrop_reaped, server})
              after
                _ = File.rm(skip_file)
              end
@@ -538,43 +602,114 @@ defmodule UniversalProxy.Display.MilkDrop do
     :exit, reason -> {:error, {:reaper, reason}}
   end
 
+  # `:gone` once the renderer is known not to run any more, `:unknown`
+  # when that could not be confirmed.
   defp reap(ref, grace_ms) do
     receive do
       {:os_pid, os_pid} -> watch(ref, os_pid, grace_ms)
-      :renderer_exited -> :ok
-      {:DOWN, ^ref, :process, _pid, _reason} -> :ok
-      {:EXIT, _from, reason} -> Kernel.exit(reason)
+      :renderer_exited -> :gone
+      {:DOWN, ^ref, :process, _pid, _reason} -> :unknown
+      {:EXIT, _from, reason} -> shutdown_before_spawn(ref, reason)
+    end
+  end
+
+  # Shut down while the server may still be spawning the renderer: its
+  # pid (or the news there is none) follows at once, or the server died.
+  @spec shutdown_before_spawn(reference(), term()) :: no_return()
+  defp shutdown_before_spawn(ref, reason) do
+    receive do
+      {:os_pid, os_pid} -> reaper_shutdown(os_pid, reason)
+      :renderer_exited -> Kernel.exit(reason)
+      {:DOWN, ^ref, :process, _pid, _reason} -> Kernel.exit(reason)
+    after
+      @kill_confirm_ms -> Kernel.exit(reason)
     end
   end
 
   defp watch(ref, os_pid, grace_ms) do
     receive do
       :renderer_exited ->
-        :ok
+        :gone
 
       {:DOWN, ^ref, :process, _pid, _reason} ->
         grace(os_pid, grace_ms)
 
       {:EXIT, _from, reason} ->
-        kill_if_alive(os_pid, "its reaper was shut down")
-        Kernel.exit(reason)
+        reaper_shutdown(os_pid, reason)
     end
   end
 
+  # The renderer may exit on its own (EOF) during the grace period; past it,
+  # it is SIGKILLed and awaited.
   defp grace(os_pid, grace_ms) do
-    receive do
-      {:EXIT, _from, reason} ->
-        kill_if_alive(os_pid, "its reaper was shut down")
-        Kernel.exit(reason)
-    after
-      grace_ms -> kill_if_alive(os_pid, "it outlived its port")
+    with :alive <- await_gone(os_pid, grace_ms, &reaper_shutdown/2),
+         :ok <- kill_if_alive(os_pid, "it outlived its port"),
+         :alive <- await_gone(os_pid, @kill_confirm_ms, &reaper_shutdown/2) do
+      Logger.warning(
+        "MilkDrop renderer #{os_pid} still running #{@kill_confirm_ms} ms after SIGKILL"
+      )
+
+      :unknown
+    end
+  end
+
+  # Exits only once the renderer is gone (or 1 s after the SIGKILL), so
+  # its supervisor's shutdown completes with DRM master let go.
+  defp reaper_shutdown(os_pid, reason) do
+    kill_if_alive(os_pid, "its reaper was shut down")
+    _ = await_gone(os_pid, @kill_confirm_ms)
+    Kernel.exit(reason)
+  end
+
+  # Polls /proc until the renderer is gone (`:gone`) or `timeout_ms` passed
+  # (`:alive`). With `on_exit`, an `{:EXIT, _, reason}` meanwhile calls it.
+  defp await_gone(os_pid, timeout_ms, on_exit \\ nil) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    await_gone_until(os_pid, deadline, on_exit)
+  end
+
+  defp await_gone_until(os_pid, deadline, on_exit) do
+    left = deadline - System.monotonic_time(:millisecond)
+
+    cond do
+      not alive?(os_pid) ->
+        :gone
+
+      left <= 0 ->
+        :alive
+
+      is_nil(on_exit) ->
+        Process.sleep(min(@reap_poll_ms, left))
+        await_gone_until(os_pid, deadline, on_exit)
+
+      true ->
+        receive do
+          {:EXIT, _from, reason} -> on_exit.(os_pid, reason)
+        after
+          min(@reap_poll_ms, left) -> await_gone_until(os_pid, deadline, on_exit)
+        end
     end
   end
 
   defp kill_if_alive(os_pid, why) do
-    if File.exists?("/proc/#{os_pid}") do
+    if alive?(os_pid) do
       Logger.warning("MilkDrop renderer #{os_pid} still running and #{why}; killing it")
       kill(os_pid)
+    end
+
+    :ok
+  end
+
+  # A zombie has closed its files (DRM master included) and only waits to
+  # be reaped by erl_child_setup.
+  defp alive?(os_pid) do
+    case File.read("/proc/#{os_pid}/stat") do
+      {:ok, stat} ->
+        state = stat |> String.split(") ") |> List.last() |> String.first()
+        state not in ["Z", "X"]
+
+      {:error, _} ->
+        false
     end
   end
 

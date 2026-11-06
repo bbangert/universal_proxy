@@ -55,6 +55,15 @@ defmodule UniversalProxyWeb.AudioLive do
   volume number marks an output whose slider is currently driving the
   receiver (`volume_external`). Outputs on unpaired cards, and every
   output on a build without CEC, show none of this.
+
+  ## MilkDrop visualizer
+
+  While `UniversalProxy.MilkDrop.enabled?/0`, a "MilkDrop visualizer"
+  section (`UniversalProxyWeb.MilkDropComponent`) sits below the outputs,
+  and this LiveView subscribes to the MilkDrop settings and pack topics and
+  forwards their messages to it. A boolean `:milkdrop_ui_override` app env
+  overrides the flag, for host tests (the flag is compile-time false on
+  the host).
   """
 
   use UniversalProxyWeb, :live_view
@@ -81,6 +90,8 @@ defmodule UniversalProxyWeb.AudioLive do
   alias UniversalProxy.Bluetooth
   alias UniversalProxy.Bluetooth.AudioManager
   alias UniversalProxy.Cec
+  alias UniversalProxy.MilkDrop
+  alias UniversalProxyWeb.MilkDropComponent
   alias UniversalProxyWeb.OpaqueKey
 
   # How long a Bluetooth output keeps a "Reconnecting" placeholder card
@@ -105,6 +116,7 @@ defmodule UniversalProxyWeb.AudioLive do
     # no `assign_async` — and `Audio.Input.list_inputs/0` already degrades
     # to `[]` (via `catch :exit`) when the input subtree is down.
     inputs = Input.list_inputs()
+    milkdrop? = milkdrop_ui?()
 
     if connected?(socket) do
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:output_added")
@@ -116,11 +128,17 @@ defmodule UniversalProxyWeb.AudioLive do
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:input_removed")
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:input_state")
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, Cec.topic())
+
+      if milkdrop? do
+        Phoenix.PubSub.subscribe(UniversalProxy.PubSub, MilkDrop.settings_topic())
+        Phoenix.PubSub.subscribe(UniversalProxy.PubSub, MilkDrop.pack_topic())
+      end
     end
 
     {:ok,
      socket
      |> assign(:page_title, "Audio")
+     |> assign(:milkdrop?, milkdrop?)
      |> assign(:friendly_name_max, @friendly_name_max)
      |> assign(:outputs, build_outputs_map(outputs))
      # mac → "hciN" for Bluetooth outputs (the bound-radio pill). Built by
@@ -456,6 +474,22 @@ defmodule UniversalProxyWeb.AudioLive do
     end
   end
 
+  # A LiveComponent can't subscribe: route MilkDrop settings and pack
+  # status to it, re-rendering only the component.
+  def handle_info({kind, _} = event, %{assigns: %{milkdrop?: true}} = socket)
+      when kind in [:milkdrop_settings, :milkdrop_pack, :milkdrop_pack_started] do
+    Phoenix.LiveView.send_update(MilkDropComponent, id: "milkdrop", event: event)
+    {:noreply, socket}
+  end
+
+  def handle_info(
+        {:milkdrop_skipped, _version, _entries} = event,
+        %{assigns: %{milkdrop?: true}} = socket
+      ) do
+    Phoenix.LiveView.send_update(MilkDropComponent, id: "milkdrop", event: event)
+    {:noreply, socket}
+  end
+
   def handle_info(_msg, socket), do: {:noreply, socket}
 
   @impl true
@@ -482,6 +516,8 @@ defmodule UniversalProxyWeb.AudioLive do
         />
         <.reconnecting_card :for={{mac, info} <- active_reconnecting(@reconnecting, @outputs)} name={info.name} mac={mac} />
       </div>
+
+      <.live_component :if={@milkdrop?} module={MilkDropComponent} id="milkdrop" />
 
       <section aria-label="Audio inputs" class="mt-10">
         <.input_header count={map_size(@inputs)} />
@@ -1479,6 +1515,13 @@ defmodule UniversalProxyWeb.AudioLive do
   # Test seam, like `OverviewLive`'s `:storage_facade`: the app-tree
   # `Audio.Server` runs with no outputs in test.
   defp audio_facade, do: Application.get_env(:universal_proxy, :audio_facade, Audio)
+
+  defp milkdrop_ui? do
+    case Application.get_env(:universal_proxy, :milkdrop_ui_override) do
+      override when is_boolean(override) -> override
+      _ -> MilkDrop.enabled?()
+    end
+  end
 
   defp fetch_output(socket, id) do
     case Map.fetch(socket.assigns.outputs, id) do

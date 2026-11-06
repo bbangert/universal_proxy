@@ -27,7 +27,8 @@ defmodule UniversalProxy.MilkDrop do
       `{:milkdrop_skipped, version, %{preset => reason}}`;
     * `pack_topic/0` (`"milkdrop:pack"`) — `{:milkdrop_pack, status}` on
       every `UniversalProxy.MilkDrop.Pack` status change (including
-      download progress).
+      download progress), and `{:milkdrop_pack_started, status}` each time
+      a Pack process starts.
   """
 
   @supported_targets ~w(rpi3 rpi4 rpi5)a
