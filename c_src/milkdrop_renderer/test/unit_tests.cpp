@@ -893,6 +893,14 @@ static void test_selection() {
     CHECK(select_preset(ab, ab.start(""), 8, [](const PresetEntry&) { return Attempt::Abort; }) ==
           Selection::Aborted);
     CHECK(ab.eligible_count() == 5);
+
+    // A failed switch to a preloaded preset is a skip like a failed
+    // preload; the selection moves on and the playing preset is untouched.
+    SkipCause sc = activation_failure("Error switching to preset: bad texture", "older error");
+    CHECK(sc.reason == "load_failed" && sc.message == "Error switching to preset: bad texture");
+    sc = activation_failure("", "[ProjectM] Error switching to preset");
+    CHECK(sc.reason == "load_failed" && sc.message == "[ProjectM] Error switching to preset");
+    CHECK(activation_failure("", "").message.empty());
 }
 
 static void test_poll_round() {

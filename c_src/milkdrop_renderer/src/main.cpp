@@ -387,9 +387,13 @@ bool App::warm_up(const PresetEntry& entry, bool smooth, std::string& reason, st
         reason = "shader_error";
         message = vis_.last_error();
     } else {
-        activated = vis_.activate(smooth);
+        std::string switch_message;
+        activated = vis_.activate(smooth, switch_message);
         if (!activated) {
-            reason = "load_failed";
+            // The playing preset runs on; this one is skipped.
+            const SkipCause cause = activation_failure(switch_message, vis_.last_error());
+            reason = cause.reason;
+            message = cause.message;
         } else {
             gl_.clear_sentinel();
             vis_.render(gl_.internal_fbo(), vtime_ + 0.001);

@@ -236,7 +236,10 @@ stays on screen and the playing preset is untouched. A clean preload is
 activated (`projectm_activate_preloaded_preset`, blend or cut), one frame is
 rendered off-screen at a frozen clock over the sentinel (below), and a
 1-pixel readback waits for the GPU. A failed preload is discarded and the
-playing preset carries on.
+playing preset carries on. So is a failed activation: the projectM fork
+then discards the preloaded preset itself and keeps the playing one and any
+running blend; the candidate is skipped (`load_failed`, with the message
+projectM reported) and the next one is tried.
 
 **PCM.** Each frame takes the 576 frames of audio whose last frame plays at
 the frame's predicted scanout time. Flip times are CLOCK_MONOTONIC and the
@@ -312,7 +315,7 @@ Unit tests (host, no GL): `test/milkdrop_renderer_unit_test.exs` builds
 and runs `milkdrop_renderer_unit_tests` — protocol and JSON, options,
 connector and mode selection (`src/output_select.h`), manifest and skip list, rotation and history, the photosensitivity
 filter (picks, history, lock, blends in and out), preset selection
-batches and exhaustion, the cost guard ladder, frame pacing, the poll-round
+batches and exhaustion (a failed activation included), the cost guard ladder, frame pacing, the poll-round
 dispatch order, the command drain (nothing after `exit`), the exit guard
 (a hung shutdown still exits in budget, full stdout/stderr included), the
 test tone's tempo,
