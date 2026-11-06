@@ -46,6 +46,40 @@ defmodule UniversalProxy.Display.State do
   the progress bar, once a second while playing, and the burn-in drift
   every few minutes).
 
+  ## MilkDrop
+
+  With MilkDrop on (`UniversalProxy.MilkDrop.enabled?/0`, or the
+  `:milkdrop` option) State also follows the preset pack
+  (`UniversalProxy.MilkDrop.Pack`'s status and PubSub, `:ensure_pack` as a
+  task) and runs the model's `{:yield, :milkdrop}` / `:reclaim` as a
+  handover with the renderer's port owner, `UniversalProxy.Display.MilkDrop`
+  (started unlinked and monitored):
+
+    1. `:tapping` — the bound player's PCM tap is turned on and its ring
+       path read (`UniversalProxy.Audio.pcm_tap/2`, `pcm_tap_status/1`), as
+       an audio job like the others;
+    2. `:preparing` — the renderer starts with the viewport's mode
+       (`UniversalProxy.Display.OutputMode.renderer_mode/2`), the pack, the
+       ring and the target's ladder, and builds GL without DRM master;
+    3. on `prepared` the viewport is stopped (the model's `:yielded`) and
+       `take` sent; `:taking` until `presenting`;
+    4. `:presenting` — Left/Right/Select arrive as `next`/`prev` and
+       `lock`/`unlock` casts;
+    5. on reclaim, `release`; `:releasing` until `released`, then the
+       viewport is started again at once and, once it runs, `exit`;
+       `:exiting` until the renderer is gone. The PCM tap goes off again.
+
+  Every phase is bounded (`:milkdrop_timeouts`, ms: tapping 10 000,
+  preparing 20 000, taking 5 000, releasing 3 000, exiting 3 000). A
+  timed-out step, a `take` the renderer reports failed, or a renderer that
+  exits or crashes unasked (`{:milkdrop_exit, pid, status}`, `:wedged` and
+  `:reaper_down` included) stops it (`UniversalProxy.Display.MilkDrop.stop/1`)
+  and, if the viewport had yielded, starts the viewport again at once;
+  the model counts the failure toward its crash latch, which is logged. A
+  renderer that stopped because it overheated (`exiting` reason
+  `thermal`) latches the bar visualizer. Nothing here waits on the
+  renderer: commands are casts and its answers are messages.
+
   ## With the UI off (`ui: false`, the default)
 
   Nothing is subscribed or claimed and no viewport starts on its own: the
@@ -72,16 +106,33 @@ defmodule UniversalProxy.Display.State do
       `UniversalProxy.TaskSupervisor`.
     * `:audio`, `:cec` — maps of funs overriding the calls into the audio
       and CEC subsystems (tests).
+    * `:milkdrop` — whether the MilkDrop mode is on (default
+      `UniversalProxy.MilkDrop.enabled?/0`).
+    * `:milkdrop_opts` — extra `UniversalProxy.Display.MilkDrop.start/1`
+      options (`:binary`, `:ladder`, `:store`, `:task_supervisor`, ...).
+    * `:milkdrop_timeouts` — per-phase timeouts (see "MilkDrop").
+    * `:pack` — map of funs overriding `status`/`ensure` of
+      `UniversalProxy.MilkDrop.Pack` (tests).
   """
 
   use GenServer
 
   require Logger
 
-  alias UniversalProxy.{Audio, Cec, Display}
-  alias UniversalProxy.Display.{Binding, Mode, Model, Spec, View, Viz}
+  alias UniversalProxy.{Audio, Cec, Display, MilkDrop}
+  alias UniversalProxy.Display.{Binding, Mode, Model, OutputMode, Spec, View, Viz}
 
   @max_clock_ms 3_600_000
+
+  @milkdrop_timeouts %{
+    tapping: 10_000,
+    preparing: 20_000,
+    taking: 5_000,
+    releasing: 3_000,
+    exiting: 3_000
+  }
+  # Renderer errors that mean `take` failed (it stays prepared, not master).
+  @take_errors ["master_timeout", "take_failed"]
 
   @model_keys [:idle_ms, :party_idle_ms, :restart_ms, :restart_max_ms, :stable_ms]
   @viewport_keys [:layer_cache_mb, :preferred_size, :viz_tick_ms, :image_dirs]
@@ -103,6 +154,7 @@ defmodule UniversalProxy.Display.State do
   @impl true
   def init(opts) do
     config = Display.config()
+    milkdrop? = Keyword.get_lazy(opts, :milkdrop, &MilkDrop.enabled?/0) == true
 
     state = %{
       ui: Keyword.get(opts, :ui, Keyword.get(config, :ui, false)),
@@ -119,7 +171,11 @@ defmodule UniversalProxy.Display.State do
       viz_tier: :full,
       model:
         Model.new(
-          Keyword.get_lazy(opts, :model_opts, fn -> Keyword.take(config, @model_keys) end)
+          Keyword.put(
+            Keyword.get_lazy(opts, :model_opts, fn -> Keyword.take(config, @model_keys) end),
+            :milkdrop,
+            milkdrop?
+          )
         ),
       outputs: [],
       adapters: [],
@@ -131,19 +187,27 @@ defmodule UniversalProxy.Display.State do
       pubsub: Keyword.get(opts, :pubsub, UniversalProxy.PubSub),
       task_sup: Keyword.get(opts, :task_supervisor, UniversalProxy.TaskSupervisor),
       audio: Map.merge(default_audio(), Map.new(Keyword.get(opts, :audio, %{}))),
-      cec: Map.merge(default_cec(), Map.new(Keyword.get(opts, :cec, %{})))
+      cec: Map.merge(default_cec(), Map.new(Keyword.get(opts, :cec, %{}))),
+      milkdrop?: milkdrop?,
+      md: nil,
+      md_last: nil,
+      md_opts: Keyword.get(opts, :milkdrop_opts, []),
+      md_timeouts:
+        Map.merge(@milkdrop_timeouts, Map.new(Keyword.get(opts, :milkdrop_timeouts, %{}))),
+      pack: Map.merge(default_pack(), Map.new(Keyword.get(opts, :pack, %{})))
     }
 
     if state.ui do
       # Subscribe before seeding, so nothing published in between is lost
       # (the snapshot's seq drops what it already covers).
-      for topic <- [
-            "sendspin:display",
-            "sendspin:state",
-            "sendspin:output_added",
-            "sendspin:output_removed",
-            Cec.topic()
-          ],
+      for topic <-
+            [
+              "sendspin:display",
+              "sendspin:state",
+              "sendspin:output_added",
+              "sendspin:output_removed",
+              Cec.topic()
+            ] ++ if(milkdrop?, do: [MilkDrop.pack_topic()], else: []),
           do: Phoenix.PubSub.subscribe(state.pubsub, topic)
 
       {:ok, state, {:continue, :start_ui}}
@@ -155,6 +219,8 @@ defmodule UniversalProxy.Display.State do
   @impl true
   def handle_continue(:start_ui, state) do
     state = %{state | adapters: state.cec.list_adapters.(), outputs: state.audio.list_outputs.()}
+    # The pack first, so a persisted MilkDrop mode sees it.
+    state = if state.milkdrop?, do: dispatch(state, {:pack, state.pack.status.()}), else: state
     state = rebind(state)
     {:noreply, dispatch(state, {:display_available, display_available?(state)})}
   end
@@ -250,6 +316,48 @@ defmodule UniversalProxy.Display.State do
 
   def handle_info({:viewport_size, handle, size}, %{viewport: %{handle: handle}} = state),
     do: {:noreply, dispatch(state, {:viewport_size, size})}
+
+  def handle_info({:milkdrop_pack, status}, %{milkdrop?: true} = state),
+    do: {:noreply, dispatch(state, {:pack, status})}
+
+  # `ensure/0`'s own answer: only a final one (progress comes on PubSub,
+  # and an unchanged error isn't broadcast).
+  def handle_info({:milkdrop_pack_ensured, status}, %{milkdrop?: true} = state) do
+    if match?({:error, _}, status) or match?({:ready, _, _}, status),
+      do: {:noreply, dispatch(state, {:pack, status})},
+      else: {:noreply, state}
+  end
+
+  def handle_info(
+        {:milkdrop_ring, session, ring},
+        %{md: %{session: session, phase: :tapping}} = state
+      ),
+      do: {:noreply, start_milkdrop(state, ring)}
+
+  def handle_info({:milkdrop, pid, event}, %{md: %{pid: pid}} = state) when is_map(event),
+    do: {:noreply, milkdrop_event(state, event)}
+
+  def handle_info({:milkdrop_exit, pid, status}, %{md: %{pid: pid} = md} = state) do
+    outcome =
+      cond do
+        md.exiting == "thermal" -> :thermal
+        md.phase == :exiting -> :requested
+        true -> {:crashed, md.exiting || status}
+      end
+
+    {:noreply, end_milkdrop(state, outcome)}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{md: %{ref: ref} = md} = state) do
+    outcome = if md.phase == :exiting, do: :requested, else: {:crashed, {:down, reason}}
+    {:noreply, end_milkdrop(%{state | md: %{md | ref: nil, pid: nil}}, outcome)}
+  end
+
+  def handle_info(
+        {:milkdrop_timeout, session, phase},
+        %{md: %{session: session, phase: phase}} = state
+      ),
+      do: {:noreply, milkdrop_timeout(state, phase)}
 
   def handle_info(_msg, state), do: {:noreply, state}
 
@@ -428,6 +536,33 @@ defmodule UniversalProxy.Display.State do
 
   defp run_effect(:stop_viewport, state), do: stop_viewport(state)
 
+  defp run_effect({:yield, :milkdrop}, state), do: yield_milkdrop(state)
+
+  defp run_effect(:reclaim, state), do: reclaim_milkdrop(state)
+
+  defp run_effect({:milkdrop_cmd, cmd}, state), do: milkdrop_cmd(state, cmd)
+
+  defp run_effect(:ensure_pack, state) do
+    server = self()
+    ensure = state.pack.ensure
+
+    case Task.Supervisor.start_child(state.task_sup, fn ->
+           send(server, {:milkdrop_pack_ensured, ensure.()})
+         end) do
+      {:ok, _pid} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("[Display] MilkDrop pack not asked for: #{inspect(reason)}")
+    end
+
+    state
+  catch
+    :exit, reason ->
+      Logger.warning("[Display] MilkDrop pack not asked for: #{inspect(reason)}")
+      state
+  end
+
   defp run_effect({:schedule, timer, gen, ms}, state) do
     Process.send_after(self(), {:display_timer, timer, gen}, ms)
     state
@@ -490,23 +625,305 @@ defmodule UniversalProxy.Display.State do
 
   defp next_job(state), do: state
 
+  # ── MilkDrop handover ────────────────────────────────────────────────
+
+  # Step 1: the PCM tap on and its ring path, as an audio job (ordered
+  # after the previous session's tap off).
+  defp yield_milkdrop(
+         %{md: nil, model: %{binding: %{key: key}, pack: {:ready, version, dir}}} = state
+       ) do
+    session = make_ref()
+    server = self()
+    audio = state.audio
+
+    state =
+      enqueue(state, fn ->
+        pcm_tap(audio, key, true)
+        send(server, {:milkdrop_ring, session, ring_path(audio, key)})
+      end)
+
+    md = %{
+      session: session,
+      phase: :tapping,
+      timer: nil,
+      pid: nil,
+      ref: nil,
+      tap_key: key,
+      version: version,
+      dir: dir,
+      ring: nil,
+      exiting: nil,
+      preset: nil,
+      locked: false,
+      stats: nil
+    }
+
+    milkdrop_phase(%{state | md: md}, :tapping)
+  end
+
+  # The model yields only with both, and never while a session is still
+  # ending; should that ever not hold, the running session is left alone.
+  defp yield_milkdrop(%{md: nil} = state) do
+    Logger.warning("[Display] MilkDrop: no pack or player to yield to")
+    follow_up(state, {:milkdrop, :ended, {:crashed, :not_ready}})
+  end
+
+  defp yield_milkdrop(state) do
+    Logger.warning("[Display] MilkDrop: a session is still running; not yielding again")
+    state
+  end
+
+  # Step 2: the renderer, building GL off-screen while the viewport shows.
+  defp start_milkdrop(%{md: md} = state, ring) do
+    size = state.model.size || Keyword.get(state.view_opts, :size) || {1280, 720}
+
+    opts =
+      Keyword.merge(state.md_opts,
+        owner: self(),
+        mode: OutputMode.renderer_mode(size),
+        pack_dir: md.dir,
+        pack_version: md.version,
+        ring_path: ring
+      )
+
+    case Display.MilkDrop.start(opts) do
+      {:ok, pid} ->
+        md = %{md | pid: pid, ref: Process.monitor(pid), ring: ring}
+        milkdrop_phase(%{state | md: md}, :preparing)
+
+      {:error, reason} ->
+        Logger.warning("[Display] MilkDrop renderer did not start: #{inspect(reason)}")
+        end_milkdrop(state, {:crashed, {:start_failed, reason}})
+    end
+  end
+
+  # Step 3: the viewport stops, the renderer takes the display.
+  defp milkdrop_event(%{md: %{phase: :preparing, session: session}} = state, %{event: :prepared}) do
+    state = state |> stop_viewport() |> dispatch({:milkdrop, :yielded})
+
+    case state.md do
+      %{session: ^session, phase: :preparing, pid: pid} ->
+        :ok = Display.MilkDrop.take(pid)
+        milkdrop_phase(state, :taking)
+
+      _other ->
+        state
+    end
+  end
+
+  defp milkdrop_event(%{md: %{phase: :taking}} = state, %{event: :presenting} = event) do
+    Logger.info(
+      "[Display] MilkDrop presenting (modeset: #{inspect(event[:modeset])}, master in #{inspect(event[:master_ms])} ms)"
+    )
+
+    state |> milkdrop_phase(:presenting) |> dispatch({:milkdrop, :presenting})
+  end
+
+  # Step 5: the viewport takes the display back, then the renderer exits.
+  defp milkdrop_event(%{md: %{phase: :releasing, session: session}} = state, %{event: :released}) do
+    state = dispatch(state, {:milkdrop, :released})
+
+    case state.md do
+      %{session: ^session, phase: :releasing, pid: pid} ->
+        :ok = Display.MilkDrop.exit(pid)
+        milkdrop_phase(state, :exiting)
+
+      _other ->
+        state
+    end
+  end
+
+  defp milkdrop_event(%{md: %{phase: :taking}} = state, %{event: :error, reason: reason})
+       when reason in @take_errors,
+       do: abort_milkdrop(state, {:take_failed, reason})
+
+  defp milkdrop_event(%{md: md} = state, %{event: :preset} = event) do
+    locked = if is_boolean(event[:locked]), do: event.locked, else: md.locked
+    %{state | md: %{md | preset: event[:file], locked: locked}}
+  end
+
+  defp milkdrop_event(%{md: md} = state, %{event: :stats} = event),
+    do: %{state | md: %{md | stats: Map.delete(event, :event)}}
+
+  defp milkdrop_event(%{md: md} = state, %{event: :exiting} = event),
+    do: %{state | md: %{md | exiting: event[:reason]}}
+
+  defp milkdrop_event(state, %{event: :error} = event) do
+    Logger.info("[Display] MilkDrop renderer error: #{inspect(Map.delete(event, :event))}")
+    state
+  end
+
+  defp milkdrop_event(state, %{event: :skip} = event) do
+    Logger.info(
+      "[Display] MilkDrop skipped #{inspect(event[:preset])}: #{inspect(event[:reason])}"
+    )
+
+    state
+  end
+
+  defp milkdrop_event(state, _event), do: state
+
+  defp reclaim_milkdrop(%{md: %{phase: :tapping} = md} = state) do
+    state = %{
+      cancel_milkdrop_timer(state)
+      | md: nil,
+        md_last: %{outcome: :requested, phase: md.phase}
+    }
+
+    state |> pcm_tap_off(md.tap_key) |> follow_up({:milkdrop, :ended, :requested})
+  end
+
+  defp reclaim_milkdrop(%{md: %{phase: :preparing, pid: pid}} = state) do
+    :ok = Display.MilkDrop.exit(pid)
+    milkdrop_phase(state, :exiting)
+  end
+
+  defp reclaim_milkdrop(%{md: %{phase: phase, pid: pid}} = state)
+       when phase in [:taking, :presenting] do
+    :ok = Display.MilkDrop.release(pid)
+    milkdrop_phase(state, :releasing)
+  end
+
+  defp reclaim_milkdrop(state), do: state
+
+  defp milkdrop_cmd(%{md: %{phase: phase, pid: pid} = md} = state, cmd)
+       when phase in [:preparing, :taking, :presenting] and is_pid(pid) do
+    case cmd do
+      :next ->
+        Display.MilkDrop.next(pid)
+        state
+
+      :prev ->
+        Display.MilkDrop.prev(pid)
+        state
+
+      :toggle_lock ->
+        # Flipped at once so a quick second press toggles back; the next
+        # `preset` event has the renderer's word.
+        if md.locked, do: Display.MilkDrop.unlock(pid), else: Display.MilkDrop.lock(pid)
+        %{state | md: %{md | locked: not md.locked}}
+    end
+  end
+
+  defp milkdrop_cmd(state, _cmd), do: state
+
+  defp milkdrop_timeout(state, :tapping) do
+    Logger.warning("[Display] MilkDrop: no PCM tap ring in time; the visuals get silence")
+    start_milkdrop(state, nil)
+  end
+
+  defp milkdrop_timeout(state, :exiting) do
+    Logger.warning("[Display] MilkDrop renderer did not exit in time; stopping it")
+    :ok = Display.MilkDrop.stop(state.md.pid)
+    end_milkdrop(state, :requested)
+  end
+
+  defp milkdrop_timeout(state, phase), do: abort_milkdrop(state, {:timeout, phase})
+
+  defp abort_milkdrop(%{md: md} = state, why) do
+    Logger.warning("[Display] MilkDrop handover failed (#{inspect(why)}); stopping the renderer")
+    if md.pid, do: :ok = Display.MilkDrop.stop(md.pid)
+    end_milkdrop(state, {:crashed, why})
+  end
+
+  # The session is over (the renderer gone or stopped): tap off, and the
+  # model restarts the viewport if it had yielded.
+  defp end_milkdrop(%{md: md} = state, outcome) do
+    state = cancel_milkdrop_timer(state)
+    if md.ref, do: Process.demonitor(md.ref, [:flush])
+
+    case outcome do
+      :requested ->
+        :ok
+
+      other ->
+        Logger.warning("[Display] MilkDrop renderer ended in #{md.phase}: #{inspect(other)}")
+    end
+
+    latch = state.model.milkdrop.latch
+
+    state =
+      %{state | md: nil, md_last: %{outcome: outcome, phase: md.phase}}
+      |> pcm_tap_off(md.tap_key)
+      |> dispatch({:milkdrop, :ended, outcome})
+
+    log_latch(latch, state.model.milkdrop, outcome)
+    state
+  end
+
+  defp log_latch(nil, %{latch: :crashed, crashes: crashes}, outcome) do
+    Logger.warning(
+      "[Display] MilkDrop off until the mode is chosen again: #{length(crashes)} renderer failures in 10 min (last: #{inspect(outcome)})"
+    )
+  end
+
+  defp log_latch(nil, %{latch: :thermal}, _outcome) do
+    Logger.warning(
+      "[Display] MilkDrop off until the mode is chosen again: the renderer stopped to cool down"
+    )
+  end
+
+  defp log_latch(_before, _milkdrop, _outcome), do: :ok
+
+  # Every phase but `:presenting` is bounded.
+  defp milkdrop_phase(state, phase) do
+    %{md: md} = state = cancel_milkdrop_timer(state)
+
+    timer =
+      case Map.get(state.md_timeouts, phase) do
+        nil -> nil
+        ms -> Process.send_after(self(), {:milkdrop_timeout, md.session, phase}, ms)
+      end
+
+    %{state | md: %{md | phase: phase, timer: timer}}
+  end
+
+  defp cancel_milkdrop_timer(%{md: %{timer: timer} = md} = state) when is_reference(timer) do
+    Process.cancel_timer(timer)
+    %{state | md: %{md | timer: nil}}
+  end
+
+  defp cancel_milkdrop_timer(state), do: state
+
+  defp pcm_tap_off(state, key) do
+    audio = state.audio
+    enqueue(state, fn -> pcm_tap(audio, key, false) end)
+  end
+
+  defp pcm_tap(audio, key, on?) do
+    case audio.pcm_tap.(key, on?) do
+      :ok -> :ok
+      {:error, reason} -> Logger.info("[Display] PCM tap #{on?} not set: #{inspect(reason)}")
+    end
+  end
+
+  defp ring_path(audio, key) do
+    case audio.pcm_tap_status.(key) do
+      {:ok, %{path: path}} when is_binary(path) -> path
+      _other -> nil
+    end
+  end
+
   # ── Binding ──────────────────────────────────────────────────────────
 
   # Also (re)applies the bound adapter's cached TV presence: a new binding
   # starts from :unknown in the model.
   defp rebind(state) do
     binding = Binding.resolve(state.outputs, state.adapters)
-    state = dispatch(state, {:bound, binding, persisted_mode(state.outputs, binding)})
+
+    state =
+      dispatch(state, {:bound, binding, persisted_mode(state.outputs, binding, state.milkdrop?)})
+
     tv_presence(state, bound_adapter(state))
   end
 
   defp refresh_outputs(state), do: %{state | outputs: state.audio.list_outputs.()}
 
-  defp persisted_mode(_outputs, nil), do: nil
+  defp persisted_mode(_outputs, nil, _milkdrop?), do: nil
 
-  defp persisted_mode(outputs, %{key: key}) do
+  defp persisted_mode(outputs, %{key: key}, milkdrop?) do
     with %{display_mode: option} <- Enum.find(outputs, &(Map.get(&1, :key) == key)),
-         {:ok, mode} <- Mode.parse(option) do
+         {:ok, mode} <- Mode.parse(option, milkdrop?) do
       mode
     else
       _ -> nil
@@ -579,9 +996,35 @@ defmodule UniversalProxy.Display.State do
         size: m.size,
         lifecycle: m.viewport
       })
+      |> Map.merge(if state.milkdrop?, do: %{milkdrop: milkdrop_status(state)}, else: %{})
     else
       base
     end
+  end
+
+  defp milkdrop_status(%{model: m, md: md} = state) do
+    session =
+      if md do
+        %{
+          phase: md.phase,
+          renderer: md.pid,
+          ring: md.ring,
+          pack_version: md.version,
+          preset: md.preset,
+          locked: md.locked,
+          stats: md.stats
+        }
+      else
+        %{phase: nil}
+      end
+
+    Map.merge(session, %{
+      pack: m.pack,
+      yield: m.milkdrop.yield,
+      latch: m.milkdrop.latch,
+      failures: length(m.milkdrop.crashes),
+      last: state.md_last
+    })
   end
 
   # ── Defaults ─────────────────────────────────────────────────────────
@@ -613,8 +1056,14 @@ defmodule UniversalProxy.Display.State do
       controller: &Audio.controller/2,
       viz_enable: &Audio.viz_enable/2,
       viz_topic: &Audio.viz_topic/1,
-      update_config: &update_config/2
+      update_config: &update_config/2,
+      pcm_tap: &Audio.pcm_tap/2,
+      pcm_tap_status: &Audio.pcm_tap_status/1
     }
+  end
+
+  defp default_pack do
+    %{status: fn -> MilkDrop.Pack.status() end, ensure: fn -> MilkDrop.Pack.ensure() end}
   end
 
   defp default_cec do

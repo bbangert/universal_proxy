@@ -11,11 +11,21 @@ only what the tests drive.
     {"cmd":"take"}    → {"event":"presenting"}
     {"cmd":"release"} → {"event":"released"}
     {"cmd":"exit"}    → {"event":"exiting","reason":"requested"} + exit 0
+    {"cmd":"next"|"prev"}  → {"event":"preset","file":"p<N>.milk","locked":B,"cause":...}
+    {"cmd":"lock"|"unlock"}→ the same preset event with the new lock
   test-only:
     {"cmd":"emit","line":"<raw>"} → <raw> verbatim on its own line
     {"cmd":"crash","status":N}    → exit N, no event
+    {"cmd":"thermal"}             → {"event":"exiting","reason":"thermal"} + exit 0
     {"cmd":"ignore_eof"}          → on stdin EOF, hang instead of exiting
     {"cmd":"stall"}               → stop reading stdin (hang forever)
+
+Startup behaviour for tests that don't hold the port (Display.State starts
+it) comes from an optional <pack-dir>/fake.json:
+    {"hold_prepared": true}       → no prepared until {"cmd":"prepare"}
+    {"ignore": ["release", ...]}  → log those commands but don't act on them
+    {"take_error": "<reason>"}    → answer take with an error event instead
+    {"take_exit": N}              → exit N on take, no event
 
 It touches <skip-file>.spawned first thing, so tests can tell it was ever
 started. Every stdin line is appended to <skip-file>.cmds, so tests can
@@ -26,6 +36,7 @@ No external dependencies; stdout is flushed after every write.
 """
 import argparse
 import json
+import os
 import sys
 import time
 
@@ -59,7 +70,25 @@ def main():
     cmd_log = args.skip_file + ".cmds"
     ignore_eof = False
 
-    emit({"event": "prepared", "argv": sys.argv[1:], "skip": skip})
+    fake = {}
+    fake_path = os.path.join(args.pack_dir, "fake.json")
+    if os.path.exists(fake_path):
+        with open(fake_path) as f:
+            fake = json.load(f)
+    ignore = set(fake.get("ignore", []))
+
+    preset = 0
+    locked = args.locked is not None
+
+    def emit_preset(cause):
+        emit({"event": "preset", "file": "p%d.milk" % preset, "locked": locked,
+              "cause": cause})
+
+    def prepared():
+        emit({"event": "prepared", "argv": sys.argv[1:], "skip": skip})
+
+    if not fake.get("hold_prepared"):
+        prepared()
 
     while True:
         line = sys.stdin.readline()
@@ -80,8 +109,25 @@ def main():
             continue
 
         name = cmd.get("cmd")
-        if name == "take":
-            emit({"event": "presenting"})
+        if name in ignore:
+            continue
+        if name == "take" and "take_exit" in fake:
+            sys.exit(int(fake["take_exit"]))
+        elif name == "take" and "take_error" in fake:
+            emit({"event": "error", "reason": fake["take_error"]})
+        elif name == "take":
+            emit({"event": "presenting", "modeset": False, "master_ms": 1})
+        elif name == "prepare":
+            prepared()
+        elif name in ("next", "prev"):
+            preset = preset + 1 if name == "next" else max(preset - 1, 0)
+            emit_preset(name)
+        elif name in ("lock", "unlock"):
+            locked = name == "lock"
+            emit_preset(name)
+        elif name == "thermal":
+            emit({"event": "exiting", "reason": "thermal"})
+            sys.exit(0)
         elif name == "release":
             emit({"event": "released"})
         elif name == "exit":

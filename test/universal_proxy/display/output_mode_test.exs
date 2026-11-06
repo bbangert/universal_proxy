@@ -60,4 +60,9 @@ defmodule UniversalProxy.Display.OutputModeTest do
     assert OutputMode.size("bogus") == nil
     assert OutputMode.size(nil) == nil
   end
+
+  test "renderer_mode/2 is the reported size at 60 Hz unless told otherwise" do
+    assert OutputMode.renderer_mode({1280, 720}) == %{width: 1280, height: 720, refresh: 60}
+    assert OutputMode.renderer_mode({1920, 1080}, 50) == %{width: 1920, height: 1080, refresh: 50}
+  end
 end
