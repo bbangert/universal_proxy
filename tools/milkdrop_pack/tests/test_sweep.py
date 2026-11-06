@@ -60,6 +60,20 @@ class ParseRunTest(unittest.TestCase):
         rec = sweep.parse_run("a.milk", crashed)
         self.assertEqual((rec["status"], rec["reason"]), ("error", "exit_1_gl"))
 
+    def test_a_run_needs_both_completion_markers(self):
+        done = ev(event="exiting", reason="headless_done")
+        cases = {
+            "exit_none_none": [stats("a.milk", 30), stats("a.milk", 31)],
+            "exit_none_headless_done": [stats("a.milk", 30), done],
+            "exit_0_none": [stats("a.milk", 30), "EXIT_STATUS 0"],
+            "exit_timeout_none": [stats("a.milk", 30), "EXIT_STATUS timeout"],
+        }
+        for reason, lines in cases.items():
+            rec = sweep.parse_run("a.milk", "\n".join(lines))
+            self.assertEqual((rec["status"], rec["reason"]), ("error", reason))
+        ok = sweep.parse_run("a.milk", "\n".join([stats("a.milk", 30), done, "EXIT_STATUS 0"]))
+        self.assertEqual(ok["status"], "ok")
+
 
 class LoadTest(unittest.TestCase):
     def test_sweep_file_later_lines_win(self):

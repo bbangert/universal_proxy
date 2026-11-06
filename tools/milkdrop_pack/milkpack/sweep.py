@@ -55,8 +55,10 @@ def parse_run(pid, text):
         rec.update(status="skip", reason=skips[0].get("reason"), message=skips[0].get("message", "")[:200])
     elif not stats or (shown and pid not in shown):
         rec.update(status="error", reason="not_shown" if stats or shown else "no_stats")
-    elif exit_status not in ("0", None) or (exiting and exiting[-1] != "headless_done"):
-        rec.update(status="error", reason=f"exit_{exit_status}_{exiting[-1] if exiting else 'none'}")
+    elif exit_status != "0" or not exiting or exiting[-1] != "headless_done":
+        # Only a run that reports both its own end and a clean exit is
+        # complete; a truncated reply can carry stats and neither marker.
+        rec.update(status="error", reason=f"exit_{exit_status or 'none'}_{exiting[-1] if exiting else 'none'}")
     else:
         rec.update(status="ok")
     return rec
