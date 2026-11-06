@@ -10,7 +10,11 @@ defmodule UniversalProxy.Display.View do
       title.
     * `:party_qr` / `:party_off` — the party join card (a placeholder until
       the QR code exists) or a "Party Mode is off" card.
-    * `:blank` — a black frame.
+    * `{:milkdrop_preparing, pct}` / `:milkdrop_error` — the MilkDrop mode
+      while its preset pack downloads ("Preparing visualizer… N%"), or a
+      short notice after the pack failed.
+    * `:blank` — a black frame; also `:milkdrop`, which the MilkDrop
+      renderer draws instead of the viewport.
 
   With `overlay?` the party QR sits in a corner over the view.
 
@@ -64,6 +68,9 @@ defmodule UniversalProxy.Display.View do
       :blank -> Spec.blank()
       :party_qr -> party_card(model, ctx)
       :party_off -> message_card("Party Mode is off", "Turn it on in Music Assistant", ctx)
+      :milkdrop -> Spec.blank()
+      {:milkdrop_preparing, pct} -> message_card(preparing_title(pct), preparing_detail(), ctx)
+      :milkdrop_error -> message_card("Visualizer unavailable", milkdrop_error(model.pack), ctx)
       {:now_playing, overlay?} -> model |> now_playing(ctx) |> with_overlay(overlay?, model, ctx)
       {:visualizer, overlay?} -> model |> visualizer(ctx) |> with_overlay(overlay?, model, ctx)
     end
@@ -80,7 +87,7 @@ defmodule UniversalProxy.Display.View do
     now = Keyword.get(opts, :now)
 
     case {Model.screen(model), now} do
-      {:blank, _now} ->
+      {screen, _now} when screen in [:blank, :milkdrop] ->
         nil
 
       {_screen, nil} ->
@@ -196,6 +203,17 @@ defmodule UniversalProxy.Display.View do
        ctx
      )}
   end
+
+  defp preparing_title(pct) when is_integer(pct), do: "Preparing visualizer… #{pct}%"
+  defp preparing_title(_pct), do: "Preparing visualizer…"
+
+  defp preparing_detail, do: "Downloading the MilkDrop presets"
+
+  defp milkdrop_error({:error, :no_pack_pinned}),
+    do: "No MilkDrop presets for this firmware yet · showing the bars"
+
+  defp milkdrop_error(_pack),
+    do: "The MilkDrop presets could not be downloaded · showing the bars"
 
   defp with_overlay(content, false, _model, _ctx), do: content
 

@@ -649,6 +649,376 @@ defmodule UniversalProxy.Display.ModelTest do
     end
   end
 
+  describe "MilkDrop" do
+    @pack {:ready, "2026.11.1", "/data/milkdrop/2026.11.1"}
+
+    # On HDMI port 0, so the viewport's connector is known (and its card
+    # reported).
+    @md_binding Map.put(@binding, :hdmi_port, 0)
+    @card "/dev/dri/card1"
+
+    # Bound, viewport up, pack ready, mode MilkDrop, nothing playing.
+    defp md_ready(opts \\ []) do
+      run!(md_viewport(opts), [{:pack, @pack}, {:set_mode, :milkdrop}])
+    end
+
+    defp md_viewport(opts) do
+      run!(Model.new([milkdrop: true] ++ opts), [
+        {:bound, @md_binding, nil},
+        {:snapshot, 0, %{}},
+        {:display_available, true},
+        {:viewport_card, @card},
+        {:viewport, :started}
+      ])
+    end
+
+    # Playing with the renderer asked for (not yet yielded).
+    defp md_yielding(opts \\ []) do
+      {m, effects} = run(md_ready(opts), [{:stream, :start}])
+      assert {:yield, :milkdrop} in effects
+      m
+    end
+
+    defp md_yielded(opts \\ []), do: run!(md_yielding(opts), [{:milkdrop, :yielded}])
+
+    defp starts(effects), do: for({:start_viewport, rung} <- effects, do: rung)
+
+    test "playing with the pack ready yields once; the bars show until yielded" do
+      {m, effects} = run(md_ready(), [{:stream, :start}])
+      assert Enum.count(effects, &(&1 == {:yield, :milkdrop})) == 1
+      assert m.milkdrop.yield and m.milkdrop.active
+      assert Model.milkdrop_yield?(m)
+      assert Model.screen(m) == {:visualizer, false}
+      assert m.viz == :full
+
+      {_m, effects} = run(m, [{:display_event, 5, %{event: "metadata", title: "Song"}}])
+      refute {:yield, :milkdrop} in effects
+    end
+
+    test "no yield while paused, without the pack, a player, or a running viewport" do
+      {_m, effects} = run(md_ready(), [{:key, :play}])
+      refute {:yield, :milkdrop} in effects
+
+      {m, effects} = run(md_ready(), [{:pack, {:downloading, 3}}, {:stream, :start}])
+      refute {:yield, :milkdrop} in effects
+      assert Model.screen(m) == {:milkdrop_preparing, 3}
+
+      no_player = run!(md_ready(), [{:bound, %{@binding | client_id: nil}, nil}])
+      {_m, effects} = run(no_player, [{:stream, :start}])
+      refute {:yield, :milkdrop} in effects
+
+      {m, effects} = run(md_ready(), [{:viewport, :down, :boom}, {:stream, :start}])
+      refute {:yield, :milkdrop} in effects
+      # Once the viewport is back, the yield follows.
+      {_m, effects} = run(m, [{:timer, :retry, m.viewport.gen}, {:viewport, :started}])
+      assert {:yield, :milkdrop} in effects
+    end
+
+    test "yielded: the viewport lifecycle stands still, no bars, no restart" do
+      m = md_yielding()
+      {m, effects} = run(m, [{:milkdrop, :yielded}])
+      assert m.viewport.status == :yielded
+      assert Model.screen(m) == :milkdrop
+      assert {:viz, nil} in effects
+
+      {m, effects} =
+        run(m, [
+          :hdmi_link_up,
+          {:display_available, true},
+          {:timer, :retry, m.viewport.gen},
+          {:timer, :stable, m.viewport.gen},
+          {:viewport, :down, :boom}
+        ])
+
+      assert starts(effects) == []
+      assert m.viewport.status == :yielded
+    end
+
+    test "reclaim on pause: released restarts the viewport at once; the end is quiet" do
+      m = md_yielded()
+      {m, effects} = run(m, [{:display_event, 9, %{event: "group", playback_state: "paused"}}])
+      assert :reclaim in effects
+      refute m.milkdrop.yield
+      assert m.milkdrop.active
+
+      # Playing again before the session ended waits for it.
+      {m, effects} = run(m, [{:stream, :start}])
+      refute {:yield, :milkdrop} in effects
+      assert m.viewport.status == :yielded
+
+      {m, effects} = run(m, [{:milkdrop, :released}])
+      assert [[connector: "HDMI-A-1", api: :auto]] = starts(effects)
+      assert m.viewport.status == :starting
+
+      {m, _effects} = run(m, [{:viewport, :started}])
+      {m, effects} = run(m, [{:milkdrop, :ended, :requested}])
+      assert starts(effects) == []
+      refute Enum.any?(effects, &match?({:schedule, :milkdrop_retry, _, _}, &1))
+      # Still playing: the next session starts now that the last one ended.
+      assert {:yield, :milkdrop} in effects
+      assert m.milkdrop.crashes == []
+    end
+
+    test "a crash while yielded restarts the viewport at once and holds the next yield" do
+      m = md_yielded(milkdrop_retry_ms: 7_000)
+      {m, effects} = run(m, [{:milkdrop, :ended, {:crashed, 1}}])
+      assert [_rung] = starts(effects)
+      assert [{gen, 7_000}] = schedules(effects, :milkdrop_retry)
+      refute m.milkdrop.yield or m.milkdrop.active
+
+      {m, effects} = run(m, [{:viewport, :started}])
+      refute {:yield, :milkdrop} in effects
+      assert Model.screen(m) == {:visualizer, false}
+      assert m.viz == :full
+
+      {_m, effects} = run(m, [{:timer, :milkdrop_retry, gen - 1}])
+      refute {:yield, :milkdrop} in effects
+      {_m, effects} = run(m, [{:timer, :milkdrop_retry, gen}])
+      assert {:yield, :milkdrop} in effects
+    end
+
+    test "a failure before the viewport yielded leaves it running" do
+      {m, effects} = run(md_yielding(), [{:milkdrop, :ended, {:crashed, :prepare_timeout}}])
+      assert starts(effects) == []
+      assert m.viewport.status == :running
+      assert [_] = schedules(effects, :milkdrop_retry)
+    end
+
+    defp crash_cycle(m, now) do
+      {m, _} = Model.handle(m, {:milkdrop, :yielded}, now)
+      {m, _} = Model.handle(m, {:milkdrop, :ended, {:crashed, :boom}}, now)
+      {m, _} = Model.handle(m, {:viewport, :started}, now)
+
+      case m.milkdrop.hold do
+        nil -> m
+        gen -> m |> Model.handle({:timer, :milkdrop_retry, gen}, now) |> elem(0)
+      end
+    end
+
+    test "three failures in ten minutes latch it off until an explicit mode change" do
+      m = md_yielding()
+      m = Enum.reduce([0, 1_000, 2_000], m, &crash_cycle(&2, &1))
+      assert m.milkdrop.latch == :crashed
+      refute m.milkdrop.yield
+      assert Model.screen(m) == {:visualizer, false}
+      assert m.viz == :full
+
+      {_m, effects} = run(m, [{:timer, :milkdrop_retry, m.milkdrop.gen}, {:stream, :start}])
+      refute {:yield, :milkdrop} in effects
+
+      {m, effects} = run(m, [{:set_mode, :milkdrop}])
+      assert {:yield, :milkdrop} in effects
+      assert m.milkdrop.latch == nil and m.milkdrop.crashes == []
+    end
+
+    test "failures further apart than the window don't latch" do
+      m = md_yielding()
+      m = Enum.reduce([0, 400_000, 800_000, 1_200_000], m, &crash_cycle(&2, &1))
+      assert m.milkdrop.latch == nil
+      assert length(m.milkdrop.crashes) == 2
+      assert m.milkdrop.yield
+    end
+
+    test "a thermal exit shows the bars until the next mode change" do
+      {m, effects} = run(md_yielded(), [{:milkdrop, :ended, :thermal}])
+      assert [_rung] = starts(effects)
+      {m, _effects} = run(m, [{:viewport, :started}])
+      assert m.milkdrop.latch == :thermal
+      assert Model.screen(m) == {:visualizer, false}
+      assert m.viz == :full
+
+      {m, effects} = run(m, [{:key, :up}])
+      assert m.mode == :visualizer
+      refute {:yield, :milkdrop} in effects
+      {m, effects} = run(m, [{:key, :down}])
+      assert m.mode == :milkdrop
+      assert {:yield, :milkdrop} in effects
+      assert m.milkdrop.latch == nil
+    end
+
+    test "a missing pack is ensured once, with the preparing screen and its progress" do
+      m = run!(md_viewport([]), [{:pack, :absent}])
+      {m, effects} = run(m, [{:set_mode, :milkdrop}])
+      assert Enum.count(effects, &(&1 == :ensure_pack)) == 1
+      assert Model.screen(m) == {:milkdrop_preparing, nil}
+
+      {m, effects} = run(m, [{:stream, :start}, {:key, :play}])
+      refute :ensure_pack in effects
+      refute {:yield, :milkdrop} in effects
+      assert Model.screen(m) == {:milkdrop_preparing, nil}
+      assert m.viz == nil
+
+      {m, effects} = run(m, [{:pack, {:downloading, 42}}])
+      assert :render in effects
+      assert Model.screen(m) == {:milkdrop_preparing, 42}
+
+      {m, effects} = run(m, [{:pack, @pack}])
+      assert {:yield, :milkdrop} in effects
+      assert Model.screen(m) == {:visualizer, false}
+    end
+
+    test "a restarted Pack (its download gone) is asked for the pack again" do
+      m = run!(md_viewport([]), [{:pack, :absent}])
+      {m, effects} = run(m, [{:set_mode, :milkdrop}, {:pack, {:downloading, 40}}])
+      assert Enum.count(effects, &(&1 == :ensure_pack)) == 1
+      assert Model.screen(m) == {:milkdrop_preparing, 40}
+
+      {m, effects} = run(m, [{:pack_restarted, :absent}])
+      assert :ensure_pack in effects
+      assert m.pack == :absent
+      assert Model.screen(m) == {:milkdrop_preparing, nil}
+
+      # A restarted Pack that finds the pack extracted just reports it.
+      {m, effects} = run(m, [{:pack_restarted, @pack}, {:stream, :start}])
+      refute :ensure_pack in effects
+      assert {:yield, :milkdrop} in effects
+      assert m.pack == @pack
+    end
+
+    test "the viewport's connector follows the bound HDMI port" do
+      assert Model.viewport_connector(md_ready()) == "HDMI-A-1"
+      m = md_viewport(milkdrop: true)
+      m = run!(m, [{:bound, %{@md_binding | key: {"vc4-hdmi-1", nil, nil}, hdmi_port: 1}, nil}])
+      m = run!(m, [{:viewport, :started}])
+      assert Model.viewport_connector(m) == "HDMI-A-2"
+      assert Model.viewport_connector(ready()) == nil
+    end
+
+    test "no yield while the viewport's connector is unknown: the bars show" do
+      m = run!(ready(milkdrop: true), [{:pack, @pack}, {:set_mode, :milkdrop}])
+      {m, effects} = run(m, [{:stream, :start}])
+      refute {:yield, :milkdrop} in effects
+      refute m.milkdrop.active
+      assert Model.screen(m) == {:visualizer, false}
+      assert m.viz == :full
+    end
+
+    test "no yield while the viewport's DRM card is unknown: the bars show" do
+      m =
+        run!(Model.new(milkdrop: true), [
+          {:bound, @md_binding, nil},
+          {:snapshot, 0, %{}},
+          {:display_available, true},
+          {:viewport_card, nil},
+          {:viewport, :started},
+          {:pack, @pack},
+          {:set_mode, :milkdrop}
+        ])
+
+      assert Model.viewport_connector(m) == "HDMI-A-1"
+      assert Model.viewport_card(m) == nil
+      {m, effects} = run(m, [{:stream, :start}])
+      refute {:yield, :milkdrop} in effects
+      assert Model.screen(m) == {:visualizer, false}
+
+      # Reported for the next viewport: the yield follows.
+      {m, effects} = run(m, [{:viewport_card, @card}])
+      assert {:yield, :milkdrop} in effects
+      assert Model.viewport_card(m) == @card
+    end
+
+    test "a persisted MilkDrop mode with no pack yet asks for it" do
+      m = run!(Model.new(milkdrop: true), [{:pack, :absent}])
+      {m, effects} = run(m, [{:bound, @binding, :milkdrop}])
+      assert m.mode == :milkdrop
+      assert :ensure_pack in effects
+    end
+
+    test "a pack error shows a short notice, then the bars; picking MilkDrop retries" do
+      m = run!(ready(milkdrop: true, milkdrop_notice_ms: 3_000), [{:pack, {:downloading, 10}}])
+      m = run!(m, [{:set_mode, :milkdrop}])
+      {m, effects} = run(m, [{:pack, {:error, :checksum_mismatch}}])
+      assert [{gen, 3_000}] = schedules(effects, :milkdrop_notice)
+      assert Model.screen(m) == :milkdrop_error
+
+      {m, _effects} = run(m, [{:timer, :milkdrop_notice, gen - 1}])
+      assert Model.screen(m) == :milkdrop_error
+      {m, effects} = run(m, [{:timer, :milkdrop_notice, gen}])
+      assert :render in effects
+      assert Model.screen(m) == {:visualizer, false}
+
+      {m, effects} = run(m, [{:set_mode, :milkdrop}])
+      assert :ensure_pack in effects
+      assert [_] = schedules(effects, :milkdrop_notice)
+      assert Model.screen(m) == :milkdrop_error
+
+      # The same error again (the retry failed the same way): no new notice.
+      {_m, effects} = run(m, [{:pack, {:error, :checksum_mismatch}}])
+      assert schedules(effects, :milkdrop_notice) == []
+    end
+
+    test "a pack error outside the MilkDrop mode shows nothing" do
+      {m, effects} = run(ready(milkdrop: true), [{:pack, {:error, :no_pack_pinned}}])
+      assert schedules(effects, :milkdrop_notice) == []
+      assert Model.screen(m) == {:now_playing, false}
+    end
+
+    test "while the renderer is wanted, Left/Right/Select drive it" do
+      for m <- [md_yielding(), md_yielded()],
+          {key, cmd} <- [left: :prev, right: :next, select: :toggle_lock] do
+        {after_key, effects} = run(m, [{:key, key}])
+        assert effects == [{:milkdrop_cmd, cmd}]
+        assert after_key.focus == m.focus
+      end
+    end
+
+    test "Up/Down and Exit change the mode and reclaim; transport keys work as usual" do
+      {m, effects} = run(md_yielded(), [{:key, :down}])
+      assert m.mode == :party_qr
+      assert :reclaim in effects
+      assert {:persist_mode, :party_qr} in effects
+
+      {m, effects} = run(md_yielded(), [{:key, :exit}])
+      assert m.mode == :now_playing
+      assert :reclaim in effects
+
+      {_m, effects} = run(md_yielded(), [{:key, :play_pause}])
+      assert {:controller, :pause} in effects
+      {_m, effects} = run(md_yielded(), [{:key, :forward}])
+      assert {:controller, :next} in effects
+    end
+
+    test "keys are the visualizer's while the renderer is not wanted" do
+      {m, effects} = run(md_ready(), [{:key, :left}])
+      refute Enum.any?(effects, &match?({:milkdrop_cmd, _}, &1))
+      assert m.focus == :prev
+    end
+
+    test "no party overlay while yielded (P6)" do
+      m = md_yielding()
+      m = run!(m, [{:party, @party}])
+      assert Model.screen(m) == {:visualizer, true}
+      assert Model.screen(run!(m, [{:milkdrop, :yielded}])) == :milkdrop
+    end
+
+    test "a mode change while the pack downloads stops the preparing screen" do
+      m = run!(md_ready(), [{:pack, {:downloading, 50}}])
+      assert Model.screen(m) == {:milkdrop_preparing, 50}
+      assert Model.screen(run!(m, [{:key, :up}])) == {:visualizer, false}
+    end
+
+    test "Up/Down step through MilkDrop only with the option" do
+      assert run!(ready(milkdrop: true), [{:key, :down}, {:key, :down}]).mode == :milkdrop
+      assert run!(ready(), [{:key, :down}, {:key, :down}]).mode == :party_qr
+    end
+
+    test "with the option off nothing MilkDrop happens" do
+      m = ready()
+      {m, effects} = run(m, [{:pack, @pack}, {:set_mode, :milkdrop}, {:stream, :start}])
+      assert m.mode == :now_playing
+      assert {:push_mode, :now_playing} in effects
+
+      refute Enum.any?(
+               effects,
+               &(match?({:yield, _}, &1) or &1 in [:reclaim, :ensure_pack] or
+                   match?({:persist_mode, _}, &1))
+             )
+
+      {m, _effects} = run(Model.new(), [{:bound, @binding, :milkdrop}])
+      assert m.mode == :now_playing
+    end
+  end
+
   test "TV presence keeps its last known value through :unknown" do
     model = run!(ready(), [{:tv_presence, :present}, {:tv_presence, :unknown}])
     assert model.tv_presence == :present

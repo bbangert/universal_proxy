@@ -31,7 +31,10 @@ defmodule UniversalProxy.Audio.Store do
   receiver (`nil`: no cap); values outside 1..100 are clamped into it.
   `display_mode` is the TV UI mode the user last picked for an HDMI
   output (one of `UniversalProxy.Display.Mode.options/0`; `nil` until
-  picked, and anything else is stored as `nil`).
+  picked, and anything else is stored as `nil`). `"MilkDrop"` is an
+  option only while `UniversalProxy.MilkDrop.enabled?/0`: otherwise it is
+  stored as `nil` (the default mode), and one stored before the flag went
+  off reads back as the default too (`Mode.parse/2` refuses it).
 
   `client_id` is generated once per output the first time it is sighted
   and persists across reboots. It is no longer the Sendspin `client_id`:

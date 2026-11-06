@@ -7,6 +7,7 @@
 #include "json.h"
 #include "manifest.h"
 #include "options.h"
+#include "output_select.h"
 #include "pcm_feed.h"
 #include "poll_round.h"
 #include "preset_manager.h"
@@ -86,6 +87,7 @@ static void test_options() {
     CHECK(parse_options(base_args(), o, err));
     CHECK(o.mode.size == (Resolution{1280, 720}) && o.mode.refresh == 60.0);
     CHECK(o.mode.str() == "1280x720@60");
+    CHECK(o.connector.empty());
     CHECK(o.ladder.size() == 2 && o.ladder[1] == (Resolution{480, 270}));
     CHECK(o.rotate_s == 20 && !o.high_frequency && o.locked.empty() && o.pcm_ring.empty());
     CHECK(o.blend_s == 0.5);
@@ -98,8 +100,35 @@ static void test_options() {
 
     auto m = parse_mode("1280x720@59.94");
     CHECK(m && m->refresh > 59.9 && m->refresh < 60);
-    CHECK(parse_mode("1280x720") && parse_mode("1280x720")->refresh == 60.0);
+    // No refresh: whatever the output runs at that size.
+    auto any = parse_mode("1280x720");
+    CHECK(any && any->size == (Resolution{1280, 720}) && !any->refresh);
+    CHECK(any->str() == "1280x720" && any->refresh_or_default() == 60.0);
+    CHECK(parse_mode("1920x1080@50")->refresh == 50.0 && parse_mode("1920x1080@50")->str() == "1920x1080@50");
     CHECK(!parse_mode("1280x720@") && !parse_mode("x720") && !parse_mode("1280x0"));
+    CHECK(!parse_mode("1280x720@0") && !parse_mode("1280x720@60x"));
+
+    auto wxh = base_args();
+    wxh[1] = "1920x1080";
+    Options o6;
+    CHECK(parse_options(wxh, o6, err) && !o6.mode.refresh && o6.mode.size == (Resolution{1920, 1080}));
+
+    auto conn = base_args();
+    conn.insert(conn.end(), {"--connector", "HDMI-A-2"});
+    Options o7;
+    CHECK(parse_options(conn, o7, err) && o7.connector == "HDMI-A-2");
+    for (const char* bad_name : {"", "HDMI A", "HDMI-A-1;", "../card0", "HDMI-A-1\n"}) {
+        auto bc = base_args();
+        bc.insert(bc.end(), {"--connector", bad_name});
+        Options o8;
+        CHECK(!parse_options(bc, o8, err) && err == "bad --connector");
+    }
+    CHECK(valid_connector_name("HDMI-A-1") && valid_connector_name(std::string(32, 'a')));
+    CHECK(!valid_connector_name(std::string(33, 'a')));
+    auto conn_missing = base_args();
+    conn_missing.push_back("--connector");
+    Options o9;
+    CHECK(!parse_options(conn_missing, o9, err) && err == "missing value for --connector");
     CHECK(!parse_ladder("640x360,960x540"));  // must shrink
     CHECK(!parse_ladder("640x360,"));
     CHECK(parse_ladder("960x540,640x360,480x270")->size() == 3);
@@ -128,6 +157,86 @@ static void test_options() {
     sim.insert(sim.end(), {"--headless-frames", "10"});
     Options o5;
     CHECK(!parse_options(sim, o5, err));
+}
+
+// ---------------------------------------------------------------- output selection
+
+static void test_connector_choice() {
+    CHECK(connector_name("HDMI-A", 2) == "HDMI-A-2");
+    std::string err;
+    std::vector<ConnectorCandidate> two = {
+        {"Composite-1", false, true, 4},
+        {"HDMI-A-1", true, true, 10},
+        {"HDMI-A-2", true, true, 12},
+    };
+    // Default: the first connected HDMI one.
+    CHECK(choose_connector(two, "", err) == 1);
+    // By name: the second HDMI port, not the first connected.
+    CHECK(choose_connector(two, "HDMI-A-2", err) == 2);
+    CHECK(choose_connector(two, "Composite-1", err) == 0);
+
+    std::vector<ConnectorCandidate> one_off = {
+        {"HDMI-A-1", true, true, 10},
+        {"HDMI-A-2", true, false, 0},
+    };
+    // The named one disconnected: an error, never the other port.
+    CHECK(choose_connector(one_off, "HDMI-A-2", err) == -1 && err == "connector HDMI-A-2 not connected");
+    CHECK(choose_connector(one_off, "HDMI-A-3", err) == -1 && err == "no connector HDMI-A-3");
+    CHECK(choose_connector(one_off, "", err) == 0);
+
+    std::vector<ConnectorCandidate> no_modes = {{"HDMI-A-1", true, true, 0}, {"HDMI-A-2", true, false, 0}};
+    CHECK(choose_connector(no_modes, "", err) == -1 && err == "no connected HDMI connector");
+    CHECK(choose_connector(no_modes, "HDMI-A-1", err) == -1 && err == "connector HDMI-A-1 not connected");
+    CHECK(choose_connector({}, "", err) == -1);
+}
+
+static void test_mode_choice() {
+    auto m = [](int w, int h, double hz, bool preferred = false, bool interlaced = false) {
+        return ModeCandidate{w, h, hz, interlaced, preferred};
+    };
+    auto want = [](const char* s) { return *parse_mode(s); };
+    const std::vector<ModeCandidate> tv = {
+        m(1920, 1080, 60), m(1920, 1080, 50), m(1920, 1080, 59.94), m(1920, 1080, 60, false, true),
+        m(1280, 720, 60), m(1280, 720, 50), m(1280, 720, 59.94),
+    };
+
+    // WxH: the CRTC's mode whatever its refresh (no modeset).
+    auto c = choose_mode(m(1280, 720, 50), tv, want("1280x720"));
+    CHECK(c && c->index == -1 && c->source == ModeSource::Crtc);
+    c = choose_mode(m(1280, 720, 120), tv, want("1280x720"));
+    CHECK(c && c->index == -1 && c->source == ModeSource::Crtc);
+    // An interlaced or other-size CRTC mode is not kept.
+    c = choose_mode(m(1920, 1080, 60, false, true), tv, want("1920x1080"));
+    CHECK(c && c->index == 0 && c->source == ModeSource::Highest);
+    c = choose_mode(m(1920, 1080, 60), tv, want("1280x720"));
+    CHECK(c && c->index == 4 && c->source == ModeSource::Highest);
+    // No CRTC mode: the preferred one at that size, else the highest.
+    auto preferred_50 = tv;
+    preferred_50[5].preferred = true;
+    c = choose_mode(std::nullopt, preferred_50, want("1280x720"));
+    CHECK(c && c->index == 5 && c->source == ModeSource::Preferred);
+    preferred_50[0].preferred = true;  // another size's preferred flag is ignored
+    c = choose_mode(std::nullopt, preferred_50, want("1280x720"));
+    CHECK(c && c->index == 5);
+    // A 50-Hz-only TV.
+    const std::vector<ModeCandidate> pal = {m(1280, 720, 50), m(720, 576, 50)};
+    c = choose_mode(std::nullopt, pal, want("1280x720"));
+    CHECK(c && c->index == 0 && c->source == ModeSource::Highest);
+    CHECK(!choose_mode(std::nullopt, pal, want("1280x720@60")));
+    CHECK(!choose_mode(std::nullopt, pal, want("1920x1080")));
+    CHECK(!choose_mode(std::nullopt, {m(1280, 720, 60, true, true)}, want("1280x720")));
+
+    // WxH@Hz: the CRTC's within 0.5 Hz, else the closest offered.
+    c = choose_mode(m(1280, 720, 59.94), tv, want("1280x720@60"));
+    CHECK(c && c->index == -1 && c->source == ModeSource::Crtc);
+    c = choose_mode(m(1280, 720, 50), tv, want("1280x720@60"));
+    CHECK(c && c->index == 4 && c->source == ModeSource::Closest);
+    c = choose_mode(std::nullopt, tv, want("1280x720@59.94"));
+    CHECK(c && c->index == 6 && c->source == ModeSource::Closest);
+    c = choose_mode(std::nullopt, tv, want("1920x1080@50"));
+    CHECK(c && c->index == 1);
+    CHECK(!choose_mode(m(1280, 720, 50), tv, want("1280x720@55")));
+    CHECK(std::string(mode_source_name(ModeSource::Preferred)) == "preferred");
 }
 
 // ---------------------------------------------------------------- protocol
@@ -176,12 +285,24 @@ static void test_protocol() {
           v.get("reason")->string == "compile_error" && v.get("message")->string == "warp: 0:12: bad");
     CHECK(json_parse(event_presenting(false, 3.5, false), v, err) && !v.get("modeset")->boolean &&
           v.get("master_ms")->number == 3.5 && !v.get("crtc_lit")->boolean);
-    CHECK(json_parse(event_prepared("1280x720@60", "VC4 V3D 2.1", "OpenGL ES 2.0", true, 7, true, "1280x720@60"),
-                     v, err) &&
-          v.get("crtc_mode_valid")->boolean && v.get("crtc_mode")->string == "1280x720@60" &&
-          v.get("presets")->number == 7);
-    CHECK(json_parse(event_prepared("1280x720@60", "r", "v", true, 7, false, ""), v, err) &&
-          !v.get("crtc_mode_valid")->boolean && v.get("crtc_mode") == nullptr);
+    PreparedInfo info;
+    info.mode = "1280x720@60";
+    info.connector = "HDMI-A-2";
+    info.mode_source = "crtc";
+    info.gl_renderer = "VC4 V3D 2.1";
+    info.gl_version = "OpenGL ES 2.0";
+    info.gles2 = true;
+    info.presets = 7;
+    info.crtc_mode_valid = true;
+    info.crtc_mode = "1280x720@60";
+    CHECK(json_parse(event_prepared(info), v, err) && v.get("crtc_mode_valid")->boolean &&
+          v.get("crtc_mode")->string == "1280x720@60" && v.get("presets")->number == 7 &&
+          v.get("connector")->string == "HDMI-A-2" && v.get("mode_source")->string == "crtc" &&
+          v.get("mode")->string == "1280x720@60");
+    PreparedInfo bare;
+    bare.mode = "1280x720@60";
+    CHECK(json_parse(event_prepared(bare), v, err) && !v.get("crtc_mode_valid")->boolean &&
+          v.get("crtc_mode") == nullptr && v.get("connector") == nullptr && v.get("mode_source") == nullptr);
     CHECK(json_parse(event_simple("released"), v, err) && v.get("event")->string == "released");
     CHECK(json_parse(event_exiting("thermal"), v, err) && v.get("reason")->string == "thermal");
     std::string hostile(MAX_PRESET_NAME_BYTES, '"');
@@ -192,7 +313,8 @@ static void test_protocol() {
     CHECK(json_parse(event_stats(s), v, err) && v.get("preset")->string == hostile);
     CHECK(event_preset(hostile, false, hostile, hostile, false).size() < MAX_EMIT_LINE_BYTES);
     CHECK(event_error(hostile, hostile + hostile).size() < MAX_EMIT_LINE_BYTES);
-    CHECK(event_prepared(hostile, hostile, hostile, true, 3, true, hostile).size() < MAX_EMIT_LINE_BYTES);
+    PreparedInfo worst{hostile, hostile, hostile, hostile, hostile, true, 3, true, hostile};
+    CHECK(event_prepared(worst).size() < MAX_EMIT_LINE_BYTES);
     CHECK(event_skip(hostile, hostile, hostile + hostile).size() < MAX_EMIT_LINE_BYTES);
     s.temp_c = 61.25;
     s.arm_mhz = 1200;
@@ -771,6 +893,14 @@ static void test_selection() {
     CHECK(select_preset(ab, ab.start(""), 8, [](const PresetEntry&) { return Attempt::Abort; }) ==
           Selection::Aborted);
     CHECK(ab.eligible_count() == 5);
+
+    // A failed switch to a preloaded preset is a skip like a failed
+    // preload; the selection moves on and the playing preset is untouched.
+    SkipCause sc = activation_failure("Error switching to preset: bad texture", "older error");
+    CHECK(sc.reason == "load_failed" && sc.message == "Error switching to preset: bad texture");
+    sc = activation_failure("", "[ProjectM] Error switching to preset");
+    CHECK(sc.reason == "load_failed" && sc.message == "[ProjectM] Error switching to preset");
+    CHECK(activation_failure("", "").message.empty());
 }
 
 static void test_poll_round() {
@@ -1141,6 +1271,8 @@ static void test_tone() {
 int main() {
     test_json();
     test_options();
+    test_connector_choice();
+    test_mode_choice();
     test_protocol();
     test_manifest();
     test_rotation();

@@ -15,10 +15,14 @@ defmodule UniversalProxy.Display.Model do
 
     1. mode Off, or blanked → `:blank`
     2. mode Party QR → `:party_qr` (or `:party_off` while no party is on)
-    3. playing → the mode's view, with the party QR overlay while a party
+    3. yielded to the MilkDrop renderer → `:milkdrop`
+    4. playing → the mode's view, with the party QR overlay while a party
        is on (unless Exit hid it)
-    4. a party is on → `:party_qr` as the idle screen
-    5. otherwise → the mode's view (paused / idle)
+    5. a party is on → `:party_qr` as the idle screen
+    6. otherwise → the mode's view (paused / idle)
+
+  The MilkDrop mode's view is `{:milkdrop_preparing, pct}`,
+  `:milkdrop_error` or `{:visualizer, overlay?}` (see "MilkDrop").
 
   ## Idle blanking (D3)
 
@@ -32,9 +36,40 @@ defmodule UniversalProxy.Display.Model do
   ## Remote keys (P4)
 
   Left/Right move focus across `[:prev, :play_pause, :next]`, Up/Down cycle
-  Now Playing ↔ Visualizer ↔ Party QR, Select activates the focused
+  Now Playing ↔ Visualizer (↔ MilkDrop) ↔ Party QR, Select activates the focused
   control, Play/Pause/Stop/Forward/Backward act directly, Exit hides the
   party overlay or else returns to Now Playing.
+
+  ## MilkDrop (`:milkdrop` mode, only with the `:milkdrop` option)
+
+  The MilkDrop renderer draws the screen itself, so the viewport yields
+  the display to it (no compositing). While the HDMI output's player is
+  playing and the preset pack is `{:ready, version, dir}` (`{:pack,
+  status}` events, `UniversalProxy.MilkDrop.Pack`), the model emits
+  `{:yield, :milkdrop}`; when any of that stops holding (a pause, another
+  mode, the player gone) it emits `:reclaim`. The owner reports the
+  handover back: `{:milkdrop, :yielded}` once the viewport is stopped
+  (status `:yielded`: no retry, link-up or display-available restarts),
+  `{:milkdrop, :released}` once the renderer dropped the display (the
+  viewport is started again at once), and `{:milkdrop, :ended, outcome}`
+  once the renderer is gone (`:requested`, `:thermal` or `{:crashed,
+  why}`; the viewport is started again if it was still yielded). A new
+  yield waits until the previous session ended, and needs the viewport's
+  connector (`viewport_connector/1`, from the bound output's HDMI port)
+  and DRM card (`viewport_card/1`, as the owner reports it for each started
+  viewport with `{:viewport_card, card | nil}`): without both the mode
+  shows the bars, since the renderer could present on another TV. `{:pack_restarted, status}` (a new Pack process) replaces the
+  pack status and lets a missing pack be asked for again.
+
+  Otherwise the mode shows the bar visualizer, or while the pack is
+  missing (`:ensure_pack` asks for it) or downloading a "Preparing
+  visualizer… N%" screen, and after a pack error a short error notice
+  (`milkdrop_notice_ms`). A thermal exit, or `milkdrop_crash_limit`
+  failures within `milkdrop_crash_window_ms`, latch MilkDrop off (the bar
+  visualizer instead) until the next explicit mode change; a single
+  failure only holds the next yield back for `milkdrop_retry_ms`. While
+  the renderer is wanted, Left/Right/Select are `{:milkdrop_cmd, :prev |
+  :next | :toggle_lock}`, and no party overlay shows (P6).
 
   ## Viewport lifecycle
 
@@ -57,7 +92,12 @@ defmodule UniversalProxy.Display.Model do
     restart_max_ms: 300_000,
     stable_ms: 60_000,
     crash_limit: 3,
-    ladder: [[api: :auto], [api: :raster, mode: {1280, 720}]]
+    ladder: [[api: :auto], [api: :raster, mode: {1280, 720}]],
+    milkdrop: false,
+    milkdrop_crash_limit: 3,
+    milkdrop_crash_window_ms: 600_000,
+    milkdrop_retry_ms: 5_000,
+    milkdrop_notice_ms: 5_000
   }
 
   @type playback :: :playing | :paused | :stopped
@@ -69,6 +109,9 @@ defmodule UniversalProxy.Display.Model do
           :blank
           | :party_qr
           | :party_off
+          | :milkdrop
+          | :milkdrop_error
+          | {:milkdrop_preparing, 0..100 | nil}
           | {:now_playing | :visualizer, overlay :: boolean()}
   @type key :: atom()
   @type binding :: %{
@@ -77,10 +120,11 @@ defmodule UniversalProxy.Display.Model do
           required(:cec_dev) => String.t() | nil,
           optional(:hdmi_port) => non_neg_integer() | nil
         }
-  @type timer :: :idle | :retry | :stable
+  @type timer :: :idle | :retry | :stable | :milkdrop_retry | :milkdrop_notice
   @type size :: {pos_integer(), pos_integer()}
 
-  @type vp_status :: :idle | :headless | :starting | :running | :backoff | :failed
+  @type vp_status ::
+          :idle | :headless | :starting | :running | :backoff | :failed | :yielded
   @type viewport :: %{
           status: vp_status(),
           gen: non_neg_integer(),
@@ -89,7 +133,22 @@ defmodule UniversalProxy.Display.Model do
           crash_key: term(),
           delay_ms: pos_integer() | nil,
           reason: term(),
-          port: non_neg_integer() | nil
+          port: non_neg_integer() | nil,
+          card: String.t() | nil
+        }
+
+  @type pack :: UniversalProxy.MilkDrop.Pack.status() | nil
+  @type milkdrop_outcome :: :requested | :thermal | {:crashed, term()}
+  @type milkdrop_cmd :: :next | :prev | :toggle_lock
+  @type milkdrop :: %{
+          yield: boolean(),
+          active: boolean(),
+          latch: :thermal | :crashed | nil,
+          crashes: [integer()],
+          hold: non_neg_integer() | nil,
+          notice: non_neg_integer() | nil,
+          ensure: boolean(),
+          gen: non_neg_integer()
         }
 
   @type event ::
@@ -107,7 +166,12 @@ defmodule UniversalProxy.Display.Model do
           | {:viewport, :started}
           | {:viewport, :start_failed | :down, term()}
           | {:viewport_size, size()}
+          | {:viewport_card, String.t() | nil}
           | :hdmi_link_up
+          | {:pack, pack()}
+          | {:pack_restarted, pack()}
+          | {:milkdrop, :yielded | :presenting | :released}
+          | {:milkdrop, :ended, milkdrop_outcome()}
 
   @type effect ::
           :render
@@ -122,6 +186,10 @@ defmodule UniversalProxy.Display.Model do
           | {:start_viewport, keyword()}
           | :stop_viewport
           | {:schedule, timer(), non_neg_integer(), non_neg_integer()}
+          | {:yield, :milkdrop}
+          | :reclaim
+          | {:milkdrop_cmd, milkdrop_cmd()}
+          | :ensure_pack
 
   @type t :: %__MODULE__{
           mode: Mode.t(),
@@ -148,6 +216,8 @@ defmodule UniversalProxy.Display.Model do
           claimed: String.t() | nil,
           size: size() | nil,
           viewport: viewport(),
+          pack: pack(),
+          milkdrop: milkdrop(),
           config: map()
         }
 
@@ -182,7 +252,19 @@ defmodule UniversalProxy.Display.Model do
               crash_key: nil,
               delay_ms: nil,
               reason: nil,
-              port: nil
+              port: nil,
+              card: nil
+            },
+            pack: nil,
+            milkdrop: %{
+              yield: false,
+              active: false,
+              latch: nil,
+              crashes: [],
+              hold: nil,
+              notice: nil,
+              ensure: false,
+              gen: 0
             },
             config: @defaults
 
@@ -190,7 +272,9 @@ defmodule UniversalProxy.Display.Model do
   A new model. Options override the timing defaults: `:idle_ms`,
   `:party_idle_ms`, `:restart_ms`, `:restart_max_ms`, `:stable_ms`,
   `:crash_limit` and `:ladder` (a list of renderer start options, tried
-  in order).
+  in order). `:milkdrop` (default false) turns the MilkDrop mode on, with
+  `:milkdrop_crash_limit`, `:milkdrop_crash_window_ms`,
+  `:milkdrop_retry_ms` and `:milkdrop_notice_ms`.
   """
   @spec new(keyword()) :: t()
   def new(opts \\ []) do
@@ -215,11 +299,50 @@ defmodule UniversalProxy.Display.Model do
     cond do
       m.mode == :off or m.blanked -> :blank
       m.mode == :party_qr -> if party_on?(m), do: :party_qr, else: :party_off
-      m.playback == :playing -> {m.mode, party_on?(m) and not m.overlay_hidden}
+      m.viewport.status == :yielded -> :milkdrop
+      m.playback == :playing -> view(m, party_on?(m) and not m.overlay_hidden)
       party_on?(m) -> :party_qr
-      true -> {m.mode, false}
+      true -> view(m, false)
     end
   end
+
+  # The MilkDrop mode on Emerge (not yielded): preparing the pack, a pack
+  # error notice, or the bar visualizer.
+  defp view(%{mode: :milkdrop} = m, overlay?) do
+    cond do
+      not milkdrop_mode?(m) -> {:visualizer, overlay?}
+      match?({:downloading, _pct}, m.pack) -> {:milkdrop_preparing, elem(m.pack, 1)}
+      m.pack == :absent -> {:milkdrop_preparing, nil}
+      m.milkdrop.notice != nil -> :milkdrop_error
+      true -> {:visualizer, overlay?}
+    end
+  end
+
+  defp view(m, overlay?), do: {m.mode, overlay?}
+
+  @doc """
+  The DRM connector the viewport drives: `HDMI-A-<port + 1>` for the bound
+  output's HDMI port, `nil` while that port is unknown (the renderer then
+  picks the first connected HDMI connector).
+  """
+  @spec viewport_connector(t()) :: String.t() | nil
+  def viewport_connector(%__MODULE__{viewport: %{port: port}}) when is_integer(port),
+    do: hdmi_connector(port)
+
+  def viewport_connector(%__MODULE__{}), do: nil
+
+  defp hdmi_connector(port), do: "HDMI-A-#{port + 1}"
+
+  @doc """
+  The DRM card node the last started viewport drives its connector on, as
+  its owner reported it (`{:viewport_card, card}`); `nil` when unknown.
+  """
+  @spec viewport_card(t()) :: String.t() | nil
+  def viewport_card(%__MODULE__{viewport: %{card: card}}), do: card
+
+  @doc "Whether the model wants the MilkDrop renderer on screen."
+  @spec milkdrop_yield?(t()) :: boolean()
+  def milkdrop_yield?(%__MODULE__{milkdrop: %{yield: yield?}}), do: yield?
 
   @doc "Whether a party is on."
   @spec party_on?(t()) :: boolean()
@@ -387,6 +510,14 @@ defmodule UniversalProxy.Display.Model do
       else: {m, [], []}
   end
 
+  defp apply_event(m, {:timer, :milkdrop_retry, gen}, _now) do
+    if gen == m.milkdrop.hold, do: {put_md(m, hold: nil), [], []}, else: {m, [], []}
+  end
+
+  defp apply_event(m, {:timer, :milkdrop_notice, gen}, _now) do
+    if gen == m.milkdrop.notice, do: {put_md(m, notice: nil), [], []}, else: {m, [], []}
+  end
+
   defp apply_event(m, {:timer, :retry, gen}, _now) do
     if gen == m.viewport.gen and m.viewport.status in [:backoff, :failed],
       do: start_viewport(m),
@@ -433,20 +564,55 @@ defmodule UniversalProxy.Display.Model do
        when is_integer(w) and w > 0 and is_integer(h) and h > 0,
        do: {%{m | size: size}, [], []}
 
+  defp apply_event(m, {:viewport_card, card}, _now) when is_binary(card) or is_nil(card),
+    do: {put_vp(m, card: card), [], []}
+
   defp apply_event(m, :hdmi_link_up, _now) do
     if m.viewport.status in [:backoff, :failed],
       do: start_viewport(put_vp(m, crashes: 0, crash_key: nil, delay_ms: nil)),
       else: {m, [], []}
   end
 
+  # A new Pack process (the old one crashed, its download with it): its
+  # status replaces the cached one and the pack may be asked for again.
+  defp apply_event(m, {:pack_restarted, status}, now),
+    do: apply_event(put_md(m, ensure: false), {:pack, status}, now)
+
+  defp apply_event(m, {:pack, status}, _now) do
+    cond do
+      status == m.pack -> {m, [], []}
+      pack_error?(status) and milkdrop_mode?(m) -> notice(%{m | pack: status})
+      true -> {%{m | pack: status}, [], []}
+    end
+  end
+
+  # The owner stopped the viewport for the renderer.
+  defp apply_event(m, {:milkdrop, :yielded}, _now) do
+    if m.milkdrop.active,
+      do: {put_vp(m, status: :yielded, gen: m.viewport.gen + 1, reason: nil), [], []},
+      else: {m, [], []}
+  end
+
+  # The renderer dropped the display: the viewport takes it back at once.
+  defp apply_event(m, {:milkdrop, :released}, _now), do: restart_yielded(m)
+
+  defp apply_event(m, {:milkdrop, :ended, outcome}, now) do
+    {m, effects} = m |> put_md(yield: false, active: false) |> milkdrop_outcome(outcome, now)
+    {m, start_effects, []} = restart_yielded(m)
+    {m, effects ++ start_effects, []}
+  end
+
   defp apply_event(m, _event, _now), do: {m, [], []}
 
   # ── Keys ─────────────────────────────────────────────────────────────
 
+  defp apply_key(%{milkdrop: %{yield: true}} = m, key) when key in [:left, :right, :select],
+    do: {m, [{:milkdrop_cmd, milkdrop_key(key)}]}
+
   defp apply_key(m, :left), do: {move_focus(m, -1), []}
   defp apply_key(m, :right), do: {move_focus(m, 1), []}
-  defp apply_key(m, :up), do: change_mode(m, Mode.cycle(m.mode, -1))
-  defp apply_key(m, :down), do: change_mode(m, Mode.cycle(m.mode, 1))
+  defp apply_key(m, :up), do: change_mode(m, Mode.cycle(m.mode, -1, milkdrop?(m)))
+  defp apply_key(m, :down), do: change_mode(m, Mode.cycle(m.mode, 1, milkdrop?(m)))
   defp apply_key(%{focus: :prev} = m, :select), do: controller(m, :previous)
   defp apply_key(%{focus: :next} = m, :select), do: controller(m, :next)
   defp apply_key(m, :select), do: controller(m, toggle(m))
@@ -467,6 +633,10 @@ defmodule UniversalProxy.Display.Model do
 
   defp apply_key(m, _key), do: {m, []}
 
+  defp milkdrop_key(:left), do: :prev
+  defp milkdrop_key(:right), do: :next
+  defp milkdrop_key(:select), do: :toggle_lock
+
   defp toggle(%{playback: :playing}), do: :pause
   defp toggle(_model), do: :play
 
@@ -484,12 +654,42 @@ defmodule UniversalProxy.Display.Model do
   # A user's mode choice: persisted (when bound) and pushed to Home
   # Assistant. `push: :always` echoes it even when unchanged (an HA
   # command expects a state back).
+  #
+  # Every explicit choice starts a new MilkDrop session: a latch, a retry
+  # hold and the failure count are forgotten, and picking MilkDrop again
+  # after a pack error retries the pack.
+  # MilkDrop while it is off is refused (Home Assistant gets the real mode).
   defp change_mode(m, mode, opts \\ []) do
+    if mode == :milkdrop and not milkdrop?(m),
+      do: {m, if(opts[:push] == :always, do: [{:push_mode, m.mode}], else: [])},
+      else: put_mode(m, mode, opts)
+  end
+
+  defp put_mode(m, mode, opts) do
     changed? = mode != m.mode
-    m = %{m | mode: mode, mode_explicit: true}
+
+    m =
+      put_md(%{m | mode: mode, mode_explicit: true},
+        latch: nil,
+        hold: nil,
+        crashes: [],
+        notice: nil,
+        ensure: false
+      )
+
     persist = if changed? and m.binding, do: [{:persist_mode, mode}], else: []
     push = if changed? or opts[:push] == :always, do: [{:push_mode, mode}], else: []
-    {m, persist ++ push}
+    {m, retry} = if mode == :milkdrop, do: retry_pack(m), else: {m, []}
+    {m, persist ++ push ++ retry}
+  end
+
+  defp retry_pack(m) do
+    if pack_error?(m.pack) do
+      {m, effects, []} = notice(put_md(m, ensure: true))
+      {m, [:ensure_pack | effects]}
+    else
+      {m, []}
+    end
   end
 
   # A newly bound output brings its persisted mode, unless the user chose
@@ -499,6 +699,7 @@ defmodule UniversalProxy.Display.Model do
       m.mode_explicit and not same_key? -> {m, [{:persist_mode, m.mode}]}
       m.mode_explicit -> {m, []}
       is_nil(persisted) or persisted == m.mode -> {m, []}
+      persisted == :milkdrop and not milkdrop?(m) -> {m, []}
       true -> {%{m | mode: persisted}, [{:push_mode, persisted}]}
     end
   end
@@ -547,7 +748,7 @@ defmodule UniversalProxy.Display.Model do
   defp start_viewport(m) do
     port = bound_port(m)
     rung = Enum.at(cfg(m, :ladder), m.viewport.rung, [])
-    rung = if port, do: Keyword.put(rung, :connector, "HDMI-A-#{port + 1}"), else: rung
+    rung = if port, do: Keyword.put(rung, :connector, hdmi_connector(port)), else: rung
 
     {put_vp(m, status: :starting, gen: m.viewport.gen + 1, port: port), [{:start_viewport, rung}],
      []}
@@ -636,18 +837,95 @@ defmodule UniversalProxy.Display.Model do
 
   defp put_vp(m, changes), do: %{m | viewport: Map.merge(m.viewport, Map.new(changes))}
 
+  # ── MilkDrop ─────────────────────────────────────────────────────────
+
+  defp milkdrop?(m), do: cfg(m, :milkdrop) == true
+
+  # The MilkDrop mode with its own behaviour (not latched off to the bars).
+  defp milkdrop_mode?(m), do: m.mode == :milkdrop and milkdrop?(m) and is_nil(m.milkdrop.latch)
+
+  # Once yielded it stays wanted while the rest holds; a new yield needs a
+  # running viewport to take the display from, on a known connector and
+  # card (the renderer must present on the same ones), and no session
+  # still ending.
+  defp milkdrop_wanted?(m) do
+    md = m.milkdrop
+
+    milkdrop_mode?(m) and is_nil(md.hold) and m.playback == :playing and
+      match?({:ready, _version, _dir}, m.pack) and viz_source?(m) and
+      (md.yield or
+         (not md.active and m.viewport.status == :running and viewport_connector(m) != nil and
+            m.viewport.card != nil))
+  end
+
+  defp pack_error?({:error, _reason}), do: true
+  defp pack_error?(_status), do: false
+
+  # Shows the pack error notice for `milkdrop_notice_ms`.
+  defp notice(m) do
+    gen = m.milkdrop.gen + 1
+
+    {put_md(m, notice: gen, gen: gen),
+     [{:schedule, :milkdrop_notice, gen, cfg(m, :milkdrop_notice_ms)}], []}
+  end
+
+  defp restart_yielded(m) do
+    if m.viewport.status == :yielded, do: start_viewport(m), else: {m, [], []}
+  end
+
+  defp milkdrop_outcome(m, :requested, _now), do: {m, []}
+  defp milkdrop_outcome(m, :thermal, _now), do: {put_md(m, latch: :thermal), []}
+
+  defp milkdrop_outcome(m, {:crashed, _why}, now) do
+    window = cfg(m, :milkdrop_crash_window_ms)
+    crashes = [now | Enum.filter(m.milkdrop.crashes, &(now - &1 < window))]
+
+    if length(crashes) >= cfg(m, :milkdrop_crash_limit) do
+      {put_md(m, latch: :crashed, crashes: crashes), []}
+    else
+      gen = m.milkdrop.gen + 1
+
+      {put_md(m, crashes: crashes, hold: gen, gen: gen),
+       [{:schedule, :milkdrop_retry, gen, cfg(m, :milkdrop_retry_ms)}]}
+    end
+  end
+
+  defp put_md(m, changes), do: %{m | milkdrop: Map.merge(m.milkdrop, Map.new(changes))}
+
   # ── Reconcile derived state into effects ─────────────────────────────
 
   defp reconcile(old, m, effects, opts) do
     {m, idle_effects} = reconcile_idle(m, Keyword.get(opts, :restart_idle, false))
     {m, power_effects} = reconcile_power(m)
     {m, viz_effects} = reconcile_viz(m)
+    {m, milkdrop_effects} = reconcile_milkdrop(m)
     {m, claim_effects} = reconcile_claim(m)
 
     render =
       if :render not in effects and render_key(old) != render_key(m), do: [:render], else: []
 
-    {m, effects ++ render ++ power_effects ++ viz_effects ++ claim_effects ++ idle_effects}
+    {m,
+     effects ++
+       render ++ power_effects ++ viz_effects ++ milkdrop_effects ++ claim_effects ++ idle_effects}
+  end
+
+  defp reconcile_milkdrop(m) do
+    wanted? = milkdrop_wanted?(m)
+    md = m.milkdrop
+
+    cond do
+      wanted? and not md.yield ->
+        {put_md(m, yield: true, active: true), [{:yield, :milkdrop}]}
+
+      md.yield and not wanted? ->
+        {put_md(m, yield: false), [:reclaim]}
+
+      milkdrop_mode?(m) and m.pack == :absent and not md.ensure ->
+        {put_md(m, ensure: true), [:ensure_pack]}
+
+      true ->
+        {m, []}
+    end
   end
 
   defp idle_kind(m) do

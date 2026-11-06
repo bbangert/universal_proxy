@@ -45,6 +45,40 @@ defmodule UniversalProxy.Display.ViewTest do
     end
   end
 
+  describe "MilkDrop" do
+    defp milkdrop(fields) do
+      struct(Model.new(milkdrop: true), [mode: :milkdrop, playback: :playing] ++ fields)
+    end
+
+    test "yielded to the renderer: a black frame that never refreshes" do
+      m = milkdrop(viewport: %{Model.new().viewport | status: :yielded})
+      assert Model.screen(m) == :milkdrop
+      assert View.render(m) == Spec.blank()
+      assert View.next_refresh(m, now: 0) == nil
+    end
+
+    test "preparing the pack, with and without a percentage" do
+      assert "Preparing visualizer… 42%" in texts(View.render(milkdrop(pack: {:downloading, 42})))
+      assert "Preparing visualizer…" in texts(View.render(milkdrop(pack: :absent)))
+      assert keyed(View.render(milkdrop(pack: :absent)), "viz") == []
+    end
+
+    test "a pack error notice says why" do
+      notice = %{Model.new().milkdrop | notice: 1}
+      spec = View.render(milkdrop(pack: {:error, :no_pack_pinned}, milkdrop: notice))
+      assert "Visualizer unavailable" in texts(spec)
+      assert Enum.any?(texts(spec), &(&1 =~ "No MilkDrop presets"))
+
+      spec = View.render(milkdrop(pack: {:error, :checksum_mismatch}, milkdrop: notice))
+      assert Enum.any?(texts(spec), &(&1 =~ "could not be downloaded"))
+    end
+
+    test "otherwise the bar visualizer" do
+      spec = View.render(milkdrop(pack: {:ready, "v", "/d"}))
+      assert keyed(spec, "viz") != []
+    end
+  end
+
   describe "Now Playing" do
     test "shows the metadata, artwork and a fallback" do
       spec =
