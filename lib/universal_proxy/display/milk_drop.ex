@@ -33,8 +33,10 @@ defmodule UniversalProxy.Display.MilkDrop do
   ## Options
 
     * `:owner` — pid to report to (default: the caller);
-    * `:mode` — `%{width:, height:, refresh:}`, the output mode to keep
-      (required);
+    * `:mode` — `%{width:, height:}`, the output size to present at, with
+      an optional `:refresh` (Hz) to pin as well (required; see `--mode`);
+    * `:connector` — the DRM connector to present on (`"HDMI-A-1"`;
+      default: the renderer's first connected HDMI connector);
     * `:pack_dir`, `:pack_version` — the extracted pack and its version
       (required; the version keys persisted skips);
     * `:ladder` — internal resolutions, highest first (default
@@ -56,13 +58,18 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   ## Renderer CLI contract
 
-      milkdrop_renderer --mode 1280x720@60 --pack-dir DIR
+      milkdrop_renderer --mode 1280x720[@60] --pack-dir DIR
                         --ladder 640x360,480x270 --rotate-s 20
                         --skip-file PATH
                         [--high-frequency] [--locked FILE] [--pcm-ring PATH]
+                        [--connector HDMI-A-1]
 
-    * `--mode` — the CRTC mode to present on (reused without a modeset when
-      it is already current);
+    * `--mode` — the CRTC mode to present on. `WxH` keeps the mode the CRTC
+      scans out when the renderer opens the card if it is that size,
+      whatever its refresh (no modeset), else the connector's preferred
+      (or highest-refresh) mode at that size; `WxH@Hz` also pins the
+      refresh (within 0.5 Hz);
+    * `--connector` — the connector to present on; it must be connected;
     * `--pack-dir` — the extracted pack; `manifest.json` at its root;
     * `--ladder` — comma-separated internal-resolution rungs, highest
       first; the renderer steps down per preset and skips past the last;
@@ -90,8 +97,10 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   Events (stdout), forwarded with atom keys and an atom `:event`:
 
-    * `{"event":"prepared"}` — GL is up and the first preset warmed, not
-      yet master;
+    * `{"event":"prepared","mode":M,"connector":C,"mode_source":S,...}` —
+      GL is up and the first preset warmed, not yet master; `mode` is the
+      chosen `WxH@Hz`, `mode_source` how it was chosen (`crtc`: no
+      modeset);
     * `{"event":"presenting"}` — `take` done, frames are on screen;
     * `{"event":"released"}` — `release` done, master dropped;
     * `{"event":"preset","file":F,"locked":B,...}` — preset `F` is showing;
@@ -141,8 +150,13 @@ defmodule UniversalProxy.Display.MilkDrop do
   }
 
   @resolution_re ~r/\A[1-9]\d{0,4}x[1-9]\d{0,4}\z/
+  @connector_re ~r/\A[A-Za-z0-9-]{1,32}\z/
 
-  @type mode :: %{width: pos_integer(), height: pos_integer(), refresh: number()}
+  @type mode :: %{
+          required(:width) => pos_integer(),
+          required(:height) => pos_integer(),
+          optional(:refresh) => number() | nil
+        }
 
   # -- Client API --
 
@@ -228,8 +242,8 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   @doc """
   The renderer's argv (see "Renderer CLI contract") for `config`: `:mode`,
-  `:pack_dir`, `:ladder`, `:skip_file`, `:settings` and an optional
-  `:ring_path`.
+  `:pack_dir`, `:ladder`, `:skip_file`, `:settings` and the optional
+  `:ring_path` and `:connector`.
   """
   @spec args(map()) :: [String.t()]
   def args(%{mode: mode, pack_dir: pack_dir, ladder: ladder, skip_file: skip_file} = config) do
@@ -243,7 +257,8 @@ defmodule UniversalProxy.Display.MilkDrop do
       ["--skip-file", skip_file],
       if(settings.include_high_frequency, do: ["--high-frequency"], else: []),
       if(settings.locked, do: ["--locked", settings.locked], else: []),
-      if(config[:ring_path], do: ["--pcm-ring", config.ring_path], else: [])
+      if(config[:ring_path], do: ["--pcm-ring", config.ring_path], else: []),
+      if(config[:connector], do: ["--connector", config.connector], else: [])
     ]
     |> Enum.concat()
   end
@@ -263,6 +278,7 @@ defmodule UniversalProxy.Display.MilkDrop do
       pack_dir: Keyword.fetch!(opts, :pack_dir),
       ladder: Keyword.get_lazy(opts, :ladder, &default_ladder/0),
       ring_path: Keyword.get(opts, :ring_path),
+      connector: Keyword.get(opts, :connector),
       settings: settings,
       skip_file:
         Keyword.get_lazy(opts, :skip_file, fn ->
@@ -450,21 +466,36 @@ defmodule UniversalProxy.Display.MilkDrop do
     cond do
       not valid_mode?(config.mode) -> {:error, {:invalid_mode, config.mode}}
       not valid_ladder?(config.ladder) -> {:error, {:invalid_ladder, config.ladder}}
+      not valid_connector?(config.connector) -> {:error, {:invalid_connector, config.connector}}
       true -> :ok
     end
   end
 
-  defp valid_mode?(%{width: w, height: h, refresh: r}),
-    do: is_integer(w) and w > 0 and is_integer(h) and h > 0 and is_number(r) and r > 0
+  defp valid_mode?(%{width: w, height: h} = mode)
+       when is_integer(w) and w > 0 and is_integer(h) and h > 0 do
+    case Map.get(mode, :refresh) do
+      nil -> true
+      r -> is_number(r) and r > 0
+    end
+  end
 
   defp valid_mode?(_mode), do: false
+
+  defp valid_connector?(nil), do: true
+  defp valid_connector?(name) when is_binary(name), do: name =~ @connector_re
+  defp valid_connector?(_name), do: false
 
   defp valid_ladder?([_ | _] = ladder),
     do: Enum.all?(ladder, &(is_binary(&1) and &1 =~ @resolution_re))
 
   defp valid_ladder?(_ladder), do: false
 
-  defp format_mode(%{width: w, height: h, refresh: r}), do: "#{w}x#{h}@#{format_refresh(r)}"
+  defp format_mode(%{width: w, height: h} = mode) do
+    case Map.get(mode, :refresh) do
+      nil -> "#{w}x#{h}"
+      r -> "#{w}x#{h}@#{format_refresh(r)}"
+    end
+  end
 
   defp format_refresh(r) when is_integer(r), do: Integer.to_string(r)
   defp format_refresh(r) when is_float(r), do: :erlang.float_to_binary(r, [:short])

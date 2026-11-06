@@ -280,13 +280,16 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     assert %{lifecycle: %{status: :running}} = status(ctx)
   end
 
-  test "the renderer's argv carries the mode, pack, ring and ladder", ctx do
+  test "the renderer's argv carries the connector, mode, pack, ring and ladder", ctx do
     ctx = ctx |> start_ui() |> presenting()
     %{os_pid: os_pid} = :sys.get_state(renderer(ctx))
     argv = "/proc/#{os_pid}/cmdline" |> File.read!() |> String.split(<<0>>, trim: true)
 
+    # The viewport's own connector (vc4-hdmi is HDMI port 0), and its size
+    # with no refresh pinned, so the renderer keeps Emerge's timing.
     for {flag, value} <- [
-          {"--mode", "1280x720@60"},
+          {"--connector", "HDMI-A-1"},
+          {"--mode", "1280x720"},
           {"--pack-dir", ctx.pack_dir},
           {"--pcm-ring", @ring},
           {"--ladder", "640x360,480x270"}

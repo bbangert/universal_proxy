@@ -55,22 +55,19 @@ defmodule UniversalProxy.Display.OutputMode do
   def size(_mode), do: nil
 
   @doc """
-  The mode an external KMS renderer (the MilkDrop renderer) should keep on
-  an output the viewport reported as `size`: the viewport reports only the
-  size of the mode Emerge chose, and `choose/2` picks the highest refresh
-  at that size, which is 60 Hz wherever a TV offers it. The renderer keeps
-  the CRTC's current mode when it is within 0.5 Hz of this one (59.94 Hz
-  included), so there is no modeset and the HDMI audio clock stays valid.
+  The mode an external KMS renderer (the MilkDrop renderer) should present
+  in on an output the viewport reported as `size`: that size with no
+  refresh, so the renderer keeps the mode the CRTC scans out when it
+  starts (Emerge's, whatever its refresh: 50, 60 or 120 Hz) and there is
+  no modeset to leave the HDMI audio clock stale.
   """
-  @spec renderer_mode({pos_integer(), pos_integer()}, number()) :: %{
+  @spec renderer_mode({pos_integer(), pos_integer()}) :: %{
           width: pos_integer(),
-          height: pos_integer(),
-          refresh: number()
+          height: pos_integer()
         }
-  def renderer_mode({width, height}, refresh \\ 60)
-      when is_integer(width) and width > 0 and is_integer(height) and height > 0 and
-             is_number(refresh) and refresh > 0,
-      do: %{width: width, height: height, refresh: refresh}
+  def renderer_mode({width, height})
+      when is_integer(width) and width > 0 and is_integer(height) and height > 0,
+      do: %{width: width, height: height}
 
   defp preferred_size(modes) do
     case Enum.find(modes, &Map.get(&1, :preferred, false)) do

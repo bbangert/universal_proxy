@@ -652,9 +652,21 @@ defmodule UniversalProxy.Display.ModelTest do
   describe "MilkDrop" do
     @pack {:ready, "2026.11.1", "/data/milkdrop/2026.11.1"}
 
+    # On HDMI port 0, so the viewport's connector is known.
+    @md_binding Map.put(@binding, :hdmi_port, 0)
+
     # Bound, viewport up, pack ready, mode MilkDrop, nothing playing.
     defp md_ready(opts \\ []) do
-      run!(ready([milkdrop: true] ++ opts), [{:pack, @pack}, {:set_mode, :milkdrop}])
+      run!(md_viewport(opts), [{:pack, @pack}, {:set_mode, :milkdrop}])
+    end
+
+    defp md_viewport(opts) do
+      run!(Model.new([milkdrop: true] ++ opts), [
+        {:bound, @md_binding, nil},
+        {:snapshot, 0, %{}},
+        {:display_available, true},
+        {:viewport, :started}
+      ])
     end
 
     # Playing with the renderer asked for (not yet yielded).
@@ -732,7 +744,7 @@ defmodule UniversalProxy.Display.ModelTest do
       assert m.viewport.status == :yielded
 
       {m, effects} = run(m, [{:milkdrop, :released}])
-      assert [[api: :auto]] = starts(effects)
+      assert [[connector: "HDMI-A-1", api: :auto]] = starts(effects)
       assert m.viewport.status == :starting
 
       {m, _effects} = run(m, [{:viewport, :started}])
@@ -822,7 +834,7 @@ defmodule UniversalProxy.Display.ModelTest do
     end
 
     test "a missing pack is ensured once, with the preparing screen and its progress" do
-      m = run!(ready(milkdrop: true), [{:pack, :absent}])
+      m = run!(md_viewport([]), [{:pack, :absent}])
       {m, effects} = run(m, [{:set_mode, :milkdrop}])
       assert Enum.count(effects, &(&1 == :ensure_pack)) == 1
       assert Model.screen(m) == {:milkdrop_preparing, nil}
@@ -843,7 +855,7 @@ defmodule UniversalProxy.Display.ModelTest do
     end
 
     test "a restarted Pack (its download gone) is asked for the pack again" do
-      m = run!(ready(milkdrop: true), [{:pack, :absent}])
+      m = run!(md_viewport([]), [{:pack, :absent}])
       {m, effects} = run(m, [{:set_mode, :milkdrop}, {:pack, {:downloading, 40}}])
       assert Enum.count(effects, &(&1 == :ensure_pack)) == 1
       assert Model.screen(m) == {:milkdrop_preparing, 40}
@@ -858,6 +870,24 @@ defmodule UniversalProxy.Display.ModelTest do
       refute :ensure_pack in effects
       assert {:yield, :milkdrop} in effects
       assert m.pack == @pack
+    end
+
+    test "the viewport's connector follows the bound HDMI port" do
+      assert Model.viewport_connector(md_ready()) == "HDMI-A-1"
+      m = md_viewport(milkdrop: true)
+      m = run!(m, [{:bound, %{@md_binding | key: {"vc4-hdmi-1", nil, nil}, hdmi_port: 1}, nil}])
+      m = run!(m, [{:viewport, :started}])
+      assert Model.viewport_connector(m) == "HDMI-A-2"
+      assert Model.viewport_connector(ready()) == nil
+    end
+
+    test "no yield while the viewport's connector is unknown: the bars show" do
+      m = run!(ready(milkdrop: true), [{:pack, @pack}, {:set_mode, :milkdrop}])
+      {m, effects} = run(m, [{:stream, :start}])
+      refute {:yield, :milkdrop} in effects
+      refute m.milkdrop.active
+      assert Model.screen(m) == {:visualizer, false}
+      assert m.viz == :full
     end
 
     test "a persisted MilkDrop mode with no pack yet asks for it" do

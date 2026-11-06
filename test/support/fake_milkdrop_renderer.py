@@ -60,6 +60,7 @@ def main():
     parser.add_argument("--high-frequency", action="store_true")
     parser.add_argument("--locked")
     parser.add_argument("--pcm-ring")
+    parser.add_argument("--connector")
     args = parser.parse_args()
 
     open(args.skip_file + ".spawned", "w").close()

@@ -125,6 +125,29 @@ defmodule UniversalProxy.Display.MilkDropTest do
     end
   end
 
+  test "args/1 without a refresh, and with a connector" do
+    args =
+      MilkDrop.args(%{
+        mode: %{width: 1920, height: 1080},
+        connector: "HDMI-A-2",
+        pack_dir: "/p",
+        ladder: ["960x540"],
+        skip_file: "/s",
+        settings: Store.defaults()
+      })
+
+    assert ["--mode", "1920x1080" | _] = args
+    assert Enum.take(args, -2) == ["--connector", "HDMI-A-2"]
+
+    assert ["--mode", "1280x720" | _] =
+             MilkDrop.args(%{
+               mode: %{width: 1280, height: 720, refresh: nil},
+               pack_dir: "/p",
+               ladder: ["640x360"],
+               skip_file: "/s"
+             })
+  end
+
   test "default_ladder/1 per target" do
     assert MilkDrop.default_ladder(:rpi3) == ["640x360", "480x270"]
     assert MilkDrop.default_ladder(:rpi4) == ["960x540", "640x360", "480x270"]
@@ -327,6 +350,14 @@ defmodule UniversalProxy.Display.MilkDropTest do
     assert MilkDrop.next(pid) == :ok
   end
 
+  test "a size-only mode and a connector reach the renderer", ctx do
+    {_pid, prepared} =
+      start_renderer(ctx, mode: %{width: 1920, height: 1080}, connector: "HDMI-A-2")
+
+    assert ["--mode", "1920x1080" | _] = prepared.argv
+    assert Enum.take(prepared.argv, -2) == ["--connector", "HDMI-A-2"]
+  end
+
   test "owner death closes the port (renderer sees EOF)", ctx do
     owner = forwarding_owner()
     {:ok, pid} = start_with_owner(ctx, owner)
@@ -518,6 +549,22 @@ defmodule UniversalProxy.Display.MilkDropTest do
 
     assert {:error, {:invalid_mode, _}} =
              MilkDrop.start(base |> Keyword.put(:binary, @fake_binary) |> Keyword.put(:mode, %{}))
+
+    assert {:error, {:invalid_mode, _}} =
+             MilkDrop.start(
+               base
+               |> Keyword.put(:binary, @fake_binary)
+               |> Keyword.put(:mode, %{width: 1280, height: 720, refresh: 0})
+             )
+
+    for bad <- ["", "HDMI A 1", "../card0", String.duplicate("a", 33), :hdmi] do
+      assert {:error, {:invalid_connector, ^bad}} =
+               MilkDrop.start(
+                 base
+                 |> Keyword.put(:binary, @fake_binary)
+                 |> Keyword.put(:connector, bad)
+               )
+    end
 
     assert {:error, {:invalid_ladder, _}} =
              MilkDrop.start(

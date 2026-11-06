@@ -61,9 +61,12 @@ defmodule UniversalProxy.Display.State do
        process (`UniversalProxy.Audio.pcm_tap/3`: the player turns it off
        if State dies), and its ring path read (`pcm_tap_status/1`), as an
        audio job like the others;
-    2. `:preparing` — the renderer starts with the viewport's mode
-       (`UniversalProxy.Display.OutputMode.renderer_mode/2`), the pack, the
-       ring and the target's ladder, and builds GL without DRM master;
+    2. `:preparing` — the renderer starts on the viewport's connector
+       (`UniversalProxy.Display.Model.viewport_connector/1`) at the
+       viewport's size with no refresh pinned
+       (`UniversalProxy.Display.OutputMode.renderer_mode/1`: it keeps the
+       mode Emerge scans out), the pack, the ring and the target's ladder,
+       and builds GL without DRM master;
     3. on `prepared` the viewport is stopped (the model's `:yielded`) and
        `take` sent; `:taking` until `presenting`;
     4. `:presenting` — Left/Right/Select arrive as `next`/`prev` and
@@ -530,6 +533,12 @@ defmodule UniversalProxy.Display.State do
   defp run_effect({:start_viewport, rung}, state) do
     spec = View.render(state.model, view_opts(state, now_ms()))
 
+    if state.milkdrop? and not Keyword.has_key?(rung, :connector) do
+      Logger.warning(
+        "[Display] the viewport's HDMI connector is unknown; MilkDrop shows the bars on it"
+      )
+    end
+
     case start_viewport(%{state | spec: spec}, Keyword.put(rung, :owner, self())) do
       {{:ok, _handle}, state} ->
         follow_up(state, {:viewport, :started})
@@ -679,14 +688,30 @@ defmodule UniversalProxy.Display.State do
     state
   end
 
-  # Step 2: the renderer, building GL off-screen while the viewport shows.
+  # Step 2: the renderer, building GL off-screen while the viewport shows,
+  # on the viewport's connector (the model only yields with one known).
   defp start_milkdrop(%{md: md} = state, ring) do
+    case Model.viewport_connector(state.model) do
+      nil ->
+        Logger.warning(
+          "[Display] MilkDrop: the viewport's HDMI connector is unknown; not yielding"
+        )
+
+        end_milkdrop(state, {:crashed, :no_connector})
+
+      connector ->
+        start_renderer(state, md, ring, connector)
+    end
+  end
+
+  defp start_renderer(state, md, ring, connector) do
     size = state.model.size || Keyword.get(state.view_opts, :size) || {1280, 720}
 
     opts =
       Keyword.merge(state.md_opts,
         owner: self(),
         mode: OutputMode.renderer_mode(size),
+        connector: connector,
         pack_dir: md.dir,
         pack_version: md.version,
         ring_path: ring
@@ -704,7 +729,14 @@ defmodule UniversalProxy.Display.State do
   end
 
   # Step 3: the viewport stops, the renderer takes the display.
-  defp milkdrop_event(%{md: %{phase: :preparing, session: session}} = state, %{event: :prepared}) do
+  defp milkdrop_event(
+         %{md: %{phase: :preparing, session: session}} = state,
+         %{event: :prepared} = event
+       ) do
+    Logger.info(
+      "[Display] MilkDrop prepared #{inspect(event[:mode])} on #{inspect(event[:connector])} (#{inspect(event[:mode_source])})"
+    )
+
     state = state |> stop_viewport() |> dispatch({:milkdrop, :yielded})
 
     case state.md do
