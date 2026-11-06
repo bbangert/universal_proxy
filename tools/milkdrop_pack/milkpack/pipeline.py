@@ -213,6 +213,12 @@ def build(args):
     pm_src = args.projectm_src or sources.git_checkout(
         pins["projectm"]["repo"], pm_commit, os.path.join(work, "src", "projectm"), log,
         pins["projectm"]["submodules"])
+    for label, path, want in (("--texture-pack", args.texture_pack, tex_commit),
+                              ("--projectm-src", args.projectm_src, pm_commit)):
+        if path:
+            head = subprocess.run(["git", "-C", path, "rev-parse", "HEAD"], capture_output=True, text=True)
+            if head.stdout.strip() != want:
+                report.notes.append(f"{label} {path} is at {head.stdout.strip() or '?'}, not the pin {want}")
     report.step("inputs", zip_sha256=zip_sha, projectm=pm_commit, texture_pack=tex_commit)
 
     translator = sources.build_translator(pm_src, os.path.join(work, "build-translator"), log, jobs)
@@ -269,6 +275,7 @@ def build(args):
         for pid in errors:
             report.notes.append(f"brightness: no result for {pid}: {bright[pid]}")
         if not args.no_snapshots:
+            shutil.rmtree(os.path.join(out, "review"), ignore_errors=True)
             brightness.snapshots(host, pack, too_bright + [e["file"] for e in report.review], settings,
                                  os.path.join(out, "review"), jobs=jobs)
         remove_presets(staged, too_bright, pack)

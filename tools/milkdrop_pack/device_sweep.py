@@ -215,8 +215,12 @@ def main(argv=None):
         if not opts.host:
             p.error("--host is required (or --local-renderer)")
         dev = Device(opts)
-        probe = json.loads(next(line for line in dev.ssh(elixir_probe(opts.remote_dir, version, digest), 60)
-                                .splitlines() if line.startswith("{")))
+        reply = dev.ssh(elixir_probe(opts.remote_dir, version, digest), 60)
+        line = next((ln for ln in reply.splitlines() if ln.startswith("{")), None)
+        if line is None:
+            print(f"error: no answer from {opts.host}:\n{reply[-2000:]}", file=sys.stderr)
+            return 1
+        probe = json.loads(line)
         if not probe["renderer_ok"]:
             print(f"error: no renderer at {probe['renderer']} (is this rpi3 firmware with milkdrop_renderer?)",
                   file=sys.stderr)
