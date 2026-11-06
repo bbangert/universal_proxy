@@ -14,6 +14,7 @@ const char* const USAGE =
     "  tuning: [--card DEV] [--blend S] [--min-fps F] [--interval N] [--seed N]\n"
     "          [--av-offset-ms N] [--master-timeout-ms N] [--mesh WxH] [--stats-s N]\n"
     "  check:  [--headless-frames N]  (off-screen on --card, e.g. /dev/dri/renderD128)\n"
+    "          [--simulate-kms]       (take/flips/release simulated on --card, a render node)\n"
     "          [--test-tone]          (a synthetic beat while the ring has no audio)\n";
 
 namespace {
@@ -113,6 +114,10 @@ bool parse_options(const std::vector<std::string>& args, Options& out, std::stri
         }
         if (a == "--test-tone") {
             out.test_tone = true;
+            continue;
+        }
+        if (a == "--simulate-kms") {
+            out.simulate_kms = true;
             continue;
         }
         if (a.rfind("--", 0) != 0) {
@@ -216,6 +221,10 @@ bool parse_options(const std::vector<std::string>& args, Options& out, std::stri
     }
     if (!have_mode || !have_pack || !have_ladder || !have_rotate || !have_skip) {
         error = "missing required option";
+        return false;
+    }
+    if (out.simulate_kms && out.headless_frames > 0) {
+        error = "--simulate-kms and --headless-frames are exclusive";
         return false;
     }
     return true;

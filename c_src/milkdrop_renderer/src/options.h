@@ -63,6 +63,10 @@ struct Options {
     // Off-screen check mode: render this many frames on `card` (a render
     // node is enough) without KMS, flips or master, then exit.
     int headless_frames = 0;
+    // Check mode: the normal take/present/release protocol on `card` (a
+    // render node is enough), with master, SetCrtc and flips simulated
+    // (flip events from a vblank timer). Never touches a display.
+    bool simulate_kms = false;
     // Feed a synthetic beat whenever the ring has no audio.
     bool test_tone = false;
 };

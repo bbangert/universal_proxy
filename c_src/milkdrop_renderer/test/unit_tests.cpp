@@ -2,12 +2,15 @@
 // failure and exits non-zero if any check failed.
 
 #include "cost_guard.h"
+#include "exit_guard.h"
 #include "frame_pacer.h"
 #include "json.h"
 #include "manifest.h"
 #include "options.h"
 #include "pcm_feed.h"
+#include "poll_round.h"
 #include "preset_manager.h"
+#include "preset_selection.h"
 #include "protocol.h"
 #include "ring_writer.h"  // sendspin_player's writer: the real producer
 #include "stderr_capture.h"
@@ -15,11 +18,17 @@
 #include "thermal.h"
 
 #include <algorithm>
+#include <atomic>
+#include <csignal>
+#include <functional>
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <map>
 #include <set>
 #include <string>
+#include <sys/wait.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -110,7 +119,14 @@ static void test_options() {
     checks.insert(checks.end(), {"--test-tone", "--headless-frames", "300", "--card", "/dev/dri/renderD128"});
     Options o3;
     CHECK(parse_options(checks, o3, err) && o3.test_tone && o3.headless_frames == 300 &&
-          o3.card == "/dev/dri/renderD128");
+          o3.card == "/dev/dri/renderD128" && !o3.simulate_kms);
+    auto sim = base_args();
+    sim.insert(sim.end(), {"--simulate-kms", "--card", "/dev/dri/renderD128"});
+    Options o4;
+    CHECK(parse_options(sim, o4, err) && o4.simulate_kms && o4.headless_frames == 0);
+    sim.insert(sim.end(), {"--headless-frames", "10"});
+    Options o5;
+    CHECK(!parse_options(sim, o5, err));
 }
 
 // ---------------------------------------------------------------- protocol
@@ -566,6 +582,197 @@ static void test_stderr_capture() {
     CHECK(cap.sync(10));  // not capturing: trivially in sync
 }
 
+
+static void test_selection() {
+    PresetManager::Config cfg;
+    cfg.seed = 3;
+    // 20 presets of which only p17 loads: more failures than one batch.
+    PresetManager pm(entries(20), {}, cfg);
+    std::vector<std::string> tried;
+    auto attempt = [&](const PresetEntry& e) {
+        tried.push_back(e.file);
+        return e.file == "p17.milk" ? Attempt::Loaded : Attempt::Failed;
+    };
+    const PresetEntry* first = pm.start("");
+    int calls = 0;
+    Selection sel = Selection::Deferred;
+    while (sel == Selection::Deferred && calls < 10) {
+        size_t before = tried.size();
+        sel = select_preset(pm, first, 8, attempt);
+        CHECK(tried.size() - before <= 8);  // a batch at most per call
+        if (sel == Selection::Deferred) CHECK(tried.size() - before == 8);
+        first = pm.rotate();
+        calls++;
+    }
+    CHECK(sel == Selection::Switched);
+    CHECK(tried.back() == "p17.milk");
+    CHECK(std::set<std::string>(tried.begin(), tried.end()).size() == tried.size());  // no retries
+    CHECK(pm.eligible_count() == 20 - (tried.size() - 1));
+
+    // Nothing loads: Deferred per batch, then Exhausted once none are left.
+    PresetManager none(entries(10), {}, cfg);
+    auto fail_all = [](const PresetEntry&) { return Attempt::Failed; };
+    CHECK(select_preset(none, none.start(""), 8, fail_all) == Selection::Deferred);
+    CHECK(none.eligible_count() == 2);
+    CHECK(select_preset(none, none.rotate(), 8, fail_all) == Selection::Exhausted);
+    CHECK(none.eligible_count() == 0 && none.rotate() == nullptr);
+
+    // Abort stops at once without skipping.
+    PresetManager ab(entries(5), {}, cfg);
+    CHECK(select_preset(ab, ab.start(""), 8, [](const PresetEntry&) { return Attempt::Abort; }) ==
+          Selection::Aborted);
+    CHECK(ab.eligible_count() == 5);
+}
+
+static void test_poll_round() {
+    std::vector<std::string> order;
+    bool awaiting = true;
+    auto awaited = [&] { return awaiting; };
+    auto dispatch = [&] {
+        order.push_back("flip");
+        awaiting = false;
+    };
+    // `release` waits for the pending flip itself.
+    auto release = [&] {
+        order.push_back("commands");
+        awaiting = false;
+    };
+    // Both ready: the flip first, commands after, never a second dispatch.
+    handle_poll_round({true, true}, awaited, dispatch, release);
+    CHECK((order == std::vector<std::string>{"flip", "commands"}));
+    // The flip was consumed elsewhere (stale readiness): no dispatch.
+    order.clear();
+    awaiting = false;
+    handle_poll_round({true, true}, awaited, dispatch, release);
+    CHECK((order == std::vector<std::string>{"commands"}));
+    order.clear();
+    awaiting = true;
+    handle_poll_round({false, true}, awaited, dispatch, release);
+    CHECK((order == std::vector<std::string>{"commands"}));
+}
+
+// Runs `body` in a child with stdout on a pipe. Returns the exit status
+// (-1: still running after `wait_ms`, then killed), its output and how long
+// it ran.
+static int run_child(const std::function<void()>& body, int wait_ms, std::string& out, int64_t& ran_ms) {
+    int p[2];
+    if (pipe(p) != 0) return -2;
+    std::fflush(stdout);
+    const auto t0 = std::chrono::steady_clock::now();
+    pid_t pid = fork();
+    if (pid == 0) {
+        dup2(p[1], 1);
+        close(p[0]);
+        close(p[1]);
+        body();
+        _exit(99);
+    }
+    close(p[1]);
+    int status = 0, code = -1;
+    while (true) {
+        pid_t r = waitpid(pid, &status, WNOHANG);
+        ran_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        if (r == pid) {
+            code = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+            break;
+        }
+        if (ran_ms > wait_ms) {
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(p[0], buf, sizeof(buf))) > 0) out.append(buf, static_cast<size_t>(n));
+    close(p[0]);
+    return code;
+}
+
+// A shutdown that hangs (here: a blocking read that never returns, as on
+// the DRM fd) still emits `exiting` and exits with its code in budget.
+static void hang_forever() {
+    int p[2];
+    if (pipe(p) == 0) {
+        char c;
+        while (true) (void)!read(p[0], &c, 1);
+    }
+}
+
+static void test_exit_guard() {
+    std::string out;
+    int64_t ms = 0;
+    int code = run_child(
+        [] {
+            ExitGuard g(nullptr, 150);
+            g.start();
+            g.arm("requested", 0);
+            hang_forever();
+        },
+        3000, out, ms);
+    CHECK(code == 0);
+    CHECK(ms >= 140 && ms < 1000);
+    CHECK(out == "{\"event\":\"exiting\",\"reason\":\"requested\"}\n");
+
+    // The main thread already sent `exiting`: not repeated; the code holds.
+    out.clear();
+    code = run_child(
+        [] {
+            ExitGuard g(nullptr, 100);
+            g.start();
+            g.arm("output_lost", 1);
+            emit_line(event_exiting("output_lost"));
+            g.exiting_sent();
+            hang_forever();
+        },
+        3000, out, ms);
+    CHECK(code == 1 && ms < 1000);
+    CHECK(out == "{\"event\":\"exiting\",\"reason\":\"output_lost\"}\n");
+
+    // A signal arms it even if the main thread never gets to.
+    out.clear();
+    code = run_child(
+        [] {
+            static std::atomic<int> sig{0};
+            ExitGuard g(&sig, 100);
+            g.start();
+            sig.store(1);
+            hang_forever();
+        },
+        3000, out, ms);
+    CHECK(code == 0 && ms < 1000);
+    CHECK(out == "{\"event\":\"exiting\",\"reason\":\"signal\"}\n");
+
+    // A teardown that finishes in budget: stop() and no event from the guard.
+    out.clear();
+    code = run_child(
+        [] {
+            ExitGuard g(nullptr, 100);
+            g.start();
+            g.arm("eof", 0);
+            g.stop();
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            _exit(7);
+        },
+        3000, out, ms);
+    CHECK(code == 7 && out.empty());
+
+    // The writer stuck elsewhere: emit_line_within gives up.
+    out.clear();
+    code = run_child(
+        [] {
+            std::thread([] { emit_line_within("{\"a\":1}", 50); }).join();
+            set_emit_sink([](const std::string&) { std::this_thread::sleep_for(std::chrono::seconds(10)); });
+            std::thread stuck([] { emit_line("x"); });
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            const bool sent = emit_line_within("{\"b\":2}", 50);
+            _exit(sent ? 1 : 0);
+        },
+        3000, out, ms);
+    CHECK(code == 0 && out == "{\"a\":1}\n");
+}
+
 // ---------------------------------------------------------------- pcm
 
 static void fill_indexed(std::vector<int16_t>& chunk, uint64_t first, uint32_t frames) {
@@ -697,6 +904,9 @@ int main() {
     test_stderr_capture();
     test_pcm_feed_alignment();
     test_tone();
+    test_selection();
+    test_poll_round();
+    test_exit_guard();
     if (g_failures == 0) std::printf("OK\n");
     return g_failures == 0 ? 0 : 1;
 }

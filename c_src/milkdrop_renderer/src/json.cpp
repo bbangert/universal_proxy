@@ -1,6 +1,7 @@
 #include "json.h"
 
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -283,7 +284,7 @@ size_t utf8_seq_len(std::string_view s, size_t i) {
     return needed + 1;
 }
 
-std::mutex g_emit_mtx;
+std::timed_mutex g_emit_mtx;
 std::function<void(const std::string&)> g_sink;
 
 void write_all(const std::string& s) {
@@ -351,8 +352,7 @@ std::string sanitize_text(std::string_view s, size_t max_bytes) {
     return out;
 }
 
-void emit_line(const std::string& line) {
-    std::lock_guard<std::mutex> lock(g_emit_mtx);
+static void emit_locked(const std::string& line) {
     std::string out;
     if (line.size() > MAX_EMIT_LINE_BYTES) {
         out = "{\"event\":\"error\",\"reason\":\"oversize_line\",\"bytes\":" +
@@ -368,8 +368,20 @@ void emit_line(const std::string& line) {
     write_all(out);
 }
 
+void emit_line(const std::string& line) {
+    std::lock_guard<std::timed_mutex> lock(g_emit_mtx);
+    emit_locked(line);
+}
+
+bool emit_line_within(const std::string& line, int timeout_ms) {
+    std::unique_lock<std::timed_mutex> lock(g_emit_mtx, std::chrono::milliseconds(timeout_ms));
+    if (!lock.owns_lock()) return false;
+    emit_locked(line);
+    return true;
+}
+
 void set_emit_sink(std::function<void(const std::string&)> sink) {
-    std::lock_guard<std::mutex> lock(g_emit_mtx);
+    std::lock_guard<std::timed_mutex> lock(g_emit_mtx);
     g_sink = std::move(sink);
 }
 

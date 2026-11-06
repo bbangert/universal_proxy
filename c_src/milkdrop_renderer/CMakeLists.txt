@@ -17,12 +17,14 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG" CACHE STRING "" FORCE)
 
 set(MILKDROP_CORE_SOURCES
     src/cost_guard.cpp
+    src/exit_guard.cpp
     src/frame_pacer.cpp
     src/json.cpp
     src/manifest.cpp
     src/options.cpp
     src/pcm_feed.cpp
     src/preset_manager.cpp
+    src/preset_selection.cpp
     src/protocol.cpp
     src/stderr_capture.cpp
     src/test_tone.cpp
@@ -60,7 +62,7 @@ endif()
 # a stale CMakeCache.txt. For scratch
 # builds against a local checkout set MILKDROP_PROJECTM_SOURCE_DIR (the mix
 # compiler forwards it as FETCHCONTENT_SOURCE_DIR_PROJECTM).
-set(PROJECTM_REF "9181df72a7c87b4877aaf84f2d146a68cbbfcf00" # es2/1d-cache
+set(PROJECTM_REF "bb940dbc5211a3b61d7675542c6a82e2c760cd85" # es2/1d-cache
     CACHE STRING "projectM fork commit SHA to pin" FORCE)
 
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)

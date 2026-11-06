@@ -19,6 +19,7 @@
 // Licensed under the Apache License, Version 2.0.
 
 #include "cost_guard.h"
+#include "exit_guard.h"
 #include "frame_pacer.h"
 #include "gl_output.h"
 #include "json.h"
@@ -26,7 +27,9 @@
 #include "manifest.h"
 #include "options.h"
 #include "pcm_feed.h"
+#include "poll_round.h"
 #include "preset_manager.h"
+#include "preset_selection.h"
 #include "protocol.h"
 #include "stderr_capture.h"
 #include "test_tone.h"
@@ -34,6 +37,7 @@
 #include "visualizer.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cerrno>
 #include <csignal>
@@ -54,14 +58,17 @@ constexpr bool GLES2 = true;
 constexpr bool GLES2 = false;
 #endif
 
-volatile std::sig_atomic_t g_signal = 0;
-void on_signal(int) { g_signal = 1; }
+std::atomic<int> g_signal{0};
+static_assert(std::atomic<int>::is_always_lock_free);  // async-signal-safe
+void on_signal(int) { g_signal.store(1); }
 
 // An incoming preset this heavy is cut to, not blended: a blend renders
 // both presets at once.
 constexpr double CUT_ABOVE_FRAME_MS = 25.0;
 constexpr double CUT_BELOW_FPS = 25.0;
-constexpr int MAX_SWITCH_ATTEMPTS = 8;
+// Failed warm-ups tried in one go before the loop runs again (frames,
+// commands); selection resumes after.
+constexpr int SWITCH_BATCH = 8;
 constexpr int64_t FLIP_TIMEOUT_US = 1000000;
 
 struct InFlight {
@@ -81,6 +88,7 @@ private:
     enum class Phase { Prepared, Presenting, Released };
 
     Options opt_;
+    ExitGuard exit_guard_{&g_signal};
     StderrCapture capture_;
     Manifest manifest_;
     std::unique_ptr<PresetManager> presets_;
@@ -119,8 +127,14 @@ private:
     bool first_frame_ = false;   // the next frame is its first shown
     int64_t shown_since_us_ = 0; // for rotation, warm-ups excluded
 
-    enum class Switch { None, Rotate, Next, Prev, Eject };
+    enum class Switch { None, Rotate, Next, Prev, Eject, Retry };
     Switch requested_ = Switch::None;
+    // A batch of candidates failed (Switch::Retry): the cause to report,
+    // and whether a failed preset was activated (projectM shows it, so the
+    // retry cuts and no frame is rendered until then).
+    const char* retry_cause_ = "rotate";
+    bool force_cut_ = false;
+    int fps_ = 0;  // what projectM was told
 
     // Stats since the last `stats` event.
     int64_t stats_since_us_ = 0;
@@ -149,10 +163,10 @@ private:
     void on_flip(int64_t t_us);
     bool render_frame(InFlight& out);
     void apply_switch();
-    bool switch_to(const PresetEntry* entry, const char* cause, bool smooth);
+    Selection switch_to(const PresetEntry* first, const char* cause, bool smooth);
     bool warm_up(const PresetEntry& entry, bool smooth, std::string& reason, std::string& message,
                  bool& activated);
-    void apply_level();
+    bool apply_level();
     void announce_preset(const char* cause, bool cut);
     void skip_current(const char* reason);
 
@@ -160,6 +174,7 @@ private:
     void report_driver_errors();
     void emit_stats(int64_t now);
     void fail(const char* reason, const std::string& message, int code = 1);
+    bool stdin_hung_up() const;
 
     std::string preset_path(const PresetEntry& e) const { return opt_.pack_dir + "/presets/" + e.file; }
     Resolution rung_size() const { return opt_.ladder[guard_->current().rung]; }
@@ -216,6 +231,7 @@ bool App::prepare() {
     }
 
     const bool opened = opt_.headless_frames > 0 ? kms_.open_headless(opt_.card, opt_.mode, err)
+                        : opt_.simulate_kms      ? kms_.open_simulated(opt_.card, opt_.mode, err)
                                                  : kms_.open(opt_.card, opt_.mode, err);
     if (!opened) {
         fail("output", err);
@@ -242,16 +258,25 @@ bool App::prepare() {
         fail("projectm", err);
         return false;
     }
-    vis_.configure(opt_.ladder[0], opt_.mesh_width, opt_.mesh_height,
-                   static_cast<int>(refresh / gcfg.start_interval + 0.5), opt_.blend_s);
+    fps_ = static_cast<int>(refresh / gcfg.start_interval + 0.5);
+    vis_.configure(opt_.ladder[0], opt_.mesh_width, opt_.mesh_height, fps_, opt_.blend_s);
     vis_.set_texture_dir(opt_.pack_dir + "/textures");
     vis_.set_shader_cache_dir(opt_.pack_dir + "/shaders");
 
     pcm_.maintain(monotonic_us());
 
     const PresetEntry* first = presets_->start(opt_.locked);
-    if (!switch_to(first, "start", false)) {
-        fail("no_presets", "no preset could be loaded");
+    Selection sel;
+    while ((sel = switch_to(first, "start", false)) == Selection::Deferred) {
+        // Nothing reads commands yet; only an exit can interrupt.
+        if (g_signal.load() != 0 || stdin_hung_up()) {
+            exit_reason_ = g_signal.load() != 0 ? "signal" : "eof";
+            return false;
+        }
+        first = presets_->rotate();
+    }
+    if (sel != Selection::Switched) {
+        if (exit_reason_.empty()) fail("no_presets", "no preset could be loaded");
         return false;
     }
     // The frame `take` puts on screen.
@@ -267,13 +292,23 @@ bool App::prepare() {
 
 // ------------------------------------------------------------- presets
 
-void App::apply_level() {
-    pacer_->set_interval(guard_->current().interval);
-    Resolution size = rung_size();
+bool App::apply_level() {
+    const int interval = guard_->current().interval;
+    pacer_->set_interval(interval);
+    const int fps = static_cast<int>(kms_.refresh_hz() / interval + 0.5);
+    if (fps != fps_) {
+        fps_ = fps;
+        vis_.set_fps(fps);
+    }
+    const Resolution size = rung_size();
     if (gl_.internal_size() != size) {
-        gl_.set_internal_size(size);
+        if (!gl_.set_internal_size(size)) {
+            fail("gl", "internal framebuffer incomplete at " + size.str());
+            return false;
+        }
         vis_.set_size(size);
     }
+    return true;
 }
 
 void App::announce_preset(const char* cause, bool cut) {
@@ -292,19 +327,32 @@ void App::announce_preset(const char* cause, bool cut) {
 // projectM's transition slot.
 bool App::warm_up(const PresetEntry& entry, bool smooth, std::string& reason, std::string& message,
                   bool& activated) {
-    const uint64_t ra0 = capture_.register_allocate_failures();
-    const uint64_t err0 = vis_.error_logs();
     const int64_t start = monotonic_us();
     activated = false;
+    // Driver output of earlier frames is classified before the baseline is
+    // taken, so it isn't pinned on this preset. A count change is only
+    // attributed when both syncs around it completed.
+    const bool synced_before = capture_.sync(300);
+    uint64_t ra_base = capture_.register_allocate_failures();
+    const uint64_t err0 = vis_.error_logs();
+    auto ra_failed = [&](bool synced_after) {
+        const uint64_t n = capture_.register_allocate_failures();
+        if (n == ra_base) return false;
+        if (synced_before && synced_after) return true;
+        log_msg("warm-up %s: register allocation failure not attributable (stderr sync timed out)",
+                entry.file.c_str());
+        ra_base = n;
+        return false;
+    };
 
     const Visualizer::LoadResult lr = vis_.preload(preset_path(entry));
-    capture_.sync(300);
+    const bool synced_preload = capture_.sync(300);
     const int64_t preloaded = monotonic_us();
     st_shader_stages_ += static_cast<uint64_t>(std::popcount(lr.shader_stages));
     st_cached_stages_ += static_cast<uint64_t>(std::popcount(lr.cached_stages));
 
     bool dropped = false;
-    if (capture_.register_allocate_failures() != ra0) {
+    if (ra_failed(synced_preload)) {
         reason = "register_allocate";
     } else if (!lr.reason.empty()) {
         reason = lr.reason;
@@ -321,8 +369,7 @@ bool App::warm_up(const PresetEntry& entry, bool smooth, std::string& reason, st
             vis_.render(gl_.internal_fbo(), vtime_ + 0.001);
             vtime_ += 0.001;
             dropped = gl_.sentinel_untouched();
-            capture_.sync(300);
-            if (capture_.register_allocate_failures() != ra0) {
+            if (ra_failed(capture_.sync(300))) {
                 reason = "register_allocate";
             } else if (vis_.error_logs() != err0) {
                 reason = "shader_error";
@@ -347,30 +394,40 @@ bool App::warm_up(const PresetEntry& entry, bool smooth, std::string& reason, st
     return reason.empty();
 }
 
-bool App::switch_to(const PresetEntry* entry, const char* cause, bool smooth) {
-    for (int attempt = 0; entry != nullptr && attempt < MAX_SWITCH_ATTEMPTS; attempt++) {
-        guard_->begin(entry->file, hint_rung(*entry));
-        apply_level();
-        const bool blend = smooth && opt_.blend_s > 0 && !expensive(*entry);
+Selection App::switch_to(const PresetEntry* first, const char* cause, bool smooth) {
+    bool activated_failure = false;
+    const Selection sel = select_preset(*presets_, first, SWITCH_BATCH, [&](const PresetEntry& entry) {
+        guard_->begin(entry.file, hint_rung(entry));
+        if (!apply_level()) return Attempt::Abort;
+        const bool blend = smooth && !activated_failure && opt_.blend_s > 0 && !expensive(entry);
         std::string reason, message;
         bool activated = false;
-        if (warm_up(*entry, blend, reason, message, activated)) {
-            current_ = entry;
+        if (warm_up(entry, blend, reason, message, activated)) {
+            current_ = &entry;
             blend_until_ = blend ? vtime_ + opt_.blend_s : vtime_;
             first_frame_ = true;
             shown_since_us_ = monotonic_us();
             announce_preset(cause, !blend);
-            return true;
+            return Attempt::Loaded;
         }
-        log_msg("skipping %s: %s %s", entry->file.c_str(), reason.c_str(), message.c_str());
-        emit_line(event_skip(entry->file, reason, message));
-        presets_->skip(entry->file);
+        log_msg("skipping %s: %s %s", entry.file.c_str(), reason.c_str(), message.c_str());
+        emit_line(event_skip(entry.file, reason, message));
         // An activated failure holds projectM's transition slot: cut past
         // it. A failed preload left the playing preset alone.
-        if (activated) smooth = false;
-        entry = presets_->rotate();
+        if (activated) activated_failure = true;
+        return Attempt::Failed;
+    });
+    if (sel == Selection::Deferred) {
+        force_cut_ = force_cut_ || activated_failure;
+        // Until the retry, the playing preset runs at its own level.
+        if (current_ != nullptr) {
+            guard_->begin(current_->file, hint_rung(*current_));
+            if (!apply_level()) return Selection::Aborted;
+        }
+    } else if (sel == Selection::Switched) {
+        force_cut_ = false;
     }
-    return false;
+    return sel;
 }
 
 void App::skip_current(const char* reason) {
@@ -395,12 +452,20 @@ void App::apply_switch() {
             if (next == nullptr) return;  // nothing earlier
             break;
         case Switch::Eject: next = presets_->rotate(); cause = "eject"; break;
+        case Switch::Retry: next = presets_->rotate(); cause = retry_cause_; break;
     }
-    if (next == nullptr) {
-        fail("no_presets", "no eligible presets left");
-        return;
+    switch (switch_to(next, cause, !force_cut_)) {
+        case Selection::Switched: break;
+        case Selection::Deferred:
+            log_msg("%d presets failed to load; retrying after this frame", SWITCH_BATCH);
+            requested_ = Switch::Retry;
+            retry_cause_ = cause;
+            break;
+        case Selection::Exhausted: fail("no_presets", "no eligible presets left"); break;
+        case Selection::Aborted:
+            if (exit_reason_.empty()) fail("no_presets", "preset selection aborted");
+            break;
     }
-    if (!switch_to(next, cause, true)) fail("no_presets", "no preset could be loaded");
 }
 
 // ------------------------------------------------------------- frames
@@ -460,7 +525,7 @@ void App::on_flip(int64_t t_us) {
         case CostGuard::Verdict::StepDown:
             log_msg("%s: %.1f fps, stepping down to %s every %d vblanks", current_->file.c_str(),
                     guard_->last_fps(), rung_size().str().c_str(), guard_->current().interval);
-            apply_level();
+            if (!apply_level()) return;
             first_frame_ = true;
             announce_preset("step_down", false);
             break;
@@ -495,6 +560,8 @@ void App::present_step() {
             requested_ = Switch::Rotate;
         if (requested_ != Switch::None) apply_switch();
         if (!exit_reason_.empty()) return;
+        // projectM shows a failed preset until the retry: don't present it.
+        if (requested_ == Switch::Retry && force_cut_) return;
         render_frame(queued_);
     }
 }
@@ -531,7 +598,7 @@ void App::release(bool announce) {
         // Let a queued flip land so the frame left on screen is a whole one.
         const int64_t deadline = monotonic_us() + 200000;
         while (pending_.bo != nullptr && monotonic_us() < deadline) {
-            pollfd p{kms_.fd(), POLLIN, 0};
+            pollfd p{kms_.event_fd(), POLLIN, 0};
             if (poll(&p, 1, 50) > 0) {
                 int64_t t = 0;
                 if (kms_.dispatch(t)) {
@@ -667,7 +734,7 @@ void App::housekeeping(int64_t now) {
             switch (thermal_.update(static_cast<double>(now) / 1e6, *t)) {
                 case ThermalGuard::Action::DropRung:
                     if (guard_->set_rung_floor(guard_->rung_floor() + 1)) {
-                        apply_level();
+                        if (!apply_level()) break;
                         first_frame_ = true;
                     }
                     log_msg("%.1f C for 10 s: rung floor %s", *t, rung_size().str().c_str());
@@ -686,7 +753,7 @@ void App::housekeeping(int64_t now) {
 void App::loop() {
     stats_since_us_ = monotonic_us();
     while (exit_reason_.empty()) {
-        if (g_signal) {
+        if (g_signal.load() != 0) {
             exit_reason_ = "signal";
             break;
         }
@@ -701,25 +768,35 @@ void App::loop() {
                 timeout_ms = 0;
             }
         }
+        auto flip_awaited = [this] { return phase_ == Phase::Presenting && pending_.bo != nullptr; };
         pollfd fds[2];
         nfds_t n = 0;
-        if (!stdin_eof_) fds[n++] = {STDIN_FILENO, POLLIN, 0};
-        const bool watch_drm = phase_ == Phase::Presenting && pending_.bo != nullptr;
-        if (watch_drm) fds[n++] = {kms_.fd(), POLLIN, 0};
+        int stdin_i = -1, drm_i = -1;
+        if (!stdin_eof_) {
+            stdin_i = static_cast<int>(n);
+            fds[n++] = {STDIN_FILENO, POLLIN, 0};
+        }
+        if (flip_awaited()) {
+            drm_i = static_cast<int>(n);
+            fds[n++] = {kms_.event_fd(), POLLIN, 0};
+        }
         int r = poll(fds, n, timeout_ms);
         if (r < 0 && errno != EINTR) {
             fail("poll", std::strerror(errno));
             break;
         }
-        for (nfds_t i = 0; r > 0 && i < n; i++) {
-            if (fds[i].revents == 0) continue;
-            if (fds[i].fd == STDIN_FILENO) {
-                read_stdin();
-            } else {
+        PollReady ready;
+        if (r > 0) {
+            ready.flip = drm_i >= 0 && fds[drm_i].revents != 0;
+            ready.commands = stdin_i >= 0 && fds[stdin_i].revents != 0;
+        }
+        handle_poll_round(
+            ready, flip_awaited,
+            [this] {
                 int64_t t = 0;
                 if (kms_.dispatch(t)) on_flip(t);
-            }
-        }
+            },
+            [this] { read_stdin(); });
         if (!exit_reason_.empty()) break;
         housekeeping(monotonic_us());
         if (phase_ == Phase::Presenting) present_step();
@@ -733,7 +810,7 @@ void App::loop_headless() {
     stats_since_us_ = monotonic_us();
     phase_ = Phase::Prepared;
     for (int i = 0; i < opt_.headless_frames && exit_reason_.empty(); i++) {
-        if (g_signal) {
+        if (g_signal.load() != 0) {
             exit_reason_ = "signal";
             break;
         }
@@ -758,17 +835,33 @@ void App::loop_headless() {
     if (exit_reason_.empty()) exit_reason_ = "headless_done";
 }
 
+bool App::stdin_hung_up() const {
+    if (stdin_eof_) return true;
+    pollfd p{STDIN_FILENO, POLLIN, 0};
+    return poll(&p, 1, 0) > 0 && (p.revents & (POLLHUP | POLLERR)) != 0;
+}
+
+// From here the exit guard bounds the rest: `exiting` within the budget
+// and a prompt exit even if a release or teardown step hangs.
 void App::finish() {
+    exit_guard_.arm(exit_reason_, exit_code_);
     release(false);
     log_msg("exiting: %s", exit_reason_.c_str());
     emit_line(event_exiting(exit_reason_));
+    exit_guard_.exiting_sent();
 }
 
 int App::run() {
     if (!capture_.start()) log_msg("stderr capture unavailable; driver errors go to stderr");
     std::signal(SIGPIPE, SIG_IGN);
-    std::signal(SIGINT, &on_signal);
-    std::signal(SIGTERM, &on_signal);
+    // No SA_RESTART: a signal interrupts a blocking call instead of
+    // resuming it.
+    struct sigaction sa {};
+    sa.sa_handler = &on_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+    exit_guard_.start();
     int fl = fcntl(STDIN_FILENO, F_GETFL);
     if (fl >= 0) fcntl(STDIN_FILENO, F_SETFL, fl | O_NONBLOCK);
 
@@ -788,6 +881,7 @@ int App::run() {
     gl_.destroy();
     kms_.close();
     capture_.stop();
+    exit_guard_.stop();
     return code;
 }
 

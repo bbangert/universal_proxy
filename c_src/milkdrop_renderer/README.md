@@ -34,8 +34,8 @@ Tuning and check knobs (not passed by the BEAM): `--card DEV`
 floor a preset must hold, 19), `--interval N` (vblanks per frame: 2 on
 GLES2 builds, else 1), `--seed N`, `--av-offset-ms N` (added to the PCM
 target time, for A/V tuning), `--master-timeout-ms N` (2000), `--mesh WxH`
-(48x36), `--stats-s N` (10), and `--headless-frames N` / `--test-tone`
-(see "Checks").
+(48x36), `--stats-s N` (10), and `--headless-frames N` / `--simulate-kms` /
+`--test-tone` (see "Checks").
 
 A bad command line prints `error` (`reason: "usage"`) and `exiting`
 events and exits 2.
@@ -46,7 +46,7 @@ One JSON object per line in each direction. stdout carries protocol lines
 only, each under 4096 bytes (an oversize line is replaced by an
 `error`/`oversize_line` event). The renderer's own log lines go to the
 original stderr; driver output on fd 2 is captured (see "Failure
-detection"). stdin EOF means exit.
+detection"). stdin EOF means exit, in every state.
 
 ### Commands (stdin)
 
@@ -54,7 +54,7 @@ detection"). stdin EOF means exit.
 |---|---|
 | `{"cmd":"take"}` | Poll `drmSetMaster` for up to 2 s, show the prepared frame with SetCrtc in the chosen mode, start presenting → `presenting`. On timeout: `error` `master_timeout`, still prepared. |
 | `{"cmd":"release"}` | Stop flipping (a pending flip lands first), `drmModeCloseFB` the front buffer so it stays scanned out (never RmFB the scanout framebuffer), drop master, **keep card0 open** → `released`. Also acked when not presenting. |
-| `{"cmd":"exit"}` | Release if presenting, close everything → `exiting` (`requested`), exit 0. |
+| `{"cmd":"exit"}` | Release if presenting → `exiting` (`requested`), close everything, exit 0. |
 | `{"cmd":"next"}` / `{"cmd":"prev"}` | Forward / back in the history (a new random pick at its end; `prev` with nothing earlier does nothing). A lock stays on and moves to the new preset. |
 | `{"cmd":"lock"}` / `{"cmd":"unlock"}` | Hold / resume rotation on the current preset. |
 | `{"cmd":"set_rotate","value":N}` | Rotation interval in seconds (1..3600). |
@@ -86,6 +86,15 @@ A malformed or unknown command gives `error` with `reason: "bad_command"`.
 3. Send `release`, start Emerge once `released` arrives (the renderer
    still holds card0, so fbcon doesn't relight the console in between),
    then send `exit`.
+
+**Exit is bounded.** Once an exit is decided (`exit`, stdin EOF, a
+failure) or SIGTERM/SIGINT arrives, a watchdog gives the shutdown 1 s:
+`exiting` comes first, then teardown (projectM, GL, GBM, card0, the stderr
+reader); past the budget the renderer logs, emits `exiting` if it hadn't
+and `_exit`s with the same code. The scanout is left as it is; the
+renderer never RmFBs a framebuffer it doesn't own. The card fd is
+non-blocking, and a flip event is only dispatched while one is awaited
+(a `release` can consume the pending flip itself).
 
 ## Pack layout
 
@@ -175,6 +184,10 @@ so it lands at T + interval · period, or later if the GPU isn't done (the
 kernel waits on the buffer's fence). Each frame is rendered for its
 predicted scanout time: the slot after the pending flip's.
 
+**Frame rate.** projectM is told the presented rate (refresh / interval)
+whenever the guard's level changes, so per-frame preset expressions keep
+their speed at interval 2.
+
 **Clock.** projectM time advances by the predicted presentation interval
 (clamped to 1–100 ms per frame), excluding warm-up stalls, so animation
 and blends don't jump after a hold.
@@ -238,7 +251,14 @@ reopened if the player replaces the file. `src/pcm_tap.h` is a verbatim copy of
 A failed preset is skipped and reported. A preload failure leaves the
 playing preset (and its blend) alone, so the next pick blends in as usual;
 a failure after activation holds projectM's blend slot, so the renderer
-cuts past it.
+cuts past it. At most 8 candidates are tried in one go; then the loop runs
+(commands, and frames of the playing preset unless a failed one was
+activated) and selection resumes. Only when no eligible preset is left
+does the renderer exit (`no_presets`).
+
+stderr is synced before a warm-up's baseline is taken, so output of
+earlier frames isn't pinned on the incoming preset; if a sync times out, a
+register-allocation failure in that window is logged but not attributed.
 
 ## Thermal guard
 
@@ -269,8 +289,10 @@ above 254x256.
 
 Unit tests (host, no GL): `test/milkdrop_renderer_unit_test.exs` builds
 and runs `milkdrop_renderer_unit_tests` — protocol and JSON, options,
-manifest and skip list, rotation and history, the cost guard ladder, frame
-pacing, the thermal guard, the stderr classifier and capture, and PCM ring
+manifest and skip list, rotation and history, preset selection batches
+and exhaustion, the cost guard ladder, frame pacing, the poll-round
+dispatch order, the exit guard (a hung shutdown still exits in budget),
+the thermal guard, the stderr classifier and capture, and PCM ring
 alignment against sendspin_player's real ring writer.
 
 ## Checks
@@ -280,6 +302,13 @@ off-screen without KMS, flips or master (frames back to back, each waiting
 for the GPU), with rotation, warm-ups, the guard and the skip paths
 running, then exits with `exiting` `headless_done`. It doesn't touch card0,
 so it can run next to Emerge to check a build or a pack on a device.
+
+`--simulate-kms --card /dev/dri/renderD128` runs the normal protocol
+(`prepared`, `take`, presenting, `release`, `exit`) without a display:
+master and SetCrtc are simulated, and flips "land" at each vblank of the
+mode through a timer fd. Pacing, the cost guard, warm-ups and the exit
+paths run as on HDMI, so a release/exit sequence can be checked next to
+Emerge.
 
 `--test-tone` feeds a synthetic beat (120 BPM kick, hi-hat, sine sweep)
 whenever the ring gives silence, for visual checks without a playing

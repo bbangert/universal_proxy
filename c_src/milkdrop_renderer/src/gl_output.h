@@ -26,7 +26,8 @@ public:
     bool init(gbm_device* gbm, gbm_surface* surface, int width, int height, bool gles2, std::string& err);
     void destroy();
 
-    // (Re)creates the internal render target at `size`.
+    // (Re)creates the internal render target at `size`. False (the old
+    // target and size kept) if the new one is incomplete.
     bool set_internal_size(Resolution size);
     Resolution internal_size() const { return internal_; }
     GLuint internal_fbo() const { return fbo_; }

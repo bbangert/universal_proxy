@@ -169,23 +169,32 @@ bool GlOutput::init(gbm_device* gbm, gbm_surface* surface, int width, int height
 
 bool GlOutput::set_internal_size(Resolution size) {
     if (size == internal_ && fbo_ != 0) return true;
-    if (fbo_ != 0) glDeleteFramebuffers(1, &fbo_);
-    if (texture_ != 0) glDeleteTextures(1, &texture_);
-    glGenTextures(1, &texture_);
-    glBindTexture(GL_TEXTURE_2D, texture_);
+    // Build the new target first: on failure the old one stays in use.
+    GLuint texture = 0, fbo = 0;
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, size.width, size.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glBindTexture(GL_TEXTURE_2D, 0);
-    glGenFramebuffers(1, &fbo_);
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture_, 0);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
     const bool ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (!ok) {
+        glDeleteFramebuffers(1, &fbo);
+        glDeleteTextures(1, &texture);
+        return false;
+    }
+    if (fbo_ != 0) glDeleteFramebuffers(1, &fbo_);
+    if (texture_ != 0) glDeleteTextures(1, &texture_);
+    fbo_ = fbo;
+    texture_ = texture;
     internal_ = size;
-    return ok;
+    return true;
 }
 
 void GlOutput::clear_sentinel() {

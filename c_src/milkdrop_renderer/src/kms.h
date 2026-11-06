@@ -33,8 +33,14 @@ public:
     // Off-screen: a rendering-only GBM surface of `mode`'s size on `card`
     // (a render node is enough). No connector, CRTC or master.
     bool open_headless(const std::string& card, const DisplayMode& mode, std::string& err);
+    // A check mode: open_headless plus a simulated display. take() and
+    // drop_master() only flip a flag, framebuffers are dummies, and a flip
+    // "lands" at the next vblank of `mode`'s refresh through a timer fd.
+    bool open_simulated(const std::string& card, const DisplayMode& mode, std::string& err);
 
     int fd() const { return fd_; }
+    // The fd that becomes readable when a flip completes (non-blocking).
+    int event_fd() const { return sim_timer_fd_ >= 0 ? sim_timer_fd_ : fd_; }
     gbm_device* gbm() const { return gbm_; }
     gbm_surface* surface() const { return surface_; }
     int width() const { return mode_.hdisplay; }
@@ -71,8 +77,9 @@ public:
     // still pending (try later).
     int page_flip(gbm_bo* bo);
 
-    // Dispatches pending DRM events. Returns true if a flip completed;
-    // `t_us` is its CLOCK_MONOTONIC timestamp.
+    // Dispatches pending DRM events without blocking (the card fd is
+    // O_NONBLOCK). Returns true if a flip completed; `t_us` is its
+    // CLOCK_MONOTONIC timestamp.
     bool dispatch(int64_t& t_us);
 
     // Drops our handle to `bo`'s framebuffer without disabling the plane
@@ -98,6 +105,13 @@ private:
     double headless_hz_ = 0;
     bool flip_done_ = false;
     int64_t flip_t_us_ = 0;
+
+    // open_simulated.
+    int sim_timer_fd_ = -1;
+    bool sim_master_ = false;
+    bool sim_flip_pending_ = false;
+    int64_t sim_epoch_us_ = 0;
+    int64_t sim_flip_us_ = 0;
 
     static void on_page_flip(int fd, unsigned int frame, unsigned int sec, unsigned int usec, void* data);
 };

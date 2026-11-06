@@ -9,6 +9,7 @@
 #include <cstring>
 #include <drm_fourcc.h>
 #include <fcntl.h>
+#include <sys/timerfd.h>
 #include <unistd.h>
 
 namespace md {
@@ -65,7 +66,7 @@ std::string Kms::mode_str() const {
 std::string Kms::crtc_mode_str() const { return crtc_mode_valid_ ? describe(crtc_mode_) : std::string(); }
 
 bool Kms::open_headless(const std::string& card, const DisplayMode& want, std::string& err) {
-    fd_ = ::open(card.c_str(), O_RDWR | O_CLOEXEC);
+    fd_ = ::open(card.c_str(), O_RDWR | O_CLOEXEC | O_NONBLOCK);
     if (fd_ < 0) {
         err = "open " + card + ": " + std::strerror(errno);
         return false;
@@ -86,8 +87,19 @@ bool Kms::open_headless(const std::string& card, const DisplayMode& want, std::s
     return true;
 }
 
+bool Kms::open_simulated(const std::string& card, const DisplayMode& want, std::string& err) {
+    if (!open_headless(card, want, err)) return false;
+    sim_timer_fd_ = ::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (sim_timer_fd_ < 0) {
+        err = std::string("timerfd_create: ") + std::strerror(errno);
+        return false;
+    }
+    return true;
+}
+
 bool Kms::open(const std::string& card, const DisplayMode& want, std::string& err) {
-    fd_ = ::open(card.c_str(), O_RDWR | O_CLOEXEC);
+    // Non-blocking: a flip event read must never wait (see dispatch()).
+    fd_ = ::open(card.c_str(), O_RDWR | O_CLOEXEC | O_NONBLOCK);
     if (fd_ < 0) {
         err = "open " + card + ": " + std::strerror(errno);
         return false;
@@ -191,6 +203,7 @@ bool Kms::open(const std::string& card, const DisplayMode& want, std::string& er
 }
 
 uint32_t Kms::framebuffer(gbm_bo* bo) {
+    if (sim_timer_fd_ >= 0) return 1;  // never handed to KMS
     if (auto cached = reinterpret_cast<uintptr_t>(gbm_bo_get_user_data(bo))) return static_cast<uint32_t>(cached);
     uint32_t handles[4] = {gbm_bo_get_handle(bo).u32};
     uint32_t strides[4] = {gbm_bo_get_stride(bo)};
@@ -211,6 +224,13 @@ uint32_t Kms::framebuffer(gbm_bo* bo) {
 }
 
 bool Kms::take(gbm_bo* bo, int timeout_ms, TakeResult& out, std::string& err) {
+    if (sim_timer_fd_ >= 0) {
+        out = {};
+        out.modeset = false;
+        sim_master_ = true;
+        sim_epoch_us_ = monotonic_us();
+        return true;
+    }
     const int64_t start = monotonic_us();
     while (!drmIsMaster(fd_) && drmSetMaster(fd_) != 0) {
         if (monotonic_us() - start > int64_t{timeout_ms} * 1000) {
@@ -254,6 +274,20 @@ bool Kms::take(gbm_bo* bo, int timeout_ms, TakeResult& out, std::string& err) {
 }
 
 int Kms::page_flip(gbm_bo* bo) {
+    if (sim_timer_fd_ >= 0) {
+        if (!sim_master_) return -EACCES;
+        if (sim_flip_pending_) return -EBUSY;
+        const double hz = refresh_hz() > 0 ? refresh_hz() : 60.0;
+        const auto period = static_cast<int64_t>(1e6 / hz);
+        const int64_t now = monotonic_us();
+        sim_flip_us_ = sim_epoch_us_ + ((now - sim_epoch_us_) / period + 1) * period;
+        itimerspec its{};
+        its.it_value.tv_sec = static_cast<time_t>(sim_flip_us_ / 1000000);
+        its.it_value.tv_nsec = static_cast<long>(sim_flip_us_ % 1000000) * 1000;
+        if (::timerfd_settime(sim_timer_fd_, TFD_TIMER_ABSTIME, &its, nullptr) != 0) return -errno;
+        sim_flip_pending_ = true;
+        return 0;
+    }
     uint32_t fb = framebuffer(bo);
     if (fb == 0) return -EINVAL;
     flip_done_ = false;
@@ -268,6 +302,13 @@ void Kms::on_page_flip(int, unsigned int, unsigned int sec, unsigned int usec, v
 }
 
 bool Kms::dispatch(int64_t& t_us) {
+    if (sim_timer_fd_ >= 0) {
+        uint64_t expirations = 0;
+        if (::read(sim_timer_fd_, &expirations, sizeof(expirations)) != sizeof(expirations)) return false;
+        sim_flip_pending_ = false;
+        t_us = sim_flip_us_;
+        return true;
+    }
     drmEventContext ctx{};
     ctx.version = 2;
     ctx.page_flip_handler = &Kms::on_page_flip;
@@ -279,17 +320,27 @@ bool Kms::dispatch(int64_t& t_us) {
 }
 
 void Kms::close_fb_keep_scanout(gbm_bo* bo) {
+    if (sim_timer_fd_ >= 0) return;
     const auto id = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(gbm_bo_get_user_data(bo)));
     if (id != 0 && drmModeCloseFB(fd_, id) == 0) gbm_bo_set_user_data(bo, nullptr, nullptr);
 }
 
 void Kms::drop_master() {
+    if (sim_timer_fd_ >= 0) {
+        sim_master_ = false;
+        return;
+    }
     if (fd_ >= 0) drmDropMaster(fd_);
 }
 
-bool Kms::is_master() const { return fd_ >= 0 && drmIsMaster(fd_); }
+bool Kms::is_master() const {
+    if (sim_timer_fd_ >= 0) return sim_master_;
+    return fd_ >= 0 && drmIsMaster(fd_);
+}
 
 void Kms::close() {
+    if (sim_timer_fd_ >= 0) ::close(sim_timer_fd_);
+    sim_timer_fd_ = -1;
     if (surface_ != nullptr) gbm_surface_destroy(surface_);
     surface_ = nullptr;
     if (gbm_ != nullptr) gbm_device_destroy(gbm_);

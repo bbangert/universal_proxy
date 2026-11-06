@@ -29,6 +29,9 @@ public:
     // renderer drives rotation), and time comes from set_frame_time.
     void configure(Resolution size, int mesh_w, int mesh_h, int fps, double blend_s);
     void set_size(Resolution size);
+    // The frame rate preset expressions assume (projectM advances per-frame
+    // state by 1/fps): the presented rate, refresh / interval.
+    void set_fps(int fps);
     void set_texture_dir(const std::string& dir);
     // The pack's pre-translated shaders (keys include the GLSL target, so
     // another target's files just miss).

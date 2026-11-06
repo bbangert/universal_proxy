@@ -91,6 +91,8 @@ void Visualizer::set_size(Resolution size) {
     projectm_set_window_size(pm_, static_cast<size_t>(size.width), static_cast<size_t>(size.height));
 }
 
+void Visualizer::set_fps(int fps) { projectm_set_fps(pm_, fps); }
+
 void Visualizer::set_texture_dir(const std::string& dir) {
     const char* paths[] = {dir.c_str()};
     projectm_set_texture_search_paths(pm_, paths, 1);
