@@ -180,7 +180,8 @@ defmodule UniversalProxy.MilkDrop.Store do
   end
 
   def handle_call(request, from, %{table: nil} = state)
-      when elem(request, 0) in [:update, :skip] or request == :clear_skipped do
+      when request == :clear_skipped or
+             (is_tuple(request) and elem(request, 0) in [:update, :skip]) do
     case open_table(state) do
       {:ok, state} -> handle_call(request, from, state)
       {:error, state} -> {:reply, {:error, state.open_error}, schedule_retry(state)}

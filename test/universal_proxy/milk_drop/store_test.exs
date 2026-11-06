@@ -179,12 +179,14 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
         refute File.exists?(path <> ".corrupt")
 
         File.chmod!(path, 0o644)
-        assert {:ok, %{rotate_s: 70}} = Store.update(server, %{rotate_s: 70})
+
+        # The saved record survived: an empty update reopens the table and
+        # returns it unchanged.
+        assert {:ok, %{rotate_s: 45}} = Store.update(server, %{})
         refute File.exists?(path <> ".corrupt")
 
-        # The saved record was kept: a partial update merges onto it.
         assert {:ok, %{rotate_s: 70, include_high_frequency: true}} =
-                 Store.update(server, %{include_high_frequency: true})
+                 Store.update(server, %{rotate_s: 70, include_high_frequency: true})
       end
     end
 
@@ -203,6 +205,26 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
       File.rm!(blocker)
       wait_until(fn -> :sys.get_state(server).table != nil end)
       assert {:ok, %{rotate_s: 30}} = Store.update(server, %{rotate_s: 30})
+    end
+
+    @tag capture_log: true
+    test "clear_skipped on a closed table reports the open error, then reopens", %{
+      tmp_dir: tmp_dir
+    } do
+      blocker = Path.join(tmp_dir, "blocker")
+      File.write!(blocker, "not a directory")
+      path = Path.join(blocker, "settings.dets")
+
+      server =
+        start_supervised!({Store, name: nil, table: @table, dets_path: path, retry_ms: 0})
+
+      assert :sys.get_state(server).table == nil
+      assert {:error, reason} = Store.clear_skipped(server)
+      assert reason != :not_running
+
+      File.rm!(blocker)
+      assert :ok = Store.clear_skipped(server)
+      assert :sys.get_state(server).table != nil
     end
 
     test "malformed records read as defaults", %{path: path} do
