@@ -425,10 +425,12 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     refute "exit" in cmd_names(ctx.skip_file)
     refute_received {:audio, :pcm_tap, @key, false}
 
-    # The retry runs the viewport; only then does the renderer exit.
+    # The retry runs the viewport; only then does the renderer exit. `cmds`
+    # is the log as of the viewport's start, so it can't race the exit that
+    # the viewport's running triggers.
     assert_receive {:viewport_start, cmds}, @timeout
     assert List.last(cmds) == "release"
-    assert cmd_names(ctx.skip_file) |> Enum.filter(&(&1 in ["take", "exit"])) == ["take"]
+    assert Enum.filter(cmds, &(&1 in ["take", "exit"])) == ["take"]
     assert_receive {:audio, :pcm_tap, @key, false}, @timeout
     wait_until(fn -> md(ctx).phase == nil end)
     assert List.last(cmd_names(ctx.skip_file)) == "exit"
