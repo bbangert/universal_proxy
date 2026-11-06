@@ -4,8 +4,10 @@ writes them) and the shader trial's vc4 CSV (warp+comp GPU time)."""
 import csv
 import json
 import re
+import sys
 
 from . import names
+from .sources import PipelineError
 
 RUNG_RE = re.compile(r"\A[1-9][0-9]{1,4}x[1-9][0-9]{1,4}\Z")
 
@@ -79,18 +81,25 @@ def parse_run(pid, text):
 
 def load_sweep(path):
     """{id: record} from a sweep file (JSON Lines; a later line for the same
-    preset wins, so reruns append)."""
+    preset wins, so reruns append). An invalid last line (a write cut off by
+    an interrupted sweep) is skipped with a warning; one anywhere else is an
+    error."""
     out = {}
     if not path:
         return out
     with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
+        lines = [(n, ln.strip()) for n, ln in enumerate(f, 1)]
+    lines = [(n, ln) for n, ln in lines if ln and not ln.startswith("#")]
+    for i, (n, line) in enumerate(lines):
+        try:
             rec = json.loads(line)
-            if isinstance(rec, dict) and names.valid_id(rec.get("file")):
-                out[rec["file"]] = rec
+        except ValueError as e:
+            if i == len(lines) - 1:
+                print(f"warning: {path}:{n}: skipping a partial last line", file=sys.stderr)
+                continue
+            raise PipelineError(f"{path}:{n}: invalid JSON ({e})") from e
+        if isinstance(rec, dict) and names.valid_id(rec.get("file")):
+            out[rec["file"]] = rec
     return out
 
 

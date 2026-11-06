@@ -76,6 +76,26 @@ class DeviceSweepTest(unittest.TestCase):
         _, out = self.sweep()
         self.assertIn("2 done, 0 to run", out)
 
+    def test_a_partial_last_line_is_cut_before_appending(self):
+        self.sweep("--only", "a.milk")
+        with open(self.out, "a") as f:
+            f.write('{"file": "high_frequency/b.milk", "sta')
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.sweep()
+        self.assertIn("partial last line", err.getvalue())
+        self.assertEqual([r["file"] for r in self.records()], ["a.milk", "high_frequency/b.milk"])
+
+    def test_a_complete_last_record_without_newline_is_kept(self):
+        self.sweep("--only", "a.milk")
+        with open(self.out) as f:
+            data = f.read()
+        with open(self.out, "w") as f:
+            f.write(data.rstrip("\n"))
+        _, out = self.sweep()
+        self.assertIn("1 done, 1 to run", out)
+        self.assertEqual([r["file"] for r in self.records()], ["a.milk", "high_frequency/b.milk"])
+
     def test_ssh_verifies_host_keys_unless_told_not_to(self):
         def opts(**kw):
             return device_sweep.ssh_opts(argparse.Namespace(**{"known_hosts": None,

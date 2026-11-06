@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 import unittest
@@ -83,6 +85,19 @@ class LoadTest(unittest.TestCase):
             json.dumps({"file": "a.milk", "status": "ok", "rung": "640x360"})]) + "\n")
         self.assertEqual(sweep.load_sweep(path), {"a.milk": {"file": "a.milk", "status": "ok", "rung": "640x360"}})
         self.assertEqual(sweep.load_sweep(None), {})
+
+    def test_a_partial_last_line_is_skipped_but_not_one_in_the_middle(self):
+        from milkpack.sources import PipelineError
+
+        good = json.dumps({"file": "a.milk", "status": "ok", "rung": "640x360"})
+        path = write(os.path.join(tmpdir(self), "s.jsonl"), good + "\n" + '{"file": "b.mi' + "\n\n")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(list(sweep.load_sweep(path)), ["a.milk"])
+        self.assertIn(":2: skipping a partial last line", err.getvalue())
+        write(path, '{"file": "b.mi\n' + good + "\n")
+        with self.assertRaisesRegex(PipelineError, ":1: invalid JSON"):
+            sweep.load_sweep(path)
 
     def test_vc4_trial_csv_maps_to_normalised_ids(self):
         path = write(os.path.join(tmpdir(self), "t.csv"),

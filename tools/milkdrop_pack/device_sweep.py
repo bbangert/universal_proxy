@@ -181,6 +181,27 @@ def done_ids(out_path, digest):
     return done
 
 
+def repair_tail(out_path):
+    """Make the sweep file safe to append to: an interrupted write can leave
+    a partial last line, which the next record would be glued onto. A
+    complete last record only lacks its newline; anything else is cut."""
+    if not os.path.exists(out_path):
+        return
+    with open(out_path, "rb+") as f:
+        data = f.read()
+        if not data or data.endswith(b"\n"):
+            return
+        start = data.rfind(b"\n") + 1
+        try:
+            json.loads(data[start:].decode("utf-8"))
+        except ValueError:
+            print(f"warning: {out_path}: dropping a partial last line ({len(data) - start} bytes)",
+                  file=sys.stderr)
+            f.truncate(start)
+            return
+        f.write(b"\n")
+
+
 def local_sweep_dir(pack_dir, view):
     """A view of an extracted pack at `view` for local sweeps: its presets,
     textures and shaders linked, with the stripped manifest (the pack
@@ -300,6 +321,7 @@ def sweep_all(opts, p, digest, version, todo, remote_pack, scratch):
             except subprocess.TimeoutExpired:
                 return "EXIT_STATUS ssh_timeout\n"
 
+    repair_tail(opts.out)
     with open(opts.out, "a") as out:
         for n, pid in enumerate(todo, 1):
             started = time.monotonic()

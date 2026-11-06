@@ -139,7 +139,9 @@ appends one JSON line per preset to `--out` (fps, flip and CPU frame ms,
 the rung the cost guard settled on, skip reason, warm-up ms, temperature).
 Resumable: presets with an `ok` or `skip` record for this tarball's
 SHA-256 are not rerun; `error` records (a timeout, a truncated reply) are
-retried. `--dry-run` prints the plan and the Elixir it would send;
+retried. A partial last line left by an interrupted write is cut before
+appending, and `--device-sweep` skips one with a warning (an invalid line
+anywhere else fails the build). `--dry-run` prints the plan and the Elixir it would send;
 `--only ID` / `--limit N` sweep a subset. The device runs Elixir over
 nerves_ssh; the script never sends `System.halt`.
 
