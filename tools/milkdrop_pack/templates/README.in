@@ -1,0 +1,39 @@
+up-milkdrop-pack @VERSION@
+==========================
+
+MilkDrop presets for the Universal Proxy "MilkDrop" TV display mode
+(github.com/bbangert/universal_proxy). The device downloads this archive
+on first use, checks its SHA-256 against the value compiled into the
+firmware and extracts it to /data/milkdrop/@VERSION@/.
+
+Layout (see c_src/milkdrop_renderer/README.md in universal_proxy):
+
+  manifest.json        preset list, tags and Raspberry Pi 3 hints (format 1)
+  presets/             the .milk files; presets/high_frequency/ holds the
+                       fast-flashing ones, which stay off unless enabled
+  textures/            the textures the presets sample, plus MilkDrop's own
+                       set as the random-texture pool (lowercase names)
+  shaders/<key>.glsl   warp/comp shaders pre-translated to GLSL ES 1.00
+  README, NOTICE       this file and the provenance and licence notes
+
+Contents: @PRESETS@ presets (@HIGH_FREQUENCY@ under high_frequency/, @EXTREME@ of
+those under high_frequency/extreme/), @TEXTURES@ textures, @SHADERS@
+pre-translated shaders.
+
+How it was built (tools/milkdrop_pack in universal_proxy @ @APP_COMMIT@):
+
+  - presets: @ZIP_NAME@ (sha256 @ZIP_SHA@); preview
+    thumbnails dropped; file names normalised (ASCII, single spaces,
+    trimmed); contents unchanged;
+  - excluded: @EXCLUDED@ presets (see NOTICE for the reasons);
+  - textures: projectM presets-milkdrop-texture-pack @ @TEXTURE_COMMIT@;
+    textures larger than @MAX_TEXTURE_PX@ px downscaled to fit;
+  - shaders: projectM-pretranslate-presets --target es100 from
+    bbangert/projectm @ @PROJECTM_COMMIT@ (the commit milkdrop_renderer
+    pins), with textures/ in place;
+  - brightness screen: each preset rendered @BRIGHT_FRAMES@ frames at @BRIGHT_SIZE@ with
+    synthetic music on a host reference renderer; presets with more than
+    @BRIGHT_EXCLUDE_PCT@% of the picture saturated (any channel >= 250) over frames
+    @BRIGHT_FROM@-@BRIGHT_FRAMES@ and a mean luma of @BRIGHT_MIN_LUMA@ or more are left out as
+    whiteouts (saturated but darker colour was reviewed by eye instead);
+  - rpi3 hints: @RPI3_SOURCE@.

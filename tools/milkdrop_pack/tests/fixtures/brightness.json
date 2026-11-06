@@ -1,0 +1,7 @@
+{
+ "_comment": "md_bright output (640x360, 600 frames, from 150) on the pinned fork, 2026-11-06.",
+ "Waltra - Emitter.milk": {"frames":600,"from":150,"luma":254.840,"sat":0.99913,"r":254.580,"g":254.959,"b":254.907,"load_status":0,"load_message":"","gl_error":0},
+ "$$$ Royal - Mashup (383).milk": {"frames":600,"from":150,"luma":250.189,"sat":0.99976,"r":238.942,"g":254.988,"b":254.977,"load_status":0,"load_message":"","gl_error":0},
+ "Geiss - Planar Travel.milk": {"frames":600,"from":150,"luma":37.865,"sat":0.00018,"r":28.470,"g":39.291,"b":55.163,"load_status":0,"load_message":"","gl_error":0},
+ "Isosceles mashup06.milk": {"frames":600,"from":150,"luma":108.270,"sat":0.01950,"r":147.769,"g":89.365,"b":102.012,"load_status":0,"load_message":"","gl_error":0}
+}

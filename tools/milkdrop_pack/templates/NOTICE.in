@@ -1,0 +1,40 @@
+NOTICE
+======
+
+Presets
+-------
+The presets come from Ryan Geiss's "favorite_presets_2021_01_03"
+collection (geisswerks.com/milkdrop/), a compilation of MilkDrop presets by
+many authors; the authors are named in the file names. The presets carry no
+explicit licence. They are redistributed here, unmodified apart from their
+file names, on the presumption that they are in the public domain, as
+MilkDrop presets have been freely shared for two decades (the same basis as
+projectM's preset packs). Any preset will be removed on request by its
+author.
+
+Textures
+--------
+The textures come from the projectM "presets-milkdrop-texture-pack"
+(github.com/projectM-visualizer/presets-milkdrop-texture-pack @
+@TEXTURE_COMMIT@), which collects the textures released with MilkDrop and
+others used by common presets. That pack states no licence either; the
+textures are likewise presumed public domain and will be removed on request.
+File names are lowercased; textures larger than @MAX_TEXTURE_PX@ px were downscaled.
+
+These textures are never included: @BANNED_TEXTURES@ (photos of
+identifiable people or bands, logos, or images of unknown provenance).
+Presets that sample one of them are left out.
+
+Shaders
+-------
+shaders/*.glsl are machine translations of the presets' own HLSL shader
+code (projectM's translator, github.com/bbangert/projectm @
+@PROJECTM_COMMIT@); they carry the presets' terms.
+
+Left out of this pack
+---------------------
+@EXCLUSIONS@
+
+Removal requests
+----------------
+To have a preset or texture removed, @CONTACT@

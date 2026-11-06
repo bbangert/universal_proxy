@@ -1,0 +1,16 @@
+{
+  "geiss_zip": {
+    "name": "favorite_presets_2021_01_03.zip",
+    "origin": "https://www.geisswerks.com/milkdrop/favorite_presets_2021_01_03.zip",
+    "sha256": "92b327b73eaf114cebddce99bbaa84663d363d9b57a63570a8b1b6001ee0db79"
+  },
+  "texture_pack": {
+    "repo": "https://github.com/projectM-visualizer/presets-milkdrop-texture-pack.git",
+    "commit": "6368812f27bc747b517218fbf89d21d59afce4d9"
+  },
+  "projectm": {
+    "repo": "https://github.com/bbangert/projectm.git",
+    "pin_file": "c_src/milkdrop_renderer/CMakeLists.txt",
+    "submodules": ["vendor/projectm-eval"]
+  }
+}

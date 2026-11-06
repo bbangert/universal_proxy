@@ -1,0 +1,12 @@
+milkdrop_renderer: warm-up Geiss - Chrome.milk: preload 116 ms (stages 2, cached 2), activate + frame 18 ms
+{"event":"preset","file":"Geiss - Chrome.milk","locked":true,"rung":"640x360","cause":"start","cut":true}
+milkdrop_renderer: prepared 1280x720@60 (CRTC at open: off)
+{"event":"prepared","mode":"1280x720@60","gl_renderer":"VC4 V3D 2.1","gl_version":"OpenGL ES 2.0 Mesa 26.1.8","gles2":true,"presets":50,"crtc_mode_valid":false}
+{"event":"stats","fps":41.4,"frame_ms":15.0,"frame_ms_max":18.2,"flip_ms":24.1,"frames":207,"late":0,"rung":"640x360","interval":2,"temp_c":54.8,"arm_mhz":600,"preset":"Geiss - Chrome.milk","pcm_ok":0,"pcm_silent":208,"warmups":1,"warmup_ms_max":133.6,"shader_stages":2,"cached_stages":2,"stderr_discarded":0}
+{"event":"stats","fps":41.0,"frame_ms":15.2,"frame_ms_max":20.7,"flip_ms":24.4,"frames":206,"late":0,"rung":"640x360","interval":2,"temp_c":55.3,"arm_mhz":600,"preset":"Geiss - Chrome.milk","pcm_ok":0,"pcm_silent":206,"warmups":0,"warmup_ms_max":0.0,"shader_stages":0,"cached_stages":0,"stderr_discarded":0}
+{"event":"stats","fps":41.0,"frame_ms":15.2,"frame_ms_max":18.7,"flip_ms":24.4,"frames":186,"late":0,"rung":"640x360","interval":2,"temp_c":55.3,"arm_mhz":600,"preset":"Geiss - Chrome.milk","pcm_ok":0,"pcm_silent":186,"warmups":0,"warmup_ms_max":0.0,"shader_stages":0,"cached_stages":0,"stderr_discarded":0}
+milkdrop_renderer: exiting: headless_done
+{"event":"exiting","reason":"headless_done"}
+
+EXIT_STATUS 0
+:ok

@@ -50,6 +50,11 @@ target_link_libraries(milkdrop_renderer_unit_tests PRIVATE milkdrop_core)
 target_include_directories(milkdrop_renderer_unit_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/../sendspin_player/src)
 
+# The manifest parser as a CLI, for the pack pipeline (tools/milkdrop_pack)
+# and its tests. Not part of the default build.
+add_executable(milkdrop_manifest_check EXCLUDE_FROM_ALL test/manifest_check.cpp)
+target_link_libraries(milkdrop_manifest_check PRIVATE milkdrop_core)
+
 if(MILKDROP_CORE_ONLY)
     return()
 endif()
