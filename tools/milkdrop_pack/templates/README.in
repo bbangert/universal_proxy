@@ -34,5 +34,6 @@ How it was built (tools/milkdrop_pack in universal_proxy @ @APP_COMMIT@):
   - brightness screen: each preset rendered @BRIGHT_FRAMES@ frames at @BRIGHT_SIZE@ with
     synthetic music on a host reference renderer; presets with more than
     @BRIGHT_EXCLUDE_PCT@% of the picture saturated (any channel >= 250) over frames
-    @BRIGHT_FROM@-@BRIGHT_FRAMES@ are left out as whiteouts;
+    @BRIGHT_FROM@-@BRIGHT_FRAMES@ and a mean luma of @BRIGHT_MIN_LUMA@ or more are left out as
+    whiteouts (saturated but darker colour was reviewed by eye instead);
   - rpi3 hints: @RPI3_SOURCE@.

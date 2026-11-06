@@ -264,9 +264,7 @@ def build(args):
 
         bright = brightness.screen(host, pack, sorted(staged), settings, os.path.join(work, "brightness-cache.jsonl"),
                                    jobs, tool_id, progress)
-        verdicts = {pid: brightness.classify(r, bright_cfg["exclude_sat_above"], bright_cfg["review_sat_above"],
-                                             bright_cfg.get("exclude_min_luma", 0.0))
-                    for pid, r in bright.items()}
+        verdicts = {pid: brightness.verdict(r, bright_cfg) for pid, r in bright.items()}
         load_failed = sorted(p for p, v in verdicts.items() if v == "load_failed")
         for pid in load_failed:
             report.exclude(pid, "load_failed", bright[pid].get("message", ""))
@@ -337,6 +335,7 @@ def build(args):
         "MAX_TEXTURE_PX": curation["max_texture_px"],
         "BRIGHT_FRAMES": bright_cfg["frames"], "BRIGHT_FROM": bright_cfg["from"], "BRIGHT_SIZE": bright_cfg["size"],
         "BRIGHT_EXCLUDE_PCT": int(round(bright_cfg["exclude_sat_above"] * 100)),
+        "BRIGHT_MIN_LUMA": bright_cfg["exclude_min_luma"],
         "RPI3_SOURCE": rpi3_source,
         "BANNED_TEXTURES": ", ".join(curation["banned_textures"]["names"]),
         "EXCLUSIONS": exclusion_text(report), "CONTACT": contact,

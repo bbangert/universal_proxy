@@ -3,7 +3,7 @@ import os
 import tempfile
 import unittest
 
-from milkpack import brightness
+from milkpack import brightness, sources
 
 FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
 
@@ -36,6 +36,17 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(self.verdict(dark), "exclude")
         self.assertEqual(brightness.classify(dark, 0.9, 0.5, exclude_min_luma=200), "review")
         self.assertEqual(brightness.classify(self.results["Waltra - Emitter.milk"], 0.9, 0.5, 200), "exclude")
+
+    def test_curation_excludes_only_true_whiteouts(self):
+        cfg = sources.load_json("curation.json")["brightness"]
+        self.assertEqual(cfg["exclude_min_luma"], 200)
+        for pid in ("Waltra - Emitter.milk", "$$$ Royal - Mashup (383).milk"):
+            self.assertEqual(brightness.verdict(self.results[pid], cfg), "exclude")
+        self.assertEqual(brightness.verdict({"sat": 0.95, "luma": 200.0}, cfg), "exclude")
+        self.assertEqual(brightness.verdict({"sat": 0.95, "luma": 199.0}, cfg), "review")
+        self.assertEqual(brightness.verdict({"sat": 0.966, "luma": 117.5}, cfg), "review")
+        self.assertEqual(brightness.verdict({"sat": 0.6, "luma": 250.0}, cfg), "review")
+        self.assertEqual(brightness.verdict(self.results["Geiss - Planar Travel.milk"], cfg), "ok")
 
     def test_unloadable_presets_are_flagged(self):
         self.assertEqual(self.verdict({"error": "load_failed", "message": "syntax error"}), "load_failed")

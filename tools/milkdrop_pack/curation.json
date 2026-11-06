@@ -14,12 +14,12 @@
   },
   "max_texture_px": 2048,
   "brightness": {
-    "_comment": "sat = mean fraction of pixels with a channel >= 250 over frames from..frames; luma = mean Rec.601 luma. sat > exclude_sat_above with luma >= exclude_min_luma is excluded (0 = sat alone decides; a saturated pure colour also counts), else listed for review above review_sat_above.",
+    "_comment": "sat = mean fraction of pixels with a channel >= 250 over frames from..frames; luma = mean Rec.601 luma. Only a true whiteout (sat > exclude_sat_above and luma >= exclude_min_luma) is excluded; saturated but darker colour, and anything with sat > review_sat_above, goes on the review list.",
     "frames": 600,
     "from": 150,
     "size": "640x360",
     "exclude_sat_above": 0.9,
-    "exclude_min_luma": 0,
+    "exclude_min_luma": 200,
     "review_sat_above": 0.5
   },
   "excluded_presets": {

@@ -35,6 +35,11 @@ def classify(result, exclude_above, review_above, exclude_min_luma=0.0):
     return "ok"
 
 
+def verdict(result, cfg):
+    """classify() with the thresholds of curation.json's "brightness"."""
+    return classify(result, cfg["exclude_sat_above"], cfg["review_sat_above"], cfg["exclude_min_luma"])
+
+
 def cache_key(preset_bytes, settings, tool_id):
     h = hashlib.sha256()
     h.update(json.dumps({"v": CACHE_VERSION, "settings": settings, "tool": tool_id}, sort_keys=True).encode())
