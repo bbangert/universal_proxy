@@ -14,11 +14,12 @@
 // luma is the mean Rec.601 luma (0..255) and sat the mean fraction of pixels
 // with any channel >= 250, both over frames --from..--frames. --png-at
 // writes <prefix>.<N>.png snapshots; --tsv the per-frame values.
-// Exits 0 on success, 2 on usage, 1 if GL or projectM can't start or the
-// preset doesn't load as written: it can't be loaded at all
-// ({"error":"load_failed"}) or a shader stage failed and projectM fell back
-// to its default shaders ({"error":"shader_failed"}), which would measure the
-// fallback instead of the preset. Both print one JSON line and draw nothing.
+// Exits 0 on success, 2 on usage, 1 if GL or projectM can't start, a
+// snapshot can't be written, or the preset doesn't load as written: it can't
+// be loaded at all ({"error":"load_failed"}) or a shader stage failed and
+// projectM fell back to its default shaders ({"error":"shader_failed"}),
+// which would measure the fallback instead of the preset. Both print one
+// JSON line and draw nothing.
 
 #include <projectM-4/projectM.h>
 
@@ -252,7 +253,7 @@ int main(int argc, char** argv) {
     std::vector<unsigned char> px(static_cast<size_t>(w) * h * 4), rgb;
     Music music;
     double t = 0, sum_r = 0, sum_g = 0, sum_b = 0, sum_sat = 0;
-    int counted = 0;
+    int counted = 0, png_errors = 0;
     const size_t np = static_cast<size_t>(w) * h;
     for (int f = 1; f <= frames; f++) {
         music.gen(t, rate, pcm);
@@ -293,7 +294,10 @@ int main(int argc, char** argv) {
                     for (int k = 0; k < 3; k++)
                         rgb[(static_cast<size_t>(h - 1 - y) * w + x) * 3 + k] = px[(static_cast<size_t>(y) * w + x) * 4 + k];
             const std::string name = png_prefix + "." + std::to_string(f) + ".png";
-            stbi_write_png(name.c_str(), w, h, 3, rgb.data(), w * 3);
+            if (stbi_write_png(name.c_str(), w, h, 3, rgb.data(), w * 3) == 0) {
+                std::fprintf(stderr, "can't write %s\n", name.c_str());
+                png_errors++;
+            }
         }
     }
     if (tf != nullptr) std::fclose(tf);
@@ -301,12 +305,12 @@ int main(int argc, char** argv) {
     const double mr = sum_r / counted, mg = sum_g / counted, mb = sum_b / counted;
     std::printf(
         "{\"frames\":%d,\"from\":%d,\"luma\":%.3f,\"sat\":%.5f,\"r\":%.3f,\"g\":%.3f,\"b\":%.3f,"
-        "\"load_status\":%d,\"load_message\":\"%s\",\"gl_error\":%u}\n",
+        "\"load_status\":%d,\"load_message\":\"%s\",\"gl_error\":%u,\"png_errors\":%d}\n",
         frames, from, 0.299 * mr + 0.587 * mg + 0.114 * mb, sum_sat / counted, mr, mg, mb, result.status,
-        json_escape(result.message.substr(0, 200)).c_str(), err);
+        json_escape(result.message.substr(0, 200)).c_str(), err, png_errors);
     projectm_destroy(pm);
     eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     eglDestroyContext(dpy, ctx);
     eglTerminate(dpy);
-    return 0;
+    return png_errors == 0 ? 0 : 1;
 }

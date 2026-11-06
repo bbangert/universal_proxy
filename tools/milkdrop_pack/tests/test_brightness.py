@@ -70,6 +70,11 @@ FAKE_BRIGHT = r'''#!/usr/bin/env python3
 import json, sys
 args = sys.argv[1:]
 spec = json.load(open(args[args.index("--preset") + 1]))
+if "--png-prefix" in args and spec.get("png", True):
+    prefix = args[args.index("--png-prefix") + 1]
+    for i, a in enumerate(args):
+        if a == "--png-at":
+            open(prefix + "." + args[i + 1] + ".png", "wb").write(b"png")
 if spec.get("print") is not None:
     print(json.dumps(spec["print"]))
 sys.exit(spec.get("exit", 0))
@@ -127,6 +132,35 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(results["shader.milk"]["error"], "shader_failed")
         with open(cache) as f:
             self.assertEqual(sorted(json.loads(line)["id"] for line in f), ["bad.milk", "good.milk"])
+
+
+class SnapshotsTest(unittest.TestCase):
+    setUp = RenderTest.setUp
+
+    def snapshots(self, specs, frames=(300, 600)):
+        pack = os.path.join(self.dir, "pack")
+        for pid, spec in specs.items():
+            write(os.path.join(pack, "presets", pid), json.dumps(spec))
+        out = os.path.join(self.dir, "review")
+        return out, brightness.snapshots(self.tools, pack, sorted(specs), self.settings, out, frames, 2)
+
+    def test_writes_every_frame(self):
+        out, failed = self.snapshots({"a.milk": {"print": GOOD}, "b.milk": {"print": GOOD}})
+        self.assertEqual(failed, [])
+        self.assertEqual(len(os.listdir(out)), 4)
+
+    def test_failed_renders_and_missing_pngs_are_reported(self):
+        _, failed = self.snapshots({"ok.milk": {"print": GOOD}, "crash.milk": {"exit": 3},
+                                    "nopng.milk": {"print": GOOD, "png": False},
+                                    "pngerr.milk": {"print": {**GOOD, "png_errors": 1}, "exit": 1}})
+        failed = dict(failed)
+        self.assertEqual(sorted(failed), ["crash.milk", "nopng.milk", "pngerr.milk"])
+        self.assertEqual((failed["crash.milk"], failed["pngerr.milk"]), ("exit 3", "exit 1"))
+        self.assertRegex(failed["nopng.milk"], r"\Amissing nopng-\w+\.300\.png, nopng-\w+\.600\.png\Z")
+
+    def test_frames_past_the_render_are_not_expected(self):
+        _, failed = self.snapshots({"a.milk": {"print": GOOD}}, frames=(300, 900))
+        self.assertEqual(failed, [])
 
 
 class SnapshotNameTest(unittest.TestCase):

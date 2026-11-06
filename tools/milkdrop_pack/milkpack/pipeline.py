@@ -301,8 +301,12 @@ def build(args):
         too_bright, load_failed, shader_failed = apply_screen(staged, bright, bright_cfg, report)
         if not args.no_snapshots:
             shutil.rmtree(os.path.join(out, "review"), ignore_errors=True)
-            brightness.snapshots(host, pack, too_bright + [e["file"] for e in report.review], settings,
-                                 os.path.join(out, "review"), jobs=jobs)
+            failed = brightness.snapshots(host, pack, too_bright + [e["file"] for e in report.review], settings,
+                                          os.path.join(out, "review"), jobs=jobs)
+            if failed:
+                listed = "; ".join(f"{p}: {why}" for p, why in failed[:10])
+                raise PipelineError(f"review snapshots: {len(failed)} preset(s) failed ({listed}); "
+                                    "rerun, or --no-snapshots")
         remove_presets(staged, too_bright + load_failed + shader_failed, pack)
         report.step("brightness", presets=len(staged), too_bright=len(too_bright), load_failed=len(load_failed),
                     shader_failed=len(shader_failed),

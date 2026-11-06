@@ -75,7 +75,8 @@ or build from your own checkout with `--projectm-src` / `--texture-pack`
    as it depends on the host's Mesa). A render that fails (timeout, crash,
    GL or EGL error) fails the build; a rerun renders only those again, since
    successes are cached (`--skip-brightness` skips the screen, for dev
-   builds only).
+   builds only). So does a review snapshot that fails or leaves a PNG
+   missing (`--no-snapshots` skips them).
 7. Hand exclusions from `curation.json` (after the screen, so the report
    shows whether the screen caught them), then a final translation pass
    over exactly the shipped presets.

@@ -192,16 +192,27 @@ def snapshot_name(pid):
 
 
 def snapshots(tools, pack_dir, ids, settings, out_dir, frames=(300, 600), jobs=4):
-    """PNG frames of the given presets, for review by eye."""
+    """PNG frames of the given presets, for review by eye. Returns
+    [(id, problem)] for every preset whose render failed or whose PNGs
+    are missing (empty if all were written)."""
     os.makedirs(out_dir, exist_ok=True)
     texture_dir = os.path.join(pack_dir, "textures")
-    extra_for = {}
-    for pid in ids:
-        prefix = os.path.join(out_dir, snapshot_name(pid))
-        extra = ["--png-prefix", prefix]
+    frames = [f for f in frames if f <= settings["frames"]]
+    pngs = {pid: [f"{os.path.join(out_dir, snapshot_name(pid))}.{f}.png" for f in frames] for pid in ids}
+
+    def one(pid):
+        extra = ["--png-prefix", os.path.join(out_dir, snapshot_name(pid))]
         for f in frames:
             extra += ["--png-at", str(f)]
-        extra_for[pid] = extra
+        return render(tools, os.path.join(pack_dir, "presets", pid), texture_dir, settings, extra)
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
-        list(pool.map(lambda pid: render(tools, os.path.join(pack_dir, "presets", pid), texture_dir,
-                                         settings, extra_for[pid]), ids))
+        results = dict(zip(ids, pool.map(one, ids)))
+    failed = []
+    for pid in ids:
+        missing = [p for p in pngs[pid] if not os.path.isfile(p) or os.path.getsize(p) == 0]
+        if not measured(results[pid]):
+            failed.append((pid, results[pid].get("error", "no result")))
+        elif missing:
+            failed.append((pid, "missing " + ", ".join(os.path.basename(p) for p in missing)))
+    return failed
