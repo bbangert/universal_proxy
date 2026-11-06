@@ -65,6 +65,17 @@ class DeviceSweepTest(unittest.TestCase):
         self.assertIn("2 done, 0 to run", out)
         self.assertEqual(len(self.calls()), 2)
 
+    def test_error_records_are_retried(self):
+        write(self.out, json.dumps({"file": "a.milk", "status": "error", "reason": "no_stats",
+                                    "pack_sha256": self.digest}) + "\n")
+        _, out = self.sweep()
+        self.assertIn("0 done, 2 to run", out)
+        self.assertEqual(sorted(c[-1] for c in self.calls()), ["a.milk", "high_frequency/b.milk"])
+        self.assertEqual({r["file"]: r["status"] for r in self.records()[1:]},
+                         {"a.milk": "ok", "high_frequency/b.milk": "skip"})
+        _, out = self.sweep()
+        self.assertIn("2 done, 0 to run", out)
+
     def test_ssh_verifies_host_keys_unless_told_not_to(self):
         def opts(**kw):
             return device_sweep.ssh_opts(argparse.Namespace(**{"known_hosts": None,

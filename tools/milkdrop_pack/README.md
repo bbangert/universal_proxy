@@ -137,8 +137,9 @@ sweep is measured afresh: the renderer refuses `--locked` on an rpi3
 touched. It waits for the SoC to cool below 70 °C between presets and
 appends one JSON line per preset to `--out` (fps, flip and CPU frame ms,
 the rung the cost guard settled on, skip reason, warm-up ms, temperature).
-Resumable: presets already recorded for this tarball's SHA-256 are not
-rerun. `--dry-run` prints the plan and the Elixir it would send;
+Resumable: presets with an `ok` or `skip` record for this tarball's
+SHA-256 are not rerun; `error` records (a timeout, a truncated reply) are
+retried. `--dry-run` prints the plan and the Elixir it would send;
 `--only ID` / `--limit N` sweep a subset. The device runs Elixir over
 nerves_ssh; the script never sends `System.halt`.
 

@@ -12,8 +12,9 @@ as audio. Each run's events become one JSON line in --out (fps, flip/CPU
 frame ms, the rung the cost guard settled on, skip reason, warm-up ms, ...),
 which build_pack.py --device-sweep turns into the manifest's rpi3 fields.
 
-Resumable: presets that already have a record for this tarball's SHA-256 in
---out are not run again, so an interrupted multi-hour sweep just continues.
+Resumable: presets that already have an "ok" or "skip" record for this
+tarball's SHA-256 in --out are not run again (errors are retried), so an
+interrupted multi-hour sweep just continues.
 Before each preset it waits for the SoC to cool below --cooldown-c, so the
 renderer's thermal guard doesn't skew late results.
 
@@ -160,6 +161,11 @@ def read_pack(tarball):
     return doc["version"], [p["file"] for p in doc["presets"]]
 
 
+# Verdicts that settle a preset; an "error" record (a timeout, a truncated
+# reply, a crash) is retried by the next run.
+DONE_STATUSES = ("ok", "skip")
+
+
 def done_ids(out_path, digest):
     done = set()
     if os.path.exists(out_path):
@@ -169,7 +175,8 @@ def done_ids(out_path, digest):
                     rec = json.loads(line)
                 except ValueError:
                     continue
-                if rec.get("pack_sha256") == digest:
+                if isinstance(rec, dict) and rec.get("pack_sha256") == digest \
+                        and rec.get("status") in DONE_STATUSES:
                     done.add(rec.get("file"))
     return done
 
