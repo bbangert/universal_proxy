@@ -11,6 +11,7 @@
 
 #include "pcm_tap.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <memory>
@@ -170,12 +171,16 @@ private:
                            h.capacity_frames == capacity_ && h.chunk_capacity == chunk_capacity_;
         if (reuse) {
             // Counters stay monotonic for readers that kept the mapping.
+            // A writer killed mid-commit leaves the reserved counters past
+            // the written ones, over samples it may have overwritten; they
+            // are what makes a reader discard those, so this continues
+            // from them and never lowers them.
             seq_ = atomic(h.seq).load(std::memory_order_relaxed) & ~1u;
             epoch_ = atomic(h.epoch).load(std::memory_order_relaxed);
-            frames_ = atomic(h.frames_written).load(std::memory_order_relaxed);
-            chunks_ = atomic(h.chunks_written).load(std::memory_order_relaxed);
-            atomic(h.frames_reserved).store(frames_, std::memory_order_relaxed);
-            atomic(h.chunks_reserved).store(chunks_, std::memory_order_relaxed);
+            frames_ = std::max(atomic(h.frames_reserved).load(std::memory_order_relaxed),
+                               atomic(h.frames_written).load(std::memory_order_relaxed));
+            chunks_ = std::max(atomic(h.chunks_reserved).load(std::memory_order_relaxed),
+                               atomic(h.chunks_written).load(std::memory_order_relaxed));
             end_stream();
             return;
         }

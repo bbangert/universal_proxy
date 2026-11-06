@@ -427,8 +427,13 @@ counters: if `seq` moved, or anything it copied is older than
 the read is discarded (`Status::Retry`). Readers use only records of the
 current epoch, so after a new epoch they see no data until it has some.
 `Reader::read_ending_at(t, n, ...)` returns the `n` frames ending at play
-time `t` (zero-filled before the epoch's first frame), or `NoData` when
-nothing of the current epoch covers `t`.
+time `t`, zero-filled before the epoch's first frame and before any gap in
+play times of over a chunk (an underrun; shorter gaps are taken as
+timestamp jitter). It returns `NoData` when no PCM of the current epoch
+plays at `t` (before the epoch, after the newest chunk, or over a chunk
+into a gap), or when the window reaches back past the oldest chunk record
+kept, whose history is then unknown (only with chunks shorter than
+`F / C` frames).
 
 Enabling maps the file on the main thread (with `MAP_POPULATE`) and
 publishes the writer to the playback thread through an atomic pointer.
@@ -436,7 +441,10 @@ Disabling swaps the pointer to null, then waits out a playback-thread
 use in flight (a `tap_busy_` flag the playback thread raises around each
 commit, a one-period memcpy), so the playback thread itself never waits.
 Re-enabling on a file of the same layout keeps its counters and starts a
-new epoch, so a reader that kept it mapped resyncs.
+new epoch, so a reader that kept it mapped resyncs. The reserved counters
+never decrease: a writer killed mid-commit leaves them past the written
+ones, over samples it may have overwritten, and the next writer continues
+from them.
 
 ## Cross-target compilation
 

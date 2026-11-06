@@ -19,6 +19,8 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <vector>
 
@@ -354,7 +356,7 @@ static void test_pcm_tap_wraparound() {
     Reader r;
     CHECK(r.open(path.c_str()));
     std::vector<int16_t> chunk;
-    std::vector<int16_t> out(200 * 2);
+    std::vector<int16_t> out(256 * 2);
     uint64_t f = 0;
     for (int i = 0; i < 40; i++) {
         // 100 frames per chunk, 100 us apart at 1 MHz: frame f plays at f.
@@ -459,6 +461,115 @@ static void test_pcm_tap_epochs() {
     fs::remove(path);
 }
 
+// Play times with a gap (an underrun) between chunks, and with jitter.
+static void test_pcm_tap_gaps() {
+    std::string path = tap_path("gaps");
+    std::string err;
+    auto w = pcm_tap::Writer::open(path, err, 1024, 64);
+    Reader r;
+    CHECK(w != nullptr && r.open(path.c_str()));
+    std::vector<int16_t> chunk;
+    std::vector<int16_t> out(300 * 2);
+    Reader::Info info;
+    // 1 MHz, 100-frame chunks: A (frames 0..99) ends at 99, B (100..199)
+    // at 1099, 900 us of silence after A.
+    fill_indexed(chunk, 0, 100);
+    w->commit(1, 1'000'000, chunk.data(), 100, 99);
+    fill_indexed(chunk, 100, 100);
+    w->commit(1, 1'000'000, chunk.data(), 100, 1099);
+    // Inside the gap: no PCM plays then.
+    CHECK(r.read_ending_at(500, 50, out.data()) == Status::NoData);
+    CHECK(r.read_ending_at(999, 50, out.data()) == Status::NoData);
+    // Within a chunk of A's end: jitter, so A's end.
+    CHECK(r.read_ending_at(150, 50, out.data(), &info) == Status::Ok);
+    CHECK(info.end_frame == 100 && is_frame(&out[0], 50) && is_frame(&out[49 * 2], 99));
+    // A window reaching back across the gap: silence before B.
+    CHECK(r.read_ending_at(1099, 150, out.data(), &info) == Status::Ok);
+    CHECK(info.end_frame == 200 && out[0] == 0 && out[49 * 2 + 1] == 0);
+    CHECK(is_frame(&out[50 * 2], 100) && is_frame(&out[149 * 2], 199));
+    // Jitter under a chunk: C (200..299) ends 30 us late, D (300..399)
+    // 20 us early. Still contiguous.
+    fill_indexed(chunk, 200, 100);
+    w->commit(1, 1'000'000, chunk.data(), 100, 1229);
+    fill_indexed(chunk, 300, 100);
+    w->commit(1, 1'000'000, chunk.data(), 100, 1309);
+    CHECK(r.read_ending_at(1115, 10, out.data(), &info) == Status::Ok);
+    CHECK(info.end_frame == 200 && is_frame(&out[9 * 2], 199));
+    CHECK(r.read_ending_at(1309, 300, out.data(), &info) == Status::Ok);
+    CHECK(info.end_frame == 400 && is_frame(&out[0], 100) && is_frame(&out[299 * 2], 399));
+    fs::remove(path);
+}
+
+// Chunk records wrap before the samples do: a window older than the
+// records kept has no known history.
+static void test_pcm_tap_record_history() {
+    std::string path = tap_path("history");
+    std::string err;
+    auto w = pcm_tap::Writer::open(path, err, 256, 8);
+    Reader r;
+    CHECK(w != nullptr && r.open(path.c_str()));
+    std::vector<int16_t> chunk;
+    for (uint64_t f = 0; f < 100; f++) {
+        fill_indexed(chunk, f, 1);
+        w->commit(1, 1'000'000, chunk.data(), 1, static_cast<int64_t>(f));
+    }
+    std::vector<int16_t> out(64 * 2);
+    Reader::Info info;
+    CHECK(r.read_latest(64, out.data()) == Status::NoData);
+    CHECK(r.read_latest(8, out.data(), &info) == Status::Ok);
+    CHECK(info.end_frame == 100 && is_frame(&out[0], 92) && is_frame(&out[7 * 2], 99));
+    CHECK(r.read_ending_at(97, 6, out.data()) == Status::Ok && is_frame(&out[0], 92));
+    CHECK(r.read_ending_at(97, 7, out.data()) == Status::NoData);
+    fs::remove(path);
+}
+
+// A writer killed mid-commit leaves samples overwritten past the written
+// counters. The next writer must not lower the reserved counters that
+// make readers discard them.
+static void test_pcm_tap_reopen_after_kill() {
+    std::string path = tap_path("kill");
+    std::string err;
+    auto w = pcm_tap::Writer::open(path, err, 256, 8);
+    Reader r;
+    CHECK(w != nullptr && r.open(path.c_str()));
+    std::vector<int16_t> chunk;
+    for (uint64_t f = 0; f < 256; f += 64) {
+        fill_indexed(chunk, f, 64);
+        w->commit(1, 1'000'000, chunk.data(), 64, static_cast<int64_t>(f + 63));
+    }
+
+    // The killed writer: reserved frames 256..319 and record 4, overwrote
+    // the slots of frames 0..63, published nothing.
+    const size_t bytes = pcm_tap::file_bytes(256, 8);
+    int fd = ::open(path.c_str(), O_RDWR);
+    void* base = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    ::close(fd);
+    CHECK(base != MAP_FAILED);
+    auto& h = *static_cast<pcm_tap::Header*>(base);
+    pcm_tap::atomic(h.frames_reserved).store(320);
+    pcm_tap::atomic(h.chunks_reserved).store(5);
+    auto* samples = reinterpret_cast<int16_t*>(static_cast<uint8_t*>(base) +
+                                               pcm_tap::samples_offset(8));
+    for (size_t i = 0; i < 64 * 2; i++) samples[i] = 0x5555;
+    w.reset();
+
+    std::vector<int16_t> out(64 * 2);
+    Reader::Info info;
+    CHECK(r.read_ending_at(63, 64, out.data()) == Status::Retry);
+    CHECK(r.read_ending_at(255, 64, out.data()) == Status::Ok && is_frame(&out[0], 192));
+
+    w = pcm_tap::Writer::open(path, err, 256, 8);
+    CHECK(w != nullptr);
+    CHECK(pcm_tap::atomic(h.frames_reserved).load() >= 320);
+    CHECK(pcm_tap::atomic(h.chunks_reserved).load() >= 5);
+    fill_indexed(chunk, 320, 64);
+    w->commit(2, 1'000'000, chunk.data(), 64, 10'063);
+    CHECK(r.read_latest(64, out.data(), &info) == Status::Ok);
+    CHECK(info.end_frame == 384 && is_frame(&out[0], 320) && is_frame(&out[63 * 2], 383));
+    ::munmap(base, bytes);
+    fs::remove(path);
+}
+
 // A writer laps a small ring as fast as it can while a reader checks that
 // every read it accepts is exactly the frames it asked for.
 static void test_pcm_tap_no_torn_reads() {
@@ -528,6 +639,9 @@ int main() {
     test_pcm_tap_wraparound();
     test_pcm_tap_time_lookup();
     test_pcm_tap_epochs();
+    test_pcm_tap_gaps();
+    test_pcm_tap_record_history();
+    test_pcm_tap_reopen_after_kill();
     test_pcm_tap_no_torn_reads();
     if (g_failures == 0) std::printf("OK\n");
     return g_failures == 0 ? 0 : 1;

@@ -18,10 +18,12 @@
 // Concurrency: one writer, any number of readers, no locks.
 //   * Before touching samples or a record the writer raises
 //     frames_reserved / chunks_reserved past what it is about to write;
-//     after, it publishes frames_written / chunks_written. A reader copies
-//     what the *_written counters cover, then re-reads the *_reserved ones:
-//     anything older than reserved - capacity may have been overwritten
-//     during the copy and the read is discarded (Status::Retry).
+//     after, it publishes frames_written / chunks_written. The reserved
+//     counters never decrease, not even when a new writer reopens the
+//     file. A reader copies what the *_written counters cover, then
+//     re-reads the *_reserved ones: anything older than reserved -
+//     capacity may have been overwritten during the copy and the read is
+//     discarded (Status::Retry).
 //   * epoch and sample_rate change under `seq` (odd while changing), a
 //     seqlock; a read that saw `seq` change is discarded too.
 //   * The epoch bumps on every stream start, format change, flush and tap
@@ -129,7 +131,7 @@ class Reader {
 public:
     enum class Status {
         Ok,      // `out` holds the requested frames
-        NoData,  // nothing covers that time in the current epoch (or no stream)
+        NoData,  // no PCM of the current epoch plays then (see read_ending_at)
         Retry,   // the writer overtook the copy; try again or treat as no data
     };
 
@@ -190,7 +192,11 @@ public:
 
     // Copies into `out` (frames * CHANNELS samples) the `frames` frames
     // whose last one plays at `t_end_us` (CLOCK_MONOTONIC_RAW). Frames
-    // before the current epoch's first are zero.
+    // before the current epoch's first, or before a gap in play times of
+    // over a chunk (an underrun), are zero. NoData when no PCM plays at
+    // `t_end_us` (before the epoch, after the newest chunk, or over a
+    // chunk into a gap), or when the window reaches back past the oldest
+    // chunk record kept (only with chunks under F / C frames).
     Status read_ending_at(int64_t t_end_us, uint32_t frames, int16_t* out,
                           Info* info = nullptr) const {
         return read(false, t_end_us, frames, out, info);
@@ -237,6 +243,13 @@ private:
         return r;
     }
 
+    // Whether `us` is longer than `frames` frames at `rate`.
+    static bool longer_than(int64_t us, uint64_t frames, uint32_t rate) {
+        if (us <= 0) return false;
+        if (us > INT64_C(100000000)) return true;
+        return static_cast<uint64_t>(us) * rate > frames * UINT64_C(1000000);
+    }
+
     Status read(bool latest, int64_t t_end_us, uint32_t frames, int16_t* out,
                 Info* info) const {
         if (base_ == nullptr || frames == 0 || frames > capacity_) return Status::NoData;
@@ -250,26 +263,49 @@ private:
         if (rate == 0 || written == 0) return Status::NoData;
         const uint64_t lo = written > chunk_capacity_ ? written - chunk_capacity_ : 0;
 
-        // Newest to oldest. `best` ends up the oldest record ending at or
-        // after the target time; `first` is the oldest frame of the
-        // epoch's records read so far.
+        // After the copies: false if the writer may have changed the format,
+        // or overwritten any record from `oldest` or (with `copied`) frame
+        // from `first`, meanwhile. Every verdict but the up-front ones goes
+        // through this, so none rests on a torn record.
+        uint64_t oldest = written - 1;
+        auto settled = [&](bool copied, uint64_t first) {
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (atomic(h.seq).load(std::memory_order_relaxed) != s1) return false;
+            if (atomic(h.chunks_reserved).load(std::memory_order_relaxed) >
+                oldest + chunk_capacity_)
+                return false;
+            return !copied ||
+                   atomic(h.frames_reserved).load(std::memory_order_relaxed) <= first + capacity_;
+        };
+        auto no_data = [&] { return settled(false, 0) ? Status::NoData : Status::Retry; };
+
+        // Copies record n - 1 into `r` when it is of this epoch. Otherwise
+        // false, with `bounded` set if the epoch (or the file's history)
+        // starts at record n, clear if the records before n are gone.
+        auto older = [&](uint64_t n, ChunkRecord& r, bool& bounded) {
+            if (n == lo) {
+                bounded = lo == 0;
+                return false;
+            }
+            if (n - 1 < oldest) oldest = n - 1;
+            r = record(n - 1);
+            bounded = r.epoch != epoch;
+            return !bounded;
+        };
+
+        // Newest to oldest: `best` (record n) ends up the oldest record
+        // ending at or after the target time, `prev` the one before it.
         uint64_t n = written - 1;
         ChunkRecord best = record(n);
-        if (best.epoch != epoch) return Status::NoData;
+        if (best.epoch != epoch) return no_data();
         if (latest) t_end_us = best.t_end_us;
-        if (best.t_end_us < t_end_us) return Status::NoData;  // not written yet
-        uint64_t first = best.start_frame;
-        bool has_older = false;
-        while (!latest && n > lo) {
-            ChunkRecord r = record(n - 1);
-            if (r.epoch != epoch) break;
+        if (best.t_end_us < t_end_us) return no_data();  // not written yet
+        ChunkRecord prev{};
+        bool bounded = false;
+        bool has_prev = false;
+        while (!latest && (has_prev = older(n, prev, bounded)) && prev.t_end_us >= t_end_us) {
+            best = prev;
             --n;
-            first = r.start_frame;
-            if (r.t_end_us < t_end_us) {
-                has_older = true;
-                break;
-            }
-            best = r;
         }
 
         // Frames from the target time to the end of `best`, bounded so a
@@ -280,36 +316,43 @@ private:
             (dt * static_cast<int64_t>(rate) + INT64_C(500000)) / INT64_C(1000000));
         uint64_t end = best.start_frame + best.frames;
         if (lag >= best.frames) {
-            // Before `best`'s first frame: in a gap after an older chunk,
-            // or before the epoch's first one.
-            if (!has_older) return Status::NoData;
+            // Before `best`'s first frame. Play times jitter by up to about
+            // a chunk, so up to a chunk after `prev`'s last frame is taken
+            // as `prev`'s end. Later is a gap (an underrun) no PCM covers,
+            // as is anything before the epoch's first chunk.
+            if (!has_prev || longer_than(t_end_us - prev.t_end_us, best.frames, rate))
+                return no_data();
             end = best.start_frame;
+            best = prev;
+            --n;
         } else {
             end -= lag;
         }
         const uint64_t start = end > frames ? end - frames : 0;
 
-        // Walk back until the window is covered or the epoch ends there.
-        while (first > start && n > lo) {
-            ChunkRecord r = record(n - 1);
-            if (r.epoch != epoch) break;
+        // Walk back until the window is covered, or stop where the epoch
+        // or a gap of over a chunk starts: frames before that are zero.
+        // A window reaching past the oldest record kept has no known
+        // history, so no data.
+        ChunkRecord low = best;
+        bounded = false;
+        while (low.start_frame > start && older(n, prev, bounded)) {
+            if (longer_than(low.t_end_us - prev.t_end_us, uint64_t{low.frames} * 2, rate)) {
+                bounded = true;
+                break;
+            }
+            low = prev;
             --n;
-            first = r.start_frame;
         }
+        if (low.start_frame > start && !bounded) return no_data();
+        uint64_t first = low.start_frame;
         if (first < start) first = start;
         if (first > end) first = end;
 
-        // Zero what precedes the epoch (or frame 0), copy the rest.
         const uint32_t zeros = frames - static_cast<uint32_t>(end - first);
         if (zeros > 0) std::memset(out, 0, size_t{zeros} * CHANNELS * sizeof(int16_t));
         copy_frames(first, frames - zeros, out + size_t{zeros} * CHANNELS);
-
-        std::atomic_thread_fence(std::memory_order_acquire);
-        if (atomic(h.seq).load(std::memory_order_relaxed) != s1) return Status::Retry;
-        if (atomic(h.chunks_reserved).load(std::memory_order_relaxed) > n + chunk_capacity_)
-            return Status::Retry;
-        if (atomic(h.frames_reserved).load(std::memory_order_relaxed) > first + capacity_)
-            return Status::Retry;
+        if (!settled(true, first)) return Status::Retry;
 
         if (info != nullptr) {
             info->epoch = epoch;
