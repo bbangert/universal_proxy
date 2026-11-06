@@ -22,7 +22,10 @@ defmodule UniversalProxy.MilkDrop.Pack do
   Every change (progress included, at most one per percent) is broadcast as
   `{:milkdrop_pack, status}` on `UniversalProxy.MilkDrop.pack_topic/0`.
   On start, an already-extracted `<root>/<version>/manifest.json` for the
-  pin reads as `{:ready, ...}` without touching the network.
+  pin reads as `{:ready, ...}` without touching the network, and the
+  starting status is broadcast as `{:milkdrop_pack_started, status}`: a
+  Pack restarted after a crash (whose download died with it) is announced
+  that way, so a subscriber caching `{:downloading, pct}` can drop it.
 
   ## Download
 
@@ -136,7 +139,18 @@ defmodule UniversalProxy.MilkDrop.Pack do
       task: nil
     }
 
-    {:ok, %{state | status: initial_status(state)}}
+    {:ok, %{state | status: initial_status(state)}, {:continue, :announce}}
+  end
+
+  @impl true
+  def handle_continue(:announce, state) do
+    Phoenix.PubSub.broadcast(
+      state.pubsub,
+      MilkDrop.pack_topic(),
+      {:milkdrop_pack_started, state.status}
+    )
+
+    {:noreply, state}
   end
 
   @impl true

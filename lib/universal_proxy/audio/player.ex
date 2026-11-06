@@ -136,11 +136,17 @@ defmodule UniversalProxy.Audio.Player do
   ## PCM tap
 
   Every binary is started with `--pcm-tap-path` (see `pcm_tap_path/1`).
-  `pcm_tap/2` makes it copy the PCM it plays, before software volume, into
+  `pcm_tap/3` makes it copy the PCM it plays, before software volume, into
   an mmap'd ring at that path for the visualizer renderer; the layout is
   `c_src/sendspin_player/src/pcm_tap.h`. Off at start, independent of the
   display roles. The binary's `pcm_tap` ack is the source of truth for
   `pcm_tap_status/1`.
+
+  The tap is leased to the process that turned it on: this process
+  monitors that owner and turns the tap off when it goes down (however it
+  dies, `:kill` included), so a visualizer that vanishes can't leave the
+  copy running. One lease at a time: an enable from another owner moves
+  the lease to it, and a disable from anyone but the holder is ignored.
 
   The binary also writes its Sendspin pairing token to `pairing_token`
   in the state dir (see `state_dir/1`); that secret never appears on
@@ -240,6 +246,7 @@ defmodule UniversalProxy.Audio.Player do
     mdns_failures: 0,
     volume_external: false,
     pcm_tap: false,
+    pcm_tap_lease: nil,
     startup: [:volume],
     last_event: %{},
     os_pid: nil,
@@ -275,6 +282,7 @@ defmodule UniversalProxy.Audio.Player do
           mdns_failures: non_neg_integer(),
           volume_external: boolean(),
           pcm_tap: boolean(),
+          pcm_tap_lease: {pid(), reference()} | nil,
           startup: [:volume | :muted],
           last_event: map(),
           os_pid: pos_integer() | nil,
@@ -371,16 +379,20 @@ defmodule UniversalProxy.Audio.Player do
   end
 
   @doc """
-  Turn the PCM tap on or off (off at start). On, the binary maps the ring
-  file at its `--pcm-tap-path` and copies the PCM it plays into it,
-  before software volume; off, it stops and unmaps it (the file stays).
-  Works with or without display roles. Acked with a `pcm_tap` event on
-  `"sendspin:state"`; a failed enable acks `value: false, ok: false`.
-  `:ok` even when the binary is exiting, like `set_volume/2`.
+  Turn the PCM tap on or off for `owner` (off at start). On, the binary
+  maps the ring file at its `--pcm-tap-path` and copies the PCM it plays
+  into it, before software volume; off, it stops and unmaps it (the file
+  stays). Works with or without display roles. Acked with a `pcm_tap`
+  event on `"sendspin:state"`; a failed enable acks `value: false, ok:
+  false`. `:ok` even when the binary is exiting, like `set_volume/2`.
+
+  On leases the tap to `owner` (replacing another owner's lease): when
+  `owner` goes down the tap is turned off. Off from `owner` (or with no
+  lease) ends the lease; off from another process is ignored (`:ok`).
   """
-  @spec pcm_tap(GenServer.server(), boolean()) :: :ok
-  def pcm_tap(server, enabled?) when is_boolean(enabled?) do
-    GenServer.call(server, {:pcm_tap, enabled?})
+  @spec pcm_tap(GenServer.server(), boolean(), pid()) :: :ok
+  def pcm_tap(server, enabled?, owner) when is_boolean(enabled?) and is_pid(owner) do
+    GenServer.call(server, {:pcm_tap, enabled?, owner})
   end
 
   @doc """
@@ -540,8 +552,24 @@ defmodule UniversalProxy.Audio.Player do
     {:reply, {state.display_seq, state.display}, state}
   end
 
-  def handle_call({:pcm_tap, enabled?}, _from, state) do
-    send_command(state, {:pcm_tap, enabled?})
+  def handle_call({:pcm_tap, true, owner}, _from, state) do
+    state = release_pcm_tap_lease(state)
+    send_command(state, {:pcm_tap, true})
+    {:reply, :ok, %{state | pcm_tap_lease: {owner, Process.monitor(owner)}}}
+  end
+
+  def handle_call({:pcm_tap, false, owner}, _from, %{pcm_tap_lease: {holder, _ref}} = state)
+      when holder != owner do
+    Logger.debug(
+      "Audio.Player #{inspect(state.key)} ignored a PCM tap off from #{inspect(owner)} (leased to #{inspect(holder)})"
+    )
+
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:pcm_tap, false, _owner}, _from, state) do
+    state = release_pcm_tap_lease(state)
+    send_command(state, {:pcm_tap, false})
     {:reply, :ok, state}
   end
 
@@ -674,6 +702,15 @@ defmodule UniversalProxy.Audio.Player do
   end
 
   def handle_info(:mdns_watchdog, state), do: {:noreply, state}
+
+  def handle_info({:DOWN, ref, :process, owner, reason}, %{pcm_tap_lease: {owner, ref}} = state) do
+    Logger.info(
+      "Audio.Player #{inspect(state.key)} PCM tap owner #{inspect(owner)} went down (#{inspect(reason)}); turning the tap off"
+    )
+
+    send_command(state, {:pcm_tap, false})
+    {:noreply, %{state | pcm_tap_lease: nil}}
+  end
 
   def handle_info(_msg, state), do: {:noreply, state}
 
@@ -809,6 +846,13 @@ defmodule UniversalProxy.Audio.Player do
   end
 
   defp track_pcm_tap(state, _event), do: state
+
+  defp release_pcm_tap_lease(%{pcm_tap_lease: {_owner, ref}} = state) do
+    Process.demonitor(ref, [:flush])
+    %{state | pcm_tap_lease: nil}
+  end
+
+  defp release_pcm_tap_lease(state), do: state
 
   defp tag_startup(state, %{event: "volume"} = event), do: tag_startup(state, event, :volume)
   defp tag_startup(state, %{event: "mute"} = event), do: tag_startup(state, event, :muted)

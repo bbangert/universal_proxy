@@ -15,7 +15,8 @@ defmodule UniversalProxy.Display.SupervisorTest do
     [
       name: :"#{base}.Supervisor",
       state_name: :"#{base}.State",
-      viewport_supervisor: :"#{base}.ViewportSupervisor"
+      viewport_supervisor: :"#{base}.ViewportSupervisor",
+      milkdrop_task_supervisor: :"#{base}.MilkDropTaskSupervisor"
     ]
   end
 
@@ -41,6 +42,7 @@ defmodule UniversalProxy.Display.SupervisorTest do
              GenServer.call(names[:state_name], :status)
 
     assert DynamicSupervisor.count_children(names[:viewport_supervisor]).active == 0
+    assert is_pid(Process.whereis(names[:milkdrop_task_supervisor]))
   end
 
   test "a State crash also takes the viewport down (:one_for_all)", context do

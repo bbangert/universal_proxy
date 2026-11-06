@@ -2,7 +2,10 @@ defmodule UniversalProxy.Display.FakeRenderer do
   @moduledoc """
   A `UniversalProxy.Display.Renderer` for tests: each viewport is an `Agent`
   under the given supervisor, and every call is reported to the `:test_pid`
-  start option as `{:fake_renderer, call, ...}`.
+  start option as `{:fake_renderer, call, ...}`. An `:on_start` start
+  option (a 0-arity fun) runs in the caller before the viewport starts;
+  a `:start_error` one (a 0-arity fun) returning `{:error, reason}` makes
+  that start fail.
   """
 
   @behaviour UniversalProxy.Display.Renderer
@@ -14,9 +17,16 @@ defmodule UniversalProxy.Display.FakeRenderer do
   def start(supervisor, opts) do
     test_pid = Keyword.fetch!(opts, :test_pid)
     send(test_pid, {:fake_renderer, :start, opts})
+    if on_start = opts[:on_start], do: on_start.()
 
-    child = Supervisor.child_spec({Agent, fn -> test_pid end}, restart: :temporary)
-    DynamicSupervisor.start_child(supervisor, child)
+    case opts[:start_error] && opts[:start_error].() do
+      {:error, _reason} = error ->
+        error
+
+      _ok ->
+        child = Supervisor.child_spec({Agent, fn -> test_pid end}, restart: :temporary)
+        DynamicSupervisor.start_child(supervisor, child)
+    end
   end
 
   @impl true

@@ -22,6 +22,7 @@ set(MILKDROP_CORE_SOURCES
     src/json.cpp
     src/manifest.cpp
     src/options.cpp
+    src/output_select.cpp
     src/pcm_feed.cpp
     src/preset_manager.cpp
     src/preset_selection.cpp
@@ -56,13 +57,14 @@ endif()
 # --- projectM -----------------------------------------------------------
 #
 # Our fork (bbangert/projectm) adds the GLES 2.0 backend, the GLSL ES 1.00
-# translator, the pre-translated shader cache, preset preloading and
-# per-preset load results; the renderer needs all of them. Pinned by commit
+# translator, the pre-translated shader cache, preset preloading,
+# per-preset load results and failed preset switches reported instead of
+# thrown; the renderer needs all of them. Pinned by commit
 # SHA (tags are mutable server-side); FORCE so a pin bump always wins over
 # a stale CMakeCache.txt. For scratch
 # builds against a local checkout set MILKDROP_PROJECTM_SOURCE_DIR (the mix
 # compiler forwards it as FETCHCONTENT_SOURCE_DIR_PROJECTM).
-set(PROJECTM_REF "0c14457017ec861279f4ede2b24b7411a79e5209" # es2/1d-cache
+set(PROJECTM_REF "202160a7d85b52daf9cb1767803d5e3cc2a56dce" # es2/1d-cache
     CACHE STRING "projectM fork commit SHA to pin" FORCE)
 
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)

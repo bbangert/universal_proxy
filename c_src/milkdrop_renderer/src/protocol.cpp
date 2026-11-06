@@ -78,14 +78,14 @@ std::optional<Command> parse_command(std::string_view line, std::string& error) 
 
 std::string event_simple(std::string_view name) { return open(name) + "}"; }
 
-std::string event_prepared(std::string_view mode, std::string_view gl_renderer,
-                           std::string_view gl_version, bool gles2, int presets,
-                           bool crtc_mode_valid, std::string_view crtc_mode) {
-    std::string out = open("prepared") + str_field("mode", mode, 32) +
-                      str_field("gl_renderer", gl_renderer, 128) + str_field("gl_version", gl_version, 128) +
-                      bool_field("gles2", gles2) + int_field("presets", presets) +
-                      bool_field("crtc_mode_valid", crtc_mode_valid);
-    if (crtc_mode_valid) out += str_field("crtc_mode", crtc_mode, 32);
+std::string event_prepared(const PreparedInfo& info) {
+    std::string out = open("prepared") + str_field("mode", info.mode, 32);
+    if (!info.connector.empty()) out += str_field("connector", info.connector, 32);
+    if (!info.mode_source.empty()) out += str_field("mode_source", info.mode_source, 16);
+    out += str_field("gl_renderer", info.gl_renderer, 128) + str_field("gl_version", info.gl_version, 128) +
+           bool_field("gles2", info.gles2) + int_field("presets", info.presets) +
+           bool_field("crtc_mode_valid", info.crtc_mode_valid);
+    if (info.crtc_mode_valid) out += str_field("crtc_mode", info.crtc_mode, 32);
     return out + "}";
 }
 

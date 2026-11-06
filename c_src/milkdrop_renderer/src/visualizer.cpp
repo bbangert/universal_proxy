@@ -114,7 +114,12 @@ Visualizer::LoadResult Visualizer::preload(const std::string& path) {
     return r;
 }
 
-bool Visualizer::activate(bool smooth) { return projectm_activate_preloaded_preset(pm_, smooth); }
+bool Visualizer::activate(bool smooth, std::string& message) {
+    load_reported_ = false;
+    const bool activated = projectm_activate_preloaded_preset(pm_, smooth);
+    message = !activated && load_reported_ ? last_load_.message : std::string();
+    return activated;
+}
 
 void Visualizer::discard() { projectm_discard_preloaded_preset(pm_); }
 

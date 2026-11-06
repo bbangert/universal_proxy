@@ -10,6 +10,8 @@
 #include "preset_manager.h"
 
 #include <functional>
+#include <string>
+#include <string_view>
 
 namespace md {
 
@@ -26,5 +28,16 @@ enum class Selection {
 // candidate is presets.skip()ped before the next is drawn.
 Selection select_preset(PresetManager& presets, const PresetEntry* first, int batch,
                         const std::function<Attempt(const PresetEntry&)>& attempt);
+
+// A failed projectm_activate_preloaded_preset(): the projectM fork has
+// discarded the preloaded preset and kept the playing one (and any running
+// blend), so the candidate fails like a failed preload: skipped as
+// load_failed, with the message the load-result callback reported, else
+// the last error-level log.
+struct SkipCause {
+    std::string reason;
+    std::string message;
+};
+SkipCause activation_failure(std::string_view reported, std::string_view last_error);
 
 }  // namespace md

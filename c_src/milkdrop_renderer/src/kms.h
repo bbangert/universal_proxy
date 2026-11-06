@@ -7,6 +7,7 @@
 #pragma once
 
 #include "options.h"
+#include "output_select.h"
 
 #include <cstdint>
 #include <string>
@@ -24,19 +25,22 @@ public:
     Kms(const Kms&) = delete;
     Kms& operator=(const Kms&) = delete;
 
-    // Opens the card, picks the connected HDMI connector and its CRTC, and
-    // records the mode the CRTC scans out now (Emerge's, while it runs).
-    // The mode is that one when it fits `mode` (same size, non-interlaced,
-    // within 0.5 Hz), else the closest offered mode that does. Creates the
+    // Opens the card, picks `connector` (or, empty, the first connected
+    // HDMI one) and its CRTC, and records the mode the CRTC scans out now
+    // (Emerge's, while it runs). The mode is chosen by choose_mode
+    // (output_select.h), so the CRTC's is kept when it fits. Creates the
     // GBM device and a scanout surface of that size.
-    bool open(const std::string& card, const DisplayMode& mode, std::string& err);
+    bool open(const std::string& card, const std::string& connector, const DisplayMode& mode,
+              std::string& err);
     // Off-screen: a rendering-only GBM surface of `mode`'s size on `card`
     // (a render node is enough). No connector, CRTC or master.
     bool open_headless(const std::string& card, const DisplayMode& mode, std::string& err);
     // A check mode: open_headless plus a simulated display. take() and
     // drop_master() only flip a flag, framebuffers are dummies, and a flip
-    // "lands" at the next vblank of `mode`'s refresh through a timer fd.
-    bool open_simulated(const std::string& card, const DisplayMode& mode, std::string& err);
+    // "lands" at the next vblank of `mode`'s refresh (60 Hz without one)
+    // through a timer fd. `connector` is only reported back.
+    bool open_simulated(const std::string& card, const std::string& connector, const DisplayMode& mode,
+                        std::string& err);
 
     int fd() const { return fd_; }
     // The fd that becomes readable when a flip completes (non-blocking).
@@ -49,6 +53,11 @@ public:
     double refresh_hz() const;
     // "WxH@Hz" of the chosen mode.
     std::string mode_str() const;
+    // Where the chosen mode came from: mode_source_name(), "" when no
+    // display was asked (headless, simulated).
+    std::string mode_source_name() const { return has_mode_source_ ? md::mode_source_name(mode_source_) : ""; }
+    // The connector presented on ("" without one: headless, simulated).
+    const std::string& connector_name() const { return connector_name_; }
     // The CRTC's mode when the card was opened ("" when it had none).
     bool crtc_mode_valid() const { return crtc_mode_valid_; }
     std::string crtc_mode_str() const;
@@ -98,6 +107,9 @@ private:
     gbm_device* gbm_ = nullptr;
     gbm_surface* surface_ = nullptr;
     uint32_t connector_id_ = 0;
+    std::string connector_name_;
+    ModeSource mode_source_ = ModeSource::Crtc;
+    bool has_mode_source_ = false;
     uint32_t crtc_id_ = 0;
     drmModeModeInfo mode_{};
     drmModeModeInfo crtc_mode_{};

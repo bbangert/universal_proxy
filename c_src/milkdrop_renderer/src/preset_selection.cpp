@@ -18,4 +18,8 @@ Selection select_preset(PresetManager& presets, const PresetEntry* first, int ba
     return presets.eligible_count() == 0 ? Selection::Exhausted : Selection::Deferred;
 }
 
+SkipCause activation_failure(std::string_view reported, std::string_view last_error) {
+    return {"load_failed", std::string(reported.empty() ? last_error : reported)};
+}
+
 }  // namespace md
