@@ -207,6 +207,49 @@ defmodule UniversalProxyWeb.MilkDropComponentTest do
       assert view |> element("#milkdrop-ensure") |> render() =~ "Retry"
     end
 
+    test "an ensure answer from before a Pack restart doesn't overwrite its status",
+         %{conn: conn} do
+      test_pid = self()
+
+      fake =
+        spawn_link(fn ->
+          fake_pack = fn fake_pack ->
+            receive do
+              {:"$gen_call", from, :ensure} ->
+                send(test_pid, {:ensure_called, from})
+                fake_pack.(fake_pack)
+
+              {:"$gen_call", from, :status} ->
+                GenServer.reply(from, :absent)
+                fake_pack.(fake_pack)
+            end
+          end
+
+          fake_pack.(fake_pack)
+        end)
+
+      Process.register(fake, Pack)
+
+      {:ok, view, _html} = live(conn, "/audio")
+      view |> element("#milkdrop-ensure") |> render_click()
+      assert_receive {:ensure_called, from}, 2_000
+
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        MilkDrop.pack_topic(),
+        {:milkdrop_pack_started, {:ready, "2026.12.0", "/x"}}
+      )
+
+      wait_until(fn -> render(view) =~ "Version 2026.12.0" end)
+
+      GenServer.reply(from, {:error, :not_running})
+      render_async(view)
+
+      html = render(view)
+      assert html =~ "Version 2026.12.0"
+      refute html =~ "The visualizer service isn&#39;t running."
+    end
+
     test "a stopped Pack reads as not running", %{conn: conn} do
       {:ok, view, _html} = live(conn, "/audio")
       assert render(view) =~ "The visualizer service isn&#39;t running."
@@ -325,6 +368,7 @@ defmodule UniversalProxyWeb.MilkDropComponentTest do
       assert html =~ "Too slow for this device"
       assert html =~ "b/bright.milk"
       assert html =~ "Too bright"
+      assert html =~ "Cleared presets return from the next visualizer session."
 
       view |> element("#milkdrop-clear-skipped") |> render_click()
 

@@ -760,6 +760,7 @@ defmodule UniversalProxy.Display.State do
       preset: nil,
       locked: false,
       stats: nil,
+      sent: %{},
       reaped: false,
       ending: nil,
       ended_in: nil
@@ -944,30 +945,47 @@ defmodule UniversalProxy.Display.State do
 
   defp milkdrop_cmd(state, _cmd), do: state
 
-  # Both are idempotent in the renderer, so every broadcast (a lock the
-  # renderer persisted included) just sends the current values.
-  defp milkdrop_settings(%{md: %{phase: phase, pid: pid}} = state, settings)
+  # Only values that differ from the last one sent go out: a rotation-only
+  # change, or a lock the renderer persisted, must not re-deal the
+  # shuffle bag with a redundant `set_high_frequency`.
+  defp milkdrop_settings(%{md: %{phase: phase, pid: pid, sent: sent} = md} = state, settings)
        when phase in [:preparing, :taking, :presenting] and is_pid(pid) do
-    case settings do
-      %{rotate_s: rotate_s} when is_integer(rotate_s) and rotate_s > 0 ->
-        Display.MilkDrop.set_rotate(pid, rotate_s)
+    sent =
+      sent
+      |> send_setting(
+        :rotate_s,
+        settings,
+        &valid_rotate?/1,
+        &Display.MilkDrop.set_rotate(pid, &1)
+      )
+      |> send_setting(
+        :include_high_frequency,
+        settings,
+        &is_boolean/1,
+        &Display.MilkDrop.set_high_frequency(pid, &1)
+      )
 
-      _other ->
-        :ok
-    end
-
-    case settings do
-      %{include_high_frequency: hf} when is_boolean(hf) ->
-        Display.MilkDrop.set_high_frequency(pid, hf)
-
-      _other ->
-        :ok
-    end
-
-    state
+    %{state | md: %{md | sent: sent}}
   end
 
   defp milkdrop_settings(state, _settings), do: state
+
+  defp valid_rotate?(seconds), do: is_integer(seconds) and seconds > 0
+
+  defp send_setting(sent, key, settings, valid?, send_fun) do
+    case settings do
+      %{^key => value} ->
+        if valid?.(value) and Map.get(sent, key) != value do
+          send_fun.(value)
+          Map.put(sent, key, value)
+        else
+          sent
+        end
+
+      _other ->
+        sent
+    end
+  end
 
   defp exit_recovered(
          %{md: %{phase: :recovering, pid: pid}, model: %{viewport: %{status: :running}}} = state

@@ -132,6 +132,7 @@ bool PresetManager::skip(const std::string& file) {
 }
 
 bool PresetManager::set_high_frequency(bool include) {
+    if (include == config_.high_frequency) return high_frequency_on_screen();
     config_.high_frequency = include;
     bag_.clear();  // re-deal with the new filter
     return high_frequency_on_screen();

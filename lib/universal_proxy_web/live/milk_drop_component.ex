@@ -12,7 +12,8 @@ defmodule UniversalProxyWeb.MilkDropComponent do
       LiveView; the button is disabled while that call runs. Status changes
       arrive over PubSub, which is authoritative: the call's own answer is
       only applied when it is a failure or `:ready` (a `{:downloading, _}`
-      answer could overtake later progress broadcasts).
+      answer could overtake later progress broadcasts). Answers made of a
+      Pack that has since restarted are dropped.
     * **Rotation interval** — 10..120 s (`rotate_s`); anything else is
       refused inline without a write.
     * **Include fast-flashing presets** (`include_high_frequency`, off by
@@ -21,7 +22,8 @@ defmodule UniversalProxyWeb.MilkDropComponent do
       off writes straight away.
     * **Skipped presets** — the presets the renderer could not draw with
       the ready pack's version, with their reasons, in a disclosure;
-      "Clear" calls `Store.clear_skipped/0`.
+      "Clear" calls `Store.clear_skipped/0`; a running renderer keeps its
+      own skip set, so cleared presets return from the next session.
 
   A write the Store refuses (`{:error, reason}`, e.g. its DETS table is
   unavailable) shows an inline error until the next successful write.
@@ -58,6 +60,7 @@ defmodule UniversalProxyWeb.MilkDropComponent do
      |> assign(:pack, pack)
      |> assign(:skipped, read_skipped(pack))
      |> assign(:ensuring, false)
+     |> assign(:pack_gen, 0)
      |> assign(:confirm_hf, false)
      |> assign(:skipped_open, false)
      |> assign(:error, nil)}
@@ -79,8 +82,16 @@ defmodule UniversalProxyWeb.MilkDropComponent do
     end
   end
 
-  defp apply_event(socket, {kind, status}) when kind in [:milkdrop_pack, :milkdrop_pack_started],
-    do: put_pack(socket, status)
+  # A restarted Pack outdates every `ensure/0` call made of the previous
+  # one (see `handle_async/3`), so nothing is being waited on any more.
+  defp apply_event(socket, {:milkdrop_pack_started, status}) do
+    socket
+    |> update(:pack_gen, &(&1 + 1))
+    |> assign(:ensuring, false)
+    |> put_pack(status)
+  end
+
+  defp apply_event(socket, {:milkdrop_pack, status}), do: put_pack(socket, status)
 
   defp apply_event(socket, _event), do: socket
 
@@ -108,7 +119,7 @@ defmodule UniversalProxyWeb.MilkDropComponent do
     {:noreply,
      socket
      |> assign(:ensuring, true)
-     |> start_async(:ensure_pack, fn -> Pack.ensure() end)}
+     |> start_async({:ensure_pack, socket.assigns.pack_gen}, fn -> Pack.ensure() end)}
   end
 
   def handle_event("set_rotate", params, socket) do
@@ -158,23 +169,21 @@ defmodule UniversalProxyWeb.MilkDropComponent do
     end
   end
 
+  # Results of an `ensure/0` made before the Pack last restarted are
+  # dropped: they could overwrite the replacement's newer status.
   @impl true
-  def handle_async(:ensure_pack, {:ok, status}, socket) do
+  def handle_async({:ensure_pack, gen}, result, %{assigns: %{pack_gen: gen}} = socket) do
     socket = assign(socket, :ensuring, false)
 
-    case status do
-      {:error, _} -> {:noreply, assign(socket, :pack, status)}
-      {:ready, _, _} -> {:noreply, put_pack(socket, status)}
-      _ -> {:noreply, socket}
+    case result do
+      {:ok, {:error, _} = status} -> {:noreply, assign(socket, :pack, status)}
+      {:ok, {:ready, _, _} = status} -> {:noreply, put_pack(socket, status)}
+      {:ok, _downloading} -> {:noreply, socket}
+      {:exit, reason} -> {:noreply, assign(socket, :pack, {:error, {:crashed, reason}})}
     end
   end
 
-  def handle_async(:ensure_pack, {:exit, reason}, socket) do
-    {:noreply,
-     socket
-     |> assign(:ensuring, false)
-     |> assign(:pack, {:error, {:crashed, reason}})}
-  end
+  def handle_async({:ensure_pack, _stale_gen}, _result, socket), do: {:noreply, socket}
 
   defp write(socket, params) do
     case Store.update(params) do
@@ -361,7 +370,7 @@ defmodule UniversalProxyWeb.MilkDropComponent do
               <span class="text-fg-3" title={reason}>{reason_label(reason)}</span>
             <% end %>
             <span class="col-span-2 text-fg-4 mt-1">
-              Skipped presets are left out of the rotation until cleared. A new pack version clears them.
+              Skipped presets are left out of the rotation. Cleared presets return from the next visualizer session. A new pack version clears the list.
             </span>
           </div>
         </div>

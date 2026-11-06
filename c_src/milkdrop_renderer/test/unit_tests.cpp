@@ -427,6 +427,25 @@ static void test_rotation() {
     CHECK(pm2.start("")->file == seen[0] && pm2.rotate()->file == seen[1]);
 }
 
+// Re-sending the filter's current value must not re-deal the shuffle bag.
+static void test_high_frequency_keeps_bag() {
+    PresetManager::Config cfg;
+    cfg.seed = 42;
+    PresetManager pm(entries(10), {}, cfg);
+    std::set<std::string> seen;
+    seen.insert(pm.start("")->file);
+    for (int i = 0; i < 4; i++) seen.insert(pm.rotate()->file);
+    CHECK(seen.size() == 5);
+    CHECK(!pm.set_high_frequency(false));  // unchanged
+    for (int i = 0; i < 5; i++) seen.insert(pm.rotate()->file);
+    CHECK(seen.size() == 10);  // the rest of the round: no repeats
+
+    // A real change still re-deals, and reports a cut when needed.
+    CHECK(!pm.set_high_frequency(true));
+    CHECK(!pm.set_high_frequency(true));
+    CHECK(pm.high_frequency());
+}
+
 static void test_history() {
     PresetManager::Config cfg;
     cfg.seed = 7;
@@ -1276,6 +1295,7 @@ int main() {
     test_protocol();
     test_manifest();
     test_rotation();
+    test_high_frequency_keeps_bag();
     test_history();
     test_filters_and_lock();
     test_high_frequency_safety();
