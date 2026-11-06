@@ -118,22 +118,24 @@ defmodule UniversalProxy.Audio do
   end
 
   @doc """
-  Turn an output player's PCM tap on or off (see
-  `UniversalProxy.Audio.Player.pcm_tap/2`); the binary acks with a
+  Turn an output player's PCM tap on or off for `owner` (see
+  `UniversalProxy.Audio.Player.pcm_tap/3`); the binary acks with a
   `pcm_tap` event on `"sendspin:state"`. Any output's player has one.
+  The tap is leased to `owner`: the player turns it off when `owner` goes
+  down, and ignores an off from anyone but the lease holder.
   `{:error, :not_found}` when the output has no running player,
   `{:error, :unavailable}` while the audio subsystem or the player is down
   or wedged (the `catch :exit` idiom: a timeout reads the same).
   """
-  @spec pcm_tap(key(), boolean()) :: :ok | {:error, :not_found | :unavailable}
-  def pcm_tap({_, _, _} = key, enabled?) when is_boolean(enabled?) do
-    with_player(key, &Player.pcm_tap(&1, enabled?))
+  @spec pcm_tap(key(), boolean(), pid()) :: :ok | {:error, :not_found | :unavailable}
+  def pcm_tap({_, _, _} = key, enabled?, owner) when is_boolean(enabled?) and is_pid(owner) do
+    with_player(key, &Player.pcm_tap(&1, enabled?, owner))
   end
 
   @doc """
   An output player's PCM tap ring path and whether it is on (see
   `UniversalProxy.Audio.Player.pcm_tap_status/1`). Same errors as
-  `pcm_tap/2`.
+  `pcm_tap/3`.
   """
   @spec pcm_tap_status(key()) ::
           {:ok, Player.pcm_tap_status()} | {:error, :not_found | :unavailable}

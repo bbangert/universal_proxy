@@ -69,8 +69,9 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
       end,
       viz_enable: fn _key, _on? -> :ok end,
       update_config: fn key, params -> send(test, {:audio, :update_config, key, params}) end,
-      pcm_tap: fn key, on? ->
+      pcm_tap: fn key, on?, owner ->
         send(test, {:audio, :pcm_tap, key, on?})
+        send(test, {:audio, :pcm_tap_owner, owner})
         :ok
       end,
       pcm_tap_status: fn _key -> {:ok, %{path: @ring, enabled: true}} end
@@ -292,6 +293,12 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
         ] do
       assert [^value | _] = argv |> Enum.drop_while(&(&1 != flag)) |> tl()
     end
+  end
+
+  test "the PCM tap is leased to State", ctx do
+    ctx = ctx |> start_ui() |> presenting()
+    state = ctx.state
+    assert_received {:audio, :pcm_tap_owner, ^state}
   end
 
   test "Up/Down leave the mode and hand the display back", ctx do

@@ -55,9 +55,10 @@ defmodule UniversalProxy.Display.State do
   handover with the renderer's port owner, `UniversalProxy.Display.MilkDrop`
   (started unlinked and monitored):
 
-    1. `:tapping` — the bound player's PCM tap is turned on and its ring
-       path read (`UniversalProxy.Audio.pcm_tap/2`, `pcm_tap_status/1`), as
-       an audio job like the others;
+    1. `:tapping` — the bound player's PCM tap is turned on, leased to this
+       process (`UniversalProxy.Audio.pcm_tap/3`: the player turns it off
+       if State dies), and its ring path read (`pcm_tap_status/1`), as an
+       audio job like the others;
     2. `:preparing` — the renderer starts with the viewport's mode
        (`UniversalProxy.Display.OutputMode.renderer_mode/2`), the pack, the
        ring and the target's ladder, and builds GL without DRM master;
@@ -638,7 +639,7 @@ defmodule UniversalProxy.Display.State do
 
     state =
       enqueue(state, fn ->
-        pcm_tap(audio, key, true)
+        pcm_tap(audio, key, true, server)
         send(server, {:milkdrop_ring, session, ring_path(audio, key)})
       end)
 
@@ -887,11 +888,12 @@ defmodule UniversalProxy.Display.State do
 
   defp pcm_tap_off(state, key) do
     audio = state.audio
-    enqueue(state, fn -> pcm_tap(audio, key, false) end)
+    server = self()
+    enqueue(state, fn -> pcm_tap(audio, key, false, server) end)
   end
 
-  defp pcm_tap(audio, key, on?) do
-    case audio.pcm_tap.(key, on?) do
+  defp pcm_tap(audio, key, on?, owner) do
+    case audio.pcm_tap.(key, on?, owner) do
       :ok -> :ok
       {:error, reason} -> Logger.info("[Display] PCM tap #{on?} not set: #{inspect(reason)}")
     end
@@ -1057,7 +1059,7 @@ defmodule UniversalProxy.Display.State do
       viz_enable: &Audio.viz_enable/2,
       viz_topic: &Audio.viz_topic/1,
       update_config: &update_config/2,
-      pcm_tap: &Audio.pcm_tap/2,
+      pcm_tap: &Audio.pcm_tap/3,
       pcm_tap_status: &Audio.pcm_tap_status/1
     }
   end
