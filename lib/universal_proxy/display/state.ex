@@ -52,7 +52,8 @@ defmodule UniversalProxy.Display.State do
   `:milkdrop` option) State also follows the preset pack
   (`UniversalProxy.MilkDrop.Pack`'s status and PubSub, `:ensure_pack` as a
   task; a restarted Pack's `{:milkdrop_pack_started, status}` replaces the
-  cached status and lets the pack be asked for again) and runs the model's
+  cached status, lets the pack be asked for again and drops the answers
+  still due from `:ensure_pack` calls made before it) and runs the model's
   `{:yield, :milkdrop}` / `:reclaim` as a handover with the renderer's port
   owner, `UniversalProxy.Display.MilkDrop` (started unlinked and
   monitored):
@@ -208,7 +209,8 @@ defmodule UniversalProxy.Display.State do
       md_opts: Keyword.get(opts, :milkdrop_opts, []),
       md_timeouts:
         Map.merge(@milkdrop_timeouts, Map.new(Keyword.get(opts, :milkdrop_timeouts, %{}))),
-      pack: Map.merge(default_pack(), Map.new(Keyword.get(opts, :pack, %{})))
+      pack: Map.merge(default_pack(), Map.new(Keyword.get(opts, :pack, %{}))),
+      pack_gen: 0
     }
 
     if state.ui do
@@ -334,12 +336,16 @@ defmodule UniversalProxy.Display.State do
   def handle_info({:milkdrop_pack, status}, %{milkdrop?: true} = state),
     do: {:noreply, dispatch(state, {:pack, status})}
 
+  # Answers to `ensure` calls made of the previous Pack are stale from here.
   def handle_info({:milkdrop_pack_started, status}, %{milkdrop?: true} = state),
-    do: {:noreply, dispatch(state, {:pack_restarted, status})}
+    do: {:noreply, dispatch(%{state | pack_gen: state.pack_gen + 1}, {:pack_restarted, status})}
 
   # `ensure/0`'s own answer: only a final one (progress comes on PubSub,
-  # and an unchanged error isn't broadcast).
-  def handle_info({:milkdrop_pack_ensured, status}, %{milkdrop?: true} = state) do
+  # and an unchanged error isn't broadcast), and only from the current Pack.
+  def handle_info(
+        {:milkdrop_pack_ensured, gen, status},
+        %{milkdrop?: true, pack_gen: gen} = state
+      ) do
     if match?({:error, _}, status) or match?({:ready, _, _}, status),
       do: {:noreply, dispatch(state, {:pack, status})},
       else: {:noreply, state}
@@ -580,9 +586,10 @@ defmodule UniversalProxy.Display.State do
   defp run_effect(:ensure_pack, state) do
     server = self()
     ensure = state.pack.ensure
+    gen = state.pack_gen
 
     case Task.Supervisor.start_child(state.task_sup, fn ->
-           send(server, {:milkdrop_pack_ensured, ensure.()})
+           send(server, {:milkdrop_pack_ensured, gen, ensure.()})
          end) do
       {:ok, _pid} ->
         :ok

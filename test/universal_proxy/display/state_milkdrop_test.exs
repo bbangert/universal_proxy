@@ -84,7 +84,11 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
       end,
       ensure: fn ->
         send(test, :pack_ensure)
-        Agent.get(world, & &1.ensured)
+
+        case Agent.get(world, & &1.ensured) do
+          answer when is_function(answer, 0) -> answer.()
+          answer -> answer
+        end
       end
     }
 
@@ -535,6 +539,43 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
 
     assert_receive :pack_ensure, @timeout
     assert %{screen: {:milkdrop_preparing, nil}, milkdrop: %{pack: :absent}} = status(ctx)
+  end
+
+  test "an ensure answer from a Pack that died is dropped once a new Pack announced", ctx do
+    test = self()
+
+    ensured = fn ->
+      send(test, {:ensure_waiting, self()})
+
+      receive do
+        {:answer, answer} -> answer
+      end
+    end
+
+    ctx = start_ui(ctx, pack: :absent, ensured: ensured)
+    milkdrop_mode(ctx)
+    assert_receive {:ensure_waiting, task}, @timeout
+    task_ref = Process.monitor(task)
+
+    ready = {:ready, @version, ctx.pack_dir}
+
+    Phoenix.PubSub.broadcast(
+      ctx.pubsub,
+      UniversalProxy.MilkDrop.pack_topic(),
+      {:milkdrop_pack_started, ready}
+    )
+
+    wait_until(fn -> md(ctx).pack == ready end)
+
+    # The call into the old Pack fails only now, after the new one is ready.
+    send(task, {:answer, {:error, :not_running}})
+    assert_receive {:DOWN, ^task_ref, :process, ^task, :normal}, @timeout
+    _ = :sys.get_state(ctx.state)
+    assert md(ctx).pack == ready
+
+    playing(ctx)
+    assert_receive {:audio, :pcm_tap, @key, true}, @timeout
+    wait_until(fn -> md(ctx).phase == :presenting end)
   end
 
   test "a pack error shows a short notice, then the bars", ctx do
