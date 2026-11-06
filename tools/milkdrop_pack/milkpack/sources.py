@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 
 TOOL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -64,24 +65,65 @@ def run(cmd, log=None, cwd=None, env=None):
         raise PipelineError(f"{' '.join(cmd[:3])}... failed ({proc.returncode})\n{tail}")
 
 
+def _git(*args):
+    return subprocess.run(["git", *args], capture_output=True, text=True)
+
+
 def git_checkout(repo, commit, dest, log, submodules=()):
     """A checkout of `commit` at `dest`, fetched by SHA (content-addressed,
-    so a moved branch or tag can't change the input). Reused when already
-    there."""
-    if os.path.isdir(os.path.join(dest, ".git")):
-        head = subprocess.run(["git", "-C", dest, "rev-parse", "HEAD"], capture_output=True, text=True)
-        if head.returncode == 0 and head.stdout.strip() == commit:
-            return dest
-    os.makedirs(dest, exist_ok=True)
-    run(["git", "-C", dest, "init", "-q"], log)
-    run(["git", "-C", dest, "fetch", "-q", "--depth", "1", repo, commit], log)
-    run(["git", "-C", dest, "checkout", "-q", "--force", "FETCH_HEAD"], log)
-    head = subprocess.run(["git", "-C", dest, "rev-parse", "HEAD"], capture_output=True, text=True)
-    if head.stdout.strip() != commit:
-        raise PipelineError(f"{repo}: checked out {head.stdout.strip()}, wanted {commit}")
+    so a moved branch or tag can't change the input), with `submodules` at
+    the commits it records. Reused when already there; an interrupted
+    earlier run is repaired."""
+    head = _git("-C", dest, "rev-parse", "HEAD") if os.path.isdir(os.path.join(dest, ".git")) else None
+    if head is None or head.returncode != 0 or head.stdout.strip() != commit:
+        os.makedirs(dest, exist_ok=True)
+        run(["git", "-C", dest, "init", "-q"], log)
+        run(["git", "-C", dest, "fetch", "-q", "--depth", "1", repo, commit], log)
+        run(["git", "-C", dest, "checkout", "-q", "--force", "FETCH_HEAD"], log)
+        head = _git("-C", dest, "rev-parse", "HEAD")
+        if head.stdout.strip() != commit:
+            raise PipelineError(f"{repo}: checked out {head.stdout.strip()}, wanted {commit}")
     for sub in submodules:
-        run(["git", "-C", dest, "submodule", "update", "--init", "--depth", "1", sub], log)
+        ensure_submodule(dest, sub, log)
     return dest
+
+
+def submodule_ok(dest, sub):
+    """`sub` is its own checkout, clean, at the commit `dest` records."""
+    tree = _git("-C", dest, "ls-tree", "HEAD", "--", sub).stdout.split()
+    if len(tree) < 3 or tree[1] != "commit":
+        raise PipelineError(f"{dest}: {sub} is not a submodule at HEAD")
+    path = os.path.join(dest, sub)
+    if not os.path.isdir(path):
+        return False
+    # An empty or broken submodule directory would answer for the parent.
+    top = _git("-C", path, "rev-parse", "--show-toplevel")
+    if top.returncode != 0 or os.path.realpath(top.stdout.strip()) != os.path.realpath(path):
+        return False
+    have = _git("-C", path, "rev-parse", "HEAD")
+    status = _git("-C", path, "status", "--porcelain", "--untracked-files=no")
+    return have.returncode == 0 and have.stdout.strip() == tree[2] and status.returncode == 0 \
+        and not status.stdout.strip()
+
+
+def ensure_submodule(dest, sub, log):
+    """Initialise and update `sub`; if that can't produce a clean checkout
+    (an interrupted clone leaves one half-made), start it over."""
+    if submodule_ok(dest, sub):
+        return
+    update = ["git", "-C", dest, "submodule", "update", "--init", "--force", "--depth", "1", "--", sub]
+    try:
+        run(update, log)
+    except PipelineError:
+        pass
+    if submodule_ok(dest, sub):
+        return
+    _git("-C", dest, "submodule", "deinit", "-q", "--force", "--", sub)
+    shutil.rmtree(os.path.join(dest, ".git", "modules", sub), ignore_errors=True)
+    shutil.rmtree(os.path.join(dest, sub), ignore_errors=True)
+    run(update, log)
+    if not submodule_ok(dest, sub):
+        raise PipelineError(f"{dest}: submodule {sub} is not at the recorded commit after a fresh update")
 
 
 def build_translator(src, build_dir, log, jobs):
