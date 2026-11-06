@@ -111,8 +111,8 @@ defmodule UniversalProxyWeb.MilkDropComponent do
      |> start_async(:ensure_pack, fn -> Pack.ensure() end)}
   end
 
-  def handle_event("set_rotate", %{"rotate_s" => raw}, socket) do
-    case parse_rotate(raw) do
+  def handle_event("set_rotate", params, socket) do
+    case parse_rotate(params["rotate_s"]) do
       {:ok, seconds} ->
         {:noreply, write(socket, %{rotate_s: seconds})}
 
