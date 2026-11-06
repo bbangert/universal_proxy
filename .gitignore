@@ -46,9 +46,10 @@ erl_crash.dump
 /priv/static/**/*-*.gz
 /priv/static/**/*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]*.*
 
-# sendspin_player C++ binary build artifacts
+# Native port binaries (sendspin_player, milkdrop_renderer)
 /c_src/sendspin_player/_build/
 /priv/sendspin_player/
+/priv/milkdrop_renderer/
 
 # Claude Code local workspace (plans, scratchpads, solutions, reviews) stays
 # untracked; only the shared project settings, which enable the
