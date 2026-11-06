@@ -27,13 +27,17 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
   setup context do
     sup = start_supervised!({DynamicSupervisor, strategy: :one_for_one})
     dri_dir = Path.join(context.tmp_dir, "dri")
+    sysfs_dir = Path.join(context.tmp_dir, "sys")
     pack_dir = Path.join(context.tmp_dir, "pack")
     File.mkdir_p!(dri_dir)
     File.mkdir_p!(pack_dir)
+    # card1 drives the HDMI connectors (as vc4 does on a Pi 4); card0 has none.
     File.write!(Path.join(dri_dir, "card0"), "")
+    File.write!(Path.join(dri_dir, "card1"), "")
+    Enum.each(~w(card0 card1 card1-HDMI-A-1), &File.mkdir_p!(Path.join(sysfs_dir, &1)))
     skip_file = Path.join(context.tmp_dir, "skip.txt")
     on_exit(fn -> Enum.each(renderer_os_pids(skip_file), &kill_os_pid/1) end)
-    %{sup: sup, dri_dir: dri_dir, pack_dir: pack_dir, skip_file: skip_file}
+    %{sup: sup, dri_dir: dri_dir, sysfs_dir: sysfs_dir, pack_dir: pack_dir, skip_file: skip_file}
   end
 
   # Starts State with the UI and MilkDrop on (unless `milkdrop: false`),
@@ -108,6 +112,7 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
         renderer: FakeRenderer,
         viewport_supervisor: ctx.sup,
         dri_dir: ctx.dri_dir,
+        sysfs_drm_dir: ctx.sysfs_dir,
         viewport_opts: [
           test_pid: test,
           on_start: fn -> send(test, {:viewport_start, cmd_names(skip_file)}) end
@@ -137,9 +142,9 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
       })
 
     _ = :sys.get_state(state)
-    assert_receive {:fake_renderer, :start, _opts}
+    assert_receive {:fake_renderer, :start, viewport_opts}
     assert_receive {:viewport_start, []}
-    Map.merge(ctx, %{state: state, pubsub: pubsub, world: world})
+    Map.merge(ctx, %{state: state, pubsub: pubsub, world: world, viewport_opts: viewport_opts})
   end
 
   defp status(ctx), do: GenServer.call(ctx.state, :status)
@@ -289,9 +294,10 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     %{os_pid: os_pid} = :sys.get_state(renderer(ctx))
     argv = "/proc/#{os_pid}/cmdline" |> File.read!() |> String.split(<<0>>, trim: true)
 
-    # The viewport's own connector (vc4-hdmi is HDMI port 0), and its size
-    # with no refresh pinned, so the renderer keeps Emerge's timing.
+    # The viewport's own card and connector (vc4-hdmi is HDMI port 0), and
+    # its size with no refresh pinned, so the renderer keeps Emerge's timing.
     for {flag, value} <- [
+          {"--card", Path.join(ctx.dri_dir, "card1")},
           {"--connector", "HDMI-A-1"},
           {"--mode", "1280x720"},
           {"--pack-dir", ctx.pack_dir},
@@ -300,6 +306,30 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
         ] do
       assert [^value | _] = argv |> Enum.drop_while(&(&1 != flag)) |> tl()
     end
+  end
+
+  test "the viewport is pinned to the card that has its connector", ctx do
+    ctx = start_ui(ctx)
+    assert ctx.viewport_opts[:card] == Path.join(ctx.dri_dir, "card1")
+    assert ctx.viewport_opts[:connector] == "HDMI-A-1"
+  end
+
+  test "with no card for the viewport's connector nothing yields: the bars show", ctx do
+    File.rm_rf!(Path.join(ctx.sysfs_dir, "card1-HDMI-A-1"))
+
+    log =
+      capture_log(fn ->
+        ctx = ctx |> start_ui() |> milkdrop_mode() |> playing()
+        refute Keyword.has_key?(ctx.viewport_opts, :card)
+
+        assert %{screen: {:visualizer, false}, milkdrop: %{phase: nil, yield: false}} =
+                 status(ctx)
+
+        refute_received {:audio, :pcm_tap, _, _}
+        refute_received {:fake_renderer, :stop, _}
+      end)
+
+    assert log =~ "no DRM card has the viewport's HDMI-A-1"
   end
 
   test "the PCM tap is leased to State", ctx do

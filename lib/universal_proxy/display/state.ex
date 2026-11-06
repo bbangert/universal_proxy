@@ -62,9 +62,9 @@ defmodule UniversalProxy.Display.State do
        process (`UniversalProxy.Audio.pcm_tap/3`: the player turns it off
        if State dies), and its ring path read (`pcm_tap_status/1`), as an
        audio job like the others;
-    2. `:preparing` — the renderer starts on the viewport's connector
-       (`UniversalProxy.Display.Model.viewport_connector/1`) at the
-       viewport's size with no refresh pinned
+    2. `:preparing` — the renderer starts on the viewport's DRM card and
+       connector (`UniversalProxy.Display.Model.viewport_card/1`,
+       `viewport_connector/1`) at the viewport's size with no refresh pinned
        (`UniversalProxy.Display.OutputMode.renderer_mode/1`: it keeps the
        mode Emerge scans out), the pack, the ring and the target's ladder,
        and builds GL without DRM master;
@@ -107,6 +107,11 @@ defmodule UniversalProxy.Display.State do
     * `:renderer` — the renderer module (default: the configured one).
     * `:viewport_supervisor` — the `DynamicSupervisor` the viewport runs under.
     * `:dri_dir` — where DRM cards appear (default `"/dev/dri"`).
+    * `:sysfs_drm_dir` — the DRM class directory in sysfs (default
+      `"/sys/class/drm"`). With MilkDrop on, the viewport is pinned to the
+      card that has its connector (`UniversalProxy.Display.OutputMode.connector_card/3`),
+      reported to the model as `{:viewport_card, card}`, so the renderer
+      presents on the same card; with none found, nothing yields.
     * `:viewport_opts` — default `start/2` options for the renderer.
       Default: the configured `:layer_cache_mb`, `:preferred_size`,
       `:viz_tick_ms` and `:image_dirs`, and a `:viz_buffer` sized for the
@@ -178,6 +183,7 @@ defmodule UniversalProxy.Display.State do
       supervisor:
         Keyword.get(opts, :viewport_supervisor, Display.Supervisor.viewport_supervisor()),
       dri_dir: Keyword.get(opts, :dri_dir, "/dev/dri"),
+      sysfs_drm_dir: Keyword.get(opts, :sysfs_drm_dir, "/sys/class/drm"),
       viewport_opts:
         Keyword.get_lazy(opts, :viewport_opts, fn -> default_viewport_opts(config) end),
       view_opts: Keyword.get_lazy(opts, :view_opts, fn -> default_view_opts(config) end),
@@ -558,16 +564,11 @@ defmodule UniversalProxy.Display.State do
 
   defp run_effect({:start_viewport, rung}, state) do
     spec = View.render(state.model, view_opts(state, now_ms()))
-
-    if state.milkdrop? and not Keyword.has_key?(rung, :connector) do
-      Logger.warning(
-        "[Display] the viewport's HDMI connector is unknown; MilkDrop shows the bars on it"
-      )
-    end
+    {card, rung} = viewport_card(state, rung)
 
     case start_viewport(%{state | spec: spec}, Keyword.put(rung, :owner, self())) do
       {{:ok, _handle}, state} ->
-        follow_up(state, {:viewport, :started})
+        state |> follow_up({:viewport_card, card}) |> follow_up({:viewport, :started})
 
       {{:error, reason}, state} ->
         Logger.warning("[Display] viewport did not start: #{inspect(reason)}")
@@ -609,6 +610,32 @@ defmodule UniversalProxy.Display.State do
     Process.send_after(self(), {:display_timer, timer, gen}, ms)
     state
   end
+
+  # With MilkDrop on, the viewport is pinned to the card that has its
+  # connector, so the renderer can be started on the same card.
+  defp viewport_card(%{milkdrop?: true} = state, rung) do
+    with {:ok, connector} <- Keyword.fetch(rung, :connector),
+         card when is_binary(card) <-
+           OutputMode.connector_card(connector, state.sysfs_drm_dir, state.dri_dir) do
+      {card, Keyword.put(rung, :card, card)}
+    else
+      :error ->
+        Logger.warning(
+          "[Display] the viewport's HDMI connector is unknown; MilkDrop shows the bars on it"
+        )
+
+        {nil, rung}
+
+      nil ->
+        Logger.warning(
+          "[Display] no DRM card has the viewport's #{rung[:connector]}; MilkDrop shows the bars on it"
+        )
+
+        {nil, rung}
+    end
+  end
+
+  defp viewport_card(_state, rung), do: {nil, rung}
 
   defp viz_source(%{model: %{binding: %{key: key, client_id: id}}} = state, viz)
        when is_binary(id) and viz in [:strip, :full],
@@ -719,28 +746,30 @@ defmodule UniversalProxy.Display.State do
   end
 
   # Step 2: the renderer, building GL off-screen while the viewport shows,
-  # on the viewport's connector (the model only yields with one known).
+  # on the viewport's card and connector (the model only yields with both
+  # known).
   defp start_milkdrop(%{md: md} = state, ring) do
-    case Model.viewport_connector(state.model) do
-      nil ->
+    case {Model.viewport_card(state.model), Model.viewport_connector(state.model)} do
+      {card, connector} when is_binary(card) and is_binary(connector) ->
+        start_renderer(state, md, ring, card, connector)
+
+      _unknown ->
         Logger.warning(
-          "[Display] MilkDrop: the viewport's HDMI connector is unknown; not yielding"
+          "[Display] MilkDrop: the viewport's DRM card or HDMI connector is unknown; not yielding"
         )
 
-        end_milkdrop(state, {:crashed, :no_connector}, true)
-
-      connector ->
-        start_renderer(state, md, ring, connector)
+        end_milkdrop(state, {:crashed, :no_output}, true)
     end
   end
 
-  defp start_renderer(state, md, ring, connector) do
+  defp start_renderer(state, md, ring, card, connector) do
     size = state.model.size || Keyword.get(state.view_opts, :size) || {1280, 720}
 
     opts =
       Keyword.merge(state.md_opts,
         owner: self(),
         mode: OutputMode.renderer_mode(size),
+        card: card,
         connector: connector,
         pack_dir: md.dir,
         pack_version: md.version,

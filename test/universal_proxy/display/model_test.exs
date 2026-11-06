@@ -652,8 +652,10 @@ defmodule UniversalProxy.Display.ModelTest do
   describe "MilkDrop" do
     @pack {:ready, "2026.11.1", "/data/milkdrop/2026.11.1"}
 
-    # On HDMI port 0, so the viewport's connector is known.
+    # On HDMI port 0, so the viewport's connector is known (and its card
+    # reported).
     @md_binding Map.put(@binding, :hdmi_port, 0)
+    @card "/dev/dri/card1"
 
     # Bound, viewport up, pack ready, mode MilkDrop, nothing playing.
     defp md_ready(opts \\ []) do
@@ -665,6 +667,7 @@ defmodule UniversalProxy.Display.ModelTest do
         {:bound, @md_binding, nil},
         {:snapshot, 0, %{}},
         {:display_available, true},
+        {:viewport_card, @card},
         {:viewport, :started}
       ])
     end
@@ -888,6 +891,30 @@ defmodule UniversalProxy.Display.ModelTest do
       refute m.milkdrop.active
       assert Model.screen(m) == {:visualizer, false}
       assert m.viz == :full
+    end
+
+    test "no yield while the viewport's DRM card is unknown: the bars show" do
+      m =
+        run!(Model.new(milkdrop: true), [
+          {:bound, @md_binding, nil},
+          {:snapshot, 0, %{}},
+          {:display_available, true},
+          {:viewport_card, nil},
+          {:viewport, :started},
+          {:pack, @pack},
+          {:set_mode, :milkdrop}
+        ])
+
+      assert Model.viewport_connector(m) == "HDMI-A-1"
+      assert Model.viewport_card(m) == nil
+      {m, effects} = run(m, [{:stream, :start}])
+      refute {:yield, :milkdrop} in effects
+      assert Model.screen(m) == {:visualizer, false}
+
+      # Reported for the next viewport: the yield follows.
+      {m, effects} = run(m, [{:viewport_card, @card}])
+      assert {:yield, :milkdrop} in effects
+      assert Model.viewport_card(m) == @card
     end
 
     test "a persisted MilkDrop mode with no pack yet asks for it" do

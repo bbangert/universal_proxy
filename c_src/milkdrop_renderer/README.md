@@ -23,6 +23,7 @@ milkdrop_renderer --mode 1280x720 --pack-dir DIR --ladder 640x360,480x270
 |---|---|
 | `--mode WxH[@Hz]` | The CRTC mode to present on. Keep Emerge's mode: a different pixel clock under a running HDMI audio stream leaves vc4's N/CTS stale, so the mode the CRTC scans out when the renderer starts (Emerge's) is used whenever it fits. `WxH` (what the BEAM passes): the CRTC's mode if it is that size and progressive, whatever its refresh (50, 60, 120 Hz); otherwise the connector's preferred mode at that size, else its highest refresh at that size. `WxH@Hz`: the CRTC's mode if it is that size, progressive and within 0.5 Hz; else the offered mode closest to Hz within 0.5 Hz (1280x720 comes at 60 and 59.94). No fitting mode: `exiting` `output`. |
 | `--connector NAME` | The connector to present on, by its kernel name (`HDMI-A-1`, `HDMI-A-2`: `<type>-<n>`, 1..32 of `[A-Za-z0-9-]`); it must be connected, or `exiting` `output` — never another connector. Without it, the first connected HDMI connector. The BEAM passes the one Emerge drives. |
+| `--card DEV` | The DRM card node to open (default `/dev/dri/card0`). The BEAM passes the one Emerge drives (the card whose sysfs entries have the connector), since that isn't card0 on every board. |
 | `--pack-dir DIR` | The extracted preset pack (layout below). |
 | `--ladder WxH,...` | Internal render resolutions, highest first, each smaller than the last. The renderer steps down per preset and skips a preset past the last rung. |
 | `--rotate-s N` | Auto-rotation interval, seconds. |
@@ -31,10 +32,9 @@ milkdrop_renderer --mode 1280x720 --pack-dir DIR --ladder 640x360,480x270
 | `--locked FILE` | Start locked on this preset id. If it isn't eligible (a `high_frequency` one while they are off, skipped, an rpi3 `skip`, or not in the pack): `error` `locked_refused` (`message`: `<why>: <id>`) and an unlocked random start. |
 | `--pcm-ring PATH` | The PCM tap ring (`/run/up-pcm-<client_id>`). Without it, or while it has no fresh audio, presets get silence. |
 
-Tuning and check knobs (not passed by the BEAM): `--card DEV`
-(`/dev/dri/card0`), `--blend S` (soft-cut length, 0.5), `--min-fps F` (the
-floor a preset must hold, 19), `--interval N` (vblanks per frame: 2 on
-GLES2 builds, else 1), `--seed N`, `--av-offset-ms N` (added to the PCM
+Tuning and check knobs (not passed by the BEAM): `--blend S` (soft-cut
+length, 0.5), `--min-fps F` (the floor a preset must hold, 19),
+`--interval N` (vblanks per frame: 2 on GLES2 builds, else 1), `--seed N`, `--av-offset-ms N` (added to the PCM
 target time, for A/V tuning), `--master-timeout-ms N` (2000), `--mesh WxH`
 (48x36), `--stats-s N` (10), and `--headless-frames N` / `--simulate-kms` /
 `--test-tone` (see "Checks").

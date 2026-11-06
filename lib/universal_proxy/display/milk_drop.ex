@@ -42,6 +42,8 @@ defmodule UniversalProxy.Display.MilkDrop do
     * `:owner` — pid to report to (default: the caller);
     * `:mode` — `%{width:, height:}`, the output size to present at, with
       an optional `:refresh` (Hz) to pin as well (required; see `--mode`);
+    * `:card` — the DRM card node to present on (`"/dev/dri/card1"`;
+      default: the renderer's, `/dev/dri/card0`);
     * `:connector` — the DRM connector to present on (`"HDMI-A-1"`;
       default: the renderer's first connected HDMI connector);
     * `:pack_dir`, `:pack_version` — the extracted pack and its version
@@ -69,13 +71,14 @@ defmodule UniversalProxy.Display.MilkDrop do
                         --ladder 640x360,480x270 --rotate-s 20
                         --skip-file PATH
                         [--high-frequency] [--locked FILE] [--pcm-ring PATH]
-                        [--connector HDMI-A-1]
+                        [--card /dev/dri/card1] [--connector HDMI-A-1]
 
     * `--mode` — the CRTC mode to present on. `WxH` keeps the mode the CRTC
       scans out when the renderer opens the card if it is that size,
       whatever its refresh (no modeset), else the connector's preferred
       (or highest-refresh) mode at that size; `WxH@Hz` also pins the
       refresh (within 0.5 Hz);
+    * `--card` — the DRM card node to open (default `/dev/dri/card0`);
     * `--connector` — the connector to present on; it must be connected;
     * `--pack-dir` — the extracted pack; `manifest.json` at its root;
     * `--ladder` — comma-separated internal-resolution rungs, highest
@@ -94,8 +97,8 @@ defmodule UniversalProxy.Display.MilkDrop do
 
     * `{"cmd":"take"}` — become DRM master, commit `--mode` and present;
     * `{"cmd":"release"}` — stop flipping, close the framebuffer (keeping
-      the scanout), drop master; card0 stays open;
-    * `{"cmd":"exit"}` — close card0, report `exiting`, exit 0;
+      the scanout), drop master; the card stays open;
+    * `{"cmd":"exit"}` — close the card, report `exiting`, exit 0;
     * `{"cmd":"next"}`, `{"cmd":"prev"}` — change preset (with history);
     * `{"cmd":"lock"}`, `{"cmd":"unlock"}` — hold / resume rotation on the
       current preset;
@@ -192,11 +195,11 @@ defmodule UniversalProxy.Display.MilkDrop do
   @spec take(GenServer.server()) :: :ok
   def take(server), do: command(server, %{cmd: "take"})
 
-  @doc "Stop presenting and drop DRM master, keeping card0 open."
+  @doc "Stop presenting and drop DRM master, keeping the card open."
   @spec release(GenServer.server()) :: :ok
   def release(server), do: command(server, %{cmd: "release"})
 
-  @doc "Ask the renderer to close card0 and exit."
+  @doc "Ask the renderer to close the card and exit."
   @spec exit(GenServer.server()) :: :ok
   def exit(server), do: command(server, %{cmd: "exit"})
 
@@ -254,7 +257,7 @@ defmodule UniversalProxy.Display.MilkDrop do
   @doc """
   The renderer's argv (see "Renderer CLI contract") for `config`: `:mode`,
   `:pack_dir`, `:ladder`, `:skip_file`, `:settings` and the optional
-  `:ring_path` and `:connector`.
+  `:ring_path`, `:card` and `:connector`.
   """
   @spec args(map()) :: [String.t()]
   def args(%{mode: mode, pack_dir: pack_dir, ladder: ladder, skip_file: skip_file} = config) do
@@ -269,6 +272,7 @@ defmodule UniversalProxy.Display.MilkDrop do
       if(settings.include_high_frequency, do: ["--high-frequency"], else: []),
       if(settings.locked, do: ["--locked", settings.locked], else: []),
       if(config[:ring_path], do: ["--pcm-ring", config.ring_path], else: []),
+      if(config[:card], do: ["--card", config.card], else: []),
       if(config[:connector], do: ["--connector", config.connector], else: [])
     ]
     |> Enum.concat()
@@ -289,6 +293,7 @@ defmodule UniversalProxy.Display.MilkDrop do
       pack_dir: Keyword.fetch!(opts, :pack_dir),
       ladder: Keyword.get_lazy(opts, :ladder, &default_ladder/0),
       ring_path: Keyword.get(opts, :ring_path),
+      card: Keyword.get(opts, :card),
       connector: Keyword.get(opts, :connector),
       settings: settings,
       skip_file:
@@ -482,6 +487,7 @@ defmodule UniversalProxy.Display.MilkDrop do
     cond do
       not valid_mode?(config.mode) -> {:error, {:invalid_mode, config.mode}}
       not valid_ladder?(config.ladder) -> {:error, {:invalid_ladder, config.ladder}}
+      not valid_card?(config.card) -> {:error, {:invalid_card, config.card}}
       not valid_connector?(config.connector) -> {:error, {:invalid_connector, config.connector}}
       true -> :ok
     end
@@ -496,6 +502,13 @@ defmodule UniversalProxy.Display.MilkDrop do
   end
 
   defp valid_mode?(_mode), do: false
+
+  defp valid_card?(nil), do: true
+
+  defp valid_card?(path) when is_binary(path),
+    do: Path.type(path) == :absolute and not String.contains?(path, ["\n", "\r", <<0>>])
+
+  defp valid_card?(_path), do: false
 
   defp valid_connector?(nil), do: true
   defp valid_connector?(name) when is_binary(name), do: name =~ @connector_re

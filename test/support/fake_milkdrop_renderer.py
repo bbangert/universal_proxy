@@ -62,6 +62,7 @@ def main():
     parser.add_argument("--locked")
     parser.add_argument("--pcm-ring")
     parser.add_argument("--connector")
+    parser.add_argument("--card")
     args = parser.parse_args()
 
     open(args.skip_file + ".spawned", "w").close()

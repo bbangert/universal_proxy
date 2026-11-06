@@ -55,9 +55,10 @@ defmodule UniversalProxy.Display.Model do
   once the renderer is gone (`:requested`, `:thermal` or `{:crashed,
   why}`; the viewport is started again if it was still yielded). A new
   yield waits until the previous session ended, and needs the viewport's
-  connector (`viewport_connector/1`, from the bound output's HDMI port):
-  without one the mode shows the bars, since the renderer could present on
-  another TV. `{:pack_restarted, status}` (a new Pack process) replaces the
+  connector (`viewport_connector/1`, from the bound output's HDMI port)
+  and DRM card (`viewport_card/1`, as the owner reports it for each started
+  viewport with `{:viewport_card, card | nil}`): without both the mode
+  shows the bars, since the renderer could present on another TV. `{:pack_restarted, status}` (a new Pack process) replaces the
   pack status and lets a missing pack be asked for again.
 
   Otherwise the mode shows the bar visualizer, or while the pack is
@@ -132,7 +133,8 @@ defmodule UniversalProxy.Display.Model do
           crash_key: term(),
           delay_ms: pos_integer() | nil,
           reason: term(),
-          port: non_neg_integer() | nil
+          port: non_neg_integer() | nil,
+          card: String.t() | nil
         }
 
   @type pack :: UniversalProxy.MilkDrop.Pack.status() | nil
@@ -164,6 +166,7 @@ defmodule UniversalProxy.Display.Model do
           | {:viewport, :started}
           | {:viewport, :start_failed | :down, term()}
           | {:viewport_size, size()}
+          | {:viewport_card, String.t() | nil}
           | :hdmi_link_up
           | {:pack, pack()}
           | {:pack_restarted, pack()}
@@ -249,7 +252,8 @@ defmodule UniversalProxy.Display.Model do
               crash_key: nil,
               delay_ms: nil,
               reason: nil,
-              port: nil
+              port: nil,
+              card: nil
             },
             pack: nil,
             milkdrop: %{
@@ -328,6 +332,13 @@ defmodule UniversalProxy.Display.Model do
   def viewport_connector(%__MODULE__{}), do: nil
 
   defp hdmi_connector(port), do: "HDMI-A-#{port + 1}"
+
+  @doc """
+  The DRM card node the last started viewport drives its connector on, as
+  its owner reported it (`{:viewport_card, card}`); `nil` when unknown.
+  """
+  @spec viewport_card(t()) :: String.t() | nil
+  def viewport_card(%__MODULE__{viewport: %{card: card}}), do: card
 
   @doc "Whether the model wants the MilkDrop renderer on screen."
   @spec milkdrop_yield?(t()) :: boolean()
@@ -552,6 +563,9 @@ defmodule UniversalProxy.Display.Model do
   defp apply_event(m, {:viewport_size, {w, h} = size}, _now)
        when is_integer(w) and w > 0 and is_integer(h) and h > 0,
        do: {%{m | size: size}, [], []}
+
+  defp apply_event(m, {:viewport_card, card}, _now) when is_binary(card) or is_nil(card),
+    do: {put_vp(m, card: card), [], []}
 
   defp apply_event(m, :hdmi_link_up, _now) do
     if m.viewport.status in [:backoff, :failed],
@@ -831,15 +845,17 @@ defmodule UniversalProxy.Display.Model do
   defp milkdrop_mode?(m), do: m.mode == :milkdrop and milkdrop?(m) and is_nil(m.milkdrop.latch)
 
   # Once yielded it stays wanted while the rest holds; a new yield needs a
-  # running viewport to take the display from, on a known connector (the
-  # renderer must present on the same one), and no session still ending.
+  # running viewport to take the display from, on a known connector and
+  # card (the renderer must present on the same ones), and no session
+  # still ending.
   defp milkdrop_wanted?(m) do
     md = m.milkdrop
 
     milkdrop_mode?(m) and is_nil(md.hold) and m.playback == :playing and
       match?({:ready, _version, _dir}, m.pack) and viz_source?(m) and
       (md.yield or
-         (not md.active and m.viewport.status == :running and viewport_connector(m) != nil))
+         (not md.active and m.viewport.status == :running and viewport_connector(m) != nil and
+            m.viewport.card != nil))
   end
 
   defp pack_error?({:error, _reason}), do: true

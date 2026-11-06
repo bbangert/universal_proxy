@@ -125,10 +125,11 @@ defmodule UniversalProxy.Display.MilkDropTest do
     end
   end
 
-  test "args/1 without a refresh, and with a connector" do
+  test "args/1 without a refresh, and with a card and connector" do
     args =
       MilkDrop.args(%{
         mode: %{width: 1920, height: 1080},
+        card: "/dev/dri/card1",
         connector: "HDMI-A-2",
         pack_dir: "/p",
         ladder: ["960x540"],
@@ -137,7 +138,7 @@ defmodule UniversalProxy.Display.MilkDropTest do
       })
 
     assert ["--mode", "1920x1080" | _] = args
-    assert Enum.take(args, -2) == ["--connector", "HDMI-A-2"]
+    assert Enum.take(args, -4) == ["--card", "/dev/dri/card1", "--connector", "HDMI-A-2"]
 
     assert ["--mode", "1280x720" | _] =
              MilkDrop.args(%{
@@ -350,12 +351,22 @@ defmodule UniversalProxy.Display.MilkDropTest do
     assert MilkDrop.next(pid) == :ok
   end
 
-  test "a size-only mode and a connector reach the renderer", ctx do
+  test "a size-only mode, a card and a connector reach the renderer", ctx do
     {_pid, prepared} =
-      start_renderer(ctx, mode: %{width: 1920, height: 1080}, connector: "HDMI-A-2")
+      start_renderer(ctx,
+        mode: %{width: 1920, height: 1080},
+        card: "/dev/dri/card1",
+        connector: "HDMI-A-2"
+      )
 
     assert ["--mode", "1920x1080" | _] = prepared.argv
-    assert Enum.take(prepared.argv, -2) == ["--connector", "HDMI-A-2"]
+
+    assert Enum.take(prepared.argv, -4) == [
+             "--card",
+             "/dev/dri/card1",
+             "--connector",
+             "HDMI-A-2"
+           ]
   end
 
   # ── Reaped ─────────────────────────────────────────────────────────────
@@ -610,6 +621,15 @@ defmodule UniversalProxy.Display.MilkDropTest do
                  base
                  |> Keyword.put(:binary, @fake_binary)
                  |> Keyword.put(:connector, bad)
+               )
+    end
+
+    for bad <- ["", "card1", "/dev/dri/card1\n--locked", "/dev/\0", 1] do
+      assert {:error, {:invalid_card, ^bad}} =
+               MilkDrop.start(
+                 base
+                 |> Keyword.put(:binary, @fake_binary)
+                 |> Keyword.put(:card, bad)
                )
     end
 
