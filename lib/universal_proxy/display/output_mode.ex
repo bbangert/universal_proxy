@@ -2,7 +2,8 @@ defmodule UniversalProxy.Display.OutputMode do
   @moduledoc """
   Picks the display mode the renderer pins, from the connector's advertised
   modes (`EmergeSkia.drm_outputs/1` maps: `:width`, `:height`,
-  `:refresh_hz`, `:preferred`, `:interlaced`), and reads a mode's size.
+  `:refresh_hz`, `:preferred`, `:interlaced`), reads a mode's size, and
+  finds the DRM card a connector belongs to (`connector_card/3`).
 
   The renderer always passes an explicit mode instead of a size hint, so it
   knows the output size up front: Emerge's DRM backend reports the size
@@ -68,6 +69,35 @@ defmodule UniversalProxy.Display.OutputMode do
   def renderer_mode({width, height})
       when is_integer(width) and width > 0 and is_integer(height) and height > 0,
       do: %{width: width, height: height}
+
+  @doc """
+  The DRM card node (`<dri_dir>/cardN`) that has `connector` (a kernel
+  connector name, `"HDMI-A-1"`), from the card's sysfs connector entry
+  `<sysfs_dir>/cardN-<connector>`; `nil` when no card with a node has it.
+  Of several, the first in Emerge's scan order (sorted card paths).
+  """
+  @spec connector_card(String.t(), Path.t(), Path.t()) :: Path.t() | nil
+  def connector_card(connector, sysfs_dir \\ "/sys/class/drm", dri_dir \\ "/dev/dri")
+
+  def connector_card(connector, sysfs_dir, dri_dir) when is_binary(connector) do
+    with true <- connector =~ ~r/\A[A-Za-z0-9-]{1,32}\z/,
+         {:ok, entries} <- File.ls(sysfs_dir) do
+      entries
+      |> Enum.flat_map(fn entry ->
+        case Regex.run(~r/\A(card\d+)-(.+)\z/, entry) do
+          [_entry, card, ^connector] -> [Path.join(dri_dir, card)]
+          _other -> []
+        end
+      end)
+      |> Enum.filter(&File.exists?/1)
+      |> Enum.sort()
+      |> List.first()
+    else
+      _ -> nil
+    end
+  end
+
+  def connector_card(_connector, _sysfs_dir, _dri_dir), do: nil
 
   defp preferred_size(modes) do
     case Enum.find(modes, &Map.get(&1, :preferred, false)) do

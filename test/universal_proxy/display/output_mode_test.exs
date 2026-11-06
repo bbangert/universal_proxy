@@ -65,4 +65,52 @@ defmodule UniversalProxy.Display.OutputModeTest do
     assert OutputMode.renderer_mode({1280, 720}) == %{width: 1280, height: 720}
     assert OutputMode.renderer_mode({1920, 1080}) == %{width: 1920, height: 1080}
   end
+
+  describe "connector_card/3" do
+    @describetag :tmp_dir
+
+    # A fake /sys/class/drm and /dev/dri: `cards` are the card nodes,
+    # `entries` the sysfs entries.
+    defp drm(tmp_dir, cards, entries) do
+      sysfs = Path.join(tmp_dir, "sys")
+      dri = Path.join(tmp_dir, "dri")
+      File.mkdir_p!(sysfs)
+      File.mkdir_p!(dri)
+      Enum.each(cards, &File.write!(Path.join(dri, &1), ""))
+      Enum.each(entries, &File.mkdir_p!(Path.join(sysfs, &1)))
+      {sysfs, dri}
+    end
+
+    test "the card whose sysfs entries have the connector", %{tmp_dir: tmp_dir} do
+      # As on a Pi 4: card0 is v3d (no connectors), card1 is vc4.
+      {sysfs, dri} =
+        drm(tmp_dir, ~w(card0 card1), ~w(card0 card1 card1-HDMI-A-1 card1-HDMI-A-2 renderD128))
+
+      assert OutputMode.connector_card("HDMI-A-1", sysfs, dri) == Path.join(dri, "card1")
+      assert OutputMode.connector_card("HDMI-A-2", sysfs, dri) == Path.join(dri, "card1")
+    end
+
+    test "nil without a card for it", %{tmp_dir: tmp_dir} do
+      {sysfs, dri} = drm(tmp_dir, ~w(card0), ~w(card0 card0-HDMI-A-1 card0-HDMI-A-10))
+      assert OutputMode.connector_card("HDMI-A-2", sysfs, dri) == nil
+      # A prefix of another connector's name isn't it.
+      assert OutputMode.connector_card("HDMI-A", sysfs, dri) == nil
+      # No card node for the sysfs entry.
+      {sysfs, dri} = drm(Path.join(tmp_dir, "nonode"), [], ~w(card3-HDMI-A-1))
+      assert OutputMode.connector_card("HDMI-A-1", sysfs, dri) == nil
+      assert OutputMode.connector_card("HDMI-A-1", Path.join(tmp_dir, "missing"), dri) == nil
+    end
+
+    test "of several, the first card path in sort order", %{tmp_dir: tmp_dir} do
+      {sysfs, dri} = drm(tmp_dir, ~w(card1 card2), ~w(card2-HDMI-A-1 card1-HDMI-A-1))
+      assert OutputMode.connector_card("HDMI-A-1", sysfs, dri) == Path.join(dri, "card1")
+    end
+
+    test "nil for a name that isn't a connector name", %{tmp_dir: tmp_dir} do
+      {sysfs, dri} = drm(tmp_dir, ~w(card0), ~w(card0-HDMI-A-1))
+      assert OutputMode.connector_card("*", sysfs, dri) == nil
+      assert OutputMode.connector_card("../HDMI-A-1", sysfs, dri) == nil
+      assert OutputMode.connector_card(nil, sysfs, dri) == nil
+    end
+  end
 end
