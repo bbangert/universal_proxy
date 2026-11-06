@@ -54,7 +54,9 @@ defmodule UniversalProxy.Display.Model do
   viewport is started again at once), and `{:milkdrop, :ended, outcome}`
   once the renderer is gone (`:requested`, `:thermal` or `{:crashed,
   why}`; the viewport is started again if it was still yielded). A new
-  yield waits until the previous session ended.
+  yield waits until the previous session ended. `{:pack_restarted,
+  status}` (a new Pack process) replaces the pack status and lets a
+  missing pack be asked for again.
 
   Otherwise the mode shows the bar visualizer, or while the pack is
   missing (`:ensure_pack` asks for it) or downloading a "Preparing
@@ -162,6 +164,7 @@ defmodule UniversalProxy.Display.Model do
           | {:viewport_size, size()}
           | :hdmi_link_up
           | {:pack, pack()}
+          | {:pack_restarted, pack()}
           | {:milkdrop, :yielded | :presenting | :released}
           | {:milkdrop, :ended, milkdrop_outcome()}
 
@@ -540,6 +543,11 @@ defmodule UniversalProxy.Display.Model do
       do: start_viewport(put_vp(m, crashes: 0, crash_key: nil, delay_ms: nil)),
       else: {m, [], []}
   end
+
+  # A new Pack process (the old one crashed, its download with it): its
+  # status replaces the cached one and the pack may be asked for again.
+  defp apply_event(m, {:pack_restarted, status}, now),
+    do: apply_event(put_md(m, ensure: false), {:pack, status}, now)
 
   defp apply_event(m, {:pack, status}, _now) do
     cond do

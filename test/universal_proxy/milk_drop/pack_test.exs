@@ -339,6 +339,68 @@ defmodule UniversalProxy.MilkDrop.PackTest do
     assert {:ready, @version, _} = await_final()
   end
 
+  # As UniversalProxy.MilkDrop.Supervisor runs it: the download's Task
+  # supervisor and Pack, :one_for_all.
+  @tag capture_log: true
+  test "a Pack killed mid-download restarts absent and announces it", %{root: root, src: src} do
+    body = good_pack(src)
+    test_pid = self()
+
+    Req.Test.stub(@stub, fn conn ->
+      send(test_pid, {:request, self()})
+
+      receive do
+        :go -> Plug.Conn.send_resp(conn, 200, body)
+      end
+    end)
+
+    tasks = :"#{inspect(__MODULE__)}.KillTasks"
+
+    children = [
+      {Task.Supervisor, name: tasks},
+      {Pack,
+       name: nil,
+       root: root,
+       pin: pin(body),
+       task_supervisor: tasks,
+       req_options: [plug: {Req.Test, @stub}]}
+    ]
+
+    sup =
+      start_supervised!(%{
+        id: :pack_unit,
+        type: :supervisor,
+        start: {Supervisor, :start_link, [children, [strategy: :one_for_all]]}
+      })
+
+    pack = fn ->
+      Enum.find_value(Supervisor.which_children(sup), fn
+        {Pack, pid, _, _} -> pid
+        _ -> nil
+      end)
+    end
+
+    old = pack.()
+
+    assert {:downloading, 0} = Pack.ensure(old)
+    assert_receive {:request, handler}
+    handler_ref = Process.monitor(handler)
+
+    Process.exit(old, :kill)
+    assert_receive {:milkdrop_pack_started, :absent}, 5_000
+    # The download died with it.
+    assert_receive {:DOWN, ^handler_ref, :process, ^handler, _}, 5_000
+    new = pack.()
+    assert is_pid(new) and new != old
+    assert Pack.status(new) == :absent
+
+    # And it can be asked again.
+    assert {:downloading, 0} = Pack.ensure(new)
+    assert_receive {:request, handler}
+    send(handler, :go)
+    assert {:ready, @version, _} = await_final()
+  end
+
   test "the public API reports :not_running when the server is down" do
     dead = spawn(fn -> :ok end)
     ref = Process.monitor(dead)

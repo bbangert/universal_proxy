@@ -444,6 +444,30 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     wait_until(fn -> md(ctx).phase == :presenting end)
   end
 
+  test "a Pack restarted mid-download is asked for the pack again", ctx do
+    ctx = start_ui(ctx, pack: :absent, ensured: {:downloading, 0})
+    milkdrop_mode(ctx)
+    assert_receive :pack_ensure, @timeout
+
+    Phoenix.PubSub.broadcast(
+      ctx.pubsub,
+      UniversalProxy.MilkDrop.pack_topic(),
+      {:milkdrop_pack, {:downloading, 40}}
+    )
+
+    assert_pushed(&("Preparing visualizer… 40%" in &1))
+
+    # The crashed Pack's download died with it; the new one starts absent.
+    Phoenix.PubSub.broadcast(
+      ctx.pubsub,
+      UniversalProxy.MilkDrop.pack_topic(),
+      {:milkdrop_pack_started, :absent}
+    )
+
+    assert_receive :pack_ensure, @timeout
+    assert %{screen: {:milkdrop_preparing, nil}, milkdrop: %{pack: :absent}} = status(ctx)
+  end
+
   test "a pack error shows a short notice, then the bars", ctx do
     ctx =
       start_ui(ctx,

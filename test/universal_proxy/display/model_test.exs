@@ -842,6 +842,24 @@ defmodule UniversalProxy.Display.ModelTest do
       assert Model.screen(m) == {:visualizer, false}
     end
 
+    test "a restarted Pack (its download gone) is asked for the pack again" do
+      m = run!(ready(milkdrop: true), [{:pack, :absent}])
+      {m, effects} = run(m, [{:set_mode, :milkdrop}, {:pack, {:downloading, 40}}])
+      assert Enum.count(effects, &(&1 == :ensure_pack)) == 1
+      assert Model.screen(m) == {:milkdrop_preparing, 40}
+
+      {m, effects} = run(m, [{:pack_restarted, :absent}])
+      assert :ensure_pack in effects
+      assert m.pack == :absent
+      assert Model.screen(m) == {:milkdrop_preparing, nil}
+
+      # A restarted Pack that finds the pack extracted just reports it.
+      {m, effects} = run(m, [{:pack_restarted, @pack}, {:stream, :start}])
+      refute :ensure_pack in effects
+      assert {:yield, :milkdrop} in effects
+      assert m.pack == @pack
+    end
+
     test "a persisted MilkDrop mode with no pack yet asks for it" do
       m = run!(Model.new(milkdrop: true), [{:pack, :absent}])
       {m, effects} = run(m, [{:bound, @binding, :milkdrop}])

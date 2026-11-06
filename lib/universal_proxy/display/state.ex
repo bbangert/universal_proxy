@@ -51,9 +51,11 @@ defmodule UniversalProxy.Display.State do
   With MilkDrop on (`UniversalProxy.MilkDrop.enabled?/0`, or the
   `:milkdrop` option) State also follows the preset pack
   (`UniversalProxy.MilkDrop.Pack`'s status and PubSub, `:ensure_pack` as a
-  task) and runs the model's `{:yield, :milkdrop}` / `:reclaim` as a
-  handover with the renderer's port owner, `UniversalProxy.Display.MilkDrop`
-  (started unlinked and monitored):
+  task; a restarted Pack's `{:milkdrop_pack_started, status}` replaces the
+  cached status and lets the pack be asked for again) and runs the model's
+  `{:yield, :milkdrop}` / `:reclaim` as a handover with the renderer's port
+  owner, `UniversalProxy.Display.MilkDrop` (started unlinked and
+  monitored):
 
     1. `:tapping` — the bound player's PCM tap is turned on, leased to this
        process (`UniversalProxy.Audio.pcm_tap/3`: the player turns it off
@@ -320,6 +322,9 @@ defmodule UniversalProxy.Display.State do
 
   def handle_info({:milkdrop_pack, status}, %{milkdrop?: true} = state),
     do: {:noreply, dispatch(state, {:pack, status})}
+
+  def handle_info({:milkdrop_pack_started, status}, %{milkdrop?: true} = state),
+    do: {:noreply, dispatch(state, {:pack_restarted, status})}
 
   # `ensure/0`'s own answer: only a final one (progress comes on PubSub,
   # and an unchanged error isn't broadcast).
