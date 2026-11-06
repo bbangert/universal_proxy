@@ -182,7 +182,7 @@ defmodule UniversalProxy.Display.MilkDropTest do
     assert_receive {:milkdrop, ^pid, %{event: :exiting, reason: "requested"}}, @timeout
     assert_receive {:milkdrop_exit, ^pid, 0}, @timeout
     assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, @timeout
-    refute File.exists?(ctx.skip_file)
+    wait_until(fn -> not File.exists?(ctx.skip_file) end)
   end
 
   test "preset commands are written as JSON lines", ctx do
@@ -315,11 +315,13 @@ defmodule UniversalProxy.Display.MilkDropTest do
     assert_receive {:owner_got, {:milkdrop, ^pid, %{event: :prepared}}}, @timeout
     os_pid = ignore_eof(ctx, pid)
     ref = Process.monitor(pid)
+    assert File.exists?(ctx.skip_file)
 
     Process.exit(owner, :kill)
     assert_receive {:DOWN, ^ref, :process, ^pid, _}, @timeout
     wait_until(fn -> not File.exists?("/proc/#{os_pid}") end)
     refute File.exists?(ctx.skip_file <> ".eof")
+    wait_until(fn -> not File.exists?(ctx.skip_file) end)
   end
 
   @tag capture_log: true

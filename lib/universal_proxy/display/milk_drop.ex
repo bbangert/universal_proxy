@@ -44,7 +44,8 @@ defmodule UniversalProxy.Display.MilkDrop do
     * `:settings`, `:skipped` — default to `UniversalProxy.MilkDrop.Store`'s
       settings and skip list for `:pack_version`; `:store` names the Store;
     * `:skip_file` — where the skip list is written for the renderer
-      (default `<tmp>/up-milkdrop-skip.txt`; deleted on stop);
+      (default a unique `<tmp>/up-milkdrop-skip-N.txt`; deleted by the
+      reaper however this process ends);
     * `:binary` — the renderer (default `default_binary/0`);
     * `:kill_grace_ms` — how long a renderer that outlives its closed stdin
       may run before it is SIGKILLed (default 2000);
@@ -259,7 +260,10 @@ defmodule UniversalProxy.Display.MilkDrop do
       settings: settings,
       skip_file:
         Keyword.get_lazy(opts, :skip_file, fn ->
-          Path.join(System.tmp_dir!(), "up-milkdrop-skip.txt")
+          Path.join(
+            System.tmp_dir!(),
+            "up-milkdrop-skip-#{System.unique_integer([:positive])}.txt"
+          )
         end)
     }
 
@@ -270,7 +274,7 @@ defmodule UniversalProxy.Display.MilkDrop do
 
     with :ok <- validate(config),
          :ok <- write_skip_file(config.skip_file, skipped),
-         {:ok, reaper} <- start_reaper(task_sup, kill_grace_ms),
+         {:ok, reaper} <- start_reaper(task_sup, kill_grace_ms, config.skip_file),
          {:ok, port} <- open_port(binary, args(config)) do
       os_pid = os_pid(port)
       send(reaper, if(os_pid, do: {:os_pid, os_pid}, else: :renderer_exited))
@@ -351,12 +355,6 @@ defmodule UniversalProxy.Display.MilkDrop do
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
-
-  # The port closes with this process; the reaper handles a renderer that
-  # outlives it. A killed server leaves the skip file for the next start
-  # to overwrite.
-  @impl true
-  def terminate(_reason, state), do: File.rm(state.skip_file)
 
   # -- Private --
 
@@ -476,15 +474,21 @@ defmodule UniversalProxy.Display.MilkDrop do
   # after a grace period if its pid is still alive. `:renderer_exited`
   # (sent before the server stops) means there is nothing to kill, so a
   # recycled pid is not. It traps exits so that its supervisor's shutdown
-  # kills a still-running renderer rather than abandoning it.
-  defp start_reaper(task_sup, grace_ms) do
+  # kills a still-running renderer rather than abandoning it. It also
+  # deletes the skip file, last, once the renderer is dead or gone.
+  defp start_reaper(task_sup, grace_ms, skip_file) do
     server = self()
 
     case Task.Supervisor.start_child(
            task_sup,
            fn ->
              Process.flag(:trap_exit, true)
-             reap(Process.monitor(server), grace_ms)
+
+             try do
+               reap(Process.monitor(server), grace_ms)
+             after
+               _ = File.rm(skip_file)
+             end
            end,
            shutdown: @reaper_shutdown_ms
          ) do
