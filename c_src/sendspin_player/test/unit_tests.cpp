@@ -323,6 +323,25 @@ static void test_pcm_tap_layout() {
     fs::remove(path);
 }
 
+static void test_pcm_tap_rejects_symlink() {
+    std::string target = tap_path("symlink_target");
+    std::string link = tap_path("symlink_link");
+    {
+        FILE* f = std::fopen(target.c_str(), "w");
+        CHECK(f != nullptr);
+        std::fputs("keep", f);
+        std::fclose(f);
+    }
+    fs::remove(link);
+    fs::create_symlink(target, link);
+    std::string err;
+    CHECK(pcm_tap::Writer::open(link, err) == nullptr);
+    CHECK(!err.empty());
+    CHECK(fs::file_size(target) == 4);
+    fs::remove(link);
+    fs::remove(target);
+}
+
 static void test_pcm_tap_convert() {
     int16_t out[8];
     // S16_LE stereo: unchanged.
@@ -635,6 +654,7 @@ int main() {
     test_artwork_store();
     test_viz_gate();
     test_pcm_tap_layout();
+    test_pcm_tap_rejects_symlink();
     test_pcm_tap_convert();
     test_pcm_tap_wraparound();
     test_pcm_tap_time_lookup();

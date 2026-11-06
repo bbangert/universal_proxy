@@ -48,7 +48,8 @@ public:
     // Creates (or reuses) and maps the ring file at `path`. An existing
     // file of this layout keeps its counters and moves to a new epoch, so
     // a reader that still has it mapped resyncs; anything else is
-    // resized and zeroed. Null with `err` set on failure.
+    // resized and zeroed. A symlink or non-regular file at `path` is
+    // rejected. Null with `err` set on failure.
     static std::unique_ptr<Writer> open(const std::string& path, std::string& err,
                                         uint32_t capacity_frames = DEFAULT_CAPACITY_FRAMES,
                                         uint32_t chunk_capacity = DEFAULT_CHUNK_CAPACITY) {
@@ -57,7 +58,7 @@ public:
             return nullptr;
         }
         const size_t bytes = file_bytes(capacity_frames, chunk_capacity);
-        int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+        int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
         if (fd < 0) {
             err = std::string("open: ") + std::strerror(errno);
             return nullptr;
@@ -65,6 +66,11 @@ public:
         struct stat st {};
         if (::fstat(fd, &st) != 0) {
             err = std::string("fstat: ") + std::strerror(errno);
+            ::close(fd);
+            return nullptr;
+        }
+        if (!S_ISREG(st.st_mode)) {
+            err = "not a regular file";
             ::close(fd);
             return nullptr;
         }
