@@ -1,11 +1,14 @@
 #pragma once
 
+#include "pcm_tap_writer.h"
+
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -58,6 +61,15 @@ class AlsaPipeSink {
     /// first configure(). Empty string uses the system default device.
     void set_device(const std::string& device);
 
+    /// Main thread only. Publishes `tap` (already mapped) to the playback
+    /// thread, which then copies each period, pre-volume, into it; nullptr
+    /// turns the tap off. Returns once the playback thread can no longer be
+    /// writing to the previous tap, which is then closed.
+    void set_pcm_tap(std::unique_ptr<pcm_tap::Writer> tap);
+
+    /// Main thread only.
+    bool pcm_tap_enabled() const { return tap_owner_ != nullptr; }
+
     /// Callback for timing feedback — wired to player.notify_audio_played().
     std::function<void(uint32_t frames, int64_t timestamp)> on_frames_played;
 
@@ -98,4 +110,18 @@ class AlsaPipeSink {
     std::atomic<bool> volume_external_{false};
 
     void apply_volume(uint8_t* data, size_t length);
+
+    // ---- PCM tap (pcm_tap.h) ----
+    // tap_owner_ is the main thread's; tap_ is what the playback thread
+    // sees. tap_busy_ brackets every playback-thread use of tap_, so
+    // set_pcm_tap() can wait out an in-flight one before freeing it.
+    std::unique_ptr<pcm_tap::Writer> tap_owner_;
+    std::atomic<pcm_tap::Writer*> tap_{nullptr};
+    std::atomic<bool> tap_busy_{false};
+    // Playback thread only (successive threads are joined in between):
+    // bumped on every stream start and flush, so each gets its own epoch.
+    uint64_t tap_stream_{0};
+
+    template <typename F>
+    void with_tap(F&& f);
 };

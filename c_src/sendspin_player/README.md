@@ -28,6 +28,8 @@ c_src/sendspin_player/
     ├── started_event.{h,cpp} ours — advertised formats + the `started` line
     ├── json_out.{h,cpp}     ours — JSON escaping + the guarded stdout writer
     ├── sha256.{h,cpp}       ours — artwork file names
+    ├── pcm_tap.h            ours — PCM tap ring layout + reader (renderer copies it)
+    ├── pcm_tap_writer.h     ours — PCM tap writer + S16 conversion
     └── main.cpp             ours — CLI args + JSON stdout/stdin
 test/unit_tests.cpp          host unit tests (target sendspin_player_unit_tests,
                              run by test/sendspin_player_unit_test.exs)
@@ -182,6 +184,7 @@ The flags must match what `UniversalProxy.Audio.Player` passes — see the
 | `--viz-bins 1..128`        | no       | Visualizer spectrum bins (default 32) |
 | `--viz-rate 1..60`         | no       | Visualizer frames per second (default 20) |
 | `--viz-offset-ms 0..1000`  | no       | Deliver visualizer frames this far ahead of their display time (default 0) |
+| `--pcm-tap-path PATH`      | no       | File the `pcm_tap` command maps the PCM tap ring at (see *PCM tap*). Without it `pcm_tap` fails |
 | `--log-level STR`          | no       | `none\|error\|warn\|info\|debug\|verbose`    |
 | `--help` / `-h`            | no       | Print usage and exit                         |
 | `--version` / `-V`         | no       | Print version and exit                       |
@@ -203,6 +206,8 @@ changes, and on errors.
 {"event":"volume","value":80}
 {"event":"mute","value":false}
 {"event":"volume_external","value":true}  // ack of set_volume_external / --external-volume
+{"event":"pcm_tap","value":true}          // ack of pcm_tap
+{"event":"pcm_tap","value":false,"ok":false,"error":"open: Permission denied"} // pcm_tap on failed
 {"event":"error","kind":"alsa_configure","msg":"..."}
 {"event":"error","kind":"pairing_token","msg":"..."}  // non-fatal; token itself never on stdout
 {"event":"error","kind":"oversize_line","msg":"..."}  // a line over the cap was dropped (a bug)
@@ -351,6 +356,7 @@ window.
 {"cmd":"set_volume_external","value":true}
 {"cmd":"controller","value":3}      // --display-roles only
 {"cmd":"viz_enable","value":true}   // --display-roles only
+{"cmd":"pcm_tap","value":true}
 {"cmd":"shutdown"}
 ```
 
@@ -368,6 +374,77 @@ HDMI-CEC). While it is on, the sink writes samples at unity gain and never
 mutes them. Volume and mute are still stored, reported to the server and
 emitted as `volume`/`mute` events exactly as in software mode. Turning it off resumes software scaling at the stored values. Default
 off; `--external-volume` starts in it.
+
+## PCM tap
+
+`{"cmd":"pcm_tap","value":true}` maps the ring file at `--pcm-tap-path`
+(created `0644` if missing; `Audio.Player` uses `/run/up-pcm-<client_id>`
+on target, a tmpfs) and from then on the playback thread copies every
+period it plays into it, **before** software volume, so the visualizer
+does not follow the volume. `false` stops the copy and unmaps the ring;
+the file stays. Off at start; while off the playback thread pays one
+relaxed atomic load per period. The tap works with or without
+`--display-roles`. Both are acked with a `pcm_tap` event; a failed `true`
+(no path, `open`/`ftruncate`/`mmap` error) acks `value:false` with
+`ok:false` and the error.
+
+The ring is one file, little-endian, naturally aligned. The layout and a
+reader live in `src/pcm_tap.h`, which a reader in another process (the
+`milkdrop_renderer`) copies:
+
+| Offset | Size | Field | |
+| ------ | ---- | ----- | - |
+| 0  | u32 | `magic` | `0x4D435055` ("UPCM"), written last at init |
+| 4  | u16 | `version` | 1 |
+| 6  | u16 | `header_bytes` | 64 |
+| 8  | u32 | `seq` | seqlock over `epoch` + `sample_rate`, odd while changing |
+| 12 | u32 | `epoch` | bumps on stream start, format change, flush, tap off/on |
+| 16 | u32 | `sample_rate` | Hz, 0 = no stream |
+| 20 | u16 | `channels` | 2 (mono duplicated; more than 2 keep the first two) |
+| 22 | u16 | `format` | 1 = S16_LE interleaved (24/32-bit input keeps its top 16 bits) |
+| 24 | u32 | `capacity_frames` | F = 65536 (~1.4 s at 48 kHz), power of two |
+| 28 | u32 | `chunk_capacity` | C = 1024, power of two |
+| 32 | u64 | `frames_reserved` | raised before samples are written |
+| 40 | u64 | `frames_written` | the write index: total frames committed |
+| 48 | u64 | `chunks_reserved` | raised before a record is written |
+| 56 | u64 | `chunks_written` | total chunks committed |
+| 64 | 24 × C | chunk records | `{u64 start_frame, i64 t_end_us, u32 frames, u32 epoch}` |
+| 64 + 24·C (24640) | 4 × F | samples | `int16[F][2]`; frame `i` in slot `i % F` |
+
+The counters never wrap (only slot offsets do); the 64-bit ones are
+lock-free atomics. Each period played adds one chunk record (`n`-th chunk
+in slot `n % C`): `t_end_us` is the `CLOCK_MONOTONIC_RAW` play time of its
+last frame, `now_us() + snd_pcm_delay()` taken right after the
+`snd_pcm_writei` that queued it, the same timestamp the sync feedback
+uses. Within an epoch frame indices are contiguous, so frame `i` of a
+record plays `(start_frame + frames - 1 - i) / sample_rate` before
+`t_end_us`.
+
+The writer is wait-free. A reader copies records and samples covered by
+the `*_written` counters, then re-reads `seq` and the `*_reserved`
+counters: if `seq` moved, or anything it copied is older than
+`reserved - capacity`, the writer may have overwritten it mid-copy and
+the read is discarded (`Status::Retry`). Readers use only records of the
+current epoch, so after a new epoch they see no data until it has some.
+`Reader::read_ending_at(t, n, ...)` returns the `n` frames ending at play
+time `t`, zero-filled before the epoch's first frame and before any gap in
+play times of over a chunk (an underrun; shorter gaps are taken as
+timestamp jitter). It returns `NoData` when no PCM of the current epoch
+plays at `t` (before the epoch, after the newest chunk, or over a chunk
+into a gap), or when the window reaches back past the oldest chunk record
+kept, whose history is then unknown (only with chunks shorter than
+`F / C` frames).
+
+Enabling maps the file on the main thread (with `MAP_POPULATE`) and
+publishes the writer to the playback thread through an atomic pointer.
+Disabling swaps the pointer to null, then waits out a playback-thread
+use in flight (a `tap_busy_` flag the playback thread raises around each
+commit, a one-period memcpy), so the playback thread itself never waits.
+Re-enabling on a file of the same layout keeps its counters and starts a
+new epoch, so a reader that kept it mapped resyncs. The reserved counters
+never decrease: a writer killed mid-commit leaves them past the written
+ones, over samples it may have overwritten, and the next writer continues
+from them.
 
 ## Cross-target compilation
 

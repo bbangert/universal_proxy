@@ -266,6 +266,31 @@ void AlsaPipeSink::apply_volume(uint8_t* data, size_t length) {
 }
 
 // ---------------------------------------------------------------------------
+// PCM tap
+// ---------------------------------------------------------------------------
+
+// A Dekker-style handshake: the playback thread raises tap_busy_ before it
+// loads tap_, set_pcm_tap() swaps tap_ before it loads tap_busy_, all
+// seq_cst. So either the playback thread sees the new pointer, or
+// set_pcm_tap() sees it busy and waits for the (one period copy) to end.
+// The playback thread never waits.
+void AlsaPipeSink::set_pcm_tap(std::unique_ptr<pcm_tap::Writer> tap) {
+    pcm_tap::Writer* prev = tap_.exchange(tap.get(), std::memory_order_seq_cst);
+    while (tap_busy_.load(std::memory_order_seq_cst)) std::this_thread::yield();
+    // Readers drop the old tap's data now rather than when it goes stale.
+    if (prev != nullptr) prev->end_stream();
+    tap_owner_ = std::move(tap);
+}
+
+template <typename F>
+void AlsaPipeSink::with_tap(F&& f) {
+    if (tap_.load(std::memory_order_relaxed) == nullptr) return;
+    tap_busy_.store(true, std::memory_order_seq_cst);
+    if (pcm_tap::Writer* w = tap_.load(std::memory_order_seq_cst)) f(*w);
+    tap_busy_.store(false, std::memory_order_release);
+}
+
+// ---------------------------------------------------------------------------
 // Ring buffer producer (called from sendspin's network/decode thread)
 // ---------------------------------------------------------------------------
 
@@ -337,12 +362,22 @@ void AlsaPipeSink::playback_loop() {
     const size_t period_bytes =
         static_cast<size_t>(period_frames_) * bytes_per_frame_;
     std::vector<uint8_t> buf(period_bytes);
+    // Pre-volume S16 copy of `buf` for the PCM tap, filled only while on.
+    std::vector<int16_t> tap_buf(static_cast<size_t>(period_frames_) * pcm_tap::CHANNELS);
+
+    // A new stream (configure() starts a new thread per format): new epoch.
+    auto tap_new_stream = [this] {
+        ++tap_stream_;
+        with_tap([this](pcm_tap::Writer& w) { w.begin_stream(tap_stream_, sample_rate_); });
+    };
+    tap_new_stream();
 
     while (running_.load()) {
         // ---- Handle flush request (from clear()) ----
         if (flush_requested_.exchange(false)) {
             snd_pcm_drop(PCM);
             snd_pcm_prepare(PCM);
+            tap_new_stream();
             continue;
         }
 
@@ -373,6 +408,15 @@ void AlsaPipeSink::playback_loop() {
         }
         ring_cv_.notify_one();  // wake producer if it was blocked
 
+        // ---- PCM tap: keep the pre-volume samples (visuals ignore volume) ----
+        uint32_t tap_frames = 0;
+        if (tap_.load(std::memory_order_relaxed) != nullptr &&
+            pcm_tap::to_s16_stereo(buf.data(),
+                                   static_cast<uint32_t>(to_read / bytes_per_frame_),
+                                   bits_per_sample_, channels_, tap_buf.data())) {
+            tap_frames = static_cast<uint32_t>(to_read / bytes_per_frame_);
+        }
+
         // ---- Apply volume (done here so changes take effect immediately) ----
         apply_volume(buf.data(), to_read);
 
@@ -396,7 +440,10 @@ void AlsaPipeSink::playback_loop() {
         }
 
         // ---- Timing feedback via snd_pcm_delay() ----
-        if (offset > 0 && on_frames_played) {
+        // The frames just written end at now + delay: that is both the
+        // sync feedback and the tap's t_end_us, so the tap commits here,
+        // after the write, rather than where it copied the samples.
+        if (offset > 0 && (on_frames_played || tap_frames > 0)) {
             snd_pcm_sframes_t delay = 0;
             if (snd_pcm_delay(PCM, &delay) < 0 || delay < 0)
                 delay = static_cast<snd_pcm_sframes_t>(buffer_frames_);
@@ -408,8 +455,19 @@ void AlsaPipeSink::playback_loop() {
             // steady_clock (CLOCK_MONOTONIC) as NTP slews the latter. Stamping
             // playback times from the wrong domain would skew sync over time.
             int64_t now_us = sendspin::SendspinClient::now_us();
+            int64_t t_end_us = now_us + delay_us;
 
-            on_frames_played(static_cast<uint32_t>(offset), now_us + delay_us);
+            if (on_frames_played)
+                on_frames_played(static_cast<uint32_t>(offset), t_end_us);
+
+            // A short write (stop, hard error) played only its first
+            // `offset` frames.
+            if (tap_frames > 0) {
+                uint32_t n = std::min(tap_frames, static_cast<uint32_t>(offset));
+                with_tap([&](pcm_tap::Writer& w) {
+                    w.commit(tap_stream_, sample_rate_, tap_buf.data(), n, t_end_us);
+                });
+            }
         }
     }
 }

@@ -820,6 +820,88 @@ defmodule UniversalProxy.Audio.PlayerTest do
     end
   end
 
+  describe "pcm_tap/2" do
+    test "the binary gets --pcm-tap-path, under the tmp dir on the host" do
+      pid = start_player!()
+      assert_receive {:sendspin_state, @key, %{event: "started"}}, 2_000
+
+      path = Player.pcm_tap_path(config())
+      assert path == Path.join(System.tmp_dir!(), "up-pcm-deadbeef")
+      assert %{path: ^path, enabled: false} = Player.pcm_tap_status(pid)
+
+      assert ["--pcm-tap-path", ^path | _] =
+               Enum.drop_while(
+                 Player.__cli_args__(:sys.get_state(pid)),
+                 &(&1 != "--pcm-tap-path")
+               )
+    end
+
+    test "a player started without a path passes no flag" do
+      refute "--pcm-tap-path" in Player.__cli_args__(cli_state(pcm_tap_path: nil))
+    end
+
+    test "the ack is broadcast and tracked in pcm_tap_status/1" do
+      pid = start_player!(pcm_tap_path: "/run/up-pcm-test")
+      assert_receive {:sendspin_state, @key, %{event: "started"}}, 2_000
+
+      :ok = Player.pcm_tap(pid, true)
+      assert_receive {:sendspin_state, @key, %{event: "pcm_tap", value: true}}, 1_000
+      assert %{path: "/run/up-pcm-test", enabled: true} = Player.pcm_tap_status(pid)
+
+      :ok = Player.pcm_tap(pid, false)
+      assert_receive {:sendspin_state, @key, %{event: "pcm_tap", value: false}}, 1_000
+      assert %{enabled: false} = Player.pcm_tap_status(pid)
+    end
+
+    test "a failed enable leaves the tap off and logs why" do
+      pid = start_player!(pcm_tap_path: nil)
+      assert_receive {:sendspin_state, @key, %{event: "started"}}, 2_000
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          :ok = Player.pcm_tap(pid, true)
+
+          assert_receive {:sendspin_state, @key, %{event: "pcm_tap", value: false, ok: false}},
+                         1_000
+
+          assert %{path: nil, enabled: false} = Player.pcm_tap_status(pid)
+        end)
+
+      assert log =~ "could not enable the PCM tap"
+      assert log =~ "no --pcm-tap-path"
+    end
+
+    test "rejects a non-boolean" do
+      pid = start_player!()
+      assert_raise FunctionClauseError, fn -> apply(Player, :pcm_tap, [pid, 1]) end
+    end
+
+    @tag :tmp_dir
+    test "writes the command with the fixed field order", %{tmp_dir: tmp_dir} do
+      log = Path.join(tmp_dir, "stdin.log")
+      recorder = Path.join(tmp_dir, "recorder.sh")
+
+      File.write!(recorder, """
+      #!/bin/sh
+      echo '{"event":"started","version":"0.0.0-fake","port":19003,"name":"x","alsa_device":"x"}'
+      cat > "#{log}"
+      """)
+
+      File.chmod!(recorder, 0o755)
+
+      pid = start_player!(binary_path: recorder, mdns_port: 19_003)
+      assert_receive {:sendspin_state, @key, %{event: "started"}}, 2_000
+
+      :ok = Player.pcm_tap(pid, true)
+      :ok = Player.pcm_tap(pid, false)
+      :ok = GenServer.stop(pid, :normal, 2_000)
+
+      lines = log |> File.read!() |> String.split("\n", trim: true)
+      assert ~s({"cmd":"pcm_tap","value":true}) in lines
+      assert ~s({"cmd":"pcm_tap","value":false}) in lines
+    end
+  end
+
   describe "termination" do
     test "sends shutdown command and removes the mDNS service" do
       pid = start_player!()

@@ -17,6 +17,9 @@ Player tests need to drive.
     {"cmd":"set_muted","value":B}  → {"event":"mute","value":B}
     {"cmd":"set_volume_external","value":B} → {"event":"volume_external","value":B}
                                    (non-bool value dropped, like the real binary)
+    {"cmd":"pcm_tap","value":B}    → {"event":"pcm_tap","value":B}, or with B true
+                                     and no --pcm-tap-path the ok:false ack
+                                     (no ring file is written)
     {"cmd":"shutdown"}             → {"event":"shutdown"} + exit 0
     {"cmd":"force_exit"}           → exit 7 (test-only; no event)
 
@@ -140,6 +143,7 @@ def main():
     p.add_argument("--viz-bins", type=int, default=32)
     p.add_argument("--viz-rate", type=int, default=20)
     p.add_argument("--viz-offset-ms", type=int, default=0)
+    p.add_argument("--pcm-tap-path", default="")
     p.add_argument("--log-level", default="info")
     args = p.parse_args()
 
@@ -217,6 +221,13 @@ def main():
         elif kind == "set_volume_external":
             if isinstance(cmd.get("value"), bool):
                 emit({"event": "volume_external", "value": cmd["value"]})
+        elif kind == "pcm_tap":
+            if isinstance(cmd.get("value"), bool):
+                if cmd["value"] and not args.pcm_tap_path:
+                    emit({"event": "pcm_tap", "value": False, "ok": False,
+                          "error": "no --pcm-tap-path"})
+                else:
+                    emit({"event": "pcm_tap", "value": cmd["value"]})
         elif kind == "shutdown":
             emit({"event": "shutdown"})
             return 0

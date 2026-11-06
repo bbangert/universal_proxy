@@ -48,6 +48,8 @@ defmodule UniversalProxy.Audio.Player do
       {"event":"mute","value":false}
       {"event":"volume_external","value":true}
       {"event":"static_delay","value":200}
+      {"event":"pcm_tap","value":true}
+      {"event":"pcm_tap","value":false,"ok":false,"error":"open: Permission denied"}
       {"event":"error","kind":"alsa_configure","msg":"..."}
       {"event":"error","kind":"pairing_token","msg":"..."}
       {"event":"shutdown"}
@@ -57,6 +59,7 @@ defmodule UniversalProxy.Audio.Player do
       {"cmd":"set_volume","value":75}
       {"cmd":"set_muted","value":true}
       {"cmd":"set_volume_external","value":true}
+      {"cmd":"pcm_tap","value":true}
       {"cmd":"shutdown"}
 
   ## Display roles
@@ -129,6 +132,15 @@ defmodule UniversalProxy.Audio.Player do
   emitted as `volume`/`mute` events exactly as in software mode. Start
   in it with the `:volume_external` option (passed as
   `--external-volume`), toggle it with `set_volume_external/2`.
+
+  ## PCM tap
+
+  Every binary is started with `--pcm-tap-path` (see `pcm_tap_path/1`).
+  `pcm_tap/2` makes it copy the PCM it plays, before software volume, into
+  an mmap'd ring at that path for the visualizer renderer; the layout is
+  `c_src/sendspin_player/src/pcm_tap.h`. Off at start, independent of the
+  display roles. The binary's `pcm_tap` ack is the source of truth for
+  `pcm_tap_status/1`.
 
   The binary also writes its Sendspin pairing token to `pairing_token`
   in the state dir (see `state_dir/1`); that secret never appears on
@@ -217,6 +229,7 @@ defmodule UniversalProxy.Audio.Player do
     :device_name_fun,
     :mac_address_fun,
     :state_dir,
+    :pcm_tap_path,
     port: nil,
     client_id: nil,
     mdns_id: nil,
@@ -226,6 +239,7 @@ defmodule UniversalProxy.Audio.Player do
     mdns_retry_ms: @mdns_retry_ms,
     mdns_failures: 0,
     volume_external: false,
+    pcm_tap: false,
     startup: [:volume],
     last_event: %{},
     os_pid: nil,
@@ -250,6 +264,7 @@ defmodule UniversalProxy.Audio.Player do
           device_name_fun: (-> String.t() | nil) | term(),
           mac_address_fun: (-> String.t() | nil) | term(),
           state_dir: String.t(),
+          pcm_tap_path: String.t() | nil,
           port: port() | nil,
           client_id: String.t() | nil,
           mdns_id: term(),
@@ -259,6 +274,7 @@ defmodule UniversalProxy.Audio.Player do
           mdns_retry_ms: pos_integer(),
           mdns_failures: non_neg_integer(),
           volume_external: boolean(),
+          pcm_tap: boolean(),
           startup: [:volume | :muted],
           last_event: map(),
           os_pid: pos_integer() | nil,
@@ -270,6 +286,8 @@ defmodule UniversalProxy.Audio.Player do
         }
 
   @type controller_command :: :play | :pause | :stop | :next | :previous
+
+  @type pcm_tap_status :: %{path: String.t() | nil, enabled: boolean()}
 
   # -- Client API --
 
@@ -353,6 +371,26 @@ defmodule UniversalProxy.Audio.Player do
   end
 
   @doc """
+  Turn the PCM tap on or off (off at start). On, the binary maps the ring
+  file at its `--pcm-tap-path` and copies the PCM it plays into it,
+  before software volume; off, it stops and unmaps it (the file stays).
+  Works with or without display roles. Acked with a `pcm_tap` event on
+  `"sendspin:state"`; a failed enable acks `value: false, ok: false`.
+  `:ok` even when the binary is exiting, like `set_volume/2`.
+  """
+  @spec pcm_tap(GenServer.server(), boolean()) :: :ok
+  def pcm_tap(server, enabled?) when is_boolean(enabled?) do
+    GenServer.call(server, {:pcm_tap, enabled?})
+  end
+
+  @doc """
+  The PCM tap ring's path (`nil` when started without one) and whether
+  the binary last acked the tap on.
+  """
+  @spec pcm_tap_status(GenServer.server()) :: pcm_tap_status()
+  def pcm_tap_status(server), do: GenServer.call(server, :pcm_tap_status)
+
+  @doc """
   The PubSub topic a player's visualizer frames go to, named by the
   output's `Audio.Store` `client_id`.
   """
@@ -400,6 +438,7 @@ defmodule UniversalProxy.Audio.Player do
     state_dir = Keyword.get(opts, :state_dir) || state_dir(config)
     volume_external = Keyword.get(opts, :volume_external, false)
     display_roles = Keyword.get(opts, :display_roles)
+    tap_path = Keyword.get_lazy(opts, :pcm_tap_path, fn -> pcm_tap_path(config) end)
 
     state = %__MODULE__{
       key: key,
@@ -413,7 +452,8 @@ defmodule UniversalProxy.Audio.Player do
       mac_address_fun: mac_address_fun,
       state_dir: state_dir,
       volume_external: volume_external,
-      display_roles: display_roles
+      display_roles: display_roles,
+      pcm_tap_path: tap_path
     }
 
     if File.exists?(binary_path) do
@@ -500,6 +540,15 @@ defmodule UniversalProxy.Audio.Player do
     {:reply, {state.display_seq, state.display}, state}
   end
 
+  def handle_call({:pcm_tap, enabled?}, _from, state) do
+    send_command(state, {:pcm_tap, enabled?})
+    {:reply, :ok, state}
+  end
+
+  def handle_call(:pcm_tap_status, _from, state) do
+    {:reply, %{path: state.pcm_tap_path, enabled: state.pcm_tap}, state}
+  end
+
   def handle_call({cmd, _arg}, _from, %{display_roles: nil} = state)
       when cmd in [:controller, :viz_enable] do
     {:reply, {:error, :display_roles_disabled}, state}
@@ -555,7 +604,12 @@ defmodule UniversalProxy.Audio.Player do
          state |> forget_frozen(event) |> retime_progress(event) |> handle_display_event(event)}
 
       {:ok, %{event: _} = event} ->
-        state = state |> maybe_register_mdns(event) |> track_volume_external(event)
+        state =
+          state
+          |> maybe_register_mdns(event)
+          |> track_volume_external(event)
+          |> track_pcm_tap(event)
+
         {state, event} = tag_startup(state, event)
         broadcast_state(state, event)
         {:noreply, forget_group(%{state | last_event: event}, event)}
@@ -738,6 +792,24 @@ defmodule UniversalProxy.Audio.Player do
 
   defp track_volume_external(state, _event), do: state
 
+  defp track_pcm_tap(state, %{event: "pcm_tap", ok: false} = event) do
+    Logger.warning(
+      "Audio.Player #{inspect(state.key)} could not enable the PCM tap: #{inspect(event[:error])}"
+    )
+
+    %{state | pcm_tap: false}
+  end
+
+  defp track_pcm_tap(state, %{event: "pcm_tap", value: enabled?}) when is_boolean(enabled?) do
+    Logger.debug(
+      "Audio.Player #{inspect(state.key)} PCM tap #{if enabled?, do: "on", else: "off"}"
+    )
+
+    %{state | pcm_tap: enabled?}
+  end
+
+  defp track_pcm_tap(state, _event), do: state
+
   defp tag_startup(state, %{event: "volume"} = event), do: tag_startup(state, event, :volume)
   defp tag_startup(state, %{event: "mute"} = event), do: tag_startup(state, event, :muted)
   defp tag_startup(state, event), do: {state, event}
@@ -818,6 +890,11 @@ defmodule UniversalProxy.Audio.Player do
 
     base = if state.volume_external, do: base ++ ["--external-volume"], else: base
     base = base ++ display_args(state.display_roles)
+
+    base =
+      if is_binary(state.pcm_tap_path),
+        do: base ++ ["--pcm-tap-path", state.pcm_tap_path],
+        else: base
 
     # Sendspin servers display device_info as "Vendor / Product" (Music
     # Assistant's player list). Pass the node name (which carries the
@@ -909,6 +986,10 @@ defmodule UniversalProxy.Audio.Player do
 
   defp send_command(state, {:viz_enable, enabled?}) when is_boolean(enabled?) do
     send_raw(state, [~s({"cmd":"viz_enable","value":), to_string(enabled?), ~s(})])
+  end
+
+  defp send_command(state, {:pcm_tap, enabled?}) when is_boolean(enabled?) do
+    send_raw(state, [~s({"cmd":"pcm_tap","value":), to_string(enabled?), ~s(})])
   end
 
   defp send_command(state, :shutdown) do
@@ -1445,6 +1526,24 @@ defmodule UniversalProxy.Audio.Player do
       end
 
     Path.join(base, state_dir_name(Map.fetch!(cfg, :client_id)))
+  end
+
+  @doc """
+  The `--pcm-tap-path` a player for this output config uses (unless
+  started with an explicit `:pcm_tap_path`): `/run/up-pcm-<client_id>` on
+  the device, a tmpfs (`/dev/shm` is not one on our systems), and the
+  same name under the system tmp dir on the host. Named like `state_dir/1`.
+  """
+  @spec pcm_tap_path(%{required(:client_id) => String.t(), optional(any()) => any()}) ::
+          String.t()
+  def pcm_tap_path(cfg) do
+    Path.join(pcm_tap_root(), "up-pcm-" <> state_dir_name(Map.fetch!(cfg, :client_id)))
+  end
+
+  if Mix.target() == :host do
+    defp pcm_tap_root, do: System.tmp_dir!()
+  else
+    defp pcm_tap_root, do: "/run"
   end
 
   defp state_dir_name(id) when is_binary(id) do
