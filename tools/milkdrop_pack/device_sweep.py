@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""Measure every preset of a built pack on a Raspberry Pi 3 (the rpi3 sweep).
+
+    tools/milkdrop_pack/device_sweep.py --host 192.168.2.102 \\
+        --tarball out/up-milkdrop-pack-2026.11.1.tar.gz --out sweep.jsonl
+
+Copies the tarball to the device (sftp) and extracts it under --remote-dir,
+then runs the device's own milkdrop_renderer once per preset, headless on the
+render node (--headless-frames on /dev/dri/renderD128: no KMS, no DRM master,
+so Emerge and the TV are untouched), locked on that preset with the test tone
+as audio. Each run's events become one JSON line in --out (fps, flip/CPU
+frame ms, the rung the cost guard settled on, skip reason, warm-up ms, ...),
+which build_pack.py --device-sweep turns into the manifest's rpi3 fields.
+
+Resumable: presets that already have a record for this tarball's SHA-256 in
+--out are not run again, so an interrupted multi-hour sweep just continues.
+Before each preset it waits for the SoC to cool below --cooldown-c, so the
+renderer's thermal guard doesn't skew late results.
+
+The device is driven over nerves_ssh, which evaluates Elixir: never send
+System.halt (it reboots the device). --dry-run prints the plan and the
+Elixir for the first preset without connecting; --local-renderer runs a
+renderer binary on this machine instead of over SSH.
+"""
+
+import argparse
+import base64
+import datetime
+import json
+import os
+import subprocess
+import sys
+import tarfile
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from milkpack import sweep  # noqa: E402
+from milkpack.tarball import sha256  # noqa: E402
+
+SSH_OPTS = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
+            "-o", "ConnectTimeout=15"]
+
+
+def renderer_args(opts, pack_dir, pid):
+    return ["--mode", "1280x720@60", "--pack-dir", pack_dir, "--ladder", opts.ladder,
+            "--rotate-s", "3600", "--skip-file", pack_dir + ".none.skip", "--card", opts.card,
+            "--headless-frames", str(opts.frames), "--test-tone", "--high-frequency",
+            "--stats-s", str(opts.stats_s), "--seed", "1", "--locked", pid]
+
+
+def b64json(value):
+    return base64.b64encode(json.dumps(value).encode()).decode()
+
+
+def elixir_probe(remote_dir, version, digest):
+    """Prints a JSON object: the renderer path, firmware UUID and whether the
+    pack is already extracted for this digest."""
+    return f'''
+renderer = Path.join(:code.priv_dir(:universal_proxy) |> List.to_string(), "milkdrop_renderer/rpi3/milkdrop_renderer")
+marker = Path.join("{remote_dir}", "{version}.sha256")
+IO.puts(:json.encode(%{{
+  renderer: renderer,
+  renderer_ok: File.regular?(renderer),
+  fw_uuid: Nerves.Runtime.KV.get_active("nerves_fw_uuid"),
+  pack_ok: File.read(marker) == {{:ok, "{digest}"}} and File.regular?(Path.join("{remote_dir}/{version}", "manifest.json"))
+}}))'''
+
+
+def elixir_extract(remote_dir, version, digest):
+    return f'''
+dir = Path.join("{remote_dir}", "{version}")
+File.rm_rf!(dir)
+File.mkdir_p!(dir)
+:ok = :erl_tar.extract(~c"{remote_dir}/{version}.tar.gz", [:compressed, {{:cwd, String.to_charlist(dir)}}])
+File.write!(Path.join("{remote_dir}", "{version}.sha256"), "{digest}")
+File.rm("{remote_dir}/{version}.tar.gz")
+IO.puts("EXTRACTED " <> dir)'''
+
+
+def elixir_run(renderer, args, timeout_ms, cooldown_c, cooldown_max_s):
+    """Waits for the SoC to cool, runs the renderer, prints its output and
+    "EXIT_STATUS n" (or "EXIT_STATUS timeout" after a kill -9)."""
+    return f'''
+cool = fn cool, waited ->
+  temp = case File.read("/sys/class/thermal/thermal_zone0/temp") do
+    {{:ok, t}} -> String.to_integer(String.trim(t)) / 1000
+    _ -> 0
+  end
+  if temp >= {cooldown_c} and waited < {cooldown_max_s} do
+    Process.sleep(5000)
+    cool.(cool, waited + 5)
+  else
+    IO.puts("COOLDOWN #{{waited}} #{{temp}}")
+  end
+end
+cool.(cool, 0)
+args = :json.decode(Base.decode64!("{b64json(args)}"))
+port = Port.open({{:spawn_executable, "{renderer}"}}, [:binary, :exit_status, :stderr_to_stdout, {{:args, args}}])
+{{:os_pid, os}} = Port.info(port, :os_pid)
+loop = fn loop, acc, deadline ->
+  receive do
+    {{^port, {{:data, d}}}} -> loop.(loop, [acc, d], deadline)
+    {{^port, {{:exit_status, s}}}} -> {{s, acc}}
+  after max(deadline - System.monotonic_time(:millisecond), 0) ->
+    System.cmd("kill", ["-9", Integer.to_string(os)])
+    {{:timeout, acc}}
+  end
+end
+{{st, out}} = loop.(loop, [], System.monotonic_time(:millisecond) + {timeout_ms})
+IO.puts(IO.iodata_to_binary(out))
+IO.puts("EXIT_STATUS " <> to_string(st))'''
+
+
+class Device:
+    def __init__(self, opts):
+        self.opts = opts
+        self.target = f"{opts.user}@{opts.host}" if opts.user else opts.host
+
+    def ssh(self, code, timeout):
+        cmd = ["ssh", "-i", os.path.expanduser(self.opts.key), *SSH_OPTS, self.target, code]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return proc.stdout + proc.stderr
+
+    def put(self, local, remote):
+        batch = f'-mkdir {os.path.dirname(remote)}\nput "{local}" "{remote}"\n'
+        cmd = ["sftp", "-i", os.path.expanduser(self.opts.key), *SSH_OPTS, "-b", "-", self.target]
+        subprocess.run(cmd, input=batch, text=True, check=True, capture_output=True, timeout=1800)
+
+
+def read_pack(tarball):
+    with tarfile.open(tarball, "r:gz") as tar:
+        doc = json.load(tar.extractfile("manifest.json"))
+    return doc["version"], [p["file"] for p in doc["presets"]]
+
+
+def done_ids(out_path, digest):
+    done = set()
+    if os.path.exists(out_path):
+        with open(out_path) as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get("pack_sha256") == digest:
+                    done.add(rec.get("file"))
+    return done
+
+
+def run_local(opts, pack_dir, pid):
+    args = renderer_args(opts, pack_dir, pid)
+    try:
+        proc = subprocess.run([opts.local_renderer, *args], capture_output=True, text=True,
+                              timeout=opts.timeout)
+        status = str(proc.returncode)
+        out = proc.stdout + proc.stderr
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout or ""
+        status, out = "timeout", out.decode("utf-8", "replace") if isinstance(out, bytes) else out
+    return out + f"\nEXIT_STATUS {status}\n"
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--tarball", required=True, help="the pack built by build_pack.py")
+    p.add_argument("--out", required=True, help="sweep file (JSON Lines, appended)")
+    p.add_argument("--host", help="the rpi3's address (nerves_ssh)")
+    p.add_argument("--user", default="", help="SSH user (default: none, as nerves_ssh takes any)")
+    p.add_argument("--key", default="~/.ssh/up_dev_key", help="SSH private key")
+    p.add_argument("--remote-dir", default="/data/md-sweep", help="where the pack goes on the device")
+    p.add_argument("--frames", type=int, default=600, help="headless frames per preset")
+    p.add_argument("--stats-s", type=int, default=5, help="renderer stats interval")
+    p.add_argument("--ladder", default="640x360,480x270", help="render ladder (the device's)")
+    p.add_argument("--card", default="/dev/dri/renderD128", help="DRM node (keep the render node)")
+    p.add_argument("--timeout", type=int, default=240, help="seconds per preset before kill -9")
+    p.add_argument("--cooldown-c", type=float, default=70.0, help="wait until the SoC is below this")
+    p.add_argument("--cooldown-max-s", type=int, default=300, help="longest cooldown wait")
+    p.add_argument("--only", action="append", default=[], help="sweep just this preset id (repeatable)")
+    p.add_argument("--limit", type=int, help="stop after this many presets")
+    p.add_argument("--dry-run", action="store_true", help="print the plan and the first preset's Elixir")
+    p.add_argument("--local-renderer", help="run this renderer binary here instead of over SSH")
+    p.add_argument("--local-pack-dir", help="extracted pack for --local-renderer")
+    opts = p.parse_args(argv)
+
+    digest = sha256(opts.tarball)
+    version, ids = read_pack(opts.tarball)
+    if opts.only:
+        unknown = sorted(set(opts.only) - set(ids))
+        if unknown:
+            p.error(f"not in the pack: {unknown}")
+        ids = [i for i in ids if i in set(opts.only)]
+    done = done_ids(opts.out, digest)
+    todo = [i for i in ids if i not in done]
+    if opts.limit is not None:
+        todo = todo[: opts.limit]
+    remote_pack = f"{opts.remote_dir}/{version}"
+    print(f"pack {version} ({digest[:12]}): {len(ids)} presets, {len(done & set(ids))} done, {len(todo)} to run",
+          flush=True)
+
+    if opts.dry_run:
+        if todo:
+            print("renderer args:", json.dumps(renderer_args(opts, remote_pack, todo[0])))
+            print(elixir_run("<renderer>", renderer_args(opts, remote_pack, todo[0]), opts.timeout * 1000,
+                             opts.cooldown_c, opts.cooldown_max_s))
+        return 0
+
+    meta = {"pack_version": version, "pack_sha256": digest, "frames": opts.frames, "ladder": opts.ladder}
+    if opts.local_renderer:
+        if not opts.local_pack_dir:
+            p.error("--local-renderer needs --local-pack-dir")
+        meta.update(renderer=opts.local_renderer, host="local")
+        runner = lambda pid: run_local(opts, opts.local_pack_dir, pid)  # noqa: E731
+    else:
+        if not opts.host:
+            p.error("--host is required (or --local-renderer)")
+        dev = Device(opts)
+        probe = json.loads(next(line for line in dev.ssh(elixir_probe(opts.remote_dir, version, digest), 60)
+                                .splitlines() if line.startswith("{")))
+        if not probe["renderer_ok"]:
+            print(f"error: no renderer at {probe['renderer']} (is this rpi3 firmware with milkdrop_renderer?)",
+                  file=sys.stderr)
+            return 1
+        if not probe["pack_ok"]:
+            print(f"copying the pack to {opts.host}:{opts.remote_dir}", flush=True)
+            dev.put(os.path.abspath(opts.tarball), f"{opts.remote_dir}/{version}.tar.gz")
+            out = dev.ssh(elixir_extract(opts.remote_dir, version, digest), 600)
+            if "EXTRACTED" not in out:
+                print(f"error: extracting on the device failed:\n{out[-2000:]}", file=sys.stderr)
+                return 1
+        meta.update(renderer=probe["renderer"], fw_uuid=probe["fw_uuid"], host=opts.host)
+
+        def runner(pid):
+            code = elixir_run(probe["renderer"], renderer_args(opts, remote_pack, pid), opts.timeout * 1000,
+                              opts.cooldown_c, opts.cooldown_max_s)
+            try:
+                return dev.ssh(code, opts.timeout + opts.cooldown_max_s + 60)
+            except subprocess.TimeoutExpired:
+                return "EXIT_STATUS ssh_timeout\n"
+
+    with open(opts.out, "a") as out:
+        for n, pid in enumerate(todo, 1):
+            started = time.monotonic()
+            text = runner(pid)
+            rec = sweep.parse_run(pid, text)
+            rec.update(meta, at=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+                       wall_s=round(time.monotonic() - started, 1))
+            out.write(json.dumps(rec) + "\n")
+            out.flush()
+            print(f"[{n}/{len(todo)}] {rec['status']:5s} {rec.get('rung') or '-':8s} "
+                  f"{rec.get('fps') or 0:5.1f} fps  {pid}" + (f"  ({rec.get('reason')})" if rec.get("reason") else ""),
+                  flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
