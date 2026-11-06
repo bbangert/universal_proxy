@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Measure every preset of a built pack on a Raspberry Pi 3 (the rpi3 sweep).
 
-    tools/milkdrop_pack/device_sweep.py --host 192.168.2.102 \\
+    tools/milkdrop_pack/device_sweep.py --host 192.168.2.102 --known-hosts ~/.ssh/md-sweep-known_hosts \\
         --tarball out/up-milkdrop-pack-2026.11.1.tar.gz --out sweep.jsonl
 
 Copies the tarball to the device (sftp) and extracts it under --remote-dir,
@@ -16,6 +16,9 @@ Resumable: presets that already have a record for this tarball's SHA-256 in
 --out are not run again, so an interrupted multi-hour sweep just continues.
 Before each preset it waits for the SoC to cool below --cooldown-c, so the
 renderer's thermal guard doesn't skew late results.
+
+The device's SSH host key is verified (known_hosts, or --known-hosts FILE);
+--insecure-no-host-key-check is for a throwaway dev device only.
 
 The device is driven over nerves_ssh, which evaluates Elixir: never send
 System.halt (it reboots the device). --dry-run prints the plan and the
@@ -42,8 +45,21 @@ from milkpack.tarball import sha256  # noqa: E402
 # Marks a device copy extracted (and its manifest stripped) by this script.
 MARKER_SUFFIX = " sweep-manifest"
 
-SSH_OPTS = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
-            "-o", "ConnectTimeout=15"]
+BASE_SSH_OPTS = ["-o", "LogLevel=ERROR", "-o", "ConnectTimeout=15", "-o", "BatchMode=yes"]
+
+
+def ssh_opts(opts):
+    """ssh/sftp options. The device's host key is verified (against the
+    user's known_hosts, or --known-hosts) unless --insecure-no-host-key-check:
+    an impersonated device could feed fabricated measurements into the
+    manifest."""
+    if opts.insecure_no_host_key_check:
+        keys = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"]
+    elif opts.known_hosts:
+        keys = ["-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={os.path.expanduser(opts.known_hosts)}"]
+    else:
+        keys = ["-o", "StrictHostKeyChecking=yes"]
+    return [*keys, *BASE_SSH_OPTS]
 
 
 def renderer_args(opts, pack_dir, pid):
@@ -128,13 +144,13 @@ class Device:
         self.target = f"{opts.user}@{opts.host}" if opts.user else opts.host
 
     def ssh(self, code, timeout):
-        cmd = ["ssh", "-i", os.path.expanduser(self.opts.key), *SSH_OPTS, self.target, code]
+        cmd = ["ssh", "-i", os.path.expanduser(self.opts.key), *ssh_opts(self.opts), self.target, code]
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return proc.stdout + proc.stderr
 
     def put(self, local, remote):
         batch = f'-mkdir {os.path.dirname(remote)}\nput "{local}" "{remote}"\n'
-        cmd = ["sftp", "-i", os.path.expanduser(self.opts.key), *SSH_OPTS, "-b", "-", self.target]
+        cmd = ["sftp", "-i", os.path.expanduser(self.opts.key), *ssh_opts(self.opts), "-b", "-", self.target]
         subprocess.run(cmd, input=batch, text=True, check=True, capture_output=True, timeout=1800)
 
 
@@ -193,6 +209,10 @@ def main(argv=None):
     p.add_argument("--host", help="the rpi3's address (nerves_ssh)")
     p.add_argument("--user", default="", help="SSH user (default: none, as nerves_ssh takes any)")
     p.add_argument("--key", default="~/.ssh/up_dev_key", help="SSH private key")
+    keys = p.add_mutually_exclusive_group()
+    keys.add_argument("--known-hosts", help="verify the device's host key against this file (default: ssh's own)")
+    keys.add_argument("--insecure-no-host-key-check", action="store_true",
+                      help="don't verify the host key (a throwaway dev device that's reflashed often)")
     p.add_argument("--remote-dir", default="/data/md-sweep", help="where the pack goes on the device")
     p.add_argument("--frames", type=int, default=600, help="headless frames per preset")
     p.add_argument("--stats-s", type=int, default=5, help="renderer stats interval")

@@ -1,3 +1,4 @@
+import argparse
 import contextlib
 import io
 import json
@@ -63,6 +64,23 @@ class DeviceSweepTest(unittest.TestCase):
         _, out = self.sweep()
         self.assertIn("2 done, 0 to run", out)
         self.assertEqual(len(self.calls()), 2)
+
+    def test_ssh_verifies_host_keys_unless_told_not_to(self):
+        def opts(**kw):
+            return device_sweep.ssh_opts(argparse.Namespace(**{"known_hosts": None,
+                                                                "insecure_no_host_key_check": False, **kw}))
+
+        default = opts()
+        self.assertIn("StrictHostKeyChecking=yes", default)
+        self.assertFalse(any(o.startswith("UserKnownHostsFile") for o in default))
+        pinned = opts(known_hosts="/k/hosts")
+        self.assertIn("StrictHostKeyChecking=yes", pinned)
+        self.assertIn("UserKnownHostsFile=/k/hosts", pinned)
+        insecure = opts(insecure_no_host_key_check=True)
+        self.assertIn("StrictHostKeyChecking=no", insecure)
+        self.assertIn("UserKnownHostsFile=/dev/null", insecure)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.sweep("--known-hosts", "/k", "--insecure-no-host-key-check")
 
     def test_the_sweep_feeds_the_manifest(self):
         from milkpack import manifest, sweep

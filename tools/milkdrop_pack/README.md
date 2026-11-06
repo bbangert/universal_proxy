@@ -100,9 +100,30 @@ builds and the brightness cache, so a rerun only renders changed presets.
 `milkdrop_renderer`:
 
 ```sh
-tools/milkdrop_pack/device_sweep.py --host <rpi3 address> \
+tools/milkdrop_pack/device_sweep.py --host <rpi3 address> --known-hosts ~/.ssh/md-sweep-known_hosts \
     --tarball /tmp/milkdrop-pack/up-milkdrop-pack-2026.11.1.tar.gz --out sweep.jsonl
 tools/milkdrop_pack/build_pack.py ... --device-sweep sweep.jsonl   # rebuild with the results
+```
+
+The device's SSH host key is verified: against your `known_hosts` by
+default, or against `--known-hosts FILE`. Enrol a device's key once, into
+a dedicated file, from a network you trust (nerves_ssh keeps it in
+`/data/nerves_ssh`, so it survives firmware updates but not a reflash that
+wipes `/data`):
+
+```sh
+ssh-keyscan <rpi3 address> > ~/.ssh/md-sweep-known_hosts
+ssh-keygen -lf ~/.ssh/md-sweep-known_hosts   # note the fingerprint
+```
+
+A sweep's results become the manifest's rpi3 hints, so an impersonated
+device could ship fabricated measurements. **`--insecure-no-host-key-check`
+skips verification**: use it only for the throwaway dev Pi, whose host key
+changes on every reflash, and only on a network you trust:
+
+```sh
+tools/milkdrop_pack/device_sweep.py --host 192.168.2.148 --insecure-no-host-key-check \
+    --tarball /tmp/milkdrop-pack/up-milkdrop-pack-2026.11.1.tar.gz --out sweep.jsonl
 ```
 
 It copies the pack to `/data/md-sweep/` (sftp + `:erl_tar` on the device)
