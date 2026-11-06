@@ -62,6 +62,12 @@ defmodule UniversalProxy.Application do
         # `:ignore` unless `UniversalProxy.Cec` has `enabled: true`
         # (targets only), so host/test never open a CEC device.
         UniversalProxy.Cec.Supervisor,
+        # MilkDrop visualizer settings store (DETS) and preset-pack manager.
+        # BEFORE Display.Supervisor, whose State will start the renderer
+        # with the pack dir and settings these hold. Returns `:ignore`
+        # unless `UniversalProxy.MilkDrop.enabled?/0` (rpi3/rpi4/rpi5 with
+        # the Display `:milkdrop` flag on; off everywhere for now).
+        UniversalProxy.MilkDrop.Supervisor,
         # TV UI on the Pi HDMI output (State + the viewport's
         # DynamicSupervisor). AFTER Audio and Cec, whose state it will follow.
         # Returns `:ignore` unless `UniversalProxy.Display` has
