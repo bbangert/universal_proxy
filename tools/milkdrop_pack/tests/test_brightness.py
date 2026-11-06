@@ -114,6 +114,18 @@ class RenderTest(unittest.TestCase):
             self.assertEqual(sorted(json.loads(line)["id"] for line in f), ["bad.milk", "good.milk"])
 
 
+class SnapshotNameTest(unittest.TestCase):
+    def test_names_are_unique_per_id(self):
+        long_a, long_b = "x" * 130 + "a.milk", "x" * 130 + "b.milk"
+        ids = ["A-B.milk", "A B.milk", "A_B.milk", "high_frequency/A B.milk", long_a, long_b]
+        names = [brightness.snapshot_name(pid) for pid in ids]
+        self.assertEqual(len(set(names)), len(ids))
+        self.assertEqual(brightness.snapshot_name("A B.milk"), brightness.snapshot_name("A B.milk"))
+        self.assertTrue(names[0].startswith("A_B-"))
+        for name in names:
+            self.assertRegex(name, r"\A[A-Za-z0-9_]{1,120}-[0-9a-f]{10}\Z")
+
+
 class CacheTest(unittest.TestCase):
     def test_key_depends_on_content_settings_and_tool(self):
         s = {"frames": 600, "from": 150, "size": "640x360"}

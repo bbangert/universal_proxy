@@ -174,13 +174,21 @@ def screen(tools, pack_dir, ids, settings, cache_path, jobs, tool_id, progress=N
     return results
 
 
+def snapshot_name(pid):
+    """A file-name prefix for a preset's review PNGs: readable, and unique
+    per id (ids that differ only in punctuation or past the cut get
+    different hashes)."""
+    readable = "".join(c if c.isalnum() else "_" for c in pid[:-5])[:120]
+    return f"{readable}-{hashlib.sha256(pid.encode()).hexdigest()[:10]}"
+
+
 def snapshots(tools, pack_dir, ids, settings, out_dir, frames=(300, 600), jobs=4):
     """PNG frames of the given presets, for review by eye."""
     os.makedirs(out_dir, exist_ok=True)
     texture_dir = os.path.join(pack_dir, "textures")
     extra_for = {}
     for pid in ids:
-        prefix = os.path.join(out_dir, "".join(c if c.isalnum() else "_" for c in pid[:-5])[:120])
+        prefix = os.path.join(out_dir, snapshot_name(pid))
         extra = ["--png-prefix", prefix]
         for f in frames:
             extra += ["--png-at", str(f)]
