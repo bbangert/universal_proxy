@@ -81,6 +81,24 @@ class StepsTest(unittest.TestCase):
         self.assertEqual([e["reason"] for e in report.excluded], ["too_bright"])
         self.assertTrue(any("already excluded" in n for n in report.notes))
 
+    def test_apply_screen_records_verdicts(self):
+        cfg = {"exclude_sat_above": 0.9, "review_sat_above": 0.5, "exclude_min_luma": 200}
+        bright = {"white.milk": {"sat": 0.99, "luma": 250.0}, "red.milk": {"sat": 0.97, "luma": 120.0},
+                  "bad.milk": {"error": "load_failed", "message": "syntax"}, "ok.milk": {"sat": 0.1, "luma": 50.0}}
+        report = Quiet()
+        too_bright, load_failed = pipeline.apply_screen(dict.fromkeys(bright, b""), bright, cfg, report)
+        self.assertEqual((too_bright, load_failed), (["white.milk"], ["bad.milk"]))
+        self.assertEqual([e["file"] for e in report.review], ["red.milk"])
+
+    def test_apply_screen_fails_on_missing_or_failed_renders(self):
+        cfg = {"exclude_sat_above": 0.9, "review_sat_above": 0.5, "exclude_min_luma": 200}
+        for bright in ({"a.milk": {"sat": 0.1, "luma": 50.0}, "b.milk": {"error": "timeout"}},
+                       {"a.milk": {"sat": 0.1, "luma": 50.0}, "b.milk": {"error": "gl_error", "gl_error": 1282}},
+                       {"a.milk": {"sat": 0.1, "luma": 50.0}}):
+            with self.assertRaises(PipelineError) as ctx:
+                pipeline.apply_screen({"a.milk": b"", "b.milk": b""}, bright, cfg, Quiet())
+            self.assertIn("b.milk", str(ctx.exception))
+
     def test_exclusion_text_and_detail_cap(self):
         report = Quiet()
         report.exclude("b.milk", "translate_failed", "x" * 500)

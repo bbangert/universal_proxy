@@ -120,6 +120,29 @@ def texture_policy(staged, available, curation, report):
     return stems
 
 
+def apply_screen(staged, bright, cfg, report):
+    """Record the brightness verdicts; return (too_bright, load_failed) ids.
+    Every staged preset needs a verdict: a missing result or a render
+    error (timeout, crash, GL failure) fails the build, and a rerun renders
+    just those again (successes are cached)."""
+    verdicts = {pid: brightness.verdict(bright.get(pid), cfg) for pid in staged}
+    errors = sorted(p for p, v in verdicts.items() if v == "error")
+    if errors:
+        listed = "; ".join(f"{p}: {(bright.get(p) or {}).get('error', 'no result')}" for p in errors[:10])
+        raise PipelineError(f"brightness screen: {len(errors)} preset(s) without a result ({listed}); "
+                            "rerun to retry them, or --skip-brightness for a dev build")
+    load_failed = sorted(p for p, v in verdicts.items() if v == "load_failed")
+    for pid in load_failed:
+        report.exclude(pid, "load_failed", bright[pid].get("message", ""))
+    too_bright = sorted(p for p, v in verdicts.items() if v == "exclude")
+    for pid in too_bright:
+        r = bright[pid]
+        report.exclude(pid, "too_bright", f"sat {r['sat']:.3f}, luma {r['luma']:.1f}")
+    report.review = sorted(({"file": p, "sat": round(bright[p]["sat"], 4), "luma": round(bright[p]["luma"], 1)}
+                            for p, v in verdicts.items() if v == "review"), key=lambda e: (-e["sat"], e["file"]))
+    return too_bright, load_failed
+
+
 def write_presets(staged, pack_dir):
     root = os.path.join(pack_dir, "presets")
     shutil.rmtree(root, ignore_errors=True)
@@ -263,26 +286,14 @@ def build(args):
 
         bright = brightness.screen(host, pack, sorted(staged), settings, os.path.join(work, "brightness-cache.jsonl"),
                                    jobs, tool_id, progress)
-        verdicts = {pid: brightness.verdict(r, bright_cfg) for pid, r in bright.items()}
-        load_failed = sorted(p for p, v in verdicts.items() if v == "load_failed")
-        for pid in load_failed:
-            report.exclude(pid, "load_failed", bright[pid].get("message", ""))
-        too_bright = sorted(p for p, v in verdicts.items() if v == "exclude")
-        for pid in too_bright:
-            r = bright[pid]
-            report.exclude(pid, "too_bright", f"sat {r['sat']:.3f}, luma {r['luma']:.1f}")
-        report.review = sorted(({"file": p, "sat": round(bright[p]["sat"], 4), "luma": round(bright[p]["luma"], 1)}
-                                for p, v in verdicts.items() if v == "review"), key=lambda e: -e["sat"])
-        errors = sorted(p for p, v in verdicts.items() if v == "error")
-        for pid in errors:
-            report.notes.append(f"brightness: no result for {pid}: {bright[pid]}")
+        too_bright, load_failed = apply_screen(staged, bright, bright_cfg, report)
         if not args.no_snapshots:
             shutil.rmtree(os.path.join(out, "review"), ignore_errors=True)
             brightness.snapshots(host, pack, too_bright + [e["file"] for e in report.review], settings,
                                  os.path.join(out, "review"), jobs=jobs)
         remove_presets(staged, too_bright + load_failed, pack)
         report.step("brightness", presets=len(staged), too_bright=len(too_bright), load_failed=len(load_failed),
-                    review=len(report.review), errors=len(errors))
+                    review=len(report.review))
     else:
         report.notes.append("brightness screen skipped (--skip-brightness)")
 

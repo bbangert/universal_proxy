@@ -64,7 +64,9 @@ builds and the brightness cache, so a rerun only renders changed presets.
    darker colour and anything with `sat > 0.5` go on the review list (look
    at `review/`, add to `curation.json` if needed).
    Presets projectM can't load at all (expression syntax errors) are
-   excluded too.
+   excluded too. A render that fails (timeout, crash, GL or EGL error)
+   fails the build; a rerun renders only those again, since successes are
+   cached (`--skip-brightness` skips the screen, for dev builds only).
 7. Hand exclusions from `curation.json` (after the screen, so the report
    shows whether the screen caught them), then a final translation pass
    over exactly the shipped presets.
