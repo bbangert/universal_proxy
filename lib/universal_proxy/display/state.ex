@@ -129,6 +129,11 @@ defmodule UniversalProxy.Display.State do
       `UniversalProxy.MilkDrop.enabled?/0`).
     * `:milkdrop_opts` — extra `UniversalProxy.Display.MilkDrop.start/1`
       options (`:binary`, `:ladder`, `:store`, `:task_supervisor`, ...).
+    * `:milkdrop_task_supervisor` — the renderer reaper's `Task.Supervisor`
+      unless `:milkdrop_opts` names one (default
+      `UniversalProxy.Display.Supervisor.milkdrop_task_supervisor/0`, the
+      display subtree's own, so a State restart waits for the renderer to
+      be gone).
     * `:milkdrop_timeouts` — per-phase timeouts (see "MilkDrop").
     * `:pack` — map of funs overriding `status`/`ensure` of
       `UniversalProxy.MilkDrop.Pack` (tests).
@@ -212,7 +217,14 @@ defmodule UniversalProxy.Display.State do
       milkdrop?: milkdrop?,
       md: nil,
       md_last: nil,
-      md_opts: Keyword.get(opts, :milkdrop_opts, []),
+      md_opts:
+        Keyword.put_new_lazy(Keyword.get(opts, :milkdrop_opts, []), :task_supervisor, fn ->
+          Keyword.get(
+            opts,
+            :milkdrop_task_supervisor,
+            Display.Supervisor.milkdrop_task_supervisor()
+          )
+        end),
       md_timeouts:
         Map.merge(@milkdrop_timeouts, Map.new(Keyword.get(opts, :milkdrop_timeouts, %{}))),
       pack: Map.merge(default_pack(), Map.new(Keyword.get(opts, :pack, %{}))),

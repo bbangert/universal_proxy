@@ -13,6 +13,7 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
   alias UniversalProxy.Display.MilkDrop, as: Renderer
   alias UniversalProxy.Display.Mode
   alias UniversalProxy.Display.State
+  alias UniversalProxy.Display.Supervisor, as: DisplaySupervisor
   alias UniversalProxy.MilkDrop.Store
 
   @fake_binary Path.expand("../../support/fake_milkdrop_renderer.py", __DIR__)
@@ -42,7 +43,10 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
 
   # Starts State with the UI and MilkDrop on (unless `milkdrop: false`),
   # the fake viewport running, fake audio/CEC/pack funs reporting to the
-  # test. `:fake` is the fake renderer's fake.json.
+  # test. `:fake` is the fake renderer's fake.json. `supervised: true` runs
+  # it in its own `Display.Supervisor` subtree (the reaper under the
+  # subtree's Task.Supervisor), and each viewport start also reports the
+  # renderers still running then as `{:viewport_renderers, os_pids}`.
   defp start_ui(ctx, opts \\ []) do
     test = self()
     pubsub = :"#{inspect(__MODULE__)}.#{ctx.test}.PubSub"
@@ -103,43 +107,63 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     }
 
     skip_file = ctx.skip_file
+    supervised? = Keyword.get(opts, :supervised, false)
+    name = :"#{inspect(__MODULE__)}.#{ctx.test}"
 
-    state =
-      start_supervised!({
-        State,
-        name: :"#{inspect(__MODULE__)}.#{ctx.test}",
-        ui: true,
-        renderer: FakeRenderer,
-        viewport_supervisor: ctx.sup,
-        dri_dir: ctx.dri_dir,
-        sysfs_drm_dir: ctx.sysfs_dir,
-        viewport_opts: [
-          test_pid: test,
-          on_start: fn -> send(test, {:viewport_start, cmd_names(skip_file)}) end
-        ],
-        view_opts: [bars: 8, drift_period_ms: 1_000_000_000_000],
-        model_opts:
-          Keyword.merge(
-            [idle_ms: 60_000, restart_ms: 60_000, restart_max_ms: 60_000, stable_ms: 60_000],
-            Keyword.get(opts, :model_opts, [])
-          ),
-        pubsub: pubsub,
-        task_supervisor: tasks,
-        audio: audio,
-        cec: cec,
-        pack: pack,
-        milkdrop: Keyword.get(opts, :milkdrop, true),
-        milkdrop_opts: [
+    on_start = fn ->
+      send(test, {:viewport_start, cmd_names(skip_file)})
+      if supervised?, do: send(test, {:viewport_renderers, renderer_os_pids(skip_file)})
+    end
+
+    state_opts = [
+      name: name,
+      ui: true,
+      renderer: FakeRenderer,
+      viewport_supervisor: ctx.sup,
+      dri_dir: ctx.dri_dir,
+      sysfs_drm_dir: ctx.sysfs_dir,
+      viewport_opts: [test_pid: test, on_start: on_start],
+      view_opts: [bars: 8, drift_period_ms: 1_000_000_000_000],
+      model_opts:
+        Keyword.merge(
+          [idle_ms: 60_000, restart_ms: 60_000, restart_max_ms: 60_000, stable_ms: 60_000],
+          Keyword.get(opts, :model_opts, [])
+        ),
+      pubsub: pubsub,
+      task_supervisor: tasks,
+      audio: audio,
+      cec: cec,
+      pack: pack,
+      milkdrop: Keyword.get(opts, :milkdrop, true),
+      milkdrop_opts:
+        [
           binary: @fake_binary,
           skip_file: skip_file,
           settings: Store.defaults(),
           skipped: %{},
           store: :"#{inspect(__MODULE__)}.NoStore",
-          task_supervisor: tasks,
           kill_grace_ms: Keyword.get(opts, :kill_grace_ms, 300)
-        ],
-        milkdrop_timeouts: Keyword.get(opts, :timeouts, %{})
-      })
+        ] ++ if(supervised?, do: [], else: [task_supervisor: tasks]),
+      milkdrop_timeouts: Keyword.get(opts, :timeouts, %{})
+    ]
+
+    state =
+      if supervised? do
+        start_supervised!(
+          {DisplaySupervisor,
+           [
+             enabled: true,
+             name: :"#{name}.Supervisor",
+             state_name: name,
+             viewport_supervisor: :"#{name}.ViewportSupervisor",
+             milkdrop_task_supervisor: :"#{name}.MilkDropTaskSupervisor"
+           ] ++ Keyword.drop(state_opts, [:name, :viewport_supervisor])}
+        )
+
+        name
+      else
+        start_supervised!({State, state_opts})
+      end
 
     _ = :sys.get_state(state)
     assert_receive {:fake_renderer, :start, viewport_opts}
@@ -425,6 +449,28 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     refute File.exists?("/proc/#{os_pid}")
     assert_received {:audio, :pcm_tap, @key, false}
     assert %{last: %{outcome: {:crashed, {:timeout, :releasing}}}, failures: 1} = md(ctx)
+  end
+
+  # The renderer ignores EOF and its grace period outlasts the test: only
+  # the display subtree's restart can have it killed in time.
+  test "a killed State's replacement starts the viewport only once the renderer is gone", ctx do
+    ctx =
+      ctx
+      |> start_ui(supervised: true, fake: %{ignore_eof: true}, kill_grace_ms: 60_000)
+      |> presenting()
+
+    old = Process.whereis(ctx.state)
+    %{os_pid: os_pid} = :sys.get_state(renderer(ctx))
+    assert_received {:viewport_renderers, []}
+    assert renderer_os_pids(ctx.skip_file) == [os_pid]
+
+    Process.exit(old, :kill)
+
+    assert_receive {:viewport_renderers, running}, @timeout
+    assert running == []
+    assert_receive {:fake_renderer, :start, _opts}
+    refute Process.whereis(ctx.state) in [nil, old]
+    refute File.exists?(ctx.skip_file <> ".eof")
   end
 
   test "a renderer never confirmed gone still gets the display back, bounded", ctx do

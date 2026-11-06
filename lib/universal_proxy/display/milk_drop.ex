@@ -23,8 +23,10 @@ defmodule UniversalProxy.Display.MilkDrop do
     * however this process ends (stopped, its owner gone, crashed or
       killed), SIGKILLs a renderer still running `:kill_grace_ms` later;
     * when shut down by its supervisor (application teardown, a restart of
-      the task supervisor), SIGKILLs a still-running renderer before it
-      exits, within its shutdown budget.
+      the task supervisor), SIGKILLs a still-running renderer and waits up
+      to 1 s for it to be gone before it exits, within its shutdown budget.
+      A supervisor that restarts its children only once they are down (the
+      display subtree) thus restarts them with the renderer gone.
 
   Once the renderer process is confirmed gone (its exit status arrived, or
   `/proc/<os_pid>` is gone or a zombie, after the grace period and SIGKILL
@@ -607,7 +609,20 @@ defmodule UniversalProxy.Display.MilkDrop do
       {:os_pid, os_pid} -> watch(ref, os_pid, grace_ms)
       :renderer_exited -> :gone
       {:DOWN, ^ref, :process, _pid, _reason} -> :unknown
-      {:EXIT, _from, reason} -> Kernel.exit(reason)
+      {:EXIT, _from, reason} -> shutdown_before_spawn(ref, reason)
+    end
+  end
+
+  # Shut down while the server may still be spawning the renderer: its
+  # pid (or the news there is none) follows at once, or the server died.
+  @spec shutdown_before_spawn(reference(), term()) :: no_return()
+  defp shutdown_before_spawn(ref, reason) do
+    receive do
+      {:os_pid, os_pid} -> reaper_shutdown(os_pid, reason)
+      :renderer_exited -> Kernel.exit(reason)
+      {:DOWN, ^ref, :process, _pid, _reason} -> Kernel.exit(reason)
+    after
+      @kill_confirm_ms -> Kernel.exit(reason)
     end
   end
 
@@ -620,8 +635,7 @@ defmodule UniversalProxy.Display.MilkDrop do
         grace(os_pid, grace_ms)
 
       {:EXIT, _from, reason} ->
-        kill_if_alive(os_pid, "its reaper was shut down")
-        Kernel.exit(reason)
+        reaper_shutdown(os_pid, reason)
     end
   end
 
@@ -639,8 +653,11 @@ defmodule UniversalProxy.Display.MilkDrop do
     end
   end
 
+  # Exits only once the renderer is gone (or 1 s after the SIGKILL), so
+  # its supervisor's shutdown completes with DRM master let go.
   defp reaper_shutdown(os_pid, reason) do
     kill_if_alive(os_pid, "its reaper was shut down")
+    _ = await_gone(os_pid, @kill_confirm_ms)
     Kernel.exit(reason)
   end
 
