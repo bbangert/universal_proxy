@@ -16,12 +16,18 @@ defmodule UniversalProxy.Display.Spec do
     * `{:text, attrs, string}`
     * `{:image, attrs, path}` — an absolute path to a PNG/JPEG file. The
       renderer only loads files under the directories it allows.
+    * `{:icon, attrs, name}` — one of the bundled monochrome icons
+      (`t:icon/0`), tinted with the `:color` attr.
     * `{:bars, attrs, heights}` — a row of bars, bottom-aligned, each height a
       fraction `0.0..1.0` of the `:max_height` attr. `bar_mode: :height`
       (default) sizes each bar; `bar_mode: :offset` keeps every bar full
       height and slides it down inside the clipping row by a paint-only
       offset, so height changes need no relayout.
     * `:none` — renders nothing.
+
+  `:padding` is one number for every side or `{top, right, bottom, left}`.
+  `:border` is `{width, color}`; its width counts towards the element's
+  size. `:move` is a `{dx, dy}` paint-only shift (no relayout).
 
   Colours are `{r, g, b}` or `{r, g, b, alpha}` with bytes `0..255` and
   `alpha` in `0.0..1.0`. A `:background` or `:font_color` may also be
@@ -38,7 +44,7 @@ defmodule UniversalProxy.Display.Spec do
   @type attr ::
           {:width, length()}
           | {:height, length()}
-          | {:padding, number()}
+          | {:padding, number() | {number(), number(), number(), number()}}
           | {:spacing, number()}
           | {:background, paint()}
           | {:font_size, number()}
@@ -47,7 +53,9 @@ defmodule UniversalProxy.Display.Spec do
           | {:align_x, :left | :center | :right}
           | {:align_y, :top | :center | :bottom}
           | {:rounded, number()}
+          | {:border, {number(), color()}}
           | {:alpha, float()}
+          | {:move, {number(), number()}}
           | {:image_fit, :cover | :contain}
           | {:key, String.t()}
           | {:bar_width, number()}
@@ -56,10 +64,14 @@ defmodule UniversalProxy.Display.Spec do
           | {:bar_mode, :height | :offset}
   @type attrs :: [attr()]
 
+  @typedoc "The bundled icons (`priv/display/icons/<name>.svg`)."
+  @type icon :: :previous | :play | :pause | :next
+
   @type t ::
           {:column | :row | :stack, attrs(), [t()]}
           | {:text, attrs(), String.t()}
           | {:image, attrs(), Path.t()}
+          | {:icon, attrs(), icon()}
           | {:bars, attrs(), [float()]}
           | :none
 
@@ -182,6 +194,20 @@ defmodule UniversalProxy.Display.Spec do
     do: Enum.any?(children, &has_bars?(&1, key))
 
   def has_bars?(_node, _key), do: false
+
+  @doc """
+  How many renderer elements `spec` becomes (the per-tick tree work scales
+  with it): a text is a framing element plus its text leaf, bars are their
+  row plus one element per bar.
+  """
+  @spec element_count(t()) :: pos_integer()
+  def element_count({:text, _attrs, _string}), do: 2
+  def element_count({:bars, _attrs, heights}), do: 1 + length(heights)
+
+  def element_count({tag, _attrs, children}) when tag in [:column, :row, :stack],
+    do: Enum.reduce(children, 1, &(element_count(&1) + &2))
+
+  def element_count(_leaf), do: 1
 
   @doc "An all-black screen, drawn while the display is blanked."
   @spec blank() :: t()

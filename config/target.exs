@@ -56,6 +56,8 @@ config :nerves_runtime,
 # which limits the `:emerge` dependency to the same targets.
 display_targets = [:rpi0_2, :rpi3, :rpi4, :rpi5]
 display_target? = Mix.target() in display_targets
+# The A53 display boards, which get the smaller TV UI tiers.
+small_display? = Mix.target() in [:rpi0_2, :rpi3]
 
 # Advance the system clock on devices without real-time clocks.
 #
@@ -199,34 +201,38 @@ if display_target? do
   # display systems ship (Mesa on rpi0_2/rpi3 since systems v0.1.14).
   config :emerge, compiled_backends: [drm: [:raster, :opengl]]
 
-  # `ui: false` keeps the TV UI dormant (no CEC key claims, no viewport, no
-  # HA select) until it ships: then `ui: true` here goes on together with
-  # `UniversalProxy.Audio.DisplayRoles` `enabled: true` below.
+  # `ui: true` turns the TV UI on (CEC key claims, the viewport, the HA
+  # select); it goes together with `UniversalProxy.Audio.DisplayRoles`
+  # `enabled: true` below, which feeds it.
   config :universal_proxy, UniversalProxy.Display,
     enabled: true,
     renderer: UniversalProxy.Display.Renderer.Emerge,
-    ui: false,
+    ui: true,
     # MilkDrop visualizer (rpi3/rpi4/rpi5 only; see config.exs).
     milkdrop: false,
-    # Visualizer redraw period: 20 Hz on the A53 boards, 30 Hz on rpi4/rpi5.
-    viz_tick_ms: if(Mix.target() in [:rpi3, :rpi0_2], do: 50, else: 33),
+    # Visualizer redraw period: 20 Hz on the A53 boards, 30 Hz on rpi4/rpi5
+    # (matching the DisplayRoles `viz_rate` below).
+    viz_tick_ms: if(small_display?, do: 50, else: 33),
     # Images the renderer may load: the Sendspin artwork dir (tmpfs).
     image_dirs: ["/tmp/up_display", "/tmp/up_artwork"],
     # Emerge's paint-layer cache defaults to 640 MiB, far above the CMA
     # pool GL render targets come from; the 512 MB/1 GB boards get less.
-    layer_cache_mb: if(Mix.target() in [:rpi3, :rpi0_2], do: 48, else: 128),
-    # Ask for 720p on the A53 boards, where 1080p CPU raster is the main
-    # frame-budget risk (an automatic-selection hint, not a pinned mode).
-    preferred_size: if(Mix.target() in [:rpi3, :rpi0_2], do: {1280, 720}, else: nil)
-end
+    layer_cache_mb: if(small_display?, do: 48, else: 128),
+    # Mode-selection hint (the closest advertised mode wins; the layout
+    # scales to whatever mode the viewport reports): 720p on the A53
+    # boards, where 1080p CPU raster is the frame-budget risk, and 1080p on
+    # rpi4/rpi5, so a 4K TV doesn't get a 4K scanout buffer.
+    preferred_size: if(small_display?, do: {1280, 720}, else: {1920, 1080})
 
-# Sendspin display roles on the HDMI output's player, for the targets that
-# will drive a TV UI. Still off (config.exs) until the TV UI ships, and then
-# turned on together with `UniversalProxy.Display` `ui: true` above: once on,
-# Music Assistant streams visualizer data for that player all the time.
-# Artwork lives on tmpfs.
-if Mix.target() in [:rpi0_2, :rpi3, :rpi4, :rpi5] do
-  config :universal_proxy, UniversalProxy.Audio.DisplayRoles, artwork_root: "/tmp/up_artwork"
+  # Sendspin display roles on the HDMI output's player, which feed the TV
+  # UI above (visualizer frames are forwarded only while the UI shows bars,
+  # see `Audio.Player.viz_enable/2`). Artwork lives on tmpfs. Visualizer
+  # tiers: 32 bars at 20 Hz on the A53 boards, 48 at 30 Hz on rpi4/rpi5.
+  config :universal_proxy, UniversalProxy.Audio.DisplayRoles,
+    enabled: true,
+    artwork_root: "/tmp/up_artwork",
+    viz_bins: if(small_display?, do: 32, else: 48),
+    viz_rate: if(small_display?, do: 20, else: 30)
 end
 
 # Import target specific config. This must remain at the bottom

@@ -14,12 +14,13 @@ if Code.ensure_loaded?(Emerge) do
       * `:card` — the DRM card path. Default: the first `/dev/dri/card*`
         with a connected HDMI connector.
       * `:connector` — connector name. Default: the first connected HDMI one.
-      * `:mode` — `nil` (default: Emerge picks, steered by
-        `:preferred_size`), `:preferred` (the TV's preferred mode),
+      * `:mode` — `nil` (default: the advertised mode closest to
+        `:preferred_size`, chosen here the way Emerge would, so the size is
+        known up front), `:preferred` (the TV's preferred mode),
         `{width, height}` (the highest refresh at that size),
         `{width, height, refresh_hz}` (the nearest refresh) or an Emerge
         mode id string.
-      * `:preferred_size` — `{width, height}` hint for automatic selection.
+      * `:preferred_size` — `{width, height}` wanted for the default mode.
       * `:layer_cache_mb` — paint-layer cache budget in MiB (Emerge's default
         is 640). `:cache` — `:auto` (default: on for GPU, off for explicit
         raster), `true` or `false`.
@@ -28,21 +29,38 @@ if Code.ensure_loaded?(Emerge) do
         `:log` also logs a summary every ~5 s.
       * `:image_dirs` — directories image paths may come from (default
         `["/tmp/up_display"]`, created if missing).
+      * `:image_cache_mb` — decoded-image cache budget in MiB (default 32).
       * `:spec` — the first `UniversalProxy.Display.Spec` to show.
       * `:viz_tick_ms` — visualizer redraw period (default 50).
+      * `:viz_buffer` — how many early visualizer frames may wait for their
+        display time (default 8; see `UniversalProxy.Display.Viz.buffer_cap/2`).
       * `:owner` — a pid told about visualizer tier changes as
         `{:viewport_viz_tier, viewport, tier}`.
     """
 
     @behaviour UniversalProxy.Display.Renderer
 
+    use Emerge.Assets.Path, otp_app: :universal_proxy
+
     alias Emerge.UI
-    alias Emerge.UI.{Align, Background, Border, Color, Font, Nearby, Size, Space, Transform}
-    alias UniversalProxy.Display.{Spec, State, Viewport}
+    alias Emerge.UI.{Align, Background, Border, Color, Font, Nearby, Size, Space, Svg, Transform}
+    alias UniversalProxy.Display.{OutputMode, Spec, State, Viewport}
 
     @mib 1024 * 1024
     @default_image_dirs ["/tmp/up_display"]
+    # Decoded images kept (every track's cover is a new file): Emerge's
+    # default of 256 MiB / 256 entries would hold hours of covers.
+    @image_cache_mb 32
+    @image_cache_entries 24
     @bar_attrs [:bar_width, :max_height, :color, :bar_mode]
+
+    # Checked at compile time (`~m`): a missing icon fails the build.
+    @icons %{
+      previous: ~m"display/icons/previous.svg",
+      play: ~m"display/icons/play.svg",
+      pause: ~m"display/icons/pause.svg",
+      next: ~m"display/icons/next.svg"
+    }
 
     @impl true
     def available?, do: Code.ensure_loaded?(EmergeSkia.Native) and State.display_card?()
@@ -53,7 +71,7 @@ if Code.ensure_loaded?(Emerge) do
         spec = Keyword.get_lazy(opts, :spec, fn -> Spec.now_playing() end)
 
         viewport_opts =
-          [config: config, spec: spec] ++ Keyword.take(opts, [:viz_tick_ms, :owner])
+          [config: config, spec: spec] ++ Keyword.take(opts, [:viz_tick_ms, :viz_buffer, :owner])
 
         child = Supervisor.child_spec({Viewport, viewport_opts}, restart: :temporary)
 
@@ -107,7 +125,8 @@ if Code.ensure_loaded?(Emerge) do
     @spec config(keyword()) :: {:ok, Emerge.Config.t()} | {:error, term()}
     def config(opts) do
       with {:ok, card, output} <- select_output(opts),
-           {:ok, mode} <- select_mode(output, Keyword.get(opts, :mode)) do
+           {:ok, mode} <-
+             select_mode(output, Keyword.get(opts, :mode), Keyword.get(opts, :preferred_size)) do
         image_dirs = Keyword.get(opts, :image_dirs, @default_image_dirs)
         Enum.each(image_dirs, &File.mkdir_p/1)
 
@@ -117,17 +136,22 @@ if Code.ensure_loaded?(Emerge) do
              card: card,
              connector: output.name,
              mode: mode,
-             preferred_size: if(mode, do: nil, else: Keyword.get(opts, :preferred_size))
+             preferred_size: nil
            },
            renderer: %Emerge.Config.Renderer{
              api: Keyword.get(opts, :api, :auto),
              raster_present: Keyword.get(opts, :raster_present, :auto),
              cache: cache_config(opts)
            },
+           # The DRM backends report the chosen mode's size as a resize,
+           # which the viewport passes on to its owner.
+           input: %Emerge.Config.Input{events: [:resize]},
            assets: %Emerge.Config.Assets{
              otp_app: :universal_proxy,
+             # A 480x480 cover drawn smaller is decoded at the drawn size.
              decode_at_size: true,
-             runtime_paths: %Emerge.Config.RuntimePaths{enabled: true, allowlist: image_dirs}
+             runtime_paths: %Emerge.Config.RuntimePaths{enabled: true, allowlist: image_dirs},
+             cache: image_cache(Keyword.get(opts, :image_cache_mb, @image_cache_mb))
            },
            diagnostics: diagnostics_config(Keyword.get(opts, :diagnostics, false))
          }}
@@ -152,6 +176,11 @@ if Code.ensure_loaded?(Emerge) do
     def tree({:text, attrs, string}), do: UI.el(attrs(attrs), UI.text(string))
 
     def tree({:image, attrs, path}), do: UI.image(attrs(attrs), {:path, path})
+
+    def tree({:icon, attrs, name}) do
+      tint = attrs |> Keyword.get(:color, {255, 255, 255}) |> paint()
+      UI.svg([Svg.color(tint) | attrs(attrs)], Map.fetch!(@icons, name))
+    end
 
     def tree({:bars, attrs, heights}) do
       key = Keyword.get(attrs, :key, "bars")
@@ -204,11 +233,17 @@ if Code.ensure_loaded?(Emerge) do
     end
 
     defp attrs(attrs) do
-      for {key, value} <- attrs, key not in @bar_attrs, do: attr(key, value)
+      attrs
+      |> Enum.reject(fn {key, _value} -> key in @bar_attrs end)
+      |> Enum.flat_map(fn {key, value} -> List.wrap(attr(key, value)) end)
     end
 
     defp attr(:width, length), do: Size.width(size_value(length))
     defp attr(:height, length), do: Size.height(size_value(length))
+
+    defp attr(:padding, {top, right, bottom, left}),
+      do: Space.padding_each(top, right, bottom, left)
+
     defp attr(:padding, n), do: Space.padding(n)
     defp attr(:spacing, n), do: Space.spacing(n)
     defp attr(:background, paint), do: Background.color(paint(paint))
@@ -222,7 +257,12 @@ if Code.ensure_loaded?(Emerge) do
     defp attr(:align_y, :center), do: Align.center_y()
     defp attr(:align_y, :bottom), do: Align.align_bottom()
     defp attr(:rounded, radius), do: Border.rounded(radius)
+
+    defp attr(:border, {width, color}),
+      do: [Border.width(width), Border.color(paint(color))]
+
     defp attr(:alpha, alpha), do: Transform.alpha(alpha)
+    defp attr(:move, {dx, dy}), do: [Transform.move_x(dx), Transform.move_y(dy)]
     defp attr(:image_fit, fit), do: UI.image_fit(fit)
     defp attr(:key, key), do: UI.key(key)
 
@@ -266,8 +306,13 @@ if Code.ensure_loaded?(Emerge) do
 
     defp pick_output(outputs, name), do: Enum.find(outputs, &(&1.name == name))
 
-    defp select_mode(_output, nil), do: {:ok, nil}
-    defp select_mode(_output, id) when is_binary(id), do: {:ok, id}
+    # Always an explicit mode, so the output size is known before Emerge
+    # starts (see `UniversalProxy.Display.OutputMode`).
+    defp select_mode(output, nil, preferred_size),
+      do: found(output, :auto, OutputMode.choose(output.modes, preferred_size))
+
+    defp select_mode(_output, id, _preferred_size) when is_binary(id), do: {:ok, id}
+    defp select_mode(output, wanted, _preferred_size), do: select_mode(output, wanted)
 
     defp select_mode(output, :preferred) do
       found(output, :preferred, Enum.find(output.modes, & &1.preferred))
@@ -318,6 +363,10 @@ if Code.ensure_loaded?(Emerge) do
         enabled: Keyword.get(opts, :cache, :auto),
         paint_layer: paint_layer
       }
+    end
+
+    defp image_cache(mb) do
+      %Emerge.Config.AssetCache{max_entries: @image_cache_entries, max_bytes: round(mb * @mib)}
     end
 
     defp diagnostics_config(true), do: %Emerge.Config.Diagnostics{stats: true}

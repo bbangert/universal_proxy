@@ -35,8 +35,16 @@ defmodule UniversalProxy.Display.State do
   effects, so they always build on its final state. Mode changes are broadcast on `UniversalProxy.Display.topic/0`
   as `{:display_mode, mode}`.
 
+  The viewport reports the output size it got as `{:viewport_size,
+  viewport, {w, h}}`; screens are laid out for that size (before the
+  first report, for the configured `:preferred_size`).
+
   Timers fire as `{:display_timer, timer, gen}` messages (`timer` is
-  `:idle`, `:retry` or `:stable`); a stale `gen` is ignored.
+  `:idle`, `:retry` or `:stable`); a stale `gen` is ignored. While a
+  viewport runs, a `{:display_clock, ref}` timer redraws the screen when
+  it changes with time alone (`UniversalProxy.Display.View.next_refresh/2`:
+  the progress bar, once a second while playing, and the burn-in drift
+  every few minutes).
 
   ## With the UI off (`ui: false`, the default)
 
@@ -53,7 +61,8 @@ defmodule UniversalProxy.Display.State do
     * `:dri_dir` — where DRM cards appear (default `"/dev/dri"`).
     * `:viewport_opts` — default `start/2` options for the renderer.
       Default: the configured `:layer_cache_mb`, `:preferred_size`,
-      `:viz_tick_ms` and `:image_dirs`.
+      `:viz_tick_ms` and `:image_dirs`, and a `:viz_buffer` sized for the
+      display roles' `:viz_offset_ms` and `:viz_rate`.
     * `:spec` — the first screen in manual mode (default: `Spec.now_playing/1`).
     * `:model_opts` — `UniversalProxy.Display.Model.new/1` options
       (default: the configured `:idle_ms`, `:party_idle_ms`, `:restart_ms`,
@@ -70,7 +79,9 @@ defmodule UniversalProxy.Display.State do
   require Logger
 
   alias UniversalProxy.{Audio, Cec, Display}
-  alias UniversalProxy.Display.{Binding, Mode, Model, Spec, View}
+  alias UniversalProxy.Display.{Binding, Mode, Model, Spec, View, Viz}
+
+  @max_clock_ms 3_600_000
 
   @model_keys [:idle_ms, :party_idle_ms, :restart_ms, :restart_max_ms, :stable_ms]
   @viewport_keys [:layer_cache_mb, :preferred_size, :viz_tick_ms, :image_dirs]
@@ -101,9 +112,7 @@ defmodule UniversalProxy.Display.State do
         Keyword.get(opts, :viewport_supervisor, Display.Supervisor.viewport_supervisor()),
       dri_dir: Keyword.get(opts, :dri_dir, "/dev/dri"),
       viewport_opts:
-        Keyword.get_lazy(opts, :viewport_opts, fn ->
-          config |> Keyword.take(@viewport_keys) |> drop_nil()
-        end),
+        Keyword.get_lazy(opts, :viewport_opts, fn -> default_viewport_opts(config) end),
       view_opts: Keyword.get_lazy(opts, :view_opts, fn -> default_view_opts(config) end),
       spec: Keyword.get_lazy(opts, :spec, fn -> Spec.now_playing() end),
       viewport: nil,
@@ -118,6 +127,7 @@ defmodule UniversalProxy.Display.State do
       job: nil,
       follow_ups: [],
       viz_on: nil,
+      clock: nil,
       pubsub: Keyword.get(opts, :pubsub, UniversalProxy.PubSub),
       task_sup: Keyword.get(opts, :task_supervisor, UniversalProxy.TaskSupervisor),
       audio: Map.merge(default_audio(), Map.new(Keyword.get(opts, :audio, %{}))),
@@ -229,11 +239,17 @@ defmodule UniversalProxy.Display.State do
   def handle_info({:display_timer, timer, gen}, state),
     do: {:noreply, dispatch(state, {:timer, timer, gen})}
 
+  def handle_info({:display_clock, ref}, %{clock: {ref, _due}} = state),
+    do: {:noreply, arm_clock(run_effect(:render, %{state | clock: nil}))}
+
   def handle_info({:display_party, party}, state),
     do: {:noreply, dispatch(state, {:party, party})}
 
   def handle_info({:viewport_viz_tier, _pid, tier}, state),
     do: {:noreply, %{state | viz_tier: tier}}
+
+  def handle_info({:viewport_size, handle, size}, %{viewport: %{handle: handle}} = state),
+    do: {:noreply, dispatch(state, {:viewport_size, size})}
 
   def handle_info(_msg, state), do: {:noreply, state}
 
@@ -287,18 +303,53 @@ defmodule UniversalProxy.Display.State do
   # ── Model plumbing ───────────────────────────────────────────────────
 
   defp dispatch(state, event) do
-    {model, effects} = Model.handle(state.model, event, System.monotonic_time(:millisecond))
+    {model, effects} = Model.handle(state.model, event, now_ms())
     state = Enum.reduce(effects, %{state | model: model}, &run_effect/2)
 
     # Events the effects produced, after all of this transition's effects.
     {follow_ups, state} = Map.get_and_update(state, :follow_ups, &{&1, []})
-    follow_ups |> Enum.reverse() |> Enum.reduce(state, &dispatch(&2, &1))
+    follow_ups |> Enum.reverse() |> Enum.reduce(state, &dispatch(&2, &1)) |> arm_clock()
   end
+
+  # The screen also changes with time alone (the progress clock): one timer
+  # redraws it when `View.next_refresh/2` says so. An earlier pending
+  # wake-up is kept, so a stream of events can't keep pushing it out.
+  defp arm_clock(%{viewport: nil} = state), do: cancel_clock(state)
+
+  defp arm_clock(state) do
+    now = now_ms()
+
+    case View.next_refresh(state.model, view_opts(state, now)) do
+      nil ->
+        cancel_clock(state)
+
+      ms ->
+        # An early wake-up only redraws the same screen.
+        ms = min(ms, @max_clock_ms)
+
+        case state.clock do
+          {_ref, due} when due <= now + ms ->
+            state
+
+          _other ->
+            state = cancel_clock(state)
+            ref = make_ref()
+            Process.send_after(self(), {:display_clock, ref}, ms)
+            %{state | clock: {ref, now + ms}}
+        end
+    end
+  end
+
+  defp cancel_clock(state), do: %{state | clock: nil}
+
+  defp view_opts(state, now), do: Keyword.put(state.view_opts, :now, now)
+
+  defp now_ms, do: System.monotonic_time(:millisecond)
 
   defp follow_up(state, event), do: %{state | follow_ups: [event | state.follow_ups]}
 
   defp run_effect(:render, state) do
-    spec = View.render(state.model, state.view_opts)
+    spec = View.render(state.model, view_opts(state, now_ms()))
 
     if state.viewport && spec != state.spec,
       do: state.renderer.push(state.viewport.handle, spec)
@@ -363,7 +414,7 @@ defmodule UniversalProxy.Display.State do
   end
 
   defp run_effect({:start_viewport, rung}, state) do
-    spec = View.render(state.model, state.view_opts)
+    spec = View.render(state.model, view_opts(state, now_ms()))
 
     case start_viewport(%{state | spec: spec}, Keyword.put(rung, :owner, self())) do
       {{:ok, _handle}, state} ->
@@ -525,6 +576,7 @@ defmodule UniversalProxy.Display.State do
         keys_claimed: m.claimed,
         viz: m.viz,
         viz_tier: state.viz_tier,
+        size: m.size,
         lifecycle: m.viewport
       })
     else
@@ -533,6 +585,19 @@ defmodule UniversalProxy.Display.State do
   end
 
   # ── Defaults ─────────────────────────────────────────────────────────
+
+  # The visualizer buffer holds one lead time of frames at the player's rate.
+  defp default_viewport_opts(config) do
+    roles = Audio.DisplayRoles.config()
+
+    config
+    |> Keyword.take(@viewport_keys)
+    |> drop_nil()
+    |> Keyword.put_new(
+      :viz_buffer,
+      Viz.buffer_cap(roles[:viz_offset_ms], roles[:viz_rate])
+    )
+  end
 
   defp default_view_opts(config) do
     [

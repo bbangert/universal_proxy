@@ -88,25 +88,26 @@ defmodule UniversalProxy.Display.StateTest do
     }
 
     state =
-      start_supervised!(
-        {State,
-         name: :"#{inspect(__MODULE__)}.#{context.test}",
-         ui: true,
-         renderer: FakeRenderer,
-         viewport_supervisor: context.sup,
-         dri_dir: context.dri_dir,
-         viewport_opts: [test_pid: test],
-         view_opts: [bars: 8],
-         model_opts:
-           Keyword.merge(
-             [idle_ms: 60_000, restart_ms: 1, restart_max_ms: 4, stable_ms: 60_000],
-             Keyword.get(opts, :model_opts, [])
-           ),
-         pubsub: pubsub,
-         task_supervisor: tasks,
-         audio: audio,
-         cec: cec}
-      )
+      start_supervised!({
+        State,
+        # No burn-in drift step during a test.
+        name: :"#{inspect(__MODULE__)}.#{context.test}",
+        ui: true,
+        renderer: FakeRenderer,
+        viewport_supervisor: context.sup,
+        dri_dir: context.dri_dir,
+        viewport_opts: [test_pid: test],
+        view_opts: [bars: 8, drift_period_ms: 1_000_000_000_000],
+        model_opts:
+          Keyword.merge(
+            [idle_ms: 60_000, restart_ms: 1, restart_max_ms: 4, stable_ms: 60_000],
+            Keyword.get(opts, :model_opts, [])
+          ),
+        pubsub: pubsub,
+        task_supervisor: tasks,
+        audio: audio,
+        cec: cec
+      })
 
     # Past the start-up continue.
     _ = :sys.get_state(state)
@@ -124,6 +125,14 @@ defmodule UniversalProxy.Display.StateTest do
     do: Enum.flat_map(children, &texts/1)
 
   defp texts(_node), do: []
+
+  defp flush_pushes(viewport) do
+    receive do
+      {:fake_renderer, :push, ^viewport, _spec} -> flush_pushes(viewport)
+    after
+      50 -> :ok
+    end
+  end
 
   # The next viewport start's options.
   defp started! do
@@ -252,6 +261,66 @@ defmodule UniversalProxy.Display.StateTest do
       assert GenServer.call(ctx.state, {:set_mode, :off}) == :ok
       assert_receive {:fake_renderer, :set_display, ^viewport, :off}
       assert_receive {:cec, :release, "/dev/cec0"}
+    end
+  end
+
+  describe "output size" do
+    test "the viewport's reported size re-lays the screen out", context do
+      ctx = start_ui(context)
+      viewport = viewport!(ctx)
+
+      send(ctx.state, {:viewport_size, viewport, {1920, 1080}})
+      assert_receive {:fake_renderer, :push, ^viewport, spec}
+      assert {:column, attrs, _} = spec
+      assert attrs[:padding] == {54, 96, 54, 96}
+      assert GenServer.call(ctx.state, :status).size == {1920, 1080}
+
+      # Another process's (a stale viewport's) report is ignored.
+      send(ctx.state, {:viewport_size, self(), {1280, 720}})
+      assert GenServer.call(ctx.state, :status).size == {1920, 1080}
+    end
+  end
+
+  describe "progress clock" do
+    test "a playing track's progress redraws about once a second; pausing stops that",
+         context do
+      ctx = start_ui(context)
+      viewport = viewport!(ctx)
+      playing(ctx)
+
+      metadata = %{
+        event: "metadata",
+        title: "Song",
+        received_at: System.monotonic_time(:millisecond) - 10_000,
+        progress: %{
+          track_progress: 0,
+          track_duration: 100_000,
+          playback_speed: 1000,
+          progress_age_ms: 0
+        }
+      }
+
+      flush_pushes(viewport)
+      broadcast(ctx, "sendspin:display", {:sendspin_display, @key, 1, metadata})
+      assert_receive {:fake_renderer, :push, ^viewport, spec}
+      assert "Song" in texts(spec) and "0:10" in texts(spec)
+      assert %{clock: {_ref, _due}} = :sys.get_state(ctx.state)
+
+      flush_pushes(viewport)
+      assert_receive {:fake_renderer, :push, ^viewport, spec}, 1_500
+      assert "0:11" in texts(spec) or "0:12" in texts(spec)
+
+      broadcast(
+        ctx,
+        "sendspin:display",
+        {:sendspin_display, @key, 2, %{event: "group", playback_state: "paused"}}
+      )
+
+      # Paused: no more per-second redraws; only the burn-in drift wakes it.
+      flush_pushes(viewport)
+      refute_receive {:fake_renderer, :push, ^viewport, _spec}, 1_200
+      assert %{clock: {_ref, due}} = :sys.get_state(ctx.state)
+      assert due - System.monotonic_time(:millisecond) > 60_000
     end
   end
 
