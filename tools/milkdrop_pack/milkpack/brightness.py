@@ -24,15 +24,28 @@ def classify(result, exclude_above, review_above, exclude_min_luma=0.0):
     (pure colour rather than white) is only reviewed, not excluded."""
     if result and result.get("error") == "load_failed":
         return "load_failed"
-    if not result or "sat" not in result:
+    if not measured(result):
         return "error"
-    if result["sat"] > exclude_above and result.get("luma", 255.0) >= exclude_min_luma:
+    if result["sat"] > exclude_above and result["luma"] >= exclude_min_luma:
         return "exclude"
     if result["sat"] > exclude_above:
         return "review"
     if result["sat"] > review_above:
         return "review"
     return "ok"
+
+
+def measured(result):
+    """A clean measurement: brightness metrics and no GL error."""
+    return (isinstance(result, dict) and "error" not in result and not result.get("gl_error")
+            and all(isinstance(result.get(k), (int, float)) and not isinstance(result.get(k), bool)
+                    for k in ("sat", "luma")))
+
+
+def cacheable(result):
+    """Only measurements and the deterministic load failure are cached; a
+    timeout, crash or GL failure is rendered again next time."""
+    return measured(result) or (isinstance(result, dict) and result.get("error") == "load_failed")
 
 
 def verdict(result, cfg):
@@ -54,8 +67,9 @@ def load_cache(path):
             for line in f:
                 try:
                     rec = json.loads(line)
-                    cache[rec["key"]] = rec["result"]
-                except (ValueError, KeyError):
+                    if cacheable(rec["result"]):
+                        cache[rec["key"]] = rec["result"]
+                except (ValueError, KeyError, TypeError):
                     continue
     return cache
 
@@ -79,6 +93,7 @@ def render(tools, preset_path, texture_dir, settings, extra=(), timeout=900):
         proc = subprocess.run(cmd, capture_output=True, text=True, env=env_for(tools), timeout=timeout)
     except subprocess.TimeoutExpired:
         return {"error": "timeout"}
+    result = None
     for line in reversed(proc.stdout.splitlines()):
         if line.startswith("{"):
             try:
@@ -86,8 +101,15 @@ def render(tools, preset_path, texture_dir, settings, extra=(), timeout=900):
                 break
             except ValueError:
                 continue
-    else:
-        result = {"error": f"exit {proc.returncode}", "stderr": proc.stderr[-300:]}
+    # md_bright exits 1 after printing load_failed; that one is a verdict.
+    if isinstance(result, dict) and result.get("error") == "load_failed":
+        return {"error": "load_failed", "message": result.get("message", "")}
+    if proc.returncode != 0 or not isinstance(result, dict):
+        return {"error": f"exit {proc.returncode}", "stderr": proc.stderr[-300:]}
+    if result.get("gl_error"):
+        return {"error": "gl_error", "gl_error": result["gl_error"], "stderr": proc.stderr[-300:]}
+    if not measured(result):
+        return {"error": "bad_result", "stdout": json.dumps(result)[:300]}
     return result
 
 
@@ -114,7 +136,7 @@ def screen(tools, pack_dir, ids, settings, cache_path, jobs, tool_id, progress=N
             pid, key = futures[fut]
             result = fut.result()
             results[pid] = result
-            if "sat" in result or result.get("error") == "load_failed":
+            if cacheable(result):
                 cache_file.write(json.dumps({"key": key, "id": pid, "result": result}) + "\n")
                 cache_file.flush()
             done += 1
