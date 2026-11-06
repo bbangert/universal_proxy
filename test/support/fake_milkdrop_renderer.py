@@ -17,8 +17,9 @@ only what the tests drive.
     {"cmd":"ignore_eof"}          → on stdin EOF, hang instead of exiting
     {"cmd":"stall"}               → stop reading stdin (hang forever)
 
-Every stdin line is appended to <skip-file>.cmds, so tests can check what
-was written. On stdin EOF it writes <skip-file>.eof and exits 0, as the
+It touches <skip-file>.spawned first thing, so tests can tell it was ever
+started. Every stdin line is appended to <skip-file>.cmds, so tests can
+check what was written. On stdin EOF it writes <skip-file>.eof and exits 0, as the
 real binary must.
 
 No external dependencies; stdout is flushed after every write.
@@ -49,6 +50,8 @@ def main():
     parser.add_argument("--locked")
     parser.add_argument("--pcm-ring")
     args = parser.parse_args()
+
+    open(args.skip_file + ".spawned", "w").close()
 
     with open(args.skip_file) as f:
         skip = [line for line in f.read().split("\n") if line]

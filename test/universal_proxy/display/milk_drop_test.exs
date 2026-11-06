@@ -21,7 +21,11 @@ defmodule UniversalProxy.Display.MilkDropTest do
         {Store, name: nil, table: @table, dets_path: Path.join(tmp_dir, "settings.dets")}
       )
 
-    {:ok, store: store, skip_file: Path.join(tmp_dir, "skip.txt"), pack_dir: tmp_dir}
+    skip_file = Path.join(tmp_dir, "skip.txt")
+    # Every fake renderer this test spawned has its (per-test) skip file in argv.
+    on_exit(fn -> Enum.each(renderer_os_pids(skip_file), &kill_os_pid/1) end)
+
+    {:ok, store: store, skip_file: skip_file, pack_dir: tmp_dir}
   end
 
   defp start_renderer(ctx, opts \\ []) do
@@ -331,6 +335,73 @@ defmodule UniversalProxy.Display.MilkDropTest do
   end
 
   @tag capture_log: true
+  test "a killed reaper kills the running renderer and stops the server", ctx do
+    {pid, _} = start_renderer(ctx, kill_grace_ms: 60_000)
+    os_pid = ignore_eof(ctx, pid)
+    %{reaper: reaper} = :sys.get_state(pid)
+    ref = Process.monitor(pid)
+
+    Process.exit(reaper, :kill)
+    assert_receive {:milkdrop_exit, ^pid, :reaper_down}, @timeout
+    assert_receive {:DOWN, ^ref, :process, ^pid, {:shutdown, :reaper_down}}, @timeout
+    wait_until(fn -> not File.exists?("/proc/#{os_pid}") end, 1_000)
+  end
+
+  @tag capture_log: true
+  test "a reaper shut down by its supervisor kills the running renderer", ctx do
+    sup = start_supervised!(Task.Supervisor)
+    {pid, _} = start_renderer(ctx, task_supervisor: sup, kill_grace_ms: 60_000)
+    os_pid = ignore_eof(ctx, pid)
+    %{reaper: reaper} = :sys.get_state(pid)
+    ref = Process.monitor(pid)
+
+    :ok = Task.Supervisor.terminate_child(sup, reaper)
+    wait_until(fn -> not File.exists?("/proc/#{os_pid}") end, 1_000)
+    # The reaper's SIGKILL can reach the server as an exit status (128 + 9)
+    # before the reaper's own DOWN does.
+    assert_receive {:milkdrop_exit, ^pid, status}, @timeout
+    assert status in [:reaper_down, 137]
+    assert_receive {:DOWN, ^ref, :process, ^pid, reason}, @timeout
+    assert reason in [{:shutdown, :reaper_down}, :normal]
+  end
+
+  @tag capture_log: true
+  test "stopping the reaper's supervisor during the grace period kills the renderer", ctx do
+    start_supervised!({Task.Supervisor, name: :milkdrop_reaper_test_sup}, id: :reaper_sup)
+    owner = forwarding_owner()
+
+    {:ok, pid} =
+      start_with_owner(ctx, owner,
+        task_supervisor: :milkdrop_reaper_test_sup,
+        kill_grace_ms: 60_000
+      )
+
+    assert_receive {:owner_got, {:milkdrop, ^pid, %{event: :prepared}}}, @timeout
+    os_pid = ignore_eof(ctx, pid)
+    ref = Process.monitor(pid)
+
+    Process.exit(owner, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, @timeout
+    assert File.exists?("/proc/#{os_pid}")
+
+    :ok = stop_supervised(:reaper_sup)
+    wait_until(fn -> not File.exists?("/proc/#{os_pid}") end, 1_000)
+    refute File.exists?(ctx.skip_file <> ".eof")
+  end
+
+  @tag capture_log: true
+  test "no renderer is spawned when the reaper cannot start", ctx do
+    assert {:error, {:reaper, _}} =
+             MilkDrop.start(renderer_opts(ctx, task_supervisor: :no_such_milkdrop_task_sup))
+
+    assert renderer_os_pids(ctx.skip_file) == []
+    # Long enough for an already-spawned fake to have reached its marker.
+    Process.sleep(300)
+    refute File.exists?(ctx.skip_file <> ".spawned")
+    refute File.exists?(ctx.skip_file)
+  end
+
+  @tag capture_log: true
   test "a renderer that stops reading stdin is reported wedged and killed", ctx do
     {pid, _} = start_renderer(ctx, kill_grace_ms: 100)
     %{os_pid: os_pid} = :sys.get_state(pid)
@@ -427,6 +498,16 @@ defmodule UniversalProxy.Display.MilkDropTest do
       binary: @fake_binary
     ] ++ opts
   end
+
+  defp renderer_os_pids(skip_file) do
+    for dir <- Path.wildcard("/proc/[0-9]*"),
+        {:ok, cmdline} <- [File.read(Path.join(dir, "cmdline"))],
+        skip_file in String.split(cmdline, <<0>>),
+        do: dir |> Path.basename() |> String.to_integer()
+  end
+
+  defp kill_os_pid(os_pid),
+    do: System.cmd("kill", ["-9", Integer.to_string(os_pid)], stderr_to_stdout: true)
 
   defp ignore_eof(ctx, pid) do
     %{os_pid: os_pid} = :sys.get_state(pid)
