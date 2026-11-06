@@ -58,7 +58,7 @@ endif()
 # FORCE so a pin bump always wins over a stale CMakeCache.txt. For scratch
 # builds against a local checkout set MILKDROP_PROJECTM_SOURCE_DIR (the mix
 # compiler forwards it as FETCHCONTENT_SOURCE_DIR_PROJECTM).
-set(PROJECTM_REF "487f9d000a967973901f3af0b6197fe62d93dff8" # es2/1ac
+set(PROJECTM_REF "9a0737093d119a5755b3037166d2b58d2ebb1964" # es2/1ac
     CACHE STRING "projectM fork commit SHA to pin" FORCE)
 
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
