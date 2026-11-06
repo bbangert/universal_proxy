@@ -127,7 +127,7 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
           skipped: %{},
           store: :"#{inspect(__MODULE__)}.NoStore",
           task_supervisor: tasks,
-          kill_grace_ms: 300
+          kill_grace_ms: Keyword.get(opts, :kill_grace_ms, 300)
         ],
         milkdrop_timeouts: Keyword.get(opts, :timeouts, %{})
       })
@@ -349,6 +349,72 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     assert_receive {:fake_renderer, :start, _opts}, @timeout
     wait_until(fn -> md(ctx).phase == nil end)
     assert %{last: %{outcome: {:crashed, {:down, :killed}}}} = md(ctx)
+  end
+
+  # A renderer that outlives its port may still hold DRM master: the
+  # viewport waits until the reaper has it gone.
+  test "after a killed port owner the viewport waits for the renderer to be reaped", ctx do
+    ctx = ctx |> start_ui(fake: %{ignore_eof: true}, kill_grace_ms: 500) |> presenting()
+    %{os_pid: os_pid} = :sys.get_state(renderer(ctx))
+
+    Process.exit(renderer(ctx), :kill)
+    wait_until(fn -> md(ctx).phase == :reaping end)
+    assert File.exists?("/proc/#{os_pid}")
+    refute_received {:fake_renderer, :start, _opts}
+
+    assert_receive {:fake_renderer, :start, _opts}, @timeout
+    refute File.exists?("/proc/#{os_pid}")
+    refute File.exists?(ctx.skip_file <> ".eof")
+
+    assert %{phase: nil, last: %{outcome: {:crashed, {:down, :killed}}, phase: :presenting}} =
+             md(ctx)
+
+    assert %{lifecycle: %{status: :running}} = status(ctx)
+  end
+
+  test "a timed-out release of a renderer ignoring EOF restarts the viewport once it is reaped",
+       ctx do
+    ctx =
+      start_ui(ctx,
+        fake: %{ignore: ["release"], ignore_eof: true},
+        timeouts: %{releasing: 200},
+        kill_grace_ms: 500
+      )
+
+    ctx = presenting(ctx)
+    %{os_pid: os_pid} = :sys.get_state(renderer(ctx))
+
+    paused(ctx)
+    wait_until(fn -> md(ctx).phase == :reaping end)
+    assert File.exists?("/proc/#{os_pid}")
+    assert_receive {:fake_renderer, :start, _opts}, @timeout
+    refute File.exists?("/proc/#{os_pid}")
+    assert_received {:audio, :pcm_tap, @key, false}
+    assert %{last: %{outcome: {:crashed, {:timeout, :releasing}}}, failures: 1} = md(ctx)
+  end
+
+  test "a renderer never confirmed gone still gets the display back, bounded", ctx do
+    log =
+      capture_log(fn ->
+        ctx =
+          start_ui(ctx,
+            fake: %{ignore_eof: true},
+            timeouts: %{reaping: 300},
+            kill_grace_ms: 60_000
+          )
+
+        ctx = presenting(ctx)
+        %{os_pid: os_pid} = :sys.get_state(renderer(ctx))
+
+        Process.exit(renderer(ctx), :kill)
+        wait_until(fn -> md(ctx).phase == :reaping end)
+        assert_receive {:fake_renderer, :start, _opts}, @timeout
+        assert File.exists?("/proc/#{os_pid}")
+        wait_until(fn -> md(ctx).phase == nil end)
+        assert %{last: %{outcome: {:crashed, {:down, :killed}}}} = md(ctx)
+      end)
+
+    assert log =~ "not confirmed gone in time"
   end
 
   test "three failures latch MilkDrop off until the mode is chosen again", ctx do

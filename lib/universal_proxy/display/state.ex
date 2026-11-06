@@ -76,15 +76,22 @@ defmodule UniversalProxy.Display.State do
        `:exiting` until the renderer is gone. The PCM tap goes off again.
 
   Every phase is bounded (`:milkdrop_timeouts`, ms: tapping 10 000,
-  preparing 20 000, taking 5 000, releasing 3 000, exiting 3 000). A
-  timed-out step, a `take` the renderer reports failed, or a renderer that
-  exits or crashes unasked (`{:milkdrop_exit, pid, status}`, `:wedged` and
-  `:reaper_down` included) stops it (`UniversalProxy.Display.MilkDrop.stop/1`)
-  and, if the viewport had yielded, starts the viewport again at once;
-  the model counts the failure toward its crash latch, which is logged. A
-  renderer that stopped because it overheated (`exiting` reason
-  `thermal`) latches the bar visualizer. Nothing here waits on the
-  renderer: commands are casts and its answers are messages.
+  preparing 20 000, taking 5 000, releasing 3 000, exiting 3 000,
+  reaping 3 000). A timed-out step, a `take` the renderer reports failed,
+  or a renderer that exits or crashes unasked (`{:milkdrop_exit, pid,
+  status}`, `:wedged` and `:reaper_down` included) stops it
+  (`UniversalProxy.Display.MilkDrop.stop/1`) and, if the viewport had
+  yielded, starts the viewport again; the model counts the failure toward
+  its crash latch, which is logged. A renderer that stopped because it
+  overheated (`exiting` reason `thermal`) latches the bar visualizer.
+
+  The session only ends (tap off, `{:milkdrop, :ended, outcome}`, the
+  viewport restarted) once the renderer process is known gone, since until
+  then it may hold DRM master: its exit status arrived, or its reaper
+  reported `{:milkdrop_reaped, pid}`. Otherwise the session waits in
+  `:reaping`, and past that phase's timeout it ends anyway, logged.
+  Nothing here waits on the renderer: commands are casts and its answers
+  are messages.
 
   ## With the UI off (`ui: false`, the default)
 
@@ -135,7 +142,8 @@ defmodule UniversalProxy.Display.State do
     preparing: 20_000,
     taking: 5_000,
     releasing: 3_000,
-    exiting: 3_000
+    exiting: 3_000,
+    reaping: 3_000
   }
   # Renderer errors that mean `take` failed (it stays prepared, not master).
   @take_errors ["master_timeout", "take_failed"]
@@ -346,6 +354,12 @@ defmodule UniversalProxy.Display.State do
   def handle_info({:milkdrop, pid, event}, %{md: %{pid: pid}} = state) when is_map(event),
     do: {:noreply, milkdrop_event(state, event)}
 
+  # An exit status means the renderer process is gone; `:wedged` and
+  # `:reaper_down` don't.
+  def handle_info({:milkdrop_exit, pid, status}, %{md: %{pid: pid, phase: :reaping}} = state) do
+    if is_integer(status), do: {:noreply, finish_milkdrop(state)}, else: {:noreply, state}
+  end
+
   def handle_info({:milkdrop_exit, pid, status}, %{md: %{pid: pid} = md} = state) do
     outcome =
       cond do
@@ -354,12 +368,18 @@ defmodule UniversalProxy.Display.State do
         true -> {:crashed, md.exiting || status}
       end
 
-    {:noreply, end_milkdrop(state, outcome)}
+    {:noreply, end_milkdrop(state, outcome, is_integer(status))}
   end
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{md: %{ref: ref} = md} = state) do
     outcome = if md.phase == :exiting, do: :requested, else: {:crashed, {:down, reason}}
-    {:noreply, end_milkdrop(%{state | md: %{md | ref: nil, pid: nil}}, outcome)}
+    {:noreply, end_milkdrop(%{state | md: %{md | ref: nil}}, outcome, false)}
+  end
+
+  def handle_info({:milkdrop_reaped, pid}, %{md: %{pid: pid} = md} = state) do
+    if md.phase == :reaping,
+      do: {:noreply, finish_milkdrop(state)},
+      else: {:noreply, %{state | md: %{md | reaped: true}}}
   end
 
   def handle_info(
@@ -670,7 +690,10 @@ defmodule UniversalProxy.Display.State do
       exiting: nil,
       preset: nil,
       locked: false,
-      stats: nil
+      stats: nil,
+      reaped: false,
+      ending: nil,
+      ended_in: nil
     }
 
     milkdrop_phase(%{state | md: md}, :tapping)
@@ -697,7 +720,7 @@ defmodule UniversalProxy.Display.State do
           "[Display] MilkDrop: the viewport's HDMI connector is unknown; not yielding"
         )
 
-        end_milkdrop(state, {:crashed, :no_connector})
+        end_milkdrop(state, {:crashed, :no_connector}, true)
 
       connector ->
         start_renderer(state, md, ring, connector)
@@ -724,7 +747,7 @@ defmodule UniversalProxy.Display.State do
 
       {:error, reason} ->
         Logger.warning("[Display] MilkDrop renderer did not start: #{inspect(reason)}")
-        end_milkdrop(state, {:crashed, {:start_failed, reason}})
+        end_milkdrop(state, {:crashed, {:start_failed, reason}}, true)
     end
   end
 
@@ -853,7 +876,15 @@ defmodule UniversalProxy.Display.State do
   defp milkdrop_timeout(state, :exiting) do
     Logger.warning("[Display] MilkDrop renderer did not exit in time; stopping it")
     :ok = Display.MilkDrop.stop(state.md.pid)
-    end_milkdrop(state, :requested)
+    end_milkdrop(state, :requested, false)
+  end
+
+  defp milkdrop_timeout(state, :reaping) do
+    Logger.warning(
+      "[Display] MilkDrop renderer not confirmed gone in time; taking the display back anyway"
+    )
+
+    finish_milkdrop(state)
   end
 
   defp milkdrop_timeout(state, phase), do: abort_milkdrop(state, {:timeout, phase})
@@ -861,12 +892,14 @@ defmodule UniversalProxy.Display.State do
   defp abort_milkdrop(%{md: md} = state, why) do
     Logger.warning("[Display] MilkDrop handover failed (#{inspect(why)}); stopping the renderer")
     if md.pid, do: :ok = Display.MilkDrop.stop(md.pid)
-    end_milkdrop(state, {:crashed, why})
+    end_milkdrop(state, {:crashed, why}, false)
   end
 
-  # The session is over (the renderer gone or stopped): tap off, and the
-  # model restarts the viewport if it had yielded.
-  defp end_milkdrop(%{md: md} = state, outcome) do
+  # The session is over (the renderer stopped, exited or crashed). `gone?`:
+  # the renderer process is known not to run (or never ran). Otherwise it
+  # may still hold DRM master, so the session waits in `:reaping` for its
+  # reaper's `{:milkdrop_reaped, pid}` (bounded) before it is finished.
+  defp end_milkdrop(%{md: md} = state, outcome, gone?) do
     state = cancel_milkdrop_timer(state)
     if md.ref, do: Process.demonitor(md.ref, [:flush])
 
@@ -878,10 +911,21 @@ defmodule UniversalProxy.Display.State do
         Logger.warning("[Display] MilkDrop renderer ended in #{md.phase}: #{inspect(other)}")
     end
 
+    state = %{state | md: %{md | ref: nil, ending: outcome, ended_in: md.phase}}
+
+    if gone? or is_nil(md.pid) or md.reaped,
+      do: finish_milkdrop(state),
+      else: milkdrop_phase(state, :reaping)
+  end
+
+  # Tap off, and the model restarts the viewport if it had yielded.
+  defp finish_milkdrop(%{md: md} = state) do
+    state = cancel_milkdrop_timer(state)
+    outcome = md.ending
     latch = state.model.milkdrop.latch
 
     state =
-      %{state | md: nil, md_last: %{outcome: outcome, phase: md.phase}}
+      %{state | md: nil, md_last: %{outcome: outcome, phase: md.ended_in}}
       |> pcm_tap_off(md.tap_key)
       |> dispatch({:milkdrop, :ended, outcome})
 

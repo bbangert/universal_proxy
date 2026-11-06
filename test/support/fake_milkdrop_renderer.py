@@ -26,6 +26,7 @@ it) comes from an optional <pack-dir>/fake.json:
     {"ignore": ["release", ...]}  → log those commands but don't act on them
     {"take_error": "<reason>"}    → answer take with an error event instead
     {"take_exit": N}              → exit N on take, no event
+    {"ignore_eof": true}          → as the ignore_eof command, from the start
 
 It touches <skip-file>.spawned first thing, so tests can tell it was ever
 started. Every stdin line is appended to <skip-file>.cmds, so tests can
@@ -69,7 +70,6 @@ def main():
         skip = [line for line in f.read().split("\n") if line]
 
     cmd_log = args.skip_file + ".cmds"
-    ignore_eof = False
 
     fake = {}
     fake_path = os.path.join(args.pack_dir, "fake.json")
@@ -77,6 +77,7 @@ def main():
         with open(fake_path) as f:
             fake = json.load(f)
     ignore = set(fake.get("ignore", []))
+    ignore_eof = bool(fake.get("ignore_eof"))
 
     preset = 0
     locked = args.locked is not None

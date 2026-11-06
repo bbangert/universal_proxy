@@ -358,6 +358,53 @@ defmodule UniversalProxy.Display.MilkDropTest do
     assert Enum.take(prepared.argv, -2) == ["--connector", "HDMI-A-2"]
   end
 
+  # ── Reaped ─────────────────────────────────────────────────────────────
+
+  test "a renderer that exits is reported reaped", ctx do
+    {pid, _} = start_renderer(ctx)
+    MilkDrop.exit(pid)
+    assert_receive {:milkdrop_exit, ^pid, 0}, @timeout
+    assert_receive {:milkdrop_reaped, ^pid}, @timeout
+  end
+
+  test "a stopped server's renderer is reported reaped once it exits on EOF", ctx do
+    {pid, _} = start_renderer(ctx, kill_grace_ms: 60_000)
+    %{os_pid: os_pid} = :sys.get_state(pid)
+
+    :ok = MilkDrop.stop(pid)
+    # Well inside the grace period: the reaper saw the exit itself.
+    assert_receive {:milkdrop_reaped, ^pid}, 3_000
+    refute alive?(os_pid)
+    assert File.exists?(ctx.skip_file <> ".eof")
+  end
+
+  @tag capture_log: true
+  test "a killed server's renderer that ignores EOF is reported reaped after its SIGKILL", ctx do
+    owner = forwarding_owner()
+    {:ok, pid} = start_with_owner(ctx, owner, kill_grace_ms: 300)
+    assert_receive {:owner_got, {:milkdrop, ^pid, %{event: :prepared}}}, @timeout
+    os_pid = ignore_eof(ctx, pid)
+
+    Process.exit(pid, :kill)
+    refute_receive {:owner_got, {:milkdrop_reaped, ^pid}}, 200
+    assert alive?(os_pid)
+    assert_receive {:owner_got, {:milkdrop_reaped, ^pid}}, @timeout
+    refute alive?(os_pid)
+    refute File.exists?(ctx.skip_file <> ".eof")
+  end
+
+  @tag capture_log: true
+  test "a killed reaper's renderer is reported reaped by the server", ctx do
+    {pid, _} = start_renderer(ctx, kill_grace_ms: 60_000)
+    os_pid = ignore_eof(ctx, pid)
+    %{reaper: reaper} = :sys.get_state(pid)
+
+    Process.exit(reaper, :kill)
+    assert_receive {:milkdrop_exit, ^pid, :reaper_down}, @timeout
+    assert_receive {:milkdrop_reaped, ^pid}, @timeout
+    refute alive?(os_pid)
+  end
+
   test "owner death closes the port (renderer sees EOF)", ctx do
     owner = forwarding_owner()
     {:ok, pid} = start_with_owner(ctx, owner)
@@ -610,6 +657,16 @@ defmodule UniversalProxy.Display.MilkDropTest do
 
   defp kill_os_pid(os_pid),
     do: System.cmd("kill", ["-9", Integer.to_string(os_pid)], stderr_to_stdout: true)
+
+  defp alive?(os_pid) do
+    case File.read("/proc/#{os_pid}/stat") do
+      {:ok, stat} ->
+        (stat |> String.split(") ") |> List.last() |> String.first()) not in ["Z", "X"]
+
+      {:error, _} ->
+        false
+    end
+  end
 
   defp ignore_eof(ctx, pid) do
     %{os_pid: os_pid} = :sys.get_state(pid)
