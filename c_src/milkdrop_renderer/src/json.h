@@ -57,9 +57,15 @@ inline constexpr size_t MAX_EMIT_LINE_BYTES = 4000;
 
 // Writes one line to stdout under a mutex (callable from any thread).
 void emit_line(const std::string& line);
-// emit_line, unless another thread holds the writer for `timeout_ms` (a
-// stuck write): then nothing is written and false is returned.
+// emit_line bounded by `timeout_ms` in all: waiting for the writer (another
+// thread stuck in a write) and the write itself (stdout full). False when
+// the line wasn't written whole in time.
 bool emit_line_within(const std::string& line, int timeout_ms);
+
+// Writes `data` to `fd` without blocking past `timeout_ms`: non-blocking
+// writes, polling for room in between. False on timeout (possibly after a
+// partial write) or a write error.
+bool write_within(int fd, std::string_view data, int timeout_ms);
 
 // Redirects emit_line (tests). Null restores stdout.
 void set_emit_sink(std::function<void(const std::string&)> sink);

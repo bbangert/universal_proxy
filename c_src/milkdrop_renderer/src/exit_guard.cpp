@@ -3,7 +3,7 @@
 #include "json.h"
 #include "pcm_feed.h"        // monotonic_us
 #include "protocol.h"
-#include "stderr_capture.h"  // log_msg
+#include "stderr_capture.h"  // log_msg_within
 
 #include <chrono>
 #include <unistd.h>
@@ -55,9 +55,10 @@ void ExitGuard::run() {
         const std::string reason = reason_;
         const int code = code_;
         lock.unlock();
-        log_msg("shutdown (%s) still running after %d ms: exiting now", reason.c_str(), budget_ms_);
-        // A main thread stuck inside a stdout write holds the writer; don't
-        // wait on it for long.
+        // Both writes are best effort and bounded: a full stdout or stderr
+        // (or a main thread stuck in a stdout write, holding the writer)
+        // must not hold up the _exit.
+        log_msg_within(50, "shutdown (%s) still running after %d ms: exiting now", reason.c_str(), budget_ms_);
         if (!exiting_sent_.load()) emit_line_within(event_exiting(reason), 100);
         ::_exit(code);
     }

@@ -23,6 +23,7 @@
 #include <functional>
 #include <chrono>
 #include <cstdio>
+#include <fcntl.h>
 #include <filesystem>
 #include <map>
 #include <set>
@@ -354,19 +355,28 @@ static void test_filters_and_lock() {
     // Locked start on an eligible file; an ineligible one falls back unlocked.
     PresetManager lk(es, {}, cfg);
     CHECK(lk.start("p3.milk")->file == "p3.milk" && lk.locked());
+    CHECK(lk.refused_lock().empty());
     PresetManager lk2(es, {}, cfg);
     CHECK(lk2.start("p1.milk")->file != "p1.milk" && !lk2.locked());
+    CHECK(lk2.refused_lock() == "high_frequency");
     PresetManager lk3(es, {}, cfg);
     CHECK(lk3.start("nope.milk") != nullptr && !lk3.locked());
+    CHECK(lk3.refused_lock() == "unknown");
+    PresetManager lk4(es, {"p0.milk"}, cfg);
+    CHECK(lk4.start("p0.milk")->file != "p0.milk" && lk4.refused_lock() == "skipped");
+    PresetManager lk5(es, {}, cfg);
+    CHECK(lk5.start("p2.milk")->file != "p2.milk" && lk5.refused_lock() == "rpi3_skip");
+    CHECK(lk5.start("")->file != "" && lk5.refused_lock().empty());
 
-    // Turning high_frequency on admits p1; off again ejects it if current.
+    // Turning high_frequency on admits p1; off again ejects it if shown.
     PresetManager hf(es, {}, cfg);
-    hf.start("");
+    hf.on_shown(*hf.start(""), false);
     CHECK(!hf.set_high_frequency(true));
     CHECK(hf.eligible_count() == 5);
     const PresetEntry* p = nullptr;
     for (int i = 0; i < 20 && (p == nullptr || p->file != "p1.milk"); i++) p = hf.rotate();
     CHECK(p != nullptr && p->file == "p1.milk");
+    hf.on_shown(*p, false);
     CHECK(hf.set_high_frequency(false));
 
     // Expensive presets rotate at half weight: later in the round on average.
@@ -388,6 +398,145 @@ static void test_filters_and_lock() {
     // Nothing eligible.
     PresetManager none(entries(2), {"p0.milk", "p1.milk"}, cfg);
     CHECK(none.start("") == nullptr && none.eligible_count() == 0);
+}
+
+// The photosensitivity filter: with high_frequency presets off, none is
+// ever picked, and one still rendered (playing or blending out) must be
+// cut away.
+static const PresetEntry* by_file(const PresetManager& pm, const std::string& file) {
+    for (const auto& e : pm.entries())
+        if (e.file == file) return &e;
+    return nullptr;
+}
+
+static void test_high_frequency_safety() {
+    // Mostly high_frequency: a random pick would land on one quickly.
+    auto es = entries(40);
+    for (int i = 0; i < 40; i++) es[static_cast<size_t>(i)].high_frequency = i % 10 != 0;  // p0, p10, p20, p30 safe
+    auto safe = [](const PresetEntry* e) { return e != nullptr && !e->high_frequency; };
+
+    // Startup: never one, whatever the seed; a locked one is refused.
+    for (uint64_t seed = 1; seed <= 200; seed++) {
+        PresetManager::Config cfg;
+        cfg.seed = seed;
+        PresetManager pm(es, {}, cfg);
+        CHECK(safe(pm.start("")));
+        PresetManager lk(es, {}, cfg);
+        const PresetEntry* first = lk.start("p1.milk");
+        CHECK(safe(first) && !lk.locked() && lk.refused_lock() == "high_frequency");
+    }
+
+    PresetManager::Config cfg;
+    cfg.seed = 9;
+
+    // rotate / next / prev never return one while off, history included.
+    {
+        PresetManager pm(es, {}, cfg);
+        pm.set_high_frequency(true);
+        pm.on_shown(*pm.start(""), false);
+        for (int i = 0; i < 30; i++) pm.on_shown(*pm.rotate(), false);  // history full of them
+        for (int i = 0; i < 15; i++) pm.prev();                          // somewhere in the middle
+        pm.set_high_frequency(false);
+        for (int i = 0; i < 40; i++) {
+            const PresetEntry* q = pm.prev();
+            if (q == nullptr) break;
+            CHECK(safe(q));
+        }
+        for (int i = 0; i < 60; i++) CHECK(safe(pm.next()));
+        for (int i = 0; i < 60; i++) CHECK(safe(pm.rotate()));
+        CHECK(safe(pm.cut_target()));
+    }
+
+    // The playing preset is one when they turn off: cut, and to a safe one.
+    {
+        PresetManager pm(es, {}, cfg);
+        pm.set_high_frequency(true);
+        pm.on_shown(*by_file(pm, "p1.milk"), false);
+        CHECK(!pm.high_frequency_on_screen());
+        CHECK(pm.set_high_frequency(false));
+        CHECK(pm.high_frequency_on_screen());
+        const PresetEntry* to = pm.cut_target();
+        CHECK(safe(to) && to->file != "p1.milk");
+        pm.on_shown(*to, false);  // a cut
+        CHECK(!pm.high_frequency_on_screen() && pm.outgoing() == nullptr);
+    }
+
+    // Mid-blend, the outgoing one is high_frequency and the safe incoming
+    // one plays: still on screen until a cut. The cut target is the
+    // playing preset itself (its blend completes at once).
+    {
+        PresetManager pm(es, {}, cfg);
+        pm.set_high_frequency(true);
+        pm.on_shown(*by_file(pm, "p1.milk"), false);
+        pm.on_shown(*by_file(pm, "p10.milk"), true);  // blending p1 -> p10
+        CHECK(pm.outgoing()->file == "p1.milk" && pm.showing()->file == "p10.milk");
+        CHECK(pm.set_high_frequency(false));
+        CHECK(pm.high_frequency_on_screen());
+        const PresetEntry* to = pm.cut_target();
+        CHECK(to != nullptr && to->file == "p10.milk");
+        pm.on_shown(*to, false);
+        CHECK(!pm.high_frequency_on_screen());
+        // The same blend ending by itself also clears it.
+        pm.set_high_frequency(true);
+        pm.on_shown(*by_file(pm, "p2.milk"), true);  // p10 -> p2
+        pm.on_shown(*by_file(pm, "p20.milk"), true);  // completes p10 -> p2; p2 -> p20
+        CHECK(pm.outgoing()->file == "p2.milk");
+        pm.set_high_frequency(false);
+        CHECK(pm.high_frequency_on_screen());
+        pm.on_blend_done();
+        CHECK(!pm.high_frequency_on_screen());
+    }
+
+    // Mid-blend into a high_frequency one (the filter turned on during
+    // it): both directions count, and the cut goes elsewhere.
+    {
+        PresetManager pm(es, {}, cfg);
+        pm.set_high_frequency(true);
+        pm.on_shown(*by_file(pm, "p0.milk"), false);
+        pm.on_shown(*by_file(pm, "p3.milk"), true);  // p0 -> p3
+        CHECK(pm.set_high_frequency(false));
+        const PresetEntry* to = pm.cut_target();
+        CHECK(safe(to));
+        pm.on_shown(*to, false);
+        CHECK(!pm.high_frequency_on_screen() && pm.outgoing() == nullptr);
+    }
+
+    // A locked high_frequency preset turning ineligible: the cut target is
+    // a safe one (the caller keeps the lock on it).
+    {
+        PresetManager pm(es, {}, cfg);
+        pm.set_high_frequency(true);
+        const PresetEntry* lp = pm.start("p5.milk");
+        CHECK(lp->file == "p5.milk" && pm.locked());
+        pm.on_shown(*lp, false);
+        CHECK(pm.set_high_frequency(false));
+        CHECK(safe(pm.cut_target()) && pm.locked());
+    }
+
+    // Through select_preset: every candidate tried is safe, and failures
+    // (skips) don't open a way to one.
+    {
+        PresetManager pm(es, {}, cfg);
+        std::vector<std::string> tried;
+        auto attempt = [&](const PresetEntry& e) {
+            tried.push_back(e.file);
+            return e.file == "p30.milk" ? Attempt::Loaded : Attempt::Failed;
+        };
+        Selection sel = select_preset(pm, pm.start(""), 8, attempt);
+        while (sel == Selection::Deferred) sel = select_preset(pm, pm.rotate(), 8, attempt);
+        for (const auto& f : tried) CHECK(!by_file(pm, f)->high_frequency);
+        CHECK(sel == Selection::Switched || sel == Selection::Exhausted);
+    }
+
+    // A preset the manager doesn't own is ignored.
+    {
+        PresetManager pm(es, {}, cfg);
+        PresetEntry stray;
+        stray.file = "p1.milk";
+        stray.high_frequency = true;
+        pm.on_shown(stray, false);
+        CHECK(pm.showing() == nullptr && !pm.high_frequency_on_screen());
+    }
 }
 
 // ---------------------------------------------------------------- guard
@@ -651,6 +800,60 @@ static void test_poll_round() {
     CHECK((order == std::vector<std::string>{"commands"}));
 }
 
+static void test_drain_lines() {
+    // `exit` then `take` in one read: the take never runs, and the drain
+    // returns although more input keeps coming.
+    LineBuffer lines;
+    std::vector<std::string> handled;
+    bool exit_decided = false;
+    int reads = 0;
+    auto endless = [&](char* buf, size_t cap) -> ssize_t {
+        reads++;
+        const std::string chunk = reads == 1 ? "{\"cmd\":\"next\"}\n{\"cmd\":\"exit\"}\n{\"cmd\":\"take\"}\n"
+                                             : "{\"cmd\":\"take\"}\n";
+        const size_t n = std::min(cap, chunk.size());
+        std::copy_n(chunk.data(), n, buf);
+        return static_cast<ssize_t>(n);
+    };
+    auto on_line = [&](std::string_view line) {
+        handled.emplace_back(line);
+        if (line.find("exit") != line.npos) exit_decided = true;
+    };
+    auto stop = [&] { return exit_decided; };
+    CHECK(drain_lines(lines, endless, on_line, stop) == DrainEnd::Stopped);
+    CHECK(reads == 1);
+    CHECK((handled == std::vector<std::string>{"{\"cmd\":\"next\"}", "{\"cmd\":\"exit\"}"}));
+    // Already decided: nothing is read at all.
+    CHECK(drain_lines(lines, endless, on_line, stop) == DrainEnd::Stopped && reads == 1);
+
+    // Input that never runs dry, no exit: the drain gives the loop back.
+    LineBuffer l2;
+    handled.clear();
+    exit_decided = false;
+    auto takes = [](char* buf, size_t cap) -> ssize_t {
+        const std::string chunk = "{\"cmd\":\"take\"}\n";
+        const size_t n = std::min(cap, chunk.size());
+        std::copy_n(chunk.data(), n, buf);
+        return static_cast<ssize_t>(n);
+    };
+    CHECK(drain_lines(l2, takes, on_line, stop, 4) == DrainEnd::Budget);
+    CHECK(handled.size() == 4);
+
+    // Would block, EOF, errors.
+    auto eagain = [](char*, size_t) -> ssize_t {
+        errno = EAGAIN;
+        return -1;
+    };
+    auto eof = [](char*, size_t) -> ssize_t { return 0; };
+    auto ebadf = [](char*, size_t) -> ssize_t {
+        errno = EBADF;
+        return -1;
+    };
+    CHECK(drain_lines(l2, eagain, on_line, stop) == DrainEnd::Drained);
+    CHECK(drain_lines(l2, eof, on_line, stop) == DrainEnd::Eof);
+    CHECK(drain_lines(l2, ebadf, on_line, stop) == DrainEnd::Eof);
+}
+
 // Runs `body` in a child with stdout on a pipe. Returns the exit status
 // (-1: still running after `wait_ms`, then killed), its output and how long
 // it ran.
@@ -757,6 +960,31 @@ static void test_exit_guard() {
         },
         3000, out, ms);
     CHECK(code == 7 && out.empty());
+
+    // stdout and stderr both full (readers that never read): the watchdog's
+    // writes give up and the exit still comes in budget.
+    out.clear();
+    code = run_child(
+        [] {
+            static int err_pipe[2];
+            if (pipe(err_pipe) != 0) _exit(98);
+            dup2(err_pipe[1], 2);
+            for (int fd : {1, 2}) {
+                const int fl = fcntl(fd, F_GETFL);
+                fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+                const std::string junk(4096, 'x');
+                while (write(fd, junk.data(), junk.size()) > 0) {}
+                fcntl(fd, F_SETFL, fl);  // blocking again, as the renderer's are
+            }
+            ExitGuard g(nullptr, 100);
+            g.start();
+            g.arm("requested", 3);
+            hang_forever();
+        },
+        3000, out, ms);
+    CHECK(code == 3);
+    CHECK(ms >= 90 && ms < 1000);
+    CHECK(out.find("exiting") == std::string::npos);  // no room: dropped, not blocked on
 
     // The writer stuck elsewhere: emit_line_within gives up.
     out.clear();
@@ -886,6 +1114,28 @@ static void test_tone() {
     // Time going backwards adds nothing.
     tone.fill(1'000'000, 576, a.data());
     CHECK(a == b);
+
+    // A normal 33 ms frame interval asks for 576 frames but ~1455 have
+    // passed: the tone advances by all of them (the beat keeps 120 BPM),
+    // and the window matches a tone sampled finely to the same times.
+    TestTone frame_rate, fine;
+    std::vector<int16_t> fa(576 * 2), fb(576 * 2);
+    const int64_t t0 = 5'000'000;
+    frame_rate.fill(t0, 576, fa.data());
+    fine.fill(t0, 576, fb.data());
+    bool same = true;
+    for (int f = 1; f <= 90; f++) {
+        const int64_t t = t0 + int64_t{f} * 33'000;
+        for (int64_t u = t - 30'000; u <= t; u += 3'000) fine.fill(u, 576, fb.data());
+        frame_rate.fill(t, 576, fa.data());
+        same = same && fa == fb;
+    }
+    CHECK(same);
+    const uint64_t expect = 576 + uint64_t{90} * 33'000 * TestTone::RATE / 1'000'000;
+    CHECK(frame_rate.position() == expect && fine.position() == expect);
+    // A long silence is stepped over, not generated.
+    frame_rate.fill(t0 + 3'600'000'000LL, 576, fa.data());
+    CHECK(frame_rate.position() == 576 + uint64_t{3600} * TestTone::RATE);
 }
 
 int main() {
@@ -896,6 +1146,7 @@ int main() {
     test_rotation();
     test_history();
     test_filters_and_lock();
+    test_high_frequency_safety();
     test_guard_ladder();
     test_guard_60hz();
     test_pacer();
@@ -906,6 +1157,7 @@ int main() {
     test_tone();
     test_selection();
     test_poll_round();
+    test_drain_lines();
     test_exit_guard();
     if (g_failures == 0) std::printf("OK\n");
     return g_failures == 0 ? 0 : 1;

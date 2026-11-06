@@ -93,6 +93,9 @@ private:
 
 // Writes a printf-style line to the original stderr.
 void log_msg(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+// log_msg that gives up after `timeout_ms` instead of blocking on a full
+// stderr (the exit watchdog). False if the line wasn't written whole.
+bool log_msg_within(int timeout_ms, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
 void set_log_fd(int fd);
 
 }  // namespace md

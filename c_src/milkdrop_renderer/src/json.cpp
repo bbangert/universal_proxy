@@ -1,11 +1,15 @@
 #include "json.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <fcntl.h>
 #include <mutex>
+#include <poll.h>
 #include <unistd.h>
 
 namespace md {
@@ -352,14 +356,15 @@ std::string sanitize_text(std::string_view s, size_t max_bytes) {
     return out;
 }
 
-static void emit_locked(const std::string& line) {
-    std::string out;
-    if (line.size() > MAX_EMIT_LINE_BYTES) {
-        out = "{\"event\":\"error\",\"reason\":\"oversize_line\",\"bytes\":" +
-              std::to_string(line.size()) + "}";
-    } else {
-        out = line;
-    }
+static std::string framed(const std::string& line) {
+    if (line.size() > MAX_EMIT_LINE_BYTES)
+        return "{\"event\":\"error\",\"reason\":\"oversize_line\",\"bytes\":" + std::to_string(line.size()) + "}";
+    return line;
+}
+
+void emit_line(const std::string& line) {
+    std::lock_guard<std::timed_mutex> lock(g_emit_mtx);
+    std::string out = framed(line);
     if (g_sink) {
         g_sink(out);
         return;
@@ -368,16 +373,52 @@ static void emit_locked(const std::string& line) {
     write_all(out);
 }
 
-void emit_line(const std::string& line) {
-    std::lock_guard<std::timed_mutex> lock(g_emit_mtx);
-    emit_locked(line);
+bool emit_line_within(const std::string& line, int timeout_ms) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    std::unique_lock<std::timed_mutex> lock(g_emit_mtx, deadline);
+    if (!lock.owns_lock()) return false;
+    std::string out = framed(line);
+    if (g_sink) {
+        g_sink(out);
+        return true;
+    }
+    out += '\n';
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+    return write_within(STDOUT_FILENO, out, static_cast<int>(std::max<int64_t>(0, left.count())));
 }
 
-bool emit_line_within(const std::string& line, int timeout_ms) {
-    std::unique_lock<std::timed_mutex> lock(g_emit_mtx, std::chrono::milliseconds(timeout_ms));
-    if (!lock.owns_lock()) return false;
-    emit_locked(line);
-    return true;
+bool write_within(int fd, std::string_view data, int timeout_ms) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    // The file description may be shared with a thread blocked in a write
+    // on it; flipping O_NONBLOCK affects that one too (callers are about
+    // to exit). The flags are restored after.
+    const int flags = ::fcntl(fd, F_GETFL);
+    const bool set_nonblock = flags >= 0 && (flags & O_NONBLOCK) == 0;
+    if (set_nonblock) ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    bool ok = true;
+    while (!data.empty()) {
+        const ssize_t n = ::write(fd, data.data(), data.size());
+        if (n > 0) {
+            data.remove_prefix(static_cast<size_t>(n));
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now());
+            if (left.count() <= 0) {
+                ok = false;
+                break;
+            }
+            pollfd p{fd, POLLOUT, 0};
+            (void)::poll(&p, 1, static_cast<int>(left.count()));
+            continue;
+        }
+        ok = false;
+        break;
+    }
+    if (set_nonblock) ::fcntl(fd, F_SETFL, flags);
+    return ok;
 }
 
 void set_emit_sink(std::function<void(const std::string&)> sink) {

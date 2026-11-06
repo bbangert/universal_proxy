@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <utility>
 
 namespace md {
@@ -72,13 +73,22 @@ void PresetManager::push_history(size_t index) {
 }
 
 const PresetEntry* PresetManager::start(const std::string& locked_file) {
+    refused_lock_.clear();
     if (!locked_file.empty()) {
+        refused_lock_ = "unknown";
         for (size_t i = 0; i < entries_.size(); i++) {
-            if (entries_[i].file == locked_file && eligible(i)) {
+            if (entries_[i].file != locked_file) continue;
+            if (eligible(i)) {
+                refused_lock_.clear();
                 push_history(i);
                 locked_ = true;
                 return current();
             }
+            const PresetEntry& e = entries_[i];
+            refused_lock_ = skipped_.count(e.file) != 0 ? "skipped"
+                            : excluded_high_frequency(i) ? "high_frequency"
+                                                         : "rpi3_skip";
+            break;
         }
     }
     locked_ = false;
@@ -124,8 +134,39 @@ bool PresetManager::skip(const std::string& file) {
 bool PresetManager::set_high_frequency(bool include) {
     config_.high_frequency = include;
     bag_.clear();  // re-deal with the new filter
-    const PresetEntry* cur = current();
-    return cur != nullptr && !eligible(history_[cursor_]);
+    return high_frequency_on_screen();
+}
+
+bool PresetManager::excluded_high_frequency(size_t index) const {
+    return index < entries_.size() && entries_[index].high_frequency && !config_.high_frequency;
+}
+
+void PresetManager::on_shown(const PresetEntry& entry, bool blend) {
+    const PresetEntry* begin = entries_.data();
+    const std::less<const PresetEntry*> before;
+    if (before(&entry, begin) || !before(&entry, begin + entries_.size())) return;  // not ours
+    const size_t index = static_cast<size_t>(&entry - begin);
+    outgoing_ = blend ? showing_ : NONE;
+    showing_ = index;
+}
+
+void PresetManager::on_blend_done() { outgoing_ = NONE; }
+
+const PresetEntry* PresetManager::showing() const {
+    return showing_ == NONE ? nullptr : &entries_[showing_];
+}
+
+const PresetEntry* PresetManager::outgoing() const {
+    return outgoing_ == NONE ? nullptr : &entries_[outgoing_];
+}
+
+bool PresetManager::high_frequency_on_screen() const {
+    return excluded_high_frequency(showing_) || excluded_high_frequency(outgoing_);
+}
+
+const PresetEntry* PresetManager::cut_target() {
+    if (showing_ != NONE && eligible(showing_)) return &entries_[showing_];
+    return rotate();
 }
 
 }  // namespace md

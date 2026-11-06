@@ -174,6 +174,10 @@ private:
     void report_driver_errors();
     void emit_stats(int64_t now);
     void fail(const char* reason, const std::string& message, int code = 1);
+    // The first exit decision wins; it starts the exit guard's budget.
+    void decide_exit(const char* reason, int code = 0);
+    // The photosensitivity filter, before any frame is rendered.
+    void guard_high_frequency();
     bool stdin_hung_up() const;
 
     std::string preset_path(const PresetEntry& e) const { return opt_.pack_dir + "/presets/" + e.file; }
@@ -182,13 +186,19 @@ private:
     bool expensive(const PresetEntry& e) const;
 };
 
+void App::decide_exit(const char* reason, int code) {
+    if (!exit_reason_.empty()) return;
+    exit_reason_ = reason;
+    exit_code_ = code;
+    exit_guard_.arm(exit_reason_, exit_code_);
+}
+
+// Decided (and the guard armed) before the writes: a full stdout or
+// stderr then can't keep the bounded shutdown from starting.
 void App::fail(const char* reason, const std::string& message, int code) {
+    decide_exit(reason, code);
     log_msg("%s: %s", reason, message.c_str());
     emit_line(event_error(reason, message));
-    if (exit_reason_.empty()) {
-        exit_reason_ = reason;
-        exit_code_ = code;
-    }
 }
 
 size_t App::hint_rung(const PresetEntry& e) const {
@@ -266,11 +276,17 @@ bool App::prepare() {
     pcm_.maintain(monotonic_us());
 
     const PresetEntry* first = presets_->start(opt_.locked);
+    if (!presets_->refused_lock().empty()) {
+        // Not a `skip`: the preset isn't broken, just not eligible here.
+        log_msg("--locked %s refused (%s); starting unlocked", opt_.locked.c_str(),
+                presets_->refused_lock().c_str());
+        emit_line(event_error("locked_refused", presets_->refused_lock() + ": " + opt_.locked));
+    }
     Selection sel;
     while ((sel = switch_to(first, "start", false)) == Selection::Deferred) {
         // Nothing reads commands yet; only an exit can interrupt.
         if (g_signal.load() != 0 || stdin_hung_up()) {
-            exit_reason_ = g_signal.load() != 0 ? "signal" : "eof";
+            decide_exit(g_signal.load() != 0 ? "signal" : "eof");
             return false;
         }
         first = presets_->rotate();
@@ -397,6 +413,12 @@ bool App::warm_up(const PresetEntry& entry, bool smooth, std::string& reason, st
 Selection App::switch_to(const PresetEntry* first, const char* cause, bool smooth) {
     bool activated_failure = false;
     const Selection sel = select_preset(*presets_, first, SWITCH_BATCH, [&](const PresetEntry& entry) {
+        // The manager never picks one while they are off; this is the last
+        // gate before projectM.
+        if (entry.high_frequency && !presets_->high_frequency()) {
+            log_msg("refusing %s: high_frequency presets are off", entry.file.c_str());
+            return Attempt::Failed;
+        }
         guard_->begin(entry.file, hint_rung(entry));
         if (!apply_level()) return Attempt::Abort;
         const bool blend = smooth && !activated_failure && opt_.blend_s > 0 && !expensive(entry);
@@ -404,6 +426,7 @@ Selection App::switch_to(const PresetEntry* first, const char* cause, bool smoot
         bool activated = false;
         if (warm_up(entry, blend, reason, message, activated)) {
             current_ = &entry;
+            presets_->on_shown(entry, blend);
             blend_until_ = blend ? vtime_ + opt_.blend_s : vtime_;
             first_frame_ = true;
             shown_since_us_ = monotonic_us();
@@ -437,24 +460,41 @@ void App::skip_current(const char* reason) {
     requested_ = Switch::Eject;
 }
 
+// Photosensitivity: while high_frequency presets are off, a switch away
+// from one still rendered (playing or blending out) is always a cut, and
+// there is always one: a `prev` with nothing earlier cuts to cut_target().
+void App::guard_high_frequency() {
+    if (!presets_->high_frequency_on_screen()) return;
+    // A frame rendered with it is never shown.
+    if (queued_.bo != nullptr) {
+        gbm_surface_release_buffer(kms_.surface(), queued_.bo);
+        queued_ = {};
+    }
+    if (requested_ == Switch::None) requested_ = Switch::Eject;
+}
+
 void App::apply_switch() {
     const Switch s = requested_;
     requested_ = Switch::None;
+    const bool hf = presets_->high_frequency_on_screen();
     const PresetEntry* next = nullptr;
     const char* cause = "rotate";
     switch (s) {
-        case Switch::None: return;
+        case Switch::None: break;
         case Switch::Rotate: next = presets_->rotate(); break;
         case Switch::Next: next = presets_->next(); cause = "next"; break;
-        case Switch::Prev:
-            next = presets_->prev();
-            cause = "prev";
-            if (next == nullptr) return;  // nothing earlier
-            break;
-        case Switch::Eject: next = presets_->rotate(); cause = "eject"; break;
+        case Switch::Prev: next = presets_->prev(); cause = "prev"; break;
+        case Switch::Eject: next = hf ? presets_->cut_target() : presets_->rotate(); cause = "eject"; break;
         case Switch::Retry: next = presets_->rotate(); cause = retry_cause_; break;
     }
-    switch (switch_to(next, cause, !force_cut_)) {
+    if (next == nullptr) {
+        if (!hf && (s == Switch::None || s == Switch::Prev)) return;  // nothing earlier
+        if (hf) {
+            next = presets_->cut_target();
+            cause = "eject";
+        }
+    }
+    switch (switch_to(next, cause, !force_cut_ && !hf)) {
         case Selection::Switched: break;
         case Selection::Deferred:
             log_msg("%d presets failed to load; retrying after this frame", SWITCH_BATCH);
@@ -480,6 +520,8 @@ bool App::render_frame(InFlight& out) {
     }
     stall_us_ = 0;
     last_target_us_ = target;
+    // projectM drops the outgoing preset once its clock passes the blend.
+    if (vtime_ >= blend_until_) presets_->on_blend_done();
 
     if (pcm_.read(target, pcm_buf_.data()) == PcmFeed::Result::Silent && opt_.test_tone)
         tone_.fill(target, PcmFeed::FRAMES, pcm_buf_.data());
@@ -543,6 +585,7 @@ void App::present_step() {
         fail("output_lost", "page flip did not complete");
         return;
     }
+    guard_high_frequency();
     if (pending_.bo == nullptr && queued_.bo != nullptr && now >= pacer_->earliest_submit()) {
         int r = kms_.page_flip(queued_.bo);
         if (r == 0) {
@@ -562,6 +605,9 @@ void App::present_step() {
         if (!exit_reason_.empty()) return;
         // projectM shows a failed preset until the retry: don't present it.
         if (requested_ == Switch::Retry && force_cut_) return;
+        // The cut away from a high_frequency preset failed this round: no
+        // frame until the retry.
+        if (presets_->high_frequency_on_screen()) return;
         render_frame(queued_);
     }
 }
@@ -570,6 +616,13 @@ void App::present_step() {
 
 void App::take() {
     if (phase_ == Phase::Presenting) return;
+    // A high_frequency preset turned off before the take: cut first (each
+    // failed batch skips its candidates, so this ends).
+    while (presets_->high_frequency_on_screen() && exit_reason_.empty() && g_signal.load() == 0) {
+        guard_high_frequency();
+        apply_switch();
+    }
+    if (!exit_reason_.empty() || presets_->high_frequency_on_screen()) return;
     if (queued_.bo == nullptr && !render_frame(queued_)) return;
     Kms::TakeResult tr;
     std::string err;
@@ -629,9 +682,7 @@ void App::handle_command(const Command& c) {
     switch (c.type) {
         case Command::Type::Take: take(); break;
         case Command::Type::Release: release(true); break;
-        case Command::Type::Exit:
-            if (exit_reason_.empty()) exit_reason_ = "requested";
-            break;
+        case Command::Type::Exit: decide_exit("requested"); break;
         case Command::Type::Next: requested_ = Switch::Next; break;
         case Command::Type::Prev: requested_ = Switch::Prev; break;
         case Command::Type::Lock:
@@ -646,37 +697,27 @@ void App::handle_command(const Command& c) {
         }
         case Command::Type::SetRotate: opt_.rotate_s = c.int_value; break;
         case Command::Type::SetHighFrequency:
-            if (presets_->set_high_frequency(c.bool_value)) requested_ = Switch::Eject;
+            if (presets_->set_high_frequency(c.bool_value)) guard_high_frequency();
             break;
     }
 }
 
 void App::read_stdin() {
-    char buf[4096];
-    while (true) {
-        ssize_t n = ::read(STDIN_FILENO, buf, sizeof(buf));
-        if (n > 0) {
-            stdin_lines_.feed(buf, static_cast<size_t>(n), [&](std::string_view line) {
-                if (line.empty()) return;
-                std::string err;
-                if (auto cmd = parse_command(line, err)) {
-                    handle_command(*cmd);
-                } else {
-                    emit_line(event_error("bad_command", err));
-                }
-            });
-            continue;
-        }
-        if (n == 0) {
-            stdin_eof_ = true;
-            if (exit_reason_.empty()) exit_reason_ = "eof";
-        }
-        // EAGAIN: drained. Other errors: treat as EOF.
-        if (n < 0 && errno != EAGAIN && errno != EINTR) {
-            stdin_eof_ = true;
-            if (exit_reason_.empty()) exit_reason_ = "eof";
-        }
-        return;
+    const DrainEnd end = drain_lines(
+        stdin_lines_, [](char* buf, size_t cap) { return ::read(STDIN_FILENO, buf, cap); },
+        [&](std::string_view line) {
+            if (line.empty()) return;
+            std::string err;
+            if (auto cmd = parse_command(line, err)) {
+                handle_command(*cmd);
+            } else {
+                emit_line(event_error("bad_command", err));
+            }
+        },
+        [&] { return !exit_reason_.empty(); });
+    if (end == DrainEnd::Eof) {
+        stdin_eof_ = true;
+        decide_exit("eof");
     }
 }
 
@@ -740,9 +781,7 @@ void App::housekeeping(int64_t now) {
                     log_msg("%.1f C for 10 s: rung floor %s", *t, rung_size().str().c_str());
                     emit_line(event_error("thermal_drop", rung_size().str()));
                     break;
-                case ThermalGuard::Action::Exit:
-                    if (exit_reason_.empty()) exit_reason_ = "thermal";
-                    break;
+                case ThermalGuard::Action::Exit: decide_exit("thermal"); break;
                 case ThermalGuard::Action::None: break;
             }
         }
@@ -754,7 +793,7 @@ void App::loop() {
     stats_since_us_ = monotonic_us();
     while (exit_reason_.empty()) {
         if (g_signal.load() != 0) {
-            exit_reason_ = "signal";
+            decide_exit("signal");
             break;
         }
         const int64_t now = monotonic_us();
@@ -811,7 +850,7 @@ void App::loop_headless() {
     phase_ = Phase::Prepared;
     for (int i = 0; i < opt_.headless_frames && exit_reason_.empty(); i++) {
         if (g_signal.load() != 0) {
-            exit_reason_ = "signal";
+            decide_exit("signal");
             break;
         }
         if (!stdin_eof_) {
@@ -823,8 +862,10 @@ void App::loop_headless() {
         if (!presets_->locked() && requested_ == Switch::None &&
             now - shown_since_us_ >= int64_t{opt_.rotate_s} * 1000000)
             requested_ = Switch::Rotate;
+        guard_high_frequency();
         if (requested_ != Switch::None) apply_switch();
         if (!exit_reason_.empty()) break;
+        if (presets_->high_frequency_on_screen()) continue;
         if (queued_.bo == nullptr && !render_frame(queued_)) break;
         gl_.sentinel_untouched();  // waits for the GPU
         pending_ = queued_;
@@ -832,7 +873,7 @@ void App::loop_headless() {
         on_flip(monotonic_us());
     }
     emit_stats(monotonic_us());
-    if (exit_reason_.empty()) exit_reason_ = "headless_done";
+    decide_exit("headless_done");
 }
 
 bool App::stdin_hung_up() const {

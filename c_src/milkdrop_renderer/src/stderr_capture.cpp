@@ -1,5 +1,7 @@
 #include "stderr_capture.h"
 
+#include "json.h"  // write_within
+
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -22,17 +24,35 @@ bool starts_with(std::string_view s, std::string_view p) { return s.substr(0, p.
 
 void set_log_fd(int fd) { g_log_fd.store(fd); }
 
-void log_msg(const char* fmt, ...) {
-    char buf[1024];
+namespace {
+
+size_t format_log(char (&buf)[1024], const char* fmt, va_list args) {
     int n = std::snprintf(buf, sizeof(buf), "milkdrop_renderer: ");
-    va_list args;
-    va_start(args, fmt);
     int m = std::vsnprintf(buf + n, sizeof(buf) - static_cast<size_t>(n) - 1, fmt, args);
-    va_end(args);
     size_t len = static_cast<size_t>(n) + (m < 0 ? 0 : std::min<size_t>(static_cast<size_t>(m), sizeof(buf) - static_cast<size_t>(n) - 2));
     buf[len++] = '\n';
+    return len;
+}
+
+}  // namespace
+
+void log_msg(const char* fmt, ...) {
+    char buf[1024];
+    va_list args;
+    va_start(args, fmt);
+    const size_t len = format_log(buf, fmt, args);
+    va_end(args);
     ssize_t w = ::write(g_log_fd.load(), buf, len);
     (void)w;
+}
+
+bool log_msg_within(int timeout_ms, const char* fmt, ...) {
+    char buf[1024];
+    va_list args;
+    va_start(args, fmt);
+    const size_t len = format_log(buf, fmt, args);
+    va_end(args);
+    return write_within(g_log_fd.load(), std::string_view(buf, len), timeout_ms);
 }
 
 std::string StderrClassifier::marker_line(uint64_t n) {

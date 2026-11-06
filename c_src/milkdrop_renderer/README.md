@@ -25,8 +25,8 @@ milkdrop_renderer --mode 1280x720@60 --pack-dir DIR --ladder 640x360,480x270
 | `--ladder WxH,...` | Internal render resolutions, highest first, each smaller than the last. The renderer steps down per preset and skips a preset past the last rung. |
 | `--rotate-s N` | Auto-rotation interval, seconds. |
 | `--skip-file PATH` | Presets never to load: one preset id per line. A missing file is an empty list. |
-| `--high-frequency` | Include `high_frequency/` presets (photosensitivity; off by default). |
-| `--locked FILE` | Start locked on this preset id. Ignored (unlocked) if it isn't eligible. |
+| `--high-frequency` | Include `high_frequency/` presets (photosensitivity; off by default; see "Photosensitivity filter"). |
+| `--locked FILE` | Start locked on this preset id. If it isn't eligible (a `high_frequency` one while they are off, skipped, an rpi3 `skip`, or not in the pack): `error` `locked_refused` (`message`: `<why>: <id>`) and an unlocked random start. |
 | `--pcm-ring PATH` | The PCM tap ring (`/run/up-pcm-<client_id>`). Without it, or while it has no fresh audio, presets get silence. |
 
 Tuning and check knobs (not passed by the BEAM): `--card DEV`
@@ -58,7 +58,7 @@ detection"). stdin EOF means exit, in every state.
 | `{"cmd":"next"}` / `{"cmd":"prev"}` | Forward / back in the history (a new random pick at its end; `prev` with nothing earlier does nothing). A lock stays on and moves to the new preset. |
 | `{"cmd":"lock"}` / `{"cmd":"unlock"}` | Hold / resume rotation on the current preset. |
 | `{"cmd":"set_rotate","value":N}` | Rotation interval in seconds (1..3600). |
-| `{"cmd":"set_high_frequency","value":B}` | Include `high_frequency/` presets; turning it off while one shows switches away at once. |
+| `{"cmd":"set_high_frequency","value":B}` | Include `high_frequency/` presets; turning it off while one is rendered (playing or blending out) cuts away at once (see "Photosensitivity filter"). |
 
 A malformed or unknown command gives `error` with `reason: "bad_command"`.
 
@@ -69,10 +69,10 @@ A malformed or unknown command gives `error` with `reason: "bad_command"`.
 | `prepared` | `mode` (the chosen mode, e.g. `1280x720@60`), `gl_renderer`, `gl_version`, `gles2`, `presets` (eligible count), `crtc_mode_valid` and `crtc_mode` (only when valid): what the CRTC scanned out when the card was opened. GL is up, the first preset warmed and a frame rendered; not master. |
 | `presenting` | `modeset` (true = the mode set differs from the last one scanned out before the handover: the CRTC's at take if it still had one, else the one in `prepared`), `master_ms`, `crtc_lit` (the CRTC still had a mode at take; Emerge's stop detaches it, so this is normally false and SetCrtc re-enables the CRTC, at the same timing when `modeset` is false). |
 | `released` | Ack for `release`. |
-| `preset` | `file` (preset id), `locked`, `rung` (internal WxH), `cause` (`start`, `take`, `rotate`, `next`, `prev`, `eject`, `lock`, `unlock`, `step_down`), `cut` (true = no blend). Sent whenever the showing preset, its lock or its rung changes. |
+| `preset` | `file` (preset id), `locked`, `rung` (internal WxH), `cause` (`start`, `take`, `rotate`, `next`, `prev`, `eject`, `lock`, `unlock`, `step_down`), `cut` (true = no blend). `eject` is also the cut away from a `high_frequency` preset (it can name the preset already playing: its blend in was completed). Sent whenever the showing preset, its lock or its rung changes. |
 | `skip` | `preset`, `reason`, optional `message` (the first line of the error): the preset can't be drawn here (persist it for this pack version). Reasons: `register_allocate` (vc4 register allocation failed), `translate_error` / `compile_error` / `link_error` (a warp or composite shader failed and projectM fell back to its default), `shader_error` (another error-level projectM log during the warm-up), `load_failed` (unreadable or unparsable preset), `draw_dropped` (sentinel pixel untouched), `budget` (below the floor at the last rung). |
 | `stats` | Every `--stats-s`: `fps` (presented), `frames`, `flip_ms` (mean flip-to-flip), `frame_ms` / `frame_ms_max` (CPU render + submit), `late` (flips past their slot), `rung`, `interval`, `temp_c`, `arm_mhz`, `gpu_ms` (only with `GL_EXT_disjoint_timer_query`, which vc4 lacks), `preset`, `pcm_ok` / `pcm_silent` (frames with ring audio / silence), `warmups`, `warmup_ms_max`, `shader_stages` / `cached_stages` (translated shader stages warmed up, and those read from the pack's shader cache), `stderr_discarded` (driver stderr bytes dropped). |
-| `error` | `reason`, optional `message`: a non-fatal problem (`bad_command`, `master_timeout`, `take_failed`, `driver`, `register_allocate`, `thermal_drop`, …), or the cause just before a failing `exiting`. |
+| `error` | `reason`, optional `message`: a non-fatal problem (`bad_command`, `master_timeout`, `take_failed`, `driver`, `register_allocate`, `thermal_drop`, `locked_refused`, …), or the cause just before a failing `exiting`. |
 | `exiting` | `reason`: `requested`, `eof`, `signal`, `thermal` (exit 0), or a failure — `manifest`, `no_presets`, `output`, `gl`, `projectm`, `kms`, `output_lost` (exit 1), `usage` (exit 2). |
 
 ### Handover
@@ -91,10 +91,29 @@ A malformed or unknown command gives `error` with `reason: "bad_command"`.
 failure) or SIGTERM/SIGINT arrives, a watchdog gives the shutdown 1 s:
 `exiting` comes first, then teardown (projectM, GL, GBM, card0, the stderr
 reader); past the budget the renderer logs, emits `exiting` if it hadn't
-and `_exit`s with the same code. The scanout is left as it is; the
+and `_exit`s with the same code. The budget starts at the decision, before
+anything is written about it, and the watchdog's own log line and
+`exiting` are best effort (non-blocking, ~150 ms at most), so a full
+stdout or stderr can't hold the exit up. Commands after an `exit` (in the
+same read or later) are ignored. The scanout is left as it is; the
 renderer never RmFBs a framebuffer it doesn't own. The card fd is
 non-blocking, and a flip event is only dispatched while one is awaited
 (a `release` can consume the pending flip itself).
+
+## Photosensitivity filter
+
+While `high_frequency` presets are off (the default):
+
+- no pick returns one: start, rotation, `next` / `prev` (history entries
+  are passed over) and `--locked` (refused, see above);
+- the renderer tracks what projectM renders, the playing preset and,
+  during a blend, the outgoing one. When either is `high_frequency` (the
+  filter was just turned on, mid-blend in either direction), it cuts at
+  once, never blends: to the playing preset when that one is eligible (its
+  blend completes), else to a random eligible one. A frame rendered but
+  not yet submitted is dropped, and no frame is rendered until the cut
+  has happened (a failed batch holds the last frame on screen). A `take`
+  cuts before its first frame.
 
 ## Pack layout
 
@@ -289,9 +308,12 @@ above 254x256.
 
 Unit tests (host, no GL): `test/milkdrop_renderer_unit_test.exs` builds
 and runs `milkdrop_renderer_unit_tests` — protocol and JSON, options,
-manifest and skip list, rotation and history, preset selection batches
-and exhaustion, the cost guard ladder, frame pacing, the poll-round
-dispatch order, the exit guard (a hung shutdown still exits in budget),
+manifest and skip list, rotation and history, the photosensitivity
+filter (picks, history, lock, blends in and out), preset selection
+batches and exhaustion, the cost guard ladder, frame pacing, the poll-round
+dispatch order, the command drain (nothing after `exit`), the exit guard
+(a hung shutdown still exits in budget, full stdout/stderr included), the
+test tone's tempo,
 the thermal guard, the stderr classifier and capture, and PCM ring
 alignment against sendspin_player's real ring writer.
 

@@ -4,10 +4,12 @@
 
 #pragma once
 
+#include <cerrno>
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <sys/types.h>
 
 namespace md {
 
@@ -67,6 +69,37 @@ private:
     std::string buf_;
     bool discarding_ = false;
 };
+
+enum class DrainEnd {
+    Drained,  // the input would block
+    Eof,      // end of input, or a read error
+    Stopped,  // `stop()` turned true: an exit was decided
+    Budget,   // `max_reads` reads in a row had data; call again later
+};
+
+// Reads commands through `read_chunk(buf, cap)` (read(2) semantics, non-
+// blocking) into `lines`, handing each complete line to `on_line`. Once
+// `stop()` is true (checked before every line), the remaining lines of that
+// read are dropped and the drain returns: nothing after an `exit` runs, and
+// input that keeps arriving can't hold up the shutdown.
+template <typename Read, typename OnLine, typename Stop>
+DrainEnd drain_lines(LineBuffer& lines, Read&& read_chunk, OnLine&& on_line, Stop&& stop, int max_reads = 16) {
+    char buf[4096];
+    for (int reads = 0; reads < max_reads; reads++) {
+        if (stop()) return DrainEnd::Stopped;
+        const ssize_t n = read_chunk(buf, sizeof(buf));
+        if (n > 0) {
+            lines.feed(buf, static_cast<size_t>(n), [&](std::string_view line) {
+                if (!stop()) on_line(line);
+            });
+            continue;
+        }
+        if (n == 0) return DrainEnd::Eof;
+        if (errno == EINTR) continue;
+        return errno == EAGAIN || errno == EWOULDBLOCK ? DrainEnd::Drained : DrainEnd::Eof;
+    }
+    return stop() ? DrainEnd::Stopped : DrainEnd::Budget;
+}
 
 // Event lines. Every string field is sanitized and bounded so a line stays
 // well under MAX_EMIT_LINE_BYTES; preset file names (at most

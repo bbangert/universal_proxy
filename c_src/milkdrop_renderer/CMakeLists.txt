@@ -62,7 +62,7 @@ endif()
 # a stale CMakeCache.txt. For scratch
 # builds against a local checkout set MILKDROP_PROJECTM_SOURCE_DIR (the mix
 # compiler forwards it as FETCHCONTENT_SOURCE_DIR_PROJECTM).
-set(PROJECTM_REF "bb940dbc5211a3b61d7675542c6a82e2c760cd85" # es2/1d-cache
+set(PROJECTM_REF "0c14457017ec861279f4ede2b24b7411a79e5209" # es2/1d-cache
     CACHE STRING "projectM fork commit SHA to pin" FORCE)
 
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
