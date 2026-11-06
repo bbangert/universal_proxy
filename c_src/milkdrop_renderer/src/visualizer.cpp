@@ -17,18 +17,45 @@ std::string first_line(const char* s) {
     return sanitize_text(v.substr(0, v.find('\n')), 256);
 }
 
+const char* skip_reason(projectm_preset_load_status status) {
+    switch (status) {
+        case PROJECTM_PRESET_LOAD_OK: return "";
+        case PROJECTM_PRESET_LOAD_TRANSLATE_ERROR: return "translate_error";
+        case PROJECTM_PRESET_LOAD_COMPILE_ERROR: return "compile_error";
+        case PROJECTM_PRESET_LOAD_LINK_ERROR: return "link_error";
+        case PROJECTM_PRESET_LOAD_OTHER_ERROR: break;
+    }
+    return "load_failed";
+}
+
+const char* stage_name(projectm_preset_shader_stage stage) {
+    switch (stage) {
+        case PROJECTM_PRESET_SHADER_WARP: return "warp";
+        case PROJECTM_PRESET_SHADER_COMPOSITE: return "composite";
+        case PROJECTM_PRESET_SHADER_NONE: break;
+    }
+    return "";
+}
+
 }  // namespace
+
+void Visualizer::on_load_result(const projectm_preset_load_result* r, void* user) {
+    auto* self = static_cast<Visualizer*>(user);
+    LoadResult& out = self->last_load_;
+    out = {};
+    out.reason = skip_reason(r->status);
+    const std::string stage = stage_name(r->stage);
+    const std::string line = first_line(r->message);
+    out.message = stage.empty() || line.empty() ? line : stage + ": " + line;
+    out.shader_stages = r->shader_stages;
+    out.cached_stages = r->cached_stages;
+    self->load_reported_ = true;
+}
 
 void Visualizer::on_log(const char* message, projectm_log_level level, void* user) {
     if (level < PROJECTM_LOG_LEVEL_ERROR) return;
     auto* self = static_cast<Visualizer*>(user);
     self->error_logs_++;
-    self->last_error_ = first_line(message);
-}
-
-void Visualizer::on_switch_failed(const char*, const char* message, void* user) {
-    auto* self = static_cast<Visualizer*>(user);
-    self->load_failures_++;
     self->last_error_ = first_line(message);
 }
 
@@ -40,7 +67,7 @@ bool Visualizer::create(std::string& err) {
         err = "projectm_create failed";
         return false;
     }
-    projectm_set_preset_switch_failed_event_callback(pm_, &Visualizer::on_switch_failed, this);
+    projectm_set_preset_load_result_event_callback(pm_, &Visualizer::on_load_result, this);
     return true;
 }
 
@@ -69,29 +96,25 @@ void Visualizer::set_texture_dir(const std::string& dir) {
     projectm_set_texture_search_paths(pm_, paths, 1);
 }
 
-bool Visualizer::set_shader_cache_dir(const std::string& dir) {
-#ifdef MILKDROP_HAVE_SHADER_CACHE
-    projectm_set_shader_cache_dir(pm_, dir.c_str());
-    return true;
-#else
-    (void)dir;
-    return false;
-#endif
+void Visualizer::set_shader_cache_dir(const std::string& dir) { projectm_set_shader_cache_dir(pm_, dir.c_str()); }
+
+Visualizer::LoadResult Visualizer::preload(const std::string& path) {
+    load_reported_ = false;
+    const projectm_preset_load_status status = projectm_preload_preset_file(pm_, path.c_str());
+    LoadResult r = load_reported_ ? last_load_ : LoadResult{};
+    // The return value has the last word: a preset that loaded but failed
+    // its warm-up draw is reported OK to the callback, OTHER_ERROR here.
+    const std::string reason = skip_reason(status);
+    if (r.reason != reason) {
+        r.reason = reason;
+        if (r.message.empty() && !reason.empty()) r.message = last_error_;
+    }
+    return r;
 }
 
-bool Visualizer::preload(const std::string& path) {
-#ifdef MILKDROP_HAVE_PRELOAD
-    // The es2/1d API; align the call here if its final signature differs.
-    return projectm_preload_preset_file(pm_, path.c_str());
-#else
-    (void)path;
-    return false;
-#endif
-}
+bool Visualizer::activate(bool smooth) { return projectm_activate_preloaded_preset(pm_, smooth); }
 
-void Visualizer::load(const std::string& path, bool smooth) {
-    projectm_load_preset_file(pm_, path.c_str(), smooth);
-}
+void Visualizer::discard() { projectm_discard_preloaded_preset(pm_); }
 
 void Visualizer::add_pcm(const int16_t* stereo, uint32_t frames) {
     projectm_pcm_add_int16(pm_, stereo, frames, PROJECTM_STEREO);

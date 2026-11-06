@@ -10,7 +10,8 @@
 //                                                  -> {"event":"presenting"}
 //   present  pipelined: frame N+1 renders while flip N is pending, flips
 //            are paced to every `interval` vblanks; presets rotate with a
-//            warm-up (compile + sentinel draw) before each blend
+//            warm-up (preload: compile + draw off-screen, then a sentinel
+//            frame) before each blend
 //   release  stop flipping, CloseFB (the last frame stays scanned out),
 //            drop master, keep card0 open         -> {"event":"released"}
 //   exit     tear down                              -> {"event":"exiting"}
@@ -33,6 +34,7 @@
 #include "visualizer.h"
 
 #include <algorithm>
+#include <bit>
 #include <cerrno>
 #include <csignal>
 #include <cstring>
@@ -124,7 +126,7 @@ private:
     int64_t stats_since_us_ = 0;
     uint64_t st_frames_ = 0, st_late_base_ = 0;
     double st_render_ms_ = 0, st_render_max_ = 0, st_flip_ms_ = 0;
-    uint64_t st_flips_ = 0, st_warmups_ = 0;
+    uint64_t st_flips_ = 0, st_warmups_ = 0, st_shader_stages_ = 0, st_cached_stages_ = 0;
     double st_warmup_max_ = 0;
     uint64_t pcm_ok_base_ = 0, pcm_silent_base_ = 0;
     int64_t last_thermal_us_ = 0;
@@ -148,7 +150,8 @@ private:
     bool render_frame(InFlight& out);
     void apply_switch();
     bool switch_to(const PresetEntry* entry, const char* cause, bool smooth);
-    bool warm_up(const PresetEntry& entry, bool smooth, std::string& reason);
+    bool warm_up(const PresetEntry& entry, bool smooth, std::string& reason, std::string& message,
+                 bool& activated);
     void apply_level();
     void announce_preset(const char* cause, bool cut);
     void skip_current(const char* reason);
@@ -242,7 +245,7 @@ bool App::prepare() {
     vis_.configure(opt_.ladder[0], opt_.mesh_width, opt_.mesh_height,
                    static_cast<int>(refresh / gcfg.start_interval + 0.5), opt_.blend_s);
     vis_.set_texture_dir(opt_.pack_dir + "/textures");
-    if (GLES2) vis_.set_shader_cache_dir(opt_.pack_dir + "/shaders");
+    vis_.set_shader_cache_dir(opt_.pack_dir + "/shaders");
 
     pcm_.maintain(monotonic_us());
 
@@ -254,8 +257,11 @@ bool App::prepare() {
     // The frame `take` puts on screen.
     if (!render_frame(queued_)) return false;
 
-    emit_line(event_prepared(opt_.mode.str(), gl_.renderer(), gl_.version(), GLES2,
-                             static_cast<int>(presets_->eligible_count())));
+    log_msg("prepared %s (CRTC at open: %s)", kms_.mode_str().c_str(),
+            kms_.crtc_mode_valid() ? kms_.crtc_mode_str().c_str() : "off");
+    emit_line(event_prepared(kms_.mode_str(), gl_.renderer(), gl_.version(), GLES2,
+                             static_cast<int>(presets_->eligible_count()), kms_.crtc_mode_valid(),
+                             kms_.crtc_mode_str()));
     return true;
 }
 
@@ -275,36 +281,70 @@ void App::announce_preset(const char* cause, bool cut) {
     emit_line(event_preset(current_->file, presets_->locked(), rung_size().str(), cause, cut));
 }
 
-// Loads `entry` with a blend (or a cut), compiles everything it draws with
-// one off-screen frame at a frozen clock while the last presented frame
-// stays on screen (P8), and checks the result. On failure the preset is
-// skipped and reported. The 1-pixel readback waits for the GPU, so the
-// vc4 backend compile (done at first draw) is paid here, not mid-blend.
-bool App::warm_up(const PresetEntry& entry, bool smooth, std::string& reason) {
+// The P8 warm-up. projectM preloads `entry` (parse, translate or read the
+// shader cache, compile, one draw clipped to a pixel so vc4's draw-time
+// backend compile happens now) while the last presented frame stays on
+// screen and the playing preset and any blend run on untouched. A clean
+// preload is activated (blend or cut) and drawn once off-screen at a
+// frozen clock over a sentinel; the 1-pixel readback waits for the GPU.
+// Driver stderr is synced after each step, so a failure is pinned to this
+// preset. `activated` tells the caller a failed preset now holds
+// projectM's transition slot.
+bool App::warm_up(const PresetEntry& entry, bool smooth, std::string& reason, std::string& message,
+                  bool& activated) {
     const uint64_t ra0 = capture_.register_allocate_failures();
-    const uint64_t load0 = vis_.load_failures();
     const uint64_t err0 = vis_.error_logs();
     const int64_t start = monotonic_us();
+    activated = false;
 
-    vis_.preload(preset_path(entry));
-    vis_.load(preset_path(entry), smooth);
-    gl_.clear_sentinel();
-    vis_.render(gl_.internal_fbo(), vtime_ + 0.001);
-    vtime_ += 0.001;
-    const bool dropped = gl_.sentinel_untouched();
+    const Visualizer::LoadResult lr = vis_.preload(preset_path(entry));
     capture_.sync(300);
+    const int64_t preloaded = monotonic_us();
+    st_shader_stages_ += static_cast<uint64_t>(std::popcount(lr.shader_stages));
+    st_cached_stages_ += static_cast<uint64_t>(std::popcount(lr.cached_stages));
 
-    const int64_t took = monotonic_us() - start;
+    bool dropped = false;
+    if (capture_.register_allocate_failures() != ra0) {
+        reason = "register_allocate";
+    } else if (!lr.reason.empty()) {
+        reason = lr.reason;
+        message = lr.message;
+    } else if (vis_.error_logs() != err0) {
+        reason = "shader_error";
+        message = vis_.last_error();
+    } else {
+        activated = vis_.activate(smooth);
+        if (!activated) {
+            reason = "load_failed";
+        } else {
+            gl_.clear_sentinel();
+            vis_.render(gl_.internal_fbo(), vtime_ + 0.001);
+            vtime_ += 0.001;
+            dropped = gl_.sentinel_untouched();
+            capture_.sync(300);
+            if (capture_.register_allocate_failures() != ra0) {
+                reason = "register_allocate";
+            } else if (vis_.error_logs() != err0) {
+                reason = "shader_error";
+                message = vis_.last_error();
+            } else if (dropped) {
+                reason = "draw_dropped";
+            }
+        }
+    }
+    if (!activated) vis_.discard();
+
+    const int64_t end = monotonic_us();
+    const int64_t took = end - start;
     stall_us_ += took;
     st_warmups_++;
     st_warmup_max_ = std::max(st_warmup_max_, static_cast<double>(took) / 1000.0);
-
-    if (capture_.register_allocate_failures() != ra0) reason = "register_allocate";
-    else if (vis_.load_failures() != load0) reason = "load_failed";
-    else if (vis_.error_logs() != err0) reason = "shader_error";
-    else if (dropped) reason = "draw_dropped";
-    else return true;
-    return false;
+    log_msg("warm-up %s: preload %.0f ms (stages %u, cached %u), activate + frame %.0f ms%s%s",
+            entry.file.c_str(), static_cast<double>(preloaded - start) / 1000.0,
+            static_cast<unsigned>(std::popcount(lr.shader_stages)),
+            static_cast<unsigned>(std::popcount(lr.cached_stages)), static_cast<double>(end - preloaded) / 1000.0,
+            reason.empty() ? "" : ", ", reason.c_str());
+    return reason.empty();
 }
 
 bool App::switch_to(const PresetEntry* entry, const char* cause, bool smooth) {
@@ -312,8 +352,9 @@ bool App::switch_to(const PresetEntry* entry, const char* cause, bool smooth) {
         guard_->begin(entry->file, hint_rung(*entry));
         apply_level();
         const bool blend = smooth && opt_.blend_s > 0 && !expensive(*entry);
-        std::string reason;
-        if (warm_up(*entry, blend, reason)) {
+        std::string reason, message;
+        bool activated = false;
+        if (warm_up(*entry, blend, reason, message, activated)) {
             current_ = entry;
             blend_until_ = blend ? vtime_ + opt_.blend_s : vtime_;
             first_frame_ = true;
@@ -321,11 +362,12 @@ bool App::switch_to(const PresetEntry* entry, const char* cause, bool smooth) {
             announce_preset(cause, !blend);
             return true;
         }
-        log_msg("skipping %s: %s %s", entry->file.c_str(), reason.c_str(), vis_.last_error().c_str());
-        emit_line(event_skip(entry->file, reason));
+        log_msg("skipping %s: %s %s", entry->file.c_str(), reason.c_str(), message.c_str());
+        emit_line(event_skip(entry->file, reason, message));
         presets_->skip(entry->file);
-        // The failed preset holds projectM's transition slot: cut past it.
-        smooth = false;
+        // An activated failure holds projectM's transition slot: cut past
+        // it. A failed preload left the playing preset alone.
+        if (activated) smooth = false;
         entry = presets_->rotate();
     }
     return false;
@@ -462,10 +504,9 @@ void App::present_step() {
 void App::take() {
     if (phase_ == Phase::Presenting) return;
     if (queued_.bo == nullptr && !render_frame(queued_)) return;
-    double master_ms = 0;
-    bool modeset = false;
+    Kms::TakeResult tr;
     std::string err;
-    if (!kms_.take(queued_.bo, opt_.master_timeout_ms, master_ms, modeset, err)) {
+    if (!kms_.take(queued_.bo, opt_.master_timeout_ms, tr, err)) {
         log_msg("take failed: %s", err.c_str());
         emit_line(event_error(err.rfind("no DRM master", 0) == 0 ? "master_timeout" : "take_failed", err));
         return;
@@ -478,9 +519,10 @@ void App::take() {
     guard_->resettle();
     shown_since_us_ = monotonic_us();
     phase_ = Phase::Presenting;
-    log_msg("presenting %dx%d (%s), internal %s, master after %.0f ms", kms_.width(), kms_.height(),
-            modeset ? "modeset" : "no modeset", rung_size().str().c_str(), master_ms);
-    emit_line(event_presenting(modeset, master_ms));
+    log_msg("presenting %s (%s, CRTC %s at take), internal %s, master after %.0f ms", kms_.mode_str().c_str(),
+            tr.modeset ? "new mode" : "same mode", tr.crtc_lit ? "lit" : "off", rung_size().str().c_str(),
+            tr.master_ms);
+    emit_line(event_presenting(tr.modeset, tr.master_ms, tr.crtc_lit));
     announce_preset("take", true);
 }
 
@@ -602,11 +644,13 @@ void App::emit_stats(int64_t now) {
     s.pcm_silent = pcm_.silent - pcm_silent_base_;
     s.warmups = st_warmups_;
     s.warmup_ms_max = st_warmup_max_;
+    s.shader_stages = st_shader_stages_;
+    s.cached_stages = st_cached_stages_;
     s.stderr_discarded = capture_.discarded_bytes();
     emit_line(event_stats(s));
 
     stats_since_us_ = now;
-    st_frames_ = st_flips_ = st_warmups_ = 0;
+    st_frames_ = st_flips_ = st_warmups_ = st_shader_stages_ = st_cached_stages_ = 0;
     st_render_ms_ = st_render_max_ = st_flip_ms_ = st_warmup_max_ = 0;
     st_late_base_ = pacer_->late();
     pcm_ok_base_ = pcm_.ok;

@@ -79,14 +79,19 @@ std::optional<Command> parse_command(std::string_view line, std::string& error) 
 std::string event_simple(std::string_view name) { return open(name) + "}"; }
 
 std::string event_prepared(std::string_view mode, std::string_view gl_renderer,
-                           std::string_view gl_version, bool gles2, int presets) {
-    return open("prepared") + str_field("mode", mode, 32) + str_field("gl_renderer", gl_renderer, 128) +
-           str_field("gl_version", gl_version, 128) + bool_field("gles2", gles2) +
-           int_field("presets", presets) + "}";
+                           std::string_view gl_version, bool gles2, int presets,
+                           bool crtc_mode_valid, std::string_view crtc_mode) {
+    std::string out = open("prepared") + str_field("mode", mode, 32) +
+                      str_field("gl_renderer", gl_renderer, 128) + str_field("gl_version", gl_version, 128) +
+                      bool_field("gles2", gles2) + int_field("presets", presets) +
+                      bool_field("crtc_mode_valid", crtc_mode_valid);
+    if (crtc_mode_valid) out += str_field("crtc_mode", crtc_mode, 32);
+    return out + "}";
 }
 
-std::string event_presenting(bool modeset, double master_ms) {
-    return open("presenting") + bool_field("modeset", modeset) + num_field("master_ms", master_ms) + "}";
+std::string event_presenting(bool modeset, double master_ms, bool crtc_lit) {
+    return open("presenting") + bool_field("modeset", modeset) + num_field("master_ms", master_ms) +
+           bool_field("crtc_lit", crtc_lit) + "}";
 }
 
 std::string event_preset(std::string_view file, bool locked, std::string_view rung,
@@ -95,9 +100,10 @@ std::string event_preset(std::string_view file, bool locked, std::string_view ru
            str_field("rung", rung, 32) + str_field("cause", cause, 32) + bool_field("cut", cut) + "}";
 }
 
-std::string event_skip(std::string_view file, std::string_view reason) {
-    return open("skip") + str_field("preset", file, MAX_PRESET_NAME_BYTES) + str_field("reason", reason, 64) +
-           "}";
+std::string event_skip(std::string_view file, std::string_view reason, std::string_view message) {
+    std::string out = open("skip") + str_field("preset", file, MAX_PRESET_NAME_BYTES) + str_field("reason", reason, 64);
+    if (!message.empty()) out += str_field("message", message, 256);
+    return out + "}";
 }
 
 std::string event_error(std::string_view reason, std::string_view message) {
@@ -128,6 +134,8 @@ std::string event_stats(const StatsSnapshot& s) {
     out += int_field("pcm_silent", static_cast<long long>(s.pcm_silent));
     out += int_field("warmups", static_cast<long long>(s.warmups));
     out += num_field("warmup_ms_max", s.warmup_ms_max);
+    out += int_field("shader_stages", static_cast<long long>(s.shader_stages));
+    out += int_field("cached_stages", static_cast<long long>(s.cached_stages));
     out += int_field("stderr_discarded", static_cast<long long>(s.stderr_discarded));
     return out + "}";
 }

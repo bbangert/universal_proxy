@@ -18,7 +18,10 @@ run = "MIX_TARGET=host mix deps.get && MIX_TARGET=host mix test"
 description = "Build firmware for a target: mise run firmware -- rpi3"
 # Clean ALL per-target native binaries first: a foreign-arch binary left in
 # priv/ ships into the release and the Nerves rootfs scrubber rejects it.
-run = 'rm -rf priv/sendspin_player priv/milkdrop_renderer && MIX_TARGET="{{arg(name="target")}}" mix firmware'
+# Emerge's precompiled NIFs share deps/emerge/priv/native across targets;
+# dropping it with this target's compiled emerge makes the build restore
+# only this target's NIF (from the rustler_precompiled cache).
+run = 'T="{{arg(name="target")}}" && rm -rf priv/sendspin_player priv/milkdrop_renderer deps/emerge/priv/native "_build/${T}_${MIX_ENV:-dev}/lib/emerge" && MIX_TARGET="$T" mix firmware'
 
 [tasks.mix-for]
 description = "Run a mix task for a target: mise run mix-for -- rpi0 deps.get"

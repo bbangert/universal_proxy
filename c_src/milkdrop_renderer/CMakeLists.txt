@@ -53,12 +53,14 @@ endif()
 
 # --- projectM -----------------------------------------------------------
 #
-# Our fork (bbangert/projectm) adds the GLES 2.0 backend and the GLSL ES
-# 1.00 translator. Pinned by commit SHA (tags are mutable server-side);
-# FORCE so a pin bump always wins over a stale CMakeCache.txt. For scratch
+# Our fork (bbangert/projectm) adds the GLES 2.0 backend, the GLSL ES 1.00
+# translator, the pre-translated shader cache, preset preloading and
+# per-preset load results; the renderer needs all of them. Pinned by commit
+# SHA (tags are mutable server-side); FORCE so a pin bump always wins over
+# a stale CMakeCache.txt. For scratch
 # builds against a local checkout set MILKDROP_PROJECTM_SOURCE_DIR (the mix
 # compiler forwards it as FETCHCONTENT_SOURCE_DIR_PROJECTM).
-set(PROJECTM_REF "9a0737093d119a5755b3037166d2b58d2ebb1964" # es2/1ac
+set(PROJECTM_REF "9181df72a7c87b4877aaf84f2d146a68cbbfcf00" # es2/1d-cache
     CACHE STRING "projectM fork commit SHA to pin" FORCE)
 
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
@@ -93,26 +95,6 @@ if(FETCHCONTENT_SOURCE_DIR_PROJECTM)
     endif()
 endif()
 
-# Optional fork APIs (es2/1d): the pre-translated shader cache and preset
-# preloading. Detected from the headers so the renderer builds against
-# forks with or without them.
-file(GLOB _projectm_headers "${projectm_SOURCE_DIR}/src/api/include/projectM-4/*.h")
-set(_projectm_api "")
-foreach(_h IN LISTS _projectm_headers)
-    file(READ "${_h}" _text)
-    string(APPEND _projectm_api "${_text}")
-endforeach()
-set(MILKDROP_PROJECTM_DEFINES "")
-string(FIND "${_projectm_api}" "projectm_set_shader_cache_dir" _pos)
-if(NOT _pos EQUAL -1)
-    list(APPEND MILKDROP_PROJECTM_DEFINES MILKDROP_HAVE_SHADER_CACHE)
-endif()
-string(FIND "${_projectm_api}" "projectm_preload_preset_file" _pos)
-if(NOT _pos EQUAL -1)
-    list(APPEND MILKDROP_PROJECTM_DEFINES MILKDROP_HAVE_PRELOAD)
-endif()
-message(STATUS "milkdrop_renderer: projectM optional APIs: ${MILKDROP_PROJECTM_DEFINES}")
-
 # --- system libraries (the Nerves toolchain file roots these in the sysroot)
 find_path(EGL_INCLUDE_DIR EGL/egl.h)
 find_path(GLES2_INCLUDE_DIR GLES2/gl2.h)
@@ -143,7 +125,6 @@ target_link_libraries(milkdrop_renderer PRIVATE
 )
 target_include_directories(milkdrop_renderer PRIVATE
     ${EGL_INCLUDE_DIR} ${GLES2_INCLUDE_DIR} ${GBM_INCLUDE_DIR} ${DRM_INCLUDE_DIR} ${DRM_UAPI_INCLUDE_DIR})
-target_compile_definitions(milkdrop_renderer PRIVATE ${MILKDROP_PROJECTM_DEFINES})
 if(MILKDROP_GLES2)
     target_compile_definitions(milkdrop_renderer PRIVATE MILKDROP_GLES2)
 endif()

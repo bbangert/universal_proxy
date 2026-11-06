@@ -154,7 +154,17 @@ static void test_protocol() {
     CHECK(v.get("event")->string == "preset" && v.get("file")->string == "a \"b\".milk" &&
           v.get("locked")->boolean && v.get("rung")->string == "640x360");
     CHECK(json_parse(event_skip("x.milk", "budget"), v, err) && v.get("preset")->string == "x.milk" &&
-          v.get("reason")->string == "budget");
+          v.get("reason")->string == "budget" && v.get("message") == nullptr);
+    CHECK(json_parse(event_skip("x.milk", "compile_error", "warp: 0:12: bad"), v, err) &&
+          v.get("reason")->string == "compile_error" && v.get("message")->string == "warp: 0:12: bad");
+    CHECK(json_parse(event_presenting(false, 3.5, false), v, err) && !v.get("modeset")->boolean &&
+          v.get("master_ms")->number == 3.5 && !v.get("crtc_lit")->boolean);
+    CHECK(json_parse(event_prepared("1280x720@60", "VC4 V3D 2.1", "OpenGL ES 2.0", true, 7, true, "1280x720@60"),
+                     v, err) &&
+          v.get("crtc_mode_valid")->boolean && v.get("crtc_mode")->string == "1280x720@60" &&
+          v.get("presets")->number == 7);
+    CHECK(json_parse(event_prepared("1280x720@60", "r", "v", true, 7, false, ""), v, err) &&
+          !v.get("crtc_mode_valid")->boolean && v.get("crtc_mode") == nullptr);
     CHECK(json_parse(event_simple("released"), v, err) && v.get("event")->string == "released");
     CHECK(json_parse(event_exiting("thermal"), v, err) && v.get("reason")->string == "thermal");
     std::string hostile(MAX_PRESET_NAME_BYTES, '"');
@@ -165,7 +175,8 @@ static void test_protocol() {
     CHECK(json_parse(event_stats(s), v, err) && v.get("preset")->string == hostile);
     CHECK(event_preset(hostile, false, hostile, hostile, false).size() < MAX_EMIT_LINE_BYTES);
     CHECK(event_error(hostile, hostile + hostile).size() < MAX_EMIT_LINE_BYTES);
-    CHECK(event_prepared(hostile, hostile, hostile, true, 3).size() < MAX_EMIT_LINE_BYTES);
+    CHECK(event_prepared(hostile, hostile, hostile, true, 3, true, hostile).size() < MAX_EMIT_LINE_BYTES);
+    CHECK(event_skip(hostile, hostile, hostile + hostile).size() < MAX_EMIT_LINE_BYTES);
     s.temp_c = 61.25;
     s.arm_mhz = 1200;
     CHECK(json_parse(event_stats(s), v, err) && v.get("arm_mhz")->number == 1200 &&

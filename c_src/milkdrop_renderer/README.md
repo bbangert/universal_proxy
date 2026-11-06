@@ -20,7 +20,7 @@ milkdrop_renderer --mode 1280x720@60 --pack-dir DIR --ladder 640x360,480x270
 
 | Option | Meaning |
 |---|---|
-| `--mode WxH[@Hz]` | The CRTC mode to present on. Keep Emerge's mode (1280x720@60): a modeset under a running HDMI audio stream corrupts its N/CTS. When the CRTC already runs this mode it is reused without a modeset. The closest offered mode within 0.5 Hz is picked (1280x720 comes at 60 and 59.94). |
+| `--mode WxH[@Hz]` | The CRTC mode to present on. Keep Emerge's mode (1280x720@60): a different pixel clock under a running HDMI audio stream leaves vc4's N/CTS stale. The mode the CRTC scans out when the renderer starts (Emerge's) is used when it fits (same size, progressive, within 0.5 Hz); else the closest offered mode that does (1280x720 comes at 60 and 59.94). |
 | `--pack-dir DIR` | The extracted preset pack (layout below). |
 | `--ladder WxH,...` | Internal render resolutions, highest first, each smaller than the last. The renderer steps down per preset and skips a preset past the last rung. |
 | `--rotate-s N` | Auto-rotation interval, seconds. |
@@ -52,7 +52,7 @@ detection"). stdin EOF means exit.
 
 | Command | Effect |
 |---|---|
-| `{"cmd":"take"}` | Poll `drmSetMaster` for up to 2 s, show the prepared frame with SetCrtc (no modeset if the mode is current), start presenting → `presenting`. On timeout: `error` `master_timeout`, still prepared. |
+| `{"cmd":"take"}` | Poll `drmSetMaster` for up to 2 s, show the prepared frame with SetCrtc in the chosen mode, start presenting → `presenting`. On timeout: `error` `master_timeout`, still prepared. |
 | `{"cmd":"release"}` | Stop flipping (a pending flip lands first), `drmModeCloseFB` the front buffer so it stays scanned out (never RmFB the scanout framebuffer), drop master, **keep card0 open** → `released`. Also acked when not presenting. |
 | `{"cmd":"exit"}` | Release if presenting, close everything → `exiting` (`requested`), exit 0. |
 | `{"cmd":"next"}` / `{"cmd":"prev"}` | Forward / back in the history (a new random pick at its end; `prev` with nothing earlier does nothing). A lock stays on and moves to the new preset. |
@@ -66,12 +66,12 @@ A malformed or unknown command gives `error` with `reason: "bad_command"`.
 
 | Event | Fields |
 |---|---|
-| `prepared` | `mode`, `gl_renderer`, `gl_version`, `gles2`, `presets` (eligible count). GL is up, the first preset warmed and a frame rendered; not master. |
-| `presenting` | `modeset` (false = the current mode was reused), `master_ms`. |
+| `prepared` | `mode` (the chosen mode, e.g. `1280x720@60`), `gl_renderer`, `gl_version`, `gles2`, `presets` (eligible count), `crtc_mode_valid` and `crtc_mode` (only when valid): what the CRTC scanned out when the card was opened. GL is up, the first preset warmed and a frame rendered; not master. |
+| `presenting` | `modeset` (true = the mode set differs from the last one scanned out before the handover: the CRTC's at take if it still had one, else the one in `prepared`), `master_ms`, `crtc_lit` (the CRTC still had a mode at take; Emerge's stop detaches it, so this is normally false and SetCrtc re-enables the CRTC, at the same timing when `modeset` is false). |
 | `released` | Ack for `release`. |
 | `preset` | `file` (preset id), `locked`, `rung` (internal WxH), `cause` (`start`, `take`, `rotate`, `next`, `prev`, `eject`, `lock`, `unlock`, `step_down`), `cut` (true = no blend). Sent whenever the showing preset, its lock or its rung changes. |
-| `skip` | `preset`, `reason`: the preset can't be drawn here (persist it for this pack version). Reasons: `register_allocate` (vc4 register allocation failed), `shader_error` (projectM failed to translate or compile a shader and fell back), `load_failed`, `draw_dropped` (sentinel pixel untouched), `budget` (below the floor at the last rung). |
-| `stats` | Every `--stats-s`: `fps` (presented), `frames`, `flip_ms` (mean flip-to-flip), `frame_ms` / `frame_ms_max` (CPU render + submit), `late` (flips past their slot), `rung`, `interval`, `temp_c`, `arm_mhz`, `gpu_ms` (only with `GL_EXT_disjoint_timer_query`, which vc4 lacks), `preset`, `pcm_ok` / `pcm_silent` (frames with ring audio / silence), `warmups`, `warmup_ms_max`, `stderr_discarded` (driver stderr bytes dropped). |
+| `skip` | `preset`, `reason`, optional `message` (the first line of the error): the preset can't be drawn here (persist it for this pack version). Reasons: `register_allocate` (vc4 register allocation failed), `translate_error` / `compile_error` / `link_error` (a warp or composite shader failed and projectM fell back to its default), `shader_error` (another error-level projectM log during the warm-up), `load_failed` (unreadable or unparsable preset), `draw_dropped` (sentinel pixel untouched), `budget` (below the floor at the last rung). |
+| `stats` | Every `--stats-s`: `fps` (presented), `frames`, `flip_ms` (mean flip-to-flip), `frame_ms` / `frame_ms_max` (CPU render + submit), `late` (flips past their slot), `rung`, `interval`, `temp_c`, `arm_mhz`, `gpu_ms` (only with `GL_EXT_disjoint_timer_query`, which vc4 lacks), `preset`, `pcm_ok` / `pcm_silent` (frames with ring audio / silence), `warmups`, `warmup_ms_max`, `shader_stages` / `cached_stages` (translated shader stages warmed up, and those read from the pack's shader cache), `stderr_discarded` (driver stderr bytes dropped). |
 | `error` | `reason`, optional `message`: a non-fatal problem (`bad_command`, `master_timeout`, `take_failed`, `driver`, `register_allocate`, `thermal_drop`, …), or the cause just before a failing `exiting`. |
 | `exiting` | `reason`: `requested`, `eof`, `signal`, `thermal` (exit 0), or a failure — `manifest`, `no_presets`, `output`, `gl`, `projectm`, `kms`, `output_lost` (exit 1), `usage` (exit 2). |
 
@@ -142,13 +142,20 @@ Unknown fields are ignored.
 
 ### Shader cache
 
-The fork's es2/1d branch adds loading pre-translated shaders from
-`shaders/<sha256(translator header version + stage HLSL)>.glsl`, and a
-preset preload call. CMake detects them by name in the projectM headers
-(`projectm_set_shader_cache_dir`, `projectm_preload_preset_file`) and
-defines `MILKDROP_HAVE_SHADER_CACHE` / `MILKDROP_HAVE_PRELOAD`; without
-them the renderer translates at load and warms up with a frame (below).
-`visualizer.cpp` is the one place to align with the final API.
+`shaders/` holds pre-translated preset shaders, `<key>.glsl`, where the key
+is the SHA-256 of the translator version, the GLSL target, the shader stage,
+the sampler declarations and the preprocessed HLSL. The renderer passes it
+to `projectm_set_shader_cache_dir`; a missing file only costs a translation
+at load, and other targets' files (rpi4/5 use GLSL ES 3.00) just miss. The
+pack pipeline fills it with the fork's tool, with `textures/` in place
+(texture names are part of the sampler declarations):
+
+```
+projectM-pretranslate-presets --target es100 <pack> <pack>/presets
+```
+
+(built with `-DBUILD_TRANSLATOR_HARNESS=ON`; it writes `<pack>/shaders/`).
+The `stats` event's `cached_stages` shows the hit rate.
 
 ## How it renders
 
@@ -187,11 +194,15 @@ fine, with jitter allowance). Below that, step down a level; below it at
 the last level, `skip` (`budget`). A preset keeps the level it settled on
 for the session.
 
-**Warm-up (P8).** Before a preset is shown, it is loaded (blend or cut
-starts), one frame is rendered off-screen at a frozen clock while the last
-presented frame stays on screen, and a 1-pixel readback waits for the GPU,
-so vc4's backend compile (done at first draw, p50 175 ms) is a short
-freeze rather than a stalled blend.
+**Warm-up (P8).** Before a preset is shown, projectM preloads it
+(`projectm_preload_preset_file`): parse, translate (or read the shader
+cache), compile, and one draw clipped to a pixel, so vc4's backend compile
+(done at first draw, p50 175 ms) happens while the last presented frame
+stays on screen and the playing preset is untouched. A clean preload is
+activated (`projectm_activate_preloaded_preset`, blend or cut), one frame is
+rendered off-screen at a frozen clock over the sentinel (below), and a
+1-pixel readback waits for the GPU. A failed preload is discarded and the
+playing preset carries on.
 
 **PCM.** Each frame takes the 576 frames of audio whose last frame plays at
 the frame's predicted scanout time. Flip times are CLOCK_MONOTONIC and the
@@ -218,11 +229,16 @@ reopened if the player replaces the file. `src/pcm_tap.h` is a verbatim copy of
   the frame, the draw was dropped. projectM's output reaches our target
   through a final copy/blend, so this catches a dropped frame, not a single
   dropped preset stage; stderr is the primary channel for those.
-- **projectM.** Load failures and error-level log messages during the
-  warm-up skip the preset (`load_failed`, `shader_error`).
+- **projectM.** The preload's load result (the fork's
+  `projectm_set_preset_load_result_event_callback` and return status)
+  gives `translate_error`, `compile_error`, `link_error` or `load_failed`,
+  with the failing stage and message; other error-level log messages during
+  the warm-up give `shader_error`.
 
-A failed preset is skipped and reported, and the renderer cuts to the
-next one (the failed preset holds projectM's blend slot).
+A failed preset is skipped and reported. A preload failure leaves the
+playing preset (and its blend) alone, so the next pick blends in as usual;
+a failure after activation holds projectM's blend slot, so the renderer
+cuts past it.
 
 ## Thermal guard
 
@@ -238,7 +254,8 @@ clock (`scaling_cur_freq`). A heatsink is recommended on rpi3.
 (device targets: rpi3 with `-DMILKDROP_GLES2=ON`, rpi4/rpi5 GLES 3; the
 host: `-DMILKDROP_CORE_ONLY=ON`). projectM comes from
 `bbangert/projectm` via FetchContent, pinned by SHA in `CMakeLists.txt`,
-built static at -O2 with the playlist library off.
+built static at -O2 with the playlist library off. The renderer needs the
+fork's es2/1d APIs (shader cache, preload, load results).
 
 To build against a local fork checkout instead of the pin:
 

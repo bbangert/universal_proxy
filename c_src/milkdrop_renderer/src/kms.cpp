@@ -1,9 +1,11 @@
 #include "kms.h"
 
 #include "pcm_feed.h"  // monotonic_us
+#include "stderr_capture.h"  // log_msg
 
 #include <cerrno>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <drm_fourcc.h>
 #include <fcntl.h>
@@ -21,11 +23,29 @@ double exact_refresh(const drmModeModeInfo& m) {
     return hz;
 }
 
+// The fields the kernel's drm_mode_equal() compares (not name or type).
 bool same_timing(const drmModeModeInfo& a, const drmModeModeInfo& b) {
     return a.clock == b.clock && a.hdisplay == b.hdisplay && a.hsync_start == b.hsync_start &&
-           a.hsync_end == b.hsync_end && a.htotal == b.htotal && a.vdisplay == b.vdisplay &&
-           a.vsync_start == b.vsync_start && a.vsync_end == b.vsync_end && a.vtotal == b.vtotal &&
-           a.flags == b.flags;
+           a.hsync_end == b.hsync_end && a.htotal == b.htotal && a.hskew == b.hskew &&
+           a.vdisplay == b.vdisplay && a.vsync_start == b.vsync_start && a.vsync_end == b.vsync_end &&
+           a.vtotal == b.vtotal && a.vscan == b.vscan && a.flags == b.flags;
+}
+
+// A mode `want` can use: same size, progressive, within 0.5 Hz.
+bool fits(const drmModeModeInfo& m, const DisplayMode& want, double& off_hz) {
+    if (m.hdisplay != want.size.width || m.vdisplay != want.size.height) return false;
+    if (m.flags & DRM_MODE_FLAG_INTERLACE) return false;
+    off_hz = std::fabs(exact_refresh(m) - want.refresh);
+    return off_hz <= 0.5;
+}
+
+std::string describe(const drmModeModeInfo& m) {
+    char hz[32];
+    std::snprintf(hz, sizeof(hz), "%.2f", exact_refresh(m));
+    std::string r = hz;
+    while (!r.empty() && r.back() == '0') r.pop_back();
+    if (!r.empty() && r.back() == '.') r.pop_back();
+    return std::to_string(m.hdisplay) + "x" + std::to_string(m.vdisplay) + "@" + r;
 }
 
 void destroy_fb(gbm_bo* bo, void* data) {
@@ -36,6 +56,13 @@ void destroy_fb(gbm_bo* bo, void* data) {
 }  // namespace
 
 double Kms::refresh_hz() const { return headless_hz_ > 0 ? headless_hz_ : exact_refresh(mode_); }
+
+std::string Kms::mode_str() const {
+    if (headless_hz_ > 0) return DisplayMode{{mode_.hdisplay, mode_.vdisplay}, headless_hz_}.str();
+    return describe(mode_);
+}
+
+std::string Kms::crtc_mode_str() const { return crtc_mode_valid_ ? describe(crtc_mode_) : std::string(); }
 
 bool Kms::open_headless(const std::string& card, const DisplayMode& want, std::string& err) {
     fd_ = ::open(card.c_str(), O_RDWR | O_CLOEXEC);
@@ -118,17 +145,29 @@ bool Kms::open(const std::string& card, const DisplayMode& want, std::string& er
     }
     crtc_id_ = crtc;
 
-    // The closest offered mode. Our systems' EDIDs flag none as preferred,
-    // and 1280x720 comes at 60 and 59.94 (both vrefresh 60 in KMS).
-    double best = 1e9;
-    for (int i = 0; i < conn->count_modes; i++) {
-        const drmModeModeInfo& m = conn->modes[i];
-        if (m.hdisplay != want.size.width || m.vdisplay != want.size.height) continue;
-        if (m.flags & DRM_MODE_FLAG_INTERLACE) continue;
-        double d = std::fabs(exact_refresh(m) - want.refresh);
-        if (d < best) {
-            best = d;
-            mode_ = m;
+    // What the display's owner scans out now. Read here, not at take:
+    // Emerge's stop detaches the CRTC (ACTIVE=0, MODE_ID=0), so by then it
+    // reports no mode.
+    if (drmModeCrtc* c = drmModeGetCrtc(fd_, crtc_id_)) {
+        crtc_mode_valid_ = c->mode_valid != 0;
+        if (crtc_mode_valid_) crtc_mode_ = c->mode;
+        drmModeFreeCrtc(c);
+    }
+
+    // Keep the current mode when it fits: a different pixel clock under a
+    // running HDMI audio stream leaves vc4's N/CTS stale. Otherwise the
+    // closest offered mode. Our systems' EDIDs flag none as preferred, and
+    // 1280x720 comes at 60 and 59.94 (both vrefresh 60 in KMS).
+    double best = 1e9, off = 0;
+    if (crtc_mode_valid_ && fits(crtc_mode_, want, off)) {
+        mode_ = crtc_mode_;
+        best = off;
+    } else {
+        for (int i = 0; i < conn->count_modes; i++) {
+            if (fits(conn->modes[i], want, off) && off < best) {
+                best = off;
+                mode_ = conn->modes[i];
+            }
         }
     }
     drmModeFreeConnector(conn);
@@ -171,7 +210,7 @@ uint32_t Kms::framebuffer(gbm_bo* bo) {
     return id;
 }
 
-bool Kms::take(gbm_bo* bo, int timeout_ms, double& master_ms, bool& modeset, std::string& err) {
+bool Kms::take(gbm_bo* bo, int timeout_ms, TakeResult& out, std::string& err) {
     const int64_t start = monotonic_us();
     while (!drmIsMaster(fd_) && drmSetMaster(fd_) != 0) {
         if (monotonic_us() - start > int64_t{timeout_ms} * 1000) {
@@ -180,7 +219,7 @@ bool Kms::take(gbm_bo* bo, int timeout_ms, double& master_ms, bool& modeset, std
         }
         usleep(2000);
     }
-    master_ms = static_cast<double>(monotonic_us() - start) / 1000.0;
+    out.master_ms = static_cast<double>(monotonic_us() - start) / 1000.0;
 
     uint32_t fb = framebuffer(bo);
     if (fb == 0) {
@@ -188,16 +227,25 @@ bool Kms::take(gbm_bo* bo, int timeout_ms, double& master_ms, bool& modeset, std
         drmDropMaster(fd_);
         return false;
     }
-    drmModeModeInfo mode = mode_;
-    modeset = true;
+    // The last mode on screen: the CRTC's now if something still drives it,
+    // else the one recorded at open.
+    out.crtc_lit = false;
+    drmModeModeInfo last{};
+    bool last_valid = crtc_mode_valid_;
+    if (last_valid) last = crtc_mode_;
     if (drmModeCrtc* c = drmModeGetCrtc(fd_, crtc_id_)) {
-        if (c->mode_valid && same_timing(c->mode, mode_)) {
-            mode = c->mode;
-            modeset = false;
+        out.crtc_lit = c->mode_valid != 0;
+        log_msg("take: CRTC %u %s at take, %s at open", crtc_id_,
+                out.crtc_lit ? describe(c->mode).c_str() : "off",
+                crtc_mode_valid_ ? describe(crtc_mode_).c_str() : "off");
+        if (out.crtc_lit) {
+            last = c->mode;
+            last_valid = true;
         }
         drmModeFreeCrtc(c);
     }
-    if (drmModeSetCrtc(fd_, crtc_id_, fb, 0, 0, &connector_id_, 1, &mode) != 0) {
+    out.modeset = !(last_valid && same_timing(last, mode_));
+    if (drmModeSetCrtc(fd_, crtc_id_, fb, 0, 0, &connector_id_, 1, &mode_) != 0) {
         err = std::string("SetCrtc: ") + std::strerror(errno);
         drmDropMaster(fd_);
         return false;

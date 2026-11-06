@@ -74,12 +74,16 @@ private:
 inline constexpr size_t MAX_PRESET_NAME_BYTES = 1024;
 
 std::string event_simple(std::string_view name);
+// `crtc_mode` is the CRTC's mode when the card was opened, sent only when
+// `crtc_mode_valid`.
 std::string event_prepared(std::string_view mode, std::string_view gl_renderer,
-                           std::string_view gl_version, bool gles2, int presets);
-std::string event_presenting(bool modeset, double master_ms);
+                           std::string_view gl_version, bool gles2, int presets,
+                           bool crtc_mode_valid, std::string_view crtc_mode);
+std::string event_presenting(bool modeset, double master_ms, bool crtc_lit);
 std::string event_preset(std::string_view file, bool locked, std::string_view rung,
                          std::string_view cause, bool cut);
-std::string event_skip(std::string_view file, std::string_view reason);
+// `message` (optional) is the first line of the error behind it.
+std::string event_skip(std::string_view file, std::string_view reason, std::string_view message = {});
 std::string event_error(std::string_view reason, std::string_view message = {});
 std::string event_exiting(std::string_view reason);
 
@@ -100,6 +104,8 @@ struct StatsSnapshot {
     uint64_t pcm_silent = 0;
     uint64_t warmups = 0;
     double warmup_ms_max = 0;
+    uint64_t shader_stages = 0;  // translated stages warmed up (warp, composite)
+    uint64_t cached_stages = 0;  // of those, read from the pack's shader cache
     uint64_t stderr_discarded = 0;  // driver stderr bytes dropped
 };
 
