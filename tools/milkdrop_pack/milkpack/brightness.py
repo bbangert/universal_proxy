@@ -18,12 +18,18 @@ import subprocess
 CACHE_VERSION = 1
 
 
-def classify(result, exclude_above, review_above):
-    """'exclude' | 'review' | 'ok' | 'error' for one md_bright result."""
+def classify(result, exclude_above, review_above, exclude_min_luma=0.0):
+    """'exclude' | 'review' | 'ok' | 'load_failed' | 'error' for one
+    md_bright result. With exclude_min_luma, a saturated but dark picture
+    (pure colour rather than white) is only reviewed, not excluded."""
+    if result and result.get("error") == "load_failed":
+        return "load_failed"
     if not result or "sat" not in result:
         return "error"
-    if result["sat"] > exclude_above:
+    if result["sat"] > exclude_above and result.get("luma", 255.0) >= exclude_min_luma:
         return "exclude"
+    if result["sat"] > exclude_above:
+        return "review"
     if result["sat"] > review_above:
         return "review"
     return "ok"
@@ -103,7 +109,7 @@ def screen(tools, pack_dir, ids, settings, cache_path, jobs, tool_id, progress=N
             pid, key = futures[fut]
             result = fut.result()
             results[pid] = result
-            if "sat" in result:
+            if "sat" in result or result.get("error") == "load_failed":
                 cache_file.write(json.dumps({"key": key, "id": pid, "result": result}) + "\n")
                 cache_file.flush()
             done += 1

@@ -59,8 +59,11 @@ builds and the brightness cache, so a rerun only renders changed presets.
    deterministic music-like PCM on the host reference (`host/md_bright`:
    projectM desktop GL on llvmpipe, RNG and clock pinned by `md_seed`).
    `sat` = mean fraction of pixels with a channel ≥ 250 over frames
-   150–600. `sat > 0.9` is a whiteout and is excluded; `sat > 0.5` goes on
+   150–600. `sat > 0.9` is a whiteout and is excluded (`exclude_min_luma`
+   can spare saturated-but-dark colour); `sat > 0.5` goes on
    the review list (look at `review/`, add to `curation.json` if needed).
+   Presets projectM can't load at all (expression syntax errors) are
+   excluded too.
 7. Hand exclusions from `curation.json` (after the screen, so the report
    shows whether the screen caught them), then a final translation pass
    over exactly the shipped presets.

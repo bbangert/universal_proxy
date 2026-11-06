@@ -31,6 +31,15 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(self.verdict({"sat": 0.5, "luma": 200}), "ok")
         self.assertEqual(self.verdict({"sat": 0.50001, "luma": 200}), "review")
 
+    def test_luma_gate_spares_saturated_colour(self):
+        dark = {"sat": 0.97, "luma": 117.5}
+        self.assertEqual(self.verdict(dark), "exclude")
+        self.assertEqual(brightness.classify(dark, 0.9, 0.5, exclude_min_luma=200), "review")
+        self.assertEqual(brightness.classify(self.results["Waltra - Emitter.milk"], 0.9, 0.5, 200), "exclude")
+
+    def test_unloadable_presets_are_flagged(self):
+        self.assertEqual(self.verdict({"error": "load_failed", "message": "syntax error"}), "load_failed")
+
     def test_failures_are_errors_not_exclusions(self):
         self.assertEqual(self.verdict({"error": "timeout"}), "error")
         self.assertEqual(self.verdict(None), "error")

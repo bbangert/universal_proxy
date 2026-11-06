@@ -159,6 +159,7 @@ def exclusion_text(report):
         "missing_texture": "sample a texture that isn't available",
         "translate_failed": "a shader doesn't translate to GLSL ES 1.00",
         "too_bright": "whiteout in the brightness screen",
+        "load_failed": "projectM can't load the preset (expression syntax)",
         "curated": "excluded by hand",
         "duplicate": "byte-identical duplicate after name normalisation",
         "invalid_name": "no valid file name after normalisation",
@@ -263,8 +264,12 @@ def build(args):
 
         bright = brightness.screen(host, pack, sorted(staged), settings, os.path.join(work, "brightness-cache.jsonl"),
                                    jobs, tool_id, progress)
-        verdicts = {pid: brightness.classify(r, bright_cfg["exclude_sat_above"], bright_cfg["review_sat_above"])
+        verdicts = {pid: brightness.classify(r, bright_cfg["exclude_sat_above"], bright_cfg["review_sat_above"],
+                                             bright_cfg.get("exclude_min_luma", 0.0))
                     for pid, r in bright.items()}
+        load_failed = sorted(p for p, v in verdicts.items() if v == "load_failed")
+        for pid in load_failed:
+            report.exclude(pid, "load_failed", bright[pid].get("message", ""))
         too_bright = sorted(p for p, v in verdicts.items() if v == "exclude")
         for pid in too_bright:
             r = bright[pid]
@@ -278,9 +283,9 @@ def build(args):
             shutil.rmtree(os.path.join(out, "review"), ignore_errors=True)
             brightness.snapshots(host, pack, too_bright + [e["file"] for e in report.review], settings,
                                  os.path.join(out, "review"), jobs=jobs)
-        remove_presets(staged, too_bright, pack)
-        report.step("brightness", presets=len(staged), excluded=len(too_bright), review=len(report.review),
-                    errors=len(errors))
+        remove_presets(staged, too_bright + load_failed, pack)
+        report.step("brightness", presets=len(staged), too_bright=len(too_bright), load_failed=len(load_failed),
+                    review=len(report.review), errors=len(errors))
     else:
         report.notes.append("brightness screen skipped (--skip-brightness)")
 
