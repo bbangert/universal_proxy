@@ -1,7 +1,6 @@
 """The pack build, step by step (build_pack.py is the command line)."""
 
 import datetime
-import hashlib
 import json
 import os
 import re
@@ -255,8 +254,8 @@ def build(args):
     bright = {}
     if not args.skip_brightness:
         settings = {k: bright_cfg[k] for k in ("frames", "from", "size")}
-        with open(os.path.join(sources.TOOL_DIR, "host", "bright.cpp"), "rb") as f:
-            tool_id = pm_commit + ":" + hashlib.sha256(f.read()).hexdigest()[:16]
+        tool_id = brightness.tool_identity(host, pm_commit, os.path.join(pack, "textures"),
+                                           curation["milkdrop_textures"]["names"])
 
         def progress(done, total, pid, result):
             if done % 50 == 0 or done == total:

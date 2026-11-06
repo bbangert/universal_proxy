@@ -123,6 +123,28 @@ class CacheTest(unittest.TestCase):
         self.assertNotEqual(k, brightness.cache_key(b"preset", {**s, "frames": 300}, "t1"))
         self.assertNotEqual(k, brightness.cache_key(b"preset", s, "t2"))
 
+    def test_tool_identity_covers_builds_textures_and_rand_pool(self):
+        d = tmpdir(self)
+        tools = {"bright": write(os.path.join(d, "md_bright"), b"bright"),
+                 "seed": write(os.path.join(d, "libmd_seed.so"), b"seed")}
+        tex = os.path.join(d, "textures")
+        write(os.path.join(tex, "cells.jpg"), b"cells")
+
+        def ident(pool=("cells",)):
+            return brightness.tool_identity(tools, "pm1", tex, pool)
+
+        base = ident()
+        self.assertEqual(base, ident())
+        self.assertNotEqual(base, brightness.tool_identity(tools, "pm2", tex, ("cells",)))
+        self.assertNotEqual(base, ident(("cells", "heart")))
+        changes = [(os.path.join(tex, "cells.jpg"), b"cells2"), (os.path.join(tex, "heart.jpg"), b"heart"),
+                   (tools["seed"], b"seed2"), (tools["bright"], b"bright2")]
+        seen = {base}
+        for path, data in changes:
+            write(path, data)
+            seen.add(ident())
+        self.assertEqual(len(seen), len(changes) + 1)
+
     def test_load_cache_skips_bad_lines(self):
         path = os.path.join(tempfile.mkdtemp(), "c.jsonl")
         with open(path, "w") as f:

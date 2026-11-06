@@ -5,8 +5,9 @@ Each preset renders `frames` frames of synthetic music on the host reference
 renderer (md_bright: projectM desktop GL on Mesa llvmpipe, pinned RNG/clock).
 `sat` is the mean fraction of pixels with any channel >= 250 over frames
 `from`..`frames` (the first seconds are a fade-in), `luma` the mean Rec.601
-luma. Results are cached per preset content + settings, so a rerun only
-renders what changed.
+luma. Results are cached per preset content, settings and tool identity
+(the md_bright/md_seed builds, the installed textures, the rand pool), so a
+rerun only renders what changed.
 """
 
 import concurrent.futures
@@ -15,7 +16,7 @@ import json
 import os
 import subprocess
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 
 
 def classify(result, exclude_above, review_above, exclude_min_luma=0.0):
@@ -51,6 +52,34 @@ def cacheable(result):
 def verdict(result, cfg):
     """classify() with the thresholds of curation.json's "brightness"."""
     return classify(result, cfg["exclude_sat_above"], cfg["review_sat_above"], cfg["exclude_min_luma"])
+
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def tool_identity(tools, projectm_commit, texture_dir, rand_pool):
+    """Everything a render depends on besides the preset and the settings:
+    the md_bright and md_seed builds, the projectM pin, every installed
+    texture (name and content) and the sampler_randNN pool."""
+    textures = []
+    for root, dirs, files in os.walk(texture_dir):
+        dirs.sort()
+        for name in sorted(files):
+            path = os.path.join(root, name)
+            textures.append([os.path.relpath(path, texture_dir), _sha256(path)])
+    ident = {
+        "projectm": projectm_commit,
+        "bright": _sha256(tools["bright"]),
+        "seed": _sha256(tools["seed"]),
+        "textures": textures,
+        "rand_pool": sorted(rand_pool),
+    }
+    return hashlib.sha256(json.dumps(ident, sort_keys=True).encode()).hexdigest()
 
 
 def cache_key(preset_bytes, settings, tool_id):
