@@ -80,6 +80,12 @@ defmodule UniversalProxy.Display.State do
        sent `take` again, and gets `exit` once a viewport retry runs or
        the recovery budget is spent, whichever comes first.
 
+  From `:preparing` through `:presenting`, a settings change on
+  `UniversalProxy.MilkDrop.settings_topic/0` reaches the renderer at once
+  as `set_rotate` and `set_high_frequency` casts (with high-frequency
+  presets turned off it cuts away from one on screen); a renderer started
+  later reads them from `UniversalProxy.MilkDrop.Store` itself.
+
   Every phase is bounded (`:milkdrop_timeouts`, ms: tapping 10 000,
   preparing 20 000, taking 5 000, releasing 3 000, recovering 45 000 (the
   viewport's first five retries, 1 s doubling), exiting 3 000, reaping
@@ -248,7 +254,8 @@ defmodule UniversalProxy.Display.State do
               "sendspin:output_added",
               "sendspin:output_removed",
               Cec.topic()
-            ] ++ if(milkdrop?, do: [MilkDrop.pack_topic()], else: []),
+            ] ++
+              if(milkdrop?, do: [MilkDrop.pack_topic(), MilkDrop.settings_topic()], else: []),
           do: Phoenix.PubSub.subscribe(state.pubsub, topic)
 
       {:ok, state, {:continue, :start_ui}}
@@ -375,6 +382,10 @@ defmodule UniversalProxy.Display.State do
       do: {:noreply, dispatch(state, {:pack, status})},
       else: {:noreply, state}
   end
+
+  def handle_info({:milkdrop_settings, settings}, %{milkdrop?: true} = state)
+      when is_map(settings),
+      do: {:noreply, milkdrop_settings(state, settings)}
 
   def handle_info(
         {:milkdrop_ring, session, ring},
@@ -749,6 +760,7 @@ defmodule UniversalProxy.Display.State do
       preset: nil,
       locked: false,
       stats: nil,
+      sent: %{},
       reaped: false,
       ending: nil,
       ended_in: nil
@@ -932,6 +944,48 @@ defmodule UniversalProxy.Display.State do
   end
 
   defp milkdrop_cmd(state, _cmd), do: state
+
+  # Only values that differ from the last one sent go out: a rotation-only
+  # change, or a lock the renderer persisted, must not re-deal the
+  # shuffle bag with a redundant `set_high_frequency`.
+  defp milkdrop_settings(%{md: %{phase: phase, pid: pid, sent: sent} = md} = state, settings)
+       when phase in [:preparing, :taking, :presenting] and is_pid(pid) do
+    sent =
+      sent
+      |> send_setting(
+        :rotate_s,
+        settings,
+        &valid_rotate?/1,
+        &Display.MilkDrop.set_rotate(pid, &1)
+      )
+      |> send_setting(
+        :include_high_frequency,
+        settings,
+        &is_boolean/1,
+        &Display.MilkDrop.set_high_frequency(pid, &1)
+      )
+
+    %{state | md: %{md | sent: sent}}
+  end
+
+  defp milkdrop_settings(state, _settings), do: state
+
+  defp valid_rotate?(seconds), do: is_integer(seconds) and seconds > 0
+
+  defp send_setting(sent, key, settings, valid?, send_fun) do
+    case settings do
+      %{^key => value} ->
+        if valid?.(value) and Map.get(sent, key) != value do
+          send_fun.(value)
+          Map.put(sent, key, value)
+        else
+          sent
+        end
+
+      _other ->
+        sent
+    end
+  end
 
   defp exit_recovered(
          %{md: %{phase: :recovering, pid: pid}, model: %{viewport: %{status: :running}}} = state
