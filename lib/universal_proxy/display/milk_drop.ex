@@ -47,6 +47,8 @@ defmodule UniversalProxy.Display.MilkDrop do
       (default a unique `<tmp>/up-milkdrop-skip-N.txt`; deleted by the
       reaper however this process ends);
     * `:binary` — the renderer (default `default_binary/0`);
+    * `:skip_retry_ms` — how often skips the Store could not take are
+      retried (default 5000);
     * `:kill_grace_ms` — how long a renderer that outlives its closed stdin
       may run before it is SIGKILLed (default 2000);
     * `:task_supervisor` — the `Task.Supervisor` the reaper runs under
@@ -94,7 +96,10 @@ defmodule UniversalProxy.Display.MilkDrop do
     * `{"event":"released"}` — `release` done, master dropped;
     * `{"event":"preset","file":F,"locked":B,...}` — preset `F` is showing;
     * `{"event":"skip","preset":F,"reason":R}` — `F` cannot be drawn
-      (persisted to the Store for this pack version);
+      (persisted to the Store for this pack version). The forwarded event
+      carries `persisted: true | false`; while the Store cannot take it
+      (not running) it is kept and retried on the next `skip` or `preset`
+      event and every `:skip_retry_ms`, until the process ends;
     * `{"event":"stats",...}` — periodic counters (fps, rung, temperature,
       ARM clock);
     * `{"event":"error","reason":R,...}` — a non-fatal problem;
@@ -119,6 +124,7 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   @line_max 4096
   @kill_grace_ms 2_000
+  @skip_retry_ms 5_000
   # Time the reaper's supervisor allows it to SIGKILL the renderer on shutdown.
   @reaper_shutdown_ms 5_000
   @target Mix.target()
@@ -291,7 +297,10 @@ defmodule UniversalProxy.Display.MilkDrop do
          version: version,
          locked: Map.get(settings, :locked),
          skip_file: config.skip_file,
-         discarding: false
+         discarding: false,
+         pending_skips: %{},
+         skip_retry_ms: Keyword.get(opts, :skip_retry_ms, @skip_retry_ms),
+         skip_timer: nil
        }}
     else
       {:error, reason} ->
@@ -354,6 +363,10 @@ defmodule UniversalProxy.Display.MilkDrop do
     {:stop, {:shutdown, :reaper_down}, state}
   end
 
+  def handle_info(:retry_skips, state) do
+    {:noreply, state |> Map.put(:skip_timer, nil) |> flush_skips()}
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
 
   # -- Private --
@@ -361,7 +374,7 @@ defmodule UniversalProxy.Display.MilkDrop do
   defp handle_line(line, state) do
     case decode_event(line) do
       {:ok, event} ->
-        state = persist(event, state)
+        {event, state} = persist(event, state)
         send(state.owner, {:milkdrop, self(), event})
         state
 
@@ -384,28 +397,54 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   defp persist(%{event: :skip, preset: preset} = event, state) when is_binary(preset) do
     reason = if is_binary(event[:reason]), do: event.reason, else: "unknown"
-    _ = Store.skip(state.store, state.version, preset, reason)
-    state
+    state = flush_skips(%{state | pending_skips: Map.put(state.pending_skips, preset, reason)})
+    {Map.put(event, :persisted, not is_map_key(state.pending_skips, preset)), state}
   end
 
-  defp persist(%{event: :preset, file: file, locked: locked?}, state)
+  defp persist(%{event: :preset, file: file, locked: locked?} = event, state)
        when is_binary(file) and is_boolean(locked?) do
     locked = if locked?, do: file, else: nil
+    state = flush_skips(state)
 
     with true <- locked != state.locked,
          {:ok, _settings} <- Store.update(state.store, %{locked: locked}) do
-      %{state | locked: locked}
+      {event, %{state | locked: locked}}
     else
       false ->
-        state
+        {event, state}
 
       {:error, reason} ->
         Logger.warning("MilkDrop: could not save the preset lock: #{inspect(reason)}")
-        state
+        {event, state}
     end
   end
 
-  defp persist(_event, state), do: state
+  defp persist(event, state), do: {event, state}
+
+  # Skips the Store refused (it is down) stay pending and are retried on
+  # the next skip/preset event or `:retry_skips` timer; the first refusal
+  # ends the pass, since the rest would be refused too.
+  defp flush_skips(%{pending_skips: pending} = state) when map_size(pending) == 0, do: state
+
+  defp flush_skips(state) do
+    pending =
+      Enum.reduce_while(state.pending_skips, state.pending_skips, fn {preset, reason}, acc ->
+        case Store.skip(state.store, state.version, preset, reason) do
+          :ok -> {:cont, Map.delete(acc, preset)}
+          {:error, _} -> {:halt, acc}
+        end
+      end)
+
+    schedule_skip_retry(%{state | pending_skips: pending})
+  end
+
+  defp schedule_skip_retry(%{pending_skips: pending} = state) when map_size(pending) == 0,
+    do: state
+
+  defp schedule_skip_retry(%{skip_timer: nil} = state),
+    do: %{state | skip_timer: Process.send_after(self(), :retry_skips, state.skip_retry_ms)}
+
+  defp schedule_skip_retry(state), do: state
 
   defp validate(config) do
     cond do

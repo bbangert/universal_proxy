@@ -224,10 +224,63 @@ defmodule UniversalProxy.Display.MilkDropTest do
 
     emit(pid, ~s({"event":"skip","preset":"hf/strobe.milk","reason":"budget"}))
 
-    assert_receive {:milkdrop, ^pid, %{event: :skip, preset: "hf/strobe.milk", reason: "budget"}},
+    assert_receive {:milkdrop, ^pid,
+                    %{event: :skip, preset: "hf/strobe.milk", reason: "budget", persisted: true}},
                    @timeout
 
     assert Store.skipped(ctx.store, @version) == %{"hf/strobe.milk" => "budget"}
+  end
+
+  describe "while the Store is down" do
+    @store_name :milkdrop_display_test_store
+
+    setup ctx do
+      stop_supervised!(Store)
+      start_named_store(ctx)
+      stop_supervised!(Store)
+      :ok
+    end
+
+    defp start_named_store(ctx) do
+      start_supervised!(
+        {Store,
+         name: @store_name, table: @table, dets_path: Path.join(ctx.tmp_dir, "settings.dets")}
+      )
+    end
+
+    test "a skip is forwarded as not persisted, then persisted when the Store is back", ctx do
+      {pid, _} =
+        start_renderer(ctx, store: @store_name, settings: Store.defaults(), skipped: %{})
+
+      emit(pid, ~s({"event":"skip","preset":"a.milk","reason":"draw"}))
+
+      assert_receive {:milkdrop, ^pid, %{event: :skip, preset: "a.milk", persisted: false}},
+                     @timeout
+
+      start_named_store(ctx)
+      wait_until(fn -> Store.skipped(@store_name, @version) == %{"a.milk" => "draw"} end)
+    end
+
+    test "pending skips are flushed by the next event", ctx do
+      {pid, _} =
+        start_renderer(ctx,
+          store: @store_name,
+          settings: Store.defaults(),
+          skipped: %{},
+          skip_retry_ms: 600_000
+        )
+
+      emit(pid, ~s({"event":"skip","preset":"a.milk","reason":"draw"}))
+      assert_receive {:milkdrop, ^pid, %{event: :skip, persisted: false}}, @timeout
+
+      start_named_store(ctx)
+      emit(pid, ~s({"event":"skip","preset":"b.milk","reason":"budget"}))
+
+      assert_receive {:milkdrop, ^pid, %{event: :skip, preset: "b.milk", persisted: true}},
+                     @timeout
+
+      assert Store.skipped(@store_name, @version) == %{"a.milk" => "draw", "b.milk" => "budget"}
+    end
   end
 
   test "persists a lock change from preset events", ctx do

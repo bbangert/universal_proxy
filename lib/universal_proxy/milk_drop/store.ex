@@ -19,10 +19,15 @@ defmodule UniversalProxy.MilkDrop.Store do
       `skipped/2` for any other version reads as empty.
 
   Values are sanitized on every read and write, so a corrupt or older
-  record reads back as defaults. A file DETS refuses to open (not a DETS
-  file, unrepairable) is moved aside to `<path>.corrupt` and a fresh table
-  is opened: the store fails closed to defaults rather than refusing to
-  start.
+  record reads back as defaults. A file DETS reports as corrupt or
+  unrepairable (not a DETS file, a failed repair) is moved aside to
+  `<path>.corrupt` and a fresh table is opened.
+
+  Any other open failure (permissions, missing directory, out of file
+  descriptors) says nothing about the file's contents, so it is left
+  untouched: the store stays up serving defaults, writes return
+  `{:error, reason}`, and the open is retried before every write and on a
+  timer (`:retry_ms`, default #{30_000}).
 
   Changes are broadcast on `UniversalProxy.MilkDrop.settings_topic/0` (see
   `UniversalProxy.MilkDrop`).
@@ -44,6 +49,7 @@ defmodule UniversalProxy.MilkDrop.Store do
   alias UniversalProxy.MilkDrop
 
   @default_table :milkdrop_settings
+  @retry_ms 30_000
 
   @rotate_min 10
   @rotate_max 120
@@ -138,23 +144,47 @@ defmodule UniversalProxy.MilkDrop.Store do
     path = Keyword.get(opts, :dets_path) || Path.join(MilkDrop.root(), "settings.dets")
     pubsub = Keyword.get(opts, :pubsub, UniversalProxy.PubSub)
 
-    with :ok <- mkdir_p(path),
-         {:ok, table} <- open(table_name, path) do
-      Logger.info("MilkDrop store opened at #{path}")
-      {:ok, %{table: table, pubsub: pubsub}}
-    else
-      {:error, reason} ->
-        Logger.error("MilkDrop store failed to open #{path}: #{inspect(reason)}")
-        {:stop, reason}
+    state = %{
+      table: nil,
+      table_name: table_name,
+      path: path,
+      pubsub: pubsub,
+      retry_ms: Keyword.get(opts, :retry_ms, @retry_ms),
+      retry_timer: nil,
+      open_error: nil
+    }
+
+    case open_table(state) do
+      {:ok, state} -> {:ok, state}
+      {:error, state} -> {:ok, schedule_retry(state)}
     end
   end
 
   @impl true
+  def terminate(_reason, %{table: nil}), do: :ok
   def terminate(_reason, %{table: table}), do: :dets.close(table)
+
+  @impl true
+  def handle_info(:retry_open, %{table: nil} = state) do
+    case open_table(%{state | retry_timer: nil}) do
+      {:ok, state} -> {:noreply, state}
+      {:error, state} -> {:noreply, schedule_retry(state)}
+    end
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
 
   @impl true
   def handle_call(:settings, _from, state) do
     {:reply, read_settings(state.table), state}
+  end
+
+  def handle_call(request, from, %{table: nil} = state)
+      when elem(request, 0) in [:update, :skip] or request == :clear_skipped do
+    case open_table(state) do
+      {:ok, state} -> handle_call(request, from, state)
+      {:error, state} -> {:reply, {:error, state.open_error}, schedule_retry(state)}
+    end
   end
 
   def handle_call({:update, params}, _from, state) do
@@ -214,23 +244,69 @@ defmodule UniversalProxy.MilkDrop.Store do
 
   # -- Private --
 
+  # Opens the table into `state`. On failure the state stays closed
+  # (`table: nil`) with `open_error` set.
+  defp open_table(%{table_name: table_name, path: path} = state) do
+    with :ok <- mkdir_p(path),
+         {:ok, table} <- open(table_name, path) do
+      Logger.info("MilkDrop store opened at #{path}")
+      {:ok, %{state | table: table, open_error: nil}}
+    else
+      {:error, reason} ->
+        Logger.warning(
+          "MilkDrop store could not open #{path}: #{inspect(reason)}; " <>
+            "serving defaults until it can"
+        )
+
+        {:error, %{state | open_error: reason}}
+    end
+  end
+
+  defp schedule_retry(%{retry_timer: nil, retry_ms: ms} = state) when is_integer(ms) and ms > 0,
+    do: %{state | retry_timer: Process.send_after(self(), :retry_open, ms)}
+
+  defp schedule_retry(state), do: state
+
   defp open(table_name, path) do
-    case :dets.open_file(table_name, file: to_charlist(path), type: :set) do
+    case dets_open(table_name, path) do
       {:ok, table} ->
         {:ok, table}
 
-      {:error, reason} ->
-        aside = path <> ".corrupt"
-
-        Logger.warning(
-          "MilkDrop store could not open #{path} (#{inspect(reason)}); " <>
-            "moving it to #{aside} and starting from defaults"
-        )
-
-        with :ok <- File.rename(path, aside) do
-          :dets.open_file(table_name, file: to_charlist(path), type: :set)
-        end
+      {:error, reason} = error ->
+        if corrupt?(reason), do: move_aside(table_name, path, reason), else: error
     end
+  end
+
+  # A repair that crashes inside DETS (a truncated file) comes back as a
+  # bare `{:EXIT, _}`, which is missing from its specs.
+  @dialyzer {:nowarn_function, dets_open: 2}
+  defp dets_open(table_name, path) do
+    case :dets.open_file(table_name, file: to_charlist(path), type: :set) do
+      {:ok, _table} = ok -> ok
+      {:error, _reason} = error -> error
+      other -> {:error, {:dets_crash, other}}
+    end
+  end
+
+  # Only reasons that describe the file itself. `{:file_error, _, posix}`
+  # (:eacces, :enoent, :emfile, ...) is operational: the file may be fine.
+  defp corrupt?({:not_a_dets_file, _}), do: true
+  defp corrupt?({:needs_repair, _}), do: true
+  defp corrupt?({:bad_freelist, _}), do: true
+  defp corrupt?({:bad_object, _}), do: true
+  defp corrupt?({:dets_crash, _}), do: true
+  defp corrupt?(:bad_object), do: true
+  defp corrupt?(_reason), do: false
+
+  defp move_aside(table_name, path, reason) do
+    aside = path <> ".corrupt"
+
+    Logger.warning(
+      "MilkDrop store could not open #{path} (#{inspect(reason)}); " <>
+        "moving it to #{aside} and starting from defaults"
+    )
+
+    with :ok <- File.rename(path, aside), do: dets_open(table_name, path)
   end
 
   defp mkdir_p(path), do: File.mkdir_p(Path.dirname(path))
@@ -239,12 +315,16 @@ defmodule UniversalProxy.MilkDrop.Store do
     with :ok <- :dets.insert(table, record), do: :dets.sync(table)
   end
 
+  defp read_settings(nil), do: @defaults
+
   defp read_settings(table) do
     case :dets.lookup(table, :settings) do
       [{:settings, stored}] when is_map(stored) -> sanitize(Map.merge(@defaults, stored))
       _ -> @defaults
     end
   end
+
+  defp read_skipped(nil), do: nil
 
   defp read_skipped(table) do
     case :dets.lookup(table, :skipped) do
