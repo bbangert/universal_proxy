@@ -26,8 +26,10 @@ defmodule UniversalProxy.MilkDrop.Pack do
 
   ## Download
 
-  `ensure/0` starts the download under `UniversalProxy.TaskSupervisor`
-  (monitored: a crash becomes `{:error, {:crashed, reason}}`):
+  `ensure/0` starts the download under the `:task_supervisor`
+  (`UniversalProxy.MilkDrop.PackTasks` by default, which
+  `UniversalProxy.MilkDrop.Supervisor` restarts together with this server)
+  and monitors it (a crash becomes `{:error, {:crashed, reason}}`):
 
     1. `Req` streams into `<root>/<version>.tar.gz.part`; an existing
        `.part` is resumed with an HTTP `Range` request (a server that
@@ -63,6 +65,7 @@ defmodule UniversalProxy.MilkDrop.Pack do
   @version_re ~r/\A[0-9A-Za-z][0-9A-Za-z._-]*\z/
   @sha256_re ~r/\A[0-9a-fA-F]{64}\z/
   @read_chunk 65_536
+  @task_supervisor UniversalProxy.MilkDrop.PackTasks
 
   @type pin :: %{version: String.t(), url: String.t(), sha256: String.t()}
 
@@ -104,6 +107,10 @@ defmodule UniversalProxy.MilkDrop.Pack do
     :exit, _ -> {:error, :not_running}
   end
 
+  @doc "The default `:task_supervisor` the download runs under."
+  @spec task_supervisor() :: atom()
+  def task_supervisor, do: @task_supervisor
+
   @doc "The compiled-in pin, or `nil` when no pack is pinned."
   @spec configured_pin() :: map() | nil
   def configured_pin do
@@ -123,7 +130,7 @@ defmodule UniversalProxy.MilkDrop.Pack do
       root: Keyword.get_lazy(opts, :root, &MilkDrop.root/0),
       pin: Keyword.get_lazy(opts, :pin, &configured_pin/0),
       req_options: Keyword.get(opts, :req_options, []),
-      task_supervisor: Keyword.get(opts, :task_supervisor, UniversalProxy.TaskSupervisor),
+      task_supervisor: Keyword.get(opts, :task_supervisor, @task_supervisor),
       pubsub: Keyword.get(opts, :pubsub, UniversalProxy.PubSub),
       status: :absent,
       task: nil

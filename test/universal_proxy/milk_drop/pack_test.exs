@@ -42,8 +42,15 @@ defmodule UniversalProxy.MilkDrop.PackTest do
     do: Map.merge(%{version: @version, url: @url, sha256: sha256(body)}, overrides)
 
   defp start_pack(root, pin) do
+    tasks = start_supervised!(Task.Supervisor)
+
     start_supervised!(
-      {Pack, name: nil, root: root, pin: pin, req_options: [plug: {Req.Test, @stub}]}
+      {Pack,
+       name: nil,
+       root: root,
+       pin: pin,
+       task_supervisor: tasks,
+       req_options: [plug: {Req.Test, @stub}]}
     )
   end
 

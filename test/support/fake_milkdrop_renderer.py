@@ -15,6 +15,7 @@ only what the tests drive.
     {"cmd":"emit","line":"<raw>"} → <raw> verbatim on its own line
     {"cmd":"crash","status":N}    → exit N, no event
     {"cmd":"ignore_eof"}          → on stdin EOF, hang instead of exiting
+    {"cmd":"stall"}               → stop reading stdin (hang forever)
 
 Every stdin line is appended to <skip-file>.cmds, so tests can check what
 was written. On stdin EOF it writes <skip-file>.eof and exits 0, as the
@@ -89,6 +90,9 @@ def main():
             sys.exit(int(cmd["status"]))
         elif name == "ignore_eof":
             ignore_eof = True
+        elif name == "stall":
+            while True:
+                time.sleep(1)
 
 
 if __name__ == "__main__":

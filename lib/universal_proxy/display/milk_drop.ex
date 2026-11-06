@@ -7,11 +7,18 @@ defmodule UniversalProxy.Display.MilkDrop do
   `start/1`. It is not supervised: the owner monitors it and gets every
   renderer event as `{:milkdrop, pid, event}` and the binary's exit as
   `{:milkdrop_exit, pid, status}`, after which this process stops. If the
-  owner dies, the port is closed (the renderer sees EOF on stdin) and this
-  process stops.
+  owner dies (linked or not), this process stops and its port closes (the
+  renderer sees EOF on stdin).
 
-  All commands are casts: a wedged renderer can block this process on port
-  I/O, never its owner.
+  All commands are casts and are written without blocking: a renderer that
+  stops reading stdin (its pipe and the port queue full) is reported as
+  `{:milkdrop_exit, pid, :wedged}` and this process stops with
+  `{:shutdown, :wedged}`.
+
+  However this process ends — stopped, its owner gone, crashed or killed —
+  a reaper task under `UniversalProxy.TaskSupervisor` that monitors it
+  SIGKILLs a renderer still running `:kill_grace_ms` later: one that
+  ignores EOF or has stopped reading would otherwise keep DRM master.
 
   ## Options
 
@@ -244,20 +251,24 @@ defmodule UniversalProxy.Display.MilkDrop do
 
     binary = Keyword.get_lazy(opts, :binary, &default_binary/0)
 
+    kill_grace_ms = Keyword.get(opts, :kill_grace_ms, @kill_grace_ms)
+
     with :ok <- validate(config),
          :ok <- write_skip_file(config.skip_file, skipped),
-         {:ok, port} <- open_port(binary, args(config)) do
+         {:ok, port} <- open_port(binary, args(config)),
+         os_pid = os_pid(port),
+         {:ok, reaper} <- start_reaper(os_pid, kill_grace_ms) do
       {:ok,
        %{
          owner: owner,
          owner_ref: Process.monitor(owner),
          port: port,
-         os_pid: os_pid(port),
+         os_pid: os_pid,
+         reaper: reaper,
          store: store,
          version: version,
          locked: Map.get(settings, :locked),
          skip_file: config.skip_file,
-         kill_grace_ms: Keyword.get(opts, :kill_grace_ms, @kill_grace_ms),
          discarding: false
        }}
     else
@@ -269,9 +280,16 @@ defmodule UniversalProxy.Display.MilkDrop do
   end
 
   @impl true
+  # `:nosuspend`: a busy port would otherwise suspend this process, leaving
+  # owner death and `stop/1` unhandled.
   def handle_cast({:command, cmd}, %{port: port} = state) when is_port(port) do
-    Port.command(port, [Jason.encode!(cmd), "\n"])
-    {:noreply, state}
+    if Port.command(port, [Jason.encode!(cmd), "\n"], [:nosuspend]) do
+      {:noreply, state}
+    else
+      Logger.warning("MilkDrop renderer is not reading its commands; stopping it")
+      send(state.owner, {:milkdrop_exit, self(), :wedged})
+      {:stop, {:shutdown, :wedged}, state}
+    end
   rescue
     ArgumentError -> {:noreply, state}
   end
@@ -297,6 +315,7 @@ defmodule UniversalProxy.Display.MilkDrop do
   def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
     level = if status == 0, do: :info, else: :warning
     Logger.log(level, "MilkDrop renderer exited with status #{status}")
+    if state.reaper, do: send(state.reaper, :renderer_exited)
     send(state.owner, {:milkdrop_exit, self(), status})
     {:stop, :normal, %{state | port: nil}}
   end
@@ -307,15 +326,11 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   def handle_info(_msg, state), do: {:noreply, state}
 
+  # The port closes with this process; the reaper handles a renderer that
+  # outlives it. A killed server leaves the skip file for the next start
+  # to overwrite.
   @impl true
-  def terminate(_reason, state) do
-    if is_port(state.port) do
-      safe_port_close(state.port)
-      kill_later(state.os_pid, state.kill_grace_ms)
-    end
-
-    File.rm(state.skip_file)
-  end
+  def terminate(_reason, state), do: File.rm(state.skip_file)
 
   # -- Private --
 
@@ -353,11 +368,16 @@ defmodule UniversalProxy.Display.MilkDrop do
        when is_binary(file) and is_boolean(locked?) do
     locked = if locked?, do: file, else: nil
 
-    if locked != state.locked do
-      _ = Store.update(state.store, %{locked: locked})
+    with true <- locked != state.locked,
+         {:ok, _settings} <- Store.update(state.store, %{locked: locked}) do
       %{state | locked: locked}
     else
-      state
+      false ->
+        state
+
+      {:error, reason} ->
+        Logger.warning("MilkDrop: could not save the preset lock: #{inspect(reason)}")
+        state
     end
   end
 
@@ -424,32 +444,41 @@ defmodule UniversalProxy.Display.MilkDrop do
     end
   end
 
-  defp safe_port_close(port) do
-    Port.close(port)
-  rescue
-    ArgumentError -> :ok
+  # A process outside this server, so it runs however the server ends (a
+  # `:kill` included). Closing the port only closes the renderer's stdin;
+  # one that does not exit on EOF would keep DRM master, so it is SIGKILLed
+  # after a grace period if its pid is still alive. `:renderer_exited`
+  # (sent before the server stops) means there is nothing to kill.
+  defp start_reaper(nil, _grace_ms), do: {:ok, nil}
+
+  defp start_reaper(os_pid, grace_ms) do
+    server = self()
+
+    case Task.Supervisor.start_child(UniversalProxy.TaskSupervisor, fn ->
+           reap(Process.monitor(server), os_pid, grace_ms)
+         end) do
+      {:ok, pid} -> {:ok, pid}
+      {:error, reason} -> {:error, {:reaper, reason}}
+    end
+  catch
+    :exit, reason -> {:error, {:reaper, reason}}
   end
 
-  # Closing the port only closes the renderer's stdin. One that does not
-  # exit on EOF would keep DRM master, so it is SIGKILLed after a grace
-  # period if its pid is still alive.
-  defp kill_later(nil, _grace_ms), do: :ok
+  defp reap(ref, os_pid, grace_ms) do
+    receive do
+      :renderer_exited ->
+        :ok
 
-  defp kill_later(os_pid, grace_ms) do
-    Task.Supervisor.start_child(UniversalProxy.TaskSupervisor, fn ->
-      Process.sleep(grace_ms)
+      {:DOWN, ^ref, :process, _pid, _reason} ->
+        Process.sleep(grace_ms)
 
-      if File.exists?("/proc/#{os_pid}") do
-        Logger.warning("MilkDrop renderer #{os_pid} ignored stdin EOF; killing it")
-        # `os_pid` is the integer from Port.info/2; nothing user-controlled
-        # reaches the shell.
-        # credo:disable-for-next-line Credo.Check.Warning.UnsafeExec
-        _ = :os.cmd(~c"kill -9 #{os_pid} 2>/dev/null")
-      end
-    end)
-
-    :ok
-  catch
-    :exit, _ -> :ok
+        if File.exists?("/proc/#{os_pid}") do
+          Logger.warning("MilkDrop renderer #{os_pid} outlived its port; killing it")
+          # `os_pid` is the integer from Port.info/2; nothing user-controlled
+          # reaches the shell.
+          # credo:disable-for-next-line Credo.Check.Warning.UnsafeExec
+          _ = :os.cmd(~c"kill -9 #{os_pid} 2>/dev/null")
+        end
+    end
   end
 end

@@ -297,6 +297,85 @@ defmodule UniversalProxy.Display.MilkDropTest do
   end
 
   @tag capture_log: true
+  test "a linked owner's death still kills a renderer that ignores EOF", ctx do
+    test_pid = self()
+
+    owner =
+      spawn(fn ->
+        {:ok, pid} = MilkDrop.start_link(renderer_opts(ctx, kill_grace_ms: 100))
+        send(test_pid, {:started, pid})
+        forward(test_pid)
+      end)
+
+    assert_receive {:started, pid}, @timeout
+    assert_receive {:owner_got, {:milkdrop, ^pid, %{event: :prepared}}}, @timeout
+    os_pid = ignore_eof(ctx, pid)
+    ref = Process.monitor(pid)
+
+    Process.exit(owner, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^pid, _}, @timeout
+    wait_until(fn -> not File.exists?("/proc/#{os_pid}") end)
+    refute File.exists?(ctx.skip_file <> ".eof")
+  end
+
+  @tag capture_log: true
+  test "a killed server still kills a renderer that ignores EOF", ctx do
+    owner = forwarding_owner()
+    {:ok, pid} = start_with_owner(ctx, owner, kill_grace_ms: 100)
+    assert_receive {:owner_got, {:milkdrop, ^pid, %{event: :prepared}}}, @timeout
+    os_pid = ignore_eof(ctx, pid)
+
+    Process.exit(pid, :kill)
+    wait_until(fn -> not File.exists?("/proc/#{os_pid}") end)
+    refute File.exists?(ctx.skip_file <> ".eof")
+  end
+
+  @tag capture_log: true
+  test "a renderer that stops reading stdin is reported wedged and killed", ctx do
+    {pid, _} = start_renderer(ctx, kill_grace_ms: 100)
+    %{os_pid: os_pid} = :sys.get_state(pid)
+    # Unblocks a suspended server if the stdin-busy handling regresses.
+    on_exit(fn ->
+      System.cmd("kill", ["-9", Integer.to_string(os_pid)], stderr_to_stdout: true)
+    end)
+
+    ref = Process.monitor(pid)
+
+    MilkDrop.command(pid, %{cmd: "stall"})
+    wait_until(fn -> cmd_lines(ctx) == [%{"cmd" => "stall"}] end)
+
+    filler = String.duplicate("x", 4_000)
+    for _ <- 1..200, do: MilkDrop.command(pid, %{cmd: "pad", pad: filler})
+
+    assert_receive {:milkdrop_exit, ^pid, :wedged}, @timeout
+    assert_receive {:DOWN, ^ref, :process, ^pid, {:shutdown, :wedged}}, @timeout
+    wait_until(fn -> not File.exists?("/proc/#{os_pid}") end)
+  end
+
+  @tag capture_log: true
+  test "a lock the Store failed to save is retried on the next preset event", ctx do
+    store_opts = [
+      name: :milkdrop_display_lock_store,
+      table: :milkdrop_display_lock_test,
+      dets_path: Path.join(ctx.tmp_dir, "lock.dets")
+    ]
+
+    start_supervised!({Store, store_opts}, id: :lock_store)
+
+    {pid, _} =
+      start_renderer(ctx, store: :milkdrop_display_lock_store, settings: Store.defaults())
+
+    :ok = stop_supervised(:lock_store)
+    emit(pid, ~s({"event":"preset","file":"a.milk","locked":true}))
+    assert_receive {:milkdrop, ^pid, %{event: :preset, locked: true}}, @timeout
+
+    start_supervised!({Store, store_opts}, id: :lock_store)
+    emit(pid, ~s({"event":"preset","file":"a.milk","locked":true}))
+    assert_receive {:milkdrop, ^pid, %{event: :preset, locked: true}}, @timeout
+    assert Store.settings(:milkdrop_display_lock_store).locked == "a.milk"
+  end
+
+  @tag capture_log: true
   test "refuses to start without a binary or with a bad mode/ladder", ctx do
     base = [
       mode: @mode,
@@ -335,17 +414,24 @@ defmodule UniversalProxy.Display.MilkDropTest do
     forward(test_pid)
   end
 
-  defp start_with_owner(ctx, owner, opts \\ []) do
-    MilkDrop.start(
-      [
-        owner: owner,
-        mode: @mode,
-        pack_dir: ctx.pack_dir,
-        pack_version: @version,
-        store: ctx.store,
-        skip_file: ctx.skip_file,
-        binary: @fake_binary
-      ] ++ opts
-    )
+  defp start_with_owner(ctx, owner, opts \\ []),
+    do: MilkDrop.start(renderer_opts(ctx, [owner: owner] ++ opts))
+
+  defp renderer_opts(ctx, opts) do
+    [
+      mode: @mode,
+      pack_dir: ctx.pack_dir,
+      pack_version: @version,
+      store: ctx.store,
+      skip_file: ctx.skip_file,
+      binary: @fake_binary
+    ] ++ opts
+  end
+
+  defp ignore_eof(ctx, pid) do
+    %{os_pid: os_pid} = :sys.get_state(pid)
+    MilkDrop.command(pid, %{cmd: "ignore_eof"})
+    wait_until(fn -> cmd_lines(ctx) == [%{"cmd" => "ignore_eof"}] end)
+    os_pid
   end
 end
