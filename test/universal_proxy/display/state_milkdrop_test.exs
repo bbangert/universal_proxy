@@ -240,6 +240,21 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     end
   end
 
+  defp cmds(skip_file) do
+    case File.read(skip_file <> ".cmds") do
+      {:ok, body} -> body |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
+      {:error, _} -> []
+    end
+  end
+
+  defp settings_changed(ctx, changes) do
+    Phoenix.PubSub.broadcast(
+      ctx.pubsub,
+      UniversalProxy.MilkDrop.settings_topic(),
+      {:milkdrop_settings, Map.merge(Store.defaults(), changes)}
+    )
+  end
+
   defp texts({:text, _attrs, s}), do: [s]
 
   defp texts({_tag, _attrs, children}) when is_list(children),
@@ -326,6 +341,35 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     assert List.last(cmd_names(ctx.skip_file)) == "exit"
     assert %{last: %{outcome: :requested, phase: :exiting}, failures: 0} = md(ctx)
     assert %{lifecycle: %{status: :running}} = status(ctx)
+  end
+
+  test "a settings change reaches the presenting renderer at once", ctx do
+    ctx = ctx |> start_ui() |> presenting()
+
+    settings_changed(ctx, %{rotate_s: 45, include_high_frequency: true})
+
+    wait_until(fn ->
+      Enum.take(cmds(ctx.skip_file), -2) == [
+        %{"cmd" => "set_rotate", "value" => 45},
+        %{"cmd" => "set_high_frequency", "value" => true}
+      ]
+    end)
+
+    # Turning fast-flashing presets off again applies just as fast.
+    settings_changed(ctx, %{rotate_s: 45, include_high_frequency: false})
+
+    wait_until(fn ->
+      List.last(cmds(ctx.skip_file)) == %{"cmd" => "set_high_frequency", "value" => false}
+    end)
+  end
+
+  test "settings changed before a session aren't sent: the renderer reads them at start", ctx do
+    ctx = start_ui(ctx)
+    settings_changed(ctx, %{include_high_frequency: true})
+    _ = :sys.get_state(ctx.state)
+
+    ctx = presenting(ctx)
+    refute Enum.any?(cmd_names(ctx.skip_file), &(&1 in ["set_rotate", "set_high_frequency"]))
   end
 
   test "a viewport that fails to start after the release gets the renderer's exit only once it runs",

@@ -33,8 +33,8 @@ defmodule UniversalProxyWeb.MilkDropComponent do
   forwards each message as `send_update(__MODULE__, id: id, event: message)`.
   Initial state is read in `mount/1`.
 
-  Settings reach a running renderer through whoever owns the session
-  (`UniversalProxy.Display.State`); this component only writes the Store.
+  This component only writes the Store: `UniversalProxy.Display.State`
+  forwards its broadcasts to a running renderer.
   """
 
   use UniversalProxyWeb, :live_component
