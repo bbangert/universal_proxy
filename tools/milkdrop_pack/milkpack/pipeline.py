@@ -13,7 +13,7 @@ from . import brightness, manifest, names, presets, sources, sweep as sweep_mod,
 from .sources import PipelineError
 
 YYYYMMN_RE = re.compile(r"\A\d{4}\.\d{2}\.\d+\Z")
-CONTACT_PLACEHOLDER = "[removal-request contact to be filled in before publishing]"
+DEFAULT_CONTACT = "open an issue at https://github.com/bbangert/up-milkdrop-pack/issues"
 
 
 class Report:
@@ -321,9 +321,7 @@ def build(args):
                 trial=sum(1 for p in staged if p in trial))
 
     # README / NOTICE.
-    contact = args.contact or CONTACT_PLACEHOLDER
-    if contact == CONTACT_PLACEHOLDER:
-        report.notes.append("NOTICE has the removal-request contact placeholder: pass --contact before publishing")
+    contact = args.contact or DEFAULT_CONTACT
     values = {
         "VERSION": version, "PRESETS": len(staged),
         "HIGH_FREQUENCY": checked["high_frequency"],

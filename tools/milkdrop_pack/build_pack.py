@@ -27,7 +27,8 @@ def main(argv=None):
     p.add_argument("--device-sweep", help="rpi3 sweep file from device_sweep.py (JSON Lines)")
     p.add_argument("--vc4-trial", help="shader-trial CSV with gpu_ms_warp_comp (rpi3.frame_ms)")
     p.add_argument("--default-rung", default=manifest.DEFAULT_RUNG, help="rpi3 rung for unswept presets")
-    p.add_argument("--contact", help="removal-request contact for NOTICE")
+    p.add_argument("--contact", default=pipeline.DEFAULT_CONTACT,
+                   help="how to request a removal, for NOTICE (default: %(default)r)")
     p.add_argument("--jobs", type=int, help="parallel brightness renders (default: CPUs / 2)")
     p.add_argument("--skip-brightness", action="store_true", help="skip the brightness screen (dev builds only)")
     p.add_argument("--no-snapshots", action="store_true", help="don't write review PNGs")

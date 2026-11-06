@@ -105,6 +105,14 @@ class TemplatesTest(unittest.TestCase):
         self.assertIn("@BANNED_TEXTURES@", notice)
         self.assertIn("@CONTACT@", notice)
 
+    def test_removal_requests_go_to_the_issue_tracker(self):
+        self.assertEqual(pipeline.DEFAULT_CONTACT,
+                         "open an issue at https://github.com/bbangert/up-milkdrop-pack/issues")
+        self.assertNotIn("@", pipeline.DEFAULT_CONTACT)
+        with open(os.path.join(sources.TOOL_DIR, "templates", "NOTICE.in")) as f:
+            notice = f.read()
+        self.assertIn("To have a preset or texture removed, @CONTACT@", notice)
+
 
 class PinsTest(unittest.TestCase):
     def test_projectm_pin_is_the_renderers(self):

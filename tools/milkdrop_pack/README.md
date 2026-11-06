@@ -28,7 +28,7 @@ compiler and Mesa with EGL (llvmpipe; no GPU needed).
 ```sh
 tools/milkdrop_pack/build_pack.py --zip ~/favorite_presets_2021_01_03.zip \
     --out /tmp/milkdrop-pack --version 2026.11.1 \
-    [--device-sweep sweep.jsonl] [--vc4-trial shader-trial-vc4.csv] [--contact '<removal-request contact>']
+    [--device-sweep sweep.jsonl] [--vc4-trial shader-trial-vc4.csv]
 ```
 
 Output in `--out`: the tarball, `<tarball>.sha256`, `report.json` (counts per
@@ -73,7 +73,8 @@ builds and the brightness cache, so a rerun only renders changed presets.
    `c_src/milkdrop_renderer`): no entry may be dropped or missing.
 9. `README` and `NOTICE` from `templates/` (origin, "presumed public
    domain, removed on request", texture provenance, banned textures, the
-   pins, every exclusion, the removal-request contact — `--contact`).
+   pins, every exclusion, how to request a removal: by default "open an issue at
+   https://github.com/bbangert/up-milkdrop-pack/issues", `--contact` to change it).
 10. A reproducible tarball (sorted, mtime 0, root-owned, gzip without a
     timestamp): `manifest.json` at the root, only regular files and
     directories with safe relative paths (what `MilkDrop.Pack` accepts),
