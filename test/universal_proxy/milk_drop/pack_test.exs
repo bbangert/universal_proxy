@@ -381,6 +381,8 @@ defmodule UniversalProxy.MilkDrop.PackTest do
     end
 
     old = pack.()
+    # The first Pack's own announcement, so the one below is the replacement's.
+    assert_receive {:milkdrop_pack_started, :absent}, 5_000
 
     assert {:downloading, 0} = Pack.ensure(old)
     assert_receive {:request, handler}
