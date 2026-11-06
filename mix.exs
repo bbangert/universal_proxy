@@ -27,12 +27,12 @@ defmodule UniversalProxy.MixProject do
       elixir: "~> 1.20",
       elixirc_paths: elixirc_paths(Mix.env()),
       archives: [nerves_bootstrap: "~> 1.14"],
-      # :sendspin_player runs BEFORE :app so the freshly built C++ binary
-      # is in priv/ when :app finalises the application bundle. In dev/test
-      # priv is a symlink (writes flow through regardless of order), but
-      # release tooling that snapshots priv at the :app step would otherwise
-      # miss it on a first compile.
-      compilers: (Mix.compilers() -- [:app]) ++ [:sendspin_player, :app],
+      # :sendspin_player and :milkdrop_renderer run BEFORE :app so the
+      # freshly built C++ binaries are in priv/ when :app finalises the
+      # application bundle. In dev/test priv is a symlink (writes flow
+      # through regardless of order), but release tooling that snapshots
+      # priv at the :app step would otherwise miss them on a first compile.
+      compilers: (Mix.compilers() -- [:app]) ++ [:sendspin_player, :milkdrop_renderer, :app],
       listeners: listeners(Mix.target(), Mix.env()),
       start_permanent: Mix.env() == :prod,
       deps: deps(),
