@@ -16,15 +16,16 @@ import json
 import os
 import subprocess
 
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 
 
 def classify(result, exclude_above, review_above, exclude_min_luma=0.0):
-    """'exclude' | 'review' | 'ok' | 'load_failed' | 'error' for one
-    md_bright result. With exclude_min_luma, a saturated but dark picture
-    (pure colour rather than white) is only reviewed, not excluded."""
-    if result and result.get("error") == "load_failed":
-        return "load_failed"
+    """'exclude' | 'review' | 'ok' | 'load_failed' | 'shader_failed' |
+    'error' for one md_bright result. With exclude_min_luma, a saturated but
+    dark picture (pure colour rather than white) is only reviewed, not
+    excluded."""
+    if result and result.get("error") in ("load_failed", "shader_failed"):
+        return result["error"]
     if not measured(result):
         return "error"
     if result["sat"] > exclude_above and result["luma"] >= exclude_min_luma:
@@ -37,15 +38,19 @@ def classify(result, exclude_above, review_above, exclude_min_luma=0.0):
 
 
 def measured(result):
-    """A clean measurement: brightness metrics and no GL error."""
+    """A clean measurement: brightness metrics of the preset's own shaders
+    (no fallback) and no GL error."""
     return (isinstance(result, dict) and "error" not in result and not result.get("gl_error")
+            and result.get("load_status", 0) == 0
             and all(isinstance(result.get(k), (int, float)) and not isinstance(result.get(k), bool)
                     for k in ("sat", "luma")))
 
 
 def cacheable(result):
     """Only measurements and the deterministic load failure are cached; a
-    timeout, crash or GL failure is rendered again next time."""
+    timeout, crash or GL failure is rendered again next time, and so is a
+    shader failure (it depends on the host's Mesa, which the cache key
+    doesn't cover; md_bright stops before drawing, so it's cheap)."""
     return measured(result) or (isinstance(result, dict) and result.get("error") == "load_failed")
 
 
@@ -130,9 +135,13 @@ def render(tools, preset_path, texture_dir, settings, extra=(), timeout=900):
                 break
             except ValueError:
                 continue
-    # md_bright exits 1 after printing load_failed; that one is a verdict.
+    # md_bright exits 1 after printing load_failed or shader_failed; those
+    # are verdicts.
     if isinstance(result, dict) and result.get("error") == "load_failed":
         return {"error": "load_failed", "message": result.get("message", "")}
+    if isinstance(result, dict) and result.get("error") == "shader_failed":
+        return {"error": "shader_failed", "load_status": result.get("load_status"), "stage": result.get("stage"),
+                "message": result.get("message", "")}
     if proc.returncode != 0 or not isinstance(result, dict):
         return {"error": f"exit {proc.returncode}", "stderr": proc.stderr[-300:]}
     if result.get("gl_error"):

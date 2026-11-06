@@ -53,6 +53,11 @@ class ClassifyTest(unittest.TestCase):
     def test_unloadable_presets_are_flagged(self):
         self.assertEqual(self.verdict({"error": "load_failed", "message": "syntax error"}), "load_failed")
 
+    def test_shader_fallbacks_are_flagged_not_measured(self):
+        self.assertEqual(self.verdict({"error": "shader_failed", "load_status": 2, "message": "x"}), "shader_failed")
+        # A measurement of projectM's fallback shaders is not the preset's.
+        self.assertEqual(self.verdict({"sat": 0.1, "luma": 50.0, "load_status": 2, "gl_error": 0}), "error")
+
     def test_failures_are_errors_not_exclusions(self):
         self.assertEqual(self.verdict({"error": "timeout"}), "error")
         self.assertEqual(self.verdict(None), "error")
@@ -100,16 +105,26 @@ class RenderTest(unittest.TestCase):
         result = self.render({"print": {"error": "load_failed", "message": "syntax"}, "exit": 1})
         self.assertEqual(result, {"error": "load_failed", "message": "syntax"})
 
+    def test_shader_failed_survives_its_exit_status(self):
+        out = {"error": "shader_failed", "load_status": 2, "stage": 1, "message": "array index must be < 4"}
+        self.assertEqual(self.render({"print": out, "exit": 1}), out)
+        self.assertEqual(brightness.classify(self.render({"print": out, "exit": 1}), 0.9, 0.5), "shader_failed")
+        # Any other non-OK load status is a render error, not a verdict.
+        other = self.render({"print": {"error": "load_status", "load_status": -1}, "exit": 1})
+        self.assertEqual(brightness.classify(other, 0.9, 0.5), "error")
+
     def test_screen_caches_only_measurements_and_load_failures(self):
         pack = os.path.join(self.dir, "pack")
         specs = {"good.milk": {"print": GOOD}, "gl.milk": {"print": {**GOOD, "gl_error": 1282}},
-                 "crash.milk": {"exit": 1}, "bad.milk": {"print": {"error": "load_failed"}, "exit": 1}}
+                 "crash.milk": {"exit": 1}, "bad.milk": {"print": {"error": "load_failed"}, "exit": 1},
+                 "shader.milk": {"print": {"error": "shader_failed", "load_status": 2}, "exit": 1}}
         for pid, spec in specs.items():
             write(os.path.join(pack, "presets", pid), json.dumps(spec))
         cache = os.path.join(self.dir, "cache.jsonl")
         results = brightness.screen(self.tools, pack, sorted(specs), self.settings, cache, 2, "t")
         self.assertEqual(results["good.milk"], GOOD)
         self.assertEqual((results["gl.milk"]["error"], results["crash.milk"]["error"]), ("gl_error", "exit 1"))
+        self.assertEqual(results["shader.milk"]["error"], "shader_failed")
         with open(cache) as f:
             self.assertEqual(sorted(json.loads(line)["id"] for line in f), ["bad.milk", "good.milk"])
 

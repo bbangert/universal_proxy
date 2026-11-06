@@ -95,10 +95,12 @@ class StepsTest(unittest.TestCase):
     def test_apply_screen_records_verdicts(self):
         cfg = {"exclude_sat_above": 0.9, "review_sat_above": 0.5, "exclude_min_luma": 200}
         bright = {"white.milk": {"sat": 0.99, "luma": 250.0}, "red.milk": {"sat": 0.97, "luma": 120.0},
-                  "bad.milk": {"error": "load_failed", "message": "syntax"}, "ok.milk": {"sat": 0.1, "luma": 50.0}}
+                  "bad.milk": {"error": "load_failed", "message": "syntax"}, "ok.milk": {"sat": 0.1, "luma": 50.0},
+                  "fallback.milk": {"error": "shader_failed", "load_status": 2, "message": "array index"}}
         report = Quiet()
-        too_bright, load_failed = pipeline.apply_screen(dict.fromkeys(bright, b""), bright, cfg, report)
-        self.assertEqual((too_bright, load_failed), (["white.milk"], ["bad.milk"]))
+        verdicts = pipeline.apply_screen(dict.fromkeys(bright, b""), bright, cfg, report)
+        self.assertEqual(verdicts, (["white.milk"], ["bad.milk"], ["fallback.milk"]))
+        self.assertIn({"file": "fallback.milk", "reason": "shader_failed", "detail": "array index"}, report.excluded)
         self.assertEqual([e["file"] for e in report.review], ["red.milk"])
 
     def test_apply_screen_fails_on_missing_or_failed_renders(self):

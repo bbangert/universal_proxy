@@ -122,7 +122,8 @@ def texture_policy(staged, available, curation, report):
 
 
 def apply_screen(staged, bright, cfg, report):
-    """Record the brightness verdicts; return (too_bright, load_failed) ids.
+    """Record the brightness verdicts; return the (too_bright, load_failed,
+    shader_failed) ids.
     Every staged preset needs a verdict: a missing result or a render
     error (timeout, crash, GL failure) fails the build, and a rerun renders
     just those again (successes are cached)."""
@@ -135,13 +136,16 @@ def apply_screen(staged, bright, cfg, report):
     load_failed = sorted(p for p, v in verdicts.items() if v == "load_failed")
     for pid in load_failed:
         report.exclude(pid, "load_failed", bright[pid].get("message", ""))
+    shader_failed = sorted(p for p, v in verdicts.items() if v == "shader_failed")
+    for pid in shader_failed:
+        report.exclude(pid, "shader_failed", bright[pid].get("message", ""))
     too_bright = sorted(p for p, v in verdicts.items() if v == "exclude")
     for pid in too_bright:
         r = bright[pid]
         report.exclude(pid, "too_bright", f"sat {r['sat']:.3f}, luma {r['luma']:.1f}")
     report.review = sorted(({"file": p, "sat": round(bright[p]["sat"], 4), "luma": round(bright[p]["luma"], 1)}
                             for p, v in verdicts.items() if v == "review"), key=lambda e: (-e["sat"], e["file"]))
-    return too_bright, load_failed
+    return too_bright, load_failed, shader_failed
 
 
 def write_presets(staged, pack_dir):
@@ -183,6 +187,7 @@ def exclusion_text(report):
         "translate_failed": "a shader doesn't translate to GLSL ES 1.00",
         "too_bright": "whiteout in the brightness screen",
         "load_failed": "projectM can't load the preset (expression syntax)",
+        "shader_failed": "a shader doesn't compile or link (projectM would show its default shaders)",
         "curated": "excluded by hand",
         "duplicate": "byte-identical duplicate after name normalisation",
         "invalid_name": "no valid file name after normalisation",
@@ -293,13 +298,14 @@ def build(args):
 
         bright = brightness.screen(host, pack, sorted(staged), settings, os.path.join(work, "brightness-cache.jsonl"),
                                    jobs, tool_id, progress)
-        too_bright, load_failed = apply_screen(staged, bright, bright_cfg, report)
+        too_bright, load_failed, shader_failed = apply_screen(staged, bright, bright_cfg, report)
         if not args.no_snapshots:
             shutil.rmtree(os.path.join(out, "review"), ignore_errors=True)
             brightness.snapshots(host, pack, too_bright + [e["file"] for e in report.review], settings,
                                  os.path.join(out, "review"), jobs=jobs)
-        remove_presets(staged, too_bright + load_failed, pack)
+        remove_presets(staged, too_bright + load_failed + shader_failed, pack)
         report.step("brightness", presets=len(staged), too_bright=len(too_bright), load_failed=len(load_failed),
+                    shader_failed=len(shader_failed),
                     review=len(report.review))
     else:
         report.notes.append("brightness screen skipped (--skip-brightness)")

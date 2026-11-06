@@ -15,7 +15,10 @@
 // with any channel >= 250, both over frames --from..--frames. --png-at
 // writes <prefix>.<N>.png snapshots; --tsv the per-frame values.
 // Exits 0 on success, 2 on usage, 1 if GL or projectM can't start or the
-// preset can't be loaded at all.
+// preset doesn't load as written: it can't be loaded at all
+// ({"error":"load_failed"}) or a shader stage failed and projectM fell back
+// to its default shaders ({"error":"shader_failed"}), which would measure the
+// fallback instead of the preset. Both print one JSON line and draw nothing.
 
 #include <projectM-4/projectM.h>
 
@@ -72,7 +75,8 @@ void log_cb(const char* message, projectm_log_level level, void*) {
 }
 
 struct LoadResult {
-    int status = -1;
+    int status = -1;  // -1: projectM never reported a load result
+    int stage = 0;
     std::string message;
     bool failed = false;
 };
@@ -80,6 +84,7 @@ struct LoadResult {
 void load_result_cb(const projectm_preset_load_result* r, void* user) {
     auto* out = static_cast<LoadResult*>(user);
     out->status = static_cast<int>(r->status);
+    out->stage = static_cast<int>(r->stage);
     out->message = r->message != nullptr ? r->message : "";
 }
 
@@ -226,6 +231,16 @@ int main(int argc, char** argv) {
     projectm_load_preset_file(pm, preset.c_str(), false);
     if (result.failed) {
         std::printf("{\"error\":\"load_failed\",\"message\":\"%s\"}\n", json_escape(result.message).c_str());
+        projectm_destroy(pm);
+        return 1;
+    }
+    if (result.status != PROJECTM_PRESET_LOAD_OK) {
+        const bool shader = result.status == PROJECTM_PRESET_LOAD_TRANSLATE_ERROR ||
+                            result.status == PROJECTM_PRESET_LOAD_COMPILE_ERROR ||
+                            result.status == PROJECTM_PRESET_LOAD_LINK_ERROR;
+        std::printf("{\"error\":\"%s\",\"load_status\":%d,\"stage\":%d,\"message\":\"%s\"}\n",
+                    shader ? "shader_failed" : "load_status", result.status, result.stage,
+                    json_escape(result.message.substr(0, 2000)).c_str());
         projectm_destroy(pm);
         return 1;
     }
