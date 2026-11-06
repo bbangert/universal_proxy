@@ -63,7 +63,8 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
          fn ->
            %{
              pack: Keyword.get(opts, :pack, ready),
-             ensured: Keyword.get(opts, :ensured, Keyword.get(opts, :pack, ready))
+             ensured: Keyword.get(opts, :ensured, Keyword.get(opts, :pack, ready)),
+             viewport_fails: 0
            }
          end}
       )
@@ -115,6 +116,20 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
       if supervised?, do: send(test, {:viewport_renderers, renderer_os_pids(skip_file)})
     end
 
+    # The next `viewport_fails` viewport starts fail (`:always`: all of them).
+    start_error = fn ->
+      Agent.get_and_update(world, fn
+        %{viewport_fails: :always} = w ->
+          {{:error, :no_display}, w}
+
+        %{viewport_fails: n} = w when n > 0 ->
+          {{:error, :no_display}, %{w | viewport_fails: n - 1}}
+
+        w ->
+          {:ok, w}
+      end)
+    end
+
     state_opts = [
       name: name,
       ui: true,
@@ -122,7 +137,7 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
       viewport_supervisor: ctx.sup,
       dri_dir: ctx.dri_dir,
       sysfs_drm_dir: ctx.sysfs_dir,
-      viewport_opts: [test_pid: test, on_start: on_start],
+      viewport_opts: [test_pid: test, on_start: on_start, start_error: start_error],
       view_opts: [bars: 8, drift_period_ms: 1_000_000_000_000],
       model_opts:
         Keyword.merge(
@@ -311,6 +326,59 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     assert List.last(cmd_names(ctx.skip_file)) == "exit"
     assert %{last: %{outcome: :requested, phase: :exiting}, failures: 0} = md(ctx)
     assert %{lifecycle: %{status: :running}} = status(ctx)
+  end
+
+  test "a viewport that fails to start after the release gets the renderer's exit only once it runs",
+       ctx do
+    ctx = ctx |> start_ui(model_opts: [restart_ms: 200]) |> presenting()
+    pid = renderer(ctx)
+    Agent.update(ctx.world, &%{&1 | viewport_fails: 1})
+
+    log =
+      capture_log(fn ->
+        paused(ctx)
+        assert_receive {:viewport_start, cmds}, @timeout
+        assert List.last(cmds) == "release"
+        wait_until(fn -> md(ctx).phase == :recovering end)
+      end)
+
+    assert log =~ "the viewport did not start after MilkDrop released the display"
+    assert %{lifecycle: %{status: :backoff}, viewport: nil} = status(ctx)
+    assert md(ctx).renderer == pid
+    refute "exit" in cmd_names(ctx.skip_file)
+    refute_received {:audio, :pcm_tap, @key, false}
+
+    # The retry runs the viewport; only then does the renderer exit.
+    assert_receive {:viewport_start, cmds}, @timeout
+    assert List.last(cmds) == "release"
+    assert cmd_names(ctx.skip_file) |> Enum.filter(&(&1 in ["take", "exit"])) == ["take"]
+    assert_receive {:audio, :pcm_tap, @key, false}, @timeout
+    wait_until(fn -> md(ctx).phase == nil end)
+    assert List.last(cmd_names(ctx.skip_file)) == "exit"
+    assert %{last: %{outcome: :requested, phase: :exiting}, failures: 0} = md(ctx)
+    assert %{lifecycle: %{status: :running}} = status(ctx)
+  end
+
+  test "a viewport that never comes back after the release ends the session once the recovery budget is spent",
+       ctx do
+    ctx = ctx |> start_ui(timeouts: %{recovering: 300}) |> presenting()
+    %{os_pid: os_pid} = :sys.get_state(renderer(ctx))
+    Agent.update(ctx.world, &%{&1 | viewport_fails: :always})
+
+    log =
+      capture_log(fn ->
+        paused(ctx)
+        wait_until(fn -> md(ctx).phase == :recovering end)
+        refute "exit" in cmd_names(ctx.skip_file)
+        assert_receive {:audio, :pcm_tap, @key, false}, @timeout
+        wait_until(fn -> md(ctx).phase == nil end)
+      end)
+
+    assert log =~ "did not come back within 300 ms of MilkDrop's release"
+    assert Enum.take(cmd_names(ctx.skip_file), -2) == ["release", "exit"]
+    assert %{last: %{outcome: :requested, phase: :exiting}, failures: 0, latch: nil} = md(ctx)
+    assert %{lifecycle: %{status: :backoff}, viewport: nil} = status(ctx)
+    wait_until(fn -> not File.exists?("/proc/#{os_pid}") end)
   end
 
   test "the renderer's argv carries the connector, mode, pack, ring and ladder", ctx do

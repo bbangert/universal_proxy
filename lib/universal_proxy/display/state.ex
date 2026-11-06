@@ -75,10 +75,16 @@ defmodule UniversalProxy.Display.State do
     5. on reclaim, `release`; `:releasing` until `released`, then the
        viewport is started again at once and, once it runs, `exit`;
        `:exiting` until the renderer is gone. The PCM tap goes off again.
+       A viewport that doesn't start (`:backoff`) leaves the released
+       renderer, card open but not master, in `:recovering`: it is never
+       sent `take` again, and gets `exit` once a viewport retry runs or
+       the recovery budget is spent, whichever comes first.
 
   Every phase is bounded (`:milkdrop_timeouts`, ms: tapping 10 000,
-  preparing 20 000, taking 5 000, releasing 3 000, exiting 3 000,
-  reaping 3 000). A timed-out step, a `take` the renderer reports failed,
+  preparing 20 000, taking 5 000, releasing 3 000, recovering 45 000 (the
+  viewport's first five retries, 1 s doubling), exiting 3 000, reaping
+  3 000). A timed-out step (`:recovering` aside), a `take` the renderer
+  reports failed,
   or a renderer that exits or crashes unasked (`{:milkdrop_exit, pid,
   status}`, `:wedged` and `:reaper_down` included) stops it
   (`UniversalProxy.Display.MilkDrop.stop/1`) and, if the viewport had
@@ -153,6 +159,7 @@ defmodule UniversalProxy.Display.State do
     preparing: 20_000,
     taking: 5_000,
     releasing: 3_000,
+    recovering: 45_000,
     exiting: 3_000,
     reaping: 3_000
   }
@@ -469,7 +476,12 @@ defmodule UniversalProxy.Display.State do
 
     # Events the effects produced, after all of this transition's effects.
     {follow_ups, state} = Map.get_and_update(state, :follow_ups, &{&1, []})
-    follow_ups |> Enum.reverse() |> Enum.reduce(state, &dispatch(&2, &1)) |> arm_clock()
+
+    follow_ups
+    |> Enum.reverse()
+    |> Enum.reduce(state, &dispatch(&2, &1))
+    |> exit_recovered()
+    |> arm_clock()
   end
 
   # The screen also changes with time alone (the progress clock): one timer
@@ -828,14 +840,19 @@ defmodule UniversalProxy.Display.State do
     state |> milkdrop_phase(:presenting) |> dispatch({:milkdrop, :presenting})
   end
 
-  # Step 5: the viewport takes the display back, then the renderer exits.
+  # Step 5: the viewport takes the display back, then the renderer exits
+  # (`exit_recovered/1`, once the viewport runs). Until then the renderer
+  # keeps its card open, so the scanout it leaves stays up.
   defp milkdrop_event(%{md: %{phase: :releasing, session: session}} = state, %{event: :released}) do
-    state = dispatch(state, {:milkdrop, :released})
+    state = state |> milkdrop_phase(:recovering) |> dispatch({:milkdrop, :released})
 
     case state.md do
-      %{session: ^session, phase: :releasing, pid: pid} ->
-        :ok = Display.MilkDrop.exit(pid)
-        milkdrop_phase(state, :exiting)
+      %{session: ^session, phase: :recovering} ->
+        Logger.warning(
+          "[Display] the viewport did not start after MilkDrop released the display; keeping the renderer up to #{state.md_timeouts.recovering} ms for a retry"
+        )
+
+        state
 
       _other ->
         state
@@ -916,9 +933,27 @@ defmodule UniversalProxy.Display.State do
 
   defp milkdrop_cmd(state, _cmd), do: state
 
+  defp exit_recovered(
+         %{md: %{phase: :recovering, pid: pid}, model: %{viewport: %{status: :running}}} = state
+       ) do
+    :ok = Display.MilkDrop.exit(pid)
+    milkdrop_phase(state, :exiting)
+  end
+
+  defp exit_recovered(state), do: state
+
   defp milkdrop_timeout(state, :tapping) do
     Logger.warning("[Display] MilkDrop: no PCM tap ring in time; the visuals get silence")
     start_milkdrop(state, nil)
+  end
+
+  defp milkdrop_timeout(state, :recovering) do
+    Logger.warning(
+      "[Display] the viewport did not come back within #{state.md_timeouts.recovering} ms of MilkDrop's release; letting the renderer exit"
+    )
+
+    :ok = Display.MilkDrop.exit(state.md.pid)
+    milkdrop_phase(state, :exiting)
   end
 
   defp milkdrop_timeout(state, :exiting) do
