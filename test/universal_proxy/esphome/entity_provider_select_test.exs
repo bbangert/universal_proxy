@@ -65,6 +65,17 @@ defmodule UniversalProxy.ESPHome.EntityProviderSelectTest do
       assert ad.options == Mode.options()
     end
 
+    test "offers \"MilkDrop\" only where MilkDrop is enabled (never on the host)" do
+      ad =
+        EP.specs() |> EP.advertisements(false, true) |> Enum.find(&(&1.object_id == @object_id))
+
+      refute UniversalProxy.MilkDrop.enabled?()
+      refute "MilkDrop" in ad.options
+      assert ad.options == Mode.options(false)
+
+      assert Mode.options(true) -- ["MilkDrop"] == ad.options
+    end
+
     test "is not a privileged entity" do
       assert EP.privileged_object_id(%Proto.SelectCommandRequest{key: key(), state: "Off"}) ==
                nil
@@ -177,7 +188,7 @@ defmodule UniversalProxy.ESPHome.EntityProviderSelectTest do
     test "an option outside the frozen list is rejected", ctx do
       pid = start_provider(ctx)
 
-      for bad <- ["visualizer", "Off ", "", "Party"] do
+      for bad <- ["visualizer", "Off ", "", "Party", "MilkDrop"] do
         command(pid, bad)
       end
 

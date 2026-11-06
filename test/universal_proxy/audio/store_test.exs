@@ -136,6 +136,12 @@ defmodule UniversalProxy.Audio.StoreTest do
       assert {:ok, %{display_mode: "Party QR"}} = Store.get_config(server, @key)
     end
 
+    test "display_mode refuses \"MilkDrop\" while MilkDrop is disabled", %{server: server} do
+      refute UniversalProxy.MilkDrop.enabled?()
+      :ok = Store.save_config(server, @key, %{display_mode: "MilkDrop"})
+      assert {:ok, %{display_mode: nil}} = Store.get_config(server, @key)
+    end
+
     test "round-trips and clamps static_delay_ms (0..5000)", %{server: server} do
       :ok = Store.save_config(server, @key, %{static_delay_ms: 250})
       assert {:ok, %{static_delay_ms: 250}} = Store.get_config(server, @key)
