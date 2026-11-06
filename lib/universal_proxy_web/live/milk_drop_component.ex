@@ -268,15 +268,16 @@ defmodule UniversalProxyWeb.MilkDropComponent do
           </.button>
         </div>
 
-        <%!-- Rotation interval --%>
-        <div class="flex items-center gap-3 pt-3 pr-5 pb-3 pl-[22px] border-t border-border-2 bg-sunken">
+        <%!-- Rotation interval: on the surface, like the volume row, so the
+             slider's unfilled (sunken) track stays visible --%>
+        <div class="flex items-center gap-3 pt-1 pr-5 pb-4 pl-[22px]">
           <label for={"#{@id}-rotate"} class="text-sm text-fg-2 flex-none">Change preset every</label>
           <form
             id={"#{@id}-rotate-form"}
             phx-change="set_rotate"
             phx-submit="set_rotate"
             phx-target={@myself}
-            class="flex-1 min-w-0 flex items-center gap-3"
+            class="flex-1 min-w-0"
           >
             <input
               type="range"
@@ -287,7 +288,7 @@ defmodule UniversalProxyWeb.MilkDropComponent do
               step="5"
               value={@settings.rotate_s}
               phx-debounce="300"
-              class="audio-volume flex-1 min-w-0"
+              class="audio-volume"
               style={"--vol: #{rotate_pct(@settings.rotate_s)};"}
               aria-valuetext={"#{@settings.rotate_s} seconds"}
             />
@@ -335,7 +336,7 @@ defmodule UniversalProxyWeb.MilkDropComponent do
                 stroke={2.2}
                 class={"transition-transform #{if @skipped_open, do: "rotate-180", else: ""}"}
               />
-              <span id={"#{@id}-skipped-count"}>{skipped_label(length(@skipped_list))}</span>
+              <span id={"#{@id}-skipped-count"} class="whitespace-nowrap">{skipped_label(length(@skipped_list))}</span>
             </button>
             <div class="flex-1"></div>
             <.button
