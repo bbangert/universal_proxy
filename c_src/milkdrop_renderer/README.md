@@ -13,14 +13,16 @@ path). The host builds only the GL-free core and its unit tests.
 ## Command line
 
 ```
-milkdrop_renderer --mode 1280x720@60 --pack-dir DIR --ladder 640x360,480x270
+milkdrop_renderer --mode 1280x720 --pack-dir DIR --ladder 640x360,480x270
                   --rotate-s 20 --skip-file PATH
                   [--high-frequency] [--locked FILE] [--pcm-ring PATH]
+                  [--connector HDMI-A-1]
 ```
 
 | Option | Meaning |
 |---|---|
-| `--mode WxH[@Hz]` | The CRTC mode to present on. Keep Emerge's mode (1280x720@60): a different pixel clock under a running HDMI audio stream leaves vc4's N/CTS stale. The mode the CRTC scans out when the renderer starts (Emerge's) is used when it fits (same size, progressive, within 0.5 Hz); else the closest offered mode that does (1280x720 comes at 60 and 59.94). |
+| `--mode WxH[@Hz]` | The CRTC mode to present on. Keep Emerge's mode: a different pixel clock under a running HDMI audio stream leaves vc4's N/CTS stale, so the mode the CRTC scans out when the renderer starts (Emerge's) is used whenever it fits. `WxH` (what the BEAM passes): the CRTC's mode if it is that size and progressive, whatever its refresh (50, 60, 120 Hz); otherwise the connector's preferred mode at that size, else its highest refresh at that size. `WxH@Hz`: the CRTC's mode if it is that size, progressive and within 0.5 Hz; else the offered mode closest to Hz within 0.5 Hz (1280x720 comes at 60 and 59.94). No fitting mode: `exiting` `output`. |
+| `--connector NAME` | The connector to present on, by its kernel name (`HDMI-A-1`, `HDMI-A-2`: `<type>-<n>`, 1..32 of `[A-Za-z0-9-]`); it must be connected, or `exiting` `output` — never another connector. Without it, the first connected HDMI connector. The BEAM passes the one Emerge drives. |
 | `--pack-dir DIR` | The extracted preset pack (layout below). |
 | `--ladder WxH,...` | Internal render resolutions, highest first, each smaller than the last. The renderer steps down per preset and skips a preset past the last rung. |
 | `--rotate-s N` | Auto-rotation interval, seconds. |
@@ -66,7 +68,7 @@ A malformed or unknown command gives `error` with `reason: "bad_command"`.
 
 | Event | Fields |
 |---|---|
-| `prepared` | `mode` (the chosen mode, e.g. `1280x720@60`), `gl_renderer`, `gl_version`, `gles2`, `presets` (eligible count), `crtc_mode_valid` and `crtc_mode` (only when valid): what the CRTC scanned out when the card was opened. GL is up, the first preset warmed and a frame rendered; not master. |
+| `prepared` | `mode` (the chosen mode, e.g. `1280x720@60`), `connector` (e.g. `HDMI-A-1`; with `--simulate-kms` the `--connector` given, if any), `mode_source` (how `mode` was chosen: `crtc` — the CRTC's at open, no modeset; `closest` — `WxH@Hz`'s nearest offered; `preferred` / `highest` — `WxH` without a fitting CRTC mode; absent in the check modes), `gl_renderer`, `gl_version`, `gles2`, `presets` (eligible count), `crtc_mode_valid` and `crtc_mode` (only when valid): what the CRTC scanned out when the card was opened. GL is up, the first preset warmed and a frame rendered; not master. |
 | `presenting` | `modeset` (true = the mode set differs from the last one scanned out before the handover: the CRTC's at take if it still had one, else the one in `prepared`), `master_ms`, `crtc_lit` (the CRTC still had a mode at take; Emerge's stop detaches it, so this is normally false and SetCrtc re-enables the CRTC, at the same timing when `modeset` is false). |
 | `released` | Ack for `release`. |
 | `preset` | `file` (preset id), `locked`, `rung` (internal WxH), `cause` (`start`, `take`, `rotate`, `next`, `prev`, `eject`, `lock`, `unlock`, `step_down`), `cut` (true = no blend). `eject` is also the cut away from a `high_frequency` preset (it can name the preset already playing: its blend in was completed). Sent whenever the showing preset, its lock or its rung changes. |
@@ -308,7 +310,7 @@ above 254x256.
 
 Unit tests (host, no GL): `test/milkdrop_renderer_unit_test.exs` builds
 and runs `milkdrop_renderer_unit_tests` — protocol and JSON, options,
-manifest and skip list, rotation and history, the photosensitivity
+connector and mode selection (`src/output_select.h`), manifest and skip list, rotation and history, the photosensitivity
 filter (picks, history, lock, blends in and out), preset selection
 batches and exhaustion, the cost guard ladder, frame pacing, the poll-round
 dispatch order, the command drain (nothing after `exit`), the exit guard
@@ -328,7 +330,7 @@ so it can run next to Emerge to check a build or a pack on a device.
 `--simulate-kms --card /dev/dri/renderD128` runs the normal protocol
 (`prepared`, `take`, presenting, `release`, `exit`) without a display:
 master and SetCrtc are simulated, and flips "land" at each vblank of the
-mode through a timer fd. Pacing, the cost guard, warm-ups and the exit
+mode through a timer fd (60 Hz for a `WxH` mode). Pacing, the cost guard, warm-ups and the exit
 paths run as on HDMI, so a release/exit sequence can be checked next to
 Emerge.
 

@@ -22,6 +22,7 @@ set(MILKDROP_CORE_SOURCES
     src/json.cpp
     src/manifest.cpp
     src/options.cpp
+    src/output_select.cpp
     src/pcm_feed.cpp
     src/preset_manager.cpp
     src/preset_selection.cpp

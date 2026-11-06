@@ -109,9 +109,19 @@ inline constexpr size_t MAX_PRESET_NAME_BYTES = 1024;
 std::string event_simple(std::string_view name);
 // `crtc_mode` is the CRTC's mode when the card was opened, sent only when
 // `crtc_mode_valid`.
-std::string event_prepared(std::string_view mode, std::string_view gl_renderer,
-                           std::string_view gl_version, bool gles2, int presets,
-                           bool crtc_mode_valid, std::string_view crtc_mode);
+struct PreparedInfo {
+    std::string mode;         // "WxH@Hz" chosen
+    std::string connector;    // "HDMI-A-1"; omitted when empty
+    std::string mode_source;  // mode_source_name(); omitted when empty
+    std::string gl_renderer;
+    std::string gl_version;
+    bool gles2 = false;
+    int presets = 0;
+    bool crtc_mode_valid = false;
+    std::string crtc_mode;    // only with crtc_mode_valid
+};
+
+std::string event_prepared(const PreparedInfo& info);
 std::string event_presenting(bool modeset, double master_ms, bool crtc_lit);
 std::string event_preset(std::string_view file, bool locked, std::string_view rung,
                          std::string_view cause, bool cut);

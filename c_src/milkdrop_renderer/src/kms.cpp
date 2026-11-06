@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
+#include <vector>
 
 namespace md {
 
@@ -32,12 +33,9 @@ bool same_timing(const drmModeModeInfo& a, const drmModeModeInfo& b) {
            a.vtotal == b.vtotal && a.vscan == b.vscan && a.flags == b.flags;
 }
 
-// A mode `want` can use: same size, progressive, within 0.5 Hz.
-bool fits(const drmModeModeInfo& m, const DisplayMode& want, double& off_hz) {
-    if (m.hdisplay != want.size.width || m.vdisplay != want.size.height) return false;
-    if (m.flags & DRM_MODE_FLAG_INTERLACE) return false;
-    off_hz = std::fabs(exact_refresh(m) - want.refresh);
-    return off_hz <= 0.5;
+ModeCandidate candidate(const drmModeModeInfo& m) {
+    return {m.hdisplay, m.vdisplay, exact_refresh(m), (m.flags & DRM_MODE_FLAG_INTERLACE) != 0,
+            (m.type & DRM_MODE_TYPE_PREFERRED) != 0};
 }
 
 std::string describe(const drmModeModeInfo& m) {
@@ -75,7 +73,7 @@ bool Kms::open_headless(const std::string& card, const DisplayMode& want, std::s
     mode_ = {};
     mode_.hdisplay = static_cast<uint16_t>(want.size.width);
     mode_.vdisplay = static_cast<uint16_t>(want.size.height);
-    headless_hz_ = want.refresh;
+    headless_hz_ = want.refresh_or_default();
     gbm_ = gbm_create_device(fd_);
     surface_ = gbm_ ? gbm_surface_create(gbm_, mode_.hdisplay, mode_.vdisplay, GBM_FORMAT_XRGB8888,
                                          GBM_BO_USE_RENDERING)
@@ -87,8 +85,10 @@ bool Kms::open_headless(const std::string& card, const DisplayMode& want, std::s
     return true;
 }
 
-bool Kms::open_simulated(const std::string& card, const DisplayMode& want, std::string& err) {
+bool Kms::open_simulated(const std::string& card, const std::string& connector, const DisplayMode& want,
+                         std::string& err) {
     if (!open_headless(card, want, err)) return false;
+    connector_name_ = connector;
     sim_timer_fd_ = ::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
     if (sim_timer_fd_ < 0) {
         err = std::string("timerfd_create: ") + std::strerror(errno);
@@ -97,7 +97,8 @@ bool Kms::open_simulated(const std::string& card, const DisplayMode& want, std::
     return true;
 }
 
-bool Kms::open(const std::string& card, const DisplayMode& want, std::string& err) {
+bool Kms::open(const std::string& card, const std::string& connector, const DisplayMode& want,
+               std::string& err) {
     // Non-blocking: a flip event read must never wait (see dispatch()).
     fd_ = ::open(card.c_str(), O_RDWR | O_CLOEXEC | O_NONBLOCK);
     if (fd_ < 0) {
@@ -113,23 +114,28 @@ bool Kms::open(const std::string& card, const DisplayMode& want, std::string& er
         err = std::string("drmModeGetResources: ") + std::strerror(errno);
         return false;
     }
-    drmModeConnector* conn = nullptr;
-    for (int i = 0; i < res->count_connectors && conn == nullptr; i++) {
+    std::vector<drmModeConnector*> conns;
+    std::vector<ConnectorCandidate> candidates;
+    for (int i = 0; i < res->count_connectors; i++) {
         // Current state only: no EDID re-probe (~50 ms).
         drmModeConnector* c = drmModeGetConnectorCurrent(fd_, res->connectors[i]);
-        if (c != nullptr && c->connector_type == DRM_MODE_CONNECTOR_HDMIA &&
-            c->connection == DRM_MODE_CONNECTED && c->count_modes > 0) {
-            conn = c;
-        } else if (c != nullptr) {
-            drmModeFreeConnector(c);
-        }
+        if (c == nullptr) continue;
+        const char* type = drmModeGetConnectorTypeName(c->connector_type);
+        conns.push_back(c);
+        candidates.push_back({md::connector_name(type ? type : "Unknown", c->connector_type_id),
+                              c->connector_type == DRM_MODE_CONNECTOR_HDMIA,
+                              c->connection == DRM_MODE_CONNECTED, c->count_modes});
     }
+    const int picked = choose_connector(candidates, connector, err);
+    drmModeConnector* conn = picked >= 0 ? conns[static_cast<size_t>(picked)] : nullptr;
+    for (drmModeConnector* c : conns)
+        if (c != conn) drmModeFreeConnector(c);
     if (conn == nullptr) {
         drmModeFreeResources(res);
-        err = "no connected HDMI connector";
         return false;
     }
     connector_id_ = conn->connector_id;
+    connector_name_ = candidates[static_cast<size_t>(picked)].name;
 
     uint32_t crtc = 0;
     if (conn->encoder_id != 0) {
@@ -152,7 +158,7 @@ bool Kms::open(const std::string& card, const DisplayMode& want, std::string& er
     drmModeFreeResources(res);
     if (crtc == 0) {
         drmModeFreeConnector(conn);
-        err = "no CRTC for the HDMI connector";
+        err = "no CRTC for " + connector_name_;
         return false;
     }
     crtc_id_ = crtc;
@@ -166,25 +172,19 @@ bool Kms::open(const std::string& card, const DisplayMode& want, std::string& er
         drmModeFreeCrtc(c);
     }
 
-    // Keep the current mode when it fits: a different pixel clock under a
-    // running HDMI audio stream leaves vc4's N/CTS stale. Otherwise the
-    // closest offered mode. Our systems' EDIDs flag none as preferred, and
-    // 1280x720 comes at 60 and 59.94 (both vrefresh 60 in KMS).
-    double best = 1e9, off = 0;
-    if (crtc_mode_valid_ && fits(crtc_mode_, want, off)) {
-        mode_ = crtc_mode_;
-        best = off;
-    } else {
-        for (int i = 0; i < conn->count_modes; i++) {
-            if (fits(conn->modes[i], want, off) && off < best) {
-                best = off;
-                mode_ = conn->modes[i];
-            }
-        }
+    std::optional<ModeCandidate> current;
+    if (crtc_mode_valid_) current = candidate(crtc_mode_);
+    std::vector<ModeCandidate> offered;
+    for (int i = 0; i < conn->count_modes; i++) offered.push_back(candidate(conn->modes[i]));
+    const std::optional<ModeChoice> choice = choose_mode(current, offered, want);
+    if (choice) {
+        mode_ = choice->index < 0 ? crtc_mode_ : conn->modes[choice->index];
+        mode_source_ = choice->source;
+        has_mode_source_ = true;
     }
     drmModeFreeConnector(conn);
-    if (best > 0.5) {
-        err = "mode " + want.str() + " not offered";
+    if (!choice) {
+        err = "mode " + want.str() + " not offered on " + connector_name_;
         return false;
     }
 

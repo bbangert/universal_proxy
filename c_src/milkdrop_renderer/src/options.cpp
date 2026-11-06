@@ -11,6 +11,7 @@ const char* const USAGE =
     "usage: milkdrop_renderer --mode WxH[@Hz] --pack-dir DIR --ladder WxH[,WxH...]\n"
     "                         --rotate-s N --skip-file PATH\n"
     "                         [--high-frequency] [--locked FILE] [--pcm-ring PATH]\n"
+    "                         [--connector NAME]\n"
     "  tuning: [--card DEV] [--blend S] [--min-fps F] [--interval N] [--seed N]\n"
     "          [--av-offset-ms N] [--master-timeout-ms N] [--mesh WxH] [--stats-s N]\n"
     "  check:  [--headless-frames N]  (off-screen on --card, e.g. /dev/dri/renderD128)\n"
@@ -54,12 +55,13 @@ std::optional<Resolution> parse_resolution(std::string_view s) {
 }
 
 std::string DisplayMode::str() const {
+    if (!refresh) return size.str();
     char buf[64];
-    if (std::fabs(refresh - std::round(refresh)) < 1e-9) {
+    if (std::fabs(*refresh - std::round(*refresh)) < 1e-9) {
         std::snprintf(buf, sizeof(buf), "%dx%d@%d", size.width, size.height,
-                      static_cast<int>(std::lround(refresh)));
+                      static_cast<int>(std::lround(*refresh)));
     } else {
-        std::snprintf(buf, sizeof(buf), "%dx%d@%.3g", size.width, size.height, refresh);
+        std::snprintf(buf, sizeof(buf), "%dx%d@%.3g", size.width, size.height, *refresh);
     }
     return buf;
 }
@@ -70,9 +72,21 @@ std::optional<DisplayMode> parse_mode(std::string_view s) {
     auto res = parse_resolution(s.substr(0, at));
     if (!res) return std::nullopt;
     mode.size = *res;
-    if (at != std::string_view::npos && !parse_double(s.substr(at + 1), 1.0, 1000.0, mode.refresh))
-        return std::nullopt;
+    if (at != std::string_view::npos) {
+        double hz = 0;
+        if (!parse_double(s.substr(at + 1), 1.0, 1000.0, hz)) return std::nullopt;
+        mode.refresh = hz;
+    }
     return mode;
+}
+
+bool valid_connector_name(std::string_view s) {
+    if (s.empty() || s.size() > 32) return false;
+    for (char c : s) {
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-';
+        if (!ok) return false;
+    }
+    return true;
 }
 
 std::optional<std::vector<Resolution>> parse_ladder(std::string_view s) {
@@ -158,6 +172,12 @@ bool parse_options(const std::vector<std::string>& args, Options& out, std::stri
             out.locked = v;
         } else if (a == "--pcm-ring") {
             out.pcm_ring = v;
+        } else if (a == "--connector") {
+            if (!valid_connector_name(v)) {
+                error = "bad --connector";
+                return false;
+            }
+            out.connector = v;
         } else if (a == "--card") {
             out.card = v;
         } else if (a == "--blend") {

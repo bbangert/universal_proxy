@@ -241,8 +241,8 @@ bool App::prepare() {
     }
 
     const bool opened = opt_.headless_frames > 0 ? kms_.open_headless(opt_.card, opt_.mode, err)
-                        : opt_.simulate_kms      ? kms_.open_simulated(opt_.card, opt_.mode, err)
-                                                 : kms_.open(opt_.card, opt_.mode, err);
+                        : opt_.simulate_kms      ? kms_.open_simulated(opt_.card, opt_.connector, opt_.mode, err)
+                                                 : kms_.open(opt_.card, opt_.connector, opt_.mode, err);
     if (!opened) {
         fail("output", err);
         return false;
@@ -298,11 +298,21 @@ bool App::prepare() {
     // The frame `take` puts on screen.
     if (!render_frame(queued_)) return false;
 
-    log_msg("prepared %s (CRTC at open: %s)", kms_.mode_str().c_str(),
+    log_msg("prepared %s on %s (%s; CRTC at open: %s)", kms_.mode_str().c_str(),
+            kms_.connector_name().empty() ? "-" : kms_.connector_name().c_str(),
+            kms_.mode_source_name().empty() ? "-" : kms_.mode_source_name().c_str(),
             kms_.crtc_mode_valid() ? kms_.crtc_mode_str().c_str() : "off");
-    emit_line(event_prepared(kms_.mode_str(), gl_.renderer(), gl_.version(), GLES2,
-                             static_cast<int>(presets_->eligible_count()), kms_.crtc_mode_valid(),
-                             kms_.crtc_mode_str()));
+    PreparedInfo info;
+    info.mode = kms_.mode_str();
+    info.connector = kms_.connector_name();
+    info.mode_source = kms_.mode_source_name();
+    info.gl_renderer = gl_.renderer();
+    info.gl_version = gl_.version();
+    info.gles2 = GLES2;
+    info.presets = static_cast<int>(presets_->eligible_count());
+    info.crtc_mode_valid = kms_.crtc_mode_valid();
+    info.crtc_mode = kms_.crtc_mode_str();
+    emit_line(event_prepared(info));
     return true;
 }
 
