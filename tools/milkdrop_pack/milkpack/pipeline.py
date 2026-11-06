@@ -83,7 +83,8 @@ def curate(staged, curation, report, pack_dir):
     screened = {e["file"] for e in report.excluded}
     removed = []
     for pid, why in sorted(curation.get("excluded_presets", {}).items()):
-        if pid.startswith("_"):
+        # Preset ids may start with "_" too (e.g. "_Flexi - mindblob ...").
+        if pid == "_comment":
             continue
         if pid in screened:
             report.notes.append(f"curated exclusion {pid!r} was already excluded by the pipeline")

@@ -73,6 +73,17 @@ class StepsTest(unittest.TestCase):
         self.assertEqual(report.excluded[0]["reason"], "curated")
         self.assertTrue(any("Gone.milk" in n for n in report.notes))
 
+    def test_curate_takes_ids_starting_with_an_underscore(self):
+        d = tmpdir(self)
+        pid = "_Flexi - mindblob [where it's at now].milk"
+        staged = {pid: b"x", "Keep.milk": b"y"}
+        pipeline.write_presets(staged, d)
+        report = Quiet()
+        pipeline.curate(staged, {"excluded_presets": {"_comment": "x", pid: "removal request"}}, report, d)
+        self.assertEqual(list(staged), ["Keep.milk"])
+        self.assertEqual(report.excluded, [{"file": pid, "reason": "curated", "detail": "removal request"}])
+        self.assertFalse(os.path.exists(os.path.join(d, "presets", pid)))
+
     def test_curate_after_the_screen_caught_it(self):
         staged = {"Keep.milk": b"y"}
         report = Quiet()
