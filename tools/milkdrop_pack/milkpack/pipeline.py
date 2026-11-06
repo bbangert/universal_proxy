@@ -243,6 +243,12 @@ def build(args):
             head = subprocess.run(["git", "-C", path, "rev-parse", "HEAD"], capture_output=True, text=True)
             if head.stdout.strip() != want:
                 report.notes.append(f"{label} {path} is at {head.stdout.strip() or '?'}, not the pin {want}")
+            try:
+                dirty = sources.dirty_paths(path)
+            except PipelineError:
+                dirty = ["?"]
+            if dirty:
+                report.notes.append(f"{label} {path} has local changes (or isn't a git checkout)")
     report.step("inputs", zip_sha256=zip_sha, projectm=pm_commit, texture_pack=tex_commit)
 
     translator = sources.build_translator(pm_src, os.path.join(work, "build-translator"), log, jobs)

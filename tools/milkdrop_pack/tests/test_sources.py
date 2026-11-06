@@ -86,6 +86,22 @@ class GitCheckoutTest(unittest.TestCase):
         self.checkout()
         self.assert_complete()
 
+    def test_reuse_refuses_a_dirty_parent(self):
+        cmake = os.path.join(self.dest, "CMakeLists.txt")
+        for spoil in (lambda: write(cmake, "project(evil)\n"), lambda: os.remove(cmake),
+                      lambda: write(os.path.join(self.dest, "extra.txt"), "x")):
+            shutil.rmtree(self.dest, ignore_errors=True)
+            self.checkout()
+            spoil()
+            with self.assertRaisesRegex(sources.PipelineError, "has local changes"):
+                self.checkout()
+
+    def test_a_dirty_submodule_does_not_count_as_a_dirty_parent(self):
+        self.checkout()
+        write(os.path.join(self.eval_dir, "eval.c"), "int y;\n")
+        write(os.path.join(self.eval_dir, "untracked.c"), "int z;\n")
+        self.assertEqual(sources.dirty_paths(self.dest), [])
+
 
 if __name__ == "__main__":
     unittest.main()

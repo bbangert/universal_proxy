@@ -73,7 +73,8 @@ def git_checkout(repo, commit, dest, log, submodules=()):
     """A checkout of `commit` at `dest`, fetched by SHA (content-addressed,
     so a moved branch or tag can't change the input), with `submodules` at
     the commits it records. Reused when already there; an interrupted
-    earlier run is repaired."""
+    earlier run is repaired. A checkout with local changes is refused, so
+    the pack never records the pin while building from something else."""
     head = _git("-C", dest, "rev-parse", "HEAD") if os.path.isdir(os.path.join(dest, ".git")) else None
     if head is None or head.returncode != 0 or head.stdout.strip() != commit:
         os.makedirs(dest, exist_ok=True)
@@ -83,9 +84,25 @@ def git_checkout(repo, commit, dest, log, submodules=()):
         head = _git("-C", dest, "rev-parse", "HEAD")
         if head.stdout.strip() != commit:
             raise PipelineError(f"{repo}: checked out {head.stdout.strip()}, wanted {commit}")
+    dirty = dirty_paths(dest)
+    if dirty:
+        listed = ", ".join(dirty[:5]) + (f" and {len(dirty) - 5} more" if len(dirty) > 5 else "")
+        raise PipelineError(
+            f"{dest} has local changes ({listed}), so it isn't the pinned {commit}. Remove it "
+            f"(rm -rf {dest}) and rerun to fetch the pin again, or build from your own checkout "
+            "with --projectm-src / --texture-pack")
     for sub in submodules:
         ensure_submodule(dest, sub, log)
     return dest
+
+
+def dirty_paths(dest):
+    """Modified, deleted or untracked (not ignored) files of the checkout at
+    `dest`, without its submodules (ensure_submodule repairs those)."""
+    status = _git("-C", dest, "status", "--porcelain", "--ignore-submodules=all")
+    if status.returncode != 0:
+        raise PipelineError(f"{dest}: git status failed: {status.stderr.strip()}")
+    return [line[3:] for line in status.stdout.splitlines() if line.strip()]
 
 
 def submodule_ok(dest, sub):

@@ -36,6 +36,11 @@ step, every exclusion with its reason, the brightness review list, texture
 records, per-preset brightness) and `review/` (PNG frames of the excluded and
 review-listed presets). `--work` (default `OUT/work`) keeps the checkouts,
 builds and the brightness cache, so a rerun only renders changed presets.
+A kept checkout with local changes (modified, deleted or untracked files
+outside its submodules) fails the build rather than building something
+other than the pin: delete it (`rm -rf WORK/src/projectm`) to refetch it,
+or build from your own checkout with `--projectm-src` / `--texture-pack`
+(the report notes when those differ from the pin or have local changes).
 
 ## Steps
 
