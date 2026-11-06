@@ -4,12 +4,21 @@ import tempfile
 
 # Stands in for milkdrop_renderer --headless-frames: records its argv and
 # prints the events a real run would (high_frequency/b.milk is "skipped").
+# Like the renderer, it refuses --locked on a manifest entry marked rpi3
+# "skip" and starts another preset instead.
 FAKE_RENDERER = r'''#!/usr/bin/env python3
 import json, sys
 args = sys.argv[1:]
 open(sys.argv[0] + ".calls", "a").write(json.dumps(args) + "\n")
 pid = args[args.index("--locked") + 1]
 def out(**kw): print(json.dumps(kw, separators=(",", ":")))
+doc = json.load(open(args[args.index("--pack-dir") + 1] + "/manifest.json"))
+def rpi3_skip(e):
+    r = e.get("rpi3") or {}
+    return (r if isinstance(r, str) else r.get("rung")) == "skip"
+if any(e["file"] == pid and rpi3_skip(e) for e in doc["presets"]):
+    out(event="error", code="locked_refused", message="rpi3_skip: " + pid)
+    pid = next(e["file"] for e in doc["presets"] if not rpi3_skip(e))
 out(event="preset", file=pid, locked=True, rung="640x360", cause="start", cut=True)
 if pid.startswith("high_frequency/"):
     out(event="skip", preset=pid, reason="register_allocate", message="Failed to register allocate")
@@ -35,8 +44,9 @@ def write(path, data=b""):
     return path
 
 
-def tiny_pack(root, presets=("a.milk", "high_frequency/b.milk")):
-    """A minimal extracted pack: manifest, presets, a texture, a shader."""
+def tiny_pack(root, presets=("a.milk", "high_frequency/b.milk"), sweep=None):
+    """A minimal extracted pack: manifest (rpi3 hints from `sweep`),
+    presets, a texture, a shader."""
     from milkpack import manifest
 
     for pid in presets:
@@ -45,5 +55,5 @@ def tiny_pack(root, presets=("a.milk", "high_frequency/b.milk")):
     write(os.path.join(root, "shaders", "0" * 64 + ".glsl"), "void main() {}\n")
     write(os.path.join(root, "README"), "readme\n")
     write(os.path.join(root, "NOTICE"), "notice\n")
-    write(os.path.join(root, "manifest.json"), manifest.dumps(manifest.build("2026.11.1", presets)))
+    write(os.path.join(root, "manifest.json"), manifest.dumps(manifest.build("2026.11.1", presets, sweep)))
     return root

@@ -92,6 +92,12 @@ defmodule MilkdropPackToolsTest do
     assert File.regular?(Path.join([remote, version, "manifest.json"]))
     refute File.exists?(Path.join(remote, version <> ".tar.gz"))
 
+    # The sweep's copy carries no rpi3 hints (the fixture has a skip).
+    swept = remote |> Path.join(version) |> Path.join("manifest.json") |> File.read!()
+    presets = Jason.decode!(swept)["presets"]
+    assert length(presets) == length(fixture["presets"])
+    assert Enum.all?(presets, &(Map.keys(&1) -- ["file", "tags"] == []))
+
     probe = elixir["probe"] |> eval() |> last_line() |> Jason.decode!()
     assert probe["pack_ok"]
 
@@ -100,7 +106,11 @@ defmodule MilkdropPackToolsTest do
     assert run =~ ~s("preset":"Geiss - Chrome.milk")
     assert run =~ "EXIT_STATUS 0"
 
-    [args] =
+    skip_run = eval(elixir["run_skip"])
+    assert skip_run =~ ~s|"preset":"$$$ Royal - Mashup (109).milk"|
+    refute skip_run =~ "locked_refused"
+
+    [args | _] =
       elixir["renderer"] |> Kernel.<>(".calls") |> File.read!() |> String.split("\n", trim: true)
 
     assert "--headless-frames" in Jason.decode!(args)

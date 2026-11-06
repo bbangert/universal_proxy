@@ -2,7 +2,7 @@
 """The device sweep's Elixir for test/milkdrop_pack_tools_test.exs, which
 evaluates it on the host against a fake renderer.
 
-    sweep_elixir.py WORK_DIR VERSION SHA256  ->  {"probe", "extract", "run", "renderer"}
+    sweep_elixir.py WORK_DIR VERSION SHA256  ->  {"probe", "extract", "run", "run_skip", "renderer"}
 """
 
 import json
@@ -34,6 +34,10 @@ def main(work, version, digest):
         "extract": device_sweep.elixir_extract(remote, version, digest),
         # Cooldown threshold far above any host's temperature.
         "run": device_sweep.elixir_run(renderer, args, 30_000, 1000, 0),
+        # The fixture marks this one rpi3 "skip"; the sweep copy must not.
+        "run_skip": device_sweep.elixir_run(
+            renderer, device_sweep.renderer_args(Opts, f"{remote}/{version}", "$$$ Royal - Mashup (109).milk"),
+            30_000, 1000, 0),
         "renderer": renderer,
         "remote": remote,
     }))

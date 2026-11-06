@@ -75,6 +75,38 @@ class DeviceSweepTest(unittest.TestCase):
         self.assertEqual((by["a.milk"]["compile_ms"], by["a.milk"]["eval_ms"]), (200, 12.5))
         self.assertEqual(by["high_frequency/b.milk"]["rpi3"], {"rung": "skip", "reason": "register_allocate"})
 
+    def test_a_pack_built_from_earlier_results_is_measured_afresh(self):
+        # Rebuilt with an earlier sweep: a.milk was skipped on the rpi3 and
+        # c.milk settled on the lower rung.
+        d = tmpdir(self)
+        earlier = {"a.milk": {"status": "skip", "reason": "register_allocate"},
+                   "c.milk": {"status": "ok", "rung": "480x270", "warmup_ms": 100.0, "cpu_ms": 9.0}}
+        self.pack = tiny_pack(os.path.join(d, "pack"), ("a.milk", "c.milk"), earlier)
+        with open(os.path.join(self.pack, "manifest.json")) as f:
+            before = f.read()
+        self.assertIn('"skip"', before)
+        self.digest = tarball.create(self.pack, self.tar)
+        code, _ = self.sweep()
+        self.assertEqual(code, 0)
+        recs = {r["file"]: r for r in self.records()}
+        self.assertEqual((recs["a.milk"]["status"], recs["a.milk"]["rung"]), ("ok", "640x360"))
+        self.assertEqual(recs["c.milk"]["status"], "ok")
+        with open(os.path.join(self.pack, "manifest.json")) as f:
+            self.assertEqual(f.read(), before)
+
+    def test_sweep_manifest_drops_the_rpi3_hints(self):
+        from milkpack import manifest, sweep
+
+        doc = manifest.build("2026.11.1", ["a.milk", "high_frequency/b.milk"],
+                             {"a.milk": {"status": "skip", "reason": "x"},
+                              "high_frequency/b.milk": {"status": "ok", "rung": "480x270", "cpu_ms": 9.0}},
+                             {"high_frequency/b.milk": {"warp_comp_ms": 20.0}})
+        stripped = sweep.sweep_manifest(doc)
+        self.assertEqual(stripped["presets"], [{"file": "a.milk"},
+                                               {"file": "high_frequency/b.milk", "tags": ["high_frequency"]}])
+        self.assertEqual((stripped["format"], stripped["version"]), (1, "2026.11.1"))
+        self.assertIn("rpi3", doc["presets"][0])
+
     def test_dry_run_connects_to_nothing(self):
         code, out = self.sweep("--dry-run", "--only", "a.milk")
         self.assertEqual(code, 0)

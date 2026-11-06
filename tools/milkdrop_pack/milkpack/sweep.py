@@ -9,6 +9,19 @@ from . import names
 
 RUNG_RE = re.compile(r"\A[1-9][0-9]{1,4}x[1-9][0-9]{1,4}\Z")
 
+# The per-preset rpi3 hints a sweep must not start from: the renderer
+# refuses --locked on an rpi3 "skip" entry, and a rung hint would bias the
+# rung the cost guard settles on. The sweep runs on a copy of the manifest
+# without them (device_sweep.py), so a pack rebuilt from earlier results
+# is measured afresh.
+SWEEP_STRIPPED_KEYS = ("rpi3", "compile_ms", "eval_ms")
+
+
+def sweep_manifest(doc):
+    """`doc` (a parsed manifest) with the rpi3 hints taken out."""
+    presets = [{k: v for k, v in e.items() if k not in SWEEP_STRIPPED_KEYS} for e in doc["presets"]]
+    return {**doc, "presets": presets}
+
 
 def parse_run(pid, text):
     """One headless renderer run of `pid` (its stdout+stderr, plus an

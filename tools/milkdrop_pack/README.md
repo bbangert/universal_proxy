@@ -105,8 +105,11 @@ tools/milkdrop_pack/device_sweep.py --host <rpi3 address> \
 tools/milkdrop_pack/build_pack.py ... --device-sweep sweep.jsonl   # rebuild with the results
 ```
 
-It copies the pack to `/data/md-sweep/` (sftp + `:erl_tar` on the device),
-then per preset runs the device's renderer
+It copies the pack to `/data/md-sweep/` (sftp + `:erl_tar` on the device)
+and strips that copy's manifest of its rpi3 hints (`rung`, `skip`,
+`frame_ms`, `compile_ms`, `eval_ms`), so a pack rebuilt from an earlier
+sweep is measured afresh: the renderer refuses `--locked` on an rpi3
+`"skip"` entry. Then per preset it runs the device's renderer
 (`<priv>/milkdrop_renderer/rpi3/milkdrop_renderer`) headless on
 `/dev/dri/renderD128`: `--headless-frames 600 --locked <id> --test-tone
 --high-frequency`. No KMS, no DRM master: Emerge and the TV are not

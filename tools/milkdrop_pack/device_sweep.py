@@ -31,12 +31,16 @@ import os
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from milkpack import sweep  # noqa: E402
 from milkpack.tarball import sha256  # noqa: E402
+
+# Marks a device copy extracted (and its manifest stripped) by this script.
+MARKER_SUFFIX = " sweep-manifest"
 
 SSH_OPTS = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
             "-o", "ConnectTimeout=15"]
@@ -63,17 +67,23 @@ IO.puts(:json.encode(%{{
   renderer: renderer,
   renderer_ok: File.regular?(renderer),
   fw_uuid: Nerves.Runtime.KV.get_active("nerves_fw_uuid"),
-  pack_ok: File.read(marker) == {{:ok, "{digest}"}} and File.regular?(Path.join("{remote_dir}/{version}", "manifest.json"))
+  pack_ok: File.read(marker) == {{:ok, "{digest}{MARKER_SUFFIX}"}} and File.regular?(Path.join("{remote_dir}/{version}", "manifest.json"))
 }}))'''
 
 
 def elixir_extract(remote_dir, version, digest):
+    """Extracts the pack and strips its manifest's rpi3 hints
+    (sweep.sweep_manifest): the device copy is the sweep's own."""
     return f'''
 dir = Path.join("{remote_dir}", "{version}")
 File.rm_rf!(dir)
 File.mkdir_p!(dir)
 :ok = :erl_tar.extract(~c"{remote_dir}/{version}.tar.gz", [:compressed, {{:cwd, String.to_charlist(dir)}}])
-File.write!(Path.join("{remote_dir}", "{version}.sha256"), "{digest}")
+manifest = Path.join(dir, "manifest.json")
+doc = :json.decode(File.read!(manifest))
+stripped = Enum.map(doc["presets"], &Map.drop(&1, {json.dumps(list(sweep.SWEEP_STRIPPED_KEYS))}))
+File.write!(manifest, :json.encode(Map.put(doc, "presets", stripped)))
+File.write!(Path.join("{remote_dir}", "{version}.sha256"), "{digest}{MARKER_SUFFIX}")
 File.rm("{remote_dir}/{version}.tar.gz")
 IO.puts("EXTRACTED " <> dir)'''
 
@@ -148,6 +158,21 @@ def done_ids(out_path, digest):
     return done
 
 
+def local_sweep_dir(pack_dir, view):
+    """A view of an extracted pack at `view` for local sweeps: its presets,
+    textures and shaders linked, with the stripped manifest (the pack
+    itself is left alone)."""
+    os.makedirs(view)
+    for name in ("presets", "textures", "shaders"):
+        if os.path.exists(os.path.join(pack_dir, name)):
+            os.symlink(os.path.abspath(os.path.join(pack_dir, name)), os.path.join(view, name))
+    with open(os.path.join(pack_dir, "manifest.json")) as f:
+        doc = json.load(f)
+    with open(os.path.join(view, "manifest.json"), "w") as f:
+        json.dump(sweep.sweep_manifest(doc), f)
+    return view
+
+
 def run_local(opts, pack_dir, pid):
     args = renderer_args(opts, pack_dir, pid)
     try:
@@ -205,12 +230,18 @@ def main(argv=None):
                              opts.cooldown_c, opts.cooldown_max_s))
         return 0
 
+    with tempfile.TemporaryDirectory(prefix="md-sweep-") as scratch:
+        return sweep_all(opts, p, digest, version, todo, remote_pack, scratch)
+
+
+def sweep_all(opts, p, digest, version, todo, remote_pack, scratch):
     meta = {"pack_version": version, "pack_sha256": digest, "frames": opts.frames, "ladder": opts.ladder}
     if opts.local_renderer:
         if not opts.local_pack_dir:
             p.error("--local-renderer needs --local-pack-dir")
         meta.update(renderer=opts.local_renderer, host="local")
-        runner = lambda pid: run_local(opts, opts.local_pack_dir, pid)  # noqa: E731
+        view = local_sweep_dir(opts.local_pack_dir, os.path.join(scratch, "pack"))
+        runner = lambda pid: run_local(opts, view, pid)  # noqa: E731
     else:
         if not opts.host:
             p.error("--host is required (or --local-renderer)")
