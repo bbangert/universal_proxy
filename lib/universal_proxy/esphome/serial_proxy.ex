@@ -51,7 +51,7 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
   owner knows its row (while the tty is open, and while a reopen is
   pending after an error). Keeping the row through a transient error
   keeps every instance number stable for connected clients; the identity
-  reports it not connected meanwhile.
+  reports it not connected, with blank strings and no USB ids, meanwhile.
 
   Its handles are `{:zigbee, session}`: `open/3` attaches a session to
   the owner and `close/1` detaches it, so the tty (and its DTR/RTS) stay
@@ -354,6 +354,24 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
   # What Home Assistant's ZBT-2 matcher reads: VID/PID and the product
   # string, plus the serial (its config-flow unique id). espex copies `usb`
   # into the protobuf as given, so unknown ids are left out, never nil.
+  #
+  # Per espex's Identity contract, `error?` means the USB host stack refused
+  # the descriptor query (strings and ids then empty), not that our tty
+  # open failed; while the device isn't attached the `:usb` strings are
+  # blank and `usb` is empty.
+  defp zigbee_identity(instance, %{attached?: false}) do
+    %Identity{
+      instance: instance,
+      source: :usb,
+      connected?: false,
+      error?: false,
+      manufacturer: "",
+      product: "",
+      serial_number: "",
+      usb: %{}
+    }
+  end
+
   defp zigbee_identity(instance, entry) do
     port = entry.port
     descriptor = Map.get(port, :usb_descriptor) || %{}
@@ -371,8 +389,8 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
     %Identity{
       instance: instance,
       source: :usb,
-      connected?: entry.attached?,
-      error?: entry.error?,
+      connected?: true,
+      error?: false,
       manufacturer: Map.get(port, :usb_manufacturer) || "",
       product: Map.get(port, :usb_product) || "",
       serial_number: entry.serial || "",

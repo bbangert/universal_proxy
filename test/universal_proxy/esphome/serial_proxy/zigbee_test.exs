@@ -268,11 +268,24 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeTest do
       assert is_binary(identity |> Identity.to_proto() |> Proto.SerialProxyIdentity.encode())
     end
 
-    test "reports a failing owner as not connected, with the error flag" do
+    test "reports a failing owner as not connected, blank, without the error flag" do
       row = ZigbeeFixtures.zbt2_row()
       inventory = SerialProxy.build_inventory([], %{attached?: false, error?: true, port: row})
 
-      assert %Identity{connected?: false, error?: true} = SerialProxy.identity_for(inventory, 0)
+      identity = SerialProxy.identity_for(inventory, 0)
+
+      assert %Identity{
+               source: :usb,
+               connected?: false,
+               error?: false,
+               manufacturer: "",
+               product: "",
+               serial_number: "",
+               usb: usb
+             } = identity
+
+      assert usb == %{}
+      assert is_binary(identity |> Identity.to_proto() |> Proto.SerialProxyIdentity.encode())
     end
 
     test "is nil for TTL ports and unknown instances" do
@@ -317,7 +330,9 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeTest do
 
       assert ZigbeeProxy.advertised(server) == %{attached?: false, error?: true, port: row}
       assert zigbee_instance() == instance
-      assert %Identity{connected?: false, error?: true} = SerialProxy.identity(instance)
+
+      assert %Identity{connected?: false, error?: false, product: ""} =
+               SerialProxy.identity(instance)
 
       send(server, :zigbee_reopen)
       assert_receive {:fake_uart, _fake}
