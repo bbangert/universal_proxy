@@ -278,7 +278,7 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
       assert ZigbeeProxy.advertised(server) == %{attached?: true, error?: false, port: moved}
     end
 
-    test "a re-resolved row with another HA name does not replace the advertised one" do
+    test "a resolved stick with another HA name is not opened" do
       %{server: server, port: port} = start_proxy!()
       _ = :sys.get_state(server)
 
@@ -288,13 +288,45 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
       other = %{port | ha_name: "other"}
 
       :sys.replace_state(server, fn state ->
-        %{state | resolver: fn -> %{path: "ttyZB", display_name: "o", port: other} end}
+        %{state | resolver: fn -> %{path: "ttyOther", display_name: "o", port: other} end}
       end)
 
       send(server, :zigbee_reopen)
-      assert_receive {:fake_uart, _fake}
       _ = :sys.get_state(server)
-      assert %{attached?: true, port: ^port} = ZigbeeProxy.advertised(server)
+      refute_received {:fake_uart, _}
+      assert %{attached?: false, port: ^port} = ZigbeeProxy.advertised(server)
+    end
+
+    test "only the advertised stick is reopened after an unplug (matched by serial)" do
+      test_pid = self()
+      a = %{kind: :zigbee, tty_name: "ttyA", ha_name: "zb-a", serial: "AAA"}
+      b = %{kind: :zigbee, tty_name: "ttyB", ha_name: "zb-b", serial: "BBB"}
+      {:ok, slot} = Agent.start_link(fn -> %{path: "ttyA", display_name: "zb-a", port: a} end)
+
+      open_fun = fn path ->
+        send(test_pid, {:open_attempt, path})
+        FakeUART.start_link(test_pid)
+      end
+
+      server =
+        start_supervised!(
+          {ZigbeeProxy, name: nil, resolver: fn -> Agent.get(slot, & &1) end, open_fun: open_fun}
+        )
+
+      assert_receive {:open_attempt, "ttyA"}
+      send(server, {:circuits_uart, "ttyA", {:error, :eio}})
+
+      Agent.update(slot, fn _ -> %{path: "ttyB", display_name: "zb-b", port: b} end)
+      send(server, :zigbee_reopen)
+      _ = :sys.get_state(server)
+      refute_received {:open_attempt, _}
+      assert %{attached?: false, port: ^a} = ZigbeeProxy.advertised(server)
+
+      Agent.update(slot, fn _ -> %{path: "ttyA2", display_name: "zb-a", port: a} end)
+      send(server, :zigbee_reopen)
+      assert_receive {:open_attempt, "ttyA2"}
+      _ = :sys.get_state(server)
+      assert %{attached?: true, port: ^a} = ZigbeeProxy.advertised(server)
     end
 
     test "advertised already holds the row while the first open is blocked" do

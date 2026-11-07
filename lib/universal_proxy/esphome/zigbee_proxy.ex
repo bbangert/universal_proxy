@@ -43,9 +43,15 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
     adapter numbers its instances from this snapshot, so a row that
     vanished or appeared would shift later instances under connected
     clients. The advertised row is therefore fixed for the owner's
-    lifetime: only a row resolved in `init/1` is ever published, and a
-    re-resolved row (the stick back, possibly on another tty) replaces
-    it only when it has the same `ha_name`. An owner that started with
+    lifetime: only a row resolved in `init/1` is ever published, and the
+    owner only reopens the physical stick that row describes (same USB
+    serial when both rows carry one, else same `ha_name`). A different
+    stick the resolver returns meanwhile (a second coordinator after
+    the advertised one is unplugged) is not opened, so sessions and
+    Home Assistant, which still address the original, never reach the
+    wrong radio; the owner stays detached and keeps rescanning. A
+    re-resolved match (possibly on another tty) replaces the row only
+    when it has the same `ha_name`. An owner that started with
     no row still opens and holds a stick plugged in later (avoiding a
     later DTR bounce) but keeps advertising `port: nil`. Renumbering
     happens only on the ESPHome tree restart that hotplug triggers.
@@ -792,40 +798,68 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
         schedule_reopen(%{state | display_name: nil, error?: false})
 
       {port_path, display_name, port} ->
-        case state.open_fun.(port_path) do
-          {:ok, uart_pid} ->
-            Logger.info("Zigbee proxy holding #{port_path}")
-
-            state = %{
-              state
-              | uart_pid: uart_pid,
-                port_path: port_path,
-                display_name: display_name,
-                port: advertised_row(state.port, port),
-                line: @default_line,
-                modem: @default_modem,
-                ash: Ash.reset(state.ash),
-                rx_buffer: <<>>,
-                error?: false,
-                last_open_error: nil
-            }
-
-            broadcast_lifecycle(state, "uart:port_opened", :uart_port_opened)
-            state
-
-          {:error, reason} ->
-            level = if reason == state.last_open_error, do: :debug, else: :warning
-            Logger.log(level, "Zigbee proxy failed to open #{port_path}: #{inspect(reason)}")
-
-            schedule_reopen(%{
-              state
-              | port: advertised_row(state.port, port),
-                error?: true,
-                last_open_error: reason
-            })
+        if same_stick?(state.port, port) do
+          open_port(state, port_path, display_name, port)
+        else
+          Logger.debug("Zigbee proxy ignoring #{port_path}: not the advertised stick")
+          schedule_reopen(%{state | display_name: nil, error?: false})
         end
     end
   end
+
+  defp open_port(state, port_path, display_name, port) do
+    case state.open_fun.(port_path) do
+      {:ok, uart_pid} ->
+        Logger.info("Zigbee proxy holding #{port_path}")
+
+        state = %{
+          state
+          | uart_pid: uart_pid,
+            port_path: port_path,
+            display_name: display_name,
+            port: advertised_row(state.port, port),
+            line: @default_line,
+            modem: @default_modem,
+            ash: Ash.reset(state.ash),
+            rx_buffer: <<>>,
+            error?: false,
+            last_open_error: nil
+        }
+
+        broadcast_lifecycle(state, "uart:port_opened", :uart_port_opened)
+        state
+
+      {:error, reason} ->
+        level = if reason == state.last_open_error, do: :debug, else: :warning
+        Logger.log(level, "Zigbee proxy failed to open #{port_path}: #{inspect(reason)}")
+
+        schedule_reopen(%{
+          state
+          | port: advertised_row(state.port, port),
+            error?: true,
+            last_open_error: reason
+        })
+    end
+  end
+
+  # Nothing advertised (late discovery): any stick may be held. Otherwise
+  # only the advertised physical device: same USB serial when both rows
+  # carry a real one, else same `ha_name`.
+  defp same_stick?(nil, _resolved), do: true
+
+  defp same_stick?(%{} = advertised, %{} = resolved) do
+    case {real_serial(advertised), real_serial(resolved)} do
+      {a, b} when is_binary(a) and is_binary(b) -> a == b
+      _ -> advertised[:ha_name] != nil and advertised[:ha_name] == resolved[:ha_name]
+    end
+  end
+
+  defp same_stick?(_advertised, _resolved), do: false
+
+  defp real_serial(%{serial: serial}) when is_binary(serial) and serial not in ["", "—"],
+    do: serial
+
+  defp real_serial(_row), do: nil
 
   # The advertised row is fixed at init (see the moduledoc): a stick
   # resolved later is held but not advertised, and a re-resolved row
