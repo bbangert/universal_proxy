@@ -254,12 +254,13 @@ defmodule UniversalProxy.ESPHome.Infrared.Server do
   defp build_inventory do
     enumerated = UARTEnumerate.safe()
     key_to_tty = Hardware.live_port_keys(enumerated: enumerated)
+    ports = Hardware.list_ports(enumerated: enumerated)
 
     # Auto-detected IR adapters from Hardware.list_ports/0 — these
     # don't need a saved config (they're branded products that the
     # device-table classifies as :ir on sight).
     auto =
-      Hardware.list_ports()
+      ports
       |> Enum.filter(&(&1.connected and &1.kind == :ir))
       |> Enum.flat_map(fn port ->
         info = Map.get(enumerated, port.tty_name, %{})
@@ -280,7 +281,7 @@ defmodule UniversalProxy.ESPHome.Infrared.Server do
 
     # User-saved IR overrides on otherwise-unclassified hardware.
     saved =
-      Hardware.list_ports()
+      ports
       |> saved_infrared_targets(key_to_tty, UARTStore.all_configs())
       |> Enum.flat_map(fn {config, tty} ->
         start_entry(config, tty, Map.get(enumerated, tty, %{}))

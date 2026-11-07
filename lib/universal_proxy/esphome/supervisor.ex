@@ -5,15 +5,17 @@ defmodule UniversalProxy.ESPHome.Supervisor do
 
   Children, started in `:rest_for_one` order:
 
-    1. `ZWaveProxy` — GenServer that owns the Z-Wave UART port and
+    1. `ZWaveProxy.Advertiser` — the `_zwave._tcp` mDNS advertisement,
+       kept off the UART owner because MdnsLite calls can block
+    2. `ZWaveProxy` — GenServer that owns the Z-Wave UART port and
        implements the `Espex.ZWaveProxy` behaviour
-    2. `ZigbeeProxy` — GenServer that holds the ZBT-2's tty open and
+    3. `ZigbeeProxy` — GenServer that holds the ZBT-2's tty open and
        serves serial-proxy sessions on it
-    3. `Infrared.Supervisor` — DynamicSupervisor + `Infrared.Server`
+    4. `Infrared.Supervisor` — DynamicSupervisor + `Infrared.Server`
        (the `Espex.InfraredProxy` adapter)
-    4. `Espex` — the library supervisor: registry, server, TCP acceptor,
+    5. `Espex` — the library supervisor: registry, server, TCP acceptor,
        and (optionally) mDNS advertiser
-    5. `UniversalProxy.TuyaMesh.Commander` (Bluetooth targets) — runs the
+    6. `UniversalProxy.TuyaMesh.Commander` (Bluetooth targets) — runs the
        Tuya mesh light commands the `EntityProvider` hands it
 
   `ConfigStore` lives one level up in the application supervisor so a
@@ -50,6 +52,7 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   alias UniversalProxy.ESPHome.EntityProvider.MeshSync
   alias UniversalProxy.Hardware
   alias UniversalProxy.TuyaMesh.Commander
+  alias UniversalProxy.UART.Enumerate
   alias UniversalProxy.UART.Store, as: UARTStore
 
   def start_link(init_arg) do
@@ -106,6 +109,8 @@ defmodule UniversalProxy.ESPHome.Supervisor do
       ] ++ bluetooth_opts()
 
     children = [
+      # Before ZWaveProxy, which casts to it.
+      ZWaveProxy.Advertiser,
       # No port is resolved here — the proxy resolves (and re-resolves)
       # through the resolver on its open/rescan loop, so boot, hotplug,
       # and replug all take the same path.
@@ -249,7 +254,13 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   # invokes it from its open/rescan loop.
   @doc false
   def resolve_zwave_port do
-    pick_zwave_port(resolver_ports(), Hardware.live_port_keys(), UARTStore.all_configs())
+    enumerated = Enumerate.safe()
+
+    pick_zwave_port(
+      resolver_ports(enumerated),
+      Hardware.live_port_keys(enumerated: enumerated),
+      UARTStore.all_configs()
+    )
   end
 
   # Pure core of `resolve_zwave_port/0`: `ports` from `Hardware.list_ports/0`,
@@ -282,7 +293,7 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   # device) as `%{path: tty, display_name: ha_name, port: row}`, or nil.
   # Public because `ZigbeeProxy` invokes it from its open/rescan loop.
   @doc false
-  def resolve_zigbee_port, do: pick_zigbee_port(resolver_ports())
+  def resolve_zigbee_port, do: pick_zigbee_port(resolver_ports(Enumerate.safe()))
 
   @doc false
   def pick_zigbee_port(ports) do
@@ -296,7 +307,8 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   # default each `list_ports/0` would call both proxies' `claimed_port/1`,
   # so two proxies resolving at once would block on each other until the
   # call timeout.
-  defp resolver_ports, do: Hardware.list_ports(zwave_claim: nil, zigbee_claim: nil)
+  defp resolver_ports(enumerated),
+    do: Hardware.list_ports(enumerated: enumerated, zwave_claim: nil, zigbee_claim: nil)
 
   defp display_name_for(ports, tty) do
     case Enum.find(ports, &(&1.tty_name == tty)) do

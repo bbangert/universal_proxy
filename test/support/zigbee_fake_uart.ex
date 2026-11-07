@@ -3,7 +3,8 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy.FakeUART do
   Stands in for the Circuits.UART GenServer under
   `UniversalProxy.ESPHome.ZigbeeProxy`: reports every wire-level call to
   the test process (plus `{:uart_write_timeout, timeout}` after each
-  write) and replies `:ok` unless told otherwise with `reply_with/3`.
+  write) and replies `:ok` unless told otherwise with `reply_with/3`
+  (`reply_with(fake, :close, :exit)` makes `close` stop the fake).
   """
 
   use GenServer
@@ -36,6 +37,11 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy.FakeUART do
 
   def handle_call({:set_rts, value}, _from, state) do
     report(state, :set_rts, {:uart_set_rts, value})
+  end
+
+  def handle_call(:close, _from, %{replies: %{close: :exit}} = state) do
+    send(state.test, :uart_close)
+    {:stop, :normal, state}
   end
 
   def handle_call(:close, _from, state), do: report(state, :close, :uart_close)

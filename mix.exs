@@ -42,8 +42,15 @@ defmodule UniversalProxy.MixProject do
       # serialisation). Neither universal_proxy nor cowboy/plug_cowboy calls
       # the affected serialisers with attacker-controlled input. Drop this
       # once cowlib ships a fix.
+      #
+      # EEF-CVE-2026-115701 (cowboy 2.20.0, unbounded buffering of pipelined
+      # HTTP/1.1 data) and EEF-CVE-2026-113431 (cowlib 2.21.0, unbounded
+      # HTTP/2 HPACK header lists) are memory-exhaustion DoS issues fixed
+      # only in upstream git so far. Both are reachable from the LAN (cowboy
+      # serves the web UI and audio-source listeners); accepted until cowboy
+      # and cowlib ship releases. Drop each ID when its fix is released.
       hex: [
-        ignore_advisories: ["EEF-CVE-2026-43966"]
+        ignore_advisories: ["EEF-CVE-2026-43966", "EEF-CVE-2026-115701", "EEF-CVE-2026-113431"]
       ],
       releases: [{@app, release()}],
       aliases: aliases(),

@@ -181,7 +181,18 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
           {:ok, session()}
           | {:error, :not_attached | :invalid_speed | :invalid_argument | :timeout | term()}
   def attach(server \\ __MODULE__, opts, subscriber) when is_list(opts) and is_pid(subscriber) do
-    call(server, {:attach, opts, subscriber}, {:error, :not_attached})
+    ref = make_ref()
+
+    case call(server, {:attach, ref, opts, subscriber}, {:error, :not_attached}) do
+      {:error, :timeout} = timeout ->
+        # The queued attach may still run after we gave up; the cast
+        # queues behind it and drops the session nobody can reach.
+        GenServer.cast(server, {:detach, ref})
+        timeout
+
+      result ->
+        result
+    end
   end
 
   @doc """
@@ -284,6 +295,22 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   end
 
   @doc """
+  The tty this proxy is holding open, for `UART.History` restart
+  recovery and for `UniversalProxy.Hardware` to mark the port in use
+  (it is invisible to `UART.ports/0`); same shape and semantics as
+  `ZWaveProxy.claimed_port/1`. `subscribed` says whether an API client
+  is attached. Exits (server down, or `:calling_self` from the owner's
+  own resolver path) read as "no claim".
+  """
+  @spec claimed_port(GenServer.server()) ::
+          %{tty_name: String.t(), display_name: String.t(), subscribed: boolean()} | nil
+  def claimed_port(server \\ __MODULE__) do
+    GenServer.call(server, :claimed_port, @call_timeout)
+  catch
+    :exit, _ -> nil
+  end
+
+  @doc """
   Whether the tty is open, whether the last attempt to hold it failed,
   and the `Hardware` row it belongs to (kept while `error?`, nil when no
   ZBT-2 is resolved). A wedged server reports `error?: true`, a missing
@@ -320,23 +347,6 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   defp unattached, do: %{attached?: false, error?: false, port: nil}
 
   defp snapshot_key(server), do: {__MODULE__, :advertised, server}
-
-  @doc """
-  The tty this proxy holds open, or `nil`, for
-  `UniversalProxy.Hardware` to mark the port in use (it is invisible to
-  `UART.ports/0`). `subscribed` says whether a client holds the session
-  that receives RX data.
-
-  `Hardware.list_ports/0` calls this by default; a call from this
-  server's own resolver exits with `:calling_self` and is answered `nil`.
-  """
-  @spec claimed_port(GenServer.server()) ::
-          %{tty_name: String.t(), display_name: String.t(), subscribed: boolean()} | nil
-  def claimed_port(server \\ __MODULE__) do
-    GenServer.call(server, :claimed_port, @call_timeout)
-  catch
-    :exit, _ -> nil
-  end
 
   defp call(server, msg, default, timeout \\ @call_timeout) do
     GenServer.call(server, msg, timeout)
@@ -379,14 +389,13 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   end
 
   @impl GenServer
-  def handle_call({:attach, _opts, _pid}, _from, %{uart_pid: nil} = state) do
+  def handle_call({:attach, _ref, _opts, _pid}, _from, %{uart_pid: nil} = state) do
     {:reply, {:error, :not_attached}, state}
   end
 
-  def handle_call({:attach, opts, pid}, _from, state) do
+  def handle_call({:attach, ref, opts, pid}, _from, state) do
     case apply_opts(state, opts) do
       {:ok, state} ->
-        ref = make_ref()
         session = %{pid: pid, monitor: Process.monitor(pid)}
         Logger.debug("Zigbee proxy session #{inspect(ref)} attached for #{inspect(pid)}")
         {:reply, {:ok, ref}, put_in(state.sessions[ref], session)}
@@ -480,18 +489,15 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
     {:reply, to_open_opts(state.line), state}
   end
 
-  def handle_call(:claimed_port, _from, %{uart_pid: nil} = state) do
-    {:reply, nil, state}
-  end
-
   def handle_call(:claimed_port, _from, state) do
-    tty = Path.basename(state.port_path)
-
-    reply = %{
-      tty_name: tty,
-      display_name: state.display_name || tty,
-      subscribed: state.subscribed != nil
-    }
+    reply =
+      if state.uart_pid && state.port_path do
+        %{
+          tty_name: Path.basename(state.port_path),
+          display_name: state.display_name || Path.basename(state.port_path),
+          subscribed: state.subscribed != nil
+        }
+      end
 
     {:reply, reply, state}
   end
@@ -501,26 +507,28 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   end
 
   @impl GenServer
-  def handle_info({:circuits_uart, _port, {:error, reason}}, %{uart_pid: pid} = state)
-      when pid != nil do
-    Logger.warning("Zigbee proxy UART error: #{inspect(reason)}")
-    cleanup_uart(pid)
-    broadcast_lifecycle(state, "uart:port_closed", :uart_port_closed)
-
-    state =
-      %{state | uart_pid: nil, ash: Ash.reset(state.ash), rx_buffer: <<>>, error?: true}
-      |> schedule_reopen()
-      |> publish_snapshot()
-
-    {:noreply, state}
+  def handle_cast({:detach, ref}, state) do
+    {:noreply, drop_session(state, ref)}
   end
 
-  def handle_info({:circuits_uart, _port, data}, %{uart_pid: pid} = state)
+  @impl GenServer
+  def handle_info({:circuits_uart, port, {:error, reason}}, %{uart_pid: pid} = state)
+      when pid != nil do
+    if current_tty?(state, port),
+      do: handle_uart_error(state, pid, reason),
+      else: {:noreply, state}
+  end
+
+  def handle_info({:circuits_uart, port, data}, %{uart_pid: pid} = state)
       when is_binary(data) and pid != nil do
-    {state, acks} = deliver_rx(state, data)
-    broadcast_data(state, data, :rx)
-    if acks, do: broadcast_data(state, acks, :tx, origin: :ash_ack)
-    {:noreply, state}
+    if current_tty?(state, port) do
+      {state, acks} = deliver_rx(state, data)
+      broadcast_data(state, data, :rx)
+      if acks, do: broadcast_data(state, acks, :tx, origin: :ash_ack)
+      {:noreply, state}
+    else
+      {:noreply, state}
+    end
   end
 
   def handle_info(:zigbee_reopen, state) do
@@ -549,6 +557,33 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   def handle_info(_msg, state) do
     {:noreply, state}
   end
+
+  defp handle_uart_error(state, pid, reason) do
+    Logger.warning("Zigbee proxy UART error: #{inspect(reason)}")
+    cleanup_uart(pid)
+    broadcast_lifecycle(state, "uart:port_closed", :uart_port_closed)
+
+    state =
+      %{
+        state
+        | uart_pid: nil,
+          ash: Ash.reset(state.ash),
+          rx_buffer: <<>>,
+          line: @default_line,
+          error?: true
+      }
+      |> schedule_reopen()
+      |> publish_snapshot()
+
+    {:noreply, state}
+  end
+
+  # Circuits.UART active messages carry the tty name ("ttyACM0"); a late
+  # message from a previous UART must not reach the current session.
+  defp current_tty?(%{port_path: path}, port) when is_binary(path) and is_binary(port),
+    do: Path.basename(path) == Path.basename(port)
+
+  defp current_tty?(_state, _port), do: false
 
   @impl GenServer
   def terminate(_reason, state) do
@@ -715,7 +750,7 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   defp open_resolved(state) do
     case resolve_port(state) do
       nil ->
-        schedule_reopen(%{state | port: nil, error?: false})
+        schedule_reopen(%{state | port: nil, display_name: nil, error?: false})
 
       {port_path, display_name, port} ->
         case state.open_fun.(port_path) do
@@ -756,7 +791,9 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
         {path, display, Map.get(resolved, :port)}
 
       nil ->
-        if state.port_path do
+        # With a resolver, never fall back to a remembered path: after an
+        # unplug that tty may be reassigned to a different device.
+        if is_nil(state.resolver) and state.port_path do
           {state.port_path, state.display_name || Path.basename(state.port_path), state.port}
         end
     end
@@ -800,15 +837,18 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   defp cleanup_uart(nil), do: :ok
 
   defp cleanup_uart(pid) when is_pid(pid) do
-    try do
-      Circuits.UART.close(pid)
-      Circuits.UART.stop(pid)
-    catch
-      kind, reason ->
-        Logger.debug("Zigbee proxy UART cleanup failed: #{inspect({kind, reason})}")
-    end
-
+    # Separate guards: a failed close must not leave the linked UART
+    # process alive (it would keep delivering data).
+    guarded(fn -> Circuits.UART.close(pid) end)
+    guarded(fn -> Circuits.UART.stop(pid) end)
     :ok
+  end
+
+  defp guarded(fun) do
+    fun.()
+  catch
+    kind, reason ->
+      Logger.debug("Zigbee proxy UART cleanup failed: #{inspect({kind, reason})}")
   end
 
   # -- TX / PubSub --
