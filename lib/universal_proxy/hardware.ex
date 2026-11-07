@@ -783,8 +783,8 @@ defmodule UniversalProxy.Hardware do
   # Returns nil for other products so a bare 303A:4001 falls through to the
   # VID/PID table (ZWA-2), which keeps existing ZWA-2 setups unchanged.
   @nabucasa_vid 0x303A
-  @zbt2_product ~r/zbt-?2/i
-  @zwa2_product ~r/zwa-?2/i
+  @zbt2_product ~r/\bzbt-?2\b/i
+  @zwa2_product ~r/\bzwa-?2\b/i
   @zbt2_device %{
     kind: :zigbee,
     name: "Home Assistant Connect ZBT-2",

@@ -810,6 +810,13 @@ defmodule UniversalProxy.HardwareTest do
       end
     end
 
+    test "product match respects word boundaries" do
+      for product <- ["ZBT-20", "XZBT2", "ZWA-21", "AZWA2"] do
+        port = nabucasa_port(0x303A, 0x831A, %{description: product})
+        assert port.kind == nil, "expected #{inspect(product)} to be unclassified"
+      end
+    end
+
     test "a ZBT-2 product string under another vendor id is not Zigbee" do
       port = nabucasa_port(0x10C4, 0xEA60, %{description: "ZBT-2"})
 

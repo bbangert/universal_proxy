@@ -283,6 +283,19 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
       assert_receive {:uart_data, %{dir: :tx, data: ^ack1, origin: :ash_ack}}
     end
 
+    test "ACK writes use a short timeout; client writes keep the long one" do
+      %{server: server} = start_proxy!()
+      ref = subscribed!(server, :protocol)
+
+      rx(server, @data_0)
+      assert_receive {:uart_write_timeout, ack_timeout}
+      assert ack_timeout <= 250
+
+      :ok = ZigbeeProxy.write(server, ref, <<1, 2, 3>>)
+      assert_receive {:uart_write_timeout, write_timeout}
+      assert write_timeout >= 1_000
+    end
+
     test "T3: RAW stops ACKs; re-enabling PROTOCOL resets the numbering" do
       %{server: server} = start_proxy!()
       ref = subscribed!(server, :protocol)

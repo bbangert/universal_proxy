@@ -95,7 +95,9 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   follows only the calls that succeeded.
   """
 
-  use GenServer
+  # Circuits.UART.close/1 and stop/1 each wait up to 5 s, so terminate/2
+  # can take ~10 s on a wedged UART; the child shutdown budget must exceed it.
+  use GenServer, shutdown: 12_000
 
   require Logger
 
@@ -116,6 +118,9 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   # A write can legitimately take a while at a low bootloader baud; the
   # UART write gets its own ceiling, the call a little more.
   @uart_write_timeout 1_000
+  # An ASH ACK is 5 bytes and is written from the RX handler, so a stuck
+  # UART must not hold the owner for the full client-write ceiling.
+  @ack_write_timeout 200
   @write_call_timeout 1_500
 
   @reopen_interval 5_000
@@ -594,7 +599,7 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   end
 
   defp write_acks(state, acks) do
-    case Circuits.UART.write(state.uart_pid, acks, @uart_write_timeout) do
+    case Circuits.UART.write(state.uart_pid, acks, @ack_write_timeout) do
       :ok ->
         acks
 
