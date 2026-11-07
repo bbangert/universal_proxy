@@ -547,6 +547,14 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
       end
     end
 
+    # A stand-in MdnsLite table owner, killed when the test exits even if an
+    # assertion fails first.
+    defp spawn_table do
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+      pid
+    end
+
     # Round-trips the advertiser so every earlier cast has been handled.
     defp sync(advertiser), do: :sys.get_state(advertiser)
 
@@ -681,8 +689,8 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
     end
 
     test "re-registers against a live replacement after the MdnsLite table owner restarts" do
-      old = spawn(fn -> Process.sleep(:infinity) end)
-      replacement = spawn(fn -> Process.sleep(:infinity) end)
+      old = spawn_table()
+      replacement = spawn_table()
       Application.put_env(:fake_mdns, :table_pid, old)
 
       adv = start_advertiser!()
@@ -702,7 +710,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
     end
 
     test "a table lookup that still names the dead owner backs off instead of spinning" do
-      old = spawn(fn -> Process.sleep(:infinity) end)
+      old = spawn_table()
       Application.put_env(:fake_mdns, :table_pid, old)
 
       adv = start_advertiser!()
@@ -721,7 +729,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
     end
 
     test "a missing table owner after :DOWN waits for the retry timer" do
-      old = spawn(fn -> Process.sleep(:infinity) end)
+      old = spawn_table()
       Application.put_env(:fake_mdns, :table_pid, old)
 
       adv = start_advertiser!()
@@ -766,7 +774,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
     end
 
     test "a table owner going down after a withdraw is ignored" do
-      table = spawn(fn -> Process.sleep(:infinity) end)
+      table = spawn_table()
       Application.put_env(:fake_mdns, :table_pid, table)
       on_exit(fn -> Application.delete_env(:fake_mdns, :table_pid) end)
 
