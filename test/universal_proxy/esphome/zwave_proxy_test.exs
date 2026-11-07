@@ -9,7 +9,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
   use ExUnit.Case, async: false
 
   alias UniversalProxy.ESPHome.ZWaveProxy
-  alias UniversalProxy.ESPHome.ZWaveProxy.{Frame, Parser}
+  alias UniversalProxy.ESPHome.ZWaveProxy.{Advertiser, Frame, Parser}
 
   # Stands in for the Circuits.UART GenServer: replies :ok to every call
   # and forwards writes to the test process, so tests can assert exactly
@@ -55,6 +55,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
     on_exit(fn ->
       Application.delete_env(:fake_mdns, :test_pid)
       Application.delete_env(:fake_mdns, :add_result)
+      Application.delete_env(:fake_mdns, :table_pid)
     end)
 
     pid = start_supervised!({ZWaveProxy, name: nil, port_path: nil})
@@ -387,7 +388,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "uart:port_opened")
 
       opts =
-        [name: nil, open_fun: fn _path -> {:ok, fake} end, mdns_module: nil] ++
+        [name: nil, open_fun: fn _path -> {:ok, fake} end, advertiser: nil] ++
           List.wrap(resolver_or_opts)
 
       server = start_supervised!({ZWaveProxy, opts}, id: {:zw_open, System.unique_integer()})
@@ -433,7 +434,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
          name: nil,
          port_path: "/dev/ttyShutdown",
          open_fun: fn _path -> {:ok, fake} end,
-         mdns_module: nil},
+         advertiser: nil},
         id: id
       )
 
@@ -461,8 +462,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
       server =
         start_supervised!(
           Supervisor.child_spec(
-            {ZWaveProxy,
-             name: nil, port_path: "/dev/ttyCrash", open_fun: open_fun, mdns_module: nil},
+            {ZWaveProxy, name: nil, port_path: "/dev/ttyCrash", open_fun: open_fun},
             id: {:zw_crash, System.unique_integer()},
             restart: :temporary
           )
@@ -483,8 +483,33 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
 
   describe "_zwave._tcp mDNS" do
     @config %{name: "universal-proxy-abc123", port: 7053}
+    @service %{
+      id: :zwave_proxy,
+      instance_name: "universal-proxy-abc123",
+      protocol: "zwave",
+      transport: "tcp",
+      port: 7053,
+      txt_payload: ["protocol=esphome"]
+    }
+    @register [{:remove, :zwave_proxy}, {:add, @service}, {:announce_all, nil}]
+    @withdraw [{:goodbye, :zwave_proxy}, {:remove, :zwave_proxy}]
 
-    defp start_mdns_proxy!(opts \\ []) do
+    defp start_advertiser!(opts \\ []) do
+      opts =
+        Keyword.merge(
+          [
+            name: nil,
+            mdns_module: FakeMdns,
+            config_fun: fn -> @config end,
+            table_fun: fn -> Application.get_env(:fake_mdns, :table_pid) end
+          ],
+          opts
+        )
+
+      start_supervised!({Advertiser, opts}, id: {:zw_adv, System.unique_integer()})
+    end
+
+    defp start_mdns_proxy!(advertiser, opts \\ []) do
       {:ok, fake} = FakeUART.start_link(self())
       id = {:zw_mdns, System.unique_integer()}
 
@@ -494,8 +519,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
             name: nil,
             port_path: "/dev/ttyMdns",
             open_fun: fn _path -> {:ok, fake} end,
-            mdns_module: FakeMdns,
-            config_fun: fn -> @config end
+            advertiser: advertiser
           ],
           opts
         )
@@ -504,113 +528,176 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
       {pid, fake, id}
     end
 
+    # The next `n` recorded MdnsLite calls, in the order they were made.
+    defp calls(n) do
+      for _ <- 1..n do
+        receive do
+          {:mdns, call, arg} -> {call, arg}
+        after
+          1_000 -> flunk("expected #{n} mDNS calls, mailbox ran dry")
+        end
+      end
+    end
+
+    # Round-trips the advertiser so every earlier cast has been handled.
+    defp sync(advertiser), do: :sys.get_state(advertiser)
+
     test "registers on claim with the node name and configured API port, then announces" do
-      {_pid, _fake, _id} = start_mdns_proxy!()
+      adv = start_advertiser!()
+      start_mdns_proxy!(adv)
 
-      assert_receive {:mdns, :remove, :zwave_proxy}
-      assert_receive {:mdns, :add, service}
-
-      assert service == %{
-               id: :zwave_proxy,
-               instance_name: "universal-proxy-abc123",
-               protocol: "zwave",
-               transport: "tcp",
-               port: 7053,
-               txt_payload: ["protocol=esphome"]
-             }
-
-      assert_receive {:mdns, :announce_all, nil}
+      assert calls(3) == @register
     end
 
     test "registers nothing when there is no stick" do
-      start_supervised!({ZWaveProxy, name: nil, mdns_module: FakeMdns}, id: :zw_mdns_idle)
+      adv = start_advertiser!()
+      start_supervised!({ZWaveProxy, name: nil, advertiser: adv}, id: :zw_mdns_idle)
       # A resolver that finds nothing: the reopen loop never claims a port.
       start_supervised!(
-        {ZWaveProxy, name: nil, resolver: fn -> nil end, mdns_module: FakeMdns},
+        {ZWaveProxy, name: nil, resolver: fn -> nil end, advertiser: adv},
         id: :zw_mdns_no_stick
       )
 
+      sync(adv)
+      refute_receive {:mdns, _, _}, 100
+    end
+
+    test "a proxy with the advertiser disabled makes no mDNS calls" do
+      adv = start_advertiser!()
+      start_mdns_proxy!(nil)
+
+      sync(adv)
       refute_receive {:mdns, _, _}, 100
     end
 
     test "unplug withdraws the service: goodbye before remove" do
-      {pid, _fake, _id} = start_mdns_proxy!()
-      assert_receive {:mdns, :remove, :zwave_proxy}
-      assert_receive {:mdns, :add, _}
-      assert_receive {:mdns, :announce_all, nil}
+      adv = start_advertiser!()
+      {pid, _fake, _id} = start_mdns_proxy!(adv)
+      assert calls(3) == @register
 
       send(pid, {:circuits_uart, "ttyMdns", {:error, :eio}})
 
-      assert_receive {:mdns, :goodbye, :zwave_proxy}
-      assert_receive {:mdns, :remove, :zwave_proxy}
+      assert calls(2) == @withdraw
+      sync(adv)
       refute_receive {:mdns, _, _}, 50
     end
 
-    test "terminate (supervisor shutdown) says goodbye then removes" do
-      {_pid, _fake, id} = start_mdns_proxy!()
-      assert_receive {:mdns, :announce_all, nil}
+    test "proxy shutdown withdraws: goodbye then remove" do
+      adv = start_advertiser!()
+      {_pid, _fake, id} = start_mdns_proxy!(adv)
+      assert calls(3) == @register
 
       :ok = stop_supervised(id)
 
-      assert_receive {:mdns, :goodbye, :zwave_proxy}
-      assert_receive {:mdns, :remove, :zwave_proxy}
+      assert calls(2) == @withdraw
+    end
+
+    test "a proxy killed before terminate/2 still gets its service withdrawn" do
+      adv = start_advertiser!()
+      {pid, _fake, _id} = start_mdns_proxy!(adv)
+      assert calls(3) == @register
+
+      Process.exit(pid, :kill)
+
+      assert calls(2) == @withdraw
+    end
+
+    test "advertiser shutdown while advertised withdraws" do
+      adv = start_advertiser!()
+      start_mdns_proxy!(adv)
+      assert calls(3) == @register
+
+      GenServer.stop(adv)
+
+      assert calls(2) == @withdraw
     end
 
     test "terminate with no claim touches nothing" do
+      adv = start_advertiser!()
       id = :zw_mdns_unclaimed
-      start_supervised!({ZWaveProxy, name: nil, mdns_module: FakeMdns}, id: id)
+      start_supervised!({ZWaveProxy, name: nil, advertiser: adv}, id: id)
       :ok = stop_supervised(id)
 
+      sync(adv)
       refute_receive {:mdns, _, _}, 100
     end
 
-    test "re-registration (supervisor restart) removes any stale entry first and never errors" do
-      {_pid, _fake, id} = start_mdns_proxy!()
-      assert_receive {:mdns, :announce_all, nil}
+    test "re-registration (restart) removes any stale entry first and never errors" do
+      adv = start_advertiser!()
+      {_pid, _fake, id} = start_mdns_proxy!(adv)
+      assert calls(3) == @register
       :ok = stop_supervised(id)
-      assert_receive {:mdns, :goodbye, :zwave_proxy}
-      assert_receive {:mdns, :remove, :zwave_proxy}
+      assert calls(2) == @withdraw
 
-      {_pid, _fake, _id} = start_mdns_proxy!()
-      assert_receive {:mdns, :remove, :zwave_proxy}
-      assert_receive {:mdns, :add, %{id: :zwave_proxy, port: 7053}}
-      assert_receive {:mdns, :announce_all, nil}
+      start_mdns_proxy!(adv)
+
+      assert calls(3) == @register
     end
 
     test "a failed add is retried and the service lands once MdnsLite recovers" do
       Application.put_env(:fake_mdns, :add_result, {:error, :mdns_unavailable})
-      {pid, _fake, _id} = start_mdns_proxy!()
-      assert_receive {:mdns, :add, _}
+      adv = start_advertiser!()
+      start_mdns_proxy!(adv)
+      assert calls(2) == [{:remove, :zwave_proxy}, {:add, @service}]
       refute_receive {:mdns, :announce_all, _}, 50
 
       Application.put_env(:fake_mdns, :add_result, :ok)
       # Fire the retry now rather than waiting out the backoff.
-      send(pid, :zwave_mdns_retry)
+      send(adv, :retry)
 
-      assert_receive {:mdns, :add, %{id: :zwave_proxy}}
-      assert_receive {:mdns, :announce_all, nil}
+      assert calls(3) == @register
     end
 
-    test "unplug while a retry is pending removes the service and cancels the retry" do
+    test "unplug while a retry is pending withdraws (the add may have landed) and cancels the retry" do
       Application.put_env(:fake_mdns, :add_result, {:error, :mdns_unavailable})
-      {pid, _fake, _id} = start_mdns_proxy!()
-      assert_receive {:mdns, :remove, :zwave_proxy}
-      assert_receive {:mdns, :add, _}
+      adv = start_advertiser!()
+      {pid, _fake, _id} = start_mdns_proxy!(adv)
+      assert calls(2) == [{:remove, :zwave_proxy}, {:add, @service}]
 
       send(pid, {:circuits_uart, "ttyMdns", {:error, :eio}})
 
-      # Never registered, so no goodbye — but the possibly-landed add is removed.
-      assert_receive {:mdns, :remove, :zwave_proxy}
-      refute_receive {:mdns, :goodbye, _}, 50
-      assert :sys.get_state(pid).mdns_retry_timer == nil
+      assert calls(2) == @withdraw
+      assert :sys.get_state(adv).retry_timer == nil
     end
 
     test "an unreadable config is retried rather than registering a bogus port" do
-      {pid, _fake, _id} =
-        start_mdns_proxy!(config_fun: fn -> raise "config down" end)
+      adv = start_advertiser!(config_fun: fn -> raise "config down" end)
+      start_mdns_proxy!(adv)
 
+      assert calls(1) == [{:remove, :zwave_proxy}]
       refute_receive {:mdns, :add, _}, 100
-      assert :sys.get_state(pid).mdns_failures == 1
+      assert :sys.get_state(adv).failures == 1
+    end
+
+    test "re-registers after the MdnsLite table owner restarts" do
+      table = spawn(fn -> Process.sleep(:infinity) end)
+      Application.put_env(:fake_mdns, :table_pid, table)
+      on_exit(fn -> Application.delete_env(:fake_mdns, :table_pid) end)
+
+      adv = start_advertiser!()
+      start_mdns_proxy!(adv)
+      assert calls(3) == @register
+
+      Process.exit(table, :kill)
+
+      assert calls(3) == @register
+    end
+
+    test "a table owner going down after a withdraw is ignored" do
+      table = spawn(fn -> Process.sleep(:infinity) end)
+      Application.put_env(:fake_mdns, :table_pid, table)
+      on_exit(fn -> Application.delete_env(:fake_mdns, :table_pid) end)
+
+      adv = start_advertiser!()
+      {pid, _fake, _id} = start_mdns_proxy!(adv)
+      assert calls(3) == @register
+      send(pid, {:circuits_uart, "ttyMdns", {:error, :eio}})
+      assert calls(2) == @withdraw
+
+      Process.exit(table, :kill)
+
+      sync(adv)
+      refute_receive {:mdns, _, _}, 50
     end
   end
 

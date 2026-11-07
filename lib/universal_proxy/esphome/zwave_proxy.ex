@@ -43,7 +43,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
   (Z-Wave JS UI's port picker). The service is withdrawn — goodbye, then
   remove — when the port closes, the stick is unplugged, or the proxy
   terminates, so an `ESPHome.Supervisor.restart/0` re-registers cleanly.
-  A failed registration (MdnsLite not up yet) is retried with backoff.
+  The mDNS calls run in `ZWaveProxy.Advertiser`, off this process.
   """
 
   use GenServer
@@ -52,9 +52,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
 
   require Logger
 
-  alias UniversalProxy.ESPHome.{ConfigStore, MdnsAdapter}
-  alias UniversalProxy.ESPHome.ZWaveProxy.{Frame, Parser}
-  alias UniversalProxy.SafeMdns
+  alias UniversalProxy.ESPHome.ZWaveProxy.{Advertiser, Frame, Parser}
 
   @uart_speed 115_200
 
@@ -77,11 +75,6 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
   # Z-Wave API spec's data-frame reception timeout.
   @frame_timeout 1_500
 
-  # mDNS registration retry backoff (MdnsLite may not be up at boot).
-  @mdns_retry_ms 5_000
-  @mdns_retry_max_ms 60_000
-  @mdns_service_id :zwave_proxy
-
   @zero_home_id <<0, 0, 0, 0>>
 
   @pubsub UniversalProxy.PubSub
@@ -98,11 +91,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
     :frame_timer,
     :frame_timer_ref,
     :last_open_error,
-    :mdns_retry_timer,
-    mdns_registered: false,
-    mdns_failures: 0,
-    mdns_module: MdnsLite,
-    config_fun: &ConfigStore.current/0,
+    advertiser: Advertiser,
     parser: nil,
     home_id: @zero_home_id,
     home_id_ready: false,
@@ -224,11 +213,8 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
       # nil (explicit or absent) falls back to the real opener so
       # state.open_fun is always callable.
       open_fun: Keyword.get(opts, :open_fun) || (&open_port/1),
-      # Seams for the `_zwave._tcp` advertisement: `mdns_module: nil`
-      # disables it; `config_fun` yields the map with the node `:name`
-      # and API `:port`.
-      mdns_module: Keyword.get(opts, :mdns_module, MdnsLite),
-      config_fun: Keyword.get(opts, :config_fun, &ConfigStore.current/0)
+      # The `_zwave._tcp` advertiser to cast to; nil disables it.
+      advertiser: Keyword.get(opts, :advertiser, Advertiser)
     }
 
     if state.port_path || state.resolver do
@@ -372,16 +358,6 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
       {:noreply, state}
     else
       {:noreply, attempt_open(state)}
-    end
-  end
-
-  def handle_info(:zwave_mdns_retry, state) do
-    state = %{state | mdns_retry_timer: nil}
-
-    if state.uart_pid do
-      {:noreply, register_mdns(state)}
-    else
-      {:noreply, state}
     end
   end
 
@@ -531,84 +507,22 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
 
   defp schedule_home_id_retry(state), do: state
 
-  # Advertise `_zwave._tcp` for the stick we hold. Re-adding is safe: any
-  # entry under our id (a predecessor killed before terminate/2, or one
-  # with a since-changed port) is removed first, because MdnsLite keeps
-  # services in a set of whole maps and a differing map would duplicate.
-  defp register_mdns(%{mdns_module: nil} = state), do: state
+  # The advertisement I/O (GenServer calls into MdnsLite, up to 5 s each)
+  # lives in the Advertiser so it never stalls this process, the UART owner.
+  # Casts from one sender are ordered, so a withdraw can't be overtaken by
+  # an earlier advertise.
+  defp register_mdns(%{advertiser: nil} = state), do: state
 
   defp register_mdns(state) do
-    state = cancel_mdns_retry(state)
-    _ = SafeMdns.call(state.mdns_module, & &1.remove_mdns_service(@mdns_service_id))
-
-    with {:ok, service} <- mdns_service(state),
-         :ok <- SafeMdns.call(state.mdns_module, & &1.add_mdns_service(service)) do
-      # Announce so passive peers see it now rather than at their next poll.
-      _ = SafeMdns.call(state.mdns_module, & &1.announce_all())
-      %{state | mdns_registered: true, mdns_failures: 0}
-    else
-      other ->
-        delay = min(@mdns_retry_ms * Integer.pow(2, state.mdns_failures), @mdns_retry_max_ms)
-        level = if state.mdns_failures == 0, do: :warning, else: :debug
-
-        Logger.log(
-          level,
-          "Z-Wave _zwave._tcp registration failed (#{inspect(other)}); retrying in #{delay}ms"
-        )
-
-        %{
-          state
-          | mdns_failures: state.mdns_failures + 1,
-            mdns_retry_timer: Process.send_after(self(), :zwave_mdns_retry, delay)
-        }
-    end
+    Advertiser.advertise(state.advertiser)
+    state
   end
 
-  # Goodbye BEFORE remove: removing strips the service from the table, and
-  # a goodbye after that has nothing to build the TTL=0 packet from.
-  defp unregister_mdns(%{mdns_module: nil} = state), do: state
+  defp unregister_mdns(%{advertiser: nil} = state), do: state
 
   defp unregister_mdns(state) do
-    state = cancel_mdns_retry(state)
-
-    if state.mdns_registered do
-      _ = SafeMdns.call(state.mdns_module, & &1.goodbye_service(@mdns_service_id))
-    end
-
-    # A failed add may still have landed (call timeout), so a pending retry
-    # also warrants the remove.
-    if state.mdns_registered or state.mdns_failures > 0 do
-      _ = SafeMdns.call(state.mdns_module, & &1.remove_mdns_service(@mdns_service_id))
-    end
-
-    %{state | mdns_registered: false, mdns_failures: 0}
-  end
-
-  defp cancel_mdns_retry(%{mdns_retry_timer: nil} = state), do: state
-
-  defp cancel_mdns_retry(state) do
-    Process.cancel_timer(state.mdns_retry_timer)
-    %{state | mdns_retry_timer: nil}
-  end
-
-  # The node name and API port come from the live ESPHome config (a change
-  # restarts this tree), not a literal 6053.
-  defp mdns_service(state) do
-    %{name: name, port: port} = state.config_fun.()
-
-    {:ok,
-     %{
-       id: @mdns_service_id,
-       instance_name: MdnsAdapter.instance_name(name),
-       protocol: "zwave",
-       transport: "tcp",
-       port: port,
-       txt_payload: ["protocol=esphome"]
-     }}
-  rescue
-    e -> {:error, {:config_unavailable, Exception.message(e)}}
-  catch
-    :exit, reason -> {:error, {:config_unavailable, reason}}
+    Advertiser.withdraw(state.advertiser)
+    state
   end
 
   # Frame reception timeout, timed from the frame's start byte (the

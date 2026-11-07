@@ -93,7 +93,6 @@ defmodule UniversalProxy.Audio.Input.Server do
 
   alias UniversalProxy.Audio.Input.{DeviceInfo, Enumerate, Source, Store}
   alias UniversalProxy.Audio.Player
-  alias UniversalProxy.SafeMdns
 
   @pubsub UniversalProxy.PubSub
   @hotplug_interval 5_000
@@ -971,7 +970,22 @@ defmodule UniversalProxy.Audio.Input.Server do
 
   defp mdns_service_id({slot_sub, vid, pid}), do: {:sendspin_source, slot_sub, vid, pid}
 
-  defp safe_mdns(state, fun), do: SafeMdns.call(state.mdns_module, fun)
+  # `MdnsLite`'s functions are `GenServer.call`s into the TableServer: a
+  # stopped or restarting MdnsLite exits rather than raising, and an
+  # unstarted `MdnsLite.Responders` registry raises `ArgumentError`. Both
+  # shapes have to be caught or an mDNS hiccup takes the whole input
+  # subsystem down with it.
+  defp safe_mdns(state, fun) do
+    fun.(state.mdns_module)
+  rescue
+    e ->
+      Logger.debug("#{inspect(state.mdns_module)} call raised: #{Exception.message(e)}")
+      {:error, :mdns_unavailable}
+  catch
+    :exit, reason ->
+      Logger.debug("#{inspect(state.mdns_module)} call exited: #{inspect(reason)}")
+      {:error, :mdns_unavailable}
+  end
 
   # -- Broadcast helpers (literal topics; static atom tags) --
 
