@@ -500,7 +500,7 @@ def settle(device, before, wait_s, grace_s, clock=None, sleep=None):
     if before is not None and rebooted(before, first):
         return "reset", first
     last = first
-    while last["lo"] - first["hi"] < grace_s:
+    while grace_s > 0 and last["lo"] - first["hi"] < grace_s:
         sleep(GRACE_POLL_S)
         state = wait_for_device(device, wait_s, clock, sleep)
         if state is None:

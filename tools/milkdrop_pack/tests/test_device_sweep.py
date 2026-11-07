@@ -292,7 +292,8 @@ class FakeDevice(device_sweep.Device):
       no_connect  ssh can't connect at all (the run never starts)
     """
 
-    def __init__(self, behaviours=None, down=3, boot_ids=True, connect_s=0, run_s=30, alive=1):
+    def __init__(self, behaviours=None, down=3, boot_ids=True, connect_s=0, run_s=30, alive=1, probe_s=0):
+        self.probe_s = probe_s  # how long each boot-state probe takes, so lo < hi
         self.behaviours = {k: list(v) for k, v in (behaviours or {}).items()}
         self.down, self.boot_ids, self.alive = down, boot_ids, alive
         self.reset_in = None  # probes left before a pending reboot
@@ -322,7 +323,9 @@ class FakeDevice(device_sweep.Device):
             if self.polls_left > 0:
                 self.polls_left -= 1
                 return "ssh: connect to host dev port 22: No route to host"
-            return self.boot_line()
+            line = self.boot_line()
+            self.clock.now += self.probe_s
+            return line
         args = next(a for a in (json.loads(base64.b64decode(b)) for b in re.findall(r'decode64!\("([^"]+)"\)', code))
                     if "--locked" in a)
         pid = args[args.index("--locked") + 1]
@@ -455,6 +458,21 @@ class RebootAwareSweepTest(unittest.TestCase):
         os.remove(self.out)
         self.sweep(FakeDevice({"b.milk": ["drop"]}), "--reset-grace-s", "12")
         self.assertEqual(self.sleeps, [5, 5, 5])
+
+    def test_zero_grace_probes_and_sleeps_no_more_with_real_probe_times(self):
+        dev = FakeDevice({"b.milk": ["drop"]}, probe_s=0.5)
+        probes = []
+        real_state = dev.state
+        dev.state = lambda *a, **k: probes.append(1) or real_state(*a, **k)
+        self.sweep(dev, "--reset-grace-s", "0")
+        self.assertEqual(self.sleeps, [])
+        self.assertEqual(len(probes), 1)  # the settle probe after b.milk, nothing more
+
+    def test_a_run_that_never_started_skips_the_grace_path(self):
+        dev = FakeDevice({"b.milk": ["no_connect", "ok"]}, probe_s=0.5)
+        self.sweep(dev)
+        self.assertEqual(self.sleeps, [])
+        self.assertEqual(dev.runs, ["a.milk", "b.milk", "b.milk", "c.milk"])
 
     def test_a_dropped_connection_without_a_reboot_is_an_error(self):
         dev = FakeDevice({"b.milk": ["drop"]})
