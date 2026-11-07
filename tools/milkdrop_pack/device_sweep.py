@@ -502,7 +502,7 @@ def settle(device, before, wait_s, grace_s, clock=None, sleep=None):
     last = first
     while last["lo"] - first["hi"] < grace_s:
         sleep(GRACE_POLL_S)
-        state = device.state() or wait_for_device(device, wait_s, clock, sleep)
+        state = wait_for_device(device, wait_s, clock, sleep)
         if state is None:
             return "unreachable", None
         if rebooted(first, state) or (before is not None and rebooted(before, state)):

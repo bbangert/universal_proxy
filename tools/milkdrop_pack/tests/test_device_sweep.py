@@ -248,6 +248,35 @@ class WaitForDeviceTest(unittest.TestCase):
         self.assertLessEqual(elapsed, 1)
 
 
+class SettleTest(unittest.TestCase):
+    def test_a_device_lost_mid_grace_is_unreachable_within_the_reboot_wait(self):
+        clock = FakeClock()
+        down_at = clock.now + 7
+
+        class VanishingDevice:
+            """Answers on one boot until `down_at`, then every ssh hangs to its timeout."""
+
+            def __init__(self):
+                self.timeouts = []
+
+            def state(self, timeout=device_sweep.PROBE_TIMEOUT_S):
+                self.timeouts.append(timeout)
+                if clock.now < down_at:
+                    clock.now += 0.5
+                    return {"uptime_ms": 1000, "boot_id": "b", "lo": clock.now - 0.5, "hi": clock.now}
+                clock.now += timeout
+                return None
+
+        dev = VanishingDevice()
+        with contextlib.redirect_stdout(io.StringIO()):
+            verdict, state = device_sweep.settle(dev, None, 60, 20, clock=clock, sleep=clock.sleep)
+        self.assertEqual((verdict, state), ("unreachable", None))
+        # From the first hung probe: the wait budget, plus at most one grace
+        # poll and one capped probe.
+        self.assertLessEqual(clock.now - down_at, 60 + device_sweep.GRACE_POLL_S + 1)
+        self.assertTrue(all(t <= device_sweep.PROBE_TIMEOUT_S for t in dev.timeouts))
+
+
 class FakeDevice(device_sweep.Device):
     """A device driven over ssh, answering by what the Elixir is for. Per
     preset, `behaviours` lists what each run does (default "ok"):
