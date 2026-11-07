@@ -154,23 +154,42 @@ appending, and `--device-sweep` skips one with a warning (an invalid line
 anywhere else fails the build).
 
 Some presets hang the Pi 3's vc4 GPU: the kernel logs `[drm] Resetting GPU.`
-and the whole Pi reboots within seconds (`high_frequency/Martin - QBikal -
-Surface Turbulence IIz2 (by hakanh mash-up).milk` does, every time). The
-sweep is reboot-aware. Each run starts by printing the device's uptime
-(BEAM wall clock) and `boot_id`; when a run fails (error, timeout, dropped
-connection) the sweep polls SSH with backoff for up to `--reboot-wait-s`
-(default 300) and compares them. If the device restarted, the preset is
-recorded as `status: "skip"`, `reason: "device_reset"` (with `boot_before`
-/ `boot_after`, `uptime_before_ms` / `uptime_after_ms` and the run's
-`error`), never retried, and the sweep carries on, so nothing is recorded
-for the presets that would have found the device down. `--device-sweep`
-turns it into `rpi3: {"rung": "skip", "reason": "device_reset"}`, as it does
-the hand-written `"gpu_hang"`. A failure without a reboot stays an `error`
-(retried by the next run); a run that never started (SSH couldn't connect)
-is retried up to twice before it counts; a device that doesn't come back
-stops the sweep (exit 1). A reboot for another reason (power loss, a
-reflash) during a failing run is recorded the same way: delete that line
-to have the preset measured again.
+and the Pi either recovers or reboots, sometimes seconds after the preset
+seemed to finish (`high_frequency/Martin - QBikal - Surface Turbulence IIz2
+(by hakanh mash-up).milk` reboots it every time). The sweep watches for
+both:
+
+- **GPU hangs.** Each run writes a marker record to `/dev/kmsg` and streams
+  the kernel log (a `cat /dev/kmsg` port, as busybox has no `dmesg -w`)
+  from just before the renderer starts until 500 ms after it exits, then
+  prints `GPU_RESET <n>`: the `Resetting GPU` lines logged after the
+  marker (`GPU_RESET unknown` when the kernel log can't be written or
+  read). Any reset makes the preset `status: "skip"`, `reason: "gpu_hang"`
+  (with `gpu_resets` and the renderer's own `run_status` / `run_reason`),
+  even when the run finished and the device survived: survivable resets
+  exclude a preset too, as the next one may not be.
+- **Device resets.** Each run starts by printing the device's uptime (BEAM
+  wall clock) and `boot_id`. After a failed run (error, timeout, dropped
+  connection) or a GPU hang, the sweep polls SSH with backoff for up to
+  `--reboot-wait-s` (default 300), then requires the device to stay up on
+  the same boot across probes spanning `--reset-grace-s` (default 20)
+  before it starts the next preset, so a delayed reboot is blamed on the
+  preset that caused it rather than the next one. A restart is recorded as
+  `status: "skip"`, `reason: "device_reset"` (with `boot_before` /
+  `boot_after`, `uptime_before_ms` / `uptime_after_ms` and the run's
+  `error`). The boot id decides; without one, only an uptime below what the
+  device must have reached since the earlier sample counts (each sample is
+  bounded by its ssh call's start and end, so slow connects and delayed
+  replies aren't reboots).
+
+Both are never retried, and `--device-sweep` turns them into
+`rpi3: {"rung": "skip", "reason": "gpu_hang"}` / `"device_reset"`. A failure
+without either stays an `error` (retried by the next run); a run that never
+started (SSH couldn't connect) is retried up to twice before it counts; a
+device that doesn't come back stops the sweep (exit 1). A reboot for
+another reason (power loss, a reflash) during a failing run or its grace
+period is recorded the same way: delete that line to have the preset
+measured again.
 
 `--dry-run` prints the plan and the Elixir it would send;
 `--only ID` / `--limit N` sweep a subset. The device runs Elixir over

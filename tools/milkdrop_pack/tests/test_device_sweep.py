@@ -485,6 +485,18 @@ class RebootAwareSweepTest(unittest.TestCase):
         self.assertIsNone(sweep.parse_boot("ssh: connect to host dev: refused"))
         self.assertEqual(sweep.parse_run("a.milk", "BOOT 7 x\nEXIT_STATUS timeout")["reason"], "no_stats")
 
+    def test_swept_gpu_hangs_and_device_resets_reach_the_manifest(self):
+        from milkpack import manifest, sweep
+
+        self.sweep(FakeDevice({"a.milk": ["gpu"], "b.milk": ["late_reset"]}))
+        doc = manifest.build("2026.11.1", list(self.PRESETS), sweep.load_sweep(self.out))
+        self.assertEqual(manifest.validate(doc), [])
+        by = {p["file"]: p for p in doc["presets"]}
+        self.assertEqual(by["a.milk"]["rpi3"], {"rung": "skip", "reason": "gpu_hang"})
+        self.assertNotIn("compile_ms", by["a.milk"])  # the hung run's timings aren't kept
+        self.assertEqual(by["b.milk"]["rpi3"], {"rung": "skip", "reason": "device_reset"})
+        self.assertEqual(by["c.milk"]["rpi3"], {"rung": "640x360"})
+
     def test_device_resets_reach_the_manifest(self):
         from milkpack import manifest, sweep
 

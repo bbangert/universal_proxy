@@ -16,12 +16,15 @@ Resumable: presets that already have an "ok" or "skip" record for this
 tarball's SHA-256 in --out are not run again (errors are retried), so an
 interrupted multi-hour sweep just continues.
 
-Reboot-aware: some presets hang the vc4 GPU, the kernel resets it and the
-whole Pi reboots. Each run reports the device's uptime and boot id first;
-when a run fails, the sweep waits (--reboot-wait-s) for the device to come
-back and compares them. A preset that took the device down is recorded as
-a "skip" with reason "device_reset" (and never retried); other failures
-stay "error".
+Reboot-aware: some presets hang the vc4 GPU; the kernel resets it and the
+Pi recovers or reboots, sometimes seconds later. Each run reports the
+device's uptime and boot id first and the kernel's "Resetting GPU" count
+(from /dev/kmsg) last; any reset makes the preset a "skip" with reason
+"gpu_hang". After a failed or GPU-resetting run the sweep waits
+(--reboot-wait-s) for the device to answer and then to stay up on the same
+boot for --reset-grace-s before the next preset. A preset that took the
+device down is recorded as a "skip" with reason "device_reset"; neither is
+retried, and other failures stay "error".
 Before each preset it waits for the SoC to cool below --cooldown-c, so the
 renderer's thermal guard doesn't skew late results.
 
