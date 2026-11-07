@@ -66,7 +66,7 @@ defmodule UniversalProxy.Application do
         # BEFORE Display.Supervisor, whose State will start the renderer
         # with the pack dir and settings these hold. Returns `:ignore`
         # unless `UniversalProxy.MilkDrop.enabled?/0` (rpi3/rpi4/rpi5 with
-        # the Display `:milkdrop` flag on; off everywhere for now).
+        # the Display `:milkdrop` flag on).
         UniversalProxy.MilkDrop.Supervisor,
         # TV UI on the Pi HDMI output (State + the viewport's
         # DynamicSupervisor). AFTER Audio and Cec, whose state it will follow.

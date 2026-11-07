@@ -187,8 +187,14 @@ defmodule UniversalProxy.MilkDrop.PackTest do
     assert Pack.ensure(server) == {:error, :invalid_pin}
   end
 
-  test "the configured pin is nil until a pack is published" do
-    assert Pack.configured_pin() == nil
+  test "the configured pin is a well-formed release asset of its version" do
+    assert %{version: version, url: url, sha256: sha256} = Pack.configured_pin()
+    assert version =~ ~r/\A[0-9A-Za-z][0-9A-Za-z._-]*\z/
+    assert sha256 =~ ~r/\A[0-9a-f]{64}\z/
+
+    assert url ==
+             "https://github.com/bbangert/up-milkdrop-pack/releases/download/" <>
+               "#{version}/up-milkdrop-pack-#{version}.tar.gz"
   end
 
   @tag capture_log: true
