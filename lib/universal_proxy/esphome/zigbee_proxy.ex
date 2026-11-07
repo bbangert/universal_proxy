@@ -40,11 +40,15 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   - Once a row has been resolved it stays in the snapshot for the
     owner's lifetime, even after the resolver stops finding the stick
     (unplugged): it then reads `attached?: false`. The serial-proxy
-    adapter numbers its instances from this snapshot, so a vanishing
-    row would shift every later instance under connected clients. A
-    newly resolved row (the stick back, possibly on another tty)
-    replaces it. The owner restarts with the ESPHome tree on hotplug,
-    which is when renumbering is safe.
+    adapter numbers its instances from this snapshot, so a row that
+    vanished or appeared would shift later instances under connected
+    clients. The advertised row is therefore fixed for the owner's
+    lifetime: only a row resolved in `init/1` is ever published, and a
+    re-resolved row (the stick back, possibly on another tty) replaces
+    it only when it has the same `ha_name`. An owner that started with
+    no row still opens and holds a stick plugged in later (avoiding a
+    later DTR bounce) but keeps advertising `port: nil`. Renumbering
+    happens only on the ESPHome tree restart that hotplug triggers.
   - When the attach state or the row changes, the owner notifies an
     `IdentityPusher` it links at init (only with an `:on_change` fun);
     the pusher runs the fun, which reads the latest snapshot. One
@@ -797,7 +801,7 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
               | uart_pid: uart_pid,
                 port_path: port_path,
                 display_name: display_name,
-                port: port,
+                port: advertised_row(state.port, port),
                 line: @default_line,
                 modem: @default_modem,
                 ash: Ash.reset(state.ash),
@@ -812,10 +816,23 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
           {:error, reason} ->
             level = if reason == state.last_open_error, do: :debug, else: :warning
             Logger.log(level, "Zigbee proxy failed to open #{port_path}: #{inspect(reason)}")
-            schedule_reopen(%{state | port: port, error?: true, last_open_error: reason})
+
+            schedule_reopen(%{
+              state
+              | port: advertised_row(state.port, port),
+                error?: true,
+                last_open_error: reason
+            })
         end
     end
   end
+
+  # The advertised row is fixed at init (see the moduledoc): a stick
+  # resolved later is held but not advertised, and a re-resolved row
+  # replaces the advertised one only when it keeps the same HA name, so
+  # the serial-proxy adapter's instance order can't change.
+  defp advertised_row(%{ha_name: name}, %{ha_name: name} = new), do: new
+  defp advertised_row(current, _new), do: current
 
   # `{tty, display_name, hardware_row | nil}` or nil. The resolver hands
   # back `%{path:, display_name:, port:}` (`port` optional); a bare

@@ -128,6 +128,27 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
       assert %{attached?: true, port: nil} = ZigbeeProxy.status(server)
     end
 
+    test "a row resolved after an empty init is held but never advertised" do
+      {:ok, fake} = FakeUART.start_link(self())
+      {:ok, slot} = Agent.start_link(fn -> nil end)
+      row = %{kind: :zigbee, tty_name: "ttyLate", ha_name: "late"}
+
+      server =
+        start_supervised!(
+          {ZigbeeProxy,
+           name: nil,
+           resolver: fn -> Agent.get(slot, & &1) end,
+           open_fun: fn _path -> {:ok, fake} end}
+        )
+
+      Agent.update(slot, fn _ -> %{path: "ttyLate", display_name: "late", port: row} end)
+      send(server, :zigbee_reopen)
+      _ = :sys.get_state(server)
+
+      assert %{attached?: true, port: nil} = ZigbeeProxy.advertised(server)
+      assert %{attached?: true, port: nil} = ZigbeeProxy.status(server)
+    end
+
     test "after an unplug a resolver returning nil never reopens the old tty" do
       test_pid = self()
       {:ok, slot} = Agent.start_link(fn -> %{path: "ttyZB", display_name: "zb"} end)
@@ -255,6 +276,25 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
       assert_receive {:fake_uart, _fake}
       _ = :sys.get_state(server)
       assert ZigbeeProxy.advertised(server) == %{attached?: true, error?: false, port: moved}
+    end
+
+    test "a re-resolved row with another HA name does not replace the advertised one" do
+      %{server: server, port: port} = start_proxy!()
+      _ = :sys.get_state(server)
+
+      send(server, {:circuits_uart, "ttyZB", {:error, :eio}})
+      _ = :sys.get_state(server)
+
+      other = %{port | ha_name: "other"}
+
+      :sys.replace_state(server, fn state ->
+        %{state | resolver: fn -> %{path: "ttyZB", display_name: "o", port: other} end}
+      end)
+
+      send(server, :zigbee_reopen)
+      assert_receive {:fake_uart, _fake}
+      _ = :sys.get_state(server)
+      assert %{attached?: true, port: ^port} = ZigbeeProxy.advertised(server)
     end
 
     test "advertised already holds the row while the first open is blocked" do
