@@ -106,6 +106,18 @@ defmodule MilkdropPackToolsTest do
     assert run =~ ~s("preset":"Geiss - Chrome.milk")
     assert run =~ "EXIT_STATUS 0"
     assert run =~ ~r/^BOOT \d+ \S+$/m
+    # The host has no kernel log the sweep can use (or one with no resets).
+    assert run =~ ~r/^GPU_RESET (0|unknown)$/m
+
+    # Only resets logged after the run's marker count; the blocked reader
+    # is killed rather than waited for.
+    {usec, kmsg_run} = :timer.tc(fn -> eval(elixir["run_kmsg"]) end)
+    assert kmsg_run =~ ~r/^GPU_RESET 1$/m
+    assert kmsg_run =~ "EXIT_STATUS 0"
+    assert usec < 15_000_000
+    assert File.read!(elixir["kmsg"]) =~ ~r/^<6>md_sweep run \S+$/m
+
+    assert eval(elixir["run_kmsg_unreadable"]) =~ ~r/^GPU_RESET unknown$/m
 
     skip_run = eval(elixir["run_skip"])
     assert skip_run =~ ~s|"preset":"$$$ Royal - Mashup (109).milk"|

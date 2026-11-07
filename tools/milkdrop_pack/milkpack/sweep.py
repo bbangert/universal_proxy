@@ -38,9 +38,22 @@ def parse_boot(text):
     return {"uptime_ms": int(m.group(1)), "boot_id": None if m.group(2) == "none" else m.group(2)}
 
 
+GPU_RESET_RE = re.compile(r"^GPU_RESET (\d+|unknown)\s*$", re.M)
+
+
+def parse_gpu_resets(text):
+    """The run's "GPU_RESET n" count (kernel "Resetting GPU" lines logged
+    during it), or None when it's missing or "unknown"."""
+    m = GPU_RESET_RE.search(text)
+    return int(m.group(1)) if m and m.group(1) != "unknown" else None
+
+
 def parse_run(pid, text):
-    """One headless renderer run of `pid` (its stdout+stderr, plus an
-    "EXIT_STATUS n" line) as a sweep record."""
+    """One headless renderer run of `pid` (its stdout+stderr, plus the
+    "GPU_RESET n" and "EXIT_STATUS n" lines) as a sweep record. A run during
+    which the kernel reset the GPU is a "skip" with reason "gpu_hang",
+    whatever the renderer reported: the device survives some of those, but
+    not reliably."""
     events = []
     exit_status = None
     for line in text.splitlines():
@@ -89,6 +102,9 @@ def parse_run(pid, text):
         rec.update(status="error", reason=f"exit_{exit_status or 'none'}_{exiting[-1] if exiting else 'none'}")
     else:
         rec.update(status="ok")
+    rec["gpu_resets"] = parse_gpu_resets(text)
+    if rec["gpu_resets"]:
+        rec.update(status="skip", reason="gpu_hang", run_status=rec["status"], run_reason=rec.get("reason"))
     return rec
 
 

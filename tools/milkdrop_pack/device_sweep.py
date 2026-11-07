@@ -123,11 +123,23 @@ end
 IO.puts("BOOT #{up} #{boot}")'''
 
 
-def elixir_run(renderer, args, timeout_ms, cooldown_c, cooldown_max_s):
+def kmsg_reader(kmsg):
+    """/bin/sh args that stream the kernel log (busybox has no dmesg -w):
+    /dev/kmsg replays its whole buffer to a new reader, then blocks for
+    new records."""
+    return ["-c", 'exec cat "$0" 2>/dev/null', kmsg]
+
+
+def elixir_run(renderer, args, timeout_ms, cooldown_c, cooldown_max_s, kmsg="/dev/kmsg", reader=None):
     """Prints the boot state, waits for the SoC to cool, runs the renderer,
-    prints its output and "EXIT_STATUS n" (or "EXIT_STATUS timeout" after a
-    kill -9)."""
-    return f'''{BOOT_ELIXIR}
+    prints its output, "GPU_RESET n" (kernel "Resetting GPU" lines logged
+    during the run, or "unknown" when the kernel log can't be read) and
+    "EXIT_STATUS n" (or "EXIT_STATUS timeout" after a kill -9).
+
+    The kernel log is read by a `reader` port (default: cat `kmsg`) started
+    just before the renderer and killed after it. A marker record written
+    to `kmsg` first marks where the run's records begin in the replay."""
+    return f"""{BOOT_ELIXIR}
 cool = fn cool, waited ->
   temp = case File.read("/sys/class/thermal/thermal_zone0/temp") do
     {{:ok, t}} -> String.to_integer(String.trim(t)) / 1000
@@ -141,6 +153,20 @@ cool = fn cool, waited ->
   end
 end
 cool.(cool, 0)
+kmsg = "{kmsg}"
+reader = :json.decode(Base.decode64!("{b64json(reader or kmsg_reader(kmsg))}"))
+marker = "md_sweep run #{{System.os_time()}}-#{{:erlang.unique_integer([:positive])}}"
+# Never create kmsg: a missing one means no kernel log.
+kport = with true <- File.exists?(kmsg),
+             :ok <- File.write(kmsg, "<6>" <> marker <> "\\n", [:append]) do
+  try do
+    Port.open({{:spawn_executable, "/bin/sh"}}, [:binary, :exit_status, {{:args, reader}}])
+  rescue
+    _ -> nil
+  end
+else
+  _ -> nil
+end
 args = :json.decode(Base.decode64!("{b64json(args)}"))
 port = Port.open({{:spawn_executable, "{renderer}"}}, [:binary, :exit_status, :stderr_to_stdout, {{:args, args}}])
 {{:os_pid, os}} = Port.info(port, :os_pid)
@@ -155,7 +181,41 @@ loop = fn loop, acc, deadline ->
 end
 {{st, out}} = loop.(loop, [], System.monotonic_time(:millisecond) + {timeout_ms})
 IO.puts(IO.iodata_to_binary(out))
-IO.puts("EXIT_STATUS " <> to_string(st))'''
+# The replay and anything logged since: read until 500 ms pass quietly
+# (3 s at most), then stop the reader, which would otherwise block forever.
+gpu = if kport do
+  drain = fn drain, acc, cap ->
+    left = cap - System.monotonic_time(:millisecond)
+    if left <= 0 do
+      acc
+    else
+      receive do
+        {{^kport, {{:data, d}}}} -> drain.(drain, [acc, d], cap)
+        {{^kport, {{:exit_status, _}}}} -> acc
+      after min(500, left) -> acc
+      end
+    end
+  end
+  log = drain.(drain, [], System.monotonic_time(:millisecond) + 3000)
+  case Port.info(kport, :os_pid) do
+    {{:os_pid, kos}} -> System.cmd("kill", ["-9", Integer.to_string(kos)], stderr_to_stdout: true)
+    _ -> :ok
+  end
+  try do
+    Port.close(kport)
+  rescue
+    _ -> :ok
+  end
+  lines = log |> IO.iodata_to_binary() |> String.split("\\n")
+  case Enum.find_index(lines, &String.contains?(&1, marker)) do
+    nil -> "unknown"
+    i -> lines |> Enum.drop(i + 1) |> Enum.count(&String.contains?(&1, "Resetting GPU")) |> Integer.to_string()
+  end
+else
+  "unknown"
+end
+IO.puts("GPU_RESET " <> gpu)
+IO.puts("EXIT_STATUS " <> to_string(st))"""
 
 
 PROBE_TIMEOUT_S = 45

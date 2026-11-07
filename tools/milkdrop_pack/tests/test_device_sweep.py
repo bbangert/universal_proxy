@@ -284,7 +284,8 @@ class FakeDevice(device_sweep.Device):
                 self.polls_left -= 1
                 return "ssh: connect to host dev port 22: No route to host"
             return self.boot_line()
-        args = json.loads(base64.b64decode(re.search(r'decode64!\("([^"]+)"\)', code).group(1)))
+        args = next(a for a in (json.loads(base64.b64decode(b)) for b in re.findall(r'decode64!\("([^"]+)"\)', code))
+                    if "--locked" in a)
         pid = args[args.index("--locked") + 1]
         self.runs.append(pid)
         queue = self.behaviours.get(pid) or []
