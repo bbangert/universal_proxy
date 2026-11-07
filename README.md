@@ -196,8 +196,10 @@ Zigbee coordinator is also **auto-detected**, by its USB product string. A ZWA-2
 can share the same USB ID (`303A:4001`) and is told apart only by that string:
 a stick whose product string says ZBT-2 is a Zigbee coordinator, and one without
 a product string stays a Z-Wave stick. One ZBT-2 per device is exposed. The
-device opens the stick's port once and holds it open, so line-setting changes and
-firmware flashing do not reset the radio. Home Assistant 2026.11 or later
+device opens the stick's port once and holds it open, so sessions and
+line-setting changes never close and reopen it (each reopen would toggle the
+radio's reset lines); the resets a firmware flasher asks for on purpose are
+still passed through. Home Assistant 2026.11 or later
 discovers it from the serial proxy's USB identity and runs ZHA over it; the
 EZSP/ASH ACKs are sent locally on the device (PROTOCOL mode), and firmware
 updates go through Home Assistant's flasher. While it is held it
@@ -258,9 +260,11 @@ Bluetooth-enabled target (see [Supported targets](#supported-targets)).
    MAC, `localKey`, `nodeId` and optional `label`, and any groups (`localId`,
    `name`, `members`). It contains the mesh's secret keys, which are stored only
    on the device and never shown in the UI. This device does not produce the
-   file; it only reads it. Uploading a *different* mesh replaces every bulb and
-   its Home Assistant entities, so the UI shows what will be added and removed
-   and asks you to confirm first. Re-uploading the same mesh just updates it.
+   file; it only reads it. Uploading a *different* mesh replaces the stored
+   inventory, so the UI shows which bulbs will be added and removed and asks you
+   to confirm first. Bulbs are matched by MAC, so ones that stay keep their Home
+   Assistant devices; groups from the old mesh are recreated as new devices.
+   Re-uploading the same mesh just updates it.
 3. **Check the status.** The card shows Running / Not set up / Idle with a hint,
    the radio's state, and each bulb's reachability and last-seen time.
    **Clear inventory** removes the stored mesh.
@@ -282,7 +286,10 @@ Known limits:
 - Effects, transitions and flashing are ignored.
 - Using the Tuya or Smart Life app after uploading can move the bulbs' sequence
   counter past the device's, and they then ignore its commands. If control stops
-  working, export and upload a fresh dump.
+  working, export a fresh dump after your last app use and upload it. If the
+  dump's counter is far ahead of the device's, the upload keeps the device's
+  counter unless you choose **Adopt the dump's counter…** in the upload dialog
+  and then **Adopt counter and upload**.
 
 ### Editing ESPHome device configuration
 
