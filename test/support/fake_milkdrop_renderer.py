@@ -58,6 +58,7 @@ def main():
     parser.add_argument("--pack-dir", required=True)
     parser.add_argument("--ladder", required=True)
     parser.add_argument("--rotate-s", required=True, type=int)
+    parser.add_argument("--min-fps", required=True, type=int)
     parser.add_argument("--skip-file", required=True)
     parser.add_argument("--high-frequency", action="store_true")
     parser.add_argument("--locked")
