@@ -132,7 +132,8 @@ std::string event_preset(std::string_view file, bool locked, std::string_view ru
 // takes the device down with it.
 std::string event_loading(std::string_view file);
 // `message` (optional) is the first line of the error behind it; `fps`
-// (sent when >= 0) the frame rate measured before a `budget` skip.
+// (sent when >= 0) the frame rate measured before a `budget` skip, rounded
+// down to one decimal.
 std::string event_skip(std::string_view file, std::string_view reason, std::string_view message = {},
                        double fps = -1);
 std::string event_error(std::string_view reason, std::string_view message = {});

@@ -295,6 +295,10 @@ static void test_protocol() {
           v.get("reason")->string == "budget" && v.get("message") == nullptr && v.get("fps") == nullptr);
     CHECK(json_parse(event_skip("x.milk", "budget", {}, 17.34), v, err) && v.get("fps")->number == 17.3 &&
           v.get("message") == nullptr);
+    // Rounded down, so a measurement under a floor never reads back at it.
+    CHECK(json_parse(event_skip("x.milk", "budget", {}, 28.96), v, err) && v.get("fps")->number == 28.9);
+    CHECK(json_parse(event_skip("x.milk", "budget", {}, 29.0), v, err) && v.get("fps")->number == 29.0);
+    CHECK(json_parse(event_skip("x.milk", "budget", {}, 0.0), v, err) && v.get("fps")->number == 0.0);
     CHECK(json_parse(event_skip("x.milk", "compile_error", "warp: 0:12: bad"), v, err) &&
           v.get("reason")->string == "compile_error" && v.get("message")->string == "warp: 0:12: bad");
     CHECK(json_parse(event_presenting(false, 3.5, false), v, err) && !v.get("modeset")->boolean &&

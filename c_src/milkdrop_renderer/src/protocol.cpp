@@ -116,7 +116,9 @@ std::string event_loading(std::string_view file) {
 std::string event_skip(std::string_view file, std::string_view reason, std::string_view message, double fps) {
     std::string out = open("skip") + str_field("preset", file, MAX_PRESET_NAME_BYTES) + str_field("reason", reason, 64);
     if (!message.empty()) out += str_field("message", message, 256);
-    if (fps >= 0) out += num_field("fps", fps);
+    // Rounded down, never to nearest: the BEAM compares the stored value
+    // with a later minimum, and a failing 28.96 must not read back as 29.0.
+    if (fps >= 0) out += num_field("fps", std::floor(fps * 10) / 10);
     return out + "}";
 }
 
