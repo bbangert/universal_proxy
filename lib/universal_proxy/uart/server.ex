@@ -385,8 +385,9 @@ defmodule UniversalProxy.UART.Server do
 
         {:error, _reason} = error ->
           # A tty held elsewhere (flock → :eagain) must not leave the
-          # freshly started Circuits.UART process behind.
-          _ = DynamicSupervisor.terminate_child(UniversalProxy.UART.PortSupervisor, pid)
+          # freshly started Circuits.UART process behind. Its child spec is
+          # :temporary, so stopping it directly (as close_port does) is enough.
+          Circuits.UART.stop(pid)
           error
       end
     end
