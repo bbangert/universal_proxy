@@ -41,40 +41,55 @@ defmodule UniversalProxy.MilkDrop.PackTest do
   defp pin(body, overrides \\ %{}),
     do: Map.merge(%{version: @version, url: @url, sha256: sha256(body)}, overrides)
 
-  defp start_pack(root, pin) do
+  defp start_pack(root, pin, opts \\ []) do
     tasks = start_supervised!(Task.Supervisor)
 
     start_supervised!(
       {Pack,
-       name: nil,
-       root: root,
-       pin: pin,
-       task_supervisor: tasks,
-       req_options: [plug: {Req.Test, @stub}]}
+       [
+         name: nil,
+         root: root,
+         pin: pin,
+         task_supervisor: tasks,
+         req_options: [plug: {Req.Test, @stub}]
+       ] ++ opts}
     )
   end
 
-  # Serves `body`, honouring `Range: bytes=N-` with a 206.
-  defp serve(body, test_pid \\ self()) do
+  # Fails the first `failures` requests with `fail`, then runs `then`.
+  defp flaky(failures, fail, then) do
+    calls = :counters.new(1, [])
+
     Req.Test.stub(@stub, fn conn ->
-      range = Plug.Conn.get_req_header(conn, "range")
-      send(test_pid, {:request, range})
-      size = byte_size(body)
-
-      case range do
-        ["bytes=" <> spec] ->
-          {start, "-"} = Integer.parse(spec)
-
-          conn
-          |> Plug.Conn.put_resp_header("content-range", "bytes #{start}-#{size - 1}/#{size}")
-          |> Plug.Conn.send_resp(206, binary_part(body, start, size - start))
-
-        [] ->
-          conn
-          |> Plug.Conn.put_resp_header("content-length", Integer.to_string(size))
-          |> Plug.Conn.send_resp(200, body)
-      end
+      :counters.add(calls, 1, 1)
+      if :counters.get(calls, 1) <= failures, do: fail.(conn), else: then.(conn)
     end)
+  end
+
+  defp serve_fun(body, test_pid), do: &serve_conn(&1, body, test_pid)
+
+  # Serves `body`, honouring `Range: bytes=N-` with a 206.
+  defp serve(body, test_pid \\ self()),
+    do: Req.Test.stub(@stub, &serve_conn(&1, body, test_pid))
+
+  defp serve_conn(conn, body, test_pid) do
+    range = Plug.Conn.get_req_header(conn, "range")
+    send(test_pid, {:request, range})
+    size = byte_size(body)
+
+    case range do
+      ["bytes=" <> spec] ->
+        {start, "-"} = Integer.parse(spec)
+
+        conn
+        |> Plug.Conn.put_resp_header("content-range", "bytes #{start}-#{size - 1}/#{size}")
+        |> Plug.Conn.send_resp(206, binary_part(body, start, size - start))
+
+      [] ->
+        conn
+        |> Plug.Conn.put_resp_header("content-length", Integer.to_string(size))
+        |> Plug.Conn.send_resp(200, body)
+    end
   end
 
   defp await_final do
@@ -226,12 +241,177 @@ defmodule UniversalProxy.MilkDrop.PackTest do
   end
 
   @tag capture_log: true
-  test "a transport error is reported", %{root: root} do
+  test "a transport error is retried on the backoff", %{root: root} do
     Req.Test.stub(@stub, &Req.Test.transport_error(&1, :econnrefused))
-    server = start_pack(root, pin("x"))
+    server = start_pack(root, pin("x"), retry_delays_ms: [60_000])
     Pack.ensure(server)
 
-    assert await_final() == {:error, {:transport, :econnrefused}}
+    assert await_final() == {:retrying, {:transport, :econnrefused}, 60_000}
+    assert Pack.status(server) == {:retrying, {:transport, :econnrefused}, 60_000}
+  end
+
+  describe "retries" do
+    @describetag capture_log: true
+
+    test "transient failures retry until the download succeeds", %{root: root, src: src} do
+      body = good_pack(src)
+      ok = serve_fun(body, self())
+
+      flaky(3, &Req.Test.transport_error(&1, :nxdomain), ok)
+
+      server = start_pack(root, pin(body), retry_delays_ms: [10, 20])
+      assert {:downloading, 0} = Pack.ensure(server)
+
+      assert await_final() == {:retrying, {:transport, :nxdomain}, 10}
+      assert await_final() == {:retrying, {:transport, :nxdomain}, 20}
+      # The last delay repeats.
+      assert await_final() == {:retrying, {:transport, :nxdomain}, 20}
+      assert await_final() == {:ready, @version, Path.join(root, @version)}
+    end
+
+    test "HTTP 5xx and 429 are transient", %{root: root, src: src} do
+      body = good_pack(src)
+      ok = serve_fun(body, self())
+      calls = :counters.new(1, [])
+
+      Req.Test.stub(@stub, fn conn ->
+        :counters.add(calls, 1, 1)
+
+        case :counters.get(calls, 1) do
+          1 -> Plug.Conn.send_resp(conn, 503, "")
+          2 -> Plug.Conn.send_resp(conn, 429, "")
+          _ -> ok.(conn)
+        end
+      end)
+
+      server = start_pack(root, pin(body), retry_delays_ms: [10])
+      Pack.ensure(server)
+
+      assert await_final() == {:retrying, {:http_status, 503}, 10}
+      assert await_final() == {:retrying, {:http_status, 429}, 10}
+      assert {:ready, @version, _} = await_final()
+    end
+
+    test "a retry resumes the .part with a Range request", %{root: root, src: src} do
+      body = good_pack(src)
+      split = div(byte_size(body), 2)
+      File.mkdir_p!(root)
+      File.write!(Path.join(root, @version <> ".tar.gz.part"), binary_part(body, 0, split))
+
+      flaky(1, &Req.Test.transport_error(&1, :timeout), serve_fun(body, self()))
+      server = start_pack(root, pin(body), retry_delays_ms: [10])
+      Pack.ensure(server)
+
+      assert await_final() == {:retrying, {:transport, :timeout}, 10}
+      assert {:ready, @version, _} = await_final()
+      assert_received {:request, ["bytes=" <> range]}
+      assert range == "#{split}-"
+    end
+
+    test "terminal failures are not retried", %{root: root, src: src} do
+      body = good_pack(src)
+      serve(body)
+
+      server =
+        start_pack(root, pin(body, %{sha256: String.duplicate("0", 64)}), retry_delays_ms: [10])
+
+      Pack.ensure(server)
+      assert await_final() == {:error, :checksum_mismatch}
+      assert_received {:request, _}
+      refute_receive {:request, _}, 100
+      assert Pack.status(server) == {:error, :checksum_mismatch}
+    end
+
+    test "HTTP 404 is terminal", %{root: root} do
+      Req.Test.stub(@stub, &Plug.Conn.send_resp(&1, 404, ""))
+
+      server = start_pack(root, pin("x"), retry_delays_ms: [10])
+      Pack.ensure(server)
+
+      assert await_final() == {:error, {:http_status, 404}}
+      refute_receive {:milkdrop_pack, _}, 100
+    end
+
+    test "ensure/1 during a backoff retries at once", %{root: root, src: src} do
+      body = good_pack(src)
+      Req.Test.stub(@stub, &Req.Test.transport_error(&1, :nxdomain))
+      server = start_pack(root, pin(body), retry_delays_ms: [60_000])
+
+      Pack.ensure(server)
+      assert await_final() == {:retrying, {:transport, :nxdomain}, 60_000}
+
+      serve(body)
+      assert {:downloading, 0} = Pack.ensure(server)
+      assert {:ready, @version, _} = await_final()
+    end
+
+    test "ensure/1 restarts the backoff schedule", %{root: root} do
+      Req.Test.stub(@stub, &Req.Test.transport_error(&1, :nxdomain))
+      server = start_pack(root, pin("x"), retry_delays_ms: [10, 60_000])
+
+      Pack.ensure(server)
+      assert await_final() == {:retrying, {:transport, :nxdomain}, 10}
+      assert await_final() == {:retrying, {:transport, :nxdomain}, 60_000}
+
+      Pack.ensure(server)
+      assert await_final() == {:retrying, {:transport, :nxdomain}, 10}
+    end
+  end
+
+  describe "network wait" do
+    @describetag capture_log: true
+
+    test "waits for the connection before the first attempt", %{root: root, src: src} do
+      body = good_pack(src)
+      serve(body)
+
+      server =
+        start_pack(root, pin(body),
+          retry_delays_ms: [60_000],
+          network_up?: fn -> false end,
+          subscribe?: false
+        )
+
+      assert Pack.ensure(server) == {:retrying, :network_down, 60_000}
+      assert_receive {:milkdrop_pack, {:retrying, :network_down, 60_000}}
+      refute_received {:request, _}
+
+      # Another state change than coming up is ignored.
+      send(server, {VintageNet, ["connection"], :disconnected, :disconnected, %{}})
+      refute_receive {:request, _}, 50
+
+      send(server, {VintageNet, ["connection"], :disconnected, :lan, %{}})
+      assert {:ready, @version, _} = await_final()
+      assert_received {:request, []}
+    end
+
+    test "starts anyway once the backoff runs out", %{root: root, src: src} do
+      body = good_pack(src)
+      serve(body)
+
+      server =
+        start_pack(root, pin(body),
+          retry_delays_ms: [10],
+          network_up?: fn -> false end,
+          subscribe?: false
+        )
+
+      assert Pack.ensure(server) == {:retrying, :network_down, 10}
+      assert_receive {:milkdrop_pack, {:retrying, :network_down, 10}}
+      assert {:ready, @version, _} = await_final()
+    end
+
+    test "the connection coming up cuts a backoff short", %{root: root, src: src} do
+      body = good_pack(src)
+      flaky(1, &Req.Test.transport_error(&1, :nxdomain), serve_fun(body, self()))
+      server = start_pack(root, pin(body), retry_delays_ms: [60_000], subscribe?: false)
+
+      Pack.ensure(server)
+      assert await_final() == {:retrying, {:transport, :nxdomain}, 60_000}
+
+      send(server, {VintageNet, ["connection"], :lan, :internet, %{}})
+      assert {:ready, @version, _} = await_final()
+    end
   end
 
   @tag capture_log: true
@@ -328,11 +508,11 @@ defmodule UniversalProxy.MilkDrop.PackTest do
   @tag capture_log: true
   test "a failed attempt can be retried with ensure/1", %{root: root, src: src} do
     body = good_pack(src)
-    Req.Test.stub(@stub, fn conn -> Plug.Conn.send_resp(conn, 503, "") end)
+    Req.Test.stub(@stub, fn conn -> Plug.Conn.send_resp(conn, 404, "") end)
     server = start_pack(root, pin(body))
 
     Pack.ensure(server)
-    assert await_final() == {:error, {:http_status, 503}}
+    assert await_final() == {:error, {:http_status, 404}}
 
     serve(body)
     assert {:downloading, 0} = Pack.ensure(server)

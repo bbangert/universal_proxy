@@ -62,9 +62,10 @@ defmodule UniversalProxy.Display.Model do
   pack status and lets a missing pack be asked for again.
 
   Otherwise the mode shows the bar visualizer, or while the pack is
-  missing (`:ensure_pack` asks for it) or downloading a "Preparing
-  visualizer… N%" screen, and after a pack error a short error notice
-  (`milkdrop_notice_ms`). A thermal exit, or `milkdrop_crash_limit`
+  missing (`:ensure_pack` asks for it), downloading or retrying a
+  transient failure (`{:retrying, reason, next_in_ms}`, Pack retries on its
+  own) a "Preparing visualizer… N%" screen, and after a terminal pack
+  error a short error notice (`milkdrop_notice_ms`). A thermal exit, or `milkdrop_crash_limit`
   failures within `milkdrop_crash_window_ms`, latch MilkDrop off (the bar
   visualizer instead) until the next explicit mode change; a single
   failure only holds the next yield back for `milkdrop_retry_ms`. While
@@ -312,7 +313,7 @@ defmodule UniversalProxy.Display.Model do
     cond do
       not milkdrop_mode?(m) -> {:visualizer, overlay?}
       match?({:downloading, _pct}, m.pack) -> {:milkdrop_preparing, elem(m.pack, 1)}
-      m.pack == :absent -> {:milkdrop_preparing, nil}
+      m.pack == :absent or pack_retrying?(m.pack) -> {:milkdrop_preparing, nil}
       m.milkdrop.notice != nil -> :milkdrop_error
       true -> {:visualizer, overlay?}
     end
@@ -657,7 +658,7 @@ defmodule UniversalProxy.Display.Model do
   #
   # Every explicit choice starts a new MilkDrop session: a latch, a retry
   # hold and the failure count are forgotten, and picking MilkDrop again
-  # after a pack error retries the pack.
+  # after a pack error, or while Pack waits to retry, retries the pack now.
   # MilkDrop while it is off is refused (Home Assistant gets the real mode).
   defp change_mode(m, mode, opts \\ []) do
     if mode == :milkdrop and not milkdrop?(m),
@@ -684,11 +685,16 @@ defmodule UniversalProxy.Display.Model do
   end
 
   defp retry_pack(m) do
-    if pack_error?(m.pack) do
-      {m, effects, []} = notice(put_md(m, ensure: true))
-      {m, [:ensure_pack | effects]}
-    else
-      {m, []}
+    cond do
+      pack_error?(m.pack) ->
+        {m, effects, []} = notice(put_md(m, ensure: true))
+        {m, [:ensure_pack | effects]}
+
+      pack_retrying?(m.pack) ->
+        {put_md(m, ensure: true), [:ensure_pack]}
+
+      true ->
+        {m, []}
     end
   end
 
@@ -860,6 +866,9 @@ defmodule UniversalProxy.Display.Model do
 
   defp pack_error?({:error, _reason}), do: true
   defp pack_error?(_status), do: false
+
+  defp pack_retrying?({:retrying, _reason, _next_in_ms}), do: true
+  defp pack_retrying?(_status), do: false
 
   # Shows the pack error notice for `milkdrop_notice_ms`.
   defp notice(m) do

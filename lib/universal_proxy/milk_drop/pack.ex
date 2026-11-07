@@ -1,4 +1,7 @@
 defmodule UniversalProxy.MilkDrop.Pack do
+  # VintageNet is target-only: `apply/3` keeps the compiler and Dialyzer from
+  # resolving it on host, where every call is gated by Code.ensure_loaded?/1.
+  # credo:disable-for-this-file Credo.Check.Refactor.Apply
   @moduledoc """
   Downloads, verifies and extracts the pinned MilkDrop preset pack.
 
@@ -17,7 +20,11 @@ defmodule UniversalProxy.MilkDrop.Pack do
     * `:absent` — nothing extracted for the pinned version yet;
     * `{:downloading, pct}` — a download is running (0..100);
     * `{:ready, version, dir}` — the pack is extracted at `dir`;
-    * `{:error, reason}` — the last attempt failed; `ensure/0` retries.
+    * `{:retrying, reason, next_in_ms}` — a transient failure (or no
+      network yet, `:network_down`); the next attempt starts on its own in
+      `next_in_ms` (see "Retries");
+    * `{:error, reason}` — the last attempt failed for good; only
+      `ensure/0` tries again.
 
   Every change (progress included, at most one per percent) is broadcast as
   `{:milkdrop_pack, status}` on `UniversalProxy.MilkDrop.pack_topic/0`.
@@ -51,12 +58,30 @@ defmodule UniversalProxy.MilkDrop.Pack do
   Filesystem failures are `{:error, {:io, posix}}`, HTTP failures
   `{:error, {:http_status, status}}` or `{:error, {:transport, reason}}`.
 
+  ## Retries
+
+  A transport error or an HTTP 5xx/429 answer is transient: the status
+  becomes `{:retrying, reason, next_in_ms}` and the download starts again
+  after `:retry_delays_ms` (5 s, 15 s, 60 s, then every 5 min), resuming
+  the `.part`. Every other failure (a checksum mismatch, a bad pin, a disk
+  error, a crash, …) is terminal. `ensure/0` during a backoff tries again
+  at once and restarts the schedule.
+
+  `ensure/0` first checks the network (VintageNet's `["connection"]` is
+  `:lan` or `:internet`; always up where VintageNet is absent). Without it
+  the status is `{:retrying, :network_down, next_in_ms}` and the download
+  starts when the connection comes up or the backoff runs out, whichever
+  is first; a connection coming up also cuts any other backoff short.
+
   The public API follows the `catch :exit` idiom: while the server is not
   running both functions return `{:error, :not_running}`.
 
   Tests override via `:name`, `:root`, `:pin` (`%{version:, url:,
   sha256:}`), `:req_options` (merged into the `Req` request, e.g.
-  `plug: {Req.Test, name}`), `:task_supervisor` and `:pubsub`.
+  `plug: {Req.Test, name}`), `:task_supervisor`, `:pubsub`,
+  `:retry_delays_ms` (the last one repeats), `:network_up?` (a 0-arity
+  fun) and `:subscribe?` (subscribe to VintageNet, default `true`;
+  `{VintageNet, ["connection"], old, new, meta}` messages drive it).
   """
 
   use GenServer
@@ -69,6 +94,9 @@ defmodule UniversalProxy.MilkDrop.Pack do
   @sha256_re ~r/\A[0-9a-fA-F]{64}\z/
   @read_chunk 65_536
   @task_supervisor UniversalProxy.MilkDrop.PackTasks
+  @retry_delays_ms [5_000, 15_000, 60_000, 300_000]
+  @connection_topic ["connection"]
+  @up_states [:lan, :internet]
 
   @type pin :: %{version: String.t(), url: String.t(), sha256: String.t()}
 
@@ -76,6 +104,7 @@ defmodule UniversalProxy.MilkDrop.Pack do
           :absent
           | {:downloading, 0..100}
           | {:ready, String.t(), String.t()}
+          | {:retrying, term(), non_neg_integer()}
           | {:error, term()}
 
   # -- Client API --
@@ -135,8 +164,13 @@ defmodule UniversalProxy.MilkDrop.Pack do
       req_options: Keyword.get(opts, :req_options, []),
       task_supervisor: Keyword.get(opts, :task_supervisor, @task_supervisor),
       pubsub: Keyword.get(opts, :pubsub, UniversalProxy.PubSub),
+      retry_delays_ms: Keyword.get(opts, :retry_delays_ms, @retry_delays_ms),
+      network_up?: Keyword.get(opts, :network_up?, &network_up?/0),
+      subscribe?: Keyword.get(opts, :subscribe?, true),
       status: :absent,
-      task: nil
+      task: nil,
+      attempts: 0,
+      retry: nil
     }
 
     {:ok, %{state | status: initial_status(state)}, {:continue, :announce}}
@@ -150,6 +184,7 @@ defmodule UniversalProxy.MilkDrop.Pack do
       {:milkdrop_pack_started, state.status}
     )
 
+    if state.subscribe?, do: subscribe_connection()
     {:noreply, state}
   end
 
@@ -162,9 +197,15 @@ defmodule UniversalProxy.MilkDrop.Pack do
   end
 
   def handle_call(:ensure, _from, state) do
+    state = state |> cancel_retry() |> Map.put(:attempts, 0)
+
     case validate_pin(state.pin) do
       {:ok, pin} ->
-        state = start_download(state, pin)
+        state =
+          if state.network_up?.(),
+            do: start_download(state, pin),
+            else: schedule_retry(state, :network_down)
+
         {:reply, state.status, state}
 
       {:error, _} = error ->
@@ -180,21 +221,44 @@ defmodule UniversalProxy.MilkDrop.Pack do
   def handle_info({:pack_result, ref, result}, %{task: {_pid, mref, ref}} = state) do
     Process.demonitor(mref, [:flush])
 
+    state = %{state | task: nil}
+
     case result do
       {:ok, version, dir} ->
         Logger.info("MilkDrop pack #{version} ready at #{dir}")
+        {:noreply, set_status(%{state | attempts: 0}, {:ready, version, dir})}
 
-      {:error, reason} ->
-        Logger.warning("MilkDrop pack download failed: #{inspect(reason)}")
+      {:error, reason} = error ->
+        if transient?(reason) do
+          state = schedule_retry(state, reason)
+          {:retrying, _reason, ms} = state.status
+
+          Logger.warning(
+            "MilkDrop pack download failed: #{inspect(reason)}; retrying in #{div(ms, 1000)} s"
+          )
+
+          {:noreply, state}
+        else
+          Logger.warning("MilkDrop pack download failed: #{inspect(reason)}")
+          {:noreply, set_status(%{state | attempts: 0}, error)}
+        end
     end
-
-    status = with {:ok, version, dir} <- result, do: {:ready, version, dir}
-    {:noreply, set_status(%{state | task: nil}, status)}
   end
 
   def handle_info({:DOWN, mref, :process, _pid, reason}, %{task: {_pid2, mref, _ref}} = state) do
     Logger.error("MilkDrop pack download crashed: #{inspect(reason)}")
-    {:noreply, set_status(%{state | task: nil}, {:error, {:crashed, crash_reason(reason)}})}
+    state = %{state | task: nil, attempts: 0}
+    {:noreply, set_status(state, {:error, {:crashed, crash_reason(reason)}})}
+  end
+
+  def handle_info({:pack_retry, token}, %{retry: {_timer, token}} = state),
+    do: {:noreply, retry_now(%{state | retry: nil})}
+
+  # The connection came up (or got better): a pending retry starts at once.
+  def handle_info({VintageNet, @connection_topic, old, new, _meta}, %{retry: {_, _}} = state) do
+    if new in @up_states and new != old,
+      do: {:noreply, retry_now(cancel_retry(state))},
+      else: {:noreply, state}
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
@@ -208,6 +272,34 @@ defmodule UniversalProxy.MilkDrop.Pack do
       {:ready, pin.version, dir}
     else
       _ -> :absent
+    end
+  end
+
+  defp transient?({:transport, _reason}), do: true
+  defp transient?({:http_status, status}), do: status == 429 or status in 500..599
+  defp transient?(_reason), do: false
+
+  defp schedule_retry(state, reason) do
+    delay = Enum.at(state.retry_delays_ms, state.attempts, List.last(state.retry_delays_ms))
+    token = make_ref()
+    timer = Process.send_after(self(), {:pack_retry, token}, delay)
+
+    %{state | attempts: state.attempts + 1, retry: {timer, token}}
+    |> set_status({:retrying, reason, delay})
+  end
+
+  defp cancel_retry(%{retry: {timer, _token}} = state) do
+    Process.cancel_timer(timer)
+    %{state | retry: nil}
+  end
+
+  defp cancel_retry(state), do: state
+
+  # A pin that validated once still does: this only re-reads it.
+  defp retry_now(state) do
+    case validate_pin(state.pin) do
+      {:ok, pin} -> start_download(state, pin)
+      {:error, _} = error -> set_status(state, error)
     end
   end
 
@@ -493,4 +585,24 @@ defmodule UniversalProxy.MilkDrop.Pack do
 
   defp io({:error, reason}) when is_atom(reason), do: {:error, {:io, reason}}
   defp io(other), do: other
+
+  # -- Private: network --
+
+  defp network_up? do
+    if Code.ensure_loaded?(VintageNet),
+      do: apply(VintageNet, :get, [@connection_topic]) in @up_states,
+      else: true
+  rescue
+    # VintageNet not started yet: no network either.
+    ArgumentError -> false
+  end
+
+  defp subscribe_connection do
+    if Code.ensure_loaded?(VintageNet) do
+      _ = Application.ensure_all_started(:vintage_net)
+      apply(VintageNet, :subscribe, [@connection_topic])
+    end
+  rescue
+    ArgumentError -> :ok
+  end
 end

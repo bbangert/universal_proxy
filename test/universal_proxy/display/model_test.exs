@@ -947,6 +947,35 @@ defmodule UniversalProxy.Display.ModelTest do
       assert schedules(effects, :milkdrop_notice) == []
     end
 
+    test "a pack retrying shows the preparing screen, no notice, then yields once ready" do
+      m = run!(md_viewport([]), [{:pack, :absent}, {:set_mode, :milkdrop}, {:stream, :start}])
+
+      {m, effects} = run(m, [{:pack, {:retrying, {:transport, :nxdomain}, 5_000}}])
+      assert schedules(effects, :milkdrop_notice) == []
+      refute :ensure_pack in effects
+      refute {:yield, :milkdrop} in effects
+      assert Model.screen(m) == {:milkdrop_preparing, nil}
+
+      {m, effects} =
+        run(m, [{:pack, {:downloading, 0}}, {:pack, {:retrying, {:http_status, 503}, 15_000}}])
+
+      assert schedules(effects, :milkdrop_notice) == []
+      assert Model.screen(m) == {:milkdrop_preparing, nil}
+
+      {m, effects} = run(m, [{:pack, @pack}])
+      assert {:yield, :milkdrop} in effects
+      assert Model.screen(m) == {:visualizer, false}
+    end
+
+    test "picking MilkDrop while the pack waits to retry retries now, without a notice" do
+      m = run!(ready(milkdrop: true), [{:pack, {:retrying, :network_down, 60_000}}])
+
+      {m, effects} = run(m, [{:set_mode, :milkdrop}])
+      assert :ensure_pack in effects
+      assert schedules(effects, :milkdrop_notice) == []
+      assert Model.screen(m) == {:milkdrop_preparing, nil}
+    end
+
     test "a pack error outside the MilkDrop mode shows nothing" do
       {m, effects} = run(ready(milkdrop: true), [{:pack, {:error, :no_pack_pinned}}])
       assert schedules(effects, :milkdrop_notice) == []
