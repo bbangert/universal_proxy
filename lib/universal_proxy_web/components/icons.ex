@@ -51,6 +51,24 @@ defmodule UniversalProxyWeb.Components.Icons do
     """
   end
 
+  defp paths(:package) do
+    assigns = %{}
+
+    ~H"""
+    <path d="M11 21.7a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16V8a2 2 0 0 0-1-1.7l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.7z" />
+    <path d="M12 22V12M3.3 7l7.7 4.7a2 2 0 0 0 2 0L20.7 7M7.5 4.3l9 5.1" />
+    """
+  end
+
+  defp paths(:clock) do
+    assigns = %{}
+
+    ~H"""
+    <circle cx="12" cy="12" r="9" />
+    <path d="M12 7v5l3 2" />
+    """
+  end
+
   defp paths(:x) do
     assigns = %{}
 

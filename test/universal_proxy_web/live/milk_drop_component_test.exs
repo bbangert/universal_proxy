@@ -176,6 +176,48 @@ defmodule UniversalProxyWeb.MilkDropComponentTest do
       wait_until(fn -> render(view) =~ "Version 2026.12.0" end)
     end
 
+    test "retrying shows why, when it retries, and a Retry button", %{conn: conn, root: root} do
+      start_pack(root, nil)
+      {:ok, view, _html} = live(conn, "/audio")
+
+      broadcast = fn status ->
+        Phoenix.PubSub.broadcast(@pubsub, MilkDrop.pack_topic(), {:milkdrop_pack, status})
+      end
+
+      broadcast.({:retrying, :network_down, 5_000})
+      wait_until(fn -> render(view) =~ "Waiting for network…" end)
+      assert render(view) =~ "Retrying"
+      assert view |> element("#milkdrop-ensure") |> render() =~ "Retry"
+      refute has_element?(view, "#milkdrop-pack-progress")
+
+      broadcast.({:retrying, {:transport, :nxdomain}, 15_000})
+      wait_until(fn -> render(view) =~ "Waiting for network… retrying in 15 s." end)
+
+      broadcast.({:retrying, {:http_status, 503}, 60_000})
+      wait_until(fn -> render(view) =~ "The server answered HTTP 503. Retrying in 60 s." end)
+    end
+
+    test "the status icon follows the state and is not a control", ctx do
+      %{conn: conn, root: root, src: src} = ctx
+      start_pack(root, pin(good_pack(src)))
+      {:ok, view, _html} = live(conn, "/audio")
+
+      icon = fn name -> has_element?(view, ~s(#milkdrop-pack-icon[data-icon="#{name}"])) end
+      assert icon.("package")
+      assert has_element?(view, ~s(#milkdrop-pack-icon[aria-hidden="true"]))
+      refute has_element?(view, "#milkdrop-pack-icon[phx-click]")
+
+      for {status, name} <- [
+            {{:downloading, 10}, "clock"},
+            {{:retrying, :network_down, 5_000}, "clock"},
+            {{:error, :checksum_mismatch}, "alert"},
+            {{:ready, @version, "/x"}, "check"}
+          ] do
+        Phoenix.PubSub.broadcast(@pubsub, MilkDrop.pack_topic(), {:milkdrop_pack, status})
+        wait_until(fn -> icon.(name) end)
+      end
+    end
+
     test "Download runs Pack.ensure and follows it to ready", %{conn: conn, root: root, src: src} do
       body = good_pack(src)
       test_pid = self()
