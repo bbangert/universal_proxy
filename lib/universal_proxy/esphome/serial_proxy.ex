@@ -143,10 +143,7 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
         ZigbeeProxy.current_opts(zigbee_proxy())
 
       %{id: id} ->
-        case get_stored_opts(id) do
-          opts when is_list(opts) -> opts
-          _ -> Espex.SerialProxy.default_open_opts()
-        end
+        stored_or_default_opts(id)
 
       nil ->
         Espex.SerialProxy.default_open_opts()
@@ -227,7 +224,37 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
   # match the `{relay, path}` patterns.
   @impl true
   def write({:zigbee, session}, data), do: ZigbeeProxy.write(zigbee_proxy(), session, data)
-  def write({_relay, path}, data), do: UART.write(path, data)
+  def write({_relay, path}, data), do: write_uart(UART, path, data, &find_entry/1)
+
+  # A failed CONFIGURE reopen plus failed rollback leaves the handle
+  # alive over a closed port; the next WRITE reopens it with its stored
+  # settings (the Relay resubscribes by friendly_name, so RX resumes).
+  @doc false
+  def write_uart(uart, path, data, find_entry) do
+    case uart.write(path, data) do
+      {:error, :not_found} ->
+        with %{id: id, friendly_name: name} <- find_entry.(path),
+             {:ok, _pid} <-
+               uart.open(path, Keyword.put(stored_or_default_opts(id), :friendly_name, name)) do
+          uart.write(path, data)
+        else
+          {:error, _} = err -> err
+          nil -> {:error, :not_found}
+        end
+
+      other ->
+        other
+    end
+  end
+
+  defp find_entry(path), do: Enum.find(inventory(), &(&1.path == path))
+
+  defp stored_or_default_opts(id) do
+    case get_stored_opts(id) do
+      opts when is_list(opts) -> opts
+      _ -> Espex.SerialProxy.default_open_opts()
+    end
+  end
 
   @impl true
   def close({:zigbee, session}) do
@@ -262,7 +289,7 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
     do: ZigbeeProxy.configure(zigbee_proxy(), session, opts)
 
   def configure({_relay, path}, opts) do
-    case Enum.find(inventory(), &(&1.path == path)) do
+    case find_entry(path) do
       nil -> {:error, :no_such_instance}
       entry -> reconfigure_uart(entry, opts, UART)
     end

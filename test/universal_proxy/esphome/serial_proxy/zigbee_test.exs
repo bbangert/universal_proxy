@@ -221,6 +221,19 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeTest do
       end
 
       def port_info(_path), do: Process.get(:port_info, {:error, :not_found})
+
+      def write(path, data) do
+        send(Process.get(:test_pid), {:uart_write, path, data})
+
+        case Process.get(:write_replies, []) do
+          [reply | rest] ->
+            Process.put(:write_replies, rest)
+            reply
+
+          [] ->
+            :ok
+        end
+      end
     end
 
     setup do
@@ -302,6 +315,35 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeTest do
       assert SerialProxy.reconfigure_uart(entry, [speed: 9600], FakeUart) == {:error, :eagain}
       assert_received {:uart_opened, "ttyUSB9", _attempted}
       assert_received {:uart_opened, "ttyUSB9", _restored}
+    end
+
+    test "a WRITE reopens a port left closed by a failed reconfigure", %{entry: entry} do
+      Process.put(:port_info, {:ok, PortConfig.new(entry.path, speed: 115_200)})
+      Process.put(:open_replies, [{:error, :eagain}, {:error, :enoent}])
+      assert SerialProxy.reconfigure_uart(entry, [speed: 9600], FakeUart) == {:error, :eagain}
+
+      :ok = SettingsStore.put_opts(SettingsStore, entry.id, speed: 38_400)
+      Process.put(:write_replies, [{:error, :not_found}, :ok])
+
+      assert SerialProxy.write_uart(FakeUart, entry.path, "tx", fn _ -> entry end) == :ok
+      assert_received {:uart_opened, "ttyUSB9", _attempted}
+      assert_received {:uart_opened, "ttyUSB9", _restored}
+      assert_received {:uart_opened, "ttyUSB9", reopened}
+      assert reopened[:speed] == 38_400
+      assert reopened[:friendly_name] == entry.friendly_name
+      assert_received {:uart_write, "ttyUSB9", "tx"}
+      assert_received {:uart_write, "ttyUSB9", "tx"}
+    end
+
+    test "a WRITE whose reopen fails returns the error", %{entry: entry} do
+      Process.put(:write_replies, [{:error, :not_found}])
+      Process.put(:open_replies, [{:error, :enoent}])
+
+      assert SerialProxy.write_uart(FakeUart, entry.path, "tx", fn _ -> entry end) ==
+               {:error, :enoent}
+
+      assert_received {:uart_write, "ttyUSB9", "tx"}
+      refute_received {:uart_write, "ttyUSB9", "tx"}
     end
 
     test "nothing to restore without previous settings", %{entry: entry} do
