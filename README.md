@@ -32,6 +32,12 @@ range -- without needing a dedicated ESPHome microcontroller for each one.
 - Automatic mDNS advertisement -- discovered by Home Assistant like any ESPHome device
 - Serial proxy for TTL, RS-232, and RS-485 USB adapters
 - Z-Wave proxy for USB Z-Wave controllers with local ACK handling
+- Zigbee via the [Home Assistant Connect ZBT-2](https://www.home-assistant.io/connect/zbt-2/)
+  over the ESPHome serial proxy -- Home Assistant discovers it by its USB
+  identity and runs ZHA in PROTOCOL mode, with the EZSP/ASH ACKs sent locally on
+  the device; the tty stays open across sessions so firmware updates
+  (universal-silabs-flasher) work too. Host-tested and build-validated only, not
+  yet tested on real hardware.
 - Auto-detection for IRDroid / IR Toy USB infrared devices (VID `0x04D8`, PID `0xFD08`/`0xF58B`)
 - **Bluetooth proxy** -- relays BLE advertisements to Home Assistant over the
   ESPHome Native API (passive scanning plus optional active GATT connections),
@@ -71,6 +77,7 @@ persist across reboots and replugs.
 |---|---|---|
 | **Serial adapters** (TTL, RS-232, RS-485) | FTDI FT232R/FT232H/FT2232H/FT231X, Silicon Labs CP2102/CP2105, WCH CH340/CH9102, Prolific PL2303 | Exposed to Home Assistant as ESPHome **serial proxies**. Line settings (baud/framing) are remembered per port and served back to reconnecting clients; adapter kind (TTL vs RS-232) is editable in the Overview drawer. |
 | **Z-Wave controllers** | Home Assistant Connect ZWA-2, Aeotec Z-Stick Gen5+ | **Z-Wave proxy**: the latency-sensitive Serial API ACK/NAK/CAN handshake runs locally on the device while complete frames stream to Home Assistant. |
+| **Zigbee coordinators** | Home Assistant Connect ZBT-2 | Exposed as a USB serial proxy with its USB identity, so Home Assistant discovers it and runs ZHA over it; ASH ACKs are sent locally (PROTOCOL mode). Host-tested only, not yet validated on hardware. |
 | **Infrared transceivers** | IRdroid IR Toy | Auto-detected and exposed as serial proxies for IR send/receive. |
 | **Bluetooth (HCI) adapters** | Any `btusb`-supported dongle | Selectable radio for the **Bluetooth proxy** (BLE advertisement relay + active GATT connections) -- adds Bluetooth to boards without a usable onboard radio (`rpi`, `rpi2`, `x86_64`) or replaces a weak onboard one. |
 | **USB DACs / sound cards** | Any class-compliant (`snd-usb-audio`) device, including hi-res DACs (up to 24-bit/96 kHz where supported) | Each output becomes an independently discoverable **Sendspin** player for synchronized multi-room audio. |

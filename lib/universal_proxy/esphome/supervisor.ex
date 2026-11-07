@@ -116,7 +116,9 @@ defmodule UniversalProxy.ESPHome.Supervisor do
       # and replug all take the same path.
       {ZWaveProxy, resolver: &__MODULE__.resolve_zwave_port/0},
       # Before Espex (rest_for_one): serial-proxy sessions attach to it.
-      {ZigbeeProxy, resolver: &__MODULE__.resolve_zigbee_port/0},
+      # Its pushes before Espex is up go nowhere, harmlessly.
+      {ZigbeeProxy,
+       resolver: &__MODULE__.resolve_zigbee_port/0, on_change: &SerialProxy.push_zigbee_identity/0},
       Infrared.Supervisor,
       # Must start BEFORE Espex (rest_for_one): Espex calls
       # EntityProvider.list_entities/0 at connection-accept time, and a
@@ -257,7 +259,7 @@ defmodule UniversalProxy.ESPHome.Supervisor do
     enumerated = Enumerate.safe()
 
     pick_zwave_port(
-      Hardware.list_ports(enumerated: enumerated),
+      resolver_ports(enumerated),
       Hardware.live_port_keys(enumerated: enumerated),
       UARTStore.all_configs()
     )
@@ -289,19 +291,26 @@ defmodule UniversalProxy.ESPHome.Supervisor do
     end
   end
 
-  # Resolve the ZBT-2 (the first connected `:zigbee` port, one per
-  # device) as `%{path: tty, display_name: ha_name, port: row}`, or nil.
-  # Public because `ZigbeeProxy` invokes it from its open/rescan loop.
+  # Resolve every connected ZBT-2 (`:zigbee` port, one per device) as
+  # `[%{path: tty, display_name: ha_name, port: row}]` in Hardware order;
+  # `ZigbeeProxy` picks the one matching its advertised stick. Public
+  # because `ZigbeeProxy` invokes it from its open/rescan loop.
   @doc false
-  def resolve_zigbee_port, do: pick_zigbee_port(Hardware.list_ports())
+  def resolve_zigbee_port, do: pick_zigbee_port(resolver_ports(Enumerate.safe()))
 
   @doc false
   def pick_zigbee_port(ports) do
-    case Enum.find(ports, &(&1.connected and &1.kind == :zigbee and is_binary(&1.tty_name))) do
-      nil -> nil
-      port -> %{path: port.tty_name, display_name: port.ha_name, port: port}
+    for %{connected: true, kind: :zigbee, tty_name: tty} = port <- ports, is_binary(tty) do
+      %{path: tty, display_name: port.ha_name, port: port}
     end
   end
+
+  # The resolvers run inside the proxies, and need no in-use labels: by
+  # default each `list_ports/0` would call both proxies' `claimed_port/1`,
+  # so two proxies resolving at once would block on each other until the
+  # call timeout.
+  defp resolver_ports(enumerated),
+    do: Hardware.list_ports(enumerated: enumerated, zwave_claim: nil, zigbee_claim: nil)
 
   defp display_name_for(ports, tty) do
     case Enum.find(ports, &(&1.tty_name == tty)) do

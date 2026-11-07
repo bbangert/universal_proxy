@@ -20,7 +20,7 @@ defmodule UniversalProxy.Hardware do
   Returns ports in a fixed shape consumed by the Overview LiveView.
   """
 
-  alias UniversalProxy.ESPHome.ZWaveProxy
+  alias UniversalProxy.ESPHome.{ZigbeeProxy, ZWaveProxy}
   alias UniversalProxy.UART
   alias UniversalProxy.UART.Enumerate
 
@@ -205,6 +205,8 @@ defmodule UniversalProxy.Hardware do
       (`%{tty_name: ..., subscribed: ...}` or `nil`); the proxy opens
       its tty directly rather than through `UART.Server`, so it never
       appears in `:in_use_ports`
+    * `:zigbee_claim` — the Zigbee proxy's port claim, same shape and
+      reason as `:zwave_claim`
 
   All defaults are wired to live system sources; tests inject fixtures.
   """
@@ -231,7 +233,8 @@ defmodule UniversalProxy.Hardware do
       zwave_claim:
         Keyword.get_lazy(opts, :zwave_claim, fn ->
           ZWaveProxy.claimed_port()
-        end)
+        end),
+      zigbee_claim: Keyword.get_lazy(opts, :zigbee_claim, &ZigbeeProxy.claimed_port/0)
     }
 
     slots = Keyword.get(opts, :slots, target_slots())
@@ -608,6 +611,10 @@ defmodule UniversalProxy.Hardware do
       errors: 0,
       since: nil,
       notes: classification.notes,
+      # Raw USB descriptor strings; `vendor`/`chip` above may come from
+      # the device table instead.
+      usb_manufacturer: descriptor_string(info[:manufacturer]),
+      usb_product: descriptor_name(info),
       usb_descriptor: nil
     }
     |> Map.merge(line_setting_fields(line))
@@ -628,12 +635,16 @@ defmodule UniversalProxy.Hardware do
     }
   end
 
-  # Who holds this tty open, if anyone. The Z-Wave proxy owns its port
-  # directly (never via UART.Server), so it gets its own label; the
-  # subscribed flag distinguishes an attached Z-Wave JS client from the
-  # proxy merely holding the port open.
+  # Who holds this tty open, if anyone. The Z-Wave and Zigbee proxies own
+  # their ports directly (never via UART.Server), so they get their own
+  # labels; the subscribed flag distinguishes an attached Home Assistant
+  # client from the proxy merely holding the port open.
   defp port_usage(tty_name, %{zwave_claim: %{tty_name: tty_name} = claim}) do
     {true, if(claim.subscribed, do: "Z-Wave JS · Home Assistant", else: "Z-Wave proxy")}
+  end
+
+  defp port_usage(tty_name, %{zigbee_claim: %{tty_name: tty_name} = claim}) do
+    {true, if(claim.subscribed, do: "ZHA · Home Assistant", else: "Zigbee proxy")}
   end
 
   defp port_usage(tty_name, %{in_use_ports: in_use_ports}) do
@@ -733,6 +744,8 @@ defmodule UniversalProxy.Hardware do
       errors: 0,
       since: nil,
       notes: nil,
+      usb_manufacturer: nil,
+      usb_product: nil,
       usb_descriptor: nil
     }
   end
@@ -761,8 +774,11 @@ defmodule UniversalProxy.Hardware do
   end
 
   defp descriptor_name(info) do
-    Enum.find([info[:product], info[:description]], fn s -> is_binary(s) and s != "" end)
+    Enum.find([info[:product], info[:description]], &descriptor_string/1)
   end
+
+  defp descriptor_string(s) when is_binary(s) and s != "", do: s
+  defp descriptor_string(_), do: nil
 
   # Nabu Casa's ZWA-2 (Z-Wave) and ZBT-2 (Zigbee) both enumerate as
   # Espressif (VID 0x303A) and some units share a PID, so the USB product

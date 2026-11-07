@@ -258,7 +258,7 @@ defmodule UniversalProxy.ESPHome.SupervisorTest do
                Enum.find_index(ids, &(&1 == Espex))
     end
 
-    test "pick_zigbee_port/1 takes the first connected :zigbee row, keeping the row" do
+    test "pick_zigbee_port/1 returns every connected :zigbee row in order, keeping the row" do
       zbt2 = %{connected: true, kind: :zigbee, tty_name: "ttyACM1", ha_name: "ZBT-2 (1-1.2)"}
       second = %{zbt2 | tty_name: "ttyACM2", ha_name: "ZBT-2 (1-1.3)"}
 
@@ -269,10 +269,12 @@ defmodule UniversalProxy.ESPHome.SupervisorTest do
         second
       ]
 
-      assert ESPHomeSupervisor.pick_zigbee_port(ports) ==
-               %{path: "ttyACM1", display_name: "ZBT-2 (1-1.2)", port: zbt2}
+      assert ESPHomeSupervisor.pick_zigbee_port(ports) == [
+               %{path: "ttyACM1", display_name: "ZBT-2 (1-1.2)", port: zbt2},
+               %{path: "ttyACM2", display_name: "ZBT-2 (1-1.3)", port: second}
+             ]
 
-      assert ESPHomeSupervisor.pick_zigbee_port(Enum.take(ports, 2)) == nil
+      assert ESPHomeSupervisor.pick_zigbee_port(Enum.take(ports, 2)) == []
     end
   end
 end
