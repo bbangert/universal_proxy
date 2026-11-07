@@ -76,6 +76,21 @@ class ParseRunTest(unittest.TestCase):
         ok = sweep.parse_run("a.milk", "\n".join([stats("a.milk", 30), done, "EXIT_STATUS 0"]))
         self.assertEqual(ok["status"], "ok")
 
+    def test_a_gpu_reset_during_the_run_is_a_gpu_hang_skip_even_if_it_succeeded(self):
+        done = ev(event="exiting", reason="headless_done")
+        ok = [stats("a.milk", 30), stats("a.milk", 31), done]
+        rec = sweep.parse_run("a.milk", "\n".join([*ok, "GPU_RESET 2", "EXIT_STATUS 0"]))
+        self.assertEqual((rec["status"], rec["reason"], rec["gpu_resets"]), ("skip", "gpu_hang", 2))
+        self.assertEqual((rec["run_status"], rec["run_reason"]), ("ok", None))
+        self.assertEqual(rec["fps"], 31)
+        timed_out = sweep.parse_run("a.milk", "GPU_RESET 1\nEXIT_STATUS timeout")
+        self.assertEqual((timed_out["status"], timed_out["reason"]), ("skip", "gpu_hang"))
+        self.assertEqual((timed_out["run_status"], timed_out["run_reason"]), ("error", "no_stats"))
+        for tail in ("GPU_RESET 0", "GPU_RESET unknown", ""):
+            rec = sweep.parse_run("a.milk", "\n".join([*ok, tail, "EXIT_STATUS 0"]))
+            self.assertEqual(rec["status"], "ok", tail)
+            self.assertEqual(rec["gpu_resets"], 0 if tail == "GPU_RESET 0" else None)
+
 
 class LoadTest(unittest.TestCase):
     def test_sweep_file_later_lines_win(self):
