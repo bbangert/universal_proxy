@@ -504,5 +504,6 @@ defmodule UniversalProxyWeb.MilkDropComponent do
   defp reason_label("load_failed"), do: "Failed to load"
   defp reason_label("draw_dropped"), do: "Failed to draw"
   defp reason_label("device_reset"), do: "Reset the device"
+  defp reason_label("gpu_hang"), do: "Hung the GPU"
   defp reason_label(reason), do: reason
 end

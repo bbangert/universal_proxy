@@ -259,6 +259,20 @@ defmodule UniversalProxy.Display.MilkDropTest do
     assert Store.skipped(ctx.store, @version) == %{"hf/strobe.milk" => "budget"}
   end
 
+  test "a gpu_hang skip is persisted before it is forwarded", ctx do
+    {pid, _} = start_renderer(ctx)
+
+    emit(
+      pid,
+      ~s({"event":"skip","preset":"hang.milk","reason":"gpu_hang","message":"[drm] Resetting GPU."})
+    )
+
+    assert_receive {:milkdrop, ^pid, %{event: :skip, reason: "gpu_hang", persisted: true}},
+                   @timeout
+
+    assert Store.skipped(ctx.store, @version) == %{"hang.milk" => "gpu_hang"}
+  end
+
   describe "while the Store is down" do
     @store_name :milkdrop_display_test_store
 

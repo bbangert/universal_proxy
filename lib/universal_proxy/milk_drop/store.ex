@@ -14,7 +14,9 @@ defmodule UniversalProxy.MilkDrop.Store do
 
     * `:skipped` — `{pack_version, %{preset_file => reason}}`: presets the
       renderer found it cannot draw (compile/draw failure, over budget at
-      the last ladder rung). Only one pack version is kept: recording a
+      the last ladder rung, a GPU reset) or that were showing when the
+      device went down (`device_reset`). Every write is synced to disk
+      before it returns. Only one pack version is kept: recording a
       skip for a different version drops the old entries, and
       `skipped/2` for any other version reads as empty.
 
@@ -35,8 +37,9 @@ defmodule UniversalProxy.MilkDrop.Store do
   ## Device resets
 
   On rpi3 some presets hang the vc4 GPU, and the kernel's hang recovery
-  takes the whole device down (it reboots within ~7 s of
-  `[drm] Resetting GPU.`): nothing in userspace sees it coming. So
+  can take the whole device down (it reboots within ~7 s of
+  `[drm] Resetting GPU.`). The renderer reports a reset it survives as a
+  `gpu_hang` skip; a fatal one leaves no time for that. So
   `UniversalProxy.Display.MilkDrop` records each preset before the
   renderer loads it (`mark_in_flight/4`, synced to disk before it
   returns) and asks for the record to be dropped when its session ends

@@ -119,7 +119,9 @@ defmodule UniversalProxy.Display.MilkDrop do
       warmed up (written before any GPU work for it; see "Device resets");
     * `{"event":"preset","file":F,"locked":B,...}` — preset `F` is showing;
     * `{"event":"skip","preset":F,"reason":R}` — `F` cannot be drawn
-      (persisted to the Store for this pack version). The forwarded event
+      (persisted to the Store for this pack version, synced to disk before
+      the event is forwarded: a `gpu_hang` skip can come seconds before a
+      GPU reset takes the device down). The forwarded event
       carries `persisted: true | false`; while the Store cannot take it
       (not running) it is kept and retried on the next `skip` or `preset`
       event and every `:skip_retry_ms`, until the process ends;
