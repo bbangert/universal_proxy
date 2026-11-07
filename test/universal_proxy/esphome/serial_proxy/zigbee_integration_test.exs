@@ -16,7 +16,10 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeIntegrationTest do
   # NCP DATA frame 0 (ESPHome ezsp_proxy_tap test vector) and the ACK the
   # acknowledger answers it with.
   @data_0 hex.("00 43 21 A8 50 9B 98 7E")
+  @data_1 hex.("10 43 21 A8 50 9F C2 7E")
+  @data_5 hex.("50 43 21 A8 50 8E AA 7E")
   @ack_1 hex.("7E 81 60 59 7E")
+  @ack_2 hex.("7E 82 50 3A 7E")
 
   # Half of the 1 s USF 1.3.0 gives the whole esphome-hass:// open for
   # SUBSCRIBE + SET_MODE + CONFIGURE acks: loose enough for a loaded CI
@@ -238,11 +241,41 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeIntegrationTest do
     assert state.subscribed == nil
   end
 
-  test "SET_MODE(protocol) survives the CONFIGURE reopen", ctx do
+  test "CONFIGURE keeps the session: PROTOCOL mode, subscription and the same acker", ctx do
     request(ctx, :subscribe)
     set_mode(ctx, :protocol)
-    configure(ctx, 115_200, false)
+    session = :sys.get_state(ctx.server).subscribed
 
-    assert :sys.get_state(ctx.server).mode == :protocol
+    assert configure(ctx, 115_200, false).status == :SERIAL_PROXY_STATUS_OK
+
+    state = :sys.get_state(ctx.server)
+    assert state.mode == :protocol
+    assert state.subscribed == session
+    assert [{:uart_configure, opts}] = uart_calls()
+    assert opts[:speed] == 115_200
+  end
+
+  test "CONFIGURE does not reset the acker: out-of-sequence DATA_5 after a baud change is not ACKed",
+       ctx do
+    request(ctx, :subscribe)
+    set_mode(ctx, :protocol)
+
+    send(ctx.server, {:circuits_uart, ZigbeeFixtures.tty(), @data_0})
+    await(ctx, &match?(%Proto.SerialProxyDataReceived{}, &1))
+    assert_receive {:uart_write, @ack_1}
+
+    assert configure(ctx, 115_200, false).status == :SERIAL_PROXY_STATUS_OK
+
+    # A reset acker would resync to DATA_5 and ACK it 6; the kept one
+    # expects frame 1, so DATA_5 earns nothing. The bytes still reach the
+    # client (no RX drop window across the CONFIGURE).
+    send(ctx.server, {:circuits_uart, ZigbeeFixtures.tty(), @data_5})
+    data = await(ctx, &match?(%Proto.SerialProxyDataReceived{}, &1))
+    assert data.data == @data_5
+    refute_receive {:uart_write, _}, 100
+
+    send(ctx.server, {:circuits_uart, ZigbeeFixtures.tty(), @data_1})
+    assert await(ctx, &match?(%Proto.SerialProxyDataReceived{}, &1)).data == @data_1
+    assert_receive {:uart_write, @ack_2}
   end
 end

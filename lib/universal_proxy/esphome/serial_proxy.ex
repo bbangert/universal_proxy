@@ -84,7 +84,7 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
   alias UniversalProxy.ESPHome.ZigbeeProxy
   alias UniversalProxy.Hardware
   alias UniversalProxy.UART
-  alias UniversalProxy.UART.SettingsStore
+  alias UniversalProxy.UART.{PortConfig, SettingsStore}
 
   @impl true
   def list_instances do
@@ -143,10 +143,7 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
         ZigbeeProxy.current_opts(zigbee_proxy())
 
       %{id: id} ->
-        case get_stored_opts(id) do
-          opts when is_list(opts) -> opts
-          _ -> Espex.SerialProxy.default_open_opts()
-        end
+        stored_or_default_opts(id)
 
       nil ->
         Espex.SerialProxy.default_open_opts()
@@ -227,7 +224,37 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
   # match the `{relay, path}` patterns.
   @impl true
   def write({:zigbee, session}, data), do: ZigbeeProxy.write(zigbee_proxy(), session, data)
-  def write({_relay, path}, data), do: UART.write(path, data)
+  def write({_relay, path}, data), do: write_uart(UART, path, data, &find_entry/1)
+
+  # A failed CONFIGURE reopen plus failed rollback leaves the handle
+  # alive over a closed port; the next WRITE reopens it with its stored
+  # settings (the Relay resubscribes by friendly_name, so RX resumes).
+  @doc false
+  def write_uart(uart, path, data, find_entry) do
+    case uart.write(path, data) do
+      {:error, :not_found} ->
+        with %{id: id, friendly_name: name} <- find_entry.(path),
+             {:ok, _pid} <-
+               uart.open(path, Keyword.put(stored_or_default_opts(id), :friendly_name, name)) do
+          uart.write(path, data)
+        else
+          {:error, _} = err -> err
+          nil -> {:error, :not_found}
+        end
+
+      other ->
+        other
+    end
+  end
+
+  defp find_entry(path), do: Enum.find(inventory(), &(&1.path == path))
+
+  defp stored_or_default_opts(id) do
+    case get_stored_opts(id) do
+      opts when is_list(opts) -> opts
+      _ -> Espex.SerialProxy.default_open_opts()
+    end
+  end
 
   @impl true
   def close({:zigbee, session}) do
@@ -248,6 +275,67 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
     case UART.close(path) do
       :ok -> :ok
       {:error, _} -> :ok
+    end
+  end
+
+  # In place from espex's side: the handle, subscription and mode stay.
+  # The ZBT-2 retunes its open tty (no close, so DTR/RTS hold). A UART
+  # port is reopened under the same relay, which keeps its PubSub
+  # subscription, so a subscribed relay keeps forwarding and the handle
+  # stays valid; only the `Circuits.UART` process is replaced, as the
+  # close+open it replaces did.
+  @impl true
+  def configure({:zigbee, session}, opts),
+    do: ZigbeeProxy.configure(zigbee_proxy(), session, opts)
+
+  def configure({_relay, path}, opts) do
+    case find_entry(path) do
+      nil -> {:error, :no_such_instance}
+      entry -> reconfigure_uart(entry, opts, UART)
+    end
+  end
+
+  # `uart` is the module owning the tty (injectable for tests). A reopen
+  # that fails goes back to the settings an open port had, so a rejected
+  # CONFIGURE never leaves the tty closed under a live handle; the
+  # CONFIGURE itself still fails.
+  @doc false
+  def reconfigure_uart(%{id: id, path: path, friendly_name: name, serial: serial}, opts, uart) do
+    previous = previous_opts(uart, path)
+    _ = uart.close(path)
+
+    case uart.open(path, Keyword.put(opts, :friendly_name, name)) do
+      {:ok, _pid} ->
+        persist_opts(id, opts, serial)
+        :ok
+
+      {:error, reason} = err ->
+        Logger.warning("ESPHome serial proxy failed to reconfigure #{path}: #{inspect(reason)}")
+        restore_uart(uart, path, name, previous)
+        err
+    end
+  end
+
+  # The open port's live settings, or nil when it wasn't open: a port that
+  # was already closed has no previous state to go back to.
+  defp previous_opts(uart, path) do
+    case uart.port_info(path) do
+      {:ok, %PortConfig{} = config} -> PortConfig.to_uart_opts(config)
+      _ -> nil
+    end
+  end
+
+  defp restore_uart(_uart, _path, _name, nil), do: :ok
+
+  defp restore_uart(uart, path, name, previous) do
+    case uart.open(path, Keyword.put(previous, :friendly_name, name)) do
+      {:ok, _pid} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "ESPHome serial proxy failed to reopen #{path} with its previous settings: #{inspect(reason)}"
+        )
     end
   end
 
@@ -427,9 +515,15 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
       manufacturer: Map.get(port, :usb_manufacturer) || "",
       product: Map.get(port, :usb_product) || "",
       serial_number: entry.serial || "",
-      usb: usb
+      usb: usb_with_interface_description(usb, descriptor[:interface_description])
     }
   end
+
+  defp usb_with_interface_description(usb, description)
+       when is_binary(description) and description != "",
+       do: Map.put(usb, :interface_description, description)
+
+  defp usb_with_interface_description(usb, _description), do: usb
 
   # Best-effort: a `SettingsStore` hiccup (down, wedged, or DETS write
   # failure) must not fail an otherwise-good open. Follows this project's
