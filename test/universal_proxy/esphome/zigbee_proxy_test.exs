@@ -107,6 +107,16 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
     ref
   end
 
+  # Poll for a condition the proxy reaches asynchronously (e.g. after a
+  # monitored process dies); bounded so a regression fails, not hangs.
+  defp wait_until(fun, attempts \\ 100) do
+    cond do
+      fun.() -> :ok
+      attempts == 0 -> flunk("condition not reached")
+      true -> Process.sleep(10) && wait_until(fun, attempts - 1)
+    end
+  end
+
   # Deliver NCP bytes and wait until the proxy has handled them.
   defp rx(server, data) do
     send(server, {:circuits_uart, "ttyZB", data})
@@ -294,9 +304,10 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
       :ok = ZigbeeProxy.subscribe(server, ref)
       :ok = ZigbeeProxy.set_mode(server, ref, :protocol)
 
+      sub_ref = Process.monitor(sub)
       Process.exit(sub, :kill)
-      _ = :sys.get_state(server)
-      assert :sys.get_state(server).sessions == %{}
+      assert_receive {:DOWN, ^sub_ref, :process, ^sub, _}
+      wait_until(fn -> :sys.get_state(server).sessions == %{} end)
 
       # A new subscriber can take the port, and starts in RAW: no ACK.
       ref2 = subscribed!(server)
@@ -598,6 +609,17 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
       assert {:error, :invalid_argument} = ZigbeeProxy.configure(server, ref, data_bits: 9)
       refute_receive {:uart_configure, _}, 50
       assert map_size(:sys.get_state(server).sessions) == 1
+    end
+
+    test "a UART error resets current_opts to the defaults the next open uses" do
+      %{server: server} = start_proxy!()
+      ref = attach!(server)
+      assert :ok = ZigbeeProxy.configure(server, ref, speed: 115_200)
+      assert ZigbeeProxy.current_opts(server)[:speed] == 115_200
+
+      send(server, {:circuits_uart, "ttyZB", {:error, :eio}})
+      refute ZigbeeProxy.status(server).attached?
+      assert ZigbeeProxy.current_opts(server)[:speed] == 460_800
     end
 
     test "a failed configure keeps the old settings" do

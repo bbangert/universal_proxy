@@ -279,6 +279,21 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   end
 
   @doc """
+  The tty this proxy is holding open, for `UART.History` restart
+  recovery (same shape and semantics as `ZWaveProxy.claimed_port/1`).
+  `subscribed` says whether an API client is attached. Exits (server
+  down, or `:calling_self` from the owner's own resolver path) read as
+  "no claim".
+  """
+  @spec claimed_port(GenServer.server()) ::
+          %{tty_name: String.t(), display_name: String.t(), subscribed: boolean()} | nil
+  def claimed_port(server \\ __MODULE__) do
+    GenServer.call(server, :claimed_port, @call_timeout)
+  catch
+    :exit, _ -> nil
+  end
+
+  @doc """
   Whether the tty is open, whether the last attempt to hold it failed,
   and the `Hardware` row it belongs to (kept while `error?`, nil when no
   ZBT-2 is resolved). A wedged server reports `error?: true`, a missing
@@ -433,6 +448,19 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
     {:reply, to_open_opts(state.line), state}
   end
 
+  def handle_call(:claimed_port, _from, state) do
+    reply =
+      if state.uart_pid && state.port_path do
+        %{
+          tty_name: Path.basename(state.port_path),
+          display_name: state.display_name || Path.basename(state.port_path),
+          subscribed: state.subscribed != nil
+        }
+      end
+
+    {:reply, reply, state}
+  end
+
   def handle_call(:status, _from, state) do
     {:reply, %{attached?: state.uart_pid != nil, error?: state.error?, port: state.port}, state}
   end
@@ -490,7 +518,14 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
     broadcast_lifecycle(state, "uart:port_closed", :uart_port_closed)
 
     state =
-      %{state | uart_pid: nil, ash: Ash.reset(state.ash), rx_buffer: <<>>, error?: true}
+      %{
+        state
+        | uart_pid: nil,
+          ash: Ash.reset(state.ash),
+          rx_buffer: <<>>,
+          line: @default_line,
+          error?: true
+      }
       |> schedule_reopen()
 
     {:noreply, state}
