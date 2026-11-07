@@ -5,13 +5,15 @@ defmodule UniversalProxy.ESPHome.Supervisor do
 
   Children, started in `:rest_for_one` order:
 
-    1. `ZWaveProxy` — GenServer that owns the Z-Wave UART port and
+    1. `ZWaveProxy.Advertiser` — the `_zwave._tcp` mDNS advertisement,
+       kept off the UART owner because MdnsLite calls can block
+    2. `ZWaveProxy` — GenServer that owns the Z-Wave UART port and
        implements the `Espex.ZWaveProxy` behaviour
-    2. `Infrared.Supervisor` — DynamicSupervisor + `Infrared.Server`
+    3. `Infrared.Supervisor` — DynamicSupervisor + `Infrared.Server`
        (the `Espex.InfraredProxy` adapter)
-    3. `Espex` — the library supervisor: registry, server, TCP acceptor,
+    4. `Espex` — the library supervisor: registry, server, TCP acceptor,
        and (optionally) mDNS advertiser
-    4. `UniversalProxy.TuyaMesh.Commander` (Bluetooth targets) — runs the
+    5. `UniversalProxy.TuyaMesh.Commander` (Bluetooth targets) — runs the
        Tuya mesh light commands the `EntityProvider` hands it
 
   `ConfigStore` lives one level up in the application supervisor so a
@@ -104,6 +106,8 @@ defmodule UniversalProxy.ESPHome.Supervisor do
       ] ++ bluetooth_opts()
 
     children = [
+      # Before ZWaveProxy, which casts to it.
+      ZWaveProxy.Advertiser,
       # No port is resolved here — the proxy resolves (and re-resolves)
       # through the resolver on its open/rescan loop, so boot, hotplug,
       # and replug all take the same path.

@@ -34,6 +34,16 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
     the Traffic tab for this port exactly like any proxied serial port.
     The display name comes from the resolver (the port's `ha_name`) so
     it matches the key the Overview subscribes with.
+
+  ## mDNS
+
+  While a stick is held open the proxy advertises `_zwave._tcp` (TXT
+  `protocol=esphome`, the configured ESPHome API port) under the node name,
+  which is what the Z-Wave JS driver browses to list remote serial ports
+  (Z-Wave JS UI's port picker). The service is withdrawn — goodbye, then
+  remove — when the port closes, the stick is unplugged, or the proxy
+  terminates, so an `ESPHome.Supervisor.restart/0` re-registers cleanly.
+  The mDNS calls run in `ZWaveProxy.Advertiser`, off this process.
   """
 
   use GenServer
@@ -42,7 +52,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
 
   require Logger
 
-  alias UniversalProxy.ESPHome.ZWaveProxy.{Frame, Parser}
+  alias UniversalProxy.ESPHome.ZWaveProxy.{Advertiser, Frame, Parser}
 
   @uart_speed 115_200
 
@@ -81,6 +91,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
     :frame_timer,
     :frame_timer_ref,
     :last_open_error,
+    advertiser: Advertiser,
     parser: nil,
     home_id: @zero_home_id,
     home_id_ready: false,
@@ -201,7 +212,9 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
       # open-success path (resolve_port, :uart_port_opened broadcast).
       # nil (explicit or absent) falls back to the real opener so
       # state.open_fun is always callable.
-      open_fun: Keyword.get(opts, :open_fun) || (&open_port/1)
+      open_fun: Keyword.get(opts, :open_fun) || (&open_port/1),
+      # The `_zwave._tcp` advertiser to cast to; nil disables it.
+      advertiser: Keyword.get(opts, :advertiser, Advertiser)
     }
 
     if state.port_path || state.resolver do
@@ -299,6 +312,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
 
     state =
       %{state | uart_pid: nil, parser: Parser.new(), home_id_ready: false, query_retries: 0}
+      |> unregister_mdns()
       |> cancel_frame_timer()
       |> clear_home_id()
       |> schedule_reopen()
@@ -388,6 +402,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
       broadcast_lifecycle(state, "uart:port_closed", :uart_port_closed)
     end
 
+    unregister_mdns(state)
     cleanup_uart(state.uart_pid)
     :ok
   end
@@ -438,7 +453,10 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
 
             broadcast_lifecycle(state, "uart:port_opened", :uart_port_opened)
             request_home_id(state)
-            schedule_home_id_retry(state)
+
+            state
+            |> schedule_home_id_retry()
+            |> register_mdns()
 
           {:error, reason} ->
             # First (or changed) failure logs at warning; identical
@@ -488,6 +506,24 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy do
   end
 
   defp schedule_home_id_retry(state), do: state
+
+  # The advertisement I/O (GenServer calls into MdnsLite, up to 5 s each)
+  # lives in the Advertiser so it never stalls this process, the UART owner.
+  # Casts from one sender are ordered, so a withdraw can't be overtaken by
+  # an earlier advertise.
+  defp register_mdns(%{advertiser: nil} = state), do: state
+
+  defp register_mdns(state) do
+    Advertiser.advertise(state.advertiser)
+    state
+  end
+
+  defp unregister_mdns(%{advertiser: nil} = state), do: state
+
+  defp unregister_mdns(state) do
+    Advertiser.withdraw(state.advertiser)
+    state
+  end
 
   # Frame reception timeout, timed from the frame's start byte (the
   # Z-Wave API spec aborts a data frame that takes >1500 ms from its SOF,
