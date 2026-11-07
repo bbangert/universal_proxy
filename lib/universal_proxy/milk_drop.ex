@@ -16,9 +16,9 @@ defmodule UniversalProxy.MilkDrop do
   `UniversalProxy.MilkDrop.Supervisor` runs Store + Pack only when
   `enabled?/0`: a supported target (`#{inspect(~w(rpi3 rpi4 rpi5)a)}`, a
   compile-time constant) **and** `config :universal_proxy,
-  UniversalProxy.Display, milkdrop: true`. The flag is false everywhere
-  until the mode is validated on hardware. Host tests start the subtree
-  with `enabled: true` instead.
+  UniversalProxy.Display, milkdrop: true` (config/target.exs sets it on
+  the display targets). Host tests start the subtree with `enabled: true`
+  instead.
 
   ## PubSub (`UniversalProxy.PubSub`)
 
