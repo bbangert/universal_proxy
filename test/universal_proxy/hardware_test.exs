@@ -481,6 +481,33 @@ defmodule UniversalProxy.HardwareTest do
       assert port.chip == "EFR32MG24"
     end
 
+    test "an empty USB description does not shadow the product string" do
+      [port] =
+        Hardware.list_ports(
+          slots: nil,
+          enumerated: %{
+            "ttyACM0" => %{
+              vendor_id: 0x303A,
+              product_id: 0x831A,
+              manufacturer: "",
+              description: "",
+              product: "Home Assistant Connect ZBT-2",
+              serial_number: "Z1"
+            }
+          },
+          bus_paths: %{"ttyACM0" => "1-1.1"},
+          saved_configs: %{},
+          line_settings: %{},
+          in_use_ports: MapSet.new(),
+          zwave_claim: nil,
+          zigbee_claim: nil,
+          tty_class_dir: "/nonexistent-#{System.unique_integer([:positive])}"
+        )
+
+      assert port.usb_product == "Home Assistant Connect ZBT-2"
+      assert port.usb_manufacturer == nil
+    end
+
     test "zwave claim on a different tty does not mark this port in_use" do
       [port] =
         Hardware.list_ports(

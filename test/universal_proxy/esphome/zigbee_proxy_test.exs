@@ -257,6 +257,31 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
       assert ZigbeeProxy.advertised(server) == %{attached?: true, error?: false, port: moved}
     end
 
+    test "advertised already holds the row while the first open is blocked" do
+      test_pid = self()
+      port = %{kind: :zigbee, tty_name: "ttyZB", ha_name: "zb"}
+
+      open_fun = fn _path ->
+        send(test_pid, {:open_blocked, self()})
+
+        receive do
+          :release -> {:error, :eacces}
+        end
+      end
+
+      server =
+        start_supervised!(
+          {ZigbeeProxy,
+           name: nil,
+           resolver: fn -> %{path: "ttyZB", display_name: "zb", port: port} end,
+           open_fun: open_fun}
+        )
+
+      assert_receive {:open_blocked, opener}
+      assert ZigbeeProxy.advertised(server) == %{attached?: false, error?: false, port: port}
+      send(opener, :release)
+    end
+
     test "on_change runs when the attach state or row changes, and only then" do
       test_pid = self()
       port = %{kind: :zigbee, tty_name: "ttyZB", ha_name: "zb"}

@@ -392,8 +392,10 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
 
     if state.port_path || state.resolver do
       # `Circuits.UART.open` can block on a misbehaving tty; keep it out
-      # of init so the ESPHome supervisor's boot never waits on it.
-      {:ok, state, {:continue, :open_port}}
+      # of init so the ESPHome supervisor's boot never waits on it. The
+      # row is resolved here (a port-list read, no UART I/O) and published
+      # first, so Espex starts with the final instance inventory.
+      {:ok, state |> preresolve_port() |> publish_snapshot(false), {:continue, :open_port}}
     else
       {:ok, state}
     end
@@ -771,6 +773,13 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
 
   defp attempt_open(state), do: state |> open_resolved() |> publish_snapshot()
 
+  defp preresolve_port(state) do
+    case state.resolver && resolve_port(state) do
+      {_path, _display, port} -> %{state | port: port}
+      _ -> state
+    end
+  end
+
   defp open_resolved(state) do
     case resolve_port(state) do
       # Keeps the last row (see the moduledoc), but not its tty name: the
@@ -828,7 +837,9 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   # A persistent_term write that replaces a term costs a global GC pass,
   # so the snapshot is only rewritten when it actually changes (never on
   # the RX path).
-  defp publish_snapshot(state) do
+  # `notify?: false` for the initial publish: Espex starts after init
+  # and reads the snapshot itself.
+  defp publish_snapshot(state, notify? \\ true) do
     snapshot =
       {self(), %{attached?: state.uart_pid != nil, error?: state.error?, port: state.port}}
 
@@ -836,7 +847,7 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
 
     if previous != snapshot do
       :persistent_term.put(state.snapshot_key, snapshot)
-      if identity_changed?(previous, snapshot), do: notify_change(state)
+      if notify? and identity_changed?(previous, snapshot), do: notify_change(state)
     end
 
     state
