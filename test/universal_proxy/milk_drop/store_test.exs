@@ -364,6 +364,183 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
       assert Store.skipped(server, "v1") == %{}
     end
 
+    # A process that marks `preset` and then idles: the record's owner.
+    defp spawn_owner(server, session, preset) do
+      test = self()
+
+      owner =
+        spawn(fn ->
+          send(test, {:marked, Store.mark_in_flight(server, session, "v1", preset)})
+          Process.sleep(:infinity)
+        end)
+
+      on_exit(fn -> Process.exit(owner, :kill) end)
+      assert_receive {:marked, result}
+      {owner, result}
+    end
+
+    defp start_owner(server, session, preset) do
+      {owner, :ok} = spawn_owner(server, session, preset)
+      owner
+    end
+
+    # The table's directory replaced by a file: DETS can't open it.
+    defp block_dir(dir) do
+      File.rename!(dir, dir <> ".away")
+      File.write!(dir, "not a directory")
+
+      fn ->
+        File.rm!(dir)
+        File.rename!(dir <> ".away", dir)
+      end
+    end
+
+    defp opened?(server), do: :sys.get_state(server).table != nil
+
+    test "a record is cleared a grace period after its owner goes down", %{path: path} do
+      server = start_boot(path, "boot-1", in_flight_grace_ms: 300)
+      owner = start_owner(server, 7, "a.milk")
+      assert %{owner: ^owner, clear_at: nil} = Store.in_flight(server)
+
+      power_cut(owner)
+      wait_until(fn -> is_integer(Store.in_flight(server).clear_at) end)
+      assert %{preset: "a.milk"} = Store.in_flight(server)
+      wait_until(fn -> Store.in_flight(server) == nil end)
+    end
+
+    test "an owner that dies while the store is down is cleared after a restart", %{path: path} do
+      server = start_boot(path, "boot-1", in_flight_grace_ms: 300)
+      owner = start_owner(server, 7, "a.milk")
+      power_cut(server)
+      power_cut(owner)
+
+      server = start_boot(path, "boot-1", in_flight_grace_ms: 300)
+      assert %{preset: "a.milk", clear_at: clear_at} = Store.in_flight(server)
+      assert is_integer(clear_at)
+      wait_until(fn -> Store.in_flight(server) == nil end)
+
+      power_cut(server)
+      server = start_boot(path, "boot-2")
+      assert Store.skipped(server, "v1") == %{}
+    end
+
+    test "a live owner is monitored again after a restart", %{path: path} do
+      server = start_boot(path, "boot-1", in_flight_grace_ms: 100)
+      owner = start_owner(server, 7, "a.milk")
+      power_cut(server)
+
+      server = start_boot(path, "boot-1", in_flight_grace_ms: 100)
+      Process.sleep(250)
+      assert %{preset: "a.milk", owner: ^owner, clear_at: nil} = Store.in_flight(server)
+
+      power_cut(owner)
+      wait_until(fn -> Store.in_flight(server) == nil end)
+    end
+
+    test "an owner from another VM run is not trusted after a restart", %{path: path} do
+      server = start_boot(path, "boot-1", in_flight_grace_ms: 300)
+      _owner = start_owner(server, 7, "a.milk")
+      power_cut(server)
+
+      server = start_boot(path, "boot-1", in_flight_grace_ms: 300, vm: "another-vm")
+      assert %{preset: "a.milk", clear_at: clear_at} = Store.in_flight(server)
+      assert is_integer(clear_at)
+      wait_until(fn -> Store.in_flight(server) == nil end)
+    end
+
+    @tag capture_log: true
+    test "a clear while the table can't open is refused, then applied when it opens", %{
+      tmp_dir: tmp_dir
+    } do
+      dir = Path.join(tmp_dir, "db")
+      path = Path.join(dir, "settings.dets")
+      opts = [in_flight_grace_ms: 1_000, retry_ms: 20]
+
+      server = start_boot(path, "boot-1", opts)
+      :ok = Store.mark_in_flight(server, 7, "v1", "a.milk")
+      power_cut(server)
+
+      unblock = block_dir(dir)
+      server = start_boot(path, "boot-1", opts)
+      assert {:error, reason} = Store.clear_in_flight(server, 7)
+      assert reason != :not_running
+
+      unblock.()
+      wait_until(fn -> opened?(server) end)
+      # This test's process (the owner) is alive: the queued clear did it.
+      assert %{preset: "a.milk", clear_at: clear_at} = Store.in_flight(server)
+      assert is_integer(clear_at)
+      wait_until(fn -> Store.in_flight(server) == nil end)
+    end
+
+    @tag capture_log: true
+    test "a mark while the table can't open is refused, then applied when it opens", %{
+      tmp_dir: tmp_dir
+    } do
+      dir = Path.join(tmp_dir, "db")
+      path = Path.join(dir, "settings.dets")
+      opts = [in_flight_grace_ms: 300, retry_ms: 20]
+
+      server = start_boot(path, "boot-1", opts)
+      :ok = Store.mark_in_flight(server, 7, "v1", "a.milk")
+      power_cut(server)
+
+      unblock = block_dir(dir)
+      server = start_boot(path, "boot-1", opts)
+      {owner, {:error, reason}} = spawn_owner(server, 8, "b.milk")
+      assert reason != :not_running
+
+      unblock.()
+      wait_until(fn -> opened?(server) end)
+
+      assert %{preset: "b.milk", session: 8, owner: ^owner, clear_at: nil} =
+               Store.in_flight(server)
+
+      # Its owner is monitored from the refused mark on.
+      power_cut(owner)
+      wait_until(fn -> Store.in_flight(server) == nil end)
+    end
+
+    @tag capture_log: true
+    test "an earlier boot's record is kept until its skip is on disk", %{path: path} do
+      server = start_boot(path, "boot-1")
+      :ok = Store.mark_in_flight(server, 7, "v1", "hang.milk")
+      power_cut(server)
+
+      failing = :atomics.new(1, [])
+      :atomics.put(failing, 1, 1)
+
+      insert = fn
+        table, {:skipped, _} = record ->
+          if :atomics.get(failing, 1) == 1,
+            do: {:error, :enospc},
+            else: :dets.insert(table, record)
+
+        table, record ->
+          :dets.insert(table, record)
+      end
+
+      {server, log} = with_log(fn -> start_boot(path, "boot-2", insert: insert) end)
+      assert log =~ "could not record hang.milk as device_reset"
+      assert %{preset: "hang.milk", boot_id: "boot-1"} = Store.in_flight(server)
+      assert Store.skipped(server, "v1") == %{}
+
+      # Neither a mark nor a clear may replace it, nor an orderly shutdown
+      # delete it, while the skip can't be written.
+      assert {:error, :enospc} = Store.mark_in_flight(server, 7, "v1", "next.milk")
+      assert {:error, :enospc} = Store.clear_in_flight(server, 7)
+      :ok = GenServer.stop(server, :shutdown)
+
+      server = start_boot(path, "boot-2", insert: insert)
+      assert %{preset: "hang.milk", boot_id: "boot-1"} = Store.in_flight(server)
+
+      # The next mark retries the recovery first.
+      :atomics.put(failing, 1, 0)
+      assert :ok = Store.mark_in_flight(server, 7, "v1", "next.milk")
+      assert Store.skipped(server, "v1") == %{"hang.milk" => "device_reset"}
+      assert %{preset: "next.milk", boot_id: "boot-2"} = Store.in_flight(server)
+    end
+
     @tag capture_log: true
     test "a malformed record is deleted", %{path: path} do
       {:ok, table} = :dets.open_file(@table, file: to_charlist(path), type: :set)

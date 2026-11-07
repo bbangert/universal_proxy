@@ -42,36 +42,46 @@ defmodule UniversalProxy.MilkDrop.Store do
   `gpu_hang` skip; a fatal one leaves no time for that. So
   `UniversalProxy.Display.MilkDrop` records each preset before the
   renderer loads it (`mark_in_flight/4`, synced to disk before it
-  returns) and asks for the record to be dropped when its session ends
-  (`clear_in_flight/2`).
+  returns).
 
   The record carries the Linux boot id (`/proc/sys/kernel/random/boot_id`).
   When the store opens a record written during an earlier boot, the device
   went down while that preset was loading or playing: the preset is added
   to the skip list with reason `device_reset` (if the record's pack version
-  is the pinned one), a warning is logged and the record is deleted. A
-  record from the current boot (the store restarted, the device did not) is
-  left to its session.
+  is the pinned one), a warning is logged and the record is deleted once
+  that skip is on disk. If the skip can't be written the record is kept,
+  and the recovery is retried before the next mark or clear (which are
+  refused until it succeeds) and when the store next opens.
 
-  `clear_in_flight/2` deletes the record only after `:in_flight_grace_ms`
-  (default #{30_000}) and only if it is still the one that session wrote
-  (every mark carries a unique `generation`, so a re-mark of the same
-  preset within the same second is not mistaken for the cleared one): a
-  renderer stuck on a hung GPU can still exit "cleanly" (its exit
-  watchdog) in the seconds before the device dies. The pending clear is
-  persisted with the record (a wall-clock deadline and the boot id), so a
-  store that restarts during the grace period in the same boot still
-  clears it: at the deadline, or at once if that has passed (a clock step
-  can't push it past one grace period from the restart). An orderly
-  shutdown of the store (`:normal`, `:shutdown`: a reboot or firmware
-  update) deletes it at once, since that is not a device reset.
+  The record belongs to the process that wrote it (its owner, the
+  session's server), which the store monitors. It is deleted
+  `:in_flight_grace_ms` (default #{30_000}) after its owner goes down,
+  however it went down, or after the owner asks for it with
+  `clear_in_flight/2` (the session ended cleanly while its server lives
+  on), and only if it is still the same record then (every mark carries a
+  unique `generation`, so a re-mark of the same preset within the same
+  second is not mistaken for the cleared one). The grace period is there
+  because a renderer stuck on a hung GPU can still exit "cleanly" (its
+  exit watchdog) in the seconds before the device dies.
+
+  The pending clear is persisted with the record (a wall-clock deadline and
+  the boot id), so a store that restarts during the grace period in the
+  same boot still clears it: at the deadline, or at once if that has passed
+  (a clock step can't push it past one grace period from the restart). A
+  store that restarts in the same boot also checks the owner it finds in
+  the record: a live one is monitored again, a dead one (or one from
+  another VM run) starts a full grace period. While the table can't be
+  opened, marks and clears are refused but kept in memory and applied when
+  it opens. An orderly shutdown of the store (`:normal`, `:shutdown`: a
+  reboot or firmware update) deletes the record at once, since that is
+  not a device reset.
 
   Accepted false positive: a power cut while a preset is loading or
   playing skips that one preset. "Clear skipped presets" in the web UI
   (`clear_skipped/1`) brings it back.
 
   The record is written on each preset change (about every 20 s by
-  default, `rotate_s`) and once more when its session ends, so its flash
+  default, `rotate_s`) and once more when its owner ends, so its flash
   wear is negligible.
 
   Changes are broadcast on `UniversalProxy.MilkDrop.settings_topic/0` (see
@@ -83,7 +93,9 @@ defmodule UniversalProxy.MilkDrop.Store do
 
   The DETS file lives at `<UniversalProxy.MilkDrop.root()>/settings.dets`
   (`/data/milkdrop/settings.dets` on Nerves). Tests override via the
-  `:dets_path`, `:table`, `:name` and `:pubsub` opts to `start_link/1`.
+  `:dets_path`, `:table`, `:name` and `:pubsub` opts to `start_link/1`
+  (and `:boot_id`, `:vm`, `:pack_version`, `:in_flight_grace_ms`,
+  `:retry_ms`, and `:insert`, a stand-in for `:dets.insert/2`).
   """
 
   use GenServer
@@ -97,7 +109,16 @@ defmodule UniversalProxy.MilkDrop.Store do
   @retry_ms 30_000
   @in_flight_grace_ms 30_000
   @boot_id_path "/proc/sys/kernel/random/boot_id"
-  @in_flight_keys [:pack_version, :preset, :at, :session, :boot_id, :generation, :clear_at]
+  @in_flight_keys [
+    :pack_version,
+    :preset,
+    :at,
+    :session,
+    :owner,
+    :boot_id,
+    :generation,
+    :clear_at
+  ]
 
   @rotate_min 10
   @rotate_max 120
@@ -119,6 +140,7 @@ defmodule UniversalProxy.MilkDrop.Store do
           preset: String.t(),
           at: integer(),
           session: term(),
+          owner: pid() | nil,
           boot_id: String.t() | nil,
           generation: term(),
           clear_at: integer() | nil
@@ -192,8 +214,9 @@ defmodule UniversalProxy.MilkDrop.Store do
 
   @doc """
   Record that `session` (a renderer session) is about to load `preset` of
-  pack `version`, replacing any earlier record. The write is synced to disk
-  before this returns. See "Device resets".
+  pack `version`, replacing any earlier record. The calling process owns
+  the record: it is cleared a grace period after the caller goes down. The
+  write is synced to disk before this returns. See "Device resets".
   """
   @spec mark_in_flight(GenServer.server(), term(), String.t(), String.t()) ::
           :ok | {:error, term()}
@@ -207,7 +230,8 @@ defmodule UniversalProxy.MilkDrop.Store do
   @doc """
   `session` ended: its in-flight record is deleted `:in_flight_grace_ms`
   from now, if it is still the same record then. Another session's record
-  is left alone.
+  is left alone. An error means the clear is not on disk yet; the store
+  still clears the record once its owner goes down.
   """
   @spec clear_in_flight(GenServer.server(), term()) :: :ok | {:error, term()}
   def clear_in_flight(server \\ __MODULE__, session) do
@@ -248,8 +272,18 @@ defmodule UniversalProxy.MilkDrop.Store do
       # Tells this store's marks from those of another VM run in the same
       # boot (unique_integer/1 starts over with the VM).
       incarnation: :crypto.strong_rand_bytes(8),
+      # Tells this VM's pids from those another VM run left in the record.
+      vm: Keyword.get_lazy(opts, :vm, fn -> List.to_string(:os.getpid()) end),
       pack_version: Keyword.get_lazy(opts, :pack_version, &pinned_version/0),
-      in_flight_grace_ms: Keyword.get(opts, :in_flight_grace_ms, @in_flight_grace_ms)
+      in_flight_grace_ms: Keyword.get(opts, :in_flight_grace_ms, @in_flight_grace_ms),
+      insert: Keyword.get(opts, :insert, &:dets.insert/2),
+      # `{pid, ref}` of the monitored owner of the in-flight record.
+      owner: nil,
+      # Asked for while the table was closed, applied when it opens.
+      pending_mark: nil,
+      pending_clears: %{},
+      # false while an earlier boot's record could not be recorded as a skip.
+      recovered?: true
     }
 
     case open_table(state) do
@@ -261,8 +295,8 @@ defmodule UniversalProxy.MilkDrop.Store do
   @impl true
   def terminate(_reason, %{table: nil}), do: :ok
 
-  def terminate(reason, %{table: table}) do
-    if orderly?(reason), do: _ = :dets.delete(table, :in_flight)
+  def terminate(reason, %{table: table} = state) do
+    if orderly?(reason) and state.recovered?, do: _ = :dets.delete(table, :in_flight)
     :dets.close(table)
   end
 
@@ -283,6 +317,12 @@ defmodule UniversalProxy.MilkDrop.Store do
     {:noreply, state}
   end
 
+  def handle_info({:DOWN, ref, :process, pid, _reason}, %{owner: {pid, ref}} = state) do
+    state = %{state | owner: nil}
+    _ = owner_down(state, pid)
+    {:noreply, state}
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
 
   @impl true
@@ -300,44 +340,25 @@ defmodule UniversalProxy.MilkDrop.Store do
     {:reply, reply, state}
   end
 
-  # Nothing readable to clear while closed.
-  def handle_call({:clear_in_flight, _session}, _from, %{table: nil} = state),
-    do: {:reply, :ok, state}
+  # A mark or clear refused here is kept and applied when the table opens.
+  def handle_call(request, from, %{table: nil} = state)
+      when request == :clear_skipped or
+             (is_tuple(request) and
+                elem(request, 0) in [:update, :skip, :mark_in_flight, :clear_in_flight]) do
+    case open_table(state) do
+      {:ok, state} ->
+        handle_call(request, from, state)
 
-  def handle_call({:clear_in_flight, session}, _from, state) do
-    case read_in_flight(state.table) do
-      %{session: ^session} when state.in_flight_grace_ms <= 0 ->
-        {:reply, delete_in_flight(state.table), state}
-
-      %{session: ^session, generation: generation} = marker ->
-        schedule_clear(generation, state.in_flight_grace_ms)
-
-        pending = %{
-          marker
-          | clear_at: System.os_time(:millisecond) + state.in_flight_grace_ms,
-            clear_boot_id: state.boot_id
-        }
-
-        case persist(state.table, {:in_flight, pending}) do
-          :ok ->
-            {:reply, :ok, state}
-
-          {:error, reason} = error ->
-            Logger.error("MilkDrop store in-flight clear write failed: #{inspect(reason)}")
-            {:reply, error, state}
-        end
-
-      _other ->
-        {:reply, :ok, state}
+      {:error, state} ->
+        state = queue_closed(request, from, state)
+        {:reply, {:error, state.open_error}, schedule_retry(state)}
     end
   end
 
-  def handle_call(request, from, %{table: nil} = state)
-      when request == :clear_skipped or
-             (is_tuple(request) and elem(request, 0) in [:update, :skip, :mark_in_flight]) do
-    case open_table(state) do
-      {:ok, state} -> handle_call(request, from, state)
-      {:error, state} -> {:reply, {:error, state.open_error}, schedule_retry(state)}
+  def handle_call({:clear_in_flight, session}, _from, state) do
+    case ensure_recovered(state) do
+      {:ok, state} -> {:reply, clear_session(state, session), state}
+      {error, state} -> {:reply, error, state}
     end
   end
 
@@ -345,7 +366,7 @@ defmodule UniversalProxy.MilkDrop.Store do
     existing = read_settings(state.table)
     merged = merge(existing, params)
 
-    case persist(state.table, {:settings, merged}) do
+    case persist(state, {:settings, merged}) do
       :ok ->
         if merged != existing, do: broadcast(state, {:milkdrop_settings, merged})
         {:reply, {:ok, merged}, state}
@@ -360,23 +381,19 @@ defmodule UniversalProxy.MilkDrop.Store do
     {:reply, add_skip(state, version, preset, reason), state}
   end
 
-  def handle_call({:mark_in_flight, session, version, preset}, _from, state) do
-    marker = %{
-      pack_version: version,
-      preset: preset,
-      at: System.os_time(:second),
-      session: session,
-      boot_id: state.boot_id,
-      generation: {state.incarnation, System.unique_integer([:monotonic, :positive])}
-    }
+  def handle_call({:mark_in_flight, session, version, preset}, {owner, _tag}, state) do
+    marker = new_marker(state, owner, session, version, preset)
 
-    case persist(state.table, {:in_flight, marker}) do
-      :ok ->
-        {:reply, :ok, state}
+    with {:ok, state} <- ensure_recovered(state),
+         :ok <- persist(state, {:in_flight, marker}) do
+      {:reply, :ok, monitor_owner(state, owner)}
+    else
+      {{:error, _reason} = error, state} ->
+        {:reply, error, state}
 
-      {:error, reason} ->
+      {:error, reason} = error ->
         Logger.error("MilkDrop store in-flight write failed: #{inspect(reason)}")
-        {:reply, {:error, reason}, state}
+        {:reply, error, state}
     end
   end
 
@@ -410,9 +427,7 @@ defmodule UniversalProxy.MilkDrop.Store do
     with :ok <- mkdir_p(path),
          {:ok, table} <- open(table_name, path) do
       Logger.info("MilkDrop store opened at #{path}")
-      state = %{state | table: table, open_error: nil}
-      consume_in_flight(state)
-      {:ok, state}
+      {:ok, recover_in_flight(%{state | table: table, open_error: nil})}
     else
       {:error, reason} ->
         Logger.warning(
@@ -480,7 +495,7 @@ defmodule UniversalProxy.MilkDrop.Store do
         _ -> %{preset => reason}
       end
 
-    case persist(state.table, {:skipped, {version, skipped}}) do
+    case persist(state, {:skipped, {version, skipped}}) do
       :ok ->
         broadcast(state, {:milkdrop_skipped, version, skipped})
         :ok
@@ -491,18 +506,77 @@ defmodule UniversalProxy.MilkDrop.Store do
     end
   end
 
+  defp new_marker(state, owner, session, version, preset) do
+    %{
+      pack_version: version,
+      preset: preset,
+      at: System.os_time(:second),
+      session: session,
+      owner: owner,
+      vm: state.vm,
+      boot_id: state.boot_id,
+      generation: {state.incarnation, System.unique_integer([:monotonic, :positive])}
+    }
+  end
+
+  defp queue_closed({:mark_in_flight, session, version, preset}, {owner, _tag}, state) do
+    marker = new_marker(state, owner, session, version, preset)
+    pending_clears = Map.delete(state.pending_clears, session)
+    monitor_owner(%{state | pending_mark: marker, pending_clears: pending_clears}, owner)
+  end
+
+  defp queue_closed({:clear_in_flight, session}, _from, state) do
+    clear_at = System.os_time(:millisecond) + state.in_flight_grace_ms
+    %{state | pending_clears: Map.put(state.pending_clears, session, clear_at)}
+  end
+
+  defp queue_closed(_request, _from, state), do: state
+
+  defp monitor_owner(%{owner: {owner, _ref}} = state, owner), do: state
+
+  defp monitor_owner(state, owner) do
+    with {_old, ref} <- state.owner, do: Process.demonitor(ref, [:flush])
+    %{state | owner: {owner, Process.monitor(owner)}}
+  end
+
+  # Run on every open: the earlier boot's record first, then what was asked
+  # for while the table was closed, then the same-boot record's owner.
+  defp recover_in_flight(state) do
+    %{pending_mark: mark, pending_clears: clears} = state
+    state = %{state | pending_mark: nil, pending_clears: %{}}
+
+    case consume_in_flight(state) do
+      :ok ->
+        state = %{state | recovered?: true}
+        apply_pending_mark(state, mark)
+        reconcile(state, clears)
+
+      {:error, _reason} ->
+        %{state | recovered?: false}
+    end
+  end
+
+  defp ensure_recovered(%{recovered?: true} = state), do: {:ok, state}
+
+  defp ensure_recovered(state) do
+    case consume_in_flight(state) do
+      :ok -> {:ok, %{state | recovered?: true}}
+      {:error, _reason} = error -> {error, state}
+    end
+  end
+
   # A record from an earlier boot names the preset that was loading or
-  # playing when the device went down. Same boot: the store restarted; the
-  # record still belongs to its session, unless that session ended and its
-  # clear is pending. An unreadable boot id on either side counts as an
-  # earlier boot.
+  # playing when the device went down; it is deleted only once its skip is
+  # on disk. A record from this boot is left for `reconcile/2`. An
+  # unreadable boot id on either side counts as an earlier boot.
   defp consume_in_flight(%{table: table} = state) do
     case read_in_flight(table) do
       nil ->
-        if :dets.member(table, :in_flight), do: delete_in_flight(table)
+        if :dets.member(table, :in_flight), do: _ = delete_in_flight(table)
+        :ok
 
-      %{boot_id: boot_id} = marker when boot_id != nil and boot_id == state.boot_id ->
-        restore_pending_clear(state, marker)
+      %{boot_id: boot_id} when boot_id != nil and boot_id == state.boot_id ->
+        :ok
 
       %{pack_version: version, preset: preset} ->
         if is_nil(state.pack_version) or state.pack_version == version do
@@ -510,34 +584,127 @@ defmodule UniversalProxy.MilkDrop.Store do
             "MilkDrop preset #{preset} was running when the device last stopped; skipping it"
           )
 
-          add_skip(state, version, preset, "device_reset")
+          record_device_reset(state, version, preset)
         else
           Logger.info(
             "MilkDrop preset #{preset} (pack #{version}) was running when the device last " <>
               "stopped; that pack is no longer pinned"
           )
-        end
 
-        delete_in_flight(table)
+          delete_in_flight(table)
+        end
     end
+  end
+
+  defp record_device_reset(state, version, preset) do
+    case add_skip(state, version, preset, "device_reset") do
+      :ok ->
+        delete_in_flight(state.table)
+
+      {:error, reason} = error ->
+        Logger.error(
+          "MilkDrop store could not record #{preset} as device_reset (#{inspect(reason)}); " <>
+            "keeping its in-flight record to retry"
+        )
+
+        error
+    end
+  end
+
+  defp apply_pending_mark(_state, nil), do: :ok
+
+  defp apply_pending_mark(state, marker) do
+    with {:error, reason} = error <- persist(state, {:in_flight, marker}) do
+      Logger.error("MilkDrop store in-flight write failed: #{inspect(reason)}")
+      error
+    end
+  end
+
+  # The same-boot record after a (re)open: a persisted pending clear resumes,
+  # a clear asked for while closed starts, a live owner is monitored again
+  # and a dead one (or one from another VM run) starts a full grace period.
+  defp reconcile(state, clears) do
+    case read_in_flight(state.table) do
+      nil ->
+        state
+
+      %{clear_at: at, clear_boot_id: boot_id} = marker
+      when is_integer(at) and boot_id == state.boot_id ->
+        _ = start_clear(state, marker, remaining(state, at), persist: false)
+        state
+
+      %{session: session} = marker when is_map_key(clears, session) ->
+        _ = start_clear(state, marker, remaining(state, Map.fetch!(clears, session)))
+        state
+
+      %{owner: owner} = marker ->
+        if owner_alive?(state, marker) do
+          monitor_owner(state, owner)
+        else
+          _ = start_clear(state, marker, state.in_flight_grace_ms)
+          state
+        end
+    end
+  end
+
+  defp owner_down(%{table: nil}, _owner), do: :ok
+
+  defp owner_down(state, owner) do
+    case read_in_flight(state.table) do
+      %{owner: ^owner, clear_at: nil} = marker ->
+        if own?(state, marker), do: start_clear(state, marker, state.in_flight_grace_ms)
+
+      _other ->
+        :ok
+    end
+  end
+
+  defp clear_session(state, session) do
+    case read_in_flight(state.table) do
+      %{session: ^session, clear_at: nil} = marker ->
+        start_clear(state, marker, state.in_flight_grace_ms)
+
+      _other ->
+        :ok
+    end
+  end
+
+  defp own?(state, marker),
+    do: state.recovered? and marker.boot_id == state.boot_id and marker.vm == state.vm
+
+  defp owner_alive?(state, %{owner: owner} = marker) do
+    is_pid(owner) and node(owner) == node() and own?(state, marker) and Process.alive?(owner)
   end
 
   # The wall clock can step (NTP on a board without an RTC): the remaining
   # wait is capped at one grace period.
-  defp restore_pending_clear(state, %{clear_at: at, clear_boot_id: boot_id} = marker)
-       when is_integer(at) and boot_id == state.boot_id do
-    case min(at - System.os_time(:millisecond), state.in_flight_grace_ms) do
-      remaining when remaining > 0 -> schedule_clear(marker.generation, remaining)
-      _passed -> delete_in_flight(state.table)
+  defp remaining(state, clear_at),
+    do: min(clear_at - System.os_time(:millisecond), state.in_flight_grace_ms)
+
+  # Deletes `marker` after `ms` if it is still the record then; the
+  # deadline is persisted with it unless it already is.
+  defp start_clear(state, marker, ms, opts \\ [])
+
+  defp start_clear(state, _marker, ms, _opts) when ms <= 0, do: delete_in_flight(state.table)
+
+  defp start_clear(state, marker, ms, opts) do
+    Process.send_after(self(), {:clear_in_flight, marker.generation}, ms)
+
+    if Keyword.get(opts, :persist, true) do
+      pending = %{
+        marker
+        | clear_at: System.os_time(:millisecond) + ms,
+          clear_boot_id: state.boot_id
+      }
+
+      with {:error, reason} = error <- persist(state, {:in_flight, pending}) do
+        Logger.error("MilkDrop store in-flight clear write failed: #{inspect(reason)}")
+        error
+      end
+    else
+      :ok
     end
-
-    :ok
   end
-
-  defp restore_pending_clear(_state, _marker), do: :ok
-
-  defp schedule_clear(generation, ms),
-    do: Process.send_after(self(), {:clear_in_flight, generation}, ms)
 
   defp read_in_flight(nil), do: nil
 
@@ -548,6 +715,8 @@ defmodule UniversalProxy.MilkDrop.Store do
              is_map_key(marker, :session) ->
         marker
         |> Map.put_new(:generation, nil)
+        |> Map.update(:owner, nil, &if(is_pid(&1), do: &1))
+        |> Map.put_new(:vm, nil)
         |> Map.update(:clear_at, nil, &if(is_integer(&1), do: &1))
         |> Map.update(:clear_boot_id, nil, &if(is_binary(&1), do: &1))
 
@@ -579,8 +748,8 @@ defmodule UniversalProxy.MilkDrop.Store do
     end
   end
 
-  defp persist(table, record) do
-    with :ok <- :dets.insert(table, record), do: :dets.sync(table)
+  defp persist(%{table: table, insert: insert}, record) do
+    with :ok <- insert.(table, record), do: :dets.sync(table)
   end
 
   defp read_settings(nil), do: @defaults
