@@ -9,16 +9,27 @@ defmodule UniversalProxy.MilkDrop.Store do
           %{
             include_high_frequency: boolean(),  # default false
             rotate_s: 10..120,                  # default 20
+            min_fps: 20..max, step 5,           # default 20
             locked: String.t() | nil            # pack-relative preset file
           }
 
-    * `:skipped` — `{pack_version, %{preset_file => reason}}`: presets the
+      `min_fps` is the frame rate a preset must hold; its maximum is
+      `UniversalProxy.MilkDrop.max_min_fps/0` (30 on rpi3, 60 on rpi4/5).
+
+    * `:skipped` — `{pack_version, %{preset_file => entry}}`: presets the
       renderer found it cannot draw (compile/draw failure, over budget at
       the last ladder rung, a GPU reset) or that were showing when the
-      device went down (`device_reset`). Every write is synced to disk
-      before it returns. Only one pack version is kept: recording a
-      skip for a different version drops the old entries, and
-      `skipped/2` for any other version reads as empty.
+      device went down (`device_reset`). An entry is the reason string,
+      or `%{reason: reason, fps: fps}` when the renderer measured a frame
+      rate (`budget`). Every write is synced to disk before it returns.
+      Only one pack version is kept: recording a skip for a different
+      version drops the old entries, and `skipped/2` for any other version
+      reads as empty.
+
+      Lowering `min_fps` drops the `budget` skips whose recorded fps holds
+      the new minimum (with the renderer's 1 fps slack: `fps >= min_fps -
+      1`), so those presets return from the next visualizer session.
+      `budget` skips without a recorded fps are kept.
 
     * `:in_flight` — the preset the renderer was last told to load (see
       "Device resets" below).
@@ -123,17 +134,26 @@ defmodule UniversalProxy.MilkDrop.Store do
   @rotate_min 10
   @rotate_max 120
 
-  @defaults %{include_high_frequency: false, rotate_s: 20, locked: nil}
+  @min_fps_min 20
+  @min_fps_step 5
+  # The renderer accepts a window at one under the minimum (see its README,
+  # "Cost guard").
+  @min_fps_slack 1
+
+  @defaults %{include_high_frequency: false, rotate_s: 20, min_fps: @min_fps_min, locked: nil}
 
   @keys Map.keys(@defaults)
 
   @type settings :: %{
           include_high_frequency: boolean(),
           rotate_s: 10..120,
+          min_fps: pos_integer(),
           locked: String.t() | nil
         }
 
   @type skipped :: %{String.t() => String.t()}
+
+  @type skip_entry :: %{reason: String.t(), fps: float() | nil}
 
   @type in_flight :: %{
           pack_version: String.t(),
@@ -173,7 +193,9 @@ defmodule UniversalProxy.MilkDrop.Store do
   @doc """
   Merge `params` (atom or string keys; unknown keys dropped) into the
   settings and persist. `rotate_s` is clamped to #{@rotate_min}..#{@rotate_max};
-  a wrongly-typed value keeps the saved one. Returns the new settings.
+  `min_fps` to the nearest of `min_fps_options/0`; a wrongly-typed value
+  keeps the saved one. A lower `min_fps` drops the `budget` skips it lets
+  back in (see the moduledoc). Returns the new settings.
   """
   @spec update(GenServer.server(), map()) :: {:ok, settings()} | {:error, term()}
   def update(server \\ __MODULE__, params) when is_map(params) do
@@ -182,16 +204,31 @@ defmodule UniversalProxy.MilkDrop.Store do
     :exit, _ -> {:error, :not_running}
   end
 
+  @doc "The `min_fps` values this board offers: 20 up to `UniversalProxy.MilkDrop.max_min_fps/0` in steps of 5."
+  @spec min_fps_options() :: [pos_integer()]
+  def min_fps_options,
+    do: Enum.to_list(@min_fps_min..max_min_fps()//@min_fps_step)
+
   @doc """
   Record that `preset` (a pack-relative file) cannot be drawn with pack
   `version`, for `reason`. A different `version` than the stored one
-  replaces the whole skip list.
+  replaces the whole skip list. See `skip/5` to record a measured fps.
   """
   @spec skip(GenServer.server(), String.t(), String.t(), String.t() | atom()) ::
           :ok | {:error, term()}
-  def skip(server \\ __MODULE__, version, preset, reason)
-      when is_binary(version) and is_binary(preset) do
-    GenServer.call(server, {:skip, version, preset, reason_string(reason)})
+  def skip(server \\ __MODULE__, version, preset, reason),
+    do: skip(server, version, preset, reason, [])
+
+  @doc """
+  `skip/4` with options: `fps:` — the frame rate the renderer measured
+  (with a `budget` skip), kept so a lower `min_fps` can bring it back.
+  """
+  @spec skip(GenServer.server(), String.t(), String.t(), String.t() | atom(), keyword()) ::
+          :ok | {:error, term()}
+  def skip(server, version, preset, reason, opts)
+      when is_binary(version) and is_binary(preset) and is_list(opts) do
+    entry = skip_entry(reason_string(reason), Keyword.get(opts, :fps))
+    GenServer.call(server, {:skip, version, preset, entry})
   catch
     :exit, _ -> {:error, :not_running}
   end
@@ -199,6 +236,15 @@ defmodule UniversalProxy.MilkDrop.Store do
   @doc "The skip list for pack `version` (`%{}` for any version but the stored one)."
   @spec skipped(GenServer.server(), String.t()) :: skipped()
   def skipped(server \\ __MODULE__, version) when is_binary(version) do
+    server |> skip_entries(version) |> Map.new(fn {preset, %{reason: r}} -> {preset, r} end)
+  end
+
+  @doc """
+  The skip list for pack `version` with each entry's recorded fps (`nil`
+  when none was measured); `%{}` for any version but the stored one.
+  """
+  @spec skip_entries(GenServer.server(), String.t()) :: %{String.t() => skip_entry()}
+  def skip_entries(server \\ __MODULE__, version) when is_binary(version) do
     GenServer.call(server, {:skipped, version})
   catch
     :exit, _ -> %{}
@@ -369,6 +415,7 @@ defmodule UniversalProxy.MilkDrop.Store do
     case persist(state, {:settings, merged}) do
       :ok ->
         if merged != existing, do: broadcast(state, {:milkdrop_settings, merged})
+        if merged.min_fps < existing.min_fps, do: readmit_budget_skips(state, merged.min_fps)
         {:reply, {:ok, merged}, state}
 
       {:error, reason} ->
@@ -400,7 +447,7 @@ defmodule UniversalProxy.MilkDrop.Store do
   def handle_call({:skipped, version}, _from, state) do
     reply =
       case read_skipped(state.table) do
-        {^version, entries} -> entries
+        {^version, entries} -> Map.new(entries, fn {p, e} -> {p, entry_details(e)} end)
         _ -> %{}
       end
 
@@ -497,13 +544,47 @@ defmodule UniversalProxy.MilkDrop.Store do
 
     case persist(state, {:skipped, {version, skipped}}) do
       :ok ->
-        broadcast(state, {:milkdrop_skipped, version, skipped})
+        broadcast_skipped(state, version, skipped)
         :ok
 
       {:error, reason} = error ->
         Logger.error("MilkDrop store skip update failed: #{inspect(reason)}")
         error
     end
+  end
+
+  # Budget skips measured at or above the new minimum (with the renderer's
+  # slack) are dropped; those without a recorded fps stay.
+  defp readmit_budget_skips(state, min_fps) do
+    with {version, entries} <- read_skipped(state.table),
+         kept = Map.reject(entries, fn {_preset, e} -> readmitted?(e, min_fps) end),
+         true <- map_size(kept) < map_size(entries) do
+      case persist(state, {:skipped, {version, kept}}) do
+        :ok ->
+          Logger.info(
+            "MilkDrop: minimum frame rate #{min_fps}: #{map_size(entries) - map_size(kept)} " <>
+              "budget skip(s) cleared"
+          )
+
+          broadcast_skipped(state, version, kept)
+
+        {:error, reason} = error ->
+          Logger.error("MilkDrop store budget skip clear failed: #{inspect(reason)}")
+          error
+      end
+    else
+      _ -> :ok
+    end
+  end
+
+  defp readmitted?(%{reason: "budget", fps: fps}, min_fps) when is_number(fps),
+    do: fps >= min_fps - @min_fps_slack
+
+  defp readmitted?(_entry, _min_fps), do: false
+
+  defp broadcast_skipped(state, version, entries) do
+    reasons = Map.new(entries, fn {preset, e} -> {preset, entry_details(e).reason} end)
+    broadcast(state, {:milkdrop_skipped, version, reasons})
   end
 
   defp new_marker(state, owner, session, version, preset) do
@@ -795,15 +876,39 @@ defmodule UniversalProxy.MilkDrop.Store do
   defp sanitize_field(:rotate_s, v, _fallback) when is_integer(v),
     do: v |> max(@rotate_min) |> min(@rotate_max)
 
+  defp sanitize_field(:min_fps, v, _fallback) when is_number(v) do
+    steps = round((min(max(v, @min_fps_min), max_min_fps()) - @min_fps_min) / @min_fps_step)
+    min(@min_fps_min + steps * @min_fps_step, max_min_fps())
+  end
+
   defp sanitize_field(:locked, nil, _fallback), do: nil
   defp sanitize_field(:locked, v, _fallback) when is_binary(v) and v != "", do: v
   defp sanitize_field(_key, _v, fallback), do: fallback
 
   defp sanitize_skipped(entries) do
-    for {preset, reason} <- entries, is_binary(preset), is_binary(reason), into: %{} do
-      {preset, reason}
+    for {preset, entry} <- entries, is_binary(preset), valid_entry?(entry), into: %{} do
+      {preset, entry}
     end
   end
+
+  defp valid_entry?(reason) when is_binary(reason), do: true
+
+  defp valid_entry?(%{reason: reason, fps: fps}) when is_binary(reason) and is_float(fps),
+    do: true
+
+  defp valid_entry?(_entry), do: false
+
+  # Stored as the bare reason unless there is an fps to keep (the original
+  # format, still read as is).
+  defp skip_entry(reason, fps) when is_number(fps) and fps >= 0,
+    do: %{reason: reason, fps: fps / 1}
+
+  defp skip_entry(reason, _fps), do: reason
+
+  defp entry_details(reason) when is_binary(reason), do: %{reason: reason, fps: nil}
+  defp entry_details(%{reason: reason, fps: fps}), do: %{reason: reason, fps: fps}
+
+  defp max_min_fps, do: MilkDrop.max_min_fps()
 
   defp reason_string(reason) when is_binary(reason), do: reason
   defp reason_string(reason) when is_atom(reason), do: Atom.to_string(reason)
