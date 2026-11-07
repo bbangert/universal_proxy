@@ -60,8 +60,8 @@ defmodule UniversalProxy.Display.MilkDrop do
       (default a unique `<tmp>/up-milkdrop-skip-N.txt`; deleted by the
       reaper however this process ends);
     * `:binary` — the renderer (default `default_binary/0`);
-    * `:skip_retry_ms` — how often skips the Store could not take are
-      retried (default 5000);
+    * `:skip_retry_ms` — how often skips, and in-flight marks and clears,
+      the Store could not take are retried (default 5000);
     * `:kill_grace_ms` — how long a renderer that outlives its closed stdin
       may run before it is SIGKILLed (default 2000);
     * `:task_supervisor` — the `Task.Supervisor` the reaper runs under
@@ -159,7 +159,9 @@ defmodule UniversalProxy.Display.MilkDrop do
     * a `gpu_hang` skip the Store could not take keeps the record on that
       preset, through later events, until the skip is on disk: until then
       the record is the only durable trace of the hang;
-    * a refused mark is retried on the next event or skip retry;
+    * a mark or clear the Store did not acknowledge stays pending and is
+      retried on the next event and every `:skip_retry_ms` until it is
+      (so a locked preset, which only sends `stats`, still gets its mark);
     * the Store monitors this process, the record's owner, and clears the
       record a grace period after it goes down, however it went down (only
       if it is still this session's). A clean end — `released`, `exiting`
@@ -377,7 +379,8 @@ defmodule UniversalProxy.Display.MilkDrop do
          discarding: false,
          pending_skips: %{},
          skip_retry_ms: Keyword.get(opts, :skip_retry_ms, @skip_retry_ms),
-         skip_timer: nil
+         skip_timer: nil,
+         record_timer: nil
        }}
     else
       {:error, reason} ->
@@ -450,6 +453,10 @@ defmodule UniversalProxy.Display.MilkDrop do
     {:noreply, state |> Map.put(:skip_timer, nil) |> flush_skips() |> sync_record()}
   end
 
+  def handle_info(:retry_record, state) do
+    {:noreply, state |> Map.put(:record_timer, nil) |> sync_record()}
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
 
   # -- Private --
@@ -510,10 +517,11 @@ defmodule UniversalProxy.Display.MilkDrop do
   # The in-flight record. `want` is what it should name going by the
   # renderer's events: the preset loading, else the one showing (`nil`
   # after a clean end). `intended` is what the Store was last asked to hold
-  # and `acked?` whether it said so: a refused mark may still be queued (the
-  # Store queues them while its table is closed), so a refused ask still
-  # counts as the record's content. `hold` is a `gpu_hang` preset whose skip
-  # is not on disk yet; the record stays on it until the skip is.
+  # (`nil`: cleared) and `acked?` whether it said so: a refused ask may
+  # still be queued (the Store queues them while its table is closed), so it
+  # counts as the record's content, but stays pending until acknowledged.
+  # `hold` is a `gpu_hang` preset whose skip is not on disk yet; the record
+  # stays on it until the skip is.
   #
   #   event                                want       record
   #   loading F                            F          hold || F
@@ -525,7 +533,8 @@ defmodule UniversalProxy.Display.MilkDrop do
   #
   # Invariant: the durable record names the most recent preset that could
   # have hung the GPU and is not yet persisted as skipped. Unacked asks are
-  # retried on every event and skip retry.
+  # retried on every tracked event and on `:retry_record`, armed while one
+  # is pending.
   defp track_in_flight(%{event: :loading, preset: preset}, state) when is_binary(preset),
     do: sync_record(%{state | want: preset})
 
@@ -560,12 +569,14 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   defp sync_record(state) do
     state = release_hold(state)
+    target = state.hold || state.want
 
-    case state.hold || state.want do
-      nil when is_nil(state.intended) -> state
-      nil -> clear_in_flight(state)
-      target -> if synced?(state, target), do: state, else: mark_in_flight(state, target)
+    cond do
+      synced?(state, target) -> state
+      is_nil(target) -> clear_in_flight(state)
+      true -> mark_in_flight(state, target)
     end
+    |> schedule_record_retry()
   end
 
   defp release_hold(%{hold: hold, pending_skips: pending} = state)
@@ -578,23 +589,31 @@ defmodule UniversalProxy.Display.MilkDrop do
   defp synced?(_state, _target), do: false
 
   defp mark_in_flight(state, preset) do
-    case Store.mark_in_flight(state.store, state.session, state.version, preset) do
-      :ok ->
-        %{state | intended: preset, acked?: true}
-
-      {:error, reason} ->
-        Logger.warning(
-          "MilkDrop: could not record #{inspect(preset)} as loading: #{inspect(reason)}"
-        )
-
-        %{state | intended: preset, acked?: false}
-    end
+    state.store
+    |> Store.mark_in_flight(state.session, state.version, preset)
+    |> record_ask(state, preset, "record #{inspect(preset)} as loading")
   end
 
   defp clear_in_flight(state) do
-    _ = Store.clear_in_flight(state.store, state.session)
-    %{state | intended: nil, acked?: true}
+    state.store
+    |> Store.clear_in_flight(state.session)
+    |> record_ask(state, nil, "clear the in-flight record")
   end
+
+  defp record_ask(:ok, state, target, _what), do: %{state | intended: target, acked?: true}
+
+  # Logged once per target, not on every retry.
+  defp record_ask({:error, reason}, state, target, what) do
+    unless state.intended == target and not state.acked?,
+      do: Logger.warning("MilkDrop: could not #{what}: #{inspect(reason)}; retrying")
+
+    %{state | intended: target, acked?: false}
+  end
+
+  defp schedule_record_retry(%{acked?: false, record_timer: nil} = state),
+    do: %{state | record_timer: Process.send_after(self(), :retry_record, state.skip_retry_ms)}
+
+  defp schedule_record_retry(state), do: state
 
   # Skips the Store refused (it is down) stay pending and are retried on
   # the next skip/preset event or `:retry_skips` timer; the first refusal

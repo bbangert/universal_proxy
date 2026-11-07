@@ -635,6 +635,56 @@ defmodule UniversalProxy.Display.MilkDropTest do
     end
 
     @tag capture_log: true
+    test "marks refused while the Store is down are retried for a stats-only stream", ctx do
+      path = Path.join(ctx.tmp_dir, "settings.dets")
+      store = start_supervised!(store_spec(path, "boot-1"))
+
+      {pid, _} = start_renderer(ctx, store: @store_name, skip_retry_ms: 50)
+      emit(pid, ~s({"event":"preset","file":"a.milk","locked":false}))
+      assert_receive {:milkdrop, ^pid, %{event: :preset, file: "a.milk"}}, @timeout
+      assert %{preset: "a.milk"} = Store.in_flight(@store_name)
+
+      power_cut(store)
+      emit(pid, ~s({"event":"loading","preset":"b.milk"}))
+      emit(pid, ~s({"event":"preset","file":"b.milk","locked":true}))
+      assert_receive {:milkdrop, ^pid, %{event: :preset, file: "b.milk"}}, @timeout
+
+      # Locked: from here on the renderer only sends stats.
+      start_supervised!(store_spec(path, "boot-1"))
+      emit(pid, ~s({"event":"stats","fps":60}))
+      assert_receive {:milkdrop, ^pid, %{event: :stats}}, @timeout
+
+      wait_until(fn -> match?(%{preset: "b.milk", owner: ^pid}, Store.in_flight(@store_name)) end)
+    end
+
+    @tag capture_log: true
+    test "a clear refused during a release is retried while the server lives on", ctx do
+      path = Path.join(ctx.tmp_dir, "settings.dets")
+      store = start_supervised!(store_spec(path, "boot-1"))
+
+      {pid, _} = start_renderer(ctx, store: @store_name, skip_retry_ms: 50)
+      emit(pid, ~s({"event":"preset","file":"a.milk","locked":false}))
+      assert_receive {:milkdrop, ^pid, %{event: :preset, file: "a.milk"}}, @timeout
+      assert %{preset: "a.milk"} = Store.in_flight(@store_name)
+
+      power_cut(store)
+      MilkDrop.release(pid)
+      assert_receive {:milkdrop, ^pid, %{event: :released}}, @timeout
+
+      # The server stays up (viewport recovery), so the restarted Store
+      # finds a live owner and keeps the record until the clear lands.
+      store = start_supervised!(store_spec(path, "boot-1", in_flight_grace_ms: 200))
+      wait_until(fn -> Store.in_flight(@store_name) == nil end)
+      assert %{intended: nil, acked?: true} = :sys.get_state(pid)
+      assert Process.alive?(pid)
+
+      power_cut(store)
+      store = start_supervised!(store_spec(path, "boot-2"))
+      assert Store.skipped(store, @version) == %{}
+      assert Store.in_flight(store) == nil
+    end
+
+    @tag capture_log: true
     test "a power cut while a gpu_hang is held skips that preset on the next boot", ctx do
       {insert, _allow_skips} = failing_skips()
       path = Path.join(ctx.tmp_dir, "settings.dets")
