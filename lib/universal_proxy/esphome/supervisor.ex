@@ -249,7 +249,7 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   # invokes it from its open/rescan loop.
   @doc false
   def resolve_zwave_port do
-    pick_zwave_port(Hardware.list_ports(), Hardware.live_port_keys(), UARTStore.all_configs())
+    pick_zwave_port(resolver_ports(), Hardware.live_port_keys(), UARTStore.all_configs())
   end
 
   # Pure core of `resolve_zwave_port/0`: `ports` from `Hardware.list_ports/0`,
@@ -282,7 +282,7 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   # device) as `%{path: tty, display_name: ha_name, port: row}`, or nil.
   # Public because `ZigbeeProxy` invokes it from its open/rescan loop.
   @doc false
-  def resolve_zigbee_port, do: pick_zigbee_port(Hardware.list_ports())
+  def resolve_zigbee_port, do: pick_zigbee_port(resolver_ports())
 
   @doc false
   def pick_zigbee_port(ports) do
@@ -291,6 +291,12 @@ defmodule UniversalProxy.ESPHome.Supervisor do
       port -> %{path: port.tty_name, display_name: port.ha_name, port: port}
     end
   end
+
+  # The resolvers run inside the proxies, and need no in-use labels: by
+  # default each `list_ports/0` would call both proxies' `claimed_port/1`,
+  # so two proxies resolving at once would block on each other until the
+  # call timeout.
+  defp resolver_ports, do: Hardware.list_ports(zwave_claim: nil, zigbee_claim: nil)
 
   defp display_name_for(ports, tty) do
     case Enum.find(ports, &(&1.tty_name == tty)) do

@@ -287,6 +287,23 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
     :exit, _ -> %{attached?: false, error?: false, port: nil}
   end
 
+  @doc """
+  The tty this proxy holds open, or `nil`, for
+  `UniversalProxy.Hardware` to mark the port in use (it is invisible to
+  `UART.ports/0`). `subscribed` says whether a client holds the session
+  that receives RX data.
+
+  `Hardware.list_ports/0` calls this by default; a call from this
+  server's own resolver exits with `:calling_self` and is answered `nil`.
+  """
+  @spec claimed_port(GenServer.server()) ::
+          %{tty_name: String.t(), display_name: String.t(), subscribed: boolean()} | nil
+  def claimed_port(server \\ __MODULE__) do
+    GenServer.call(server, :claimed_port, @call_timeout)
+  catch
+    :exit, _ -> nil
+  end
+
   defp call(server, msg, default, timeout \\ @call_timeout) do
     GenServer.call(server, msg, timeout)
   catch
@@ -426,6 +443,22 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
 
   def handle_call(:current_opts, _from, state) do
     {:reply, to_open_opts(state.line), state}
+  end
+
+  def handle_call(:claimed_port, _from, %{uart_pid: nil} = state) do
+    {:reply, nil, state}
+  end
+
+  def handle_call(:claimed_port, _from, state) do
+    tty = Path.basename(state.port_path)
+
+    reply = %{
+      tty_name: tty,
+      display_name: state.display_name || tty,
+      subscribed: state.subscribed != nil
+    }
+
+    {:reply, reply, state}
   end
 
   def handle_call(:status, _from, state) do

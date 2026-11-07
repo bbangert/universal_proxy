@@ -43,14 +43,37 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
   espex's 9600-8-N-1 fallback. Real ESPHome hardware retains its UART
   settings across a client reconnect, so this keeps a resumed connection
   talking at the baud rate the attached device actually expects.
+
+  ## Home Assistant Connect ZBT-2
+
+  The ZBT-2 that `UniversalProxy.ESPHome.ZigbeeProxy` holds is advertised
+  as a `:usb_serial` port that drives RTS and DTR, for as long as the
+  owner knows its row (while the tty is open, and while a reopen is
+  pending after an error). Keeping the row through a transient error
+  keeps every instance number stable for connected clients; the identity
+  reports it not connected meanwhile.
+
+  Its handles are `{:zigbee, session}`: `open/3` attaches a session to
+  the owner and `close/1` detaches it, so the tty (and its DTR/RTS) stay
+  put across sessions and CONFIGUREs. Subscribe, writes, modem pins and
+  `set_mode/2` go to the owner, which runs the ASH acknowledger in
+  `:protocol` mode. `default_open_opts/1` serves the owner's live line
+  settings (a lazy open is then a no-op) and nothing is persisted, since
+  a flasher's magic-baud CONFIGUREs are signalling, not settings.
+
+  `identity/1` reports the USB identity Home Assistant's ZBT-2 discovery
+  matches on. Every other port reports none: an identity on our
+  CP210x/CH34x adapters would match ZHA's USB matchers and offer them as
+  Zigbee radios.
   """
 
   @behaviour Espex.SerialProxy
 
   require Logger
 
-  alias Espex.SerialProxy.Info
+  alias Espex.SerialProxy.{Identity, Info}
   alias UniversalProxy.ESPHome.SerialProxy.Relay
+  alias UniversalProxy.ESPHome.ZigbeeProxy
   alias UniversalProxy.Hardware
   alias UniversalProxy.UART
   alias UniversalProxy.UART.SettingsStore
@@ -60,13 +83,21 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
     inventory()
     |> Enum.with_index()
     |> Enum.map(fn {entry, idx} ->
-      %Info{instance: idx, name: entry.friendly_name, port_type: entry.port_type}
+      %Info{
+        instance: idx,
+        name: entry.friendly_name,
+        port_type: entry.port_type,
+        configured_line_states: entry.line_states
+      }
     end)
   end
 
   @impl true
   def open(instance, opts, subscriber) do
     case Enum.at(inventory(), instance) do
+      %{kind: :zigbee} = entry ->
+        open_zigbee(instance, entry, opts, subscriber)
+
       %{id: id, path: path, friendly_name: friendly_name, serial: serial} ->
         with {:ok, _pid} <- UART.open(path, Keyword.put(opts, :friendly_name, friendly_name)),
              {:ok, relay} <- start_relay_or_close(path, friendly_name, subscriber) do
@@ -97,11 +128,51 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
     # instance without a prior CONFIGURE on this connection (e.g. HA
     # resuming after a proxy restart). Serve the settings the port was
     # last successfully opened with; fall back to espex's 9600-8-N-1.
-    with %{id: id} <- Enum.at(inventory(), instance),
-         opts when is_list(opts) <- get_stored_opts(id) do
-      opts
-    else
-      _ -> Espex.SerialProxy.default_open_opts()
+    case Enum.at(inventory(), instance) do
+      # Live, not persisted: a stale value would retune the ZBT-2's line
+      # on every lazy open.
+      %{kind: :zigbee} ->
+        ZigbeeProxy.current_opts(zigbee_proxy())
+
+      %{id: id} ->
+        case get_stored_opts(id) do
+          opts when is_list(opts) -> opts
+          _ -> Espex.SerialProxy.default_open_opts()
+        end
+
+      nil ->
+        Espex.SerialProxy.default_open_opts()
+    end
+  end
+
+  @impl true
+  def identity(instance), do: identity_for(inventory(), instance)
+
+  # Pure core of `identity/1`, over a `build_inventory/2` result.
+  @doc false
+  def identity_for(inventory, instance) do
+    case Enum.at(inventory, instance) do
+      %{kind: :zigbee} = entry -> zigbee_identity(instance, entry)
+      _ -> nil
+    end
+  end
+
+  # No `persist_opts`: the owner keeps the line settings itself.
+  defp open_zigbee(instance, entry, opts, subscriber) do
+    case ZigbeeProxy.attach(zigbee_proxy(), opts, subscriber) do
+      {:ok, session} ->
+        Logger.info(
+          "ESPHome serial proxy opened instance #{instance} (#{entry.friendly_name} @ #{entry.path}, #{opts[:speed]} baud)"
+        )
+
+        {:ok, {:zigbee, session}}
+
+      {:error, reason} = err ->
+        Logger.warning(
+          "ESPHome serial proxy failed to open instance #{instance} (#{entry.path}): #{inspect(reason)}"
+        )
+
+        err
     end
   end
 
@@ -119,10 +190,18 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
     end
   end
 
+  # Zigbee clauses come first throughout: `{:zigbee, session}` would also
+  # match the `{relay, path}` patterns.
   @impl true
+  def write({:zigbee, session}, data), do: ZigbeeProxy.write(zigbee_proxy(), session, data)
   def write({_relay, path}, data), do: UART.write(path, data)
 
   @impl true
+  def close({:zigbee, session}) do
+    _ = ZigbeeProxy.detach(zigbee_proxy(), session)
+    :ok
+  end
+
   def close({relay, path}) do
     # No alive?-guard: it was a TOCTOU (the relay can die between the
     # check and the stop). Stopping an already-dead process exits with
@@ -141,14 +220,27 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
 
   # espex 0.8 guards both set_modem_pins/3 and get_modem_pins/1 with
   # function_exported? and would otherwise fall back to its own
-  # omitted-callback default (all lines low / no-op). We keep these stubs
-  # anyway to answer NOT_SUPPORTED explicitly rather than relying on that
-  # fallback.
+  # omitted-callback default (all lines low / no-op). Only the ZBT-2
+  # drives its lines; every other port answers NOT_SUPPORTED explicitly
+  # rather than relying on that fallback.
   @impl true
+  def set_modem_pins({:zigbee, session}, rts, dtr),
+    do: ZigbeeProxy.set_modem_pins(zigbee_proxy(), session, rts, dtr)
+
   def set_modem_pins(_handle, _rts, _dtr), do: {:error, :not_supported}
 
   @impl true
+  def get_modem_pins({:zigbee, session}), do: ZigbeeProxy.get_modem_pins(zigbee_proxy(), session)
   def get_modem_pins(_handle), do: {:error, :not_supported}
+
+  @doc """
+  Switch a port between RAW and PROTOCOL mode. Only the ZBT-2 has a
+  protocol handler (the ASH acknowledger); every other port is RAW only.
+  """
+  @impl true
+  def set_mode({:zigbee, session}, mode), do: ZigbeeProxy.set_mode(zigbee_proxy(), session, mode)
+  def set_mode(_handle, :raw), do: :ok
+  def set_mode(_handle, :protocol), do: {:error, :not_supported}
 
   @doc """
   Handle an `Espex.SerialProxy` request.
@@ -159,6 +251,14 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
   layer can respond to the client without crashing.
   """
   @impl true
+  def request({:zigbee, session}, :subscribe) do
+    zigbee_status(ZigbeeProxy.subscribe(zigbee_proxy(), session))
+  end
+
+  def request({:zigbee, session}, :unsubscribe) do
+    zigbee_status(ZigbeeProxy.unsubscribe(zigbee_proxy(), session))
+  end
+
   def request({relay, _path}, :subscribe) do
     :ok = Relay.subscribe(relay)
     {:ok, :ok}
@@ -171,7 +271,17 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
 
   def request(_handle, _type), do: {:ok, :not_supported}
 
+  # espex logs these answers (the ack is OK regardless), so keep the
+  # statuses it has names for.
+  defp zigbee_status(:ok), do: {:ok, :ok}
+  defp zigbee_status({:error, status}) when status in [:port_in_use, :timeout], do: {:ok, status}
+  defp zigbee_status({:error, _reason} = error), do: error
+
   # -- Private --
+
+  # The owner's registered name; tests point it at their own instance.
+  defp zigbee_proxy,
+    do: Application.get_env(:universal_proxy, :serial_proxy_zigbee_server, ZigbeeProxy)
 
   # Build the serial-port inventory from `Hardware.list_ports/0` so we
   # surface auto-detected chipset defaults AND user-saved overrides
@@ -179,23 +289,86 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
   # Assistant's serial picker shows in the Overview UI ("FTDI FT232RL
   # (1-1.1.2)") so the user sees the same label everywhere.
   defp inventory do
-    Hardware.list_ports()
+    build_inventory(Hardware.list_ports(), ZigbeeProxy.status(zigbee_proxy()))
+  end
+
+  # Pure core of `inventory/0`: `ports` from `Hardware.list_ports/0`,
+  # `zigbee` from `ZigbeeProxy.status/1`. The ZBT-2 comes from the owner's
+  # own row, never from `ports`, so only the one it holds is advertised.
+  @doc false
+  def build_inventory(ports, zigbee) do
+    ports
     |> Enum.filter(fn port ->
       port.connected and port.configured and port.kind in [:ttl, :rs232, :rs485]
     end)
     |> Enum.map(fn port ->
       %{
+        kind: :uart,
         id: port.id,
         path: port.tty_name,
         friendly_name: port.ha_name,
         port_type: port.kind,
+        line_states: [],
         # The device's USB serial, tagging persisted line settings so a
         # delayed unplug-clear can never wipe a different adapter's write
         # (list_ports renders missing serials as an em-dash placeholder).
-        serial: if(port.serial == "—", do: nil, else: port.serial)
+        serial: usb_serial(port.serial)
       }
     end)
-    |> Enum.sort_by(& &1.friendly_name)
+    |> Kernel.++(zigbee_entries(zigbee))
+    |> Enum.sort_by(&{&1.friendly_name, &1.path})
+  end
+
+  defp zigbee_entries(%{port: %{ha_name: name, tty_name: tty} = port} = status)
+       when is_binary(name) and is_binary(tty) do
+    [
+      %{
+        kind: :zigbee,
+        id: Map.get(port, :id),
+        path: tty,
+        friendly_name: name,
+        port_type: :usb_serial,
+        line_states: [:rts, :dtr],
+        serial: usb_serial(Map.get(port, :serial)),
+        port: port,
+        attached?: status.attached?,
+        error?: status.error?
+      }
+    ]
+  end
+
+  defp zigbee_entries(_status), do: []
+
+  defp usb_serial("—"), do: nil
+  defp usb_serial(serial), do: serial
+
+  # What Home Assistant's ZBT-2 matcher reads: VID/PID and the product
+  # string, plus the serial (its config-flow unique id). espex copies `usb`
+  # into the protobuf as given, so unknown ids are left out, never nil.
+  defp zigbee_identity(instance, entry) do
+    port = entry.port
+    descriptor = Map.get(port, :usb_descriptor) || %{}
+
+    usb =
+      %{
+        vendor_id: Map.get(port, :vendor_id),
+        product_id: Map.get(port, :product_id),
+        bcd_device: descriptor[:bcd_device],
+        interface_number: descriptor[:interface_number],
+        interface_class: descriptor[:interface_class]
+      }
+      |> Map.filter(fn {_key, value} -> is_integer(value) end)
+
+    %Identity{
+      instance: instance,
+      source: :usb,
+      connected?: entry.attached?,
+      error?: entry.error?,
+      manufacturer: Map.get(port, :usb_manufacturer) || "",
+      product: Map.get(port, :usb_product) || "",
+      serial_number: entry.serial || "",
+      usb: usb
+    }
   end
 
   # Best-effort: a `SettingsStore` hiccup (down, wedged, or DETS write

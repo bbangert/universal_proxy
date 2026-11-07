@@ -7,7 +7,7 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
   @moduletag :capture_log
 
   alias UniversalProxy.ESPHome.ZigbeeProxy
-  alias UniversalProxy.ESPHome.ZigbeeProxy.Ash
+  alias UniversalProxy.ESPHome.ZigbeeProxy.{Ash, FakeUART}
 
   @pubsub UniversalProxy.PubSub
 
@@ -17,50 +17,6 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
   @data_0 hex.("00 43 21 A8 50 9B 98 7E")
   @data_1 hex.("10 43 21 A8 50 9F C2 7E")
   @data_5 hex.("50 43 21 A8 50 8E AA 7E")
-
-  # Stands in for the Circuits.UART GenServer: reports every wire-level
-  # call to the test process and replies :ok unless told otherwise with
-  # `reply_with/3`.
-  defmodule FakeUART do
-    use GenServer
-
-    def start_link(test_pid), do: GenServer.start_link(__MODULE__, test_pid)
-
-    def reply_with(fake, op, reply), do: GenServer.call(fake, {:fake_reply, op, reply})
-
-    @impl true
-    def init(test_pid), do: {:ok, %{test: test_pid, replies: %{}}}
-
-    @impl true
-    def handle_call({:fake_reply, op, reply}, _from, state) do
-      {:reply, :ok, put_in(state.replies[op], reply)}
-    end
-
-    def handle_call({:write, data, _timeout}, _from, state) do
-      report(state, :write, {:uart_write, IO.iodata_to_binary(data)})
-    end
-
-    def handle_call({:configure, opts}, _from, state) do
-      report(state, :configure, {:uart_configure, opts})
-    end
-
-    def handle_call({:set_dtr, value}, _from, state) do
-      report(state, :set_dtr, {:uart_set_dtr, value})
-    end
-
-    def handle_call({:set_rts, value}, _from, state) do
-      report(state, :set_rts, {:uart_set_rts, value})
-    end
-
-    def handle_call(:close, _from, state), do: report(state, :close, :uart_close)
-
-    def handle_call(_msg, _from, state), do: {:reply, :ok, state}
-
-    defp report(state, op, message) do
-      send(state.test, message)
-      {:reply, Map.get(state.replies, op, :ok), state}
-    end
-  end
 
   # Every open starts a fresh FakeUART (a reopen after cleanup needs a
   # live one), linked to the proxy as Circuits.UART.start_link/0 is.
@@ -181,6 +137,24 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
       %{server: server} = start_proxy!()
       ref = attach!(server)
       assert {:ok, %{rts: true, dtr: true}} = ZigbeeProxy.get_modem_pins(server, ref)
+    end
+
+    test "claimed_port reports the held tty and whether a session is subscribed" do
+      %{server: server, name: name} = start_proxy!()
+      base = %{tty_name: "ttyZB", display_name: name, subscribed: false}
+
+      assert ZigbeeProxy.claimed_port(server) == base
+      ref = attach!(server)
+      :ok = ZigbeeProxy.subscribe(server, ref)
+      assert ZigbeeProxy.claimed_port(server) == %{base | subscribed: true}
+      :ok = ZigbeeProxy.detach(server, ref)
+      assert ZigbeeProxy.claimed_port(server) == base
+    end
+
+    test "claimed_port is nil without a tty or a server" do
+      server = start_supervised!({ZigbeeProxy, name: nil, resolver: fn -> nil end})
+      assert ZigbeeProxy.claimed_port(server) == nil
+      assert ZigbeeProxy.claimed_port(:no_such_zigbee_proxy) == nil
     end
   end
 
