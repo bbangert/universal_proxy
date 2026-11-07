@@ -18,9 +18,10 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeIntegrationTest do
   @data_0 hex.("00 43 21 A8 50 9B 98 7E")
   @ack_1 hex.("7E 81 60 59 7E")
 
-  # Generous host bound on SUBSCRIBE + SET_MODE + CONFIGURE acks; USF
-  # 1.3.0 gives the whole esphome-hass:// open 1 s.
-  @open_budget_ms 200
+  # Half of the 1 s USF 1.3.0 gives the whole esphome-hass:// open for
+  # SUBSCRIBE + SET_MODE + CONFIGURE acks: loose enough for a loaded CI
+  # host, tight enough to catch a call timing out on the way.
+  @open_budget_ms 500
 
   setup do
     owner = ZigbeeFixtures.start_owner!()
@@ -42,6 +43,8 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeIntegrationTest do
 
     instance =
       Enum.find_index(SerialProxy.list_instances(), &(&1.port_type == :usb_serial))
+
+    assert is_integer(instance)
 
     Map.merge(owner, %{socket: socket, instance: instance, buffer: make_ref()})
   end
@@ -169,13 +172,19 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeIntegrationTest do
     assert data.instance == ctx.instance
     assert data.data == @data_0
 
-    # Written to the NCP before the bytes were forwarded.
-    assert_received {:uart_write, @ack_1}
+    # The ACK reached the NCP too. That it is written before the bytes
+    # are forwarded is pinned by the owner's unit tests, not here.
+    assert_receive {:uart_write, @ack_1}, 1_000
     assert uart_calls() == []
 
     # Host → NCP writes pass through.
     send_msg(ctx, %Proto.SerialProxyWriteRequest{instance: ctx.instance, data: "host"})
-    assert_receive {:uart_write, "host"}
+    assert_receive {:uart_write, "host"}, 1_000
+
+    # UNSUBSCRIBE releases the session, never the tty.
+    assert request(ctx, :unsubscribe).status == :SERIAL_PROXY_STATUS_OK
+    assert ctx.server |> ZigbeeProxy.status() |> Map.fetch!(:attached?)
+    refute :uart_close in uart_calls()
   end
 
   test "flasher: three SUBSCRIBE/RAW/CONFIGURE/UNSUBSCRIBE cycles keep the tty open", ctx do

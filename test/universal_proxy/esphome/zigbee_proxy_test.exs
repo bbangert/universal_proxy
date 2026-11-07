@@ -275,8 +275,13 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
       assert ack1 == <<0x7E, 0x81, 0x60, 0x59, 0x7E>>
 
       # The ACK reaches the wire first, then the subscriber.
-      assert_receive first
-      assert first == {:uart_write, ack1}
+      receive do
+        {:uart_write, ^ack1} -> :ok
+        {:espex_serial_data, {:zigbee, ^ref}, _} -> flunk("RX forwarded before the ACK write")
+      after
+        1_000 -> flunk("no ACK write")
+      end
+
       assert_receive {:espex_serial_data, {:zigbee, ^ref}, @data_0}
 
       assert_receive {:uart_data, %{dir: :rx, data: @data_0}}
@@ -546,8 +551,8 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
       assert_receive {:uart_set_dtr, false}
 
       assert :ok = ZigbeeProxy.set_modem_pins(server, ref, false, true)
-      assert_receive first
-      assert_receive second
+      assert_receive {line, _} = first when line in [:uart_set_dtr, :uart_set_rts]
+      assert_receive {line, _} = second when line in [:uart_set_dtr, :uart_set_rts]
       assert [first, second] == [{:uart_set_dtr, true}, {:uart_set_rts, false}]
 
       assert {:ok, %{rts: false, dtr: true}} = ZigbeeProxy.get_modem_pins(server, ref)
