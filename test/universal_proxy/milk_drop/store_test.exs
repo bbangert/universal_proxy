@@ -37,7 +37,13 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
   describe "settings" do
     test "defaults on a fresh file", %{path: path} do
       server = start_store(path)
-      assert Store.settings(server) == %{include_high_frequency: false, rotate_s: 20, locked: nil}
+
+      assert Store.settings(server) == %{
+               include_high_frequency: false,
+               rotate_s: 20,
+               min_fps: 20,
+               locked: nil
+             }
     end
 
     test "round-trip survives a restart", %{path: path} do
@@ -54,6 +60,7 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
       assert Store.settings(server) == %{
                include_high_frequency: true,
                rotate_s: 45,
+               min_fps: 20,
                locked: "a/b.milk"
              }
     end
@@ -85,7 +92,39 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
                  bogus: 1
                })
 
-      assert settings == %{include_high_frequency: true, rotate_s: 30, locked: nil}
+      assert settings == %{include_high_frequency: true, rotate_s: 30, min_fps: 20, locked: nil}
+    end
+
+    test "min_fps runs from 20 to the board's maximum in steps of 5", %{path: path} do
+      server = start_store(path)
+      assert MilkDrop.max_min_fps() == 60
+      assert Store.min_fps_options() == [20, 25, 30, 35, 40, 45, 50, 55, 60]
+
+      for {given, kept} <- [
+            {25, 25},
+            {60, 60},
+            {5, 20},
+            {500, 60},
+            {22, 20},
+            {23, 25},
+            {37.4, 35}
+          ] do
+        assert {:ok, %{min_fps: ^kept}} = Store.update(server, %{min_fps: given})
+      end
+
+      assert {:ok, %{min_fps: 35}} = Store.update(server, %{"min_fps" => "fast"})
+    end
+
+    test "min_fps is capped at a smaller board maximum, also on read", %{path: path} do
+      server = start_store(path)
+      {:ok, %{min_fps: 45}} = Store.update(server, %{min_fps: 45})
+
+      Application.put_env(:universal_proxy, :milkdrop_max_min_fps, 30)
+      on_exit(fn -> Application.delete_env(:universal_proxy, :milkdrop_max_min_fps) end)
+
+      assert Store.min_fps_options() == [20, 25, 30]
+      assert Store.settings(server).min_fps == 30
+      assert {:ok, %{min_fps: 30}} = Store.update(server, %{min_fps: 60})
     end
 
     test "changes are broadcast", %{path: path} do
@@ -122,6 +161,122 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
 
       assert Store.skipped(server, "2026.11.1") == %{}
       assert Store.skipped(server, "2026.12.1") == %{"c.milk" => "draw"}
+    end
+
+    test "a measured fps is kept with the skip", %{path: path} do
+      server = start_store(path)
+      :ok = Store.skip(server, "v1", "slow.milk", "budget", fps: 17.3)
+      :ok = Store.skip(server, "v1", "even.milk", "budget", fps: 18)
+      :ok = Store.skip(server, "v1", "bad.milk", "compile_error", fps: nil)
+
+      assert Store.skipped(server, "v1") == %{
+               "slow.milk" => "budget",
+               "even.milk" => "budget",
+               "bad.milk" => "compile_error"
+             }
+
+      assert Store.skip_entries(server, "v1") == %{
+               "slow.milk" => %{reason: "budget", fps: 17.3},
+               "even.milk" => %{reason: "budget", fps: 18.0},
+               "bad.milk" => %{reason: "compile_error", fps: nil}
+             }
+    end
+
+    test "lowering min_fps drops the budget skips that hold it", %{path: path} do
+      {:ok, table} = :dets.open_file(@table, file: to_charlist(path), type: :set)
+      # A skip list written before skips carried an fps.
+      :ok = :dets.insert(table, {:skipped, {"v1", %{"old.milk" => "budget", "x.milk" => "draw"}}})
+      :ok = :dets.close(table)
+
+      server = start_store(path)
+      {:ok, _} = Store.update(server, %{min_fps: 40})
+      :ok = Store.skip(server, "v1", "a.milk", "budget", fps: 34.2)
+      :ok = Store.skip(server, "v1", "b.milk", "budget", fps: 28.9)
+      :ok = Store.skip(server, "v1", "c.milk", "budget", fps: 21.5)
+      Phoenix.PubSub.subscribe(UniversalProxy.PubSub, MilkDrop.settings_topic())
+
+      # Raising drops nothing.
+      {:ok, _} = Store.update(server, %{min_fps: 45})
+      assert map_size(Store.skipped(server, "v1")) == 5
+
+      # 30 lets in what holds 29 (the renderer's 1 fps slack).
+      {:ok, _} = Store.update(server, %{min_fps: 30})
+
+      assert_receive {:milkdrop_skipped, "v1",
+                      %{"b.milk" => "budget", "c.milk" => "budget", "old.milk" => "budget"} =
+                        entries}
+
+      assert map_size(entries) == 4
+
+      assert Store.skipped(server, "v1") == %{
+               "b.milk" => "budget",
+               "c.milk" => "budget",
+               "old.milk" => "budget",
+               "x.milk" => "draw"
+             }
+
+      {:ok, _} = Store.update(server, %{min_fps: 20})
+
+      assert Store.skip_entries(server, "v1") == %{
+               "old.milk" => %{reason: "budget", fps: nil},
+               "x.milk" => %{reason: "draw", fps: nil}
+             }
+
+      # Survives a restart.
+      stop_supervised!(Store)
+      server = start_store(path)
+      assert Store.skipped(server, "v1") == %{"old.milk" => "budget", "x.milk" => "draw"}
+    end
+
+    @tag capture_log: true
+    test "a lower min_fps and its readmission are saved together or not at all", %{path: path} do
+      failing = :atomics.new(1, [])
+
+      # Fails any write that touches the skip list, alone or with other records.
+      insert = fn table, records ->
+        if :atomics.get(failing, 1) == 1 and
+             Enum.any?(List.wrap(records), &match?({:skipped, _}, &1)),
+           do: {:error, :enospc},
+           else: :dets.insert(table, records)
+      end
+
+      server =
+        start_supervised!({Store, name: nil, table: @table, dets_path: path, insert: insert})
+
+      {:ok, _} = Store.update(server, %{min_fps: 40})
+      :ok = Store.skip(server, "v1", "a.milk", "budget", fps: 34.2)
+
+      :atomics.put(failing, 1, 1)
+      assert {:error, :enospc} = Store.update(server, %{min_fps: 30})
+      assert Store.settings(server).min_fps == 40
+      assert Store.skipped(server, "v1") == %{"a.milk" => "budget"}
+
+      # The same selection, retried, readmits.
+      :atomics.put(failing, 1, 0)
+      assert {:ok, %{min_fps: 30}} = Store.update(server, %{min_fps: 30})
+      assert Store.skipped(server, "v1") == %{}
+    end
+
+    @tag capture_log: true
+    test "a budget skip measured under an earlier, higher min_fps is not stored", %{path: path} do
+      server = start_store(path)
+      {:ok, _} = Store.update(server, %{min_fps: 30})
+      :ok = Store.skip(server, "v1", "x.milk", "draw")
+      Phoenix.PubSub.subscribe(UniversalProxy.PubSub, MilkDrop.settings_topic())
+
+      # Emitted while the minimum was 40, delivered after it dropped to 30.
+      assert :ok = Store.skip(server, "v1", "late.milk", "budget", fps: 34.2)
+      # At the slack boundary it still holds 30.
+      assert :ok = Store.skip(server, "v1", "edge.milk", "budget", fps: 29.0)
+      refute_receive {:milkdrop_skipped, _, _}, 50
+
+      # Under the slack it fails 30 and is kept.
+      :ok = Store.skip(server, "v1", "slow.milk", "budget", fps: 28.9)
+
+      assert Store.skip_entries(server, "v1") == %{
+               "x.milk" => %{reason: "draw", fps: nil},
+               "slow.milk" => %{reason: "budget", fps: 28.9}
+             }
     end
 
     test "clear_skipped/1 forgets everything and broadcasts", %{path: path} do
@@ -663,8 +818,21 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
 
     test "out-of-range stored values are clamped on read", %{path: path} do
       {:ok, table} = :dets.open_file(@table, file: to_charlist(path), type: :set)
-      :ok = :dets.insert(table, {:settings, %{rotate_s: 5000, locked: 42}})
-      :ok = :dets.insert(table, {:skipped, {"v1", %{"a.milk" => "draw", :bad => 1}}})
+      :ok = :dets.insert(table, {:settings, %{rotate_s: 5000, min_fps: 500, locked: 42}})
+
+      :ok =
+        :dets.insert(
+          table,
+          {:skipped,
+           {"v1",
+            %{
+              "a.milk" => "draw",
+              "b.milk" => %{reason: "budget", fps: 12.5},
+              "c.milk" => %{reason: "budget", fps: "slow"},
+              :bad => 1
+            }}}
+        )
+
       :ok = :dets.close(table)
 
       server = start_store(path)
@@ -672,10 +840,11 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
       assert Store.settings(server) == %{
                include_high_frequency: false,
                rotate_s: 120,
+               min_fps: 60,
                locked: nil
              }
 
-      assert Store.skipped(server, "v1") == %{"a.milk" => "draw"}
+      assert Store.skipped(server, "v1") == %{"a.milk" => "draw", "b.milk" => "budget"}
     end
   end
 
@@ -689,6 +858,8 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
       assert Store.skipped(dead, "v1") == %{}
       assert Store.update(dead, %{rotate_s: 30}) == {:error, :not_running}
       assert Store.skip(dead, "v1", "a.milk", "draw") == {:error, :not_running}
+      assert Store.skip(dead, "v1", "a.milk", "budget", fps: 10.0) == {:error, :not_running}
+      assert Store.skip_entries(dead, "v1") == %{}
       assert Store.clear_skipped(dead) == {:error, :not_running}
       assert Store.in_flight(dead) == nil
       assert Store.mark_in_flight(dead, 1, "v1", "a.milk") == {:error, :not_running}

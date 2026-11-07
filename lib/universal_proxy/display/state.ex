@@ -82,8 +82,9 @@ defmodule UniversalProxy.Display.State do
 
   From `:preparing` through `:presenting`, a settings change on
   `UniversalProxy.MilkDrop.settings_topic/0` reaches the renderer at once
-  as `set_rotate` and `set_high_frequency` casts (with high-frequency
-  presets turned off it cuts away from one on screen); a renderer started
+  as `set_rotate`, `set_high_frequency` and `set_min_fps` casts (with
+  high-frequency presets turned off it cuts away from one on screen), each
+  only when its value differs from the last one sent; a renderer started
   later reads them from `UniversalProxy.MilkDrop.Store` itself.
 
   Every phase is bounded (`:milkdrop_timeouts`, ms: tapping 10 000,
@@ -956,7 +957,7 @@ defmodule UniversalProxy.Display.State do
       |> send_setting(
         :rotate_s,
         settings,
-        &valid_rotate?/1,
+        &pos_integer?/1,
         &Display.MilkDrop.set_rotate(pid, &1)
       )
       |> send_setting(
@@ -965,13 +966,14 @@ defmodule UniversalProxy.Display.State do
         &is_boolean/1,
         &Display.MilkDrop.set_high_frequency(pid, &1)
       )
+      |> send_setting(:min_fps, settings, &pos_integer?/1, &Display.MilkDrop.set_min_fps(pid, &1))
 
     %{state | md: %{md | sent: sent}}
   end
 
   defp milkdrop_settings(state, _settings), do: state
 
-  defp valid_rotate?(seconds), do: is_integer(seconds) and seconds > 0
+  defp pos_integer?(n), do: is_integer(n) and n > 0
 
   defp send_setting(sent, key, settings, valid?, send_fun) do
     case settings do

@@ -174,7 +174,8 @@ private:
                  bool& activated);
     bool apply_level();
     void announce_preset(const char* cause, bool cut);
-    void skip_current(const char* reason);
+    void skip_current(const char* reason, double fps = -1);
+    void set_min_fps(double min_fps);
     void drop_queued();
     void recover_step();
     bool gpu_reset_during(const PresetEntry& entry, std::string& message);
@@ -490,9 +491,9 @@ Selection App::switch_to(const PresetEntry* first, const char* cause, bool smoot
     return sel;
 }
 
-void App::skip_current(const char* reason) {
+void App::skip_current(const char* reason, double fps) {
     if (current_ == nullptr) return;
-    emit_line(event_skip(current_->file, reason));
+    emit_line(event_skip(current_->file, reason, {}, fps));
     presets_->skip(current_->file);
     sw_.eject();
 }
@@ -660,10 +661,20 @@ void App::on_flip(int64_t t_us) {
             break;
         case CostGuard::Verdict::Skip:
             log_msg("%s: %.1f fps at the last level", current_->file.c_str(), guard_->last_fps());
-            skip_current("budget");
+            skip_current("budget", guard_->last_fps());
             break;
         default: break;
     }
+}
+
+void App::set_min_fps(double min_fps) {
+    opt_.min_fps = min_fps;
+    // The verdict concerns the preset being measured; none while one is
+    // being replaced.
+    const CostGuard::Verdict v = guard_->set_min_fps(min_fps);
+    if (v != CostGuard::Verdict::Skip || current_ == nullptr || sw_.holding_frames()) return;
+    log_msg("%s: no level can present %.0f fps", current_->file.c_str(), min_fps);
+    skip_current("budget", guard_->measured_fps(current_->file));
 }
 
 void App::present_step() {
@@ -794,6 +805,7 @@ void App::handle_command(const Command& c) {
         case Command::Type::SetHighFrequency:
             if (presets_->set_high_frequency(c.bool_value)) guard_high_frequency();
             break;
+        case Command::Type::SetMinFps: set_min_fps(c.number_value); break;
     }
 }
 

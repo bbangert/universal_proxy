@@ -9,9 +9,33 @@ CostGuard::CostGuard(Config config) : config_(config) {
     if (config_.start_interval < 1) config_.start_interval = 1;
     if (config_.window_frames < 2) config_.window_frames = 2;
     const int i0 = config_.start_interval;
-    if (i0 == 1) levels_.push_back({0, 1, 0.9 * config_.refresh_hz});
-    for (size_t r = 0; r < config_.rungs; r++)
-        levels_.push_back({r, i0 == 1 ? 2 : i0, config_.min_fps});
+    if (i0 == 1) levels_.push_back({0, 1, 0});
+    for (size_t r = 0; r < config_.rungs; r++) levels_.push_back({r, i0 == 1 ? 2 : i0, 0});
+    apply_floors();
+}
+
+void CostGuard::apply_floors() {
+    double target = config_.min_fps;
+    if (config_.refresh_hz > 0)
+        target = std::min(target, config_.refresh_hz / config_.start_interval);
+    const double floor = target - MIN_FPS_SLACK;
+    const bool half_rate_holds = config_.refresh_hz / 2 >= floor;
+    for (GuardLevel& l : levels_) {
+        if (l.interval == 1)
+            l.min_fps = half_rate_holds ? std::max(0.9 * config_.refresh_hz, floor) : floor;
+        else
+            l.min_fps = floor;
+    }
+}
+
+bool CostGuard::reachable(size_t level) const {
+    const GuardLevel& l = levels_[level];
+    return l.interval == 1 || config_.refresh_hz <= 0 || config_.refresh_hz / l.interval >= l.min_fps;
+}
+
+size_t CostGuard::reachable_from(size_t level) const {
+    while (level < levels_.size() && !reachable(level)) level++;
+    return level;
 }
 
 size_t CostGuard::clamp_to_floor(size_t level) const {
@@ -31,7 +55,10 @@ size_t CostGuard::begin(const std::string& file, size_t hint_rung) {
     } else {
         while (level + 1 < levels_.size() && levels_[level].rung < hint_rung) level++;
     }
-    level_ = clamp_to_floor(level);
+    level = clamp_to_floor(level);
+    // No reachable level from here: keep it, its first window skips.
+    const size_t usable = reachable_from(level);
+    level_ = usable < levels_.size() ? usable : level;
     return level_;
 }
 
@@ -69,15 +96,30 @@ CostGuard::Verdict CostGuard::on_flip(int64_t interval_us, bool measurable) {
         settled_[file_] = level_;
         return Verdict::Accept;
     }
-    if (level_ + 1 >= levels_.size()) {
+    const size_t next = reachable_from(level_ + 1);
+    if (next >= levels_.size()) {
         settled_.erase(file_);
         file_.clear();
         return Verdict::Skip;
     }
-    level_++;
+    level_ = next;
     settled_[file_] = level_;
     settle_left_ = config_.settle_frames;
     return Verdict::StepDown;
+}
+
+CostGuard::Verdict CostGuard::set_min_fps(double min_fps) {
+    if (min_fps == config_.min_fps) return Verdict::None;
+    config_.min_fps = min_fps;
+    apply_floors();
+    settled_.clear();
+    if (file_.empty()) return Verdict::None;
+    settle_left_ = config_.settle_frames;
+    window_.clear();
+    if (reachable(level_)) return Verdict::None;
+    // The levels below share its interval: none of them can either.
+    file_.clear();
+    return Verdict::Skip;
 }
 
 bool CostGuard::set_rung_floor(size_t rung) {

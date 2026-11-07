@@ -17,6 +17,9 @@ defmodule UniversalProxyWeb.MilkDropComponent do
       Pack that has since restarted are dropped.
     * **Rotation interval** — 10..120 s (`rotate_s`); anything else is
       refused inline without a write.
+    * **Minimum frame rate** (`min_fps`) — a select of
+      `Store.min_fps_options/0` (20 fps up to the board's maximum, in steps
+      of 5); anything else is refused inline without a write.
     * **Include fast-flashing presets** (`include_high_frequency`, off by
       default) — turning it on first opens a confirmation carrying a
       photosensitivity warning; only its confirm writes `true`. Turning it
@@ -140,6 +143,16 @@ defmodule UniversalProxyWeb.MilkDropComponent do
     end
   end
 
+  def handle_event("set_min_fps", params, socket) do
+    with raw when is_binary(raw) <- params["min_fps"],
+         {fps, ""} <- Integer.parse(raw),
+         true <- fps in Store.min_fps_options() do
+      {:noreply, write(socket, %{min_fps: fps})}
+    else
+      _ -> {:noreply, assign(socket, :error, "Pick a minimum frame rate from the list.")}
+    end
+  end
+
   def handle_event("toggle_high_frequency", _params, socket) do
     if socket.assigns.settings.include_high_frequency do
       {:noreply, write(socket, %{include_high_frequency: false})}
@@ -216,6 +229,7 @@ defmodule UniversalProxyWeb.MilkDropComponent do
       |> assign(:view, pack_view(assigns.pack))
       |> assign(:rotate_min, @rotate_min)
       |> assign(:rotate_max, @rotate_max)
+      |> assign(:min_fps_options, Store.min_fps_options())
       |> assign(:skipped_list, skipped_list(assigns.pack, assigns.skipped))
 
     ~H"""
@@ -314,6 +328,28 @@ defmodule UniversalProxyWeb.MilkDropComponent do
             {@settings.rotate_s} s
           </div>
         </div>
+
+        <%!-- Minimum frame rate --%>
+        <form
+          id={"#{@id}-min-fps-form"}
+          phx-change="set_min_fps"
+          phx-target={@myself}
+          class="flex items-center gap-3 pt-3 pr-5 pb-3 pl-[22px] border-t border-border-2"
+        >
+          <div class="flex-1 min-w-0">
+            <label for={"#{@id}-min-fps"} class="text-sm text-fg-2">Minimum frame rate</label>
+            <div class="text-xs text-fg-3 mt-0.5">Presets that can't hold this rate are skipped.</div>
+          </div>
+          <select
+            id={"#{@id}-min-fps"}
+            name="min_fps"
+            class="h-9 px-3 rounded-md text-sm border border-border-strong bg-surface text-fg-1 outline-none focus:border-accent focus:shadow-focus"
+          >
+            <option :for={fps <- @min_fps_options} value={fps} selected={fps == @settings.min_fps}>
+              {fps} fps
+            </option>
+          </select>
+        </form>
 
         <%!-- Fast-flashing presets --%>
         <div class="flex items-center gap-3 pt-3 pr-5 pb-3 pl-[22px] border-t border-border-2 bg-sunken">
