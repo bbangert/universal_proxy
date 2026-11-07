@@ -283,17 +283,26 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
   defp zigbee_proxy,
     do: Application.get_env(:universal_proxy, :serial_proxy_zigbee_server, ZigbeeProxy)
 
-  # Build the serial-port inventory from `Hardware.list_ports/0` so we
+  # Build the serial-port inventory from `Hardware.list_ports/1` so we
   # surface auto-detected chipset defaults AND user-saved overrides
   # uniformly. The `:ha_name` field on each port matches what Home
   # Assistant's serial picker shows in the Overview UI ("FTDI FT232RL
   # (1-1.1.2)") so the user sees the same label everywhere.
+  #
+  # Both reads stay off the owners' mailboxes: these run in the espex
+  # connection process inside Home Assistant's open budget, and a busy
+  # owner must not drop the ZBT-2 row (shifting every later instance
+  # number). The proxies' claims only label ports in use, which nothing
+  # here reads.
   defp inventory do
-    build_inventory(Hardware.list_ports(), ZigbeeProxy.status(zigbee_proxy()))
+    build_inventory(
+      Hardware.list_ports(zwave_claim: nil, zigbee_claim: nil),
+      ZigbeeProxy.advertised(zigbee_proxy())
+    )
   end
 
-  # Pure core of `inventory/0`: `ports` from `Hardware.list_ports/0`,
-  # `zigbee` from `ZigbeeProxy.status/1`. The ZBT-2 comes from the owner's
+  # Pure core of `inventory/0`: `ports` from `Hardware.list_ports/1`,
+  # `zigbee` from `ZigbeeProxy.advertised/1`. The ZBT-2 comes from the owner's
   # own row, never from `ports`, so only the one it holds is advertised.
   @doc false
   def build_inventory(ports, zigbee) do

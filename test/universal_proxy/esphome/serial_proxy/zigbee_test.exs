@@ -290,4 +290,51 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeTest do
       assert SerialProxy.identity(99) == nil
     end
   end
+
+  describe "published owner snapshot" do
+    test "a suspended owner keeps the ZBT-2 at the same instance" do
+      %{server: server} = ZigbeeFixtures.start_owner!()
+      instance = zigbee_instance()
+      assert is_integer(instance)
+
+      :sys.suspend(server)
+
+      try do
+        assert zigbee_instance() == instance
+
+        assert %Identity{connected?: true, error?: false} = SerialProxy.identity(instance)
+      after
+        :sys.resume(server)
+      end
+    end
+
+    test "follows a UART error and the reopen" do
+      %{server: server, row: row} = ZigbeeFixtures.start_owner!()
+      instance = zigbee_instance()
+
+      send(server, {:circuits_uart, ZigbeeFixtures.tty(), {:error, :eio}})
+      _ = ZigbeeProxy.status(server)
+
+      assert ZigbeeProxy.advertised(server) == %{attached?: false, error?: true, port: row}
+      assert zigbee_instance() == instance
+      assert %Identity{connected?: false, error?: true} = SerialProxy.identity(instance)
+
+      send(server, :zigbee_reopen)
+      assert_receive {:fake_uart, _fake}
+      _ = ZigbeeProxy.status(server)
+
+      assert ZigbeeProxy.advertised(server) == %{attached?: true, error?: false, port: row}
+    end
+
+    test "is erased when the owner stops" do
+      %{server: server} = ZigbeeFixtures.start_owner!()
+      assert %{attached?: true} = ZigbeeProxy.advertised(server)
+
+      GenServer.stop(server)
+
+      assert :persistent_term.get({ZigbeeProxy, :advertised, server}, :erased) == :erased
+      assert ZigbeeProxy.advertised(server) == %{attached?: false, error?: false, port: nil}
+      assert zigbee_instance() == nil
+    end
+  end
 end

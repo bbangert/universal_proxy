@@ -32,6 +32,10 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
     `{:error, :not_attached}` until the tty is back. A reopen starts from
     the default line settings and DTR=RTS=true again, as an ESPHome USB
     UART does on re-attach.
+  - The advertised row and attach state (`advertised/1`) are published
+    to `:persistent_term` on every change of either, and erased in
+    `terminate/2`, so the serial-proxy adapter can read them without a
+    call that a busy owner would time out.
   - Exits are trapped so `terminate/2` closes the tty and broadcasts
     `uart:port_closed` on a supervisor shutdown. A crash of the linked
     UART process still stops this server.
@@ -142,6 +146,7 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
     :reopen_timer,
     :last_open_error,
     :subscribed,
+    :snapshot_key,
     error?: false,
     mode: :raw,
     sessions: %{},
@@ -293,6 +298,30 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   end
 
   @doc """
+  The same answer as `status/1`, read from the snapshot the owner
+  publishes on every change, without calling it: a busy or suspended
+  owner still reports its last row. A missing (or dead) owner reports
+  `%{attached?: false, error?: false, port: nil}`.
+
+  `server` must be the registered name (or pid) the owner was started
+  under.
+  """
+  @spec advertised(GenServer.server()) :: status()
+  def advertised(server \\ __MODULE__) do
+    case :persistent_term.get(snapshot_key(server), nil) do
+      {owner, snapshot} when is_pid(owner) ->
+        if Process.alive?(owner), do: snapshot, else: unattached()
+
+      nil ->
+        unattached()
+    end
+  end
+
+  defp unattached, do: %{attached?: false, error?: false, port: nil}
+
+  defp snapshot_key(server), do: {__MODULE__, :advertised, server}
+
+  @doc """
   The tty this proxy holds open, or `nil`, for
   `UniversalProxy.Hardware` to mark the port in use (it is invisible to
   `UART.ports/0`). `subscribed` says whether a client holds the session
@@ -328,6 +357,7 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
     state = %__MODULE__{
       ash: Ash.new(),
       port_path: Keyword.get(opts, :port_path),
+      snapshot_key: snapshot_key(Keyword.get(opts, :name, __MODULE__) || self()),
       resolver: Keyword.get(opts, :resolver),
       # Seam for tests: an opener returning a fake UART pid. Every UART
       # operation here is a `Circuits.UART` GenServer call on that pid.
@@ -480,6 +510,7 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
     state =
       %{state | uart_pid: nil, ash: Ash.reset(state.ash), rx_buffer: <<>>, error?: true}
       |> schedule_reopen()
+      |> publish_snapshot()
 
     {:noreply, state}
   end
@@ -526,6 +557,7 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
     end
 
     cleanup_uart(state.uart_pid)
+    :persistent_term.erase(state.snapshot_key)
     :ok
   end
 
@@ -678,7 +710,9 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
 
   # -- Open / rescan --
 
-  defp attempt_open(state) do
+  defp attempt_open(state), do: state |> open_resolved() |> publish_snapshot()
+
+  defp open_resolved(state) do
     case resolve_port(state) do
       nil ->
         schedule_reopen(%{state | port: nil, error?: false})
@@ -726,6 +760,20 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
           {state.port_path, state.display_name || Path.basename(state.port_path), state.port}
         end
     end
+  end
+
+  # A persistent_term write that replaces a term costs a global GC pass,
+  # so the snapshot is only rewritten when it actually changes (never on
+  # the RX path).
+  defp publish_snapshot(state) do
+    snapshot =
+      {self(), %{attached?: state.uart_pid != nil, error?: state.error?, port: state.port}}
+
+    if :persistent_term.get(state.snapshot_key, nil) != snapshot do
+      :persistent_term.put(state.snapshot_key, snapshot)
+    end
+
+    state
   end
 
   defp schedule_reopen(%{port_path: nil, resolver: nil} = state), do: state
