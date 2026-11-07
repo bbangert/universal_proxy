@@ -172,13 +172,14 @@ class Device:
         return proc.stdout + proc.stderr
 
     def state(self, timeout=PROBE_TIMEOUT_S):
-        """The device's boot state ({"uptime_ms", "boot_id", "at"}), or None
-        while it doesn't answer within `timeout` seconds."""
+        """The device's boot state ({"uptime_ms", "boot_id", "lo", "hi"}),
+        or None while it doesn't answer within `timeout` seconds."""
+        lo = time.monotonic()
         try:
-            boot = sweep.parse_boot(self.ssh(BOOT_ELIXIR, timeout))
+            reply = self.ssh(BOOT_ELIXIR, timeout)
         except subprocess.TimeoutExpired:
             return None
-        return {**boot, "at": time.monotonic()} if boot else None
+        return observed(sweep.parse_boot(reply), lo, time.monotonic())
 
     def put(self, local, remote):
         batch = f'-mkdir {os.path.dirname(remote)}\nput "{local}" "{remote}"\n'
@@ -367,18 +368,26 @@ def sweep_all(opts, p, digest, version, todo, remote_pack, scratch):
 # it is run again, a few times, before it counts as an error.
 MAX_START_RETRIES = 2
 
-# The boot-state comparison's tolerance when no boot id is readable.
-UPTIME_SLACK_MS = 30_000
+# Clock-rate and rounding margin of the uptime comparison (no boot id).
+UPTIME_SLACK_MS = 2_000
+
+
+def observed(boot, lo, hi):
+    """A parsed boot state with when it was sampled: some time between `lo`
+    and `hi` (time.monotonic(), before the ssh call and after its reply)."""
+    return {**boot, "lo": lo, "hi": hi} if boot else None
 
 
 def rebooted(before, after):
     """Whether the device restarted between two boot states. The boot id
-    decides when both have one; otherwise the uptime must have fallen
-    behind what it would be had the device stayed up."""
+    decides when both have one. Otherwise only an uptime below what the
+    device must have reached had it stayed up counts: the time between the
+    two samples is at least `after["lo"] - before["hi"]`, as each was taken
+    somewhere inside its ssh call."""
     if before["boot_id"] and after["boot_id"]:
         return before["boot_id"] != after["boot_id"]
-    expected = before["uptime_ms"] + (after["at"] - before["at"]) * 1000
-    return after["uptime_ms"] + UPTIME_SLACK_MS < expected
+    least_elapsed_ms = max(0.0, after["lo"] - before["hi"]) * 1000
+    return after["uptime_ms"] + UPTIME_SLACK_MS < before["uptime_ms"] + least_elapsed_ms
 
 
 def wait_for_device(device, budget_s, clock=None, sleep=None):
@@ -427,9 +436,7 @@ def sweep_presets(opts, todo, runner, meta, device=None):
             while True:
                 started = time.monotonic()
                 text = runner(pid)
-                boot = sweep.parse_boot(text)
-                if boot:
-                    boot["at"] = started
+                boot = observed(sweep.parse_boot(text), started, time.monotonic())
                 rec = sweep.parse_run(pid, text)
                 if device is None or rec["status"] != "error":
                     last = boot or last

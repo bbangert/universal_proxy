@@ -205,7 +205,7 @@ class StubDevice:
         self.timeouts.append(timeout)
         self.clock.now += min(self.probe_s, timeout)
         if self.clock.now >= self.up_at:
-            return {"uptime_ms": 1000, "boot_id": "b", "at": self.clock.now}
+            return {"uptime_ms": 1000, "boot_id": "b", "lo": self.clock.now, "hi": self.clock.now}
         return None
 
 
@@ -259,17 +259,22 @@ class FakeDevice(device_sweep.Device):
       no_connect  ssh can't connect at all (the run never starts)
     """
 
-    def __init__(self, behaviours=None, down=3, boot_ids=True):
+    def __init__(self, behaviours=None, down=3, boot_ids=True, connect_s=0, run_s=30):
         self.behaviours = {k: list(v) for k, v in (behaviours or {}).items()}
         self.down, self.boot_ids = down, boot_ids
+        self.connect_s, self.run_s = connect_s, run_s
         self.polls_left = 0
-        self.uptime_ms = 600_000
+        self.clock = FakeClock()
+        self.boot_at = self.clock.now - 600
         self.boot = 1
         self.runs = []
 
     def boot_line(self):
-        self.uptime_ms += 1000
-        return f"BOOT {self.uptime_ms} " + (f"boot-{self.boot}" if self.boot_ids else "none")
+        uptime_ms = int((self.clock.now - self.boot_at) * 1000)
+        return f"BOOT {uptime_ms} " + (f"boot-{self.boot}" if self.boot_ids else "none")
+
+    def reboot(self):
+        self.boot_at, self.boot, self.polls_left = self.clock.now - 12, self.boot + 1, self.down
 
     def ssh(self, code, timeout):
         if "renderer_ok" in code:
@@ -286,9 +291,11 @@ class FakeDevice(device_sweep.Device):
         behaviour = queue.pop(0) if queue else "ok"
         if behaviour == "no_connect":
             return "ssh: connect to host dev port 22: Connection refused"
+        self.clock.now += self.connect_s
         boot = self.boot_line()
+        self.clock.now += self.run_s
         if behaviour == "reset":
-            self.uptime_ms, self.boot, self.polls_left = 12_000, self.boot + 1, self.down
+            self.reboot()
             return boot + "\nConnection to dev closed by remote host."
         if behaviour == "drop":
             return boot + "\nclient_loop: send disconnect: Broken pipe"
@@ -314,7 +321,7 @@ class RebootAwareSweepTest(unittest.TestCase):
 
     def sweep(self, device, *extra):
         buf = io.StringIO()
-        clock = FakeClock()
+        clock = device.clock
         with mock.patch.object(device_sweep, "Device", lambda opts: device), \
                 mock.patch.object(device_sweep.time, "monotonic", clock), \
                 mock.patch.object(device_sweep.time, "sleep", side_effect=clock.sleep) as sleep, \
@@ -356,6 +363,13 @@ class RebootAwareSweepTest(unittest.TestCase):
         b = {r["file"]: r for r in self.records()}["b.milk"]
         self.assertEqual((b["status"], b["reason"], b["boot_before"]), ("skip", "device_reset", None))
 
+    def test_a_slow_ssh_connect_without_a_boot_id_is_not_a_reboot(self):
+        # The run's boot state is sampled 60 s after its ssh call began.
+        dev = FakeDevice({"b.milk": ["drop"]}, boot_ids=False, connect_s=60)
+        self.sweep(dev)
+        b = {r["file"]: r for r in self.records()}["b.milk"]
+        self.assertEqual((b["status"], b["reason"]), ("error", "no_stats"))
+
     def test_a_dropped_connection_without_a_reboot_is_an_error(self):
         dev = FakeDevice({"b.milk": ["drop"]})
         self.sweep(dev)
@@ -388,6 +402,23 @@ class RebootAwareSweepTest(unittest.TestCase):
         self.assertEqual(recs[1]["device"], "unreachable")
         self.assertEqual(dev.runs, ["a.milk", "b.milk"])  # nothing recorded for c.milk
         self.assertLessEqual(sum(self.sleeps), 60)
+
+    def test_an_uptime_reboot_needs_the_uptime_to_fall_behind_the_least_elapsed_time(self):
+        def state(uptime_s, lo, hi, boot_id=None):
+            return {"uptime_ms": uptime_s * 1000, "boot_id": boot_id, "lo": lo, "hi": hi}
+
+        # Sampled 60 s into a 70 s call; probed right after: 10 s further on.
+        before = state(660, lo=0, hi=70)
+        self.assertFalse(device_sweep.rebooted(before, state(670, lo=70, hi=71)))
+        # Delayed probe replies (sampled late in the call) aren't reboots either.
+        self.assertFalse(device_sweep.rebooted(before, state(760, lo=71, hi=170)))
+        self.assertFalse(device_sweep.rebooted(before, state(900, lo=200, hi=240)))
+        # Up 200 s later with less uptime than that: it restarted.
+        self.assertTrue(device_sweep.rebooted(before, state(30, lo=72, hi=73)))
+        self.assertTrue(device_sweep.rebooted(before, state(800, lo=300, hi=301)))
+        # The boot id decides whenever both states have one.
+        self.assertFalse(device_sweep.rebooted(state(660, 0, 70, "a"), state(5, 72, 73, "a")))
+        self.assertTrue(device_sweep.rebooted(state(660, 0, 70, "a"), state(900, 72, 73, "b")))
 
     def test_the_boot_state_parses(self):
         from milkpack import sweep
