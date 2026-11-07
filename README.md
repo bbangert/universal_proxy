@@ -55,6 +55,10 @@ range -- without needing a dedicated ESPHome microcontroller for each one.
   on an HDMI output sends One Touch Play, so an AV receiver (or TV) in standby
   wakes and switches to the Pi's input first. `UniversalProxy.Cec` also exposes
   standby, power/volume status and volume/mute key presses from IEx.
+- **MilkDrop visualizer** -- on `rpi3`, `rpi4` and `rpi5`, music playing to
+  the HDMI output can drive full-screen [projectM](https://github.com/projectM-visualizer/projectm)
+  (MilkDrop) presets on the TV (see
+  [MilkDrop visualizer (HDMI)](#milkdrop-visualizer-hdmi))
 - **Bluetooth-audio transmitter control** -- FlooGoo FMA120 and Sennheiser
   BTD 700 dongles get full control drawers in the web UI (see
   [Supported USB devices](#supported-usb-devices))
@@ -217,6 +221,57 @@ From the drive's Overview drawer you can:
 The share requires Samba in the target's Nerves system, which every custom
 target ships except `x86_64`. On targets without it, drives still mount and
 show in the Overview but sharing is unavailable.
+
+### MilkDrop visualizer (HDMI)
+
+On `rpi3`, `rpi4` and `rpi5` the TV on the Pi's HDMI output can show MilkDrop
+presets rendered by projectM, reacting to the music playing on that output.
+The Pi 3 runs projectM on OpenGL ES 2.0 through the
+[bbangert/projectm](https://github.com/bbangert/projectm) fork; the Pi 4 and 5
+use upstream's ES 3.0 path.
+
+To use it, set the device's **TV display mode** select in Home Assistant to
+**MilkDrop** while music plays to the HDMI output. Presets rotate with short
+blends. On the TV remote (HDMI-CEC):
+
+| Key | Action |
+|-----|--------|
+| Left / Right | Previous / next preset |
+| Select | Lock / unlock the current preset |
+| Up / Down | Change display mode |
+
+The preset pack (about 4.5 MB, ~35 MB extracted) downloads once to `/data`,
+SHA-256 verified, the first time MilkDrop is selected, or earlier with the
+**Download** button. Nothing downloads at boot.
+
+The **MilkDrop visualizer** section of the web UI's **Audio** tab shows the
+pack status and sets:
+
+- **Change preset every** -- the rotation interval (10-120 s).
+- **Include fast-flashing presets** -- off by default. These presets flash
+  rapidly and may trigger seizures in people with photosensitive epilepsy;
+  turning them on asks for confirmation.
+- **Clear skipped presets** -- returns presets the device skipped at runtime
+  to the rotation.
+
+Notes for the Pi 3:
+
+- A 60-minute soak on a Pi 3 B+ held 59-64 °C with no throttling. A heatsink
+  is recommended but not required. If the SoC gets too hot, MilkDrop drops to
+  a lower resolution and, past that, shows the bar visualizer until the mode
+  is chosen again.
+- Presets too heavy for the Pi 3 were marked as skips by a sweep on a real
+  device and never play there.
+- Presets that hang the Pi 3's GPU are skipped automatically: when the GPU
+  resets, and, if the hang reboots the Pi, on the next boot.
+
+The Pi 4 and 5 have no device sweep yet: a runtime cost guard lowers the
+resolution of, then skips, presets that can't hold their frame rate.
+
+The pack is built from community MilkDrop presets
+([bbangert/up-milkdrop-pack](https://github.com/bbangert/up-milkdrop-pack)),
+which are presumed to be in the public domain, as with projectM's own preset
+packs. To have a preset removed, [open an issue](https://github.com/bbangert/up-milkdrop-pack/issues).
 
 ### Editing ESPHome device configuration
 
