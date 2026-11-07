@@ -60,8 +60,8 @@ defmodule UniversalProxy.ESPHome.ZigbeeFixtures do
   end
 
   @doc """
-  Start the owner (`:row` overrides the resolved row, `nil` for none) and
-  point the adapter at it. Every UART open sends `{:fake_uart, pid}` to
+  Start the owner (`:row` overrides the resolved row, `nil` for none;
+  `:on_change` is passed through) and point the adapter at it. Every UART open sends `{:fake_uart, pid}` to
   the caller. Returns `%{server:, fake:, row:}` (`fake: nil` without a row).
   """
   def start_owner!(opts \\ []) do
@@ -81,7 +81,11 @@ defmodule UniversalProxy.ESPHome.ZigbeeFixtures do
 
     server =
       start_supervised!(
-        {ZigbeeProxy, name: nil, resolver: resolver, open_fun: open_fun},
+        {ZigbeeProxy,
+         name: nil,
+         resolver: resolver,
+         open_fun: open_fun,
+         on_change: Keyword.get(opts, :on_change)},
         id: {:zigbee_owner, System.unique_integer()}
       )
 

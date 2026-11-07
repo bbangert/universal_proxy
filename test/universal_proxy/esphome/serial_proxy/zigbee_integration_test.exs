@@ -24,14 +24,20 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeIntegrationTest do
   @open_budget_ms 500
 
   setup do
-    owner = ZigbeeFixtures.start_owner!()
     id = System.unique_integer([:positive])
+    server_name = :"zigbee_espex_server_#{id}"
+
+    # Its first push precedes the Espex start, as at boot.
+    owner =
+      ZigbeeFixtures.start_owner!(
+        on_change: fn -> SerialProxy.push_zigbee_identity(server_name) end
+      )
 
     sup =
       start_supervised!(
         {Espex.Supervisor,
          name: :"zigbee_espex_#{id}",
-         server_name: :"zigbee_espex_server_#{id}",
+         server_name: server_name,
          port: 0,
          device_config: [name: "zigbee-test"],
          serial_proxy: SerialProxy}
@@ -149,6 +155,24 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeIntegrationTest do
     assert identity.product == "ZBT-2"
     assert identity.serial_number == "abcd1234"
     assert %Proto.UsbDeviceDescriptor{vendor_id: 0x303A, product_id: 0x831A} = identity.usb
+  end
+
+  test "pushes the identity live across a UART error and the reopen", ctx do
+    send_msg(ctx, %Proto.SubscribeSerialProxyIdentityRequest{})
+    instance = ctx.instance
+
+    assert %{flags: 1, product: "ZBT-2"} =
+             await(ctx, &match?(%Proto.SerialProxyIdentity{instance: ^instance}, &1))
+
+    send(ctx.server, {:circuits_uart, ZigbeeFixtures.tty(), {:error, :eio}})
+
+    assert %{flags: 0, product: "", serial_number: ""} =
+             await(ctx, &match?(%Proto.SerialProxyIdentity{instance: ^instance}, &1))
+
+    send(ctx.server, :zigbee_reopen)
+
+    assert %{flags: 1, product: "ZBT-2", serial_number: "abcd1234"} =
+             await(ctx, &match?(%Proto.SerialProxyIdentity{instance: ^instance}, &1))
   end
 
   test "ZHA: SUBSCRIBE, SET_MODE(protocol), CONFIGURE(460800, hardware), then ACKed RX", ctx do

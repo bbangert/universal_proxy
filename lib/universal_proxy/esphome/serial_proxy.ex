@@ -65,6 +65,15 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
   matches on. Every other port reports none: an identity on our
   CP210x/CH34x adapters would match ZHA's USB matchers and offer them as
   Zigbee radios.
+
+  `identity/1` only answers a client's identity subscription. The owner
+  attaches and detaches without an ESPHome tree restart (a UART error
+  and the reopen after it, or a first open that fails and later
+  succeeds), so it calls `push_zigbee_identity/1` whenever its attach
+  state or row changes, and subscribed clients see each change live.
+  Once the row is gone there is nothing to push; an unplug normally
+  shows up as a UART error first, which pushes the not-connected
+  identity.
   """
 
   @behaviour Espex.SerialProxy
@@ -155,6 +164,31 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
       %{kind: :zigbee} = entry -> zigbee_identity(instance, entry)
       _ -> nil
     end
+  end
+
+  @doc """
+  Push the ZBT-2's current identity to espex's subscribed clients, under
+  the instance number `list_instances/0` advertises for it.
+
+  A no-op without a ZBT-2 row, or while espex (`server`, default
+  `Espex.Server`) isn't running.
+  """
+  @spec push_zigbee_identity(atom()) :: :ok
+  def push_zigbee_identity(server \\ Espex.Server) do
+    inventory = inventory()
+
+    case Enum.find_index(inventory, &(&1.kind == :zigbee)) do
+      nil -> :ok
+      instance -> push_identity(server, identity_for(inventory, instance))
+    end
+  end
+
+  # `Registry.dispatch/3` raises, not exits, when espex's registry isn't
+  # started (early boot: the owner starts before Espex).
+  defp push_identity(server, identity) do
+    Espex.push_serial_proxy_identity(server, identity)
+  rescue
+    ArgumentError -> :ok
   end
 
   # No `persist_opts`: the owner keeps the line settings itself.

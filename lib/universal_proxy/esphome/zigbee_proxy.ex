@@ -35,7 +35,11 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   - The advertised row and attach state (`advertised/1`) are published
     to `:persistent_term` on every change of either, and erased in
     `terminate/2`, so the serial-proxy adapter can read them without a
-    call that a busy owner would time out.
+    call that a busy owner would time out. When the attach state or the
+    row changes, the `:on_change` fun (if any) runs in a task under
+    `UniversalProxy.TaskSupervisor`, after the new snapshot is
+    published; the supervisor wires it to push the serial-proxy
+    identity, which must not block the owner.
   - Exits are trapped so `terminate/2` closes the tty and broadcasts
     `uart:port_closed` on a supervisor shutdown. A crash of the linked
     UART process still stops this server.
@@ -147,6 +151,7 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
     :last_open_error,
     :subscribed,
     :snapshot_key,
+    :on_change,
     error?: false,
     mode: :raw,
     sessions: %{},
@@ -369,6 +374,7 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
       port_path: Keyword.get(opts, :port_path),
       snapshot_key: snapshot_key(Keyword.get(opts, :name, __MODULE__) || self()),
       resolver: Keyword.get(opts, :resolver),
+      on_change: Keyword.get(opts, :on_change),
       # Seam for tests: an opener returning a fake UART pid. Every UART
       # operation here is a `Circuits.UART` GenServer call on that pid.
       open_fun: Keyword.get(opts, :open_fun) || (&open_port/1)
@@ -806,11 +812,34 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
     snapshot =
       {self(), %{attached?: state.uart_pid != nil, error?: state.error?, port: state.port}}
 
-    if :persistent_term.get(state.snapshot_key, nil) != snapshot do
+    previous = :persistent_term.get(state.snapshot_key, nil)
+
+    if previous != snapshot do
       :persistent_term.put(state.snapshot_key, snapshot)
+      if identity_changed?(previous, snapshot), do: notify_change(state)
     end
 
     state
+  end
+
+  # `error?` alone doesn't change the identity.
+  defp identity_changed?(
+         {_, %{attached?: attached?, port: port}},
+         {_, %{attached?: attached?, port: port}}
+       ),
+       do: false
+
+  defp identity_changed?(_previous, _snapshot), do: true
+
+  defp notify_change(%{on_change: nil}), do: :ok
+
+  # The task reads the published snapshot, so it sees this change or a
+  # later one. A missing task supervisor (shutdown) only drops the push.
+  defp notify_change(%{on_change: fun}) do
+    _ = Task.Supervisor.start_child(UniversalProxy.TaskSupervisor, fun)
+    :ok
+  catch
+    :exit, _ -> :ok
   end
 
   defp schedule_reopen(%{port_path: nil, resolver: nil} = state), do: state

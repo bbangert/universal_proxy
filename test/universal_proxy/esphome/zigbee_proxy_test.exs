@@ -236,6 +236,47 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
       assert ZigbeeProxy.advertised(server) == %{attached?: false, error?: false, port: nil}
     end
 
+    test "on_change runs when the attach state or row changes, and only then" do
+      test_pid = self()
+      port = %{kind: :zigbee, tty_name: "ttyZB", ha_name: "zb"}
+      opens = :counters.new(1, [])
+
+      # The first open succeeds, every reopen fails the same way.
+      open_fun = fn _path ->
+        :counters.add(opens, 1, 1)
+
+        if :counters.get(opens, 1) == 1 do
+          FakeUART.start_link(test_pid)
+        else
+          {:error, :eio}
+        end
+      end
+
+      server =
+        start_supervised!(
+          {ZigbeeProxy,
+           name: nil,
+           resolver: fn -> %{path: "ttyZB", display_name: "zb", port: port} end,
+           open_fun: open_fun,
+           on_change: fn -> send(test_pid, {:zigbee_changed, self()}) end}
+        )
+
+      # Off the owner, in a task.
+      assert_receive {:zigbee_changed, pid}
+      assert pid != server
+
+      rx(server, "data")
+      refute_receive {:zigbee_changed, _}, 50
+
+      send(server, {:circuits_uart, "ttyZB", {:error, :eio}})
+      assert_receive {:zigbee_changed, _}
+
+      send(server, :zigbee_reopen)
+      _ = :sys.get_state(server)
+      assert %{attached?: false, error?: true, port: ^port} = ZigbeeProxy.advertised(server)
+      refute_receive {:zigbee_changed, _}, 50
+    end
+
     test "claimed_port is nil without a tty or a server" do
       server = start_supervised!({ZigbeeProxy, name: nil, resolver: fn -> nil end})
       assert ZigbeeProxy.claimed_port(server) == nil

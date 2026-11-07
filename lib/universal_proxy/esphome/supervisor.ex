@@ -116,7 +116,9 @@ defmodule UniversalProxy.ESPHome.Supervisor do
       # and replug all take the same path.
       {ZWaveProxy, resolver: &__MODULE__.resolve_zwave_port/0},
       # Before Espex (rest_for_one): serial-proxy sessions attach to it.
-      {ZigbeeProxy, resolver: &__MODULE__.resolve_zigbee_port/0},
+      # Its pushes before Espex is up go nowhere, harmlessly.
+      {ZigbeeProxy,
+       resolver: &__MODULE__.resolve_zigbee_port/0, on_change: &SerialProxy.push_zigbee_identity/0},
       Infrared.Supervisor,
       # Must start BEFORE Espex (rest_for_one): Espex calls
       # EntityProvider.list_entities/0 at connection-accept time, and a
