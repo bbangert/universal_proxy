@@ -69,6 +69,15 @@ std::optional<Command> parse_command(std::string_view line, std::string& error) 
         }
         c.type = Command::Type::SetHighFrequency;
         c.bool_value = val->boolean;
+    } else if (name == "set_min_fps") {
+        const JsonValue* val = v.get("value");
+        if (val == nullptr || !val->is_number() || !std::isfinite(val->number) || val->number < 1 ||
+            val->number > 240) {
+            error = "bad set_min_fps value";
+            return std::nullopt;
+        }
+        c.type = Command::Type::SetMinFps;
+        c.number_value = val->number;
     } else {
         error = "unknown cmd";
         return std::nullopt;
@@ -104,9 +113,12 @@ std::string event_loading(std::string_view file) {
     return open("loading") + str_field("preset", file, MAX_PRESET_NAME_BYTES) + "}";
 }
 
-std::string event_skip(std::string_view file, std::string_view reason, std::string_view message) {
+std::string event_skip(std::string_view file, std::string_view reason, std::string_view message, double fps) {
     std::string out = open("skip") + str_field("preset", file, MAX_PRESET_NAME_BYTES) + str_field("reason", reason, 64);
     if (!message.empty()) out += str_field("message", message, 256);
+    // Rounded down, never to nearest: the BEAM compares the stored value
+    // with a later minimum, and a failing 28.96 must not read back as 29.0.
+    if (fps >= 0) out += num_field("fps", std::floor(fps * 10) / 10);
     return out + "}";
 }
 

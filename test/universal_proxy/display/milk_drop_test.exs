@@ -93,6 +93,8 @@ defmodule UniversalProxy.Display.MilkDropTest do
                "640x360,480x270",
                "--rotate-s",
                "20",
+               "--min-fps",
+               "20",
                "--skip-file",
                "/tmp/skip.txt"
              ]
@@ -106,7 +108,7 @@ defmodule UniversalProxy.Display.MilkDropTest do
           ladder: ["960x540"],
           skip_file: "/s",
           ring_path: "/run/up-pcm-abc",
-          settings: %{include_high_frequency: true, rotate_s: 45, locked: "x/y.milk"}
+          settings: %{include_high_frequency: true, rotate_s: 45, min_fps: 30, locked: "x/y.milk"}
         })
 
       assert args == [
@@ -118,6 +120,8 @@ defmodule UniversalProxy.Display.MilkDropTest do
                "960x540",
                "--rotate-s",
                "45",
+               "--min-fps",
+               "30",
                "--skip-file",
                "/s",
                "--high-frequency",
@@ -165,7 +169,7 @@ defmodule UniversalProxy.Display.MilkDropTest do
   end
 
   test "spawns the renderer with the Store's settings and skip list", ctx do
-    {:ok, _} = Store.update(ctx.store, %{rotate_s: 45, include_high_frequency: true})
+    {:ok, _} = Store.update(ctx.store, %{rotate_s: 45, include_high_frequency: true, min_fps: 25})
     :ok = Store.skip(ctx.store, @version, "b.milk", "draw")
     :ok = Store.skip(ctx.store, @version, "a.milk", "compile")
 
@@ -180,6 +184,8 @@ defmodule UniversalProxy.Display.MilkDropTest do
              "640x360,480x270",
              "--rotate-s",
              "45",
+             "--min-fps",
+             "25",
              "--skip-file",
              ctx.skip_file,
              "--high-frequency",
@@ -222,6 +228,7 @@ defmodule UniversalProxy.Display.MilkDropTest do
     MilkDrop.unlock(pid)
     MilkDrop.set_rotate(pid, 30)
     MilkDrop.set_high_frequency(pid, true)
+    MilkDrop.set_min_fps(pid, 35)
 
     expected = [
       %{"cmd" => "next"},
@@ -229,7 +236,8 @@ defmodule UniversalProxy.Display.MilkDropTest do
       %{"cmd" => "lock"},
       %{"cmd" => "unlock"},
       %{"cmd" => "set_rotate", "value" => 30},
-      %{"cmd" => "set_high_frequency", "value" => true}
+      %{"cmd" => "set_high_frequency", "value" => true},
+      %{"cmd" => "set_min_fps", "value" => 35}
     ]
 
     wait_until(fn -> cmd_lines(ctx) == expected end)
@@ -257,6 +265,20 @@ defmodule UniversalProxy.Display.MilkDropTest do
                    @timeout
 
     assert Store.skipped(ctx.store, @version) == %{"hf/strobe.milk" => "budget"}
+  end
+
+  test "a budget skip is persisted with its measured fps", ctx do
+    {pid, _} = start_renderer(ctx)
+
+    emit(pid, ~s({"event":"skip","preset":"slow.milk","reason":"budget","fps":17.3}))
+
+    assert_receive {:milkdrop, ^pid,
+                    %{event: :skip, preset: "slow.milk", fps: 17.3, persisted: true}},
+                   @timeout
+
+    assert Store.skip_entries(ctx.store, @version) == %{
+             "slow.milk" => %{reason: "budget", fps: 17.3}
+           }
   end
 
   test "a gpu_hang skip is persisted before it is forwarded", ctx do

@@ -71,7 +71,7 @@ defmodule UniversalProxy.Display.MilkDrop do
 
       milkdrop_renderer --mode 1280x720[@60] --pack-dir DIR
                         --ladder 640x360,480x270 --rotate-s 20
-                        --skip-file PATH
+                        --min-fps 20 --skip-file PATH
                         [--high-frequency] [--locked FILE] [--pcm-ring PATH]
                         [--card /dev/dri/card1] [--connector HDMI-A-1]
 
@@ -86,6 +86,8 @@ defmodule UniversalProxy.Display.MilkDrop do
     * `--ladder` — comma-separated internal-resolution rungs, highest
       first; the renderer steps down per preset and skips past the last;
     * `--rotate-s` — auto-rotation interval in seconds (10..120);
+    * `--min-fps` — the frame rate a preset must hold (the Store's
+      `min_fps`); presets that can't hold it at the last rung are skipped;
     * `--skip-file` — UTF-8 text, one pack-relative preset file per line
       (`\\n`-separated, possibly empty): presets never to load;
     * `--high-frequency` — include `high_frequency/` presets;
@@ -105,7 +107,8 @@ defmodule UniversalProxy.Display.MilkDrop do
     * `{"cmd":"lock"}`, `{"cmd":"unlock"}` — hold / resume rotation on the
       current preset;
     * `{"cmd":"set_rotate","value":N}` — rotation interval in seconds;
-    * `{"cmd":"set_high_frequency","value":B}` — include `high_frequency/`.
+    * `{"cmd":"set_high_frequency","value":B}` — include `high_frequency/`;
+    * `{"cmd":"set_min_fps","value":N}` — the minimum frame rate.
 
   Events (stdout), forwarded with atom keys and an atom `:event`:
 
@@ -118,8 +121,11 @@ defmodule UniversalProxy.Display.MilkDrop do
     * `{"event":"loading","preset":F}` — `F` is about to be loaded and
       warmed up (written before any GPU work for it; see "Device resets");
     * `{"event":"preset","file":F,"locked":B,...}` — preset `F` is showing;
-    * `{"event":"skip","preset":F,"reason":R}` — `F` cannot be drawn
-      (persisted to the Store for this pack version, synced to disk before
+    * `{"event":"skip","preset":F,"reason":R}` — `F` cannot be drawn; a
+      `budget` skip also carries the measured `fps`, persisted with it
+      (`UniversalProxy.MilkDrop.Store.skip/5`) so a lower minimum frame
+      rate can bring the preset back (persisted to the Store for this pack
+      version, synced to disk before
       the event is forwarded: a `gpu_hang` skip can come seconds before a
       GPU reset takes the device down). The forwarded event
       carries `persisted: true | false`; while the Store cannot take it
@@ -269,6 +275,11 @@ defmodule UniversalProxy.Display.MilkDrop do
   def set_high_frequency(server, enabled?) when is_boolean(enabled?),
     do: command(server, %{cmd: "set_high_frequency", value: enabled?})
 
+  @doc "Set the minimum frame rate a preset must hold."
+  @spec set_min_fps(GenServer.server(), pos_integer()) :: :ok
+  def set_min_fps(server, fps) when is_integer(fps) and fps > 0,
+    do: command(server, %{cmd: "set_min_fps", value: fps})
+
   @doc false
   @spec command(GenServer.server(), map()) :: :ok
   def command(server, cmd) when is_map(cmd), do: GenServer.cast(server, {:command, cmd})
@@ -308,6 +319,7 @@ defmodule UniversalProxy.Display.MilkDrop do
       ["--pack-dir", pack_dir],
       ["--ladder", Enum.join(ladder, ",")],
       ["--rotate-s", Integer.to_string(settings.rotate_s)],
+      ["--min-fps", Integer.to_string(settings.min_fps)],
       ["--skip-file", skip_file],
       if(settings.include_high_frequency, do: ["--high-frequency"], else: []),
       if(settings.locked, do: ["--locked", settings.locked], else: []),
@@ -488,7 +500,9 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   defp persist(%{event: :skip, preset: preset} = event, state) when is_binary(preset) do
     reason = if is_binary(event[:reason]), do: event.reason, else: "unknown"
-    state = flush_skips(%{state | pending_skips: Map.put(state.pending_skips, preset, reason)})
+    fps = if is_number(event[:fps]), do: event.fps
+    pending = Map.put(state.pending_skips, preset, {reason, fps})
+    state = flush_skips(%{state | pending_skips: pending})
     {Map.put(event, :persisted, not is_map_key(state.pending_skips, preset)), state}
   end
 
@@ -622,8 +636,10 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   defp flush_skips(state) do
     pending =
-      Enum.reduce_while(state.pending_skips, state.pending_skips, fn {preset, reason}, acc ->
-        case Store.skip(state.store, state.version, preset, reason) do
+      Enum.reduce_while(state.pending_skips, state.pending_skips, fn {preset, skip}, acc ->
+        {reason, fps} = skip
+
+        case Store.skip(state.store, state.version, preset, reason, fps: fps) do
           :ok -> {:cont, Map.delete(acc, preset)}
           {:error, _} -> {:halt, acc}
         end

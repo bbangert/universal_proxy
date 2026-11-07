@@ -93,6 +93,7 @@ static void test_options() {
     CHECK(o.ladder.size() == 2 && o.ladder[1] == (Resolution{480, 270}));
     CHECK(o.rotate_s == 20 && !o.high_frequency && o.locked.empty() && o.pcm_ring.empty());
     CHECK(o.blend_s == 0.5);
+    CHECK(o.min_fps == 20.0);
 
     auto args = base_args();
     args.insert(args.end(), {"--high-frequency", "--locked", "a/b.milk", "--pcm-ring", "/run/up-pcm-x"});
@@ -261,6 +262,13 @@ static void test_protocol() {
     c = parse_command(R"({"cmd":"set_high_frequency","value":true})", err);
     CHECK(c && c->type == Command::Type::SetHighFrequency && c->bool_value);
     CHECK(!parse_command(R"({"cmd":"set_high_frequency","value":1})", err));
+    c = parse_command(R"({"cmd":"set_min_fps","value":25})", err);
+    CHECK(c && c->type == Command::Type::SetMinFps && c->number_value == 25.0);
+    CHECK(parse_command(R"({"cmd":"set_min_fps","value":27.5})", err)->number_value == 27.5);
+    CHECK(!parse_command(R"({"cmd":"set_min_fps","value":"25"})", err) && err == "bad set_min_fps value");
+    CHECK(!parse_command(R"({"cmd":"set_min_fps","value":0})", err));
+    CHECK(!parse_command(R"({"cmd":"set_min_fps","value":241})", err));
+    CHECK(!parse_command(R"({"cmd":"set_min_fps"})", err));
     CHECK(!parse_command(R"({"cmd":"dance"})", err) && err == "unknown cmd");
     CHECK(!parse_command(R"({"value":1})", err));
     CHECK(!parse_command("take", err));
@@ -284,7 +292,13 @@ static void test_protocol() {
     CHECK(json_parse(event_loading("hf/a \"b\".milk"), v, err) && v.get("event")->string == "loading" &&
           v.get("preset")->string == "hf/a \"b\".milk" && v.object.size() == 2);
     CHECK(json_parse(event_skip("x.milk", "budget"), v, err) && v.get("preset")->string == "x.milk" &&
-          v.get("reason")->string == "budget" && v.get("message") == nullptr);
+          v.get("reason")->string == "budget" && v.get("message") == nullptr && v.get("fps") == nullptr);
+    CHECK(json_parse(event_skip("x.milk", "budget", {}, 17.34), v, err) && v.get("fps")->number == 17.3 &&
+          v.get("message") == nullptr);
+    // Rounded down, so a measurement under a floor never reads back at it.
+    CHECK(json_parse(event_skip("x.milk", "budget", {}, 28.96), v, err) && v.get("fps")->number == 28.9);
+    CHECK(json_parse(event_skip("x.milk", "budget", {}, 29.0), v, err) && v.get("fps")->number == 29.0);
+    CHECK(json_parse(event_skip("x.milk", "budget", {}, 0.0), v, err) && v.get("fps")->number == 0.0);
     CHECK(json_parse(event_skip("x.milk", "compile_error", "warp: 0:12: bad"), v, err) &&
           v.get("reason")->string == "compile_error" && v.get("message")->string == "warp: 0:12: bad");
     CHECK(json_parse(event_presenting(false, 3.5, false), v, err) && !v.get("modeset")->boolean &&
@@ -701,11 +715,12 @@ static void test_guard_ladder() {
     CostGuard::Config cfg;
     cfg.rungs = 2;
     cfg.start_interval = 2;
-    cfg.min_fps = 19.0;
+    cfg.min_fps = 20.0;
     cfg.settle_frames = 5;
     cfg.window_frames = 10;
     CostGuard g(cfg);
     CHECK(g.levels().size() == 2 && g.levels()[0].interval == 2 && g.levels()[1].rung == 1);
+    CHECK(g.levels()[0].min_fps == 19.0 && g.levels()[1].min_fps == 19.0);  // 20 with the slack
 
     // 30 fps holds.
     CHECK(g.begin("fast.milk") == 0);
@@ -782,6 +797,105 @@ static void test_guard_60hz() {
     CHECK(last == V::StepDown && g.level() == 1 && g.current().interval == 2 && g.current().rung == 0);
     feed(g, 10, 33333, last);
     CHECK(last == V::Accept && g.level() == 1);
+}
+
+static void test_guard_min_fps() {
+    using V = CostGuard::Verdict;
+    // rpi3: interval 2 at 60 Hz presents at most 30 fps.
+    CostGuard::Config cfg;
+    cfg.rungs = 2;
+    cfg.start_interval = 2;
+    cfg.refresh_hz = 60;
+    cfg.min_fps = 25;
+    cfg.settle_frames = 0;
+    cfg.window_frames = 10;
+    {
+        CostGuard g(cfg);
+        CHECK(g.levels()[0].min_fps == 24.0);
+        V last = V::None;
+        g.begin("twenty.milk");
+        feed(g, 10, 50000, last);  // 20 fps no longer holds
+        CHECK(last == V::StepDown && g.level() == 1);
+        feed(g, 10, 50000, last);
+        CHECK(last == V::Skip && g.measured_fps("twenty.milk") > 19.9);
+        g.begin("thirty.milk");
+        feed(g, 10, 33333, last);
+        CHECK(last == V::Accept);
+    }
+    {
+        // Capped at what interval 2 can present: 30 (29 with the slack).
+        cfg.min_fps = 60;
+        CostGuard g(cfg);
+        CHECK(g.levels()[0].min_fps == 29.0 && g.levels()[1].min_fps == 29.0);
+        V last = V::None;
+        g.begin("thirty.milk");
+        feed(g, 10, 33333, last);
+        CHECK(last == V::Accept);
+    }
+    // rpi4/5: (r0,1) (r0,2) (r1,2) at 60 Hz.
+    cfg.start_interval = 1;
+    cfg.min_fps = 20;
+    {
+        CostGuard g(cfg);
+        CHECK(g.levels()[0].min_fps == 54.0 && g.levels()[1].min_fps == 19.0);
+    }
+    {
+        // 35: no interval-2 level can hold it, so (r0,1) needs only the
+        // floor, and a preset failing it skips without trying them.
+        cfg.min_fps = 35;
+        CostGuard g(cfg);
+        CHECK(g.levels()[0].min_fps == 34.0 && g.levels()[1].min_fps == 34.0);
+        V last = V::None;
+        g.begin("forty.milk");
+        feed(g, 10, 25000, last);
+        CHECK(last == V::Accept && g.level() == 0);
+        g.begin("thirty.milk");
+        feed(g, 10, 33333, last);
+        CHECK(last == V::Skip);
+    }
+    {
+        cfg.min_fps = 60;
+        CostGuard g(cfg);
+        CHECK(g.levels()[0].min_fps == 59.0);
+        V last = V::None;
+        g.begin("sixty.milk");
+        feed(g, 10, 16667, last);
+        CHECK(last == V::Accept && g.level() == 0);
+    }
+    {
+        // Live changes: the current preset is judged against the new floor.
+        cfg.min_fps = 20;
+        CostGuard g(cfg);
+        V last = V::None;
+        g.begin("half.milk");
+        feed(g, 10, 33333, last);
+        CHECK(last == V::StepDown && g.level() == 1);
+        feed(g, 10, 33333, last);
+        CHECK(last == V::Accept && g.level() == 1);
+        CHECK(g.set_min_fps(20) == V::None && g.begin("half.milk") == 1);  // unchanged: kept
+        feed(g, 10, 33333, last);
+        CHECK(last == V::Accept);
+        CHECK(g.set_min_fps(25) == V::None && g.min_fps() == 25 && g.level() == 1);
+        CHECK(g.levels()[1].min_fps == 24.0);
+        feed(g, 10, 50000, last);  // 20 fps fails the new floor at once
+        CHECK(last == V::StepDown && g.level() == 2);
+        // Raised past what interval 2 can present: skipped straight away.
+        g.begin("half2.milk");
+        feed(g, 10, 33333, last);
+        CHECK(g.level() == 1);
+        CHECK(g.set_min_fps(40) == V::Skip);
+        CHECK(g.on_flip(33333, true) == V::None);  // nothing measured any more
+        // Settled levels are forgotten: re-measured from the hint.
+        CHECK(g.set_min_fps(20) == V::None);
+        CHECK(g.begin("half.milk") == 0);
+        // Thermal floor past the interval-1 level with a floor interval 2
+        // can't present: the first window skips.
+        CHECK(g.set_min_fps(40) == V::None);
+        g.set_rung_floor(1);
+        CHECK(g.begin("cool.milk") == 2);
+        feed(g, 10, 33333, last);
+        CHECK(last == V::Skip);
+    }
 }
 
 // ---------------------------------------------------------------- pacing
@@ -1504,6 +1618,7 @@ int main() {
     test_high_frequency_safety();
     test_guard_ladder();
     test_guard_60hz();
+    test_guard_min_fps();
     test_pacer();
     test_thermal();
     test_stderr_classifier();

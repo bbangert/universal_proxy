@@ -7,7 +7,8 @@ defmodule UniversalProxyWeb.MilkDropComponent do
   so a stopped subsystem reads as defaults / `{:error, :not_running}`).
 
     * **Preset pack** — absent, downloading (progress bar), ready (its
-      version) or failed (the reason). Download / Retry calls
+      version), retrying ("Waiting for network…" or "Retrying in N s",
+      with Retry to try now) or failed (the reason). Download / Retry calls
       `Pack.ensure/0` in `start_async/3`, so a slow Pack never blocks the
       LiveView; the button is disabled while that call runs. Status changes
       arrive over PubSub, which is authoritative: the call's own answer is
@@ -16,6 +17,9 @@ defmodule UniversalProxyWeb.MilkDropComponent do
       Pack that has since restarted are dropped.
     * **Rotation interval** — 10..120 s (`rotate_s`); anything else is
       refused inline without a write.
+    * **Minimum frame rate** (`min_fps`) — a select of
+      `Store.min_fps_options/0` (20 fps up to the board's maximum, in steps
+      of 5); anything else is refused inline without a write.
     * **Include fast-flashing presets** (`include_high_frequency`, off by
       default) — turning it on first opens a confirmation carrying a
       photosensitivity warning; only its confirm writes `true`. Turning it
@@ -139,6 +143,16 @@ defmodule UniversalProxyWeb.MilkDropComponent do
     end
   end
 
+  def handle_event("set_min_fps", params, socket) do
+    with raw when is_binary(raw) <- params["min_fps"],
+         {fps, ""} <- Integer.parse(raw),
+         true <- fps in Store.min_fps_options() do
+      {:noreply, write(socket, %{min_fps: fps})}
+    else
+      _ -> {:noreply, assign(socket, :error, "Pick a minimum frame rate from the list.")}
+    end
+  end
+
   def handle_event("toggle_high_frequency", _params, socket) do
     if socket.assigns.settings.include_high_frequency do
       {:noreply, write(socket, %{include_high_frequency: false})}
@@ -215,6 +229,7 @@ defmodule UniversalProxyWeb.MilkDropComponent do
       |> assign(:view, pack_view(assigns.pack))
       |> assign(:rotate_min, @rotate_min)
       |> assign(:rotate_max, @rotate_max)
+      |> assign(:min_fps_options, Store.min_fps_options())
       |> assign(:skipped_list, skipped_list(assigns.pack, assigns.skipped))
 
     ~H"""
@@ -231,11 +246,16 @@ defmodule UniversalProxyWeb.MilkDropComponent do
       <.card padding={:none} class="overflow-hidden">
         <%!-- Preset pack --%>
         <div class="flex items-start gap-4 p-[20px_22px]">
-          <div class={[
-            "flex-none w-11 h-11 rounded-[10px] flex items-center justify-center",
-            if(@view.ready?, do: "bg-success-soft text-success", else: "bg-sunken text-fg-4")
-          ]}>
-            <.icon name={:download} size={22} stroke={1.7} />
+          <div
+            id={"#{@id}-pack-icon"}
+            data-icon={@view.icon}
+            aria-hidden="true"
+            class={[
+              "flex-none w-11 h-11 rounded-[10px] flex items-center justify-center select-none",
+              tile_classes(@view.variant)
+            ]}
+          >
+            <.icon name={@view.icon} size={22} stroke={1.7} />
           </div>
 
           <div class="flex-1 min-w-0">
@@ -268,7 +288,7 @@ defmodule UniversalProxyWeb.MilkDropComponent do
           <.button
             :if={@view.action}
             id={"#{@id}-ensure"}
-            variant={if @view.action == "Retry", do: :secondary, else: :primary}
+            variant={:primary}
             size={:sm}
             phx-click="ensure_pack"
             phx-target={@myself}
@@ -308,6 +328,28 @@ defmodule UniversalProxyWeb.MilkDropComponent do
             {@settings.rotate_s} s
           </div>
         </div>
+
+        <%!-- Minimum frame rate --%>
+        <form
+          id={"#{@id}-min-fps-form"}
+          phx-change="set_min_fps"
+          phx-target={@myself}
+          class="flex items-center gap-3 pt-3 pr-5 pb-3 pl-[22px] border-t border-border-2"
+        >
+          <div class="flex-1 min-w-0">
+            <label for={"#{@id}-min-fps"} class="text-sm text-fg-2">Minimum frame rate</label>
+            <div class="text-xs text-fg-3 mt-0.5">Presets that can't hold this rate are skipped.</div>
+          </div>
+          <select
+            id={"#{@id}-min-fps"}
+            name="min_fps"
+            class="h-9 px-3 rounded-md text-sm border border-border-strong bg-surface text-fg-1 outline-none focus:border-accent focus:shadow-focus"
+          >
+            <option :for={fps <- @min_fps_options} value={fps} selected={fps == @settings.min_fps}>
+              {fps} fps
+            </option>
+          </select>
+        </form>
 
         <%!-- Fast-flashing presets --%>
         <div class="flex items-center gap-3 pt-3 pr-5 pb-3 pl-[22px] border-t border-border-2 bg-sunken">
@@ -440,8 +482,8 @@ defmodule UniversalProxyWeb.MilkDropComponent do
       variant: :neutral,
       hint: "The preset pack downloads on first use, or now with Download.",
       action: "Download",
-      pct: nil,
-      ready?: false
+      icon: :package,
+      pct: nil
     }
   end
 
@@ -451,8 +493,8 @@ defmodule UniversalProxyWeb.MilkDropComponent do
       variant: :accent,
       hint: "Downloading and verifying the preset pack.",
       action: nil,
-      pct: pct,
-      ready?: false
+      icon: :clock,
+      pct: pct
     }
   end
 
@@ -462,8 +504,19 @@ defmodule UniversalProxyWeb.MilkDropComponent do
       variant: :success,
       hint: "Version #{version}",
       action: nil,
-      pct: nil,
-      ready?: true
+      icon: :check,
+      pct: nil
+    }
+  end
+
+  defp pack_view({:retrying, reason, next_in_ms}) do
+    %{
+      label: "Retrying",
+      variant: :warning,
+      hint: retry_hint(reason, next_in_ms),
+      action: "Retry",
+      icon: :clock,
+      pct: nil
     }
   end
 
@@ -473,12 +526,31 @@ defmodule UniversalProxyWeb.MilkDropComponent do
       variant: :danger,
       hint: pack_error(reason),
       action: "Retry",
-      pct: nil,
-      ready?: false
+      icon: :alert,
+      pct: nil
     }
   end
 
   defp pack_view(_other), do: pack_view({:error, :unknown})
+
+  # The status tile is decoration (no hover, aria-hidden); the only action
+  # is the Download/Retry button.
+  defp tile_classes(:success), do: "bg-success-soft text-success"
+  defp tile_classes(:accent), do: "bg-accent-soft text-accent"
+  defp tile_classes(:warning), do: "bg-warning-soft text-warning"
+  defp tile_classes(:danger), do: "bg-danger-soft text-danger"
+  defp tile_classes(_neutral), do: "bg-sunken text-fg-3"
+
+  defp retry_hint(:network_down, _ms), do: "Waiting for network…"
+
+  defp retry_hint({:transport, _reason}, ms),
+    do: "Waiting for network… retrying in #{retry_seconds(ms)} s."
+
+  defp retry_hint(reason, ms),
+    do: "#{pack_error(reason)} Retrying in #{retry_seconds(ms)} s."
+
+  defp retry_seconds(ms) when is_integer(ms), do: max(div(ms + 999, 1000), 1)
+  defp retry_seconds(_ms), do: 1
 
   defp pack_error(:not_running), do: "The visualizer service isn't running."
   defp pack_error(:no_pack_pinned), do: "This firmware doesn't pin a preset pack."

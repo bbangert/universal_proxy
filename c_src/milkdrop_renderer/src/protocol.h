@@ -24,10 +24,12 @@ struct Command {
         Unlock,
         SetRotate,         // int_value: seconds
         SetHighFrequency,  // bool_value
+        SetMinFps,         // number_value: frames per second
     };
     Type type = Type::Exit;
     int int_value = 0;
     bool bool_value = false;
+    double number_value = 0;
 };
 
 // One stdin line. Unknown commands, bad values and non-JSON give nullopt
@@ -129,8 +131,11 @@ std::string event_preset(std::string_view file, bool locked, std::string_view ru
 // frame), so the BEAM can persist what was loading if the GPU hangs and
 // takes the device down with it.
 std::string event_loading(std::string_view file);
-// `message` (optional) is the first line of the error behind it.
-std::string event_skip(std::string_view file, std::string_view reason, std::string_view message = {});
+// `message` (optional) is the first line of the error behind it; `fps`
+// (sent when >= 0) the frame rate measured before a `budget` skip, rounded
+// down to one decimal.
+std::string event_skip(std::string_view file, std::string_view reason, std::string_view message = {},
+                       double fps = -1);
 std::string event_error(std::string_view reason, std::string_view message = {});
 std::string event_exiting(std::string_view reason);
 

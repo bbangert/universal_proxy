@@ -354,9 +354,10 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     settings_changed(ctx, %{rotate_s: 45, include_high_frequency: true})
 
     wait_until(fn ->
-      Enum.take(cmds(ctx.skip_file), -2) == [
+      Enum.take(cmds(ctx.skip_file), -3) == [
         %{"cmd" => "set_rotate", "value" => 45},
-        %{"cmd" => "set_high_frequency", "value" => true}
+        %{"cmd" => "set_high_frequency", "value" => true},
+        %{"cmd" => "set_min_fps", "value" => 20}
       ]
     end)
 
@@ -396,13 +397,45 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     end)
   end
 
+  test "a minimum frame rate change is sent only when it changes", ctx do
+    ctx = ctx |> start_ui() |> presenting()
+    min_fps_cmds = fn -> Enum.filter(cmds(ctx.skip_file), &(&1["cmd"] == "set_min_fps")) end
+
+    settings_changed(ctx, %{min_fps: 30})
+    wait_until(fn -> min_fps_cmds.() == [%{"cmd" => "set_min_fps", "value" => 30}] end)
+
+    # Other settings changing, or the same value again, send nothing.
+    settings_changed(ctx, %{min_fps: 30, rotate_s: 60})
+    settings_changed(ctx, %{min_fps: 30, rotate_s: 60, locked: "a/b.milk"})
+
+    wait_until(fn ->
+      List.last(cmds(ctx.skip_file)) == %{"cmd" => "set_rotate", "value" => 60}
+    end)
+
+    _ = :sys.get_state(ctx.state)
+    assert length(min_fps_cmds.()) == 1
+
+    settings_changed(ctx, %{min_fps: 25, rotate_s: 60})
+
+    wait_until(fn ->
+      min_fps_cmds.() == [
+        %{"cmd" => "set_min_fps", "value" => 30},
+        %{"cmd" => "set_min_fps", "value" => 25}
+      ]
+    end)
+  end
+
   test "settings changed before a session aren't sent: the renderer reads them at start", ctx do
     ctx = start_ui(ctx)
     settings_changed(ctx, %{include_high_frequency: true})
     _ = :sys.get_state(ctx.state)
 
     ctx = presenting(ctx)
-    refute Enum.any?(cmd_names(ctx.skip_file), &(&1 in ["set_rotate", "set_high_frequency"]))
+
+    refute Enum.any?(
+             cmd_names(ctx.skip_file),
+             &(&1 in ["set_rotate", "set_high_frequency", "set_min_fps"])
+           )
   end
 
   test "a viewport that fails to start after the release gets the renderer's exit only once it runs",
@@ -799,6 +832,35 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     playing(ctx)
     assert_receive {:audio, :pcm_tap, @key, true}, @timeout
     wait_until(fn -> md(ctx).phase == :presenting end)
+  end
+
+  test "a pack retrying keeps the preparing screen, then yields once ready", ctx do
+    retrying = {:retrying, {:transport, :nxdomain}, 5_000}
+    ctx = start_ui(ctx, pack: :absent, ensured: retrying, model_opts: [milkdrop_notice_ms: 100])
+    ctx |> milkdrop_mode() |> playing()
+    assert_receive :pack_ensure, @timeout
+
+    Phoenix.PubSub.broadcast(
+      ctx.pubsub,
+      UniversalProxy.MilkDrop.pack_topic(),
+      {:milkdrop_pack, retrying}
+    )
+
+    wait_until(fn -> md(ctx).pack == retrying end)
+    assert %{screen: {:milkdrop_preparing, nil}} = status(ctx)
+    assert_pushed(&("Preparing visualizer…" in &1))
+    refute_received {:audio, :pcm_tap, _, _}
+
+    # Pack retries on its own: no second ensure, and the yield follows.
+    Phoenix.PubSub.broadcast(
+      ctx.pubsub,
+      UniversalProxy.MilkDrop.pack_topic(),
+      {:milkdrop_pack, {:ready, @version, ctx.pack_dir}}
+    )
+
+    assert_receive {:audio, :pcm_tap, @key, true}, @timeout
+    wait_until(fn -> md(ctx).phase == :presenting end)
+    refute_received :pack_ensure
   end
 
   test "a pack error shows a short notice, then the bars", ctx do

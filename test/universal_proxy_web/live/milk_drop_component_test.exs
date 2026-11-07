@@ -176,6 +176,48 @@ defmodule UniversalProxyWeb.MilkDropComponentTest do
       wait_until(fn -> render(view) =~ "Version 2026.12.0" end)
     end
 
+    test "retrying shows why, when it retries, and a Retry button", %{conn: conn, root: root} do
+      start_pack(root, nil)
+      {:ok, view, _html} = live(conn, "/audio")
+
+      broadcast = fn status ->
+        Phoenix.PubSub.broadcast(@pubsub, MilkDrop.pack_topic(), {:milkdrop_pack, status})
+      end
+
+      broadcast.({:retrying, :network_down, 5_000})
+      wait_until(fn -> render(view) =~ "Waiting for network…" end)
+      assert render(view) =~ "Retrying"
+      assert view |> element("#milkdrop-ensure") |> render() =~ "Retry"
+      refute has_element?(view, "#milkdrop-pack-progress")
+
+      broadcast.({:retrying, {:transport, :nxdomain}, 15_000})
+      wait_until(fn -> render(view) =~ "Waiting for network… retrying in 15 s." end)
+
+      broadcast.({:retrying, {:http_status, 503}, 60_000})
+      wait_until(fn -> render(view) =~ "The server answered HTTP 503. Retrying in 60 s." end)
+    end
+
+    test "the status icon follows the state and is not a control", ctx do
+      %{conn: conn, root: root, src: src} = ctx
+      start_pack(root, pin(good_pack(src)))
+      {:ok, view, _html} = live(conn, "/audio")
+
+      icon = fn name -> has_element?(view, ~s(#milkdrop-pack-icon[data-icon="#{name}"])) end
+      assert icon.("package")
+      assert has_element?(view, ~s(#milkdrop-pack-icon[aria-hidden="true"]))
+      refute has_element?(view, "#milkdrop-pack-icon[phx-click]")
+
+      for {status, name} <- [
+            {{:downloading, 10}, "clock"},
+            {{:retrying, :network_down, 5_000}, "clock"},
+            {{:error, :checksum_mismatch}, "alert"},
+            {{:ready, @version, "/x"}, "check"}
+          ] do
+        Phoenix.PubSub.broadcast(@pubsub, MilkDrop.pack_topic(), {:milkdrop_pack, status})
+        wait_until(fn -> icon.(name) end)
+      end
+    end
+
     test "Download runs Pack.ensure and follows it to ready", %{conn: conn, root: root, src: src} do
       body = good_pack(src)
       test_pid = self()
@@ -304,6 +346,66 @@ defmodule UniversalProxyWeb.MilkDropComponentTest do
     end
   end
 
+  describe "minimum frame rate" do
+    setup %{root: root} do
+      start_pack(root, nil)
+      :ok
+    end
+
+    defp option_values(view) do
+      ~r/<option value="(\d+)"/
+      |> Regex.scan(view |> element("#milkdrop-min-fps") |> render())
+      |> Enum.map(fn [_, v] -> String.to_integer(v) end)
+    end
+
+    test "offers 20 fps up to the board's maximum in steps of 5", %{conn: conn} do
+      {:ok, view, html} = live(conn, "/audio")
+      assert html =~ "Minimum frame rate"
+      assert html =~ "Presets that can&#39;t hold this rate are skipped."
+      assert option_values(view) == [20, 25, 30, 35, 40, 45, 50, 55, 60]
+      assert has_element?(view, "#milkdrop-min-fps option[value=\"20\"][selected]")
+      assert render(view) =~ "60 fps"
+    end
+
+    test "a board that presents 30 fps offers 20 to 30", %{conn: conn} do
+      Application.put_env(:universal_proxy, :milkdrop_max_min_fps, 30)
+      on_exit(fn -> Application.delete_env(:universal_proxy, :milkdrop_max_min_fps) end)
+
+      {:ok, view, _html} = live(conn, "/audio")
+      assert option_values(view) == [20, 25, 30]
+    end
+
+    test "a selection updates the Store", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/audio")
+
+      view |> form("#milkdrop-min-fps-form", %{min_fps: "35"}) |> render_change()
+
+      assert Store.settings().min_fps == 35
+      assert has_element?(view, "#milkdrop-min-fps option[value=\"35\"][selected]")
+    end
+
+    test "a value off the list is refused without a write", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/audio")
+
+      for bad <- ["33", "65", "abc"] do
+        html = render_change(view |> element("#milkdrop-min-fps-form"), %{min_fps: bad})
+        assert html =~ "Pick a minimum frame rate from the list."
+      end
+
+      assert Store.settings().min_fps == 20
+    end
+
+    test "a Store that can't write shows an inline error", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/audio")
+      stop_supervised!(Store)
+
+      html = view |> form("#milkdrop-min-fps-form", %{min_fps: "25"}) |> render_change()
+
+      assert html =~
+               "Couldn&#39;t save the visualizer settings (the settings store isn&#39;t running)."
+    end
+  end
+
   describe "fast-flashing presets" do
     setup %{root: root} do
       start_pack(root, nil)
@@ -357,7 +459,7 @@ defmodule UniversalProxyWeb.MilkDropComponentTest do
 
     test "lists the ready version's skips with reasons, and clears them", %{conn: conn} do
       :ok = Store.skip(@version, "b/bright.milk", "too_bright")
-      :ok = Store.skip(@version, "a/slow.milk", "budget")
+      :ok = Store.skip(Store, @version, "a/slow.milk", "budget", fps: 17.3)
       :ok = Store.skip(@version, "c/hang.milk", "device_reset")
       :ok = Store.skip(@version, "d/stall.milk", "gpu_hang")
 

@@ -14,7 +14,7 @@ path). The host builds only the GL-free core and its unit tests.
 
 ```
 milkdrop_renderer --mode 1280x720 --pack-dir DIR --ladder 640x360,480x270
-                  --rotate-s 20 --skip-file PATH
+                  --rotate-s 20 --min-fps 20 --skip-file PATH
                   [--high-frequency] [--locked FILE] [--pcm-ring PATH]
                   [--connector HDMI-A-1]
 ```
@@ -27,14 +27,14 @@ milkdrop_renderer --mode 1280x720 --pack-dir DIR --ladder 640x360,480x270
 | `--pack-dir DIR` | The extracted preset pack (layout below). |
 | `--ladder WxH,...` | Internal render resolutions, highest first, each smaller than the last. The renderer steps down per preset and skips a preset past the last rung. |
 | `--rotate-s N` | Auto-rotation interval, seconds. |
+| `--min-fps F` | The frame rate a preset must hold (default 20; 1..240); see "Cost guard". The BEAM passes the user's setting (20..30 on rpi3, 20..60 on rpi4/5, in steps of 5). |
 | `--skip-file PATH` | Presets never to load: one preset id per line. A missing file is an empty list. |
 | `--high-frequency` | Include `high_frequency/` presets (photosensitivity; off by default; see "Photosensitivity filter"). |
 | `--locked FILE` | Start locked on this preset id. If it isn't eligible (a `high_frequency` one while they are off, skipped, an rpi3 `skip`, or not in the pack): `error` `locked_refused` (`message`: `<why>: <id>`) and an unlocked random start. |
 | `--pcm-ring PATH` | The PCM tap ring (`/run/up-pcm-<client_id>`). Without it, or while it has no fresh audio, presets get silence. |
 
 Tuning and check knobs (not passed by the BEAM): `--blend S` (soft-cut
-length, 0.5), `--min-fps F` (the floor a preset must hold, 19),
-`--interval N` (vblanks per frame: 2 on GLES2 builds, else 1), `--seed N`, `--av-offset-ms N` (added to the PCM
+length, 0.5), `--interval N` (vblanks per frame: 2 on GLES2 builds, else 1), `--seed N`, `--av-offset-ms N` (added to the PCM
 target time, for A/V tuning), `--master-timeout-ms N` (2000), `--mesh WxH`
 (48x36), `--stats-s N` (10), and `--headless-frames N` / `--simulate-kms` /
 `--test-tone` (see "Checks").
@@ -61,6 +61,7 @@ detection"). stdin EOF means exit, in every state.
 | `{"cmd":"lock"}` / `{"cmd":"unlock"}` | Hold / resume rotation on the current preset. |
 | `{"cmd":"set_rotate","value":N}` | Rotation interval in seconds (1..3600). |
 | `{"cmd":"set_high_frequency","value":B}` | Include `high_frequency/` presets; turning it off while one is rendered (playing or blending out) cuts away at once (see "Photosensitivity filter"). |
+| `{"cmd":"set_min_fps","value":F}` | The minimum frame rate (1..240), as `--min-fps`; the current value changes nothing. Otherwise levels settled this session are forgotten, and the current preset's next window is judged against the new floor; one whose level's interval can't present it at all is skipped at once (`skip` `budget`). |
 
 A malformed or unknown command gives `error` with `reason: "bad_command"`.
 
@@ -73,7 +74,7 @@ A malformed or unknown command gives `error` with `reason: "bad_command"`.
 | `released` | Ack for `release`. |
 | `loading` | `preset` (preset id): about to load and warm up this preset; written before any GPU work for it (its level, preload, warm-up frame), for every candidate tried (a failed one is followed by `skip`). A vc4 GPU hang can reset the whole device (the kernel logs `[drm] Resetting GPU.` and the Pi reboots within seconds); the BEAM persists this so the preset is skipped after the reboot. A `preset` event that keeps the same preset (`lock`, `unlock`, `step_down`) has no `loading` before it. |
 | `preset` | `file` (preset id), `locked`, `rung` (internal WxH), `cause` (`start`, `take`, `rotate`, `next`, `prev`, `eject`, `lock`, `unlock`, `step_down`), `cut` (true = no blend). `eject` is also the cut away from a `high_frequency` preset (it can name the preset already playing: its blend in was completed). Sent whenever the showing preset, its lock or its rung changes. |
-| `skip` | `preset`, `reason`, optional `message` (the first line of the error): the preset can't be drawn here (persist it for this pack version). Reasons: `register_allocate` (vc4 register allocation failed), `translate_error` / `compile_error` / `link_error` (a warp or composite shader failed and projectM fell back to its default), `shader_error` (another error-level projectM log during the warm-up), `load_failed` (unreadable or unparsable preset), `draw_dropped` (sentinel pixel untouched), `budget` (below the floor at the last rung), `gpu_hang` (the kernel reset the GPU while it was loading or showing; `message` is the kernel's line; see "Failure detection"). |
+| `skip` | `preset`, `reason`, optional `message` (the first line of the error), `fps` (with `budget`, when a window was measured: the preset's last measured frame rate rounded down to one decimal, which the BEAM keeps so a lower minimum can bring it back): the preset can't be drawn here (persist it for this pack version). Reasons: `register_allocate` (vc4 register allocation failed), `translate_error` / `compile_error` / `link_error` (a warp or composite shader failed and projectM fell back to its default), `shader_error` (another error-level projectM log during the warm-up), `load_failed` (unreadable or unparsable preset), `draw_dropped` (sentinel pixel untouched), `budget` (below the floor at the last rung), `gpu_hang` (the kernel reset the GPU while it was loading or showing; `message` is the kernel's line; see "Failure detection"). |
 | `stats` | Every `--stats-s`: `fps` (presented), `frames`, `flip_ms` (mean flip-to-flip), `frame_ms` / `frame_ms_max` (CPU render + submit), `late` (flips past their slot), `rung`, `interval`, `temp_c`, `arm_mhz`, `gpu_ms` (only with `GL_EXT_disjoint_timer_query`, which vc4 lacks), `preset`, `pcm_ok` / `pcm_silent` (frames with ring audio / silence), `warmups`, `warmup_ms_max`, `shader_stages` / `cached_stages` (translated shader stages warmed up, and those read from the pack's shader cache), `stderr_discarded` (driver stderr bytes dropped). |
 | `error` | `reason`, optional `message`: a non-fatal problem (`bad_command`, `master_timeout`, `take_failed`, `driver`, `register_allocate`, `thermal_drop`, `locked_refused`, …), or the cause just before a failing `exiting`. |
 | `exiting` | `reason`: `requested`, `eof`, `signal`, `thermal` (exit 0), or a failure — `manifest`, `no_presets`, `output`, `gl`, `projectm`, `kms`, `output_lost` (exit 1), `usage` (exit 2). |
@@ -224,10 +225,19 @@ the fps. Levels walk down a ladder of (rung, interval):
   then (r0, 2), (r1, 2), …;
 - rpi3: (r0, 2), (r1, 2), ….
 
-Levels at interval ≥ 2 must hold `--min-fps` (19: 20 fps = 3 vblanks looks
-fine, with jitter allowance). Below that, step down a level; below it at
-the last level, `skip` (`budget`). A preset keeps the level it settled on
-for the session.
+`--min-fps` (20 by default) is the frame rate a preset must hold, capped at
+what the start interval can present (refresh / interval: 30 on rpi3 at
+60 Hz). A window holds it at `--min-fps` − 1 or more: 20 fps = 3 vblanks
+measures just under 20 with jitter (and at 59.94 Hz), so the default
+accepts 19. Levels at interval ≥ 2 must reach that floor; a level whose
+interval can't present it (refresh / interval below the floor, e.g. 30 fps
+levels under a minimum of 35) is passed over. The interval-1 level must
+also hold 90 % of the refresh while an interval-2 level could hold the
+floor (a steady half rate beats a jittery full one); with a higher
+minimum it needs only the floor. Below its floor, step down to the next
+level that can present it; with none left, `skip` (`budget`, with the
+measured `fps`). A preset keeps the level it settled on for the session,
+until `set_min_fps` changes the floor.
 
 **Warm-up (P8).** Before a preset is shown, projectM preloads it
 (`projectm_preload_preset_file`): parse, translate (or read the shader
