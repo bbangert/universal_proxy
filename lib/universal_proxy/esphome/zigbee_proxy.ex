@@ -95,7 +95,9 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   follows only the calls that succeeded.
   """
 
-  use GenServer
+  # Circuits.UART.close/1 and stop/1 each wait up to 5 s, so terminate/2
+  # can take ~10 s on a wedged UART; the child shutdown budget must exceed it.
+  use GenServer, shutdown: 12_000
 
   require Logger
 
@@ -119,9 +121,6 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   # An ASH ACK is 5 bytes and is written from the RX handler, so a stuck
   # UART must not hold the owner for the full client-write ceiling.
   @ack_write_timeout 200
-  # Circuits.UART.close/1 and stop/1 default to 5 s each, which can exceed
-  # the 5 s child shutdown budget; bound each so terminate/2 fits inside it.
-  @cleanup_timeout 1_000
   @write_call_timeout 1_500
 
   @reopen_interval 5_000
@@ -721,8 +720,8 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
 
   defp cleanup_uart(pid) when is_pid(pid) do
     try do
-      GenServer.call(pid, :close, @cleanup_timeout)
-      GenServer.stop(pid, :normal, @cleanup_timeout)
+      Circuits.UART.close(pid)
+      Circuits.UART.stop(pid)
     catch
       kind, reason ->
         Logger.debug("Zigbee proxy UART cleanup failed: #{inspect({kind, reason})}")
