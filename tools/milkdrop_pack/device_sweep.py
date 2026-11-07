@@ -158,6 +158,9 @@ IO.puts(IO.iodata_to_binary(out))
 IO.puts("EXIT_STATUS " <> to_string(st))'''
 
 
+PROBE_TIMEOUT_S = 45
+
+
 class Device:
     def __init__(self, opts):
         self.opts = opts
@@ -168,11 +171,11 @@ class Device:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return proc.stdout + proc.stderr
 
-    def state(self):
+    def state(self, timeout=PROBE_TIMEOUT_S):
         """The device's boot state ({"uptime_ms", "boot_id", "at"}), or None
-        while it doesn't answer."""
+        while it doesn't answer within `timeout` seconds."""
         try:
-            boot = sweep.parse_boot(self.ssh(BOOT_ELIXIR, 45))
+            boot = sweep.parse_boot(self.ssh(BOOT_ELIXIR, timeout))
         except subprocess.TimeoutExpired:
             return None
         return {**boot, "at": time.monotonic()} if boot else None
@@ -378,21 +381,30 @@ def rebooted(before, after):
     return after["uptime_ms"] + UPTIME_SLACK_MS < expected
 
 
-def wait_for_device(device, budget_s):
-    """The device's boot state once it answers (polled with backoff, for up
-    to `budget_s`), or None."""
-    waited, delay = 0.0, 5
+def wait_for_device(device, budget_s, clock=None, sleep=None):
+    """The device's boot state once it answers (polled with backoff until
+    `budget_s` seconds have passed on `clock`), or None. Each probe is
+    capped at the time left, so the wait never outlasts the budget by more
+    than a one-second probe."""
+    clock = clock or time.monotonic
+    sleep = sleep or time.sleep
+    deadline = clock() + budget_s
+    delay, first = 5, True
     while True:
-        t = time.monotonic()
-        state = device.state()
+        remaining = deadline - clock()
+        if remaining <= 0 and not first:
+            return None
+        first = False
+        state = device.state(timeout=max(min(PROBE_TIMEOUT_S, remaining), 1))
         if state:
             return state
-        if waited >= budget_s:
+        remaining = deadline - clock()
+        if remaining <= 0:
             return None
-        pause = min(delay, budget_s - waited)
-        print(f"device not answering; retrying in {pause:.0f}s ({waited:.0f}s of {budget_s}s)", flush=True)
-        time.sleep(pause)
-        waited += pause + (time.monotonic() - t)
+        pause = min(delay, remaining)
+        print(f"device not answering; retrying in {pause:.0f}s ({budget_s - remaining:.0f}s of {budget_s}s)",
+              flush=True)
+        sleep(pause)
         delay = min(delay * 2, 60)
 
 

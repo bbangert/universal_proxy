@@ -180,6 +180,74 @@ class DeviceSweepTest(unittest.TestCase):
         self.assertIn(device_sweep.b64json(["--locked", 'we#{ird} "x".milk']), code)
 
 
+class FakeClock:
+    """A monotonic clock that only moves when a sleep or a probe takes time."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class StubDevice:
+    """Answers `state` once the clock reaches `up_at`; until then each probe
+    takes `probe_s` (hanging to its timeout when that is longer)."""
+
+    def __init__(self, clock, up_at=float("inf"), probe_s=0.5):
+        self.clock, self.up_at, self.probe_s = clock, up_at, probe_s
+        self.timeouts = []
+
+    def state(self, timeout):
+        self.timeouts.append(timeout)
+        self.clock.now += min(self.probe_s, timeout)
+        if self.clock.now >= self.up_at:
+            return {"uptime_ms": 1000, "boot_id": "b", "at": self.clock.now}
+        return None
+
+
+class WaitForDeviceTest(unittest.TestCase):
+    def wait(self, device, clock, budget_s):
+        with contextlib.redirect_stdout(io.StringIO()):
+            start = clock.now
+            state = device_sweep.wait_for_device(device, budget_s, clock=clock, sleep=clock.sleep)
+        return state, clock.now - start
+
+    def test_a_300s_budget_polls_for_about_300s_with_fast_failing_probes(self):
+        clock = FakeClock()
+        dev = StubDevice(clock, up_at=clock.now + 250)
+        state, _ = self.wait(dev, clock, 300)
+        self.assertIsNotNone(state)  # a device back late in the budget is still found
+
+        clock = FakeClock()
+        dev = StubDevice(clock)
+        state, elapsed = self.wait(dev, clock, 300)
+        self.assertIsNone(state)
+        self.assertGreaterEqual(elapsed, 300)
+        self.assertLess(elapsed, 301)
+
+    def test_a_60s_budget_is_not_overrun_by_slow_probes(self):
+        clock = FakeClock()
+        dev = StubDevice(clock, probe_s=1000)  # every probe hangs to its timeout
+        state, elapsed = self.wait(dev, clock, 60)
+        self.assertIsNone(state)
+        self.assertLessEqual(elapsed, 61)
+        self.assertTrue(all(t <= device_sweep.PROBE_TIMEOUT_S for t in dev.timeouts))
+        self.assertEqual(dev.timeouts[0], 45)
+        self.assertLessEqual(dev.timeouts[-1], 15)  # capped to what was left
+
+    def test_a_zero_budget_still_probes_once(self):
+        clock = FakeClock()
+        dev = StubDevice(clock, probe_s=1000)
+        state, elapsed = self.wait(dev, clock, 0)
+        self.assertIsNone(state)
+        self.assertEqual(len(dev.timeouts), 1)
+        self.assertLessEqual(elapsed, 1)
+
+
 class FakeDevice(device_sweep.Device):
     """A device driven over ssh, answering by what the Elixir is for. Per
     preset, `behaviours` lists what each run does (default "ok"):
@@ -246,8 +314,10 @@ class RebootAwareSweepTest(unittest.TestCase):
 
     def sweep(self, device, *extra):
         buf = io.StringIO()
+        clock = FakeClock()
         with mock.patch.object(device_sweep, "Device", lambda opts: device), \
-                mock.patch.object(device_sweep.time, "sleep") as sleep, \
+                mock.patch.object(device_sweep.time, "monotonic", clock), \
+                mock.patch.object(device_sweep.time, "sleep", side_effect=clock.sleep) as sleep, \
                 contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
             code = device_sweep.main(["--tarball", self.tar, "--out", self.out, "--host", "dev", *extra])
         self.sleeps = [c.args[0] for c in sleep.call_args_list]
