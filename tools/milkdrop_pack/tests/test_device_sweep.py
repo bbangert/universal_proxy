@@ -256,12 +256,17 @@ class FakeDevice(device_sweep.Device):
       reset       the Pi reboots mid-run; the connection drops and ssh
                   stays unanswered for `down` polls
       drop        the connection drops, the Pi stays up
+      late_reset  the connection drops; the Pi answers `alive` more probes,
+                  then reboots
+      gpu         runs to the end, but the kernel reset the GPU (once)
+      gpu_reset   as gpu, then the Pi answers `alive` probes and reboots
       no_connect  ssh can't connect at all (the run never starts)
     """
 
-    def __init__(self, behaviours=None, down=3, boot_ids=True, connect_s=0, run_s=30):
+    def __init__(self, behaviours=None, down=3, boot_ids=True, connect_s=0, run_s=30, alive=1):
         self.behaviours = {k: list(v) for k, v in (behaviours or {}).items()}
-        self.down, self.boot_ids = down, boot_ids
+        self.down, self.boot_ids, self.alive = down, boot_ids, alive
+        self.reset_in = None  # probes left before a pending reboot
         self.connect_s, self.run_s = connect_s, run_s
         self.polls_left = 0
         self.clock = FakeClock()
@@ -280,6 +285,11 @@ class FakeDevice(device_sweep.Device):
         if "renderer_ok" in code:
             return json.dumps({"renderer": "/r", "renderer_ok": True, "fw_uuid": "u", "pack_ok": True})
         if "Port.open" not in code:
+            if self.reset_in is not None:
+                self.reset_in -= 1
+                if self.reset_in < 0:
+                    self.reset_in = None
+                    self.reboot()
             if self.polls_left > 0:
                 self.polls_left -= 1
                 return "ssh: connect to host dev port 22: No route to host"
@@ -298,13 +308,16 @@ class FakeDevice(device_sweep.Device):
         if behaviour == "reset":
             self.reboot()
             return boot + "\nConnection to dev closed by remote host."
-        if behaviour == "drop":
+        if behaviour in ("late_reset", "gpu_reset"):
+            self.reset_in = self.alive
+        if behaviour in ("drop", "late_reset"):
             return boot + "\nclient_loop: send disconnect: Broken pipe"
         stats = {"event": "stats", "fps": 30.0, "frames": 150, "flip_ms": 33.0, "frame_ms": 12.5,
                  "rung": "640x360", "temp_c": 60.0, "arm_mhz": 1200, "preset": pid, "warmups": 1,
                  "warmup_ms_max": 200.0, "shader_stages": 2, "cached_stages": 2}
         return "\n".join([boot, json.dumps({"event": "preset", "file": pid}), json.dumps(stats),
-                          json.dumps({"event": "exiting", "reason": "headless_done"}), "EXIT_STATUS 0"])
+                          json.dumps({"event": "exiting", "reason": "headless_done"}),
+                          "GPU_RESET " + ("1" if behaviour.startswith("gpu") else "0"), "EXIT_STATUS 0"])
 
     def put(self, local, remote):
         raise AssertionError("the pack is already on the device")
@@ -370,6 +383,49 @@ class RebootAwareSweepTest(unittest.TestCase):
         self.sweep(dev)
         b = {r["file"]: r for r in self.records()}["b.milk"]
         self.assertEqual((b["status"], b["reason"]), ("error", "no_stats"))
+
+    def test_a_reset_seconds_after_a_failed_run_is_blamed_on_it(self):
+        for boot_ids in (True, False):
+            with self.subTest(boot_ids=boot_ids):
+                if os.path.exists(self.out):
+                    os.remove(self.out)
+                # Answers the first probe after the run, then goes down.
+                dev = FakeDevice({"b.milk": ["late_reset"]}, boot_ids=boot_ids, alive=1)
+                self.assertEqual(self.sweep(dev), 0)
+                recs = {r["file"]: r for r in self.records()}
+                b = recs["b.milk"]
+                self.assertEqual((b["status"], b["reason"], b["error"]), ("skip", "device_reset", "no_stats"))
+                self.assertEqual((recs["a.milk"]["status"], recs["c.milk"]["status"]), ("ok", "ok"))
+                self.assertEqual(dev.runs, ["a.milk", "b.milk", "c.milk"])
+
+    def test_a_gpu_reset_the_device_survived_skips_the_preset(self):
+        dev = FakeDevice({"b.milk": ["gpu"]})
+        self.assertEqual(self.sweep(dev), 0)
+        recs = {r["file"]: r for r in self.records()}
+        b = recs["b.milk"]
+        self.assertEqual((b["status"], b["reason"], b["gpu_resets"], b["run_status"]), ("skip", "gpu_hang", 1, "ok"))
+        self.assertEqual((recs["a.milk"]["gpu_resets"], recs["c.milk"]["status"]), (0, "ok"))
+        self.assertEqual(dev.runs, ["a.milk", "b.milk", "c.milk"])
+        self.assertEqual(self.sleeps, [5, 5, 5, 5])  # stayed up through the 20 s grace
+        self.assertEqual(self.sweep(FakeDevice()), 0)  # settled: not run again
+        self.assertEqual(len(self.records()), 3)
+
+    def test_a_gpu_reset_that_takes_the_device_down_later_is_a_device_reset(self):
+        dev = FakeDevice({"b.milk": ["gpu_reset"]}, alive=2)
+        self.assertEqual(self.sweep(dev), 0)
+        recs = {r["file"]: r for r in self.records()}
+        b = recs["b.milk"]
+        self.assertEqual((b["status"], b["reason"], b["error"], b["gpu_resets"]),
+                         ("skip", "device_reset", "gpu_hang", 1))
+        self.assertEqual((b["boot_before"], b["boot_after"]), ("boot-1", "boot-2"))
+        self.assertEqual(recs["c.milk"]["status"], "ok")
+
+    def test_the_grace_period_is_configurable(self):
+        self.sweep(FakeDevice({"b.milk": ["drop"]}), "--reset-grace-s", "0")
+        self.assertEqual(self.sleeps, [])
+        os.remove(self.out)
+        self.sweep(FakeDevice({"b.milk": ["drop"]}), "--reset-grace-s", "12")
+        self.assertEqual(self.sleeps, [5, 5, 5])
 
     def test_a_dropped_connection_without_a_reboot_is_an_error(self):
         dev = FakeDevice({"b.milk": ["drop"]})

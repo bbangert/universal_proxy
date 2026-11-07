@@ -341,6 +341,9 @@ def main(argv=None):
     p.add_argument("--timeout", type=int, default=240, help="seconds per preset before kill -9")
     p.add_argument("--reboot-wait-s", type=int, default=300,
                    help="how long to wait for the device to come back after a failed run")
+    p.add_argument("--reset-grace-s", type=int, default=20,
+                   help="how long the device must stay up on the same boot after a failed or GPU-resetting "
+                        "run before the next preset")
     p.add_argument("--cooldown-c", type=float, default=70.0, help="wait until the SoC is below this")
     p.add_argument("--cooldown-max-s", type=int, default=300, help="longest cooldown wait")
     p.add_argument("--only", action="append", default=[], help="sweep just this preset id (repeatable)")
@@ -477,8 +480,37 @@ def wait_for_device(device, budget_s, clock=None, sleep=None):
         delay = min(delay * 2, 60)
 
 
+GRACE_POLL_S = 5
+
+
+def settle(device, before, wait_s, grace_s, clock=None, sleep=None):
+    """After a suspect run on boot state `before`: ("reset", state) if the
+    device restarted, ("up", state) once it has answered on the same boot
+    across probes spanning at least `grace_s` seconds (a GPU hang can take
+    the Pi down seconds after a probe succeeded), or ("unreachable", None)
+    when it stays silent for `wait_s`."""
+    clock = clock or time.monotonic
+    sleep = sleep or time.sleep
+    first = wait_for_device(device, wait_s, clock, sleep)
+    if first is None:
+        return "unreachable", None
+    if before is not None and rebooted(before, first):
+        return "reset", first
+    last = first
+    while last["lo"] - first["hi"] < grace_s:
+        sleep(GRACE_POLL_S)
+        state = device.state() or wait_for_device(device, wait_s, clock, sleep)
+        if state is None:
+            return "unreachable", None
+        if rebooted(first, state) or (before is not None and rebooted(before, state)):
+            return "reset", state
+        last = state
+    return "up", last
+
+
 def reset_record(rec, before, after, text):
-    """`rec` (a failed run) as the "skip" of a preset that reset the device."""
+    """`rec` (a failed or gpu_hang run) as the "skip" of a preset that reset
+    the device."""
     rec.update(status="skip", reason="device_reset", error=rec.get("reason"),
                boot_before=before["boot_id"], boot_after=after["boot_id"],
                uptime_before_ms=before["uptime_ms"], uptime_after_ms=after["uptime_ms"],
@@ -487,8 +519,10 @@ def reset_record(rec, before, after, text):
 
 
 def sweep_presets(opts, todo, runner, meta, device=None):
-    """Runs and records `todo`. With a `device`, a failed run is followed by
-    waiting for it to answer again and checking whether it rebooted."""
+    """Runs and records `todo`. With a `device`, a failed run or one that
+    reset the GPU is settled before the next preset starts: the sweep waits
+    for the device to answer and stay up on the same boot for
+    --reset-grace-s, and a restart in that time is blamed on this preset."""
     last = None  # the latest boot state seen
     with open(opts.out, "a") as out:
         for n, pid in enumerate(todo, 1):
@@ -498,19 +532,18 @@ def sweep_presets(opts, todo, runner, meta, device=None):
                 text = runner(pid)
                 boot = observed(sweep.parse_boot(text), started, time.monotonic())
                 rec = sweep.parse_run(pid, text)
-                if device is None or rec["status"] != "error":
+                if device is None or (rec["status"] != "error" and not rec.get("gpu_resets")):
                     last = boot or last
                     break
-                after = wait_for_device(device, opts.reboot_wait_s)
-                if after is None:
+                # A run that never started touched nothing: no grace for it.
+                verdict, after = settle(device, boot or last, opts.reboot_wait_s,
+                                        opts.reset_grace_s if boot else 0)
+                if verdict == "unreachable":
                     rec["device"] = "unreachable"
                     break
-                before = boot or last
-                reset = before is not None and rebooted(before, after)
+                if verdict == "reset" and boot:
+                    reset_record(rec, boot, after, text)
                 last = after
-                if reset and boot:
-                    reset_record(rec, before, after, text)
-                    break
                 if boot is None and retries < MAX_START_RETRIES:
                     retries += 1
                     print(f"{pid}: the run did not start; trying again ({retries}/{MAX_START_RETRIES})", flush=True)
