@@ -50,6 +50,7 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   alias UniversalProxy.ESPHome.EntityProvider.MeshSync
   alias UniversalProxy.Hardware
   alias UniversalProxy.TuyaMesh.Commander
+  alias UniversalProxy.UART.Enumerate
   alias UniversalProxy.UART.Store, as: UARTStore
 
   def start_link(init_arg) do
@@ -249,7 +250,13 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   # invokes it from its open/rescan loop.
   @doc false
   def resolve_zwave_port do
-    pick_zwave_port(Hardware.list_ports(), Hardware.live_port_keys(), UARTStore.all_configs())
+    enumerated = Enumerate.safe()
+
+    pick_zwave_port(
+      Hardware.list_ports(enumerated: enumerated),
+      Hardware.live_port_keys(enumerated: enumerated),
+      UARTStore.all_configs()
+    )
   end
 
   # Pure core of `resolve_zwave_port/0`: `ports` from `Hardware.list_ports/0`,
