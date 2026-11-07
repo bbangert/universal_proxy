@@ -735,6 +735,10 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
       after
         :sys.resume(server)
       end
+
+      # The timed-out attach ran after resume; its cast detach follows it.
+      assert %{sessions: sessions} = :sys.get_state(server)
+      assert Map.keys(sessions) == [ref]
     end
 
     test "a dead server answers the defaults" do

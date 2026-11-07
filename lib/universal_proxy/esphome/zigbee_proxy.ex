@@ -176,7 +176,18 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
           {:ok, session()}
           | {:error, :not_attached | :invalid_speed | :invalid_argument | :timeout | term()}
   def attach(server \\ __MODULE__, opts, subscriber) when is_list(opts) and is_pid(subscriber) do
-    call(server, {:attach, opts, subscriber}, {:error, :not_attached})
+    ref = make_ref()
+
+    case call(server, {:attach, ref, opts, subscriber}, {:error, :not_attached}) do
+      {:error, :timeout} = timeout ->
+        # The queued attach may still run after we gave up; the cast
+        # queues behind it and drops the session nobody can reach.
+        GenServer.cast(server, {:detach, ref})
+        timeout
+
+      result ->
+        result
+    end
   end
 
   @doc """
@@ -347,14 +358,13 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   end
 
   @impl GenServer
-  def handle_call({:attach, _opts, _pid}, _from, %{uart_pid: nil} = state) do
+  def handle_call({:attach, _ref, _opts, _pid}, _from, %{uart_pid: nil} = state) do
     {:reply, {:error, :not_attached}, state}
   end
 
-  def handle_call({:attach, opts, pid}, _from, state) do
+  def handle_call({:attach, ref, opts, pid}, _from, state) do
     case apply_opts(state, opts) do
       {:ok, state} ->
-        ref = make_ref()
         session = %{pid: pid, monitor: Process.monitor(pid)}
         Logger.debug("Zigbee proxy session #{inspect(ref)} attached for #{inspect(pid)}")
         {:reply, {:ok, ref}, put_in(state.sessions[ref], session)}
@@ -463,6 +473,11 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
 
   def handle_call(:status, _from, state) do
     {:reply, %{attached?: state.uart_pid != nil, error?: state.error?, port: state.port}, state}
+  end
+
+  @impl GenServer
+  def handle_cast({:detach, ref}, state) do
+    {:noreply, drop_session(state, ref)}
   end
 
   @impl GenServer
