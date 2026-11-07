@@ -38,6 +38,10 @@ range -- without needing a dedicated ESPHome microcontroller for each one.
   the device; the tty stays open across sessions so firmware updates
   (universal-silabs-flasher) work too. Host-tested and build-validated only, not
   yet tested on real hardware.
+- **Tuya Bluetooth mesh lights** -- control Tuya "Beacon" (advertisement-mesh)
+  bulbs and their groups from Home Assistant through a dedicated Bluetooth
+  adapter, one HA light per bulb and group (see
+  [Tuya Bluetooth mesh lights](#tuya-bluetooth-mesh-lights))
 - Auto-detection for IRDroid / IR Toy USB infrared devices (VID `0x04D8`, PID `0xFD08`/`0xF58B`)
 - **Bluetooth proxy** -- relays BLE advertisements to Home Assistant over the
   ESPHome Native API (passive scanning plus optional active GATT connections),
@@ -183,7 +187,24 @@ opens the controller at 115200 baud, parses Z-Wave Serial API framing, and sends
 ACK/NAK/CAN responses locally (avoiding network round-trip latency). Complete
 frames are forwarded to Home Assistant's Z-Wave JS integration over the ESPHome
 API. Only one Home Assistant instance can subscribe to the Z-Wave proxy at a
-time.
+time. While a Z-Wave stick is held, the device also advertises a `_zwave._tcp`
+mDNS service (TXT `protocol=esphome`, pointing at the ESPHome API port) so Z-Wave
+JS UI's remote serial-port picker can find it.
+
+The [Home Assistant Connect ZBT-2](https://www.home-assistant.io/connect/zbt-2/)
+Zigbee coordinator is also **auto-detected**, by its USB product string. A ZWA-2
+can share the same USB ID (`303A:4001`) and is told apart only by that string:
+a stick whose product string says ZBT-2 is a Zigbee coordinator, and one without
+a product string stays a Z-Wave stick. One ZBT-2 per device is exposed. The
+device opens the stick's port once and holds it open, so sessions and
+line-setting changes never close and reopen it (each reopen would toggle the
+radio's reset lines); the resets a firmware flasher asks for on purpose are
+still passed through. Home Assistant 2026.11 or later
+discovers it from the serial proxy's USB identity and runs ZHA over it; the
+EZSP/ASH ACKs are sent locally on the device (PROTOCOL mode), and firmware
+updates go through Home Assistant's flasher. While it is held it
+shows as "in use" in the Overview. ZBT-2 support is host-tested and build-validated
+only; it has not yet been tested on real hardware.
 
 IRDroid / IR Toy USB infrared devices are also **auto-detected** by USB ID
 (VID `0x04D8`, PID `0xFD08` or `0xF58B`) and shown in Connected Devices with an
@@ -218,6 +239,58 @@ The share requires Samba in the target's Nerves system, which every custom
 target ships except `x86_64`. On targets without it, drives still mount and
 show in the Overview but sharing is unavailable.
 
+### Tuya Bluetooth mesh lights
+
+The device can control Tuya **Beacon Mesh** bulbs (Beacon v2 / "P2" -- the
+advertisement-based Bluetooth mesh, not Tuya's GATT "paired BLE" bulbs) from
+Home Assistant. Pairing and Tuya cloud login are not part of this: you pair the
+bulbs in the Tuya or Smart Life app first, then give the device a JSON dump of
+the mesh. It has only been hardware-validated on one product, Gardenreet RGBCW
+G4 12 V bi-pin bulbs; other Beacon mesh bulbs may differ. It needs a
+Bluetooth-enabled target (see [Supported targets](#supported-targets)).
+
+1. **Dedicate a Bluetooth adapter.** Open the **Bluetooth** tab and set one
+   radio's role to **Tuya mesh**. The option appears only when the device has at
+   least two radios, because nothing else may use the mesh radio -- the
+   Bluetooth proxy, audio and Wi-Fi setup run on your other radios. For example,
+   keep the onboard radio as the Bluetooth proxy and add a USB dongle for the
+   mesh. Only one radio can hold the role.
+2. **Upload the dump.** In the Tuya mesh card, choose the JSON file and click
+   **Upload dump**. It describes the mesh: its `beaconKey` and `seq`, each bulb's
+   MAC, `localKey`, `nodeId` and optional `label`, and any groups (`localId`,
+   `name`, `members`). It contains the mesh's secret keys, which are stored only
+   on the device and never shown in the UI. This device does not produce the
+   file; it only reads it. Uploading a *different* mesh replaces the stored
+   inventory, so the UI shows which bulbs will be added and removed and asks you
+   to confirm first. Bulbs are matched by MAC, so ones that stay keep their Home
+   Assistant devices; groups from the old mesh are recreated as new devices.
+   Re-uploading the same mesh just updates it.
+3. **Check the status.** The card shows Running / Not set up / Idle with a hint,
+   the radio's state, and each bulb's reachability and last-seen time.
+   **Clear inventory** removes the stored mesh.
+
+In Home Assistant, each bulb and each group becomes a sub-device of the Universal
+Proxy device. A bulb has a **Light** (on/off, brightness, colour temperature and
+RGB colour), a **Connectivity** sensor, and a **Last seen** sensor; a group has a
+**Light** that commands all its members. Colour-temperature range is set in the
+card under **Colour temperature** (Warmest / Coolest in Kelvin, with an
+**Invert** switch for bulbs that show warm as cool); changing it briefly
+reconnects Home Assistant. Groups can be created, renamed, deleted and have their
+members edited from the card while the mesh is running.
+
+Known limits:
+
+- A light's state in Home Assistant is optimistic: what was last sent to it and
+  accepted, or what the bulb last reported, so a light stays unknown in Home
+  Assistant until it has a state.
+- Effects, transitions and flashing are ignored.
+- Using the Tuya or Smart Life app after uploading can move the bulbs' sequence
+  counter past the device's, and they then ignore its commands. If control stops
+  working, export a fresh dump after your last app use and upload it. If the
+  dump's counter is far ahead of the device's, the upload keeps the device's
+  counter unless you choose **Adopt the dump's counter…** in the upload dialog
+  and then **Adopt counter and upload**.
+
 ### Editing ESPHome device configuration
 
 1. Go to the **ESPHome Config** tab (`/esphome-config`).
@@ -236,7 +309,7 @@ Once the device is powered on and connected to the network:
 1. Home Assistant should auto-discover it via mDNS under **Settings > Devices & Services**.
 2. If not, manually add an ESPHome integration pointing to `universal_proxy.local` (or the IP).
 3. No API password is required.
-4. Configured serial adapters appear as serial proxy entities on the device. An auto-detected ZWA-2 appears as a Z-Wave proxy.
+4. Configured serial adapters appear as serial proxy entities on the device. An auto-detected ZWA-2 appears as a Z-Wave proxy. An auto-detected ZBT-2 appears as a Zigbee serial proxy, and Tuya mesh bulbs and groups appear as sub-devices.
 
 ---
 
