@@ -834,6 +834,35 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     wait_until(fn -> md(ctx).phase == :presenting end)
   end
 
+  test "a pack retrying keeps the preparing screen, then yields once ready", ctx do
+    retrying = {:retrying, {:transport, :nxdomain}, 5_000}
+    ctx = start_ui(ctx, pack: :absent, ensured: retrying, model_opts: [milkdrop_notice_ms: 100])
+    ctx |> milkdrop_mode() |> playing()
+    assert_receive :pack_ensure, @timeout
+
+    Phoenix.PubSub.broadcast(
+      ctx.pubsub,
+      UniversalProxy.MilkDrop.pack_topic(),
+      {:milkdrop_pack, retrying}
+    )
+
+    wait_until(fn -> md(ctx).pack == retrying end)
+    assert %{screen: {:milkdrop_preparing, nil}} = status(ctx)
+    assert_pushed(&("Preparing visualizer…" in &1))
+    refute_received {:audio, :pcm_tap, _, _}
+
+    # Pack retries on its own: no second ensure, and the yield follows.
+    Phoenix.PubSub.broadcast(
+      ctx.pubsub,
+      UniversalProxy.MilkDrop.pack_topic(),
+      {:milkdrop_pack, {:ready, @version, ctx.pack_dir}}
+    )
+
+    assert_receive {:audio, :pcm_tap, @key, true}, @timeout
+    wait_until(fn -> md(ctx).phase == :presenting end)
+    refute_received :pack_ensure
+  end
+
   test "a pack error shows a short notice, then the bars", ctx do
     ctx =
       start_ui(ctx,

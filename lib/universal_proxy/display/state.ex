@@ -373,8 +373,9 @@ defmodule UniversalProxy.Display.State do
   def handle_info({:milkdrop_pack_started, status}, %{milkdrop?: true} = state),
     do: {:noreply, dispatch(%{state | pack_gen: state.pack_gen + 1}, {:pack_restarted, status})}
 
-  # `ensure/0`'s own answer: only a final one (progress comes on PubSub,
-  # and an unchanged error isn't broadcast), and only from the current Pack.
+  # `ensure/0`'s own answer: only a final one (progress and retries come on
+  # PubSub, and an unchanged error isn't broadcast), and only from the
+  # current Pack.
   def handle_info(
         {:milkdrop_pack_ensured, gen, status},
         %{milkdrop?: true, pack_gen: gen} = state
