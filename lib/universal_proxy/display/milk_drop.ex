@@ -154,11 +154,12 @@ defmodule UniversalProxy.Display.MilkDrop do
     * a `preset` event for another preset re-marks it (normally the one
       just loaded, so nothing is written), and a `skip` for the marked
       preset moves the record back to the preset still showing;
-    * a clean end — `released`, `exiting` with reason `"requested"`, exit
-      status 0 — and the reaper, once the renderer is confirmed gone however
-      the session ended, ask the Store to clear it
-      (`Store.clear_in_flight/2`: after a grace period, and only if it is
-      still this session's).
+    * the Store monitors this process, the record's owner, and clears the
+      record a grace period after it goes down, however it went down (only
+      if it is still this session's). A clean end — `released`, `exiting`
+      with reason `"requested"`, exit status 0 — asks for that at once
+      (`Store.clear_in_flight/2`), so a session whose server lives on past
+      a release is cleared too.
 
   The record is written once per preset change (about every 20 s), so its
   flash wear is negligible.
@@ -343,8 +344,7 @@ defmodule UniversalProxy.Display.MilkDrop do
 
     with :ok <- validate(config),
          :ok <- write_skip_file(config.skip_file, skipped),
-         {:ok, reaper} <-
-           start_reaper(task_sup, owner, kill_grace_ms, config.skip_file, {store, session}),
+         {:ok, reaper} <- start_reaper(task_sup, owner, kill_grace_ms, config.skip_file),
          {:ok, port} <- open_port(binary, args(config)) do
       os_pid = os_pid(port)
       send(reaper, if(os_pid, do: {:os_pid, os_pid}, else: :renderer_exited))
@@ -430,10 +430,8 @@ defmodule UniversalProxy.Display.MilkDrop do
     if state.os_pid, do: kill(state.os_pid)
     send(state.owner, {:milkdrop_exit, self(), :reaper_down})
 
-    if is_nil(state.os_pid) or await_gone(state.os_pid, @kill_confirm_ms) == :gone do
-      _ = Store.clear_in_flight(state.store, state.session)
-      send(state.owner, {:milkdrop_reaped, self()})
-    end
+    if is_nil(state.os_pid) or await_gone(state.os_pid, @kill_confirm_ms) == :gone,
+      do: send(state.owner, {:milkdrop_reaped, self()})
 
     {:stop, {:shutdown, :reaper_down}, state}
   end
@@ -656,11 +654,10 @@ defmodule UniversalProxy.Display.MilkDrop do
   # after a grace period if its pid is still alive. `:renderer_exited`
   # (sent before the server stops) means there is nothing to kill, so a
   # recycled pid is not. Once the renderer is known gone the owner is told
-  # (`{:milkdrop_reaped, server}`) and the Store's in-flight record for
-  # this session is cleared. It traps exits so that its supervisor's
+  # (`{:milkdrop_reaped, server}`). It traps exits so that its supervisor's
   # shutdown kills a still-running renderer rather than abandoning it. It
   # also deletes the skip file, last, once the renderer is dead or gone.
-  defp start_reaper(task_sup, owner, grace_ms, skip_file, {store, session}) do
+  defp start_reaper(task_sup, owner, grace_ms, skip_file) do
     server = self()
 
     case Task.Supervisor.start_child(
@@ -669,10 +666,8 @@ defmodule UniversalProxy.Display.MilkDrop do
              Process.flag(:trap_exit, true)
 
              try do
-               if reap(Process.monitor(server), grace_ms) == :gone do
-                 _ = Store.clear_in_flight(store, session)
-                 send(owner, {:milkdrop_reaped, server})
-               end
+               if reap(Process.monitor(server), grace_ms) == :gone,
+                 do: send(owner, {:milkdrop_reaped, server})
              after
                _ = File.rm(skip_file)
              end

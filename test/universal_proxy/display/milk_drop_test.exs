@@ -660,6 +660,45 @@ defmodule UniversalProxy.Display.MilkDropTest do
   end
 
   @tag capture_log: true
+  test "a session whose reaper is shut down after its server stopped is cleared", ctx do
+    stop_supervised!(Store)
+
+    store =
+      start_supervised!(
+        {Store,
+         name: nil,
+         table: @table,
+         dets_path: Path.join(ctx.tmp_dir, "settings.dets"),
+         in_flight_grace_ms: 1_500}
+      )
+
+    start_supervised!({Task.Supervisor, name: :milkdrop_reaper_clear_sup}, id: :reaper_sup)
+    owner = forwarding_owner()
+
+    {:ok, pid} =
+      start_with_owner(%{ctx | store: store}, owner,
+        task_supervisor: :milkdrop_reaper_clear_sup,
+        kill_grace_ms: 60_000
+      )
+
+    assert_receive {:owner_got, {:milkdrop, ^pid, %{event: :prepared}}}, @timeout
+    os_pid = ignore_eof(ctx, pid)
+    emit(pid, ~s({"event":"loading","preset":"a.milk"}))
+    assert_receive {:owner_got, {:milkdrop, ^pid, %{event: :loading}}}, @timeout
+    ref = Process.monitor(pid)
+
+    Process.exit(owner, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, @timeout
+    :ok = stop_supervised(:reaper_sup)
+    wait_until(fn -> not File.exists?("/proc/#{os_pid}") end, 1_000)
+
+    # Nothing of the session is left to ask: the Store saw its server go.
+    assert %{preset: "a.milk", clear_at: clear_at} = Store.in_flight(store)
+    assert is_integer(clear_at)
+    wait_until(fn -> Store.in_flight(store) == nil end)
+  end
+
+  @tag capture_log: true
   test "no renderer is spawned when the reaper cannot start", ctx do
     assert {:error, {:reaper, _}} =
              MilkDrop.start(renderer_opts(ctx, task_supervisor: :no_such_milkdrop_task_sup))
