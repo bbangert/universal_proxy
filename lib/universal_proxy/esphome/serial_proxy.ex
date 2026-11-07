@@ -47,11 +47,13 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
   ## Home Assistant Connect ZBT-2
 
   The ZBT-2 that `UniversalProxy.ESPHome.ZigbeeProxy` holds is advertised
-  as a `:usb_serial` port that drives RTS and DTR, for as long as the
-  owner knows its row (while the tty is open, and while a reopen is
-  pending after an error). Keeping the row through a transient error
-  keeps every instance number stable for connected clients; the identity
-  reports it not connected meanwhile.
+  as a `:usb_serial` port that drives RTS and DTR from the owner's first
+  resolved row until the owner stops, including while the tty is closed
+  after an error or an unplug. Keeping the row keeps every instance
+  number stable for connected clients (an unplug renumbers only when the
+  hotplug restart of the ESPHome tree drops them); meanwhile the identity
+  reports it not connected, with blank strings and no USB ids, and an
+  open answers `:not_attached`.
 
   Its handles are `{:zigbee, session}`: `open/3` attaches a session to
   the owner and `close/1` detaches it, so the tty (and its DTR/RTS) stay
@@ -65,6 +67,12 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
   matches on. Every other port reports none: an identity on our
   CP210x/CH34x adapters would match ZHA's USB matchers and offer them as
   Zigbee radios.
+
+  `identity/1` only answers a client's identity subscription. The owner
+  attaches and detaches without an ESPHome tree restart (a UART error
+  and the reopen after it, or a first open that fails and later
+  succeeds), so it calls `push_zigbee_identity/1` whenever its attach
+  state or row changes, and subscribed clients see each change live.
   """
 
   @behaviour Espex.SerialProxy
@@ -155,6 +163,31 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
       %{kind: :zigbee} = entry -> zigbee_identity(instance, entry)
       _ -> nil
     end
+  end
+
+  @doc """
+  Push the ZBT-2's current identity to espex's subscribed clients, under
+  the instance number `list_instances/0` advertises for it.
+
+  A no-op without a ZBT-2 row, or while espex (`server`, default
+  `Espex.Server`) isn't running.
+  """
+  @spec push_zigbee_identity(atom()) :: :ok
+  def push_zigbee_identity(server \\ Espex.Server) do
+    inventory = inventory()
+
+    case Enum.find_index(inventory, &(&1.kind == :zigbee)) do
+      nil -> :ok
+      instance -> push_identity(server, identity_for(inventory, instance))
+    end
+  end
+
+  # `Registry.dispatch/3` raises, not exits, when espex's registry isn't
+  # started (early boot: the owner starts before Espex).
+  defp push_identity(server, identity) do
+    Espex.push_serial_proxy_identity(server, identity)
+  rescue
+    ArgumentError -> :ok
   end
 
   # No `persist_opts`: the owner keeps the line settings itself.
@@ -316,17 +349,26 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
   defp zigbee_proxy,
     do: Application.get_env(:universal_proxy, :serial_proxy_zigbee_server, ZigbeeProxy)
 
-  # Build the serial-port inventory from `Hardware.list_ports/0` so we
+  # Build the serial-port inventory from `Hardware.list_ports/1` so we
   # surface auto-detected chipset defaults AND user-saved overrides
   # uniformly. The `:ha_name` field on each port matches what Home
   # Assistant's serial picker shows in the Overview UI ("FTDI FT232RL
   # (1-1.1.2)") so the user sees the same label everywhere.
+  #
+  # Both reads stay off the owners' mailboxes: these run in the espex
+  # connection process inside Home Assistant's open budget, and a busy
+  # owner must not drop the ZBT-2 row (shifting every later instance
+  # number). The proxies' claims only label ports in use, which nothing
+  # here reads.
   defp inventory do
-    build_inventory(Hardware.list_ports(), ZigbeeProxy.status(zigbee_proxy()))
+    build_inventory(
+      Hardware.list_ports(zwave_claim: nil, zigbee_claim: nil),
+      ZigbeeProxy.advertised(zigbee_proxy())
+    )
   end
 
-  # Pure core of `inventory/0`: `ports` from `Hardware.list_ports/0`,
-  # `zigbee` from `ZigbeeProxy.status/1`. The ZBT-2 comes from the owner's
+  # Pure core of `inventory/0`: `ports` from `Hardware.list_ports/1`,
+  # `zigbee` from `ZigbeeProxy.advertised/1`. The ZBT-2 comes from the owner's
   # own row, never from `ports`, so only the one it holds is advertised.
   @doc false
   def build_inventory(ports, zigbee) do
@@ -378,6 +420,24 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
   # What Home Assistant's ZBT-2 matcher reads: VID/PID and the product
   # string, plus the serial (its config-flow unique id). espex copies `usb`
   # into the protobuf as given, so unknown ids are left out, never nil.
+  #
+  # Per espex's Identity contract, `error?` means the USB host stack refused
+  # the descriptor query (strings and ids then empty), not that our tty
+  # open failed; while the device isn't attached the `:usb` strings are
+  # blank and `usb` is empty.
+  defp zigbee_identity(instance, %{attached?: false}) do
+    %Identity{
+      instance: instance,
+      source: :usb,
+      connected?: false,
+      error?: false,
+      manufacturer: "",
+      product: "",
+      serial_number: "",
+      usb: %{}
+    }
+  end
+
   defp zigbee_identity(instance, entry) do
     port = entry.port
     descriptor = Map.get(port, :usb_descriptor) || %{}
@@ -395,8 +455,8 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
     %Identity{
       instance: instance,
       source: :usb,
-      connected?: entry.attached?,
-      error?: entry.error?,
+      connected?: true,
+      error?: false,
       manufacturer: Map.get(port, :usb_manufacturer) || "",
       product: Map.get(port, :usb_product) || "",
       serial_number: entry.serial || "",

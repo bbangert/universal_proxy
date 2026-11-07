@@ -33,6 +33,16 @@
       "False positive: UART.History only queries ZWaveProxy.claimed_port/0 (a read; nothing is registered or monitored for History). The proxy's monitor at the flagged line is for its Espex subscriber, not History; after a proxy restart History learns the claim again from the uart:port_opened broadcast."
   },
   %{
+    analysis: "coupling",
+    file: "lib/universal_proxy/application.ex",
+    title: "Coupled children under one_for_one",
+    at_label: "supervision tree defined here",
+    detail:
+      "UniversalProxy.UART.History registers with UniversalProxy.ESPHome.ZigbeeProxy when it starts, and UniversalProxy.ESPHome.ZigbeeProxy keeps a monitor or link for it. Both are children of the one_for_one supervisor UniversalProxy.Application, which restarts either alone. When UniversalProxy.ESPHome.ZigbeeProxy restarts, its init/1 starts it afresh without what UniversalProxy.UART.History put there, and UniversalProxy.UART.History, which is not restarted with it, never registers again. When UniversalProxy.UART.History restarts, it registers a second time beside what its old process left.",
+    reason:
+      "False positive: UART.History only queries ZigbeeProxy.claimed_port/0 (a read; nothing is registered or monitored for History). The proxy's monitor at the flagged line is for its Espex subscriber, not History; after a proxy restart History learns the claim again from the uart:port_opened broadcast."
+  },
+  %{
     analysis: "shutdown",
     file: "lib/universal_proxy/audio/input/capture.ex",
     title: "terminate/2 does unbounded work inside the shutdown timeout",
@@ -231,6 +241,16 @@
       "UniversalProxy.UART.History sync-calls UniversalProxy.ESPHome.ZWaveProxy, a later sibling, from handle_continue under UniversalProxy.Application. The continue runs concurrently with the supervisor's start sequence, so whether UniversalProxy.ESPHome.ZWaveProxy is alive when the call lands is a boot-time race — it works on the fast machine and fails in CI.",
     reason:
       "Deliberate: History's boot-time ZWaveProxy.claimed_port/0 call is wrapped in catch :exit (returns nil when the proxy is not up yet); the proxy's uart:port_opened lifecycle broadcast (owner: :zwave_proxy) adds the claim when it opens the port."
+  },
+  %{
+    analysis: "startup",
+    file: "lib/universal_proxy/uart/history.ex",
+    title: "handle_continue races a later sibling",
+    at_label: "the racing call originates here",
+    detail:
+      "UniversalProxy.UART.History sync-calls UniversalProxy.ESPHome.ZigbeeProxy, a later sibling, from handle_continue under UniversalProxy.Application. The continue runs concurrently with the supervisor's start sequence, so whether UniversalProxy.ESPHome.ZigbeeProxy is alive when the call lands is a boot-time race — it works on the fast machine and fails in CI.",
+    reason:
+      "Deliberate: History's boot-time ZigbeeProxy.claimed_port/0 call is wrapped in catch :exit (returns nil when the proxy is not up yet); the proxy's uart:port_opened lifecycle broadcast (owner: :zigbee_proxy) adds the claim when it opens the port."
   },
   %{
     analysis: "shutdown",

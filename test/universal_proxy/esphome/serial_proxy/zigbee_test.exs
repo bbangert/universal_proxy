@@ -381,11 +381,24 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeTest do
       assert is_binary(identity |> Identity.to_proto() |> Proto.SerialProxyIdentity.encode())
     end
 
-    test "reports a failing owner as not connected, with the error flag" do
+    test "reports a failing owner as not connected, blank, without the error flag" do
       row = ZigbeeFixtures.zbt2_row()
       inventory = SerialProxy.build_inventory([], %{attached?: false, error?: true, port: row})
 
-      assert %Identity{connected?: false, error?: true} = SerialProxy.identity_for(inventory, 0)
+      identity = SerialProxy.identity_for(inventory, 0)
+
+      assert %Identity{
+               source: :usb,
+               connected?: false,
+               error?: false,
+               manufacturer: "",
+               product: "",
+               serial_number: "",
+               usb: usb
+             } = identity
+
+      assert usb == %{}
+      assert is_binary(identity |> Identity.to_proto() |> Proto.SerialProxyIdentity.encode())
     end
 
     test "is nil for TTL ports and unknown instances" do
@@ -401,6 +414,87 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeTest do
       assert %Identity{} = SerialProxy.identity_for(inventory, 1)
       assert SerialProxy.identity_for(inventory, 2) == nil
       assert SerialProxy.identity(99) == nil
+    end
+  end
+
+  describe "published owner snapshot" do
+    test "a suspended owner keeps the ZBT-2 at the same instance" do
+      %{server: server} = ZigbeeFixtures.start_owner!()
+      instance = zigbee_instance()
+      assert is_integer(instance)
+
+      :sys.suspend(server)
+
+      try do
+        assert zigbee_instance() == instance
+
+        assert %Identity{connected?: true, error?: false} = SerialProxy.identity(instance)
+      after
+        :sys.resume(server)
+      end
+    end
+
+    test "follows a UART error and the reopen" do
+      %{server: server, row: row} = ZigbeeFixtures.start_owner!()
+      instance = zigbee_instance()
+
+      send(server, {:circuits_uart, ZigbeeFixtures.tty(), {:error, :eio}})
+      _ = ZigbeeProxy.status(server)
+
+      assert ZigbeeProxy.advertised(server) == %{attached?: false, error?: true, port: row}
+      assert zigbee_instance() == instance
+
+      assert %Identity{connected?: false, error?: false, product: ""} =
+               SerialProxy.identity(instance)
+
+      send(server, :zigbee_reopen)
+      assert_receive {:fake_uart, _fake}
+      _ = ZigbeeProxy.status(server)
+
+      assert ZigbeeProxy.advertised(server) == %{attached?: true, error?: false, port: row}
+    end
+
+    test "an unplug with the owner running keeps every instance number" do
+      %{server: server, row: row} = ZigbeeFixtures.start_owner!()
+      ports = [ttl_row("Zeta (1-1.4)", "ttyUSB1"), ttl_row("Alpha (1-1.2)", "ttyUSB0")]
+
+      names = fn ->
+        ports
+        |> SerialProxy.build_inventory(ZigbeeProxy.advertised(server))
+        |> Enum.map(& &1.friendly_name)
+      end
+
+      before = names.()
+      assert before == ["Alpha (1-1.2)", row.ha_name, "Zeta (1-1.4)"]
+      instance = zigbee_instance()
+
+      # Unplugged: the tty errors, then the resolver finds nothing.
+      :sys.replace_state(server, &%{&1 | resolver: fn -> nil end})
+      send(server, {:circuits_uart, ZigbeeFixtures.tty(), {:error, :eio}})
+      send(server, :zigbee_reopen)
+      _ = ZigbeeProxy.status(server)
+
+      assert names.() == before
+      assert zigbee_instance() == instance
+      assert %Identity{connected?: false, usb: usb} = SerialProxy.identity(instance)
+      assert usb == %{}
+
+      # The kept row never reopens its old tty.
+      assert {:error, :not_attached} = SerialProxy.open(instance, [], self())
+      send(server, :zigbee_reopen)
+      _ = ZigbeeProxy.status(server)
+      refute_received {:fake_uart, _}
+    end
+
+    test "is erased when the owner stops" do
+      %{server: server} = ZigbeeFixtures.start_owner!()
+      assert %{attached?: true} = ZigbeeProxy.advertised(server)
+
+      GenServer.stop(server)
+
+      assert :persistent_term.get({ZigbeeProxy, :advertised, server}, :erased) == :erased
+      assert ZigbeeProxy.advertised(server) == %{attached?: false, error?: false, port: nil}
+      assert zigbee_instance() == nil
     end
   end
 end

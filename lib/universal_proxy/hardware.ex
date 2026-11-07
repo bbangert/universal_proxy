@@ -613,8 +613,8 @@ defmodule UniversalProxy.Hardware do
       notes: classification.notes,
       # Raw USB descriptor strings; `vendor`/`chip` above may come from
       # the device table instead.
-      usb_manufacturer: info[:manufacturer],
-      usb_product: info[:description] || info[:product],
+      usb_manufacturer: descriptor_string(info[:manufacturer]),
+      usb_product: descriptor_name(info),
       usb_descriptor: nil
     }
     |> Map.merge(line_setting_fields(line))
@@ -774,8 +774,11 @@ defmodule UniversalProxy.Hardware do
   end
 
   defp descriptor_name(info) do
-    Enum.find([info[:product], info[:description]], fn s -> is_binary(s) and s != "" end)
+    Enum.find([info[:product], info[:description]], &descriptor_string/1)
   end
+
+  defp descriptor_string(s) when is_binary(s) and s != "", do: s
+  defp descriptor_string(_), do: nil
 
   # Nabu Casa's ZWA-2 (Z-Wave) and ZBT-2 (Zigbee) both enumerate as
   # Espressif (VID 0x303A) and some units share a PID, so the USB product
@@ -783,8 +786,8 @@ defmodule UniversalProxy.Hardware do
   # Returns nil for other products so a bare 303A:4001 falls through to the
   # VID/PID table (ZWA-2), which keeps existing ZWA-2 setups unchanged.
   @nabucasa_vid 0x303A
-  @zbt2_product ~r/zbt-?2/i
-  @zwa2_product ~r/zwa-?2/i
+  @zbt2_product ~r/\bzbt-?2\b/i
+  @zwa2_product ~r/\bzwa-?2\b/i
   @zbt2_device %{
     kind: :zigbee,
     name: "Home Assistant Connect ZBT-2",

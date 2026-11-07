@@ -56,6 +56,16 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
     ref
   end
 
+  # Poll for a condition the proxy reaches asynchronously (e.g. after a
+  # monitored process dies); bounded so a regression fails, not hangs.
+  defp wait_until(fun, attempts \\ 100) do
+    cond do
+      fun.() -> :ok
+      attempts == 0 -> flunk("condition not reached")
+      true -> Process.sleep(10) && wait_until(fun, attempts - 1)
+    end
+  end
+
   # Deliver NCP bytes and wait until the proxy has handled them.
   defp rx(server, data) do
     send(server, {:circuits_uart, "ttyZB", data})
@@ -64,6 +74,18 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
   end
 
   defp ack(n), do: Ash.ack_frame(n)
+
+  defp pushes(acc \\ []) do
+    receive do
+      {:pushed, attached?} -> pushes([attached? | acc])
+    after
+      100 -> Enum.reverse(acc)
+    end
+  end
+
+  defp wait_open(gate) do
+    if Agent.get(gate, & &1) == :open, do: :ok, else: Process.sleep(5) && wait_open(gate)
+  end
 
   # All UART writes received so far, concatenated.
   defp written(acc \\ <<>>) do
@@ -104,6 +126,82 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
 
       assert_receive {:uart_port_opened, %{friendly_name: "late-zb", owner: :zigbee_proxy}}
       assert %{attached?: true, port: nil} = ZigbeeProxy.status(server)
+    end
+
+    test "a row resolved after an empty init is held but never advertised" do
+      {:ok, fake} = FakeUART.start_link(self())
+      {:ok, slot} = Agent.start_link(fn -> nil end)
+      row = %{kind: :zigbee, tty_name: "ttyLate", ha_name: "late"}
+
+      server =
+        start_supervised!(
+          {ZigbeeProxy,
+           name: nil,
+           resolver: fn -> Agent.get(slot, & &1) end,
+           open_fun: fn _path -> {:ok, fake} end}
+        )
+
+      Agent.update(slot, fn _ -> %{path: "ttyLate", display_name: "late", port: row} end)
+      send(server, :zigbee_reopen)
+      _ = :sys.get_state(server)
+
+      assert %{attached?: true, port: nil} = ZigbeeProxy.advertised(server)
+      assert %{attached?: true, port: nil} = ZigbeeProxy.status(server)
+    end
+
+    test "after an unplug a resolver returning nil never reopens the old tty" do
+      test_pid = self()
+      {:ok, slot} = Agent.start_link(fn -> %{path: "ttyZB", display_name: "zb"} end)
+
+      open_fun = fn path ->
+        send(test_pid, {:open_attempt, path})
+        {:ok, fake} = FakeUART.start_link(test_pid)
+        {:ok, fake}
+      end
+
+      server =
+        start_supervised!(
+          {ZigbeeProxy, name: nil, resolver: fn -> Agent.get(slot, & &1) end, open_fun: open_fun}
+        )
+
+      assert_receive {:open_attempt, "ttyZB"}
+      assert ZigbeeProxy.status(server).attached?
+
+      Agent.update(slot, fn _ -> nil end)
+      send(server, {:circuits_uart, "ttyZB", {:error, :eio}})
+      assert %{attached?: false, port: nil} = ZigbeeProxy.status(server)
+
+      send(server, :zigbee_reopen)
+      assert :sys.get_state(server).display_name == nil
+      refute_received {:open_attempt, _}
+      refute ZigbeeProxy.status(server).attached?
+    end
+
+    test "cleanup completes and the proxy reopens when the UART close exits" do
+      %{server: server, fake: fake} = start_proxy!()
+      FakeUART.reply_with(fake, :close, :exit)
+      ref = Process.monitor(fake)
+
+      send(server, {:circuits_uart, "ttyZB", {:error, :eio}})
+      assert_receive :uart_close
+      assert_receive {:DOWN, ^ref, :process, ^fake, _}
+      assert %{attached?: false, error?: true} = ZigbeeProxy.status(server)
+
+      send(server, :zigbee_reopen)
+      assert_receive {:fake_uart, _new}
+      assert ZigbeeProxy.status(server).attached?
+    end
+
+    test "messages from another tty are ignored" do
+      %{server: server} = start_proxy!()
+      subscribed!(server)
+
+      send(server, {:circuits_uart, "ttyOLD", "stale"})
+      send(server, {:circuits_uart, "ttyOLD", {:error, :eio}})
+      _ = :sys.get_state(server)
+
+      assert ZigbeeProxy.status(server).attached?
+      refute_received {:espex_serial_data, _, _}
     end
 
     test "a failed open reports error? and keeps the row" do
@@ -149,6 +247,249 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
       assert ZigbeeProxy.claimed_port(server) == %{base | subscribed: true}
       :ok = ZigbeeProxy.detach(server, ref)
       assert ZigbeeProxy.claimed_port(server) == base
+    end
+
+    test "advertised follows open, a UART error and an unplug, keeping the row" do
+      slot = start_supervised!({Agent, fn -> nil end})
+      %{server: server, port: port} = start_proxy!()
+      _ = :sys.get_state(server)
+
+      assert ZigbeeProxy.advertised(server) == %{attached?: true, error?: false, port: port}
+
+      send(server, {:circuits_uart, "ttyZB", {:error, :eio}})
+      _ = :sys.get_state(server)
+      assert ZigbeeProxy.advertised(server) == %{attached?: false, error?: true, port: port}
+
+      :sys.replace_state(server, fn state ->
+        %{state | resolver: fn -> Agent.get(slot, & &1) end}
+      end)
+
+      send(server, :zigbee_reopen)
+      _ = :sys.get_state(server)
+      assert ZigbeeProxy.advertised(server) == %{attached?: false, error?: false, port: port}
+      assert {:error, :not_attached} = ZigbeeProxy.attach(server, [], self())
+
+      # The stick back on another tty: its row replaces the kept one.
+      moved = %{port | tty_name: "ttyZB2"}
+      Agent.update(slot, fn _ -> %{path: "ttyZB2", display_name: "zb2", port: moved} end)
+      send(server, :zigbee_reopen)
+      assert_receive {:fake_uart, _fake}
+      _ = :sys.get_state(server)
+      assert ZigbeeProxy.advertised(server) == %{attached?: true, error?: false, port: moved}
+    end
+
+    test "a resolved stick with another HA name is not opened" do
+      %{server: server, port: port} = start_proxy!()
+      _ = :sys.get_state(server)
+
+      send(server, {:circuits_uart, "ttyZB", {:error, :eio}})
+      _ = :sys.get_state(server)
+
+      other = %{port | ha_name: "other"}
+
+      :sys.replace_state(server, fn state ->
+        %{state | resolver: fn -> %{path: "ttyOther", display_name: "o", port: other} end}
+      end)
+
+      send(server, :zigbee_reopen)
+      _ = :sys.get_state(server)
+      refute_received {:fake_uart, _}
+      assert %{attached?: false, port: ^port} = ZigbeeProxy.advertised(server)
+    end
+
+    test "only the advertised stick is reopened after an unplug (matched by serial)" do
+      test_pid = self()
+      a = %{kind: :zigbee, tty_name: "ttyA", ha_name: "zb-a", serial: "AAA"}
+      b = %{kind: :zigbee, tty_name: "ttyB", ha_name: "zb-b", serial: "BBB"}
+      {:ok, slot} = Agent.start_link(fn -> %{path: "ttyA", display_name: "zb-a", port: a} end)
+
+      open_fun = fn path ->
+        send(test_pid, {:open_attempt, path})
+        FakeUART.start_link(test_pid)
+      end
+
+      server =
+        start_supervised!(
+          {ZigbeeProxy, name: nil, resolver: fn -> Agent.get(slot, & &1) end, open_fun: open_fun}
+        )
+
+      assert_receive {:open_attempt, "ttyA"}
+      send(server, {:circuits_uart, "ttyA", {:error, :eio}})
+
+      Agent.update(slot, fn _ -> %{path: "ttyB", display_name: "zb-b", port: b} end)
+      send(server, :zigbee_reopen)
+      _ = :sys.get_state(server)
+      refute_received {:open_attempt, _}
+      assert %{attached?: false, port: ^a} = ZigbeeProxy.advertised(server)
+
+      Agent.update(slot, fn _ -> %{path: "ttyA2", display_name: "zb-a", port: a} end)
+      send(server, :zigbee_reopen)
+      assert_receive {:open_attempt, "ttyA2"}
+      _ = :sys.get_state(server)
+      assert %{attached?: true, port: ^a} = ZigbeeProxy.advertised(server)
+    end
+
+    test "reopens the advertised stick when another candidate sorts first" do
+      test_pid = self()
+      a = %{kind: :zigbee, tty_name: "ttyA", ha_name: "zb-a", serial: "AAA"}
+      b = %{kind: :zigbee, tty_name: "ttyB", ha_name: "zb-b", serial: "BBB"}
+      {:ok, slot} = Agent.start_link(fn -> [%{path: "ttyA", display_name: "zb-a", port: a}] end)
+
+      open_fun = fn path ->
+        send(test_pid, {:open_attempt, path})
+        FakeUART.start_link(test_pid)
+      end
+
+      server =
+        start_supervised!(
+          {ZigbeeProxy, name: nil, resolver: fn -> Agent.get(slot, & &1) end, open_fun: open_fun}
+        )
+
+      assert_receive {:open_attempt, "ttyA"}
+      send(server, {:circuits_uart, "ttyA", {:error, :eio}})
+
+      Agent.update(slot, fn _ ->
+        [
+          %{path: "ttyB", display_name: "zb-b", port: b},
+          %{path: "ttyA2", display_name: "zb-a", port: a}
+        ]
+      end)
+
+      send(server, :zigbee_reopen)
+      assert_receive {:open_attempt, "ttyA2"}
+      refute_received {:open_attempt, "ttyB"}
+      _ = :sys.get_state(server)
+      assert %{attached?: true, port: ^a} = ZigbeeProxy.advertised(server)
+    end
+
+    test "advertised already holds the row while the first open is blocked" do
+      test_pid = self()
+      port = %{kind: :zigbee, tty_name: "ttyZB", ha_name: "zb"}
+
+      open_fun = fn _path ->
+        send(test_pid, {:open_blocked, self()})
+
+        receive do
+          :release -> {:error, :eacces}
+        end
+      end
+
+      server =
+        start_supervised!(
+          {ZigbeeProxy,
+           name: nil,
+           resolver: fn -> %{path: "ttyZB", display_name: "zb", port: port} end,
+           open_fun: open_fun}
+        )
+
+      assert_receive {:open_blocked, opener}
+      assert ZigbeeProxy.advertised(server) == %{attached?: false, error?: false, port: port}
+      send(opener, :release)
+    end
+
+    test "on_change runs when the attach state or row changes, and only then" do
+      test_pid = self()
+      port = %{kind: :zigbee, tty_name: "ttyZB", ha_name: "zb"}
+      opens = :counters.new(1, [])
+
+      # The first open succeeds, every reopen fails the same way.
+      open_fun = fn _path ->
+        :counters.add(opens, 1, 1)
+
+        if :counters.get(opens, 1) == 1 do
+          FakeUART.start_link(test_pid)
+        else
+          {:error, :eio}
+        end
+      end
+
+      server =
+        start_supervised!(
+          {ZigbeeProxy,
+           name: nil,
+           resolver: fn -> %{path: "ttyZB", display_name: "zb", port: port} end,
+           open_fun: open_fun,
+           on_change: fn -> send(test_pid, {:zigbee_changed, self()}) end}
+        )
+
+      # Off the owner, in a task.
+      assert_receive {:zigbee_changed, pid}
+      assert pid != server
+
+      rx(server, "data")
+      refute_receive {:zigbee_changed, _}, 50
+
+      send(server, {:circuits_uart, "ttyZB", {:error, :eio}})
+      assert_receive {:zigbee_changed, _}
+
+      send(server, :zigbee_reopen)
+      _ = :sys.get_state(server)
+      assert %{attached?: false, error?: true, port: ^port} = ZigbeeProxy.advertised(server)
+      refute_receive {:zigbee_changed, _}, 50
+    end
+
+    test "pushes run one at a time, so the last one delivers the latest state" do
+      test_pid = self()
+      gate = start_supervised!({Agent, fn -> :closed end})
+      calls = :counters.new(1, [])
+      name = :"zb_order_#{System.unique_integer([:positive])}"
+
+      # Reads the snapshot, then (first call only) waits for the test
+      # before delivering, as a slow push to espex would.
+      on_change = fn ->
+        snapshot = ZigbeeProxy.advertised(name)
+        :counters.add(calls, 1, 1)
+
+        if :counters.get(calls, 1) == 1 do
+          send(test_pid, :push_blocked)
+          wait_open(gate)
+        end
+
+        send(test_pid, {:pushed, snapshot.attached?})
+      end
+
+      open_fun = fn _path ->
+        {:ok, fake} = FakeUART.start_link(test_pid)
+        send(test_pid, {:fake_uart, fake})
+        {:ok, fake}
+      end
+
+      server =
+        start_supervised!(
+          {ZigbeeProxy,
+           name: name,
+           resolver: fn -> %{path: "ttyZB", display_name: "zb", port: %{ha_name: "zb"}} end,
+           open_fun: open_fun,
+           on_change: on_change}
+        )
+
+      assert_receive :push_blocked
+      send(server, {:circuits_uart, "ttyZB", {:error, :eio}})
+      _ = :sys.get_state(server)
+      send(server, :zigbee_reopen)
+      assert_receive {:fake_uart, _}
+      send(server, {:circuits_uart, "ttyZB", {:error, :eio}})
+      _ = :sys.get_state(server)
+
+      Agent.update(gate, fn _ -> :open end)
+
+      # The blocked push (the open) delivers first, then one coalesced
+      # push of the final, detached state.
+      assert pushes() == [true, false]
+      assert :counters.get(calls, 1) == 2
+    end
+
+    test "the pusher stops with the owner" do
+      server =
+        start_supervised!(
+          {ZigbeeProxy, name: nil, resolver: fn -> nil end, on_change: fn -> :ok end}
+        )
+
+      {pusher, _fun} = :sys.get_state(server).pusher
+      ref = Process.monitor(pusher)
+
+      GenServer.stop(server)
+      assert_receive {:DOWN, ^ref, :process, ^pusher, _}
     end
 
     test "claimed_port is nil without a tty or a server" do
@@ -206,9 +547,10 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
       :ok = ZigbeeProxy.subscribe(server, ref)
       :ok = ZigbeeProxy.set_mode(server, ref, :protocol)
 
+      sub_ref = Process.monitor(sub)
       Process.exit(sub, :kill)
-      _ = :sys.get_state(server)
-      assert :sys.get_state(server).sessions == %{}
+      assert_receive {:DOWN, ^sub_ref, :process, ^sub, _}
+      wait_until(fn -> :sys.get_state(server).sessions == %{} end)
 
       # A new subscriber can take the port, and starts in RAW: no ACK.
       ref2 = subscribed!(server)
@@ -275,12 +617,30 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
       assert ack1 == <<0x7E, 0x81, 0x60, 0x59, 0x7E>>
 
       # The ACK reaches the wire first, then the subscriber.
-      assert_receive first
-      assert first == {:uart_write, ack1}
+      receive do
+        {:uart_write, ^ack1} -> :ok
+        {:espex_serial_data, {:zigbee, ^ref}, _} -> flunk("RX forwarded before the ACK write")
+      after
+        1_000 -> flunk("no ACK write")
+      end
+
       assert_receive {:espex_serial_data, {:zigbee, ^ref}, @data_0}
 
       assert_receive {:uart_data, %{dir: :rx, data: @data_0}}
       assert_receive {:uart_data, %{dir: :tx, data: ^ack1, origin: :ash_ack}}
+    end
+
+    test "ACK writes use a short timeout; client writes keep the long one" do
+      %{server: server} = start_proxy!()
+      ref = subscribed!(server, :protocol)
+
+      rx(server, @data_0)
+      assert_receive {:uart_write_timeout, ack_timeout}
+      assert ack_timeout <= 250
+
+      :ok = ZigbeeProxy.write(server, ref, <<1, 2, 3>>)
+      assert_receive {:uart_write_timeout, write_timeout}
+      assert write_timeout >= 1_000
     end
 
     test "T3: RAW stops ACKs; re-enabling PROTOCOL resets the numbering" do
@@ -499,6 +859,17 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
       assert map_size(:sys.get_state(server).sessions) == 1
     end
 
+    test "a UART error resets current_opts to the defaults the next open uses" do
+      %{server: server} = start_proxy!()
+      ref = attach!(server)
+      assert :ok = ZigbeeProxy.configure(server, ref, speed: 115_200)
+      assert ZigbeeProxy.current_opts(server)[:speed] == 115_200
+
+      send(server, {:circuits_uart, "ttyZB", {:error, :eio}})
+      refute ZigbeeProxy.status(server).attached?
+      assert ZigbeeProxy.current_opts(server)[:speed] == 460_800
+    end
+
     test "a failed configure keeps the old settings" do
       %{server: server, fake: fake} = start_proxy!()
       ref = attach!(server)
@@ -533,8 +904,8 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
       assert_receive {:uart_set_dtr, false}
 
       assert :ok = ZigbeeProxy.set_modem_pins(server, ref, false, true)
-      assert_receive first
-      assert_receive second
+      assert_receive {line, _} = first when line in [:uart_set_dtr, :uart_set_rts]
+      assert_receive {line, _} = second when line in [:uart_set_dtr, :uart_set_rts]
       assert [first, second] == [{:uart_set_dtr, true}, {:uart_set_rts, false}]
 
       assert {:ok, %{rts: false, dtr: true}} = ZigbeeProxy.get_modem_pins(server, ref)
@@ -612,6 +983,10 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
       after
         :sys.resume(server)
       end
+
+      # The timed-out attach ran after resume; its cast detach follows it.
+      assert %{sessions: sessions} = :sys.get_state(server)
+      assert Map.keys(sessions) == [ref]
     end
 
     test "a dead server answers the defaults" do

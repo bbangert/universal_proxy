@@ -23,7 +23,8 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
     reach it.
   - No port, or a failed open, arms a 5 s rescan that re-resolves each
     time, so a stick plugged in after boot (or replugged onto another
-    tty) attaches without restarting the supervision tree.
+    tty) attaches without restarting the supervision tree. The rescan
+    never reopens a remembered tty, only what the resolver returns.
   - On a UART error the tty is closed, the ASH acknowledger and the RX
     buffer are reset, `uart:port_closed` is broadcast, and the rescan
     starts. Sessions, the subscription and its mode survive the
@@ -32,6 +33,33 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
     `{:error, :not_attached}` until the tty is back. A reopen starts from
     the default line settings and DTR=RTS=true again, as an ESPHome USB
     UART does on re-attach.
+  - The advertised row and attach state (`advertised/1`) are published
+    to `:persistent_term` on every change of either, and erased in
+    `terminate/2`, so the serial-proxy adapter can read them without a
+    call that a busy owner would time out.
+  - Once a row has been resolved it stays in the snapshot for the
+    owner's lifetime, even after the resolver stops finding the stick
+    (unplugged): it then reads `attached?: false`. The serial-proxy
+    adapter numbers its instances from this snapshot, so a row that
+    vanished or appeared would shift later instances under connected
+    clients. The advertised row is therefore fixed for the owner's
+    lifetime: only a row resolved in `init/1` is ever published, and the
+    owner only reopens the physical stick that row describes (same USB
+    serial when both rows carry one, else same `ha_name`). A different
+    stick the resolver returns meanwhile (a second coordinator after
+    the advertised one is unplugged) is not opened, so sessions and
+    Home Assistant, which still address the original, never reach the
+    wrong radio; the owner stays detached and keeps rescanning. A
+    re-resolved match (possibly on another tty) replaces the row only
+    when it has the same `ha_name`. An owner that started with
+    no row still opens and holds a stick plugged in later (avoiding a
+    later DTR bounce) but keeps advertising `port: nil`. Renumbering
+    happens only on the ESPHome tree restart that hotplug triggers.
+  - When the attach state or the row changes, the owner notifies an
+    `IdentityPusher` it links at init (only with an `:on_change` fun);
+    the pusher runs the fun, which reads the latest snapshot. One
+    process running them in turn keeps deliveries in state order, and
+    the owner never blocks on them.
   - Exits are trapped so `terminate/2` closes the tty and broadcasts
     `uart:port_closed` on a supervisor shutdown. A crash of the linked
     UART process still stops this server.
@@ -95,11 +123,13 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   follows only the calls that succeeded.
   """
 
-  use GenServer
+  # Circuits.UART.close/1 and stop/1 each wait up to 5 s, so terminate/2
+  # can take ~10 s on a wedged UART; the child shutdown budget must exceed it.
+  use GenServer, shutdown: 12_000
 
   require Logger
 
-  alias UniversalProxy.ESPHome.ZigbeeProxy.Ash
+  alias UniversalProxy.ESPHome.ZigbeeProxy.{Ash, IdentityPusher}
 
   @typedoc "A session, as returned by `attach/3`."
   @type session :: reference()
@@ -116,6 +146,9 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   # A write can legitimately take a while at a low bootloader baud; the
   # UART write gets its own ceiling, the call a little more.
   @uart_write_timeout 1_000
+  # An ASH ACK is 5 bytes and is written from the RX handler, so a stuck
+  # UART must not hold the owner for the full client-write ceiling.
+  @ack_write_timeout 200
   @write_call_timeout 1_500
 
   @reopen_interval 5_000
@@ -137,6 +170,8 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
     :reopen_timer,
     :last_open_error,
     :subscribed,
+    :snapshot_key,
+    :pusher,
     error?: false,
     mode: :raw,
     sessions: %{},
@@ -171,7 +206,18 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
           {:ok, session()}
           | {:error, :not_attached | :invalid_speed | :invalid_argument | :timeout | term()}
   def attach(server \\ __MODULE__, opts, subscriber) when is_list(opts) and is_pid(subscriber) do
-    call(server, {:attach, opts, subscriber}, {:error, :not_attached})
+    ref = make_ref()
+
+    case call(server, {:attach, ref, opts, subscriber}, {:error, :not_attached}) do
+      {:error, :timeout} = timeout ->
+        # The queued attach may still run after we gave up; the cast
+        # queues behind it and drops the session nobody can reach.
+        GenServer.cast(server, {:detach, ref})
+        timeout
+
+      result ->
+        result
+    end
   end
 
   @doc """
@@ -274,10 +320,26 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   end
 
   @doc """
+  The tty this proxy is holding open, for `UART.History` restart
+  recovery and for `UniversalProxy.Hardware` to mark the port in use
+  (it is invisible to `UART.ports/0`); same shape and semantics as
+  `ZWaveProxy.claimed_port/1`. `subscribed` says whether an API client
+  is attached. Exits (server down, or `:calling_self` from the owner's
+  own resolver path) read as "no claim".
+  """
+  @spec claimed_port(GenServer.server()) ::
+          %{tty_name: String.t(), display_name: String.t(), subscribed: boolean()} | nil
+  def claimed_port(server \\ __MODULE__) do
+    GenServer.call(server, :claimed_port, @call_timeout)
+  catch
+    :exit, _ -> nil
+  end
+
+  @doc """
   Whether the tty is open, whether the last attempt to hold it failed,
-  and the `Hardware` row it belongs to (kept while `error?`, nil when no
-  ZBT-2 is resolved). A wedged server reports `error?: true`, a missing
-  one `error?: false`.
+  and the `Hardware` row it belongs to (the last one resolved, kept
+  after an unplug; nil until a ZBT-2 is first resolved). A wedged server
+  reports `error?: true`, a missing one `error?: false`.
   """
   @spec status(GenServer.server()) :: status()
   def status(server \\ __MODULE__) do
@@ -288,21 +350,28 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   end
 
   @doc """
-  The tty this proxy holds open, or `nil`, for
-  `UniversalProxy.Hardware` to mark the port in use (it is invisible to
-  `UART.ports/0`). `subscribed` says whether a client holds the session
-  that receives RX data.
+  The same answer as `status/1`, read from the snapshot the owner
+  publishes on every change, without calling it: a busy or suspended
+  owner still reports its last row. A missing (or dead) owner reports
+  `%{attached?: false, error?: false, port: nil}`.
 
-  `Hardware.list_ports/0` calls this by default; a call from this
-  server's own resolver exits with `:calling_self` and is answered `nil`.
+  `server` must be the registered name (or pid) the owner was started
+  under.
   """
-  @spec claimed_port(GenServer.server()) ::
-          %{tty_name: String.t(), display_name: String.t(), subscribed: boolean()} | nil
-  def claimed_port(server \\ __MODULE__) do
-    GenServer.call(server, :claimed_port, @call_timeout)
-  catch
-    :exit, _ -> nil
+  @spec advertised(GenServer.server()) :: status()
+  def advertised(server \\ __MODULE__) do
+    case :persistent_term.get(snapshot_key(server), nil) do
+      {owner, snapshot} when is_pid(owner) ->
+        if Process.alive?(owner), do: snapshot, else: unattached()
+
+      nil ->
+        unattached()
+    end
   end
+
+  defp unattached, do: %{attached?: false, error?: false, port: nil}
+
+  defp snapshot_key(server), do: {__MODULE__, :advertised, server}
 
   defp call(server, msg, default, timeout \\ @call_timeout) do
     GenServer.call(server, msg, timeout)
@@ -323,7 +392,9 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
     state = %__MODULE__{
       ash: Ash.new(),
       port_path: Keyword.get(opts, :port_path),
+      snapshot_key: snapshot_key(Keyword.get(opts, :name, __MODULE__) || self()),
       resolver: Keyword.get(opts, :resolver),
+      pusher: start_pusher(Keyword.get(opts, :on_change)),
       # Seam for tests: an opener returning a fake UART pid. Every UART
       # operation here is a `Circuits.UART` GenServer call on that pid.
       open_fun: Keyword.get(opts, :open_fun) || (&open_port/1)
@@ -331,8 +402,10 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
 
     if state.port_path || state.resolver do
       # `Circuits.UART.open` can block on a misbehaving tty; keep it out
-      # of init so the ESPHome supervisor's boot never waits on it.
-      {:ok, state, {:continue, :open_port}}
+      # of init so the ESPHome supervisor's boot never waits on it. The
+      # row is resolved here (a port-list read, no UART I/O) and published
+      # first, so Espex starts with the final instance inventory.
+      {:ok, state |> preresolve_port() |> publish_snapshot(false), {:continue, :open_port}}
     else
       {:ok, state}
     end
@@ -344,14 +417,13 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   end
 
   @impl GenServer
-  def handle_call({:attach, _opts, _pid}, _from, %{uart_pid: nil} = state) do
+  def handle_call({:attach, _ref, _opts, _pid}, _from, %{uart_pid: nil} = state) do
     {:reply, {:error, :not_attached}, state}
   end
 
-  def handle_call({:attach, opts, pid}, _from, state) do
+  def handle_call({:attach, ref, opts, pid}, _from, state) do
     case apply_opts(state, opts) do
       {:ok, state} ->
-        ref = make_ref()
         session = %{pid: pid, monitor: Process.monitor(pid)}
         Logger.debug("Zigbee proxy session #{inspect(ref)} attached for #{inspect(pid)}")
         {:reply, {:ok, ref}, put_in(state.sessions[ref], session)}
@@ -445,18 +517,15 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
     {:reply, to_open_opts(state.line), state}
   end
 
-  def handle_call(:claimed_port, _from, %{uart_pid: nil} = state) do
-    {:reply, nil, state}
-  end
-
   def handle_call(:claimed_port, _from, state) do
-    tty = Path.basename(state.port_path)
-
-    reply = %{
-      tty_name: tty,
-      display_name: state.display_name || tty,
-      subscribed: state.subscribed != nil
-    }
+    reply =
+      if state.uart_pid && state.port_path do
+        %{
+          tty_name: Path.basename(state.port_path),
+          display_name: state.display_name || Path.basename(state.port_path),
+          subscribed: state.subscribed != nil
+        }
+      end
 
     {:reply, reply, state}
   end
@@ -466,25 +535,28 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   end
 
   @impl GenServer
-  def handle_info({:circuits_uart, _port, {:error, reason}}, %{uart_pid: pid} = state)
-      when pid != nil do
-    Logger.warning("Zigbee proxy UART error: #{inspect(reason)}")
-    cleanup_uart(pid)
-    broadcast_lifecycle(state, "uart:port_closed", :uart_port_closed)
-
-    state =
-      %{state | uart_pid: nil, ash: Ash.reset(state.ash), rx_buffer: <<>>, error?: true}
-      |> schedule_reopen()
-
-    {:noreply, state}
+  def handle_cast({:detach, ref}, state) do
+    {:noreply, drop_session(state, ref)}
   end
 
-  def handle_info({:circuits_uart, _port, data}, %{uart_pid: pid} = state)
+  @impl GenServer
+  def handle_info({:circuits_uart, port, {:error, reason}}, %{uart_pid: pid} = state)
+      when pid != nil do
+    if current_tty?(state, port),
+      do: handle_uart_error(state, pid, reason),
+      else: {:noreply, state}
+  end
+
+  def handle_info({:circuits_uart, port, data}, %{uart_pid: pid} = state)
       when is_binary(data) and pid != nil do
-    {state, acks} = deliver_rx(state, data)
-    broadcast_data(state, data, :rx)
-    if acks, do: broadcast_data(state, acks, :tx, origin: :ash_ack)
-    {:noreply, state}
+    if current_tty?(state, port) do
+      {state, acks} = deliver_rx(state, data)
+      broadcast_data(state, data, :rx)
+      if acks, do: broadcast_data(state, acks, :tx, origin: :ash_ack)
+      {:noreply, state}
+    else
+      {:noreply, state}
+    end
   end
 
   def handle_info(:zigbee_reopen, state) do
@@ -510,9 +582,43 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
     {:stop, reason, state}
   end
 
+  # The pusher crashed in its fun: replace it for the next change. No
+  # re-push here, so a fun that always fails can't spin a crash loop.
+  def handle_info({:EXIT, pid, reason}, %{pusher: {pid, fun}} = state) do
+    Logger.warning("Zigbee proxy identity pusher exited: #{inspect(reason)}")
+    {:noreply, %{state | pusher: start_pusher(fun)}}
+  end
+
   def handle_info(_msg, state) do
     {:noreply, state}
   end
+
+  defp handle_uart_error(state, pid, reason) do
+    Logger.warning("Zigbee proxy UART error: #{inspect(reason)}")
+    cleanup_uart(pid)
+    broadcast_lifecycle(state, "uart:port_closed", :uart_port_closed)
+
+    state =
+      %{
+        state
+        | uart_pid: nil,
+          ash: Ash.reset(state.ash),
+          rx_buffer: <<>>,
+          line: @default_line,
+          error?: true
+      }
+      |> schedule_reopen()
+      |> publish_snapshot()
+
+    {:noreply, state}
+  end
+
+  # Circuits.UART active messages carry the tty name ("ttyACM0"); a late
+  # message from a previous UART must not reach the current session.
+  defp current_tty?(%{port_path: path}, port) when is_binary(path) and is_binary(port),
+    do: Path.basename(path) == Path.basename(port)
+
+  defp current_tty?(_state, _port), do: false
 
   @impl GenServer
   def terminate(_reason, state) do
@@ -521,6 +627,8 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
     end
 
     cleanup_uart(state.uart_pid)
+    :persistent_term.erase(state.snapshot_key)
+    stop_pusher(state.pusher)
     :ok
   end
 
@@ -594,7 +702,7 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   end
 
   defp write_acks(state, acks) do
-    case Circuits.UART.write(state.uart_pid, acks, @uart_write_timeout) do
+    case Circuits.UART.write(state.uart_pid, acks, @ack_write_timeout) do
       :ok ->
         acks
 
@@ -673,54 +781,158 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
 
   # -- Open / rescan --
 
-  defp attempt_open(state) do
-    case resolve_port(state) do
-      nil ->
-        schedule_reopen(%{state | port: nil, error?: false})
+  defp attempt_open(state), do: state |> open_resolved() |> publish_snapshot()
 
-      {port_path, display_name, port} ->
-        case state.open_fun.(port_path) do
-          {:ok, uart_pid} ->
-            Logger.info("Zigbee proxy holding #{port_path}")
-
-            state = %{
-              state
-              | uart_pid: uart_pid,
-                port_path: port_path,
-                display_name: display_name,
-                port: port,
-                line: @default_line,
-                modem: @default_modem,
-                ash: Ash.reset(state.ash),
-                rx_buffer: <<>>,
-                error?: false,
-                last_open_error: nil
-            }
-
-            broadcast_lifecycle(state, "uart:port_opened", :uart_port_opened)
-            state
-
-          {:error, reason} ->
-            level = if reason == state.last_open_error, do: :debug, else: :warning
-            Logger.log(level, "Zigbee proxy failed to open #{port_path}: #{inspect(reason)}")
-            schedule_reopen(%{state | port: port, error?: true, last_open_error: reason})
-        end
+  defp preresolve_port(state) do
+    case state.resolver && resolve_port(state) do
+      {_path, _display, port} -> %{state | port: port}
+      _ -> state
     end
   end
 
-  # `{tty, display_name, hardware_row | nil}` or nil. The resolver hands
-  # back `%{path:, display_name:, port:}` (`port` optional); a bare
-  # `:port_path` (tests, manual wiring) uses its basename as the name.
-  defp resolve_port(state) do
-    case state.resolver && state.resolver.() do
-      %{path: path, display_name: display} = resolved ->
-        {path, display, Map.get(resolved, :port)}
-
+  defp open_resolved(state) do
+    case resolve_port(state) do
+      # Keeps the last row (see the moduledoc), but not its tty name: the
+      # tty may be reassigned to another device.
       nil ->
-        if state.port_path do
-          {state.port_path, state.display_name || Path.basename(state.port_path), state.port}
-        end
+        schedule_reopen(%{state | display_name: nil, error?: false})
+
+      {port_path, display_name, port} ->
+        open_port(state, port_path, display_name, port)
     end
+  end
+
+  defp open_port(state, port_path, display_name, port) do
+    case state.open_fun.(port_path) do
+      {:ok, uart_pid} ->
+        Logger.info("Zigbee proxy holding #{port_path}")
+
+        state = %{
+          state
+          | uart_pid: uart_pid,
+            port_path: port_path,
+            display_name: display_name,
+            port: advertised_row(state.port, port),
+            line: @default_line,
+            modem: @default_modem,
+            ash: Ash.reset(state.ash),
+            rx_buffer: <<>>,
+            error?: false,
+            last_open_error: nil
+        }
+
+        broadcast_lifecycle(state, "uart:port_opened", :uart_port_opened)
+        state
+
+      {:error, reason} ->
+        level = if reason == state.last_open_error, do: :debug, else: :warning
+        Logger.log(level, "Zigbee proxy failed to open #{port_path}: #{inspect(reason)}")
+
+        schedule_reopen(%{
+          state
+          | port: advertised_row(state.port, port),
+            error?: true,
+            last_open_error: reason
+        })
+    end
+  end
+
+  # Nothing advertised (late discovery): any stick may be held. Otherwise
+  # only the advertised physical device: same USB serial when both rows
+  # carry a real one, else same `ha_name`.
+  defp same_stick?(nil, _resolved), do: true
+
+  defp same_stick?(%{} = advertised, %{} = resolved) do
+    case {real_serial(advertised), real_serial(resolved)} do
+      {a, b} when is_binary(a) and is_binary(b) -> a == b
+      _ -> advertised[:ha_name] != nil and advertised[:ha_name] == resolved[:ha_name]
+    end
+  end
+
+  defp same_stick?(_advertised, _resolved), do: false
+
+  defp real_serial(%{serial: serial}) when is_binary(serial) and serial not in ["", "—"],
+    do: serial
+
+  defp real_serial(_row), do: nil
+
+  # The advertised row is fixed at init (see the moduledoc): a stick
+  # resolved later is held but not advertised, and a re-resolved row
+  # replaces the advertised one only when it keeps the same HA name, so
+  # the serial-proxy adapter's instance order can't change.
+  defp advertised_row(%{ha_name: name}, %{ha_name: name} = new), do: new
+  defp advertised_row(current, _new), do: current
+
+  # `{tty, display_name, hardware_row | nil}` or nil. The resolver hands
+  # back `%{path:, display_name:, port:}` (`port` optional) or a list of
+  # them (every connected candidate, in order); the one matching the
+  # advertised stick is chosen, else none. With nothing advertised the
+  # first wins. A bare `:port_path` (tests, manual wiring) uses its
+  # basename as the name.
+  defp resolve_port(%{resolver: nil, port_path: path} = state) when is_binary(path),
+    do: {path, state.display_name || Path.basename(path), state.port}
+
+  defp resolve_port(%{resolver: nil}), do: nil
+
+  # With a resolver, never fall back to a remembered path: after an
+  # unplug that tty may be reassigned to a different device.
+  defp resolve_port(state) do
+    state.resolver.()
+    |> List.wrap()
+    |> Enum.map(fn %{path: path, display_name: display} = resolved ->
+      {path, display, Map.get(resolved, :port)}
+    end)
+    |> Enum.find(fn {_path, _display, port} -> same_stick?(state.port, port) end)
+  end
+
+  # A persistent_term write that replaces a term costs a global GC pass,
+  # so the snapshot is only rewritten when it actually changes (never on
+  # the RX path).
+  # `notify?: false` for the initial publish: Espex starts after init
+  # and reads the snapshot itself.
+  defp publish_snapshot(state, notify? \\ true) do
+    snapshot =
+      {self(), %{attached?: state.uart_pid != nil, error?: state.error?, port: state.port}}
+
+    previous = :persistent_term.get(state.snapshot_key, nil)
+
+    if previous != snapshot do
+      :persistent_term.put(state.snapshot_key, snapshot)
+      if notify? and identity_changed?(previous, snapshot), do: notify_change(state)
+    end
+
+    state
+  end
+
+  # `error?` alone doesn't change the identity.
+  defp identity_changed?(
+         {_, %{attached?: attached?, port: port}},
+         {_, %{attached?: attached?, port: port}}
+       ),
+       do: false
+
+  defp identity_changed?(_previous, _snapshot), do: true
+
+  # The pusher reads the snapshot after this publish, so it sees this
+  # change or a later one.
+  defp notify_change(%{pusher: nil}), do: :ok
+  defp notify_change(%{pusher: {pid, _fun}}), do: IdentityPusher.changed(pid)
+
+  # Linked, not supervised: it must not outlive this owner (a `:normal`
+  # stop doesn't take a linked process down, hence stop_pusher/1).
+  defp start_pusher(nil), do: nil
+
+  defp start_pusher(fun) do
+    {:ok, pid} = IdentityPusher.start_link(fun)
+    {pid, fun}
+  end
+
+  defp stop_pusher(nil), do: :ok
+
+  defp stop_pusher({pid, _fun}) do
+    Process.unlink(pid)
+    Process.exit(pid, :kill)
+    :ok
   end
 
   defp schedule_reopen(%{port_path: nil, resolver: nil} = state), do: state
@@ -747,15 +959,18 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   defp cleanup_uart(nil), do: :ok
 
   defp cleanup_uart(pid) when is_pid(pid) do
-    try do
-      Circuits.UART.close(pid)
-      Circuits.UART.stop(pid)
-    catch
-      kind, reason ->
-        Logger.debug("Zigbee proxy UART cleanup failed: #{inspect({kind, reason})}")
-    end
-
+    # Separate guards: a failed close must not leave the linked UART
+    # process alive (it would keep delivering data).
+    guarded(fn -> Circuits.UART.close(pid) end)
+    guarded(fn -> Circuits.UART.stop(pid) end)
     :ok
+  end
+
+  defp guarded(fun) do
+    fun.()
+  catch
+    kind, reason ->
+      Logger.debug("Zigbee proxy UART cleanup failed: #{inspect({kind, reason})}")
   end
 
   # -- TX / PubSub --

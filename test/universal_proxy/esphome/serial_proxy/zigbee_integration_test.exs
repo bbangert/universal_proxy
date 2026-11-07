@@ -20,19 +20,26 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeIntegrationTest do
   @ack_1 hex.("7E 81 60 59 7E")
   @ack_2 hex.("7E 82 50 3A 7E")
 
-  # Generous host bound on SUBSCRIBE + SET_MODE + CONFIGURE acks; USF
-  # 1.3.0 gives the whole esphome-hass:// open 1 s.
-  @open_budget_ms 200
+  # Half of the 1 s USF 1.3.0 gives the whole esphome-hass:// open for
+  # SUBSCRIBE + SET_MODE + CONFIGURE acks: loose enough for a loaded CI
+  # host, tight enough to catch a call timing out on the way.
+  @open_budget_ms 500
 
   setup do
-    owner = ZigbeeFixtures.start_owner!()
     id = System.unique_integer([:positive])
+    server_name = :"zigbee_espex_server_#{id}"
+
+    # Its first push precedes the Espex start, as at boot.
+    owner =
+      ZigbeeFixtures.start_owner!(
+        on_change: fn -> SerialProxy.push_zigbee_identity(server_name) end
+      )
 
     sup =
       start_supervised!(
         {Espex.Supervisor,
          name: :"zigbee_espex_#{id}",
-         server_name: :"zigbee_espex_server_#{id}",
+         server_name: server_name,
          port: 0,
          device_config: [name: "zigbee-test"],
          serial_proxy: SerialProxy}
@@ -44,6 +51,8 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeIntegrationTest do
 
     instance =
       Enum.find_index(SerialProxy.list_instances(), &(&1.port_type == :usb_serial))
+
+    assert is_integer(instance)
 
     Map.merge(owner, %{socket: socket, instance: instance, buffer: make_ref()})
   end
@@ -150,6 +159,24 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeIntegrationTest do
     assert %Proto.UsbDeviceDescriptor{vendor_id: 0x303A, product_id: 0x831A} = identity.usb
   end
 
+  test "pushes the identity live across a UART error and the reopen", ctx do
+    send_msg(ctx, %Proto.SubscribeSerialProxyIdentityRequest{})
+    instance = ctx.instance
+
+    assert %{flags: 1, product: "ZBT-2"} =
+             await(ctx, &match?(%Proto.SerialProxyIdentity{instance: ^instance}, &1))
+
+    send(ctx.server, {:circuits_uart, ZigbeeFixtures.tty(), {:error, :eio}})
+
+    assert %{flags: 0, product: "", serial_number: ""} =
+             await(ctx, &match?(%Proto.SerialProxyIdentity{instance: ^instance}, &1))
+
+    send(ctx.server, :zigbee_reopen)
+
+    assert %{flags: 1, product: "ZBT-2", serial_number: "abcd1234"} =
+             await(ctx, &match?(%Proto.SerialProxyIdentity{instance: ^instance}, &1))
+  end
+
   test "ZHA: SUBSCRIBE, SET_MODE(protocol), CONFIGURE(460800, hardware), then ACKed RX", ctx do
     started = System.monotonic_time(:millisecond)
 
@@ -171,13 +198,19 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeIntegrationTest do
     assert data.instance == ctx.instance
     assert data.data == @data_0
 
-    # Written to the NCP before the bytes were forwarded.
-    assert_received {:uart_write, @ack_1}
+    # The ACK reached the NCP too. That it is written before the bytes
+    # are forwarded is pinned by the owner's unit tests, not here.
+    assert_receive {:uart_write, @ack_1}, 1_000
     assert uart_calls() == []
 
     # Host → NCP writes pass through.
     send_msg(ctx, %Proto.SerialProxyWriteRequest{instance: ctx.instance, data: "host"})
-    assert_receive {:uart_write, "host"}
+    assert_receive {:uart_write, "host"}, 1_000
+
+    # UNSUBSCRIBE releases the session, never the tty.
+    assert request(ctx, :unsubscribe).status == :SERIAL_PROXY_STATUS_OK
+    assert ctx.server |> ZigbeeProxy.status() |> Map.fetch!(:attached?)
+    refute :uart_close in uart_calls()
   end
 
   test "flasher: three SUBSCRIBE/RAW/CONFIGURE/UNSUBSCRIBE cycles keep the tty open", ctx do
