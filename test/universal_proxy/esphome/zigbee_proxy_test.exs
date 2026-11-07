@@ -54,6 +54,11 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
       report(state, :set_rts, {:uart_set_rts, value})
     end
 
+    def handle_call(:close, _from, %{replies: %{close: :exit}} = state) do
+      send(state.test, :uart_close)
+      {:stop, :normal, state}
+    end
+
     def handle_call(:close, _from, state), do: report(state, :close, :uart_close)
 
     def handle_call(_msg, _from, state), do: {:reply, :ok, state}
@@ -150,6 +155,61 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
 
       assert_receive {:uart_port_opened, %{friendly_name: "late-zb", owner: :zigbee_proxy}}
       assert %{attached?: true, port: nil} = ZigbeeProxy.status(server)
+    end
+
+    test "after an unplug a resolver returning nil never reopens the old tty" do
+      test_pid = self()
+      {:ok, slot} = Agent.start_link(fn -> %{path: "ttyZB", display_name: "zb"} end)
+
+      open_fun = fn path ->
+        send(test_pid, {:open_attempt, path})
+        {:ok, fake} = FakeUART.start_link(test_pid)
+        {:ok, fake}
+      end
+
+      server =
+        start_supervised!(
+          {ZigbeeProxy, name: nil, resolver: fn -> Agent.get(slot, & &1) end, open_fun: open_fun}
+        )
+
+      assert_receive {:open_attempt, "ttyZB"}
+      assert ZigbeeProxy.status(server).attached?
+
+      Agent.update(slot, fn _ -> nil end)
+      send(server, {:circuits_uart, "ttyZB", {:error, :eio}})
+      assert %{attached?: false, port: nil} = ZigbeeProxy.status(server)
+
+      send(server, :zigbee_reopen)
+      assert :sys.get_state(server).display_name == nil
+      refute_received {:open_attempt, _}
+      refute ZigbeeProxy.status(server).attached?
+    end
+
+    test "cleanup completes and the proxy reopens when the UART close exits" do
+      %{server: server, fake: fake} = start_proxy!()
+      FakeUART.reply_with(fake, :close, :exit)
+      ref = Process.monitor(fake)
+
+      send(server, {:circuits_uart, "ttyZB", {:error, :eio}})
+      assert_receive :uart_close
+      assert_receive {:DOWN, ^ref, :process, ^fake, _}
+      assert %{attached?: false, error?: true} = ZigbeeProxy.status(server)
+
+      send(server, :zigbee_reopen)
+      assert_receive {:fake_uart, _new}
+      assert ZigbeeProxy.status(server).attached?
+    end
+
+    test "messages from another tty are ignored" do
+      %{server: server} = start_proxy!()
+      subscribed!(server)
+
+      send(server, {:circuits_uart, "ttyOLD", "stale"})
+      send(server, {:circuits_uart, "ttyOLD", {:error, :eio}})
+      _ = :sys.get_state(server)
+
+      assert ZigbeeProxy.status(server).attached?
+      refute_received {:espex_serial_data, _, _}
     end
 
     test "a failed open reports error? and keeps the row" do

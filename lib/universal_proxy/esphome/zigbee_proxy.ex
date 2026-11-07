@@ -438,25 +438,23 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   end
 
   @impl GenServer
-  def handle_info({:circuits_uart, _port, {:error, reason}}, %{uart_pid: pid} = state)
+  def handle_info({:circuits_uart, port, {:error, reason}}, %{uart_pid: pid} = state)
       when pid != nil do
-    Logger.warning("Zigbee proxy UART error: #{inspect(reason)}")
-    cleanup_uart(pid)
-    broadcast_lifecycle(state, "uart:port_closed", :uart_port_closed)
-
-    state =
-      %{state | uart_pid: nil, ash: Ash.reset(state.ash), rx_buffer: <<>>, error?: true}
-      |> schedule_reopen()
-
-    {:noreply, state}
+    if current_tty?(state, port),
+      do: handle_uart_error(state, pid, reason),
+      else: {:noreply, state}
   end
 
-  def handle_info({:circuits_uart, _port, data}, %{uart_pid: pid} = state)
+  def handle_info({:circuits_uart, port, data}, %{uart_pid: pid} = state)
       when is_binary(data) and pid != nil do
-    {state, acks} = deliver_rx(state, data)
-    broadcast_data(state, data, :rx)
-    if acks, do: broadcast_data(state, acks, :tx, origin: :ash_ack)
-    {:noreply, state}
+    if current_tty?(state, port) do
+      {state, acks} = deliver_rx(state, data)
+      broadcast_data(state, data, :rx)
+      if acks, do: broadcast_data(state, acks, :tx, origin: :ash_ack)
+      {:noreply, state}
+    else
+      {:noreply, state}
+    end
   end
 
   def handle_info(:zigbee_reopen, state) do
@@ -485,6 +483,25 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   def handle_info(_msg, state) do
     {:noreply, state}
   end
+
+  defp handle_uart_error(state, pid, reason) do
+    Logger.warning("Zigbee proxy UART error: #{inspect(reason)}")
+    cleanup_uart(pid)
+    broadcast_lifecycle(state, "uart:port_closed", :uart_port_closed)
+
+    state =
+      %{state | uart_pid: nil, ash: Ash.reset(state.ash), rx_buffer: <<>>, error?: true}
+      |> schedule_reopen()
+
+    {:noreply, state}
+  end
+
+  # Circuits.UART active messages carry the tty name ("ttyACM0"); a late
+  # message from a previous UART must not reach the current session.
+  defp current_tty?(%{port_path: path}, port) when is_binary(path) and is_binary(port),
+    do: Path.basename(path) == Path.basename(port)
+
+  defp current_tty?(_state, _port), do: false
 
   @impl GenServer
   def terminate(_reason, state) do
@@ -648,7 +665,7 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   defp attempt_open(state) do
     case resolve_port(state) do
       nil ->
-        schedule_reopen(%{state | port: nil, error?: false})
+        schedule_reopen(%{state | port: nil, display_name: nil, error?: false})
 
       {port_path, display_name, port} ->
         case state.open_fun.(port_path) do
@@ -689,7 +706,9 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
         {path, display, Map.get(resolved, :port)}
 
       nil ->
-        if state.port_path do
+        # With a resolver, never fall back to a remembered path: after an
+        # unplug that tty may be reassigned to a different device.
+        if is_nil(state.resolver) and state.port_path do
           {state.port_path, state.display_name || Path.basename(state.port_path), state.port}
         end
     end
@@ -719,15 +738,18 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   defp cleanup_uart(nil), do: :ok
 
   defp cleanup_uart(pid) when is_pid(pid) do
-    try do
-      Circuits.UART.close(pid)
-      Circuits.UART.stop(pid)
-    catch
-      kind, reason ->
-        Logger.debug("Zigbee proxy UART cleanup failed: #{inspect({kind, reason})}")
-    end
-
+    # Separate guards: a failed close must not leave the linked UART
+    # process alive (it would keep delivering data).
+    guarded(fn -> Circuits.UART.close(pid) end)
+    guarded(fn -> Circuits.UART.stop(pid) end)
     :ok
+  end
+
+  defp guarded(fun) do
+    fun.()
+  catch
+    kind, reason ->
+      Logger.debug("Zigbee proxy UART cleanup failed: #{inspect({kind, reason})}")
   end
 
   # -- TX / PubSub --
