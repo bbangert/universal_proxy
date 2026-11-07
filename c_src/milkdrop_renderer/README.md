@@ -73,7 +73,7 @@ A malformed or unknown command gives `error` with `reason: "bad_command"`.
 | `released` | Ack for `release`. |
 | `loading` | `preset` (preset id): about to load and warm up this preset; written before any GPU work for it (its level, preload, warm-up frame), for every candidate tried (a failed one is followed by `skip`). A vc4 GPU hang can reset the whole device (the kernel logs `[drm] Resetting GPU.` and the Pi reboots within seconds); the BEAM persists this so the preset is skipped after the reboot. A `preset` event that keeps the same preset (`lock`, `unlock`, `step_down`) has no `loading` before it. |
 | `preset` | `file` (preset id), `locked`, `rung` (internal WxH), `cause` (`start`, `take`, `rotate`, `next`, `prev`, `eject`, `lock`, `unlock`, `step_down`), `cut` (true = no blend). `eject` is also the cut away from a `high_frequency` preset (it can name the preset already playing: its blend in was completed). Sent whenever the showing preset, its lock or its rung changes. |
-| `skip` | `preset`, `reason`, optional `message` (the first line of the error): the preset can't be drawn here (persist it for this pack version). Reasons: `register_allocate` (vc4 register allocation failed), `translate_error` / `compile_error` / `link_error` (a warp or composite shader failed and projectM fell back to its default), `shader_error` (another error-level projectM log during the warm-up), `load_failed` (unreadable or unparsable preset), `draw_dropped` (sentinel pixel untouched), `budget` (below the floor at the last rung). |
+| `skip` | `preset`, `reason`, optional `message` (the first line of the error): the preset can't be drawn here (persist it for this pack version). Reasons: `register_allocate` (vc4 register allocation failed), `translate_error` / `compile_error` / `link_error` (a warp or composite shader failed and projectM fell back to its default), `shader_error` (another error-level projectM log during the warm-up), `load_failed` (unreadable or unparsable preset), `draw_dropped` (sentinel pixel untouched), `budget` (below the floor at the last rung), `gpu_hang` (the kernel reset the GPU while it was loading or showing; `message` is the kernel's line; see "Failure detection"). |
 | `stats` | Every `--stats-s`: `fps` (presented), `frames`, `flip_ms` (mean flip-to-flip), `frame_ms` / `frame_ms_max` (CPU render + submit), `late` (flips past their slot), `rung`, `interval`, `temp_c`, `arm_mhz`, `gpu_ms` (only with `GL_EXT_disjoint_timer_query`, which vc4 lacks), `preset`, `pcm_ok` / `pcm_silent` (frames with ring audio / silence), `warmups`, `warmup_ms_max`, `shader_stages` / `cached_stages` (translated shader stages warmed up, and those read from the pack's shader cache), `stderr_discarded` (driver stderr bytes dropped). |
 | `error` | `reason`, optional `message`: a non-fatal problem (`bad_command`, `master_timeout`, `take_failed`, `driver`, `register_allocate`, `thermal_drop`, `locked_refused`, …), or the cause just before a failing `exiting`. |
 | `exiting` | `reason`: `requested`, `eof`, `signal`, `thermal` (exit 0), or a failure — `manifest`, `no_presets`, `output`, `gl`, `projectm`, `kms`, `output_lost` (exit 1), `usage` (exit 2). |
@@ -272,11 +272,23 @@ reopened if the player replaces the file. `src/pcm_tap.h` is a verbatim copy of
   gives `translate_error`, `compile_error`, `link_error` or `load_failed`,
   with the failing stage and message; other error-level log messages during
   the warm-up give `shader_error`.
-- **Device resets.** Some presets hang the vc4 GPU on rpi3; the kernel's
-  hang recovery then takes the whole device down (it reboots within
-  ~7 s), which nothing in userspace can catch. The `loading` event, sent
-  before each warm-up, lets the BEAM persist the preset being loaded and
-  skip it (`device_reset`) after the reboot.
+- **GPU resets.** Some presets hang the vc4 GPU on rpi3. The kernel logs
+  `[drm] Resetting GPU.` (v3d: `Resetting GPU for hang.`) and usually
+  recovers, but a reset can also take the whole device down about 7 s
+  later. The renderer (root) follows `/dev/kmsg` from its end (opened
+  non-blocking at start; unavailable means no watch, logged): it is read
+  right after each warm-up's GPU wait and once per loop round. A reset
+  seen after a warm-up fails that candidate (`skip` `gpu_hang`); one seen
+  otherwise is blamed on the candidate whose warm-up failed within the
+  last second, else on the preset showing, which gets `skip` `gpu_hang`
+  and is cut away from at once (before a `take` too: the prepared frame is
+  replaced). The `skip` goes out before anything else, so the BEAM can
+  persist it before a fatal reset. Throttle: one `gpu_hang` skip per
+  preset per run, and a reset within 3 s of the last one seen is taken as
+  the same hang.
+- **Device resets.** A fatal reset leaves no time for any of that, so the
+  `loading` event, sent before each warm-up, lets the BEAM persist the
+  preset being loaded and skip it (`device_reset`) after the reboot.
 
 A failed preset is skipped and reported. A preload failure leaves the
 playing preset (and its blend) alone, so the next pick blends in as usual;
@@ -325,7 +337,8 @@ batches and exhaustion (a failed activation included), the cost guard ladder, fr
 dispatch order, the command drain (nothing after `exit`), the exit guard
 (a hung shutdown still exits in budget, full stdout/stderr included), the
 test tone's tempo,
-the thermal guard, the stderr classifier and capture, and PCM ring
+the thermal guard, the stderr classifier and capture, the GPU reset
+watch (kmsg parsing, following a file from its end, the throttle), and PCM ring
 alignment against sendspin_player's real ring writer.
 
 ## Checks

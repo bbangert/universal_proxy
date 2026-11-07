@@ -23,6 +23,7 @@
 #include "frame_pacer.h"
 #include "gl_output.h"
 #include "json.h"
+#include "kmsg_watch.h"
 #include "kms.h"
 #include "manifest.h"
 #include "options.h"
@@ -70,6 +71,9 @@ constexpr double CUT_BELOW_FPS = 25.0;
 // commands); selection resumes after.
 constexpr int SWITCH_BATCH = 8;
 constexpr int64_t FLIP_TIMEOUT_US = 1000000;
+// A GPU reset read this soon after a warm-up that failed for another
+// reason is blamed on that candidate, not on the preset still showing.
+constexpr int64_t RESET_BLAME_ATTEMPT_US = 1000000;
 
 struct InFlight {
     gbm_bo* bo = nullptr;
@@ -90,6 +94,11 @@ private:
     Options opt_;
     ExitGuard exit_guard_{&g_signal};
     StderrCapture capture_;
+    KmsgWatch kmsg_;
+    GpuResetThrottle gpu_resets_;
+    // The last warm-up that failed, and when (see RESET_BLAME_ATTEMPT_US).
+    std::string failed_attempt_;
+    int64_t failed_attempt_us_ = 0;
     Manifest manifest_;
     std::unique_ptr<PresetManager> presets_;
     std::unique_ptr<CostGuard> guard_;
@@ -169,6 +178,8 @@ private:
     bool apply_level();
     void announce_preset(const char* cause, bool cut);
     void skip_current(const char* reason);
+    bool gpu_reset_during(const PresetEntry& entry, std::string& message);
+    void check_gpu_resets();
 
     void housekeeping(int64_t now);
     void report_driver_errors();
@@ -409,6 +420,13 @@ bool App::warm_up(const PresetEntry& entry, bool smooth, std::string& reason, st
             }
         }
     }
+    // The readback above waited for the GPU, so a reset the warm-up caused
+    // has been logged by now.
+    std::string reset_message;
+    if (gpu_reset_during(entry, reset_message)) {
+        reason = "gpu_hang";
+        message = reset_message;
+    }
     if (!activated) vis_.discard();
 
     const int64_t end = monotonic_us();
@@ -416,6 +434,10 @@ bool App::warm_up(const PresetEntry& entry, bool smooth, std::string& reason, st
     stall_us_ += took;
     st_warmups_++;
     st_warmup_max_ = std::max(st_warmup_max_, static_cast<double>(took) / 1000.0);
+    if (!reason.empty()) {
+        failed_attempt_ = entry.file;
+        failed_attempt_us_ = end;
+    }
     log_msg("warm-up %s: preload %.0f ms (stages %u, cached %u), activate + frame %.0f ms%s%s",
             entry.file.c_str(), static_cast<double>(preloaded - start) / 1000.0,
             static_cast<unsigned>(std::popcount(lr.shader_stages)),
@@ -476,6 +498,49 @@ void App::skip_current(const char* reason) {
     emit_line(event_skip(current_->file, reason));
     presets_->skip(current_->file);
     requested_ = Switch::Eject;
+}
+
+// A GPU reset logged during `entry`'s warm-up, not yet reported.
+bool App::gpu_reset_during(const PresetEntry& entry, std::string& message) {
+    if (kmsg_.poll_resets(&message) == 0) return false;
+    if (gpu_resets_.report(entry.file, monotonic_us())) {
+        log_msg("GPU reset while warming up %s", entry.file.c_str());
+        return true;
+    }
+    log_msg("GPU reset while warming up %s (taken as the same hang as the last one)", entry.file.c_str());
+    return false;
+}
+
+// A GPU reset outside a warm-up: blamed on the candidate whose warm-up
+// just failed (its reset was logged late), else on the preset showing,
+// which is cut away from. A reset can take the whole device down seconds
+// later, so the skip goes out first.
+void App::check_gpu_resets() {
+    std::string message;
+    if (kmsg_.poll_resets(&message) == 0) return;
+    const int64_t now = monotonic_us();
+    const bool attempt = !failed_attempt_.empty() && now - failed_attempt_us_ < RESET_BLAME_ATTEMPT_US &&
+                         (current_ == nullptr || current_->file != failed_attempt_);
+    const std::string blamed = attempt ? failed_attempt_ : current_ != nullptr ? current_->file : "";
+    if (blamed.empty()) {
+        log_msg("GPU reset with no preset to blame: %s", message.c_str());
+        return;
+    }
+    if (!gpu_resets_.report(blamed, now)) {
+        log_msg("GPU reset (%s), taken as the same hang as the last one", blamed.c_str());
+        return;
+    }
+    log_msg("GPU reset while %s %s; skipping it", blamed.c_str(), attempt ? "was warming up" : "was showing");
+    emit_line(event_skip(blamed, "gpu_hang", message));
+    if (attempt) return;  // already skipped for this run; the showing preset carries on
+    presets_->skip(blamed);
+    requested_ = Switch::Eject;
+    if (phase_ == Phase::Prepared && opt_.headless_frames == 0) {
+        // `take` shows the prepared frame: replace it with another preset's.
+        if (queued_.bo != nullptr) gbm_surface_release_buffer(kms_.surface(), queued_.bo);
+        queued_ = {};
+        apply_switch();
+    }
 }
 
 // Photosensitivity: while high_frequency presets are off, a switch away
@@ -855,6 +920,7 @@ void App::loop() {
             },
             [this] { read_stdin(); });
         if (!exit_reason_.empty()) break;
+        check_gpu_resets();
         housekeeping(monotonic_us());
         if (phase_ == Phase::Presenting) present_step();
     }
@@ -875,6 +941,7 @@ void App::loop_headless() {
             pollfd p{STDIN_FILENO, POLLIN, 0};
             if (poll(&p, 1, 0) > 0) read_stdin();
         }
+        check_gpu_resets();
         const int64_t now = monotonic_us();
         housekeeping(now);
         if (!presets_->locked() && requested_ == Switch::None &&
@@ -912,6 +979,8 @@ void App::finish() {
 
 int App::run() {
     if (!capture_.start()) log_msg("stderr capture unavailable; driver errors go to stderr");
+    std::string kmsg_err;
+    if (!kmsg_.open("/dev/kmsg", kmsg_err)) log_msg("GPU reset watch unavailable (%s)", kmsg_err.c_str());
     std::signal(SIGPIPE, SIG_IGN);
     // No SA_RESTART: a signal interrupts a blocking call instead of
     // resuming it.
@@ -940,6 +1009,7 @@ int App::run() {
     gl_.destroy();
     kms_.close();
     capture_.stop();
+    kmsg_.close();
     exit_guard_.stop();
     return code;
 }

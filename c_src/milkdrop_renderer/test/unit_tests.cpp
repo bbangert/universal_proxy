@@ -5,6 +5,7 @@
 #include "exit_guard.h"
 #include "frame_pacer.h"
 #include "json.h"
+#include "kmsg_watch.h"
 #include "manifest.h"
 #include "options.h"
 #include "output_select.h"
@@ -1291,6 +1292,57 @@ static void test_tone() {
     CHECK(frame_rate.position() == 576 + uint64_t{3600} * TestTone::RATE);
 }
 
+// ---------------------------------------------------------------- kmsg
+
+static void append_file(const std::string& path, const std::string& text) {
+    FILE* f = std::fopen(path.c_str(), "a");
+    std::fputs(text.c_str(), f);
+    std::fclose(f);
+}
+
+static void test_kmsg_watch() {
+    // vc4 (rpi3) and v3d (rpi4/5) wording, as /dev/kmsg records.
+    CHECK(is_gpu_reset("6,4242,512345678,-;[drm] Resetting GPU."));
+    CHECK(is_gpu_reset("3,99,1,-;[drm:v3d_gpu_reset_for_timeout [v3d]] *ERROR* Resetting GPU for hang."));
+    CHECK(!is_gpu_reset("6,4243,512345679,-;vc4-drm soc:gpu: [drm] fb0: vc4drmfb frame buffer device"));
+    CHECK(!is_gpu_reset(" SUBSYSTEM=platform"));
+    CHECK(kmsg_message("6,4242,512345678,-;[drm] Resetting GPU.") == "[drm] Resetting GPU.");
+    CHECK(kmsg_message("12,7,3,c,caller=T1;a;b") == "a;b");
+    CHECK(kmsg_message("no record header; here") == "no record header; here");
+
+    // Opened at the end: earlier lines are never seen.
+    const std::string path = tmp_path("kmsg");
+    fs::remove(path);
+    append_file(path, "6,1,1,-;[drm] Resetting GPU.\n");
+    KmsgWatch w;
+    std::string err, msg;
+    CHECK(!KmsgWatch().open(tmp_path("kmsg_missing"), err) && !err.empty());
+    CHECK(w.open(path, err) && w.active());
+    CHECK(w.poll_resets(&msg) == 0 && msg.empty());
+
+    append_file(path, "6,2,2,-;usb 1-1.3: new device\n SUBSYSTEM=usb\n6,3,3,-;[drm] Resetting GPU.\n");
+    CHECK(w.poll_resets(&msg) == 1 && msg == "[drm] Resetting GPU.");
+    CHECK(w.poll_resets(&msg) == 0);
+
+    // A line split across reads counts once, when it is complete.
+    append_file(path, "6,4,4,-;[drm] Resetting");
+    CHECK(w.poll_resets() == 0);
+    append_file(path, " GPU.\n6,5,5,-;[drm] Resetting GPU.\n");
+    CHECK(w.poll_resets() == 2);
+    w.close();
+    CHECK(!w.active() && w.poll_resets() == 0);
+    fs::remove(path);
+
+    // One skip per preset; resets within the window are the same hang.
+    GpuResetThrottle t(3000000);
+    CHECK(t.report("a.milk", 10000000));
+    CHECK(!t.report("b.milk", 11000000));  // 1 s later: the same hang
+    CHECK(!t.report("a.milk", 60000000));  // ~50 s later, same preset: already skipped
+    CHECK(t.report("b.milk", 70000000));
+    CHECK(!t.report("c.milk", 72000000));  // window counts from the last reset seen
+    CHECK(t.report("c.milk", 76000000));
+}
+
 int main() {
     test_json();
     test_options();
@@ -1315,6 +1367,7 @@ int main() {
     test_poll_round();
     test_drain_lines();
     test_exit_guard();
+    test_kmsg_watch();
     if (g_failures == 0) std::printf("OK\n");
     return g_failures == 0 ? 0 : 1;
 }

@@ -20,6 +20,7 @@ set(MILKDROP_CORE_SOURCES
     src/exit_guard.cpp
     src/frame_pacer.cpp
     src/json.cpp
+    src/kmsg_watch.cpp
     src/manifest.cpp
     src/options.cpp
     src/output_select.cpp
