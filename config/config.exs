@@ -106,8 +106,7 @@ config :universal_proxy, UniversalProxy.Cec,
 # only). `:idle_ms` / `:party_idle_ms` are the idle-blank timeouts.
 #
 # `:milkdrop` turns on the MilkDrop visualizer (`UniversalProxy.MilkDrop`):
-# it has effect only on rpi3/rpi4/rpi5 and stays false until the mode is
-# validated on hardware.
+# it has effect only on rpi3/rpi4/rpi5 (config/target.exs turns it on).
 config :universal_proxy, UniversalProxy.Display,
   enabled: false,
   renderer: UniversalProxy.Display.Renderer.Null,
@@ -117,12 +116,13 @@ config :universal_proxy, UniversalProxy.Display,
   party_idle_ms: 600_000
 
 # The MilkDrop preset pack the device downloads on first use
-# (`UniversalProxy.MilkDrop.Pack`): a release asset pinned by version, URL
-# and SHA-256. No pack is published yet, so nothing is pinned.
+# (`UniversalProxy.MilkDrop.Pack`): a release asset of
+# github.com/bbangert/up-milkdrop-pack pinned by version, URL and SHA-256.
 config :universal_proxy, UniversalProxy.MilkDrop.Pack,
-  version: nil,
-  url: nil,
-  sha256: nil
+  version: "2026.11.1",
+  url:
+    "https://github.com/bbangert/up-milkdrop-pack/releases/download/2026.11.1/up-milkdrop-pack-2026.11.1.tar.gz",
+  sha256: "5acd020220887497cb6876df7e9a187e97719945ef246a186841c26d55a2b89f"
 
 # Sendspin display roles (metadata, controller, color, artwork, visualizer)
 # for the HDMI TV UI, carried by one HDMI output's player (see
