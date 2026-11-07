@@ -648,6 +648,265 @@ defmodule UniversalProxy.HardwareTest do
     end
   end
 
+  describe "ZWA-2 / ZBT-2 disambiguation by USB product string" do
+    defp nabucasa_port(vid, pid, extra) do
+      [port] =
+        Hardware.list_ports(
+          slots: nil,
+          enumerated: %{
+            "ttyACM0" => Map.merge(%{vendor_id: vid, product_id: pid, serial_number: "S1"}, extra)
+          },
+          bus_paths: %{"ttyACM0" => "1-1.1"},
+          saved_configs: %{},
+          line_settings: %{},
+          in_use_ports: MapSet.new(),
+          zwave_claim: nil,
+          tty_class_dir: "/nonexistent-#{System.unique_integer([:positive])}"
+        )
+
+      port
+    end
+
+    test "ZBT-2 product on 303A:4001 is a locked Zigbee port, not a ZWA-2" do
+      port = nabucasa_port(0x303A, 0x4001, %{description: "Home Assistant Connect ZBT-2"})
+
+      assert port.kind == :zigbee
+      assert port.kind_label == "Zigbee"
+      assert port.name == "Home Assistant Connect ZBT-2"
+      assert port.vendor == "Nabu Casa"
+      assert port.chip == "EFR32MG24"
+      assert port.detection == :auto
+      assert port.configured == true
+      assert port.locked == true
+      assert port.vidpid == "303A:4001"
+    end
+
+    test "ZBT-2 product on 303A:831A is a locked Zigbee port" do
+      port = nabucasa_port(0x303A, 0x831A, %{description: "Home Assistant Connect ZBT-2"})
+
+      assert port.kind == :zigbee
+      assert port.locked == true
+      assert port.vidpid == "303A:831A"
+    end
+
+    test "ZBT-2 matches on the :product key too" do
+      port = nabucasa_port(0x303A, 0x831A, %{product: "ZBT-2"})
+      assert port.kind == :zigbee
+    end
+
+    test "ZWA-2 product on 303A:4001 stays Z-Wave" do
+      port = nabucasa_port(0x303A, 0x4001, %{description: "Home Assistant Connect ZWA-2"})
+
+      assert port.kind == :zwave
+      assert port.name == "Home Assistant Connect ZWA-2"
+      assert port.chip == "Silicon Labs EFR32ZG23"
+      assert port.locked == true
+    end
+
+    test "ZWA-2 product on another 303A PID is still Z-Wave" do
+      port = nabucasa_port(0x303A, 0x831A, %{description: "Home Assistant Connect ZWA-2"})
+      assert port.kind == :zwave
+    end
+
+    test "303A:4001 with no product string falls back to the ZWA-2 table entry" do
+      port = nabucasa_port(0x303A, 0x4001, %{})
+      assert port.kind == :zwave
+      assert port.locked == true
+    end
+
+    test "303A:4001 with an unrelated product string stays a ZWA-2" do
+      port = nabucasa_port(0x303A, 0x4001, %{description: "USB JTAG/serial debug unit"})
+      assert port.kind == :zwave
+    end
+
+    test "303A:831A with no product string is generic and unconfigured" do
+      port = nabucasa_port(0x303A, 0x831A, %{})
+
+      assert port.kind == nil
+      assert port.detection == :unknown
+      assert port.configured == false
+      assert port.locked == false
+    end
+
+    test "303A:831A with an unrelated product string is generic and unconfigured" do
+      port = nabucasa_port(0x303A, 0x831A, %{description: "Some ESP32-S3 board"})
+      assert port.kind == nil
+      assert port.configured == false
+    end
+
+    test "the product match is case- and hyphen-insensitive" do
+      for product <- ["zbt-2", "ZBT2", "zbt2", "Home Assistant Connect ZBT-2", "HA ZBT-2 (v2)"] do
+        port = nabucasa_port(0x303A, 0x831A, %{description: product})
+        assert port.kind == :zigbee, "expected #{inspect(product)} to be Zigbee"
+      end
+
+      for product <- ["zwa-2", "ZWA2", "Home Assistant Connect ZWA-2"] do
+        port = nabucasa_port(0x303A, 0x831A, %{description: product})
+        assert port.kind == :zwave, "expected #{inspect(product)} to be Z-Wave"
+      end
+    end
+
+    test "a ZBT-2 product string under another vendor id is not Zigbee" do
+      port = nabucasa_port(0x10C4, 0xEA60, %{description: "ZBT-2"})
+
+      refute port.kind == :zigbee
+      assert port.locked == false
+    end
+
+    test "a saved port type cannot override the locked Zigbee kind" do
+      [port] =
+        Hardware.list_ports(
+          slots: nil,
+          enumerated: %{
+            "ttyACM0" => %{
+              vendor_id: 0x303A,
+              product_id: 0x831A,
+              description: "Home Assistant Connect ZBT-2",
+              serial_number: "S1"
+            }
+          },
+          bus_paths: %{"ttyACM0" => "1-1.1"},
+          saved_configs: %{
+            {"1-1.1", 0x303A, 0x831A} => %{port_type: :ttl, friendly_name: "Mine"}
+          },
+          line_settings: %{},
+          in_use_ports: MapSet.new(),
+          zwave_claim: nil
+        )
+
+      assert port.kind == :zigbee
+      assert port.detection == :auto
+    end
+  end
+
+  describe "list_ports/1 USB descriptors for Zigbee ports" do
+    # Fake /sys/class/tty + /sys/bus/usb/devices trees: the tty symlink
+    # target carries the interface dir name, which locates the sysfs files.
+    setup do
+      root = Path.join(System.tmp_dir!(), "uph-usbdesc-#{System.unique_integer([:positive])}")
+      tty_dir = Path.join(root, "tty")
+      usb_dir = Path.join(root, "usb")
+      File.mkdir_p!(tty_dir)
+      File.mkdir_p!(usb_dir)
+      on_exit(fn -> File.rm_rf!(root) end)
+      {:ok, tty_dir: tty_dir, usb_dir: usb_dir}
+    end
+
+    defp link_tty(tty_dir, tty, interface_dir) do
+      bus = interface_dir |> String.split(":") |> hd()
+
+      File.ln_s!(
+        "../../devices/platform/soc/usb1/1-1/#{bus}/#{interface_dir}/tty/#{tty}",
+        Path.join(tty_dir, tty)
+      )
+    end
+
+    defp write_attrs(dir, attrs) do
+      File.mkdir_p!(dir)
+      Enum.each(attrs, fn {file, value} -> File.write!(Path.join(dir, file), value <> "\n") end)
+    end
+
+    defp list(tty_dir, usb_dir, enumerated) do
+      Hardware.list_ports(
+        slots: nil,
+        enumerated: enumerated,
+        tty_class_dir: tty_dir,
+        usb_devices_dir: usb_dir,
+        saved_configs: %{},
+        line_settings: %{},
+        in_use_ports: MapSet.new(),
+        zwave_claim: nil
+      )
+    end
+
+    @zbt2_enum %{
+      vendor_id: 0x303A,
+      product_id: 0x831A,
+      description: "Home Assistant Connect ZBT-2",
+      serial_number: "S1"
+    }
+
+    test "reads bcdDevice, interface number/class and iInterface", %{tty_dir: t, usb_dir: u} do
+      link_tty(t, "ttyACM0", "1-1.3:1.0")
+      write_attrs(Path.join(u, "1-1.3"), [{"bcdDevice", "0100"}])
+
+      write_attrs(Path.join(u, "1-1.3:1.0"), [
+        {"bInterfaceNumber", "00"},
+        {"bInterfaceClass", "02"},
+        {"interface", "ZBT-2 Zigbee"}
+      ])
+
+      [port] = list(t, u, %{"ttyACM0" => @zbt2_enum})
+
+      assert port.kind == :zigbee
+
+      assert port.usb_descriptor == %{
+               bcd_device: 0x0100,
+               interface_number: 0,
+               interface_class: 0x02,
+               interface_description: "ZBT-2 Zigbee"
+             }
+    end
+
+    test "hex attributes parse as hex and a missing interface file is nil",
+         %{tty_dir: t, usb_dir: u} do
+      link_tty(t, "ttyACM0", "1-1.2:1.2")
+      write_attrs(Path.join(u, "1-1.2"), [{"bcdDevice", "021a"}])
+
+      write_attrs(Path.join(u, "1-1.2:1.2"), [
+        {"bInterfaceNumber", "02"},
+        {"bInterfaceClass", "0a"}
+      ])
+
+      [port] = list(t, u, %{"ttyACM0" => @zbt2_enum})
+
+      assert port.usb_descriptor == %{
+               bcd_device: 0x021A,
+               interface_number: 2,
+               interface_class: 0x0A,
+               interface_description: nil
+             }
+    end
+
+    test "absent sysfs files yield nil fields rather than failing", %{tty_dir: t, usb_dir: u} do
+      link_tty(t, "ttyACM0", "1-1.3:1.0")
+
+      [port] = list(t, u, %{"ttyACM0" => @zbt2_enum})
+
+      assert port.usb_descriptor == %{
+               bcd_device: nil,
+               interface_number: nil,
+               interface_class: nil,
+               interface_description: nil
+             }
+    end
+
+    test "is nil when the tty has no sysfs symlink", %{tty_dir: t, usb_dir: u} do
+      [port] = list(t, u, %{"ttyACM0" => @zbt2_enum})
+
+      assert port.kind == :zigbee
+      assert port.usb_descriptor == nil
+    end
+
+    test "non-Zigbee ports never read descriptors", %{tty_dir: t, usb_dir: u} do
+      link_tty(t, "ttyACM0", "1-1.3:1.0")
+      write_attrs(Path.join(u, "1-1.3"), [{"bcdDevice", "0100"}])
+
+      [port] =
+        list(t, u, %{
+          "ttyACM0" => %{
+            vendor_id: 0x303A,
+            product_id: 0x4001,
+            description: "Home Assistant Connect ZWA-2",
+            serial_number: "S2"
+          }
+        })
+
+      assert port.kind == :zwave
+      assert port.usb_descriptor == nil
+    end
+  end
+
   describe "list_ports/1 sysfs walk" do
     # Builds a fake /sys/class/tty/ tree with matching symlinks so the
     # parse_bus_path/1 logic gets exercised end-to-end.

@@ -151,4 +151,86 @@ defmodule UniversalProxy.ESPHome.SupervisorTest do
       assert Keyword.get_values(merged, :devices) == [@devices]
     end
   end
+
+  describe "pick_zwave_port/3" do
+    alias UniversalProxy.Hardware
+
+    defp ports(enumerated, bus_paths) do
+      Hardware.list_ports(
+        slots: nil,
+        enumerated: enumerated,
+        bus_paths: bus_paths,
+        saved_configs: %{},
+        line_settings: %{},
+        in_use_ports: MapSet.new(),
+        zwave_claim: nil,
+        tty_class_dir: "/nonexistent-#{System.unique_integer([:positive])}"
+      )
+    end
+
+    defp zbt2(product_id) do
+      %{
+        vendor_id: 0x303A,
+        product_id: product_id,
+        manufacturer: "Nabu Casa",
+        description: "Home Assistant Connect ZBT-2",
+        serial_number: "ZB0001"
+      }
+    end
+
+    test "claims a ZWA-2 by its auto-classified kind" do
+      ports =
+        ports(
+          %{
+            "ttyACM0" => %{
+              vendor_id: 0x303A,
+              product_id: 0x4001,
+              description: "Home Assistant Connect ZWA-2",
+              serial_number: "DH001K8R"
+            }
+          },
+          %{"ttyACM0" => "1-1.1"}
+        )
+
+      assert %{path: "ttyACM0"} = ESPHomeSupervisor.pick_zwave_port(ports, %{}, [])
+    end
+
+    test "never returns a ZBT-2, whatever PID it enumerates with" do
+      for pid <- [0x4001, 0x831A] do
+        ports = ports(%{"ttyACM0" => zbt2(pid)}, %{"ttyACM0" => "1-1.1"})
+        assert [%{kind: :zigbee}] = ports
+        assert ESPHomeSupervisor.pick_zwave_port(ports, %{}, []) == nil
+      end
+    end
+
+    test "a stale saved :zwave config on a ZBT-2's port is ignored (locked ports ignore saved config)" do
+      for pid <- [0x4001, 0x831A] do
+        ports = ports(%{"ttyACM0" => zbt2(pid)}, %{"ttyACM0" => "1-1.1"})
+        key = {"1-1.1", 0x303A, pid}
+
+        config = %{
+          port_type: :zwave,
+          slot_sub: "1-1.1",
+          vendor_id: 0x303A,
+          product_id: pid
+        }
+
+        assert ESPHomeSupervisor.pick_zwave_port(ports, %{key => "ttyACM0"}, [config]) == nil
+      end
+    end
+
+    test "a saved :zwave override on an unlocked generic port still wins" do
+      ports =
+        ports(
+          %{"ttyUSB0" => %{vendor_id: 0x10C4, product_id: 0xEA60, serial_number: "X"}},
+          %{"ttyUSB0" => "1-1.2"}
+        )
+
+      config = %{port_type: :zwave, slot_sub: "1-1.2", vendor_id: 0x10C4, product_id: 0xEA60}
+      key = {"1-1.2", 0x10C4, 0xEA60}
+
+      assert %{path: "ttyUSB0"} =
+               ESPHomeSupervisor.pick_zwave_port(ports, %{key => "ttyUSB0"}, [config])
+    end
+  end
 end

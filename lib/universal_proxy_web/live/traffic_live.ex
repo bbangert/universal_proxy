@@ -192,6 +192,7 @@ defmodule UniversalProxyWeb.TrafficLive do
   defp format_ts(_), do: "—"
 
   defp proto_label(:zwave), do: "Z-Wave"
+  defp proto_label(:zigbee), do: "Zigbee"
   defp proto_label(:ir), do: "IR"
   defp proto_label(:rs232), do: "RS-232"
   defp proto_label(:rs485), do: "RS-485"

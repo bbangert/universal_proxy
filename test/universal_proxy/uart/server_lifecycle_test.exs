@@ -60,6 +60,17 @@ defmodule UniversalProxy.UART.ServerLifecycleTest do
     end
   end
 
+  describe "failed open" do
+    test "returns an error and leaves no Circuits.UART child behind" do
+      baseline = port_count()
+
+      assert {:error, _reason} =
+               Server.open_port("ttyNOSUCHDEV#{System.unique_integer([:positive])}")
+
+      assert port_count() == baseline
+    end
+  end
+
   describe "init orphan sweep" do
     test "a Server-only restart sweeps leftover PortSupervisor children" do
       {:ok, stray} = DynamicSupervisor.start_child(PortSupervisor, Server.port_child_spec())

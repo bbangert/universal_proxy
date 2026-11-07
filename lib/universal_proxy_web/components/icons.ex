@@ -369,6 +369,21 @@ defmodule UniversalProxyWeb.Components.Icons do
     """
   end
 
+  defp kind_glyph(:zigbee) do
+    assigns = %{}
+
+    ~H"""
+    <path
+      d="M5 6h14L5 18h14"
+      stroke="currentColor"
+      stroke-width="1.6"
+      fill="none"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    />
+    """
+  end
+
   defp kind_glyph(:ir) do
     assigns = %{}
 
