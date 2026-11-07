@@ -798,12 +798,7 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
         schedule_reopen(%{state | display_name: nil, error?: false})
 
       {port_path, display_name, port} ->
-        if same_stick?(state.port, port) do
-          open_port(state, port_path, display_name, port)
-        else
-          Logger.debug("Zigbee proxy ignoring #{port_path}: not the advertised stick")
-          schedule_reopen(%{state | display_name: nil, error?: false})
-        end
+        open_port(state, port_path, display_name, port)
     end
   end
 
@@ -869,20 +864,25 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   defp advertised_row(current, _new), do: current
 
   # `{tty, display_name, hardware_row | nil}` or nil. The resolver hands
-  # back `%{path:, display_name:, port:}` (`port` optional); a bare
-  # `:port_path` (tests, manual wiring) uses its basename as the name.
-  defp resolve_port(state) do
-    case state.resolver && state.resolver.() do
-      %{path: path, display_name: display} = resolved ->
-        {path, display, Map.get(resolved, :port)}
+  # back `%{path:, display_name:, port:}` (`port` optional) or a list of
+  # them (every connected candidate, in order); the one matching the
+  # advertised stick is chosen, else none. With nothing advertised the
+  # first wins. A bare `:port_path` (tests, manual wiring) uses its
+  # basename as the name.
+  defp resolve_port(%{resolver: nil, port_path: path} = state) when is_binary(path),
+    do: {path, state.display_name || Path.basename(path), state.port}
 
-      nil ->
-        # With a resolver, never fall back to a remembered path: after an
-        # unplug that tty may be reassigned to a different device.
-        if is_nil(state.resolver) and state.port_path do
-          {state.port_path, state.display_name || Path.basename(state.port_path), state.port}
-        end
-    end
+  defp resolve_port(%{resolver: nil}), do: nil
+
+  # With a resolver, never fall back to a remembered path: after an
+  # unplug that tty may be reassigned to a different device.
+  defp resolve_port(state) do
+    state.resolver.()
+    |> List.wrap()
+    |> Enum.map(fn %{path: path, display_name: display} = resolved ->
+      {path, display, Map.get(resolved, :port)}
+    end)
+    |> Enum.find(fn {_path, _display, port} -> same_stick?(state.port, port) end)
   end
 
   # A persistent_term write that replaces a term costs a global GC pass,

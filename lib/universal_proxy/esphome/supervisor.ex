@@ -291,17 +291,17 @@ defmodule UniversalProxy.ESPHome.Supervisor do
     end
   end
 
-  # Resolve the ZBT-2 (the first connected `:zigbee` port, one per
-  # device) as `%{path: tty, display_name: ha_name, port: row}`, or nil.
-  # Public because `ZigbeeProxy` invokes it from its open/rescan loop.
+  # Resolve every connected ZBT-2 (`:zigbee` port, one per device) as
+  # `[%{path: tty, display_name: ha_name, port: row}]` in Hardware order;
+  # `ZigbeeProxy` picks the one matching its advertised stick. Public
+  # because `ZigbeeProxy` invokes it from its open/rescan loop.
   @doc false
   def resolve_zigbee_port, do: pick_zigbee_port(resolver_ports(Enumerate.safe()))
 
   @doc false
   def pick_zigbee_port(ports) do
-    case Enum.find(ports, &(&1.connected and &1.kind == :zigbee and is_binary(&1.tty_name))) do
-      nil -> nil
-      port -> %{path: port.tty_name, display_name: port.ha_name, port: port}
+    for %{connected: true, kind: :zigbee, tty_name: tty} = port <- ports, is_binary(tty) do
+      %{path: tty, display_name: port.ha_name, port: port}
     end
   end
 

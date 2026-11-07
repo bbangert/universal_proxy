@@ -329,6 +329,39 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
       assert %{attached?: true, port: ^a} = ZigbeeProxy.advertised(server)
     end
 
+    test "reopens the advertised stick when another candidate sorts first" do
+      test_pid = self()
+      a = %{kind: :zigbee, tty_name: "ttyA", ha_name: "zb-a", serial: "AAA"}
+      b = %{kind: :zigbee, tty_name: "ttyB", ha_name: "zb-b", serial: "BBB"}
+      {:ok, slot} = Agent.start_link(fn -> [%{path: "ttyA", display_name: "zb-a", port: a}] end)
+
+      open_fun = fn path ->
+        send(test_pid, {:open_attempt, path})
+        FakeUART.start_link(test_pid)
+      end
+
+      server =
+        start_supervised!(
+          {ZigbeeProxy, name: nil, resolver: fn -> Agent.get(slot, & &1) end, open_fun: open_fun}
+        )
+
+      assert_receive {:open_attempt, "ttyA"}
+      send(server, {:circuits_uart, "ttyA", {:error, :eio}})
+
+      Agent.update(slot, fn _ ->
+        [
+          %{path: "ttyB", display_name: "zb-b", port: b},
+          %{path: "ttyA2", display_name: "zb-a", port: a}
+        ]
+      end)
+
+      send(server, :zigbee_reopen)
+      assert_receive {:open_attempt, "ttyA2"}
+      refute_received {:open_attempt, "ttyB"}
+      _ = :sys.get_state(server)
+      assert %{attached?: true, port: ^a} = ZigbeeProxy.advertised(server)
+    end
+
     test "advertised already holds the row while the first open is blocked" do
       test_pid = self()
       port = %{kind: :zigbee, tty_name: "ttyZB", ha_name: "zb"}
