@@ -116,6 +116,12 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   # A write can legitimately take a while at a low bootloader baud; the
   # UART write gets its own ceiling, the call a little more.
   @uart_write_timeout 1_000
+  # An ASH ACK is 5 bytes and is written from the RX handler, so a stuck
+  # UART must not hold the owner for the full client-write ceiling.
+  @ack_write_timeout 200
+  # Circuits.UART.close/1 and stop/1 default to 5 s each, which can exceed
+  # the 5 s child shutdown budget; bound each so terminate/2 fits inside it.
+  @cleanup_timeout 1_000
   @write_call_timeout 1_500
 
   @reopen_interval 5_000
@@ -561,7 +567,7 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   end
 
   defp write_acks(state, acks) do
-    case Circuits.UART.write(state.uart_pid, acks, @uart_write_timeout) do
+    case Circuits.UART.write(state.uart_pid, acks, @ack_write_timeout) do
       :ok ->
         acks
 
@@ -715,8 +721,8 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
 
   defp cleanup_uart(pid) when is_pid(pid) do
     try do
-      Circuits.UART.close(pid)
-      Circuits.UART.stop(pid)
+      GenServer.call(pid, :close, @cleanup_timeout)
+      GenServer.stop(pid, :normal, @cleanup_timeout)
     catch
       kind, reason ->
         Logger.debug("Zigbee proxy UART cleanup failed: #{inspect({kind, reason})}")
