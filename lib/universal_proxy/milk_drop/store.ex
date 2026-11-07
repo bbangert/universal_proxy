@@ -54,8 +54,10 @@ defmodule UniversalProxy.MilkDrop.Store do
   left to its session.
 
   `clear_in_flight/2` deletes the record only after `:in_flight_grace_ms`
-  (default #{30_000}) and only if it is still the one that session wrote:
-  a renderer stuck on a hung GPU can still exit "cleanly" (its exit
+  (default #{30_000}) and only if it is still the one that session wrote
+  (every mark carries a unique `generation`, so a re-mark of the same
+  preset within the same second is not mistaken for the cleared one): a
+  renderer stuck on a hung GPU can still exit "cleanly" (its exit
   watchdog) in the seconds before the device dies. An orderly shutdown of
   the store (`:normal`, `:shutdown`: a reboot or firmware update) deletes
   it at once, since that is not a device reset.
@@ -111,7 +113,8 @@ defmodule UniversalProxy.MilkDrop.Store do
           preset: String.t(),
           at: integer(),
           session: term(),
-          boot_id: String.t() | nil
+          boot_id: String.t() | nil,
+          generation: term()
         }
 
   # -- Client API --
@@ -235,6 +238,9 @@ defmodule UniversalProxy.MilkDrop.Store do
       retry_timer: nil,
       open_error: nil,
       boot_id: Keyword.get_lazy(opts, :boot_id, &read_boot_id/0),
+      # Tells this store's marks from those of another VM run in the same
+      # boot (unique_integer/1 starts over with the VM).
+      incarnation: :crypto.strong_rand_bytes(8),
       pack_version: Keyword.get_lazy(opts, :pack_version, &pinned_version/0),
       in_flight_grace_ms: Keyword.get(opts, :in_flight_grace_ms, @in_flight_grace_ms)
     }
@@ -261,8 +267,12 @@ defmodule UniversalProxy.MilkDrop.Store do
     end
   end
 
-  def handle_info({:clear_in_flight, marker}, %{table: table} = state) when table != nil do
-    if read_in_flight(table) == marker, do: delete_in_flight(table)
+  def handle_info({:clear_in_flight, generation}, %{table: table} = state) when table != nil do
+    case read_in_flight(table) do
+      %{generation: ^generation} -> delete_in_flight(table)
+      _other -> :ok
+    end
+
     {:noreply, state}
   end
 
@@ -277,7 +287,7 @@ defmodule UniversalProxy.MilkDrop.Store do
     reply =
       case read_in_flight(state.table) do
         nil -> nil
-        marker -> Map.take(marker, [:pack_version, :preset, :at, :session, :boot_id])
+        marker -> Map.take(marker, [:pack_version, :preset, :at, :session, :boot_id, :generation])
       end
 
     {:reply, reply, state}
@@ -292,8 +302,8 @@ defmodule UniversalProxy.MilkDrop.Store do
       %{session: ^session} when state.in_flight_grace_ms <= 0 ->
         {:reply, delete_in_flight(state.table), state}
 
-      %{session: ^session} = marker ->
-        Process.send_after(self(), {:clear_in_flight, marker}, state.in_flight_grace_ms)
+      %{session: ^session, generation: generation} ->
+        Process.send_after(self(), {:clear_in_flight, generation}, state.in_flight_grace_ms)
         {:reply, :ok, state}
 
       _other ->
@@ -335,7 +345,8 @@ defmodule UniversalProxy.MilkDrop.Store do
       preset: preset,
       at: System.os_time(:second),
       session: session,
-      boot_id: state.boot_id
+      boot_id: state.boot_id,
+      generation: {state.incarnation, System.unique_integer([:monotonic, :positive])}
     }
 
     case persist(state.table, {:in_flight, marker}) do
@@ -496,7 +507,7 @@ defmodule UniversalProxy.MilkDrop.Store do
       [{:in_flight, %{pack_version: v, preset: p, at: at, boot_id: b} = marker}]
       when is_binary(v) and is_binary(p) and is_integer(at) and (is_binary(b) or is_nil(b)) and
              is_map_key(marker, :session) ->
-        marker
+        Map.put_new(marker, :generation, nil)
 
       _ ->
         nil

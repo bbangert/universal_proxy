@@ -197,6 +197,25 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
       assert %{preset: "b.milk", session: 9} = Store.in_flight(server)
     end
 
+    test "a clear spares a re-mark of the same preset by the same session", %{path: path} do
+      server = start_boot(path, "boot-1", in_flight_grace_ms: 100)
+
+      # Within one second: the same preset, session and timestamp.
+      :ok = Store.mark_in_flight(server, 7, "v1", "a.milk")
+      %{generation: first} = Store.in_flight(server)
+      :ok = Store.clear_in_flight(server, 7)
+      :ok = Store.mark_in_flight(server, 7, "v1", "a.milk")
+      %{generation: second} = Store.in_flight(server)
+      assert first != second
+
+      Process.sleep(200)
+      assert %{preset: "a.milk", session: 7, generation: ^second} = Store.in_flight(server)
+
+      # Its own clear still applies.
+      :ok = Store.clear_in_flight(server, 7)
+      wait_until(fn -> Store.in_flight(server) == nil end)
+    end
+
     test "a record from an earlier boot skips its preset as device_reset", %{path: path} do
       server = start_boot(path, "boot-1")
       :ok = Store.skip(server, "v1", "slow.milk", "budget")
