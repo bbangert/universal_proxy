@@ -280,17 +280,10 @@ defmodule UniversalProxy.ESPHome.Infrared.Server do
 
     # User-saved IR overrides on otherwise-unclassified hardware.
     saved =
-      UARTStore.all_configs()
-      |> Enum.flat_map(fn config ->
-        key = {config[:slot_sub], config[:vendor_id], config[:product_id]}
-
-        with true <- config[:port_type] == :infrared,
-             tty when is_binary(tty) <- Map.get(key_to_tty, key) do
-          info = Map.get(enumerated, tty, %{})
-          start_entry(config, tty, info)
-        else
-          _ -> []
-        end
+      Hardware.list_ports()
+      |> saved_infrared_targets(key_to_tty, UARTStore.all_configs())
+      |> Enum.flat_map(fn {config, tty} ->
+        start_entry(config, tty, Map.get(enumerated, tty, %{}))
       end)
 
     auto ++ saved
@@ -353,6 +346,25 @@ defmodule UniversalProxy.ESPHome.Infrared.Server do
       Process.monitor(pid)
       {:ok, pid}
     end
+  end
+
+  # Pure core of the saved-config fallback: `{config, tty}` for each saved
+  # `:infrared` config whose port is live and not locked. Locked (branded)
+  # ports ignore saved config, so a stale row can't claim e.g. a ZBT-2.
+  @doc false
+  def saved_infrared_targets(ports, key_to_tty, configs) do
+    locked_ttys = for %{locked: true, tty_name: tty} <- ports, into: MapSet.new(), do: tty
+
+    Enum.flat_map(configs, fn config ->
+      tty = Map.get(key_to_tty, {config[:slot_sub], config[:vendor_id], config[:product_id]})
+
+      if config[:port_type] == :infrared and is_binary(tty) and
+           not MapSet.member?(locked_ttys, tty) do
+        [{config, tty}]
+      else
+        []
+      end
+    end)
   end
 
   # -- Helpers exposed to product modules --
