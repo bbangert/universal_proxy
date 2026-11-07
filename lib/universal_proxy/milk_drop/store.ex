@@ -58,16 +58,21 @@ defmodule UniversalProxy.MilkDrop.Store do
   (every mark carries a unique `generation`, so a re-mark of the same
   preset within the same second is not mistaken for the cleared one): a
   renderer stuck on a hung GPU can still exit "cleanly" (its exit
-  watchdog) in the seconds before the device dies. An orderly shutdown of
-  the store (`:normal`, `:shutdown`: a reboot or firmware update) deletes
-  it at once, since that is not a device reset.
+  watchdog) in the seconds before the device dies. The pending clear is
+  persisted with the record (a wall-clock deadline and the boot id), so a
+  store that restarts during the grace period in the same boot still
+  clears it: at the deadline, or at once if that has passed (a clock step
+  can't push it past one grace period from the restart). An orderly
+  shutdown of the store (`:normal`, `:shutdown`: a reboot or firmware
+  update) deletes it at once, since that is not a device reset.
 
   Accepted false positive: a power cut while a preset is loading or
   playing skips that one preset. "Clear skipped presets" in the web UI
   (`clear_skipped/1`) brings it back.
 
-  The record is written on each preset change only (about every 20 s by
-  default, `rotate_s`), so its flash wear is negligible.
+  The record is written on each preset change (about every 20 s by
+  default, `rotate_s`) and once more when its session ends, so its flash
+  wear is negligible.
 
   Changes are broadcast on `UniversalProxy.MilkDrop.settings_topic/0` (see
   `UniversalProxy.MilkDrop`).
@@ -92,6 +97,7 @@ defmodule UniversalProxy.MilkDrop.Store do
   @retry_ms 30_000
   @in_flight_grace_ms 30_000
   @boot_id_path "/proc/sys/kernel/random/boot_id"
+  @in_flight_keys [:pack_version, :preset, :at, :session, :boot_id, :generation, :clear_at]
 
   @rotate_min 10
   @rotate_max 120
@@ -114,7 +120,8 @@ defmodule UniversalProxy.MilkDrop.Store do
           at: integer(),
           session: term(),
           boot_id: String.t() | nil,
-          generation: term()
+          generation: term(),
+          clear_at: integer() | nil
         }
 
   # -- Client API --
@@ -287,7 +294,7 @@ defmodule UniversalProxy.MilkDrop.Store do
     reply =
       case read_in_flight(state.table) do
         nil -> nil
-        marker -> Map.take(marker, [:pack_version, :preset, :at, :session, :boot_id, :generation])
+        marker -> Map.take(marker, @in_flight_keys)
       end
 
     {:reply, reply, state}
@@ -302,9 +309,23 @@ defmodule UniversalProxy.MilkDrop.Store do
       %{session: ^session} when state.in_flight_grace_ms <= 0 ->
         {:reply, delete_in_flight(state.table), state}
 
-      %{session: ^session, generation: generation} ->
-        Process.send_after(self(), {:clear_in_flight, generation}, state.in_flight_grace_ms)
-        {:reply, :ok, state}
+      %{session: ^session, generation: generation} = marker ->
+        schedule_clear(generation, state.in_flight_grace_ms)
+
+        pending = %{
+          marker
+          | clear_at: System.os_time(:millisecond) + state.in_flight_grace_ms,
+            clear_boot_id: state.boot_id
+        }
+
+        case persist(state.table, {:in_flight, pending}) do
+          :ok ->
+            {:reply, :ok, state}
+
+          {:error, reason} = error ->
+            Logger.error("MilkDrop store in-flight clear write failed: #{inspect(reason)}")
+            {:reply, error, state}
+        end
 
       _other ->
         {:reply, :ok, state}
@@ -471,16 +492,17 @@ defmodule UniversalProxy.MilkDrop.Store do
   end
 
   # A record from an earlier boot names the preset that was loading or
-  # playing when the device went down. Same boot: the store restarted, the
-  # record still belongs to its session. An unreadable boot id on either
-  # side counts as an earlier boot.
+  # playing when the device went down. Same boot: the store restarted; the
+  # record still belongs to its session, unless that session ended and its
+  # clear is pending. An unreadable boot id on either side counts as an
+  # earlier boot.
   defp consume_in_flight(%{table: table} = state) do
     case read_in_flight(table) do
       nil ->
         if :dets.member(table, :in_flight), do: delete_in_flight(table)
 
-      %{boot_id: boot_id} when boot_id != nil and boot_id == state.boot_id ->
-        :ok
+      %{boot_id: boot_id} = marker when boot_id != nil and boot_id == state.boot_id ->
+        restore_pending_clear(state, marker)
 
       %{pack_version: version, preset: preset} ->
         if is_nil(state.pack_version) or state.pack_version == version do
@@ -500,6 +522,23 @@ defmodule UniversalProxy.MilkDrop.Store do
     end
   end
 
+  # The wall clock can step (NTP on a board without an RTC): the remaining
+  # wait is capped at one grace period.
+  defp restore_pending_clear(state, %{clear_at: at, clear_boot_id: boot_id} = marker)
+       when is_integer(at) and boot_id == state.boot_id do
+    case min(at - System.os_time(:millisecond), state.in_flight_grace_ms) do
+      remaining when remaining > 0 -> schedule_clear(marker.generation, remaining)
+      _passed -> delete_in_flight(state.table)
+    end
+
+    :ok
+  end
+
+  defp restore_pending_clear(_state, _marker), do: :ok
+
+  defp schedule_clear(generation, ms),
+    do: Process.send_after(self(), {:clear_in_flight, generation}, ms)
+
   defp read_in_flight(nil), do: nil
 
   defp read_in_flight(table) do
@@ -507,7 +546,10 @@ defmodule UniversalProxy.MilkDrop.Store do
       [{:in_flight, %{pack_version: v, preset: p, at: at, boot_id: b} = marker}]
       when is_binary(v) and is_binary(p) and is_integer(at) and (is_binary(b) or is_nil(b)) and
              is_map_key(marker, :session) ->
-        Map.put_new(marker, :generation, nil)
+        marker
+        |> Map.put_new(:generation, nil)
+        |> Map.update(:clear_at, nil, &if(is_integer(&1), do: &1))
+        |> Map.update(:clear_boot_id, nil, &if(is_binary(&1), do: &1))
 
       _ ->
         nil

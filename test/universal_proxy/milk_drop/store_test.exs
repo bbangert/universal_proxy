@@ -261,6 +261,76 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
       assert %{preset: "a.milk"} = Store.in_flight(server)
     end
 
+    test "a store killed during the grace period still clears the record", %{path: path} do
+      server = start_boot(path, "boot-1", in_flight_grace_ms: 300)
+      :ok = Store.mark_in_flight(server, 7, "v1", "a.milk")
+      :ok = Store.clear_in_flight(server, 7)
+      assert %{clear_at: clear_at} = Store.in_flight(server)
+      assert is_integer(clear_at)
+      power_cut(server)
+
+      # Restarted before the deadline: kept until then, then cleared.
+      server = start_boot(path, "boot-1", in_flight_grace_ms: 300)
+      assert %{preset: "a.milk", clear_at: ^clear_at} = Store.in_flight(server)
+      wait_until(fn -> Store.in_flight(server) == nil end)
+
+      # A later power cut skips nothing.
+      power_cut(server)
+      server = start_boot(path, "boot-2")
+      assert Store.skipped(server, "v1") == %{}
+    end
+
+    test "a pending clear past its deadline applies when the store reopens", %{path: path} do
+      server = start_boot(path, "boot-1", in_flight_grace_ms: 50)
+      :ok = Store.mark_in_flight(server, 7, "v1", "a.milk")
+      :ok = Store.clear_in_flight(server, 7)
+      power_cut(server)
+      Process.sleep(100)
+
+      server = start_boot(path, "boot-1", in_flight_grace_ms: 50)
+      assert Store.in_flight(server) == nil
+      power_cut(server)
+
+      server = start_boot(path, "boot-2")
+      assert Store.skipped(server, "v1") == %{}
+    end
+
+    test "a pending clear waits at most one grace period after a restart", %{path: path} do
+      # A clock stepped back: the persisted deadline is far ahead.
+      server = start_boot(path, "boot-1", in_flight_grace_ms: 60_000)
+      :ok = Store.mark_in_flight(server, 7, "v1", "a.milk")
+      :ok = Store.clear_in_flight(server, 7)
+      power_cut(server)
+
+      server = start_boot(path, "boot-1", in_flight_grace_ms: 100)
+      assert %{preset: "a.milk"} = Store.in_flight(server)
+      wait_until(fn -> Store.in_flight(server) == nil end)
+    end
+
+    test "a re-mark after a clear is active again across a store restart", %{path: path} do
+      server = start_boot(path, "boot-1", in_flight_grace_ms: 100)
+      :ok = Store.mark_in_flight(server, 7, "v1", "a.milk")
+      :ok = Store.clear_in_flight(server, 7)
+      :ok = Store.mark_in_flight(server, 8, "v1", "b.milk")
+      assert %{session: 8, clear_at: nil} = Store.in_flight(server)
+      power_cut(server)
+
+      server = start_boot(path, "boot-1", in_flight_grace_ms: 100)
+      Process.sleep(200)
+      assert %{preset: "b.milk", session: 8} = Store.in_flight(server)
+    end
+
+    test "a power cut during the grace period still skips the preset", %{path: path} do
+      server = start_boot(path, "boot-1", in_flight_grace_ms: 5_000)
+      :ok = Store.mark_in_flight(server, 7, "v1", "hang.milk")
+      :ok = Store.clear_in_flight(server, 7)
+      power_cut(server)
+
+      {server, _log} = with_log(fn -> start_boot(path, "boot-2") end)
+      assert Store.skipped(server, "v1") == %{"hang.milk" => "device_reset"}
+      assert Store.in_flight(server) == nil
+    end
+
     test "an orderly shutdown is not a device reset", %{path: path} do
       server = start_boot(path, "boot-1")
       :ok = Store.mark_in_flight(server, 7, "v1", "a.milk")
