@@ -190,6 +190,37 @@ defmodule UniversalProxy.UART.HistoryTest do
     assert [_a, %{data: "still-alive"}] = History.subscribe_and_snapshot(server)
   end
 
+  test "restart recovery re-subscribes a port held by the Zigbee proxy" do
+    name = "ZBT-2 (1-1.2) #{System.unique_integer([:positive])}"
+    zigbee = UniversalProxy.ESPHome.ZigbeeProxy
+    original = :sys.get_state(zigbee)
+
+    # Make the app-tree proxy look like it holds a tty, then start a
+    # History that never saw the port_opened event.
+    :sys.replace_state(zigbee, fn st ->
+      %{st | uart_pid: self(), port_path: "/dev/ttyZB", display_name: name}
+    end)
+
+    try do
+      hname = :"history_zb_#{System.unique_integer([:positive])}"
+      {:ok, _} = History.start_link(name: hname, auto_tick: false)
+      drain(hname)
+
+      publish(name, "zb-frame", :rx)
+      drain(hname)
+      assert [%{data: "zb-frame"}] = History.subscribe_and_snapshot(hname)
+    after
+      :sys.replace_state(zigbee, fn st ->
+        %{
+          st
+          | uart_pid: original.uart_pid,
+            port_path: original.port_path,
+            display_name: original.display_name
+        }
+      end)
+    end
+  end
+
   test "eviction proceeds once an externally-owned port closes for good", %{server: server} do
     port = "gone-zw-port #{System.unique_integer([:positive])}"
 

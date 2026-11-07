@@ -9,11 +9,13 @@ defmodule UniversalProxy.ESPHome.Supervisor do
        kept off the UART owner because MdnsLite calls can block
     2. `ZWaveProxy` — GenServer that owns the Z-Wave UART port and
        implements the `Espex.ZWaveProxy` behaviour
-    3. `Infrared.Supervisor` — DynamicSupervisor + `Infrared.Server`
+    3. `ZigbeeProxy` — GenServer that holds the ZBT-2's tty open and
+       serves serial-proxy sessions on it
+    4. `Infrared.Supervisor` — DynamicSupervisor + `Infrared.Server`
        (the `Espex.InfraredProxy` adapter)
-    4. `Espex` — the library supervisor: registry, server, TCP acceptor,
+    5. `Espex` — the library supervisor: registry, server, TCP acceptor,
        and (optionally) mDNS advertiser
-    5. `UniversalProxy.TuyaMesh.Commander` (Bluetooth targets) — runs the
+    6. `UniversalProxy.TuyaMesh.Commander` (Bluetooth targets) — runs the
        Tuya mesh light commands the `EntityProvider` hands it
 
   `ConfigStore` lives one level up in the application supervisor so a
@@ -42,6 +44,7 @@ defmodule UniversalProxy.ESPHome.Supervisor do
     Infrared,
     PskStore,
     SerialProxy,
+    ZigbeeProxy,
     ZWaveProxy
   }
 
@@ -112,6 +115,8 @@ defmodule UniversalProxy.ESPHome.Supervisor do
       # through the resolver on its open/rescan loop, so boot, hotplug,
       # and replug all take the same path.
       {ZWaveProxy, resolver: &__MODULE__.resolve_zwave_port/0},
+      # Before Espex (rest_for_one): serial-proxy sessions attach to it.
+      {ZigbeeProxy, resolver: &__MODULE__.resolve_zigbee_port/0},
       Infrared.Supervisor,
       # Must start BEFORE Espex (rest_for_one): Espex calls
       # EntityProvider.list_entities/0 at connection-accept time, and a
@@ -281,6 +286,20 @@ defmodule UniversalProxy.ESPHome.Supervisor do
 
       port ->
         %{path: port.tty_name, display_name: port.ha_name}
+    end
+  end
+
+  # Resolve the ZBT-2 (the first connected `:zigbee` port, one per
+  # device) as `%{path: tty, display_name: ha_name, port: row}`, or nil.
+  # Public because `ZigbeeProxy` invokes it from its open/rescan loop.
+  @doc false
+  def resolve_zigbee_port, do: pick_zigbee_port(Hardware.list_ports())
+
+  @doc false
+  def pick_zigbee_port(ports) do
+    case Enum.find(ports, &(&1.connected and &1.kind == :zigbee and is_binary(&1.tty_name))) do
+      nil -> nil
+      port -> %{path: port.tty_name, display_name: port.ha_name, port: port}
     end
   end
 

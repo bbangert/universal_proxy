@@ -31,6 +31,7 @@ defmodule UniversalProxy.UART.History do
 
   require Logger
 
+  alias UniversalProxy.ESPHome.ZigbeeProxy
   alias UniversalProxy.ESPHome.ZWaveProxy
   alias UniversalProxy.UART
 
@@ -373,18 +374,17 @@ defmodule UniversalProxy.UART.History do
 
   # One-shot restart recovery for ports owned outside UART.Server: a
   # History restart replays no lifecycle events, so without this a
-  # Z-Wave port open at that moment would lose its data subscription
+  # Z-Wave or Zigbee port open at that moment would lose its data subscription
   # (and eviction protection) until its next reopen. Runs only from
   # handle_continue — steady-state tracking is event-driven via the
   # `owner:` lifecycle payloads, never a per-eviction call.
   # `claimed_port/1` absorbs `:noproc` (at app boot the ESPHome tree —
-  # and thus the Z-Wave proxy — starts after this one) via its
+  # and thus the proxies — starts after this one) via its
   # documented `catch :exit`.
   defp external_claims do
-    case ZWaveProxy.claimed_port() do
-      %{display_name: name} -> [name]
-      _ -> []
-    end
+    for claim <- [ZWaveProxy.claimed_port(), ZigbeeProxy.claimed_port()],
+        is_map(claim),
+        do: claim.display_name
   end
 
   # Send only when the receiver's mailbox is short enough to keep up.

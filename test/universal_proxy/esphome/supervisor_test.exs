@@ -246,4 +246,33 @@ defmodule UniversalProxy.ESPHome.SupervisorTest do
                ESPHomeSupervisor.pick_zwave_port(ports, %{key => "ttyUSB0"}, [config])
     end
   end
+
+  describe "Zigbee proxy wiring" do
+    alias UniversalProxy.ESPHome.ZigbeeProxy
+
+    test "the ZigbeeProxy child starts before Espex (rest_for_one)" do
+      {:ok, {%{strategy: :rest_for_one}, children}} = ESPHomeSupervisor.init([])
+      ids = Enum.map(children, & &1.id)
+
+      assert Enum.find_index(ids, &(&1 == ZigbeeProxy)) <
+               Enum.find_index(ids, &(&1 == Espex))
+    end
+
+    test "pick_zigbee_port/1 takes the first connected :zigbee row, keeping the row" do
+      zbt2 = %{connected: true, kind: :zigbee, tty_name: "ttyACM1", ha_name: "ZBT-2 (1-1.2)"}
+      second = %{zbt2 | tty_name: "ttyACM2", ha_name: "ZBT-2 (1-1.3)"}
+
+      ports = [
+        %{connected: true, kind: :zwave, tty_name: "ttyACM0", ha_name: "ZWA-2"},
+        %{zbt2 | connected: false},
+        zbt2,
+        second
+      ]
+
+      assert ESPHomeSupervisor.pick_zigbee_port(ports) ==
+               %{path: "ttyACM1", display_name: "ZBT-2 (1-1.2)", port: zbt2}
+
+      assert ESPHomeSupervisor.pick_zigbee_port(Enum.take(ports, 2)) == nil
+    end
+  end
 end
