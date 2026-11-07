@@ -279,6 +279,8 @@ static void test_protocol() {
     CHECK(json_parse(event_preset("a \"b\".milk", true, "640x360", "rotate", false), v, err));
     CHECK(v.get("event")->string == "preset" && v.get("file")->string == "a \"b\".milk" &&
           v.get("locked")->boolean && v.get("rung")->string == "640x360");
+    CHECK(json_parse(event_loading("hf/a \"b\".milk"), v, err) && v.get("event")->string == "loading" &&
+          v.get("preset")->string == "hf/a \"b\".milk" && v.object.size() == 2);
     CHECK(json_parse(event_skip("x.milk", "budget"), v, err) && v.get("preset")->string == "x.milk" &&
           v.get("reason")->string == "budget" && v.get("message") == nullptr);
     CHECK(json_parse(event_skip("x.milk", "compile_error", "warp: 0:12: bad"), v, err) &&
@@ -316,6 +318,8 @@ static void test_protocol() {
     PreparedInfo worst{hostile, hostile, hostile, hostile, hostile, true, 3, true, hostile};
     CHECK(event_prepared(worst).size() < MAX_EMIT_LINE_BYTES);
     CHECK(event_skip(hostile, hostile, hostile + hostile).size() < MAX_EMIT_LINE_BYTES);
+    CHECK(event_loading(hostile).size() < MAX_EMIT_LINE_BYTES);
+    CHECK(json_parse(event_loading(hostile), v, err) && v.get("preset")->string == hostile);
     s.temp_c = 61.25;
     s.arm_mhz = 1200;
     CHECK(json_parse(event_stats(s), v, err) && v.get("arm_mhz")->number == 1200 &&

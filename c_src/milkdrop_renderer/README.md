@@ -71,6 +71,7 @@ A malformed or unknown command gives `error` with `reason: "bad_command"`.
 | `prepared` | `mode` (the chosen mode, e.g. `1280x720@60`), `connector` (e.g. `HDMI-A-1`; with `--simulate-kms` the `--connector` given, if any), `mode_source` (how `mode` was chosen: `crtc` — the CRTC's at open, no modeset; `closest` — `WxH@Hz`'s nearest offered; `preferred` / `highest` — `WxH` without a fitting CRTC mode; absent in the check modes), `gl_renderer`, `gl_version`, `gles2`, `presets` (eligible count), `crtc_mode_valid` and `crtc_mode` (only when valid): what the CRTC scanned out when the card was opened. GL is up, the first preset warmed and a frame rendered; not master. |
 | `presenting` | `modeset` (true = the mode set differs from the last one scanned out before the handover: the CRTC's at take if it still had one, else the one in `prepared`), `master_ms`, `crtc_lit` (the CRTC still had a mode at take; Emerge's stop detaches it, so this is normally false and SetCrtc re-enables the CRTC, at the same timing when `modeset` is false). |
 | `released` | Ack for `release`. |
+| `loading` | `preset` (preset id): about to load and warm up this preset; written before any GPU work for it (its level, preload, warm-up frame), for every candidate tried (a failed one is followed by `skip`). A vc4 GPU hang can reset the whole device (the kernel logs `[drm] Resetting GPU.` and the Pi reboots within seconds); the BEAM persists this so the preset is skipped after the reboot. A `preset` event that keeps the same preset (`lock`, `unlock`, `step_down`) has no `loading` before it. |
 | `preset` | `file` (preset id), `locked`, `rung` (internal WxH), `cause` (`start`, `take`, `rotate`, `next`, `prev`, `eject`, `lock`, `unlock`, `step_down`), `cut` (true = no blend). `eject` is also the cut away from a `high_frequency` preset (it can name the preset already playing: its blend in was completed). Sent whenever the showing preset, its lock or its rung changes. |
 | `skip` | `preset`, `reason`, optional `message` (the first line of the error): the preset can't be drawn here (persist it for this pack version). Reasons: `register_allocate` (vc4 register allocation failed), `translate_error` / `compile_error` / `link_error` (a warp or composite shader failed and projectM fell back to its default), `shader_error` (another error-level projectM log during the warm-up), `load_failed` (unreadable or unparsable preset), `draw_dropped` (sentinel pixel untouched), `budget` (below the floor at the last rung). |
 | `stats` | Every `--stats-s`: `fps` (presented), `frames`, `flip_ms` (mean flip-to-flip), `frame_ms` / `frame_ms_max` (CPU render + submit), `late` (flips past their slot), `rung`, `interval`, `temp_c`, `arm_mhz`, `gpu_ms` (only with `GL_EXT_disjoint_timer_query`, which vc4 lacks), `preset`, `pcm_ok` / `pcm_silent` (frames with ring audio / silence), `warmups`, `warmup_ms_max`, `shader_stages` / `cached_stages` (translated shader stages warmed up, and those read from the pack's shader cache), `stderr_discarded` (driver stderr bytes dropped). |
@@ -271,6 +272,11 @@ reopened if the player replaces the file. `src/pcm_tap.h` is a verbatim copy of
   gives `translate_error`, `compile_error`, `link_error` or `load_failed`,
   with the failing stage and message; other error-level log messages during
   the warm-up give `shader_error`.
+- **Device resets.** Some presets hang the vc4 GPU on rpi3; the kernel's
+  hang recovery then takes the whole device down (it reboots within
+  ~7 s), which nothing in userspace can catch. The `loading` event, sent
+  before each warm-up, lets the BEAM persist the preset being loaded and
+  skip it (`device_reset`) after the reboot.
 
 A failed preset is skipped and reported. A preload failure leaves the
 playing preset (and its blend) alone, so the next pick blends in as usual;

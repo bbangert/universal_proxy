@@ -125,6 +125,10 @@ std::string event_prepared(const PreparedInfo& info);
 std::string event_presenting(bool modeset, double master_ms, bool crtc_lit);
 std::string event_preset(std::string_view file, bool locked, std::string_view rung,
                          std::string_view cause, bool cut);
+// Sent before any GPU work for preset `file` (its level, preload, warm-up
+// frame), so the BEAM can persist what was loading if the GPU hangs and
+// takes the device down with it.
+std::string event_loading(std::string_view file);
 // `message` (optional) is the first line of the error behind it.
 std::string event_skip(std::string_view file, std::string_view reason, std::string_view message = {});
 std::string event_error(std::string_view reason, std::string_view message = {});

@@ -433,6 +433,10 @@ Selection App::switch_to(const PresetEntry* first, const char* cause, bool smoot
             log_msg("refusing %s: high_frequency presets are off", entry.file.c_str());
             return Attempt::Failed;
         }
+        // Written (unbuffered) before any GPU work for this preset: a vc4
+        // hang during it can reset the whole device, and the BEAM persists
+        // this to skip the preset after the reboot.
+        emit_line(event_loading(entry.file));
         guard_->begin(entry.file, hint_rung(entry));
         if (!apply_level()) return Attempt::Abort;
         const bool blend = smooth && !activated_failure && opt_.blend_s > 0 && !expensive(entry);
