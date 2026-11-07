@@ -31,7 +31,11 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy.Advertiser do
       services, or nil (default: the registered `MdnsLite.TableServer`)
   """
 
-  use GenServer
+  # The supervisor's shutdown budget. An in-flight registration can spend
+  # three 5 s MdnsLite calls (remove, add, announce) and terminate/2's
+  # withdrawal two more (goodbye, remove): 25 s worst case. The default 5 s
+  # would kill it before the remove, leaving a stale service in MdnsLite.
+  use GenServer, shutdown: 30_000
 
   require Logger
 
@@ -98,9 +102,20 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy.Advertiser do
     {:noreply, if(state.advertised, do: register(state), else: state)}
   end
 
-  def handle_info({:DOWN, ref, :process, _pid, reason}, %{table_ref: ref} = state) do
+  def handle_info({:DOWN, ref, :process, dead, reason}, %{table_ref: ref} = state) do
     Logger.debug("Z-Wave mDNS table owner went down (#{inspect(reason)}); re-registering")
-    {:noreply, register(%{state | table_ref: nil, registered: false, failures: 0})}
+    state = %{state | table_ref: nil, registered: false, failures: 0}
+
+    # Re-register at once only against a live replacement. Otherwise the
+    # lookup still names the dead owner (or nothing), and registering now
+    # would spin; the backoff retry waits for the replacement instead.
+    case safe_table_pid(state.table_fun) do
+      pid when is_pid(pid) and pid != dead ->
+        if Process.alive?(pid), do: {:noreply, register(state)}, else: {:noreply, backoff(state)}
+
+      _ ->
+        {:noreply, backoff(state)}
+    end
   end
 
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %{owner_ref: ref} = state) do
@@ -127,21 +142,24 @@ defmodule UniversalProxy.ESPHome.ZWaveProxy.Advertiser do
       %{state | registered: true, failures: 0} |> monitor_table()
     else
       other ->
-        delay = min(@retry_ms * Integer.pow(2, state.failures), @retry_max_ms)
-        level = if state.failures == 0, do: :warning, else: :debug
-
         Logger.log(
-          level,
-          "Z-Wave _zwave._tcp registration failed (#{inspect(other)}); retrying in #{delay}ms"
+          if(state.failures == 0, do: :warning, else: :debug),
+          "Z-Wave _zwave._tcp registration failed (#{inspect(other)}); retrying"
         )
 
-        %{
-          state
-          | registered: false,
-            failures: state.failures + 1,
-            retry_timer: Process.send_after(self(), :retry, delay)
-        }
+        backoff(state)
     end
+  end
+
+  defp backoff(state) do
+    delay = min(@retry_ms * Integer.pow(2, state.failures), @retry_max_ms)
+
+    %{
+      state
+      | registered: false,
+        failures: state.failures + 1,
+        retry_timer: Process.send_after(self(), :retry, delay)
+    }
   end
 
   defp unregister(state) do

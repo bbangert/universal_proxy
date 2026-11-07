@@ -43,6 +43,11 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
     def announce_all, do: record(:announce_all, nil, :ok)
 
     defp record(call, arg, result) do
+      case Application.get_env(:fake_mdns, :delay_ms) do
+        nil -> :ok
+        ms -> Process.sleep(ms)
+      end
+
       send(Application.fetch_env!(:fake_mdns, :test_pid), {:mdns, call, arg})
       result
     end
@@ -56,6 +61,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
       Application.delete_env(:fake_mdns, :test_pid)
       Application.delete_env(:fake_mdns, :add_result)
       Application.delete_env(:fake_mdns, :table_pid)
+      Application.delete_env(:fake_mdns, :delay_ms)
     end)
 
     pid = start_supervised!({ZWaveProxy, name: nil, port_path: nil})
@@ -510,6 +516,7 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
     end
 
     defp start_mdns_proxy!(advertiser, opts \\ []) do
+      {child, opts} = Keyword.pop(opts, :child, [])
       {:ok, fake} = FakeUART.start_link(self())
       id = {:zw_mdns, System.unique_integer()}
 
@@ -524,7 +531,8 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
           opts
         )
 
-      pid = start_supervised!({ZWaveProxy, opts}, id: id)
+      spec = Supervisor.child_spec({ZWaveProxy, opts}, [id: id] ++ child)
+      pid = start_supervised!(spec)
       {pid, fake, id}
     end
 
@@ -594,7 +602,10 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
 
     test "a proxy killed before terminate/2 still gets its service withdrawn" do
       adv = start_advertiser!()
-      {pid, _fake, _id} = start_mdns_proxy!(adv)
+      # Temporary: a restarted replacement would re-advertise and race the
+      # old owner's :DOWN, hiding whether the cleanup works.
+      {pid, _fake, _id} = start_mdns_proxy!(adv, child: [restart: :temporary])
+
       assert calls(3) == @register
 
       Process.exit(pid, :kill)
@@ -669,18 +680,89 @@ defmodule UniversalProxy.ESPHome.ZWaveProxyTest do
       assert :sys.get_state(adv).failures == 1
     end
 
-    test "re-registers after the MdnsLite table owner restarts" do
-      table = spawn(fn -> Process.sleep(:infinity) end)
-      Application.put_env(:fake_mdns, :table_pid, table)
-      on_exit(fn -> Application.delete_env(:fake_mdns, :table_pid) end)
+    test "re-registers against a live replacement after the MdnsLite table owner restarts" do
+      old = spawn(fn -> Process.sleep(:infinity) end)
+      replacement = spawn(fn -> Process.sleep(:infinity) end)
+      Application.put_env(:fake_mdns, :table_pid, old)
 
       adv = start_advertiser!()
       start_mdns_proxy!(adv)
       assert calls(3) == @register
+      sync(adv)
 
-      Process.exit(table, :kill)
+      # The replacement is already registered when the old owner dies.
+      Application.put_env(:fake_mdns, :table_pid, replacement)
+      Process.exit(old, :kill)
 
       assert calls(3) == @register
+      state = sync(adv)
+      assert is_reference(state.table_ref)
+      assert adv in elem(Process.info(replacement, :monitored_by), 1)
+      refute_receive {:mdns, _, _}, 100
+    end
+
+    test "a table lookup that still names the dead owner backs off instead of spinning" do
+      old = spawn(fn -> Process.sleep(:infinity) end)
+      Application.put_env(:fake_mdns, :table_pid, old)
+
+      adv = start_advertiser!()
+      start_mdns_proxy!(adv)
+      assert calls(3) == @register
+      sync(adv)
+
+      # The lookup keeps returning the dead pid.
+      Process.exit(old, :kill)
+
+      refute_receive {:mdns, _, _}, 150
+      state = sync(adv)
+      assert state.retry_timer != nil
+      assert state.table_ref == nil
+      refute state.registered
+    end
+
+    test "a missing table owner after :DOWN waits for the retry timer" do
+      old = spawn(fn -> Process.sleep(:infinity) end)
+      Application.put_env(:fake_mdns, :table_pid, old)
+
+      adv = start_advertiser!()
+      start_mdns_proxy!(adv)
+      assert calls(3) == @register
+      sync(adv)
+
+      Application.delete_env(:fake_mdns, :table_pid)
+      Process.exit(old, :kill)
+
+      refute_receive {:mdns, _, _}, 150
+      assert sync(adv).retry_timer != nil
+
+      send(adv, :retry)
+      assert calls(3) == @register
+    end
+
+    test "supervisor shutdown mid-registration still withdraws, within a finite budget" do
+      adv_spec = Supervisor.child_spec({Advertiser, name: nil}, [])
+      assert adv_spec.shutdown > 5_000
+      assert is_integer(adv_spec.shutdown)
+
+      Application.put_env(:fake_mdns, :delay_ms, 50)
+      id = {:zw_adv_slow, System.unique_integer()}
+
+      adv =
+        start_supervised!(
+          {Advertiser,
+           name: nil,
+           mdns_module: FakeMdns,
+           config_fun: fn -> @config end,
+           table_fun: fn -> nil end},
+          id: id
+        )
+
+      Advertiser.advertise(adv)
+      # The shutdown signal queues behind the cast; registration (3 slow
+      # calls) completes, then terminate/2 withdraws (2 more).
+      :ok = stop_supervised(id)
+
+      assert calls(5) == @register ++ @withdraw
     end
 
     test "a table owner going down after a withdraw is ignored" do
