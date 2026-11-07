@@ -105,6 +105,7 @@ defmodule MilkdropPackToolsTest do
     assert run =~ ~s("event":"stats")
     assert run =~ ~s("preset":"Geiss - Chrome.milk")
     assert run =~ "EXIT_STATUS 0"
+    assert run =~ ~r/^BOOT \d+ \S+$/m
 
     skip_run = eval(elixir["run_skip"])
     assert skip_run =~ ~s|"preset":"$$$ Royal - Mashup (109).milk"|

@@ -25,6 +25,19 @@ def sweep_manifest(doc):
     return {**doc, "presets": presets}
 
 
+BOOT_RE = re.compile(r"^BOOT (\d+) (\S+)\s*$", re.M)
+
+
+def parse_boot(text):
+    """The device's "BOOT <uptime ms> <boot id>" line (device_sweep.py's
+    BOOT_ELIXIR) as {"uptime_ms", "boot_id"} (boot_id None when the device
+    couldn't read it), or None."""
+    m = BOOT_RE.search(text)
+    if not m:
+        return None
+    return {"uptime_ms": int(m.group(1)), "boot_id": None if m.group(2) == "none" else m.group(2)}
+
+
 def parse_run(pid, text):
     """One headless renderer run of `pid` (its stdout+stderr, plus an
     "EXIT_STATUS n" line) as a sweep record."""

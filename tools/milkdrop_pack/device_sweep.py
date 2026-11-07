@@ -15,6 +15,13 @@ which build_pack.py --device-sweep turns into the manifest's rpi3 fields.
 Resumable: presets that already have an "ok" or "skip" record for this
 tarball's SHA-256 in --out are not run again (errors are retried), so an
 interrupted multi-hour sweep just continues.
+
+Reboot-aware: some presets hang the vc4 GPU, the kernel resets it and the
+whole Pi reboots. Each run reports the device's uptime and boot id first;
+when a run fails, the sweep waits (--reboot-wait-s) for the device to come
+back and compares them. A preset that took the device down is recorded as
+a "skip" with reason "device_reset" (and never retried); other failures
+stay "error".
 Before each preset it waits for the SoC to cool below --cooldown-c, so the
 renderer's thermal guard doesn't skew late results.
 
@@ -105,10 +112,22 @@ File.rm("{remote_dir}/{version}.tar.gz")
 IO.puts("EXTRACTED " <> dir)'''
 
 
+# Prints "BOOT <BEAM wall clock ms> <boot id or none>": the device's uptime
+# (the BEAM starts with the system) and which boot it is.
+BOOT_ELIXIR = '''
+{up, _} = :erlang.statistics(:wall_clock)
+boot = case File.read("/proc/sys/kernel/random/boot_id") do
+  {:ok, id} -> String.trim(id)
+  _ -> "none"
+end
+IO.puts("BOOT #{up} #{boot}")'''
+
+
 def elixir_run(renderer, args, timeout_ms, cooldown_c, cooldown_max_s):
-    """Waits for the SoC to cool, runs the renderer, prints its output and
-    "EXIT_STATUS n" (or "EXIT_STATUS timeout" after a kill -9)."""
-    return f'''
+    """Prints the boot state, waits for the SoC to cool, runs the renderer,
+    prints its output and "EXIT_STATUS n" (or "EXIT_STATUS timeout" after a
+    kill -9)."""
+    return f'''{BOOT_ELIXIR}
 cool = fn cool, waited ->
   temp = case File.read("/sys/class/thermal/thermal_zone0/temp") do
     {{:ok, t}} -> String.to_integer(String.trim(t)) / 1000
@@ -148,6 +167,15 @@ class Device:
         cmd = ["ssh", "-i", os.path.expanduser(self.opts.key), *ssh_opts(self.opts), self.target, code]
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return proc.stdout + proc.stderr
+
+    def state(self):
+        """The device's boot state ({"uptime_ms", "boot_id", "at"}), or None
+        while it doesn't answer."""
+        try:
+            boot = sweep.parse_boot(self.ssh(BOOT_ELIXIR, 45))
+        except subprocess.TimeoutExpired:
+            return None
+        return {**boot, "at": time.monotonic()} if boot else None
 
     def put(self, local, remote):
         batch = f'-mkdir {os.path.dirname(remote)}\nput "{local}" "{remote}"\n'
@@ -247,6 +275,8 @@ def main(argv=None):
     p.add_argument("--ladder", default="640x360,480x270", help="render ladder (the device's)")
     p.add_argument("--card", default="/dev/dri/renderD128", help="DRM node (keep the render node)")
     p.add_argument("--timeout", type=int, default=240, help="seconds per preset before kill -9")
+    p.add_argument("--reboot-wait-s", type=int, default=300,
+                   help="how long to wait for the device to come back after a failed run")
     p.add_argument("--cooldown-c", type=float, default=70.0, help="wait until the SoC is below this")
     p.add_argument("--cooldown-max-s", type=int, default=300, help="longest cooldown wait")
     p.add_argument("--only", action="append", default=[], help="sweep just this preset id (repeatable)")
@@ -284,6 +314,7 @@ def main(argv=None):
 
 def sweep_all(opts, p, digest, version, todo, remote_pack, scratch):
     meta = {"pack_version": version, "pack_sha256": digest, "frames": opts.frames, "ladder": opts.ladder}
+    device = None
     if opts.local_renderer:
         if not opts.local_pack_dir:
             p.error("--local-renderer needs --local-pack-dir")
@@ -318,15 +349,94 @@ def sweep_all(opts, p, digest, version, todo, remote_pack, scratch):
                               opts.cooldown_c, opts.cooldown_max_s)
             try:
                 return dev.ssh(code, opts.timeout + opts.cooldown_max_s + 60)
-            except subprocess.TimeoutExpired:
-                return "EXIT_STATUS ssh_timeout\n"
+            except subprocess.TimeoutExpired as e:
+                partial = e.stdout or ""
+                partial = partial.decode("utf-8", "replace") if isinstance(partial, bytes) else partial
+                return partial + "\nEXIT_STATUS ssh_timeout\n"
+
+        device = dev
 
     repair_tail(opts.out)
+    return sweep_presets(opts, todo, runner, meta, device)
+
+
+# A run whose reply has no boot state never started (ssh couldn't connect):
+# it is run again, a few times, before it counts as an error.
+MAX_START_RETRIES = 2
+
+# The boot-state comparison's tolerance when no boot id is readable.
+UPTIME_SLACK_MS = 30_000
+
+
+def rebooted(before, after):
+    """Whether the device restarted between two boot states. The boot id
+    decides when both have one; otherwise the uptime must have fallen
+    behind what it would be had the device stayed up."""
+    if before["boot_id"] and after["boot_id"]:
+        return before["boot_id"] != after["boot_id"]
+    expected = before["uptime_ms"] + (after["at"] - before["at"]) * 1000
+    return after["uptime_ms"] + UPTIME_SLACK_MS < expected
+
+
+def wait_for_device(device, budget_s):
+    """The device's boot state once it answers (polled with backoff, for up
+    to `budget_s`), or None."""
+    waited, delay = 0.0, 5
+    while True:
+        t = time.monotonic()
+        state = device.state()
+        if state:
+            return state
+        if waited >= budget_s:
+            return None
+        pause = min(delay, budget_s - waited)
+        print(f"device not answering; retrying in {pause:.0f}s ({waited:.0f}s of {budget_s}s)", flush=True)
+        time.sleep(pause)
+        waited += pause + (time.monotonic() - t)
+        delay = min(delay * 2, 60)
+
+
+def reset_record(rec, before, after, text):
+    """`rec` (a failed run) as the "skip" of a preset that reset the device."""
+    rec.update(status="skip", reason="device_reset", error=rec.get("reason"),
+               boot_before=before["boot_id"], boot_after=after["boot_id"],
+               uptime_before_ms=before["uptime_ms"], uptime_after_ms=after["uptime_ms"],
+               message=text.strip()[-200:])
+    return rec
+
+
+def sweep_presets(opts, todo, runner, meta, device=None):
+    """Runs and records `todo`. With a `device`, a failed run is followed by
+    waiting for it to answer again and checking whether it rebooted."""
+    last = None  # the latest boot state seen
     with open(opts.out, "a") as out:
         for n, pid in enumerate(todo, 1):
-            started = time.monotonic()
-            text = runner(pid)
-            rec = sweep.parse_run(pid, text)
+            retries = 0
+            while True:
+                started = time.monotonic()
+                text = runner(pid)
+                boot = sweep.parse_boot(text)
+                if boot:
+                    boot["at"] = started
+                rec = sweep.parse_run(pid, text)
+                if device is None or rec["status"] != "error":
+                    last = boot or last
+                    break
+                after = wait_for_device(device, opts.reboot_wait_s)
+                if after is None:
+                    rec["device"] = "unreachable"
+                    break
+                before = boot or last
+                reset = before is not None and rebooted(before, after)
+                last = after
+                if reset and boot:
+                    reset_record(rec, before, after, text)
+                    break
+                if boot is None and retries < MAX_START_RETRIES:
+                    retries += 1
+                    print(f"{pid}: the run did not start; trying again ({retries}/{MAX_START_RETRIES})", flush=True)
+                    continue
+                break
             rec.update(meta, at=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
                        wall_s=round(time.monotonic() - started, 1))
             out.write(json.dumps(rec) + "\n")
@@ -334,6 +444,10 @@ def sweep_all(opts, p, digest, version, todo, remote_pack, scratch):
             print(f"[{n}/{len(todo)}] {rec['status']:5s} {rec.get('rung') or '-':8s} "
                   f"{rec.get('fps') or 0:5.1f} fps  {pid}" + (f"  ({rec.get('reason')})" if rec.get("reason") else ""),
                   flush=True)
+            if rec.get("device") == "unreachable":
+                print(f"error: the device did not come back within {opts.reboot_wait_s}s; stopping "
+                      "(rerun to continue)", file=sys.stderr)
+                return 1
     return 0
 
 

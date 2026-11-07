@@ -151,7 +151,28 @@ Resumable: presets with an `ok` or `skip` record for this tarball's
 SHA-256 are not rerun; `error` records (a timeout, a truncated reply) are
 retried. A partial last line left by an interrupted write is cut before
 appending, and `--device-sweep` skips one with a warning (an invalid line
-anywhere else fails the build). `--dry-run` prints the plan and the Elixir it would send;
+anywhere else fails the build).
+
+Some presets hang the Pi 3's vc4 GPU: the kernel logs `[drm] Resetting GPU.`
+and the whole Pi reboots within seconds (`high_frequency/Martin - QBikal -
+Surface Turbulence IIz2 (by hakanh mash-up).milk` does, every time). The
+sweep is reboot-aware. Each run starts by printing the device's uptime
+(BEAM wall clock) and `boot_id`; when a run fails (error, timeout, dropped
+connection) the sweep polls SSH with backoff for up to `--reboot-wait-s`
+(default 300) and compares them. If the device restarted, the preset is
+recorded as `status: "skip"`, `reason: "device_reset"` (with `boot_before`
+/ `boot_after`, `uptime_before_ms` / `uptime_after_ms` and the run's
+`error`), never retried, and the sweep carries on, so nothing is recorded
+for the presets that would have found the device down. `--device-sweep`
+turns it into `rpi3: {"rung": "skip", "reason": "device_reset"}`, as it does
+the hand-written `"gpu_hang"`. A failure without a reboot stays an `error`
+(retried by the next run); a run that never started (SSH couldn't connect)
+is retried up to twice before it counts; a device that doesn't come back
+stops the sweep (exit 1). A reboot for another reason (power loss, a
+reflash) during a failing run is recorded the same way: delete that line
+to have the preset measured again.
+
+`--dry-run` prints the plan and the Elixir it would send;
 `--only ID` / `--limit N` sweep a subset. The device runs Elixir over
 nerves_ssh; the script never sends `System.halt`.
 
