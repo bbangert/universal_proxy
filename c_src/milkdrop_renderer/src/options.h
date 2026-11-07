@@ -63,7 +63,7 @@ struct Options {
     // Tuning and test knobs, not passed by the BEAM.
     std::string card = "/dev/dri/card0";
     double blend_s = 0.5;
-    double min_fps = 19.0;   // the floor a preset must hold at the last rung
+    double min_fps = 20.0;   // the frame rate a preset must hold (see CostGuard)
     int interval = 0;        // vblanks per frame; 0 = 2 on GLES2 builds, else 1
     uint64_t seed = 0;       // 0 = random
     int av_offset_ms = 0;    // added to the PCM target time
