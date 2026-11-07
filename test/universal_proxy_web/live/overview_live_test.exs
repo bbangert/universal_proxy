@@ -290,6 +290,64 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
     assert render(view) =~ ~s|href="/audio"|
   end
 
+  describe "request_kind_change" do
+    defp put_ports(view, ports) do
+      :sys.replace_state(view.pid, fn state ->
+        socket = state.socket
+        %{state | socket: Phoenix.Component.assign(socket, :ports, ports)}
+      end)
+    end
+
+    defp kind_port(info, overrides) do
+      [port] =
+        UniversalProxy.Hardware.list_ports(
+          slots: nil,
+          enumerated: %{"ttyACM0" => info},
+          bus_paths: %{"ttyACM0" => "1-1.1"},
+          saved_configs: %{},
+          line_settings: %{},
+          in_use_ports: MapSet.new(),
+          zwave_claim: nil,
+          tty_class_dir: "/nonexistent-#{System.unique_integer([:positive])}"
+        )
+
+      Map.merge(port, Map.new(overrides))
+    end
+
+    @zbt2 %{
+      vendor_id: 0x303A,
+      product_id: 0x831A,
+      manufacturer: "Nabu Casa",
+      description: "Home Assistant Connect ZBT-2",
+      serial_number: "ZB0001"
+    }
+    @generic %{vendor_id: 0x10C4, product_id: 0xEA60, serial_number: "X"}
+
+    defp pending(view), do: :sys.get_state(view.pid).socket.assigns.pending_kind_change
+
+    test "is ignored for a locked (branded) port", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      port = kind_port(@zbt2, configured: true)
+      assert %{locked: true, connected: true, in_use: false} = port
+      put_ports(view, [port])
+
+      render_hook(view, "request_kind_change", %{"port" => port.id, "kind" => "rs485"})
+
+      assert pending(view) == nil
+    end
+
+    test "is still offered for an unlocked configured port", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      port = kind_port(@generic, configured: true)
+      assert %{locked: false, in_use: false} = port
+      put_ports(view, [port])
+
+      render_hook(view, "request_kind_change", %{"port" => port.id, "kind" => "rs485"})
+
+      assert %{new_kind: "rs485"} = pending(view)
+    end
+  end
+
   describe "capture inputs in Connected hardware" do
     test "a capture-only input appears in Connected hardware but not the outputs card",
          %{conn: conn} do

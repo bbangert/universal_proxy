@@ -53,7 +53,7 @@ defmodule UniversalProxy.Hardware do
   #
   # Each entry: `{vendor_id, product_id, %{...}}` where the map carries:
   #   * `:kind`      — port kind atom (`:ttl`, `:rs232`, `:rs485`,
-  #                    `:zwave`, `:ir`)
+  #                    `:zwave`, `:zigbee`, `:ir`)
   #   * `:name`      — adapter name shown in the table
   #   * `:vendor`    — overrides USB descriptor manufacturer (optional)
   #   * `:chip`      — chipset shown in the detail drawer (optional)
@@ -69,7 +69,11 @@ defmodule UniversalProxy.Hardware do
     # ── Branded products (kind locked by hardware) ────────────────
     # VID/PID from Home Assistant's zwave_js manifest (vid 303A =
     # Espressif — the ZWA-2's USB interface is its ESP32 bridge; the
-    # Z-Wave radio itself is the EFR32ZG23).
+    # Z-Wave radio itself is the EFR32ZG23). Some ZBT-2 units share
+    # this VID/PID (AUX-2 yaml), so `nabucasa_by_product/1` runs ahead
+    # of this table; 4001 with a missing or unrelated product string
+    # stays a ZWA-2. The ZBT-2 has no table entry — its other PID
+    # (831A) is only recognised by product string.
     {0x303A, 0x4001,
      %{
        kind: :zwave,
@@ -164,6 +168,7 @@ defmodule UniversalProxy.Hardware do
     rs232: "RS-232",
     rs485: "RS-485",
     zwave: "Z-Wave",
+    zigbee: "Zigbee",
     ir: "IR",
     infrared: "IR",
     bt_audio: "BT Audio"
@@ -194,6 +199,8 @@ defmodule UniversalProxy.Hardware do
       `UniversalProxy.UART.SettingsStore.all_opts/1`)
     * `:in_use_ports` — pre-built `MapSet` of currently-opened tty
       basenames
+    * `:usb_devices_dir` — sysfs root read for a Zigbee port's USB
+      descriptors (default: `"/sys/bus/usb/devices"`)
     * `:zwave_claim` — the Z-Wave proxy's port claim
       (`%{tty_name: ..., subscribed: ...}` or `nil`); the proxy opens
       its tty directly rather than through `UART.Server`, so it never
@@ -229,10 +236,13 @@ defmodule UniversalProxy.Hardware do
 
     slots = Keyword.get(opts, :slots, target_slots())
 
-    case slots do
-      nil -> dynamic_listing(enumerated, bus_paths, saved, usage, line_settings)
-      slots -> slot_listing(slots, enumerated, bus_paths, saved, usage, line_settings)
-    end
+    ports =
+      case slots do
+        nil -> dynamic_listing(enumerated, bus_paths, saved, usage, line_settings)
+        slots -> slot_listing(slots, enumerated, bus_paths, saved, usage, line_settings)
+      end
+
+    with_usb_descriptors(ports, opts)
   end
 
   # A wedged/absent SettingsStore must degrade to "no settings shown", not
@@ -364,6 +374,43 @@ defmodule UniversalProxy.Hardware do
     end
   end
 
+  # Identity descriptors are only needed for the Zigbee port (the serial
+  # proxy reports them to Home Assistant), so other ports skip the sysfs
+  # reads and keep `usb_descriptor: nil`.
+  defp with_usb_descriptors(ports, opts) do
+    tty_dir = Keyword.get(opts, :tty_class_dir, @tty_class_dir)
+    usb_dir = Keyword.get(opts, :usb_devices_dir, @usb_devices_dir)
+
+    Enum.map(ports, fn
+      %{kind: :zigbee, tty_name: tty_name} = port when is_binary(tty_name) ->
+        %{port | usb_descriptor: read_usb_descriptor(tty_name, tty_dir, usb_dir)}
+
+      port ->
+        port
+    end)
+  end
+
+  # The device dir (`<bus>`) carries `bcdDevice`; the interface dir
+  # (`<bus>:1.N`) carries `bInterfaceNumber`, `bInterfaceClass` and the
+  # optional `interface` string (iInterface). Both are located through the
+  # tty class symlink; nil when it is absent or unparseable.
+  defp read_usb_descriptor(tty_name, tty_dir, usb_dir) do
+    with {:ok, target} <- File.read_link(Path.join(tty_dir, tty_name)),
+         {bus_path, interface} <- parse_usb_interface(target) do
+      device_dir = Path.join(usb_dir, bus_path)
+      interface_dir = Path.join(usb_dir, interface)
+
+      %{
+        bcd_device: parse_hex_id(read_sysfs_attr(device_dir, "bcdDevice")),
+        interface_number: parse_hex_id(read_sysfs_attr(interface_dir, "bInterfaceNumber")),
+        interface_class: parse_hex_id(read_sysfs_attr(interface_dir, "bInterfaceClass")),
+        interface_description: read_sysfs_attr(interface_dir, "interface")
+      }
+    else
+      _ -> nil
+    end
+  end
+
   defp read_sysfs_attr(base, file) do
     case File.read(Path.join(base, file)) do
       {:ok, value} -> String.trim(value)
@@ -491,11 +538,20 @@ defmodule UniversalProxy.Hardware do
   @bus_path_segment ~r/^(\d+-[\d.]+):\d+\.\d+$/
 
   defp parse_bus_path(symlink) do
+    case parse_usb_interface(symlink) do
+      {bus_path, _interface} -> bus_path
+      nil -> nil
+    end
+  end
+
+  # `{bus_path, interface_dir}` (e.g. `{"1-1.3", "1-1.3:1.0"}`) from the
+  # interface segment of a tty symlink target, or nil.
+  defp parse_usb_interface(symlink) do
     symlink
     |> String.split("/")
     |> Enum.find_value(fn segment ->
       case Regex.run(@bus_path_segment, segment) do
-        [_, bus_path] -> bus_path
+        [interface, bus_path] -> {bus_path, interface}
         _ -> nil
       end
     end)
@@ -512,7 +568,11 @@ defmodule UniversalProxy.Hardware do
     pid = info[:product_id]
     serial = info[:serial_number]
     {in_use?, user} = port_usage(tty_name, usage)
-    device_info = zwave_by_descriptor(info) || Map.get(@usb_device_table, {vid, pid})
+
+    device_info =
+      zwave_by_descriptor(info) || nabucasa_by_product(info) ||
+        Map.get(@usb_device_table, {vid, pid})
+
     saved_cfg = Map.get(saved, {slot_sub, vid, pid})
 
     classification = classify(device_info, saved_cfg)
@@ -547,7 +607,8 @@ defmodule UniversalProxy.Hardware do
       throughput: %{in: 0, out: 0, unit: "B/s"},
       errors: 0,
       since: nil,
-      notes: classification.notes
+      notes: classification.notes,
+      usb_descriptor: nil
     }
     |> Map.merge(line_setting_fields(line))
   end
@@ -671,7 +732,8 @@ defmodule UniversalProxy.Hardware do
       throughput: %{in: 0, out: 0, unit: "B/s"},
       errors: 0,
       since: nil,
-      notes: nil
+      notes: nil,
+      usb_descriptor: nil
     }
   end
 
@@ -700,6 +762,38 @@ defmodule UniversalProxy.Hardware do
 
   defp descriptor_name(info) do
     Enum.find([info[:product], info[:description]], fn s -> is_binary(s) and s != "" end)
+  end
+
+  # Nabu Casa's ZWA-2 (Z-Wave) and ZBT-2 (Zigbee) both enumerate as
+  # Espressif (VID 0x303A) and some units share a PID, so the USB product
+  # string is the only discriminator. Any PID is accepted, mirroring AUX-2.
+  # Returns nil for other products so a bare 303A:4001 falls through to the
+  # VID/PID table (ZWA-2), which keeps existing ZWA-2 setups unchanged.
+  @nabucasa_vid 0x303A
+  @zbt2_product ~r/\bzbt-?2\b/i
+  @zwa2_product ~r/\bzwa-?2\b/i
+  @zbt2_device %{
+    kind: :zigbee,
+    name: "Home Assistant Connect ZBT-2",
+    vendor: "Nabu Casa",
+    chip: "EFR32MG24",
+    locked: true
+  }
+  @zwa2_device Map.fetch!(@usb_device_table, {@nabucasa_vid, 0x4001})
+
+  defp nabucasa_by_product(%{vendor_id: @nabucasa_vid} = info) do
+    cond do
+      product_matches?(info, @zbt2_product) -> @zbt2_device
+      product_matches?(info, @zwa2_product) -> @zwa2_device
+      true -> nil
+    end
+  end
+
+  defp nabucasa_by_product(_info), do: nil
+
+  defp product_matches?(info, regex) do
+    [info[:description], info[:product]]
+    |> Enum.any?(fn s -> is_binary(s) and Regex.match?(regex, s) end)
   end
 
   # Branded device: hardware-locked, ignore any saved override.

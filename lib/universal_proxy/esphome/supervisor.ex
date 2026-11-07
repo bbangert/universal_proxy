@@ -47,6 +47,7 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   alias UniversalProxy.ESPHome.EntityProvider.MeshSync
   alias UniversalProxy.Hardware
   alias UniversalProxy.TuyaMesh.Commander
+  alias UniversalProxy.UART.Enumerate
   alias UniversalProxy.UART.Store, as: UARTStore
 
   def start_link(init_arg) do
@@ -234,6 +235,9 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   #      needs no saved config.
   #   2. A user-saved `:zwave` override on a generic port still wins
   #      (e.g. a SONOFF Z-Wave 800 dongle on a CP2102, `0x10C4:0xEA60`).
+  #      Locked (branded) ports are skipped: their kind is fixed by
+  #      hardware, so a stale saved `:zwave` row must never claim a
+  #      ZBT-2 (`:zigbee`).
   #
   # `display_name` is the row's `ha_name` — the key the Overview
   # subscribes to `UART.History` throughput with, so the proxy's
@@ -241,26 +245,35 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   # invokes it from its open/rescan loop.
   @doc false
   def resolve_zwave_port do
-    ports = Hardware.list_ports()
+    enumerated = Enumerate.safe()
 
+    pick_zwave_port(
+      Hardware.list_ports(enumerated: enumerated),
+      Hardware.live_port_keys(enumerated: enumerated),
+      UARTStore.all_configs()
+    )
+  end
+
+  # Pure core of `resolve_zwave_port/0`: `ports` from `Hardware.list_ports/0`,
+  # `key_to_tty` from `Hardware.live_port_keys/0`, `configs` from
+  # `UART.Store.all_configs/0`.
+  @doc false
+  def pick_zwave_port(ports, key_to_tty, configs) do
     case Enum.find(ports, &(&1.connected and &1.kind == :zwave)) do
       nil ->
         # Fallback for pre-existing saved configs that target a port
         # whose adapter isn't currently classified as Z-Wave by
         # Hardware (e.g. a CP2102N on a non-ZWA-2 device).
-        key_to_tty = Hardware.live_port_keys()
+        locked_ttys = for %{locked: true, tty_name: tty} <- ports, into: MapSet.new(), do: tty
 
-        case Enum.find(UARTStore.all_configs(), fn cfg ->
-               cfg[:port_type] == :zwave and
-                 Map.has_key?(key_to_tty, {cfg[:slot_sub], cfg[:vendor_id], cfg[:product_id]})
-             end) do
-          nil ->
-            nil
+        Enum.find_value(configs, fn cfg ->
+          tty = Map.get(key_to_tty, {cfg[:slot_sub], cfg[:vendor_id], cfg[:product_id]})
 
-          cfg ->
-            tty = Map.get(key_to_tty, {cfg[:slot_sub], cfg[:vendor_id], cfg[:product_id]})
+          if cfg[:port_type] == :zwave and is_binary(tty) and
+               not MapSet.member?(locked_ttys, tty) do
             %{path: tty, display_name: display_name_for(ports, tty)}
-        end
+          end
+        end)
 
       port ->
         %{path: port.tty_name, display_name: port.ha_name}

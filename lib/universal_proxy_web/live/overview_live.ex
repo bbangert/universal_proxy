@@ -521,7 +521,9 @@ defmodule UniversalProxyWeb.OverviewLive do
     port = Enum.find(socket.assigns.ports, &(&1.id == port_id))
 
     cond do
-      is_nil(port) or port.in_use ->
+      # Locked (branded) kinds are fixed by hardware; the UI renders no
+      # picker for them, so a crafted event is ignored.
+      is_nil(port) or port.in_use or port.locked ->
         {:noreply, socket}
 
       to_string(port.kind) == new_kind ->

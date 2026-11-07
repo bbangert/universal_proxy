@@ -378,12 +378,18 @@ defmodule UniversalProxy.UART.Server do
     uart_opts = PortConfig.to_uart_opts(config)
 
     with {:ok, pid} <-
-           DynamicSupervisor.start_child(UniversalProxy.UART.PortSupervisor, port_child_spec()),
-         :ok <- Circuits.UART.open(pid, port_name, uart_opts) do
-      {:ok, pid, config}
-    else
-      {:error, _reason} = error ->
-        error
+           DynamicSupervisor.start_child(UniversalProxy.UART.PortSupervisor, port_child_spec()) do
+      case Circuits.UART.open(pid, port_name, uart_opts) do
+        :ok ->
+          {:ok, pid, config}
+
+        {:error, _reason} = error ->
+          # A tty held elsewhere (flock → :eagain) must not leave the
+          # freshly started Circuits.UART process behind. Its child spec is
+          # :temporary, so stopping it directly (as close_port does) is enough.
+          Circuits.UART.stop(pid)
+          error
+      end
     end
   end
 
@@ -536,22 +542,14 @@ defmodule UniversalProxy.UART.Server do
     )
   end
 
-  # Branded-device VID/PID predicates retained for the test suite and
-  # for any caller that wants to ask "is this a ZWA-2/IRdroid?" by USB
+  # Branded-device VID/PID predicate retained for the test suite and
+  # for any caller that wants to ask "is this an IRdroid?" by USB
   # descriptor. Auto-classification of the saved-config kind is handled
   # by `UniversalProxy.Hardware`'s `@usb_devices` table — those branded
   # entries carry `locked: true` so ESPHome consumers (Supervisor and
   # Infrared.Server) pick them up directly via `Hardware.list_ports/0`
-  # without needing a saved-config row.
-
-  # ZWA-2 USB VID/PID from Home Assistant's zwave_js manifest.
-  @zwa2_vid 0x303A
-  @zwa2_pid 0x4001
-
-  @doc false
-  def zwa2_device?(info) do
-    info[:vendor_id] == @zwa2_vid and info[:product_id] == @zwa2_pid
-  end
+  # without needing a saved-config row. (ZWA-2 vs ZBT-2 share a VID/PID
+  # and are told apart by product string in `Hardware` only.)
 
   @doc false
   def irdroid_device?(info) do
