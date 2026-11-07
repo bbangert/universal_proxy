@@ -228,6 +228,35 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
       assert Store.skipped(server, "v1") == %{"old.milk" => "budget", "x.milk" => "draw"}
     end
 
+    @tag capture_log: true
+    test "a lower min_fps and its readmission are saved together or not at all", %{path: path} do
+      failing = :atomics.new(1, [])
+
+      # Fails any write that touches the skip list, alone or with other records.
+      insert = fn table, records ->
+        if :atomics.get(failing, 1) == 1 and
+             Enum.any?(List.wrap(records), &match?({:skipped, _}, &1)),
+           do: {:error, :enospc},
+           else: :dets.insert(table, records)
+      end
+
+      server =
+        start_supervised!({Store, name: nil, table: @table, dets_path: path, insert: insert})
+
+      {:ok, _} = Store.update(server, %{min_fps: 40})
+      :ok = Store.skip(server, "v1", "a.milk", "budget", fps: 34.2)
+
+      :atomics.put(failing, 1, 1)
+      assert {:error, :enospc} = Store.update(server, %{min_fps: 30})
+      assert Store.settings(server).min_fps == 40
+      assert Store.skipped(server, "v1") == %{"a.milk" => "budget"}
+
+      # The same selection, retried, readmits.
+      :atomics.put(failing, 1, 0)
+      assert {:ok, %{min_fps: 30}} = Store.update(server, %{min_fps: 30})
+      assert Store.skipped(server, "v1") == %{}
+    end
+
     test "clear_skipped/1 forgets everything and broadcasts", %{path: path} do
       server = start_store(path)
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, MilkDrop.settings_topic())

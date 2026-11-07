@@ -28,8 +28,9 @@ defmodule UniversalProxy.MilkDrop.Store do
 
       Lowering `min_fps` drops the `budget` skips whose recorded fps holds
       the new minimum (with the renderer's 1 fps slack: `fps >= min_fps -
-      1`), so those presets return from the next visualizer session.
-      `budget` skips without a recorded fps are kept.
+      1`) in the same write as the new settings, so those presets return
+      from the next visualizer session. `budget` skips without a recorded
+      fps are kept.
 
     * `:in_flight` — the preset the renderer was last told to load (see
       "Device resets" below).
@@ -195,7 +196,8 @@ defmodule UniversalProxy.MilkDrop.Store do
   settings and persist. `rotate_s` is clamped to #{@rotate_min}..#{@rotate_max};
   `min_fps` to the nearest of `min_fps_options/0`; a wrongly-typed value
   keeps the saved one. A lower `min_fps` drops the `budget` skips it lets
-  back in (see the moduledoc). Returns the new settings.
+  back in, in the same write (see the moduledoc): on an error neither is
+  saved. Returns the new settings.
   """
   @spec update(GenServer.server(), map()) :: {:ok, settings()} | {:error, term()}
   def update(server \\ __MODULE__, params) when is_map(params) do
@@ -408,14 +410,17 @@ defmodule UniversalProxy.MilkDrop.Store do
     end
   end
 
+  # The settings and the skip list they readmit from are one write, so a
+  # failure leaves both as they were and a retry readmits again.
   def handle_call({:update, params}, _from, state) do
     existing = read_settings(state.table)
     merged = merge(existing, params)
+    readmission = readmission(state.table, merged.min_fps)
 
-    case persist(state, {:settings, merged}) do
+    case persist(state, [{:settings, merged} | readmission_records(readmission)]) do
       :ok ->
         if merged != existing, do: broadcast(state, {:milkdrop_settings, merged})
-        if merged.min_fps < existing.min_fps, do: readmit_budget_skips(state, merged.min_fps)
+        announce_readmission(state, merged.min_fps, readmission)
         {:reply, {:ok, merged}, state}
 
       {:error, reason} ->
@@ -553,30 +558,32 @@ defmodule UniversalProxy.MilkDrop.Store do
     end
   end
 
-  # Budget skips measured at or above the new minimum (with the renderer's
-  # slack) are dropped; those without a recorded fps stay.
-  defp readmit_budget_skips(state, min_fps) do
-    with {version, entries} <- read_skipped(state.table),
+  # `{version, kept, cleared}` when budget skips measured at or above
+  # `min_fps` (with the renderer's slack) are to be dropped, else nil.
+  # Those without a recorded fps stay.
+  defp readmission(table, min_fps) do
+    with {version, entries} <- read_skipped(table),
          kept = Map.reject(entries, fn {_preset, e} -> readmitted?(e, min_fps) end),
-         true <- map_size(kept) < map_size(entries) do
-      case persist(state, {:skipped, {version, kept}}) do
-        :ok ->
-          Logger.info(
-            "MilkDrop: minimum frame rate #{min_fps}: #{map_size(entries) - map_size(kept)} " <>
-              "budget skip(s) cleared"
-          )
-
-          broadcast_skipped(state, version, kept)
-
-        {:error, reason} = error ->
-          Logger.error("MilkDrop store budget skip clear failed: #{inspect(reason)}")
-          error
-      end
+         cleared when cleared > 0 <- map_size(entries) - map_size(kept) do
+      {version, kept, cleared}
     else
-      _ -> :ok
+      _ -> nil
     end
   end
 
+  defp readmission_records(nil), do: []
+  defp readmission_records({version, kept, _cleared}), do: [{:skipped, {version, kept}}]
+
+  defp announce_readmission(_state, _min_fps, nil), do: :ok
+
+  defp announce_readmission(state, min_fps, {version, kept, cleared}) do
+    Logger.info("MilkDrop: minimum frame rate #{min_fps}: #{cleared} budget skip(s) cleared")
+    broadcast_skipped(state, version, kept)
+  end
+
+  # The renderer's own rule: a window holds `min_fps` at `min_fps - slack`
+  # or more. The fps it reports is rounded down, so this never readmits a
+  # preset the renderer would skip again.
   defp readmitted?(%{reason: "budget", fps: fps}, min_fps) when is_number(fps),
     do: fps >= min_fps - @min_fps_slack
 
@@ -829,8 +836,9 @@ defmodule UniversalProxy.MilkDrop.Store do
     end
   end
 
-  defp persist(%{table: table, insert: insert}, record) do
-    with :ok <- insert.(table, record), do: :dets.sync(table)
+  # `records` is one record or a list of them, inserted in one call.
+  defp persist(%{table: table, insert: insert}, records) do
+    with :ok <- insert.(table, records), do: :dets.sync(table)
   end
 
   defp read_settings(nil), do: @defaults
