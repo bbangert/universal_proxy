@@ -75,6 +75,18 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
 
   defp ack(n), do: Ash.ack_frame(n)
 
+  defp pushes(acc \\ []) do
+    receive do
+      {:pushed, attached?} -> pushes([attached? | acc])
+    after
+      100 -> Enum.reverse(acc)
+    end
+  end
+
+  defp wait_open(gate) do
+    if Agent.get(gate, & &1) == :open, do: :ok, else: Process.sleep(5) && wait_open(gate)
+  end
+
   # All UART writes received so far, concatenated.
   defp written(acc \\ <<>>) do
     receive do
@@ -216,7 +228,7 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
       assert ZigbeeProxy.claimed_port(server) == base
     end
 
-    test "advertised follows open, a UART error and an unplug" do
+    test "advertised follows open, a UART error and an unplug, keeping the row" do
       slot = start_supervised!({Agent, fn -> nil end})
       %{server: server, port: port} = start_proxy!()
       _ = :sys.get_state(server)
@@ -233,7 +245,16 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
 
       send(server, :zigbee_reopen)
       _ = :sys.get_state(server)
-      assert ZigbeeProxy.advertised(server) == %{attached?: false, error?: false, port: nil}
+      assert ZigbeeProxy.advertised(server) == %{attached?: false, error?: false, port: port}
+      assert {:error, :not_attached} = ZigbeeProxy.attach(server, [], self())
+
+      # The stick back on another tty: its row replaces the kept one.
+      moved = %{port | tty_name: "ttyZB2"}
+      Agent.update(slot, fn _ -> %{path: "ttyZB2", display_name: "zb2", port: moved} end)
+      send(server, :zigbee_reopen)
+      assert_receive {:fake_uart, _fake}
+      _ = :sys.get_state(server)
+      assert ZigbeeProxy.advertised(server) == %{attached?: true, error?: false, port: moved}
     end
 
     test "on_change runs when the attach state or row changes, and only then" do
@@ -275,6 +296,70 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxyTest do
       _ = :sys.get_state(server)
       assert %{attached?: false, error?: true, port: ^port} = ZigbeeProxy.advertised(server)
       refute_receive {:zigbee_changed, _}, 50
+    end
+
+    test "pushes run one at a time, so the last one delivers the latest state" do
+      test_pid = self()
+      gate = start_supervised!({Agent, fn -> :closed end})
+      calls = :counters.new(1, [])
+      name = :"zb_order_#{System.unique_integer([:positive])}"
+
+      # Reads the snapshot, then (first call only) waits for the test
+      # before delivering, as a slow push to espex would.
+      on_change = fn ->
+        snapshot = ZigbeeProxy.advertised(name)
+        :counters.add(calls, 1, 1)
+
+        if :counters.get(calls, 1) == 1 do
+          send(test_pid, :push_blocked)
+          wait_open(gate)
+        end
+
+        send(test_pid, {:pushed, snapshot.attached?})
+      end
+
+      open_fun = fn _path ->
+        {:ok, fake} = FakeUART.start_link(test_pid)
+        send(test_pid, {:fake_uart, fake})
+        {:ok, fake}
+      end
+
+      server =
+        start_supervised!(
+          {ZigbeeProxy,
+           name: name,
+           resolver: fn -> %{path: "ttyZB", display_name: "zb", port: %{ha_name: "zb"}} end,
+           open_fun: open_fun,
+           on_change: on_change}
+        )
+
+      assert_receive :push_blocked
+      send(server, {:circuits_uart, "ttyZB", {:error, :eio}})
+      _ = :sys.get_state(server)
+      send(server, :zigbee_reopen)
+      assert_receive {:fake_uart, _}
+      send(server, {:circuits_uart, "ttyZB", {:error, :eio}})
+      _ = :sys.get_state(server)
+
+      Agent.update(gate, fn _ -> :open end)
+
+      # The blocked push (the open) delivers first, then one coalesced
+      # push of the final, detached state.
+      assert pushes() == [true, false]
+      assert :counters.get(calls, 1) == 2
+    end
+
+    test "the pusher stops with the owner" do
+      server =
+        start_supervised!(
+          {ZigbeeProxy, name: nil, resolver: fn -> nil end, on_change: fn -> :ok end}
+        )
+
+      {pusher, _fun} = :sys.get_state(server).pusher
+      ref = Process.monitor(pusher)
+
+      GenServer.stop(server)
+      assert_receive {:DOWN, ^ref, :process, ^pusher, _}
     end
 
     test "claimed_port is nil without a tty or a server" do

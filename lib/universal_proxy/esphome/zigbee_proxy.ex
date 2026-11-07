@@ -23,7 +23,8 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
     reach it.
   - No port, or a failed open, arms a 5 s rescan that re-resolves each
     time, so a stick plugged in after boot (or replugged onto another
-    tty) attaches without restarting the supervision tree.
+    tty) attaches without restarting the supervision tree. The rescan
+    never reopens a remembered tty, only what the resolver returns.
   - On a UART error the tty is closed, the ASH acknowledger and the RX
     buffer are reset, `uart:port_closed` is broadcast, and the rescan
     starts. Sessions, the subscription and its mode survive the
@@ -35,11 +36,20 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
   - The advertised row and attach state (`advertised/1`) are published
     to `:persistent_term` on every change of either, and erased in
     `terminate/2`, so the serial-proxy adapter can read them without a
-    call that a busy owner would time out. When the attach state or the
-    row changes, the `:on_change` fun (if any) runs in a task under
-    `UniversalProxy.TaskSupervisor`, after the new snapshot is
-    published; the supervisor wires it to push the serial-proxy
-    identity, which must not block the owner.
+    call that a busy owner would time out.
+  - Once a row has been resolved it stays in the snapshot for the
+    owner's lifetime, even after the resolver stops finding the stick
+    (unplugged): it then reads `attached?: false`. The serial-proxy
+    adapter numbers its instances from this snapshot, so a vanishing
+    row would shift every later instance under connected clients. A
+    newly resolved row (the stick back, possibly on another tty)
+    replaces it. The owner restarts with the ESPHome tree on hotplug,
+    which is when renumbering is safe.
+  - When the attach state or the row changes, the owner notifies an
+    `IdentityPusher` it links at init (only with an `:on_change` fun);
+    the pusher runs the fun, which reads the latest snapshot. One
+    process running them in turn keeps deliveries in state order, and
+    the owner never blocks on them.
   - Exits are trapped so `terminate/2` closes the tty and broadcasts
     `uart:port_closed` on a supervisor shutdown. A crash of the linked
     UART process still stops this server.
@@ -109,7 +119,7 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
 
   require Logger
 
-  alias UniversalProxy.ESPHome.ZigbeeProxy.Ash
+  alias UniversalProxy.ESPHome.ZigbeeProxy.{Ash, IdentityPusher}
 
   @typedoc "A session, as returned by `attach/3`."
   @type session :: reference()
@@ -151,7 +161,7 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
     :last_open_error,
     :subscribed,
     :snapshot_key,
-    :on_change,
+    :pusher,
     error?: false,
     mode: :raw,
     sessions: %{},
@@ -317,9 +327,9 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
 
   @doc """
   Whether the tty is open, whether the last attempt to hold it failed,
-  and the `Hardware` row it belongs to (kept while `error?`, nil when no
-  ZBT-2 is resolved). A wedged server reports `error?: true`, a missing
-  one `error?: false`.
+  and the `Hardware` row it belongs to (the last one resolved, kept
+  after an unplug; nil until a ZBT-2 is first resolved). A wedged server
+  reports `error?: true`, a missing one `error?: false`.
   """
   @spec status(GenServer.server()) :: status()
   def status(server \\ __MODULE__) do
@@ -374,7 +384,7 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
       port_path: Keyword.get(opts, :port_path),
       snapshot_key: snapshot_key(Keyword.get(opts, :name, __MODULE__) || self()),
       resolver: Keyword.get(opts, :resolver),
-      on_change: Keyword.get(opts, :on_change),
+      pusher: start_pusher(Keyword.get(opts, :on_change)),
       # Seam for tests: an opener returning a fake UART pid. Every UART
       # operation here is a `Circuits.UART` GenServer call on that pid.
       open_fun: Keyword.get(opts, :open_fun) || (&open_port/1)
@@ -560,6 +570,13 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
     {:stop, reason, state}
   end
 
+  # The pusher crashed in its fun: replace it for the next change. No
+  # re-push here, so a fun that always fails can't spin a crash loop.
+  def handle_info({:EXIT, pid, reason}, %{pusher: {pid, fun}} = state) do
+    Logger.warning("Zigbee proxy identity pusher exited: #{inspect(reason)}")
+    {:noreply, %{state | pusher: start_pusher(fun)}}
+  end
+
   def handle_info(_msg, state) do
     {:noreply, state}
   end
@@ -599,6 +616,7 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
 
     cleanup_uart(state.uart_pid)
     :persistent_term.erase(state.snapshot_key)
+    stop_pusher(state.pusher)
     :ok
   end
 
@@ -755,8 +773,10 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
 
   defp open_resolved(state) do
     case resolve_port(state) do
+      # Keeps the last row (see the moduledoc), but not its tty name: the
+      # tty may be reassigned to another device.
       nil ->
-        schedule_reopen(%{state | port: nil, display_name: nil, error?: false})
+        schedule_reopen(%{state | display_name: nil, error?: false})
 
       {port_path, display_name, port} ->
         case state.open_fun.(port_path) do
@@ -831,15 +851,26 @@ defmodule UniversalProxy.ESPHome.ZigbeeProxy do
 
   defp identity_changed?(_previous, _snapshot), do: true
 
-  defp notify_change(%{on_change: nil}), do: :ok
+  # The pusher reads the snapshot after this publish, so it sees this
+  # change or a later one.
+  defp notify_change(%{pusher: nil}), do: :ok
+  defp notify_change(%{pusher: {pid, _fun}}), do: IdentityPusher.changed(pid)
 
-  # The task reads the published snapshot, so it sees this change or a
-  # later one. A missing task supervisor (shutdown) only drops the push.
-  defp notify_change(%{on_change: fun}) do
-    _ = Task.Supervisor.start_child(UniversalProxy.TaskSupervisor, fun)
+  # Linked, not supervised: it must not outlive this owner (a `:normal`
+  # stop doesn't take a linked process down, hence stop_pusher/1).
+  defp start_pusher(nil), do: nil
+
+  defp start_pusher(fun) do
+    {:ok, pid} = IdentityPusher.start_link(fun)
+    {pid, fun}
+  end
+
+  defp stop_pusher(nil), do: :ok
+
+  defp stop_pusher({pid, _fun}) do
+    Process.unlink(pid)
+    Process.exit(pid, :kill)
     :ok
-  catch
-    :exit, _ -> :ok
   end
 
   defp schedule_reopen(%{port_path: nil, resolver: nil} = state), do: state

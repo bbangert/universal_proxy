@@ -341,6 +341,38 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeTest do
       assert ZigbeeProxy.advertised(server) == %{attached?: true, error?: false, port: row}
     end
 
+    test "an unplug with the owner running keeps every instance number" do
+      %{server: server, row: row} = ZigbeeFixtures.start_owner!()
+      ports = [ttl_row("Zeta (1-1.4)", "ttyUSB1"), ttl_row("Alpha (1-1.2)", "ttyUSB0")]
+
+      names = fn ->
+        ports
+        |> SerialProxy.build_inventory(ZigbeeProxy.advertised(server))
+        |> Enum.map(& &1.friendly_name)
+      end
+
+      before = names.()
+      assert before == ["Alpha (1-1.2)", row.ha_name, "Zeta (1-1.4)"]
+      instance = zigbee_instance()
+
+      # Unplugged: the tty errors, then the resolver finds nothing.
+      :sys.replace_state(server, &%{&1 | resolver: fn -> nil end})
+      send(server, {:circuits_uart, ZigbeeFixtures.tty(), {:error, :eio}})
+      send(server, :zigbee_reopen)
+      _ = ZigbeeProxy.status(server)
+
+      assert names.() == before
+      assert zigbee_instance() == instance
+      assert %Identity{connected?: false, usb: usb} = SerialProxy.identity(instance)
+      assert usb == %{}
+
+      # The kept row never reopens its old tty.
+      assert {:error, :not_attached} = SerialProxy.open(instance, [], self())
+      send(server, :zigbee_reopen)
+      _ = ZigbeeProxy.status(server)
+      refute_received {:fake_uart, _}
+    end
+
     test "is erased when the owner stops" do
       %{server: server} = ZigbeeFixtures.start_owner!()
       assert %{attached?: true} = ZigbeeProxy.advertised(server)

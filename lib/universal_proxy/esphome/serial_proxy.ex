@@ -47,11 +47,13 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
   ## Home Assistant Connect ZBT-2
 
   The ZBT-2 that `UniversalProxy.ESPHome.ZigbeeProxy` holds is advertised
-  as a `:usb_serial` port that drives RTS and DTR, for as long as the
-  owner knows its row (while the tty is open, and while a reopen is
-  pending after an error). Keeping the row through a transient error
-  keeps every instance number stable for connected clients; the identity
-  reports it not connected, with blank strings and no USB ids, meanwhile.
+  as a `:usb_serial` port that drives RTS and DTR from the owner's first
+  resolved row until the owner stops, including while the tty is closed
+  after an error or an unplug. Keeping the row keeps every instance
+  number stable for connected clients (an unplug renumbers only when the
+  hotplug restart of the ESPHome tree drops them); meanwhile the identity
+  reports it not connected, with blank strings and no USB ids, and an
+  open answers `:not_attached`.
 
   Its handles are `{:zigbee, session}`: `open/3` attaches a session to
   the owner and `close/1` detaches it, so the tty (and its DTR/RTS) stay
@@ -71,9 +73,6 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
   and the reopen after it, or a first open that fails and later
   succeeds), so it calls `push_zigbee_identity/1` whenever its attach
   state or row changes, and subscribed clients see each change live.
-  Once the row is gone there is nothing to push; an unplug normally
-  shows up as a UART error first, which pushes the not-connected
-  identity.
   """
 
   @behaviour Espex.SerialProxy
