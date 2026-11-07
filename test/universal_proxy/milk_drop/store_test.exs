@@ -257,6 +257,28 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
       assert Store.skipped(server, "v1") == %{}
     end
 
+    @tag capture_log: true
+    test "a budget skip measured under an earlier, higher min_fps is not stored", %{path: path} do
+      server = start_store(path)
+      {:ok, _} = Store.update(server, %{min_fps: 30})
+      :ok = Store.skip(server, "v1", "x.milk", "draw")
+      Phoenix.PubSub.subscribe(UniversalProxy.PubSub, MilkDrop.settings_topic())
+
+      # Emitted while the minimum was 40, delivered after it dropped to 30.
+      assert :ok = Store.skip(server, "v1", "late.milk", "budget", fps: 34.2)
+      # At the slack boundary it still holds 30.
+      assert :ok = Store.skip(server, "v1", "edge.milk", "budget", fps: 29.0)
+      refute_receive {:milkdrop_skipped, _, _}, 50
+
+      # Under the slack it fails 30 and is kept.
+      :ok = Store.skip(server, "v1", "slow.milk", "budget", fps: 28.9)
+
+      assert Store.skip_entries(server, "v1") == %{
+               "x.milk" => %{reason: "draw", fps: nil},
+               "slow.milk" => %{reason: "budget", fps: 28.9}
+             }
+    end
+
     test "clear_skipped/1 forgets everything and broadcasts", %{path: path} do
       server = start_store(path)
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, MilkDrop.settings_topic())

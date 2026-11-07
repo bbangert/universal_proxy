@@ -26,11 +26,12 @@ defmodule UniversalProxy.MilkDrop.Store do
       version drops the old entries, and `skipped/2` for any other version
       reads as empty.
 
-      Lowering `min_fps` drops the `budget` skips whose recorded fps holds
-      the new minimum (with the renderer's 1 fps slack: `fps >= min_fps -
-      1`) in the same write as the new settings, so those presets return
-      from the next visualizer session. `budget` skips without a recorded
-      fps are kept.
+      A `budget` skip whose recorded fps holds the current minimum (with
+      the renderer's 1 fps slack: `fps >= min_fps - 1`) is never kept:
+      lowering `min_fps` drops those skips in the same write as the new
+      settings, so those presets return from the next visualizer session,
+      and a late skip measured under an earlier, higher minimum is not
+      stored. `budget` skips without a recorded fps are kept.
 
     * `:in_flight` — the preset the renderer was last told to load (see
       "Device resets" below).
@@ -223,7 +224,9 @@ defmodule UniversalProxy.MilkDrop.Store do
 
   @doc """
   `skip/4` with options: `fps:` — the frame rate the renderer measured
-  (with a `budget` skip), kept so a lower `min_fps` can bring it back.
+  (with a `budget` skip), kept so a lower `min_fps` can bring it back. A
+  `budget` skip whose fps already holds the current `min_fps` (measured
+  under an earlier, higher one) is not stored, and returns `:ok`.
   """
   @spec skip(GenServer.server(), String.t(), String.t(), String.t() | atom(), keyword()) ::
           :ok | {:error, term()}
@@ -541,6 +544,21 @@ defmodule UniversalProxy.MilkDrop.Store do
   defp mkdir_p(path), do: File.mkdir_p(Path.dirname(path))
 
   defp add_skip(state, version, preset, reason) do
+    min_fps = read_settings(state.table).min_fps
+
+    if readmitted?(reason, min_fps) do
+      Logger.info(
+        "MilkDrop: #{preset} holds the minimum frame rate #{min_fps} " <>
+          "(#{reason.fps} fps); not skipping it"
+      )
+
+      :ok
+    else
+      store_skip(state, version, preset, reason)
+    end
+  end
+
+  defp store_skip(state, version, preset, reason) do
     skipped =
       case read_skipped(state.table) do
         {^version, entries} -> Map.put(entries, preset, reason)
