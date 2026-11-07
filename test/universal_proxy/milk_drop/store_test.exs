@@ -5,6 +5,8 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
   use ExUnit.Case, async: false
 
   alias UniversalProxy.MilkDrop
+  import ExUnit.CaptureLog
+
   alias UniversalProxy.MilkDrop.Store
 
   @moduletag :tmp_dir
@@ -132,6 +134,161 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
       assert :ok = Store.clear_skipped(server)
       assert_receive {:milkdrop_skipped, nil, %{}}
       assert Store.skipped(server, "v1") == %{}
+    end
+  end
+
+  describe "in-flight record" do
+    # Not restarted by the test supervisor, so a test can kill it (a power
+    # cut: no terminate/2) and start the next "boot" with another boot id.
+    defp start_boot(path, boot_id, opts \\ []) do
+      opts =
+        Keyword.merge(
+          [name: nil, table: @table, dets_path: path, boot_id: boot_id, pack_version: nil],
+          opts
+        )
+
+      start_supervised!(Supervisor.child_spec({Store, opts}, restart: :temporary))
+    end
+
+    defp power_cut(pid) do
+      ref = Process.monitor(pid)
+      Process.exit(pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
+    end
+
+    test "a mark replaces the last one and is read back", %{path: path} do
+      server = start_boot(path, "boot-1")
+      assert Store.in_flight(server) == nil
+
+      assert :ok = Store.mark_in_flight(server, 7, "v1", "a.milk")
+      assert :ok = Store.mark_in_flight(server, 7, "v1", "b.milk")
+
+      assert %{pack_version: "v1", preset: "b.milk", session: 7, boot_id: "boot-1", at: at} =
+               Store.in_flight(server)
+
+      assert is_integer(at)
+    end
+
+    test "clear_in_flight/2 clears only its own session's record", %{path: path} do
+      server = start_boot(path, "boot-1", in_flight_grace_ms: 0)
+
+      :ok = Store.mark_in_flight(server, 7, "v1", "a.milk")
+      assert :ok = Store.clear_in_flight(server, 8)
+      assert %{preset: "a.milk"} = Store.in_flight(server)
+
+      assert :ok = Store.clear_in_flight(server, 7)
+      assert Store.in_flight(server) == nil
+      assert :ok = Store.clear_in_flight(server, 7)
+    end
+
+    test "a clear waits out the grace period, and spares a newer record", %{path: path} do
+      server = start_boot(path, "boot-1", in_flight_grace_ms: 100)
+
+      :ok = Store.mark_in_flight(server, 7, "v1", "a.milk")
+      :ok = Store.clear_in_flight(server, 7)
+      assert %{preset: "a.milk"} = Store.in_flight(server)
+      wait_until(fn -> Store.in_flight(server) == nil end)
+
+      # Re-marked before the grace period ended: the newer record stays.
+      :ok = Store.mark_in_flight(server, 7, "v1", "a.milk")
+      :ok = Store.clear_in_flight(server, 7)
+      :ok = Store.mark_in_flight(server, 9, "v1", "b.milk")
+      Process.sleep(200)
+      assert %{preset: "b.milk", session: 9} = Store.in_flight(server)
+    end
+
+    test "a record from an earlier boot skips its preset as device_reset", %{path: path} do
+      server = start_boot(path, "boot-1")
+      :ok = Store.skip(server, "v1", "slow.milk", "budget")
+      :ok = Store.mark_in_flight(server, 7, "v1", "hang.milk")
+      power_cut(server)
+
+      Phoenix.PubSub.subscribe(UniversalProxy.PubSub, MilkDrop.settings_topic())
+
+      {server, log} = with_log(fn -> start_boot(path, "boot-2") end)
+
+      assert log =~
+               "MilkDrop preset hang.milk was running when the device last stopped; skipping it"
+
+      assert Store.skipped(server, "v1") == %{
+               "slow.milk" => "budget",
+               "hang.milk" => "device_reset"
+             }
+
+      assert_receive {:milkdrop_skipped, "v1", %{"hang.milk" => "device_reset"}}
+      assert Store.in_flight(server) == nil
+
+      # Consumed: the next boot skips nothing new.
+      power_cut(server)
+      server = start_boot(path, "boot-3")
+
+      assert Store.skipped(server, "v1") == %{
+               "slow.milk" => "budget",
+               "hang.milk" => "device_reset"
+             }
+    end
+
+    test "a record survives a store restart within the same boot", %{path: path} do
+      server = start_boot(path, "boot-1")
+      :ok = Store.mark_in_flight(server, 7, "v1", "a.milk")
+      power_cut(server)
+
+      server = start_boot(path, "boot-1")
+      assert %{preset: "a.milk", session: 7} = Store.in_flight(server)
+      assert Store.skipped(server, "v1") == %{}
+
+      # Its session can still clear it.
+      :ok = Store.clear_in_flight(server, 7)
+      assert %{preset: "a.milk"} = Store.in_flight(server)
+    end
+
+    test "an orderly shutdown is not a device reset", %{path: path} do
+      server = start_boot(path, "boot-1")
+      :ok = Store.mark_in_flight(server, 7, "v1", "a.milk")
+      :ok = GenServer.stop(server, :shutdown)
+
+      server = start_boot(path, "boot-2")
+      assert Store.in_flight(server) == nil
+      assert Store.skipped(server, "v1") == %{}
+    end
+
+    @tag capture_log: true
+    test "a record for a pack that is no longer pinned is dropped", %{path: path} do
+      server = start_boot(path, "boot-1")
+      :ok = Store.skip(server, "v1", "slow.milk", "budget")
+      :ok = Store.mark_in_flight(server, 7, "v1", "a.milk")
+      power_cut(server)
+
+      server = start_boot(path, "boot-2", pack_version: "v2")
+      assert Store.in_flight(server) == nil
+      assert Store.skipped(server, "v1") == %{"slow.milk" => "budget"}
+    end
+
+    test "a record for the pinned pack replaces an older pack's skips", %{path: path} do
+      server = start_boot(path, "boot-1")
+      :ok = Store.skip(server, "v1", "slow.milk", "budget")
+      :ok = Store.mark_in_flight(server, 7, "v2", "a.milk")
+      power_cut(server)
+
+      {server, _log} = with_log(fn -> start_boot(path, "boot-2", pack_version: "v2") end)
+      assert Store.skipped(server, "v2") == %{"a.milk" => "device_reset"}
+      assert Store.skipped(server, "v1") == %{}
+    end
+
+    @tag capture_log: true
+    test "a malformed record is deleted", %{path: path} do
+      {:ok, table} = :dets.open_file(@table, file: to_charlist(path), type: :set)
+      :ok = :dets.insert(table, {:in_flight, {:bogus}})
+      :ok = :dets.close(table)
+
+      server = start_boot(path, "boot-2")
+      assert Store.in_flight(server) == nil
+      assert Store.skipped(server, "v1") == %{}
+      power_cut(server)
+
+      {:ok, table} = :dets.open_file(@table, file: to_charlist(path), type: :set)
+      assert :dets.lookup(table, :in_flight) == []
+      :ok = :dets.close(table)
     end
   end
 
@@ -267,6 +424,9 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
       assert Store.update(dead, %{rotate_s: 30}) == {:error, :not_running}
       assert Store.skip(dead, "v1", "a.milk", "draw") == {:error, :not_running}
       assert Store.clear_skipped(dead) == {:error, :not_running}
+      assert Store.in_flight(dead) == nil
+      assert Store.mark_in_flight(dead, 1, "v1", "a.milk") == {:error, :not_running}
+      assert Store.clear_in_flight(dead, 1) == {:error, :not_running}
     end
   end
 end
