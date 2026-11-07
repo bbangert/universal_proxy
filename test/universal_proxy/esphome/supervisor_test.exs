@@ -219,6 +219,19 @@ defmodule UniversalProxy.ESPHome.SupervisorTest do
       end
     end
 
+    test "ports and keys derived from one snapshot never let a saved :zwave config claim a ZBT-2" do
+      enumerated = %{"ttyACM0" => zbt2(0x4001)}
+      bus_paths = %{"ttyACM0" => "1-1.1"}
+      ports = ports(enumerated, bus_paths)
+      keys = Hardware.live_port_keys(enumerated: enumerated, bus_paths: bus_paths)
+
+      assert Map.values(keys) == ["ttyACM0"]
+      assert [%{tty_name: "ttyACM0", locked: true}] = ports
+
+      config = %{port_type: :zwave, slot_sub: "1-1.1", vendor_id: 0x303A, product_id: 0x4001}
+      assert ESPHomeSupervisor.pick_zwave_port(ports, keys, [config]) == nil
+    end
+
     test "a saved :zwave override on an unlocked generic port still wins" do
       ports =
         ports(
