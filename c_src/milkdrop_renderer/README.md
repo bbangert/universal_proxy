@@ -54,7 +54,7 @@ detection"). stdin EOF means exit, in every state.
 
 | Command | Effect |
 |---|---|
-| `{"cmd":"take"}` | Poll `drmSetMaster` for up to 2 s, show the prepared frame with SetCrtc in the chosen mode, start presenting → `presenting`. On timeout: `error` `master_timeout`, still prepared. |
+| `{"cmd":"take"}` | Poll `drmSetMaster` for up to 2 s, show the prepared frame with SetCrtc in the chosen mode, start presenting → `presenting`. On timeout: `error` `master_timeout`, still prepared. While the prepared preset is being replaced (it hung the GPU, see "Failure detection"), the take waits until a replacement has loaded (`no_presets` if none can be); a `release` drops it. |
 | `{"cmd":"release"}` | Stop flipping (a pending flip lands first), `drmModeCloseFB` the front buffer so it stays scanned out (never RmFB the scanout framebuffer), drop master, **keep card0 open** → `released`. Also acked when not presenting. |
 | `{"cmd":"exit"}` | Release if presenting → `exiting` (`requested`), close everything, exit 0. |
 | `{"cmd":"next"}` / `{"cmd":"prev"}` | Forward / back in the history (a new random pick at its end; `prev` with nothing earlier does nothing). A lock stays on and moves to the new preset. |
@@ -281,9 +281,13 @@ reopened if the player replaces the file. `src/pcm_tap.h` is a verbatim copy of
   seen after a warm-up fails that candidate (`skip` `gpu_hang`); one seen
   otherwise is blamed on the candidate whose warm-up failed within the
   last second, else on the preset showing, which gets `skip` `gpu_hang`
-  and is cut away from at once (before a `take` too: the prepared frame is
-  replaced). The `skip` goes out before anything else, so the BEAM can
-  persist it before a fatal reset. Throttle: one `gpu_hang` skip per
+  and is never rendered again: its unsubmitted frame is dropped, no frame
+  is rendered until a replacement has loaded (selection batches run each
+  loop round, in every phase), and the switch is a cut, never a blend. A
+  `take` waits for the replacement. The kernel log is also read before
+  each round's commands, so a `take` never shows a preset whose reset was
+  already logged. The `skip` goes out before anything else, so the BEAM
+  can persist it before a fatal reset. Throttle: one `gpu_hang` skip per
   preset per run, and a reset within 3 s of the last one seen is taken as
   the same hang.
 - **Device resets.** A fatal reset leaves no time for any of that, so the
@@ -333,8 +337,9 @@ Unit tests (host, no GL): `test/milkdrop_renderer_unit_test.exs` builds
 and runs `milkdrop_renderer_unit_tests` — protocol and JSON, options,
 connector and mode selection (`src/output_select.h`), manifest and skip list, rotation and history, the photosensitivity
 filter (picks, history, lock, blends in and out), preset selection
-batches and exhaustion (a failed activation included), the cost guard ladder, frame pacing, the poll-round
-dispatch order, the command drain (nothing after `exit`), the exit guard
+batches and exhaustion (a failed activation included), the switch state (held frames, cuts, a
+`take` that waits for a replacement, recovery batches), the cost guard ladder, frame pacing, the poll-round
+dispatch order (reset check before commands), the command drain (nothing after `exit`), the exit guard
 (a hung shutdown still exits in budget, full stdout/stderr included), the
 test tone's tempo,
 the thermal guard, the stderr classifier and capture, the GPU reset

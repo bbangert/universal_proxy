@@ -16,6 +16,7 @@
 #include "protocol.h"
 #include "ring_writer.h"  // sendspin_player's writer: the real producer
 #include "stderr_capture.h"
+#include "switch_state.h"
 #include "test_tone.h"
 #include "thermal.h"
 
@@ -940,18 +941,164 @@ static void test_poll_round() {
         order.push_back("commands");
         awaiting = false;
     };
-    // Both ready: the flip first, commands after, never a second dispatch.
-    handle_poll_round({true, true}, awaited, dispatch, release);
-    CHECK((order == std::vector<std::string>{"flip", "commands"}));
+    auto checks = [&] { order.push_back("checks"); };
+    // Both ready: the flip first, the checks, commands last, never a
+    // second dispatch.
+    handle_poll_round({true, true}, awaited, dispatch, checks, release);
+    CHECK((order == std::vector<std::string>{"flip", "checks", "commands"}));
     // The flip was consumed elsewhere (stale readiness): no dispatch.
     order.clear();
     awaiting = false;
-    handle_poll_round({true, true}, awaited, dispatch, release);
-    CHECK((order == std::vector<std::string>{"commands"}));
+    handle_poll_round({true, true}, awaited, dispatch, checks, release);
+    CHECK((order == std::vector<std::string>{"checks", "commands"}));
     order.clear();
     awaiting = true;
-    handle_poll_round({false, true}, awaited, dispatch, release);
-    CHECK((order == std::vector<std::string>{"commands"}));
+    handle_poll_round({false, true}, awaited, dispatch, checks, release);
+    CHECK((order == std::vector<std::string>{"checks", "commands"}));
+    // Nothing ready (a poll timeout): the checks still run.
+    order.clear();
+    handle_poll_round({false, false}, awaited, dispatch, checks, release);
+    CHECK((order == std::vector<std::string>{"checks"}));
+
+    // A GPU reset logged before a `take` in the same round: the check sees
+    // it first, so the take waits instead of showing the hung preset.
+    SwitchState sw;
+    int taken = 0, deferred = 0;
+    auto take = [&] { sw.request_take() ? taken++ : deferred++; };
+    handle_poll_round({false, true}, awaited, [] {}, [&] { sw.hang(); }, take);
+    CHECK(taken == 0 && deferred == 1 && sw.take_pending());
+}
+
+static void test_switch_state() {
+    SwitchState sw;
+    CHECK(!sw.pending() && sw.smooth() && !sw.holding_frames());
+    CHECK(sw.request_take() && !sw.take_pending() && !sw.take_due());
+
+    // Commands and the rotation timer replace each other...
+    sw.request(Switch::Next);
+    sw.request(Switch::Prev);
+    CHECK(sw.requested() == Switch::Prev);
+    CHECK(sw.begin() == Switch::Prev && !sw.pending());
+
+    // ...but never a pending eject or retry.
+    sw.eject();
+    sw.request(Switch::Prev);
+    sw.request(Switch::Rotate);
+    CHECK(sw.requested() == Switch::Eject);
+    sw.eject_if_idle();
+    CHECK(sw.begin() == Switch::Eject);
+    sw.retry("next");
+    sw.request(Switch::Next);
+    CHECK(sw.requested() == Switch::Retry && std::string(sw.retry_cause()) == "next");
+    sw.selected(Selection::Switched, false);
+    sw.begin();
+
+    // A failed preload batch leaves the playing preset: frames go on, blends too.
+    CHECK(sw.begin() == Switch::None);
+    sw.selected(Selection::Deferred, false);
+    sw.retry("rotate");
+    CHECK(sw.smooth() && !sw.holding_frames() && sw.request_take());
+    sw.begin();
+    sw.selected(Selection::Switched, false);
+
+    // An activated failure holds frames and cuts until a switch succeeds.
+    sw.request(Switch::Rotate);
+    sw.begin();
+    sw.selected(Selection::Deferred, true);
+    sw.retry("rotate");
+    CHECK(!sw.smooth() && sw.holding_frames());
+    sw.begin();
+    sw.selected(Selection::Deferred, false);  // the force carries over batches
+    sw.retry("rotate");
+    CHECK(!sw.smooth() && sw.holding_frames());
+    sw.begin();
+    sw.selected(Selection::Switched, false);
+    CHECK(sw.smooth() && !sw.holding_frames() && !sw.pending());
+
+    // The showing preset hung the GPU: eject it with a cut, hold frames,
+    // and a take waits for the replacement (once).
+    sw.request(Switch::Next);
+    sw.hang();
+    CHECK(sw.requested() == Switch::Eject && !sw.smooth() && sw.holding_frames());
+    CHECK(!sw.request_take() && sw.take_pending() && !sw.take_due());
+    sw.request(Switch::Prev);  // a prev with nothing earlier can't drop the eject
+    CHECK(sw.begin() == Switch::Eject && !sw.smooth());
+    sw.selected(Selection::Deferred, false);
+    sw.retry("eject");
+    CHECK(sw.holding_frames() && !sw.take_due());
+    CHECK(sw.begin() == Switch::Retry && !sw.smooth());
+    sw.selected(Selection::Switched, false);
+    CHECK(!sw.holding_frames() && sw.take_due() && !sw.take_due() && !sw.take_pending());
+
+    // A release drops a waiting take.
+    sw.hang();
+    CHECK(!sw.request_take());
+    sw.cancel_take();
+    sw.begin();
+    sw.selected(Selection::Switched, false);
+    CHECK(!sw.take_due());
+}
+
+// The non-presenting loop's recovery after the prepared preset hung the
+// GPU: selection batches until a preset loads, the take only after, and
+// none when nothing loads.
+static void test_recovery_round() {
+    PresetManager::Config cfg;
+    cfg.seed = 5;
+    auto run = [&](int n, const std::string& loads, std::vector<std::string>& tried, int& taken,
+                   std::string& exit_reason) {
+        PresetManager pm(entries(n), {}, cfg);
+        const PresetEntry* showing = pm.start("");
+        SwitchState sw;
+        exit_reason.clear();
+        taken = 0;
+        auto attempt = [&](const PresetEntry& e) {
+            tried.push_back(e.file);
+            return e.file == loads ? Attempt::Loaded : Attempt::Failed;
+        };
+        // As App::apply_switch(): the eject or retry is a rotate pick.
+        auto apply = [&] {
+            const Switch s = sw.begin();
+            CHECK(s == Switch::Eject || s == Switch::Retry);
+            CHECK(!sw.smooth());  // a cut, never a blend with the hung preset
+            const Selection sel = select_preset(pm, pm.rotate(), 8, attempt);
+            sw.selected(sel, false);
+            if (sel == Selection::Deferred) sw.retry("eject");
+            if (sel == Selection::Exhausted) exit_reason = "no_presets";
+        };
+        auto take = [&] {
+            if (!sw.request_take()) return;
+            CHECK(!sw.holding_frames());
+            taken++;
+        };
+        auto stopped = [&] { return !exit_reason.empty(); };
+
+        pm.skip(showing->file);
+        sw.hang();
+        take();  // arrives right after the reset: waits
+        CHECK(taken == 0 && sw.take_pending());
+        int rounds = 0;
+        while (exit_reason.empty() && taken == 0 && rounds++ < 10) {
+            const size_t before = tried.size();
+            recovery_round(sw, apply, take, stopped);
+            CHECK(tried.size() - before <= 8);
+            CHECK(std::find(tried.begin(), tried.end(), showing->file) == tried.end());
+        }
+        return rounds;
+    };
+
+    // 20 presets, only p17 loads: more than one batch, then the take.
+    std::vector<std::string> tried;
+    int taken = 0;
+    std::string exit_reason;
+    int rounds = run(20, "p17.milk", tried, taken, exit_reason);
+    CHECK(taken == 1 && exit_reason.empty() && tried.back() == "p17.milk");
+    CHECK(rounds >= 2 || tried.size() <= 8);
+
+    // Nothing loads: batches until exhausted, no_presets, never a take.
+    tried.clear();
+    run(12, "none.milk", tried, taken, exit_reason);
+    CHECK(taken == 0 && exit_reason == "no_presets" && tried.size() == 11);
 }
 
 static void test_drain_lines() {
@@ -1365,6 +1512,8 @@ int main() {
     test_tone();
     test_selection();
     test_poll_round();
+    test_switch_state();
+    test_recovery_round();
     test_drain_lines();
     test_exit_guard();
     test_kmsg_watch();
