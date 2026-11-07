@@ -18,7 +18,11 @@ defmodule UniversalProxy.Display.MilkDropTest do
   setup %{tmp_dir: tmp_dir} do
     store =
       start_supervised!(
-        {Store, name: nil, table: @table, dets_path: Path.join(tmp_dir, "settings.dets")}
+        {Store,
+         name: nil,
+         table: @table,
+         dets_path: Path.join(tmp_dir, "settings.dets"),
+         in_flight_grace_ms: 0}
       )
 
     skip_file = Path.join(tmp_dir, "skip.txt")
@@ -367,6 +371,114 @@ defmodule UniversalProxy.Display.MilkDropTest do
              "--connector",
              "HDMI-A-2"
            ]
+  end
+
+  # ── In-flight record (device resets) ──────────────────────────────────
+
+  test "a loading event records the preset in flight before it is forwarded", ctx do
+    {pid, _} = start_renderer(ctx)
+    assert Store.in_flight(ctx.store) == nil
+
+    emit(pid, ~s({"event":"loading","preset":"hf/a.milk"}))
+    assert_receive {:milkdrop, ^pid, %{event: :loading, preset: "hf/a.milk"}}, @timeout
+    assert %{pack_version: @version, preset: "hf/a.milk"} = Store.in_flight(ctx.store)
+
+    MilkDrop.next(pid)
+    assert_receive {:milkdrop, ^pid, %{event: :loading, preset: "p1.milk"}}, @timeout
+    assert_receive {:milkdrop, ^pid, %{event: :preset, file: "p1.milk"}}, @timeout
+    assert %{preset: "p1.milk"} = Store.in_flight(ctx.store)
+  end
+
+  test "a skipped candidate hands the record back to the preset showing", ctx do
+    {pid, _} = start_renderer(ctx)
+
+    emit(pid, ~s({"event":"preset","file":"a.milk","locked":false}))
+    emit(pid, ~s({"event":"loading","preset":"b.milk"}))
+    assert_receive {:milkdrop, ^pid, %{event: :loading}}, @timeout
+    assert %{preset: "b.milk"} = Store.in_flight(ctx.store)
+
+    emit(pid, ~s({"event":"skip","preset":"b.milk","reason":"compile_error"}))
+    assert_receive {:milkdrop, ^pid, %{event: :skip, preset: "b.milk"}}, @timeout
+    assert %{preset: "a.milk"} = Store.in_flight(ctx.store)
+  end
+
+  test "a release or a requested exit clears the record", ctx do
+    {pid, _} = start_renderer(ctx)
+    MilkDrop.take(pid)
+    MilkDrop.next(pid)
+    assert_receive {:milkdrop, ^pid, %{event: :preset, file: "p1.milk"}}, @timeout
+    assert %{preset: "p1.milk"} = Store.in_flight(ctx.store)
+
+    MilkDrop.release(pid)
+    assert_receive {:milkdrop, ^pid, %{event: :released}}, @timeout
+    assert Store.in_flight(ctx.store) == nil
+
+    emit(pid, ~s({"event":"loading","preset":"b.milk"}))
+    assert_receive {:milkdrop, ^pid, %{event: :loading}}, @timeout
+    MilkDrop.exit(pid)
+    assert_receive {:milkdrop, ^pid, %{event: :exiting, reason: "requested"}}, @timeout
+    assert Store.in_flight(ctx.store) == nil
+    assert_receive {:milkdrop_exit, ^pid, 0}, @timeout
+  end
+
+  @tag capture_log: true
+  test "a crashed renderer's record outlasts it by the Store's grace period", ctx do
+    stop_supervised!(Store)
+
+    store =
+      start_supervised!(
+        {Store,
+         name: nil,
+         table: @table,
+         dets_path: Path.join(ctx.tmp_dir, "settings.dets"),
+         in_flight_grace_ms: 300}
+      )
+
+    {pid, _} = start_renderer(%{ctx | store: store})
+    emit(pid, ~s({"event":"loading","preset":"a.milk"}))
+    assert_receive {:milkdrop, ^pid, %{event: :loading}}, @timeout
+
+    MilkDrop.command(pid, %{cmd: "crash", status: 3})
+    assert_receive {:milkdrop_exit, ^pid, 3}, @timeout
+    assert_receive {:milkdrop_reaped, ^pid}, @timeout
+    assert %{preset: "a.milk"} = Store.in_flight(store)
+    wait_until(fn -> Store.in_flight(store) == nil end)
+  end
+
+  @tag capture_log: true
+  test "after a power cut mid-preset the next boot skips that preset", ctx do
+    stop_supervised!(Store)
+
+    store_spec = fn boot_id ->
+      Supervisor.child_spec(
+        {Store,
+         name: nil,
+         table: @table,
+         dets_path: Path.join(ctx.tmp_dir, "settings.dets"),
+         boot_id: boot_id,
+         pack_version: @version},
+        restart: :temporary
+      )
+    end
+
+    store = start_supervised!(store_spec.("boot-1"))
+    {pid, _} = start_renderer(%{ctx | store: store})
+    emit(pid, ~s({"event":"loading","preset":"hang.milk"}))
+    assert_receive {:milkdrop, ^pid, %{event: :loading}}, @timeout
+
+    # Everything dies at once, nothing gets to clean up.
+    ref = Process.monitor(store)
+    Process.exit(store, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^store, :killed}
+    Process.exit(pid, :kill)
+    assert_receive {:milkdrop_reaped, ^pid}, @timeout
+
+    store = start_supervised!(store_spec.("boot-2"))
+    assert Store.skipped(store, @version) == %{"hang.milk" => "device_reset"}
+    assert Store.in_flight(store) == nil
+
+    {_pid, prepared} = start_renderer(%{ctx | store: store}, skip_file: ctx.skip_file <> "2")
+    assert prepared.skip == ["hang.milk"]
   end
 
   # ── Reaped ─────────────────────────────────────────────────────────────

@@ -115,6 +115,8 @@ defmodule UniversalProxy.Display.MilkDrop do
       modeset);
     * `{"event":"presenting"}` — `take` done, frames are on screen;
     * `{"event":"released"}` — `release` done, master dropped;
+    * `{"event":"loading","preset":F}` — `F` is about to be loaded and
+      warmed up (written before any GPU work for it; see "Device resets");
     * `{"event":"preset","file":F,"locked":B,...}` — preset `F` is showing;
     * `{"event":"skip","preset":F,"reason":R}` — `F` cannot be drawn
       (persisted to the Store for this pack version). The forwarded event
@@ -135,6 +137,29 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   A `preset` event whose `locked` differs from the stored setting persists
   it to the Store (`locked: file` or `nil`), so a lock survives a restart.
+
+  ## Device resets
+
+  A vc4 GPU hang can take the whole device down (see
+  `UniversalProxy.MilkDrop.Store`, "Device resets"), so the preset the GPU
+  is working on is kept in the Store's in-flight record, keyed by a
+  per-process session:
+
+    * `loading` writes it (`Store.mark_in_flight/4`, synced to disk) before
+      the event is forwarded. The renderer does not wait for it: the device
+      only dies seconds after a hang starts, which is ample time for one
+      DETS write. A slow write blocks only this process;
+    * a `preset` event for another preset re-marks it (normally the one
+      just loaded, so nothing is written), and a `skip` for the marked
+      preset moves the record back to the preset still showing;
+    * a clean end — `released`, `exiting` with reason `"requested"`, exit
+      status 0 — and the reaper, once the renderer is confirmed gone however
+      the session ended, ask the Store to clear it
+      (`Store.clear_in_flight/2`: after a grace period, and only if it is
+      still this session's).
+
+  The record is written once per preset change (about every 20 s), so its
+  flash wear is negligible.
   """
 
   use GenServer
@@ -152,6 +177,7 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   @events %{
     "prepared" => :prepared,
+    "loading" => :loading,
     "presenting" => :presenting,
     "released" => :released,
     "preset" => :preset,
@@ -308,13 +334,15 @@ defmodule UniversalProxy.Display.MilkDrop do
     }
 
     binary = Keyword.get_lazy(opts, :binary, &default_binary/0)
+    session = System.unique_integer([:positive])
 
     kill_grace_ms = Keyword.get(opts, :kill_grace_ms, @kill_grace_ms)
     task_sup = Keyword.get(opts, :task_supervisor, UniversalProxy.TaskSupervisor)
 
     with :ok <- validate(config),
          :ok <- write_skip_file(config.skip_file, skipped),
-         {:ok, reaper} <- start_reaper(task_sup, owner, kill_grace_ms, config.skip_file),
+         {:ok, reaper} <-
+           start_reaper(task_sup, owner, kill_grace_ms, config.skip_file, {store, session}),
          {:ok, port} <- open_port(binary, args(config)) do
       os_pid = os_pid(port)
       send(reaper, if(os_pid, do: {:os_pid, os_pid}, else: :renderer_exited))
@@ -328,7 +356,10 @@ defmodule UniversalProxy.Display.MilkDrop do
          reaper: reaper,
          reaper_ref: Process.monitor(reaper),
          store: store,
+         session: session,
          version: version,
+         marked: nil,
+         showing: nil,
          locked: Map.get(settings, :locked),
          skip_file: config.skip_file,
          discarding: false,
@@ -381,6 +412,7 @@ defmodule UniversalProxy.Display.MilkDrop do
     level = if status == 0, do: :info, else: :warning
     Logger.log(level, "MilkDrop renderer exited with status #{status}")
     send(state.reaper, :renderer_exited)
+    state = if status == 0, do: clear_in_flight(state), else: state
     send(state.owner, {:milkdrop_exit, self(), status})
     {:stop, :normal, %{state | port: nil}}
   end
@@ -396,8 +428,10 @@ defmodule UniversalProxy.Display.MilkDrop do
     if state.os_pid, do: kill(state.os_pid)
     send(state.owner, {:milkdrop_exit, self(), :reaper_down})
 
-    if is_nil(state.os_pid) or await_gone(state.os_pid, @kill_confirm_ms) == :gone,
-      do: send(state.owner, {:milkdrop_reaped, self()})
+    if is_nil(state.os_pid) or await_gone(state.os_pid, @kill_confirm_ms) == :gone do
+      _ = Store.clear_in_flight(state.store, state.session)
+      send(state.owner, {:milkdrop_reaped, self()})
+    end
 
     {:stop, {:shutdown, :reaper_down}, state}
   end
@@ -414,6 +448,7 @@ defmodule UniversalProxy.Display.MilkDrop do
     case decode_event(line) do
       {:ok, event} ->
         {event, state} = persist(event, state)
+        state = track_in_flight(event, state)
         send(state.owner, {:milkdrop, self(), event})
         state
 
@@ -459,6 +494,50 @@ defmodule UniversalProxy.Display.MilkDrop do
   end
 
   defp persist(event, state), do: {event, state}
+
+  defp track_in_flight(%{event: :loading, preset: preset}, state) when is_binary(preset),
+    do: mark_in_flight(state, preset)
+
+  defp track_in_flight(%{event: :preset, file: file}, state) when is_binary(file) do
+    state = %{state | showing: file}
+    if file == state.marked, do: state, else: mark_in_flight(state, file)
+  end
+
+  # A failed candidate: the GPU is back on the preset still showing.
+  defp track_in_flight(
+         %{event: :skip, preset: preset},
+         %{marked: preset, showing: showing} = state
+       )
+       when is_binary(showing) and showing != preset,
+       do: mark_in_flight(state, showing)
+
+  defp track_in_flight(%{event: :released}, state), do: clear_in_flight(state)
+
+  defp track_in_flight(%{event: :exiting, reason: "requested"}, state),
+    do: clear_in_flight(state)
+
+  defp track_in_flight(_event, state), do: state
+
+  # A failed write leaves `marked` as it was, so the next `preset` event
+  # for this preset tries again.
+  defp mark_in_flight(state, preset) do
+    case Store.mark_in_flight(state.store, state.session, state.version, preset) do
+      :ok ->
+        %{state | marked: preset}
+
+      {:error, reason} ->
+        Logger.warning(
+          "MilkDrop: could not record #{inspect(preset)} as loading: #{inspect(reason)}"
+        )
+
+        state
+    end
+  end
+
+  defp clear_in_flight(state) do
+    _ = Store.clear_in_flight(state.store, state.session)
+    %{state | marked: nil}
+  end
 
   # Skips the Store refused (it is down) stay pending and are retried on
   # the next skip/preset event or `:retry_skips` timer; the first refusal
@@ -575,10 +654,11 @@ defmodule UniversalProxy.Display.MilkDrop do
   # after a grace period if its pid is still alive. `:renderer_exited`
   # (sent before the server stops) means there is nothing to kill, so a
   # recycled pid is not. Once the renderer is known gone the owner is told
-  # (`{:milkdrop_reaped, server}`). It traps exits so that its supervisor's
+  # (`{:milkdrop_reaped, server}`) and the Store's in-flight record for
+  # this session is cleared. It traps exits so that its supervisor's
   # shutdown kills a still-running renderer rather than abandoning it. It
   # also deletes the skip file, last, once the renderer is dead or gone.
-  defp start_reaper(task_sup, owner, grace_ms, skip_file) do
+  defp start_reaper(task_sup, owner, grace_ms, skip_file, {store, session}) do
     server = self()
 
     case Task.Supervisor.start_child(
@@ -587,8 +667,10 @@ defmodule UniversalProxy.Display.MilkDrop do
              Process.flag(:trap_exit, true)
 
              try do
-               if reap(Process.monitor(server), grace_ms) == :gone,
-                 do: send(owner, {:milkdrop_reaped, server})
+               if reap(Process.monitor(server), grace_ms) == :gone do
+                 _ = Store.clear_in_flight(store, session)
+                 send(owner, {:milkdrop_reaped, server})
+               end
              after
                _ = File.rm(skip_file)
              end
