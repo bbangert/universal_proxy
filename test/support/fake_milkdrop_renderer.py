@@ -11,7 +11,8 @@ only what the tests drive.
     {"cmd":"take"}    → {"event":"presenting"}
     {"cmd":"release"} → {"event":"released"}
     {"cmd":"exit"}    → {"event":"exiting","reason":"requested"} + exit 0
-    {"cmd":"next"|"prev"}  → {"event":"preset","file":"p<N>.milk","locked":B,"cause":...}
+    {"cmd":"next"|"prev"}  → {"event":"loading","preset":"p<N>.milk"}, then
+                             {"event":"preset","file":"p<N>.milk","locked":B,"cause":...}
     {"cmd":"lock"|"unlock"}→ the same preset event with the new lock
   test-only:
     {"cmd":"emit","line":"<raw>"} → <raw> verbatim on its own line
@@ -124,6 +125,7 @@ def main():
             prepared()
         elif name in ("next", "prev"):
             preset = preset + 1 if name == "next" else max(preset - 1, 0)
+            emit({"event": "loading", "preset": "p%d.milk" % preset})
             emit_preset(name)
         elif name in ("lock", "unlock"):
             locked = name == "lock"

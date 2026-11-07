@@ -5,6 +5,7 @@
 #include "exit_guard.h"
 #include "frame_pacer.h"
 #include "json.h"
+#include "kmsg_watch.h"
 #include "manifest.h"
 #include "options.h"
 #include "output_select.h"
@@ -15,6 +16,7 @@
 #include "protocol.h"
 #include "ring_writer.h"  // sendspin_player's writer: the real producer
 #include "stderr_capture.h"
+#include "switch_state.h"
 #include "test_tone.h"
 #include "thermal.h"
 
@@ -279,6 +281,8 @@ static void test_protocol() {
     CHECK(json_parse(event_preset("a \"b\".milk", true, "640x360", "rotate", false), v, err));
     CHECK(v.get("event")->string == "preset" && v.get("file")->string == "a \"b\".milk" &&
           v.get("locked")->boolean && v.get("rung")->string == "640x360");
+    CHECK(json_parse(event_loading("hf/a \"b\".milk"), v, err) && v.get("event")->string == "loading" &&
+          v.get("preset")->string == "hf/a \"b\".milk" && v.object.size() == 2);
     CHECK(json_parse(event_skip("x.milk", "budget"), v, err) && v.get("preset")->string == "x.milk" &&
           v.get("reason")->string == "budget" && v.get("message") == nullptr);
     CHECK(json_parse(event_skip("x.milk", "compile_error", "warp: 0:12: bad"), v, err) &&
@@ -316,6 +320,8 @@ static void test_protocol() {
     PreparedInfo worst{hostile, hostile, hostile, hostile, hostile, true, 3, true, hostile};
     CHECK(event_prepared(worst).size() < MAX_EMIT_LINE_BYTES);
     CHECK(event_skip(hostile, hostile, hostile + hostile).size() < MAX_EMIT_LINE_BYTES);
+    CHECK(event_loading(hostile).size() < MAX_EMIT_LINE_BYTES);
+    CHECK(json_parse(event_loading(hostile), v, err) && v.get("preset")->string == hostile);
     s.temp_c = 61.25;
     s.arm_mhz = 1200;
     CHECK(json_parse(event_stats(s), v, err) && v.get("arm_mhz")->number == 1200 &&
@@ -935,18 +941,164 @@ static void test_poll_round() {
         order.push_back("commands");
         awaiting = false;
     };
-    // Both ready: the flip first, commands after, never a second dispatch.
-    handle_poll_round({true, true}, awaited, dispatch, release);
-    CHECK((order == std::vector<std::string>{"flip", "commands"}));
+    auto checks = [&] { order.push_back("checks"); };
+    // Both ready: the flip first, the checks, commands last, never a
+    // second dispatch.
+    handle_poll_round({true, true}, awaited, dispatch, checks, release);
+    CHECK((order == std::vector<std::string>{"flip", "checks", "commands"}));
     // The flip was consumed elsewhere (stale readiness): no dispatch.
     order.clear();
     awaiting = false;
-    handle_poll_round({true, true}, awaited, dispatch, release);
-    CHECK((order == std::vector<std::string>{"commands"}));
+    handle_poll_round({true, true}, awaited, dispatch, checks, release);
+    CHECK((order == std::vector<std::string>{"checks", "commands"}));
     order.clear();
     awaiting = true;
-    handle_poll_round({false, true}, awaited, dispatch, release);
-    CHECK((order == std::vector<std::string>{"commands"}));
+    handle_poll_round({false, true}, awaited, dispatch, checks, release);
+    CHECK((order == std::vector<std::string>{"checks", "commands"}));
+    // Nothing ready (a poll timeout): the checks still run.
+    order.clear();
+    handle_poll_round({false, false}, awaited, dispatch, checks, release);
+    CHECK((order == std::vector<std::string>{"checks"}));
+
+    // A GPU reset logged before a `take` in the same round: the check sees
+    // it first, so the take waits instead of showing the hung preset.
+    SwitchState sw;
+    int taken = 0, deferred = 0;
+    auto take = [&] { sw.request_take() ? taken++ : deferred++; };
+    handle_poll_round({false, true}, awaited, [] {}, [&] { sw.hang(); }, take);
+    CHECK(taken == 0 && deferred == 1 && sw.take_pending());
+}
+
+static void test_switch_state() {
+    SwitchState sw;
+    CHECK(!sw.pending() && sw.smooth() && !sw.holding_frames());
+    CHECK(sw.request_take() && !sw.take_pending() && !sw.take_due());
+
+    // Commands and the rotation timer replace each other...
+    sw.request(Switch::Next);
+    sw.request(Switch::Prev);
+    CHECK(sw.requested() == Switch::Prev);
+    CHECK(sw.begin() == Switch::Prev && !sw.pending());
+
+    // ...but never a pending eject or retry.
+    sw.eject();
+    sw.request(Switch::Prev);
+    sw.request(Switch::Rotate);
+    CHECK(sw.requested() == Switch::Eject);
+    sw.eject_if_idle();
+    CHECK(sw.begin() == Switch::Eject);
+    sw.retry("next");
+    sw.request(Switch::Next);
+    CHECK(sw.requested() == Switch::Retry && std::string(sw.retry_cause()) == "next");
+    sw.selected(Selection::Switched, false);
+    sw.begin();
+
+    // A failed preload batch leaves the playing preset: frames go on, blends too.
+    CHECK(sw.begin() == Switch::None);
+    sw.selected(Selection::Deferred, false);
+    sw.retry("rotate");
+    CHECK(sw.smooth() && !sw.holding_frames() && sw.request_take());
+    sw.begin();
+    sw.selected(Selection::Switched, false);
+
+    // An activated failure holds frames and cuts until a switch succeeds.
+    sw.request(Switch::Rotate);
+    sw.begin();
+    sw.selected(Selection::Deferred, true);
+    sw.retry("rotate");
+    CHECK(!sw.smooth() && sw.holding_frames());
+    sw.begin();
+    sw.selected(Selection::Deferred, false);  // the force carries over batches
+    sw.retry("rotate");
+    CHECK(!sw.smooth() && sw.holding_frames());
+    sw.begin();
+    sw.selected(Selection::Switched, false);
+    CHECK(sw.smooth() && !sw.holding_frames() && !sw.pending());
+
+    // The showing preset hung the GPU: eject it with a cut, hold frames,
+    // and a take waits for the replacement (once).
+    sw.request(Switch::Next);
+    sw.hang();
+    CHECK(sw.requested() == Switch::Eject && !sw.smooth() && sw.holding_frames());
+    CHECK(!sw.request_take() && sw.take_pending() && !sw.take_due());
+    sw.request(Switch::Prev);  // a prev with nothing earlier can't drop the eject
+    CHECK(sw.begin() == Switch::Eject && !sw.smooth());
+    sw.selected(Selection::Deferred, false);
+    sw.retry("eject");
+    CHECK(sw.holding_frames() && !sw.take_due());
+    CHECK(sw.begin() == Switch::Retry && !sw.smooth());
+    sw.selected(Selection::Switched, false);
+    CHECK(!sw.holding_frames() && sw.take_due() && !sw.take_due() && !sw.take_pending());
+
+    // A release drops a waiting take.
+    sw.hang();
+    CHECK(!sw.request_take());
+    sw.cancel_take();
+    sw.begin();
+    sw.selected(Selection::Switched, false);
+    CHECK(!sw.take_due());
+}
+
+// The non-presenting loop's recovery after the prepared preset hung the
+// GPU: selection batches until a preset loads, the take only after, and
+// none when nothing loads.
+static void test_recovery_round() {
+    PresetManager::Config cfg;
+    cfg.seed = 5;
+    auto run = [&](int n, const std::string& loads, std::vector<std::string>& tried, int& taken,
+                   std::string& exit_reason) {
+        PresetManager pm(entries(n), {}, cfg);
+        const PresetEntry* showing = pm.start("");
+        SwitchState sw;
+        exit_reason.clear();
+        taken = 0;
+        auto attempt = [&](const PresetEntry& e) {
+            tried.push_back(e.file);
+            return e.file == loads ? Attempt::Loaded : Attempt::Failed;
+        };
+        // As App::apply_switch(): the eject or retry is a rotate pick.
+        auto apply = [&] {
+            const Switch s = sw.begin();
+            CHECK(s == Switch::Eject || s == Switch::Retry);
+            CHECK(!sw.smooth());  // a cut, never a blend with the hung preset
+            const Selection sel = select_preset(pm, pm.rotate(), 8, attempt);
+            sw.selected(sel, false);
+            if (sel == Selection::Deferred) sw.retry("eject");
+            if (sel == Selection::Exhausted) exit_reason = "no_presets";
+        };
+        auto take = [&] {
+            if (!sw.request_take()) return;
+            CHECK(!sw.holding_frames());
+            taken++;
+        };
+        auto stopped = [&] { return !exit_reason.empty(); };
+
+        pm.skip(showing->file);
+        sw.hang();
+        take();  // arrives right after the reset: waits
+        CHECK(taken == 0 && sw.take_pending());
+        int rounds = 0;
+        while (exit_reason.empty() && taken == 0 && rounds++ < 10) {
+            const size_t before = tried.size();
+            recovery_round(sw, apply, take, stopped);
+            CHECK(tried.size() - before <= 8);
+            CHECK(std::find(tried.begin(), tried.end(), showing->file) == tried.end());
+        }
+        return rounds;
+    };
+
+    // 20 presets, only p17 loads: more than one batch, then the take.
+    std::vector<std::string> tried;
+    int taken = 0;
+    std::string exit_reason;
+    int rounds = run(20, "p17.milk", tried, taken, exit_reason);
+    CHECK(taken == 1 && exit_reason.empty() && tried.back() == "p17.milk");
+    CHECK(rounds >= 2 || tried.size() <= 8);
+
+    // Nothing loads: batches until exhausted, no_presets, never a take.
+    tried.clear();
+    run(12, "none.milk", tried, taken, exit_reason);
+    CHECK(taken == 0 && exit_reason == "no_presets" && tried.size() == 11);
 }
 
 static void test_drain_lines() {
@@ -1287,6 +1439,57 @@ static void test_tone() {
     CHECK(frame_rate.position() == 576 + uint64_t{3600} * TestTone::RATE);
 }
 
+// ---------------------------------------------------------------- kmsg
+
+static void append_file(const std::string& path, const std::string& text) {
+    FILE* f = std::fopen(path.c_str(), "a");
+    std::fputs(text.c_str(), f);
+    std::fclose(f);
+}
+
+static void test_kmsg_watch() {
+    // vc4 (rpi3) and v3d (rpi4/5) wording, as /dev/kmsg records.
+    CHECK(is_gpu_reset("6,4242,512345678,-;[drm] Resetting GPU."));
+    CHECK(is_gpu_reset("3,99,1,-;[drm:v3d_gpu_reset_for_timeout [v3d]] *ERROR* Resetting GPU for hang."));
+    CHECK(!is_gpu_reset("6,4243,512345679,-;vc4-drm soc:gpu: [drm] fb0: vc4drmfb frame buffer device"));
+    CHECK(!is_gpu_reset(" SUBSYSTEM=platform"));
+    CHECK(kmsg_message("6,4242,512345678,-;[drm] Resetting GPU.") == "[drm] Resetting GPU.");
+    CHECK(kmsg_message("12,7,3,c,caller=T1;a;b") == "a;b");
+    CHECK(kmsg_message("no record header; here") == "no record header; here");
+
+    // Opened at the end: earlier lines are never seen.
+    const std::string path = tmp_path("kmsg");
+    fs::remove(path);
+    append_file(path, "6,1,1,-;[drm] Resetting GPU.\n");
+    KmsgWatch w;
+    std::string err, msg;
+    CHECK(!KmsgWatch().open(tmp_path("kmsg_missing"), err) && !err.empty());
+    CHECK(w.open(path, err) && w.active());
+    CHECK(w.poll_resets(&msg) == 0 && msg.empty());
+
+    append_file(path, "6,2,2,-;usb 1-1.3: new device\n SUBSYSTEM=usb\n6,3,3,-;[drm] Resetting GPU.\n");
+    CHECK(w.poll_resets(&msg) == 1 && msg == "[drm] Resetting GPU.");
+    CHECK(w.poll_resets(&msg) == 0);
+
+    // A line split across reads counts once, when it is complete.
+    append_file(path, "6,4,4,-;[drm] Resetting");
+    CHECK(w.poll_resets() == 0);
+    append_file(path, " GPU.\n6,5,5,-;[drm] Resetting GPU.\n");
+    CHECK(w.poll_resets() == 2);
+    w.close();
+    CHECK(!w.active() && w.poll_resets() == 0);
+    fs::remove(path);
+
+    // One skip per preset; resets within the window are the same hang.
+    GpuResetThrottle t(3000000);
+    CHECK(t.report("a.milk", 10000000));
+    CHECK(!t.report("b.milk", 11000000));  // 1 s later: the same hang
+    CHECK(!t.report("a.milk", 60000000));  // ~50 s later, same preset: already skipped
+    CHECK(t.report("b.milk", 70000000));
+    CHECK(!t.report("c.milk", 72000000));  // window counts from the last reset seen
+    CHECK(t.report("c.milk", 76000000));
+}
+
 int main() {
     test_json();
     test_options();
@@ -1309,8 +1512,11 @@ int main() {
     test_tone();
     test_selection();
     test_poll_round();
+    test_switch_state();
+    test_recovery_round();
     test_drain_lines();
     test_exit_guard();
+    test_kmsg_watch();
     if (g_failures == 0) std::printf("OK\n");
     return g_failures == 0 ? 0 : 1;
 }

@@ -60,8 +60,8 @@ defmodule UniversalProxy.Display.MilkDrop do
       (default a unique `<tmp>/up-milkdrop-skip-N.txt`; deleted by the
       reaper however this process ends);
     * `:binary` — the renderer (default `default_binary/0`);
-    * `:skip_retry_ms` — how often skips the Store could not take are
-      retried (default 5000);
+    * `:skip_retry_ms` — how often skips, and in-flight marks and clears,
+      the Store could not take are retried (default 5000);
     * `:kill_grace_ms` — how long a renderer that outlives its closed stdin
       may run before it is SIGKILLed (default 2000);
     * `:task_supervisor` — the `Task.Supervisor` the reaper runs under
@@ -115,12 +115,16 @@ defmodule UniversalProxy.Display.MilkDrop do
       modeset);
     * `{"event":"presenting"}` — `take` done, frames are on screen;
     * `{"event":"released"}` — `release` done, master dropped;
+    * `{"event":"loading","preset":F}` — `F` is about to be loaded and
+      warmed up (written before any GPU work for it; see "Device resets");
     * `{"event":"preset","file":F,"locked":B,...}` — preset `F` is showing;
     * `{"event":"skip","preset":F,"reason":R}` — `F` cannot be drawn
-      (persisted to the Store for this pack version). The forwarded event
+      (persisted to the Store for this pack version, synced to disk before
+      the event is forwarded: a `gpu_hang` skip can come seconds before a
+      GPU reset takes the device down). The forwarded event
       carries `persisted: true | false`; while the Store cannot take it
-      (not running) it is kept and retried on the next `skip` or `preset`
-      event and every `:skip_retry_ms`, until the process ends;
+      (not running) it is kept and retried on the next `loading`, `skip`
+      or `preset` event and every `:skip_retry_ms`, until the process ends;
     * `{"event":"stats",...}` — periodic counters (fps, rung, temperature,
       ARM clock);
     * `{"event":"error","reason":R,...}` — a non-fatal problem;
@@ -135,6 +139,39 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   A `preset` event whose `locked` differs from the stored setting persists
   it to the Store (`locked: file` or `nil`), so a lock survives a restart.
+
+  ## Device resets
+
+  A vc4 GPU hang can take the whole device down (see
+  `UniversalProxy.MilkDrop.Store`, "Device resets"), so the preset the GPU
+  is working on is kept in the Store's in-flight record, keyed by a
+  per-process session:
+
+    * `loading` writes it (`Store.mark_in_flight/4`, synced to disk) before
+      the event is forwarded. The renderer does not wait for it: the device
+      only dies seconds after a hang starts, which is ample time for one
+      DETS write. A slow write blocks only this process;
+    * a `preset` event for another preset re-marks it (normally the one
+      just loaded, so nothing is written), and a `skip` for the preset
+      loading moves the record back to the preset still showing, whether
+      or not the Store took the `loading` mark (it queues marks while its
+      table is closed);
+    * a `gpu_hang` skip the Store could not take keeps the record on that
+      preset, through later events, until the skip is on disk: until then
+      the record is the only durable trace of the hang;
+    * a mark or clear the Store did not acknowledge stays pending and is
+      retried on the next event and every `:skip_retry_ms` until it is
+      (so a locked preset, which only sends `stats`, still gets its mark);
+    * the Store monitors this process, the record's owner, and clears the
+      record a grace period after it goes down, however it went down (only
+      if it is still this session's). A clean end — `released`, `exiting`
+      with reason `"requested"`, exit status 0 — asks for that at once
+      (`Store.clear_in_flight/2`; while a `gpu_hang` skip is held, once it
+      is on disk), so a session whose server lives on past a release is
+      cleared too.
+
+  The record is written once per preset change (about every 20 s), so its
+  flash wear is negligible.
   """
 
   use GenServer
@@ -152,6 +189,7 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   @events %{
     "prepared" => :prepared,
+    "loading" => :loading,
     "presenting" => :presenting,
     "released" => :released,
     "preset" => :preset,
@@ -308,6 +346,7 @@ defmodule UniversalProxy.Display.MilkDrop do
     }
 
     binary = Keyword.get_lazy(opts, :binary, &default_binary/0)
+    session = System.unique_integer([:positive])
 
     kill_grace_ms = Keyword.get(opts, :kill_grace_ms, @kill_grace_ms)
     task_sup = Keyword.get(opts, :task_supervisor, UniversalProxy.TaskSupervisor)
@@ -328,13 +367,20 @@ defmodule UniversalProxy.Display.MilkDrop do
          reaper: reaper,
          reaper_ref: Process.monitor(reaper),
          store: store,
+         session: session,
          version: version,
+         want: nil,
+         intended: nil,
+         acked?: true,
+         hold: nil,
+         showing: nil,
          locked: Map.get(settings, :locked),
          skip_file: config.skip_file,
          discarding: false,
          pending_skips: %{},
          skip_retry_ms: Keyword.get(opts, :skip_retry_ms, @skip_retry_ms),
-         skip_timer: nil
+         skip_timer: nil,
+         record_timer: nil
        }}
     else
       {:error, reason} ->
@@ -381,6 +427,7 @@ defmodule UniversalProxy.Display.MilkDrop do
     level = if status == 0, do: :info, else: :warning
     Logger.log(level, "MilkDrop renderer exited with status #{status}")
     send(state.reaper, :renderer_exited)
+    state = if status == 0, do: sync_record(%{state | want: nil}), else: state
     send(state.owner, {:milkdrop_exit, self(), status})
     {:stop, :normal, %{state | port: nil}}
   end
@@ -403,7 +450,11 @@ defmodule UniversalProxy.Display.MilkDrop do
   end
 
   def handle_info(:retry_skips, state) do
-    {:noreply, state |> Map.put(:skip_timer, nil) |> flush_skips()}
+    {:noreply, state |> Map.put(:skip_timer, nil) |> flush_skips() |> sync_record()}
+  end
+
+  def handle_info(:retry_record, state) do
+    {:noreply, state |> Map.put(:record_timer, nil) |> sync_record()}
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
@@ -414,6 +465,7 @@ defmodule UniversalProxy.Display.MilkDrop do
     case decode_event(line) do
       {:ok, event} ->
         {event, state} = persist(event, state)
+        state = track_in_flight(event, state)
         send(state.owner, {:milkdrop, self(), event})
         state
 
@@ -458,7 +510,110 @@ defmodule UniversalProxy.Display.MilkDrop do
     end
   end
 
+  defp persist(%{event: :loading} = event, state), do: {event, flush_skips(state)}
+
   defp persist(event, state), do: {event, state}
+
+  # The in-flight record. `want` is what it should name going by the
+  # renderer's events: the preset loading, else the one showing (`nil`
+  # after a clean end). `intended` is what the Store was last asked to hold
+  # (`nil`: cleared) and `acked?` whether it said so: a refused ask may
+  # still be queued (the Store queues them while its table is closed), so it
+  # counts as the record's content, but stays pending until acknowledged.
+  # `hold` is a `gpu_hang` preset whose skip is not on disk yet; the record
+  # stays on it until the skip is.
+  #
+  #   event                                want       record
+  #   loading F                            F          hold || F
+  #   preset F                             F          hold || F
+  #   skip F (want F, showing S != F)      S          hold || S
+  #   skip F, gpu_hang, persisted: false   as above   F (hold = F)
+  #   the held skip persists               -          want (cleared if nil)
+  #   released / exiting "requested"       nil        hold || cleared
+  #
+  # Invariant: the durable record names the most recent preset that could
+  # have hung the GPU and is not yet persisted as skipped. Unacked asks are
+  # retried on every tracked event and on `:retry_record`, armed while one
+  # is pending.
+  defp track_in_flight(%{event: :loading, preset: preset}, state) when is_binary(preset),
+    do: sync_record(%{state | want: preset})
+
+  defp track_in_flight(%{event: :preset, file: file}, state) when is_binary(file),
+    do: sync_record(%{state | want: file, showing: file})
+
+  defp track_in_flight(%{event: :skip, preset: preset} = event, state) when is_binary(preset) do
+    state
+    |> hand_back(preset)
+    |> hold_unpersisted_hang(event)
+    |> sync_record()
+  end
+
+  defp track_in_flight(%{event: :released}, state), do: sync_record(%{state | want: nil})
+
+  defp track_in_flight(%{event: :exiting, reason: "requested"}, state),
+    do: sync_record(%{state | want: nil})
+
+  defp track_in_flight(_event, state), do: state
+
+  # A failed candidate: the GPU is back on the preset still showing.
+  defp hand_back(%{want: preset, showing: showing} = state, preset)
+       when is_binary(showing) and showing != preset,
+       do: %{state | want: showing}
+
+  defp hand_back(state, _preset), do: state
+
+  defp hold_unpersisted_hang(state, %{reason: "gpu_hang", persisted: false, preset: preset}),
+    do: %{state | hold: preset}
+
+  defp hold_unpersisted_hang(state, _event), do: state
+
+  defp sync_record(state) do
+    state = release_hold(state)
+    target = state.hold || state.want
+
+    cond do
+      synced?(state, target) -> state
+      is_nil(target) -> clear_in_flight(state)
+      true -> mark_in_flight(state, target)
+    end
+    |> schedule_record_retry()
+  end
+
+  defp release_hold(%{hold: hold, pending_skips: pending} = state)
+       when is_binary(hold) and not is_map_key(pending, hold),
+       do: %{state | hold: nil}
+
+  defp release_hold(state), do: state
+
+  defp synced?(%{intended: target, acked?: true}, target), do: true
+  defp synced?(_state, _target), do: false
+
+  defp mark_in_flight(state, preset) do
+    state.store
+    |> Store.mark_in_flight(state.session, state.version, preset)
+    |> record_ask(state, preset, "record #{inspect(preset)} as loading")
+  end
+
+  defp clear_in_flight(state) do
+    state.store
+    |> Store.clear_in_flight(state.session)
+    |> record_ask(state, nil, "clear the in-flight record")
+  end
+
+  defp record_ask(:ok, state, target, _what), do: %{state | intended: target, acked?: true}
+
+  # Logged once per target, not on every retry.
+  defp record_ask({:error, reason}, state, target, what) do
+    unless state.intended == target and not state.acked?,
+      do: Logger.warning("MilkDrop: could not #{what}: #{inspect(reason)}; retrying")
+
+    %{state | intended: target, acked?: false}
+  end
+
+  defp schedule_record_retry(%{acked?: false, record_timer: nil} = state),
+    do: %{state | record_timer: Process.send_after(self(), :retry_record, state.skip_retry_ms)}
+
+  defp schedule_record_retry(state), do: state
 
   # Skips the Store refused (it is down) stay pending and are retried on
   # the next skip/preset event or `:retry_skips` timer; the first refusal

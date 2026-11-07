@@ -23,6 +23,7 @@
 #include "frame_pacer.h"
 #include "gl_output.h"
 #include "json.h"
+#include "kmsg_watch.h"
 #include "kms.h"
 #include "manifest.h"
 #include "options.h"
@@ -32,6 +33,7 @@
 #include "preset_selection.h"
 #include "protocol.h"
 #include "stderr_capture.h"
+#include "switch_state.h"
 #include "test_tone.h"
 #include "thermal.h"
 #include "visualizer.h"
@@ -70,6 +72,9 @@ constexpr double CUT_BELOW_FPS = 25.0;
 // commands); selection resumes after.
 constexpr int SWITCH_BATCH = 8;
 constexpr int64_t FLIP_TIMEOUT_US = 1000000;
+// A GPU reset read this soon after a warm-up that failed for another
+// reason is blamed on that candidate, not on the preset still showing.
+constexpr int64_t RESET_BLAME_ATTEMPT_US = 1000000;
 
 struct InFlight {
     gbm_bo* bo = nullptr;
@@ -90,6 +95,11 @@ private:
     Options opt_;
     ExitGuard exit_guard_{&g_signal};
     StderrCapture capture_;
+    KmsgWatch kmsg_;
+    GpuResetThrottle gpu_resets_;
+    // The last warm-up that failed, and when (see RESET_BLAME_ATTEMPT_US).
+    std::string failed_attempt_;
+    int64_t failed_attempt_us_ = 0;
     Manifest manifest_;
     std::unique_ptr<PresetManager> presets_;
     std::unique_ptr<CostGuard> guard_;
@@ -127,13 +137,9 @@ private:
     bool first_frame_ = false;   // the next frame is its first shown
     int64_t shown_since_us_ = 0; // for rotation, warm-ups excluded
 
-    enum class Switch { None, Rotate, Next, Prev, Eject, Retry };
-    Switch requested_ = Switch::None;
-    // A batch of candidates failed (Switch::Retry): the cause to report,
-    // and whether a failed preset was activated (projectM shows it, so the
-    // retry cuts and no frame is rendered until then).
-    const char* retry_cause_ = "rotate";
-    bool force_cut_ = false;
+    // The pending switch; while it holds frames (a failed or hung preset
+    // is showing), nothing is rendered or presented and a `take` waits.
+    SwitchState sw_;
     int fps_ = 0;  // what projectM was told
 
     // Stats since the last `stats` event.
@@ -169,6 +175,10 @@ private:
     bool apply_level();
     void announce_preset(const char* cause, bool cut);
     void skip_current(const char* reason);
+    void drop_queued();
+    void recover_step();
+    bool gpu_reset_during(const PresetEntry& entry, std::string& message);
+    void check_gpu_resets();
 
     void housekeeping(int64_t now);
     void report_driver_errors();
@@ -409,6 +419,13 @@ bool App::warm_up(const PresetEntry& entry, bool smooth, std::string& reason, st
             }
         }
     }
+    // The readback above waited for the GPU, so a reset the warm-up caused
+    // has been logged by now.
+    std::string reset_message;
+    if (gpu_reset_during(entry, reset_message)) {
+        reason = "gpu_hang";
+        message = reset_message;
+    }
     if (!activated) vis_.discard();
 
     const int64_t end = monotonic_us();
@@ -416,6 +433,10 @@ bool App::warm_up(const PresetEntry& entry, bool smooth, std::string& reason, st
     stall_us_ += took;
     st_warmups_++;
     st_warmup_max_ = std::max(st_warmup_max_, static_cast<double>(took) / 1000.0);
+    if (!reason.empty()) {
+        failed_attempt_ = entry.file;
+        failed_attempt_us_ = end;
+    }
     log_msg("warm-up %s: preload %.0f ms (stages %u, cached %u), activate + frame %.0f ms%s%s",
             entry.file.c_str(), static_cast<double>(preloaded - start) / 1000.0,
             static_cast<unsigned>(std::popcount(lr.shader_stages)),
@@ -433,6 +454,10 @@ Selection App::switch_to(const PresetEntry* first, const char* cause, bool smoot
             log_msg("refusing %s: high_frequency presets are off", entry.file.c_str());
             return Attempt::Failed;
         }
+        // Written (unbuffered) before any GPU work for this preset: a vc4
+        // hang during it can reset the whole device, and the BEAM persists
+        // this to skip the preset after the reboot.
+        emit_line(event_loading(entry.file));
         guard_->begin(entry.file, hint_rung(entry));
         if (!apply_level()) return Attempt::Abort;
         const bool blend = smooth && !activated_failure && opt_.blend_s > 0 && !expensive(entry);
@@ -454,15 +479,13 @@ Selection App::switch_to(const PresetEntry* first, const char* cause, bool smoot
         if (activated) activated_failure = true;
         return Attempt::Failed;
     });
+    sw_.selected(sel, activated_failure);
     if (sel == Selection::Deferred) {
-        force_cut_ = force_cut_ || activated_failure;
         // Until the retry, the playing preset runs at its own level.
         if (current_ != nullptr) {
             guard_->begin(current_->file, hint_rung(*current_));
             if (!apply_level()) return Selection::Aborted;
         }
-    } else if (sel == Selection::Switched) {
-        force_cut_ = false;
     }
     return sel;
 }
@@ -471,7 +494,61 @@ void App::skip_current(const char* reason) {
     if (current_ == nullptr) return;
     emit_line(event_skip(current_->file, reason));
     presets_->skip(current_->file);
-    requested_ = Switch::Eject;
+    sw_.eject();
+}
+
+// A frame rendered but not yet submitted is never shown.
+void App::drop_queued() {
+    if (queued_.bo != nullptr) gbm_surface_release_buffer(kms_.surface(), queued_.bo);
+    queued_ = {};
+}
+
+// A GPU reset logged during `entry`'s warm-up, not yet reported.
+bool App::gpu_reset_during(const PresetEntry& entry, std::string& message) {
+    if (kmsg_.poll_resets(&message) == 0) return false;
+    if (gpu_resets_.report(entry.file, monotonic_us())) {
+        log_msg("GPU reset while warming up %s", entry.file.c_str());
+        return true;
+    }
+    log_msg("GPU reset while warming up %s (taken as the same hang as the last one)", entry.file.c_str());
+    return false;
+}
+
+// A GPU reset outside a warm-up: blamed on the candidate whose warm-up
+// just failed (its reset was logged late), else on the preset showing.
+// That one is never rendered again, in any phase: its unsubmitted frame is
+// dropped, nothing is rendered or taken until a replacement has loaded, and
+// the switch is a cut. A reset can take the whole device down seconds
+// later, so the skip goes out first.
+void App::check_gpu_resets() {
+    std::string message;
+    if (kmsg_.poll_resets(&message) == 0) return;
+    const int64_t now = monotonic_us();
+    const bool attempt = !failed_attempt_.empty() && now - failed_attempt_us_ < RESET_BLAME_ATTEMPT_US &&
+                         (current_ == nullptr || current_->file != failed_attempt_);
+    const std::string blamed = attempt ? failed_attempt_ : current_ != nullptr ? current_->file : "";
+    if (blamed.empty()) {
+        log_msg("GPU reset with no preset to blame: %s", message.c_str());
+        return;
+    }
+    if (!gpu_resets_.report(blamed, now)) {
+        log_msg("GPU reset (%s), taken as the same hang as the last one", blamed.c_str());
+        return;
+    }
+    log_msg("GPU reset while %s %s; skipping it", blamed.c_str(), attempt ? "was warming up" : "was showing");
+    emit_line(event_skip(blamed, "gpu_hang", message));
+    if (attempt) return;  // already skipped for this run; the showing preset carries on
+    presets_->skip(blamed);
+    drop_queued();
+    sw_.hang();
+}
+
+// Not presenting: while frames are held, one selection batch per round
+// (a hung prepared preset is replaced before any `take`), then a take that
+// waited for it.
+void App::recover_step() {
+    recovery_round(
+        sw_, [this] { apply_switch(); }, [this] { take(); }, [this] { return !exit_reason_.empty(); });
 }
 
 // Photosensitivity: while high_frequency presets are off, a switch away
@@ -480,16 +557,12 @@ void App::skip_current(const char* reason) {
 void App::guard_high_frequency() {
     if (!presets_->high_frequency_on_screen()) return;
     // A frame rendered with it is never shown.
-    if (queued_.bo != nullptr) {
-        gbm_surface_release_buffer(kms_.surface(), queued_.bo);
-        queued_ = {};
-    }
-    if (requested_ == Switch::None) requested_ = Switch::Eject;
+    drop_queued();
+    sw_.eject_if_idle();
 }
 
 void App::apply_switch() {
-    const Switch s = requested_;
-    requested_ = Switch::None;
+    const Switch s = sw_.begin();
     const bool hf = presets_->high_frequency_on_screen();
     const PresetEntry* next = nullptr;
     const char* cause = "rotate";
@@ -499,7 +572,7 @@ void App::apply_switch() {
         case Switch::Next: next = presets_->next(); cause = "next"; break;
         case Switch::Prev: next = presets_->prev(); cause = "prev"; break;
         case Switch::Eject: next = hf ? presets_->cut_target() : presets_->rotate(); cause = "eject"; break;
-        case Switch::Retry: next = presets_->rotate(); cause = retry_cause_; break;
+        case Switch::Retry: next = presets_->rotate(); cause = sw_.retry_cause(); break;
     }
     if (next == nullptr) {
         if (!hf && (s == Switch::None || s == Switch::Prev)) return;  // nothing earlier
@@ -508,12 +581,11 @@ void App::apply_switch() {
             cause = "eject";
         }
     }
-    switch (switch_to(next, cause, !force_cut_ && !hf)) {
+    switch (switch_to(next, cause, sw_.smooth() && !hf)) {
         case Selection::Switched: break;
         case Selection::Deferred:
             log_msg("%d presets failed to load; retrying after this frame", SWITCH_BATCH);
-            requested_ = Switch::Retry;
-            retry_cause_ = cause;
+            sw_.retry(cause);
             break;
         case Selection::Exhausted: fail("no_presets", "no eligible presets left"); break;
         case Selection::Aborted:
@@ -576,7 +648,8 @@ void App::on_flip(int64_t t_us) {
         st_flip_ms_ += static_cast<double>(dt) / 1000.0;
         st_flips_++;
     }
-    if (current_ == nullptr) return;
+    // No verdicts on a preset that is being replaced.
+    if (current_ == nullptr || sw_.holding_frames()) return;
     switch (guard_->on_flip(dt, front_.measurable)) {
         case CostGuard::Verdict::StepDown:
             log_msg("%s: %.1f fps, stepping down to %s every %d vblanks", current_->file.c_str(),
@@ -612,13 +685,14 @@ void App::present_step() {
         }
     }
     if (queued_.bo == nullptr && gbm_surface_has_free_buffers(kms_.surface())) {
-        if (!presets_->locked() && current_ != nullptr && requested_ == Switch::None &&
+        if (!presets_->locked() && current_ != nullptr && !sw_.pending() &&
             now - shown_since_us_ >= int64_t{opt_.rotate_s} * 1000000)
-            requested_ = Switch::Rotate;
-        if (requested_ != Switch::None) apply_switch();
+            sw_.request(Switch::Rotate);
+        if (sw_.pending()) apply_switch();
         if (!exit_reason_.empty()) return;
-        // projectM shows a failed preset until the retry: don't present it.
-        if (requested_ == Switch::Retry && force_cut_) return;
+        // projectM shows a failed or hung preset until the retry: don't
+        // present it.
+        if (sw_.holding_frames()) return;
         // The cut away from a high_frequency preset failed this round: no
         // frame until the retry.
         if (presets_->high_frequency_on_screen()) return;
@@ -630,6 +704,12 @@ void App::present_step() {
 
 void App::take() {
     if (phase_ == Phase::Presenting) return;
+    // The prepared preset hung the GPU or failed: never show it. The take
+    // runs once a replacement has loaded (recover_step()).
+    if (!sw_.request_take()) {
+        log_msg("take waits for a replacement preset");
+        return;
+    }
     // A high_frequency preset turned off before the take: cut first (each
     // failed batch skips its candidates, so this ends).
     while (presets_->high_frequency_on_screen() && exit_reason_.empty() && g_signal.load() == 0) {
@@ -661,6 +741,7 @@ void App::take() {
 }
 
 void App::release(bool announce) {
+    sw_.cancel_take();
     if (phase_ == Phase::Presenting) {
         // Let a queued flip land so the frame left on screen is a whole one.
         const int64_t deadline = monotonic_us() + 200000;
@@ -697,8 +778,8 @@ void App::handle_command(const Command& c) {
         case Command::Type::Take: take(); break;
         case Command::Type::Release: release(true); break;
         case Command::Type::Exit: decide_exit("requested"); break;
-        case Command::Type::Next: requested_ = Switch::Next; break;
-        case Command::Type::Prev: requested_ = Switch::Prev; break;
+        case Command::Type::Next: sw_.request(Switch::Next); break;
+        case Command::Type::Prev: sw_.request(Switch::Prev); break;
         case Command::Type::Lock:
         case Command::Type::Unlock: {
             const bool lock = c.type == Command::Type::Lock;
@@ -811,7 +892,7 @@ void App::loop() {
             break;
         }
         const int64_t now = monotonic_us();
-        int timeout_ms = 200;
+        int timeout_ms = sw_.holding_frames() ? 0 : 200;  // a recovery batch is due
         if (phase_ == Phase::Presenting) {
             if (pending_.bo != nullptr) {
                 timeout_ms = 50;
@@ -849,10 +930,15 @@ void App::loop() {
                 int64_t t = 0;
                 if (kms_.dispatch(t)) on_flip(t);
             },
-            [this] { read_stdin(); });
+            [this] { check_gpu_resets(); },
+            [this] {
+                if (exit_reason_.empty()) read_stdin();
+            });
         if (!exit_reason_.empty()) break;
+        check_gpu_resets();
         housekeeping(monotonic_us());
         if (phase_ == Phase::Presenting) present_step();
+        else recover_step();
     }
 }
 
@@ -871,15 +957,16 @@ void App::loop_headless() {
             pollfd p{STDIN_FILENO, POLLIN, 0};
             if (poll(&p, 1, 0) > 0) read_stdin();
         }
+        check_gpu_resets();
         const int64_t now = monotonic_us();
         housekeeping(now);
-        if (!presets_->locked() && requested_ == Switch::None &&
+        if (!presets_->locked() && !sw_.pending() &&
             now - shown_since_us_ >= int64_t{opt_.rotate_s} * 1000000)
-            requested_ = Switch::Rotate;
+            sw_.request(Switch::Rotate);
         guard_high_frequency();
-        if (requested_ != Switch::None) apply_switch();
+        if (sw_.pending()) apply_switch();
         if (!exit_reason_.empty()) break;
-        if (presets_->high_frequency_on_screen()) continue;
+        if (sw_.holding_frames() || presets_->high_frequency_on_screen()) continue;
         if (queued_.bo == nullptr && !render_frame(queued_)) break;
         gl_.sentinel_untouched();  // waits for the GPU
         pending_ = queued_;
@@ -908,6 +995,8 @@ void App::finish() {
 
 int App::run() {
     if (!capture_.start()) log_msg("stderr capture unavailable; driver errors go to stderr");
+    std::string kmsg_err;
+    if (!kmsg_.open("/dev/kmsg", kmsg_err)) log_msg("GPU reset watch unavailable (%s)", kmsg_err.c_str());
     std::signal(SIGPIPE, SIG_IGN);
     // No SA_RESTART: a signal interrupts a blocking call instead of
     // resuming it.
@@ -936,6 +1025,7 @@ int App::run() {
     gl_.destroy();
     kms_.close();
     capture_.stop();
+    kmsg_.close();
     exit_guard_.stop();
     return code;
 }

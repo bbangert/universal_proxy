@@ -100,6 +100,10 @@ std::string event_preset(std::string_view file, bool locked, std::string_view ru
            str_field("rung", rung, 32) + str_field("cause", cause, 32) + bool_field("cut", cut) + "}";
 }
 
+std::string event_loading(std::string_view file) {
+    return open("loading") + str_field("preset", file, MAX_PRESET_NAME_BYTES) + "}";
+}
+
 std::string event_skip(std::string_view file, std::string_view reason, std::string_view message) {
     std::string out = open("skip") + str_field("preset", file, MAX_PRESET_NAME_BYTES) + str_field("reason", reason, 64);
     if (!message.empty()) out += str_field("message", message, 256);

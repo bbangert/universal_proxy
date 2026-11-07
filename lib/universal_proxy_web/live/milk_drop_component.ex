@@ -23,7 +23,9 @@ defmodule UniversalProxyWeb.MilkDropComponent do
     * **Skipped presets** — the presets the renderer could not draw with
       the ready pack's version, with their reasons, in a disclosure;
       "Clear" calls `Store.clear_skipped/0`; a running renderer keeps its
-      own skip set, so cleared presets return from the next session.
+      own skip set, so cleared presets return from the next session. A
+      preset that was showing when the device went down (`device_reset`,
+      possibly a power cut rather than a GPU hang) comes back the same way.
 
   A write the Store refuses (`{:error, reason}`, e.g. its DETS table is
   unavailable) shows an inline error until the next successful write.
@@ -501,5 +503,7 @@ defmodule UniversalProxyWeb.MilkDropComponent do
   defp reason_label("register_allocate"), do: "Too complex for the GPU"
   defp reason_label("load_failed"), do: "Failed to load"
   defp reason_label("draw_dropped"), do: "Failed to draw"
+  defp reason_label("device_reset"), do: "Reset the device"
+  defp reason_label("gpu_hang"), do: "Hung the GPU"
   defp reason_label(reason), do: reason
 end
