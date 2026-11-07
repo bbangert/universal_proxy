@@ -263,8 +263,9 @@ blends. On the TV remote (HDMI-CEC):
 
 The preset pack (about 4.5 MB, ~35 MB extracted) downloads once to `/data`,
 SHA-256 verified, the first time MilkDrop is selected, or earlier with the
-**Download** button. Nothing downloads at boot. The download waits for the
-network and retries on its own.
+**Download** button. Enabling the feature never downloads anything by itself;
+only a box whose display mode is already MilkDrop fetches a missing pack at
+boot. The download waits for the network and retries on its own.
 
 The **MilkDrop visualizer** section of the web UI's **Audio** tab shows the
 pack status and sets:
