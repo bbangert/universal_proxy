@@ -284,15 +284,14 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeTest do
       assert SettingsStore.get_opts(entry.id) == nil
     end
 
-    test "a failed reopen of an unopened port restores the persisted settings", %{entry: entry} do
+    test "a failed reopen of a port that wasn't open leaves it closed", %{entry: entry} do
       :ok = SettingsStore.put_opts(SettingsStore, entry.id, speed: 38_400)
       Process.put(:open_replies, [{:error, :eagain}])
 
       assert SerialProxy.reconfigure_uart(entry, [speed: 9600], FakeUart) == {:error, :eagain}
       assert_received {:uart_opened, "ttyUSB9", attempted}
       assert attempted[:speed] == 9600
-      assert_received {:uart_opened, "ttyUSB9", restored}
-      assert restored[:speed] == 38_400
+      refute_received {:uart_opened, "ttyUSB9", _}
       assert SettingsStore.get_opts(entry.id)[:speed] == 38_400
     end
 

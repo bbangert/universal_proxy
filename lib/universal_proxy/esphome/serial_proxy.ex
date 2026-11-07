@@ -269,12 +269,12 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
   end
 
   # `uart` is the module owning the tty (injectable for tests). A reopen
-  # that fails falls back to the settings the port had, so a rejected
+  # that fails goes back to the settings an open port had, so a rejected
   # CONFIGURE never leaves the tty closed under a live handle; the
   # CONFIGURE itself still fails.
   @doc false
   def reconfigure_uart(%{id: id, path: path, friendly_name: name, serial: serial}, opts, uart) do
-    previous = previous_opts(uart, id, path)
+    previous = previous_opts(uart, path)
     _ = uart.close(path)
 
     case uart.open(path, Keyword.put(opts, :friendly_name, name)) do
@@ -289,16 +289,16 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
     end
   end
 
-  # The open port's live settings; the persisted ones if it isn't open.
-  defp previous_opts(uart, id, path) do
+  # The open port's live settings, or nil when it wasn't open: a port that
+  # was already closed has no previous state to go back to.
+  defp previous_opts(uart, path) do
     case uart.port_info(path) do
       {:ok, %PortConfig{} = config} -> PortConfig.to_uart_opts(config)
-      _ -> get_stored_opts(id)
+      _ -> nil
     end
   end
 
-  defp restore_uart(_uart, path, _name, nil),
-    do: Logger.warning("ESPHome serial proxy has no previous settings to reopen #{path} with")
+  defp restore_uart(_uart, _path, _name, nil), do: :ok
 
   defp restore_uart(uart, path, name, previous) do
     case uart.open(path, Keyword.put(previous, :friendly_name, name)) do
