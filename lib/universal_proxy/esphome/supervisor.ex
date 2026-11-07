@@ -46,8 +46,8 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   alias UniversalProxy.Bluetooth.Settings, as: BluetoothSettings
   alias UniversalProxy.ESPHome.EntityProvider.MeshSync
   alias UniversalProxy.Hardware
-  alias UniversalProxy.UART.Enumerate
   alias UniversalProxy.TuyaMesh.Commander
+  alias UniversalProxy.UART.Enumerate
   alias UniversalProxy.UART.Store, as: UARTStore
 
   def start_link(init_arg) do
