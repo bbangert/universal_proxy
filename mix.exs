@@ -126,7 +126,8 @@ defmodule UniversalProxy.MixProject do
       {:circuits_uart, "~> 1.5"},
 
       # ESPHome Native API server library
-      {:espex, "~> 0.12"},
+      # TODO restore hex: {:espex, "~> 0.13"} once 0.13.0 is released
+      {:espex, path: "/workspaces/espex-configure", override: true},
 
       # Dependencies for all targets
       {:nerves, "~> 1.10", runtime: false},

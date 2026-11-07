@@ -16,7 +16,9 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeIntegrationTest do
   # NCP DATA frame 0 (ESPHome ezsp_proxy_tap test vector) and the ACK the
   # acknowledger answers it with.
   @data_0 hex.("00 43 21 A8 50 9B 98 7E")
+  @data_1 hex.("10 43 21 A8 50 9F C2 7E")
   @ack_1 hex.("7E 81 60 59 7E")
+  @ack_2 hex.("7E 82 50 3A 7E")
 
   # Generous host bound on SUBSCRIBE + SET_MODE + CONFIGURE acks; USF
   # 1.3.0 gives the whole esphome-hass:// open 1 s.
@@ -205,11 +207,35 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeIntegrationTest do
     assert state.subscribed == nil
   end
 
-  test "SET_MODE(protocol) survives the CONFIGURE reopen", ctx do
+  test "CONFIGURE keeps the session: PROTOCOL mode, subscription and the same acker", ctx do
     request(ctx, :subscribe)
     set_mode(ctx, :protocol)
-    configure(ctx, 115_200, false)
+    session = :sys.get_state(ctx.server).subscribed
 
-    assert :sys.get_state(ctx.server).mode == :protocol
+    assert configure(ctx, 115_200, false).status == :SERIAL_PROXY_STATUS_OK
+
+    state = :sys.get_state(ctx.server)
+    assert state.mode == :protocol
+    assert state.subscribed == session
+    assert [{:uart_configure, opts}] = uart_calls()
+    assert opts[:speed] == 115_200
+  end
+
+  test "CONFIGURE does not reset the acker: DATA_1 after a baud change is ACKed 2", ctx do
+    request(ctx, :subscribe)
+    set_mode(ctx, :protocol)
+
+    send(ctx.server, {:circuits_uart, ZigbeeFixtures.tty(), @data_0})
+    await(ctx, &match?(%Proto.SerialProxyDataReceived{}, &1))
+    assert_receive {:uart_write, @ack_1}
+
+    assert configure(ctx, 115_200, false).status == :SERIAL_PROXY_STATUS_OK
+
+    # No RX drop window: bytes right after the ack reach the client, and
+    # the sequence continues rather than resyncing.
+    send(ctx.server, {:circuits_uart, ZigbeeFixtures.tty(), @data_1})
+    data = await(ctx, &match?(%Proto.SerialProxyDataReceived{}, &1))
+    assert data.data == @data_1
+    assert_receive {:uart_write, @ack_2}
   end
 end

@@ -37,6 +37,14 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeTest do
     {instance, handle}
   end
 
+  defp flush_uart_messages do
+    receive do
+      {:uart_configure, _} -> flush_uart_messages()
+    after
+      0 -> :ok
+    end
+  end
+
   describe "inventory" do
     test "advertises the owner's ZBT-2 as USB_SERIAL driving RTS and DTR" do
       %{row: row} = ZigbeeFixtures.start_owner!()
@@ -170,6 +178,95 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeTest do
     end
   end
 
+  describe "configure/2" do
+    test "retunes the owner's open tty in place, keeping the session" do
+      %{server: server} = ZigbeeFixtures.start_owner!()
+      {_instance, handle} = open_zigbee!()
+      flush_uart_messages()
+
+      assert SerialProxy.configure(handle, speed: 1200, flow_control: :hardware) == :ok
+      assert_receive {:uart_configure, opts}
+      assert opts[:speed] == 1200
+      refute_received :uart_close
+      assert ZigbeeProxy.status(server).attached?
+    end
+
+    test "answers an error for a session that is gone" do
+      ZigbeeFixtures.start_owner!()
+      {_instance, {:zigbee, _} = handle} = open_zigbee!()
+      :ok = SerialProxy.close(handle)
+
+      assert {:error, _} = SerialProxy.configure(handle, speed: 1200)
+    end
+  end
+
+  describe "configure/2 on a UART handle" do
+    defmodule FakeUart do
+      def close(path) do
+        send(Process.get(:test_pid), {:uart_closed, path})
+        :ok
+      end
+
+      def open(path, opts) do
+        send(Process.get(:test_pid), {:uart_opened, path, opts})
+        Process.get(:open_reply, {:ok, self()})
+      end
+    end
+
+    setup do
+      Process.put(:test_pid, self())
+      name = "ttl-#{System.unique_integer([:positive])}"
+
+      entry = %{
+        id: name,
+        path: "ttyUSB9",
+        friendly_name: name,
+        serial: nil
+      }
+
+      {:ok, relay} =
+        UniversalProxy.ESPHome.SerialProxy.Relay.start_link(
+          path: entry.path,
+          friendly_name: name,
+          subscriber: self()
+        )
+
+      on_exit(fn -> SettingsStore.delete_opts(name) end)
+      %{entry: entry, relay: relay}
+    end
+
+    test "reopens the port with the new settings and persists them", %{entry: entry} do
+      opts = [speed: 19_200, data_bits: 8, stop_bits: 1, parity: :even, flow_control: :none]
+
+      assert SerialProxy.reconfigure_uart(entry, opts, FakeUart) == :ok
+      assert_received {:uart_closed, "ttyUSB9"}
+      assert_received {:uart_opened, "ttyUSB9", reopened}
+      assert reopened[:speed] == 19_200
+      assert reopened[:friendly_name] == entry.friendly_name
+      assert SettingsStore.get_opts(entry.id)[:speed] == 19_200
+    end
+
+    test "a subscribed relay keeps forwarding across the reopen", %{entry: entry, relay: relay} do
+      :ok = UniversalProxy.ESPHome.SerialProxy.Relay.subscribe(relay)
+      assert SerialProxy.reconfigure_uart(entry, [speed: 57_600], FakeUart) == :ok
+
+      Phoenix.PubSub.broadcast(
+        UniversalProxy.PubSub,
+        "uart:#{entry.friendly_name}",
+        {:uart_data, %{data: "rx", dir: :rx}}
+      )
+
+      assert_receive {:espex_serial_data, {^relay, "ttyUSB9"}, "rx"}
+    end
+
+    test "reports a failed reopen", %{entry: entry} do
+      Process.put(:open_reply, {:error, :eagain})
+
+      assert SerialProxy.reconfigure_uart(entry, [speed: 9600], FakeUart) == {:error, :eagain}
+      assert SettingsStore.get_opts(entry.id) == nil
+    end
+  end
+
   describe "non-Zigbee handles" do
     @ttl_handle {:relay, "ttyUSB0"}
 
@@ -238,6 +335,22 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeTest do
       assert decoded.product == "ZBT-2"
       assert decoded.usb.vendor_id == 0x303A
       assert decoded.usb.interface_class == 0x02
+    end
+
+    test "reports the interface description when known" do
+      row = ZigbeeFixtures.zbt2_row(%{interface_description: "Home Assistant Connect ZBT-2"})
+      inventory = SerialProxy.build_inventory([], Map.put(@attached, :port, row))
+      identity = SerialProxy.identity_for(inventory, 0)
+
+      assert identity.usb.interface_description == "Home Assistant Connect ZBT-2"
+
+      decoded =
+        identity
+        |> Identity.to_proto()
+        |> Proto.SerialProxyIdentity.encode()
+        |> Proto.SerialProxyIdentity.decode()
+
+      assert decoded.usb.interface_description == "Home Assistant Connect ZBT-2"
     end
 
     test "omits unknown descriptor ids, so the identity still encodes" do

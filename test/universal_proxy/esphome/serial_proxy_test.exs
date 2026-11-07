@@ -12,8 +12,8 @@ defmodule UniversalProxy.ESPHome.SerialProxyTest do
   #   * CONFIGURE and WRITE are gated on ownership (= this connection has
   #     SUBSCRIBEd). A non-owner's CONFIGURE is refused with PORT_IN_USE;
   #     its WRITE is dropped (no ack exists to carry an error).
-  #   * For the owner, CONFIGURE always attempts an open (closing first if
-  #     already open), and WRITE against an advertised-but-unopened
+  #   * For the owner, CONFIGURE opens an unopened instance and retunes an
+  #     open one in place (`configure/2`), and WRITE against an advertised-but-unopened
   #     instance lazily opens via `{:serial_open, instance, :default_opts}`.
   #
   # These tests drive `Espex.Dispatch.handle_request/2` directly. They
@@ -113,10 +113,11 @@ defmodule UniversalProxy.ESPHome.SerialProxyTest do
       assert opts[:speed] == 9600
     end
 
-    test "from the owner on an already-open instance closes then re-opens" do
+    test "from the owner on an already-open instance retunes the handle in place" do
       {_state, actions} = Dispatch.handle_request(opened(owned(state())), configure_req())
 
-      assert [{:serial_close, @instance}, {:serial_open, @instance, _opts}] = actions
+      assert [{:serial_configure, @instance, opts}] = actions
+      assert opts[:speed] == 9600
     end
   end
 

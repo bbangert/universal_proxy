@@ -218,6 +218,39 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
     end
   end
 
+  # In place from espex's side: the handle, subscription and mode stay.
+  # The ZBT-2 retunes its open tty (no close, so DTR/RTS hold). A UART
+  # port is reopened under the same relay, which keeps its PubSub
+  # subscription, so a subscribed relay keeps forwarding and the handle
+  # stays valid; only the `Circuits.UART` process is replaced, as the
+  # close+open it replaces did.
+  @impl true
+  def configure({:zigbee, session}, opts),
+    do: ZigbeeProxy.configure(zigbee_proxy(), session, opts)
+
+  def configure({_relay, path}, opts) do
+    case Enum.find(inventory(), &(&1.path == path)) do
+      nil -> {:error, :no_such_instance}
+      entry -> reconfigure_uart(entry, opts, UART)
+    end
+  end
+
+  # `uart` is the module owning the tty (injectable for tests).
+  @doc false
+  def reconfigure_uart(%{id: id, path: path, friendly_name: name, serial: serial}, opts, uart) do
+    _ = uart.close(path)
+
+    case uart.open(path, Keyword.put(opts, :friendly_name, name)) do
+      {:ok, _pid} ->
+        persist_opts(id, opts, serial)
+        :ok
+
+      {:error, reason} = err ->
+        Logger.warning("ESPHome serial proxy failed to reconfigure #{path}: #{inspect(reason)}")
+        err
+    end
+  end
+
   # espex 0.8 guards both set_modem_pins/3 and get_modem_pins/1 with
   # function_exported? and would otherwise fall back to its own
   # omitted-callback default (all lines low / no-op). Only the ZBT-2
@@ -367,9 +400,15 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
       manufacturer: Map.get(port, :usb_manufacturer) || "",
       product: Map.get(port, :usb_product) || "",
       serial_number: entry.serial || "",
-      usb: usb
+      usb: usb_with_interface_description(usb, descriptor[:interface_description])
     }
   end
+
+  defp usb_with_interface_description(usb, description)
+       when is_binary(description) and description != "",
+       do: Map.put(usb, :interface_description, description)
+
+  defp usb_with_interface_description(usb, _description), do: usb
 
   # Best-effort: a `SettingsStore` hiccup (down, wedged, or DETS write
   # failure) must not fail an otherwise-good open. Follows this project's
