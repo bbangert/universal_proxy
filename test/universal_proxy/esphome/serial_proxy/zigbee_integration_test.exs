@@ -17,6 +17,7 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeIntegrationTest do
   # acknowledger answers it with.
   @data_0 hex.("00 43 21 A8 50 9B 98 7E")
   @data_1 hex.("10 43 21 A8 50 9F C2 7E")
+  @data_5 hex.("50 43 21 A8 50 8E AA 7E")
   @ack_1 hex.("7E 81 60 59 7E")
   @ack_2 hex.("7E 82 50 3A 7E")
 
@@ -254,7 +255,8 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeIntegrationTest do
     assert opts[:speed] == 115_200
   end
 
-  test "CONFIGURE does not reset the acker: DATA_1 after a baud change is ACKed 2", ctx do
+  test "CONFIGURE does not reset the acker: out-of-sequence DATA_5 after a baud change is not ACKed",
+       ctx do
     request(ctx, :subscribe)
     set_mode(ctx, :protocol)
 
@@ -264,11 +266,16 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeIntegrationTest do
 
     assert configure(ctx, 115_200, false).status == :SERIAL_PROXY_STATUS_OK
 
-    # No RX drop window: bytes right after the ack reach the client, and
-    # the sequence continues rather than resyncing.
-    send(ctx.server, {:circuits_uart, ZigbeeFixtures.tty(), @data_1})
+    # A reset acker would resync to DATA_5 and ACK it 6; the kept one
+    # expects frame 1, so DATA_5 earns nothing. The bytes still reach the
+    # client (no RX drop window across the CONFIGURE).
+    send(ctx.server, {:circuits_uart, ZigbeeFixtures.tty(), @data_5})
     data = await(ctx, &match?(%Proto.SerialProxyDataReceived{}, &1))
-    assert data.data == @data_1
+    assert data.data == @data_5
+    refute_receive {:uart_write, _}, 100
+
+    send(ctx.server, {:circuits_uart, ZigbeeFixtures.tty(), @data_1})
+    assert await(ctx, &match?(%Proto.SerialProxyDataReceived{}, &1)).data == @data_1
     assert_receive {:uart_write, @ack_2}
   end
 end

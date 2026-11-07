@@ -10,7 +10,7 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeTest do
   alias Espex.Proto
   alias Espex.SerialProxy.{Identity, Info}
   alias UniversalProxy.ESPHome.{SerialProxy, ZigbeeFixtures, ZigbeeProxy}
-  alias UniversalProxy.UART.SettingsStore
+  alias UniversalProxy.UART.{PortConfig, SettingsStore}
 
   @attached %{attached?: true, error?: false}
 
@@ -209,8 +209,18 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeTest do
 
       def open(path, opts) do
         send(Process.get(:test_pid), {:uart_opened, path, opts})
-        Process.get(:open_reply, {:ok, self()})
+
+        case Process.get(:open_replies, []) do
+          [reply | rest] ->
+            Process.put(:open_replies, rest)
+            reply
+
+          [] ->
+            {:ok, self()}
+        end
       end
+
+      def port_info(_path), do: Process.get(:port_info, {:error, :not_found})
     end
 
     setup do
@@ -259,11 +269,48 @@ defmodule UniversalProxy.ESPHome.SerialProxy.ZigbeeTest do
       assert_receive {:espex_serial_data, {^relay, "ttyUSB9"}, "rx"}
     end
 
-    test "reports a failed reopen", %{entry: entry} do
-      Process.put(:open_reply, {:error, :eagain})
+    test "a failed reopen restores the live settings and reports the error", %{entry: entry} do
+      Process.put(:port_info, {:ok, PortConfig.new(entry.path, speed: 115_200, parity: :odd)})
+      Process.put(:open_replies, [{:error, :eagain}])
 
       assert SerialProxy.reconfigure_uart(entry, [speed: 9600], FakeUart) == {:error, :eagain}
+      assert_received {:uart_closed, "ttyUSB9"}
+      assert_received {:uart_opened, "ttyUSB9", attempted}
+      assert attempted[:speed] == 9600
+      assert_received {:uart_opened, "ttyUSB9", restored}
+      assert restored[:speed] == 115_200
+      assert restored[:parity] == :odd
+      assert restored[:friendly_name] == entry.friendly_name
       assert SettingsStore.get_opts(entry.id) == nil
+    end
+
+    test "a failed reopen of an unopened port restores the persisted settings", %{entry: entry} do
+      :ok = SettingsStore.put_opts(SettingsStore, entry.id, speed: 38_400)
+      Process.put(:open_replies, [{:error, :eagain}])
+
+      assert SerialProxy.reconfigure_uart(entry, [speed: 9600], FakeUart) == {:error, :eagain}
+      assert_received {:uart_opened, "ttyUSB9", attempted}
+      assert attempted[:speed] == 9600
+      assert_received {:uart_opened, "ttyUSB9", restored}
+      assert restored[:speed] == 38_400
+      assert SettingsStore.get_opts(entry.id)[:speed] == 38_400
+    end
+
+    test "reports the reconfigure error when the restore fails too", %{entry: entry} do
+      Process.put(:port_info, {:ok, PortConfig.new(entry.path, speed: 115_200)})
+      Process.put(:open_replies, [{:error, :eagain}, {:error, :enoent}])
+
+      assert SerialProxy.reconfigure_uart(entry, [speed: 9600], FakeUart) == {:error, :eagain}
+      assert_received {:uart_opened, "ttyUSB9", _attempted}
+      assert_received {:uart_opened, "ttyUSB9", _restored}
+    end
+
+    test "nothing to restore without previous settings", %{entry: entry} do
+      Process.put(:open_replies, [{:error, :eagain}])
+
+      assert SerialProxy.reconfigure_uart(entry, [speed: 9600], FakeUart) == {:error, :eagain}
+      assert_received {:uart_opened, "ttyUSB9", _attempted}
+      refute_received {:uart_opened, "ttyUSB9", _}
     end
   end
 

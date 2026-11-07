@@ -84,7 +84,7 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
   alias UniversalProxy.ESPHome.ZigbeeProxy
   alias UniversalProxy.Hardware
   alias UniversalProxy.UART
-  alias UniversalProxy.UART.SettingsStore
+  alias UniversalProxy.UART.{PortConfig, SettingsStore}
 
   @impl true
   def list_instances do
@@ -268,9 +268,13 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
     end
   end
 
-  # `uart` is the module owning the tty (injectable for tests).
+  # `uart` is the module owning the tty (injectable for tests). A reopen
+  # that fails falls back to the settings the port had, so a rejected
+  # CONFIGURE never leaves the tty closed under a live handle; the
+  # CONFIGURE itself still fails.
   @doc false
   def reconfigure_uart(%{id: id, path: path, friendly_name: name, serial: serial}, opts, uart) do
+    previous = previous_opts(uart, id, path)
     _ = uart.close(path)
 
     case uart.open(path, Keyword.put(opts, :friendly_name, name)) do
@@ -280,7 +284,31 @@ defmodule UniversalProxy.ESPHome.SerialProxy do
 
       {:error, reason} = err ->
         Logger.warning("ESPHome serial proxy failed to reconfigure #{path}: #{inspect(reason)}")
+        restore_uart(uart, path, name, previous)
         err
+    end
+  end
+
+  # The open port's live settings; the persisted ones if it isn't open.
+  defp previous_opts(uart, id, path) do
+    case uart.port_info(path) do
+      {:ok, %PortConfig{} = config} -> PortConfig.to_uart_opts(config)
+      _ -> get_stored_opts(id)
+    end
+  end
+
+  defp restore_uart(_uart, path, _name, nil),
+    do: Logger.warning("ESPHome serial proxy has no previous settings to reopen #{path} with")
+
+  defp restore_uart(uart, path, name, previous) do
+    case uart.open(path, Keyword.put(previous, :friendly_name, name)) do
+      {:ok, _pid} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "ESPHome serial proxy failed to reopen #{path} with its previous settings: #{inspect(reason)}"
+        )
     end
   end
 
