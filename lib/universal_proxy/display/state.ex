@@ -290,6 +290,7 @@ defmodule UniversalProxy.Display.State do
       view_opts: Keyword.get_lazy(opts, :view_opts, fn -> default_view_opts(config) end),
       spec: Keyword.get_lazy(opts, :spec, fn -> Spec.now_playing() end),
       viewport: nil,
+      viewport_fail: nil,
       viz_tier: :full,
       model:
         Model.new(
@@ -794,11 +795,13 @@ defmodule UniversalProxy.Display.State do
 
     case start_viewport(%{state | spec: spec}, Keyword.put(rung, :owner, self())) do
       {{:ok, _handle}, state} ->
-        state |> follow_up({:viewport_card, card}) |> follow_up({:viewport, :started})
+        %{state | viewport_fail: nil}
+        |> follow_up({:viewport_card, card})
+        |> follow_up({:viewport, :started})
 
       {{:error, reason}, state} ->
-        Logger.warning("[Display] viewport did not start: #{inspect(reason)}")
-        follow_up(state, {:viewport, :start_failed, reason})
+        log_start_failure(reason, state.viewport_fail)
+        follow_up(%{state | viewport_fail: reason}, {:viewport, :start_failed, reason})
     end
   end
 
@@ -1583,6 +1586,20 @@ defmodule UniversalProxy.Display.State do
     do: state.renderer.available?() and display_card?(state.dri_dir)
 
   # ── Viewport ─────────────────────────────────────────────────────────
+
+  # The model retries a failed start on a backoff, so a display that stays
+  # absent fails identically forever: the first (or a changed) failure is
+  # logged loudly, repeats at debug.
+  defp log_start_failure(reason, reason),
+    do: Logger.debug("[Display] viewport did not start: #{inspect(reason)}")
+
+  # A connected connector that reports no modes at all: nothing is plugged
+  # in (or it has not been read yet), not a mode-selection problem.
+  defp log_start_failure({:mode_not_found, _wanted, []}, _previous),
+    do: Logger.info("[Display] no display connected; will retry")
+
+  defp log_start_failure(reason, _previous),
+    do: Logger.warning("[Display] viewport did not start: #{inspect(reason)}")
 
   defp start_viewport(state, opts) do
     opts = state.viewport_opts |> Keyword.merge(opts) |> Keyword.put_new(:spec, state.spec)

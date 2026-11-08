@@ -96,7 +96,7 @@ defmodule UniversalProxy.Display.StateTest do
         renderer: FakeRenderer,
         viewport_supervisor: context.sup,
         dri_dir: context.dri_dir,
-        viewport_opts: [test_pid: test],
+        viewport_opts: [test_pid: test] ++ Keyword.get(opts, :viewport_opts, []),
         view_opts: [bars: 8, drift_period_ms: 1_000_000_000_000],
         model_opts:
           Keyword.merge(
@@ -485,6 +485,66 @@ defmodule UniversalProxy.Display.StateTest do
 
       broadcast(ctx, "cec:events", {:cec_adapters, [@adapter]})
       assert_receive {:fake_renderer, :start, _}
+    end
+  end
+
+  describe "viewport start failures" do
+    setup do
+      Logger.put_module_level(State, :debug)
+      on_exit(fn -> Logger.delete_module_level(State) end)
+    end
+
+    # Each start pops the next scripted result: a reason fails, :ok succeeds
+    # (the last entry repeats).
+    defp scripted(results) do
+      {:ok, agent} = Agent.start_link(fn -> results end)
+
+      fn ->
+        Agent.get_and_update(agent, fn
+          [last] -> {last, [last]}
+          [head | rest] -> {head, rest}
+        end)
+        |> case do
+          :ok -> :ok
+          reason -> {:error, reason}
+        end
+      end
+    end
+
+    defp failing_log(context, results) do
+      ExUnit.CaptureLog.capture_log([level: :debug], fn ->
+        start_ui(context, viewport_opts: [start_error: scripted(results)])
+        for _ <- 2..length(results), do: assert_receive({:fake_renderer, :start, _}, 1_000)
+        assert_receive {:fake_renderer, :start, _}, 1_000
+      end)
+    end
+
+    test "an identical repeated failure warns once", context do
+      log = failing_log(context, [:boom, :boom, :boom])
+      assert length(Regex.scan(~r/\[warning\].*did not start/, log)) == 1
+      assert log =~ "[debug] [Display] viewport did not start: :boom"
+    end
+
+    test "a changed reason warns again", context do
+      log = failing_log(context, [:boom, :bang, :bang])
+      assert length(Regex.scan(~r/\[warning\].*did not start/, log)) == 2
+    end
+
+    test "a success resets, so the same failure warns again", context do
+      log = failing_log(context, [:boom, :ok])
+      assert length(Regex.scan(~r/\[warning\].*did not start/, log)) == 1
+    end
+
+    test "the no-display reason is calm info, not a warning", context do
+      reason = {:mode_not_found, :auto, []}
+      log = failing_log(context, [reason, reason])
+      assert log =~ "[info] [Display] no display connected; will retry"
+      refute log =~ "[warning]"
+    end
+
+    test "other mode_not_found cases still warn", context do
+      log = failing_log(context, [{:mode_not_found, :auto, [{800, 600, 60.0}]}, :ok])
+      assert log =~ "[warning]"
     end
   end
 
