@@ -187,6 +187,13 @@ defmodule UniversalProxy.MilkDrop.PackTest do
     assert Pack.ensure(server) == {:error, :invalid_pin}
   end
 
+  for version <- ~w(user incoming) do
+    test "the reserved upload dir #{version} is refused as a pack version", %{root: root} do
+      server = start_pack(root, pin("x", %{version: unquote(version)}))
+      assert Pack.ensure(server) == {:error, :invalid_pin}
+    end
+  end
+
   test "the configured pin is a well-formed release asset of its version" do
     assert %{version: version, url: url, sha256: sha256} = Pack.configured_pin()
     assert version =~ ~r/\A[0-9A-Za-z][0-9A-Za-z._-]*\z/
@@ -502,13 +509,23 @@ defmodule UniversalProxy.MilkDrop.PackTest do
     File.mkdir_p!(Path.join(root, "2026.10.1.tmp"))
     File.write!(Path.join(root, "settings.dets"), "store")
 
+    for dir <- ~w(user incoming) do
+      File.mkdir_p!(Path.join(root, dir))
+      File.write!(Path.join([root, dir, "keep.milk"]), "upload")
+    end
+
     body = good_pack(src)
     serve(body)
     server = start_pack(root, pin(body))
     Pack.ensure(server)
 
     assert {:ready, @version, _} = await_final()
-    assert File.ls!(root) |> Enum.sort() == [@version, "settings.dets"]
+
+    assert File.ls!(root) |> Enum.sort() ==
+             Enum.sort([@version, "incoming", "settings.dets", "user"])
+
+    assert File.read!(Path.join(root, "user/keep.milk")) == "upload"
+    assert File.read!(Path.join(root, "incoming/keep.milk")) == "upload"
   end
 
   @tag capture_log: true

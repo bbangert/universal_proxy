@@ -52,8 +52,10 @@ defmodule UniversalProxy.MilkDrop.Pack do
        archive must have `manifest.json` at its root
        (`{:error, :missing_manifest}`).
     4. `<version>.tmp` is renamed to `<version>`; every other directory and
-       `.part` file under the root is deleted (other files, such as
-       `UniversalProxy.MilkDrop.Store`'s DETS file, are left alone).
+       `.part` file under the root is deleted, except the reserved `user`
+       and `incoming` directories (user uploads, never touched by the
+       installer; they are also refused as a pin version). Other files,
+       such as `UniversalProxy.MilkDrop.Store`'s DETS file, are left alone.
 
   Filesystem failures are `{:error, {:io, posix}}`, HTTP failures
   `{:error, {:http_status, status}}` or `{:error, {:transport, reason}}`.
@@ -92,6 +94,8 @@ defmodule UniversalProxy.MilkDrop.Pack do
 
   @version_re ~r/\A[0-9A-Za-z][0-9A-Za-z._-]*\z/
   @sha256_re ~r/\A[0-9a-fA-F]{64}\z/
+  # Hold user uploads: never a pack version, never swept by `cleanup/2`.
+  @reserved ~w(user incoming)
   @read_chunk 65_536
   @task_supervisor UniversalProxy.MilkDrop.PackTasks
   @retry_delays_ms [5_000, 15_000, 60_000, 300_000]
@@ -307,7 +311,7 @@ defmodule UniversalProxy.MilkDrop.Pack do
 
   defp validate_pin(%{version: version, url: url, sha256: sha256} = pin)
        when is_binary(version) and is_binary(url) and is_binary(sha256) do
-    if version =~ @version_re and sha256 =~ @sha256_re do
+    if version =~ @version_re and version not in @reserved and sha256 =~ @sha256_re do
       {:ok, %{pin | sha256: String.downcase(sha256)}}
     else
       {:error, :invalid_pin}
@@ -559,7 +563,8 @@ defmodule UniversalProxy.MilkDrop.Pack do
   defp tar({:error, reason}), do: {:error, {:extract, reason}}
   defp tar(other), do: other
 
-  # Delete every other version dir, stale `.tmp` dir and `.part` file.
+  # Delete every other version dir, stale `.tmp` dir and `.part` file
+  # (never the `@reserved` upload dirs).
   defp cleanup(root, version) do
     case File.ls(root) do
       {:ok, names} ->
@@ -571,6 +576,8 @@ defmodule UniversalProxy.MilkDrop.Pack do
         []
     end
   end
+
+  defp stale?(_root, name) when name in @reserved, do: false
 
   defp stale?(root, name) do
     String.ends_with?(name, ".part") or File.dir?(Path.join(root, name))

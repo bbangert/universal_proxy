@@ -462,9 +462,11 @@ defmodule UniversalProxyWeb.MilkDropComponentTest do
       :ok = Store.skip(Store, @version, "a/slow.milk", "budget", fps: 17.3)
       :ok = Store.skip(@version, "c/hang.milk", "device_reset")
       :ok = Store.skip(@version, "d/stall.milk", "gpu_hang")
+      :ok = Store.skip(@version, "e/loop.milk", "hang")
+      :ok = Store.skip(@version, "f/crash.milk", "crashed")
 
       {:ok, view, _html} = live(conn, "/audio")
-      assert view |> element("#milkdrop-skipped-count") |> render() =~ "4 skipped presets"
+      assert view |> element("#milkdrop-skipped-count") |> render() =~ "6 skipped presets"
       refute has_element?(view, "#milkdrop-skipped-list")
 
       html = view |> element("#milkdrop-skipped-toggle") |> render_click()
@@ -475,6 +477,8 @@ defmodule UniversalProxyWeb.MilkDropComponentTest do
       assert html =~ "c/hang.milk"
       assert html =~ "Reset the device"
       assert html =~ "Hung the GPU"
+      assert html =~ "Froze the renderer"
+      assert html =~ "Crashed the renderer"
       assert html =~ "Cleared presets return from the next visualizer session."
 
       view |> element("#milkdrop-clear-skipped") |> render_click()
