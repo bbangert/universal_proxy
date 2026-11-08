@@ -366,6 +366,15 @@ defmodule UniversalProxy.MilkDrop.UserPresetsTest do
     end
   end
 
+  # Until no free-space measurement is in flight.
+  defp await_measured(server, timeout \\ 2_000) do
+    cond do
+      :sys.get_state(server).budget.task == nil -> :ok
+      timeout <= 0 -> flunk("the measurement never finished")
+      true -> Process.sleep(5) && await_measured(server, timeout - 5)
+    end
+  end
+
   defp incoming_files(ctx),
     do: ctx.incoming |> File.ls!() |> Enum.reject(&String.starts_with?(&1, "."))
 
@@ -918,7 +927,7 @@ defmodule UniversalProxy.MilkDrop.UserPresetsTest do
              bytes: 0,
              presets: 0,
              textures: 0,
-             quota: UserPresets.quota()
+             quota: Map.put(UserPresets.quota(), :upload_bytes, UserPresets.max_upload_bytes())
            }
 
     assert UserPresets.import(dead, []) == {:error, :not_running}
@@ -1047,6 +1056,24 @@ defmodule UniversalProxy.MilkDrop.UserPresetsTest do
       assert capture_log(fn ->
                assert Task.await(waiter) == {:error, {:free_space, :timeout}}
              end) =~ "free-space check took over 200 ms"
+    end
+
+    test "a timed-out reserve is cancelled, queued or granted", ctx do
+      server = start_library(ctx)
+      :ok = :sys.suspend(server)
+      assert UserPresets.reserve(server, 10, 50) == {:error, :timeout}
+      :ok = :sys.resume(server)
+      await_measured(server)
+      assert :sys.get_state(server).reservations == %{}
+
+      # Granted before its cancel arrives: released, file and all.
+      req = make_ref()
+      {:ok, r} = GenServer.call(server, {:reserve, 10, req})
+      File.write!(r.path, "x")
+      GenServer.cast(server, {:cancel_reserve, req})
+      _ = UserPresets.list(server)
+      assert :sys.get_state(server).reservations == %{}
+      refute File.exists?(r.path)
     end
 
     test "a timed-out claim is cancelled: its file doesn't outlive it", ctx do

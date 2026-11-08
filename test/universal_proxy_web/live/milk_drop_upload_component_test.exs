@@ -176,6 +176,13 @@ defmodule UniversalProxyWeb.MilkDropUploadComponentTest do
 
         import!(view, [file("b.milk", milk())])
         assert view |> element("#milkdrop-upload-usage") |> render() =~ "2 of 500 presets"
+
+        # A change elsewhere reaches it through the Index (debounced).
+        :ok = UserPresets.delete("user/b.milk")
+
+        wait_until(fn ->
+          view |> element("#milkdrop-upload-usage") |> render() =~ "1 of 500 presets"
+        end)
       end
     end
   end
@@ -255,7 +262,8 @@ defmodule UniversalProxyWeb.MilkDropUploadComponentTest do
     end
 
     test "a submit with an unfinished entry waits, keeping its error", %{conn: conn} = ctx do
-      restart_user_presets(ctx, max_upload_bytes: 500)
+      # Room above the floor for the small file only.
+      restart_user_presets(ctx, free_bytes: 200 * @mib + 300)
       {:ok, view, _html} = live(conn, "/audio/milkdrop")
       big = milk(String.duplicate("x", 600))
       input = file_input(view, @form, :presets, [file("l.milk", milk()), file("big.milk", big)])
@@ -265,7 +273,7 @@ defmodule UniversalProxyWeb.MilkDropUploadComponentTest do
 
       view |> form(@form) |> render_submit()
       html = render(view)
-      assert html =~ "Larger than 500 B, the upload limit."
+      assert html =~ "Not enough free storage on the device."
       assert html =~ "l.milk"
       refute has_element?(view, "#milkdrop-upload-results")
       assert [_part] = incoming_files(ctx)
@@ -309,16 +317,17 @@ defmodule UniversalProxyWeb.MilkDropUploadComponentTest do
       assert render(view) =~ "Larger than 32 MiB, the upload limit."
     end
 
-    test "the writer cuts off an upload past the library's cap", %{conn: conn} = ctx do
+    test "the running library's upload cap applies", %{conn: conn} = ctx do
       restart_user_presets(ctx, max_upload_bytes: 100)
       {:ok, view, _html} = live(conn, "/audio/milkdrop")
+      assert render(view) =~ "Up to 20 files, 100 B each."
 
       input =
         file_input(view, @form, :presets, [file("e.milk", milk(String.duplicate("x", 200)))])
 
-      render_upload(input, "e.milk")
+      assert {:error, [[_ref, :too_large]]} = render_upload(input, "e.milk")
       assert render(view) =~ "Larger than 100 B, the upload limit."
-      wait_until(fn -> incoming_files(ctx) == [] end)
+      assert incoming_files(ctx) == []
     end
 
     test "a batch over the library quota is refused", %{conn: conn} = ctx do

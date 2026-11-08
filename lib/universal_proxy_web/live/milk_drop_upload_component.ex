@@ -8,7 +8,8 @@ defmodule UniversalProxyWeb.MilkDropUploadComponent do
 
   ## Upload
 
-  Up to #{20} files of at most `UserPresets.max_upload_bytes/0` each, sent
+  Up to #{20} files of at most the server's upload cap each
+  (`UserPresets.usage/1`'s `quota.upload_bytes`, read at mount), sent
   when the form is submitted (no `auto_upload`), so one batch is one
   import and one results table. Each entry streams through
   `UniversalProxyWeb.MilkDropUploadWriter` into the library's
@@ -36,7 +37,8 @@ defmodule UniversalProxyWeb.MilkDropUploadComponent do
   names; added presets link to their browser rows.
 
   The parent forwards Index changes as `send_update(__MODULE__, id: id,
-  refresh: true)`, which re-reads the quota usage (`UserPresets.usage/1`).
+  refresh: true)`, which re-reads the quota usage (`UserPresets.usage/1`)
+  at most every 250 ms.
   """
 
   use UniversalProxyWeb, :live_component
@@ -50,14 +52,18 @@ defmodule UniversalProxyWeb.MilkDropUploadComponent do
 
   @max_entries 20
   @max_rows 50
+  @refresh_ms 250
   @mib 1024 * 1024
 
   @impl true
   def mount(socket) do
+    usage = UserPresets.usage()
+
     {:ok,
      socket
      |> assign(:class, nil)
-     |> assign(:usage, UserPresets.usage())
+     |> assign(:usage, usage)
+     |> assign(:refresh_pending, false)
      |> assign(:importing, nil)
      |> assign(:results, nil)
      |> assign(:import_error, nil)
@@ -65,14 +71,25 @@ defmodule UniversalProxyWeb.MilkDropUploadComponent do
        accept: :any,
        validator: &validate_entry/1,
        max_entries: @max_entries,
-       max_file_size: UserPresets.max_upload_bytes(),
+       # The running server's cap (the default while it isn't running).
+       max_file_size: usage.quota.upload_bytes,
        auto_upload: false,
        writer: &writer/3
      )}
   end
 
   @impl true
-  def update(%{refresh: true}, socket), do: {:ok, assign(socket, :usage, UserPresets.usage())}
+  # Index changes come in bursts: one re-read per 250 ms at most.
+  def update(%{refresh: true}, %{assigns: %{refresh_pending: true}} = socket), do: {:ok, socket}
+
+  def update(%{refresh: true}, socket) do
+    send_update_after(__MODULE__, [id: socket.assigns.id, refreshed: true], @refresh_ms)
+    {:ok, assign(socket, :refresh_pending, true)}
+  end
+
+  def update(%{refreshed: true}, socket),
+    do: {:ok, assign(socket, usage: UserPresets.usage(), refresh_pending: false)}
+
   def update(assigns, socket), do: {:ok, assign(socket, assigns)}
 
   # `accept: :any` plus this, because `.milk` has no MIME type (`accept`
@@ -328,7 +345,7 @@ defmodule UniversalProxyWeb.MilkDropUploadComponent do
                 role="alert"
                 class="text-xs text-danger mt-1 mb-0"
               >
-                {upload_error(err)}
+                {upload_error(err, @uploads.presets.max_file_size)}
               </p>
             </li>
           </ul>
@@ -338,7 +355,7 @@ defmodule UniversalProxyWeb.MilkDropUploadComponent do
             role="alert"
             class="mt-2.5 mb-0 text-xs text-danger"
           >
-            {upload_error(err)}
+            {upload_error(err, @uploads.presets.max_file_size)}
           </p>
 
           <p :if={@batch_over} id={"#{@id}-batch-over"} role="alert" class="mt-2.5 mb-0 text-xs text-danger">
@@ -554,8 +571,8 @@ defmodule UniversalProxyWeb.MilkDropUploadComponent do
   defp import_error(_reason), do: "The import failed."
 
   # upload_errors/1,2
-  defp upload_error(:too_large),
-    do: "Larger than #{mib(UserPresets.max_upload_bytes())}, the upload limit."
+  defp upload_error(:too_large, max), do: "Larger than #{mib(max)}, the upload limit."
+  defp upload_error(reason, _max), do: upload_error(reason)
 
   defp upload_error(:not_accepted), do: "Choose .milk presets or .zip archives."
   defp upload_error(:too_many_files), do: "Choose at most #{@max_entries} files at a time."

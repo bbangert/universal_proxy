@@ -249,7 +249,12 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
           bytes: non_neg_integer(),
           presets: non_neg_integer(),
           textures: non_neg_integer(),
-          quota: %{bytes: pos_integer(), presets: pos_integer(), textures: pos_integer()}
+          quota: %{
+            bytes: pos_integer(),
+            presets: pos_integer(),
+            textures: pos_integer(),
+            upload_bytes: pos_integer()
+          }
         }
 
   # -- Client API --
@@ -294,16 +299,25 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   when the free space can't be measured (`{:free_space, :timeout}` when
   `df` takes over `:measure_timeout_ms`); `{:error, :timeout}` when the
   server doesn't answer within `timeout` ms (a wedged server, told apart
-  from `{:error, :not_running}`).
+  from `{:error, :not_running}`). A timed-out request is cancelled: still
+  queued, it is dropped; already granted, its reservation is released.
   """
   @spec reserve(GenServer.server(), non_neg_integer(), timeout()) ::
           {:ok, %{ref: reference(), path: String.t()}} | {:error, term()}
   def reserve(server \\ __MODULE__, bytes, timeout \\ @budget_call_timeout_ms)
       when is_integer(bytes) and bytes >= 0 do
-    GenServer.call(server, {:reserve, bytes}, timeout)
-  catch
-    :exit, {:timeout, _} -> {:error, :timeout}
-    :exit, _ -> {:error, :not_running}
+    req = make_ref()
+
+    try do
+      GenServer.call(server, {:reserve, bytes, req}, timeout)
+    catch
+      :exit, {:timeout, _} ->
+        GenServer.cast(server, {:cancel_reserve, req})
+        {:error, :timeout}
+
+      :exit, _ ->
+        {:error, :not_running}
+    end
   end
 
   @doc """
@@ -381,12 +395,22 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
     :exit, _ -> %{presets: [], textures: []}
   end
 
-  @doc "The library's size and counts against its quota (zeros while not running)."
+  @doc """
+  The library's size and counts against its quota, which also carries
+  the largest single upload (`:upload_bytes`); zeros and the defaults
+  while the server is not running.
+  """
   @spec usage(GenServer.server()) :: usage()
   def usage(server \\ __MODULE__) do
     GenServer.call(server, :usage)
   catch
-    :exit, _ -> %{bytes: 0, presets: 0, textures: 0, quota: @quota}
+    :exit, _ ->
+      %{
+        bytes: 0,
+        presets: 0,
+        textures: 0,
+        quota: Map.put(@quota, :upload_bytes, @max_upload_bytes)
+      }
   end
 
   @doc """
@@ -512,12 +536,14 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   @impl true
   def handle_call(:list, _from, state), do: {:reply, listing(state.library), state}
 
-  def handle_call(:usage, _from, state),
-    do: {:reply, Map.put(usage_of(state.library), :quota, state.quota), state}
+  def handle_call(:usage, _from, state) do
+    quota = Map.put(state.quota, :upload_bytes, state.max_upload_bytes)
+    {:reply, Map.put(usage_of(state.library), :quota, quota), state}
+  end
 
-  def handle_call({:reserve, bytes}, {owner, _tag} = from, state) do
+  def handle_call({:reserve, bytes, req}, {owner, _tag} = from, state) do
     case check_upload_size(state, bytes) do
-      :ok -> {:noreply, await_budget(state, {:upload, from, owner, bytes})}
+      :ok -> {:noreply, await_budget(state, {:upload, from, owner, bytes, req})}
       {:error, _reason} = error -> {:reply, error, state}
     end
   end
@@ -610,6 +636,17 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
     case state.reservations do
       %{^ref => r} -> {:noreply, put_in(state.reservations[ref], %{r | written: r.bytes})}
       _gone -> {:noreply, state}
+    end
+  end
+
+  # Sent after the reserve request (same caller): still waiting, or decided.
+  def handle_cast({:cancel_reserve, req}, state) do
+    waiting = Enum.reject(state.budget.waiting, &match?({:upload, _, _, _, ^req}, &1))
+    state = %{state | budget: %{state.budget | waiting: waiting}}
+
+    case Enum.find(state.reservations, fn {_ref, r} -> r.req == req end) do
+      {ref, _r} -> {:noreply, drop_reservation(state, ref, :delete)}
+      nil -> {:noreply, state}
     end
   end
 
@@ -1095,14 +1132,14 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
       else: {:error, :no_space}
   end
 
-  defp request_bytes({:upload, _from, _owner, bytes}), do: bytes
+  defp request_bytes({:upload, _from, _owner, bytes, _req}), do: bytes
   defp request_bytes({:staging, _from, _owner, bytes, _path}), do: bytes
   defp request_bytes({:check, _from}), do: 0
 
-  defp decide(state, {:upload, from, owner, bytes}, :ok) do
+  defp decide(state, {:upload, from, owner, bytes, req}, :ok) do
     name = "up-" <> Base.encode16(:crypto.strong_rand_bytes(12), case: :lower) <> ".part"
     path = Path.join(state.incoming, name)
-    {ref, state} = add_reservation(state, owner, bytes, path)
+    {ref, state} = add_reservation(state, owner, bytes, path, req)
     GenServer.reply(from, {:ok, %{ref: ref, path: path}})
     state
   end
@@ -1118,11 +1155,13 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
     state
   end
 
-  defp add_reservation(state, owner, bytes, path) do
+  # `req`: the `reserve/3` request it answers, for `{:cancel_reserve, req}`.
+  defp add_reservation(state, owner, bytes, path, req \\ nil) do
     ref = make_ref()
 
     reservation = %{
       owner: owner,
+      req: req,
       bytes: bytes,
       path: path,
       written: nil,
