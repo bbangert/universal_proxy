@@ -280,6 +280,43 @@ pack status and sets:
 - **Clear skipped presets** -- returns presets the device skipped at runtime
   to the rotation.
 
+**Browse presets** (or `/audio/milkdrop`) lists every pack and uploaded
+preset, with search and filters (uploaded, favourites, hidden, playlist,
+skipped, fast-flashing) kept in the URL. Each preset can be:
+
+- **played now** on the TV, or played and **locked** there (with nothing on
+  screen, the lock applies to the next MilkDrop session);
+- **favourited** -- favourites come up about three times as often;
+- **hidden** -- never picked by rotation, though it can still be played by
+  hand;
+- added to a **playlist** -- with the playlist on, rotation picks only from it
+  (falling back to everything, with a warning, if nothing on it can play).
+
+Skipped presets and, with the filter off, fast-flashing ones can't be played.
+
+#### Uploading presets
+
+The **Upload presets** form, on the Audio tab and the preset browser, takes
+`.milk` files, or `.zip` files of `.milk` presets with their `.jpg`/`.png`
+textures (anything else in a zip is ignored). Uploads are stored in
+`/data/milkdrop/user/`, survive pack updates, join the rotation tagged
+**Uploaded**, and can be deleted from the browser. A results table lists what
+was added, replaced, unchanged or rejected, and why.
+
+- Limits: 32 MiB per file and 20 files per upload; the library holds at most
+  64 MiB, 500 presets and 256 textures, and an upload must leave
+  max(200 MiB, 10%) of `/data` free.
+- Zips are read with a hardened reader (no path traversal, symlinks, ZIP64,
+  encryption or zip bombs), and every preset and texture is checked before it
+  is stored.
+- **Photosensitivity:** uploads are not screened for fast flashing and are not
+  marked fast-flashing by default -- you are responsible for what you upload.
+  Mark one fast-flashing in the browser to put it behind the fast-flashing
+  setting.
+- Uploads get the same runtime guards as pack presets: one that is too slow,
+  fails to compile, hangs the GPU, freezes the renderer (nested expression
+  loops) or crashes it is skipped, and replacing the file clears its skips.
+
 Notes for the Pi 3:
 
 - A 60-minute soak on a Pi 3 B+ held 59-64 °C with no throttling. A heatsink
@@ -290,6 +327,9 @@ Notes for the Pi 3:
   device and never play there.
 - Presets that hang the Pi 3's GPU are skipped automatically: when the GPU
   resets, and, if the hang reboots the Pi, on the next boot.
+- On every board, a preset that freezes the renderer (no output for 30 s, or
+  no answer within 10 s of starting to load) or crashes it is skipped, and the
+  TV goes back to the regular display.
 
 The Pi 4 and 5 have no device sweep yet: a runtime cost guard lowers the
 resolution of, then skips, presets that can't hold their frame rate.
