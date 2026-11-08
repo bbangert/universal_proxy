@@ -336,7 +336,12 @@ defmodule UniversalProxy.MilkDrop.Store do
     :exit, _ -> {:error, :not_running}
   end
 
-  @doc "Forget the skips of these uploads (`user/` ids): their content changed."
+  @doc """
+  These uploads (`user/` ids) were replaced: forget their skips of
+  content other than the library file's now. A skip already recorded for
+  the replacement stays, so this may arrive late (retried while the Store
+  was down).
+  """
   @spec clear_user_skips(GenServer.server(), [String.t()]) :: :ok | {:error, term()}
   def clear_user_skips(server \\ __MODULE__, ids) when is_list(ids) do
     GenServer.call(server, {:forget_user, ids, false})
@@ -888,11 +893,13 @@ defmodule UniversalProxy.MilkDrop.Store do
     end
   end
 
-  # Skips of these ids go, and with `removed?` (the uploads are gone) the
-  # lock if it names one and their selection entries.
+  # Skips of these ids go, and with `removed?` (deleted) the lock if it
+  # names one and their selection entries; without (replaced) only their
+  # stale skips go, which `current_user_skips/1` drops anyway.
   defp forget_user(state, ids, removed?) do
     entries = read_user_skipped(state.table)
-    kept = state |> current_user_skips() |> Map.drop(ids)
+    current = current_user_skips(state)
+    kept = if removed?, do: Map.drop(current, ids), else: current
     settings = read_settings(state.table)
     unlock? = removed? and settings.locked in ids
     selection = read_selection(state.table)

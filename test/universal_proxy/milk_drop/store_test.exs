@@ -553,10 +553,14 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
       {:ok, _} = Store.update(server, %{locked: "user/b.milk"})
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, MilkDrop.settings_topic())
 
+      # b replaced: its old content's skip goes, the lock stays.
+      set_sha(agent, "user/b.milk", "sha-b2")
       assert :ok = Store.clear_user_skips(server, ["user/b.milk"])
       assert Store.settings(server).locked == "user/b.milk"
       assert_receive {:milkdrop_skipped, "v1", %{"user/a.milk" => "draw"} = reasons}
       refute Map.has_key?(reasons, "user/b.milk")
+      set_sha(agent, "user/b.milk", "sha-b")
+      assert Store.skipped(server, "v1") == %{"user/a.milk" => "draw", "pack.milk" => "draw"}
 
       assert :ok = Store.user_presets_removed(server, ["user/b.milk"])
       assert Store.settings(server).locked == nil
@@ -620,6 +624,19 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
       end)
 
       assert "user/c.milk" in Store.selection(server).favourites
+    end
+
+    test "a late clean-up of a replaced upload keeps the replacement's own skip",
+         %{path: path} do
+      agent = library(%{"user/a.milk" => "sha-old"})
+      server = start_with_library(path, agent)
+      :ok = Store.skip(server, "v1", "user/a.milk", "draw")
+
+      # Replaced; the replacement is skipped before the (deferred) clean-up lands.
+      set_sha(agent, "user/a.milk", "sha-new")
+      :ok = Store.skip(server, "v1", "user/a.milk", "compile", sha256: "sha-new")
+      assert :ok = Store.clear_user_skips(server, ["user/a.milk"])
+      assert Store.skipped(server, "v1") == %{"user/a.milk" => "compile"}
     end
 
     test "clear_skipped/1 forgets them too", %{path: path} do
