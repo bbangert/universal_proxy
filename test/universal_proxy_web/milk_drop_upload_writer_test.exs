@@ -109,6 +109,16 @@ defmodule UniversalProxyWeb.MilkDropUploadWriterTest do
     refute File.exists?(path)
   end
 
+  test "a restarted library stops the upload", ctx do
+    state = init!(ctx, 6)
+    {:ok, state} = Writer.write_chunk("abc", state)
+
+    :ok = GenServer.stop(ctx.server)
+    assert {:error, :library_restarted, state} = Writer.write_chunk("def", state)
+    {:ok, _state} = Writer.close(state, {:error, :library_restarted})
+    assert files(ctx) == []
+  end
+
   test "refuse fails init with its reason and writes nothing", ctx do
     assert {:error, :no_space} = Writer.init(refuse: :no_space)
     assert files(ctx) == []

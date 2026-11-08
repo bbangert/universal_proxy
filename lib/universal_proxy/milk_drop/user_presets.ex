@@ -61,13 +61,17 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
        64 MiB, 500 presets and 256 textures in the library afterwards; a
        replacement counts its size difference (`{:rejected, :quota}`) —
        and the free-space floor — max(200 MiB, 10% of the filesystem)
-       must stay free after the files staged so far (`{:rejected,
-       :no_space}`) — then written by the task, mode 0644, under a
-       staging directory in `incoming/`. A file past a limit is rejected
-       on its own; a later, smaller one may still fit;
-    4. the free space is measured again: below the floor (something else
-       wrote to the filesystem meanwhile) every staged file is
-       `{:rejected, :no_space}`.
+       must stay free (`{:rejected, :no_space}`), checked by the server
+       and reserved there like an upload's room (see "Uploads"), so
+       staging and uploads streaming meanwhile share one budget — then
+       written by the task, mode 0644, under a staging directory in
+       `incoming/`. A file past a limit is rejected on its own; a later,
+       smaller one may still fit;
+    4. the budget is checked again: overdrawn (something else wrote to
+       the filesystem meanwhile) every staged file is `{:rejected,
+       :no_space}`.
+
+  The staged files' reservations last until the import's answer.
 
   The server then renames the staged files into `user/` (the same
   filesystem), each only if the quota still admits it against the library
@@ -127,8 +131,10 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   The web UI streams each upload into `incoming/` under a reservation
   (`reserve/2`): the server picks the path (`up-<random>.part`) and
   admits `bytes` only if they fit the room above the free-space floor,
-  counting every live reservation once — at its reserved size, in place
-  of whatever of it `df` already sees on disk. `claim/2` renames a
+  counting every live reservation — an upload's, or a file an import is
+  staging — once: at its reserved size, in place of whatever of it `df`
+  already sees on disk (read before `df` runs, so a write in between
+  only makes the check stricter). `claim/2` renames a
   finished upload to `up-<random>` and hands it to the claiming process,
   until that passes it to `import/2` (a busy import deletes it too). A
   reservation or claim whose owner exits is dropped and its file
@@ -476,22 +482,32 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
 
   def handle_call({:reserve, bytes}, {owner, _tag}, state) do
     with :ok <- check_upload_size(state, bytes),
-         {:ok, floor, free} <- measure(state),
-         :ok <- check_room(state, bytes, free - floor) do
-      ref = make_ref()
+         :ok <- admit(state, bytes) do
       name = "up-" <> Base.encode16(:crypto.strong_rand_bytes(12), case: :lower) <> ".part"
-      path = Path.join(state.incoming, name)
-      reservation = %{bytes: bytes, path: path, mon: Process.monitor(owner)}
-
-      state = %{
-        state
-        | reservations: Map.put(state.reservations, ref, reservation),
-          watched: Map.put(state.watched, reservation.mon, {:reservation, ref})
-      }
-
-      {:reply, {:ok, %{ref: ref, path: path}}, state}
+      {ref, state} = add_reservation(state, owner, bytes, Path.join(state.incoming, name))
+      {:reply, {:ok, %{ref: ref, path: reservation_path(state, ref)}}, state}
     else
       {:error, _reason} = error -> {:reply, error, state}
+    end
+  end
+
+  # From the import task: a file it is about to stage, and the final
+  # check. Its reservations go with the import (`finish_import/2`).
+  def handle_call({:reserve_staging, bytes, path}, {owner, _tag}, state) do
+    case admit(state, bytes) do
+      :ok ->
+        {_ref, state} = add_reservation(state, owner, bytes, path)
+        {:reply, :ok, state}
+
+      {:error, _reason} ->
+        {:reply, :no_space, state}
+    end
+  end
+
+  def handle_call(:check_budget, _from, state) do
+    case admit(state, 0) do
+      :ok -> {:reply, :ok, state}
+      {:error, _reason} -> {:reply, :no_space, state}
     end
   end
 
@@ -624,6 +640,7 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
 
   defp import_job(state, staging) do
     %{
+      server: self(),
       root: state.root,
       incoming: state.incoming,
       staging: staging,
@@ -640,7 +657,7 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   # `{:ok, results, staged}`: results in upload order, staged files in
   # the order they are to be installed.
   defp run_import(job, uploads) do
-    with {:ok, floor, free} <- measure(job) do
+    with {:ok, _floor, _free} <- measure(job) do
       plan =
         ImportPlan.new(%{
           presets: shas(job.library.presets),
@@ -648,14 +665,14 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
           pack_textures: job.pack_textures.()
         })
 
-      acc = %{usage: usage_of(job.library), free: free, results: [], staged: []}
+      acc = %{usage: usage_of(job.library), results: [], staged: []}
 
       {_plan, acc} =
         Enum.reduce(uploads, {plan, acc}, fn {client_name, path}, {plan, acc} ->
           case check_source(job, path) do
             :ok ->
               {results, plan} = ImportPlan.add(plan, client_name, path)
-              {plan, Enum.reduce(results, acc, &stage(job, floor, &1, &2))}
+              {plan, Enum.reduce(results, acc, &stage(job, &1, &2))}
 
             {:error, reason} ->
               {plan, add_result(acc, source_rejected(client_name, reason))}
@@ -665,7 +682,7 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
       results = Enum.reverse(acc.results)
       staged = Enum.reverse(acc.staged)
 
-      case recheck(job, floor, staged) do
+      case recheck(job, staged) do
         :ok -> {:ok, results, staged}
         :no_space -> {:ok, Enum.map(results, &unstage(&1, staged)), []}
       end
@@ -682,13 +699,14 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
     end
   end
 
-  defp recheck(_job, _floor, []), do: :ok
+  defp recheck(_job, []), do: :ok
+  defp recheck(job, _staged), do: budget_call(job, :check_budget)
 
-  defp recheck(job, floor, _staged) do
-    case measure(job) do
-      {:ok, _floor, free} when free >= floor -> :ok
-      _low_or_unknown -> :no_space
-    end
+  # A server that doesn't answer (a hung `df`) admits nothing.
+  defp budget_call(job, request) do
+    GenServer.call(job.server, request)
+  catch
+    :exit, _reason -> :no_space
   end
 
   defp unstage(result, staged) do
@@ -738,7 +756,7 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
 
   # One planned result: written to staging if it changes something and
   # fits, its bytes dropped either way.
-  defp stage(job, floor, %{status: status, data: data} = result, acc)
+  defp stage(job, %{status: status, data: data} = result, acc)
        when status in [:added, :replaced] and is_binary(data) do
     result = Map.delete(result, :data)
     old = old_size(job.library, result)
@@ -748,26 +766,21 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
       |> Map.update!(:bytes, &(&1 + result.size - old))
       |> Map.update!(count_key(result.kind), &(&1 + if(status == :added, do: 1, else: 0)))
 
+    path = Path.join([job.staging, subdir(result.kind), result.name])
+
     cond do
       over_quota?(usage, job.quota) ->
         add_result(acc, %{result | status: {:rejected, :quota}})
 
-      acc.free - result.size < floor ->
+      budget_call(job, {:reserve_staging, result.size, path}) != :ok ->
         add_result(acc, %{result | status: {:rejected, :no_space}})
 
       true ->
-        path = Path.join([job.staging, subdir(result.kind), result.name])
-
         case write_file(path, data) do
           :ok ->
             item = Map.take(result, [:kind, :name, :replaces, :sha256, :size, :status])
 
-            %{
-              acc
-              | usage: usage,
-                free: acc.free - result.size,
-                staged: [Map.put(item, :path, path) | acc.staged]
-            }
+            %{acc | usage: usage, staged: [Map.put(item, :path, path) | acc.staged]}
             |> add_result(result)
 
           {:error, reason} ->
@@ -776,7 +789,7 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
     end
   end
 
-  defp stage(_job, _floor, result, acc), do: add_result(acc, Map.delete(result, :data))
+  defp stage(_job, result, acc), do: add_result(acc, Map.delete(result, :data))
 
   defp add_result(acc, result), do: %{acc | results: [result | acc.results]}
 
@@ -950,6 +963,7 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   defp finish_import(%{busy: busy} = state, reply) do
     Process.cancel_timer(busy.timer)
     _ = File.rm_rf(busy.staging)
+    state = drop_reservations_of(state, busy.task.pid)
     consume_uploads(state, busy.uploads)
     GenServer.reply(busy.from, reply)
     %{state | busy: nil}
@@ -963,9 +977,10 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
       else: :ok
   end
 
-  # `df` already counts what the reserved uploads wrote so far: that part
-  # is added back, so each reservation counts once at its full size.
-  defp check_room(state, bytes, above_floor) do
+  # `df` already counts what the reservations wrote so far: that part is
+  # added back, so each counts once at its full size. Sizes are read
+  # first: a write before `df` runs is then deducted, never credited.
+  defp admit(state, bytes) do
     {reserved, written} =
       Enum.reduce(state.reservations, {0, 0}, fn {_ref, r}, {reserved, written} ->
         size =
@@ -977,7 +992,29 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
         {reserved + r.bytes, written + size}
       end)
 
-    if bytes <= above_floor + written - reserved, do: :ok, else: {:error, :no_space}
+    with {:ok, floor, free} <- measure(state) do
+      if bytes <= free - floor + written - reserved, do: :ok, else: {:error, :no_space}
+    end
+  end
+
+  defp add_reservation(state, owner, bytes, path) do
+    ref = make_ref()
+    reservation = %{owner: owner, bytes: bytes, path: path, mon: Process.monitor(owner)}
+
+    {ref,
+     %{
+       state
+       | reservations: Map.put(state.reservations, ref, reservation),
+         watched: Map.put(state.watched, reservation.mon, {:reservation, ref})
+     }}
+  end
+
+  defp reservation_path(state, ref), do: state.reservations[ref].path
+
+  defp drop_reservations_of(state, owner) do
+    for {ref, %{owner: ^owner}} <- state.reservations, reduce: state do
+      state -> drop_reservation(state, ref, :keep)
+    end
   end
 
   defp drop_reservation(state, ref, file) do

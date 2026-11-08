@@ -11,7 +11,11 @@ defmodule UniversalProxyWeb.MilkDropUploadWriter do
   created exclusively (`O_EXCL`, so not through a symlink) with mode
   0644. Writing past the reserved size fails the entry with
   `:too_large`, whatever the client sends. A cancelled or failed upload
-  deletes its file and releases its reservation; a finished one nobody
+  deletes its file and releases its reservation. Each chunk first checks
+  that the server that granted the reservation still runs: a restarted
+  one has emptied `incoming/` and forgotten the reservation, so the entry
+  fails with `:library_restarted` rather than keep writing an unlinked
+  file. A finished one nobody
   claims (`UserPresets.claim/2`, with `meta/1`'s `:ref`) is deleted by
   the server when its channel exits — LiveView doesn't close the writer
   then.
@@ -38,7 +42,16 @@ defmodule UniversalProxyWeb.MilkDropUploadWriter do
         with {:ok, %{ref: ref, path: path}} <- UserPresets.reserve(server, bytes) do
           case open_file(path) do
             {:ok, io} ->
-              {:ok, %{server: server, ref: ref, path: path, io: io, bytes: 0, max_bytes: bytes}}
+              {:ok,
+               %{
+                 server: server,
+                 granted_by: GenServer.whereis(server),
+                 ref: ref,
+                 path: path,
+                 io: io,
+                 bytes: 0,
+                 max_bytes: bytes
+               }}
 
             {:error, _reason} = error ->
               UserPresets.release(server, ref)
@@ -57,11 +70,18 @@ defmodule UniversalProxyWeb.MilkDropUploadWriter do
       do: {:error, :too_large, state}
 
   def write_chunk(data, state) do
-    case :file.write(state.io, data) do
-      :ok -> {:ok, %{state | bytes: state.bytes + byte_size(data)}}
-      {:error, reason} -> {:error, {:io, reason}, state}
+    if granted?(state) do
+      case :file.write(state.io, data) do
+        :ok -> {:ok, %{state | bytes: state.bytes + byte_size(data)}}
+        {:error, reason} -> {:error, {:io, reason}, state}
+      end
+    else
+      {:error, :library_restarted, state}
     end
   end
+
+  defp granted?(%{granted_by: pid}) when is_pid(pid), do: Process.alive?(pid)
+  defp granted?(_state), do: false
 
   @impl true
   def close(state, :done) do
@@ -70,15 +90,22 @@ defmodule UniversalProxyWeb.MilkDropUploadWriter do
         {:ok, state}
 
       {:error, reason} ->
-        UserPresets.release(state.server, state.ref)
+        discard(state)
         {:error, {:io, reason}}
     end
   end
 
   def close(state, _cancel_or_error) do
     _ = :file.close(state.io)
-    UserPresets.release(state.server, state.ref)
+    discard(state)
     {:ok, state}
+  end
+
+  # The server deletes the file too, unless it is gone (stopped or
+  # restarted) and no longer knows the reservation.
+  defp discard(state) do
+    _ = File.rm(state.path)
+    UserPresets.release(state.server, state.ref)
   end
 
   defp open_file(path) do

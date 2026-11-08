@@ -371,6 +371,24 @@ defmodule UniversalProxyWeb.MilkDropUploadComponentTest do
     end
   end
 
+  describe "a library restart" do
+    test "fails an upload in progress and leaves nothing behind", %{conn: conn} = ctx do
+      {:ok, view, _html} = live(conn, "/audio/milkdrop")
+
+      input =
+        file_input(view, @form, :presets, [file("q.milk", milk(String.duplicate("x", 4000)))])
+
+      assert render_upload(input, "q.milk", 50) =~ "50%"
+      restart_user_presets(ctx, [])
+
+      render_upload(input, "q.milk", 50)
+      assert render(view) =~ "The preset library restarted. Try again."
+      assert incoming_files(ctx) == []
+
+      assert :sys.get_state(UserPresets).reservations == %{}
+    end
+  end
+
   describe "cancelling" do
     test "removing a half-sent upload deletes its file", %{conn: conn} = ctx do
       {:ok, view, _html} = live(conn, "/audio/milkdrop")

@@ -566,6 +566,7 @@ defmodule UniversalProxyWeb.MilkDropUploadComponent do
     do: "These files add up to more than #{mib(max)}. Upload fewer at once."
 
   defp writer_error(:no_space), do: "Not enough free storage on the device."
+  defp writer_error(:library_restarted), do: "The preset library restarted. Try again."
   defp writer_error(:not_running), do: "The preset library isn't running."
   defp writer_error({:free_space, _reason}), do: "Couldn't measure the device's free storage."
   defp writer_error(_reason), do: "The upload failed. Try again."

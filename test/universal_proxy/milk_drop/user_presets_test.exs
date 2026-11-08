@@ -357,15 +357,30 @@ defmodule UniversalProxy.MilkDrop.UserPresetsTest do
     end
   end
 
+  # `room` bytes above the 200 MiB floor of a 1000 MiB filesystem, less
+  # the uploads, staging and library files on disk, as `df` would see them.
+  defp du_free(ctx, room) do
+    fn _path ->
+      used =
+        [ctx.incoming, Path.join(ctx.user, "presets"), Path.join(ctx.user, "textures")]
+        |> Enum.flat_map(&Path.wildcard(Path.join(&1, "**/*"), match_dot: true))
+        |> Enum.map(fn path ->
+          case File.lstat(path) do
+            {:ok, %File.Stat{type: :regular, size: size}} -> size
+            _ -> 0
+          end
+        end)
+        |> Enum.sum()
+
+      {:ok, %{total_bytes: 1000 * @mib, free_bytes: 200 * @mib + room - used}}
+    end
+  end
+
   describe "free space" do
     test "an import must leave max(200 MiB, 10%) free", ctx do
       data = milk()
-      free = 200 * @mib + byte_size(data)
-
-      server =
-        start_library(ctx,
-          free_space: fn _path -> {:ok, %{total_bytes: 1000 * @mib, free_bytes: free}} end
-        )
+      # The two uploads take two of the three files' room.
+      server = start_library(ctx, free_space: du_free(ctx, 3 * byte_size(data)))
 
       # The first fits exactly; the second would dip under the floor.
       results = import!(server, [upload(ctx, "a.milk", data), upload(ctx, "b.milk", data)])
@@ -989,6 +1004,67 @@ defmodule UniversalProxy.MilkDrop.UserPresetsTest do
       Agent.update(agent, &(&1 + 1))
       assert {:ok, _} = UserPresets.reserve(server, 1000)
       refute File.exists?(r.path)
+    end
+
+    test "a reserved file written while df runs is never credited", ctx do
+      agent = start_supervised!({Agent, fn -> nil end})
+
+      # The df snapshot predates the write it races with.
+      free = fn _ ->
+        case Agent.get_and_update(agent, &{&1, nil}) do
+          nil -> :ok
+          path -> File.write!(path, :binary.copy("x", 500))
+        end
+
+        {:ok, %{total_bytes: 1000 * @mib, free_bytes: 200 * @mib + 1000}}
+      end
+
+      server = start_library(ctx, free_space: free)
+      {:ok, r} = UserPresets.reserve(server, 1000)
+      Agent.update(agent, fn _ -> r.path end)
+
+      assert UserPresets.reserve(server, 1) == {:error, :no_space}
+      assert File.stat!(r.path).size == 500
+    end
+
+    test "uploads streaming in hold room an import can't take", ctx do
+      body = milk(String.duplicate("x", 20_000))
+      # Room for the upload itself (on disk) plus 40,000 bytes.
+      server = start_library(ctx, free_space: du_free(ctx, byte_size(body) + 40_000))
+
+      {:ok, _r} = UserPresets.reserve(server, 30_000)
+
+      assert [%{status: {:rejected, :no_space}}] =
+               import!(server, [upload(ctx, "Big.milk", body)])
+
+      refute File.exists?(preset_path(ctx, "Big.milk"))
+    end
+
+    test "an import's staged files hold room uploads can't take", ctx do
+      test = self()
+      ref = make_ref()
+      body = milk(String.duplicate("x", 20_000))
+      armed = :counters.new(1, [])
+      room = du_free(ctx, byte_size(body) + 40_000)
+
+      # While the import reserves its staging file, queue an upload's
+      # reservation (from the test process) right behind it, before the
+      # file is written.
+      free = fn path ->
+        :counters.add(armed, 1, 1)
+
+        if :counters.get(armed, 1) == 2,
+          do: send(self(), {:"$gen_call", {test, ref}, {:reserve, 30_000}})
+
+        room.(path)
+      end
+
+      server = start_library(ctx, free_space: free)
+      assert [%{status: :added}] = import!(server, [upload(ctx, "Big.milk", body)])
+      assert_received {^ref, {:error, :no_space}}
+
+      # The import's reservation ended with it.
+      assert {:ok, _} = UserPresets.reserve(server, 40_000)
     end
 
     test "a claimed upload is the claimer's until import takes it", ctx do
