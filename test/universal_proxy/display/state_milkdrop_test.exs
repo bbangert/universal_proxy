@@ -569,6 +569,52 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     assert md(ctx).pending_play == nil
   end
 
+  test "a repeat play of the same id waits for the earlier one's answer", ctx do
+    ctx = ctx |> start_ui(fake: %{play_delay_ms: 300}) |> presenting()
+
+    first = Task.async(fn -> play(ctx, "a.milk", true) end)
+    wait_until(fn -> md(ctx).pending_play == "a.milk" end)
+    second = Task.async(fn -> play(ctx, "a.milk", false) end)
+    assert Task.await(first) == {:error, :superseded}
+
+    # Not answered by the first command's `preset` (locked: true).
+    assert Task.await(second) == :ok
+    assert %{preset: "a.milk", locked: false, pending_play: nil} = md(ctx)
+
+    assert Enum.filter(cmds(ctx.skip_file), &(&1["cmd"] == "play")) == [
+             %{"cmd" => "play", "preset" => "a.milk", "lock" => true},
+             %{"cmd" => "play", "preset" => "a.milk", "lock" => false}
+           ]
+  end
+
+  test "a selection the renderer didn't get is sent again until it is", ctx do
+    selection_file = Path.join(ctx.tmp_dir, "selection.json")
+
+    ctx =
+      ctx
+      |> start_ui(
+        milkdrop_opts: [selection_file: selection_file],
+        timeouts: %{selection_retry: 50}
+      )
+      |> presenting()
+
+    wait_until(fn -> match?(%{selection: %{gen: 0}}, md(ctx)) end)
+    # The adapter's temporary file can't be created for now.
+    File.mkdir_p!(selection_file <> ".tmp")
+
+    capture_log(fn ->
+      selection_changed(ctx, %{gen: 3, favourites: ["a.milk"]})
+      wait_until(fn -> md(ctx).selection_retries >= 2 end)
+    end)
+
+    assert reloads(ctx) == 0
+    File.rmdir!(selection_file <> ".tmp")
+    wait_until(fn -> md(ctx).selection.gen == 3 end)
+    assert reloads(ctx) == 1
+    assert md(ctx).selection_retries == 0
+    assert %{"gen" => 3, "favourites" => ["a.milk"]} = Jason.decode!(File.read!(selection_file))
+  end
+
   test "a play pending when the session is reclaimed or ends is answered not_presenting", ctx do
     ctx = ctx |> start_ui(fake: %{ignore: ["play"]}) |> presenting()
 

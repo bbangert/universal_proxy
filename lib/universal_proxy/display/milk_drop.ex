@@ -394,7 +394,8 @@ defmodule UniversalProxy.Display.MilkDrop do
   @doc """
   Rewrite the selection file with `selection` (a
   `UniversalProxy.MilkDrop.Store` selection) and have the renderer
-  re-read it. A file that can't be written is logged and not announced.
+  re-read it. A file that can't be written is logged, not announced, and
+  reported to the owner as `{:milkdrop_selection_unsent, pid, gen}`.
   """
   @spec reload_selection(GenServer.server(), Store.selection()) :: :ok
   def reload_selection(server, selection) when is_map(selection),
@@ -571,6 +572,7 @@ defmodule UniversalProxy.Display.MilkDrop do
 
       {:error, reason} ->
         Logger.warning("MilkDrop: could not write the selection file: #{inspect(reason)}")
+        send(state.owner, {:milkdrop_selection_unsent, self(), selection[:gen]})
         {:noreply, state}
     end
   end

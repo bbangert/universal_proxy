@@ -217,7 +217,8 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
 
       bad_ids =
         ["", "a\nb.milk", "tab\t.milk", "del\x7F.milk", <<0xFF, 0xFE>>, nil, 42] ++
-          ["a.txt", "/abs.milk", "../up.milk", "a/./b.milk", "a//b.milk", "dir/", "user/"]
+          ["a.txt", "/abs.milk", "../up.milk", "a/./b.milk", "a//b.milk", "dir/", "user/"] ++
+          [".milk", "/.milk", "a.milk/", "a.MILK"]
 
       for bad <- bad_ids do
         assert Store.favourite(server, bad, true) == {:error, :invalid_id}
@@ -229,6 +230,9 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
 
       assert {:ok, _} = Store.hide(server, String.duplicate("é", 251) <> ".milk", true)
       assert Store.valid_id?("user/Ünïcode – ok.milk")
+      # The renderer's shortest id, and a dot-file segment it accepts.
+      assert Store.valid_id?("x.milk")
+      assert Store.valid_id?("dir/.milk")
 
       stop_supervised!(Store)
       many = for n <- 1..5000, do: "p#{n}.milk"

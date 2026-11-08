@@ -345,6 +345,22 @@ defmodule UniversalProxy.Display.MilkDropTest do
                       %{event: :selection, gen: 6, eligible: 9, playlist_fallback: true}},
                      @timeout
 
+      # Everything hidden: hidden is ignored too, and both fallbacks show.
+      hidden = for n <- 0..9, do: "p#{n}.milk"
+      {:ok, _} = Store.playlist_add(ctx.store, "p2.milk")
+      sel = %{Store.selection(ctx.store) | hidden: hidden, gen: 99}
+      :ok = MilkDrop.reload_selection(pid, sel)
+
+      assert_receive {:milkdrop, ^pid,
+                      %{
+                        event: :selection,
+                        gen: 99,
+                        eligible: 10,
+                        playlist_fallback: true,
+                        hidden_fallback: true
+                      }},
+                     @timeout
+
       MilkDrop.stop(pid)
       wait_until(fn -> not File.exists?(ctx.selection_file) end)
     end
@@ -361,6 +377,7 @@ defmodule UniversalProxy.Display.MilkDropTest do
         end)
 
       assert log =~ "could not write the selection file"
+      assert_received {:milkdrop_selection_unsent, ^pid, 0}
       MilkDrop.next(pid)
       assert_receive {:milkdrop, ^pid, %{event: :preset}}, @timeout
       assert cmd_lines(ctx) == [%{"cmd" => "next"}]
