@@ -145,6 +145,10 @@ defmodule UniversalProxyWeb.MilkDropUploadComponentTest do
                )
 
         wait_until(fn -> match?({:ok, _}, Index.fetch_id("user/a.milk")) end)
+
+        # The browser inserts the new row in place (Index's `added`).
+        if @path == "/audio/milkdrop",
+          do: wait_until(fn -> has_element?(view, "#preset-#{Index.key("user/a.milk")}") end)
       end
 
       test "imports a zip with its texture", %{conn: conn, root: root} do
