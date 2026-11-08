@@ -80,6 +80,8 @@ bool parse_entry(const JsonValue& v, PresetEntry& e) {
     }
     e.compile_ms = number_or(v.get("compile_ms"), -1);
     e.eval_ms = number_or(v.get("eval_ms"), -1);
+    if (const JsonValue* sha = v.get("sha256"); sha != nullptr && sha->is_string())
+        e.sha256 = sanitize_text(sha->string, 128);
     return true;
 }
 

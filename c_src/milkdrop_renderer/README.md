@@ -121,10 +121,13 @@ While `high_frequency` presets are off (the default):
 - no pick returns one: start, rotation, `next` / `prev` (history entries
   are passed over), `--locked` and `play` (refused, see above);
 - the renderer tracks what projectM renders, the playing preset and,
-  during a blend, the outgoing one. When either is `high_frequency` (the
-  filter was just turned on, mid-blend in either direction), it cuts at
-  once, never blends: to the playing preset when that one is eligible (its
-  blend completes), else to a random eligible one. A frame rendered but
+  during a blend, the outgoing one, as `high_frequency` or not as they
+  were loaded (a `reload_user` that clears an upload's tag doesn't change
+  what is on screen; one that sets it counts at once). When either is
+  `high_frequency` (the filter was just turned on, mid-blend in either
+  direction), it cuts at once, never blends: to the playing preset when
+  that one is eligible (its blend completes; one whose tag was cleared is
+  reloaded as its file is now), else to a random eligible one. A frame rendered but
   not yet submitted is dropped, and no frame is rendered until the cut
   has happened (a failed batch holds the last frame on screen). A `take`
   cuts before its first frame.
@@ -202,8 +205,9 @@ Uploads live outside the pack (the BEAM never writes into it), in
   rejected. A missing manifest (or no `--user-dir`) is no user presets; a
   malformed one is logged and reported (`error` `user_manifest`), and the
   pack plays alone. Never fatal.
-- **Fields.** The BEAM writes `file` and `tags` (`rpi3`, `compile_ms` and
-  the like are absent; uploads are not swept). A `high_frequency` tag puts
+- **Fields.** The BEAM writes `file`, `tags` and optionally `sha256` (the
+  file's content hash; `rpi3`, `compile_ms` and the like are absent:
+  uploads are not swept). A `high_frequency` tag puts
   an upload behind `--high-frequency` like a pack preset (the `user/`
   prefix defeats the `high_frequency/` path rule).
 - **Shaders.** The pack's shader cache simply misses for them: they are
@@ -223,6 +227,10 @@ Uploads live outside the pack (the BEAM never writes into it), in
   stays until `unlock`/`next` (then rotation moves on). An id that comes
   back revives its entry with the new fields; projectM reads the file at
   each load, so a replaced file plays its new content from its next load.
+  A refreshed or revived id whose `sha256` differs (or is absent) is
+  measured afresh by the cost guard at that load (its settled level and
+  measured frame rate are forgotten); if it is playing, the old content
+  keeps its level and its measurements no longer count for the id.
 - **Skips** are by id: a `--skip-file` entry or a skip this session holds
   for a `user/` id like any other, for the whole session (a replaced file
   is retried at the next start, when the BEAM's skip file no longer lists

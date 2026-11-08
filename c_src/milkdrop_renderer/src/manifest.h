@@ -29,6 +29,7 @@ struct PresetEntry {
     double rpi3_frame_ms = -1;     // whole-frame vc4 time at that rung, if measured
     double compile_ms = -1;
     double eval_ms = -1;
+    std::string sha256;  // content hash, if the manifest gives one (user presets)
 };
 
 struct Manifest {

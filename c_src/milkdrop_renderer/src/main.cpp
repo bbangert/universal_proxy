@@ -484,6 +484,7 @@ bool App::warm_up(const PresetEntry& entry, bool smooth, std::string& reason, st
 Selection App::switch_to(const PresetEntry* first, const char* cause, bool smooth, int batch,
                          const std::function<void(const PresetEntry&)>& loaded) {
     bool activated_failure = false;
+    const CostGuard::Run playing = guard_->run();
     const Selection sel = select_preset(*presets_, first, batch, [&](const PresetEntry& entry) {
         // The manager never picks one while they are off; this is the last
         // gate before projectM.
@@ -523,7 +524,8 @@ Selection App::switch_to(const PresetEntry* first, const char* cause, bool smoot
     if (sel == Selection::Deferred) {
         // Until the retry, the playing preset runs at its own level.
         if (current_ != nullptr) {
-            guard_->begin(current_->file, hint_rung(*current_));
+            if (playing.file == current_->file) guard_->resume(playing);
+            else guard_->begin(current_->file, hint_rung(*current_));
             if (!apply_level()) return Selection::Aborted;
         }
     }
@@ -688,6 +690,9 @@ void App::reload_user() {
         return;
     }
     const PresetManager::UserReload r = presets_->set_user_presets(std::move(user.presets));
+    // A replaced upload is measured afresh at its next load; one playing
+    // keeps its level (it is still the old content).
+    for (const std::string& id : r.changed) guard_->forget(id);
     log_msg("user presets reloaded: %zu (%zu added, %zu removed, %zu rejected)", r.presets, r.added, r.removed,
             user.rejected);
     emit_line(event_user_reloaded(r.presets, r.added, r.removed, user.rejected));

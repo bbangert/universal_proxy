@@ -2285,6 +2285,131 @@ static void test_favourites_tiny_pools() {
     }
 }
 
+// A replaced upload: the guard forgets what it learnt about the id, but
+// the old content still playing keeps its level and records nothing.
+static void test_guard_forget() {
+    using V = CostGuard::Verdict;
+    CostGuard::Config cfg;
+    cfg.rungs = 3;
+    cfg.start_interval = 2;
+    cfg.settle_frames = 5;
+    cfg.window_frames = 10;
+    CostGuard g(cfg);
+    V last = V::None;
+    CHECK(g.begin("user/a.milk") == 0);
+    feed(g, 15, 66666, last);  // 15 fps: down a rung
+    CHECK(last == V::StepDown && g.level() == 1 && g.measured_fps("user/a.milk") > 14);
+    g.begin("p.milk");
+    CHECK(g.begin("user/a.milk") == 1);  // settled this session
+    g.begin("p.milk");
+    g.forget("user/a.milk");
+    CHECK(g.measured_fps("user/a.milk") < 0);
+    CHECK(g.begin("user/a.milk") == 0);  // from the hint again
+
+    // Forgotten while it plays: same level, verdicts still apply, nothing
+    // recorded; the next load starts fresh.
+    feed(g, 15, 66666, last);
+    CHECK(g.level() == 1);
+    g.forget("user/a.milk");
+    CHECK(g.level() == 1 && g.measured_fps("user/a.milk") < 0);
+    last = V::None;
+    feed(g, 15, 40000, last);  // 25 fps holds at this level
+    CHECK(last == V::Accept && g.level() == 1 && g.last_fps() > 24);
+    CHECK(g.measured_fps("user/a.milk") < 0);
+    feed(g, 10, 66666, last);  // still steps down for the content it measures
+    CHECK(last == V::StepDown && g.level() == 2);
+    // A failed switch hands the guard back to it as it was.
+    const CostGuard::Run run = g.run();
+    CHECK(run.file == "user/a.milk" && run.level == 2 && run.detached);
+    g.begin("candidate.milk");
+    g.resume(run);
+    CHECK(g.level() == 2 && g.current().rung == 2);
+    feed(g, 15, 33333, last);
+    CHECK(last == V::Accept && g.measured_fps("user/a.milk") < 0);
+    g.begin("p.milk");
+    CHECK(g.begin("user/a.milk") == 0);
+    feed(g, 15, 33333, last);
+    CHECK(g.measured_fps("user/a.milk") > 29);  // a fresh load records again
+    // resume() respects the thermal floor.
+    CostGuard::Run low{"x.milk", 0, false};
+    g.set_rung_floor(1);
+    g.resume(low);
+    CHECK(g.current().rung >= 1);
+}
+
+// What projectM renders keeps the high_frequency it was loaded with: a
+// reload clearing the tag doesn't let flashing content stay on screen.
+static void test_high_frequency_loaded() {
+    PresetManager::Config cfg;
+    cfg.seed = 4;
+    std::vector<PresetEntry> es = entries(4);
+    es.push_back(entry("user/flash.milk", true));
+    PresetManager pm(es, {}, cfg);
+    pm.set_high_frequency(true);
+    std::string reason;
+    const PresetEntry* flash = pm.find_playable("user/flash.milk", reason);
+    pm.on_shown(*flash, false);
+
+    // The tag goes while it shows: turning the filter off still cuts.
+    auto r = pm.set_user_presets({entry("user/flash.milk", false)});
+    CHECK(!r.cut && !flash->high_frequency);
+    CHECK(pm.set_high_frequency(false) && pm.high_frequency_on_screen());
+    // The cut may reload it (its file is no longer flagged): that load is
+    // the new content, classified as it is now.
+    pm.on_shown(*pm.cut_target(), false);
+    CHECK(!pm.high_frequency_on_screen());
+
+    // Blending out when the tag goes: still on screen until the blend ends.
+    PresetManager b(es, {}, cfg);
+    b.set_high_frequency(true);
+    std::string why;
+    const PresetEntry* f2 = b.find_playable("user/flash.milk", why);
+    b.on_shown(*f2, false);
+    b.on_shown(*by_file(b, "p0.milk"), true);  // flash -> p0
+    b.set_user_presets({entry("user/flash.milk", false)});
+    CHECK(b.set_high_frequency(false) && b.high_frequency_on_screen());
+    b.on_blend_done();
+    CHECK(!b.high_frequency_on_screen());
+
+    // A tag added while it shows counts at once.
+    PresetManager a(es, {}, cfg);
+    a.set_user_presets({entry("user/flash.milk", false)});
+    a.on_shown(*a.find_playable("user/flash.milk", why), false);
+    CHECK(!a.high_frequency_on_screen());
+    r = a.set_user_presets({entry("user/flash.milk", true)});
+    CHECK(r.cut && a.high_frequency_on_screen());
+    // ...and clearing it again doesn't undo that.
+    r = a.set_user_presets({entry("user/flash.milk", false)});
+    CHECK(r.cut && a.high_frequency_on_screen());
+}
+
+// Which reloaded ids may have new content (per-content caches go).
+static void test_user_changed() {
+    auto sha = [](const std::string& file, const std::string& hash) {
+        PresetEntry e = entry(file);
+        e.sha256 = hash;
+        return e;
+    };
+    PresetManager::Config cfg;
+    PresetManager pm(std::vector<PresetEntry>{entry("p.milk"), sha("user/a.milk", "aa"), sha("user/b.milk", "bb"),
+                                              entry("user/c.milk")},
+                     {}, cfg);
+    auto r = pm.set_user_presets({sha("user/a.milk", "aa"), sha("user/b.milk", "b2"), entry("user/c.milk"),
+                                  sha("user/new.milk", "nn")});
+    // Same hash: unchanged; another hash or none: changed; new ids have
+    // nothing cached.
+    CHECK((r.changed == std::vector<std::string>{"user/b.milk", "user/c.milk"}));
+    r = pm.set_user_presets({});
+    CHECK(r.changed.empty() && r.removed == 4);
+    r = pm.set_user_presets({sha("user/a.milk", "aa"), sha("user/b.milk", "b3")});
+    CHECK((r.changed == std::vector<std::string>{"user/b.milk"}) && r.added == 2);  // revived
+
+    Manifest m;
+    std::string err;
+    CHECK(parse_manifest(R"({"presets":[{"file":"a.milk","sha256":"ab12"},{"file":"b.milk","sha256":7}]})", m, err));
+    CHECK(m.presets.size() == 2 && m.presets[0].sha256 == "ab12" && m.presets[1].sha256.empty());
+}
+
 int main() {
     test_json();
     test_options();
@@ -2324,6 +2449,9 @@ int main() {
     test_switch_play();
     test_play_before_take();
     test_favourites_tiny_pools();
+    test_guard_forget();
+    test_high_frequency_loaded();
+    test_user_changed();
     if (g_failures == 0) std::printf("OK\n");
     return g_failures == 0 ? 0 : 1;
 }

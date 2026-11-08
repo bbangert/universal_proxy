@@ -99,9 +99,14 @@ PresetManager::UserReload PresetManager::set_user_presets(std::vector<PresetEntr
             gone_.push_back(0);
             r.added++;
         } else {
-            if (listed.count(it->second) != 0) continue;  // a duplicate in `user`
+            const size_t index = it->second;
+            if (listed.count(index) != 0) continue;  // a duplicate in `user`
+            if (e.sha256.empty() || e.sha256 != entries_[index].sha256) r.changed.push_back(e.file);
+            // Rendered content keeps its classification; a new tag counts.
+            if (index == showing_) showing_hf_ = showing_hf_ || e.high_frequency;
+            if (index == outgoing_) outgoing_hf_ = outgoing_hf_ || e.high_frequency;
             // In place: a pointer to the entry reads the new fields.
-            entries_[it->second] = std::move(e);
+            entries_[index] = std::move(e);
             if (gone_[it->second] != 0) r.added++;
             gone_[it->second] = 0;
         }
@@ -302,10 +307,15 @@ void PresetManager::on_shown(const PresetEntry& entry, bool blend) {
     const size_t index = index_of(entry);
     if (index == NONE) return;  // not ours
     outgoing_ = blend ? showing_ : NONE;
+    outgoing_hf_ = blend && showing_hf_;
     showing_ = index;
+    showing_hf_ = entries_[index].high_frequency;
 }
 
-void PresetManager::on_blend_done() { outgoing_ = NONE; }
+void PresetManager::on_blend_done() {
+    outgoing_ = NONE;
+    outgoing_hf_ = false;
+}
 
 const PresetEntry* PresetManager::showing() const {
     return showing_ == NONE ? nullptr : &entries_[showing_];
@@ -316,7 +326,8 @@ const PresetEntry* PresetManager::outgoing() const {
 }
 
 bool PresetManager::high_frequency_on_screen() const {
-    return excluded_high_frequency(showing_) || excluded_high_frequency(outgoing_);
+    if (config_.high_frequency) return false;
+    return (showing_ != NONE && showing_hf_) || (outgoing_ != NONE && outgoing_hf_);
 }
 
 const PresetEntry* PresetManager::cut_target() {

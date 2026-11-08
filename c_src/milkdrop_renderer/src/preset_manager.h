@@ -75,6 +75,9 @@ public:
         size_t added = 0;    // new or revived ids
         size_t removed = 0;  // tombstoned
         bool cut = false;    // as set_high_frequency(): cut away now
+        // Refreshed or revived ids whose content may have changed (no
+        // sha256, or a different one): per-content caches must go.
+        std::vector<std::string> changed;
     };
     // The user presets (ids under USER_PREFIX; others are ignored) become
     // `user`: new ids are appended, present ones refreshed in place, ones
@@ -122,7 +125,9 @@ public:
     // What projectM renders, as the caller reports it. A switch to `entry`
     // took effect, blended (the preset shown so far blends out) or cut
     // (nothing blends out). As in projectM, a switch during a blend first
-    // completes it: only the latest outgoing preset remains.
+    // completes it: only the latest outgoing preset remains. Whether each
+    // is high_frequency is fixed when it is shown: a reload clearing the
+    // tag doesn't change what projectM loaded (one setting it does count).
     void on_shown(const PresetEntry& entry, bool blend);
     // The blend is over: the outgoing preset is no longer rendered.
     void on_blend_done();
@@ -161,6 +166,8 @@ private:
     static constexpr size_t NONE = static_cast<size_t>(-1);
     size_t showing_ = NONE;   // entries_ index projectM plays
     size_t outgoing_ = NONE;  // and the one blending out
+    bool showing_hf_ = false;   // their high_frequency as loaded
+    bool outgoing_hf_ = false;
     Pool bag_pool_ = Pool::Eligible;  // the pool bag_ was dealt from
 
     bool excluded_high_frequency(size_t index) const;
