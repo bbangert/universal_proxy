@@ -117,6 +117,17 @@ bool parse_manifest(std::string_view text, Manifest& out, std::string& error) {
         }
         out.presets.push_back(std::move(e));
     }
+    if (const JsonValue* textures = doc.get("textures"); textures != nullptr && textures->is_array()) {
+        for (const JsonValue& t : textures->array) {
+            const JsonValue* file = t.is_object() ? t.get("file") : nullptr;
+            if (file == nullptr || !file->is_string()) continue;
+            const JsonValue* sha = t.get("sha256");
+            out.textures_key += file->string;
+            out.textures_key += '\0';
+            if (sha != nullptr && sha->is_string()) out.textures_key += sha->string;
+            out.textures_key += '\n';
+        }
+    }
     return true;
 }
 
@@ -188,6 +199,7 @@ FileStatus load_user_manifest(const std::string& dir, Manifest& out, std::string
     out.version = parsed.version;
     out.format = parsed.format;
     out.rejected = parsed.rejected;
+    out.textures_key = std::move(parsed.textures_key);
     for (PresetEntry& e : parsed.presets) {
         e.file = std::string(USER_PREFIX) + e.file;
         if (!valid_preset_file(e.file)) {

@@ -135,6 +135,7 @@ defmodule UniversalProxy.MilkDrop do
           | :not_presenting
           | :timeout
           | :superseded
+          | :unresponsive
           | {:refused,
              :unknown | :skipped | :high_frequency | :rpi3_skip | :load_failed | String.t()}
 
@@ -146,7 +147,9 @@ defmodule UniversalProxy.MilkDrop do
   not know, or fails to load (`{:error, {:refused, reason}}`).
 
   `:ok` once it shows (within 15 s, else `{:error, :timeout}`);
-  `{:error, :superseded}` when another `play/3` came first;
+  `{:error, :superseded}` when a newer `play/3` replaced it;
+  `{:error, :unresponsive}` once the session's renderer stopped answering
+  plays;
   `{:error, :not_presenting}` while no visualizer session runs (or ends
   meanwhile), in which case `lock?` still saves `id` as the Store's
   `locked`, so the next session starts on it. A lock that does show is

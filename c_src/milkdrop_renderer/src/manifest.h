@@ -37,6 +37,9 @@ struct Manifest {
     int format = 1;
     std::vector<PresetEntry> presets;
     size_t rejected = 0;  // entries dropped as malformed
+    // The user manifest's "textures" list as "file\0sha256\n" per entry:
+    // it changes whenever an uploaded texture is added, replaced or deleted.
+    std::string textures_key;
 };
 
 // Parses manifest.json text. Malformed entries are dropped (and counted);
