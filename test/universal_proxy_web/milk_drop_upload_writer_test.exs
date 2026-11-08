@@ -119,6 +119,11 @@ defmodule UniversalProxyWeb.MilkDropUploadWriterTest do
     assert files(ctx) == []
   end
 
+  test "no server, no reservation", ctx do
+    assert Writer.init(server: :no_such_user_presets, bytes: 1) == {:error, :not_running}
+    assert files(ctx) == []
+  end
+
   test "refuse fails init with its reason and writes nothing", ctx do
     assert {:error, :no_space} = Writer.init(refuse: :no_space)
     assert files(ctx) == []

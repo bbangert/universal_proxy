@@ -129,16 +129,26 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   ## Uploads
 
   The web UI streams each upload into `incoming/` under a reservation
-  (`reserve/2`): the server picks the path (`up-<random>.part`) and
+  (`reserve/3`): the server picks the path (`up-<random>.part`) and
   admits `bytes` only if they fit the room above the free-space floor,
   counting every live reservation — an upload's, or a file an import is
   staging — once: at its reserved size, in place of whatever of it `df`
-  already sees on disk (read before `df` runs, so a write in between
-  only makes the check stricter). `claim/2` renames a
-  finished upload to `up-<random>` and hands it to the claiming process,
-  until that passes it to `import/2` (a busy import deletes it too). A
-  reservation or claim whose owner exits is dropped and its file
-  deleted, so no upload outlives its page.
+  already sees on disk. `claim/3` renames a finished upload to
+  `up-<random>` and hands it to the claiming process, until that passes
+  it to `import/2` (a busy import deletes it too). A reservation or claim
+  whose owner exits is dropped and its file deleted, so no upload
+  outlives its page.
+
+  `df` never runs in the server: each admission (`reserve/3`, and the
+  import's staging and final checks) waits for a measurement in a task
+  under `:task_supervisor`, bounded by `:measure_timeout_ms` (5 s; then
+  `{:free_space, :timeout}`). Requests that arrive while one runs share
+  it, and are decided in order in the server, so each sees the ones
+  before it. The on-disk sizes it adds back are read before the task
+  starts — a write while `df` runs is deducted, never credited — and
+  only for files that may still grow: uploads streaming in (at most a
+  page's few entries); a staged file reports itself written once, after
+  which its size is known.
 
   ## Changes
 
@@ -176,7 +186,7 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   free_bytes:}} | {:error, reason}`), `:pack_textures` (0-arity: the
   pack's texture file names), `:quota` (`%{bytes:, presets:, textures:}`),
   `:min_free_bytes`, `:min_free_pct`, `:max_upload_bytes`,
-  `:import_timeout_ms` and `:retry_ms`.
+  `:import_timeout_ms`, `:measure_timeout_ms` and `:retry_ms`.
   """
 
   use GenServer
@@ -195,6 +205,9 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   @min_free_bytes 200 * @mib
   @min_free_pct 10
   @import_timeout_ms 60_000
+  @measure_timeout_ms 5_000
+  # A budget request waits for a measurement, then for its answer.
+  @budget_call_timeout_ms @measure_timeout_ms + 5_000
   @retry_ms 5_000
   # The caller waits past the task's bound for the server's answer.
   @call_timeout_ms @import_timeout_ms + 15_000
@@ -275,16 +288,17 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   Reserve room for an upload of `bytes` the caller is about to stream
   into `incoming/` (see "Uploads" in the moduledoc). Returns the
   reservation's ref and the server-chosen path to write; the reservation
-  lasts until `claim/2`, `release/2` or the caller's exit, which also
+  lasts until `claim/3`, `release/2` or the caller's exit, which also
   deletes the path. `{:error, {:too_large, max}}` past the upload cap,
   `{:error, :no_space}` without room, `{:error, {:free_space, reason}}`
-  when the free space can't be measured; `{:error, :timeout}` when the
+  when the free space can't be measured (`{:free_space, :timeout}` when
+  `df` takes over `:measure_timeout_ms`); `{:error, :timeout}` when the
   server doesn't answer within `timeout` ms (a wedged server, told apart
   from `{:error, :not_running}`).
   """
   @spec reserve(GenServer.server(), non_neg_integer(), timeout()) ::
           {:ok, %{ref: reference(), path: String.t()}} | {:error, term()}
-  def reserve(server \\ __MODULE__, bytes, timeout \\ 5_000)
+  def reserve(server \\ __MODULE__, bytes, timeout \\ @budget_call_timeout_ms)
       when is_integer(bytes) and bytes >= 0 do
     GenServer.call(server, {:reserve, bytes}, timeout)
   catch
@@ -292,27 +306,37 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
     :exit, _ -> {:error, :not_running}
   end
 
-  @doc "Drop reservation `ref` (an upload that failed or was cancelled) and delete its path."
+  @doc """
+  Drop reservation `ref` (an upload that failed or was cancelled) and
+  delete its path. A cast: nothing waits on it, and the owner's exit
+  does the same anyway.
+  """
   @spec release(GenServer.server(), reference()) :: :ok
-  def release(server \\ __MODULE__, ref) when is_reference(ref) do
-    GenServer.call(server, {:release, ref})
-  catch
-    :exit, _ -> :ok
-  end
+  def release(server \\ __MODULE__, ref) when is_reference(ref),
+    do: GenServer.cast(server, {:release, ref})
 
   @doc """
   Turn reservation `ref` (a finished upload) into a file waiting for
   `import/2`, owned by the caller: its new path, which the server deletes
-  if the caller exits before passing it to `import/2`. `{:error, :timeout}`
-  and `{:error, :not_running}` as for `reserve/3`.
+  if the caller exits before passing it to `import/2`.
+
+  `{:error, :unknown}` when there is no such reservation (released, its
+  owner gone, or the server restarted), `{:error, posix}` when the rename
+  fails (the file is deleted). `{:error, :timeout}` and `{:error,
+  :not_running}` as for `reserve/3`; a timed-out claim is cancelled, so
+  the server deletes the file should it get to the claim later.
   """
   @spec claim(GenServer.server(), reference(), timeout()) ::
           {:ok, String.t()} | {:error, term()}
   def claim(server \\ __MODULE__, ref, timeout \\ 5_000) when is_reference(ref) do
     GenServer.call(server, {:claim, ref}, timeout)
   catch
-    :exit, {:timeout, _} -> {:error, :timeout}
-    :exit, _ -> {:error, :not_running}
+    :exit, {:timeout, _} ->
+      GenServer.cast(server, {:cancel_claim, ref})
+      {:error, :timeout}
+
+    :exit, _ ->
+      {:error, :not_running}
   end
 
   @doc "Import uploads copied into `incoming_dir/1` (see the moduledoc)."
@@ -436,14 +460,18 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
       max_upload_bytes: Keyword.get(opts, :max_upload_bytes, @max_upload_bytes),
       import_timeout_ms: Keyword.get(opts, :import_timeout_ms, @import_timeout_ms),
       retry_ms: Keyword.get(opts, :retry_ms, @retry_ms),
+      measure_timeout_ms: Keyword.get(opts, :measure_timeout_ms, @measure_timeout_ms),
       library: %{presets: %{}, textures: %{}},
       busy: nil,
-      # Uploads streaming into incoming/ (`reserve/2`) and finished ones
-      # waiting for `import/2` (`claim/2`), each watched by a monitor of
+      # Uploads streaming into incoming/ (`reserve/3`) and finished ones
+      # waiting for `import/2` (`claim/3`), each watched by a monitor of
       # its owner.
       reservations: %{},
       claims: %{},
       watched: %{},
+      # The free-space measurement in flight and the requests waiting for
+      # it (newest first); `written`: sizes read just before it started.
+      budget: %{task: nil, timer: nil, waiting: [], written: %{}},
       # The manifest on disk lags the library; `pending` is the change not
       # announced yet.
       dirty: false,
@@ -487,34 +515,20 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   def handle_call(:usage, _from, state),
     do: {:reply, Map.put(usage_of(state.library), :quota, state.quota), state}
 
-  def handle_call({:reserve, bytes}, {owner, _tag}, state) do
-    with :ok <- check_upload_size(state, bytes),
-         :ok <- admit(state, bytes) do
-      name = "up-" <> Base.encode16(:crypto.strong_rand_bytes(12), case: :lower) <> ".part"
-      {ref, state} = add_reservation(state, owner, bytes, Path.join(state.incoming, name))
-      {:reply, {:ok, %{ref: ref, path: reservation_path(state, ref)}}, state}
-    else
+  def handle_call({:reserve, bytes}, {owner, _tag} = from, state) do
+    case check_upload_size(state, bytes) do
+      :ok -> {:noreply, await_budget(state, {:upload, from, owner, bytes})}
       {:error, _reason} = error -> {:reply, error, state}
     end
   end
 
   # From the import task: a file it is about to stage, and the final
   # check. Its reservations go with the import (`finish_import/2`).
-  def handle_call({:reserve_staging, bytes, path}, {owner, _tag}, state) do
-    case admit(state, bytes) do
-      :ok ->
-        {_ref, state} = add_reservation(state, owner, bytes, path)
-        {:reply, :ok, state}
+  def handle_call({:reserve_staging, bytes, path}, {owner, _tag} = from, state),
+    do: {:noreply, await_budget(state, {:staging, from, owner, bytes, path})}
 
-      {:error, _reason} = error ->
-        {:reply, error, state}
-    end
-  end
-
-  def handle_call(:check_budget, _from, state), do: {:reply, admit(state, 0), state}
-
-  def handle_call({:release, ref}, _from, state),
-    do: {:reply, :ok, drop_reservation(state, ref, :delete)}
+  def handle_call(:check_budget, from, state),
+    do: {:noreply, await_budget(state, {:check, from})}
 
   def handle_call({:claim, ref}, {owner, _tag}, state) do
     case Map.fetch(state.reservations, ref) do
@@ -528,7 +542,7 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
 
             state = %{
               state
-              | claims: Map.put(state.claims, claimed, mon),
+              | claims: Map.put(state.claims, claimed, %{mon: mon, ref: ref}),
                 watched: Map.put(state.watched, mon, {:claim, claimed})
             }
 
@@ -589,6 +603,51 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   end
 
   @impl true
+  def handle_cast({:release, ref}, state), do: {:noreply, drop_reservation(state, ref, :delete)}
+
+  # Its file is complete: no need to read its size again.
+  def handle_cast({:staged, ref}, state) do
+    case state.reservations do
+      %{^ref => r} -> {:noreply, put_in(state.reservations[ref], %{r | written: r.bytes})}
+      _gone -> {:noreply, state}
+    end
+  end
+
+  # Sent after the claim (same caller), so the claim is done by now.
+  def handle_cast({:cancel_claim, ref}, state) do
+    case Enum.find(state.claims, fn {_path, claim} -> claim.ref == ref end) do
+      {path, %{mon: mon}} ->
+        Process.demonitor(mon, [:flush])
+        _ = File.rm(path)
+
+        {:noreply,
+         %{
+           state
+           | claims: Map.delete(state.claims, path),
+             watched: Map.delete(state.watched, mon)
+         }}
+
+      nil ->
+        {:noreply, drop_reservation(state, ref, :delete)}
+    end
+  end
+
+  @impl true
+  def handle_info({ref, result}, %{budget: %{task: %{ref: ref}}} = state) do
+    Process.demonitor(ref, [:flush])
+    {:noreply, decide_budget(state, result)}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{budget: %{task: %{ref: ref}}} = state),
+    do: {:noreply, decide_budget(state, {:error, {:free_space, :crashed}})}
+
+  def handle_info({:budget_timeout, ref}, %{budget: %{task: %{ref: ref} = task}} = state) do
+    Logger.warning("MilkDrop free-space check took over #{state.measure_timeout_ms} ms")
+    _ = Task.Supervisor.terminate_child(state.task_supervisor, task.pid)
+    Process.demonitor(ref, [:flush])
+    {:noreply, decide_budget(state, {:error, {:free_space, :timeout}})}
+  end
+
   def handle_info({ref, result}, %{busy: %{task: %{ref: ref}}} = state) do
     Process.demonitor(ref, [:flush])
 
@@ -704,12 +763,11 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   defp recheck(_job, []), do: :ok
   defp recheck(job, _staged), do: budget_call(job, :check_budget)
 
-  # `:ok | {:error, :no_space | {:free_space, reason}}`; a server that
-  # doesn't answer (a hung `df`) admits nothing.
   defp budget_call(job, request) do
-    GenServer.call(job.server, request)
+    GenServer.call(job.server, request, @budget_call_timeout_ms)
   catch
-    :exit, _reason -> {:error, :no_space}
+    :exit, {:timeout, _} -> {:error, :timeout}
+    :exit, _reason -> {:error, :not_running}
   end
 
   defp unstage(result, staged, reason) do
@@ -772,15 +830,19 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
     path = Path.join([job.staging, subdir(result.kind), result.name])
 
     with {:quota, false} <- {:quota, over_quota?(usage, job.quota)},
-         :ok <- budget_call(job, {:reserve_staging, result.size, path}) do
+         {:ok, ref} <- budget_call(job, {:reserve_staging, result.size, path}) do
       case write_file(path, data) do
         :ok ->
+          GenServer.cast(job.server, {:staged, ref})
           item = Map.take(result, [:kind, :name, :replaces, :sha256, :size, :status])
 
           %{acc | usage: usage, staged: [Map.put(item, :path, path) | acc.staged]}
           |> add_result(result)
 
         {:error, reason} ->
+          # Its room goes back before the next file asks.
+          _ = File.rm(path)
+          GenServer.cast(job.server, {:release, ref})
           add_result(acc, %{result | status: {:rejected, {:io, reason}}})
       end
     else
@@ -977,29 +1039,95 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
       else: :ok
   end
 
-  # `df` already counts what the reservations wrote so far: that part is
-  # added back, so each counts once at its full size. Sizes are read
-  # first: a write before `df` runs is then deducted, never credited.
-  defp admit(state, bytes) do
-    {reserved, written} =
-      Enum.reduce(state.reservations, {0, 0}, fn {_ref, r}, {reserved, written} ->
-        size =
-          case File.lstat(r.path) do
-            {:ok, %File.Stat{size: size}} -> size
-            {:error, _reason} -> 0
-          end
+  # -- Private: the storage budget --
 
-        {reserved + r.bytes, written + size}
+  defp await_budget(state, request) do
+    budget = %{state.budget | waiting: [request | state.budget.waiting]}
+    state = %{state | budget: budget}
+    if budget.task, do: state, else: start_measurement(state)
+  end
+
+  # Sizes first: a write while `df` runs is then deducted, never credited.
+  defp start_measurement(state) do
+    written =
+      Map.new(state.reservations, fn
+        {ref, %{written: nil, path: path}} -> {ref, file_size(path)}
+        {ref, %{written: written}} -> {ref, written}
       end)
 
-    with {:ok, floor, free} <- measure(state) do
-      if bytes <= free - floor + written - reserved, do: :ok, else: {:error, :no_space}
+    probe = Map.take(state, [:free_space, :root, :min_free_bytes, :min_free_pct])
+    task = Task.Supervisor.async_nolink(state.task_supervisor, fn -> measure(probe) end)
+    timer = Process.send_after(self(), {:budget_timeout, task.ref}, state.measure_timeout_ms)
+    %{state | budget: %{state.budget | task: task, timer: timer, written: written}}
+  catch
+    :exit, _reason -> decide_budget(state, {:error, {:free_space, :unavailable}})
+  end
+
+  defp file_size(path) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{size: size}} -> size
+      {:error, _reason} -> 0
     end
+  end
+
+  # Every waiting request, oldest first, against one measurement: each
+  # admitted one is reserved before the next is decided.
+  defp decide_budget(state, measurement) do
+    %{waiting: waiting, written: written, timer: timer} = state.budget
+    if timer, do: Process.cancel_timer(timer)
+    state = %{state | budget: %{task: nil, timer: nil, waiting: [], written: %{}}}
+
+    waiting
+    |> Enum.reverse()
+    |> Enum.reduce(state, &decide(&2, &1, admit(&2, &1, measurement, written)))
+  end
+
+  defp admit(_state, _request, {:error, _reason} = error, _written), do: error
+
+  defp admit(state, request, {:ok, floor, free}, written) do
+    {reserved, credited} =
+      Enum.reduce(state.reservations, {0, 0}, fn {ref, r}, {reserved, credited} ->
+        {reserved + r.bytes, credited + Map.get(written, ref, 0)}
+      end)
+
+    if request_bytes(request) <= free - floor + credited - reserved,
+      do: :ok,
+      else: {:error, :no_space}
+  end
+
+  defp request_bytes({:upload, _from, _owner, bytes}), do: bytes
+  defp request_bytes({:staging, _from, _owner, bytes, _path}), do: bytes
+  defp request_bytes({:check, _from}), do: 0
+
+  defp decide(state, {:upload, from, owner, bytes}, :ok) do
+    name = "up-" <> Base.encode16(:crypto.strong_rand_bytes(12), case: :lower) <> ".part"
+    path = Path.join(state.incoming, name)
+    {ref, state} = add_reservation(state, owner, bytes, path)
+    GenServer.reply(from, {:ok, %{ref: ref, path: path}})
+    state
+  end
+
+  defp decide(state, {:staging, from, owner, bytes, path}, :ok) do
+    {ref, state} = add_reservation(state, owner, bytes, path)
+    GenServer.reply(from, {:ok, ref})
+    state
+  end
+
+  defp decide(state, request, reply) do
+    GenServer.reply(elem(request, 1), reply)
+    state
   end
 
   defp add_reservation(state, owner, bytes, path) do
     ref = make_ref()
-    reservation = %{owner: owner, bytes: bytes, path: path, mon: Process.monitor(owner)}
+
+    reservation = %{
+      owner: owner,
+      bytes: bytes,
+      path: path,
+      written: nil,
+      mon: Process.monitor(owner)
+    }
 
     {ref,
      %{
@@ -1008,8 +1136,6 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
          watched: Map.put(state.watched, reservation.mon, {:reservation, ref})
      }}
   end
-
-  defp reservation_path(state, ref), do: state.reservations[ref].path
 
   defp drop_reservations_of(state, owner) do
     for {ref, %{owner: ^owner}} <- state.reservations, reduce: state do
@@ -1037,7 +1163,7 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   defp disown(state, uploads) do
     Enum.reduce(uploads, state, fn
       {_client_name, path}, state when is_map_key(state.claims, path) ->
-        {mon, claims} = Map.pop(state.claims, path)
+        {%{mon: mon}, claims} = Map.pop(state.claims, path)
         Process.demonitor(mon, [:flush])
         %{state | claims: claims, watched: Map.delete(state.watched, mon)}
 

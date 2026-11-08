@@ -16,19 +16,20 @@ defmodule UniversalProxyWeb.MilkDropUploadComponent do
   declared sizes of every valid entry; the upload channel never accepts
   more than an entry declared) must be at most the library's byte quota,
   and the writer reserves the entry's own size with
-  `UserPresets.reserve/2`, which admits it only within the room above the
+  `UserPresets.reserve/3`, which admits it only within the room above the
   free-space floor left by every other live upload, on any page; else
   the entry fails with `{:writer_failure, reason}`.
 
   ## Import
 
-  Submit imports only once every entry has finished: one still
-  uploading, failed or refused keeps its error on screen until it is
-  removed. The finished entries are then claimed (`UserPresets.claim/2`:
-  the server deletes them should this LiveView exit before the import
-  takes them) and handed to `UserPresets.import/2` in `start_async/3`; a
-  second submit while it runs is ignored. An import that fails as a whole
-  deletes the claimed files.
+  Submit imports only once every entry has finished (the button is
+  disabled while one is uploading): one that failed or was refused keeps
+  its error on screen until it is removed. The finished entries are then
+  claimed (`UserPresets.claim/3`: the server deletes them should this
+  LiveView exit before the import takes them) and handed to
+  `UserPresets.import/2` in `start_async/3`; a second submit while it
+  runs is ignored. An import that fails as a whole deletes the claimed
+  files.
   `UniversalProxy.MilkDrop.Index` broadcasts the new presets itself, so
   nothing else is refreshed here. The results show one row per file (#{50}
   at most) through HEEx escaping only, with `UploadCheck.printable/1`
@@ -239,6 +240,7 @@ defmodule UniversalProxyWeb.MilkDropUploadComponent do
       |> assign(
         :blocked,
         entries == [] or assigns.importing != nil or batch > quota_bytes or
+          Enum.any?(entries, &(&1.progress > 0 and not &1.done?)) or
           Enum.any?(entries, &(upload_errors(assigns.uploads.presets, &1) != []))
       )
 

@@ -427,6 +427,7 @@ defmodule UniversalProxyWeb.MilkDropUploadComponentTest do
         file_input(view, @form, :presets, [file("i.milk", milk(String.duplicate("x", 4000)))])
 
       assert render_upload(input, "i.milk", 50) =~ "50%"
+      assert has_element?(view, "#milkdrop-upload-submit[disabled]")
       assert [part] = incoming_files(ctx)
       assert part =~ ~r/\Aup-[0-9a-f]{24}\.part\z/
 

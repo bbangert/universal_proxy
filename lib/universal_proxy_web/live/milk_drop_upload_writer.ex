@@ -6,7 +6,7 @@ defmodule UniversalProxyWeb.MilkDropUploadWriter do
   device).
 
   `init/1` reserves the entry's declared `:bytes` with
-  `UserPresets.reserve/2` (from the upload channel process, which then
+  `UserPresets.reserve/3` (from the upload channel process, which then
   owns the reservation) and writes to the path the server picked,
   created exclusively (`O_EXCL`, so not through a symlink) with mode
   0644. Writing past the reserved size fails the entry with
@@ -16,7 +16,7 @@ defmodule UniversalProxyWeb.MilkDropUploadWriter do
   one has emptied `incoming/` and forgotten the reservation, so the entry
   fails with `:library_restarted` rather than keep writing an unlinked
   file. A finished one nobody
-  claims (`UserPresets.claim/2`, with `meta/1`'s `:ref`) is deleted by
+  claims (`UserPresets.claim/3`, with `meta/1`'s `:ref`) is deleted by
   the server when its channel exits — LiveView doesn't close the writer
   then.
 
@@ -36,28 +36,25 @@ defmodule UniversalProxyWeb.MilkDropUploadWriter do
         {:error, reason}
 
       :error ->
-        server = Keyword.get(opts, :server, UserPresets)
-        bytes = Keyword.fetch!(opts, :bytes)
-
-        with {:ok, %{ref: ref, path: path}} <- UserPresets.reserve(server, bytes) do
-          case open_file(path) do
-            {:ok, io} ->
-              {:ok,
-               %{
-                 server: server,
-                 granted_by: GenServer.whereis(server),
-                 ref: ref,
-                 path: path,
-                 io: io,
-                 bytes: 0,
-                 max_bytes: bytes
-               }}
-
-            {:error, _reason} = error ->
-              UserPresets.release(server, ref)
-              error
-          end
+        # One pid for the reservation and the liveness check: a server
+        # restarted in between can't pass for the one that granted it.
+        case GenServer.whereis(Keyword.get(opts, :server, UserPresets)) do
+          pid when is_pid(pid) -> reserve(pid, Keyword.fetch!(opts, :bytes))
+          _none -> {:error, :not_running}
         end
+    end
+  end
+
+  defp reserve(server, bytes) do
+    with {:ok, %{ref: ref, path: path}} <- UserPresets.reserve(server, bytes) do
+      case open_file(path) do
+        {:ok, io} ->
+          {:ok, %{server: server, ref: ref, path: path, io: io, bytes: 0, max_bytes: bytes}}
+
+        {:error, _reason} = error ->
+          UserPresets.release(server, ref)
+          error
+      end
     end
   end
 
@@ -80,8 +77,7 @@ defmodule UniversalProxyWeb.MilkDropUploadWriter do
     end
   end
 
-  defp granted?(%{granted_by: pid}) when is_pid(pid), do: Process.alive?(pid)
-  defp granted?(_state), do: false
+  defp granted?(%{server: pid}), do: Process.alive?(pid)
 
   @impl true
   def close(state, :done) do
