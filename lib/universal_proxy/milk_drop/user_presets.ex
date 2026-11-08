@@ -74,12 +74,27 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   tells the Store (`UniversalProxy.MilkDrop.Store`): a replaced id's skips
   go (`Store.clear_user_skips/2`), and an id a differently-named
   replacement supersedes counts as deleted (`Store.user_presets_removed/2`).
-  A replacement keeps the replaced preset's `high_frequency` flag.
+  A replacement keeps the replaced preset's `high_frequency` flag. If the
+  superseded file can't be deleted, both stay in the library (the newer
+  wins at the next start) and the deletion is retried every `:retry_ms`
+  (5 s).
 
   The answer is `{:ok, results}`: `ImportPlan`'s results without `:data`
   (`:status` is `:added`, `:replaced`, `:unchanged`, `:ignored` or
   `{:rejected, reason}`; `:warnings` may hold `:texture_shadowed`), in
-  upload order.
+  upload order. A file that could not be renamed into place is
+  `{:rejected, {:io, :install_failed}}`.
+
+  ## Publishing
+
+  The renderer only sees what the manifest lists, so a write that fails to
+  rewrite it fails: installed files are `{:rejected, {:manifest,
+  reason}}`, and `delete/2` and `delete_texture/2` return `{:error,
+  {:manifest, reason}}` (`set_high_frequency/3` too, and its flag goes
+  back). The library keeps matching the disk; the manifest write is
+  retried on every later write and every `:retry_ms`, an import with
+  nothing to install included (uploading the same files again repairs
+  it), and the change is broadcast once it is written.
 
   ## Other writes
 
@@ -87,7 +102,9 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   (a client string is only ever a map key, never part of a path), delete
   the file, rewrite the manifest and, for a preset, call
   `Store.user_presets_removed/2` (its skips, and the `locked` setting if it
-  names it). `set_high_frequency/3` sets or clears the tag. While an import
+  names it). A file that can't be deleted (anything but already gone) is
+  `{:error, {:io, reason}}` and changes nothing. `set_high_frequency/3`
+  sets or clears the tag. While an import
   runs they return `{:error, :busy}`, as does another `import/2`; the reads
   (`list/1`, `usage/1`, `sha256/2`) are served throughout.
 
@@ -104,12 +121,19 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   renderer as `reload_user`. An id in `removed` is gone: whatever else is
   keyed by it can be dropped.
 
+  Each start (a restart may have repaired the manifest) is broadcast as
+  `{:milkdrop_user_presets_started, %{bytes:, presets:, textures:}}`:
+  anything derived from the library should be re-read; Display.State sends
+  `reload_user` for it too.
+
   ## SHA-256 lookups
 
   `sha256/2` reads the library's `{id, sha256}` table (protected ETS owned
   by the server) without a call, so the Store's skip records can be keyed
   by content even from its start-up recovery (`MilkDrop.Supervisor` starts
-  this server first). With no table it hashes the file itself.
+  this server first). The table is published whole, with a `:ready` row,
+  once the start-up scan is done; before that (a restart), or with no
+  table, a lookup hashes the file itself.
 
   The public API follows the `catch :exit` idiom: while the server is not
   running (or a call times out) reads return an empty library and writes
@@ -119,8 +143,8 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   `:task_supervisor`, `:free_space` (`path -> {:ok, %{total_bytes:,
   free_bytes:}} | {:error, reason}`), `:pack_textures` (0-arity: the
   pack's texture file names), `:quota` (`%{bytes:, presets:, textures:}`),
-  `:min_free_bytes`, `:min_free_pct`, `:max_upload_bytes` and
-  `:import_timeout_ms`.
+  `:min_free_bytes`, `:min_free_pct`, `:max_upload_bytes`,
+  `:import_timeout_ms` and `:retry_ms`.
   """
 
   use GenServer
@@ -139,6 +163,7 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   @min_free_bytes 200 * @mib
   @min_free_pct 10
   @import_timeout_ms 60_000
+  @retry_ms 5_000
   # The caller waits past the task's bound for the server's answer.
   @call_timeout_ms @import_timeout_ms + 15_000
   @manifest "manifest.json"
@@ -269,11 +294,22 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   @spec sha256(atom(), String.t()) :: String.t() | nil
   def sha256(table \\ @table, id) when is_binary(id) do
     case :ets.lookup(table, id) do
-      [{^id, sha}] -> sha
-      [] -> nil
+      [{^id, sha}] when is_binary(sha) ->
+        sha
+
+      _none ->
+        if :ets.member(table, :ready), do: nil, else: unready_sha256(table, id)
     end
   rescue
     ArgumentError -> file_sha256(user_dir(), id)
+  end
+
+  # A (re)starting server's table, before its scan is in.
+  defp unready_sha256(table, id) do
+    case :ets.lookup(table, :user_dir) do
+      [{:user_dir, dir}] -> file_sha256(dir, id)
+      [] -> file_sha256(user_dir(), id)
+    end
   end
 
   @doc """
@@ -319,15 +355,39 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
       min_free_pct: Keyword.get(opts, :min_free_pct, @min_free_pct),
       max_upload_bytes: Keyword.get(opts, :max_upload_bytes, @max_upload_bytes),
       import_timeout_ms: Keyword.get(opts, :import_timeout_ms, @import_timeout_ms),
+      retry_ms: Keyword.get(opts, :retry_ms, @retry_ms),
       library: %{presets: %{}, textures: %{}},
-      busy: nil
+      busy: nil,
+      # The manifest on disk lags the library; `pending` is the change not
+      # announced yet.
+      dirty: false,
+      pending: empty_change(),
+      # `{kind, name}` files a differently-named replacement superseded
+      # that could not be deleted yet.
+      cleanup: [],
+      retry_timer: nil
     }
 
+    # Until `:ready`, a lookup falls back to the file under `:user_dir`.
+    :ets.insert(state.table, {:user_dir, state.user_dir})
     clean_incoming(state.incoming)
-    library = load_library(state.user_dir)
-    state = %{state | library: library}
-    :ets.insert(state.table, sha_rows(library))
-    {:ok, state}
+    {library, dirty} = load_library(state.user_dir)
+    :ets.insert(state.table, sha_rows(library) ++ [{:ready, true}])
+    state = schedule_retry(%{state | library: library, dirty: dirty})
+    {:ok, state, {:continue, :announce}}
+  end
+
+  # A restarted server may have repaired the manifest a running renderer
+  # read before: announced like a change.
+  @impl true
+  def handle_continue(:announce, state) do
+    Phoenix.PubSub.broadcast(
+      state.pubsub,
+      MilkDrop.user_presets_topic(),
+      {:milkdrop_user_presets_started, usage_of(state.library)}
+    )
+
+    {:noreply, state}
   end
 
   @impl true
@@ -356,8 +416,12 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
 
   def handle_call({:delete, kind, key}, _from, state) do
     case lookup(state.library, kind, key) do
-      {:ok, name} -> {:reply, :ok, delete_file(state, kind, name)}
-      :error -> {:reply, {:error, :not_found}, state}
+      {:ok, name} ->
+        {reply, state} = delete_file(state, kind, name)
+        {:reply, reply, state}
+
+      :error ->
+        {:reply, {:error, :not_found}, state}
     end
   end
 
@@ -396,6 +460,11 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
     Process.demonitor(ref, [:flush])
     {:noreply, finish_import(state, {:error, :timeout})}
   end
+
+  def handle_info(:retry, %{busy: nil} = state),
+    do: {:noreply, retry_pending(%{state | retry_timer: nil})}
+
+  def handle_info(:retry, state), do: {:noreply, schedule_retry(%{state | retry_timer: nil})}
 
   def handle_info(_msg, state), do: {:noreply, state}
 
@@ -571,28 +640,46 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
 
   # -- Private: import (server side) --
 
+  # Nothing to install: an unpublished manifest is still retried, so
+  # uploading the same files again repairs it.
+  defp commit(%{dirty: true} = state, results, []) do
+    {_reply, state} = publish(state, empty_change())
+    {results, state}
+  end
+
   defp commit(state, results, []), do: {results, state}
 
   defp commit(state, results, staged) do
     now = System.os_time(:second)
-    acc = %{library: state.library, failed: MapSet.new(), change: empty_change()}
+    acc = %{library: state.library, failed: MapSet.new(), change: empty_change(), cleanup: []}
     acc = Enum.reduce(staged, acc, &install(state, &1, now, &2))
+
+    state = %{state | library: acc.library, cleanup: state.cleanup ++ acc.cleanup}
+    sync_table(state, acc.change)
+    tell_store(state, acc.change)
+    {published, state} = publish(state, acc.change)
 
     results =
       Enum.map(results, fn result ->
-        if result.status in [:added, :replaced] and
-             MapSet.member?(acc.failed, {result.kind, result.name}),
-           do: %{result | status: {:rejected, {:io, :install_failed}}},
-           else: result
+        cond do
+          result.status not in [:added, :replaced] ->
+            result
+
+          MapSet.member?(acc.failed, {result.kind, result.name}) ->
+            failed(result, {:io, :install_failed})
+
+          published != :ok ->
+            failed(result, elem(published, 1))
+
+          true ->
+            result
+        end
       end)
 
-    state = %{state | library: acc.library}
-    write_manifest_logged(state)
-    sync_table(state, acc.change)
-    tell_store(state, acc.change)
-    broadcast(state, acc.change)
-    {results, state}
+    {results, schedule_retry(state)}
   end
+
+  defp failed(result, reason), do: %{result | status: {:rejected, reason}}
 
   defp install(state, item, now, acc) do
     dest = Path.join([state.user_dir, subdir(item.kind), item.name])
@@ -600,8 +687,16 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
     case File.rename(item.path, dest) do
       :ok ->
         superseded = if item.replaces not in [nil, item.name], do: item.replaces
-        if superseded, do: rm_logged(Path.join([state.user_dir, subdir(item.kind), superseded]))
-        installed(acc, item, superseded, now)
+
+        case superseded && rm(Path.join([state.user_dir, subdir(item.kind), superseded])) do
+          {:error, _reason} ->
+            # Both files stay listed until the old one's removal succeeds.
+            acc = %{acc | cleanup: acc.cleanup ++ [{item.kind, superseded}]}
+            installed(acc, %{item | replaces: nil, status: :added}, nil, now, item.replaces)
+
+          _removed_or_none ->
+            installed(acc, item, superseded, now, item.replaces)
+        end
 
       {:error, reason} ->
         Logger.error(
@@ -612,9 +707,10 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
     end
   end
 
-  defp installed(acc, %{kind: :preset} = item, superseded, now) do
+  # `flagged_from`: the replaced preset whose high_frequency flag carries over.
+  defp installed(acc, %{kind: :preset} = item, superseded, now, flagged_from) do
     presets = acc.library.presets
-    old = item.replaces && presets[item.replaces]
+    old = flagged_from && presets[flagged_from]
 
     meta = %{
       sha256: item.sha256,
@@ -643,7 +739,7 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
     %{acc | library: %{acc.library | presets: presets}, change: change}
   end
 
-  defp installed(acc, %{kind: :texture} = item, superseded, now) do
+  defp installed(acc, %{kind: :texture} = item, superseded, now, _flagged_from) do
     meta = %{sha256: item.sha256, size: item.size, uploaded_at: now}
     textures = acc.library.textures |> Map.delete(superseded) |> Map.put(item.name, meta)
 
@@ -689,11 +785,23 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
     if Map.has_key?(library.textures, name), do: {:ok, name}, else: :error
   end
 
+  # A file that can't be deleted stays in the library; one already gone is
+  # deleted.
   defp delete_file(state, kind, name) do
-    rm_logged(Path.join([state.user_dir, subdir(kind), name]))
+    case rm(Path.join([state.user_dir, subdir(kind), name])) do
+      :ok ->
+        {change, state} = forget(state, kind, name)
+        publish(state, change)
+
+      {:error, reason} ->
+        {{:error, {:io, reason}}, state}
+    end
+  end
+
+  # Drops a deleted file from the library, the table and the Store.
+  defp forget(state, kind, name) do
     library = Map.update!(state.library, section(kind), &Map.delete(&1, name))
     state = %{state | library: library}
-    write_manifest_logged(state)
 
     change =
       case kind do
@@ -703,8 +811,7 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
 
     sync_table(state, change)
     tell_store(state, change)
-    broadcast(state, change)
-    state
+    {change, state}
   end
 
   defp set_flag(state, name, flag) do
@@ -714,16 +821,12 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
 
       meta ->
         library = put_in(state.library, [:presets, name], %{meta | high_frequency: flag})
+        change = add_change(empty_change(), :updated, UploadCheck.preset_id(name))
 
-        case write_manifest(state.user_dir, library) do
-          :ok ->
-            state = %{state | library: library}
-            broadcast(state, add_change(empty_change(), :updated, UploadCheck.preset_id(name)))
-            {:reply, :ok, state}
-
-          {:error, reason} = error ->
-            Logger.error("MilkDrop upload manifest write failed: #{inspect(reason)}")
-            {:reply, error, state}
+        case publish(%{state | library: library}, change) do
+          {:ok, state} -> {:reply, :ok, state}
+          # Nothing else changed: the flag goes back.
+          {error, state} -> {:reply, error, put_in(state.library.presets[name], meta)}
         end
     end
   end
@@ -731,6 +834,68 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   # -- Private: changes --
 
   defp empty_change, do: %{added: [], replaced: [], removed: [], updated: [], textures: []}
+
+  # Writes the manifest for the library as it is, then announces every
+  # change since the last write that reached disk. On failure the library
+  # (which matches the disk) stays, and the write is retried on the next
+  # write and every `:retry_ms`.
+  defp publish(state, change) do
+    pending = merge_change(state.pending, change)
+
+    case write_manifest(state.user_dir, state.library) do
+      :ok ->
+        broadcast(state, pending)
+        {:ok, %{state | dirty: false, pending: empty_change()}}
+
+      {:error, reason} ->
+        Logger.error("MilkDrop upload manifest write failed: #{inspect(reason)}; retrying")
+        {{:error, {:manifest, reason}}, schedule_retry(%{state | dirty: true, pending: pending})}
+    end
+  end
+
+  # A later change wins over an earlier one for the same id.
+  defp merge_change(old, new) do
+    gone = new.removed
+    back = new.added
+
+    %{
+      added: Enum.uniq((old.added -- gone) ++ back),
+      replaced: Enum.uniq((old.replaced -- gone) ++ new.replaced),
+      updated: Enum.uniq((old.updated -- gone) ++ new.updated),
+      removed: Enum.uniq((old.removed -- back) ++ gone),
+      textures: Enum.uniq(old.textures ++ new.textures)
+    }
+  end
+
+  defp schedule_retry(%{retry_timer: nil} = state) when state.dirty or state.cleanup != [],
+    do: %{state | retry_timer: Process.send_after(self(), :retry, state.retry_ms)}
+
+  defp schedule_retry(state), do: state
+
+  # Superseded files whose removal failed, then the manifest.
+  defp retry_pending(state) do
+    {change, cleanup, state} =
+      Enum.reduce(state.cleanup, {empty_change(), [], state}, fn {kind, name} = file,
+                                                                 {change, left, state} ->
+        case rm(Path.join([state.user_dir, subdir(kind), name])) do
+          :ok ->
+            {forgotten, state} = forget(state, kind, name)
+            {merge_change(change, forgotten), left, state}
+
+          {:error, _reason} ->
+            {change, left ++ [file], state}
+        end
+      end)
+
+    state = %{state | cleanup: cleanup}
+
+    state =
+      if state.dirty or change != empty_change(),
+        do: state |> publish(change) |> elem(1),
+        else: state
+
+    schedule_retry(state)
+  end
 
   defp add_change(change, key, value), do: Map.update!(change, key, &(&1 ++ [value]))
 
@@ -796,21 +961,25 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
       textures: scan(user_dir, :texture, old.textures)
     }
 
+    # `dirty`: the manifest on disk doesn't match and couldn't be rewritten.
     with {:ok, body} <- encode_manifest(library),
-         false <- File.read(Path.join(user_dir, @manifest)) == {:ok, body} do
-      write_manifest_logged(%{user_dir: user_dir, library: library})
+         false <- File.read(Path.join(user_dir, @manifest)) == {:ok, body},
+         {:error, reason} <- write_manifest(user_dir, library) do
+      Logger.error("MilkDrop upload manifest write failed: #{inspect(reason)}; retrying")
+      {library, true}
+    else
+      _ -> {library, false}
     end
-
-    library
   end
 
   defp scan(user_dir, kind, old_meta) do
     dir = Path.join(user_dir, subdir(kind))
 
-    # Of names that collide, one the manifest knows wins.
+    # Of names that collide, one the manifest knows wins, the newest upload
+    # among those (a replacement whose predecessor couldn't be deleted).
     names =
       case File.ls(dir) do
-        {:ok, names} -> Enum.sort_by(names, &{not Map.has_key?(old_meta, &1), &1})
+        {:ok, names} -> Enum.sort_by(names, &collision_rank(old_meta, &1))
         {:error, _} -> []
       end
 
@@ -832,6 +1001,13 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
       end)
 
     library
+  end
+
+  defp collision_rank(old_meta, name) do
+    case old_meta do
+      %{^name => meta} -> {0, -Map.get(meta, :uploaded_at, 0), name}
+      _unknown -> {1, 0, name}
+    end
   end
 
   defp valid_file(kind, name, path) do
@@ -949,16 +1125,6 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
     end
   end
 
-  # The files are in place either way; the next start rewrites a stale
-  # manifest.
-  defp write_manifest_logged(%{user_dir: user_dir, library: library}) do
-    with {:error, reason} <- write_manifest(user_dir, library) do
-      Logger.error("MilkDrop upload manifest write failed: #{inspect(reason)}")
-    end
-
-    :ok
-  end
-
   # Mode 0644 whatever the umask; with `sync: true` on disk before it returns.
   defp write_file(path, data, opts \\ []) do
     with :ok <- File.mkdir_p(Path.dirname(path)),
@@ -976,7 +1142,8 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   defp io_reason(reason) when is_atom(reason), do: {:io, reason}
   defp io_reason(reason), do: reason
 
-  defp rm_logged(path) do
+  # A file already gone counts as deleted.
+  defp rm(path) do
     case File.rm(path) do
       :ok ->
         :ok
@@ -984,8 +1151,9 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
       {:error, :enoent} ->
         :ok
 
-      {:error, reason} ->
+      {:error, reason} = error ->
         Logger.error("MilkDrop could not delete #{inspect(path)}: #{inspect(reason)}")
+        error
     end
   end
 

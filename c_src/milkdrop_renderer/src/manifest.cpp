@@ -3,6 +3,8 @@
 #include "json.h"
 #include "protocol.h"
 
+#include <cerrno>
+#include <cmath>
 #include <cstdio>
 
 namespace md {
@@ -78,6 +80,8 @@ bool parse_entry(const JsonValue& v, PresetEntry& e) {
     }
     e.compile_ms = number_or(v.get("compile_ms"), -1);
     e.eval_ms = number_or(v.get("eval_ms"), -1);
+    if (const JsonValue* sha = v.get("sha256"); sha != nullptr && sha->is_string())
+        e.sha256 = sanitize_text(sha->string, 128);
     return true;
 }
 
@@ -130,23 +134,146 @@ std::set<std::string, std::less<>> parse_skip_list(std::string_view text) {
     return out;
 }
 
-bool read_file(const std::string& path, std::string& out, size_t max_bytes) {
+FileStatus read_file_status(const std::string& path, std::string& out, size_t max_bytes, std::string& error) {
     out.clear();
     FILE* f = std::fopen(path.c_str(), "rb");
-    if (f == nullptr) return false;
+    if (f == nullptr) {
+        if (errno == ENOENT || errno == ENOTDIR) return FileStatus::Missing;
+        error = "cannot open " + path;
+        return FileStatus::Invalid;
+    }
     char buf[65536];
     size_t n;
     bool ok = true;
     while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) {
         if (out.size() + n > max_bytes) {
+            error = path + " is over " + std::to_string(max_bytes) + " bytes";
             ok = false;
             break;
         }
         out.append(buf, n);
     }
-    if (std::ferror(f)) ok = false;
+    if (ok && std::ferror(f)) {
+        error = "cannot read " + path;
+        ok = false;
+    }
     std::fclose(f);
-    return ok;
+    if (!ok) out.clear();
+    return ok ? FileStatus::Ok : FileStatus::Invalid;
+}
+
+bool read_file(const std::string& path, std::string& out, size_t max_bytes) {
+    std::string error;
+    return read_file_status(path, out, max_bytes, error) == FileStatus::Ok;
+}
+
+bool is_user_id(std::string_view id) { return id.substr(0, USER_PREFIX.size()) == USER_PREFIX; }
+
+size_t drop_user_ids(Manifest& pack) {
+    const size_t before = pack.presets.size();
+    std::erase_if(pack.presets, [](const PresetEntry& e) { return is_user_id(e.file); });
+    const size_t dropped = before - pack.presets.size();
+    pack.rejected += dropped;
+    return dropped;
+}
+
+FileStatus load_user_manifest(const std::string& dir, Manifest& out, std::string& error) {
+    out = Manifest{};
+    if (dir.empty()) return FileStatus::Missing;
+    std::string text;
+    const FileStatus st = read_file_status(dir + "/manifest.json", text, MAX_USER_MANIFEST_BYTES, error);
+    if (st != FileStatus::Ok) return st;
+    Manifest parsed;
+    if (!parse_manifest(text, parsed, error)) return FileStatus::Invalid;
+    out.version = parsed.version;
+    out.format = parsed.format;
+    out.rejected = parsed.rejected;
+    for (PresetEntry& e : parsed.presets) {
+        e.file = std::string(USER_PREFIX) + e.file;
+        if (!valid_preset_file(e.file)) {
+            out.rejected++;
+            continue;
+        }
+        out.presets.push_back(std::move(e));
+    }
+    return FileStatus::Ok;
+}
+
+std::string preset_file_path(std::string_view pack_dir, std::string_view user_dir, std::string_view id) {
+    if (!is_user_id(id)) return std::string(pack_dir) + "/presets/" + std::string(id);
+    if (user_dir.empty()) return {};
+    return std::string(user_dir) + "/presets/" + std::string(id.substr(USER_PREFIX.size()));
+}
+
+std::vector<std::string> texture_search_paths(std::string_view pack_dir, std::string_view user_dir) {
+    std::vector<std::string> out{std::string(pack_dir) + "/textures"};
+    if (!user_dir.empty()) out.push_back(std::string(user_dir) + "/textures");
+    return out;
+}
+
+namespace {
+
+bool id_list(const JsonValue& doc, std::string_view key, std::set<std::string, std::less<>>& out,
+             std::string& error) {
+    const JsonValue* v = doc.get(key);
+    if (v == nullptr || v->is_null()) return true;
+    if (!v->is_array()) {
+        error = std::string(key) + " is not an array";
+        return false;
+    }
+    for (const JsonValue& id : v->array) {
+        if (!id.is_string()) {
+            error = std::string(key) + " has a non-string id";
+            return false;
+        }
+        if (valid_preset_file(id.string)) out.insert(id.string);
+    }
+    return true;
+}
+
+}  // namespace
+
+bool parse_selection(std::string_view text, UserSelection& out, std::string& error) {
+    JsonValue doc;
+    if (!json_parse(text, doc, error)) return false;
+    if (!doc.is_object()) {
+        error = "selection is not an object";
+        return false;
+    }
+    UserSelection sel;
+    if (const JsonValue* gen = doc.get("gen"); gen != nullptr) {
+        // Integral and exactly representable.
+        if (!gen->is_number() || gen->number != std::floor(gen->number) || gen->number < 0 ||
+            gen->number > 9007199254740992.0) {
+            error = "bad gen";
+            return false;
+        }
+        sel.gen = static_cast<int64_t>(gen->number);
+    }
+    if (const JsonValue* en = doc.get("playlist_enabled"); en != nullptr) {
+        if (!en->is_bool()) {
+            error = "bad playlist_enabled";
+            return false;
+        }
+        sel.playlist_enabled = en->boolean;
+    }
+    if (!id_list(doc, "favourites", sel.favourites, error) || !id_list(doc, "hidden", sel.hidden, error) ||
+        !id_list(doc, "playlist", sel.playlist, error))
+        return false;
+    out = std::move(sel);
+    return true;
+}
+
+FileStatus load_selection(const std::string& path, UserSelection& out, std::string& error) {
+    if (path.empty()) {
+        out = UserSelection{};
+        return FileStatus::Missing;
+    }
+    std::string text;
+    const FileStatus st = read_file_status(path, text, MAX_SELECTION_BYTES, error);
+    if (st == FileStatus::Missing) out = UserSelection{};
+    if (st != FileStatus::Ok) return st;
+    return parse_selection(text, out, error) ? FileStatus::Ok : FileStatus::Invalid;
 }
 
 }  // namespace md

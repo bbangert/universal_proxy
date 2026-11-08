@@ -215,13 +215,19 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
     test "ids are checked: shape, count and the file's size", %{path: path} do
       server = start_store(path)
 
-      for bad <- ["", "a\nb.milk", "tab\t.milk", "del\x7F.milk", <<0xFF, 0xFE>>, nil, 42] do
+      bad_ids =
+        ["", "a\nb.milk", "tab\t.milk", "del\x7F.milk", <<0xFF, 0xFE>>, nil, 42] ++
+          ["a.txt", "/abs.milk", "../up.milk", "a/./b.milk", "a//b.milk", "dir/", "user/"]
+
+      for bad <- bad_ids do
         assert Store.favourite(server, bad, true) == {:error, :invalid_id}
         assert Store.playlist_add(server, bad) == {:error, :invalid_id}
       end
 
-      assert Store.hide(server, String.duplicate("x", 513), true) == {:error, :invalid_id}
-      assert {:ok, _} = Store.hide(server, String.duplicate("é", 256), true)
+      assert Store.hide(server, String.duplicate("x", 508) <> ".milk", true) ==
+               {:error, :invalid_id}
+
+      assert {:ok, _} = Store.hide(server, String.duplicate("é", 251) <> ".milk", true)
       assert Store.valid_id?("user/Ünïcode – ok.milk")
 
       stop_supervised!(Store)
@@ -468,6 +474,49 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
       :ok = Store.skip(server, "v1", "user/b.milk", "draw")
       set_sha(agent, "user/a.milk", "sha-a")
       assert Store.skipped(server, "v1") == %{"user/b.milk" => "draw"}
+    end
+
+    test "a skip of content the library no longer holds is not stored", %{path: path} do
+      server = start_with_library(path, library(%{"user/a.milk" => "sha-a"}))
+
+      assert :ok = Store.skip(server, "v1", "user/a.milk", "draw", sha256: "sha-before")
+      assert Store.skipped(server, "v1") == %{}
+
+      assert :ok = Store.skip(server, "v1", "user/a.milk", "draw", sha256: "sha-a")
+      assert Store.skipped(server, "v1") == %{"user/a.milk" => "draw"}
+    end
+
+    test "a device reset on an upload's old content doesn't skip its replacement",
+         %{path: path} do
+      agent = library(%{"user/hang.milk" => "sha-new"})
+
+      opts = [
+        name: nil,
+        table: @table,
+        dets_path: path,
+        boot_id: "boot-1",
+        pack_version: "v1",
+        user_sha: &Agent.get(agent, fn shas -> shas[&1] end)
+      ]
+
+      server = start_supervised!(Supervisor.child_spec({Store, opts}, restart: :temporary))
+      :ok = Store.mark_in_flight(server, 7, "v1", "user/hang.milk", sha256: "sha-old")
+      assert %{sha256: "sha-old"} = Store.in_flight(server)
+      ref = Process.monitor(server)
+      Process.exit(server, :kill)
+      assert_receive {:DOWN, ^ref, :process, _, :killed}
+
+      {server, _log} =
+        ExUnit.CaptureLog.with_log(fn ->
+          start_supervised!(
+            Supervisor.child_spec({Store, Keyword.put(opts, :boot_id, "boot-2")},
+              restart: :temporary
+            )
+          )
+        end)
+
+      assert Store.skipped(server, "v1") == %{}
+      assert Store.in_flight(server) == nil
     end
 
     test "a skip for an id the library doesn't hold is not stored", %{path: path} do

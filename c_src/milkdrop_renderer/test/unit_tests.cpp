@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <atomic>
 #include <csignal>
+#include <cstdlib>
 #include <functional>
 #include <chrono>
 #include <cstdio>
@@ -1604,6 +1605,811 @@ static void test_kmsg_watch() {
     CHECK(t.report("c.milk", 76000000));
 }
 
+// ---------------------------------------------------------------- user presets and selection
+
+static void write_file(const std::string& path, const std::string& text) {
+    FILE* f = std::fopen(path.c_str(), "w");
+    std::fwrite(text.data(), 1, text.size(), f);
+    std::fclose(f);
+}
+
+static PresetEntry entry(const std::string& file, bool high_frequency = false) {
+    PresetEntry e;
+    e.file = file;
+    e.high_frequency = high_frequency;
+    return e;
+}
+
+static UserSelection selection(std::vector<std::string> hidden, std::vector<std::string> playlist,
+                               bool playlist_enabled, std::vector<std::string> favourites = {}) {
+    UserSelection s;
+    s.hidden.insert(hidden.begin(), hidden.end());
+    s.playlist.insert(playlist.begin(), playlist.end());
+    s.favourites.insert(favourites.begin(), favourites.end());
+    s.playlist_enabled = playlist_enabled;
+    return s;
+}
+
+static void test_user_options() {
+    Options o;
+    std::string err;
+    CHECK(parse_options(base_args(), o, err) && o.user_dir.empty() && o.selection_file.empty());
+    auto args = base_args();
+    args.insert(args.end(), {"--user-dir", "/data/milkdrop/user", "--selection-file", "/run/md-selection.json"});
+    Options o2;
+    CHECK(parse_options(args, o2, err) && o2.user_dir == "/data/milkdrop/user" &&
+          o2.selection_file == "/run/md-selection.json");
+    for (const char* opt : {"--user-dir", "--selection-file"}) {
+        auto empty = base_args();
+        empty.insert(empty.end(), {opt, ""});
+        Options o3;
+        CHECK(!parse_options(empty, o3, err) && err == std::string("bad ") + opt);
+        auto missing = base_args();
+        missing.push_back(opt);
+        CHECK(!parse_options(missing, o3, err) && err == std::string("missing value for ") + opt);
+    }
+    CHECK(std::string(USAGE).find("--user-dir DIR") != std::string::npos &&
+          std::string(USAGE).find("--selection-file PATH") != std::string::npos);
+}
+
+static void test_user_protocol() {
+    std::string err;
+    auto c = parse_command(R"({"cmd":"play","preset":"user/My Preset.milk","lock":true})", err);
+    CHECK(c && c->type == Command::Type::Play && c->string_value == "user/My Preset.milk" && c->bool_value);
+    c = parse_command(R"({"cmd":"play","preset":"a/b.milk"})", err);
+    CHECK(c && c->type == Command::Type::Play && c->string_value == "a/b.milk" && !c->bool_value);
+    c = parse_command(R"({"cmd":"play","preset":"x.milk","lock":false})", err);
+    CHECK(c && !c->bool_value);
+    for (const char* bad : {R"({"cmd":"play"})", R"({"cmd":"play","preset":7})", R"({"cmd":"play","preset":""})",
+                            R"({"cmd":"play","preset":"../x.milk"})", R"({"cmd":"play","preset":"/x.milk"})",
+                            R"({"cmd":"play","preset":"x.txt"})", R"({"cmd":"play","preset":"a\nb.milk"})",
+                            R"({"cmd":"play","preset":"a\u0000b.milk"})", R"({"cmd":"play","preset":"a\u007fb.milk"})",
+                            R"({"cmd":"play","preset":"a//b.milk"})"}) {
+        CHECK(!parse_command(bad, err) && err == "bad play preset");
+    }
+    CHECK(!parse_command(R"({"cmd":"play","preset":"x.milk","lock":1})", err) && err == "bad play lock");
+    std::string too_long = R"({"cmd":"play","preset":")" + std::string(MAX_PRESET_NAME_BYTES - 4, 'a') + R"(.milk"})";
+    CHECK(!parse_command(too_long, err));
+    CHECK(parse_command(R"({"cmd":"reload_user"})", err)->type == Command::Type::ReloadUser);
+    CHECK(parse_command(R"({"cmd":"reload_selection"})", err)->type == Command::Type::ReloadSelection);
+
+    // The longest valid id, every byte escaped, still fits a stdin line.
+    const std::string longest = std::string(MAX_PRESET_NAME_BYTES - 5, '"') + ".milk";
+    CHECK(valid_preset_file(longest));
+    const std::string line = R"({"cmd":"play","lock":true,"preset":")" + json_escape(longest) + "\"}\n";
+    LineBuffer lb;
+    std::vector<std::string> lines;
+    lb.feed(line.data(), line.size(), [&](std::string_view l) { lines.emplace_back(l); });
+    CHECK(lines.size() == 1 && lb.overflowed == 0);
+    c = parse_command(lines.at(0), err);
+    CHECK(c && c->type == Command::Type::Play && c->string_value == longest && c->bool_value);
+
+    JsonValue v;
+    CHECK(json_parse(event_play_refused("user/a \"b\".milk", "high_frequency"), v, err) &&
+          v.get("event")->string == "play_refused" && v.get("preset")->string == "user/a \"b\".milk" &&
+          v.get("reason")->string == "high_frequency" && v.object.size() == 3);
+    CHECK(event_play_refused(longest, std::string(500, '"')).size() < MAX_EMIT_LINE_BYTES);
+    CHECK(json_parse(event_user_reloaded(12, 3, 2, 1), v, err) && v.get("event")->string == "user_reloaded" &&
+          v.get("presets")->number == 12 && v.get("added")->number == 3 && v.get("removed")->number == 2 &&
+          v.get("rejected")->number == 1);
+    CHECK(json_parse(event_selection(9007199254740992LL, 40, true, false), v, err) &&
+          v.get("event")->string == "selection" && v.get("gen")->number == 9007199254740992.0 &&
+          v.get("eligible")->number == 40 && v.get("playlist_fallback")->boolean &&
+          !v.get("hidden_fallback")->boolean);
+}
+
+static void test_user_manifest() {
+    // The pack never plays ids in the user namespace.
+    Manifest pack;
+    std::string err;
+    CHECK(parse_manifest(R"({"presets":[{"file":"a.milk"},{"file":"user/x.milk"},{"file":"users/y.milk"},
+                            {"file":"user/sub/z.milk"},{"file":"bad"}]})",
+                         pack, err));
+    CHECK(pack.presets.size() == 4 && pack.rejected == 1);
+    CHECK(drop_user_ids(pack) == 2);
+    CHECK(pack.presets.size() == 2 && pack.presets[0].file == "a.milk" && pack.presets[1].file == "users/y.milk" &&
+          pack.rejected == 3);
+    CHECK(is_user_id("user/a.milk") && !is_user_id("user") && !is_user_id("users/a.milk") && !is_user_id("a.milk"));
+
+    const fs::path dir = tmp_path("userdir");
+    fs::remove_all(dir);
+    Manifest user;
+    CHECK(load_user_manifest("", user, err) == FileStatus::Missing && user.presets.empty());
+    CHECK(load_user_manifest(dir.string(), user, err) == FileStatus::Missing);  // no dir at all
+    fs::create_directories(dir);
+    CHECK(load_user_manifest(dir.string(), user, err) == FileStatus::Missing);  // no manifest
+
+    const std::string long_name = std::string(MAX_PRESET_NAME_BYTES - USER_PREFIX.size() - 4, 'n') + ".milk";
+    CHECK(valid_preset_file(long_name));  // valid in the pack, too long with the prefix
+    write_file((dir / "manifest.json").string(),
+               R"({"format":1,"version":"user","presets":[
+                    {"file":"One.milk","tags":["uploaded"],"sha256":"ab12"},
+                    {"file":"Flash.milk","tags":["uploaded","high_frequency"]},
+                    {"file":"sub/Two.milk"},
+                    {"file":"One.milk"},
+                    {"file":"../escape.milk"},
+                    {"file":")" + long_name + R"("}]})");
+    CHECK(load_user_manifest(dir.string(), user, err) == FileStatus::Ok);
+    CHECK(user.version == "user" && user.presets.size() == 3 && user.rejected == 3);
+    CHECK(user.presets[0].file == "user/One.milk" && user.presets[0].tags == std::vector<std::string>{"uploaded"} &&
+          !user.presets[0].high_frequency && user.presets[0].compile_ms < 0 && user.presets[0].rpi3_rung.width == 0 &&
+          !user.presets[0].rpi3_skip);
+    CHECK(user.presets[1].file == "user/Flash.milk" && user.presets[1].high_frequency);
+    CHECK(user.presets[2].file == "user/sub/Two.milk");
+
+    write_file((dir / "manifest.json").string(), R"({"presets":[)");
+    CHECK(load_user_manifest(dir.string(), user, err) == FileStatus::Invalid && !err.empty() && user.presets.empty());
+    write_file((dir / "manifest.json").string(), R"({"format":2,"presets":[]})");
+    CHECK(load_user_manifest(dir.string(), user, err) == FileStatus::Invalid && err == "unsupported manifest format");
+    fs::remove(dir / "manifest.json");
+    fs::create_directories(dir / "manifest.json");  // not a file
+    CHECK(load_user_manifest(dir.string(), user, err) == FileStatus::Invalid);
+    fs::remove_all(dir);
+
+    std::string text;
+    const std::string big = tmp_path("big");
+    write_file(big, std::string(100, 'x'));
+    CHECK(read_file_status(big, text, 100, err) == FileStatus::Ok && text.size() == 100);
+    CHECK(read_file_status(big, text, 99, err) == FileStatus::Invalid && text.empty() && !err.empty());
+    CHECK(read_file_status(big + ".missing", text, 100, err) == FileStatus::Missing);
+    CHECK(read_file_status(big + "/below", text, 100, err) == FileStatus::Missing);  // ENOTDIR
+    fs::remove(big);
+
+    CHECK(preset_file_path("/p", "/u", "a/b.milk") == "/p/presets/a/b.milk");
+    CHECK(preset_file_path("/p", "/u", "user/sub/c.milk") == "/u/presets/sub/c.milk");
+    CHECK(preset_file_path("/p", "", "user/c.milk").empty());
+    CHECK(preset_file_path("/p", "/u", "users/c.milk") == "/p/presets/users/c.milk");
+    CHECK((texture_search_paths("/p", "/u") == std::vector<std::string>{"/p/textures", "/u/textures"}));
+    CHECK((texture_search_paths("/p", "") == std::vector<std::string>{"/p/textures"}));
+}
+
+static void test_selection_file() {
+    UserSelection s;
+    std::string err;
+    CHECK(parse_selection(R"({"gen":7,"favourites":["a.milk","user/f.milk"],"hidden":["h.milk"],
+                              "playlist":["a.milk","nope.milk","../bad.milk","x.txt"],"playlist_enabled":true,
+                              "future":1})",
+                          s, err));
+    CHECK(s.gen == 7 && s.playlist_enabled && s.favourites.size() == 2 && s.favourites.count("user/f.milk") &&
+          s.hidden.size() == 1 && s.hidden.count("h.milk"));
+    // Invalid ids dropped; unknown ones kept (a reload may add them).
+    CHECK(s.playlist.size() == 2 && s.playlist.count("a.milk") && s.playlist.count("nope.milk"));
+    UserSelection empty;
+    CHECK(parse_selection("{}", empty, err) && empty.gen == 0 && !empty.playlist_enabled && empty.playlist.empty());
+    CHECK(parse_selection(R"({"hidden":null})", empty, err) && empty.hidden.empty());
+
+    // Malformed: false and `out` untouched.
+    for (const char* bad : {"", "[]", "{", R"({"gen":-1})", R"({"gen":1.5})", R"({"gen":"1"})",
+                            R"({"gen":1e300})", R"({"playlist_enabled":1})", R"({"favourites":"a.milk"})",
+                            R"({"hidden":[1]})", R"({"playlist":{"a":1}})"}) {
+        CHECK(!parse_selection(bad, s, err) && !err.empty());
+    }
+    CHECK(s.gen == 7 && s.playlist.size() == 2);
+
+    const std::string path = tmp_path("selection.json");
+    fs::remove(path);
+    CHECK(load_selection(path, s, err) == FileStatus::Missing && s.gen == 0 && s.playlist.empty());
+    s.gen = 3;
+    CHECK(load_selection("", s, err) == FileStatus::Missing && s.gen == 0);
+    write_file(path, R"({"gen":4,"hidden":["h.milk"]})");
+    CHECK(load_selection(path, s, err) == FileStatus::Ok && s.gen == 4 && s.hidden.count("h.milk"));
+    write_file(path, R"({"gen":5,"hidden":)");
+    CHECK(load_selection(path, s, err) == FileStatus::Invalid && s.gen == 4 && s.hidden.count("h.milk"));
+    // Over the cap: refused unread, whatever it holds.
+    std::string big = R"({"gen":6,"hidden":[)";
+    while (big.size() <= MAX_SELECTION_BYTES) big += R"("x.milk",)";
+    big += R"("y.milk"]})";
+    write_file(path, big);
+    CHECK(load_selection(path, s, err) == FileStatus::Invalid && s.gen == 4);
+    fs::remove(path);
+}
+
+// The selection over rotation (P6): hidden never rotates, the playlist
+// narrows it, and an empty result falls back rather than ending rotation.
+static void test_selection_rotation() {
+    PresetManager::Config cfg;
+    cfg.seed = 11;
+    auto es = entries(10);
+    es[9].high_frequency = true;
+    PresetManager pm(es, {"p8.milk"}, cfg);  // eligible: p0..p7
+    pm.start("");
+
+    auto info = pm.set_selection(selection({"p0.milk", "p1.milk"}, {}, false));
+    CHECK(info.pool == PresetManager::Pool::Unhidden && info.size == 6 && !info.playlist_fallback &&
+          !info.hidden_fallback);
+    for (int i = 0; i < 40; i++) {
+        const std::string f = pm.rotate()->file;
+        CHECK(f != "p0.milk" && f != "p1.milk" && f != "p8.milk" && f != "p9.milk");
+    }
+
+    // Playlist on: playlist, eligible and unhidden only. Skipped, filtered,
+    // hidden and unknown ids on it don't count.
+    info = pm.set_selection(
+        selection({"p0.milk"}, {"p0.milk", "p2.milk", "p3.milk", "p8.milk", "p9.milk", "user/gone.milk"}, true));
+    CHECK(info.pool == PresetManager::Pool::Playlist && info.size == 2 && !info.playlist_fallback);
+    std::set<std::string> seen;
+    for (int i = 0; i < 20; i++) seen.insert(pm.rotate()->file);
+    CHECK((seen == std::set<std::string>{"p2.milk", "p3.milk"}));
+    // Off: the playlist is ignored.
+    info = pm.set_selection(selection({}, {"p2.milk"}, false));
+    CHECK(info.pool == PresetManager::Pool::Unhidden && info.size == 8);
+
+    // Nothing on the playlist can rotate: the full eligible, unhidden set.
+    info = pm.set_selection(selection({"p1.milk"}, {"p1.milk", "p8.milk", "p9.milk", "nope.milk"}, true));
+    CHECK(info.pool == PresetManager::Pool::Unhidden && info.size == 7 && info.playlist_fallback);
+    seen.clear();
+    for (int i = 0; i < 40; i++) seen.insert(pm.rotate()->file);
+    CHECK(seen.size() == 7 && !seen.count("p1.milk"));
+    info = pm.set_selection(selection({}, {}, true));
+    CHECK(info.playlist_fallback && info.size == 8);
+
+    // Everything hidden: rotation still goes on, over all eligible ones.
+    info = pm.set_selection(selection({"p0.milk", "p1.milk", "p2.milk", "p3.milk", "p4.milk", "p5.milk", "p6.milk",
+                                       "p7.milk"},
+                                      {"p0.milk"}, true));
+    CHECK(info.pool == PresetManager::Pool::Eligible && info.size == 8 && info.playlist_fallback &&
+          info.hidden_fallback);
+    for (int i = 0; i < 20; i++) CHECK(pm.rotate() != nullptr);
+
+    // The playlist empties mid-deal (its presets get skipped): the next
+    // pick falls back, never null.
+    PresetManager drain(entries(6), {}, cfg);
+    drain.start("");
+    drain.set_selection(selection({}, {"p1.milk", "p2.milk"}, true));
+    CHECK(drain.rotate() != nullptr);
+    drain.skip("p1.milk");
+    drain.skip("p2.milk");
+    CHECK(drain.rotation_pool().playlist_fallback);
+    for (int i = 0; i < 10; i++) {
+        const PresetEntry* p = drain.rotate();
+        CHECK(p != nullptr && p->file != "p1.milk" && p->file != "p2.milk");
+    }
+
+    // The current preset turning hidden or off the playlist keeps playing;
+    // history passes over hidden ones.
+    PresetManager h(entries(10), {}, cfg);
+    const std::string a = h.start("")->file;
+    const std::string b = h.next()->file;
+    const std::string c = h.next()->file;
+    h.set_selection(selection({b, c}, {a}, true));
+    CHECK(h.current()->file == c);
+    CHECK(h.prev()->file == a);  // b is hidden
+    CHECK(h.next()->file != b);
+    // A locked start may name a hidden preset (an explicit pick).
+    PresetManager lk(entries(4), {}, cfg);
+    lk.set_selection(selection({"p2.milk"}, {}, false));
+    CHECK(lk.start("p2.milk")->file == "p2.milk" && lk.locked());
+}
+
+// Favourites hold three tickets per deal: they play three times as often
+// as plain presets, never twice in a row. The GLES2 half weight still only
+// orders a deal.
+static void test_favourites() {
+    PresetManager::Config cfg;
+    cfg.seed = 5;
+    cfg.gles2 = true;
+    auto many = entries(10);
+    many[2].compile_ms = 900;  // a favourite, expensive: still three tickets
+    PresetManager w(many, {}, cfg);
+    w.set_selection(selection({}, {}, false, {"p0.milk", "p2.milk"}));
+    std::map<std::string, int> plays;
+    std::string last = w.start("")->file;
+    plays[last]++;
+    const int deals = 300, per_deal = 8 + 2 * 3;
+    for (int i = 1; i < deals * per_deal; i++) {
+        const std::string f = w.rotate()->file;
+        CHECK(f != last);  // deal boundaries included
+        plays[f]++;
+        last = f;
+    }
+    const double plain = plays["p1.milk"];
+    for (const char* f : {"p3.milk", "p5.milk", "p9.milk"}) CHECK(std::abs(plays[f] - plain) <= 2);
+    CHECK(plays["p0.milk"] > 2.9 * plain && plays["p0.milk"] < 3.1 * plain);
+    CHECK(plays["p2.milk"] > 2.9 * plain && plays["p2.milk"] < 3.1 * plain);
+
+    // A deal: every pool member, favourites three times, none adjacent.
+    PresetManager deal(entries(10), {}, cfg);
+    deal.set_selection(selection({}, {}, false, {"p4.milk"}));
+    std::vector<std::string> round{deal.start("")->file};
+    for (int i = 0; i < 40; i++) round.push_back(deal.rotate()->file);
+    for (size_t i = 1; i < round.size(); i++) CHECK(round[i] != round[i - 1]);
+    CHECK(std::count(round.begin(), round.end(), "p4.milk") >= 8);
+
+    // Tiny pools: two presets alternate; one repeats (nothing else to play).
+    PresetManager two(entries(2), {}, cfg);
+    two.set_selection(selection({}, {}, false, {"p0.milk"}));
+    last = two.start("")->file;
+    for (int i = 0; i < 30; i++) {
+        const std::string f = two.rotate()->file;
+        CHECK(f != last);
+        last = f;
+    }
+    PresetManager one(entries(1), {}, cfg);
+    one.set_selection(selection({}, {}, false, {"p0.milk"}));
+    CHECK(one.start("")->file == "p0.milk");
+    for (int i = 0; i < 5; i++) CHECK(one.rotate() != nullptr && one.current()->file == "p0.milk");
+
+    // An unfavoured preset's leftover tickets are dropped at the re-deal.
+    PresetManager re(entries(6), {}, cfg);
+    re.set_selection(selection({}, {}, false, {"p1.milk"}));
+    re.start("");
+    for (int i = 0; i < 3; i++) re.rotate();
+    re.set_selection(selection({}, {}, false, {}));
+    std::set<std::string> fresh;
+    for (int i = 0; i < 6; i++) fresh.insert(re.rotate()->file);
+    CHECK(fresh.size() == 6);
+}
+
+// reload_user: append-only entries with tombstones, so pointers the
+// caller holds (current_, what on_shown reported) stay valid.
+static void test_user_reload() {
+    PresetManager::Config cfg;
+    cfg.seed = 13;
+    std::vector<PresetEntry> es = entries(4);
+    es.push_back(entry("user/u0.milk"));
+    es.push_back(entry("user/u1.milk"));
+    PresetManager pm(es, {}, cfg);
+    const PresetEntry* u0 = pm.start("user/u0.milk");
+    CHECK(u0 != nullptr && u0->file == "user/u0.milk" && pm.locked());
+    pm.on_shown(*u0, false);
+    const PresetEntry* p0 = by_file(pm, "p0.milk");
+
+    // u0 (current, locked, showing) removed; u2 added; non-user ids ignored.
+    auto r = pm.set_user_presets({entry("user/u1.milk"), entry("user/u2.milk"), entry("p0.milk", true)});
+    CHECK(r.presets == 2 && r.added == 1 && r.removed == 1 && !r.cut);
+    CHECK(pm.current() == u0 && pm.showing() == u0 && u0->file == "user/u0.milk" && pm.locked());
+    CHECK(pm.removed(4) && !pm.eligible(4) && !p0->high_frequency);
+    std::string why;
+    CHECK(pm.find_playable("user/u0.milk", why) == nullptr && why == "unknown");
+    CHECK(pm.find_playable("user/u2.milk", why) != nullptr && why.empty());
+    CHECK(pm.eligible_count() == 6);
+    // Never picked again: rotation, next, cut_target.
+    for (int i = 0; i < 40; i++) CHECK(pm.rotate()->file != "user/u0.milk");
+
+    // Many reloads: earlier entries never move.
+    for (int n = 0; n < 50; n++) {
+        std::vector<PresetEntry> batch{entry("user/u1.milk"), entry("user/u2.milk")};
+        for (int k = 0; k < 20; k++) batch.push_back(entry("user/n" + std::to_string(n * 20 + k) + ".milk"));
+        pm.set_user_presets(std::move(batch));
+    }
+    CHECK(by_file(pm, "p0.milk") == p0 && u0->file == "user/u0.milk" && pm.showing() == u0);
+    CHECK(pm.entries().size() == 4 + 3 + 50 * 20);
+    r = pm.set_user_presets({entry("user/u1.milk"), entry("user/u2.milk")});
+    CHECK(r.removed == 20 && r.presets == 2 && r.added == 0);
+
+    // An id that comes back revives its own entry, refreshed in place.
+    PresetEntry back = entry("user/u0.milk");
+    back.tags = {"uploaded", "v2"};
+    r = pm.set_user_presets({back, entry("user/u1.milk"), entry("user/u2.milk")});
+    CHECK(r.added == 1 && r.removed == 0 && r.presets == 3);
+    CHECK(by_file(pm, "user/u0.milk") == u0 && u0->tags.size() == 2 && pm.eligible(4));
+    CHECK(pm.find_playable("user/u0.milk", why) == u0);
+
+    // Flagged fast-flashing while it shows and the filter is off: cut.
+    r = pm.set_user_presets({entry("user/u0.milk", true), entry("user/u1.milk"), entry("user/u2.milk")});
+    CHECK(r.cut && pm.high_frequency_on_screen() && u0->high_frequency);
+    const PresetEntry* to = pm.cut_target();
+    CHECK(to != nullptr && to != u0 && !to->high_frequency);
+    pm.on_shown(*to, false);
+    CHECK(!pm.high_frequency_on_screen());
+
+    // History passes over tombstones both ways.
+    PresetManager hist(entries(10), {}, cfg);
+    hist.set_user_presets({entry("user/a.milk"), entry("user/b.milk")});
+    const std::string first = hist.start("")->file;
+    std::string why2;
+    hist.played(*hist.find_playable("user/a.milk", why2), false);
+    hist.played(*hist.find_playable("user/b.milk", why2), false);
+    const std::string last = hist.next()->file;
+    hist.set_user_presets({entry("user/b.milk")});  // a removed
+    CHECK(hist.prev()->file == "user/b.milk");
+    CHECK(hist.prev()->file == first);  // over user/a
+    CHECK(hist.next()->file == "user/b.milk");
+    CHECK(hist.next()->file == last);
+    hist.set_user_presets({});
+    CHECK(hist.prev()->file == first);  // over both
+
+    // Missing user dir at start, uploads mid-session.
+    PresetManager late(entries(2), {}, cfg);
+    late.start("");
+    r = late.set_user_presets({entry("user/new.milk")});
+    CHECK(r.added == 1 && r.presets == 1 && late.eligible_count() == 3);
+    std::set<std::string> seen;
+    for (int i = 0; i < 12; i++) seen.insert(late.rotate()->file);
+    CHECK(seen.count("user/new.milk"));
+    // A session skip by id holds for user presets too.
+    late.skip("user/new.milk");
+    CHECK(late.find_playable("user/new.milk", why) == nullptr && why == "skipped");
+    PresetManager sk(std::vector<PresetEntry>{entry("p.milk"), entry("user/s.milk")}, {"user/s.milk"}, cfg);
+    CHECK(sk.start("user/s.milk")->file == "p.milk" && sk.refused_lock() == "skipped");
+}
+
+// play: any eligible preset (hidden, off the playlist), never a skipped,
+// unknown, removed or (filter off) high_frequency one.
+static void test_play() {
+    PresetManager::Config cfg;
+    cfg.seed = 17;
+    cfg.gles2 = true;
+    auto es = entries(6);
+    es[1].high_frequency = true;
+    es[2].rpi3_skip = true;
+    es.push_back(entry("user/up.milk"));
+    PresetManager pm(es, {"p3.milk"}, cfg);
+    pm.set_selection(selection({"p4.milk"}, {"p0.milk"}, true));
+    const std::string first = pm.start("")->file;
+    CHECK(first == "p0.milk");
+    std::string why;
+    CHECK(pm.find_playable("nope.milk", why) == nullptr && why == "unknown");
+    CHECK(pm.find_playable("p3.milk", why) == nullptr && why == "skipped");
+    CHECK(pm.find_playable("p1.milk", why) == nullptr && why == "high_frequency");
+    CHECK(pm.find_playable("p2.milk", why) == nullptr && why == "rpi3_skip");
+    const PresetEntry* hid = pm.find_playable("p4.milk", why);  // hidden: an explicit pick may
+    CHECK(hid != nullptr && why.empty());
+    const PresetEntry* off = pm.find_playable("p5.milk", why);  // off the playlist
+    CHECK(off != nullptr && why.empty());
+    pm.set_high_frequency(true);
+    CHECK(pm.find_playable("p1.milk", why) != nullptr);
+    pm.set_high_frequency(false);
+
+    // Played: the current preset, in history, locked or not.
+    pm.played(*off, true);
+    CHECK(pm.current() == off && pm.locked());
+    pm.played(*pm.find_playable("user/up.milk", why), false);
+    CHECK(pm.current()->file == "user/up.milk" && !pm.locked());
+    CHECK(pm.prev() == off && pm.prev()->file == first);
+    // A copy isn't ours.
+    PresetEntry copy = *off;
+    pm.played(copy, true);
+    CHECK(pm.current()->file == first && !pm.locked());
+
+    // The load: one candidate, no rotation fallback; a failure skips it.
+    std::vector<std::string> tried;
+    auto fail_all = [&](const PresetEntry& e) {
+        tried.push_back(e.file);
+        return Attempt::Failed;
+    };
+    CHECK(select_preset(pm, pm.find_playable("p5.milk", why), 1, fail_all) == Selection::Deferred);
+    CHECK((tried == std::vector<std::string>{"p5.milk"}));
+    CHECK(pm.find_playable("p5.milk", why) == nullptr && why == "skipped");
+    CHECK(pm.current()->file == first);  // the playing preset stays current
+}
+
+static void test_switch_play() {
+    SwitchState sw;
+    // A play replaces a plain request, and a later one replaces it.
+    sw.request(Switch::Rotate);
+    sw.request_play();
+    CHECK(sw.requested() == Switch::Play);
+    sw.request(Switch::Next);
+    CHECK(sw.requested() == Switch::Next);
+    sw.request_play();
+    sw.eject_if_idle();
+    CHECK(sw.begin() == Switch::Play && !sw.pending());
+    sw.selected(Selection::Switched, false);
+    sw.play_done();
+    CHECK(!sw.pending() && sw.smooth());
+
+    // A preload failure: the playing preset just carries on.
+    sw.request_play();
+    sw.begin();
+    sw.selected(Selection::Deferred, false);
+    sw.play_failed();
+    CHECK(!sw.pending() && sw.smooth() && !sw.holding_frames());
+
+    // A failure after activation holds the transition slot: cut past it.
+    sw.request_play();
+    sw.begin();
+    sw.selected(Selection::Deferred, true);
+    sw.play_failed();
+    CHECK(sw.requested() == Switch::Retry && std::string(sw.retry_cause()) == "eject" && !sw.smooth() &&
+          sw.holding_frames());
+    sw.begin();
+    sw.selected(Selection::Switched, false);
+
+    // It takes over an eject, which comes back if it fails...
+    sw.eject();
+    sw.request_play();
+    CHECK(sw.requested() == Switch::Play);
+    sw.request(Switch::Next);  // ...and nothing else drops it
+    sw.request(Switch::Rotate);
+    CHECK(sw.requested() == Switch::Play);
+    CHECK(sw.begin() == Switch::Play);
+    sw.selected(Selection::Deferred, false);
+    sw.play_failed();
+    CHECK(sw.requested() == Switch::Eject);
+    sw.begin();
+    sw.selected(Selection::Switched, false);
+    // ...or is done when it loads.
+    sw.eject();
+    sw.request_play();
+    sw.begin();
+    sw.selected(Selection::Switched, false);
+    sw.play_done();
+    sw.play_failed();  // stale: nothing to restore
+    CHECK(!sw.pending());
+
+    // A retry too, with its cause.
+    sw.retry("next");
+    sw.request_play();
+    sw.begin();
+    sw.selected(Selection::Deferred, false);
+    sw.play_failed();
+    CHECK(sw.requested() == Switch::Retry && std::string(sw.retry_cause()) == "next");
+    sw.begin();
+    sw.selected(Selection::Switched, false);
+
+    // A hang while a play is pending: the play goes first, with a cut and
+    // frames held; the eject follows if it fails.
+    sw.request_play();
+    sw.hang();
+    CHECK(sw.requested() == Switch::Play && !sw.smooth() && sw.holding_frames());
+    CHECK(!sw.request_take());
+    sw.begin();
+    sw.selected(Selection::Deferred, false);
+    sw.play_failed();
+    CHECK(sw.requested() == Switch::Eject && sw.holding_frames() && !sw.take_due());
+    sw.begin();
+    sw.selected(Selection::Switched, false);
+    CHECK(!sw.holding_frames() && sw.take_due());
+
+    // A skip (eject) arriving while a play is pending doesn't drop it.
+    sw.request_play();
+    sw.eject();
+    CHECK(sw.requested() == Switch::Play);
+    sw.begin();
+    sw.selected(Selection::Switched, false);
+    sw.play_done();
+    CHECK(!sw.pending());
+}
+
+// A play while not presenting (prepared or released) loads in the next
+// round, and before a `take` that follows it, so the take shows it.
+static void test_play_before_take() {
+    std::vector<std::string> log;
+    SwitchState sw;
+    Attempt outcome = Attempt::Loaded;
+    bool activated = false;
+    // As App::apply_switch() for a play.
+    auto apply = [&] {
+        const Switch s = sw.begin();
+        log.push_back(s == Switch::Play ? "play" : "other");
+        if (s != Switch::Play) return;
+        if (outcome == Attempt::Loaded) {
+            sw.selected(Selection::Switched, false);
+            sw.play_done();
+        } else {
+            sw.selected(Selection::Deferred, activated);
+            sw.play_failed();
+        }
+    };
+    auto take = [&] {
+        if (sw.request_take()) log.push_back("take");
+    };
+    bool stop = false;
+    auto stopped = [&] { return stop; };
+
+    // Released, a play arrives: the next round loads it; no take.
+    sw.request_play();
+    recovery_round(sw, apply, take, stopped);
+    CHECK((log == std::vector<std::string>{"play"}) && !sw.pending());
+    // Other requests still wait for presenting.
+    log.clear();
+    sw.request(Switch::Next);
+    recovery_round(sw, apply, take, stopped);
+    CHECK(log.empty() && sw.requested() == Switch::Next);
+    sw.begin();
+
+    // play then take in one read: the play loads first.
+    sw.request_play();
+    CHECK(take_ready(sw, apply, stopped));
+    CHECK((log == std::vector<std::string>{"play"}));
+    // No play pending: take_ready is request_take().
+    log.clear();
+    CHECK(take_ready(sw, apply, stopped) && log.empty());
+
+    // A play whose preload fails: the take shows the preset that stayed.
+    outcome = Attempt::Failed;
+    sw.request_play();
+    CHECK(take_ready(sw, apply, stopped) && !sw.pending());
+    // One that fails after activation holds the slot: the take waits for
+    // the replacement, which a recovery round brings.
+    activated = true;
+    log.clear();
+    sw.request_play();
+    CHECK(!take_ready(sw, apply, stopped) && sw.take_pending());
+    CHECK(sw.requested() == Switch::Retry && sw.holding_frames());
+    sw.begin();
+    sw.selected(Selection::Switched, false);
+    CHECK(sw.take_due());
+    activated = false;
+
+    // Frames held (the prepared preset hung) and a play pending: the take
+    // waits; the recovery round runs the play, then the take.
+    outcome = Attempt::Loaded;
+    log.clear();
+    sw.hang();
+    sw.request_play();
+    CHECK(!take_ready(sw, apply, stopped) && log.empty());
+    recovery_round(sw, apply, take, stopped);
+    CHECK((log == std::vector<std::string>{"play", "take"}));
+
+    // An exit decided during the play: no take.
+    log.clear();
+    sw.request_play();
+    auto apply_then_stop = [&] {
+        apply();
+        stop = true;
+    };
+    CHECK(!take_ready(sw, apply_then_stop, stopped) && !sw.take_pending());
+}
+
+// The no-repeat rule can leave a favourite's tickets unplayable in tiny
+// pools (it can play at most every other pick): the bag stays bounded,
+// and nothing repeats unless the pool is one preset.
+static void test_favourites_tiny_pools() {
+    struct Case {
+        int presets;
+        std::vector<std::string> favourites;
+        double fav_share_min, fav_share_max;
+    };
+    const std::vector<Case> cases = {
+        {1, {"p0.milk"}, 1.0, 1.0},
+        {2, {"p0.milk"}, 0.49, 0.51},             // alternates
+        {2, {"p0.milk", "p1.milk"}, 0.49, 0.51},  // alternates
+        {3, {"p0.milk"}, 0.45, 0.51},             // every other pick at most
+        {4, {"p0.milk"}, 0.45, 0.51},
+    };
+    for (const Case& c : cases) {
+        PresetManager::Config cfg;
+        cfg.seed = 21;
+        PresetManager pm(entries(c.presets), {}, cfg);
+        pm.set_selection(selection({}, {}, false, c.favourites));
+        std::string last = pm.start("")->file;
+        int fav = last == "p0.milk", repeats = 0;
+        size_t max_bag = 0;
+        const int draws = 100000;
+        for (int i = 1; i < draws; i++) {
+            const PresetEntry* p = pm.rotate();
+            CHECK(p != nullptr);
+            if (p == nullptr) break;
+            repeats += p->file == last;
+            fav += p->file == "p0.milk";
+            last = p->file;
+            max_bag = std::max(max_bag, pm.bag_size());
+        }
+        const size_t deal = static_cast<size_t>(c.presets) + 2 * c.favourites.size();
+        CHECK(max_bag <= deal + 3);  // a deal plus at most a favourite's carried tickets
+        CHECK(c.presets == 1 ? repeats == draws - 1 : repeats == 0);
+        const double share = static_cast<double>(fav) / draws;
+        CHECK(share >= c.fav_share_min && share <= c.fav_share_max);
+    }
+}
+
+// A replaced upload: the guard forgets what it learnt about the id, but
+// the old content still playing keeps its level and records nothing.
+static void test_guard_forget() {
+    using V = CostGuard::Verdict;
+    CostGuard::Config cfg;
+    cfg.rungs = 3;
+    cfg.start_interval = 2;
+    cfg.settle_frames = 5;
+    cfg.window_frames = 10;
+    CostGuard g(cfg);
+    V last = V::None;
+    CHECK(g.begin("user/a.milk") == 0);
+    feed(g, 15, 66666, last);  // 15 fps: down a rung
+    CHECK(last == V::StepDown && g.level() == 1 && g.measured_fps("user/a.milk") > 14);
+    g.begin("p.milk");
+    CHECK(g.begin("user/a.milk") == 1);  // settled this session
+    g.begin("p.milk");
+    g.forget("user/a.milk");
+    CHECK(g.measured_fps("user/a.milk") < 0);
+    CHECK(g.begin("user/a.milk") == 0);  // from the hint again
+
+    // Forgotten while it plays: same level, verdicts still apply, nothing
+    // recorded; the next load starts fresh.
+    feed(g, 15, 66666, last);
+    CHECK(g.level() == 1);
+    g.forget("user/a.milk");
+    CHECK(g.level() == 1 && g.measured_fps("user/a.milk") < 0);
+    last = V::None;
+    feed(g, 15, 40000, last);  // 25 fps holds at this level
+    CHECK(last == V::Accept && g.level() == 1 && g.last_fps() > 24);
+    CHECK(g.measured_fps("user/a.milk") < 0);
+    feed(g, 10, 66666, last);  // still steps down for the content it measures
+    CHECK(last == V::StepDown && g.level() == 2);
+    // A failed switch hands the guard back to it as it was.
+    const CostGuard::Run run = g.run();
+    CHECK(run.file == "user/a.milk" && run.level == 2 && run.detached);
+    g.begin("candidate.milk");
+    g.resume(run);
+    CHECK(g.level() == 2 && g.current().rung == 2);
+    feed(g, 15, 33333, last);
+    CHECK(last == V::Accept && g.measured_fps("user/a.milk") < 0);
+    g.begin("p.milk");
+    CHECK(g.begin("user/a.milk") == 0);
+    feed(g, 15, 33333, last);
+    CHECK(g.measured_fps("user/a.milk") > 29);  // a fresh load records again
+    // resume() respects the thermal floor.
+    CostGuard::Run low{"x.milk", 0, false};
+    g.set_rung_floor(1);
+    g.resume(low);
+    CHECK(g.current().rung >= 1);
+}
+
+// What projectM renders keeps the high_frequency it was loaded with: a
+// reload clearing the tag doesn't let flashing content stay on screen.
+static void test_high_frequency_loaded() {
+    PresetManager::Config cfg;
+    cfg.seed = 4;
+    std::vector<PresetEntry> es = entries(4);
+    es.push_back(entry("user/flash.milk", true));
+    PresetManager pm(es, {}, cfg);
+    pm.set_high_frequency(true);
+    std::string reason;
+    const PresetEntry* flash = pm.find_playable("user/flash.milk", reason);
+    pm.on_shown(*flash, false);
+
+    // The tag goes while it shows: turning the filter off still cuts.
+    auto r = pm.set_user_presets({entry("user/flash.milk", false)});
+    CHECK(!r.cut && !flash->high_frequency);
+    CHECK(pm.set_high_frequency(false) && pm.high_frequency_on_screen());
+    // The cut may reload it (its file is no longer flagged): that load is
+    // the new content, classified as it is now.
+    pm.on_shown(*pm.cut_target(), false);
+    CHECK(!pm.high_frequency_on_screen());
+
+    // Blending out when the tag goes: still on screen until the blend ends.
+    PresetManager b(es, {}, cfg);
+    b.set_high_frequency(true);
+    std::string why;
+    const PresetEntry* f2 = b.find_playable("user/flash.milk", why);
+    b.on_shown(*f2, false);
+    b.on_shown(*by_file(b, "p0.milk"), true);  // flash -> p0
+    b.set_user_presets({entry("user/flash.milk", false)});
+    CHECK(b.set_high_frequency(false) && b.high_frequency_on_screen());
+    b.on_blend_done();
+    CHECK(!b.high_frequency_on_screen());
+
+    // A tag added while it shows counts at once.
+    PresetManager a(es, {}, cfg);
+    a.set_user_presets({entry("user/flash.milk", false)});
+    a.on_shown(*a.find_playable("user/flash.milk", why), false);
+    CHECK(!a.high_frequency_on_screen());
+    r = a.set_user_presets({entry("user/flash.milk", true)});
+    CHECK(r.cut && a.high_frequency_on_screen());
+    // ...and clearing it again doesn't undo that.
+    r = a.set_user_presets({entry("user/flash.milk", false)});
+    CHECK(r.cut && a.high_frequency_on_screen());
+}
+
+// Which reloaded ids may have new content (per-content caches go).
+static void test_user_changed() {
+    auto sha = [](const std::string& file, const std::string& hash) {
+        PresetEntry e = entry(file);
+        e.sha256 = hash;
+        return e;
+    };
+    PresetManager::Config cfg;
+    PresetManager pm(std::vector<PresetEntry>{entry("p.milk"), sha("user/a.milk", "aa"), sha("user/b.milk", "bb"),
+                                              entry("user/c.milk")},
+                     {}, cfg);
+    auto r = pm.set_user_presets({sha("user/a.milk", "aa"), sha("user/b.milk", "b2"), entry("user/c.milk"),
+                                  sha("user/new.milk", "nn")});
+    // Same hash: unchanged; another hash or none: changed; new ids have
+    // nothing cached.
+    CHECK((r.changed == std::vector<std::string>{"user/b.milk", "user/c.milk"}));
+    r = pm.set_user_presets({});
+    CHECK(r.changed.empty() && r.removed == 4);
+    r = pm.set_user_presets({sha("user/a.milk", "aa"), sha("user/b.milk", "b3")});
+    CHECK((r.changed == std::vector<std::string>{"user/b.milk"}) && r.added == 2);  // revived
+
+    Manifest m;
+    std::string err;
+    CHECK(parse_manifest(R"({"presets":[{"file":"a.milk","sha256":"ab12"},{"file":"b.milk","sha256":7}]})", m, err));
+    CHECK(m.presets.size() == 2 && m.presets[0].sha256 == "ab12" && m.presets[1].sha256.empty());
+}
+
 int main() {
     test_json();
     test_options();
@@ -1632,6 +2438,20 @@ int main() {
     test_drain_lines();
     test_exit_guard();
     test_kmsg_watch();
+    test_user_options();
+    test_user_protocol();
+    test_user_manifest();
+    test_selection_file();
+    test_selection_rotation();
+    test_favourites();
+    test_user_reload();
+    test_play();
+    test_switch_play();
+    test_play_before_take();
+    test_favourites_tiny_pools();
+    test_guard_forget();
+    test_high_frequency_loaded();
+    test_user_changed();
     if (g_failures == 0) std::printf("OK\n");
     return g_failures == 0 ? 0 : 1;
 }

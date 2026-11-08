@@ -59,6 +59,11 @@ struct Options {
     std::string pcm_ring;
     // The connector to present on ("" = the first connected HDMI one).
     std::string connector;
+    // Uploaded presets: <user_dir>/manifest.json, presets/, textures/
+    // ("" = none).
+    std::string user_dir;
+    // Favourites, hidden presets and the playlist ("" = none).
+    std::string selection_file;
 
     // Tuning and test knobs, not passed by the BEAM.
     std::string card = "/dev/dri/card0";

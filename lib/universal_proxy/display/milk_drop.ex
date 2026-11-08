@@ -53,6 +53,9 @@ defmodule UniversalProxy.Display.MilkDrop do
     * `:user_dir` — the upload library (default
       `UniversalProxy.MilkDrop.UserPresets.user_dir/0` when that directory
       exists, else none; `nil` for none);
+    * `:user_sha` — a 1-arity fun from a `user/` id to its library file's
+      SHA-256 or `nil` (default `UniversalProxy.MilkDrop.UserPresets.sha256/1`),
+      read at each `loading` (see "Device resets");
     * `:ladder` — internal resolutions, highest first (default
       `default_ladder/1` for this target);
     * `:ring_path` — the Sendspin player's PCM tap ring (optional: without
@@ -226,6 +229,13 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   The record is written once per preset change (about every 20 s), so its
   flash wear is negligible.
+
+  An upload can be replaced while its old content plays. So at each
+  `loading` of a `user/` id the library file's SHA-256 is noted, and every
+  skip and in-flight mark for that id carries it (`Store.skip/5`,
+  `Store.mark_in_flight/5`, retries included): the Store drops a skip of
+  content the library no longer holds rather than pinning it on the
+  replacement.
 
   ## Hangs and crashes
 
@@ -503,6 +513,8 @@ defmodule UniversalProxy.Display.MilkDrop do
          reaper: reaper,
          reaper_ref: Process.monitor(reaper),
          store: store,
+         user_sha: Keyword.get(opts, :user_sha, &UserPresets.sha256/1),
+         loaded: %{},
          session: session,
          version: version,
          want: nil,
@@ -644,6 +656,7 @@ defmodule UniversalProxy.Display.MilkDrop do
   defp handle_line(line, state) do
     case decode_event(line) do
       {:ok, event} ->
+        state = note_loaded(state, event)
         {event, state} = persist(event, state)
         state = event |> track_in_flight(state) |> track_loading(event)
         send(state.owner, {:milkdrop, self(), event})
@@ -695,8 +708,19 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   defp persist(event, state), do: {event, state}
 
+  # The upload content a `loading` is about to load, for the skips and
+  # marks that follow.
+  defp note_loaded(state, %{event: :loading, preset: "user/" <> _ = id}) do
+    case state.user_sha.(id) do
+      nil -> %{state | loaded: Map.delete(state.loaded, id)}
+      sha -> %{state | loaded: Map.put(state.loaded, id, sha)}
+    end
+  end
+
+  defp note_loaded(state, _event), do: state
+
   defp add_skip(state, preset, reason, fps \\ nil) do
-    pending = Map.put(state.pending_skips, preset, {reason, fps})
+    pending = Map.put(state.pending_skips, preset, {reason, fps, state.loaded[preset]})
     flush_skips(%{state | pending_skips: pending})
   end
 
@@ -778,7 +802,7 @@ defmodule UniversalProxy.Display.MilkDrop do
   # The in-flight record. `want` is what it should name going by the
   # renderer's events: the preset loading, else the one showing (`nil`
   # after a clean end). `intended` is what the Store was last asked to hold
-  # (`nil`: cleared) and `acked?` whether it said so: a refused ask may
+  # (`{preset, upload sha256 | nil}`; `nil`: cleared) and `acked?` whether it said so: a refused ask may
   # still be queued (the Store queues them while its table is closed), so it
   # counts as the record's content, but stays pending until acknowledged.
   # `hold` is a `gpu_hang` preset whose skip is not on disk yet; the record
@@ -831,7 +855,7 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   defp sync_record(state) do
     state = release_hold(state)
-    target = state.hold || state.want
+    target = record_key(state, state.hold || state.want)
 
     cond do
       synced?(state, target) -> state
@@ -847,13 +871,18 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   defp release_hold(state), do: state
 
+  # A preset and the upload content noted for it: the same id reloaded
+  # after a replacement is a new record.
+  defp record_key(_state, nil), do: nil
+  defp record_key(state, preset), do: {preset, state.loaded[preset]}
+
   defp synced?(%{intended: target, acked?: true}, target), do: true
   defp synced?(_state, _target), do: false
 
-  defp mark_in_flight(state, preset) do
+  defp mark_in_flight(state, {preset, sha} = target) do
     state.store
-    |> Store.mark_in_flight(state.session, state.version, preset)
-    |> record_ask(state, preset, "record #{inspect(preset)} as loading")
+    |> Store.mark_in_flight(state.session, state.version, preset, sha256: sha)
+    |> record_ask(state, target, "record #{inspect(preset)} as loading")
   end
 
   defp clear_in_flight(state) do
@@ -885,9 +914,9 @@ defmodule UniversalProxy.Display.MilkDrop do
   defp flush_skips(state) do
     pending =
       Enum.reduce_while(state.pending_skips, state.pending_skips, fn {preset, skip}, acc ->
-        {reason, fps} = skip
+        {reason, fps, sha} = skip
 
-        case Store.skip(state.store, state.version, preset, reason, fps: fps) do
+        case Store.skip(state.store, state.version, preset, reason, fps: fps, sha256: sha) do
           :ok -> {:cont, Map.delete(acc, preset)}
           {:error, _} -> {:halt, acc}
         end

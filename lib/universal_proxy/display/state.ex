@@ -87,7 +87,9 @@ defmodule UniversalProxy.Display.State do
   only when its value differs from the last one sent; a renderer started
   later reads them from `UniversalProxy.MilkDrop.Store` itself. Likewise
   each upload library change on
-  `UniversalProxy.MilkDrop.user_presets_topic/0` is sent as `reload_user`
+  `UniversalProxy.MilkDrop.user_presets_topic/0`, and each start of the
+  library's server (it may have repaired the manifest), is sent as
+  `reload_user`
   (a renderer started later reads the library's manifest at start). The
   skip list is not re-sent: the renderer adds its own skips as it goes,
   and skips the Store dropped (a cleared list, a replaced upload) apply
@@ -474,8 +476,10 @@ defmodule UniversalProxy.Display.State do
       when is_map(settings),
       do: {:noreply, milkdrop_settings(state, settings)}
 
-  def handle_info({:milkdrop_user_presets, _change}, %{milkdrop?: true} = state),
-    do: {:noreply, milkdrop_reload_user(state)}
+  # A restarted library may have repaired the manifest the renderer read.
+  def handle_info({event, _change}, %{milkdrop?: true} = state)
+      when event in [:milkdrop_user_presets, :milkdrop_user_presets_started],
+      do: {:noreply, milkdrop_reload_user(state)}
 
   def handle_info({:milkdrop_selection, selection}, %{milkdrop?: true} = state)
       when is_map(selection),

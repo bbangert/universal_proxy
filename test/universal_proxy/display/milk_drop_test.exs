@@ -428,6 +428,42 @@ defmodule UniversalProxy.Display.MilkDropTest do
     assert prepared.skip == ["user/up.milk"]
   end
 
+  test "an upload replaced while it plays: its skip and record name the loaded content",
+       ctx do
+    {:ok, shas} = Agent.start_link(fn -> %{"user/up.milk" => "sha-old"} end)
+    user_sha = &Agent.get(shas, fn m -> m[&1] end)
+
+    store =
+      start_supervised!(
+        Supervisor.child_spec(
+          {Store,
+           name: nil,
+           table: :milkdrop_display_test_replaced,
+           dets_path: Path.join(ctx.tmp_dir, "replaced.dets"),
+           user_sha: user_sha},
+          id: :replaced_store
+        )
+      )
+
+    {pid, _} = start_renderer(ctx, store: store, user_sha: user_sha)
+    emit(pid, ~s({"event":"loading","preset":"user/up.milk"}))
+    assert_receive {:milkdrop, ^pid, %{event: :loading}}, @timeout
+    assert %{preset: "user/up.milk", sha256: "sha-old"} = Store.in_flight(store)
+
+    Agent.update(shas, &Map.put(&1, "user/up.milk", "sha-new"))
+    emit(pid, ~s({"event":"skip","preset":"user/up.milk","reason":"draw"}))
+    assert_receive {:milkdrop, ^pid, %{event: :skip, persisted: true}}, @timeout
+    assert Store.skipped(store, @version) == %{}
+
+    # Loading the same id again marks the new content.
+    emit(pid, ~s({"event":"loading","preset":"user/up.milk"}))
+    assert_receive {:milkdrop, ^pid, %{event: :loading}}, @timeout
+    assert %{sha256: "sha-new"} = Store.in_flight(store)
+    emit(pid, ~s({"event":"skip","preset":"user/up.milk","reason":"draw"}))
+    assert_receive {:milkdrop, ^pid, %{event: :skip}}, @timeout
+    assert Store.skipped(store, @version) == %{"user/up.milk" => "draw"}
+  end
+
   test "forwards events with atom keys", ctx do
     {pid, _} = start_renderer(ctx)
 
@@ -490,11 +526,41 @@ defmodule UniversalProxy.Display.MilkDropTest do
       :ok
     end
 
-    defp start_named_store(ctx) do
+    defp start_named_store(ctx, opts \\ []) do
       start_supervised!(
         {Store,
-         name: @store_name, table: @table, dets_path: Path.join(ctx.tmp_dir, "settings.dets")}
+         [name: @store_name, table: @table, dets_path: Path.join(ctx.tmp_dir, "settings.dets")] ++
+           opts}
       )
+    end
+
+    @tag capture_log: true
+    test "a retried upload skip keeps the content it was loaded with", ctx do
+      {:ok, shas} = Agent.start_link(fn -> %{"user/up.milk" => "sha-old"} end)
+      user_sha = &Agent.get(shas, fn m -> m[&1] end)
+
+      {pid, _} =
+        start_renderer(ctx,
+          store: @store_name,
+          settings: Store.defaults(),
+          skipped: %{},
+          skip_retry_ms: 600_000,
+          user_sha: user_sha
+        )
+
+      emit(pid, ~s({"event":"loading","preset":"user/up.milk"}))
+      emit(pid, ~s({"event":"skip","preset":"user/up.milk","reason":"draw"}))
+      assert_receive {:milkdrop, ^pid, %{event: :skip, persisted: false}}, @timeout
+
+      # Replaced while the skip waited: it is for the old content.
+      Agent.update(shas, &Map.put(&1, "user/up.milk", "sha-new"))
+      start_named_store(ctx, user_sha: user_sha)
+      emit(pid, ~s({"event":"skip","preset":"b.milk","reason":"draw"}))
+
+      assert_receive {:milkdrop, ^pid, %{event: :skip, preset: "b.milk", persisted: true}},
+                     @timeout
+
+      assert Store.skipped(@store_name, @version) == %{"b.milk" => "draw"}
     end
 
     test "a skip is forwarded as not persisted, then persisted when the Store is back", ctx do

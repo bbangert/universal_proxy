@@ -601,6 +601,146 @@ defmodule UniversalProxy.MilkDrop.UserPresetsTest do
     end
   end
 
+  describe "failures" do
+    # The manifest's temporary file replaced by a directory: writes fail.
+    defp block_manifest(ctx), do: File.mkdir_p!(Path.join(ctx.user, ".manifest.json.tmp"))
+    defp unblock_manifest(ctx), do: File.rm_rf!(Path.join(ctx.user, ".manifest.json.tmp"))
+
+    # A directory where a file was: deleting it fails.
+    defp pin_file(path) do
+      File.rm!(path)
+      File.mkdir_p!(Path.join(path, "x"))
+    end
+
+    defp unpin_file(path), do: File.rm_rf!(path)
+
+    defp wait_until(fun, timeout \\ 2_000) do
+      cond do
+        fun.() -> :ok
+        timeout <= 0 -> flunk("condition not met in time")
+        true -> Process.sleep(10) && wait_until(fun, timeout - 10)
+      end
+    end
+
+    @tag capture_log: true
+    test "an unpublished import fails, and the same upload again repairs it", ctx do
+      server = start_library(ctx, retry_ms: 600_000)
+      block_manifest(ctx)
+
+      assert [%{status: {:rejected, {:manifest, {:io, :eisdir}}}}] =
+               import!(server, [upload(ctx, "a.milk", milk())])
+
+      # On disk and in the library, not yet announced.
+      assert File.regular?(preset_path(ctx, "a.milk"))
+      refute_receive {:milkdrop_user_presets, _}, 50
+
+      unblock_manifest(ctx)
+      assert [%{status: :unchanged}] = import!(server, [upload(ctx, "a.milk", milk())])
+      assert %{"presets" => [%{"file" => "a.milk"}]} = manifest(ctx)
+      assert_receive {:milkdrop_user_presets, %{added: ["user/a.milk"]}}
+    end
+
+    @tag capture_log: true
+    test "an unpublished delete fails and is published by the retry", ctx do
+      server = start_library(ctx, retry_ms: 50)
+      [_] = import!(server, [upload(ctx, "a.milk", milk())])
+      assert_receive {:milkdrop_user_presets, %{added: _}}
+      block_manifest(ctx)
+
+      assert UserPresets.delete(server, "user/a.milk") == {:error, {:manifest, {:io, :eisdir}}}
+      refute File.exists?(preset_path(ctx, "a.milk"))
+      assert %{"presets" => [_]} = manifest(ctx)
+      refute_receive {:milkdrop_user_presets, _}, 100
+
+      unblock_manifest(ctx)
+      assert_receive {:milkdrop_user_presets, %{removed: ["user/a.milk"]}}, 2_000
+      assert %{"presets" => []} = manifest(ctx)
+    end
+
+    @tag capture_log: true
+    test "a failed flag write fails and changes nothing", ctx do
+      server = start_library(ctx, retry_ms: 600_000)
+      [_] = import!(server, [upload(ctx, "a.milk", milk())])
+      block_manifest(ctx)
+
+      assert {:error, {:manifest, _}} =
+               UserPresets.set_high_frequency(server, "user/a.milk", true)
+
+      assert [%{high_frequency: false}] = UserPresets.list(server).presets
+    end
+
+    @tag capture_log: true
+    test "a file that can't be deleted stays, with its lock and skips", ctx do
+      server = start_library(ctx)
+      [_] = import!(server, [upload(ctx, "a.milk", milk())])
+      :ok = Store.skip(ctx.store, "v1", "user/a.milk", "draw")
+      {:ok, _} = Store.update(ctx.store, %{locked: "user/a.milk"})
+      assert_receive {:milkdrop_user_presets, %{added: _}}
+      pin_file(preset_path(ctx, "a.milk"))
+
+      assert {:error, {:io, _reason}} = UserPresets.delete(server, "user/a.milk")
+      assert [%{id: "user/a.milk"}] = UserPresets.list(server).presets
+      assert %{"presets" => [%{"file" => "a.milk"}]} = manifest(ctx)
+      assert Store.settings(ctx.store).locked == "user/a.milk"
+      refute_receive {:milkdrop_user_presets, _}, 50
+
+      # One already gone counts as deleted.
+      unpin_file(preset_path(ctx, "a.milk"))
+      assert :ok = UserPresets.delete(server, "user/a.milk")
+      assert Store.settings(ctx.store).locked == nil
+    end
+
+    @tag capture_log: true
+    test "a superseded file that can't be deleted is kept until a retry deletes it", ctx do
+      server = start_library(ctx, retry_ms: 50)
+      [_] = import!(server, [upload(ctx, "Foo.milk", milk())])
+      {:ok, _} = Store.update(ctx.store, %{locked: "user/Foo.milk"})
+      assert_receive {:milkdrop_user_presets, %{added: _}}
+      pin_file(preset_path(ctx, "Foo.milk"))
+
+      assert [%{status: :replaced, name: "FOO.milk"}] =
+               import!(server, [upload(ctx, "FOO.milk", milk("x=1"))])
+
+      assert_receive {:milkdrop_user_presets, %{added: ["user/FOO.milk"], removed: []}}
+
+      assert ["user/FOO.milk", "user/Foo.milk"] =
+               Enum.map(UserPresets.list(server).presets, & &1.id)
+
+      assert Store.settings(ctx.store).locked == "user/Foo.milk"
+
+      unpin_file(preset_path(ctx, "Foo.milk"))
+      assert_receive {:milkdrop_user_presets, %{removed: ["user/Foo.milk"]}}, 2_000
+      assert [%{id: "user/FOO.milk"}] = UserPresets.list(server).presets
+      assert %{"presets" => [%{"file" => "FOO.milk"}]} = manifest(ctx)
+      wait_until(fn -> Store.settings(ctx.store).locked == nil end)
+    end
+  end
+
+  describe "restarts" do
+    test "each start is announced", ctx do
+      start_library(ctx)
+      assert_receive {:milkdrop_user_presets_started, %{presets: 0, textures: 0}}
+    end
+
+    test "a lookup during a restart's scan hashes the file", ctx do
+      user = UserPresets.user_dir(ctx.root)
+      File.mkdir_p!(Path.join(user, "presets"))
+      File.write!(Path.join([user, "presets", "a.milk"]), milk())
+
+      # What a starting server's table holds before its scan is in.
+      table = :ets.new(:"#{ctx.table}_unready", [:named_table, :public])
+      :ets.insert(table, {:user_dir, user})
+      assert UserPresets.sha256(table, "user/a.milk") == sha(milk())
+
+      :ets.insert(table, {:ready, true})
+      assert UserPresets.sha256(table, "user/a.milk") == nil
+
+      start_library(ctx)
+      assert :ets.member(ctx.table, :ready)
+      assert UserPresets.sha256(ctx.table, "user/a.milk") == sha(milk())
+    end
+  end
+
   test "sha256/2 hashes the file itself when the table is gone", ctx do
     user = UserPresets.user_dir(ctx.root)
     File.mkdir_p!(Path.join(user, "presets"))
