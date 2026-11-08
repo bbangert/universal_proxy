@@ -119,8 +119,20 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   `{:error, {:io, reason}}` and changes nothing. `set_high_frequency/3`
   sets or clears the tag. While an import
   runs they return `{:error, :busy}`, as does another `import/2`; the reads
-  (`list/1`, `usage/1`, `upload_target/1`, `sha256/2`) are served
+  (`list/1`, `usage/1`, `sha256/2`) and the upload calls below are served
   throughout.
+
+  ## Uploads
+
+  The web UI streams each upload into `incoming/` under a reservation
+  (`reserve/2`): the server picks the path (`up-<random>.part`) and
+  admits `bytes` only if they fit the room above the free-space floor,
+  counting every live reservation once — at its reserved size, in place
+  of whatever of it `df` already sees on disk. `claim/2` renames a
+  finished upload to `up-<random>` and hands it to the claiming process,
+  until that passes it to `import/2` (a busy import deletes it too). A
+  reservation or claim whose owner exits is dropped and its file
+  deleted, so no upload outlives its page.
 
   ## Changes
 
@@ -254,24 +266,38 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   def max_upload_bytes, do: @max_upload_bytes
 
   @doc """
-  Where an upload is streamed before `import/2` and how much may land
-  there: the server's `incoming_dir/1`, its upload cap (`:max_upload_bytes`),
-  its byte quota and `room`, the free space left above the free-space
-  floor (`df`, see the moduledoc; never negative). Served while an import
-  runs; `{:error, {:free_space, reason}}` when it can't be measured,
-  `{:error, :not_running}` without a server.
+  Reserve room for an upload of `bytes` the caller is about to stream
+  into `incoming/` (see "Uploads" in the moduledoc). Returns the
+  reservation's ref and the server-chosen path to write; the reservation
+  lasts until `claim/2`, `release/2` or the caller's exit, which also
+  deletes the path. `{:error, {:too_large, max}}` past the upload cap,
+  `{:error, :no_space}` without room, `{:error, {:free_space, reason}}`
+  when the free space can't be measured.
   """
-  @spec upload_target(GenServer.server()) ::
-          {:ok,
-           %{
-             dir: String.t(),
-             room: non_neg_integer(),
-             max_upload_bytes: pos_integer(),
-             quota_bytes: pos_integer()
-           }}
-          | {:error, term()}
-  def upload_target(server \\ __MODULE__) do
-    GenServer.call(server, :upload_target)
+  @spec reserve(GenServer.server(), non_neg_integer()) ::
+          {:ok, %{ref: reference(), path: String.t()}} | {:error, term()}
+  def reserve(server \\ __MODULE__, bytes) when is_integer(bytes) and bytes >= 0 do
+    GenServer.call(server, {:reserve, bytes})
+  catch
+    :exit, _ -> {:error, :not_running}
+  end
+
+  @doc "Drop reservation `ref` (an upload that failed or was cancelled) and delete its path."
+  @spec release(GenServer.server(), reference()) :: :ok
+  def release(server \\ __MODULE__, ref) when is_reference(ref) do
+    GenServer.call(server, {:release, ref})
+  catch
+    :exit, _ -> :ok
+  end
+
+  @doc """
+  Turn reservation `ref` (a finished upload) into a file waiting for
+  `import/2`, owned by the caller: its new path, which the server deletes
+  if the caller exits before passing it to `import/2`.
+  """
+  @spec claim(GenServer.server(), reference()) :: {:ok, String.t()} | {:error, term()}
+  def claim(server \\ __MODULE__, ref) when is_reference(ref) do
+    GenServer.call(server, {:claim, ref})
   catch
     :exit, _ -> {:error, :not_running}
   end
@@ -399,6 +425,12 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
       retry_ms: Keyword.get(opts, :retry_ms, @retry_ms),
       library: %{presets: %{}, textures: %{}},
       busy: nil,
+      # Uploads streaming into incoming/ (`reserve/2`) and finished ones
+      # waiting for `import/2` (`claim/2`), each watched by a monitor of
+      # its owner.
+      reservations: %{},
+      claims: %{},
+      watched: %{},
       # The manifest on disk lags the library; `pending` is the change not
       # announced yet.
       dirty: false,
@@ -442,25 +474,70 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   def handle_call(:usage, _from, state),
     do: {:reply, Map.put(usage_of(state.library), :quota, state.quota), state}
 
-  def handle_call(:upload_target, _from, state) do
-    reply =
-      with {:ok, floor, free} <- measure(state) do
-        {:ok,
-         %{
-           dir: state.incoming,
-           room: max(free - floor, 0),
-           max_upload_bytes: state.max_upload_bytes,
-           quota_bytes: state.quota.bytes
-         }}
-      end
+  def handle_call({:reserve, bytes}, {owner, _tag}, state) do
+    with :ok <- check_upload_size(state, bytes),
+         {:ok, floor, free} <- measure(state),
+         :ok <- check_room(state, bytes, free - floor) do
+      ref = make_ref()
+      name = "up-" <> Base.encode16(:crypto.strong_rand_bytes(12), case: :lower) <> ".part"
+      path = Path.join(state.incoming, name)
+      reservation = %{bytes: bytes, path: path, mon: Process.monitor(owner)}
 
-    {:reply, reply, state}
+      state = %{
+        state
+        | reservations: Map.put(state.reservations, ref, reservation),
+          watched: Map.put(state.watched, reservation.mon, {:reservation, ref})
+      }
+
+      {:reply, {:ok, %{ref: ref, path: path}}, state}
+    else
+      {:error, _reason} = error -> {:reply, error, state}
+    end
+  end
+
+  def handle_call({:release, ref}, _from, state),
+    do: {:reply, :ok, drop_reservation(state, ref, :delete)}
+
+  def handle_call({:claim, ref}, {owner, _tag}, state) do
+    case Map.fetch(state.reservations, ref) do
+      {:ok, %{path: path}} ->
+        state = drop_reservation(state, ref, :keep)
+        claimed = Path.join(Path.dirname(path), Path.basename(path, ".part"))
+
+        case File.rename(path, claimed) do
+          :ok ->
+            mon = Process.monitor(owner)
+
+            state = %{
+              state
+              | claims: Map.put(state.claims, claimed, mon),
+                watched: Map.put(state.watched, mon, {:claim, claimed})
+            }
+
+            {:reply, {:ok, claimed}, state}
+
+          {:error, reason} ->
+            _ = File.rm(path)
+            {:reply, {:error, reason}, state}
+        end
+
+      :error ->
+        {:reply, {:error, :unknown}, state}
+    end
+  end
+
+  # Claimed files passed in are the import's now, busy or not.
+  def handle_call({:import, uploads}, _from, %{busy: busy} = state) when busy != nil do
+    state = disown(state, uploads)
+    consume_uploads(state, uploads)
+    {:reply, {:error, :busy}, state}
   end
 
   def handle_call(_write, _from, %{busy: busy} = state) when busy != nil,
     do: {:reply, {:error, :busy}, state}
 
   def handle_call({:import, uploads}, from, state) do
+    state = disown(state, uploads)
     staging = Path.join(state.incoming, ".staging-#{Base.encode16(:crypto.strong_rand_bytes(6))}")
     job = import_job(state, staging)
 
@@ -520,6 +597,20 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
     _ = Task.Supervisor.terminate_child(state.task_supervisor, task.pid)
     Process.demonitor(ref, [:flush])
     {:noreply, finish_import(state, {:error, :timeout})}
+  end
+
+  def handle_info({:DOWN, mon, :process, _pid, _reason}, %{watched: watched} = state)
+      when is_map_key(watched, mon) do
+    case Map.fetch!(watched, mon) do
+      {:reservation, ref} ->
+        {:noreply, drop_reservation(state, ref, :delete)}
+
+      {:claim, path} ->
+        _ = File.rm(path)
+
+        {:noreply,
+         %{state | claims: Map.delete(state.claims, path), watched: Map.delete(watched, mon)}}
+    end
   end
 
   def handle_info(:retry, %{busy: nil} = state),
@@ -862,6 +953,60 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
     consume_uploads(state, busy.uploads)
     GenServer.reply(busy.from, reply)
     %{state | busy: nil}
+  end
+
+  # -- Private: uploads --
+
+  defp check_upload_size(state, bytes) do
+    if bytes > state.max_upload_bytes,
+      do: {:error, {:too_large, state.max_upload_bytes}},
+      else: :ok
+  end
+
+  # `df` already counts what the reserved uploads wrote so far: that part
+  # is added back, so each reservation counts once at its full size.
+  defp check_room(state, bytes, above_floor) do
+    {reserved, written} =
+      Enum.reduce(state.reservations, {0, 0}, fn {_ref, r}, {reserved, written} ->
+        size =
+          case File.lstat(r.path) do
+            {:ok, %File.Stat{size: size}} -> size
+            {:error, _reason} -> 0
+          end
+
+        {reserved + r.bytes, written + size}
+      end)
+
+    if bytes <= above_floor + written - reserved, do: :ok, else: {:error, :no_space}
+  end
+
+  defp drop_reservation(state, ref, file) do
+    case Map.pop(state.reservations, ref) do
+      {nil, _reservations} ->
+        state
+
+      {reservation, reservations} ->
+        Process.demonitor(reservation.mon, [:flush])
+        if file == :delete, do: _ = File.rm(reservation.path)
+
+        %{
+          state
+          | reservations: reservations,
+            watched: Map.delete(state.watched, reservation.mon)
+        }
+    end
+  end
+
+  defp disown(state, uploads) do
+    Enum.reduce(uploads, state, fn
+      {_client_name, path}, state when is_map_key(state.claims, path) ->
+        {mon, claims} = Map.pop(state.claims, path)
+        Process.demonitor(mon, [:flush])
+        %{state | claims: claims, watched: Map.delete(state.watched, mon)}
+
+      _upload, state ->
+        state
+    end)
   end
 
   # Only files inside `incoming/` are ever deleted.

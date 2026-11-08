@@ -14,17 +14,21 @@ defmodule UniversalProxyWeb.MilkDropUploadComponent do
   `UniversalProxyWeb.MilkDropUploadWriter` into the library's
   `incoming/` directory on `/data`. As each entry starts, the batch (the
   declared sizes of every valid entry; the upload channel never accepts
-  more than an entry declared) must fit `UserPresets.upload_target/1`: at
-  most the library's byte quota, and at most the room above the
-  free-space floor; else the entry fails with `{:writer_failure, reason}`.
-  The writer enforces the server's upload cap itself.
+  more than an entry declared) must be at most the library's byte quota,
+  and the writer reserves the entry's own size with
+  `UserPresets.reserve/2`, which admits it only within the room above the
+  free-space floor left by every other live upload, on any page; else
+  the entry fails with `{:writer_failure, reason}`.
 
   ## Import
 
-  On submit the finished entries are claimed (`MilkDropUploadWriter.claim/1`)
-  and handed to `UserPresets.import/2` in `start_async/3`; a second submit
-  while it runs is ignored. An import that fails as a whole deletes the
-  claimed files (a busy or stopped library doesn't consume them).
+  Submit imports only once every entry has finished: one still
+  uploading, failed or refused keeps its error on screen until it is
+  removed. The finished entries are then claimed (`UserPresets.claim/2`:
+  the server deletes them should this LiveView exit before the import
+  takes them) and handed to `UserPresets.import/2` in `start_async/3`; a
+  second submit while it runs is ignored. An import that fails as a whole
+  deletes the claimed files.
   `UniversalProxy.MilkDrop.Index` broadcasts the new presets itself, so
   nothing else is refreshed here. The results show one row per file (#{50}
   at most) through HEEx escaping only, with `UploadCheck.printable/1`
@@ -79,17 +83,13 @@ defmodule UniversalProxyWeb.MilkDropUploadComponent do
   defp extension(name), do: name |> Path.extname() |> String.downcase()
 
   # Runs in the LiveView process as each entry's upload starts.
-  defp writer(_name, _entry, socket) do
-    {MilkDropUploadWriter, writer_opts(batch_bytes(socket.assigns.uploads.presets.entries))}
-  end
+  defp writer(_name, entry, socket) do
+    batch = batch_bytes(socket.assigns.uploads.presets.entries)
+    max = socket.assigns.usage.quota.bytes
 
-  defp writer_opts(batch) do
-    case UserPresets.upload_target() do
-      {:ok, %{quota_bytes: max}} when batch > max -> [refuse: {:batch_too_large, max}]
-      {:ok, %{room: room}} when batch > room -> [refuse: :no_space]
-      {:ok, target} -> [dir: target.dir, max_bytes: target.max_upload_bytes]
-      {:error, reason} -> [refuse: reason]
-    end
+    if batch > max,
+      do: {MilkDropUploadWriter, refuse: {:batch_too_large, max}},
+      else: {MilkDropUploadWriter, bytes: entry.client_size}
   end
 
   defp batch_bytes(entries),
@@ -110,23 +110,18 @@ defmodule UniversalProxyWeb.MilkDropUploadComponent do
     do: {:noreply, socket}
 
   def handle_event("import", _params, socket) do
-    {done, rest} = uploaded_entries(socket, :presets)
-
-    cond do
-      # An entry still uploading (the client submits only once all are done).
-      Enum.any?(rest, &(&1.valid? and upload_errors(socket.assigns.uploads.presets, &1) == [])) ->
-        {:noreply, socket}
-
-      done == [] ->
-        {:noreply, socket}
-
-      true ->
+    # consume_uploaded_entries/3 raises while any entry is unfinished.
+    case uploaded_entries(socket, :presets) do
+      {[_ | _], []} ->
         claimed =
-          consume_uploaded_entries(socket, :presets, fn %{path: path}, entry ->
-            {:ok, {entry.client_name, MilkDropUploadWriter.claim(path)}}
+          consume_uploaded_entries(socket, :presets, fn %{ref: ref}, entry ->
+            {:ok, {entry.client_name, UserPresets.claim(ref)}}
           end)
 
         {:noreply, start_import(socket, claimed)}
+
+      _none_or_unfinished ->
+        {:noreply, socket}
     end
   end
 
@@ -134,7 +129,7 @@ defmodule UniversalProxyWeb.MilkDropUploadComponent do
 
   defp start_import(socket, claimed) do
     uploads = for {name, {:ok, path}} <- claimed, do: {name, path}
-    lost = for {name, {:error, _reason}} <- claimed, do: lost_result(name)
+    lost = for {name, {:error, reason}} <- claimed, do: lost_result(name, reason)
 
     socket
     |> assign(:importing, %{paths: Enum.map(uploads, &elem(&1, 1)), lost: lost})
@@ -157,14 +152,14 @@ defmodule UniversalProxyWeb.MilkDropUploadComponent do
 
   defp remove(uploads), do: Enum.each(uploads, fn {_name, path} -> File.rm(path) end)
 
-  defp lost_result(client_name) do
+  defp lost_result(client_name, reason) do
     %{
       upload: UploadCheck.printable(client_name),
       entry: nil,
       kind: :other,
       name: nil,
       id: nil,
-      status: {:rejected, :upload_lost},
+      status: {:rejected, if(reason == :not_running, do: :not_running, else: :upload_lost)},
       replaces: nil,
       sha256: nil,
       size: nil,
@@ -495,6 +490,7 @@ defmodule UniversalProxyWeb.MilkDropUploadComponent do
   defp reject_reason(:no_space), do: "Not enough free storage on the device."
   defp reject_reason(:bad_source), do: "The upload went missing. Try again."
   defp reject_reason(:upload_lost), do: "The upload went missing. Try again."
+  defp reject_reason(:not_running), do: "The preset library isn't running."
   defp reject_reason(:not_regular_file), do: "Not a regular file."
   defp reject_reason({:io, :install_failed}), do: "Couldn't be installed (storage error)."
   defp reject_reason({:io, _posix}), do: "Storage error."
@@ -563,7 +559,8 @@ defmodule UniversalProxyWeb.MilkDropUploadComponent do
   defp upload_error({:writer_failure, reason}), do: writer_error(reason)
   defp upload_error(_reason), do: "The upload failed. Try again."
 
-  defp writer_error(:too_large), do: "Larger than the upload limit."
+  defp writer_error(:too_large), do: "The file sent more data than its declared size."
+  defp writer_error({:too_large, max}), do: "Larger than #{mib(max)}, the upload limit."
 
   defp writer_error({:batch_too_large, max}),
     do: "These files add up to more than #{mib(max)}. Upload fewer at once."

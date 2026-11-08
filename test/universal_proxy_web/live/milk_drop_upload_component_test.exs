@@ -79,6 +79,11 @@ defmodule UniversalProxyWeb.MilkDropUploadComponentTest do
   defp start_user_presets(ctx, opts \\ []) do
     free = Keyword.get(opts, :free_bytes, 900 * @mib)
 
+    free_space =
+      Keyword.get(opts, :free_space, fn _ ->
+        {:ok, %{total_bytes: 1000 * @mib, free_bytes: free}}
+      end)
+
     start_supervised!(
       {UserPresets,
        [
@@ -86,9 +91,9 @@ defmodule UniversalProxyWeb.MilkDropUploadComponentTest do
          table: @uploads,
          store: ctx.store,
          task_supervisor: ctx.tasks,
-         free_space: fn _ -> {:ok, %{total_bytes: 1000 * @mib, free_bytes: free}} end,
+         free_space: free_space,
          pack_textures: fn -> [] end
-       ] ++ Keyword.drop(opts, [:free_bytes])}
+       ] ++ Keyword.drop(opts, [:free_bytes, :free_space])}
     )
   end
 
@@ -237,14 +242,40 @@ defmodule UniversalProxyWeb.MilkDropUploadComponentTest do
       assert rows == 50
     end
 
-    test "a stopped library reports the error and deletes the uploads", %{conn: conn} = ctx do
+    test "a library stopped before submit is reported", %{conn: conn} do
       {:ok, view, _html} = live(conn, "/audio/milkdrop")
       input = file_input(view, @form, :presets, [file("d.milk", milk())])
       assert render_upload(input, "d.milk") =~ "100%"
 
       stop_supervised!(UserPresets)
       view |> form(@form) |> render_submit()
-      assert render_async(view) =~ "The preset library isn&#39;t running."
+      render_async(view)
+      assert results(view) =~ "1 rejected"
+      assert results(view) =~ "The preset library isn&#39;t running."
+    end
+
+    test "a submit with an unfinished entry waits, keeping its error", %{conn: conn} = ctx do
+      restart_user_presets(ctx, max_upload_bytes: 500)
+      {:ok, view, _html} = live(conn, "/audio/milkdrop")
+      big = milk(String.duplicate("x", 600))
+      input = file_input(view, @form, :presets, [file("l.milk", milk()), file("big.milk", big)])
+
+      assert render_upload(input, "l.milk") =~ "100%"
+      render_upload(input, "big.milk")
+
+      view |> form(@form) |> render_submit()
+      html = render(view)
+      assert html =~ "Larger than 500 B, the upload limit."
+      assert html =~ "l.milk"
+      refute has_element?(view, "#milkdrop-upload-results")
+      assert [_part] = incoming_files(ctx)
+
+      view
+      |> element("#milkdrop-upload-entries button[aria-label='Remove big.milk']")
+      |> render_click()
+
+      view |> form(@form) |> render_submit()
+      assert render_async(view) =~ "1 added"
       assert incoming_files(ctx) == []
     end
   end
@@ -286,7 +317,7 @@ defmodule UniversalProxyWeb.MilkDropUploadComponentTest do
         file_input(view, @form, :presets, [file("e.milk", milk(String.duplicate("x", 200)))])
 
       render_upload(input, "e.milk")
-      assert render(view) =~ "Larger than the upload limit."
+      assert render(view) =~ "Larger than 100 B, the upload limit."
       wait_until(fn -> incoming_files(ctx) == [] end)
     end
 
@@ -301,6 +332,32 @@ defmodule UniversalProxyWeb.MilkDropUploadComponentTest do
       assert has_element?(view, "#milkdrop-upload-batch-over")
       assert has_element?(view, "#milkdrop-upload-submit[disabled]")
       assert incoming_files(ctx) == []
+    end
+
+    test "each upload counts once against the free room", %{conn: conn} = ctx do
+      # 2,000 bytes above the floor (max(200 MiB, 10% of 1000 MiB)).
+      agent = start_supervised!({Agent, fn -> 200 * @mib + 2000 end})
+
+      restart_user_presets(ctx,
+        free_space: fn _ ->
+          {:ok, %{total_bytes: 1000 * @mib, free_bytes: Agent.get(agent, & &1)}}
+        end
+      )
+
+      {:ok, view, _html} = live(conn, "/audio/milkdrop")
+      body = milk(String.duplicate("x", 1000 - byte_size(milk())))
+      files = [file("m.milk", body), file("n.milk", body), file("o.milk", body)]
+      input = file_input(view, @form, :presets, files)
+
+      # Each finished file is what df no longer reports free.
+      assert render_upload(input, "m.milk") =~ "100%"
+      Agent.update(agent, &(&1 - 1000))
+      assert render_upload(input, "n.milk") =~ "100%"
+      Agent.update(agent, &(&1 - 1000))
+
+      render_upload(input, "o.milk")
+      assert render(view) =~ "Not enough free storage on the device."
+      assert length(incoming_files(ctx)) == 2
     end
 
     test "too little free storage refuses the upload", %{conn: conn} = ctx do
@@ -359,7 +416,7 @@ defmodule UniversalProxyWeb.MilkDropUploadComponentTest do
 
       capture_log(fn ->
         Process.exit(view.pid, :kill)
-        assert_receive {:DOWN, ^ref, :process, _pid, :killed}
+        assert_receive {:DOWN, ^ref, :process, _pid, :killed}, 2_000
         wait_until(fn -> incoming_files(ctx) == [] end)
       end)
     end
