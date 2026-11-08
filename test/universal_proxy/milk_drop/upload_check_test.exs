@@ -1,0 +1,224 @@
+defmodule UniversalProxy.MilkDrop.UploadCheckTest do
+  use ExUnit.Case, async: true
+
+  import UniversalProxy.MilkDropUploadFixtures
+
+  alias UniversalProxy.MilkDrop.UploadCheck
+
+  describe "normalise_name/1" do
+    test "normalises like the pack: spaces squashed, stem trimmed, extension lowercased" do
+      assert UploadCheck.normalise_name("My  Preset .MILK") == {:ok, "My Preset.milk"}
+      assert UploadCheck.normalise_name(" a  b .milk") == {:ok, "a b.milk"}
+      assert UploadCheck.normalise_name("Stars.JPEG") == {:ok, "Stars.jpeg"}
+      assert UploadCheck.normalise_name("x.Png") == {:ok, "x.png"}
+    end
+
+    test "keeps Unicode letters, NFC-normalised" do
+      assert UploadCheck.normalise_name("cafe\u0301.milk") == {:ok, "café.milk"}
+      assert UploadCheck.normalise_name("Ünïcödé 日本.milk") == {:ok, "Ünïcödé 日本.milk"}
+    end
+
+    test "accepts the allowed punctuation" do
+      name = "Geiss & Rovastar - (v2) [mix], it's #1 +more! @$%=~;_.milk"
+      assert UploadCheck.normalise_name(name) == {:ok, name}
+    end
+
+    test "rejects disallowed characters, control and format characters" do
+      for name <- [
+            "a/b.milk",
+            "a\\b.milk",
+            "a:b.milk",
+            "a*b.milk",
+            "a?b.milk",
+            "a\"b.milk",
+            "a<b>.milk",
+            "a|b.milk",
+            "a\tb.milk",
+            "a\nb.milk",
+            "a\0b.milk",
+            "evil\u202Eklim.png",
+            "zero\u200Bwidth.milk",
+            "\uFEFFbom.milk",
+            "a\u2066b.milk"
+          ] do
+        assert UploadCheck.normalise_name(name) == {:error, :invalid_name}, inspect(name)
+      end
+    end
+
+    test "rejects dots, empty stems, bad extensions, invalid UTF-8 and long names" do
+      for name <- [
+            ".milk",
+            " .milk",
+            ".hidden.milk",
+            "trailing..milk",
+            "a..b.milk",
+            "x.txt",
+            "x",
+            "x.milk.zip",
+            <<"caf", 0xE9, ".milk">>,
+            String.duplicate("a", 196) <> ".milk"
+          ] do
+        assert UploadCheck.normalise_name(name) == {:error, :invalid_name}, inspect(name)
+      end
+
+      assert {:ok, _} = UploadCheck.normalise_name(String.duplicate("a", 195) <> ".milk")
+      # 200 bytes, counted in bytes rather than characters.
+      assert {:error, :invalid_name} =
+               UploadCheck.normalise_name(String.duplicate("é", 98) <> ".milk")
+
+      assert {:ok, _} = UploadCheck.normalise_name(String.duplicate("é", 97) <> ".milk")
+    end
+
+    test "accepted names make valid renderer ids under user/" do
+      {:ok, name} = UploadCheck.normalise_name("A preset.MILK")
+      assert UploadCheck.preset_id(name) == "user/A preset.milk"
+    end
+  end
+
+  describe "fold/1, texture_key/1, kind/1" do
+    test "fold ignores case and NFC/NFD" do
+      assert UploadCheck.fold("Café.milk") == UploadCheck.fold("CAFE\u0301.MILK")
+      refute UploadCheck.fold("a.milk") == UploadCheck.fold("b.milk")
+    end
+
+    test "texture_key compares by stem" do
+      assert UploadCheck.texture_key("Stars.png") == UploadCheck.texture_key("stars.JPG")
+    end
+
+    test "kind by extension" do
+      assert UploadCheck.kind("a.MILK") == :preset
+      assert UploadCheck.kind("a.jpeg") == :texture
+      assert UploadCheck.kind("a.gif") == :other
+      assert UploadCheck.kind("README") == :other
+    end
+
+    test "reserved texture names" do
+      for name <- ~w(main.png Noise_LQ.jpg fc_main.png pw_noisevol_hq.jpg blur2.png) do
+        assert UploadCheck.texture_reserved?(name), name
+      end
+
+      refute UploadCheck.texture_reserved?("mainframe.png")
+    end
+  end
+
+  describe "printable/1" do
+    test "replaces invalid UTF-8, control and format characters; truncates" do
+      assert UploadCheck.printable(<<"a", 0xFF, "b\n\u202Ec">>) == "a?b??c"
+      assert byte_size(UploadCheck.printable(String.duplicate("é", 300))) == 200
+    end
+  end
+
+  describe "check_preset/1" do
+    test "accepts UTF-8 and Latin-1 presets" do
+      assert UploadCheck.check_preset(milk()) == :ok
+      assert UploadCheck.check_preset(milk("// café ☕\n")) == :ok
+      assert UploadCheck.check_preset(milk(<<"// caf", 0xE9, "\n">>)) == :ok
+      assert UploadCheck.check_preset("MILKDROP_PRESET_VERSION=201\nzoom=1") == :ok
+    end
+
+    test "rejects oversize files" do
+      line = String.duplicate("a", 1000) <> "\n"
+
+      assert UploadCheck.check_preset("a=1\n" <> String.duplicate(line, 263)) ==
+               {:error, :too_large}
+
+      assert UploadCheck.check_preset("a=1\n" <> String.duplicate(line, 250)) == :ok
+    end
+
+    test "rejects NUL and C0 control bytes other than tab/LF/CR" do
+      assert UploadCheck.check_preset(milk(<<0>>)) == {:error, :nul_byte}
+      assert UploadCheck.check_preset(milk(<<0x1B, "[31m">>)) == {:error, :control_char}
+      assert UploadCheck.check_preset(milk(<<0x0C>>)) == {:error, :control_char}
+      assert UploadCheck.check_preset(milk("a\t=\t1\r\n")) == :ok
+    end
+
+    test "rejects too many or too long lines" do
+      assert UploadCheck.check_preset("a=1" <> String.duplicate("\n", 20_000)) ==
+               {:error, :too_many_lines}
+
+      assert UploadCheck.check_preset("a=" <> String.duplicate("1", 64 * 1024)) ==
+               {:error, :line_too_long}
+    end
+
+    test "requires a key=value line, as projectM's parser does" do
+      assert UploadCheck.check_preset("") == {:error, :no_values}
+      assert UploadCheck.check_preset("[preset00]\n\n=value\n") == {:error, :no_values}
+      assert UploadCheck.check_preset("just some words\n") == {:error, :no_values}
+      assert UploadCheck.check_preset("[preset00]\nkey=\n") == :ok
+    end
+  end
+
+  describe "check_texture/2" do
+    test "accepts PNG and JPEG headers within the limits" do
+      assert UploadCheck.check_texture("a.png", png(256, 128)) ==
+               {:ok, %{format: :png, width: 256, height: 128}}
+
+      assert UploadCheck.check_texture("a.jpg", jpeg(2048, 2048)) ==
+               {:ok, %{format: :jpeg, width: 2048, height: 2048}}
+
+      assert {:ok, %{format: :jpeg}} = UploadCheck.check_texture("a.JPEG", jpeg(1, 1, sof: 0xC1))
+    end
+
+    test "rejects oversize dimensions" do
+      assert UploadCheck.check_texture("a.png", png(2049, 16)) ==
+               {:error, {:dimensions, 2049, 16}}
+
+      assert UploadCheck.check_texture("a.png", png(16, 16_384)) ==
+               {:error, {:dimensions, 16, 16_384}}
+
+      assert UploadCheck.check_texture("a.png", png(0, 16)) == {:error, {:dimensions, 0, 16}}
+      assert UploadCheck.check_texture("a.jpg", jpeg(4096, 1)) == {:error, {:dimensions, 4096, 1}}
+      assert UploadCheck.check_texture("a.jpg", jpeg(16, 0)) == {:error, {:dimensions, 16, 0}}
+    end
+
+    test "rejects magic bytes that don't match the extension" do
+      assert UploadCheck.check_texture("a.png", jpeg(16, 16)) == {:error, :bad_magic}
+      assert UploadCheck.check_texture("a.jpg", png(16, 16)) == {:error, :bad_magic}
+      assert UploadCheck.check_texture("a.png", "GIF89a....") == {:error, :bad_magic}
+      assert UploadCheck.check_texture("a.png", "") == {:error, :bad_magic}
+      assert UploadCheck.check_texture("a.dds", png(16, 16)) == {:error, :bad_magic}
+    end
+
+    test "rejects malformed headers" do
+      <<head::binary-16, _::binary>> = png(16, 16)
+      assert UploadCheck.check_texture("a.png", head) == {:error, :bad_header}
+      assert UploadCheck.check_texture("a.png", png(16, 16, depth: 3)) == {:error, :bad_header}
+      assert UploadCheck.check_texture("a.png", png(16, 16, color: 5)) == {:error, :bad_header}
+
+      assert UploadCheck.check_texture("a.jpg", <<0xFF, 0xD8, 0xFF>>) == {:error, :bad_header}
+      assert UploadCheck.check_texture("a.jpg", jpeg(16, 16, eoi: "")) == {:error, :bad_header}
+
+      # Scan data before any frame header.
+      sos_first = <<0xFF, 0xD8, 0xFF, 0xDA, 4::16, 0, 0, 0xFF, 0xD9>>
+      assert UploadCheck.check_texture("a.jpg", sos_first) == {:error, :bad_header}
+
+      # A segment length running past the end.
+      assert UploadCheck.check_texture("a.jpg", <<0xFF, 0xD8, 0xFF, 0xE0, 0xFF, 0xFF, 0>>) ==
+               {:error, :bad_header}
+    end
+
+    test "rejects interlaced PNGs and non-baseline JPEGs" do
+      assert UploadCheck.check_texture("a.png", png(16, 16, interlace: 1)) ==
+               {:error, :interlaced}
+
+      for sof <- [0xC2, 0xC3, 0xC9, 0xCA, 0xCF] do
+        assert UploadCheck.check_texture("a.jpg", jpeg(16, 16, sof: sof)) ==
+                 {:error, :unsupported_jpeg}
+      end
+    end
+
+    test "skips non-frame markers looking for the frame header" do
+      # DHT (0xC4) shares the SOFn range but is not a frame header.
+      dht = <<0xFF, 0xC4, 4::16, 0, 0>>
+      <<soi::binary-2, rest::binary>> = jpeg(32, 8)
+
+      assert {:ok, %{width: 32, height: 8}} =
+               UploadCheck.check_texture("a.jpg", soi <> dht <> rest)
+    end
+
+    test "rejects files over 4 MiB" do
+      big = png(16, 16) <> :binary.copy(<<0>>, 4 * 1024 * 1024)
+      assert UploadCheck.check_texture("a.png", big) == {:error, :too_large}
+    end
+  end
+end
