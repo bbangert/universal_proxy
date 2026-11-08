@@ -278,13 +278,17 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   lasts until `claim/2`, `release/2` or the caller's exit, which also
   deletes the path. `{:error, {:too_large, max}}` past the upload cap,
   `{:error, :no_space}` without room, `{:error, {:free_space, reason}}`
-  when the free space can't be measured.
+  when the free space can't be measured; `{:error, :timeout}` when the
+  server doesn't answer within `timeout` ms (a wedged server, told apart
+  from `{:error, :not_running}`).
   """
-  @spec reserve(GenServer.server(), non_neg_integer()) ::
+  @spec reserve(GenServer.server(), non_neg_integer(), timeout()) ::
           {:ok, %{ref: reference(), path: String.t()}} | {:error, term()}
-  def reserve(server \\ __MODULE__, bytes) when is_integer(bytes) and bytes >= 0 do
-    GenServer.call(server, {:reserve, bytes})
+  def reserve(server \\ __MODULE__, bytes, timeout \\ 5_000)
+      when is_integer(bytes) and bytes >= 0 do
+    GenServer.call(server, {:reserve, bytes}, timeout)
   catch
+    :exit, {:timeout, _} -> {:error, :timeout}
     :exit, _ -> {:error, :not_running}
   end
 
@@ -299,12 +303,15 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   @doc """
   Turn reservation `ref` (a finished upload) into a file waiting for
   `import/2`, owned by the caller: its new path, which the server deletes
-  if the caller exits before passing it to `import/2`.
+  if the caller exits before passing it to `import/2`. `{:error, :timeout}`
+  and `{:error, :not_running}` as for `reserve/3`.
   """
-  @spec claim(GenServer.server(), reference()) :: {:ok, String.t()} | {:error, term()}
-  def claim(server \\ __MODULE__, ref) when is_reference(ref) do
-    GenServer.call(server, {:claim, ref})
+  @spec claim(GenServer.server(), reference(), timeout()) ::
+          {:ok, String.t()} | {:error, term()}
+  def claim(server \\ __MODULE__, ref, timeout \\ 5_000) when is_reference(ref) do
+    GenServer.call(server, {:claim, ref}, timeout)
   catch
+    :exit, {:timeout, _} -> {:error, :timeout}
     :exit, _ -> {:error, :not_running}
   end
 
@@ -499,17 +506,12 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
         {_ref, state} = add_reservation(state, owner, bytes, path)
         {:reply, :ok, state}
 
-      {:error, _reason} ->
-        {:reply, :no_space, state}
+      {:error, _reason} = error ->
+        {:reply, error, state}
     end
   end
 
-  def handle_call(:check_budget, _from, state) do
-    case admit(state, 0) do
-      :ok -> {:reply, :ok, state}
-      {:error, _reason} -> {:reply, :no_space, state}
-    end
-  end
+  def handle_call(:check_budget, _from, state), do: {:reply, admit(state, 0), state}
 
   def handle_call({:release, ref}, _from, state),
     do: {:reply, :ok, drop_reservation(state, ref, :delete)}
@@ -684,7 +686,7 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
 
       case recheck(job, staged) do
         :ok -> {:ok, results, staged}
-        :no_space -> {:ok, Enum.map(results, &unstage(&1, staged)), []}
+        {:error, reason} -> {:ok, Enum.map(results, &unstage(&1, staged, reason)), []}
       end
     end
   end
@@ -702,17 +704,18 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   defp recheck(_job, []), do: :ok
   defp recheck(job, _staged), do: budget_call(job, :check_budget)
 
-  # A server that doesn't answer (a hung `df`) admits nothing.
+  # `:ok | {:error, :no_space | {:free_space, reason}}`; a server that
+  # doesn't answer (a hung `df`) admits nothing.
   defp budget_call(job, request) do
     GenServer.call(job.server, request)
   catch
-    :exit, _reason -> :no_space
+    :exit, _reason -> {:error, :no_space}
   end
 
-  defp unstage(result, staged) do
+  defp unstage(result, staged, reason) do
     if Enum.any?(staged, &(&1.kind == result.kind and &1.name == result.name)) and
          result.status in [:added, :replaced],
-       do: %{result | status: {:rejected, :no_space}},
+       do: %{result | status: {:rejected, reason}},
        else: result
   end
 
@@ -768,24 +771,21 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
 
     path = Path.join([job.staging, subdir(result.kind), result.name])
 
-    cond do
-      over_quota?(usage, job.quota) ->
-        add_result(acc, %{result | status: {:rejected, :quota}})
+    with {:quota, false} <- {:quota, over_quota?(usage, job.quota)},
+         :ok <- budget_call(job, {:reserve_staging, result.size, path}) do
+      case write_file(path, data) do
+        :ok ->
+          item = Map.take(result, [:kind, :name, :replaces, :sha256, :size, :status])
 
-      budget_call(job, {:reserve_staging, result.size, path}) != :ok ->
-        add_result(acc, %{result | status: {:rejected, :no_space}})
+          %{acc | usage: usage, staged: [Map.put(item, :path, path) | acc.staged]}
+          |> add_result(result)
 
-      true ->
-        case write_file(path, data) do
-          :ok ->
-            item = Map.take(result, [:kind, :name, :replaces, :sha256, :size, :status])
-
-            %{acc | usage: usage, staged: [Map.put(item, :path, path) | acc.staged]}
-            |> add_result(result)
-
-          {:error, reason} ->
-            add_result(acc, %{result | status: {:rejected, {:io, reason}}})
-        end
+        {:error, reason} ->
+          add_result(acc, %{result | status: {:rejected, {:io, reason}}})
+      end
+    else
+      {:quota, true} -> add_result(acc, %{result | status: {:rejected, :quota}})
+      {:error, reason} -> add_result(acc, %{result | status: {:rejected, reason}})
     end
   end
 

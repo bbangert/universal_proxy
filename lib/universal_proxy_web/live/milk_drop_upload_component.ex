@@ -159,7 +159,7 @@ defmodule UniversalProxyWeb.MilkDropUploadComponent do
       kind: :other,
       name: nil,
       id: nil,
-      status: {:rejected, if(reason == :not_running, do: :not_running, else: :upload_lost)},
+      status: {:rejected, if(reason in [:not_running, :timeout], do: reason, else: :upload_lost)},
       replaces: nil,
       sha256: nil,
       size: nil,
@@ -491,6 +491,8 @@ defmodule UniversalProxyWeb.MilkDropUploadComponent do
   defp reject_reason(:bad_source), do: "The upload went missing. Try again."
   defp reject_reason(:upload_lost), do: "The upload went missing. Try again."
   defp reject_reason(:not_running), do: "The preset library isn't running."
+  defp reject_reason(:timeout), do: "The preset library is busy. Try again."
+  defp reject_reason({:free_space, _reason}), do: "Couldn't measure the device's free storage."
   defp reject_reason(:not_regular_file), do: "Not a regular file."
   defp reject_reason({:io, :install_failed}), do: "Couldn't be installed (storage error)."
   defp reject_reason({:io, _posix}), do: "Storage error."
@@ -569,5 +571,7 @@ defmodule UniversalProxyWeb.MilkDropUploadComponent do
   defp writer_error(:library_restarted), do: "The preset library restarted. Try again."
   defp writer_error(:not_running), do: "The preset library isn't running."
   defp writer_error({:free_space, _reason}), do: "Couldn't measure the device's free storage."
+  defp writer_error(:timeout), do: "The preset library is busy. Try again."
+  defp writer_error({:io, _posix}), do: "Storage error. Try again."
   defp writer_error(_reason), do: "The upload failed. Try again."
 end

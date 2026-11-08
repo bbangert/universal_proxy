@@ -1006,6 +1006,31 @@ defmodule UniversalProxy.MilkDrop.UserPresetsTest do
       refute File.exists?(r.path)
     end
 
+    test "a wedged server is a timeout, told apart from a stopped one", ctx do
+      server = start_library(ctx)
+      :ok = :sys.suspend(server)
+
+      assert UserPresets.reserve(server, 1, 50) == {:error, :timeout}
+      assert UserPresets.claim(server, make_ref(), 50) == {:error, :timeout}
+
+      :ok = :sys.resume(server)
+    end
+
+    test "staging that can't measure the free space says so", ctx do
+      calls = :counters.new(1, [])
+
+      # The import's own first measurement works; the staging check doesn't.
+      free = fn _ ->
+        :counters.add(calls, 1, 1)
+        if :counters.get(calls, 1) == 1, do: @roomy, else: {:error, :df_failed}
+      end
+
+      server = start_library(ctx, free_space: free)
+
+      assert [%{status: {:rejected, {:free_space, :df_failed}}}] =
+               import!(server, [upload(ctx, "a.milk", milk())])
+    end
+
     test "a reserved file written while df runs is never credited", ctx do
       agent = start_supervised!({Agent, fn -> nil end})
 

@@ -360,6 +360,36 @@ defmodule UniversalProxyWeb.MilkDropUploadComponentTest do
       assert length(incoming_files(ctx)) == 2
     end
 
+    test "a storage error refuses the upload", %{conn: conn} = ctx do
+      File.chmod!(ctx.incoming, 0o555)
+      on_exit(fn -> File.chmod(ctx.incoming, 0o755) end)
+
+      {:ok, view, _html} = live(conn, "/audio/milkdrop")
+      input = file_input(view, @form, :presets, [file("s.milk", milk())])
+
+      render_upload(input, "s.milk")
+      assert render(view) =~ "Storage error. Try again."
+    end
+
+    test "staging that can't measure the free space says so", %{conn: conn} = ctx do
+      calls = :counters.new(1, [])
+
+      # The upload's reservation and the import's first measurement work.
+      restart_user_presets(ctx,
+        free_space: fn _ ->
+          :counters.add(calls, 1, 1)
+
+          if :counters.get(calls, 1) <= 2,
+            do: {:ok, %{total_bytes: 1000 * @mib, free_bytes: 900 * @mib}},
+            else: {:error, :df_failed}
+        end
+      )
+
+      {:ok, view, _html} = live(conn, "/audio/milkdrop")
+      import!(view, [file("t.milk", milk())])
+      assert results(view) =~ "Couldn&#39;t measure the device&#39;s free storage."
+    end
+
     test "too little free storage refuses the upload", %{conn: conn} = ctx do
       restart_user_presets(ctx, free_bytes: 150 * @mib)
       {:ok, view, _html} = live(conn, "/audio/milkdrop")
