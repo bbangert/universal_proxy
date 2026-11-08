@@ -535,6 +535,35 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
              List.last(cmds(ctx.skip_file))
   end
 
+  test "unlock resumes a running session's rotation and clears the stored lock", ctx do
+    store =
+      start_supervised!(
+        {Store, name: nil, table: :"#{ctx.test}", dets_path: Path.join(ctx.tmp_dir, "s.dets")}
+      )
+
+    ctx = start_ui(ctx)
+    opts = [display: ctx.state, store: store]
+    {:ok, _} = Store.update(store, %{locked: "a.milk"})
+
+    # No session: only the Store's lock goes.
+    assert Display.milkdrop_unlock(ctx.state) == {:error, :not_presenting}
+    assert UniversalProxy.MilkDrop.unlock(opts) == :ok
+    assert Store.settings(store).locked == nil
+    refute "unlock" in cmd_names(ctx.skip_file)
+
+    ctx = presenting(ctx)
+    assert play(ctx, "x.milk", true) == :ok
+    assert %{locked: true} = md(ctx)
+
+    assert UniversalProxy.MilkDrop.unlock(opts) == :ok
+    assert md(ctx).locked == false
+    wait_until(fn -> "unlock" in cmd_names(ctx.skip_file) end)
+    wait_until(fn -> UniversalProxy.MilkDrop.now_playing(display: ctx.state).locked == false end)
+
+    assert UniversalProxy.MilkDrop.unlock(opts) == :ok
+    assert UniversalProxy.MilkDrop.unlock(display: :"#{ctx.test}.Gone", store: store) == :ok
+  end
+
   test "play without a session is answered at once; with a lock, the lock is saved", ctx do
     store =
       start_supervised!(

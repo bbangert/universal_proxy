@@ -108,7 +108,9 @@ defmodule UniversalProxy.Display.State do
   at most the `:play` timeout (then `{:error, :timeout}`). One play is
   pending at a time: a newer one answers the older `{:error,
   :superseded}`, and a reclaim or the session's end answers it
-  `{:error, :not_presenting}`.
+  `{:error, :not_presenting}`. A `:milkdrop_unlock` call
+  (`UniversalProxy.Display.milkdrop_unlock/1`) is sent as `unlock` in the
+  same phases.
 
   What the TV shows is broadcast on
   `UniversalProxy.MilkDrop.now_playing_topic/0` as
@@ -386,6 +388,16 @@ defmodule UniversalProxy.Display.State do
 
   def handle_call({:milkdrop_play, _id, _lock?}, _from, state),
     do: {:reply, {:error, :not_presenting}, state}
+
+  # Sent even when this side thinks it's unlocked: the renderer's word may
+  # not be in yet, and an unlock of an unlocked preset changes nothing.
+  def handle_call(:milkdrop_unlock, _from, %{md: %{phase: phase, pid: pid} = md} = state)
+      when phase in [:preparing, :taking, :presenting] and is_pid(pid) do
+    Display.MilkDrop.unlock(pid)
+    {:reply, :ok, sync_now_playing(%{state | md: %{md | locked: false}})}
+  end
+
+  def handle_call(:milkdrop_unlock, _from, state), do: {:reply, {:error, :not_presenting}, state}
 
   @impl true
   def handle_cast({:show, spec}, state) do

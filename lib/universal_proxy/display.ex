@@ -137,6 +137,18 @@ defmodule UniversalProxy.Display do
   end
 
   @doc """
+  Resumes rotation on the running MilkDrop session (see
+  `UniversalProxy.MilkDrop.unlock/1`). `{:error, :not_presenting}` while
+  no session runs or the subsystem is off or down.
+  """
+  @spec milkdrop_unlock(GenServer.server()) :: :ok | {:error, :not_presenting}
+  def milkdrop_unlock(server \\ State) do
+    GenServer.call(server, :milkdrop_unlock)
+  catch
+    :exit, _ -> {:error, :not_presenting}
+  end
+
+  @doc """
   What the MilkDrop visualizer shows (see
   `UniversalProxy.MilkDrop.now_playing/1`); nothing while the subsystem is
   off or down.

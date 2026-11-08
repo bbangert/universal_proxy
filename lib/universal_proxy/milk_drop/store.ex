@@ -136,6 +136,11 @@ defmodule UniversalProxy.MilkDrop.Store do
   default, `rotate_s`) and once more when its owner ends, so its flash
   wear is negligible.
 
+  Each successful open of the table (at start, and when a retry
+  succeeds) is broadcast as `{:milkdrop_store, :opened}` on
+  `UniversalProxy.MilkDrop.settings_topic/0`: whatever was read from the
+  store while it served defaults should be read again.
+
   Changes are broadcast on `UniversalProxy.MilkDrop.settings_topic/0`, the
   selection's (`{:milkdrop_selection, selection}`, the whole record) on
   `UniversalProxy.MilkDrop.selection_topic/0` (see `UniversalProxy.MilkDrop`).
@@ -692,7 +697,9 @@ defmodule UniversalProxy.MilkDrop.Store do
     with :ok <- mkdir_p(path),
          {:ok, table} <- open(table_name, path) do
       Logger.info("MilkDrop store opened at #{path}")
-      {:ok, recover_in_flight(%{state | table: table, open_error: nil})}
+      state = recover_in_flight(%{state | table: table, open_error: nil})
+      broadcast(state, {:milkdrop_store, :opened})
+      {:ok, state}
     else
       {:error, reason} ->
         Logger.warning(
