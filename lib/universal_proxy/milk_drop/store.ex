@@ -136,6 +136,11 @@ defmodule UniversalProxy.MilkDrop.Store do
   default, `rotate_s`) and once more when its owner ends, so its flash
   wear is negligible.
 
+  Each successful open of the table (at start, and when a retry
+  succeeds) is broadcast as `{:milkdrop_store, :opened}` on
+  `UniversalProxy.MilkDrop.settings_topic/0`: whatever was read from the
+  store while it served defaults should be read again.
+
   Changes are broadcast on `UniversalProxy.MilkDrop.settings_topic/0`, the
   selection's (`{:milkdrop_selection, selection}`, the whole record) on
   `UniversalProxy.MilkDrop.selection_topic/0` (see `UniversalProxy.MilkDrop`).
@@ -336,7 +341,12 @@ defmodule UniversalProxy.MilkDrop.Store do
     :exit, _ -> {:error, :not_running}
   end
 
-  @doc "Forget the skips of these uploads (`user/` ids): their content changed."
+  @doc """
+  These uploads (`user/` ids) were replaced: forget their skips of
+  content other than the library file's now. A skip already recorded for
+  the replacement stays, so this may arrive late (retried while the Store
+  was down).
+  """
   @spec clear_user_skips(GenServer.server(), [String.t()]) :: :ok | {:error, term()}
   def clear_user_skips(server \\ __MODULE__, ids) when is_list(ids) do
     GenServer.call(server, {:forget_user, ids, false})
@@ -362,13 +372,13 @@ defmodule UniversalProxy.MilkDrop.Store do
 
   @doc """
   Whether `id` can be stored in the selection or sent to the renderer:
-  the renderer's preset-id rule (a relative path ending in `.milk`, no
-  `.`, `..` or empty segment, valid UTF-8 without control characters),
-  at most #{@max_id_bytes} bytes. Says nothing about whether a preset has
-  that id.
+  the renderer's `valid_preset_file` (a relative path of at least 6
+  bytes ending in `.milk`, no `.`, `..` or empty segment, valid UTF-8
+  without control characters), at most #{@max_id_bytes} bytes (the
+  renderer allows 1024). Says nothing about whether a preset has that id.
   """
   @spec valid_id?(term()) :: boolean()
-  def valid_id?(id) when is_binary(id) and byte_size(id) in 1..@max_id_bytes do
+  def valid_id?(id) when is_binary(id) and byte_size(id) in 6..@max_id_bytes do
     String.valid?(id) and :binary.match(id, @control_bytes) == :nomatch and
       String.ends_with?(id, ".milk") and
       not Enum.any?(String.split(id, "/"), &(&1 in ["", ".", ".."]))
@@ -692,7 +702,9 @@ defmodule UniversalProxy.MilkDrop.Store do
     with :ok <- mkdir_p(path),
          {:ok, table} <- open(table_name, path) do
       Logger.info("MilkDrop store opened at #{path}")
-      {:ok, recover_in_flight(%{state | table: table, open_error: nil})}
+      state = recover_in_flight(%{state | table: table, open_error: nil})
+      broadcast(state, {:milkdrop_store, :opened})
+      {:ok, state}
     else
       {:error, reason} ->
         Logger.warning(
@@ -888,11 +900,13 @@ defmodule UniversalProxy.MilkDrop.Store do
     end
   end
 
-  # Skips of these ids go, and with `removed?` (the uploads are gone) the
-  # lock if it names one and their selection entries.
+  # Skips of these ids go, and with `removed?` (deleted) the lock if it
+  # names one and their selection entries; without (replaced) only their
+  # stale skips go, which `current_user_skips/1` drops anyway.
   defp forget_user(state, ids, removed?) do
     entries = read_user_skipped(state.table)
-    kept = state |> current_user_skips() |> Map.drop(ids)
+    current = current_user_skips(state)
+    kept = if removed?, do: Map.drop(current, ids), else: current
     settings = read_settings(state.table)
     unlock? = removed? and settings.locked in ids
     selection = read_selection(state.table)

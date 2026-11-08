@@ -321,5 +321,15 @@
       "UniversalProxy.TuyaMesh.Commander.handle_info/2 runs again and again, and each run reaches an anonymous function in UniversalProxy.TuyaMesh.Commander.subscribe/1's subscription. A second subscription to a topic the process already holds is not a no-op: every later broadcast arrives once more, and nothing UniversalProxy.TuyaMesh.Commander runs ever unsubscribes, so the copies accumulate for the life of the process.",
     reason:
       "False positive (same pattern as the Resolver and MeshSync entries above): subscribe/1 subscribes only to topics missing from Registry.keys(pubsub, self()) (the comprehension filter), and :resubscribe is only scheduled after a failed attempt (PubSub down), so a held topic is never subscribed twice. Covered by commander_test asserting each topic is held exactly once after a late PubSub start and further retries."
+  },
+  %{
+    analysis: "coupling",
+    file: "lib/universal_proxy/milk_drop/supervisor.ex",
+    title: "Coupled children under one_for_one",
+    at_label: "supervision tree defined here",
+    detail:
+      "UniversalProxy.MilkDrop.Index registers with UniversalProxy.MilkDrop.Store when it starts, and UniversalProxy.MilkDrop.Store keeps a monitor or link for it. Both are children of the one_for_one supervisor UniversalProxy.MilkDrop.Supervisor, which restarts either alone. When UniversalProxy.MilkDrop.Store restarts, its init/1 starts it afresh without what UniversalProxy.MilkDrop.Index put there, and UniversalProxy.MilkDrop.Index, which is not restarted with it, never registers again. When UniversalProxy.MilkDrop.Index restarts, it registers a second time beside what its old process left.",
+    reason:
+      "False positive: Index only reads the Store (settings/1, selection/1, skipped/2) and subscribes to its PubSub topics; the Store's monitor is for the in-flight record's owner (mark_in_flight/5's caller, Display.MilkDrop), never Index. A Store restart loses nothing of Index's: every successful table open (start or retry) broadcasts {:milkdrop_store, :opened}, on which Index re-reads all Store state (index_test 're-reads the Store when its table opens'); a restarted Index subscribes and reads afresh, holding nothing in the Store."
   }
 ]

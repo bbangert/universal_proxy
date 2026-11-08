@@ -27,8 +27,9 @@ defmodule UniversalProxy.MilkDrop do
   ## PubSub (`UniversalProxy.PubSub`)
 
     * `settings_topic/0` (`"milkdrop:settings"`) —
-      `{:milkdrop_settings, settings}` and
-      `{:milkdrop_skipped, version, %{preset => reason}}`;
+      `{:milkdrop_settings, settings}`,
+      `{:milkdrop_skipped, version, %{preset => reason}}` and
+      `{:milkdrop_store, :opened}` (the Store's table opened: re-read it);
     * `pack_topic/0` (`"milkdrop:pack"`) — `{:milkdrop_pack, status}` on
       every `UniversalProxy.MilkDrop.Pack` status change (including
       download progress), and `{:milkdrop_pack_started, status}` each time
@@ -134,6 +135,7 @@ defmodule UniversalProxy.MilkDrop do
           | :not_presenting
           | :timeout
           | :superseded
+          | :unresponsive
           | {:refused,
              :unknown | :skipped | :high_frequency | :rpi3_skip | :load_failed | String.t()}
 
@@ -145,7 +147,9 @@ defmodule UniversalProxy.MilkDrop do
   not know, or fails to load (`{:error, {:refused, reason}}`).
 
   `:ok` once it shows (within 15 s, else `{:error, :timeout}`);
-  `{:error, :superseded}` when another `play/3` came first;
+  `{:error, :superseded}` when a newer `play/3` replaced it;
+  `{:error, :unresponsive}` once the session's renderer stopped answering
+  plays;
   `{:error, :not_presenting}` while no visualizer session runs (or ends
   meanwhile), in which case `lock?` still saves `id` as the Store's
   `locked`, so the next session starts on it. A lock that does show is
@@ -168,6 +172,23 @@ defmodule UniversalProxy.MilkDrop do
       end
     else
       {:error, :invalid_id}
+    end
+  end
+
+  @doc """
+  Release the lock: a running visualizer session resumes rotation at
+  once, and the Store's `locked` is cleared so the next session starts
+  unlocked. Idempotent. Returns the Store's answer (`{:error, reason}`
+  when it can't write). Options: `:display` and `:store`, as for
+  `play/3`.
+  """
+  @spec unlock(keyword()) :: :ok | {:error, term()}
+  def unlock(opts \\ []) do
+    _ = Display.milkdrop_unlock(Keyword.get(opts, :display, Display.State))
+
+    case Store.update(Keyword.get(opts, :store, Store), %{locked: nil}) do
+      {:ok, _settings} -> :ok
+      error -> error
     end
   end
 

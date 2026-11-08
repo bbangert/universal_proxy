@@ -515,6 +515,39 @@ defmodule UniversalProxyWeb.MilkDropComponentTest do
     end
   end
 
+  describe "a Store that opens late" do
+    test "re-reads its settings and skips once its table opens",
+         %{conn: conn, tmp_dir: tmp_dir} = ctx do
+      ready_pack(ctx)
+      stop_supervised!(Store)
+      dir = Path.join(tmp_dir, "late")
+      path = Path.join(dir, "settings.dets")
+
+      {:ok, first} = Store.start_link(name: nil, table: :milkdrop_component_late, dets_path: path)
+      {:ok, _} = Store.update(first, %{rotate_s: 45})
+      :ok = Store.skip(first, @version, "a/slow.milk", "budget")
+      GenServer.stop(first)
+
+      File.rename!(dir, dir <> ".away")
+      File.write!(dir, "not a directory")
+
+      start_supervised!(
+        {Store,
+         table: :milkdrop_component_late, dets_path: path, pack_version: @version, retry_ms: 50}
+      )
+
+      {:ok, view, _html} = live(conn, "/audio")
+      assert has_element?(view, "#milkdrop-rotate[value=\"20\"]")
+      assert view |> element("#milkdrop-skipped-count") |> render() =~ "No skipped presets"
+
+      File.rm!(dir)
+      File.rename!(dir <> ".away", dir)
+
+      wait_until(fn -> has_element?(view, "#milkdrop-rotate[value=\"45\"]") end)
+      assert view |> element("#milkdrop-skipped-count") |> render() =~ "1 skipped preset"
+    end
+  end
+
   describe "presets summary" do
     test "without an index there is nothing to count", %{conn: conn} = ctx do
       ready_pack(ctx)

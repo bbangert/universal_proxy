@@ -231,8 +231,11 @@ defmodule UniversalProxy.Display.MilkDrop do
   flash wear is negligible.
 
   An upload can be replaced while its old content plays. So at each
-  `loading` of a `user/` id the library file's SHA-256 is noted, and every
-  skip and in-flight mark for that id carries it (`Store.skip/5`,
+  `loading` of a `user/` id the library file's SHA-256 is noted, and it
+  becomes the showing content's only with that preset's `preset` event (a
+  failed load of a replacement leaves the old one showing). Every skip
+  and in-flight mark carries the hash of the content it is about — the
+  one loading, else the one showing (`Store.skip/5`,
   `Store.mark_in_flight/5`, retries included): the Store drops a skip of
   content the library no longer holds rather than pinning it on the
   replacement.
@@ -394,7 +397,8 @@ defmodule UniversalProxy.Display.MilkDrop do
   @doc """
   Rewrite the selection file with `selection` (a
   `UniversalProxy.MilkDrop.Store` selection) and have the renderer
-  re-read it. A file that can't be written is logged and not announced.
+  re-read it. A file that can't be written is logged, not announced, and
+  reported to the owner as `{:milkdrop_selection_unsent, pid, gen}`.
   """
   @spec reload_selection(GenServer.server(), Store.selection()) :: :ok
   def reload_selection(server, selection) when is_map(selection),
@@ -514,7 +518,9 @@ defmodule UniversalProxy.Display.MilkDrop do
          reaper_ref: Process.monitor(reaper),
          store: store,
          user_sha: Keyword.get(opts, :user_sha, &UserPresets.sha256/1),
-         loaded: %{},
+         # `{id, sha256}` of the upload loading and of the one showing.
+         loading_sha: nil,
+         showing_sha: nil,
          session: session,
          version: version,
          want: nil,
@@ -571,6 +577,7 @@ defmodule UniversalProxy.Display.MilkDrop do
 
       {:error, reason} ->
         Logger.warning("MilkDrop: could not write the selection file: #{inspect(reason)}")
+        send(state.owner, {:milkdrop_selection_unsent, self(), selection[:gen]})
         {:noreply, state}
     end
   end
@@ -658,6 +665,7 @@ defmodule UniversalProxy.Display.MilkDrop do
       {:ok, event} ->
         state = note_loaded(state, event)
         {event, state} = persist(event, state)
+        state = settle_loaded(state, event)
         state = event |> track_in_flight(state) |> track_loading(event)
         send(state.owner, {:milkdrop, self(), event})
         state
@@ -708,19 +716,47 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   defp persist(event, state), do: {event, state}
 
-  # The upload content a `loading` is about to load, for the skips and
-  # marks that follow.
-  defp note_loaded(state, %{event: :loading, preset: "user/" <> _ = id}) do
-    case state.user_sha.(id) do
-      nil -> %{state | loaded: Map.delete(state.loaded, id)}
-      sha -> %{state | loaded: Map.put(state.loaded, id, sha)}
-    end
-  end
+  # The upload content a `loading` is about to load. It is the showing
+  # content only once its `preset` event says so: a failed load of a
+  # replacement leaves the old content showing under the same id.
+  defp note_loaded(state, %{event: :loading, preset: preset}) when is_binary(preset),
+    do: %{state | loading_sha: upload_sha(state, preset)}
 
   defp note_loaded(state, _event), do: state
 
+  defp settle_loaded(%{loading_sha: {file, _} = loaded} = state, %{event: :preset, file: file}),
+    do: %{state | showing_sha: loaded, loading_sha: nil}
+
+  # Lock/unlock, take and step_down re-announce the preset showing without
+  # loading it: still the content noted when it loaded, whatever the file
+  # holds now.
+  defp settle_loaded(%{showing_sha: {file, _}} = state, %{event: :preset, file: file}), do: state
+
+  defp settle_loaded(state, %{event: :preset, file: file}) when is_binary(file),
+    do: %{state | showing_sha: upload_sha(state, file)}
+
+  defp settle_loaded(%{loading_sha: {preset, _}} = state, %{event: :skip, preset: preset}),
+    do: %{state | loading_sha: nil}
+
+  defp settle_loaded(state, _event), do: state
+
+  defp upload_sha(state, "user/" <> _ = id) do
+    case state.user_sha.(id) do
+      nil -> nil
+      sha -> {id, sha}
+    end
+  end
+
+  defp upload_sha(_state, _preset), do: nil
+
+  # The content a skip or mark for `preset` is about: the one loading,
+  # else the one showing.
+  defp sha_for(%{loading_sha: {preset, sha}}, preset), do: sha
+  defp sha_for(%{showing_sha: {preset, sha}}, preset), do: sha
+  defp sha_for(_state, _preset), do: nil
+
   defp add_skip(state, preset, reason, fps \\ nil) do
-    pending = Map.put(state.pending_skips, preset, {reason, fps, state.loaded[preset]})
+    pending = Map.put(state.pending_skips, preset, {reason, fps, sha_for(state, preset)})
     flush_skips(%{state | pending_skips: pending})
   end
 
@@ -874,7 +910,15 @@ defmodule UniversalProxy.Display.MilkDrop do
   # A preset and the upload content noted for it: the same id reloaded
   # after a replacement is a new record.
   defp record_key(_state, nil), do: nil
-  defp record_key(state, preset), do: {preset, state.loaded[preset]}
+  # A held gpu_hang names the content its pending skip is for.
+  defp record_key(%{hold: preset, pending_skips: pending} = state, preset) do
+    case pending do
+      %{^preset => {_reason, _fps, sha}} -> {preset, sha}
+      _ -> {preset, sha_for(state, preset)}
+    end
+  end
+
+  defp record_key(state, preset), do: {preset, sha_for(state, preset)}
 
   defp synced?(%{intended: target, acked?: true}, target), do: true
   defp synced?(_state, _target), do: false

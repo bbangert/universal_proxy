@@ -301,6 +301,20 @@ defmodule UniversalProxy.MilkDrop.Index do
     ArgumentError -> false
   end
 
+  @doc """
+  Why the ready pack's manifest lists nothing (`:unsupported_format`,
+  `:no_presets`, `:invalid_json`, `:unreadable`), or `nil`.
+  """
+  @spec manifest_error(atom()) :: atom() | nil
+  def manifest_error(server \\ __MODULE__) do
+    case :ets.lookup(server, :meta) do
+      [{:meta, %{manifest_error: error}}] -> error
+      [] -> nil
+    end
+  rescue
+    ArgumentError -> nil
+  end
+
   defp filter?(row, :all), do: not row.hidden
   defp filter?(row, :uploaded), do: row.source == :user
   defp filter?(row, :favourites), do: row.favourite
@@ -341,6 +355,7 @@ defmodule UniversalProxy.MilkDrop.Index do
       batch_ms: Keyword.get(opts, :batch_ms, @batch_ms),
       pack_status: nil,
       pack_ids: [],
+      manifest_error: nil,
       user: %{},
       skips: %{},
       selection: %{favourites: MapSet.new(), hidden: MapSet.new(), playlist: MapSet.new()},
@@ -363,7 +378,7 @@ defmodule UniversalProxy.MilkDrop.Index do
       |> put_selection(Store.selection(state.store))
       |> Map.put(:skips, Store.skipped(state.store, pack_version(pack_status) || ""))
       |> Map.put(:user, read_user(state))
-      |> Map.put(:pack_ids, read_pack(pack_status))
+      |> put_pack(pack_status)
       |> rebuild()
 
     {:noreply, state}
@@ -375,44 +390,28 @@ defmodule UniversalProxy.MilkDrop.Index do
       {:noreply, %{state | pack_status: status}}
     else
       skips = Store.skipped(state.store, pack_version(status) || "")
-
-      {:noreply,
-       %{state | pack_status: status, pack_ids: read_pack(status), skips: skips} |> rebuild()}
+      {:noreply, %{state | pack_status: status, skips: skips} |> put_pack(status) |> rebuild()}
     end
   end
 
-  def handle_info({:milkdrop_skipped, version, entries}, state) when is_map(entries) do
-    skips =
-      if version == nil or version == pack_version(state.pack_status),
-        do: entries,
-        else: Map.filter(entries, fn {id, _reason} -> user_id?(id) end)
+  def handle_info({:milkdrop_skipped, version, entries}, state) when is_map(entries),
+    do: {:noreply, apply_skips(state, version, entries)}
 
-    changed = changed_ids(state.skips, skips)
-    {:noreply, %{state | skips: skips} |> refresh_ids(changed)}
-  end
+  def handle_info({:milkdrop_settings, %{locked: locked}}, state),
+    do: {:noreply, apply_locked(state, locked)}
 
-  def handle_info({:milkdrop_settings, %{locked: locked}}, %{locked: locked} = state),
-    do: {:noreply, state}
+  def handle_info({:milkdrop_selection, selection}, state) when is_map(selection),
+    do: {:noreply, apply_selection(state, selection)}
 
-  def handle_info({:milkdrop_settings, %{locked: locked}}, state) do
-    changed = Enum.reject([state.locked, locked], &is_nil/1)
-    {:noreply, %{state | locked: locked} |> refresh_ids(changed)}
-  end
+  # The Store served defaults until now (or restarted): read it all again.
+  def handle_info({:milkdrop_store, :opened}, state) do
+    skips = Store.skipped(state.store, pack_version(state.pack_status) || "")
 
-  def handle_info({:milkdrop_selection, selection}, state) when is_map(selection) do
-    old = state
-    state = put_selection(state, selection)
-
-    changed =
-      Enum.flat_map([:favourites, :hidden, :playlist], fn list ->
-        old.selection |> Map.fetch!(list) |> sym_diff(Map.fetch!(state.selection, list))
-      end)
-
-    state = refresh_ids(state, changed)
-
-    if state.playlist_enabled == old.playlist_enabled,
-      do: {:noreply, state},
-      else: {:noreply, state |> put_meta() |> queue(%{})}
+    {:noreply,
+     state
+     |> apply_locked(Store.settings(state.store).locked)
+     |> apply_selection(Store.selection(state.store))
+     |> apply_skips(nil, skips)}
   end
 
   def handle_info({kind, _change}, state)
@@ -426,6 +425,39 @@ defmodule UniversalProxy.MilkDrop.Index do
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
+
+  defp apply_skips(state, version, entries) do
+    skips =
+      if version == nil or version == pack_version(state.pack_status),
+        do: entries,
+        else: Map.filter(entries, fn {id, _reason} -> user_id?(id) end)
+
+    changed = changed_ids(state.skips, skips)
+    %{state | skips: skips} |> refresh_ids(changed)
+  end
+
+  defp apply_locked(%{locked: locked} = state, locked), do: state
+
+  defp apply_locked(state, locked) do
+    changed = Enum.reject([state.locked, locked], &is_nil/1)
+    %{state | locked: locked} |> refresh_ids(changed)
+  end
+
+  defp apply_selection(state, selection) do
+    old = state
+    state = put_selection(state, selection)
+
+    changed =
+      Enum.flat_map([:favourites, :hidden, :playlist], fn list ->
+        old.selection |> Map.fetch!(list) |> sym_diff(Map.fetch!(state.selection, list))
+      end)
+
+    state = refresh_ids(state, changed)
+
+    if state.playlist_enabled == old.playlist_enabled,
+      do: state,
+      else: state |> put_meta() |> queue(%{})
+  end
 
   # -- Building --
 
@@ -442,8 +474,16 @@ defmodule UniversalProxy.MilkDrop.Index do
   end
 
   defp put_meta(state) do
-    :ets.insert(state.rows, {:meta, %{playlist_enabled: state.playlist_enabled}})
+    meta = %{playlist_enabled: state.playlist_enabled, manifest_error: state.manifest_error}
+    :ets.insert(state.rows, {:meta, meta})
     state
+  end
+
+  defp put_pack(state, status) do
+    case read_pack(status) do
+      {:ok, entries} -> %{state | pack_ids: entries, manifest_error: nil}
+      {:error, reason} -> %{state | pack_ids: [], manifest_error: reason}
+    end
   end
 
   defp sync_user(state, user) do
@@ -600,39 +640,89 @@ defmodule UniversalProxy.MilkDrop.Index do
     with {:ok, %File.Stat{type: :regular, size: size}} when size <= @max_manifest_bytes <-
            File.stat(path),
          {:ok, text} <- File.read(path),
-         {:ok, %{"presets" => presets}} when is_list(presets) <- Jason.decode(text) do
-      presets
-      |> Enum.flat_map(&pack_entry/1)
-      |> Enum.uniq_by(& &1.id)
+         {:ok, doc} <- Jason.decode(text),
+         {:ok, presets} <- manifest_presets(doc) do
+      {:ok, presets |> Enum.flat_map(&pack_entry/1) |> Enum.uniq_by(& &1.id)}
     else
       other ->
         Logger.warning("MilkDrop.Index: can't read #{path}: #{inspect(other, limit: 5)}")
-        []
+        {:error, manifest_reason(other)}
     end
   end
 
-  defp read_pack(_status), do: []
+  defp read_pack(_status), do: {:ok, []}
 
+  # The renderer's document rules (manifest.cpp `parse_manifest`): an
+  # object, `format` absent or the number 1, a `presets` array.
+  defp manifest_presets(%{"presets" => presets} = doc) when is_list(presets) do
+    case Map.fetch(doc, "format") do
+      :error -> {:ok, presets}
+      {:ok, format} when is_number(format) and format == 1 -> {:ok, presets}
+      {:ok, _other} -> {:error, :unsupported_format}
+    end
+  end
+
+  defp manifest_presets(_doc), do: {:error, :no_presets}
+
+  defp manifest_reason({:error, reason}) when reason in [:unsupported_format, :no_presets],
+    do: reason
+
+  defp manifest_reason({:error, %Jason.DecodeError{}}), do: :invalid_json
+  defp manifest_reason(_other), do: :unreadable
+
+  # The renderer's entry rules (manifest.cpp `parse_entry`): an entry it
+  # would drop is dropped here.
   defp pack_entry(%{"file" => id} = entry) do
     tags = Map.get(entry, "tags", [])
 
-    if Store.valid_id?(id) and not user_id?(id) and is_list(tags) and
-         Enum.all?(tags, &is_binary/1),
-       do: [%{id: id, tags: tags, rpi3: rpi3(Map.get(entry, "rpi3"))}],
-       else: []
+    with true <- Store.valid_id?(id) and not user_id?(id),
+         true <- is_list(tags) and Enum.all?(tags, &is_binary/1),
+         {:ok, rpi3} <- rpi3(Map.get(entry, "rpi3")) do
+      [%{id: id, tags: tags, rpi3: rpi3}]
+    else
+      _ -> []
+    end
   end
 
   defp pack_entry(_entry), do: []
 
-  defp rpi3("skip"), do: {:skip, nil}
+  defp rpi3(nil), do: {:ok, nil}
+  defp rpi3("skip"), do: {:ok, {:skip, nil}}
   defp rpi3(rung) when is_binary(rung), do: rung(rung)
-  defp rpi3(%{"rung" => "skip"} = r), do: {:skip, reason(Map.get(r, "reason"))}
-  defp rpi3(%{"rung" => rung}) when is_binary(rung), do: rung(rung)
-  defp rpi3(_other), do: nil
 
-  defp rung(rung) do
-    if Regex.match?(~r/\A[1-9][0-9]{0,4}x[1-9][0-9]{0,4}\z/, rung), do: {:rung, rung}, else: nil
+  defp rpi3(%{} = rpi3) do
+    case Map.get(rpi3, "rung") do
+      nil -> {:ok, nil}
+      "skip" -> {:ok, {:skip, reason(Map.get(rpi3, "reason"))}}
+      rung when is_binary(rung) -> rung(rung)
+      _other -> :error
+    end
   end
+
+  defp rpi3(_other), do: :error
+
+  # options.cpp `parse_resolution`: "WxH", each 1..16384 as strtoll reads it
+  # (leading whitespace and a sign allowed, nothing after the digits).
+  defp rung(rung) do
+    with [w, h] <- :binary.split(rung, "x"),
+         {:ok, w} <- dimension(w),
+         {:ok, h} <- dimension(h) do
+      {:ok, {:rung, "#{w}x#{h}"}}
+    else
+      _ -> :error
+    end
+  end
+
+  defp dimension(text) when byte_size(text) in 1..19 do
+    with [_, sign, digits] <- Regex.run(~r/\A[ \t\n\v\f\r]*([+-]?)([0-9]+)\z/, text),
+         n when n in 1..16_384 <- String.to_integer(sign <> digits) do
+      {:ok, n}
+    else
+      _ -> :error
+    end
+  end
+
+  defp dimension(_text), do: :error
 
   defp reason(reason) when is_binary(reason) and byte_size(reason) <= 64, do: reason
   defp reason(_reason), do: nil

@@ -82,8 +82,12 @@ defmodule UniversalProxy.MilkDrop.IndexTest do
        )}
     )
 
+    # A long :batch_ms holds the first broadcast; flush it at once.
+    index = Process.whereis(ctx.index)
+    _ = :sys.get_state(index)
+    send(index, :flush)
     assert_receive {:milkdrop_index, %{rebuilt: true}}, 2_000
-    %{pack: pack, library: library}
+    %{pack: pack, library: library, index_pid: index}
   end
 
   defp all(index, query \\ Index.query("")) do
@@ -108,7 +112,8 @@ defmodule UniversalProxy.MilkDrop.IndexTest do
           "tags" => ["high_frequency"],
           "rpi3" => %{"rung" => "skip", "reason" => "register_allocate"}
         },
-        %{"file" => "Mid.milk", "rpi3" => %{"rung" => "bogus"}}
+        %{"file" => "Mid.milk", "rpi3" => %{"rung" => nil, "frame_ms" => 3}},
+        %{"file" => "Odd.milk", "rpi3" => " +0320x0180"}
       ])
 
       seed_uploads!(ctx.root, ["Mine.milk"])
@@ -119,6 +124,7 @@ defmodule UniversalProxy.MilkDrop.IndexTest do
                "high_frequency/Flash.milk",
                "Mid.milk",
                "user/Mine.milk",
+               "Odd.milk",
                "b/Zeta.milk"
              ]
 
@@ -141,6 +147,7 @@ defmodule UniversalProxy.MilkDrop.IndexTest do
                row!(ctx.index, "alpha.milk")
 
       assert %{rpi3: nil} = row!(ctx.index, "Mid.milk")
+      assert %{rpi3: {:rung, "320x180"}} = row!(ctx.index, "Odd.milk")
 
       assert %{
                name: "Mine",
@@ -161,11 +168,53 @@ defmodule UniversalProxy.MilkDrop.IndexTest do
         "no-extension",
         %{"file" => "bad-tags.milk", "tags" => [1]},
         %{"nope" => true},
-        42
+        42,
+        %{"file" => "null-tags.milk", "tags" => nil},
+        %{"file" => "rpi3-null.milk", "rpi3" => nil},
+        %{"file" => "rpi3-bogus.milk", "rpi3" => "bogus"},
+        %{"file" => "rpi3-zero.milk", "rpi3" => "0x360"},
+        %{"file" => "rpi3-huge.milk", "rpi3" => %{"rung" => "16385x360"}},
+        %{"file" => "rpi3-max.milk", "rpi3" => %{"rung" => "16384x16384"}},
+        %{"file" => "rpi3-trailing.milk", "rpi3" => "640x360 "},
+        %{"file" => "rpi3-rung-number.milk", "rpi3" => %{"rung" => 640}},
+        %{"file" => "rpi3-number.milk", "rpi3" => 1},
+        %{"file" => "rpi3-list.milk", "rpi3" => ["skip"]},
+        %{"file" => "rpi3-no-rung.milk", "rpi3" => %{"reason" => "x"}}
       ])
 
       start_all(ctx)
-      assert ids(all(ctx.index)) == ["ok.milk"]
+
+      assert ids(all(ctx.index)) ==
+               ["ok.milk", "rpi3-max.milk", "rpi3-no-rung.milk", "rpi3-null.milk"]
+
+      assert row!(ctx.index, "rpi3-max.milk").rpi3 == {:rung, "16384x16384"}
+    end
+
+    test "a manifest the renderer would refuse lists no pack presets", ctx do
+      for {doc, error} <- [
+            {%{"format" => 2, "presets" => [%{"file" => "a.milk"}]}, :unsupported_format},
+            {%{"format" => "1", "presets" => [%{"file" => "a.milk"}]}, :unsupported_format},
+            {%{"format" => 1, "presets" => %{}}, :no_presets},
+            {[%{"file" => "a.milk"}], :no_presets}
+          ] do
+        dir = write_pack!(ctx.root, @version, [])
+        File.write!(Path.join(dir, "manifest.json"), Jason.encode!(doc))
+        assert capture_log(fn -> start_all(ctx) end) =~ "can't read"
+        assert all(ctx.index) == []
+        assert Index.manifest_error(ctx.index) == error
+        Enum.each([Index, UserPresets, Pack, :pack_tasks, :upload_tasks], &stop_supervised!/1)
+      end
+
+      dir = write_pack!(ctx.root, @version, [])
+
+      File.write!(
+        Path.join(dir, "manifest.json"),
+        ~s({"format": 1.0, "presets": [{"file": "a.milk"}]})
+      )
+
+      start_all(ctx)
+      assert ids(all(ctx.index)) == ["a.milk"]
+      assert Index.manifest_error(ctx.index) == nil
     end
 
     test "a missing or malformed manifest is no pack rows, logged", ctx do
@@ -309,15 +358,19 @@ defmodule UniversalProxy.MilkDrop.IndexTest do
     setup ctx do
       write_pack!(ctx.root, @version, ["a.milk", "b.milk"])
       seed_uploads!(ctx.root, ["Mine.milk"])
-      Map.merge(ctx, start_all(ctx))
+      Map.merge(ctx, start_all(ctx, batch_ms: Map.get(ctx, :batch_ms, 20)))
     end
 
+    @tag batch_ms: 60_000
     test "selection changes update the flags, batched into one message", ctx do
       {:ok, _} = Store.favourite(ctx.store, "a.milk", true)
       {:ok, _} = Store.hide(ctx.store, "b.milk", true)
       {:ok, _} = Store.playlist_add(ctx.store, "user/Mine.milk")
       # An id with no row (an upload that may come later) changes nothing here.
       {:ok, _} = Store.favourite(ctx.store, "later.milk", true)
+      refute_receive {:milkdrop_index, _}, 50
+      _ = :sys.get_state(ctx.index_pid)
+      send(ctx.index_pid, :flush)
 
       assert_receive {:milkdrop_index, %{rebuilt: false, changed: changed}}, 1_000
 
@@ -331,6 +384,8 @@ defmodule UniversalProxy.MilkDrop.IndexTest do
       assert row!(ctx.index, "user/Mine.milk").playlist
 
       {:ok, _} = Store.playlist_clear(ctx.store)
+      _ = :sys.get_state(ctx.index_pid)
+      send(ctx.index_pid, :flush)
       assert_receive {:milkdrop_index, %{changed: [key]}}, 1_000
       assert key == Index.key("user/Mine.milk")
       refute row!(ctx.index, "user/Mine.milk").playlist
@@ -420,6 +475,51 @@ defmodule UniversalProxy.MilkDrop.IndexTest do
       assert_receive {:milkdrop_index, %{rebuilt: true}}, 1_000
       assert ids(all(ctx.index)) == ["user/Mine.milk"]
     end
+  end
+
+  test "re-reads the Store when its table opens after serving defaults", ctx do
+    # A first store writes the state; the second can't open the same file
+    # until its directory is back.
+    dir = Path.join(ctx.tmp_dir, "store")
+    path = Path.join(dir, "settings.dets")
+
+    {:ok, first} =
+      Store.start_link(name: nil, table: :index_test_reopen, dets_path: path, pubsub: ctx.pubsub)
+
+    {:ok, _} = Store.favourite(first, "a.milk", true)
+    {:ok, _} = Store.set_playlist_enabled(first, true)
+    {:ok, _} = Store.update(first, %{locked: "b.milk"})
+    :ok = Store.skip(first, @version, "b.milk", "hang")
+    GenServer.stop(first)
+
+    File.rename!(dir, dir <> ".away")
+    File.write!(dir, "not a directory")
+
+    store =
+      start_supervised!(
+        {Store,
+         name: nil,
+         table: :index_test_reopen,
+         dets_path: path,
+         pubsub: ctx.pubsub,
+         pack_version: @version,
+         retry_ms: 50},
+        id: :reopening_store
+      )
+
+    write_pack!(ctx.root, @version, ["a.milk", "b.milk"])
+    start_all(%{ctx | store: store})
+    refute row!(ctx.index, "a.milk").favourite
+    refute Index.playlist_enabled?(ctx.index)
+
+    File.rm!(dir)
+    File.rename!(dir <> ".away", dir)
+
+    assert_receive {:milkdrop_index, %{changed: changed}}, 2_000
+    assert Index.key("a.milk") in changed
+    assert row!(ctx.index, "a.milk").favourite
+    assert %{locked: true, skip: "hang"} = row!(ctx.index, "b.milk")
+    assert Index.playlist_enabled?(ctx.index)
   end
 
   test "reads are empty with no index", ctx do

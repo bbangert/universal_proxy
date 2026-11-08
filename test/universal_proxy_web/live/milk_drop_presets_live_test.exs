@@ -55,6 +55,11 @@ defmodule UniversalProxyWeb.MilkDropPresetsLiveTest do
       end
     end
 
+    def handle_call(:milkdrop_unlock, _from, state) do
+      send(state.test, :unlock)
+      {:reply, :ok, state}
+    end
+
     def handle_call(:milkdrop_now_playing, _from, state),
       do: {:reply, UniversalProxy.Display.State.idle_now_playing(), state}
   end
@@ -450,6 +455,27 @@ defmodule UniversalProxyWeb.MilkDropPresetsLiveTest do
       refute has_element?(view, "#unlock")
     end
 
+    test "unlock releases a running session and the stored lock", %{conn: conn} do
+      id = "Preset 004.milk"
+      {:ok, _} = Store.update(%{locked: id})
+      {:ok, view, _html} = live(conn, "/audio/milkdrop")
+
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        MilkDrop.now_playing_topic(),
+        {:milkdrop_now_playing, %{preset: id, locked: true, selection: nil}}
+      )
+
+      wait_until(fn -> has_element?(view, "#now-playing-name") end)
+      view |> element("#unlock") |> render_click()
+      assert_receive :unlock
+      assert Store.settings().locked == nil
+
+      # Idempotent: again is harmless.
+      assert MilkDrop.unlock(display: @display) == :ok
+      assert_receive :unlock
+    end
+
     test "play without a visualizer session says so", %{conn: conn} do
       Application.put_env(:universal_proxy, :milkdrop_display, :milkdrop_presets_live_no_display)
       {:ok, view, _html} = live(conn, "/audio/milkdrop")
@@ -499,6 +525,60 @@ defmodule UniversalProxyWeb.MilkDropPresetsLiveTest do
       wait_until(fn -> row_html(view, b) =~ "On the TV" end)
       refute row_html(view, a) =~ "On the TV"
       assert has_element?(view, "#hidden-fallback")
+    end
+  end
+
+  describe "rows that start or stop matching" do
+    defp order(view),
+      do:
+        doc(view)
+        |> LazyHTML.query("#presets > li")
+        |> Enum.map(&LazyHTML.attribute(&1, "id"))
+        |> List.flatten()
+
+    test "a preset skipped while the Skipped filter shows appears", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/audio/milkdrop?filter=skipped")
+      assert rows(view) == 0
+      assert has_element?(view, "#presets-empty")
+
+      :ok = Store.skip(@version, "Preset 120.milk", "hang")
+      wait_until(fn -> has_row?(view, "Preset 120.milk") end)
+      refute has_element?(view, "#presets-empty")
+
+      :ok = Store.clear_skipped()
+      wait_until(fn -> rows(view) == 0 end)
+    end
+
+    test "favourites made elsewhere are inserted in name order, and leave when unstarred",
+         %{conn: conn} do
+      for id <- ["Preset 001.milk", "Preset 003.milk"], do: {:ok, _} = Store.favourite(id, true)
+      assert_receive {:milkdrop_index, _}, 1_000
+      {:ok, view, _html} = live(conn, "/audio/milkdrop?filter=favourites")
+
+      {:ok, _} = Store.favourite("Preset 002.milk", true)
+      {:ok, _} = Store.favourite("Preset 199.milk", true)
+      wait_until(fn -> rows(view) == 4 end)
+
+      assert order(view) ==
+               Enum.map(~w(001 002 003 199), &"preset-#{key("Preset #{&1}.milk")}")
+
+      {:ok, _} = Store.favourite("Preset 003.milk", false)
+      wait_until(fn -> not has_row?(view, "Preset 003.milk") end)
+      assert rows(view) == 3
+    end
+
+    test "hidden and playlist filters follow changes made elsewhere", %{conn: conn} do
+      {:ok, hidden, _html} = live(conn, "/audio/milkdrop?filter=hidden")
+      {:ok, playlist, _html} = live(conn, "/audio/milkdrop?filter=playlist")
+
+      {:ok, _} = Store.hide("Preset 010.milk", true)
+      {:ok, _} = Store.playlist_add("Preset 011.milk")
+      wait_until(fn -> has_row?(hidden, "Preset 010.milk") end)
+      wait_until(fn -> has_row?(playlist, "Preset 011.milk") end)
+
+      {:ok, _} = Store.hide("Preset 010.milk", false)
+      {:ok, _} = Store.playlist_clear()
+      wait_until(fn -> rows(hidden) == 0 and rows(playlist) == 0 end)
     end
   end
 

@@ -20,11 +20,14 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
 
   Subscribes (when connected) to the index, settings, pack and
   now-playing topics. An index change re-renders the loaded rows it
-  names (or drops those that no longer match), a match among added rows
-  or a rebuild reloads the list; the now-playing preset's row is
-  re-rendered when it changes. Index changes also refresh the upload
-  component's quota line (`UniversalProxyWeb.MilkDropUploadComponent`,
-  above the search form).
+  names, drops those that no longer match, and inserts in place a row
+  that now matches and falls inside the loaded range (one beyond it
+  arrives by paging); a rebuild reloads the list. The now-playing
+  preset's row is re-rendered when it changes. Index changes also
+  refresh the upload component's quota line
+  (`UniversalProxyWeb.MilkDropUploadComponent`, above the search form).
+  Unlock goes through `UniversalProxy.MilkDrop.unlock/1`, so a running
+  session resumes rotation too.
 
   ## Play now
 
@@ -213,23 +216,72 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
     Enum.map(rows, &Map.put(&1, :playing, &1.id == playing))
   end
 
-  # Re-renders the loaded rows of these keys (a no-op for rows not in the
-  # DOM), dropping those that no longer match the query.
+  # Brings the loaded rows of these keys up to date: a matching row is
+  # re-rendered where it is, or inserted in place when it falls inside the
+  # loaded range (rows beyond it arrive by paging); one that no longer
+  # matches (or is gone) is dropped.
   defp refresh_rows(socket, keys) do
-    Enum.reduce(keys, socket, fn key, socket ->
-      case Index.fetch(key) do
-        {:ok, row} ->
-          if Index.matches?(row, socket.assigns.query) do
-            [row] = decorate(socket, [row])
-            stream_insert(socket, :presets, row, update_only: true)
-          else
-            delete_keys(socket, [key])
-          end
+    Enum.reduce(Enum.uniq(keys), socket, fn key, socket ->
+      with {:ok, row} <- Index.fetch(key),
+           true <- Index.matches?(row, socket.assigns.query) do
+        [row] = decorate(socket, [row])
 
-        :error ->
-          delete_keys(socket, [key])
+        cond do
+          loaded?(socket, key) -> stream_insert(socket, :presets, row, update_only: true)
+          in_range?(socket, Index.cursor(row)) -> insert_row(socket, row)
+          true -> socket
+        end
+      else
+        _ -> delete_keys(socket, [key])
       end
     end)
+  end
+
+  defp loaded?(socket, key), do: Enum.any?(socket.assigns.pages, &(key in &1.keys))
+
+  defp in_range?(%{assigns: %{pages: []}} = socket, _cursor),
+    do: socket.assigns.at_start and socket.assigns.at_end
+
+  defp in_range?(socket, cursor) do
+    %{pages: pages, at_start: at_start, at_end: at_end} = socket.assigns
+    (at_start or cursor > hd(pages).first) and (at_end or cursor < List.last(pages).last)
+  end
+
+  defp insert_row(%{assigns: %{pages: []}} = socket, row) do
+    socket
+    |> stream_insert(:presets, row, at: -1)
+    |> assign(:pages, page_of([row]))
+  end
+
+  defp insert_row(socket, row) do
+    cursor = Index.cursor(row)
+    pages = socket.assigns.pages
+    i = Enum.find_index(pages, &(cursor < &1.last)) || length(pages) - 1
+    page = Enum.at(pages, i)
+    before = Enum.count(page.keys, &before?(&1, cursor))
+    at = (pages |> Enum.take(i) |> Enum.map(&length(&1.keys)) |> Enum.sum()) + before
+
+    page = %{
+      page
+      | first: min(page.first, cursor),
+        last: max(page.last, cursor),
+        keys: List.insert_at(page.keys, before, row.key)
+    }
+
+    {pages, dropped} = trim(List.replace_at(pages, i, page), :back)
+
+    socket
+    |> stream_insert(:presets, row, at: at)
+    |> assign(:pages, pages)
+    |> delete_keys(dropped)
+    |> assign(:at_end, socket.assigns.at_end and dropped == [])
+  end
+
+  defp before?(key, cursor) do
+    case Index.fetch(key) do
+      {:ok, row} -> Index.cursor(row) < cursor
+      :error -> false
+    end
   end
 
   # ── Events ────────────────────────────────────────────────────────────
@@ -255,9 +307,9 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
     do: {:noreply, with_row(socket, key, &play(&1, &2, true))}
 
   def handle_event("unlock", _params, socket) do
-    case Store.update(%{locked: nil}) do
-      {:ok, settings} ->
-        {:noreply, assign(socket, :settings, settings)}
+    case MilkDrop.unlock(display: display()) do
+      :ok ->
+        {:noreply, update(socket, :settings, &%{&1 | locked: nil})}
 
       {:error, reason} ->
         {:noreply, put_flash(socket, :error, "Couldn't unlock (#{error_text(reason)}).")}
@@ -431,17 +483,12 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
 
   def handle_info({:milkdrop_index, %{} = change}, socket) do
     refresh_upload()
-    added = Map.get(change, :added, [])
 
-    if Enum.any?(added, &added_match?(socket, &1)) do
-      {:noreply, reset_list(socket)}
-    else
-      {:noreply,
-       socket
-       |> delete_keys(Map.get(change, :removed, []))
-       |> refresh_rows(Map.get(change, :changed, []))
-       |> refresh_counts()}
-    end
+    {:noreply,
+     socket
+     |> delete_keys(Map.get(change, :removed, []))
+     |> refresh_rows(Map.get(change, :added, []) ++ Map.get(change, :changed, []))
+     |> refresh_counts()}
   end
 
   def handle_info({:milkdrop_settings, settings}, socket) when is_map(settings),
@@ -466,13 +513,6 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
 
   defp refresh_upload,
     do: send_update(MilkDropUploadComponent, id: "milkdrop-upload", refresh: true)
-
-  defp added_match?(socket, key) do
-    case Index.fetch(key) do
-      {:ok, row} -> Index.matches?(row, socket.assigns.query)
-      :error -> false
-    end
-  end
 
   defp display, do: Application.get_env(:universal_proxy, :milkdrop_display, Display.State)
 
@@ -556,7 +596,12 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
   defp filter_empty(_all), do: "No presets."
 
   defp pack_hint({:downloading, pct}), do: "The preset pack is downloading (#{pct}%)."
-  defp pack_hint({:ready, _version, _dir}), do: "The preset pack lists no presets."
+
+  defp pack_hint({:ready, _version, _dir}) do
+    if Index.manifest_error(),
+      do: "The preset pack's manifest can't be read.",
+      else: "The preset pack lists no presets."
+  end
 
   defp pack_hint(_status),
     do: "The preset pack isn't downloaded yet. Download it on the Audio tab."

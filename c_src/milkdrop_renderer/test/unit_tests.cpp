@@ -1736,6 +1736,20 @@ static void test_user_manifest() {
           !user.presets[0].rpi3_skip);
     CHECK(user.presets[1].file == "user/Flash.milk" && user.presets[1].high_frequency);
     CHECK(user.presets[2].file == "user/sub/Two.milk");
+    CHECK(user.textures_key.empty());
+
+    // The textures list keys the texture cache: any file or hash change shows.
+    const auto textures_key = [&](const std::string& textures) {
+        write_file((dir / "manifest.json").string(), R"({"presets":[],"textures":)" + textures + "}");
+        CHECK(load_user_manifest(dir.string(), user, err) == FileStatus::Ok);
+        return user.textures_key;
+    };
+    const std::string one = textures_key(R"([{"file":"a.png","sha256":"11"},{"file":"b.jpg"},7,{"x":1}])");
+    CHECK(one == std::string("a.png\0" "11\n", 9) + std::string("b.jpg\0\n", 7));
+    CHECK(textures_key(R"([{"file":"a.png","sha256":"12"},{"file":"b.jpg"}])") != one);
+    CHECK(textures_key(R"([{"file":"a.png","sha256":"11"}])") != one);
+    CHECK(textures_key(R"([{"file":"a.png","sha256":"11"},{"file":"b.jpg"}])") == one);
+    CHECK(textures_key(R"("nope")").empty());
 
     write_file((dir / "manifest.json").string(), R"({"presets":[)");
     CHECK(load_user_manifest(dir.string(), user, err) == FileStatus::Invalid && !err.empty() && user.presets.empty());

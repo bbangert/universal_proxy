@@ -143,6 +143,8 @@ private:
     SwitchState sw_;
     // What a pending Switch::Play loads.
     std::string play_id_;
+    // The user textures the texture manager was built from (Manifest::textures_key).
+    std::string user_textures_;
     bool play_lock_ = false;
     int fps_ = 0;  // what projectM was told
 
@@ -263,6 +265,7 @@ bool App::prepare() {
     } else if (!opt_.user_dir.empty()) {
         log_msg("%zu user presets (%zu rejected)", user.presets.size(), user.rejected);
     }
+    user_textures_ = user.textures_key;
     all.insert(all.end(), std::make_move_iterator(user.presets.begin()), std::make_move_iterator(user.presets.end()));
     std::string skip_text;
     std::set<std::string, std::less<>> skipped;
@@ -688,6 +691,16 @@ void App::reload_user() {
         log_msg("user manifest: %s; keeping the user presets loaded", err.c_str());
         emit_line(event_error("user_manifest", err));
         return;
+    }
+    // projectM caches textures by name for the texture manager's life, so
+    // a replaced or deleted upload would keep its old image. Setting the
+    // search path builds a new manager (the fork's SetTexturePaths); the
+    // playing preset keeps the textures it holds (shared), later loads
+    // read the files afresh.
+    if (user.textures_key != user_textures_) {
+        vis_.set_texture_dirs(texture_search_paths(opt_.pack_dir, opt_.user_dir));
+        user_textures_ = user.textures_key;
+        log_msg("user textures changed; texture cache rebuilt");
     }
     const PresetManager::UserReload r = presets_->set_user_presets(std::move(user.presets));
     // A replaced upload is measured afresh at its next load; one playing
