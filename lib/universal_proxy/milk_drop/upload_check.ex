@@ -48,7 +48,11 @@ defmodule UniversalProxy.MilkDrop.UploadCheck do
   At most 4 MiB (`:too_large`). The magic bytes must match the extension
   (`:bad_magic`) and the header must parse (`:bad_header`); dimensions are
   read from the PNG `IHDR` or the first JPEG `SOFn` and must be 1..2048
-  per side and at most 2048 × 2048 pixels (`{:dimensions, w, h}`).
+  per side and at most 2048 × 2048 pixels (`{:dimensions, w, h}`). PNG
+  chunks must all be present up to `IEND` with matching CRCs
+  (`:bad_header`), and the `IDAT` stream must inflate to exactly the raw
+  size the header implies (`:bad_image`) — checked in bounded chunks, so
+  a decompression bomb never reaches stb_image.
   Interlaced PNGs (`:interlaced`) and anything but baseline or extended
   sequential Huffman JPEGs (`:unsupported_jpeg`) are refused: stb_image
   picks its decoder by content, so this keeps uploads on the common
@@ -77,6 +81,7 @@ defmodule UniversalProxy.MilkDrop.UploadCheck do
                        noisevol_lq noisevol_hq idlem idleheadphones)
 
   @png_sig <<0x89, "PNG", 0x0D, 0x0A, 0x1A, 0x0A>>
+  @png_channels %{0 => 1, 2 => 3, 3 => 1, 4 => 2, 6 => 4}
   # Legal bit depths per colour type (PNG spec, IHDR).
   @png_depths %{
     0 => [1, 2, 4, 8, 16],
@@ -199,6 +204,7 @@ defmodule UniversalProxy.MilkDrop.UploadCheck do
              :too_large
              | :bad_magic
              | :bad_header
+             | :bad_image
              | :interlaced
              | :unsupported_jpeg
              | {:dimensions, non_neg_integer(), non_neg_integer()}}
@@ -272,7 +278,7 @@ defmodule UniversalProxy.MilkDrop.UploadCheck do
       else: {:error, {:dimensions, w, h}}
   end
 
-  defp png(<<@png_sig, 13::32, "IHDR", ihdr::binary-13, crc::32, _::binary>>) do
+  defp png(<<@png_sig, 13::32, "IHDR", ihdr::binary-13, crc::32, chunks::binary>>) do
     <<w::32, h::32, depth, color, compression, filter, interlace>> = ihdr
 
     cond do
@@ -287,12 +293,78 @@ defmodule UniversalProxy.MilkDrop.UploadCheck do
         {:error, :interlaced}
 
       true ->
-        {:ok, %{format: :png, width: w, height: h}}
+        # Dimensions first: they bound the inflated size checked below.
+        with :ok <- check_dimensions(w, h),
+             {:ok, idat} <- png_chunks(chunks, []),
+             :ok <- png_inflate(idat, png_raw_size(w, h, depth, color)) do
+          {:ok, %{format: :png, width: w, height: h}}
+        end
     end
   end
 
   defp png(<<@png_sig, _::binary>>), do: {:error, :bad_header}
   defp png(_), do: {:error, :bad_magic}
+
+  # The chunks after IHDR, up to IEND: every CRC must match, nothing may
+  # run past the end, and a second IHDR is malformed. Returns the IDAT
+  # payloads (sub-binaries) in order.
+  defp png_chunks(<<len::32, type::binary-4, rest::binary>>, idat) do
+    case rest do
+      <<data::binary-size(^len), crc::32, rest::binary>> ->
+        cond do
+          crc != :erlang.crc32([type, data]) -> {:error, :bad_header}
+          type == "IHDR" -> {:error, :bad_header}
+          type == "IEND" and idat == [] -> {:error, :bad_image}
+          type == "IEND" -> {:ok, Enum.reverse(idat)}
+          type == "IDAT" -> png_chunks(rest, [data | idat])
+          true -> png_chunks(rest, idat)
+        end
+
+      _ ->
+        {:error, :bad_header}
+    end
+  end
+
+  defp png_chunks(_truncated, _idat), do: {:error, :bad_header}
+
+  # Filtered scanlines of a non-interlaced image: one filter byte plus the
+  # packed row, per row.
+  defp png_raw_size(w, h, depth, color),
+    do: h * (1 + div(w * Map.fetch!(@png_channels, color) * depth + 7, 8))
+
+  # stb_image inflates the whole IDAT stream into a growing buffer, so a
+  # tiny image can carry a decompression bomb: inflate it ourselves in
+  # bounded chunks, counting (and discarding) the output, and require
+  # exactly the raw size the header implies.
+  defp png_inflate(idat, expected) do
+    z = :zlib.open()
+
+    try do
+      :ok = :zlib.inflateInit(z)
+      count = Enum.reduce(idat, 0, &png_drain(z, :zlib.safeInflate(z, &1), &2, expected))
+      :ok = :zlib.inflateEnd(z)
+      if count == expected, do: :ok, else: {:error, :bad_image}
+    rescue
+      ErlangError -> {:error, :bad_image}
+    catch
+      :too_big -> {:error, :bad_image}
+    after
+      :zlib.close(z)
+    end
+  end
+
+  defp png_drain(z, {status, output}, count, expected) do
+    count = count + IO.iodata_length(output)
+    if count > expected, do: throw(:too_big)
+
+    case status do
+      :continue -> png_drain(z, :zlib.safeInflate(z, []), count, expected)
+      :finished -> count
+    end
+  end
+
+  defp png_drain(_z, {:need_dictionary, _adler, _output}, _count, _expected),
+    do: throw(:too_big)
 
   defp jpeg(<<0xFF, 0xD8, 0xFF, _::binary>> = data) do
     <<_soi::binary-2, rest::binary>> = data
@@ -329,11 +401,11 @@ defmodule UniversalProxy.MilkDrop.UploadCheck do
   defp jpeg_markers(_), do: {:error, :bad_header}
 
   # The body is exactly the segment (length 8 + 3 × Nf) minus its length
-  # field: precision (8 bits: all stb_image decodes), height, width, Nf in
-  # 1..4, then Nf component specs (id, sampling factors 1..4 each, table
-  # selector 0..3).
+  # field: precision (8 bits: all stb_image decodes), height, width, Nf
+  # (1, 3 or 4: what stb_image decodes), then Nf component specs (distinct
+  # ids, sampling factors 1..4 each, table selector 0..3).
   defp jpeg_segment(m, <<8, h::16, w::16, nf, specs::binary>>, rest)
-       when m in @jpeg_ok_sof and nf in 1..4 and byte_size(specs) == 3 * nf do
+       when m in @jpeg_ok_sof and nf in [1, 3, 4] and byte_size(specs) == 3 * nf do
     if components_ok?(specs) and :binary.match(rest, <<0xFF, 0xD9>>) != :nomatch,
       do: {:ok, %{format: :jpeg, width: w, height: h}},
       else: {:error, :bad_header}
@@ -344,7 +416,9 @@ defmodule UniversalProxy.MilkDrop.UploadCheck do
   defp jpeg_segment(_m, _body, rest), do: jpeg_markers(rest)
 
   defp components_ok?(specs) do
-    for(<<_id, hs::4, vs::4, tq <- specs>>, do: hs in 1..4 and vs in 1..4 and tq in 0..3)
-    |> Enum.all?()
+    components = for <<id, hs::4, vs::4, tq <- specs>>, do: {id, hs, vs, tq}
+
+    Enum.all?(components, fn {_id, hs, vs, tq} -> hs in 1..4 and vs in 1..4 and tq in 0..3 end) and
+      components |> Enum.uniq_by(&elem(&1, 0)) |> length() == length(components)
   end
 end

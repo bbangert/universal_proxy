@@ -97,15 +97,34 @@ defmodule UniversalProxy.MilkDropUploadFixtures do
     IO.iodata_to_binary(out)
   end
 
-  @doc "A PNG signature + IHDR (no image data: only the header is checked)."
+  @doc """
+  A PNG: signature, IHDR, one IDAT of all-zero scanlines and IEND.
+  Options: `:depth`, `:color`, `:interlace`, `:idat` (the zlib stream
+  stored) and `:tail` (what follows IDAT, default an IEND chunk).
+  """
   @spec png(non_neg_integer(), non_neg_integer(), keyword()) :: binary()
   def png(w, h, opts \\ []) do
     ihdr =
       <<w::32, h::32, Keyword.get(opts, :depth, 8), Keyword.get(opts, :color, 6), 0, 0,
         Keyword.get(opts, :interlace, 0)>>
 
-    <<0x89, "PNG", 0x0D, 0x0A, 0x1A, 0x0A, 13::32, "IHDR", ihdr::binary,
-      :erlang.crc32(["IHDR", ihdr])::32, 0::32, "IEND", 0xAE426082::32>>
+    idat = Keyword.get_lazy(opts, :idat, fn -> :zlib.compress(raw(w, h, opts)) end)
+
+    <<0x89, "PNG", 0x0D, 0x0A, 0x1A, 0x0A>> <>
+      chunk("IHDR", ihdr) <> chunk("IDAT", idat) <> Keyword.get(opts, :tail, chunk("IEND", ""))
+  end
+
+  @doc "One PNG chunk: length, type, data, CRC."
+  @spec chunk(binary(), binary()) :: binary()
+  def chunk(type, data),
+    do: <<byte_size(data)::32, type::binary, data::binary, :erlang.crc32([type, data])::32>>
+
+  # All-zero filtered scanlines of the right size; oversize images (only
+  # ever rejected on their dimensions) get a token stream.
+  defp raw(w, h, opts) do
+    channels = Map.get(%{0 => 1, 2 => 3, 3 => 1, 4 => 2, 6 => 4}, Keyword.get(opts, :color, 6), 1)
+    size = h * (1 + div(w * channels * Keyword.get(opts, :depth, 8) + 7, 8))
+    if size <= 20 * 1024 * 1024, do: :binary.copy(<<0>>, size), else: <<0>>
   end
 
   @doc "A JPEG with an APP0 segment, a frame header and an EOI."
