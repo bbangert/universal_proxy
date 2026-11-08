@@ -715,7 +715,8 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     assert_receive {:fake_renderer, :start, _opts}, @timeout
     assert_receive {:audio, :pcm_tap, @key, false}, @timeout
     wait_until(fn -> md(ctx).phase == nil end)
-    refute File.exists?("/proc/#{os_pid}")
+    # A SIGKILLed child can linger as a zombie until the port reaps it.
+    wait_until(fn -> not File.exists?("/proc/#{os_pid}") end)
     assert %{last: %{outcome: {:crashed, :hang}, phase: :presenting}, failures: 1} = md(ctx)
     assert %{lifecycle: %{status: :running}, screen: {:visualizer, false}} = status(ctx)
   end
@@ -785,6 +786,21 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
       wait_until(fn -> md(ctx).last != nil end)
       assert %{outcome: {:crashed, {:timeout, :preparing}}} = md(ctx).last
       assert Store.skipped(ctx.store, @version) == %{"first.milk" => "hang"}
+    end
+
+    @tag capture_log: true
+    test "skips a warm-up still unanswered when release times out", ctx do
+      ctx =
+        start_ui(ctx, timeouts: %{releasing: 300}, milkdrop_opts: [store: ctx.store])
+        |> presenting()
+
+      Renderer.command(renderer(ctx), %{cmd: "hang_loading", preset: "loop.milk"})
+      wait_until(fn -> :sys.get_state(renderer(ctx)).loading == "loop.milk" end)
+      paused(ctx)
+
+      wait_until(fn -> md(ctx).last != nil end)
+      assert %{outcome: {:crashed, {:timeout, :releasing}}} = md(ctx).last
+      assert Store.skipped(ctx.store, @version) == %{"loop.milk" => "hang"}
     end
 
     @tag capture_log: true

@@ -204,7 +204,8 @@ defmodule UniversalProxy.Display.MilkDrop do
   the skip file of a renderer started after it has it.
 
   The owner's own step timeouts can be shorter (the display's State
-  bounds `take` at 5 s and the start at 20 s); it stops a renderer stuck
+  bounds `take` at 5 s, `release` at 3 s and the start at 20 s); it
+  stops a renderer stuck
   in one with `stop_hung/2`, which blames and skips as the watchdog does.
 
   Either way the skip gets one attempt (this process stops right after),
@@ -274,11 +275,11 @@ defmodule UniversalProxy.Display.MilkDrop do
   end
 
   @doc """
-  Stop a renderer its owner gave up waiting on, as the watchdog would: the
-  preset `blame` names (`:loading` — an unanswered `loading`; `:showing` —
-  that, else the preset showing) is skipped as `hang` first, then the
-  renderer is SIGKILLed. The owner is not sent `{:milkdrop_exit, ...}`.
-  `:ok` if it is already gone.
+  Stop a renderer its owner gave up waiting on. If `blame` names a preset
+  (`:loading` — an unanswered `loading`; `:showing` — that, else the preset
+  showing), it is skipped as `hang` first and the renderer SIGKILLed, as
+  the watchdog would; else this is `stop/1`. The owner is not sent
+  `{:milkdrop_exit, ...}`. `:ok` if it is already gone.
   """
   @spec stop_hung(GenServer.server(), :loading | :showing) :: :ok
   def stop_hung(server, blame) when blame in [:loading, :showing] do
@@ -479,8 +480,14 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   @impl true
   def handle_call({:stop_hung, blame}, _from, state) do
-    state = kill_hung(state, blamed(state, blame), "its owner gave up waiting")
-    {:stop, {:shutdown, :hang}, :ok, state}
+    case blamed(state, blame) do
+      nil ->
+        {:stop, :normal, :ok, state}
+
+      preset ->
+        state = kill_hung(state, preset, "its owner gave up waiting")
+        {:stop, {:shutdown, :hang}, :ok, state}
+    end
   end
 
   @impl true
