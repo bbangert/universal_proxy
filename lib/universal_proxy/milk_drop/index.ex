@@ -432,10 +432,16 @@ defmodule UniversalProxy.MilkDrop.Index do
   def handle_info(_msg, state), do: {:noreply, state}
 
   defp apply_skips(state, version, entries) do
+    # Another version's broadcast (the Store's list is for a pack we don't
+    # show) still carries the uploads' skips: take those, keep the pack's.
     skips =
-      if version == nil or version == pack_version(state.pack_status),
-        do: entries,
-        else: Map.filter(entries, fn {id, _reason} -> user_id?(id) end)
+      if version == nil or version == pack_version(state.pack_status) do
+        entries
+      else
+        state.skips
+        |> Map.reject(fn {id, _reason} -> user_id?(id) end)
+        |> Map.merge(Map.filter(entries, fn {id, _reason} -> user_id?(id) end))
+      end
 
     changed = changed_ids(state.skips, skips)
     %{state | skips: skips} |> refresh_ids(changed)

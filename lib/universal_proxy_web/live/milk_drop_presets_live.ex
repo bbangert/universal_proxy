@@ -123,7 +123,8 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
 
   # ── List ──────────────────────────────────────────────────────────────
 
-  defp reset_list(socket) do
+  # `totals?`: the index changed, so the search-independent totals did too.
+  defp reset_list(socket, totals? \\ false) do
     {rows, more?} = Index.page(socket.assigns.query, limit: @page)
 
     socket
@@ -132,15 +133,25 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
     |> assign(:at_start, true)
     |> assign(:at_end, not more?)
     |> assign(:loaded, true)
-    |> refresh_counts()
+    |> refresh_counts(totals?)
   end
 
-  defp refresh_counts(socket) do
-    counts = Index.counts(socket.assigns.query.q)
+  # One scan for the search's counts; the totals (no search) are the same
+  # scan without one, else kept until the index changes.
+  defp refresh_counts(socket, totals?) do
+    q = socket.assigns.query.q
+    counts = Index.counts(q)
+
+    totals =
+      cond do
+        q == "" -> counts
+        totals? -> Index.counts("")
+        true -> socket.assigns.totals
+      end
 
     socket
     |> assign(:counts, counts)
-    |> assign(:totals, if(socket.assigns.query.q == "", do: counts, else: Index.counts("")))
+    |> assign(:totals, totals)
     |> assign(:playlist_enabled, Index.playlist_enabled?())
   end
 
@@ -512,14 +523,15 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
   # ── PubSub ────────────────────────────────────────────────────────────
 
   @impl true
-  def handle_info({:milkdrop_index, %{rebuilt: true}}, socket), do: {:noreply, reset_list(socket)}
+  def handle_info({:milkdrop_index, %{rebuilt: true}}, socket),
+    do: {:noreply, reset_list(socket, true)}
 
   def handle_info({:milkdrop_index, %{} = change}, socket) do
     {:noreply,
      socket
      |> delete_keys(Map.get(change, :removed, []))
      |> refresh_rows(Map.get(change, :added, []) ++ Map.get(change, :changed, []))
-     |> refresh_counts()}
+     |> refresh_counts(true)}
   end
 
   def handle_info({:milkdrop_settings, settings}, socket) when is_map(settings),
