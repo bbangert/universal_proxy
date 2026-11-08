@@ -205,8 +205,8 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   The owner's own step timeouts can be shorter (the display's State
   bounds `take` at 5 s, `release` at 3 s and the start at 20 s); it
-  stops a renderer stuck
-  in one with `stop_hung/2`, which blames and skips as the watchdog does.
+  stops a renderer stuck in one with `stop_hung/2`, which blames and
+  skips as the watchdog does.
 
   Either way the skip gets one attempt (this process stops right after),
   and the in-flight record is left to the Store's grace period.
