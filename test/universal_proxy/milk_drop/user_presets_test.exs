@@ -358,10 +358,11 @@ defmodule UniversalProxy.MilkDrop.UserPresetsTest do
   end
 
   # Until `n` requests wait for the server's free-space measurement.
-  defp await_waiting(server, n) do
-    if length(:sys.get_state(server).budget.waiting) < n do
-      Process.sleep(5)
-      await_waiting(server, n)
+  defp await_waiting(server, n, timeout \\ 2_000) do
+    cond do
+      length(:sys.get_state(server).budget.waiting) >= n -> :ok
+      timeout <= 0 -> flunk("#{n} admissions never queued")
+      true -> Process.sleep(5) && await_waiting(server, n, timeout - 5)
     end
   end
 
