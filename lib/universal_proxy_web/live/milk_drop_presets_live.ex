@@ -23,9 +23,11 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
   names, drops those that no longer match, and inserts in place a row
   that now matches and falls inside the loaded range (one beyond it
   arrives by paging); a rebuild reloads the list. The now-playing
-  preset's row is re-rendered when it changes. Unlock goes through
-  `UniversalProxy.MilkDrop.unlock/1`, so a running session resumes
-  rotation too.
+  preset's row is re-rendered when it changes. Index changes also
+  refresh the upload component's quota line
+  (`UniversalProxyWeb.MilkDropUploadComponent`, above the search form).
+  Unlock goes through `UniversalProxy.MilkDrop.unlock/1`, so a running
+  session resumes rotation too.
 
   ## Play now
 
@@ -48,6 +50,7 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
   alias UniversalProxy.MilkDrop
   alias UniversalProxy.MilkDrop.{Index, Pack, Store, UserPresets}
   alias UniversalProxyWeb.Components.MilkDropUI
+  alias UniversalProxyWeb.MilkDropUploadComponent
 
   @page 50
   @max_rows 150
@@ -523,10 +526,14 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
   # ── PubSub ────────────────────────────────────────────────────────────
 
   @impl true
-  def handle_info({:milkdrop_index, %{rebuilt: true}}, socket),
-    do: {:noreply, reset_list(socket, true)}
+  def handle_info({:milkdrop_index, %{rebuilt: true}}, socket) do
+    refresh_upload()
+    {:noreply, reset_list(socket, true)}
+  end
 
   def handle_info({:milkdrop_index, %{} = change}, socket) do
+    refresh_upload()
+
     {:noreply,
      socket
      |> delete_keys(Map.get(change, :removed, []))
@@ -564,6 +571,9 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
   end
 
   def handle_info(_msg, socket), do: {:noreply, socket}
+
+  defp refresh_upload,
+    do: send_update(MilkDropUploadComponent, id: "milkdrop-upload", refresh: true)
 
   defp playing(%{kind: :play} = play), do: play
   defp playing(_command), do: nil
@@ -694,6 +704,8 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
         stored={@stored_playlist}
         now_playing={@now_playing}
       />
+
+      <.live_component module={MilkDropUploadComponent} id="milkdrop-upload" class="block mt-5" />
 
       <form
         id="preset-search"

@@ -27,6 +27,8 @@ defmodule UniversalProxyWeb.MilkDropComponent do
       default) — turning it on first opens a confirmation carrying a
       photosensitivity warning; only its confirm writes `true`. Turning it
       off writes straight away.
+    * **Upload** — `UniversalProxyWeb.MilkDropUploadComponent`, below the
+      card (Index changes are forwarded to it as `refresh: true`).
     * **Skipped presets** — the presets the renderer could not draw with
       the ready pack's version, and the uploads it could not draw as they
       are now, with their reasons, in a disclosure; "Clear" calls
@@ -61,6 +63,7 @@ defmodule UniversalProxyWeb.MilkDropComponent do
   alias UniversalProxy.MilkDrop.Index
   alias UniversalProxy.MilkDrop.Pack
   alias UniversalProxy.MilkDrop.Store
+  alias UniversalProxyWeb.MilkDropUploadComponent
 
   @rotate_min 10
   @rotate_max 120
@@ -109,7 +112,10 @@ defmodule UniversalProxyWeb.MilkDropComponent do
 
   defp apply_event(socket, {:milkdrop_pack, status}), do: put_pack(socket, status)
 
-  defp apply_event(socket, {:milkdrop_index, _change}), do: assign_presets(socket)
+  defp apply_event(socket, {:milkdrop_index, _change}) do
+    send_update(MilkDropUploadComponent, id: "milkdrop-upload", refresh: true)
+    assign_presets(socket)
+  end
 
   # The Store served defaults until its table opened: read it again.
   defp apply_event(socket, {:milkdrop_store, :opened}) do
@@ -479,6 +485,8 @@ defmodule UniversalProxyWeb.MilkDropComponent do
           {@error}
         </div>
       </.card>
+
+      <.live_component module={MilkDropUploadComponent} id="milkdrop-upload" class="block mt-4" />
 
       <.modal
         open={@confirm_hf}
