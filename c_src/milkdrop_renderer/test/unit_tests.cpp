@@ -2162,6 +2162,129 @@ static void test_switch_play() {
     CHECK(!sw.pending());
 }
 
+// A play while not presenting (prepared or released) loads in the next
+// round, and before a `take` that follows it, so the take shows it.
+static void test_play_before_take() {
+    std::vector<std::string> log;
+    SwitchState sw;
+    Attempt outcome = Attempt::Loaded;
+    bool activated = false;
+    // As App::apply_switch() for a play.
+    auto apply = [&] {
+        const Switch s = sw.begin();
+        log.push_back(s == Switch::Play ? "play" : "other");
+        if (s != Switch::Play) return;
+        if (outcome == Attempt::Loaded) {
+            sw.selected(Selection::Switched, false);
+            sw.play_done();
+        } else {
+            sw.selected(Selection::Deferred, activated);
+            sw.play_failed();
+        }
+    };
+    auto take = [&] {
+        if (sw.request_take()) log.push_back("take");
+    };
+    bool stop = false;
+    auto stopped = [&] { return stop; };
+
+    // Released, a play arrives: the next round loads it; no take.
+    sw.request_play();
+    recovery_round(sw, apply, take, stopped);
+    CHECK((log == std::vector<std::string>{"play"}) && !sw.pending());
+    // Other requests still wait for presenting.
+    log.clear();
+    sw.request(Switch::Next);
+    recovery_round(sw, apply, take, stopped);
+    CHECK(log.empty() && sw.requested() == Switch::Next);
+    sw.begin();
+
+    // play then take in one read: the play loads first.
+    sw.request_play();
+    CHECK(take_ready(sw, apply, stopped));
+    CHECK((log == std::vector<std::string>{"play"}));
+    // No play pending: take_ready is request_take().
+    log.clear();
+    CHECK(take_ready(sw, apply, stopped) && log.empty());
+
+    // A play whose preload fails: the take shows the preset that stayed.
+    outcome = Attempt::Failed;
+    sw.request_play();
+    CHECK(take_ready(sw, apply, stopped) && !sw.pending());
+    // One that fails after activation holds the slot: the take waits for
+    // the replacement, which a recovery round brings.
+    activated = true;
+    log.clear();
+    sw.request_play();
+    CHECK(!take_ready(sw, apply, stopped) && sw.take_pending());
+    CHECK(sw.requested() == Switch::Retry && sw.holding_frames());
+    sw.begin();
+    sw.selected(Selection::Switched, false);
+    CHECK(sw.take_due());
+    activated = false;
+
+    // Frames held (the prepared preset hung) and a play pending: the take
+    // waits; the recovery round runs the play, then the take.
+    outcome = Attempt::Loaded;
+    log.clear();
+    sw.hang();
+    sw.request_play();
+    CHECK(!take_ready(sw, apply, stopped) && log.empty());
+    recovery_round(sw, apply, take, stopped);
+    CHECK((log == std::vector<std::string>{"play", "take"}));
+
+    // An exit decided during the play: no take.
+    log.clear();
+    sw.request_play();
+    auto apply_then_stop = [&] {
+        apply();
+        stop = true;
+    };
+    CHECK(!take_ready(sw, apply_then_stop, stopped) && !sw.take_pending());
+}
+
+// The no-repeat rule can leave a favourite's tickets unplayable in tiny
+// pools (it can play at most every other pick): the bag stays bounded,
+// and nothing repeats unless the pool is one preset.
+static void test_favourites_tiny_pools() {
+    struct Case {
+        int presets;
+        std::vector<std::string> favourites;
+        double fav_share_min, fav_share_max;
+    };
+    const std::vector<Case> cases = {
+        {1, {"p0.milk"}, 1.0, 1.0},
+        {2, {"p0.milk"}, 0.49, 0.51},             // alternates
+        {2, {"p0.milk", "p1.milk"}, 0.49, 0.51},  // alternates
+        {3, {"p0.milk"}, 0.45, 0.51},             // every other pick at most
+        {4, {"p0.milk"}, 0.45, 0.51},
+    };
+    for (const Case& c : cases) {
+        PresetManager::Config cfg;
+        cfg.seed = 21;
+        PresetManager pm(entries(c.presets), {}, cfg);
+        pm.set_selection(selection({}, {}, false, c.favourites));
+        std::string last = pm.start("")->file;
+        int fav = last == "p0.milk", repeats = 0;
+        size_t max_bag = 0;
+        const int draws = 100000;
+        for (int i = 1; i < draws; i++) {
+            const PresetEntry* p = pm.rotate();
+            CHECK(p != nullptr);
+            if (p == nullptr) break;
+            repeats += p->file == last;
+            fav += p->file == "p0.milk";
+            last = p->file;
+            max_bag = std::max(max_bag, pm.bag_size());
+        }
+        const size_t deal = static_cast<size_t>(c.presets) + 2 * c.favourites.size();
+        CHECK(max_bag <= deal + 3);  // a deal plus at most a favourite's carried tickets
+        CHECK(c.presets == 1 ? repeats == draws - 1 : repeats == 0);
+        const double share = static_cast<double>(fav) / draws;
+        CHECK(share >= c.fav_share_min && share <= c.fav_share_max);
+    }
+}
+
 int main() {
     test_json();
     test_options();
@@ -2199,6 +2322,8 @@ int main() {
     test_user_reload();
     test_play();
     test_switch_play();
+    test_play_before_take();
+    test_favourites_tiny_pools();
     if (g_failures == 0) std::printf("OK\n");
     return g_failures == 0 ? 0 : 1;
 }

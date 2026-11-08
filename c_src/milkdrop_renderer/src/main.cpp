@@ -518,6 +518,8 @@ Selection App::switch_to(const PresetEntry* first, const char* cause, bool smoot
         return Attempt::Failed;
     });
     sw_.selected(sel, activated_failure);
+    // Not presenting, the frame a `take` would show is the old preset's.
+    if (sel == Selection::Switched && phase_ != Phase::Presenting) drop_queued();
     if (sel == Selection::Deferred) {
         // Until the retry, the playing preset runs at its own level.
         if (current_ != nullptr) {
@@ -830,10 +832,11 @@ void App::present_step() {
 
 void App::take() {
     if (phase_ == Phase::Presenting) return;
-    // The prepared preset hung the GPU or failed: never show it. The take
-    // runs once a replacement has loaded (recover_step()).
-    if (!sw_.request_take()) {
-        log_msg("take waits for a replacement preset");
+    // A pending play loads first. The prepared preset hung the GPU or
+    // failed: never show it. The take runs once a replacement has loaded
+    // (recover_step()).
+    if (!take_ready(sw_, [this] { apply_switch(); }, [this] { return !exit_reason_.empty(); })) {
+        if (exit_reason_.empty()) log_msg("take waits for a replacement preset");
         return;
     }
     // A high_frequency preset turned off before the take: cut first (each

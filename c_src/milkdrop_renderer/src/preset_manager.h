@@ -137,6 +137,9 @@ public:
     // is eligible.
     const PresetEntry* cut_target();
 
+    // Tickets left in the current deal (tests: it stays bounded).
+    size_t bag_size() const { return bag_.size(); }
+
     // Tombstoned ones included.
     const std::deque<PresetEntry>& entries() const { return entries_; }
     bool removed(size_t index) const { return index < gone_.size() && gone_[index] != 0; }

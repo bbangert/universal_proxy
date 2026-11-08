@@ -16,6 +16,7 @@ class SwitchState {
 public:
     Switch requested() const { return requested_; }
     bool pending() const { return requested_ != Switch::None; }
+    bool play_pending() const { return requested_ == Switch::Play; }
 
     // A command (next, prev) or the rotation timer. Never replaces a
     // pending eject or retry: the preset showing has to go first, and a
@@ -115,12 +116,25 @@ private:
 };
 
 // One loop round while not presenting: a selection batch while frames are
-// held, then a `take` that waited for it. Selection exhausted or failed
-// means `stopped()` (the exit is decided) and the take never runs.
+// held, or a pending `play` (it becomes the prepared preset), then a
+// `take` that waited for it. Selection exhausted or failed means
+// `stopped()` (the exit is decided) and the take never runs. Other
+// requests (next, prev) wait for presenting.
 template <class ApplySwitch, class Take, class Stopped>
 void recovery_round(SwitchState& sw, ApplySwitch&& apply_switch, Take&& take, Stopped&& stopped) {
-    if (sw.holding_frames()) apply_switch();
+    if (sw.holding_frames() || sw.play_pending()) apply_switch();
     if (!stopped() && sw.take_due()) take();
+}
+
+// A `take` while not presenting. A `play` sent before it loads first, so
+// the take shows the played preset; then as request_take(): false while
+// frames are held (the take waits for a replacement). Nothing runs once
+// `stopped()`.
+template <class ApplySwitch, class Stopped>
+bool take_ready(SwitchState& sw, ApplySwitch&& apply_switch, Stopped&& stopped) {
+    if (sw.play_pending() && !sw.holding_frames()) apply_switch();
+    if (stopped()) return false;
+    return sw.request_take();
 }
 
 }  // namespace md

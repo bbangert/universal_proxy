@@ -186,14 +186,18 @@ size_t PresetManager::draw() {
                 i = bag_.back();
             } else if (!fresh) {
                 // Only its own tickets are left: they go into the next
-                // deal, anywhere but its first pick.
-                const std::vector<size_t> left = bag_;
+                // deal, anywhere but its first pick, at most as many as
+                // it holds per deal. With no other preset in the pool they
+                // are dropped (it just repeats). Bounded either way: the
+                // no-repeat rule can leave tickets unplayable in tiny pools.
+                const size_t left = static_cast<size_t>(std::count(bag_.begin(), bag_.end(), i));
                 refill_bag();
                 fresh = true;
-                for (size_t t : left) {
-                    if (bag_.empty()) break;
+                const size_t per_deal = static_cast<size_t>(std::count(bag_.begin(), bag_.end(), i));
+                const bool others = std::any_of(bag_.begin(), bag_.end(), [i](size_t t) { return t != i; });
+                for (size_t n = others ? std::min(left, per_deal) : 0; n > 0; n--) {
                     std::uniform_int_distribution<size_t> at(0, bag_.size() - 1);
-                    bag_.insert(bag_.begin() + static_cast<std::ptrdiff_t>(at(rng_)), t);
+                    bag_.insert(bag_.begin() + static_cast<std::ptrdiff_t>(at(rng_)), i);
                 }
                 continue;
             }

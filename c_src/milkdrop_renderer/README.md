@@ -64,7 +64,7 @@ detection"). stdin EOF means exit, in every state.
 | `{"cmd":"set_rotate","value":N}` | Rotation interval in seconds (1..3600). |
 | `{"cmd":"set_high_frequency","value":B}` | Include `high_frequency/` presets; turning it off while one is rendered (playing or blending out) cuts away at once (see "Photosensitivity filter"). |
 | `{"cmd":"set_min_fps","value":F}` | The minimum frame rate (1..240), as `--min-fps`; the current value changes nothing. Otherwise levels settled this session are forgotten, and the current preset's next window is judged against the new floor; one whose level's interval can't present it at all is skipped at once (`skip` `budget`). |
-| `{"cmd":"play","preset":ID,"lock":B}` | Load preset `ID` now, through the same warm-up as `next` (`loading`, then `preset` with `cause` `play`, or `skip`), then rotate on, or stay locked on it when `lock` is true (optional, default false). Any eligible preset may be played, hidden or off the playlist included. Refused at once, and again if that changed by the time it runs, with `play_refused`: `unknown` (not in the catalogue, or removed by `reload_user`), `skipped`, `high_frequency` (while they are off), `rpi3_skip` (GLES2 builds). A failed warm-up gives the usual `skip` and `play_refused` `load_failed`; the playing preset carries on (a failure after activation cuts to a rotation pick instead, as for any candidate) and no other candidate is tried. It goes into history like a `next` pick. A pending eject (skip, filter) waits for it and follows if it fails. `ID` must be a valid preset id (below), else `bad_command`. |
+| `{"cmd":"play","preset":ID,"lock":B}` | Load preset `ID` now, through the same warm-up as `next` (`loading`, then `preset` with `cause` `play`, or `skip`), then rotate on, or stay locked on it when `lock` is true (optional, default false). Any eligible preset may be played, hidden or off the playlist included. Refused at once, and again if that changed by the time it runs, with `play_refused`: `unknown` (not in the catalogue, or removed by `reload_user`), `skipped`, `high_frequency` (while they are off), `rpi3_skip` (GLES2 builds). A failed warm-up gives the usual `skip` and `play_refused` `load_failed`; the playing preset carries on (a failure after activation cuts to a rotation pick instead, as for any candidate) and no other candidate is tried. It goes into history like a `next` pick. A pending eject (skip, filter) waits for it and follows if it fails. While not presenting (prepared, released) it loads in the next loop round, or first thing in a `take` that follows it, so the take shows the played preset; other switches (`next`, `prev`) still wait for presenting. `ID` must be a valid preset id (below), else `bad_command`. |
 | `{"cmd":"reload_user"}` | Re-read `--user-dir`'s manifest (see "User presets") → `user_reloaded`. A bad manifest keeps the user presets loaded and gives `error` `user_manifest`. |
 | `{"cmd":"reload_selection"}` | Re-read `--selection-file` → `selection`. A bad file keeps the selection in force and gives `error` `selection`. |
 
@@ -257,9 +257,13 @@ Precedence, applied on every pick:
 - favourites play three times as often: rotation deals one ticket per
   preset of the pool and three per favourite, spread so a preset's tickets
   aren't back to back, and never plays the same preset twice in a row,
-  across deals too (unless it is the whole pool). The GLES2 half weight
-  for `compile_ms` over 600 only orders a deal (such presets come later
-  in it on average);
+  across deals too (unless it is the whole pool). So a preset plays at
+  most every other pick: in tiny pools a favourite's share is capped
+  there (with one other preset they alternate; with two others it plays
+  about half the time instead of 3/5), and the tickets that can't be
+  played are dropped rather than carried over without bound. The GLES2
+  half weight for `compile_ms` over 600 only orders a deal (such presets
+  come later in it on average);
 - `play` and `--locked` may pick any eligible preset, hidden and
   off-playlist ones included.
 
