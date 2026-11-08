@@ -592,16 +592,21 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
   end
 
   test "next and prev wait for the play in flight", ctx do
-    ctx = ctx |> start_ui(fake: %{play_delays: [300]}) |> presenting()
+    # The fake keeps reading (and logging) commands while it answers the
+    # play from a timer, so a `next` forwarded now would be logged at once.
+    ctx = ctx |> start_ui(fake: %{play_delays: [600], play_defer: true}) |> presenting()
 
     pending = Task.async(fn -> play(ctx, "x.milk") end)
     wait_until(fn -> md(ctx).pending_play == "x.milk" end)
+    wait_until(fn -> "play" in cmd_names(ctx.skip_file) end)
     key(ctx, :right)
-    _ = :sys.get_state(ctx.state)
+    assert %{md: %{held: [:next]}} = :sys.get_state(ctx.state)
+    Process.sleep(200)
     refute "next" in cmd_names(ctx.skip_file)
 
     assert Task.await(pending) == :ok
     wait_until(fn -> md(ctx).preset == "p1.milk" end)
+    assert %{md: %{held: []}} = :sys.get_state(ctx.state)
     assert Enum.take(cmd_names(ctx.skip_file), -2) == ["play", "next"]
   end
 

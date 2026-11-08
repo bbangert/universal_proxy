@@ -53,6 +53,8 @@ it) comes from an optional <pack-dir>/fake.json:
     {"refuse": {F: reason}}       → play F is refused with reason
     {"play_delay_ms": N}          → answer each play N ms after reading it
     {"play_delays": [N, ...]}     → the same for the first plays, in order
+    {"play_defer": true}          → answer them from a timer instead, reading
+                                    (and logging) later commands meanwhile
 
 It touches <skip-file>.spawned first thing, so tests can tell it was ever
 started. Every stdin line is appended to <skip-file>.cmds, so tests can
@@ -185,6 +187,20 @@ def main():
     refuse = fake.get("refuse", {})
     play_delays = list(fake.get("play_delays", []))
 
+    def answer_play(cmd):
+        nonlocal current, locked
+        target = cmd["preset"]
+        if target in refuse:
+            if refuse[target] == "load_failed":
+                emit({"event": "loading", "preset": target})
+                emit({"event": "skip", "preset": target, "reason": "compile"})
+            emit({"event": "play_refused", "preset": target, "reason": refuse[target]})
+        else:
+            locked = bool(cmd.get("lock"))
+            current = target
+            emit({"event": "loading", "preset": target})
+            emit({"event": "preset", "file": target, "locked": locked, "cause": "play"})
+
     def prepared():
         emit({"event": "prepared", "argv": sys.argv[1:], "skip": skip,
               "selection": read_selection(args.selection_file)})
@@ -247,18 +263,11 @@ def main():
             emit(selection_event(read_selection(args.selection_file)))
         elif name == "play":
             delay = play_delays.pop(0) if play_delays else fake.get("play_delay_ms", 0)
-            time.sleep(delay / 1000.0)
-            target = cmd["preset"]
-            if target in refuse:
-                if refuse[target] == "load_failed":
-                    emit({"event": "loading", "preset": target})
-                    emit({"event": "skip", "preset": target, "reason": "compile"})
-                emit({"event": "play_refused", "preset": target, "reason": refuse[target]})
+            if fake.get("play_defer"):
+                threading.Timer(delay / 1000.0, answer_play, [cmd]).start()
             else:
-                locked = bool(cmd.get("lock"))
-                current = target
-                emit({"event": "loading", "preset": target})
-                emit({"event": "preset", "file": target, "locked": locked, "cause": "play"})
+                time.sleep(delay / 1000.0)
+                answer_play(cmd)
         elif name in ("lock", "unlock"):
             locked = name == "lock"
             emit_preset(name)
