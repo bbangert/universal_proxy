@@ -178,7 +178,9 @@ defmodule UniversalProxy.MilkDrop.ImportPlan do
 
   defp add_entry(zip, upload, entry, {results, plan, textures}) do
     kind = UploadCheck.kind(entry.name)
-    base = result(upload, entry.name, kind)
+    # The raw name stays internal (validation, reading); results carry a
+    # display-safe label.
+    base = result(upload, UploadCheck.printable(entry.name), kind)
 
     case entry_check(kind, entry, plan, textures) do
       {:ok, name} ->

@@ -223,11 +223,82 @@ defmodule UniversalProxy.MilkDrop.UploadCheckTest do
       full = png(16, 16)
       # Signature, length, type and data but no CRC: 29 bytes.
       assert UploadCheck.check_texture("a.png", binary_part(full, 0, 29)) == {:error, :bad_header}
-      assert {:ok, _} = UploadCheck.check_texture("a.png", binary_part(full, 0, 33))
+      assert UploadCheck.check_texture("a.png", binary_part(full, 0, 33)) == {:error, :bad_header}
+      assert {:ok, _} = UploadCheck.check_texture("a.png", full)
 
       <<head::binary-29, crc::32, rest::binary>> = full
       bad_crc = <<head::binary, Bitwise.bxor(crc, 1)::32, rest::binary>>
       assert UploadCheck.check_texture("a.png", bad_crc) == {:error, :bad_header}
+    end
+
+    test "walks PNG chunks: CRCs, IEND, nothing past the end" do
+      assert {:ok, _} =
+               UploadCheck.check_texture(
+                 "a.png",
+                 png(8, 8, tail: chunk("tEXt", "a\0b") <> chunk("IEND", ""))
+               )
+
+      # A bad CRC on a later chunk.
+      bad_crc = <<1::32, "tEXt", "x", 0::32>>
+
+      assert UploadCheck.check_texture("a.png", png(8, 8, tail: bad_crc <> chunk("IEND", ""))) ==
+               {:error, :bad_header}
+
+      # No IEND, a chunk running past the end, a second IHDR.
+      assert UploadCheck.check_texture("a.png", png(8, 8, tail: "")) == {:error, :bad_header}
+
+      assert UploadCheck.check_texture("a.png", png(8, 8, tail: <<100::32, "tEXt", "short">>)) ==
+               {:error, :bad_header}
+
+      assert UploadCheck.check_texture(
+               "a.png",
+               png(8, 8, tail: chunk("IHDR", :binary.copy(<<0>>, 13)) <> chunk("IEND", ""))
+             ) ==
+               {:error, :bad_header}
+
+      # Apple's CgBI switches stb_image to raw-deflate IDAT, past the bound.
+      assert UploadCheck.check_texture(
+               "a.png",
+               png(8, 8, tail: chunk("CgBI", <<0x50, 0x00, 0x20, 0x06>>) <> chunk("IEND", ""))
+             ) ==
+               {:error, :bad_header}
+    end
+
+    test "rejects an IDAT decompression bomb behind tiny dimensions" do
+      bomb = :zlib.compress(:binary.copy(<<0>>, 16 * 1024 * 1024))
+      data = png(1, 1, idat: bomb)
+      assert byte_size(data) < 100_000
+
+      {us, result} = :timer.tc(fn -> UploadCheck.check_texture("a.png", data) end)
+      assert result == {:error, :bad_image}
+      # Stops at the 5-byte cap rather than inflating 16 MiB.
+      assert us < 1_000_000
+    end
+
+    test "requires IDAT to inflate to exactly the raw size" do
+      raw = fn size -> :zlib.compress(:binary.copy(<<0>>, size)) end
+      # 8×8 RGBA, 8-bit: 8 × (1 + 32) = 264 bytes.
+      assert {:ok, _} = UploadCheck.check_texture("a.png", png(8, 8, idat: raw.(264)))
+
+      assert UploadCheck.check_texture("a.png", png(8, 8, idat: raw.(263))) ==
+               {:error, :bad_image}
+
+      assert UploadCheck.check_texture("a.png", png(8, 8, idat: raw.(265))) ==
+               {:error, :bad_image}
+
+      assert UploadCheck.check_texture("a.png", png(8, 8, idat: "not zlib")) ==
+               {:error, :bad_image}
+
+      # 1-bit greyscale packs rows: 8 × (1 + 1).
+      assert {:ok, _} =
+               UploadCheck.check_texture("a.png", png(8, 8, color: 0, depth: 1, idat: raw.(16)))
+
+      # IEND with no IDAT at all.
+      no_idat =
+        <<0x89, "PNG", 0x0D, 0x0A, 0x1A, 0x0A>> <>
+          binary_part(png(8, 8), 8, 25) <> chunk("IEND", "")
+
+      assert UploadCheck.check_texture("a.png", no_idat) == {:error, :bad_image}
     end
 
     test "requires 8-bit JPEG sample precision" do
@@ -246,6 +317,28 @@ defmodule UniversalProxy.MilkDrop.UploadCheckTest do
       end
     end
 
+    test "JPEG components: 1, 3 or 4 of them, with distinct ids" do
+      sof = fn specs ->
+        body = <<8, 1::16, 1::16, div(byte_size(specs), 3), specs::binary>>
+        <<0xFF, 0xD8, 0xFF, 0xC0, byte_size(body) + 2::16, body::binary, 0xFF, 0xD9>>
+      end
+
+      two = <<1, 0x11, 0, 2, 0x11, 0>>
+      assert UploadCheck.check_texture("a.jpg", sof.(two)) == {:error, :bad_header}
+
+      same_ids = <<1, 0x11, 0, 1, 0x11, 0, 1, 0x11, 0>>
+      assert UploadCheck.check_texture("a.jpg", sof.(same_ids)) == {:error, :bad_header}
+
+      assert {:ok, _} =
+               UploadCheck.check_texture("a.jpg", sof.(<<1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0>>))
+
+      assert {:ok, _} =
+               UploadCheck.check_texture(
+                 "a.jpg",
+                 sof.(<<1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0, 4, 0x11, 0>>)
+               )
+    end
+
     test "requires a complete JPEG frame header" do
       short_sof = <<0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x07, 0x08, 0x00, 0x01, 0x00, 0x01, 0xFF, 0xD9>>
       assert UploadCheck.check_texture("a.jpg", short_sof) == {:error, :bad_header}
@@ -257,6 +350,11 @@ defmodule UniversalProxy.MilkDrop.UploadCheckTest do
 
       assert {:ok, %{width: 1}} = UploadCheck.check_texture("a.jpg", sof.(1, <<1, 0x11, 0>>))
       assert UploadCheck.check_texture("a.jpg", sof.(0, "")) == {:error, :bad_header}
+      # Sampling factors 1..4, quantisation table selector 0..3.
+      assert UploadCheck.check_texture("a.jpg", sof.(1, <<1, 0x00, 0>>)) == {:error, :bad_header}
+      assert UploadCheck.check_texture("a.jpg", sof.(1, <<1, 0x51, 0>>)) == {:error, :bad_header}
+      assert UploadCheck.check_texture("a.jpg", sof.(1, <<1, 0x11, 4>>)) == {:error, :bad_header}
+      assert {:ok, _} = UploadCheck.check_texture("a.jpg", sof.(1, <<1, 0x44, 3>>))
 
       assert UploadCheck.check_texture("a.jpg", sof.(5, :binary.copy(<<1, 0x11, 0>>, 5))) ==
                {:error, :bad_header}
