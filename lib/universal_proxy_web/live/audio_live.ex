@@ -480,7 +480,13 @@ defmodule UniversalProxyWeb.AudioLive do
   # A LiveComponent can't subscribe: route MilkDrop settings, pack status
   # and index changes to it, re-rendering only the component.
   def handle_info({kind, _} = event, %{assigns: %{milkdrop?: true}} = socket)
-      when kind in [:milkdrop_settings, :milkdrop_pack, :milkdrop_pack_started, :milkdrop_index] do
+      when kind in [
+             :milkdrop_settings,
+             :milkdrop_store,
+             :milkdrop_pack,
+             :milkdrop_pack_started,
+             :milkdrop_index
+           ] do
     Phoenix.LiveView.send_update(MilkDropComponent, id: "milkdrop", event: event)
     {:noreply, socket}
   end

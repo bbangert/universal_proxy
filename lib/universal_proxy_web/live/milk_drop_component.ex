@@ -45,7 +45,8 @@ defmodule UniversalProxyWeb.MilkDropComponent do
   `UniversalProxy.MilkDrop.pack_topic/0` and
   `UniversalProxy.MilkDrop.Index.topic/0` (a LiveComponent can't) and
   forwards each message as `send_update(__MODULE__, id: id, event: message)`.
-  Initial state is read in `mount/1`.
+  Initial state is read in `mount/1`, and again on `{:milkdrop_store,
+  :opened}` (the Store served defaults until then).
 
   This component only writes the Store: `UniversalProxy.Display.State`
   forwards its broadcasts to a running renderer.
@@ -109,6 +110,13 @@ defmodule UniversalProxyWeb.MilkDropComponent do
   defp apply_event(socket, {:milkdrop_pack, status}), do: put_pack(socket, status)
 
   defp apply_event(socket, {:milkdrop_index, _change}), do: assign_presets(socket)
+
+  # The Store served defaults until its table opened: read it again.
+  defp apply_event(socket, {:milkdrop_store, :opened}) do
+    socket
+    |> assign(:settings, Store.settings())
+    |> assign(:skipped, read_skipped(socket.assigns.pack))
+  end
 
   defp apply_event(socket, _event), do: socket
 
