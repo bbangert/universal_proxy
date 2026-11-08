@@ -535,6 +535,43 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
              List.last(cmds(ctx.skip_file))
   end
 
+  test "unlock resumes a running session's rotation, or clears the stored lock", ctx do
+    store =
+      start_supervised!(
+        {Store, name: nil, table: :"#{ctx.test}", dets_path: Path.join(ctx.tmp_dir, "s.dets")}
+      )
+
+    ctx = start_ui(ctx)
+    opts = [display: ctx.state, store: store]
+    {:ok, _} = Store.update(store, %{locked: "a.milk"})
+
+    # No session: only the Store's lock goes, fenced against a session that
+    # started earlier and is still retiring.
+    retiring = System.unique_integer([:monotonic])
+    assert Display.milkdrop_unlock(ctx.state) == {:error, :not_presenting}
+    assert UniversalProxy.MilkDrop.unlock(opts) == :ok
+    assert Store.settings(store).locked == nil
+    {:ok, _} = Store.update(store, %{locked: "late.milk"}, session: retiring)
+    assert Store.settings(store).locked == nil
+    refute "unlock" in cmd_names(ctx.skip_file)
+
+    ctx = presenting(ctx)
+    assert play(ctx, "x.milk", true) == :ok
+    assert %{locked: true} = md(ctx)
+
+    # A session: the renderer's owner persists the lock (its store here is
+    # a dead name), so this call writes nothing itself.
+    {:ok, _} = Store.update(store, %{locked: "kept.milk"})
+    assert UniversalProxy.MilkDrop.unlock(opts) == :ok
+    assert md(ctx).locked == false
+    wait_until(fn -> "unlock" in cmd_names(ctx.skip_file) end)
+    wait_until(fn -> UniversalProxy.MilkDrop.now_playing(display: ctx.state).locked == false end)
+    assert Store.settings(store).locked == "kept.milk"
+
+    assert UniversalProxy.MilkDrop.unlock(opts) == :ok
+    assert UniversalProxy.MilkDrop.unlock(display: :"#{ctx.test}.Gone", store: store) == :ok
+  end
+
   test "play without a session is answered at once; with a lock, the lock is saved", ctx do
     store =
       start_supervised!(
@@ -608,6 +645,35 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     wait_until(fn -> md(ctx).preset == "p1.milk" end)
     assert %{md: %{held: []}} = :sys.get_state(ctx.state)
     assert Enum.take(cmd_names(ctx.skip_file), -2) == ["play", "next"]
+  end
+
+  test "an unlock during a locked play in flight waits for it, and wins", ctx do
+    ctx = ctx |> start_ui(fake: %{play_delays: [300]}) |> presenting()
+
+    pending = Task.async(fn -> play(ctx, "x.milk", true) end)
+    wait_until(fn -> md(ctx).pending_play == "x.milk" end)
+    assert Display.milkdrop_unlock(ctx.state) == :ok
+    _ = :sys.get_state(ctx.state)
+    refute "unlock" in cmd_names(ctx.skip_file)
+
+    assert Task.await(pending) == :ok
+    wait_until(fn -> Enum.take(cmd_names(ctx.skip_file), -2) == ["play", "unlock"] end)
+    wait_until(fn -> match?(%{preset: "x.milk", locked: false}, md(ctx)) end)
+  end
+
+  test "an unlock then a remote lock during a locked play keep their order", ctx do
+    ctx = ctx |> start_ui(fake: %{play_delays: [300]}) |> presenting()
+
+    pending = Task.async(fn -> play(ctx, "x.milk", true) end)
+    wait_until(fn -> md(ctx).pending_play == "x.milk" end)
+    assert Display.milkdrop_unlock(ctx.state) == :ok
+    key(ctx, :select)
+    _ = :sys.get_state(ctx.state)
+    refute Enum.any?(cmd_names(ctx.skip_file), &(&1 in ["lock", "unlock"]))
+
+    assert Task.await(pending) == :ok
+    wait_until(fn -> Enum.take(cmd_names(ctx.skip_file), -3) == ["play", "unlock", "lock"] end)
+    wait_until(fn -> match?(%{preset: "x.milk", locked: true}, md(ctx)) end)
   end
 
   test "after a play, lock and unlock name the preset it showed", ctx do
@@ -774,6 +840,15 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     wait_until(fn -> md(ctx).pending_play == "b.milk" end)
     Renderer.command(renderer(ctx), %{cmd: "crash", status: 3})
     assert Task.await(pending) == {:error, :not_presenting}
+  end
+
+  test "a restarted State announces that nothing shows", ctx do
+    ctx = start_ui(ctx)
+    Phoenix.PubSub.subscribe(ctx.pubsub, UniversalProxy.MilkDrop.now_playing_topic())
+    Process.exit(GenServer.whereis(ctx.state), :kill)
+
+    assert_receive {:milkdrop_now_playing, %{preset: nil, locked: false, selection: nil}},
+                   @timeout
   end
 
   test "now-playing is broadcast while presenting and goes idle when the session ends", ctx do

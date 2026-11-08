@@ -5,13 +5,13 @@ defmodule UniversalProxyWeb.Layouts do
 
   embed_templates("layouts/*")
 
-  @doc "A single tab link in the top tab strip."
+  @doc "A single tab link in the top tab strip, active on its path and the paths under it."
   attr(:path, :string, required: true)
   attr(:current, :string, required: true)
   attr(:label, :string, required: true)
 
   def tab(assigns) do
-    active = assigns.current == assigns.path
+    active = active_tab?(assigns.current, assigns.path)
     assigns = assign(assigns, :active, active)
 
     ~H"""
@@ -29,6 +29,11 @@ defmodule UniversalProxyWeb.Layouts do
     </.link>
     """
   end
+
+  @doc false
+  @spec active_tab?(String.t(), String.t()) :: boolean()
+  def active_tab?(current, path),
+    do: current == path or (path != "/" and String.starts_with?(current, path <> "/"))
 
   @doc "Render flash messages."
   attr(:flash, :map, required: true)

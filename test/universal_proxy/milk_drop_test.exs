@@ -12,7 +12,7 @@ defmodule UniversalProxy.MilkDropTest do
     assert MilkDrop.Supervisor.start_link() == :ignore
   end
 
-  test "enabled: true starts UserPresets, Store and Pack", %{tmp_dir: tmp_dir} do
+  test "enabled: true starts UserPresets, Store, Pack and Index", %{tmp_dir: tmp_dir} do
     start_supervised!(
       {MilkDrop.Supervisor,
        enabled: true,
@@ -31,6 +31,8 @@ defmodule UniversalProxy.MilkDropTest do
     assert MilkDrop.Pack.ensure() == {:error, :no_pack_pinned}
     assert MilkDrop.UserPresets.list() == %{presets: [], textures: []}
     assert File.dir?(Path.join([tmp_dir, "user", "presets"]))
+    assert is_pid(Process.whereis(MilkDrop.Index))
+    assert MilkDrop.Index.counts("").total == 0
   end
 
   test "a Pack crash stops its running installer before Pack restarts", %{tmp_dir: tmp_dir} do

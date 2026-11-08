@@ -310,6 +310,56 @@ defmodule UniversalProxyWeb.Components.Icons do
     """
   end
 
+  defp paths(:star) do
+    assigns = %{}
+
+    ~H"""
+    <path d="M12 3l2.8 5.7 6.2.9-4.5 4.4 1.1 6.2L12 17.3 6.4 20.2l1.1-6.2L3 9.6l6.2-.9z" />
+    """
+  end
+
+  defp paths(:eye_off) do
+    assigns = %{}
+
+    ~H"""
+    <path d="M10.6 5.1A10 10 0 0 1 12 5c6 0 10 7 10 7a17 17 0 0 1-2.7 3.4M6.6 6.6C3.9 8.4 2 12 2 12s4 7 10 7a9.7 9.7 0 0 0 5.4-1.6" />
+    <path d="M9.9 9.9a3 3 0 0 0 4.2 4.2M3 3l18 18" />
+    """
+  end
+
+  defp paths(:trash) do
+    assigns = %{}
+
+    ~H"""
+    <path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3" />
+    """
+  end
+
+  defp paths(:list) do
+    assigns = %{}
+
+    ~H"""
+    <path d="M4 6h12M4 12h12M4 18h8M18 15v6M15 18h6" />
+    """
+  end
+
+  defp paths(:unlock) do
+    assigns = %{}
+
+    ~H"""
+    <rect x="4" y="11" width="16" height="10" rx="2" />
+    <path d="M8 11V7a4 4 0 0 1 7.5-2" />
+    """
+  end
+
+  defp paths(:zap) do
+    assigns = %{}
+
+    ~H"""
+    <path d="M13 2L4 14h7l-1 8 9-12h-7z" />
+    """
+  end
+
   # Speaker glyph with mute slash + wave-count variants. Drawn here
   # rather than as a `paths/1` clause because the wave count depends
   # on volume level (0 → no waves, 1+ → one wave, 60+ → two waves),

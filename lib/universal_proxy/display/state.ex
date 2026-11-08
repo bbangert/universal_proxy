@@ -124,12 +124,20 @@ defmodule UniversalProxy.Display.State do
   that a `next` or `prev` replaces, so remote-key `next`/`prev` are held
   while a play is in flight and sent once it is answered.
 
+  A `:milkdrop_unlock` call (`UniversalProxy.Display.milkdrop_unlock/1`)
+  is sent as `unlock` in the same phases. A play in flight with `lock`
+  would lock again when it loads, so the unlock is held behind it like
+  `next`/`prev`, and so is a remote's lock toggle (Select), in the order
+  they came; a play still waiting to be written goes out unlocked.
+
   What the TV shows is broadcast on
   `UniversalProxy.MilkDrop.now_playing_topic/0` as
   `{:milkdrop_now_playing, now_playing}` whenever it changes
   (`t:now_playing/0`: the preset, its lock and the renderer's last
   `selection` answer while `:presenting`, else `idle_now_playing/0`), and
-  read with a `:milkdrop_now_playing` call.
+  read with a `:milkdrop_now_playing` call. A State start broadcasts it
+  once too (idle: no session survives a restart), so a subscriber still
+  showing a preset from before the restart drops it.
 
   Every phase is bounded (`:milkdrop_timeouts`, ms: tapping 10 000,
   preparing 20 000, taking 5 000, releasing 3 000, recovering 45 000 (the
@@ -353,6 +361,7 @@ defmodule UniversalProxy.Display.State do
     state = %{state | adapters: state.cec.list_adapters.(), outputs: state.audio.list_outputs.()}
     # The pack first, so a persisted MilkDrop mode sees it.
     state = if state.milkdrop?, do: dispatch(state, {:pack, state.pack.status.()}), else: state
+    if state.milkdrop?, do: announce_now_playing(state)
     state = rebind(state)
     {:noreply, dispatch(state, {:display_available, display_available?(state)})}
   end
@@ -410,6 +419,29 @@ defmodule UniversalProxy.Display.State do
 
   def handle_call({:milkdrop_play, _id, _lock?}, _from, state),
     do: {:reply, {:error, :not_presenting}, state}
+
+  # Sent even when this side thinks it's unlocked: the renderer's word may
+  # not be in yet, and an unlock of an unlocked preset changes nothing.
+  def handle_call(:milkdrop_unlock, _from, %{md: %{phase: phase, pid: pid} = md} = state)
+      when phase in [:preparing, :taking, :presenting] and is_pid(pid) do
+    md =
+      case md.play do
+        %{sent?: false} = play -> %{md | play: %{play | lock: false}}
+        _other -> md
+      end
+
+    md =
+      if is_map(md.play_sent) do
+        %{md | held: md.held ++ [:unlock]}
+      else
+        Display.MilkDrop.unlock(pid)
+        md
+      end
+
+    {:reply, :ok, sync_now_playing(%{state | md: %{md | locked: false}})}
+  end
+
+  def handle_call(:milkdrop_unlock, _from, state), do: {:reply, {:error, :not_presenting}, state}
 
   @impl true
   def handle_cast({:show, spec}, state) do
@@ -1166,9 +1198,15 @@ defmodule UniversalProxy.Display.State do
         Display.MilkDrop.prev(pid)
         state
 
+      # Flipped at once so a quick second press toggles back; the next
+      # `preset` event has the renderer's word. A play in flight would
+      # apply its own lock after it, so the command waits in line behind
+      # it, with any held unlock (order kept).
+      :toggle_lock when is_map(md.play_sent) ->
+        held = if md.locked, do: :unlock, else: :lock
+        %{state | md: %{md | held: md.held ++ [held], locked: not md.locked}}
+
       :toggle_lock ->
-        # Flipped at once so a quick second press toggles back; the next
-        # `preset` event has the renderer's word.
         if md.locked, do: Display.MilkDrop.unlock(pid), else: Display.MilkDrop.lock(pid)
         %{state | md: %{md | locked: not md.locked}}
     end
@@ -1282,7 +1320,8 @@ defmodule UniversalProxy.Display.State do
   defp send_play(md), do: md
 
   # The command in flight was answered: its caller, if still waiting, gets
-  # `reply`, then held `next`/`prev` and a play waiting behind it go out
+  # `reply`, then held `next`/`prev`/`lock`/`unlock` (in order) and a play
+  # waiting behind it go out
   # (a play written last replaces a still-pending `next`).
   defp play_answered(md, reply) do
     Process.cancel_timer(md.play_sent.timer)
@@ -1294,6 +1333,8 @@ defmodule UniversalProxy.Display.State do
     Enum.each(held, fn
       :next -> Display.MilkDrop.next(pid)
       :prev -> Display.MilkDrop.prev(pid)
+      :lock -> Display.MilkDrop.lock(pid)
+      :unlock -> Display.MilkDrop.unlock(pid)
     end)
 
     %{md | held: []}
@@ -1312,6 +1353,16 @@ defmodule UniversalProxy.Display.State do
     do: %{preset: md.preset, locked: md.locked, selection: md.selection}
 
   defp now_playing(_state), do: @idle_now_playing
+
+  # A State (re)start has no session: subscribers holding a preset from
+  # before it must hear that nothing shows.
+  defp announce_now_playing(state) do
+    Phoenix.PubSub.broadcast(
+      state.pubsub,
+      MilkDrop.now_playing_topic(),
+      {:milkdrop_now_playing, state.now_playing}
+    )
+  end
 
   defp sync_now_playing(state) do
     case now_playing(state) do

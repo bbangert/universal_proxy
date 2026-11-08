@@ -7,13 +7,15 @@ defmodule UniversalProxy.MilkDrop.Supervisor do
   an upload's SHA-256 in its table (`UserPresets.sha256/2`, no call);
   UserPresets calls the Store (clean-up after a delete or replacement),
   its import task calls Pack (`status/0`, for the pack's texture names),
-  and neither calls back. UserPresets and Pack each share a `:one_for_all` unit with the
+  and neither calls back. `UniversalProxy.MilkDrop.Index` starts last: it
+  reads all three (each a `catch :exit` call) and subscribes to their
+  broadcasts, and none of them calls it. UserPresets and Pack each share a `:one_for_all` unit with the
   Task.Supervisor their import or download runs under, so a crash stops
   that work before the restarted server touches the same files.
 
   Returns `:ignore` unless `UniversalProxy.MilkDrop.enabled?/0` (a supported
   target with the `:milkdrop` flag on) or `start_link/1` is given
-  `enabled: true`. `:user_presets`, `:store` and `:pack` are keyword opts
+  `enabled: true`. `:user_presets`, `:store`, `:pack` and `:index` are keyword opts
   passed to the children (tests use them to run beside the app's own
   tree).
   """
@@ -39,7 +41,8 @@ defmodule UniversalProxy.MilkDrop.Supervisor do
     children = [
       user_presets_unit(Keyword.get(opts, :user_presets, [])),
       {MilkDrop.Store, Keyword.get(opts, :store, [])},
-      pack_unit(Keyword.get(opts, :pack, []))
+      pack_unit(Keyword.get(opts, :pack, [])),
+      {MilkDrop.Index, Keyword.get(opts, :index, [])}
     ]
 
     Supervisor.init(children, strategy: :one_for_one)
