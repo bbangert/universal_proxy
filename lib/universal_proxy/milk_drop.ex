@@ -152,8 +152,9 @@ defmodule UniversalProxy.MilkDrop do
   plays;
   `{:error, :not_presenting}` while no visualizer session runs (or ends
   meanwhile), in which case `lock?` still saves `id` as the Store's
-  `locked`, so the next session starts on it. A lock that does show is
-  saved by the renderer's own `preset` event. Only the id's shape is
+  `locked`, so the next session starts on it (and a retiring session's
+  late lock can't overwrite it: `Store.update/3`'s fence). A lock that
+  does show is saved by the renderer's own `preset` event. Only the id's shape is
   checked here (`Store.valid_id?/1`, else `{:error, :invalid_id}`).
 
   Options: `:display` (the `UniversalProxy.Display.State` server) and
@@ -162,9 +163,13 @@ defmodule UniversalProxy.MilkDrop do
   @spec play(String.t(), boolean(), keyword()) :: :ok | {:error, play_error()}
   def play(id, lock? \\ false, opts \\ []) when is_boolean(lock?) do
     if Store.valid_id?(id) do
+      # Taken first: every renderer session that could still write a lock
+      # when nothing presents started before it.
+      fence = System.unique_integer([:monotonic])
+
       case Display.milkdrop_play(Keyword.get(opts, :display, Display.State), id, lock?) do
         {:error, :not_presenting} = error when lock? ->
-          save_lock(Keyword.get(opts, :store, Store), id)
+          save_lock(Keyword.get(opts, :store, Store), id, fence)
           error
 
         reply ->
@@ -181,19 +186,32 @@ defmodule UniversalProxy.MilkDrop do
   unlocked. Idempotent. Returns the Store's answer (`{:error, reason}`
   when it can't write). Options: `:display` and `:store`, as for
   `play/3`.
+
+  With no session presenting the clear raises `Store.update/3`'s fence,
+  as `play/3`'s saved lock does, so a retiring session's late lock can't
+  bring it back. With one presenting it doesn't: that session's own
+  later locks (a remote's lock key) must still count, and its `preset`
+  event for the unlock saves `nil` too.
   """
   @spec unlock(keyword()) :: :ok | {:error, term()}
   def unlock(opts \\ []) do
-    _ = Display.milkdrop_unlock(Keyword.get(opts, :display, Display.State))
+    # Taken first, as in play/3.
+    fence = System.unique_integer([:monotonic])
 
-    case Store.update(Keyword.get(opts, :store, Store), %{locked: nil}) do
+    update_opts =
+      case Display.milkdrop_unlock(Keyword.get(opts, :display, Display.State)) do
+        :ok -> []
+        {:error, :not_presenting} -> [fence: fence]
+      end
+
+    case Store.update(Keyword.get(opts, :store, Store), %{locked: nil}, update_opts) do
       {:ok, _settings} -> :ok
       error -> error
     end
   end
 
-  defp save_lock(store, id) do
-    with {:error, reason} <- Store.update(store, %{locked: id}) do
+  defp save_lock(store, id, fence) do
+    with {:error, reason} <- Store.update(store, %{locked: id}, fence: fence) do
       Logger.warning("MilkDrop: could not save the lock on #{inspect(id)}: #{inspect(reason)}")
     end
   end

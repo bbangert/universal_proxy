@@ -272,8 +272,21 @@ defmodule UniversalProxy.MilkDrop.Store do
   saved. Returns the new settings.
   """
   @spec update(GenServer.server(), map()) :: {:ok, settings()} | {:error, term()}
-  def update(server \\ __MODULE__, params) when is_map(params) do
-    GenServer.call(server, {:update, params})
+  def update(server \\ __MODULE__, params) when is_map(params), do: update(server, params, [])
+
+  @doc """
+  `update/2` with an ordering for `locked`, whose writers race (a
+  renderer session that is retiring, a lock saved for the next one).
+  `session: n` — a renderer session's write (`n` from
+  `System.unique_integer([:monotonic])` at its start): its `locked` is
+  ignored when `n` is below the fence. `fence: n` — a write made when no
+  session presents (`n` taken before checking that): later writes from
+  sessions started before `n` lose their `locked`. The fence lives in
+  memory, for this store's lifetime.
+  """
+  @spec update(GenServer.server(), map(), keyword()) :: {:ok, settings()} | {:error, term()}
+  def update(server, params, opts) when is_map(params) and is_list(opts) do
+    GenServer.call(server, {:update, params, opts})
   catch
     :exit, _ -> {:error, :not_running}
   end
@@ -508,6 +521,8 @@ defmodule UniversalProxy.MilkDrop.Store do
       pubsub: pubsub,
       retry_ms: Keyword.get(opts, :retry_ms, @retry_ms),
       retry_timer: nil,
+      # Renderer sessions below this may no longer write `locked` (`update/3`).
+      lock_fence: nil,
       open_error: nil,
       boot_id: Keyword.get_lazy(opts, :boot_id, &read_boot_id/0),
       # Tells this store's marks from those of another VM run in the same
@@ -617,8 +632,9 @@ defmodule UniversalProxy.MilkDrop.Store do
 
   # The settings and the skip list they readmit from are one write, so a
   # failure leaves both as they were and a retry readmits again.
-  def handle_call({:update, params}, _from, state) do
+  def handle_call({:update, params, opts}, _from, state) do
     existing = read_settings(state.table)
+    params = fence_lock(state, params, opts[:session])
     merged = merge(existing, params)
     readmission = readmission(state, merged.min_fps)
 
@@ -626,7 +642,7 @@ defmodule UniversalProxy.MilkDrop.Store do
       :ok ->
         if merged != existing, do: broadcast(state, {:milkdrop_settings, merged})
         announce_readmission(state, merged.min_fps, readmission)
-        {:reply, {:ok, merged}, state}
+        {:reply, {:ok, merged}, raise_fence(state, opts[:fence])}
 
       {:error, reason} ->
         Logger.error("MilkDrop store settings update failed: #{inspect(reason)}")
@@ -695,6 +711,22 @@ defmodule UniversalProxy.MilkDrop.Store do
   end
 
   # -- Private --
+
+  # A retired session's late lock write, after a newer explicit one.
+  defp fence_lock(%{lock_fence: fence}, params, session)
+       when is_integer(fence) and is_integer(session) and session < fence do
+    if Params.has_key?(params, :locked),
+      do: Logger.info("MilkDrop: ignoring a retired renderer session's lock")
+
+    Map.drop(params, [:locked, "locked"])
+  end
+
+  defp fence_lock(_state, params, _session), do: params
+
+  defp raise_fence(state, fence) when is_integer(fence),
+    do: %{state | lock_fence: max(fence, state.lock_fence || fence)}
+
+  defp raise_fence(state, _fence), do: state
 
   # Opens the table into `state`. On failure the state stays closed
   # (`table: nil`) with `open_error` set.

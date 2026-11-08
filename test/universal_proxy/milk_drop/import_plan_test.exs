@@ -123,6 +123,25 @@ defmodule UniversalProxy.MilkDrop.ImportPlanTest do
       assert Enum.all?(results, &(&1.upload == "pack.zip"))
     end
 
+    test "entry labels in results are display-safe" do
+      bin =
+        zip([
+          [name: "x\u202Ey/a.milk", data: milk()],
+          [name: "x\u202Ey/notes.txt", data: "hi"],
+          [name: "x\u202Ey/bad?.milk", data: milk()]
+        ])
+
+      results = ImportPlan.plan([{"p\u202E.zip", {:binary, bin}}])
+
+      assert Enum.map(results, &{&1.upload, &1.entry, &1.status}) == [
+               {"p?.zip", "x?y/a.milk", :added},
+               {"p?.zip", "x?y/notes.txt", :ignored},
+               {"p?.zip", "x?y/bad?.milk", {:rejected, :invalid_name}}
+             ]
+
+      assert [%{name: "a.milk"}, _, _] = results
+    end
+
     test "a high_frequency/ folder does not reach the pack's id space" do
       bin = zip([[name: "high_frequency/x.milk", data: milk()]])
       assert [%{id: "user/x.milk", status: :added}] = ImportPlan.plan([{"p.zip", {:binary, bin}}])
