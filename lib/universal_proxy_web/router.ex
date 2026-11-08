@@ -27,6 +27,7 @@ defmodule UniversalProxyWeb.Router do
       live("/", OverviewLive)
       live("/traffic", TrafficLive)
       live("/audio", AudioLive)
+      live("/audio/milkdrop", MilkDropPresetsLive)
       live("/bluetooth", BluetoothLive)
       live("/discovery", DiscoveryLive)
       live("/security", SecurityLive)

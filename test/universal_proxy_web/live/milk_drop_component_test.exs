@@ -481,6 +481,9 @@ defmodule UniversalProxyWeb.MilkDropComponentTest do
       assert html =~ "Crashed the renderer"
       assert html =~ "Cleared presets return from the next visualizer session."
 
+      assert view |> element("#milkdrop-browse-skipped") |> render() =~
+               ~s(href="/audio/milkdrop?filter=skipped")
+
       view |> element("#milkdrop-clear-skipped") |> render_click()
 
       assert Store.skipped(@version) == %{}
@@ -509,6 +512,44 @@ defmodule UniversalProxyWeb.MilkDropComponentTest do
       html = view |> element("#milkdrop-clear-skipped") |> render_click()
       assert html =~ "Couldn&#39;t clear skipped presets"
       assert html =~ "1 skipped preset"
+    end
+  end
+
+  describe "presets summary" do
+    test "without an index there is nothing to count", %{conn: conn} = ctx do
+      ready_pack(ctx)
+      {:ok, view, _html} = live(conn, "/audio")
+      assert view |> element("#milkdrop-presets-summary") |> render() =~ "No presets yet."
+
+      assert view |> element("#milkdrop-browse") |> render() =~ ~s(href="/audio/milkdrop")
+    end
+
+    test "counts the pack, uploads and the playlist, kept fresh by the index",
+         %{conn: conn} = ctx do
+      UniversalProxy.MilkDropIndexFixtures.write_pack!(ctx.root, @version, [
+        "a.milk",
+        "b.milk",
+        "c.milk"
+      ])
+
+      start_pack(ctx.root, %{version: @version, url: @url, sha256: String.duplicate("a", 64)})
+      Phoenix.PubSub.subscribe(@pubsub, MilkDrop.Index.topic())
+      start_supervised!({MilkDrop.Index, batch_ms: 10})
+      assert_receive {:milkdrop_index, %{rebuilt: true}}, 2_000
+
+      {:ok, view, _html} = live(conn, "/audio")
+
+      assert view |> element("#milkdrop-presets-summary") |> render() =~
+               "3 pack presets · 0 uploaded"
+
+      {:ok, _} = Store.playlist_add("a.milk")
+      {:ok, _} = Store.favourite("b.milk", true)
+      {:ok, _} = Store.set_playlist_enabled(true)
+
+      wait_until(fn ->
+        view |> element("#milkdrop-presets-summary") |> render() =~
+          "3 pack presets · 0 uploaded · 1 favourite · playlist on (1)"
+      end)
     end
   end
 end

@@ -15,6 +15,9 @@ defmodule UniversalProxyWeb.MilkDropComponent do
       only applied when it is a failure or `:ready` (a `{:downloading, _}`
       answer could overtake later progress broadcasts). Answers made of a
       Pack that has since restarted are dropped.
+    * **Presets** — pack, upload and favourite counts and the playlist's
+      state, from `UniversalProxy.MilkDrop.Index`, with a link to the
+      preset browser (`UniversalProxyWeb.MilkDropPresetsLive`).
     * **Rotation interval** — 10..120 s (`rotate_s`); anything else is
       refused inline without a write.
     * **Minimum frame rate** (`min_fps`) — a select of
@@ -28,7 +31,8 @@ defmodule UniversalProxyWeb.MilkDropComponent do
       the ready pack's version, and the uploads it could not draw as they
       are now, with their reasons, in a disclosure; "Clear" calls
       `Store.clear_skipped/0` (both lists); a running renderer keeps its
-      own skip set, so cleared presets return from the next session. A
+      own skip set, so cleared presets return from the next session;
+      "Browse" opens the browser's skipped filter. A
       preset that was showing when the device went down (`device_reset`,
       possibly a power cut rather than a GPU hang) comes back the same way.
 
@@ -37,8 +41,9 @@ defmodule UniversalProxyWeb.MilkDropComponent do
 
   ## Updates
 
-  The parent subscribes to `UniversalProxy.MilkDrop.settings_topic/0` and
-  `UniversalProxy.MilkDrop.pack_topic/0` (a LiveComponent can't) and
+  The parent subscribes to `UniversalProxy.MilkDrop.settings_topic/0`,
+  `UniversalProxy.MilkDrop.pack_topic/0` and
+  `UniversalProxy.MilkDrop.Index.topic/0` (a LiveComponent can't) and
   forwards each message as `send_update(__MODULE__, id: id, event: message)`.
   Initial state is read in `mount/1`.
 
@@ -50,7 +55,9 @@ defmodule UniversalProxyWeb.MilkDropComponent do
 
   import UniversalProxyWeb.Components.UI
   import UniversalProxyWeb.Components.Icons
+  import UniversalProxyWeb.Components.MilkDropUI
 
+  alias UniversalProxy.MilkDrop.Index
   alias UniversalProxy.MilkDrop.Pack
   alias UniversalProxy.MilkDrop.Store
 
@@ -66,6 +73,7 @@ defmodule UniversalProxyWeb.MilkDropComponent do
      |> assign(:settings, Store.settings())
      |> assign(:pack, pack)
      |> assign(:skipped, read_skipped(pack))
+     |> assign_presets()
      |> assign(:ensuring, false)
      |> assign(:pack_gen, 0)
      |> assign(:confirm_hf, false)
@@ -100,6 +108,8 @@ defmodule UniversalProxyWeb.MilkDropComponent do
 
   defp apply_event(socket, {:milkdrop_pack, status}), do: put_pack(socket, status)
 
+  defp apply_event(socket, {:milkdrop_index, _change}), do: assign_presets(socket)
+
   defp apply_event(socket, _event), do: socket
 
   # A new ready version brings its own skip list; leaving ready keeps the
@@ -111,6 +121,12 @@ defmodule UniversalProxyWeb.MilkDropComponent do
       {:ready, _version, _dir} -> assign(socket, :skipped, read_skipped(status))
       _ -> socket
     end
+  end
+
+  defp assign_presets(socket) do
+    socket
+    |> assign(:presets, Index.counts(""))
+    |> assign(:playlist_enabled, Index.playlist_enabled?())
   end
 
   defp read_skipped({:ready, version, _dir}) when is_binary(version), do: Store.skipped(version)
@@ -300,9 +316,27 @@ defmodule UniversalProxyWeb.MilkDropComponent do
           </.button>
         </div>
 
+        <%!-- Presets summary --%>
+        <div class="flex items-center gap-3 pt-3 pr-5 pb-3 pl-[22px] border-t border-border-2">
+          <div class="flex-1 min-w-0">
+            <div class="text-sm text-fg-2">Presets</div>
+            <div id={"#{@id}-presets-summary"} class="text-xs text-fg-3 mt-0.5">
+              {presets_summary(@presets, @playlist_enabled)}
+            </div>
+          </div>
+          <.link
+            id={"#{@id}-browse"}
+            navigate={~p"/audio/milkdrop"}
+            class="inline-flex items-center gap-1.5 h-7 px-2.5 rounded-md text-sm font-medium border
+                   border-border-strong bg-surface text-fg-1 hover:bg-sunken whitespace-nowrap"
+          >
+            <.icon name={:search} size={14} /> Browse presets
+          </.link>
+        </div>
+
         <%!-- Rotation interval: on the surface, like the volume row, so the
              slider's unfilled (sunken) track stays visible --%>
-        <div class="flex items-center gap-3 pt-1 pr-5 pb-4 pl-[22px]">
+        <div class="flex items-center gap-3 pt-3 pr-5 pb-4 pl-[22px] border-t border-border-2">
           <label for={"#{@id}-rotate"} class="text-sm text-fg-2 flex-none">Change preset every</label>
           <form
             id={"#{@id}-rotate-form"}
@@ -393,6 +427,14 @@ defmodule UniversalProxyWeb.MilkDropComponent do
               <span id={"#{@id}-skipped-count"} class="whitespace-nowrap">{skipped_label(length(@skipped_list))}</span>
             </button>
             <div class="flex-1"></div>
+            <.link
+              :if={@skipped_list != []}
+              id={"#{@id}-browse-skipped"}
+              navigate={~p"/audio/milkdrop?filter=skipped"}
+              class="text-sm text-accent hover:underline whitespace-nowrap"
+            >
+              Browse
+            </.link>
             <.button
               :if={@skipped_list != []}
               id={"#{@id}-clear-skipped"}
@@ -438,12 +480,7 @@ defmodule UniversalProxyWeb.MilkDropComponent do
         title="Include fast-flashing presets?"
         subtitle="Photosensitivity warning"
       >
-        <div class="p-[10px_12px] rounded-md bg-warning-soft text-warning text-sm font-medium flex items-start gap-2">
-          <.icon name={:alert} size={16} stroke={2.0} class="mt-0.5 flex-none" />
-          <span>
-            These presets flash rapidly and may trigger seizures in people with photosensitive epilepsy.
-          </span>
-        </div>
+        <.photosensitivity_warning />
         <p class="text-sm text-fg-2 mt-3 mb-0">
           Leave them off if anyone who may see the TV is sensitive to flashing lights.
         </p>
@@ -472,6 +509,23 @@ defmodule UniversalProxyWeb.MilkDropComponent do
     do: Enum.sort_by(skipped, fn {preset, _reason} -> preset end)
 
   defp skipped_list(_pack, _skipped), do: []
+
+  defp presets_summary(%{total: 0}, _playlist_enabled), do: "No presets yet."
+
+  defp presets_summary(counts, playlist_enabled) do
+    [
+      count_label(counts.pack, "pack preset"),
+      "#{delimit(counts.uploaded)} uploaded",
+      counts.favourites > 0 && count_label(counts.favourites, "favourite"),
+      playlist_summary(counts.playlist, playlist_enabled)
+    ]
+    |> Enum.filter(&is_binary/1)
+    |> Enum.join(" · ")
+  end
+
+  defp playlist_summary(0, false), do: nil
+  defp playlist_summary(n, true), do: "playlist on (#{delimit(n)})"
+  defp playlist_summary(n, false), do: "playlist off (#{delimit(n)})"
 
   defp skipped_label(0), do: "No skipped presets"
   defp skipped_label(1), do: "1 skipped preset"
@@ -568,17 +622,4 @@ defmodule UniversalProxyWeb.MilkDropComponent do
 
   defp store_error(:not_running), do: "the settings store isn't running"
   defp store_error(reason), do: inspect(reason)
-
-  defp reason_label("too_bright"), do: "Too bright"
-  defp reason_label("budget"), do: "Too slow for this device"
-  defp reason_label("compile_error"), do: "Shader failed to compile"
-  defp reason_label("shader_error"), do: "Shader failed to compile"
-  defp reason_label("register_allocate"), do: "Too complex for the GPU"
-  defp reason_label("load_failed"), do: "Failed to load"
-  defp reason_label("draw_dropped"), do: "Failed to draw"
-  defp reason_label("device_reset"), do: "Reset the device"
-  defp reason_label("gpu_hang"), do: "Hung the GPU"
-  defp reason_label("hang"), do: "Froze the renderer"
-  defp reason_label("crashed"), do: "Crashed the renderer"
-  defp reason_label(reason), do: reason
 end

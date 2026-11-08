@@ -60,10 +60,11 @@ defmodule UniversalProxyWeb.AudioLive do
 
   While `UniversalProxy.MilkDrop.enabled?/0`, a "MilkDrop visualizer"
   section (`UniversalProxyWeb.MilkDropComponent`) sits below the outputs,
-  and this LiveView subscribes to the MilkDrop settings and pack topics and
-  forwards their messages to it. A boolean `:milkdrop_ui_override` app env
-  overrides the flag, for host tests (the flag is compile-time false on
-  the host).
+  and this LiveView subscribes to the MilkDrop settings, pack and preset
+  index topics and forwards their messages to it. A boolean
+  `:milkdrop_ui_override` app env overrides the flag, for host tests (the
+  flag is compile-time false on the host; see
+  `UniversalProxyWeb.Components.MilkDropUI.enabled?/0`).
   """
 
   use UniversalProxyWeb, :live_view
@@ -91,6 +92,7 @@ defmodule UniversalProxyWeb.AudioLive do
   alias UniversalProxy.Bluetooth.AudioManager
   alias UniversalProxy.Cec
   alias UniversalProxy.MilkDrop
+  alias UniversalProxyWeb.Components.MilkDropUI
   alias UniversalProxyWeb.MilkDropComponent
   alias UniversalProxyWeb.OpaqueKey
 
@@ -116,7 +118,7 @@ defmodule UniversalProxyWeb.AudioLive do
     # no `assign_async` — and `Audio.Input.list_inputs/0` already degrades
     # to `[]` (via `catch :exit`) when the input subtree is down.
     inputs = Input.list_inputs()
-    milkdrop? = milkdrop_ui?()
+    milkdrop? = MilkDropUI.enabled?()
 
     if connected?(socket) do
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:output_added")
@@ -132,6 +134,7 @@ defmodule UniversalProxyWeb.AudioLive do
       if milkdrop? do
         Phoenix.PubSub.subscribe(UniversalProxy.PubSub, MilkDrop.settings_topic())
         Phoenix.PubSub.subscribe(UniversalProxy.PubSub, MilkDrop.pack_topic())
+        Phoenix.PubSub.subscribe(UniversalProxy.PubSub, MilkDrop.Index.topic())
       end
     end
 
@@ -474,10 +477,10 @@ defmodule UniversalProxyWeb.AudioLive do
     end
   end
 
-  # A LiveComponent can't subscribe: route MilkDrop settings and pack
-  # status to it, re-rendering only the component.
+  # A LiveComponent can't subscribe: route MilkDrop settings, pack status
+  # and index changes to it, re-rendering only the component.
   def handle_info({kind, _} = event, %{assigns: %{milkdrop?: true}} = socket)
-      when kind in [:milkdrop_settings, :milkdrop_pack, :milkdrop_pack_started] do
+      when kind in [:milkdrop_settings, :milkdrop_pack, :milkdrop_pack_started, :milkdrop_index] do
     Phoenix.LiveView.send_update(MilkDropComponent, id: "milkdrop", event: event)
     {:noreply, socket}
   end
@@ -1515,13 +1518,6 @@ defmodule UniversalProxyWeb.AudioLive do
   # Test seam, like `OverviewLive`'s `:storage_facade`: the app-tree
   # `Audio.Server` runs with no outputs in test.
   defp audio_facade, do: Application.get_env(:universal_proxy, :audio_facade, Audio)
-
-  defp milkdrop_ui? do
-    case Application.get_env(:universal_proxy, :milkdrop_ui_override) do
-      override when is_boolean(override) -> override
-      _ -> MilkDrop.enabled?()
-    end
-  end
 
   defp fetch_output(socket, id) do
     case Map.fetch(socket.assigns.outputs, id) do

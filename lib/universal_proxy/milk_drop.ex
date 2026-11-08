@@ -3,7 +3,7 @@ defmodule UniversalProxy.MilkDrop do
   The MilkDrop (projectM) visualizer: a TV display mode drawn by the
   `milkdrop_renderer` port binary from a self-hosted preset pack.
 
-  Four pieces live here:
+  Five pieces live here:
 
     * `UniversalProxy.MilkDrop.Store` — DETS settings (rotation interval,
       minimum frame rate, high-frequency presets, locked preset) and the
@@ -12,10 +12,12 @@ defmodule UniversalProxy.MilkDrop do
       pinned preset pack into `root/0`;
     * `UniversalProxy.MilkDrop.UserPresets` — the library of uploaded
       presets and textures under `root/0`'s `user/`;
+    * `UniversalProxy.MilkDrop.Index` — every pack and uploaded preset with
+      its skip, selection and lock state, for the web UI's browser;
     * `UniversalProxy.Display.MilkDrop` — the renderer's Port owner, started
       by the display while the mode is active (not part of this subtree).
 
-  `UniversalProxy.MilkDrop.Supervisor` runs UserPresets, Store and Pack
+  `UniversalProxy.MilkDrop.Supervisor` runs UserPresets, Store, Pack and Index
   only when `enabled?/0`: a supported target
   (`#{inspect(~w(rpi3 rpi4 rpi5)a)}`, a compile-time constant) **and**
   `config :universal_proxy, UniversalProxy.Display, milkdrop: true`
@@ -37,6 +39,8 @@ defmodule UniversalProxy.MilkDrop do
     * `selection_topic/0` (`"milkdrop:selection"`) —
       `{:milkdrop_selection, selection}`, the whole
       `UniversalProxy.MilkDrop.Store` selection record, on every change;
+    * `UniversalProxy.MilkDrop.Index.topic/0` (`"milkdrop:index"`) —
+      `{:milkdrop_index, change}` (see `UniversalProxy.MilkDrop.Index`);
     * `now_playing_topic/0` (`"milkdrop:now_playing"`) —
       `{:milkdrop_now_playing, now_playing}` (see `now_playing/1`)
       whenever it changes, from `UniversalProxy.Display.State`.
@@ -68,6 +72,7 @@ defmodule UniversalProxy.MilkDrop do
   # rpi3 presents on every second vblank (30 fps at 60 Hz); rpi4/rpi5 can
   # present at the refresh rate.
   @max_min_fps if(Mix.target() == :rpi3, do: 30, else: 60)
+  @rpi3 Mix.target() == :rpi3
 
   @doc "Whether this build targets hardware the renderer supports (compile-time constant)."
   @spec supported?() :: boolean()
@@ -94,6 +99,15 @@ defmodule UniversalProxy.MilkDrop do
   """
   @spec max_min_fps() :: pos_integer()
   def max_min_fps, do: Application.get_env(:universal_proxy, :milkdrop_max_min_fps, @max_min_fps)
+
+  @doc """
+  Whether the renderer follows the pack manifest's `rpi3` sweep hints
+  (resolution rung, skip): its GLES2 build, on rpi3 (a compile-time
+  constant). Tests override it with `config :universal_proxy,
+  :milkdrop_rpi3_hints, boolean`.
+  """
+  @spec rpi3_hints?() :: boolean()
+  def rpi3_hints?, do: Application.get_env(:universal_proxy, :milkdrop_rpi3_hints, @rpi3)
 
   @doc "PubSub topic for Store changes (see the moduledoc)."
   @spec settings_topic() :: String.t()
