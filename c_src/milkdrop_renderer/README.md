@@ -82,7 +82,7 @@ with every byte escaped) fits.
 | `loading` | `preset` (preset id): about to load and warm up this preset; written before any GPU work for it (its level, preload, warm-up frame), for every candidate tried (a failed one is followed by `skip`). A vc4 GPU hang can reset the whole device (the kernel logs `[drm] Resetting GPU.` and the Pi reboots within seconds); the BEAM persists this so the preset is skipped after the reboot. A `preset` event that keeps the same preset (`lock`, `unlock`, `step_down`) has no `loading` before it. |
 | `preset` | `file` (preset id), `locked`, `rung` (internal WxH), `cause` (`start`, `take`, `rotate`, `next`, `prev`, `play`, `eject`, `lock`, `unlock`, `step_down`), `cut` (true = no blend). `eject` is also the cut away from a `high_frequency` preset (it can name the preset already playing: its blend in was completed). Sent whenever the showing preset, its lock or its rung changes. |
 | `skip` | `preset`, `reason`, optional `message` (the first line of the error), `fps` (with `budget`, when a window was measured: the preset's last measured frame rate rounded down to one decimal, which the BEAM keeps so a lower minimum can bring it back): the preset can't be drawn here (persist it for this pack version). Reasons: `register_allocate` (vc4 register allocation failed), `translate_error` / `compile_error` / `link_error` (a warp or composite shader failed and projectM fell back to its default), `shader_error` (another error-level projectM log during the warm-up), `load_failed` (unreadable or unparsable preset), `draw_dropped` (sentinel pixel untouched), `budget` (below the floor at the last rung), `gpu_hang` (the kernel reset the GPU while it was loading or showing; `message` is the kernel's line; see "Failure detection"). |
-| `stats` | Every `--stats-s`: `fps` (presented), `frames`, `flip_ms` (mean flip-to-flip), `frame_ms` / `frame_ms_max` (CPU render + submit), `late` (flips past their slot), `rung`, `interval`, `temp_c`, `arm_mhz`, `gpu_ms` (only with `GL_EXT_disjoint_timer_query`, which vc4 lacks), `preset`, `pcm_ok` / `pcm_silent` (frames with ring audio / silence), `warmups`, `warmup_ms_max`, `shader_stages` / `cached_stages` (translated shader stages warmed up, and those read from the pack's shader cache), `stderr_discarded` (driver stderr bytes dropped). |
+| `stats` | Every `--stats-s`, in every phase (the BEAM's liveness signal, see "Failure detection"): `fps` (presented), `frames`, `flip_ms` (mean flip-to-flip), `frame_ms` / `frame_ms_max` (CPU render + submit), `late` (flips past their slot), `rung`, `interval`, `temp_c`, `arm_mhz`, `gpu_ms` (only with `GL_EXT_disjoint_timer_query`, which vc4 lacks), `preset`, `pcm_ok` / `pcm_silent` (frames with ring audio / silence), `warmups`, `warmup_ms_max`, `shader_stages` / `cached_stages` (translated shader stages warmed up, and those read from the pack's shader cache), `stderr_discarded` (driver stderr bytes dropped). |
 | `play_refused` | `preset`, `reason` (`unknown`, `skipped`, `high_frequency`, `rpi3_skip`, `load_failed`): a `play` that didn't happen. |
 | `user_reloaded` | `presets` (live user presets), `added` (new ids, or ids back after a removal), `removed`, `rejected` (manifest entries dropped as malformed): `reload_user` done. |
 | `selection` | `gen` (the file's), `eligible` (presets rotation picks from now), `playlist_fallback` (the playlist is on but nothing on it can rotate, so rotation uses every unhidden eligible preset), `hidden_fallback` (every eligible preset is hidden, so rotation ignores hidden): after `prepared` when there is a `--selection-file`, and after each `reload_selection`. |
@@ -397,6 +397,18 @@ reopened if the player replaces the file. `src/pcm_tap.h` is a verbatim copy of
 - **Device resets.** A fatal reset leaves no time for any of that, so the
   `loading` event, sent before each warm-up, lets the BEAM persist the
   preset being loaded and skip it (`device_reset`) after the reboot.
+- **Hangs and crashes (BEAM side).** projectm-eval caps each `loop` and
+  `while` at about 1 M iterations, but nested ones multiply, so a preset
+  can stop the renderer's only thread for hours: no flips, no events, and
+  neither the cost guard nor the exit guard runs. The BEAM takes a
+  renderer that writes nothing for 30 s, or sends no `preset` or `skip`
+  within 10 s of a `loading`, as hung: it skips the preset loading (else
+  the one showing) with reason `hang` and SIGKILLs the renderer. A
+  non-zero exit or a signal while a `loading` is unanswered, with no
+  `exiting` before it, skips that preset with reason `crashed`.
+- **Memory.** Preset `megabuf`s can reach about 256 MiB on rpi3, so the
+  renderer sets its own `oom_score_adj` to 1000 at start: the OOM killer
+  picks it rather than the BEAM (a kill mid-warm-up is a `crashed` skip).
 
 A failed preset is skipped and reported. A preload failure leaves the
 playing preset (and its blend) alone, so the next pick blends in as usual;

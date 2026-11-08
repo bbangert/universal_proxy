@@ -19,7 +19,12 @@ only what the tests drive.
     {"cmd":"crash","status":N}    → exit N, no event
     {"cmd":"thermal"}             → {"event":"exiting","reason":"thermal"} + exit 0
     {"cmd":"ignore_eof"}          → on stdin EOF, hang instead of exiting
-    {"cmd":"stall"}               → stop reading stdin (hang forever)
+    {"cmd":"stall"}               → stop reading stdin (hang forever, silent)
+    {"cmd":"hang_loading","preset":F}
+                                  → {"event":"loading","preset":F}, then as stall
+    {"cmd":"crash_on_loading","preset":F,"status":N}
+                                  → {"event":"loading","preset":F} + exit N
+    {"cmd":"stats","ms":N}        → {"event":"stats"} every N ms from then on
 
 Startup behaviour for tests that don't hold the port (Display.State starts
 it) comes from an optional <pack-dir>/fake.json:
@@ -28,6 +33,9 @@ it) comes from an optional <pack-dir>/fake.json:
     {"take_error": "<reason>"}    → answer take with an error event instead
     {"take_exit": N}              → exit N on take, no event
     {"ignore_eof": true}          → as the ignore_eof command, from the start
+    {"startup_preset": F}         → loading F and preset F (cause start) before
+                                    prepared, as the real binary's start
+    {"take_hang_loading": F}      → answer take with loading F, then as stall
 
 It touches <skip-file>.spawned first thing, so tests can tell it was ever
 started. Every stdin line is appended to <skip-file>.cmds, so tests can
@@ -40,16 +48,32 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 
 
+_out = threading.Lock()
+
+
 def emit_raw(line):
-    sys.stdout.write(line + "\n")
-    sys.stdout.flush()
+    with _out:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
 
 
 def emit(event):
     emit_raw(json.dumps(event))
+
+
+def stall():
+    while True:
+        time.sleep(1)
+
+
+def stats_every(ms):
+    while True:
+        time.sleep(ms / 1000.0)
+        emit({"event": "stats", "fps": 30})
 
 
 def main():
@@ -92,6 +116,11 @@ def main():
     def prepared():
         emit({"event": "prepared", "argv": sys.argv[1:], "skip": skip})
 
+    if "startup_preset" in fake:
+        emit({"event": "loading", "preset": fake["startup_preset"]})
+        emit({"event": "preset", "file": fake["startup_preset"], "locked": locked,
+              "cause": "start"})
+
     if not fake.get("hold_prepared"):
         prepared()
 
@@ -118,6 +147,9 @@ def main():
             continue
         if name == "take" and "take_exit" in fake:
             sys.exit(int(fake["take_exit"]))
+        elif name == "take" and "take_hang_loading" in fake:
+            emit({"event": "loading", "preset": fake["take_hang_loading"]})
+            stall()
         elif name == "take" and "take_error" in fake:
             emit({"event": "error", "reason": fake["take_error"]})
         elif name == "take":
@@ -146,8 +178,15 @@ def main():
         elif name == "ignore_eof":
             ignore_eof = True
         elif name == "stall":
-            while True:
-                time.sleep(1)
+            stall()
+        elif name == "hang_loading":
+            emit({"event": "loading", "preset": cmd["preset"]})
+            stall()
+        elif name == "crash_on_loading":
+            emit({"event": "loading", "preset": cmd["preset"]})
+            sys.exit(int(cmd["status"]))
+        elif name == "stats":
+            threading.Thread(target=stats_every, args=(int(cmd["ms"]),), daemon=True).start()
 
 
 if __name__ == "__main__":

@@ -151,14 +151,17 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
       pack: pack,
       milkdrop: Keyword.get(opts, :milkdrop, true),
       milkdrop_opts:
-        [
-          binary: @fake_binary,
-          skip_file: skip_file,
-          settings: Store.defaults(),
-          skipped: %{},
-          store: :"#{inspect(__MODULE__)}.NoStore",
-          kill_grace_ms: Keyword.get(opts, :kill_grace_ms, 300)
-        ] ++ if(supervised?, do: [], else: [task_supervisor: tasks]),
+        Keyword.merge(
+          [
+            binary: @fake_binary,
+            skip_file: skip_file,
+            settings: Store.defaults(),
+            skipped: %{},
+            store: :"#{inspect(__MODULE__)}.NoStore",
+            kill_grace_ms: Keyword.get(opts, :kill_grace_ms, 300)
+          ],
+          Keyword.get(opts, :milkdrop_opts, [])
+        ) ++ if(supervised?, do: [], else: [task_supervisor: tasks]),
       milkdrop_timeouts: Keyword.get(opts, :timeouts, %{})
     ]
 
@@ -702,6 +705,118 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
       end)
 
     assert log =~ "MilkDrop off until the mode is chosen again: 3 renderer failures"
+  end
+
+  test "a hung renderer is killed and counts as a crash: the viewport restarts", ctx do
+    ctx = ctx |> start_ui(milkdrop_opts: [loading_timeout_ms: 200]) |> presenting()
+    %{os_pid: os_pid} = :sys.get_state(renderer(ctx))
+    Renderer.command(renderer(ctx), %{cmd: "hang_loading", preset: "loop.milk"})
+
+    assert_receive {:fake_renderer, :start, _opts}, @timeout
+    assert_receive {:audio, :pcm_tap, @key, false}, @timeout
+    wait_until(fn -> md(ctx).phase == nil end)
+    # A SIGKILLed child can linger as a zombie until the port reaps it.
+    wait_until(fn -> not File.exists?("/proc/#{os_pid}") end)
+    assert %{last: %{outcome: {:crashed, :hang}, phase: :presenting}, failures: 1} = md(ctx)
+    assert %{lifecycle: %{status: :running}, screen: {:visualizer, false}} = status(ctx)
+  end
+
+  test "three hangs latch MilkDrop off until the mode is chosen again", ctx do
+    log =
+      capture_log(fn ->
+        ctx =
+          start_ui(ctx,
+            fake: %{take_hang_loading: "loop.milk"},
+            milkdrop_opts: [loading_timeout_ms: 100],
+            model_opts: [milkdrop_retry_ms: 1]
+          )
+
+        ctx |> milkdrop_mode() |> playing()
+
+        for _ <- 1..3, do: assert_receive({:fake_renderer, :start, _opts}, @timeout)
+        wait_until(fn -> md(ctx).latch == :crashed end)
+        assert %{phase: nil, yield: false, failures: 3} = md(ctx)
+        assert %{mode: :milkdrop, screen: {:visualizer, false}} = status(ctx)
+      end)
+
+    assert log =~ "3 renderer failures in 10 min (last: {:crashed, :hang})"
+  end
+
+  # The renderer's watchdog keeps its production deadlines (10 s / 30 s),
+  # so State's shorter step timeout fires first, as on a device.
+  describe "a step timeout on a hung preset" do
+    setup ctx do
+      store =
+        start_supervised!(
+          {Store,
+           name: nil,
+           table: :"#{inspect(__MODULE__)}.StepTimeout",
+           dets_path: Path.join(ctx.tmp_dir, "settings.dets"),
+           in_flight_grace_ms: 0}
+        )
+
+      %{store: store}
+    end
+
+    @tag capture_log: true
+    test "skips the warm-up a take is stuck on", ctx do
+      ctx =
+        start_ui(ctx,
+          fake: %{take_hang_loading: "loop.milk"},
+          timeouts: %{taking: 300},
+          milkdrop_opts: [store: ctx.store]
+        )
+
+      ctx |> milkdrop_mode() |> playing()
+      wait_until(fn -> md(ctx).last != nil end)
+      assert %{outcome: {:crashed, {:timeout, :taking}}} = md(ctx).last
+      assert Store.skipped(ctx.store, @version) == %{"loop.milk" => "hang"}
+    end
+
+    @tag capture_log: true
+    test "skips the first preset when the start never gets to prepared", ctx do
+      ctx =
+        start_ui(ctx,
+          fake: %{startup_preset: "first.milk", hold_prepared: true},
+          timeouts: %{preparing: 300},
+          milkdrop_opts: [store: ctx.store]
+        )
+
+      ctx |> milkdrop_mode() |> playing()
+      wait_until(fn -> md(ctx).last != nil end)
+      assert %{outcome: {:crashed, {:timeout, :preparing}}} = md(ctx).last
+      assert Store.skipped(ctx.store, @version) == %{"first.milk" => "hang"}
+    end
+
+    @tag capture_log: true
+    test "skips a warm-up still unanswered when release times out", ctx do
+      ctx =
+        start_ui(ctx, timeouts: %{releasing: 300}, milkdrop_opts: [store: ctx.store])
+        |> presenting()
+
+      Renderer.command(renderer(ctx), %{cmd: "hang_loading", preset: "loop.milk"})
+      wait_until(fn -> :sys.get_state(renderer(ctx)).loading == "loop.milk" end)
+      paused(ctx)
+
+      wait_until(fn -> md(ctx).last != nil end)
+      assert %{outcome: {:crashed, {:timeout, :releasing}}} = md(ctx).last
+      assert Store.skipped(ctx.store, @version) == %{"loop.milk" => "hang"}
+    end
+
+    @tag capture_log: true
+    test "a take timeout with no warm-up pending skips nothing", ctx do
+      ctx =
+        start_ui(ctx,
+          fake: %{startup_preset: "first.milk", ignore: ["take"]},
+          timeouts: %{taking: 300},
+          milkdrop_opts: [store: ctx.store]
+        )
+
+      ctx |> milkdrop_mode() |> playing()
+      wait_until(fn -> md(ctx).last != nil end)
+      assert %{outcome: {:crashed, {:timeout, :taking}}} = md(ctx).last
+      assert Store.skipped(ctx.store, @version) == %{}
+    end
   end
 
   test "a timed-out release kills the renderer and restarts the viewport", ctx do

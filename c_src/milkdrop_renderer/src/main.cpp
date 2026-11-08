@@ -1160,10 +1160,19 @@ int App::run() {
     return code;
 }
 
+// Preset megabufs can reach ~256 MiB on rpi3: the OOM killer must pick
+// the renderer, not the BEAM. Raising one's own score needs no privilege.
+void raise_oom_score() {
+    const int fd = ::open("/proc/self/oom_score_adj", O_WRONLY | O_CLOEXEC);
+    if (fd < 0 || ::write(fd, "1000", 4) != 4) log_msg("oom_score_adj not raised: %s", std::strerror(errno));
+    if (fd >= 0) ::close(fd);
+}
+
 }  // namespace
 }  // namespace md
 
 int main(int argc, char** argv) {
+    md::raise_oom_score();
     std::vector<std::string> args(argv + 1, argv + argc);
     md::Options opt;
     std::string err;

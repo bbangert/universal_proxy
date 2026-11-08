@@ -93,7 +93,7 @@ defmodule UniversalProxy.Display.State do
   3 000). A timed-out step (`:recovering` aside), a `take` the renderer
   reports failed,
   or a renderer that exits or crashes unasked (`{:milkdrop_exit, pid,
-  status}`, `:wedged` and `:reaper_down` included) stops it
+  status}`, `:wedged`, `:reaper_down` and `:hang` included) stops it
   (`UniversalProxy.Display.MilkDrop.stop/1`) and, if the viewport had
   yielded, starts the viewport again; the model counts the failure toward
   its crash latch, which is logged. A renderer that stopped because it
@@ -398,8 +398,8 @@ defmodule UniversalProxy.Display.State do
   def handle_info({:milkdrop, pid, event}, %{md: %{pid: pid}} = state) when is_map(event),
     do: {:noreply, milkdrop_event(state, event)}
 
-  # An exit status means the renderer process is gone; `:wedged` and
-  # `:reaper_down` don't.
+  # An exit status means the renderer process is gone; `:wedged`,
+  # `:reaper_down` and `:hang` don't.
   def handle_info({:milkdrop_exit, pid, status}, %{md: %{pid: pid, phase: :reaping}} = state) do
     if is_integer(status), do: {:noreply, finish_milkdrop(state)}, else: {:noreply, state}
   end
@@ -1031,9 +1031,19 @@ defmodule UniversalProxy.Display.State do
 
   defp abort_milkdrop(%{md: md} = state, why) do
     Logger.warning("[Display] MilkDrop handover failed (#{inspect(why)}); stopping the renderer")
-    if md.pid, do: :ok = Display.MilkDrop.stop(md.pid)
+    if md.pid, do: :ok = stop_renderer(md.pid, why)
     end_milkdrop(state, {:crashed, why}, false)
   end
+
+  # These steps time out before the renderer's own watchdog would, so the
+  # preset it is stuck on is blamed here: a warm-up the `take` (or one in
+  # progress when `release` was sent) left unanswered, or the start's
+  # first preset (its warm-up or take frame).
+  defp stop_renderer(pid, {:timeout, phase}) when phase in [:taking, :releasing],
+    do: Display.MilkDrop.stop_hung(pid, :loading)
+
+  defp stop_renderer(pid, {:timeout, :preparing}), do: Display.MilkDrop.stop_hung(pid, :showing)
+  defp stop_renderer(pid, _why), do: Display.MilkDrop.stop(pid)
 
   # The session is over (the renderer stopped, exited or crashed). `gone?`:
   # the renderer process is known not to run (or never ran). Otherwise it
