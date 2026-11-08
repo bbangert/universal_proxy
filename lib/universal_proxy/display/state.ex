@@ -85,7 +85,15 @@ defmodule UniversalProxy.Display.State do
   as `set_rotate`, `set_high_frequency` and `set_min_fps` casts (with
   high-frequency presets turned off it cuts away from one on screen), each
   only when its value differs from the last one sent; a renderer started
-  later reads them from `UniversalProxy.MilkDrop.Store` itself.
+  later reads them from `UniversalProxy.MilkDrop.Store` itself. Likewise
+  each upload library change on
+  `UniversalProxy.MilkDrop.user_presets_topic/0`, and each start of the
+  library's server (it may have repaired the manifest), is sent as
+  `reload_user`
+  (a renderer started later reads the library's manifest at start). The
+  skip list is not re-sent: the renderer adds its own skips as it goes,
+  and skips the Store dropped (a cleared list, a replaced upload) apply
+  from the next session, as with "Clear skipped presets".
 
   Every phase is bounded (`:milkdrop_timeouts`, ms: tapping 10 000,
   preparing 20 000, taking 5 000, releasing 3 000, recovering 45 000 (the
@@ -256,7 +264,14 @@ defmodule UniversalProxy.Display.State do
               "sendspin:output_removed",
               Cec.topic()
             ] ++
-              if(milkdrop?, do: [MilkDrop.pack_topic(), MilkDrop.settings_topic()], else: []),
+              if(milkdrop?,
+                do: [
+                  MilkDrop.pack_topic(),
+                  MilkDrop.settings_topic(),
+                  MilkDrop.user_presets_topic()
+                ],
+                else: []
+              ),
           do: Phoenix.PubSub.subscribe(state.pubsub, topic)
 
       {:ok, state, {:continue, :start_ui}}
@@ -388,6 +403,11 @@ defmodule UniversalProxy.Display.State do
   def handle_info({:milkdrop_settings, settings}, %{milkdrop?: true} = state)
       when is_map(settings),
       do: {:noreply, milkdrop_settings(state, settings)}
+
+  # A restarted library may have repaired the manifest the renderer read.
+  def handle_info({event, _change}, %{milkdrop?: true} = state)
+      when event in [:milkdrop_user_presets, :milkdrop_user_presets_started],
+      do: {:noreply, milkdrop_reload_user(state)}
 
   def handle_info(
         {:milkdrop_ring, session, ring},
@@ -893,6 +913,11 @@ defmodule UniversalProxy.Display.State do
     state
   end
 
+  defp milkdrop_event(state, %{event: :user_reloaded} = event) do
+    Logger.info("[Display] MilkDrop uploads reloaded: #{inspect(Map.delete(event, :event))}")
+    state
+  end
+
   defp milkdrop_event(state, %{event: :skip} = event) do
     Logger.info(
       "[Display] MilkDrop skipped #{inspect(event[:preset])}: #{inspect(event[:reason])}"
@@ -972,6 +997,14 @@ defmodule UniversalProxy.Display.State do
   end
 
   defp milkdrop_settings(state, _settings), do: state
+
+  defp milkdrop_reload_user(%{md: %{phase: phase, pid: pid}} = state)
+       when phase in [:preparing, :taking, :presenting] and is_pid(pid) do
+    :ok = Display.MilkDrop.reload_user(pid)
+    state
+  end
+
+  defp milkdrop_reload_user(state), do: state
 
   defp pos_integer?(n), do: is_integer(n) and n > 0
 

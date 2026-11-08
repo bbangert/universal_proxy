@@ -14,6 +14,9 @@ only what the tests drive.
     {"cmd":"next"|"prev"}  → {"event":"loading","preset":"p<N>.milk"}, then
                              {"event":"preset","file":"p<N>.milk","locked":B,"cause":...}
     {"cmd":"lock"|"unlock"}→ the same preset event with the new lock
+    {"cmd":"reload_user"}  → {"event":"user_reloaded","presets":N,"added":A,
+                             "removed":R,"rejected":0}, counted from
+                             <user-dir>/manifest.json (none without one)
   test-only:
     {"cmd":"emit","line":"<raw>"} → <raw> verbatim on its own line
     {"cmd":"crash","status":N}    → exit N, no event
@@ -76,10 +79,22 @@ def stats_every(ms):
         emit({"event": "stats", "fps": 30})
 
 
+def user_files(user_dir):
+    if user_dir is None:
+        return set()
+    try:
+        with open(os.path.join(user_dir, "manifest.json")) as f:
+            return {"user/" + p["file"] for p in json.load(f).get("presets", [])}
+    except (OSError, ValueError):
+        return set()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", required=True)
     parser.add_argument("--pack-dir", required=True)
+    parser.add_argument("--user-dir")
+    parser.add_argument("--selection-file")
     parser.add_argument("--ladder", required=True)
     parser.add_argument("--rotate-s", required=True, type=int)
     parser.add_argument("--min-fps", required=True, type=int)
@@ -108,6 +123,7 @@ def main():
 
     preset = 0
     locked = args.locked is not None
+    uploads = user_files(args.user_dir)
 
     def emit_preset(cause):
         emit({"event": "preset", "file": "p%d.milk" % preset, "locked": locked,
@@ -160,6 +176,12 @@ def main():
             preset = preset + 1 if name == "next" else max(preset - 1, 0)
             emit({"event": "loading", "preset": "p%d.milk" % preset})
             emit_preset(name)
+        elif name == "reload_user":
+            now = user_files(args.user_dir)
+            emit({"event": "user_reloaded", "presets": len(now),
+                  "added": len(now - uploads), "removed": len(uploads - now),
+                  "rejected": 0})
+            uploads = now
         elif name in ("lock", "unlock"):
             locked = name == "lock"
             emit_preset(name)

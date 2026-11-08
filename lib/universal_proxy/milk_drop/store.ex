@@ -2,7 +2,7 @@ defmodule UniversalProxy.MilkDrop.Store do
   @moduledoc """
   DETS-backed MilkDrop settings and the runtime skip list.
 
-  Three records share one table:
+  Four records share one table:
 
     * `:settings` —
 
@@ -10,7 +10,7 @@ defmodule UniversalProxy.MilkDrop.Store do
             include_high_frequency: boolean(),  # default false
             rotate_s: 10..120,                  # default 20
             min_fps: 20..max, step 5,           # default 20
-            locked: String.t() | nil            # pack-relative preset file
+            locked: String.t() | nil            # a preset id
           }
 
       `min_fps` is the frame rate a preset must hold; its maximum is
@@ -33,6 +33,23 @@ defmodule UniversalProxy.MilkDrop.Store do
       and a late skip measured under an earlier, higher minimum is not
       stored. `budget` skips without a recorded fps are kept.
 
+    * `:user_skipped` — `%{id => %{reason:, fps:, sha256:}}`: skipped
+      uploads (`user/` ids, which `skip/5` routes here), independent of
+      the pack version. An entry counts only while the library file its
+      id names has that SHA-256 (the `:user_sha` lookup, default
+      `UniversalProxy.MilkDrop.UserPresets.sha256/1`), so a skip is
+      effectively keyed by `{id, sha256}`: a replaced upload starts
+      afresh, and entries for changed files are dropped on the next
+      write. A skip for an id the library doesn't hold is not stored, nor
+      one for content other than the library file's: `skip/5`'s
+      `sha256:` and `mark_in_flight/5`'s name the content the renderer
+      loaded, so a skip of an upload's old content, reported after the
+      file was replaced (or recovered after a device reset), doesn't skip
+      the replacement. Without them the file's current content counts.
+      `skipped/2` and `skip_entries/2` return both lists, as does every
+      `{:milkdrop_skipped, ...}` broadcast; the budget readmission above
+      applies to both.
+
     * `:in_flight` — the preset the renderer was last told to load (see
       "Device resets" below).
 
@@ -54,15 +71,16 @@ defmodule UniversalProxy.MilkDrop.Store do
   `[drm] Resetting GPU.`). The renderer reports a reset it survives as a
   `gpu_hang` skip; a fatal one leaves no time for that. So
   `UniversalProxy.Display.MilkDrop` records each preset before the
-  renderer loads it (`mark_in_flight/4`, synced to disk before it
-  returns).
+  renderer loads it (`mark_in_flight/4`, `/5` with an upload's content
+  hash; synced to disk before it returns).
 
   The record carries the Linux boot id (`/proc/sys/kernel/random/boot_id`).
   When the store opens a record written during an earlier boot, the device
   went down while that preset was loading or playing: the preset is added
   to the skip list with reason `device_reset` (if the record's pack version
-  is the pinned one), a warning is logged and the record is deleted once
-  that skip is on disk. If the skip can't be written the record is kept,
+  is the pinned one; an upload's whatever the version, so a hostile upload
+  can't put the device in a reboot loop), a warning is logged and the
+  record is deleted once that skip is on disk. If the skip can't be written the record is kept,
   and the recovery is retried before the next mark or clear (which are
   refused until it succeeds) and when the store next opens.
 
@@ -108,7 +126,9 @@ defmodule UniversalProxy.MilkDrop.Store do
   (`/data/milkdrop/settings.dets` on Nerves). Tests override via the
   `:dets_path`, `:table`, `:name` and `:pubsub` opts to `start_link/1`
   (and `:boot_id`, `:vm`, `:pack_version`, `:in_flight_grace_ms`,
-  `:retry_ms`, and `:insert`, a stand-in for `:dets.insert/2`).
+  `:retry_ms`, `:insert`, a stand-in for `:dets.insert/2`, and
+  `:user_sha`, a 1-arity fun from a `user/` id to its library file's
+  SHA-256 or `nil`).
   """
 
   use GenServer
@@ -117,6 +137,7 @@ defmodule UniversalProxy.MilkDrop.Store do
 
   alias UniversalProxy.Audio.Params
   alias UniversalProxy.MilkDrop
+  alias UniversalProxy.MilkDrop.UserPresets
 
   @default_table :milkdrop_settings
   @retry_ms 30_000
@@ -130,7 +151,8 @@ defmodule UniversalProxy.MilkDrop.Store do
     :owner,
     :boot_id,
     :generation,
-    :clear_at
+    :clear_at,
+    :sha256
   ]
 
   @rotate_min 10
@@ -157,6 +179,8 @@ defmodule UniversalProxy.MilkDrop.Store do
 
   @type skip_entry :: %{reason: String.t(), fps: float() | nil}
 
+  @type user_skip_entry :: %{reason: String.t(), fps: float() | nil, sha256: String.t()}
+
   @type in_flight :: %{
           pack_version: String.t(),
           preset: String.t(),
@@ -165,7 +189,8 @@ defmodule UniversalProxy.MilkDrop.Store do
           owner: pid() | nil,
           boot_id: String.t() | nil,
           generation: term(),
-          clear_at: integer() | nil
+          clear_at: integer() | nil,
+          sha256: String.t() | nil
         }
 
   # -- Client API --
@@ -215,7 +240,9 @@ defmodule UniversalProxy.MilkDrop.Store do
   @doc """
   Record that `preset` (a pack-relative file) cannot be drawn with pack
   `version`, for `reason`. A different `version` than the stored one
-  replaces the whole skip list. See `skip/5` to record a measured fps.
+  replaces the whole skip list. An upload's `user/` id is recorded for
+  its current content instead, whatever `version` (see the moduledoc).
+  See `skip/5` to record a measured fps.
   """
   @spec skip(GenServer.server(), String.t(), String.t(), String.t() | atom()) ::
           :ok | {:error, term()}
@@ -227,26 +254,31 @@ defmodule UniversalProxy.MilkDrop.Store do
   (with a `budget` skip), kept so a lower `min_fps` can bring it back. A
   `budget` skip whose fps already holds the current `min_fps` (measured
   under an earlier, higher one) is not stored, and returns `:ok`.
+  `sha256:` — for an upload, the content the renderer loaded; a skip for
+  content the library no longer holds is not stored (and returns `:ok`).
   """
   @spec skip(GenServer.server(), String.t(), String.t(), String.t() | atom(), keyword()) ::
           :ok | {:error, term()}
   def skip(server, version, preset, reason, opts)
       when is_binary(version) and is_binary(preset) and is_list(opts) do
     entry = skip_entry(reason_string(reason), Keyword.get(opts, :fps))
-    GenServer.call(server, {:skip, version, preset, entry})
+    GenServer.call(server, {:skip, version, preset, entry, Keyword.get(opts, :sha256)})
   catch
     :exit, _ -> {:error, :not_running}
   end
 
-  @doc "The skip list for pack `version` (`%{}` for any version but the stored one)."
+  @doc """
+  The skip list for pack `version` (none for any version but the stored
+  one), plus the skipped uploads whose files are unchanged.
+  """
   @spec skipped(GenServer.server(), String.t()) :: skipped()
   def skipped(server \\ __MODULE__, version) when is_binary(version) do
     server |> skip_entries(version) |> Map.new(fn {preset, %{reason: r}} -> {preset, r} end)
   end
 
   @doc """
-  The skip list for pack `version` with each entry's recorded fps (`nil`
-  when none was measured); `%{}` for any version but the stored one.
+  `skipped/2` with each entry's recorded fps (`nil` when none was
+  measured).
   """
   @spec skip_entries(GenServer.server(), String.t()) :: %{String.t() => skip_entry()}
   def skip_entries(server \\ __MODULE__, version) when is_binary(version) do
@@ -255,10 +287,34 @@ defmodule UniversalProxy.MilkDrop.Store do
     :exit, _ -> %{}
   end
 
-  @doc "Forget every skipped preset."
+  @doc "Forget every skipped preset, uploads included."
   @spec clear_skipped(GenServer.server()) :: :ok | {:error, term()}
   def clear_skipped(server \\ __MODULE__) do
     GenServer.call(server, :clear_skipped)
+  catch
+    :exit, _ -> {:error, :not_running}
+  end
+
+  @doc """
+  These uploads (`user/` ids) were replaced: forget their skips of
+  content other than the library file's now. A skip already recorded for
+  the replacement stays, so this may arrive late (retried while the Store
+  was down).
+  """
+  @spec clear_user_skips(GenServer.server(), [String.t()]) :: :ok | {:error, term()}
+  def clear_user_skips(server \\ __MODULE__, ids) when is_list(ids) do
+    GenServer.call(server, {:forget_user, ids, false})
+  catch
+    :exit, _ -> {:error, :not_running}
+  end
+
+  @doc """
+  These uploads (`user/` ids) were deleted: forget their skips, and the
+  `locked` setting if it names one of them, in one write.
+  """
+  @spec user_presets_removed(GenServer.server(), [String.t()]) :: :ok | {:error, term()}
+  def user_presets_removed(server \\ __MODULE__, ids) when is_list(ids) do
+    GenServer.call(server, {:forget_user, ids, true})
   catch
     :exit, _ -> {:error, :not_running}
   end
@@ -273,7 +329,22 @@ defmodule UniversalProxy.MilkDrop.Store do
           :ok | {:error, term()}
   def mark_in_flight(server \\ __MODULE__, session, version, preset)
       when is_binary(version) and is_binary(preset) do
-    GenServer.call(server, {:mark_in_flight, session, version, preset})
+    mark_in_flight(server, session, version, preset, [])
+  end
+
+  @doc """
+  `mark_in_flight/4` with options: `sha256:` — for an upload, the content
+  being loaded, so a device reset skips that content only (see the
+  moduledoc's `:user_skipped`).
+  """
+  @spec mark_in_flight(GenServer.server(), term(), String.t(), String.t(), keyword()) ::
+          :ok | {:error, term()}
+  def mark_in_flight(server, session, version, preset, opts)
+      when is_binary(version) and is_binary(preset) and is_list(opts) do
+    GenServer.call(
+      server,
+      {:mark_in_flight, session, version, preset, Keyword.get(opts, :sha256)}
+    )
   catch
     :exit, _ -> {:error, :not_running}
   end
@@ -328,6 +399,7 @@ defmodule UniversalProxy.MilkDrop.Store do
       pack_version: Keyword.get_lazy(opts, :pack_version, &pinned_version/0),
       in_flight_grace_ms: Keyword.get(opts, :in_flight_grace_ms, @in_flight_grace_ms),
       insert: Keyword.get(opts, :insert, &:dets.insert/2),
+      user_sha: Keyword.get(opts, :user_sha, &UserPresets.sha256/1),
       # `{pid, ref}` of the monitored owner of the in-flight record.
       owner: nil,
       # Asked for while the table was closed, applied when it opens.
@@ -395,7 +467,13 @@ defmodule UniversalProxy.MilkDrop.Store do
   def handle_call(request, from, %{table: nil} = state)
       when request == :clear_skipped or
              (is_tuple(request) and
-                elem(request, 0) in [:update, :skip, :mark_in_flight, :clear_in_flight]) do
+                elem(request, 0) in [
+                  :update,
+                  :skip,
+                  :forget_user,
+                  :mark_in_flight,
+                  :clear_in_flight
+                ]) do
     case open_table(state) do
       {:ok, state} ->
         handle_call(request, from, state)
@@ -418,7 +496,7 @@ defmodule UniversalProxy.MilkDrop.Store do
   def handle_call({:update, params}, _from, state) do
     existing = read_settings(state.table)
     merged = merge(existing, params)
-    readmission = readmission(state.table, merged.min_fps)
+    readmission = readmission(state, merged.min_fps)
 
     case persist(state, [{:settings, merged} | readmission_records(readmission)]) do
       :ok ->
@@ -432,12 +510,16 @@ defmodule UniversalProxy.MilkDrop.Store do
     end
   end
 
-  def handle_call({:skip, version, preset, reason}, _from, state) do
-    {:reply, add_skip(state, version, preset, reason), state}
+  def handle_call({:skip, version, preset, reason, sha}, _from, state) do
+    {:reply, add_skip(state, version, preset, reason, sha), state}
   end
 
-  def handle_call({:mark_in_flight, session, version, preset}, {owner, _tag}, state) do
-    marker = new_marker(state, owner, session, version, preset)
+  def handle_call({:forget_user, ids, unlock?}, _from, state) do
+    {:reply, forget_user(state, ids, unlock?), state}
+  end
+
+  def handle_call({:mark_in_flight, session, version, preset, sha}, {owner, _tag}, state) do
+    marker = new_marker(state, owner, session, version, preset, sha)
 
     with {:ok, state} <- ensure_recovered(state),
          :ok <- persist(state, {:in_flight, marker}) do
@@ -453,17 +535,12 @@ defmodule UniversalProxy.MilkDrop.Store do
   end
 
   def handle_call({:skipped, version}, _from, state) do
-    reply =
-      case read_skipped(state.table) do
-        {^version, entries} -> Map.new(entries, fn {p, e} -> {p, entry_details(e)} end)
-        _ -> %{}
-      end
-
-    {:reply, reply, state}
+    {:reply, all_skips(state, version), state}
   end
 
   def handle_call(:clear_skipped, _from, state) do
     with :ok <- :dets.delete(state.table, :skipped),
+         :ok <- :dets.delete(state.table, :user_skipped),
          :ok <- :dets.sync(state.table) do
       broadcast(state, {:milkdrop_skipped, nil, %{}})
       {:reply, :ok, state}
@@ -543,18 +620,24 @@ defmodule UniversalProxy.MilkDrop.Store do
 
   defp mkdir_p(path), do: File.mkdir_p(Path.dirname(path))
 
-  defp add_skip(state, version, preset, reason) do
+  # `sha`: the upload content the skip is for (nil: whatever is installed).
+  defp add_skip(state, version, preset, reason, sha) do
     min_fps = read_settings(state.table).min_fps
 
-    if readmitted?(reason, min_fps) do
-      Logger.info(
-        "MilkDrop: #{preset} holds the minimum frame rate #{min_fps} " <>
-          "(#{reason.fps} fps); not skipping it"
-      )
+    cond do
+      readmitted?(reason, min_fps) ->
+        Logger.info(
+          "MilkDrop: #{preset} holds the minimum frame rate #{min_fps} " <>
+            "(#{reason.fps} fps); not skipping it"
+        )
 
-      :ok
-    else
-      store_skip(state, version, preset, reason)
+        :ok
+
+      user_id?(preset) ->
+        store_user_skip(state, preset, reason, sha)
+
+      true ->
+        store_skip(state, version, preset, reason)
     end
   end
 
@@ -567,7 +650,7 @@ defmodule UniversalProxy.MilkDrop.Store do
 
     case persist(state, {:skipped, {version, skipped}}) do
       :ok ->
-        broadcast_skipped(state, version, skipped)
+        broadcast_skipped(state, version)
         :ok
 
       {:error, reason} = error ->
@@ -576,27 +659,42 @@ defmodule UniversalProxy.MilkDrop.Store do
     end
   end
 
-  # `{version, kept, cleared}` when budget skips measured at or above
-  # `min_fps` (with the renderer's slack) are to be dropped, else nil.
-  # Those without a recorded fps stay.
-  defp readmission(table, min_fps) do
-    with {version, entries} <- read_skipped(table),
-         kept = Map.reject(entries, fn {_preset, e} -> readmitted?(e, min_fps) end),
-         cleared when cleared > 0 <- map_size(entries) - map_size(kept) do
-      {version, kept, cleared}
-    else
-      _ -> nil
+  # The records to write when budget skips measured at or above `min_fps`
+  # (with the renderer's slack) are to be dropped, and how many go; nil
+  # when none do. Those without a recorded fps stay.
+  defp readmission(state, min_fps) do
+    pack =
+      case read_skipped(state.table) do
+        {version, entries} -> readmit(entries, min_fps, &{:skipped, {version, &1}})
+        nil -> nil
+      end
+
+    user = readmit(read_user_skipped(state.table), min_fps, &{:user_skipped, &1})
+
+    case Enum.reject([pack, user], &is_nil/1) do
+      [] -> nil
+      parts -> {Enum.map(parts, &elem(&1, 0)), parts |> Enum.map(&elem(&1, 1)) |> Enum.sum()}
     end
   end
 
+  defp readmit(entries, min_fps, record) do
+    kept = Map.reject(entries, fn {_preset, e} -> readmitted?(e, min_fps) end)
+    cleared = map_size(entries) - map_size(kept)
+    if cleared > 0, do: {record.(kept), cleared}
+  end
+
   defp readmission_records(nil), do: []
-  defp readmission_records({version, kept, _cleared}), do: [{:skipped, {version, kept}}]
+  defp readmission_records({records, _cleared}), do: records
 
   defp announce_readmission(_state, _min_fps, nil), do: :ok
 
-  defp announce_readmission(state, min_fps, {version, kept, cleared}) do
+  defp announce_readmission(state, min_fps, {_records, cleared}) do
     Logger.info("MilkDrop: minimum frame rate #{min_fps}: #{cleared} budget skip(s) cleared")
-    broadcast_skipped(state, version, kept)
+
+    case read_skipped(state.table) do
+      {version, _entries} -> broadcast_skipped(state, version)
+      nil -> broadcast_skipped(state, skip_version(state))
+    end
   end
 
   # The renderer's own rule: a window holds `min_fps` at `min_fps - slack`
@@ -607,13 +705,99 @@ defmodule UniversalProxy.MilkDrop.Store do
 
   defp readmitted?(_entry, _min_fps), do: false
 
-  defp broadcast_skipped(state, version, entries) do
-    reasons = Map.new(entries, fn {preset, e} -> {preset, entry_details(e).reason} end)
+  # Both lists, as `skipped/2` reads them.
+  defp broadcast_skipped(state, version) do
+    reasons = Map.new(all_skips(state, version), fn {preset, e} -> {preset, e.reason} end)
     broadcast(state, {:milkdrop_skipped, version, reasons})
   end
 
-  defp new_marker(state, owner, session, version, preset) do
+  defp all_skips(state, version) do
+    pack =
+      case read_skipped(state.table) do
+        {^version, entries} -> Map.new(entries, fn {p, e} -> {p, entry_details(e)} end)
+        _ -> %{}
+      end
+
+    state
+    |> current_user_skips()
+    |> Map.new(fn {id, e} -> {id, Map.take(e, [:reason, :fps])} end)
+    |> Map.merge(pack)
+  end
+
+  # The version a broadcast of user-skip changes is for: the pinned pack's,
+  # else the stored list's.
+  defp skip_version(state) do
+    case {state.pack_version, read_skipped(state.table)} do
+      {nil, {version, _entries}} -> version
+      {version, _} -> version
+    end
+  end
+
+  # -- Private: upload skips --
+
+  defp user_id?("user/" <> _), do: true
+  defp user_id?(_preset), do: false
+
+  defp store_user_skip(state, id, reason, loaded) do
+    case state.user_sha.(id) do
+      nil ->
+        Logger.info("MilkDrop: #{id} is not in the upload library; not skipping it")
+        :ok
+
+      sha when is_binary(loaded) and loaded != sha ->
+        Logger.info("MilkDrop: #{id} was replaced since it was loaded; not skipping it")
+        :ok
+
+      sha ->
+        entry = reason |> entry_details() |> Map.put(:sha256, sha)
+        entries = state |> current_user_skips() |> Map.put(id, entry)
+        persist_user_skips(state, entries, [], "skip update")
+    end
+  end
+
+  # Skips of these ids go, and with `unlock?` (deleted) the lock if it
+  # names one; without (replaced) only their stale skips go, which
+  # `current_user_skips/1` drops anyway.
+  defp forget_user(state, ids, unlock?) do
+    entries = read_user_skipped(state.table)
+    current = current_user_skips(state)
+    kept = if unlock?, do: Map.drop(current, ids), else: current
+    settings = read_settings(state.table)
+    unlock? = unlock? and settings.locked in ids
+    settings_records = if unlock?, do: [{:settings, %{settings | locked: nil}}], else: []
+
+    if kept == entries and not unlock? do
+      :ok
+    else
+      with :ok <- persist_user_skips(state, kept, settings_records, "upload clean-up") do
+        if unlock?, do: broadcast(state, {:milkdrop_settings, %{settings | locked: nil}})
+        :ok
+      end
+    end
+  end
+
+  defp persist_user_skips(state, entries, records, what) do
+    case persist(state, [{:user_skipped, entries} | records]) do
+      :ok ->
+        broadcast_skipped(state, skip_version(state))
+        :ok
+
+      {:error, reason} = error ->
+        Logger.error("MilkDrop store #{what} failed: #{inspect(reason)}")
+        error
+    end
+  end
+
+  # The entries whose library file still has the recorded content.
+  defp current_user_skips(state) do
+    Map.filter(read_user_skipped(state.table), fn {id, %{sha256: sha}} ->
+      state.user_sha.(id) == sha
+    end)
+  end
+
+  defp new_marker(state, owner, session, version, preset, sha) do
     %{
+      sha256: sha,
       pack_version: version,
       preset: preset,
       at: System.os_time(:second),
@@ -625,8 +809,8 @@ defmodule UniversalProxy.MilkDrop.Store do
     }
   end
 
-  defp queue_closed({:mark_in_flight, session, version, preset}, {owner, _tag}, state) do
-    marker = new_marker(state, owner, session, version, preset)
+  defp queue_closed({:mark_in_flight, session, version, preset, sha}, {owner, _tag}, state) do
+    marker = new_marker(state, owner, session, version, preset, sha)
     pending_clears = Map.delete(state.pending_clears, session)
     monitor_owner(%{state | pending_mark: marker, pending_clears: pending_clears}, owner)
   end
@@ -684,13 +868,13 @@ defmodule UniversalProxy.MilkDrop.Store do
       %{boot_id: boot_id} when boot_id != nil and boot_id == state.boot_id ->
         :ok
 
-      %{pack_version: version, preset: preset} ->
-        if is_nil(state.pack_version) or state.pack_version == version do
+      %{pack_version: version, preset: preset} = marker ->
+        if is_nil(state.pack_version) or state.pack_version == version or user_id?(preset) do
           Logger.warning(
             "MilkDrop preset #{preset} was running when the device last stopped; skipping it"
           )
 
-          record_device_reset(state, version, preset)
+          record_device_reset(state, version, preset, marker.sha256)
         else
           Logger.info(
             "MilkDrop preset #{preset} (pack #{version}) was running when the device last " <>
@@ -702,8 +886,8 @@ defmodule UniversalProxy.MilkDrop.Store do
     end
   end
 
-  defp record_device_reset(state, version, preset) do
-    case add_skip(state, version, preset, "device_reset") do
+  defp record_device_reset(state, version, preset, sha) do
+    case add_skip(state, version, preset, "device_reset", sha) do
       :ok ->
         delete_in_flight(state.table)
 
@@ -825,6 +1009,7 @@ defmodule UniversalProxy.MilkDrop.Store do
         |> Map.put_new(:vm, nil)
         |> Map.update(:clear_at, nil, &if(is_integer(&1), do: &1))
         |> Map.update(:clear_boot_id, nil, &if(is_binary(&1), do: &1))
+        |> Map.update(:sha256, nil, &if(is_binary(&1), do: &1))
 
       _ ->
         nil
@@ -865,6 +1050,23 @@ defmodule UniversalProxy.MilkDrop.Store do
     case :dets.lookup(table, :settings) do
       [{:settings, stored}] when is_map(stored) -> sanitize(Map.merge(@defaults, stored))
       _ -> @defaults
+    end
+  end
+
+  defp read_user_skipped(nil), do: %{}
+
+  defp read_user_skipped(table) do
+    case :dets.lookup(table, :user_skipped) do
+      [{:user_skipped, entries}] when is_map(entries) ->
+        for {id, entry} <- entries,
+            is_binary(id),
+            user_id?(id),
+            valid_user_entry?(entry),
+            into: %{},
+            do: {id, entry}
+
+      _ ->
+        %{}
     end
   end
 
@@ -923,6 +1125,12 @@ defmodule UniversalProxy.MilkDrop.Store do
     do: true
 
   defp valid_entry?(_entry), do: false
+
+  defp valid_user_entry?(%{reason: reason, fps: fps, sha256: sha})
+       when is_binary(reason) and (is_float(fps) or is_nil(fps)) and is_binary(sha),
+       do: true
+
+  defp valid_user_entry?(_entry), do: false
 
   # Stored as the bare reason unless there is an fps to keep (the original
   # format, still read as is).

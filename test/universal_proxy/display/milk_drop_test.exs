@@ -42,6 +42,7 @@ defmodule UniversalProxy.Display.MilkDropTest do
           ladder: ["640x360", "480x270"],
           store: ctx.store,
           skip_file: ctx.skip_file,
+          user_dir: nil,
           binary: @fake_binary
         ],
         opts
@@ -131,6 +132,17 @@ defmodule UniversalProxy.Display.MilkDropTest do
                "/run/up-pcm-abc"
              ]
     end
+  end
+
+  test "args/1 with the upload library" do
+    assert [_mode, _, "--pack-dir", "/p", "--user-dir", "/data/milkdrop/user", "--ladder" | _] =
+             MilkDrop.args(%{
+               mode: @mode,
+               pack_dir: "/p",
+               user_dir: "/data/milkdrop/user",
+               ladder: ["640x360"],
+               skip_file: "/s"
+             })
   end
 
   test "args/1 without a refresh, and with a card and connector" do
@@ -243,6 +255,171 @@ defmodule UniversalProxy.Display.MilkDropTest do
     wait_until(fn -> cmd_lines(ctx) == expected end)
   end
 
+  test "reload_user is written as a JSON line and its answer forwarded", ctx do
+    user_dir = Path.join(ctx.tmp_dir, "user")
+    File.mkdir_p!(user_dir)
+    manifest = fn files -> %{format: 1, presets: Enum.map(files, &%{file: &1})} end
+    File.write!(Path.join(user_dir, "manifest.json"), Jason.encode!(manifest.(["a.milk"])))
+
+    {pid, prepared} = start_renderer(ctx, user_dir: user_dir)
+    assert ["--user-dir", ^user_dir | _] = Enum.drop_while(prepared.argv, &(&1 != "--user-dir"))
+
+    File.write!(
+      Path.join(user_dir, "manifest.json"),
+      Jason.encode!(manifest.(["b.milk", "c.milk"]))
+    )
+
+    MilkDrop.reload_user(pid)
+
+    assert_receive {:milkdrop, ^pid,
+                    %{event: :user_reloaded, presets: 2, added: 2, removed: 1, rejected: 0}},
+                   @timeout
+
+    assert cmd_lines(ctx) == [%{"cmd" => "reload_user"}]
+  end
+
+  test "an upload's skip is recorded for its content and reaches the next renderer", ctx do
+    store =
+      start_supervised!(
+        Supervisor.child_spec(
+          {Store,
+           name: nil,
+           table: :milkdrop_display_test_uploads,
+           dets_path: Path.join(ctx.tmp_dir, "uploads.dets"),
+           user_sha: fn id -> if id == "user/up.milk", do: "sha-up" end},
+          id: :upload_store
+        )
+      )
+
+    {pid, _} = start_renderer(ctx, store: store)
+    emit(pid, ~s({"event":"skip","preset":"user/up.milk","reason":"draw"}))
+
+    assert_receive {:milkdrop, ^pid, %{event: :skip, preset: "user/up.milk", persisted: true}},
+                   @timeout
+
+    assert Store.skipped(store, "another-version") == %{"user/up.milk" => "draw"}
+    MilkDrop.stop(pid)
+
+    # Another skip file: the first renderer's reaper deletes its own.
+    skip_file = Path.join(ctx.tmp_dir, "skip-2.txt")
+    {_pid, prepared} = start_renderer(ctx, store: store, skip_file: skip_file)
+    assert prepared.skip == ["user/up.milk"]
+  end
+
+  test "an upload replaced while it plays: its skip and record name the loaded content",
+       ctx do
+    {:ok, shas} = Agent.start_link(fn -> %{"user/up.milk" => "sha-old"} end)
+    user_sha = &Agent.get(shas, fn m -> m[&1] end)
+
+    store =
+      start_supervised!(
+        Supervisor.child_spec(
+          {Store,
+           name: nil,
+           table: :milkdrop_display_test_replaced,
+           dets_path: Path.join(ctx.tmp_dir, "replaced.dets"),
+           user_sha: user_sha},
+          id: :replaced_store
+        )
+      )
+
+    {pid, _} = start_renderer(ctx, store: store, user_sha: user_sha)
+    emit(pid, ~s({"event":"loading","preset":"user/up.milk"}))
+    assert_receive {:milkdrop, ^pid, %{event: :loading}}, @timeout
+    assert %{preset: "user/up.milk", sha256: "sha-old"} = Store.in_flight(store)
+
+    Agent.update(shas, &Map.put(&1, "user/up.milk", "sha-new"))
+    emit(pid, ~s({"event":"skip","preset":"user/up.milk","reason":"draw"}))
+    assert_receive {:milkdrop, ^pid, %{event: :skip, persisted: true}}, @timeout
+    assert Store.skipped(store, @version) == %{}
+
+    # Loading the same id again marks the new content.
+    emit(pid, ~s({"event":"loading","preset":"user/up.milk"}))
+    assert_receive {:milkdrop, ^pid, %{event: :loading}}, @timeout
+    assert %{sha256: "sha-new"} = Store.in_flight(store)
+    emit(pid, ~s({"event":"skip","preset":"user/up.milk","reason":"draw"}))
+    assert_receive {:milkdrop, ^pid, %{event: :skip}}, @timeout
+    assert Store.skipped(store, @version) == %{"user/up.milk" => "draw"}
+  end
+
+  test "a failed load of a replacement leaves the showing content's hash in charge", ctx do
+    {:ok, shas} = Agent.start_link(fn -> %{"user/up.milk" => "sha-a"} end)
+    user_sha = &Agent.get(shas, fn m -> m[&1] end)
+
+    store =
+      start_supervised!(
+        Supervisor.child_spec(
+          {Store,
+           name: nil,
+           table: :milkdrop_display_test_failed_load,
+           dets_path: Path.join(ctx.tmp_dir, "failed-load.dets"),
+           user_sha: user_sha},
+          id: :failed_load_store
+        )
+      )
+
+    {pid, _} = start_renderer(ctx, store: store, user_sha: user_sha)
+    emit(pid, ~s({"event":"loading","preset":"user/up.milk"}))
+    assert_receive {:milkdrop, ^pid, %{event: :loading}}, @timeout
+    emit(pid, ~s({"event":"preset","file":"user/up.milk","locked":false}))
+    assert_receive {:milkdrop, ^pid, %{event: :preset}}, @timeout
+
+    # Replaced while A plays; loading B under the same id fails.
+    Agent.update(shas, &Map.put(&1, "user/up.milk", "sha-b"))
+    emit(pid, ~s({"event":"loading","preset":"user/up.milk"}))
+    assert_receive {:milkdrop, ^pid, %{event: :loading}}, @timeout
+    assert %{sha256: "sha-b"} = Store.in_flight(store)
+    emit(pid, ~s({"event":"skip","preset":"user/up.milk","reason":"compile"}))
+    assert_receive {:milkdrop, ^pid, %{event: :skip, reason: "compile"}}, @timeout
+    assert Store.skipped(store, @version) == %{"user/up.milk" => "compile"}
+
+    # A keeps playing: the record and its later skips name A.
+    assert %{sha256: "sha-a"} = Store.in_flight(store)
+    emit(pid, ~s({"event":"skip","preset":"user/up.milk","reason":"draw"}))
+    assert_receive {:milkdrop, ^pid, %{event: :skip, reason: "draw"}}, @timeout
+    assert Store.skipped(store, @version) == %{"user/up.milk" => "compile"}
+  end
+
+  test "a re-announced preset keeps the hash it was loaded with", ctx do
+    {:ok, shas} = Agent.start_link(fn -> %{"user/up.milk" => "sha-a"} end)
+    user_sha = &Agent.get(shas, fn m -> m[&1] end)
+
+    store =
+      start_supervised!(
+        Supervisor.child_spec(
+          {Store,
+           name: nil,
+           table: :milkdrop_display_test_reannounced,
+           dets_path: Path.join(ctx.tmp_dir, "reannounced.dets"),
+           user_sha: user_sha},
+          id: :reannounced_store
+        )
+      )
+
+    {pid, _} = start_renderer(ctx, store: store, user_sha: user_sha)
+    emit(pid, ~s({"event":"loading","preset":"user/up.milk"}))
+    assert_receive {:milkdrop, ^pid, %{event: :loading}}, @timeout
+    emit(pid, ~s({"event":"preset","file":"user/up.milk","locked":false,"cause":"start"}))
+    assert_receive {:milkdrop, ^pid, %{event: :preset}}, @timeout
+
+    # Replaced while A shows; lock, unlock and take re-announce A, no load.
+    Agent.update(shas, &Map.put(&1, "user/up.milk", "sha-b"))
+
+    for {cause, locked} <- [{"lock", true}, {"unlock", false}, {"take", false}] do
+      emit(
+        pid,
+        ~s({"event":"preset","file":"user/up.milk","locked":#{locked},"cause":"#{cause}"})
+      )
+
+      assert_receive {:milkdrop, ^pid, %{event: :preset, cause: ^cause}}, @timeout
+    end
+
+    assert %{sha256: "sha-a"} = Store.in_flight(store)
+    emit(pid, ~s({"event":"skip","preset":"user/up.milk","reason":"draw"}))
+    assert_receive {:milkdrop, ^pid, %{event: :skip}}, @timeout
+    assert Store.skipped(store, @version) == %{}
+  end
+
   test "forwards events with atom keys", ctx do
     {pid, _} = start_renderer(ctx)
 
@@ -305,11 +482,41 @@ defmodule UniversalProxy.Display.MilkDropTest do
       :ok
     end
 
-    defp start_named_store(ctx) do
+    defp start_named_store(ctx, opts \\ []) do
       start_supervised!(
         {Store,
-         name: @store_name, table: @table, dets_path: Path.join(ctx.tmp_dir, "settings.dets")}
+         [name: @store_name, table: @table, dets_path: Path.join(ctx.tmp_dir, "settings.dets")] ++
+           opts}
       )
+    end
+
+    @tag capture_log: true
+    test "a retried upload skip keeps the content it was loaded with", ctx do
+      {:ok, shas} = Agent.start_link(fn -> %{"user/up.milk" => "sha-old"} end)
+      user_sha = &Agent.get(shas, fn m -> m[&1] end)
+
+      {pid, _} =
+        start_renderer(ctx,
+          store: @store_name,
+          settings: Store.defaults(),
+          skipped: %{},
+          skip_retry_ms: 600_000,
+          user_sha: user_sha
+        )
+
+      emit(pid, ~s({"event":"loading","preset":"user/up.milk"}))
+      emit(pid, ~s({"event":"skip","preset":"user/up.milk","reason":"draw"}))
+      assert_receive {:milkdrop, ^pid, %{event: :skip, persisted: false}}, @timeout
+
+      # Replaced while the skip waited: it is for the old content.
+      Agent.update(shas, &Map.put(&1, "user/up.milk", "sha-new"))
+      start_named_store(ctx, user_sha: user_sha)
+      emit(pid, ~s({"event":"skip","preset":"b.milk","reason":"draw"}))
+
+      assert_receive {:milkdrop, ^pid, %{event: :skip, preset: "b.milk", persisted: true}},
+                     @timeout
+
+      assert Store.skipped(@store_name, @version) == %{"b.milk" => "draw"}
     end
 
     test "a skip is forwarded as not persisted, then persisted when the Store is back", ctx do
@@ -1162,6 +1369,15 @@ defmodule UniversalProxy.Display.MilkDropTest do
                  base
                  |> Keyword.put(:binary, @fake_binary)
                  |> Keyword.put(:card, bad)
+               )
+    end
+
+    for bad <- ["", "user", "/data/user\n--locked"] do
+      assert {:error, {:invalid_user_dir, ^bad}} =
+               MilkDrop.start(
+                 base
+                 |> Keyword.put(:binary, @fake_binary)
+                 |> Keyword.put(:user_dir, bad)
                )
     end
 

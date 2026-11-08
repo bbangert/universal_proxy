@@ -218,7 +218,12 @@ Uploads live outside the pack (the BEAM never writes into it), in
   projectM takes the first file with a matching lowercase name, so a pack
   texture wins a clash. projectM rescans it at each preset load, so new
   uploads' textures need no restart, and its random textures
-  (`sampler_randNN`) are drawn from both directories.
+  (`sampler_randNN`) are drawn from both directories. It caches a texture
+  by name once loaded, so when `reload_user` finds the manifest's
+  `textures` list changed (a file or `sha256` added, replaced or gone) it
+  sets the search path again, which rebuilds projectM's texture manager:
+  later loads read the files afresh, and the preset playing keeps the
+  textures it holds.
 - **`reload_user`** re-reads the manifest. Entries are never erased or
   moved: new ids are appended, listed ones refreshed in place (their tags,
   e.g. a `high_frequency` toggle; an upload flagged `high_frequency` while

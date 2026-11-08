@@ -158,6 +158,7 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
             settings: Store.defaults(),
             skipped: %{},
             store: :"#{inspect(__MODULE__)}.NoStore",
+            user_dir: nil,
             kill_grace_ms: Keyword.get(opts, :kill_grace_ms, 300)
           ],
           Keyword.get(opts, :milkdrop_opts, [])
@@ -260,6 +261,15 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
       ctx.pubsub,
       UniversalProxy.MilkDrop.settings_topic(),
       {:milkdrop_settings, Map.merge(Store.defaults(), changes)}
+    )
+  end
+
+  defp library_changed(ctx) do
+    Phoenix.PubSub.broadcast(
+      ctx.pubsub,
+      UniversalProxy.MilkDrop.user_presets_topic(),
+      {:milkdrop_user_presets,
+       %{added: ["user/a.milk"], replaced: [], removed: [], updated: [], textures: []}}
     )
   end
 
@@ -439,6 +449,31 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
              cmd_names(ctx.skip_file),
              &(&1 in ["set_rotate", "set_high_frequency", "set_min_fps"])
            )
+  end
+
+  test "an upload library change reaches the presenting renderer as reload_user", ctx do
+    ctx = start_ui(ctx)
+
+    # Before a session there is nothing to tell: the renderer reads the
+    # library at start.
+    library_changed(ctx)
+    _ = :sys.get_state(ctx.state)
+    ctx = presenting(ctx)
+    refute "reload_user" in cmd_names(ctx.skip_file)
+
+    library_changed(ctx)
+    wait_until(fn -> List.last(cmd_names(ctx.skip_file)) == "reload_user" end)
+    library_changed(ctx)
+    wait_until(fn -> Enum.count(cmd_names(ctx.skip_file), &(&1 == "reload_user")) == 2 end)
+
+    # A restarted library may have repaired its manifest.
+    Phoenix.PubSub.broadcast(
+      ctx.pubsub,
+      UniversalProxy.MilkDrop.user_presets_topic(),
+      {:milkdrop_user_presets_started, %{bytes: 0, presets: 0, textures: 0}}
+    )
+
+    wait_until(fn -> Enum.count(cmd_names(ctx.skip_file), &(&1 == "reload_user")) == 3 end)
   end
 
   test "a viewport that fails to start after the release gets the renderer's exit only once it runs",
