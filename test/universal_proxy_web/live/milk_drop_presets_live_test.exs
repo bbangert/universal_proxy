@@ -425,6 +425,36 @@ defmodule UniversalProxyWeb.MilkDropPresetsLiveTest do
       refute has_element?(view, "#now-playing-pending")
     end
 
+    test "plays reach the display in click order, the latest waiting one winning",
+         %{conn: conn, display: display} do
+      FakeDisplay.set_reply(display, {:delay, 300, :ok})
+      {:ok, view, _html} = live(conn, "/audio/milkdrop")
+
+      for n <- ~w(001 002 003),
+          do: view |> element("#play-#{key("Preset #{n}.milk")}") |> render_click()
+
+      assert_receive {:play, "Preset 001.milk", false}, 1_000
+      assert_receive {:play, "Preset 003.milk", false}, 2_000
+      refute_received {:play, "Preset 002.milk", _}
+      render_async(view, 2_000)
+      assert render(view) =~ "Showing Preset 003 on the TV."
+    end
+
+    test "an unlock clicked while a lock runs goes out after it", %{conn: conn, display: display} do
+      FakeDisplay.set_reply(display, {:delay, 300, :ok})
+      id = "Preset 004.milk"
+      {:ok, _} = Store.update(%{locked: "Preset 009.milk"})
+      {:ok, view, _html} = live(conn, "/audio/milkdrop")
+
+      view |> element("#lock-#{key(id)}") |> render_click()
+      view |> element("#unlock") |> render_click()
+      assert_receive {:play, ^id, true}, 1_000
+      refute_received :unlock
+      assert_receive :unlock, 2_000
+      render_async(view, 2_000)
+      assert Store.settings().locked == nil
+    end
+
     test "a refusal is explained", %{conn: conn, display: display} do
       FakeDisplay.set_reply(display, {:error, {:refused, :skipped}})
       {:ok, view, _html} = live(conn, "/audio/milkdrop")
@@ -525,6 +555,17 @@ defmodule UniversalProxyWeb.MilkDropPresetsLiveTest do
       wait_until(fn -> row_html(view, b) =~ "On the TV" end)
       refute row_html(view, a) =~ "On the TV"
       assert has_element?(view, "#hidden-fallback")
+
+      # A restarted Display.State announces it idle.
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        MilkDrop.now_playing_topic(),
+        {:milkdrop_now_playing, UniversalProxy.Display.State.idle_now_playing()}
+      )
+
+      wait_until(fn -> not (row_html(view, b) =~ "On the TV") end)
+      refute has_element?(view, "#now-playing-name")
+      refute has_element?(view, "#hidden-fallback")
     end
   end
 
@@ -600,6 +641,33 @@ defmodule UniversalProxyWeb.MilkDropPresetsLiveTest do
       assert has_row?(view, "Preset 151.milk")
       refute has_element?(view, "#presets-more")
       assert rows(view) <= 150
+    end
+
+    test "one reverse-ordered batch of 151 new matches leaves the DOM equal to the window",
+         %{conn: conn} do
+      # Index's own broadcasts held back: the test sends the one batch.
+      stop_supervised!(Index)
+      start_supervised!({Index, batch_ms: 60_000})
+      _ = :sys.get_state(Index)
+
+      {:ok, view, _html} = live(conn, "/audio/milkdrop?filter=favourites")
+      assert rows(view) == 0
+
+      ids = pack_ids(151)
+      for id <- ids, do: {:ok, _} = Store.favourite(id, true)
+      _ = :sys.get_state(Index)
+
+      keys = ids |> Enum.reverse() |> Enum.map(&key/1)
+      send(view.pid, {:milkdrop_index, %{rebuilt: false, added: [], changed: keys, removed: []}})
+
+      assert rows(view) == 150
+      pages = :sys.get_state(view.pid).socket.assigns.pages
+      window = Enum.flat_map(pages, & &1.keys)
+      assert length(window) == 150
+      assert order(view) == Enum.map(window, &"preset-#{&1}")
+      assert has_row?(view, "Preset 001.milk") and has_row?(view, "Preset 150.milk")
+      refute has_row?(view, "Preset 151.milk")
+      assert has_element?(view, "#presets-more")
     end
 
     test "hidden and playlist filters follow changes made elsewhere", %{conn: conn} do

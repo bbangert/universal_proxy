@@ -823,6 +823,15 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     assert Task.await(pending) == {:error, :not_presenting}
   end
 
+  test "a restarted State announces that nothing shows", ctx do
+    ctx = start_ui(ctx)
+    Phoenix.PubSub.subscribe(ctx.pubsub, UniversalProxy.MilkDrop.now_playing_topic())
+    Process.exit(GenServer.whereis(ctx.state), :kill)
+
+    assert_receive {:milkdrop_now_playing, %{preset: nil, locked: false, selection: nil}},
+                   @timeout
+  end
+
   test "now-playing is broadcast while presenting and goes idle when the session ends", ctx do
     ctx = start_ui(ctx, fake: %{startup_preset: "s.milk"})
     Phoenix.PubSub.subscribe(ctx.pubsub, UniversalProxy.MilkDrop.now_playing_topic())

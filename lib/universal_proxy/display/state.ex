@@ -134,7 +134,9 @@ defmodule UniversalProxy.Display.State do
   `{:milkdrop_now_playing, now_playing}` whenever it changes
   (`t:now_playing/0`: the preset, its lock and the renderer's last
   `selection` answer while `:presenting`, else `idle_now_playing/0`), and
-  read with a `:milkdrop_now_playing` call.
+  read with a `:milkdrop_now_playing` call. A State start broadcasts it
+  once too (idle: no session survives a restart), so a subscriber still
+  showing a preset from before the restart drops it.
 
   Every phase is bounded (`:milkdrop_timeouts`, ms: tapping 10 000,
   preparing 20 000, taking 5 000, releasing 3 000, recovering 45 000 (the
@@ -358,6 +360,7 @@ defmodule UniversalProxy.Display.State do
     state = %{state | adapters: state.cec.list_adapters.(), outputs: state.audio.list_outputs.()}
     # The pack first, so a persisted MilkDrop mode sees it.
     state = if state.milkdrop?, do: dispatch(state, {:pack, state.pack.status.()}), else: state
+    if state.milkdrop?, do: announce_now_playing(state)
     state = rebind(state)
     {:noreply, dispatch(state, {:display_available, display_available?(state)})}
   end
@@ -1341,6 +1344,16 @@ defmodule UniversalProxy.Display.State do
     do: %{preset: md.preset, locked: md.locked, selection: md.selection}
 
   defp now_playing(_state), do: @idle_now_playing
+
+  # A State (re)start has no session: subscribers holding a preset from
+  # before it must hear that nothing shows.
+  defp announce_now_playing(state) do
+    Phoenix.PubSub.broadcast(
+      state.pubsub,
+      MilkDrop.now_playing_topic(),
+      {:milkdrop_now_playing, state.now_playing}
+    )
+  end
 
   defp sync_now_playing(state) do
     case now_playing(state) do
