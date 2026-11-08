@@ -664,6 +664,11 @@ defmodule UniversalProxy.Display.MilkDrop do
   defp settle_loaded(%{loading_sha: {file, _} = loaded} = state, %{event: :preset, file: file}),
     do: %{state | showing_sha: loaded, loading_sha: nil}
 
+  # Lock/unlock, take and step_down re-announce the preset showing without
+  # loading it: still the content noted when it loaded, whatever the file
+  # holds now.
+  defp settle_loaded(%{showing_sha: {file, _}} = state, %{event: :preset, file: file}), do: state
+
   defp settle_loaded(state, %{event: :preset, file: file}) when is_binary(file),
     do: %{state | showing_sha: upload_sha(state, file)}
 

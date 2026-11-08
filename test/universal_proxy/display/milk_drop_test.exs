@@ -380,6 +380,46 @@ defmodule UniversalProxy.Display.MilkDropTest do
     assert Store.skipped(store, @version) == %{"user/up.milk" => "compile"}
   end
 
+  test "a re-announced preset keeps the hash it was loaded with", ctx do
+    {:ok, shas} = Agent.start_link(fn -> %{"user/up.milk" => "sha-a"} end)
+    user_sha = &Agent.get(shas, fn m -> m[&1] end)
+
+    store =
+      start_supervised!(
+        Supervisor.child_spec(
+          {Store,
+           name: nil,
+           table: :milkdrop_display_test_reannounced,
+           dets_path: Path.join(ctx.tmp_dir, "reannounced.dets"),
+           user_sha: user_sha},
+          id: :reannounced_store
+        )
+      )
+
+    {pid, _} = start_renderer(ctx, store: store, user_sha: user_sha)
+    emit(pid, ~s({"event":"loading","preset":"user/up.milk"}))
+    assert_receive {:milkdrop, ^pid, %{event: :loading}}, @timeout
+    emit(pid, ~s({"event":"preset","file":"user/up.milk","locked":false,"cause":"start"}))
+    assert_receive {:milkdrop, ^pid, %{event: :preset}}, @timeout
+
+    # Replaced while A shows; lock, unlock and take re-announce A, no load.
+    Agent.update(shas, &Map.put(&1, "user/up.milk", "sha-b"))
+
+    for {cause, locked} <- [{"lock", true}, {"unlock", false}, {"take", false}] do
+      emit(
+        pid,
+        ~s({"event":"preset","file":"user/up.milk","locked":#{locked},"cause":"#{cause}"})
+      )
+
+      assert_receive {:milkdrop, ^pid, %{event: :preset, cause: ^cause}}, @timeout
+    end
+
+    assert %{sha256: "sha-a"} = Store.in_flight(store)
+    emit(pid, ~s({"event":"skip","preset":"user/up.milk","reason":"draw"}))
+    assert_receive {:milkdrop, ^pid, %{event: :skip}}, @timeout
+    assert Store.skipped(store, @version) == %{}
+  end
+
   test "forwards events with atom keys", ctx do
     {pid, _} = start_renderer(ctx)
 
