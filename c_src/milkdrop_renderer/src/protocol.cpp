@@ -1,6 +1,7 @@
 #include "protocol.h"
 
 #include "json.h"
+#include "manifest.h"
 
 #include <cmath>
 #include <cstdio>
@@ -78,6 +79,26 @@ std::optional<Command> parse_command(std::string_view line, std::string& error) 
         }
         c.type = Command::Type::SetMinFps;
         c.number_value = val->number;
+    } else if (name == "play") {
+        // Validated as a manifest id, so it is bounded (MAX_PRESET_NAME_BYTES)
+        // and free of control characters before anything uses it.
+        const JsonValue* preset = v.get("preset");
+        if (preset == nullptr || !preset->is_string() || !valid_preset_file(preset->string)) {
+            error = "bad play preset";
+            return std::nullopt;
+        }
+        const JsonValue* lock = v.get("lock");
+        if (lock != nullptr && !lock->is_bool()) {
+            error = "bad play lock";
+            return std::nullopt;
+        }
+        c.type = Command::Type::Play;
+        c.string_value = preset->string;
+        c.bool_value = lock != nullptr && lock->boolean;
+    } else if (name == "reload_user") {
+        c.type = Command::Type::ReloadUser;
+    } else if (name == "reload_selection") {
+        c.type = Command::Type::ReloadSelection;
     } else {
         error = "unknown cmd";
         return std::nullopt;
@@ -126,6 +147,23 @@ std::string event_error(std::string_view reason, std::string_view message) {
     std::string out = open("error") + str_field("reason", reason, 64);
     if (!message.empty()) out += str_field("message", message, 512);
     return out + "}";
+}
+
+std::string event_play_refused(std::string_view preset, std::string_view reason) {
+    return open("play_refused") + str_field("preset", preset, MAX_PRESET_NAME_BYTES) +
+           str_field("reason", reason, 32) + "}";
+}
+
+std::string event_user_reloaded(size_t presets, size_t added, size_t removed, size_t rejected) {
+    return open("user_reloaded") + int_field("presets", static_cast<long long>(presets)) +
+           int_field("added", static_cast<long long>(added)) + int_field("removed", static_cast<long long>(removed)) +
+           int_field("rejected", static_cast<long long>(rejected)) + "}";
+}
+
+std::string event_selection(int64_t gen, size_t eligible, bool playlist_fallback, bool hidden_fallback) {
+    return open("selection") + int_field("gen", gen) + int_field("eligible", static_cast<long long>(eligible)) +
+           bool_field("playlist_fallback", playlist_fallback) + bool_field("hidden_fallback", hidden_fallback) +
+           "}";
 }
 
 std::string event_exiting(std::string_view reason) {

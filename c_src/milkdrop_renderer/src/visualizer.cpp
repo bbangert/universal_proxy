@@ -93,9 +93,10 @@ void Visualizer::set_size(Resolution size) {
 
 void Visualizer::set_fps(int fps) { projectm_set_fps(pm_, fps); }
 
-void Visualizer::set_texture_dir(const std::string& dir) {
-    const char* paths[] = {dir.c_str()};
-    projectm_set_texture_search_paths(pm_, paths, 1);
+void Visualizer::set_texture_dirs(const std::vector<std::string>& dirs) {
+    std::vector<const char*> paths;
+    for (const std::string& d : dirs) paths.push_back(d.c_str());
+    projectm_set_texture_search_paths(pm_, paths.data(), paths.size());
 }
 
 void Visualizer::set_shader_cache_dir(const std::string& dir) { projectm_set_shader_cache_dir(pm_, dir.c_str()); }

@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace md {
 
@@ -32,7 +33,10 @@ public:
     // The frame rate preset expressions assume (projectM advances per-frame
     // state by 1/fps): the presented rate, refresh / interval.
     void set_fps(int fps);
-    void set_texture_dir(const std::string& dir);
+    // The texture search path, in lookup order (the first file with a
+    // matching name wins). projectM rescans it at each preset load, and
+    // its random textures (sampler_randNN) come from all of it.
+    void set_texture_dirs(const std::vector<std::string>& dirs);
     // The pack's pre-translated shaders (keys include the GLSL target, so
     // another target's files just miss).
     void set_shader_cache_dir(const std::string& dir);

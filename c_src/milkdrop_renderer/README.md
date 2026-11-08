@@ -16,7 +16,7 @@ path). The host builds only the GL-free core and its unit tests.
 milkdrop_renderer --mode 1280x720 --pack-dir DIR --ladder 640x360,480x270
                   --rotate-s 20 --min-fps 20 --skip-file PATH
                   [--high-frequency] [--locked FILE] [--pcm-ring PATH]
-                  [--connector HDMI-A-1]
+                  [--connector HDMI-A-1] [--user-dir DIR] [--selection-file PATH]
 ```
 
 | Option | Meaning |
@@ -28,10 +28,12 @@ milkdrop_renderer --mode 1280x720 --pack-dir DIR --ladder 640x360,480x270
 | `--ladder WxH,...` | Internal render resolutions, highest first, each smaller than the last. The renderer steps down per preset and skips a preset past the last rung. |
 | `--rotate-s N` | Auto-rotation interval, seconds. |
 | `--min-fps F` | The frame rate a preset must hold (default 20; 1..240); see "Cost guard". The BEAM passes the user's setting (20..30 on rpi3, 20..60 on rpi4/5, in steps of 5). |
-| `--skip-file PATH` | Presets never to load: one preset id per line. A missing file is an empty list. |
+| `--skip-file PATH` | Presets never to load: one preset id per line (`user/` ids included). A missing file is an empty list. |
 | `--high-frequency` | Include `high_frequency/` presets (photosensitivity; off by default; see "Photosensitivity filter"). |
-| `--locked FILE` | Start locked on this preset id. If it isn't eligible (a `high_frequency` one while they are off, skipped, an rpi3 `skip`, or not in the pack): `error` `locked_refused` (`message`: `<why>: <id>`) and an unlocked random start. |
+| `--locked FILE` | Start locked on this preset id (a pack or a `user/` one; hidden or off the playlist is fine). If it isn't eligible (a `high_frequency` one while they are off, skipped, an rpi3 `skip`, or unknown): `error` `locked_refused` (`message`: `<why>: <id>`) and an unlocked random start. |
 | `--pcm-ring PATH` | The PCM tap ring (`/run/up-pcm-<client_id>`). Without it, or while it has no fresh audio, presets get silence. |
+| `--user-dir DIR` | Uploaded presets (see "User presets"). Optional; a missing or bad `DIR/manifest.json` is no user presets, never fatal. |
+| `--selection-file PATH` | Favourites, hidden presets and the playlist (see "Selection"). Optional; a missing file is an empty selection. |
 
 Tuning and check knobs (not passed by the BEAM): `--blend S` (soft-cut
 length, 0.5), `--interval N` (vblanks per frame: 2 on GLES2 builds, else 1), `--seed N`, `--av-offset-ms N` (added to the PCM
@@ -62,8 +64,13 @@ detection"). stdin EOF means exit, in every state.
 | `{"cmd":"set_rotate","value":N}` | Rotation interval in seconds (1..3600). |
 | `{"cmd":"set_high_frequency","value":B}` | Include `high_frequency/` presets; turning it off while one is rendered (playing or blending out) cuts away at once (see "Photosensitivity filter"). |
 | `{"cmd":"set_min_fps","value":F}` | The minimum frame rate (1..240), as `--min-fps`; the current value changes nothing. Otherwise levels settled this session are forgotten, and the current preset's next window is judged against the new floor; one whose level's interval can't present it at all is skipped at once (`skip` `budget`). |
+| `{"cmd":"play","preset":ID,"lock":B}` | Load preset `ID` now, through the same warm-up as `next` (`loading`, then `preset` with `cause` `play`, or `skip`), then rotate on, or stay locked on it when `lock` is true (optional, default false). Any eligible preset may be played, hidden or off the playlist included. Refused at once, and again if that changed by the time it runs, with `play_refused`: `unknown` (not in the catalogue, or removed by `reload_user`), `skipped`, `high_frequency` (while they are off), `rpi3_skip` (GLES2 builds). A failed warm-up gives the usual `skip` and `play_refused` `load_failed`; the playing preset carries on (a failure after activation cuts to a rotation pick instead, as for any candidate) and no other candidate is tried. It goes into history like a `next` pick. A pending eject (skip, filter) waits for it and follows if it fails. `ID` must be a valid preset id (below), else `bad_command`. |
+| `{"cmd":"reload_user"}` | Re-read `--user-dir`'s manifest (see "User presets") → `user_reloaded`. A bad manifest keeps the user presets loaded and gives `error` `user_manifest`. |
+| `{"cmd":"reload_selection"}` | Re-read `--selection-file` → `selection`. A bad file keeps the selection in force and gives `error` `selection`. |
 
 A malformed or unknown command gives `error` with `reason: "bad_command"`.
+Lines over 4096 bytes are dropped whole; the longest `play` (a 1024-byte id
+with every byte escaped) fits.
 
 ### Events (stdout)
 
@@ -73,10 +80,13 @@ A malformed or unknown command gives `error` with `reason: "bad_command"`.
 | `presenting` | `modeset` (true = the mode set differs from the last one scanned out before the handover: the CRTC's at take if it still had one, else the one in `prepared`), `master_ms`, `crtc_lit` (the CRTC still had a mode at take; Emerge's stop detaches it, so this is normally false and SetCrtc re-enables the CRTC, at the same timing when `modeset` is false). |
 | `released` | Ack for `release`. |
 | `loading` | `preset` (preset id): about to load and warm up this preset; written before any GPU work for it (its level, preload, warm-up frame), for every candidate tried (a failed one is followed by `skip`). A vc4 GPU hang can reset the whole device (the kernel logs `[drm] Resetting GPU.` and the Pi reboots within seconds); the BEAM persists this so the preset is skipped after the reboot. A `preset` event that keeps the same preset (`lock`, `unlock`, `step_down`) has no `loading` before it. |
-| `preset` | `file` (preset id), `locked`, `rung` (internal WxH), `cause` (`start`, `take`, `rotate`, `next`, `prev`, `eject`, `lock`, `unlock`, `step_down`), `cut` (true = no blend). `eject` is also the cut away from a `high_frequency` preset (it can name the preset already playing: its blend in was completed). Sent whenever the showing preset, its lock or its rung changes. |
+| `preset` | `file` (preset id), `locked`, `rung` (internal WxH), `cause` (`start`, `take`, `rotate`, `next`, `prev`, `play`, `eject`, `lock`, `unlock`, `step_down`), `cut` (true = no blend). `eject` is also the cut away from a `high_frequency` preset (it can name the preset already playing: its blend in was completed). Sent whenever the showing preset, its lock or its rung changes. |
 | `skip` | `preset`, `reason`, optional `message` (the first line of the error), `fps` (with `budget`, when a window was measured: the preset's last measured frame rate rounded down to one decimal, which the BEAM keeps so a lower minimum can bring it back): the preset can't be drawn here (persist it for this pack version). Reasons: `register_allocate` (vc4 register allocation failed), `translate_error` / `compile_error` / `link_error` (a warp or composite shader failed and projectM fell back to its default), `shader_error` (another error-level projectM log during the warm-up), `load_failed` (unreadable or unparsable preset), `draw_dropped` (sentinel pixel untouched), `budget` (below the floor at the last rung), `gpu_hang` (the kernel reset the GPU while it was loading or showing; `message` is the kernel's line; see "Failure detection"). |
 | `stats` | Every `--stats-s`: `fps` (presented), `frames`, `flip_ms` (mean flip-to-flip), `frame_ms` / `frame_ms_max` (CPU render + submit), `late` (flips past their slot), `rung`, `interval`, `temp_c`, `arm_mhz`, `gpu_ms` (only with `GL_EXT_disjoint_timer_query`, which vc4 lacks), `preset`, `pcm_ok` / `pcm_silent` (frames with ring audio / silence), `warmups`, `warmup_ms_max`, `shader_stages` / `cached_stages` (translated shader stages warmed up, and those read from the pack's shader cache), `stderr_discarded` (driver stderr bytes dropped). |
-| `error` | `reason`, optional `message`: a non-fatal problem (`bad_command`, `master_timeout`, `take_failed`, `driver`, `register_allocate`, `thermal_drop`, `locked_refused`, …), or the cause just before a failing `exiting`. |
+| `play_refused` | `preset`, `reason` (`unknown`, `skipped`, `high_frequency`, `rpi3_skip`, `load_failed`): a `play` that didn't happen. |
+| `user_reloaded` | `presets` (live user presets), `added` (new ids, or ids back after a removal), `removed`, `rejected` (manifest entries dropped as malformed): `reload_user` done. |
+| `selection` | `gen` (the file's), `eligible` (presets rotation picks from now), `playlist_fallback` (the playlist is on but nothing on it can rotate, so rotation uses every unhidden eligible preset), `hidden_fallback` (every eligible preset is hidden, so rotation ignores hidden): after `prepared` when there is a `--selection-file`, and after each `reload_selection`. |
+| `error` | `reason`, optional `message`: a non-fatal problem (`bad_command`, `master_timeout`, `take_failed`, `driver`, `register_allocate`, `thermal_drop`, `locked_refused`, `user_manifest`, `selection`, …), or the cause just before a failing `exiting`. |
 | `exiting` | `reason`: `requested`, `eof`, `signal`, `thermal` (exit 0), or a failure — `manifest`, `no_presets`, `output`, `gl`, `projectm`, `kms`, `output_lost` (exit 1), `usage` (exit 2). |
 
 ### Handover
@@ -109,7 +119,7 @@ non-blocking, and a flip event is only dispatched while one is awaited
 While `high_frequency` presets are off (the default):
 
 - no pick returns one: start, rotation, `next` / `prev` (history entries
-  are passed over) and `--locked` (refused, see above);
+  are passed over), `--locked` and `play` (refused, see above);
 - the renderer tracks what projectM renders, the playing preset and,
   during a blend, the outgoing one. When either is `high_frequency` (the
   filter was just turned on, mid-blend in either direction), it cuts at
@@ -135,9 +145,12 @@ The pack is produced by the Phase 4 pipeline and extracted to
 
 A **preset id** is the preset's path under `presets/`, e.g.
 `Geiss - Chrome.milk` or `high_frequency/xyz.milk`. Ids are what
-`--skip-file`, `--locked` and the `preset` / `skip` events carry. A valid id
-is relative, has no `.`/`..`/empty segment and no control characters, ends
-in `.milk` and is at most 1024 bytes; others are dropped from the manifest.
+`--skip-file`, `--locked`, `play`, the selection file and the `preset` /
+`skip` events carry. A valid id is relative, has no `.`/`..`/empty segment
+and no control characters, is valid UTF-8, ends in `.milk` and is at most
+1024 bytes; others are dropped from the manifest. Ids under `user/` are
+reserved for user presets: pack entries there are dropped (counted as
+rejected).
 
 `manifest.json`:
 
@@ -167,10 +180,91 @@ in `.milk` and is at most 1024 bytes; others are dropped from the manifest.
 | `tags` | Strings. `high_frequency` (or a `high_frequency/` path) puts a preset behind `--high-frequency`. |
 | `rpi3.rung` | The rpi3 sweep's verdict: the largest internal resolution that held the budget (`"WxH"`), or `"skip"` (with `reason`). GLES2 builds start the preset at the first ladder rung no larger than it and never play `skip` presets. GLES3 builds (rpi4/5) ignore `rpi3` and rely on the runtime guard. Shorthand: `"rpi3": "skip"` or `"rpi3": "640x360"`. |
 | `rpi3.frame_ms` | Whole-frame vc4 time at that rung. Over 25 ms, a GLES2 build cuts to the preset instead of blending (a blend renders two presets). |
-| `compile_ms` | rpi3 shader compile time. Over 600 ms, rotation picks the preset at half weight (it is still played). |
+| `compile_ms` | rpi3 shader compile time. Over 600 ms, rotation picks the preset at half weight: later in a deal on average (it is still played as often). |
 | `eval_ms` | Per-frame expression eval time (informational). |
 
 Unknown fields are ignored.
+
+### User presets
+
+Uploads live outside the pack (the BEAM never writes into it), in
+`--user-dir`:
+
+```
+<user>/
+  manifest.json       BEAM-generated, same format as the pack's; optional
+  presets/            the uploaded .milk files
+  textures/           their textures
+```
+
+- **Ids** are `user/` + the entry's `file`, which resolves to
+  `<user>/presets/<file>`; one whose prefixed id isn't valid (too long) is
+  rejected. A missing manifest (or no `--user-dir`) is no user presets; a
+  malformed one is logged and reported (`error` `user_manifest`), and the
+  pack plays alone. Never fatal.
+- **Fields.** The BEAM writes `file` and `tags` (`rpi3`, `compile_ms` and
+  the like are absent; uploads are not swept). A `high_frequency` tag puts
+  an upload behind `--high-frequency` like a pack preset (the `user/`
+  prefix defeats the `high_frequency/` path rule).
+- **Shaders.** The pack's shader cache simply misses for them: they are
+  translated at load (on rpi3 about 42 ms p50, 107 ms p99 more warm-up).
+- **Textures.** The search path is `[<pack>/textures, <user>/textures]`:
+  projectM takes the first file with a matching lowercase name, so a pack
+  texture wins a clash. projectM rescans it at each preset load, so new
+  uploads' textures need no restart, and its random textures
+  (`sampler_randNN`) are drawn from both directories.
+- **`reload_user`** re-reads the manifest. Entries are never erased or
+  moved: new ids are appended, listed ones refreshed in place (their tags,
+  e.g. a `high_frequency` toggle; an upload flagged `high_frequency` while
+  rendered with the filter off is cut away at once), and ids no longer
+  listed are tombstoned. A tombstoned preset is never picked again
+  (rotation, `next`/`prev`, which pass over it, `play` → `unknown`); if it
+  is playing it carries on until the next switch, and while locked it
+  stays until `unlock`/`next` (then rotation moves on). An id that comes
+  back revives its entry with the new fields; projectM reads the file at
+  each load, so a replaced file plays its new content from its next load.
+- **Skips** are by id: a `--skip-file` entry or a skip this session holds
+  for a `user/` id like any other, for the whole session (a replaced file
+  is retried at the next start, when the BEAM's skip file no longer lists
+  it).
+
+### Selection
+
+`--selection-file` (BEAM-written, read whole, at most 1 MiB):
+
+```json
+{"gen": 12, "favourites": ["a.milk"], "hidden": ["user/b.milk"],
+ "playlist": ["a.milk", "c.milk"], "playlist_enabled": true}
+```
+
+Every field is optional (`gen` 0, lists empty, playlist off). Ids that
+aren't valid preset ids are dropped; unknown ones are kept, so a playlist
+may name an upload a later `reload_user` adds. A wrong type, malformed JSON
+or an oversize file is an `error` `selection`: at start nothing is applied,
+on `reload_selection` the selection in force stays.
+
+Precedence, applied on every pick:
+
+- the skip list and the photosensitivity filter always apply (and on
+  GLES2 the rpi3 `skip` verdict): those presets are not eligible;
+- rotation (the timer, `next` past the end of history, ejects) picks
+  from the first non-empty of: the eligible, unhidden presets on the
+  playlist (while it is enabled); the eligible, unhidden ones (the
+  `selection` event's `playlist_fallback`); every eligible one
+  (`hidden_fallback`). A selection never ends rotation: only running out
+  of eligible presets exits (`no_presets`);
+- `next`/`prev` through history pass over hidden presets;
+- favourites play three times as often: rotation deals one ticket per
+  preset of the pool and three per favourite, spread so a preset's tickets
+  aren't back to back, and never plays the same preset twice in a row,
+  across deals too (unless it is the whole pool). The GLES2 half weight
+  for `compile_ms` over 600 only orders a deal (such presets come later
+  in it on average);
+- `play` and `--locked` may pick any eligible preset, hidden and
+  off-playlist ones included.
+
+A new selection re-deals rotation; the playing preset is left alone, even
+if it is now hidden or off the playlist, until the next switch.
 
 ### Shader cache
 
@@ -345,7 +439,9 @@ above 254x256.
 
 Unit tests (host, no GL): `test/milkdrop_renderer_unit_test.exs` builds
 and runs `milkdrop_renderer_unit_tests` — protocol and JSON, options,
-connector and mode selection (`src/output_select.h`), manifest and skip list, rotation and history, the photosensitivity
+connector and mode selection (`src/output_select.h`), manifest and skip list, the user manifest (`user/` ids,
+reserved ids dropped, reloads with tombstones and stable entries), the selection file and its precedence (hidden,
+playlist and its fallbacks, favourite tickets), `play` and its refusals, rotation and history, the photosensitivity
 filter (picks, history, lock, blends in and out), preset selection
 batches and exhaustion (a failed activation included), the switch state (held frames, cuts, a
 `take` that waits for a replacement, recovery batches), the cost guard ladder, frame pacing, the poll-round
