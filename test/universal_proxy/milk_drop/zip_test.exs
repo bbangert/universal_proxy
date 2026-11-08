@@ -260,6 +260,20 @@ defmodule UniversalProxy.MilkDrop.ZipTest do
                {:error, {:bad_sizes, "a.milk"}}
 
       assert open(zip([[name: "d/", data: "abc"]])) == {:error, {:bad_sizes, "d/"}}
+      # A directory's stored sizes must agree too, and a deflated one is bounded.
+      assert open(zip([[name: "d/", data: "abc", usize: 0]])) == {:error, {:bad_sizes, "d/"}}
+
+      assert open(
+               zip([
+                 [
+                   name: "d/",
+                   data: "",
+                   method: :deflate,
+                   compressed: :crypto.strong_rand_bytes(2_000),
+                   usize: 0
+                 ]
+               ])
+             ) == {:error, {:bad_sizes, "d/"}}
 
       huge = :crypto.strong_rand_bytes(2_000)
 

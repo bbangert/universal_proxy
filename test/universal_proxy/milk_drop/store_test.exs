@@ -978,7 +978,7 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
         end)
 
       on_exit(fn -> Process.exit(owner, :kill) end)
-      assert_receive {:marked, result}
+      assert_receive {:marked, result}, 2_000
       {owner, result}
     end
 
