@@ -134,7 +134,9 @@ defmodule UniversalProxy.Display.State do
   `{:milkdrop_now_playing, now_playing}` whenever it changes
   (`t:now_playing/0`: the preset, its lock and the renderer's last
   `selection` answer while `:presenting`, else `idle_now_playing/0`), and
-  read with a `:milkdrop_now_playing` call.
+  read with a `:milkdrop_now_playing` call. A State start broadcasts it
+  once too (idle: no session survives a restart), so a subscriber still
+  showing a preset from before the restart drops it.
 
   Every phase is bounded (`:milkdrop_timeouts`, ms: tapping 10 000,
   preparing 20 000, taking 5 000, releasing 3 000, recovering 45 000 (the
@@ -358,6 +360,7 @@ defmodule UniversalProxy.Display.State do
     state = %{state | adapters: state.cec.list_adapters.(), outputs: state.audio.list_outputs.()}
     # The pack first, so a persisted MilkDrop mode sees it.
     state = if state.milkdrop?, do: dispatch(state, {:pack, state.pack.status.()}), else: state
+    if state.milkdrop?, do: announce_now_playing(state)
     state = rebind(state)
     {:noreply, dispatch(state, {:display_available, display_available?(state)})}
   end
@@ -564,12 +567,13 @@ defmodule UniversalProxy.Display.State do
       else: {:noreply, state}
   end
 
+  # Each armed retry has its own token: a cancelled one's message, already
+  # delivered, doesn't match the retry armed after it.
   def handle_info(
-        {:milkdrop_selection_retry, session},
-        %{md: %{session: session, selection_retry: %{} = retry, selection_want: want} = md} =
-          state
+        {:milkdrop_selection_retry, ref},
+        %{md: %{selection_retry: %{ref: ref} = retry, selection_want: want} = md} = state
       ) do
-    state = %{state | md: %{md | selection_retry: %{retry | timer: nil}}}
+    state = %{state | md: %{md | selection_retry: %{retry | timer: nil, ref: nil}}}
     {:noreply, send_selection(state, want)}
   end
 
@@ -1280,15 +1284,16 @@ defmodule UniversalProxy.Display.State do
       %{state | md: md}
     else
       ms = state.md_timeouts.selection_retry * Integer.pow(2, attempt)
-      timer = Process.send_after(self(), {:milkdrop_selection_retry, md.session}, ms)
-      %{state | md: %{md | selection_retry: %{timer: timer, attempt: attempt + 1}}}
+      ref = make_ref()
+      timer = Process.send_after(self(), {:milkdrop_selection_retry, ref}, ms)
+      %{state | md: %{md | selection_retry: %{timer: timer, ref: ref, attempt: attempt + 1}}}
     end
   end
 
   defp cancel_selection_retry(%{selection_retry: %{timer: timer} = retry} = md)
        when is_reference(timer) do
     Process.cancel_timer(timer)
-    %{md | selection_retry: %{retry | timer: nil}}
+    %{md | selection_retry: %{retry | timer: nil, ref: nil}}
   end
 
   defp cancel_selection_retry(md), do: md
@@ -1339,6 +1344,16 @@ defmodule UniversalProxy.Display.State do
     do: %{preset: md.preset, locked: md.locked, selection: md.selection}
 
   defp now_playing(_state), do: @idle_now_playing
+
+  # A State (re)start has no session: subscribers holding a preset from
+  # before it must hear that nothing shows.
+  defp announce_now_playing(state) do
+    Phoenix.PubSub.broadcast(
+      state.pubsub,
+      MilkDrop.now_playing_topic(),
+      {:milkdrop_now_playing, state.now_playing}
+    )
+  end
 
   defp sync_now_playing(state) do
     case now_playing(state) do

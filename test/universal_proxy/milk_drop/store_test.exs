@@ -127,6 +127,34 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
       assert {:ok, %{min_fps: 30}} = Store.update(server, %{min_fps: 60})
     end
 
+    test "a renderer session's lock write loses to a fenced one made after it started",
+         %{path: path} do
+      server = start_store(path)
+      retired = System.unique_integer([:monotonic])
+      fence = System.unique_integer([:monotonic])
+
+      assert {:ok, %{locked: "b.milk"}} = Store.update(server, %{locked: "b.milk"}, fence: fence)
+
+      # Only its `locked` is dropped.
+      assert {:ok, %{locked: "b.milk", rotate_s: 30}} =
+               Store.update(server, %{"locked" => "a.milk", rotate_s: 30}, session: retired)
+
+      newer = System.unique_integer([:monotonic])
+
+      assert {:ok, %{locked: "c.milk"}} =
+               Store.update(server, %{locked: "c.milk"}, session: newer)
+
+      # A lower fence (its write applies) doesn't lower it; untagged writes
+      # always apply.
+      assert {:ok, %{locked: "d.milk"}} =
+               Store.update(server, %{locked: "d.milk"}, fence: retired)
+
+      assert {:ok, %{locked: "d.milk"}} =
+               Store.update(server, %{locked: "x.milk"}, session: retired)
+
+      assert {:ok, %{locked: nil}} = Store.update(server, %{locked: nil})
+    end
+
     test "changes are broadcast", %{path: path} do
       server = start_store(path)
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, MilkDrop.settings_topic())
@@ -950,7 +978,7 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
         end)
 
       on_exit(fn -> Process.exit(owner, :kill) end)
-      assert_receive {:marked, result}
+      assert_receive {:marked, result}, 2_000
       {owner, result}
     end
 

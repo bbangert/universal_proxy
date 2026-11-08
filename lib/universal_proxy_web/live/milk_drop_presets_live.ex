@@ -33,7 +33,8 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
 
   `UniversalProxy.MilkDrop.play/3` blocks until the TV shows the preset
   (up to 15 s), so it runs in `start_async/3`; its answer becomes a
-  flash. A newer play supersedes an older one, whose answer is dropped.
+  flash. Play, lock and unlock run one at a time in click order; a click
+  made meanwhile waits, the latest replacing an earlier waiting one.
   Fast-flashing presets aren't played while they are filtered out (the
   renderer would refuse). A test seam, `:milkdrop_display` app env, names
   the `UniversalProxy.Display.State` server.
@@ -82,7 +83,8 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
        |> assign(:at_end, true)
        |> assign_totals()
        |> assign(:confirm, nil)
-       |> assign(:playing, nil)
+       |> assign(:command, nil)
+       |> assign(:queued, nil)
        |> stream_configure(:presets, dom_id: &"preset-#{&1.key}")
        |> stream(:presets, [])}
     else
@@ -217,24 +219,38 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
   end
 
   # Brings the loaded rows of these keys up to date: a matching row is
-  # re-rendered where it is, or inserted in place when it falls inside the
-  # loaded range (rows beyond it arrive by paging); one that no longer
-  # matches (or is gone) is dropped.
+  # re-rendered where it is; one that no longer matches (or is gone) is
+  # dropped. Rows that now match and fall inside the loaded range (rows
+  # beyond it arrive by paging) are merged into the window, which is then
+  # re-streamed whole: its final pages are worked out first, so the DOM
+  # gets exactly them (a stream delete doesn't cancel an insert made in
+  # the same render).
   defp refresh_rows(socket, keys) do
-    Enum.reduce(Enum.uniq(keys), socket, fn key, socket ->
-      with {:ok, row} <- Index.fetch(key),
-           true <- Index.matches?(row, socket.assigns.query) do
-        [row] = decorate(socket, [row])
-
-        cond do
-          loaded?(socket, key) -> stream_insert(socket, :presets, row, update_only: true)
-          in_range?(socket, Index.cursor(row)) -> insert_row(socket, row)
-          true -> socket
+    {gone, loaded, new} =
+      keys
+      |> Enum.uniq()
+      |> Enum.reduce({[], [], []}, fn key, {gone, loaded, new} ->
+        with {:ok, row} <- Index.fetch(key),
+             true <- Index.matches?(row, socket.assigns.query) do
+          cond do
+            loaded?(socket, key) -> {gone, [row | loaded], new}
+            in_range?(socket, Index.cursor(row)) -> {gone, loaded, [row | new]}
+            true -> {gone, loaded, new}
+          end
+        else
+          _ -> {[key | gone], loaded, new}
         end
-      else
-        _ -> delete_keys(socket, [key])
-      end
-    end)
+      end)
+
+    socket = delete_keys(socket, gone)
+
+    if new == [] do
+      Enum.reduce(decorate(socket, loaded), socket, fn row, socket ->
+        stream_insert(socket, :presets, row, update_only: true)
+      end)
+    else
+      merge_rows(socket, new)
+    end
   end
 
   defp loaded?(socket, key), do: Enum.any?(socket.assigns.pages, &(key in &1.keys))
@@ -242,46 +258,49 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
   defp in_range?(%{assigns: %{pages: []}} = socket, _cursor),
     do: socket.assigns.at_start and socket.assigns.at_end
 
+  # Inclusive: a page keeps its edge cursors when their rows leave, and a
+  # row coming back at one is neither loaded nor reached by paging.
   defp in_range?(socket, cursor) do
     %{pages: pages, at_start: at_start, at_end: at_end} = socket.assigns
-    (at_start or cursor > hd(pages).first) and (at_end or cursor < List.last(pages).last)
+    (at_start or cursor >= hd(pages).first) and (at_end or cursor <= List.last(pages).last)
   end
 
-  defp insert_row(%{assigns: %{pages: []}} = socket, row) do
+  # The window's rows plus `new`, in name order, cut into pages anew (the
+  # outer cursors kept) and trimmed from the end to @max_rows.
+  defp merge_rows(socket, new) do
+    old = socket.assigns.pages
+
+    rows =
+      old
+      |> Enum.flat_map(& &1.keys)
+      |> Enum.flat_map(fn key ->
+        case Index.fetch(key) do
+          {:ok, row} -> [row]
+          :error -> []
+        end
+      end)
+      |> Enum.concat(new)
+      |> Enum.uniq_by(& &1.key)
+      |> Enum.sort_by(&Index.cursor/1)
+
+    pages = rows |> Enum.chunk_every(@page) |> Enum.flat_map(&page_of/1) |> keep_bounds(old)
+    {pages, dropped} = trim(pages, :back)
+    kept = MapSet.new(Enum.flat_map(pages, & &1.keys))
+    rows = Enum.filter(rows, &MapSet.member?(kept, &1.key))
+
     socket
-    |> stream_insert(:presets, row, at: -1)
-    |> assign(:pages, page_of([row]))
-  end
-
-  defp insert_row(socket, row) do
-    cursor = Index.cursor(row)
-    pages = socket.assigns.pages
-    i = Enum.find_index(pages, &(cursor < &1.last)) || length(pages) - 1
-    page = Enum.at(pages, i)
-    before = Enum.count(page.keys, &before?(&1, cursor))
-    at = (pages |> Enum.take(i) |> Enum.map(&length(&1.keys)) |> Enum.sum()) + before
-
-    page = %{
-      page
-      | first: min(page.first, cursor),
-        last: max(page.last, cursor),
-        keys: List.insert_at(page.keys, before, row.key)
-    }
-
-    {pages, dropped} = trim(List.replace_at(pages, i, page), :back)
-
-    socket
-    |> stream_insert(:presets, row, at: at)
+    |> stream(:presets, decorate(socket, rows), reset: true)
     |> assign(:pages, pages)
-    |> delete_keys(dropped)
     |> assign(:at_end, socket.assigns.at_end and dropped == [])
   end
 
-  defp before?(key, cursor) do
-    case Index.fetch(key) do
-      {:ok, row} -> Index.cursor(row) < cursor
-      :error -> false
-    end
+  defp keep_bounds(pages, []), do: pages
+
+  defp keep_bounds(pages, old) do
+    [first | rest] = pages
+    pages = [%{first | first: min(first.first, hd(old).first)} | rest]
+    last = List.last(pages)
+    List.replace_at(pages, -1, %{last | last: max(last.last, List.last(old).last)})
   end
 
   # ── Events ────────────────────────────────────────────────────────────
@@ -306,15 +325,7 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
   def handle_event("lock", %{"key" => key}, socket),
     do: {:noreply, with_row(socket, key, &play(&1, &2, true))}
 
-  def handle_event("unlock", _params, socket) do
-    case MilkDrop.unlock(display: display()) do
-      :ok ->
-        {:noreply, update(socket, :settings, &%{&1 | locked: nil})}
-
-      {:error, reason} ->
-        {:noreply, put_flash(socket, :error, "Couldn't unlock (#{error_text(reason)}).")}
-    end
-  end
+  def handle_event("unlock", _params, socket), do: {:noreply, submit(socket, %{kind: :unlock})}
 
   def handle_event(event, %{"key" => key, "value" => value}, socket)
       when event in ["favourite", "hide", "playlist"] and value in ["true", "false"] do
@@ -442,36 +453,61 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
     if row.high_frequency and not socket.assigns.settings.include_high_frequency do
       put_flash(socket, :error, play_text({:refused, :high_frequency}, row.name, lock?))
     else
-      ref = make_ref()
-      id = row.id
-      display = display()
-
-      socket
-      |> assign(:playing, %{ref: ref, name: row.name, lock?: lock?})
-      |> start_async({:play, ref}, fn -> MilkDrop.play(id, lock?, display: display) end)
+      submit(socket, %{kind: :play, id: row.id, name: row.name, lock?: lock?})
     end
+  end
+
+  # Play, lock and unlock go out one at a time, in the order they were
+  # clicked: separate tasks could reach Display.State out of order (a
+  # delayed lock landing after an unlock). One command runs, and the
+  # latest click waits behind it, replacing any earlier waiting one.
+  defp submit(%{assigns: %{command: nil}} = socket, command), do: run(socket, command)
+  defp submit(socket, command), do: assign(socket, :queued, command)
+
+  defp run(socket, command) do
+    display = display()
+
+    fun =
+      case command do
+        %{kind: :play, id: id, lock?: lock?} ->
+          fn -> MilkDrop.play(id, lock?, display: display) end
+
+        %{kind: :unlock} ->
+          fn -> MilkDrop.unlock(display: display) end
+      end
+
+    socket
+    |> assign(:command, command)
+    |> assign(:queued, nil)
+    |> start_async(:command, fun)
   end
 
   @impl true
-  def handle_async({:play, ref}, result, %{assigns: %{playing: %{ref: ref} = playing}} = socket) do
-    socket = assign(socket, :playing, nil)
+  def handle_async(:command, result, socket) do
+    socket = socket |> report(socket.assigns.command, result) |> assign(:command, nil)
 
-    case result do
-      {:ok, :ok} ->
-        {:noreply, put_flash(socket, :info, play_text(:ok, playing.name, playing.lock?))}
-
-      {:ok, {:error, :superseded}} ->
-        {:noreply, socket}
-
-      {:ok, {:error, reason}} ->
-        {:noreply, put_flash(socket, :error, play_text(reason, playing.name, playing.lock?))}
-
-      {:exit, _reason} ->
-        {:noreply, put_flash(socket, :error, "Couldn't reach the visualizer.")}
+    case socket.assigns.queued do
+      nil -> {:noreply, socket}
+      queued -> {:noreply, run(socket, queued)}
     end
   end
 
-  def handle_async({:play, _stale}, _result, socket), do: {:noreply, socket}
+  defp report(socket, _command, {:exit, _reason}),
+    do: put_flash(socket, :error, "Couldn't reach the visualizer.")
+
+  defp report(socket, %{kind: :unlock}, {:ok, :ok}),
+    do: update(socket, :settings, &%{&1 | locked: nil})
+
+  defp report(socket, %{kind: :unlock}, {:ok, {:error, reason}}),
+    do: put_flash(socket, :error, "Couldn't unlock (#{error_text(reason)}).")
+
+  defp report(socket, %{kind: :play} = play, {:ok, :ok}),
+    do: put_flash(socket, :info, play_text(:ok, play.name, play.lock?))
+
+  defp report(socket, %{kind: :play}, {:ok, {:error, :superseded}}), do: socket
+
+  defp report(socket, %{kind: :play} = play, {:ok, {:error, reason}}),
+    do: put_flash(socket, :error, play_text(reason, play.name, play.lock?))
 
   # ── PubSub ────────────────────────────────────────────────────────────
 
@@ -494,6 +530,10 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
   def handle_info({:milkdrop_settings, settings}, socket) when is_map(settings),
     do: {:noreply, assign(socket, :settings, settings)}
 
+  # The Store served defaults until its table opened: read it again.
+  def handle_info({:milkdrop_store, :opened}, socket),
+    do: {:noreply, assign(socket, :settings, Store.settings())}
+
   def handle_info({kind, status}, socket) when kind in [:milkdrop_pack, :milkdrop_pack_started],
     do: {:noreply, assign(socket, :pack, status)}
 
@@ -514,11 +554,14 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
   defp refresh_upload,
     do: send_update(MilkDropUploadComponent, id: "milkdrop-upload", refresh: true)
 
+  defp playing(%{kind: :play} = play), do: play
+  defp playing(_command), do: nil
+
   defp display, do: Application.get_env(:universal_proxy, :milkdrop_display, Display.State)
 
   defp browse_path(q, filter) do
-    params = %{filter: Index.filter_param(filter)}
-    params = if q == "", do: params, else: Map.put(params, :q, q)
+    # A keyword list: a map's key order (and so the URL's) isn't stable.
+    params = [filter: Index.filter_param(filter)] ++ if(q == "", do: [], else: [q: q])
     ~p"/audio/milkdrop?#{params}"
   end
 
@@ -628,7 +671,7 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
       <.now_playing_bar
         now_playing={@now_playing}
         settings={@settings}
-        playing={@playing}
+        playing={playing(@command)}
       />
 
       <.playlist_bar

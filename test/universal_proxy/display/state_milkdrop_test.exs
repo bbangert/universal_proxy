@@ -545,9 +545,13 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     opts = [display: ctx.state, store: store]
     {:ok, _} = Store.update(store, %{locked: "a.milk"})
 
-    # No session: only the Store's lock goes.
+    # No session: only the Store's lock goes, fenced against a session that
+    # started earlier and is still retiring.
+    retiring = System.unique_integer([:monotonic])
     assert Display.milkdrop_unlock(ctx.state) == {:error, :not_presenting}
     assert UniversalProxy.MilkDrop.unlock(opts) == :ok
+    assert Store.settings(store).locked == nil
+    {:ok, _} = Store.update(store, %{locked: "late.milk"}, session: retiring)
     assert Store.settings(store).locked == nil
     refute "unlock" in cmd_names(ctx.skip_file)
 
@@ -621,16 +625,21 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
   end
 
   test "next and prev wait for the play in flight", ctx do
-    ctx = ctx |> start_ui(fake: %{play_delays: [300]}) |> presenting()
+    # The fake keeps reading (and logging) commands while it answers the
+    # play from a timer, so a `next` forwarded now would be logged at once.
+    ctx = ctx |> start_ui(fake: %{play_delays: [600], play_defer: true}) |> presenting()
 
     pending = Task.async(fn -> play(ctx, "x.milk") end)
     wait_until(fn -> md(ctx).pending_play == "x.milk" end)
+    wait_until(fn -> "play" in cmd_names(ctx.skip_file) end)
     key(ctx, :right)
-    _ = :sys.get_state(ctx.state)
+    assert %{md: %{held: [:next]}} = :sys.get_state(ctx.state)
+    Process.sleep(200)
     refute "next" in cmd_names(ctx.skip_file)
 
     assert Task.await(pending) == :ok
     wait_until(fn -> md(ctx).preset == "p1.milk" end)
+    assert %{md: %{held: []}} = :sys.get_state(ctx.state)
     assert Enum.take(cmd_names(ctx.skip_file), -2) == ["play", "next"]
   end
 
@@ -736,6 +745,67 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     assert md(ctx).selection_retries == 0
   end
 
+  test "a retiring session's late lock doesn't overwrite one saved after it", ctx do
+    store =
+      start_supervised!(
+        {Store,
+         name: nil,
+         table: :"#{ctx.test}",
+         dets_path: Path.join(ctx.tmp_dir, "s.dets"),
+         in_flight_grace_ms: 0}
+      )
+
+    ctx =
+      ctx
+      |> start_ui(fake: %{play_delays: [800]}, milkdrop_opts: [store: store])
+      |> presenting()
+
+    opts = [display: ctx.state, store: store]
+    pending = Task.async(fn -> UniversalProxy.MilkDrop.play("a.milk", true, opts) end)
+    wait_until(fn -> md(ctx).pending_play == "a.milk" end)
+    paused(ctx)
+    assert Task.await(pending) == {:error, :not_presenting}
+
+    assert UniversalProxy.MilkDrop.play("b.milk", true, opts) == {:error, :not_presenting}
+    assert Store.settings(store).locked == "b.milk"
+
+    # The renderer answers the play (locked: true) before `released`, so
+    # its lock write has been tried once the session is over.
+    wait_until(fn -> md(ctx).phase == nil end)
+    assert Store.settings(store).locked == "b.milk"
+  end
+
+  test "a stale selection retry doesn't fire the one armed after it", ctx do
+    selection_file = Path.join(ctx.tmp_dir, "selection.json")
+
+    ctx =
+      ctx
+      |> start_ui(
+        milkdrop_opts: [selection_file: selection_file],
+        timeouts: %{selection_retry: 60_000}
+      )
+      |> presenting()
+
+    wait_until(fn -> match?(%{selection: %{gen: 0}}, md(ctx)) end)
+    File.mkdir_p!(selection_file <> ".tmp")
+
+    capture_log(fn ->
+      selection_changed(ctx, %{gen: 2})
+      wait_until(fn -> md(ctx).selection_retries == 1 end)
+    end)
+
+    %{md: %{selection_retry: armed}} = :sys.get_state(ctx.state)
+    # A message from a retry cancelled before this one was armed.
+    send(ctx.state, {:milkdrop_selection_retry, make_ref()})
+    assert %{md: %{selection_retry: ^armed}} = :sys.get_state(ctx.state)
+
+    # The armed one's own message does resend.
+    File.rmdir!(selection_file <> ".tmp")
+    send(ctx.state, {:milkdrop_selection_retry, armed.ref})
+    wait_until(fn -> md(ctx).selection.gen == 2 end)
+    Process.cancel_timer(armed.timer)
+  end
+
   test "a play pending when the session is reclaimed or ends is answered not_presenting", ctx do
     ctx = ctx |> start_ui(fake: %{ignore: ["play"]}) |> presenting()
 
@@ -751,6 +821,15 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     wait_until(fn -> md(ctx).pending_play == "b.milk" end)
     Renderer.command(renderer(ctx), %{cmd: "crash", status: 3})
     assert Task.await(pending) == {:error, :not_presenting}
+  end
+
+  test "a restarted State announces that nothing shows", ctx do
+    ctx = start_ui(ctx)
+    Phoenix.PubSub.subscribe(ctx.pubsub, UniversalProxy.MilkDrop.now_playing_topic())
+    Process.exit(GenServer.whereis(ctx.state), :kill)
+
+    assert_receive {:milkdrop_now_playing, %{preset: nil, locked: false, selection: nil}},
+                   @timeout
   end
 
   test "now-playing is broadcast while presenting and goes idle when the session ends", ctx do
