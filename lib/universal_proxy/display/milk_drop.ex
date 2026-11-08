@@ -64,6 +64,11 @@ defmodule UniversalProxy.Display.MilkDrop do
       the Store could not take are retried (default 5000);
     * `:kill_grace_ms` — how long a renderer that outlives its closed stdin
       may run before it is SIGKILLed (default 2000);
+    * `:loading_timeout_ms` — how long a `loading` may go unanswered before
+      the renderer is taken as hung (default 10000; see "Hangs and
+      crashes");
+    * `:silence_ms` — how long the renderer may write nothing at all before
+      it is taken as hung (default 30000);
     * `:task_supervisor` — the `Task.Supervisor` the reaper runs under
       (default `UniversalProxy.TaskSupervisor`).
 
@@ -178,6 +183,28 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   The record is written once per preset change (about every 20 s), so its
   flash wear is negligible.
+
+  ## Hangs and crashes
+
+  A preset whose expressions never finish (nested `loop`s) stops the
+  renderer's only thread: no frames, no events, and its cost guard never
+  runs. So the renderer is taken as hung when a `loading` gets no `preset`
+  or `skip` for that preset within `:loading_timeout_ms` (a warm-up takes
+  well under a second), or when it writes nothing at all for `:silence_ms`
+  (counted from the spawn; it sends `stats` every 10 s in every phase).
+  Then the preset loading, else the one showing (none once `exiting` was
+  seen), is skipped with reason `hang`, persisted as any skip before
+  anything else; the renderer is SIGKILLed, the owner gets
+  `{:milkdrop_exit, pid, :hang}` and this process stops with
+  `{:shutdown, :hang}` (the reaper confirms the renderer gone).
+
+  A renderer that exits non-zero (or by a signal) while a `loading` is
+  unanswered, without having sent `exiting`, crashed on that preset: it is
+  skipped with reason `crashed` before the owner gets the exit status, so
+  the skip file of a renderer started after it has it.
+
+  Either way the skip gets one attempt (this process stops right after),
+  and the in-flight record is left to the Store's grace period.
   """
 
   use GenServer
@@ -189,6 +216,11 @@ defmodule UniversalProxy.Display.MilkDrop do
   @line_max 4096
   @kill_grace_ms 2_000
   @skip_retry_ms 5_000
+  # Well inside State's 20 s `:preparing` bound, so a hang in the first
+  # warm-up is caught (and skipped) here first.
+  @loading_timeout_ms 10_000
+  # 3 × the renderer's stats interval (10 s), at least 30 s.
+  @silence_ms 30_000
   # Time the reaper's supervisor allows it to SIGKILL the renderer on shutdown.
   @reaper_shutdown_ms 5_000
   @target Mix.target()
@@ -392,8 +424,16 @@ defmodule UniversalProxy.Display.MilkDrop do
          pending_skips: %{},
          skip_retry_ms: Keyword.get(opts, :skip_retry_ms, @skip_retry_ms),
          skip_timer: nil,
-         record_timer: nil
-       }}
+         record_timer: nil,
+         loading: nil,
+         loading_since: nil,
+         exiting: nil,
+         last_line: now_ms(),
+         loading_timeout_ms: Keyword.get(opts, :loading_timeout_ms, @loading_timeout_ms),
+         silence_ms: Keyword.get(opts, :silence_ms, @silence_ms),
+         watchdog: nil
+       }
+       |> arm_watchdog()}
     else
       {:error, reason} ->
         Logger.error("MilkDrop renderer did not start: #{inspect(reason)}")
@@ -421,25 +461,28 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   @impl true
   # A line longer than the port's line buffer arrives as `:noeol` fragments
-  # ending in one `:eol` tail; the whole line is dropped.
+  # ending in one `:eol` tail; the whole line is dropped. Any output at all
+  # counts as a sign of life for the watchdog.
   def handle_info({port, {:data, {:noeol, _chunk}}}, %{port: port} = state) do
     unless state.discarding, do: Logger.debug("MilkDrop renderer: dropped an over-long line")
-    {:noreply, %{state | discarding: true}}
+    {:noreply, %{state | discarding: true, last_line: now_ms()}}
   end
 
   def handle_info({port, {:data, {:eol, _tail}}}, %{port: port, discarding: true} = state) do
-    {:noreply, %{state | discarding: false}}
+    {:noreply, %{state | discarding: false, last_line: now_ms()}}
   end
 
   def handle_info({port, {:data, {:eol, line}}}, %{port: port} = state) do
-    {:noreply, handle_line(line, state)}
+    {:noreply, handle_line(line, %{state | last_line: now_ms()})}
   end
 
+  # Only the renderer's own exit gets here: when this process stops first,
+  # its port closes and the status is never delivered.
   def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
     level = if status == 0, do: :info, else: :warning
     Logger.log(level, "MilkDrop renderer exited with status #{status}")
     send(state.reaper, :renderer_exited)
-    state = if status == 0, do: sync_record(%{state | want: nil}), else: state
+    state = if status == 0, do: sync_record(%{state | want: nil}), else: record_crash(state)
     send(state.owner, {:milkdrop_exit, self(), status})
     {:stop, :normal, %{state | port: nil}}
   end
@@ -469,6 +512,15 @@ defmodule UniversalProxy.Display.MilkDrop do
     {:noreply, state |> Map.put(:record_timer, nil) |> sync_record()}
   end
 
+  def handle_info({:timeout, ref, :watchdog}, %{watchdog: ref} = state) do
+    state = %{state | watchdog: nil}
+
+    case overdue(state, now_ms()) do
+      nil -> {:noreply, arm_watchdog(state)}
+      why -> hung(state, why)
+    end
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
 
   # -- Private --
@@ -477,7 +529,7 @@ defmodule UniversalProxy.Display.MilkDrop do
     case decode_event(line) do
       {:ok, event} ->
         {event, state} = persist(event, state)
-        state = track_in_flight(event, state)
+        state = event |> track_in_flight(state) |> track_loading(event)
         send(state.owner, {:milkdrop, self(), event})
         state
 
@@ -501,8 +553,7 @@ defmodule UniversalProxy.Display.MilkDrop do
   defp persist(%{event: :skip, preset: preset} = event, state) when is_binary(preset) do
     reason = if is_binary(event[:reason]), do: event.reason, else: "unknown"
     fps = if is_number(event[:fps]), do: event.fps
-    pending = Map.put(state.pending_skips, preset, {reason, fps})
-    state = flush_skips(%{state | pending_skips: pending})
+    state = add_skip(state, preset, reason, fps)
     {Map.put(event, :persisted, not is_map_key(state.pending_skips, preset)), state}
   end
 
@@ -528,6 +579,77 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   defp persist(event, state), do: {event, state}
 
+  defp add_skip(state, preset, reason, fps \\ nil) do
+    pending = Map.put(state.pending_skips, preset, {reason, fps})
+    flush_skips(%{state | pending_skips: pending})
+  end
+
+  # The unanswered `loading`, for the watchdog and the crash check. The
+  # renderer answers each one, before anything else, with a `skip` for it
+  # or the `preset` event showing it (at start, before `prepared`).
+  defp track_loading(state, %{event: :loading, preset: preset}) when is_binary(preset),
+    do: arm_watchdog(%{state | loading: preset, loading_since: now_ms()})
+
+  defp track_loading(state, %{event: :preset}), do: %{state | loading: nil, loading_since: nil}
+
+  defp track_loading(%{loading: preset} = state, %{event: :skip, preset: preset}),
+    do: %{state | loading: nil, loading_since: nil}
+
+  # Its exit is decided and bounded by the renderer's exit guard.
+  defp track_loading(state, %{event: :exiting} = event),
+    do: %{state | loading: nil, loading_since: nil, exiting: event[:reason] || "unknown"}
+
+  defp track_loading(state, _event), do: state
+
+  # One timer, for the earliest deadline; lines only stamp `last_line`, and
+  # a timer that fires early re-arms for what is left. A replaced timer's
+  # message, if already sent, no longer matches `watchdog`.
+  defp arm_watchdog(state) do
+    if state.watchdog, do: :erlang.cancel_timer(state.watchdog)
+    ms = max(next_deadline(state) - now_ms(), 0)
+    %{state | watchdog: :erlang.start_timer(ms, self(), :watchdog)}
+  end
+
+  defp next_deadline(%{loading_since: nil} = state), do: state.last_line + state.silence_ms
+
+  defp next_deadline(state),
+    do: min(state.last_line + state.silence_ms, state.loading_since + state.loading_timeout_ms)
+
+  defp overdue(state, now) do
+    cond do
+      state.loading_since && now >= state.loading_since + state.loading_timeout_ms ->
+        "no answer to loading #{inspect(state.loading)} in #{state.loading_timeout_ms} ms"
+
+      now >= state.last_line + state.silence_ms ->
+        "silent for #{state.silence_ms} ms"
+
+      true ->
+        nil
+    end
+  end
+
+  # The skip goes out before the kill and the owner's message.
+  defp hung(state, why) do
+    preset = if is_nil(state.exiting), do: state.loading || state.showing
+    blamed = if preset, do: "; skipping #{inspect(preset)}", else: ""
+    Logger.warning("MilkDrop renderer hung (#{why})#{blamed}; killing it")
+    state = if preset, do: add_skip(state, preset, "hang"), else: state
+    if state.os_pid, do: kill(state.os_pid)
+    send(state.owner, {:milkdrop_exit, self(), :hang})
+    {:stop, {:shutdown, :hang}, state}
+  end
+
+  # A failed exit the renderer announced (`exiting`) is not a preset's
+  # doing; one mid-warm-up without it is.
+  defp record_crash(%{loading: preset, exiting: nil} = state) when is_binary(preset) do
+    Logger.warning("MilkDrop: #{inspect(preset)} crashed the renderer; skipping it")
+    add_skip(state, preset, "crashed")
+  end
+
+  defp record_crash(state), do: state
+
+  defp now_ms, do: System.monotonic_time(:millisecond)
+
   # The in-flight record. `want` is what it should name going by the
   # renderer's events: the preset loading, else the one showing (`nil`
   # after a clean end). `intended` is what the Store was last asked to hold
@@ -544,6 +666,7 @@ defmodule UniversalProxy.Display.MilkDrop do
   #   skip F, gpu_hang, persisted: false   as above   F (hold = F)
   #   the held skip persists               -          want (cleared if nil)
   #   released / exiting "requested"       nil        hold || cleared
+  #   hang / crash (exit status != 0)      -          as it was (Store grace)
   #
   # Invariant: the durable record names the most recent preset that could
   # have hung the GPU and is not yet persisted as skipped. Unacked asks are

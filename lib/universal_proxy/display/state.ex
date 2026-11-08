@@ -93,7 +93,7 @@ defmodule UniversalProxy.Display.State do
   3 000). A timed-out step (`:recovering` aside), a `take` the renderer
   reports failed,
   or a renderer that exits or crashes unasked (`{:milkdrop_exit, pid,
-  status}`, `:wedged` and `:reaper_down` included) stops it
+  status}`, `:wedged`, `:reaper_down` and `:hang` included) stops it
   (`UniversalProxy.Display.MilkDrop.stop/1`) and, if the viewport had
   yielded, starts the viewport again; the model counts the failure toward
   its crash latch, which is logged. A renderer that stopped because it
@@ -398,8 +398,8 @@ defmodule UniversalProxy.Display.State do
   def handle_info({:milkdrop, pid, event}, %{md: %{pid: pid}} = state) when is_map(event),
     do: {:noreply, milkdrop_event(state, event)}
 
-  # An exit status means the renderer process is gone; `:wedged` and
-  # `:reaper_down` don't.
+  # An exit status means the renderer process is gone; `:wedged`,
+  # `:reaper_down` and `:hang` don't.
   def handle_info({:milkdrop_exit, pid, status}, %{md: %{pid: pid, phase: :reaping}} = state) do
     if is_integer(status), do: {:noreply, finish_milkdrop(state)}, else: {:noreply, state}
   end

@@ -158,7 +158,9 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
           skipped: %{},
           store: :"#{inspect(__MODULE__)}.NoStore",
           kill_grace_ms: Keyword.get(opts, :kill_grace_ms, 300)
-        ] ++ if(supervised?, do: [], else: [task_supervisor: tasks]),
+        ] ++
+          Keyword.get(opts, :milkdrop_opts, []) ++
+          if(supervised?, do: [], else: [task_supervisor: tasks]),
       milkdrop_timeouts: Keyword.get(opts, :timeouts, %{})
     ]
 
@@ -702,6 +704,40 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
       end)
 
     assert log =~ "MilkDrop off until the mode is chosen again: 3 renderer failures"
+  end
+
+  test "a hung renderer is killed and counts as a crash: the viewport restarts", ctx do
+    ctx = ctx |> start_ui(milkdrop_opts: [loading_timeout_ms: 200]) |> presenting()
+    %{os_pid: os_pid} = :sys.get_state(renderer(ctx))
+    Renderer.command(renderer(ctx), %{cmd: "hang_loading", preset: "loop.milk"})
+
+    assert_receive {:fake_renderer, :start, _opts}, @timeout
+    assert_receive {:audio, :pcm_tap, @key, false}, @timeout
+    wait_until(fn -> md(ctx).phase == nil end)
+    refute File.exists?("/proc/#{os_pid}")
+    assert %{last: %{outcome: {:crashed, :hang}, phase: :presenting}, failures: 1} = md(ctx)
+    assert %{lifecycle: %{status: :running}, screen: {:visualizer, false}} = status(ctx)
+  end
+
+  test "three hangs latch MilkDrop off until the mode is chosen again", ctx do
+    log =
+      capture_log(fn ->
+        ctx =
+          start_ui(ctx,
+            fake: %{take_hang_loading: "loop.milk"},
+            milkdrop_opts: [loading_timeout_ms: 100],
+            model_opts: [milkdrop_retry_ms: 1]
+          )
+
+        ctx |> milkdrop_mode() |> playing()
+
+        for _ <- 1..3, do: assert_receive({:fake_renderer, :start, _opts}, @timeout)
+        wait_until(fn -> md(ctx).latch == :crashed end)
+        assert %{phase: nil, yield: false, failures: 3} = md(ctx)
+        assert %{mode: :milkdrop, screen: {:visualizer, false}} = status(ctx)
+      end)
+
+    assert log =~ "3 renderer failures in 10 min (last: {:crashed, :hang})"
   end
 
   test "a timed-out release kills the renderer and restarts the viewport", ctx do

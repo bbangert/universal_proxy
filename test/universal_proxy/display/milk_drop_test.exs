@@ -964,6 +964,108 @@ defmodule UniversalProxy.Display.MilkDropTest do
     wait_until(fn -> not File.exists?("/proc/#{os_pid}") end)
   end
 
+  # ── Hangs and crashes ─────────────────────────────────────────────────
+
+  @tag capture_log: true
+  test "an unanswered loading is a hang: skipped, killed and reported", ctx do
+    {pid, _} = start_renderer(ctx, loading_timeout_ms: 200)
+    %{os_pid: os_pid} = :sys.get_state(pid)
+    ref = Process.monitor(pid)
+
+    MilkDrop.command(pid, %{cmd: "hang_loading", preset: "loop.milk"})
+    assert_receive {:milkdrop, ^pid, %{event: :loading, preset: "loop.milk"}}, @timeout
+    assert_receive {:milkdrop_exit, ^pid, :hang}, @timeout
+    # On disk before the owner heard of it.
+    assert Store.skipped(ctx.store, @version) == %{"loop.milk" => "hang"}
+
+    assert_receive {:DOWN, ^ref, :process, ^pid, {:shutdown, :hang}}, @timeout
+    assert_receive {:milkdrop_reaped, ^pid}, @timeout
+    refute alive?(os_pid)
+    # The kill's exit status is never taken for a crash.
+    refute_received {:milkdrop_exit, ^pid, _}
+    assert Store.skipped(ctx.store, @version) == %{"loop.milk" => "hang"}
+  end
+
+  @tag capture_log: true
+  test "a renderer silent while showing a preset is a hang of that preset", ctx do
+    {pid, _} = start_renderer(ctx, silence_ms: 1_000)
+
+    emit(pid, ~s({"event":"preset","file":"a.milk","locked":false}))
+    assert_receive {:milkdrop, ^pid, %{event: :preset, file: "a.milk"}}, @timeout
+    MilkDrop.command(pid, %{cmd: "stall"})
+
+    assert_receive {:milkdrop_exit, ^pid, :hang}, @timeout
+    assert Store.skipped(ctx.store, @version) == %{"a.milk" => "hang"}
+    assert_receive {:milkdrop_reaped, ^pid}, @timeout
+  end
+
+  @tag capture_log: true
+  test "stats keep a renderer alive; an unanswered loading still times out", ctx do
+    {pid, _} = start_renderer(ctx, silence_ms: 300, loading_timeout_ms: 500)
+
+    MilkDrop.command(pid, %{cmd: "stats", ms: 50})
+    emit(pid, ~s({"event":"preset","file":"a.milk","locked":false}))
+    assert_receive {:milkdrop, ^pid, %{event: :preset, file: "a.milk"}}, @timeout
+    refute_receive {:milkdrop_exit, ^pid, _}, 1_000
+    assert Store.skipped(ctx.store, @version) == %{}
+
+    # The loading is blamed, not the preset showing.
+    MilkDrop.command(pid, %{cmd: "hang_loading", preset: "b.milk"})
+    assert_receive {:milkdrop_exit, ^pid, :hang}, @timeout
+    assert Store.skipped(ctx.store, @version) == %{"b.milk" => "hang"}
+  end
+
+  test "the first preset's loading at start is answered by its preset event", ctx do
+    File.write!(Path.join(ctx.pack_dir, "fake.json"), ~s({"startup_preset":"first.milk"}))
+    {pid, _} = start_renderer(ctx, loading_timeout_ms: 200)
+
+    assert_received {:milkdrop, ^pid, %{event: :loading, preset: "first.milk"}}
+    assert_received {:milkdrop, ^pid, %{event: :preset, file: "first.milk", cause: "start"}}
+    refute_receive {:milkdrop_exit, ^pid, _}, 600
+    assert Store.skipped(ctx.store, @version) == %{}
+
+    # Rotation's loading/preset pairs are answered too.
+    MilkDrop.next(pid)
+    assert_receive {:milkdrop, ^pid, %{event: :preset, file: "p1.milk"}}, @timeout
+    refute_receive {:milkdrop_exit, ^pid, _}, 400
+  end
+
+  @tag capture_log: true
+  test "a crash while loading skips that preset before the exit is reported", ctx do
+    {pid, _} = start_renderer(ctx)
+
+    MilkDrop.command(pid, %{cmd: "crash_on_loading", preset: "bad.milk", status: 139})
+    assert_receive {:milkdrop_exit, ^pid, 139}, @timeout
+    assert Store.skipped(ctx.store, @version) == %{"bad.milk" => "crashed"}
+    assert_receive {:milkdrop_reaped, ^pid}, @timeout
+
+    {_pid, prepared} = start_renderer(ctx, skip_file: ctx.skip_file <> "2")
+    assert prepared.skip == ["bad.milk"]
+  end
+
+  @tag capture_log: true
+  test "a crash with no loading pending skips nothing", ctx do
+    {pid, _} = start_renderer(ctx)
+
+    MilkDrop.next(pid)
+    assert_receive {:milkdrop, ^pid, %{event: :preset, file: "p1.milk"}}, @timeout
+    MilkDrop.command(pid, %{cmd: "crash", status: 3})
+    assert_receive {:milkdrop_exit, ^pid, 3}, @timeout
+    assert Store.skipped(ctx.store, @version) == %{}
+  end
+
+  @tag capture_log: true
+  test "a failed exit the renderer announced skips nothing", ctx do
+    {pid, _} = start_renderer(ctx)
+
+    emit(pid, ~s({"event":"loading","preset":"b.milk"}))
+    emit(pid, ~s({"event":"exiting","reason":"gl"}))
+    assert_receive {:milkdrop, ^pid, %{event: :exiting, reason: "gl"}}, @timeout
+    MilkDrop.command(pid, %{cmd: "crash", status: 1})
+    assert_receive {:milkdrop_exit, ^pid, 1}, @timeout
+    assert Store.skipped(ctx.store, @version) == %{}
+  end
+
   @tag capture_log: true
   test "a lock the Store failed to save is retried on the next preset event", ctx do
     store_opts = [
