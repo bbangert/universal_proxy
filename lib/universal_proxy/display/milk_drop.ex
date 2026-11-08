@@ -203,6 +203,10 @@ defmodule UniversalProxy.Display.MilkDrop do
   skipped with reason `crashed` before the owner gets the exit status, so
   the skip file of a renderer started after it has it.
 
+  The owner's own step timeouts can be shorter (the display's State
+  bounds `take` at 5 s and the start at 20 s); it stops a renderer stuck
+  in one with `stop_hung/2`, which blames and skips as the watchdog does.
+
   Either way the skip gets one attempt (this process stops right after),
   and the in-flight record is left to the Store's grace period.
   """
@@ -265,6 +269,20 @@ defmodule UniversalProxy.Display.MilkDrop do
   @spec stop(GenServer.server()) :: :ok
   def stop(server) do
     GenServer.stop(server)
+  catch
+    :exit, _ -> :ok
+  end
+
+  @doc """
+  Stop a renderer its owner gave up waiting on, as the watchdog would: the
+  preset `blame` names (`:loading` — an unanswered `loading`; `:showing` —
+  that, else the preset showing) is skipped as `hang` first, then the
+  renderer is SIGKILLed. The owner is not sent `{:milkdrop_exit, ...}`.
+  `:ok` if it is already gone.
+  """
+  @spec stop_hung(GenServer.server(), :loading | :showing) :: :ok
+  def stop_hung(server, blame) when blame in [:loading, :showing] do
+    GenServer.call(server, {:stop_hung, blame})
   catch
     :exit, _ -> :ok
   end
@@ -460,6 +478,12 @@ defmodule UniversalProxy.Display.MilkDrop do
   def handle_cast({:command, _cmd}, state), do: {:noreply, state}
 
   @impl true
+  def handle_call({:stop_hung, blame}, _from, state) do
+    state = kill_hung(state, blamed(state, blame), "its owner gave up waiting")
+    {:stop, {:shutdown, :hang}, :ok, state}
+  end
+
+  @impl true
   # A line longer than the port's line buffer arrives as `:noeol` fragments
   # ending in one `:eol` tail; the whole line is dropped. Any output at all
   # counts as a sign of life for the watchdog.
@@ -630,13 +654,22 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   # The skip goes out before the kill and the owner's message.
   defp hung(state, why) do
-    preset = if is_nil(state.exiting), do: state.loading || state.showing
-    blamed = if preset, do: "; skipping #{inspect(preset)}", else: ""
-    Logger.warning("MilkDrop renderer hung (#{why})#{blamed}; killing it")
-    state = if preset, do: add_skip(state, preset, "hang"), else: state
-    if state.os_pid, do: kill(state.os_pid)
+    state = kill_hung(state, blamed(state, :showing), why)
     send(state.owner, {:milkdrop_exit, self(), :hang})
     {:stop, {:shutdown, :hang}, state}
+  end
+
+  # Nobody once the renderer announced its exit (its exit guard bounds it).
+  defp blamed(%{exiting: reason}, _blame) when not is_nil(reason), do: nil
+  defp blamed(state, :loading), do: state.loading
+  defp blamed(state, :showing), do: state.loading || state.showing
+
+  defp kill_hung(state, preset, why) do
+    skipping = if preset, do: "; skipping #{inspect(preset)}", else: ""
+    Logger.warning("MilkDrop renderer hung (#{why})#{skipping}; killing it")
+    state = if preset, do: add_skip(state, preset, "hang"), else: state
+    if state.os_pid, do: kill(state.os_pid)
+    state
   end
 
   # A failed exit the renderer announced (`exiting`) is not a preset's

@@ -1031,6 +1031,39 @@ defmodule UniversalProxy.Display.MilkDropTest do
   end
 
   @tag capture_log: true
+  test "stop_hung blames what it is asked to, then kills without an exit message", ctx do
+    {pid, _} = start_renderer(ctx)
+    %{os_pid: os_pid} = :sys.get_state(pid)
+    emit(pid, ~s({"event":"preset","file":"a.milk","locked":false}))
+    assert_receive {:milkdrop, ^pid, %{event: :preset, file: "a.milk"}}, @timeout
+
+    # Nothing loading: `:loading` blames nobody.
+    assert MilkDrop.stop_hung(pid, :loading) == :ok
+    assert_receive {:milkdrop_reaped, ^pid}, @timeout
+    refute alive?(os_pid)
+    refute_received {:milkdrop_exit, ^pid, _}
+    assert Store.skipped(ctx.store, @version) == %{}
+
+    {pid, _} = start_renderer(ctx, skip_file: ctx.skip_file <> "2")
+    emit(pid, ~s({"event":"preset","file":"a.milk","locked":false}))
+    assert_receive {:milkdrop, ^pid, %{event: :preset, file: "a.milk"}}, @timeout
+    assert MilkDrop.stop_hung(pid, :showing) == :ok
+    assert Store.skipped(ctx.store, @version) == %{"a.milk" => "hang"}
+    assert MilkDrop.stop_hung(pid, :showing) == :ok
+  end
+
+  @tag capture_log: true
+  test "stop_hung with a loading pending blames it either way", ctx do
+    {pid, _} = start_renderer(ctx)
+    emit(pid, ~s({"event":"preset","file":"a.milk","locked":false}))
+    emit(pid, ~s({"event":"loading","preset":"b.milk"}))
+    assert_receive {:milkdrop, ^pid, %{event: :loading, preset: "b.milk"}}, @timeout
+
+    assert MilkDrop.stop_hung(pid, :loading) == :ok
+    assert Store.skipped(ctx.store, @version) == %{"b.milk" => "hang"}
+  end
+
+  @tag capture_log: true
   test "a crash while loading skips that preset before the exit is reported", ctx do
     {pid, _} = start_renderer(ctx)
 

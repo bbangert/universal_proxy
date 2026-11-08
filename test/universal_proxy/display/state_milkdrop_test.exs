@@ -151,16 +151,17 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
       pack: pack,
       milkdrop: Keyword.get(opts, :milkdrop, true),
       milkdrop_opts:
-        [
-          binary: @fake_binary,
-          skip_file: skip_file,
-          settings: Store.defaults(),
-          skipped: %{},
-          store: :"#{inspect(__MODULE__)}.NoStore",
-          kill_grace_ms: Keyword.get(opts, :kill_grace_ms, 300)
-        ] ++
-          Keyword.get(opts, :milkdrop_opts, []) ++
-          if(supervised?, do: [], else: [task_supervisor: tasks]),
+        Keyword.merge(
+          [
+            binary: @fake_binary,
+            skip_file: skip_file,
+            settings: Store.defaults(),
+            skipped: %{},
+            store: :"#{inspect(__MODULE__)}.NoStore",
+            kill_grace_ms: Keyword.get(opts, :kill_grace_ms, 300)
+          ],
+          Keyword.get(opts, :milkdrop_opts, [])
+        ) ++ if(supervised?, do: [], else: [task_supervisor: tasks]),
       milkdrop_timeouts: Keyword.get(opts, :timeouts, %{})
     ]
 
@@ -738,6 +739,68 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
       end)
 
     assert log =~ "3 renderer failures in 10 min (last: {:crashed, :hang})"
+  end
+
+  # The renderer's watchdog keeps its production deadlines (10 s / 30 s),
+  # so State's shorter step timeout fires first, as on a device.
+  describe "a step timeout on a hung preset" do
+    setup ctx do
+      store =
+        start_supervised!(
+          {Store,
+           name: nil,
+           table: :"#{inspect(__MODULE__)}.StepTimeout",
+           dets_path: Path.join(ctx.tmp_dir, "settings.dets"),
+           in_flight_grace_ms: 0}
+        )
+
+      %{store: store}
+    end
+
+    @tag capture_log: true
+    test "skips the warm-up a take is stuck on", ctx do
+      ctx =
+        start_ui(ctx,
+          fake: %{take_hang_loading: "loop.milk"},
+          timeouts: %{taking: 300},
+          milkdrop_opts: [store: ctx.store]
+        )
+
+      ctx |> milkdrop_mode() |> playing()
+      wait_until(fn -> md(ctx).last != nil end)
+      assert %{outcome: {:crashed, {:timeout, :taking}}} = md(ctx).last
+      assert Store.skipped(ctx.store, @version) == %{"loop.milk" => "hang"}
+    end
+
+    @tag capture_log: true
+    test "skips the first preset when the start never gets to prepared", ctx do
+      ctx =
+        start_ui(ctx,
+          fake: %{startup_preset: "first.milk", hold_prepared: true},
+          timeouts: %{preparing: 300},
+          milkdrop_opts: [store: ctx.store]
+        )
+
+      ctx |> milkdrop_mode() |> playing()
+      wait_until(fn -> md(ctx).last != nil end)
+      assert %{outcome: {:crashed, {:timeout, :preparing}}} = md(ctx).last
+      assert Store.skipped(ctx.store, @version) == %{"first.milk" => "hang"}
+    end
+
+    @tag capture_log: true
+    test "a take timeout with no warm-up pending skips nothing", ctx do
+      ctx =
+        start_ui(ctx,
+          fake: %{startup_preset: "first.milk", ignore: ["take"]},
+          timeouts: %{taking: 300},
+          milkdrop_opts: [store: ctx.store]
+        )
+
+      ctx |> milkdrop_mode() |> playing()
+      wait_until(fn -> md(ctx).last != nil end)
+      assert %{outcome: {:crashed, {:timeout, :taking}}} = md(ctx).last
+      assert Store.skipped(ctx.store, @version) == %{}
+    end
   end
 
   test "a timed-out release kills the renderer and restarts the viewport", ctx do

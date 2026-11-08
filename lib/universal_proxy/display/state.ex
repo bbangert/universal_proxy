@@ -1031,9 +1031,16 @@ defmodule UniversalProxy.Display.State do
 
   defp abort_milkdrop(%{md: md} = state, why) do
     Logger.warning("[Display] MilkDrop handover failed (#{inspect(why)}); stopping the renderer")
-    if md.pid, do: :ok = Display.MilkDrop.stop(md.pid)
+    if md.pid, do: :ok = stop_renderer(md.pid, why)
     end_milkdrop(state, {:crashed, why}, false)
   end
+
+  # These steps time out before the renderer's own watchdog would, so the
+  # preset it is stuck on is blamed here: a warm-up the `take` started, or
+  # the start's first preset (its warm-up or take frame).
+  defp stop_renderer(pid, {:timeout, :taking}), do: Display.MilkDrop.stop_hung(pid, :loading)
+  defp stop_renderer(pid, {:timeout, :preparing}), do: Display.MilkDrop.stop_hung(pid, :showing)
+  defp stop_renderer(pid, _why), do: Display.MilkDrop.stop(pid)
 
   # The session is over (the renderer stopped, exited or crashed). `gone?`:
   # the renderer process is known not to run (or never ran). Otherwise it
