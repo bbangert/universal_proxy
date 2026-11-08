@@ -567,6 +567,41 @@ defmodule UniversalProxyWeb.MilkDropPresetsLiveTest do
       assert rows(view) == 3
     end
 
+    test "a row coming back at a page's edge returns once, in place", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/audio/milkdrop")
+      last = order(view) |> List.last()
+      assert last == "preset-#{key("Preset 046.milk")}"
+
+      {:ok, _} = Store.hide("Preset 046.milk", true)
+      wait_until(fn -> rows(view) == 49 end)
+      {:ok, _} = Store.hide("Preset 046.milk", false)
+      wait_until(fn -> rows(view) == 50 end)
+      assert List.last(order(view)) == last
+
+      render_hook(view, "next_page", %{})
+      ids = order(view)
+      assert length(ids) == 100 and length(Enum.uniq(ids)) == 100
+      assert Enum.at(ids, 50) == "preset-#{key("Preset 047.milk")}"
+    end
+
+    test "more than 150 rows starting to match keep a full window", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/audio/milkdrop?filter=favourites")
+      assert rows(view) == 0
+
+      for id <- pack_ids(151), do: {:ok, _} = Store.favourite(id, true)
+      wait_until(fn -> view |> element("label", "Favourites") |> render() =~ ">151<" end)
+
+      assert rows(view) == 150
+      assert has_row?(view, "Preset 001.milk") and has_row?(view, "Preset 150.milk")
+      refute has_row?(view, "Preset 151.milk")
+      assert has_element?(view, "#presets-more")
+
+      view |> element("#presets-more") |> render_click()
+      assert has_row?(view, "Preset 151.milk")
+      refute has_element?(view, "#presets-more")
+      assert rows(view) <= 150
+    end
+
     test "hidden and playlist filters follow changes made elsewhere", %{conn: conn} do
       {:ok, hidden, _html} = live(conn, "/audio/milkdrop?filter=hidden")
       {:ok, playlist, _html} = live(conn, "/audio/milkdrop?filter=playlist")
@@ -580,6 +615,39 @@ defmodule UniversalProxyWeb.MilkDropPresetsLiveTest do
       {:ok, _} = Store.playlist_clear()
       wait_until(fn -> rows(hidden) == 0 and rows(playlist) == 0 end)
     end
+  end
+
+  test "settings are read again when the Store's table opens late",
+       %{conn: conn, tmp_dir: tmp_dir} do
+    stop_supervised!(Store)
+    dir = Path.join(tmp_dir, "late")
+    path = Path.join(dir, "settings.dets")
+
+    {:ok, first} =
+      Store.start_link(name: nil, table: :milkdrop_presets_live_late, dets_path: path)
+
+    {:ok, _} = Store.update(first, %{include_high_frequency: true, locked: "Preset 004.milk"})
+    GenServer.stop(first)
+    File.rename!(dir, dir <> ".away")
+    File.write!(dir, "not a directory")
+
+    start_supervised!(
+      {Store, table: :milkdrop_presets_live_late, dets_path: path, retry_ms: 50},
+      id: :late_store
+    )
+
+    {:ok, view, _html} = live(conn, "/audio/milkdrop")
+    refute has_element?(view, "#now-playing-locked")
+    view |> element("#play-#{key("high_frequency/Flash.milk")}") |> render_click()
+    refute_received {:play, _, _}
+
+    File.rm!(dir)
+    File.rename!(dir <> ".away", dir)
+
+    wait_until(fn -> has_element?(view, "#now-playing-locked") end)
+    assert view |> element("#now-playing-locked") |> render() =~ "Preset 004"
+    view |> element("#play-#{key("high_frequency/Flash.milk")}") |> render_click()
+    assert_receive {:play, "high_frequency/Flash.milk", false}
   end
 
   describe "uploads" do

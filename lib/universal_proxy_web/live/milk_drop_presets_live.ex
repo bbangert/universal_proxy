@@ -239,9 +239,11 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
   defp in_range?(%{assigns: %{pages: []}} = socket, _cursor),
     do: socket.assigns.at_start and socket.assigns.at_end
 
+  # Inclusive: a page keeps its edge cursors when their rows leave, and a
+  # row coming back at one is neither loaded nor reached by paging.
   defp in_range?(socket, cursor) do
     %{pages: pages, at_start: at_start, at_end: at_end} = socket.assigns
-    (at_start or cursor > hd(pages).first) and (at_end or cursor < List.last(pages).last)
+    (at_start or cursor >= hd(pages).first) and (at_end or cursor <= List.last(pages).last)
   end
 
   defp insert_row(%{assigns: %{pages: []}} = socket, row) do
@@ -253,7 +255,7 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
   defp insert_row(socket, row) do
     cursor = Index.cursor(row)
     pages = socket.assigns.pages
-    i = Enum.find_index(pages, &(cursor < &1.last)) || length(pages) - 1
+    i = Enum.find_index(pages, &(cursor <= &1.last)) || length(pages) - 1
     page = Enum.at(pages, i)
     before = Enum.count(page.keys, &before?(&1, cursor))
     at = (pages |> Enum.take(i) |> Enum.map(&length(&1.keys)) |> Enum.sum()) + before
@@ -265,13 +267,46 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
         keys: List.insert_at(page.keys, before, row.key)
     }
 
-    {pages, dropped} = trim(List.replace_at(pages, i, page), :back)
+    {pages, dropped} =
+      pages |> List.replace_at(i, page) |> Enum.flat_map(&split_page/1) |> trim(:back)
+
+    # Inserted only if it stays: a delete doesn't cancel an insert in the
+    # same render.
+    socket =
+      if row.key in dropped,
+        do: socket,
+        else: stream_insert(socket, :presets, row, at: at)
 
     socket
-    |> stream_insert(:presets, row, at: at)
     |> assign(:pages, pages)
-    |> delete_keys(dropped)
+    |> delete_keys(List.delete(dropped, row.key))
     |> assign(:at_end, socket.assigns.at_end and dropped == [])
+  end
+
+  # Inserts can grow a page past @page; split it so trimming drops rows
+  # page by page rather than the whole window.
+  defp split_page(%{keys: keys} = page) when length(keys) <= @page, do: [page]
+
+  defp split_page(page) do
+    chunks = Enum.chunk_every(page.keys, @page)
+    last = length(chunks) - 1
+
+    chunks
+    |> Enum.with_index()
+    |> Enum.map(fn {keys, n} ->
+      %{
+        first: if(n == 0, do: page.first, else: key_cursor(hd(keys), page.first)),
+        last: if(n == last, do: page.last, else: key_cursor(List.last(keys), page.last)),
+        keys: keys
+      }
+    end)
+  end
+
+  defp key_cursor(key, fallback) do
+    case Index.fetch(key) do
+      {:ok, row} -> Index.cursor(row)
+      :error -> fallback
+    end
   end
 
   defp before?(key, cursor) do
@@ -486,6 +521,10 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
   def handle_info({:milkdrop_settings, settings}, socket) when is_map(settings),
     do: {:noreply, assign(socket, :settings, settings)}
 
+  # The Store served defaults until its table opened: read it again.
+  def handle_info({:milkdrop_store, :opened}, socket),
+    do: {:noreply, assign(socket, :settings, Store.settings())}
+
   def handle_info({kind, status}, socket) when kind in [:milkdrop_pack, :milkdrop_pack_started],
     do: {:noreply, assign(socket, :pack, status)}
 
@@ -506,8 +545,8 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
   defp display, do: Application.get_env(:universal_proxy, :milkdrop_display, Display.State)
 
   defp browse_path(q, filter) do
-    params = %{filter: Index.filter_param(filter)}
-    params = if q == "", do: params, else: Map.put(params, :q, q)
+    # A keyword list: a map's key order (and so the URL's) isn't stable.
+    params = [filter: Index.filter_param(filter)] ++ if(q == "", do: [], else: [q: q])
     ~p"/audio/milkdrop?#{params}"
   end
 
