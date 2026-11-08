@@ -389,6 +389,24 @@ defmodule UniversalProxyWeb.MilkDropPresetsLiveTest do
       refute has_element?(view, "#confirm-delete")
     end
 
+    test "a playlist of presets no longer available can still be cleared", %{conn: conn} do
+      {:ok, _} = Store.playlist_add("gone/a.milk")
+      {:ok, _} = Store.playlist_add("gone/b.milk")
+      {:ok, view, _html} = live(conn, "/audio/milkdrop")
+
+      assert view |> element("#playlist-count") |> render() =~ "The playlist is empty."
+
+      assert view |> element("#playlist-missing") |> render() =~
+               "2 saved presets aren&#39;t available."
+
+      view |> element("#playlist-clear") |> render_click()
+      assert view |> element("#confirm-clear-playlist") |> render() =~ "Removes 2 presets"
+      view |> element("#confirm-clear-playlist-button") |> render_click()
+      assert Store.selection().playlist == []
+      wait_until(fn -> not has_element?(view, "#playlist-clear") end)
+      refute has_element?(view, "#playlist-missing")
+    end
+
     test "playlist on/off and clear with confirmation", %{conn: conn} do
       {:ok, _} = Store.playlist_add("Preset 001.milk")
       {:ok, _} = Store.playlist_add("Preset 002.milk")
@@ -452,7 +470,6 @@ defmodule UniversalProxyWeb.MilkDropPresetsLiveTest do
       refute_received :unlock
       assert_receive :unlock, 2_000
       render_async(view, 2_000)
-      assert Store.settings().locked == nil
     end
 
     test "a refusal is explained", %{conn: conn, display: display} do
@@ -499,7 +516,9 @@ defmodule UniversalProxyWeb.MilkDropPresetsLiveTest do
       wait_until(fn -> has_element?(view, "#now-playing-name") end)
       view |> element("#unlock") |> render_click()
       assert_receive :unlock
-      assert Store.settings().locked == nil
+      render_async(view)
+      # The session's owner persists it (from the renderer's answer).
+      assert Store.settings().locked == id
 
       # Idempotent: again is harmless.
       assert MilkDrop.unlock(display: @display) == :ok

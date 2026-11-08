@@ -127,7 +127,8 @@ defmodule UniversalProxy.Display.State do
   A `:milkdrop_unlock` call (`UniversalProxy.Display.milkdrop_unlock/1`)
   is sent as `unlock` in the same phases. A play in flight with `lock`
   would lock again when it loads, so the unlock is held behind it like
-  `next`/`prev`; a play still waiting to be written goes out unlocked.
+  `next`/`prev`, and so is a remote's lock toggle (Select), in the order
+  they came; a play still waiting to be written goes out unlocked.
 
   What the TV shows is broadcast on
   `UniversalProxy.MilkDrop.now_playing_topic/0` as
@@ -1197,9 +1198,15 @@ defmodule UniversalProxy.Display.State do
         Display.MilkDrop.prev(pid)
         state
 
+      # Flipped at once so a quick second press toggles back; the next
+      # `preset` event has the renderer's word. A play in flight would
+      # apply its own lock after it, so the command waits in line behind
+      # it, with any held unlock (order kept).
+      :toggle_lock when is_map(md.play_sent) ->
+        held = if md.locked, do: :unlock, else: :lock
+        %{state | md: %{md | held: md.held ++ [held], locked: not md.locked}}
+
       :toggle_lock ->
-        # Flipped at once so a quick second press toggles back; the next
-        # `preset` event has the renderer's word.
         if md.locked, do: Display.MilkDrop.unlock(pid), else: Display.MilkDrop.lock(pid)
         %{state | md: %{md | locked: not md.locked}}
     end
@@ -1313,7 +1320,8 @@ defmodule UniversalProxy.Display.State do
   defp send_play(md), do: md
 
   # The command in flight was answered: its caller, if still waiting, gets
-  # `reply`, then held `next`/`prev`/`unlock` and a play waiting behind it go out
+  # `reply`, then held `next`/`prev`/`lock`/`unlock` (in order) and a play
+  # waiting behind it go out
   # (a play written last replaces a still-pending `next`).
   defp play_answered(md, reply) do
     Process.cancel_timer(md.play_sent.timer)
@@ -1325,6 +1333,7 @@ defmodule UniversalProxy.Display.State do
     Enum.each(held, fn
       :next -> Display.MilkDrop.next(pid)
       :prev -> Display.MilkDrop.prev(pid)
+      :lock -> Display.MilkDrop.lock(pid)
       :unlock -> Display.MilkDrop.unlock(pid)
     end)
 

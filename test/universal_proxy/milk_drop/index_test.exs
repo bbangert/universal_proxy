@@ -35,7 +35,8 @@ defmodule UniversalProxy.MilkDrop.IndexTest do
      pubsub: pubsub,
      store: store,
      uploads: uploads,
-     index: :"index_test_#{n}"}
+     index: :"index_test_#{n}",
+     library_name: :"index_test_library_#{n}"}
   end
 
   defp start_all(ctx, opts \\ []) do
@@ -57,7 +58,7 @@ defmodule UniversalProxy.MilkDrop.IndexTest do
     library =
       start_supervised!(
         {UserPresets,
-         name: nil,
+         name: ctx.library_name,
          root: ctx.root,
          table: ctx.uploads,
          store: ctx.store,
@@ -75,7 +76,7 @@ defmodule UniversalProxy.MilkDrop.IndexTest do
            pubsub: ctx.pubsub,
            store: ctx.store,
            pack: pack,
-           user_presets: library,
+           user_presets: ctx.library_name,
            batch_ms: 20
          ],
          opts
@@ -443,6 +444,25 @@ defmodule UniversalProxy.MilkDrop.IndexTest do
       assert_receive {:milkdrop_index, %{added: [added]}}, 1_000
       assert added == Index.key("user/New.milk")
       assert ids(all(ctx.index)) == ["a.milk", "b.milk", "user/New.milk"]
+    end
+
+    test "a replacement repaired by a library restart drops its old skip", ctx do
+      id = "user/Mine.milk"
+      :ok = Store.skip(ctx.store, @version, id, "hang")
+      assert_receive {:milkdrop_index, %{changed: [_]}}, 1_000
+      assert row!(ctx.index, id).skip == "hang"
+
+      # As if a replacement was renamed in and the library died before
+      # telling the Store: the restart rescans, the Store says nothing.
+      File.write!(
+        Path.join([ctx.root, "user", "presets", "Mine.milk"]),
+        UniversalProxy.MilkDropUploadFixtures.milk("warp=1.0\r\n")
+      )
+
+      Process.exit(ctx.library, :kill)
+      assert_receive {:milkdrop_index, %{changed: [key]}}, 2_000
+      assert key == Index.key(id)
+      assert row!(ctx.index, id).skip == nil
     end
 
     test "a new ready pack rebuilds; leaving ready drops the pack's rows", ctx do

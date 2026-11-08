@@ -63,7 +63,8 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
               Index.topic(),
               MilkDrop.settings_topic(),
               MilkDrop.pack_topic(),
-              MilkDrop.now_playing_topic()
+              MilkDrop.now_playing_topic(),
+              MilkDrop.selection_topic()
             ],
             do: Phoenix.PubSub.subscribe(UniversalProxy.PubSub, topic)
       end
@@ -72,6 +73,7 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
        socket
        |> assign(:page_title, "MilkDrop presets")
        |> assign(:settings, Store.settings())
+       |> assign(:stored_playlist, length(Store.selection().playlist))
        |> assign(:pack, Pack.status())
        |> assign(:now_playing, read_now_playing(socket))
        |> assign(:rpi3_hints, MilkDrop.rpi3_hints?())
@@ -495,8 +497,9 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
   defp report(socket, _command, {:exit, _reason}),
     do: put_flash(socket, :error, "Couldn't reach the visualizer.")
 
-  defp report(socket, %{kind: :unlock}, {:ok, :ok}),
-    do: update(socket, :settings, &%{&1 | locked: nil})
+  # The Store's broadcast (from the session's owner, or the fenced write
+  # with no session) brings the new `locked`.
+  defp report(socket, %{kind: :unlock}, {:ok, :ok}), do: socket
 
   defp report(socket, %{kind: :unlock}, {:ok, {:error, reason}}),
     do: put_flash(socket, :error, "Couldn't unlock (#{error_text(reason)}).")
@@ -531,8 +534,15 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
     do: {:noreply, assign(socket, :settings, settings)}
 
   # The Store served defaults until its table opened: read it again.
-  def handle_info({:milkdrop_store, :opened}, socket),
-    do: {:noreply, assign(socket, :settings, Store.settings())}
+  def handle_info({:milkdrop_store, :opened}, socket) do
+    {:noreply,
+     socket
+     |> assign(:settings, Store.settings())
+     |> assign(:stored_playlist, length(Store.selection().playlist))}
+  end
+
+  def handle_info({:milkdrop_selection, %{playlist: playlist}}, socket) when is_list(playlist),
+    do: {:noreply, assign(socket, :stored_playlist, length(playlist))}
 
   def handle_info({kind, status}, socket) when kind in [:milkdrop_pack, :milkdrop_pack_started],
     do: {:noreply, assign(socket, :pack, status)}
@@ -609,6 +619,9 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
   defp error_text(:not_running), do: "the settings store isn't running"
   defp error_text(reason), do: inspect(reason)
 
+  defp missing_label(1), do: "1 saved preset isn't available."
+  defp missing_label(n), do: "#{delimit(n)} saved presets aren't available."
+
   defp filter_label(:all), do: "All"
   defp filter_label(:favourites), do: "Favourites"
   defp filter_label(:playlist), do: "Playlist"
@@ -677,6 +690,7 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
       <.playlist_bar
         enabled={@playlist_enabled}
         count={@totals.playlist}
+        stored={@stored_playlist}
         now_playing={@now_playing}
       />
 
@@ -818,7 +832,7 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
         </button>
       </.card>
 
-      <.confirm_modal confirm={@confirm} totals={@totals} />
+      <.confirm_modal confirm={@confirm} stored_playlist={@stored_playlist} />
     </div>
     """
   end
@@ -1024,6 +1038,8 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
 
   attr(:enabled, :boolean, required: true)
   attr(:count, :integer, required: true)
+  # The Store's playlist, ids no longer in the pack or library included.
+  attr(:stored, :integer, required: true)
   attr(:now_playing, :map, required: true)
 
   defp playlist_bar(assigns) do
@@ -1047,10 +1063,13 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
           <div class="text-sm text-fg-2">Rotate through the playlist only</div>
           <div id="playlist-count" class="text-xs text-fg-3 mt-0.5">
             {if @count == 0, do: "The playlist is empty.", else: count_label(@count, "preset") <> " on the playlist."}
+            <span :if={@stored > @count} id="playlist-missing">
+              {missing_label(@stored - @count)}
+            </span>
           </div>
         </div>
         <.button
-          :if={@count > 0}
+          :if={@stored > 0}
           id="playlist-clear"
           variant={:ghost}
           size={:sm}
@@ -1080,7 +1099,7 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
   end
 
   attr(:confirm, :any, required: true)
-  attr(:totals, :map, required: true)
+  attr(:stored_playlist, :integer, required: true)
 
   defp confirm_modal(%{confirm: {:delete, row}} = assigns) do
     assigns = assign(assigns, :row, row)
@@ -1137,7 +1156,7 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
       id="confirm-clear-playlist"
       on_close="cancel_confirm"
       title="Clear the playlist?"
-      subtitle={"Removes #{count_label(@totals.playlist, "preset")} from the playlist."}
+      subtitle={"Removes #{count_label(@stored_playlist, "preset")} from the playlist."}
     >
       <:footer>
         <.button variant={:ghost} size={:sm} phx-click="cancel_confirm">Cancel</.button>
