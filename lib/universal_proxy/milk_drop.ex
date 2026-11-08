@@ -3,22 +3,24 @@ defmodule UniversalProxy.MilkDrop do
   The MilkDrop (projectM) visualizer: a TV display mode drawn by the
   `milkdrop_renderer` port binary from a self-hosted preset pack.
 
-  Three pieces live here:
+  Four pieces live here:
 
     * `UniversalProxy.MilkDrop.Store` — DETS settings (rotation interval,
       minimum frame rate, high-frequency presets, locked preset) and the
-      per-pack-version runtime skip list;
+      runtime skip lists (per pack version, and for uploads);
     * `UniversalProxy.MilkDrop.Pack` — downloads, verifies and extracts the
       pinned preset pack into `root/0`;
+    * `UniversalProxy.MilkDrop.UserPresets` — the library of uploaded
+      presets and textures under `root/0`'s `user/`;
     * `UniversalProxy.Display.MilkDrop` — the renderer's Port owner, started
       by the display while the mode is active (not part of this subtree).
 
-  `UniversalProxy.MilkDrop.Supervisor` runs Store + Pack only when
-  `enabled?/0`: a supported target (`#{inspect(~w(rpi3 rpi4 rpi5)a)}`, a
-  compile-time constant) **and** `config :universal_proxy,
-  UniversalProxy.Display, milkdrop: true` (config/target.exs sets it on
-  the display targets). Host tests start the subtree with `enabled: true`
-  instead.
+  `UniversalProxy.MilkDrop.Supervisor` runs UserPresets, Store and Pack
+  only when `enabled?/0`: a supported target
+  (`#{inspect(~w(rpi3 rpi4 rpi5)a)}`, a compile-time constant) **and**
+  `config :universal_proxy, UniversalProxy.Display, milkdrop: true`
+  (config/target.exs sets it on the display targets). Host tests start
+  the subtree with `enabled: true` instead.
 
   ## PubSub (`UniversalProxy.PubSub`)
 
@@ -28,7 +30,10 @@ defmodule UniversalProxy.MilkDrop do
     * `pack_topic/0` (`"milkdrop:pack"`) — `{:milkdrop_pack, status}` on
       every `UniversalProxy.MilkDrop.Pack` status change (including
       download progress), and `{:milkdrop_pack_started, status}` each time
-      a Pack process starts.
+      a Pack process starts;
+    * `user_presets_topic/0` (`"milkdrop:user_presets"`) —
+      `{:milkdrop_user_presets, change}` on every change to the upload
+      library (see `UniversalProxy.MilkDrop.UserPresets`).
   """
 
   @supported_targets ~w(rpi3 rpi4 rpi5)a
@@ -39,6 +44,7 @@ defmodule UniversalProxy.MilkDrop do
 
   @settings_topic "milkdrop:settings"
   @pack_topic "milkdrop:pack"
+  @user_presets_topic "milkdrop:user_presets"
 
   # rpi3 presents on every second vblank (30 fps at 60 Hz); rpi4/rpi5 can
   # present at the refresh rate.
@@ -78,9 +84,13 @@ defmodule UniversalProxy.MilkDrop do
   @spec pack_topic() :: String.t()
   def pack_topic, do: @pack_topic
 
+  @doc "PubSub topic for upload library changes (see the moduledoc)."
+  @spec user_presets_topic() :: String.t()
+  def user_presets_topic, do: @user_presets_topic
+
   @doc """
-  Directory holding the extracted pack(s), download temporaries and the
-  Store's DETS file: `/data/milkdrop` on Nerves, `_build/milkdrop` on the
+  Directory holding the extracted pack(s), download temporaries, the
+  uploads (`user/`, `incoming/`) and the Store's DETS file: `/data/milkdrop` on Nerves, `_build/milkdrop` on the
   host.
   """
   @spec root() :: String.t()

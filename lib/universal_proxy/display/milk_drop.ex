@@ -49,7 +49,10 @@ defmodule UniversalProxy.Display.MilkDrop do
     * `:connector` — the DRM connector to present on (`"HDMI-A-1"`;
       default: the renderer's first connected HDMI connector);
     * `:pack_dir`, `:pack_version` — the extracted pack and its version
-      (required; the version keys persisted skips);
+      (required; the version keys persisted pack skips);
+    * `:user_dir` — the upload library (default
+      `UniversalProxy.MilkDrop.UserPresets.user_dir/0` when that directory
+      exists, else none; `nil` for none);
     * `:ladder` — internal resolutions, highest first (default
       `default_ladder/1` for this target);
     * `:ring_path` — the Sendspin player's PCM tap ring (optional: without
@@ -74,10 +77,10 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   ## Renderer CLI contract
 
-      milkdrop_renderer --mode 1280x720[@60] --pack-dir DIR
+      milkdrop_renderer --mode 1280x720[@60] --pack-dir DIR [--user-dir DIR]
                         --ladder 640x360,480x270 --rotate-s 20
                         --min-fps 20 --skip-file PATH
-                        [--high-frequency] [--locked FILE] [--pcm-ring PATH]
+                        [--high-frequency] [--locked ID] [--pcm-ring PATH]
                         [--card /dev/dri/card1] [--connector HDMI-A-1]
 
     * `--mode` — the CRTC mode to present on. `WxH` keeps the mode the CRTC
@@ -88,15 +91,20 @@ defmodule UniversalProxy.Display.MilkDrop do
     * `--card` — the DRM card node to open (default `/dev/dri/card0`);
     * `--connector` — the connector to present on; it must be connected;
     * `--pack-dir` — the extracted pack; `manifest.json` at its root;
+    * `--user-dir` — the upload library: `manifest.json` (the pack's
+      format; missing means no uploads), `presets/` and `textures/`; its
+      presets' ids are `user/<file>`, and its textures are looked up after
+      the pack's;
     * `--ladder` — comma-separated internal-resolution rungs, highest
       first; the renderer steps down per preset and skips past the last;
     * `--rotate-s` — auto-rotation interval in seconds (10..120);
     * `--min-fps` — the frame rate a preset must hold (the Store's
       `min_fps`); presets that can't hold it at the last rung are skipped;
-    * `--skip-file` — UTF-8 text, one pack-relative preset file per line
-      (`\\n`-separated, possibly empty): presets never to load;
-    * `--high-frequency` — include `high_frequency/` presets;
-    * `--locked` — start locked on this pack-relative preset file;
+    * `--skip-file` — UTF-8 text, one preset id (a pack-relative file or
+      a `user/` id) per line (`\\n`-separated, possibly empty): presets
+      never to load;
+    * `--high-frequency` — include `high_frequency` presets;
+    * `--locked` — start locked on this preset id;
     * `--pcm-ring` — the PCM tap ring file.
 
   ## Line-JSON protocol
@@ -113,7 +121,10 @@ defmodule UniversalProxy.Display.MilkDrop do
       current preset;
     * `{"cmd":"set_rotate","value":N}` — rotation interval in seconds;
     * `{"cmd":"set_high_frequency","value":B}` — include `high_frequency/`;
-    * `{"cmd":"set_min_fps","value":N}` — the minimum frame rate.
+    * `{"cmd":"set_min_fps","value":N}` — the minimum frame rate;
+    * `{"cmd":"reload_user"}` — re-read `--user-dir`'s manifest: new
+      uploads join the rotation, deleted ones leave it (one showing keeps
+      showing until the next change).
 
   Events (stdout), forwarded with atom keys and an atom `:event`:
 
@@ -130,14 +141,18 @@ defmodule UniversalProxy.Display.MilkDrop do
       `budget` skip also carries the measured `fps`, persisted with it
       (`UniversalProxy.MilkDrop.Store.skip/5`) so a lower minimum frame
       rate can bring the preset back (persisted to the Store for this pack
-      version, synced to disk before
-      the event is forwarded: a `gpu_hang` skip can come seconds before a
-      GPU reset takes the device down). The forwarded event
+      version, or an upload's current content, synced to disk before the
+      event is forwarded: a `gpu_hang` skip can come seconds before a GPU
+      reset takes the device down). The forwarded event
       carries `persisted: true | false`; while the Store cannot take it
       (not running) it is kept and retried on the next `loading`, `skip`
       or `preset` event and every `:skip_retry_ms`, until the process ends;
     * `{"event":"stats",...}` — periodic counters (fps, rung, temperature,
       ARM clock);
+    * `{"event":"user_reloaded","presets":N,"added":A,"removed":R,"rejected":X}`
+      — the answer to `reload_user`;
+    * `{"event":"play_refused",...}`, `{"event":"selection",...}` — the
+      preset selector's (forwarded, not acted on here);
     * `{"event":"error","reason":R,...}` — a non-fatal problem;
     * `{"event":"exiting","reason":R}` — about to exit (`"requested"`,
       `"thermal"`, …).
@@ -216,7 +231,7 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   require Logger
 
-  alias UniversalProxy.MilkDrop.Store
+  alias UniversalProxy.MilkDrop.{Store, UserPresets}
 
   @line_max 4096
   @kill_grace_ms 2_000
@@ -239,7 +254,10 @@ defmodule UniversalProxy.Display.MilkDrop do
     "skip" => :skip,
     "stats" => :stats,
     "error" => :error,
-    "exiting" => :exiting
+    "exiting" => :exiting,
+    "user_reloaded" => :user_reloaded,
+    "play_refused" => :play_refused,
+    "selection" => :selection
   }
 
   @resolution_re ~r/\A[1-9]\d{0,4}x[1-9]\d{0,4}\z/
@@ -331,6 +349,10 @@ defmodule UniversalProxy.Display.MilkDrop do
   def set_min_fps(server, fps) when is_integer(fps) and fps > 0,
     do: command(server, %{cmd: "set_min_fps", value: fps})
 
+  @doc "Re-read the upload library's manifest."
+  @spec reload_user(GenServer.server()) :: :ok
+  def reload_user(server), do: command(server, %{cmd: "reload_user"})
+
   @doc false
   @spec command(GenServer.server(), map()) :: :ok
   def command(server, cmd) when is_map(cmd), do: GenServer.cast(server, {:command, cmd})
@@ -359,7 +381,7 @@ defmodule UniversalProxy.Display.MilkDrop do
   @doc """
   The renderer's argv (see "Renderer CLI contract") for `config`: `:mode`,
   `:pack_dir`, `:ladder`, `:skip_file`, `:settings` and the optional
-  `:ring_path`, `:card` and `:connector`.
+  `:user_dir`, `:ring_path`, `:card` and `:connector`.
   """
   @spec args(map()) :: [String.t()]
   def args(%{mode: mode, pack_dir: pack_dir, ladder: ladder, skip_file: skip_file} = config) do
@@ -368,6 +390,7 @@ defmodule UniversalProxy.Display.MilkDrop do
     [
       ["--mode", format_mode(mode)],
       ["--pack-dir", pack_dir],
+      if(config[:user_dir], do: ["--user-dir", config.user_dir], else: []),
       ["--ladder", Enum.join(ladder, ",")],
       ["--rotate-s", Integer.to_string(settings.rotate_s)],
       ["--min-fps", Integer.to_string(settings.min_fps)],
@@ -394,6 +417,7 @@ defmodule UniversalProxy.Display.MilkDrop do
     config = %{
       mode: Keyword.fetch!(opts, :mode),
       pack_dir: Keyword.fetch!(opts, :pack_dir),
+      user_dir: Keyword.get_lazy(opts, :user_dir, &default_user_dir/0),
       ladder: Keyword.get_lazy(opts, :ladder, &default_ladder/0),
       ring_path: Keyword.get(opts, :ring_path),
       card: Keyword.get(opts, :card),
@@ -824,6 +848,7 @@ defmodule UniversalProxy.Display.MilkDrop do
       not valid_mode?(config.mode) -> {:error, {:invalid_mode, config.mode}}
       not valid_ladder?(config.ladder) -> {:error, {:invalid_ladder, config.ladder}}
       not valid_card?(config.card) -> {:error, {:invalid_card, config.card}}
+      not valid_card?(config.user_dir) -> {:error, {:invalid_user_dir, config.user_dir}}
       not valid_connector?(config.connector) -> {:error, {:invalid_connector, config.connector}}
       true -> :ok
     end
@@ -839,6 +864,12 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   defp valid_mode?(_mode), do: false
 
+  defp default_user_dir do
+    dir = UserPresets.user_dir()
+    if File.dir?(dir), do: dir
+  end
+
+  # An absolute path without line breaks (a card node or a directory).
   defp valid_card?(nil), do: true
 
   defp valid_card?(path) when is_binary(path),

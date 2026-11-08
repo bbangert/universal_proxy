@@ -42,6 +42,7 @@ defmodule UniversalProxy.Display.MilkDropTest do
           ladder: ["640x360", "480x270"],
           store: ctx.store,
           skip_file: ctx.skip_file,
+          user_dir: nil,
           binary: @fake_binary
         ],
         opts
@@ -131,6 +132,17 @@ defmodule UniversalProxy.Display.MilkDropTest do
                "/run/up-pcm-abc"
              ]
     end
+  end
+
+  test "args/1 with the upload library" do
+    assert [_mode, _, "--pack-dir", "/p", "--user-dir", "/data/milkdrop/user", "--ladder" | _] =
+             MilkDrop.args(%{
+               mode: @mode,
+               pack_dir: "/p",
+               user_dir: "/data/milkdrop/user",
+               ladder: ["640x360"],
+               skip_file: "/s"
+             })
   end
 
   test "args/1 without a refresh, and with a card and connector" do
@@ -241,6 +253,57 @@ defmodule UniversalProxy.Display.MilkDropTest do
     ]
 
     wait_until(fn -> cmd_lines(ctx) == expected end)
+  end
+
+  test "reload_user is written as a JSON line and its answer forwarded", ctx do
+    user_dir = Path.join(ctx.tmp_dir, "user")
+    File.mkdir_p!(user_dir)
+    manifest = fn files -> %{format: 1, presets: Enum.map(files, &%{file: &1})} end
+    File.write!(Path.join(user_dir, "manifest.json"), Jason.encode!(manifest.(["a.milk"])))
+
+    {pid, prepared} = start_renderer(ctx, user_dir: user_dir)
+    assert ["--user-dir", ^user_dir | _] = Enum.drop_while(prepared.argv, &(&1 != "--user-dir"))
+
+    File.write!(
+      Path.join(user_dir, "manifest.json"),
+      Jason.encode!(manifest.(["b.milk", "c.milk"]))
+    )
+
+    MilkDrop.reload_user(pid)
+
+    assert_receive {:milkdrop, ^pid,
+                    %{event: :user_reloaded, presets: 2, added: 2, removed: 1, rejected: 0}},
+                   @timeout
+
+    assert cmd_lines(ctx) == [%{"cmd" => "reload_user"}]
+  end
+
+  test "an upload's skip is recorded for its content and reaches the next renderer", ctx do
+    store =
+      start_supervised!(
+        Supervisor.child_spec(
+          {Store,
+           name: nil,
+           table: :milkdrop_display_test_uploads,
+           dets_path: Path.join(ctx.tmp_dir, "uploads.dets"),
+           user_sha: fn id -> if id == "user/up.milk", do: "sha-up" end},
+          id: :upload_store
+        )
+      )
+
+    {pid, _} = start_renderer(ctx, store: store)
+    emit(pid, ~s({"event":"skip","preset":"user/up.milk","reason":"draw"}))
+
+    assert_receive {:milkdrop, ^pid, %{event: :skip, preset: "user/up.milk", persisted: true}},
+                   @timeout
+
+    assert Store.skipped(store, "another-version") == %{"user/up.milk" => "draw"}
+    MilkDrop.stop(pid)
+
+    # Another skip file: the first renderer's reaper deletes its own.
+    skip_file = Path.join(ctx.tmp_dir, "skip-2.txt")
+    {_pid, prepared} = start_renderer(ctx, store: store, skip_file: skip_file)
+    assert prepared.skip == ["user/up.milk"]
   end
 
   test "forwards events with atom keys", ctx do
@@ -1162,6 +1225,15 @@ defmodule UniversalProxy.Display.MilkDropTest do
                  base
                  |> Keyword.put(:binary, @fake_binary)
                  |> Keyword.put(:card, bad)
+               )
+    end
+
+    for bad <- ["", "user", "/data/user\n--locked"] do
+      assert {:error, {:invalid_user_dir, ^bad}} =
+               MilkDrop.start(
+                 base
+                 |> Keyword.put(:binary, @fake_binary)
+                 |> Keyword.put(:user_dir, bad)
                )
     end
 

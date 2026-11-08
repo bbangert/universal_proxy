@@ -1,15 +1,21 @@
 defmodule UniversalProxy.MilkDrop.Supervisor do
   @moduledoc """
-  MilkDrop's long-lived processes: `UniversalProxy.MilkDrop.Store` and
-  `UniversalProxy.MilkDrop.Pack` (`:one_for_one`; neither calls the other).
-  Pack shares a `:one_for_all` unit with the Task.Supervisor its download
-  runs under, so a Pack crash stops a running download before the new
-  Pack can start another on the same files.
+  MilkDrop's long-lived processes (`:one_for_one`):
+  `UniversalProxy.MilkDrop.UserPresets`, then
+  `UniversalProxy.MilkDrop.Store` and `UniversalProxy.MilkDrop.Pack`.
+  UserPresets starts first so the Store's start-up recovery can look up
+  an upload's SHA-256 in its table (`UserPresets.sha256/2`, no call);
+  UserPresets calls the Store (clean-up after a delete or replacement),
+  its import task calls Pack (`status/0`, for the pack's texture names),
+  and neither calls back. UserPresets and Pack each share a `:one_for_all` unit with the
+  Task.Supervisor their import or download runs under, so a crash stops
+  that work before the restarted server touches the same files.
 
   Returns `:ignore` unless `UniversalProxy.MilkDrop.enabled?/0` (a supported
   target with the `:milkdrop` flag on) or `start_link/1` is given
-  `enabled: true`. `:store` and `:pack` are keyword opts passed to the
-  children (tests use them to run beside the app's own tree).
+  `enabled: true`. `:user_presets`, `:store` and `:pack` are keyword opts
+  passed to the children (tests use them to run beside the app's own
+  tree).
   """
 
   use Supervisor
@@ -31,6 +37,7 @@ defmodule UniversalProxy.MilkDrop.Supervisor do
   @impl true
   def init(opts) do
     children = [
+      user_presets_unit(Keyword.get(opts, :user_presets, [])),
       {MilkDrop.Store, Keyword.get(opts, :store, [])},
       pack_unit(Keyword.get(opts, :pack, []))
     ]
@@ -42,16 +49,24 @@ defmodule UniversalProxy.MilkDrop.Supervisor do
   # its Pack, so it is not fire-and-forget work for
   # `UniversalProxy.TaskSupervisor`: its own Task.Supervisor, started
   # first, is stopped (killing the download) whenever Pack dies.
-  defp pack_unit(pack_opts) do
-    {tasks, pack_opts} = Keyword.pop(pack_opts, :task_supervisor, MilkDrop.Pack.task_supervisor())
+  defp pack_unit(pack_opts),
+    do: unit(MilkDrop.Pack, MilkDrop.Pack.Supervisor, pack_opts)
+
+  # Likewise an import's task, which writes the staging directory a new
+  # UserPresets deletes at start.
+  defp user_presets_unit(opts),
+    do: unit(MilkDrop.UserPresets, MilkDrop.UserPresets.Supervisor, opts)
+
+  defp unit(server, id, opts) do
+    {tasks, opts} = Keyword.pop(opts, :task_supervisor, server.task_supervisor())
 
     children = [
       {Task.Supervisor, name: tasks},
-      {MilkDrop.Pack, Keyword.put(pack_opts, :task_supervisor, tasks)}
+      {server, Keyword.put(opts, :task_supervisor, tasks)}
     ]
 
     %{
-      id: MilkDrop.Pack.Supervisor,
+      id: id,
       type: :supervisor,
       start: {Supervisor, :start_link, [children, [strategy: :one_for_all]]}
     }

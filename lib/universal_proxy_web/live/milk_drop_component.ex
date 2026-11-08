@@ -25,8 +25,9 @@ defmodule UniversalProxyWeb.MilkDropComponent do
       photosensitivity warning; only its confirm writes `true`. Turning it
       off writes straight away.
     * **Skipped presets** — the presets the renderer could not draw with
-      the ready pack's version, with their reasons, in a disclosure;
-      "Clear" calls `Store.clear_skipped/0`; a running renderer keeps its
+      the ready pack's version, and the uploads it could not draw as they
+      are now, with their reasons, in a disclosure; "Clear" calls
+      `Store.clear_skipped/0` (both lists); a running renderer keeps its
       own skip set, so cleared presets return from the next session. A
       preset that was showing when the device went down (`device_reset`,
       possibly a power cut rather than a GPU hang) comes back the same way.

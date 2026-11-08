@@ -12,18 +12,25 @@ defmodule UniversalProxy.MilkDropTest do
     assert MilkDrop.Supervisor.start_link() == :ignore
   end
 
-  test "enabled: true starts Store and Pack", %{tmp_dir: tmp_dir} do
+  test "enabled: true starts UserPresets, Store and Pack", %{tmp_dir: tmp_dir} do
     start_supervised!(
       {MilkDrop.Supervisor,
        enabled: true,
        name: :milkdrop_supervisor_test,
-       store: [table: :milkdrop_supervisor_test, dets_path: Path.join(tmp_dir, "settings.dets")],
+       user_presets: [root: tmp_dir, table: :milkdrop_supervisor_test_uploads],
+       store: [
+         table: :milkdrop_supervisor_test,
+         dets_path: Path.join(tmp_dir, "settings.dets"),
+         user_sha: &MilkDrop.UserPresets.sha256(:milkdrop_supervisor_test_uploads, &1)
+       ],
        pack: [root: tmp_dir, pin: nil]}
     )
 
     assert MilkDrop.Store.settings() == MilkDrop.Store.defaults()
     assert MilkDrop.Pack.status() == :absent
     assert MilkDrop.Pack.ensure() == {:error, :no_pack_pinned}
+    assert MilkDrop.UserPresets.list() == %{presets: [], textures: []}
+    assert File.dir?(Path.join([tmp_dir, "user", "presets"]))
   end
 
   test "a Pack crash stops its running installer before Pack restarts", %{tmp_dir: tmp_dir} do
@@ -50,7 +57,12 @@ defmodule UniversalProxy.MilkDropTest do
       {MilkDrop.Supervisor,
        enabled: true,
        name: :milkdrop_supervisor_test,
-       store: [table: :milkdrop_supervisor_test, dets_path: Path.join(tmp_dir, "settings.dets")],
+       user_presets: [root: tmp_dir, table: :milkdrop_supervisor_test_uploads],
+       store: [
+         table: :milkdrop_supervisor_test,
+         dets_path: Path.join(tmp_dir, "settings.dets"),
+         user_sha: &MilkDrop.UserPresets.sha256(:milkdrop_supervisor_test_uploads, &1)
+       ],
        pack: [root: tmp_dir, pin: pin, req_options: [plug: plug]]}
     )
 
@@ -84,5 +96,7 @@ defmodule UniversalProxy.MilkDropTest do
     assert MilkDrop.Store.skipped("v1") == %{}
     assert MilkDrop.Pack.status() == {:error, :not_running}
     assert MilkDrop.Pack.ensure() == {:error, :not_running}
+    assert MilkDrop.UserPresets.list() == %{presets: [], textures: []}
+    assert MilkDrop.UserPresets.import([]) == {:error, :not_running}
   end
 end
