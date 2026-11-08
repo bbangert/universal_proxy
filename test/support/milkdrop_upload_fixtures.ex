@@ -12,7 +12,9 @@ defmodule UniversalProxy.MilkDropUploadFixtures do
   and for the local header `:local_name`, `:local_flags`, `:local_method`,
   `:local_crc`, `:local_csize`, `:local_usize`, `:local_extra`, `:trailer`
   (bytes after the data, e.g. a data descriptor). Archive options:
-  `:count`, `:on_disk`, `:disk`, `:cd_disk`, `:comment`, `:prefix`,
+  `:count`, `:on_disk`, `:disk`, `:cd_disk`, `:comment`, `:prefix` (bytes
+  before the archive, offsets adjusted to match), `:cd_padding` (bytes
+  appended to the central directory, counted in its size),
   `:zip64_locator` (insert one before the EOCD).
   """
 
@@ -28,7 +30,7 @@ defmodule UniversalProxy.MilkDropUploadFixtures do
         {[local | locals], [cd | cds], offset + byte_size(local)}
       end)
 
-    cd = cds |> Enum.reverse() |> IO.iodata_to_binary()
+    cd = IO.iodata_to_binary([Enum.reverse(cds), Keyword.get(opts, :cd_padding, "")])
     count = Keyword.get(opts, :count, length(entries))
     comment = Keyword.get(opts, :comment, "")
 

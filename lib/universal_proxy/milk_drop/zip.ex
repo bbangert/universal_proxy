@@ -20,7 +20,8 @@ defmodule UniversalProxy.MilkDrop.Zip do
       0xFFFFFFFF sentinels, a ZIP64 EOCD locator or a `0x0001` extra
       field), the central directory exactly fills the space before the
       EOCD and the EOCD comment runs to the end of the file
-      (`:not_a_zip` / `:bad_central_directory`);
+      (`:not_a_zip` / `:bad_central_directory`), and the first entry
+      starts the file (`:leading_data`: no prepended or SFX data);
     * at most `:max_entries` (256) entries, directories included
       (`:too_many_entries`);
     * per entry, `{reason, name}` with a display-safe `name`
@@ -118,6 +119,7 @@ defmodule UniversalProxy.MilkDrop.Zip do
           | :zip64
           | :too_many_entries
           | :too_large
+          | :leading_data
           | :truncated
           | {entry_reason(), String.t()}
           | {:io, File.posix()}
@@ -202,8 +204,8 @@ defmodule UniversalProxy.MilkDrop.Zip do
       end
 
     cond do
-      byte_size(data) != entry.size -> {:error, {:size_mismatch, entry.name}}
-      :erlang.crc32(data) != entry.crc32 -> {:error, {:crc_mismatch, entry.name}}
+      byte_size(data) != entry.size -> fail!({:size_mismatch, entry.name})
+      :erlang.crc32(data) != entry.crc32 -> fail!({:crc_mismatch, entry.name})
       true -> {:ok, data}
     end
   catch
@@ -219,6 +221,10 @@ defmodule UniversalProxy.MilkDrop.Zip do
 
     {cd_offset, cd_size, count} = eocd!(source, size)
     if count > max_entries, do: fail!(:too_many_entries)
+    # Bound the read by what `count` records can hold (each at most a
+    # header plus three 16-bit-length fields), before reading it.
+    if cd_size > count * (46 + 3 * 0xFFFF), do: fail!(:bad_central_directory)
+    if count == 0 and cd_offset != 0, do: fail!(:leading_data)
 
     records = parse_cd!(pread!(source, cd_offset, cd_size), count, [])
 
@@ -431,6 +437,11 @@ defmodule UniversalProxy.MilkDrop.Zip do
       {rec.offset, entry.data_offset + entry.compressed_size, entry.name}
     end)
     |> Enum.sort()
+    |> tap(fn
+      # The first entry starts the file: no prepended (SFX) data.
+      [{start, _stop, _name} | _] when start != 0 -> fail!(:leading_data)
+      _ -> :ok
+    end)
     |> Enum.reduce(0, fn {start, stop, name}, prev_stop ->
       if start < prev_stop, do: fail!({:overlap, name})
       stop

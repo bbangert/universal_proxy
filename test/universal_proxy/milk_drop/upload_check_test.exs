@@ -197,6 +197,55 @@ defmodule UniversalProxy.MilkDrop.UploadCheckTest do
                {:error, :bad_header}
     end
 
+    test "enforces the legal PNG bit depth for each colour type" do
+      legal = %{
+        0 => [1, 2, 4, 8, 16],
+        2 => [8, 16],
+        3 => [1, 2, 4, 8],
+        4 => [8, 16],
+        6 => [8, 16]
+      }
+
+      for color <- [0, 2, 3, 4, 6], depth <- [1, 2, 4, 8, 16] do
+        result = UploadCheck.check_texture("a.png", png(8, 8, color: color, depth: depth))
+
+        if depth in legal[color],
+          do: assert({:ok, %{format: :png}} = result),
+          else: assert(result == {:error, :bad_header}, "color #{color} depth #{depth}")
+      end
+    end
+
+    test "requires a complete JPEG frame header" do
+      short_sof = <<0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x07, 0x08, 0x00, 0x01, 0x00, 0x01, 0xFF, 0xD9>>
+      assert UploadCheck.check_texture("a.jpg", short_sof) == {:error, :bad_header}
+
+      sof = fn nf, specs ->
+        body = <<8, 1::16, 1::16, nf, specs::binary>>
+        <<0xFF, 0xD8, 0xFF, 0xC0, byte_size(body) + 2::16, body::binary, 0xFF, 0xD9>>
+      end
+
+      assert {:ok, %{width: 1}} = UploadCheck.check_texture("a.jpg", sof.(1, <<1, 0x11, 0>>))
+      assert UploadCheck.check_texture("a.jpg", sof.(0, "")) == {:error, :bad_header}
+
+      assert UploadCheck.check_texture("a.jpg", sof.(5, :binary.copy(<<1, 0x11, 0>>, 5))) ==
+               {:error, :bad_header}
+
+      # Nf says three components, the segment holds two.
+      assert UploadCheck.check_texture("a.jpg", sof.(3, :binary.copy(<<1, 0x11, 0>>, 2))) ==
+               {:error, :bad_header}
+    end
+
+    test "a long run of fill bytes near the size cap is linear" do
+      <<_soi::binary-2, rest::binary>> = jpeg(16, 16)
+      fill = :binary.copy(<<0xFF>>, 4 * 1024 * 1024 - byte_size(rest) - 2)
+      data = <<0xFF, 0xD8>> <> fill <> rest
+      assert byte_size(data) == 4 * 1024 * 1024
+
+      {us, result} = :timer.tc(fn -> UploadCheck.check_texture("a.jpg", data) end)
+      assert {:ok, %{width: 16, height: 16}} = result
+      assert us < 2_000_000
+    end
+
     test "rejects interlaced PNGs and non-baseline JPEGs" do
       assert UploadCheck.check_texture("a.png", png(16, 16, interlace: 1)) ==
                {:error, :interlaced}

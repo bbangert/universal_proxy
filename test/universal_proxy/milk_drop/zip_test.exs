@@ -115,6 +115,24 @@ defmodule UniversalProxy.MilkDrop.ZipTest do
       assert open("junk" <> good) == {:error, :bad_central_directory}
     end
 
+    test "rejects prepended (SFX) data even when the offsets account for it" do
+      assert open(zip([[name: "a.milk", data: "a=1"]], prefix: "MZ stub")) ==
+               {:error, :leading_data}
+
+      assert open(zip([], prefix: "MZ stub")) == {:error, :leading_data}
+      assert {:ok, %Zip{entries: []}} = open(zip([]))
+    end
+
+    test "bounds the central directory by its entry count before reading it" do
+      # One record can't need more than 46 + 3 × 0xFFFF bytes.
+      padding = :binary.copy(<<0>>, 46 + 3 * 0xFFFF)
+
+      assert open(zip([[name: "a.milk", data: "a=1"]], cd_padding: padding)) ==
+               {:error, :bad_central_directory}
+
+      assert open(zip([], cd_padding: "x")) == {:error, :bad_central_directory}
+    end
+
     test "rejects a central directory that disagrees with the EOCD count" do
       entries = [[name: "a.milk", data: "a=1"], [name: "b.milk", data: "b=1"]]
       assert open(zip(entries, count: 1, on_disk: 1)) == {:error, :bad_central_directory}
@@ -343,6 +361,18 @@ defmodule UniversalProxy.MilkDrop.ZipTest do
         [entry] = Zip.entries(zip)
         assert Zip.read(zip, entry) == {:error, {:crc_mismatch, "a.milk"}}
       end
+    end
+
+    test "read errors carry display-safe names" do
+      bin = zip([[name: "a\u202Eklim.png", data: "a=1", crc: 1]])
+      {:ok, zip} = open(bin)
+      [entry] = Zip.entries(zip)
+      assert Zip.read(zip, entry) == {:error, {:crc_mismatch, "a?klim.png"}}
+
+      bin = zip([[name: "b\u202Eklim.png", data: "a=1", method: :deflate, usize: 10]])
+      {:ok, zip} = open(bin)
+      [entry] = Zip.entries(zip)
+      assert Zip.read(zip, entry) == {:error, {:size_mismatch, "b?klim.png"}}
     end
 
     test "rejects a corrupt deflate stream" do

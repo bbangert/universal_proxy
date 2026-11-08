@@ -76,6 +76,14 @@ defmodule UniversalProxy.MilkDrop.UploadCheck do
                        for(p <- ~w(fc_ fw_ pc_ pw_), t <- @builtin_textures, do: p <> t)
 
   @png_sig <<0x89, "PNG", 0x0D, 0x0A, 0x1A, 0x0A>>
+  # Legal bit depths per colour type (PNG spec, IHDR).
+  @png_depths %{
+    0 => [1, 2, 4, 8, 16],
+    2 => [8, 16],
+    3 => [1, 2, 4, 8],
+    4 => [8, 16],
+    6 => [8, 16]
+  }
   # SOF0 (baseline) and SOF1 (extended sequential, Huffman).
   @jpeg_ok_sof [0xC0, 0xC1]
   # Every other SOFn: progressive, lossless, arithmetic, hierarchical.
@@ -259,8 +267,8 @@ defmodule UniversalProxy.MilkDrop.UploadCheck do
            _::binary>>
        ) do
     cond do
-      depth not in [1, 2, 4, 8, 16] or color not in [0, 2, 3, 4, 6] or compression != 0 or
-        filter != 0 or interlace not in [0, 1] ->
+      depth not in Map.get(@png_depths, color, []) or compression != 0 or filter != 0 or
+          interlace not in [0, 1] ->
         {:error, :bad_header}
 
       interlace == 1 ->
@@ -283,7 +291,9 @@ defmodule UniversalProxy.MilkDrop.UploadCheck do
 
   # Walk the marker segments up to the first frame header. Each step
   # consumes at least two bytes, so this ends on any input.
-  defp jpeg_markers(<<0xFF, 0xFF, rest::binary>>), do: jpeg_markers(<<0xFF, rest::binary>>)
+  # A fill byte: drop it as a sub-binary (no copy) and look again.
+  defp jpeg_markers(<<0xFF, 0xFF, _::binary>> = data),
+    do: jpeg_markers(binary_part(data, 1, byte_size(data) - 1))
 
   defp jpeg_markers(<<0xFF, m, rest::binary>>) when m in 0xD0..0xD7 or m == 0x01,
     do: jpeg_markers(rest)
@@ -306,7 +316,10 @@ defmodule UniversalProxy.MilkDrop.UploadCheck do
 
   defp jpeg_markers(_), do: {:error, :bad_header}
 
-  defp jpeg_segment(m, <<_precision, h::16, w::16, _::binary>>, rest) when m in @jpeg_ok_sof do
+  # The body is exactly the segment (length 8 + 3 × Nf) minus its length
+  # field: precision, height, width, Nf in 1..4, then Nf component specs.
+  defp jpeg_segment(m, <<_precision, h::16, w::16, nf, specs::binary>>, rest)
+       when m in @jpeg_ok_sof and nf in 1..4 and byte_size(specs) == 3 * nf do
     if :binary.match(rest, <<0xFF, 0xD9>>) == :nomatch,
       do: {:error, :bad_header},
       else: {:ok, %{format: :jpeg, width: w, height: h}}
