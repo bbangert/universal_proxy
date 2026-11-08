@@ -342,6 +342,44 @@ defmodule UniversalProxy.Display.MilkDropTest do
     assert Store.skipped(store, @version) == %{"user/up.milk" => "draw"}
   end
 
+  test "a failed load of a replacement leaves the showing content's hash in charge", ctx do
+    {:ok, shas} = Agent.start_link(fn -> %{"user/up.milk" => "sha-a"} end)
+    user_sha = &Agent.get(shas, fn m -> m[&1] end)
+
+    store =
+      start_supervised!(
+        Supervisor.child_spec(
+          {Store,
+           name: nil,
+           table: :milkdrop_display_test_failed_load,
+           dets_path: Path.join(ctx.tmp_dir, "failed-load.dets"),
+           user_sha: user_sha},
+          id: :failed_load_store
+        )
+      )
+
+    {pid, _} = start_renderer(ctx, store: store, user_sha: user_sha)
+    emit(pid, ~s({"event":"loading","preset":"user/up.milk"}))
+    assert_receive {:milkdrop, ^pid, %{event: :loading}}, @timeout
+    emit(pid, ~s({"event":"preset","file":"user/up.milk","locked":false}))
+    assert_receive {:milkdrop, ^pid, %{event: :preset}}, @timeout
+
+    # Replaced while A plays; loading B under the same id fails.
+    Agent.update(shas, &Map.put(&1, "user/up.milk", "sha-b"))
+    emit(pid, ~s({"event":"loading","preset":"user/up.milk"}))
+    assert_receive {:milkdrop, ^pid, %{event: :loading}}, @timeout
+    assert %{sha256: "sha-b"} = Store.in_flight(store)
+    emit(pid, ~s({"event":"skip","preset":"user/up.milk","reason":"compile"}))
+    assert_receive {:milkdrop, ^pid, %{event: :skip, reason: "compile"}}, @timeout
+    assert Store.skipped(store, @version) == %{"user/up.milk" => "compile"}
+
+    # A keeps playing: the record and its later skips name A.
+    assert %{sha256: "sha-a"} = Store.in_flight(store)
+    emit(pid, ~s({"event":"skip","preset":"user/up.milk","reason":"draw"}))
+    assert_receive {:milkdrop, ^pid, %{event: :skip, reason: "draw"}}, @timeout
+    assert Store.skipped(store, @version) == %{"user/up.milk" => "compile"}
+  end
+
   test "forwards events with atom keys", ctx do
     {pid, _} = start_renderer(ctx)
 

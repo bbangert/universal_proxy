@@ -18,15 +18,16 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
 
       {"format": 1, "version": "user",
        "presets": [{"file": "A.milk", "tags": ["uploaded"],
-                    "sha256": "<hex>", "size": 1234, "uploaded_at": 1762560000}],
+                    "sha256": "<hex>", "size": 1234, "uploaded_at": 1762560000,
+                    "seq": 7}],
        "textures": [{"file": "t.png", "sha256": "<hex>", "size": 99,
-                     "uploaded_at": 1762560000}]}
+                     "uploaded_at": 1762560000, "seq": 3}]}
 
   `tags` gains `"high_frequency"` once `set_high_frequency/3` flags a
   preset; uploads start without it (the user chose them, and the upload
   form carries the photosensitivity warning). `sha256`, `size`,
-  `uploaded_at` (Unix seconds) and `textures` are the library's own
-  metadata.
+  `uploaded_at` (Unix seconds), `seq` (install order, strictly
+  increasing) and `textures` are the library's own metadata.
 
   The directories are the truth. At start the server deletes everything
   under `incoming/` (stale uploads and staging), then rebuilds the library
@@ -34,7 +35,7 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   name normalises to itself, of the directory's kind, whose content passes
   `UploadCheck.check_preset/1` or `check_texture/2`, and that no other
   kept name claims (by `UploadCheck.fold/1`, or `texture_key/1`; names
-  the old manifest lists go first); a texture must not shadow a built-in
+  the old manifest lists go first, latest `seq` first); a texture must not shadow a built-in
   sampler. Anything else is deleted (the
   renderer's texture scan would follow a symlink). Every file is hashed
   (at most the 64 MiB quota), tags and `uploaded_at` come from the old
@@ -69,7 +70,10 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
        `{:rejected, :no_space}`.
 
   The server then renames the staged files into `user/` (the same
-  filesystem), deletes the file a replacement supersedes when its name
+  filesystem), each only if the quota still admits it against the library
+  as installed so far (a replacement that failed, or kept its
+  predecessor, may have used the room staging counted on: `{:rejected,
+  :quota}`), deletes the file a replacement supersedes when its name
   differs (in case, or a texture's extension), rewrites the manifest and
   tells the Store (`UniversalProxy.MilkDrop.Store`): a replaced id's skips
   go (`Store.clear_user_skips/2`), and an id a differently-named
@@ -377,6 +381,8 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
       # Ids whose Store clean-up (`removed`: skips and lock; `replaced`:
       # skips) the Store has not acknowledged yet.
       store_pending: %{removed: [], replaced: []},
+      # Install order, persisted as each entry's `seq`.
+      next_seq: 1,
       retry_timer: nil
     }
 
@@ -385,7 +391,7 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
     clean_incoming(state.incoming)
     {library, dirty} = load_library(state.user_dir)
     :ets.insert(state.table, sha_rows(library) ++ [{:ready, true}])
-    state = schedule_retry(%{state | library: library, dirty: dirty})
+    state = schedule_retry(%{state | library: library, dirty: dirty, next_seq: next_seq(library)})
     {:ok, state, {:continue, :announce}}
   end
 
@@ -655,27 +661,41 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   # Nothing to install: an unpublished manifest is still retried, so
   # uploading the same files again repairs it.
   defp commit(%{dirty: true} = state, results, []) do
-    {_reply, state} = publish(state, empty_change())
-    {results, state}
+    case publish(state, empty_change()) do
+      {:ok, state} ->
+        {results, state}
+
+      # Still unpublished: an unchanged file is not visible either.
+      {{:error, reason}, state} ->
+        {Enum.map(results, &if(&1.status == :unchanged, do: failed(&1, reason), else: &1)), state}
+    end
   end
 
   defp commit(state, results, []), do: {results, state}
 
   defp commit(state, results, staged) do
     now = System.os_time(:second)
-    acc = %{library: state.library, failed: MapSet.new(), change: empty_change(), cleanup: []}
+
+    acc = %{
+      library: state.library,
+      failed: %{},
+      change: empty_change(),
+      cleanup: [],
+      seq: state.next_seq
+    }
+
     acc = Enum.reduce(staged, acc, &install(state, &1, now, &2))
 
     # A queued removal of a name this import just installed would delete
     # the new file (the path is exact, so is the comparison).
     installed =
       for item <- staged,
-          not MapSet.member?(acc.failed, {item.kind, item.name}),
+          not Map.has_key?(acc.failed, {item.kind, item.name}),
           into: MapSet.new(),
           do: {item.kind, item.name}
 
     cleanup = Enum.reject(state.cleanup, &MapSet.member?(installed, &1)) ++ acc.cleanup
-    state = %{state | library: acc.library, cleanup: cleanup}
+    state = %{state | library: acc.library, cleanup: cleanup, next_seq: acc.seq}
     sync_table(state, acc.change)
     state = tell_store(state, acc.change)
     {published, state} = publish(state, acc.change)
@@ -686,8 +706,8 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
           result.status not in [:added, :replaced] ->
             result
 
-          MapSet.member?(acc.failed, {result.kind, result.name}) ->
-            failed(result, {:io, :install_failed})
+          Map.has_key?(acc.failed, {result.kind, result.name}) ->
+            failed(result, acc.failed[{result.kind, result.name}])
 
           published != :ok ->
             failed(result, elem(published, 1))
@@ -702,7 +722,25 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
 
   defp failed(result, reason), do: %{result | status: {:rejected, reason}}
 
+  # Staging admitted each file assuming the replacements before it in
+  # place; one that failed (or kept its predecessor) may have used up the
+  # room, so admission is checked again against the library as it is now.
   defp install(state, item, now, acc) do
+    if admitted?(state, acc.library, item),
+      do: rename_into_place(state, item, now, acc),
+      else: %{acc | failed: Map.put(acc.failed, {item.kind, item.name}, :quota)}
+  end
+
+  defp admitted?(state, library, item) do
+    old = item.replaces && library[section(item.kind)][item.replaces]
+    usage = usage_of(library)
+    count = Map.fetch!(usage, count_key(item.kind)) + if(old, do: 0, else: 1)
+
+    usage.bytes + item.size - ((old && old.size) || 0) <= state.quota.bytes and
+      count <= Map.fetch!(state.quota, count_key(item.kind))
+  end
+
+  defp rename_into_place(state, item, now, acc) do
     dest = Path.join([state.user_dir, subdir(item.kind), item.name])
 
     case File.rename(item.path, dest) do
@@ -724,7 +762,7 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
           "MilkDrop upload #{inspect(item.name)} could not be installed: #{inspect(reason)}"
         )
 
-        %{acc | failed: MapSet.put(acc.failed, {item.kind, item.name})}
+        %{acc | failed: Map.put(acc.failed, {item.kind, item.name}, {:io, :install_failed})}
     end
   end
 
@@ -737,6 +775,7 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
       sha256: item.sha256,
       size: item.size,
       uploaded_at: now,
+      seq: acc.seq,
       high_frequency: (old && old.high_frequency) || false
     }
 
@@ -757,11 +796,11 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
           add_change(acc.change, :replaced, id)
       end
 
-    %{acc | library: %{acc.library | presets: presets}, change: change}
+    %{acc | library: %{acc.library | presets: presets}, change: change, seq: acc.seq + 1}
   end
 
   defp installed(acc, %{kind: :texture} = item, superseded, now, _flagged_from) do
-    meta = %{sha256: item.sha256, size: item.size, uploaded_at: now}
+    meta = %{sha256: item.sha256, size: item.size, uploaded_at: now, seq: acc.seq}
     textures = acc.library.textures |> Map.delete(superseded) |> Map.put(item.name, meta)
 
     change =
@@ -771,7 +810,7 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
         &add_change(&2, :textures, &1)
       )
 
-    %{acc | library: %{acc.library | textures: textures}, change: change}
+    %{acc | library: %{acc.library | textures: textures}, change: change, seq: acc.seq + 1}
   end
 
   defp finish_import(%{busy: busy} = state, reply) do
@@ -1024,8 +1063,8 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   defp scan(user_dir, kind, old_meta) do
     dir = Path.join(user_dir, subdir(kind))
 
-    # Of names that collide, one the manifest knows wins, the newest upload
-    # among those (a replacement whose predecessor couldn't be deleted).
+    # Of names that collide, one the manifest knows wins, the latest
+    # install (`seq`) among those (a replacement whose predecessor couldn't be deleted).
     names =
       case File.ls(dir) do
         {:ok, names} -> Enum.sort_by(names, &collision_rank(old_meta, &1))
@@ -1054,8 +1093,8 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
 
   defp collision_rank(old_meta, name) do
     case old_meta do
-      %{^name => meta} -> {0, -Map.get(meta, :uploaded_at, 0), name}
-      _unknown -> {1, 0, name}
+      %{^name => meta} -> {0, -Map.get(meta, :seq, 0), -Map.get(meta, :uploaded_at, 0), name}
+      _unknown -> {1, 0, 0, name}
     end
   end
 
@@ -1089,7 +1128,7 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
         _ -> mtime(path)
       end
 
-    meta = %{sha256: sha(data), size: size, uploaded_at: uploaded_at}
+    meta = %{sha256: sha(data), size: size, uploaded_at: uploaded_at, seq: Map.get(old, :seq, 0)}
 
     if kind == :preset,
       do: Map.put(meta, :high_frequency, Map.get(old, :high_frequency, false)),
@@ -1119,6 +1158,8 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
 
       meta = %{high_frequency: "high_frequency" in tags}
       meta = if at in 0..@max_unix_s//1, do: Map.put(meta, :uploaded_at, at), else: meta
+      seq = entry["seq"]
+      meta = if is_integer(seq) and seq >= 0, do: Map.put(meta, :seq, seq), else: meta
       {file, meta}
     end
   end
@@ -1135,7 +1176,8 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
           "tags" => tags,
           "sha256" => meta.sha256,
           "size" => meta.size,
-          "uploaded_at" => meta.uploaded_at
+          "uploaded_at" => meta.uploaded_at,
+          "seq" => meta.seq
         }
       end
 
@@ -1145,7 +1187,8 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
           "file" => name,
           "sha256" => meta.sha256,
           "size" => meta.size,
-          "uploaded_at" => meta.uploaded_at
+          "uploaded_at" => meta.uploaded_at,
+          "seq" => meta.seq
         }
       end
 
@@ -1242,6 +1285,11 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
 
   defp sort_by_name(entries),
     do: Enum.sort_by(entries, fn {name, _} -> {UploadCheck.fold(name), name} end)
+
+  defp next_seq(library) do
+    seqs = Enum.map(Map.values(library.presets) ++ Map.values(library.textures), & &1.seq)
+    Enum.max([0 | seqs]) + 1
+  end
 
   defp usage_of(library) do
     sizes = Enum.map(Map.values(library.presets) ++ Map.values(library.textures), & &1.size)

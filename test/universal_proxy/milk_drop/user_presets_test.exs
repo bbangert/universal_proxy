@@ -784,6 +784,58 @@ defmodule UniversalProxy.MilkDrop.UserPresetsTest do
     end
   end
 
+  describe "round 3" do
+    @tag capture_log: true
+    test "an identical re-upload while the manifest stays unwritable is not a success", ctx do
+      server = start_library(ctx, retry_ms: 600_000)
+      block_manifest(ctx)
+      [%{status: {:rejected, {:manifest, _}}}] = import!(server, [upload(ctx, "a.milk", milk())])
+
+      assert [%{status: {:rejected, {:manifest, {:io, :eisdir}}}}] =
+               import!(server, [upload(ctx, "a.milk", milk())])
+    end
+
+    @tag capture_log: true
+    test "a replacement that fails to install doesn't lend its room to later files", ctx do
+      small = milk()
+      big = milk(String.duplicate("x=1\r\n", 100))
+      server = start_library(ctx, quota: %{bytes: byte_size(small) + byte_size(big)})
+      [%{status: :added}] = import!(server, [upload(ctx, "a.milk", big)])
+
+      # Staging counts a's shrinking to make room for b; a's rename fails.
+      pin_file(preset_path(ctx, "a.milk"))
+
+      results = import!(server, [upload(ctx, "a.milk", small), upload(ctx, "b.milk", big)])
+
+      assert Enum.map(results, & &1.status) == [
+               {:rejected, {:io, :install_failed}},
+               {:rejected, :quota}
+             ]
+
+      refute File.exists?(preset_path(ctx, "b.milk"))
+      assert %{presets: 1} = UserPresets.usage(server)
+    end
+
+    @tag capture_log: true
+    test "after a restart the later of two case twins wins, within the same second", ctx do
+      server = start_library(ctx, retry_ms: 600_000)
+      [_] = import!(server, [upload(ctx, "FOO.milk", milk())])
+      pin_file(preset_path(ctx, "FOO.milk"))
+      new = milk("x=1")
+      [%{status: :replaced}] = import!(server, [upload(ctx, "Foo.milk", new)])
+
+      # FOO.milk's removal is still queued when the device restarts.
+      unpin_file(preset_path(ctx, "FOO.milk"))
+      File.write!(preset_path(ctx, "FOO.milk"), milk())
+      assert %{"presets" => [%{"seq" => 1}, %{"seq" => 2}]} = manifest(ctx)
+
+      server = restart_library(ctx)
+      assert [%{id: "user/Foo.milk"}] = UserPresets.list(server).presets
+      assert File.read!(preset_path(ctx, "Foo.milk")) == new
+      refute File.exists?(preset_path(ctx, "FOO.milk"))
+    end
+  end
+
   describe "restarts" do
     test "each start is announced", ctx do
       start_library(ctx)
