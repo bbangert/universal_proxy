@@ -208,8 +208,10 @@ Uploads live outside the pack (the BEAM never writes into it), in
 - **Fields.** The BEAM writes `file`, `tags` and optionally `sha256` (the
   file's content hash; `rpi3`, `compile_ms` and the like are absent:
   uploads are not swept). A `high_frequency` tag puts
-  an upload behind `--high-frequency` like a pack preset (the `user/`
-  prefix defeats the `high_frequency/` path rule).
+  an upload behind `--high-frequency` like a pack preset. The
+  `high_frequency/` path rule applies to `file` as written, before the
+  `user/` prefix; the BEAM writes flat names, so for uploads only the tag
+  counts.
 - **Shaders.** The pack's shader cache simply misses for them: they are
   translated at load (on rpi3 about 42 ms p50, 107 ms p99 more warm-up).
 - **Textures.** The search path is `[<pack>/textures, <user>/textures]`:
