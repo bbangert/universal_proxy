@@ -53,8 +53,9 @@ defmodule UniversalProxy.MilkDrop.UploadCheck do
   sequential Huffman JPEGs (`:unsupported_jpeg`) are refused: stb_image
   picks its decoder by content, so this keeps uploads on the common
   decoder paths. Stems that projectM reserves for built-in samplers
-  (`main`, `blur1`, `noise_lq`, …, also with an `fc_`/`fw_`/`pc_`/`pw_`
-  prefix) are reported by `texture_reserved?/1`.
+  (`main`, `blur1`, `noise_lq`, `idlem`, …, also behind any `XY_` prefix,
+  which projectM strips before lookup) are reported by
+  `texture_reserved?/1`.
   """
 
   @max_name_bytes 200
@@ -70,10 +71,10 @@ defmodule UniversalProxy.MilkDrop.UploadCheck do
   @name_re ~r/\A[\p{L}\p{Nd} \-_.,()\[\]&'+!#@$%=~;]+\z/u
   @control_re ~r/[\x01-\x08\x0b\x0c\x0e-\x1f]/
 
+  # projectM's TextureManager preloads `idlem`, `idleheadphones` and the
+  # noise textures; `main` and `blur1..3` are the render targets.
   @builtin_textures ~w(main blur1 blur2 blur3 noise_lq noise_lq_lite noise_mq noise_hq
-                       noisevol_lq noisevol_hq idleheadphones)
-  @reserved_textures @builtin_textures ++
-                       for(p <- ~w(fc_ fw_ pc_ pw_), t <- @builtin_textures, do: p <> t)
+                       noisevol_lq noisevol_hq idlem idleheadphones)
 
   @png_sig <<0x89, "PNG", 0x0D, 0x0A, 0x1A, 0x0A>>
   # Legal bit depths per colour type (PNG spec, IHDR).
@@ -145,7 +146,10 @@ defmodule UniversalProxy.MilkDrop.UploadCheck do
 
   @doc "Whether a texture name shadows one of projectM's built-in samplers."
   @spec texture_reserved?(String.t()) :: boolean()
-  def texture_reserved?(name), do: texture_key(name) in @reserved_textures
+  def texture_reserved?(name) do
+    key = texture_key(name)
+    key in @builtin_textures or unprefixed(key) in @builtin_textures
+  end
 
   @doc """
   A display-safe rendering of an untrusted name: invalid UTF-8 and
@@ -217,6 +221,12 @@ defmodule UniversalProxy.MilkDrop.UploadCheck do
 
   # -- Private: names --
 
+  # TextureManager::ExtractTextureSettings: a name longer than three bytes
+  # whose third byte is `_` loses its first three bytes (`fc_`, `cf_`, any
+  # `XY_`) before lookup.
+  defp unprefixed(<<_, _, "_", rest::binary>>) when rest != "", do: rest
+  defp unprefixed(_key), do: nil
+
   defp squash_spaces(stem), do: stem |> String.split(" ", trim: true) |> Enum.join(" ")
 
   defp valid_stem?(stem) do
@@ -262,11 +272,13 @@ defmodule UniversalProxy.MilkDrop.UploadCheck do
       else: {:error, {:dimensions, w, h}}
   end
 
-  defp png(
-         <<@png_sig, 13::32, "IHDR", w::32, h::32, depth, color, compression, filter, interlace,
-           _::binary>>
-       ) do
+  defp png(<<@png_sig, 13::32, "IHDR", ihdr::binary-13, crc::32, _::binary>>) do
+    <<w::32, h::32, depth, color, compression, filter, interlace>> = ihdr
+
     cond do
+      crc != :erlang.crc32(["IHDR", ihdr]) ->
+        {:error, :bad_header}
+
       depth not in Map.get(@png_depths, color, []) or compression != 0 or filter != 0 or
           interlace not in [0, 1] ->
         {:error, :bad_header}
@@ -317,8 +329,9 @@ defmodule UniversalProxy.MilkDrop.UploadCheck do
   defp jpeg_markers(_), do: {:error, :bad_header}
 
   # The body is exactly the segment (length 8 + 3 × Nf) minus its length
-  # field: precision, height, width, Nf in 1..4, then Nf component specs.
-  defp jpeg_segment(m, <<_precision, h::16, w::16, nf, specs::binary>>, rest)
+  # field: precision (8 bits: all stb_image decodes), height, width, Nf in
+  # 1..4, then Nf component specs.
+  defp jpeg_segment(m, <<8, h::16, w::16, nf, specs::binary>>, rest)
        when m in @jpeg_ok_sof and nf in 1..4 and byte_size(specs) == 3 * nf do
     if :binary.match(rest, <<0xFF, 0xD9>>) == :nomatch,
       do: {:error, :bad_header},

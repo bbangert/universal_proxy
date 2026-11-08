@@ -92,12 +92,16 @@ defmodule UniversalProxy.MilkDrop.UploadCheckTest do
       assert UploadCheck.kind("README") == :other
     end
 
-    test "reserved texture names" do
-      for name <- ~w(main.png Noise_LQ.jpg fc_main.png pw_noisevol_hq.jpg blur2.png) do
+    test "reserved texture names, behind any XY_ prefix as projectM strips it" do
+      for name <-
+            ~w(main.png Noise_LQ.jpg fc_main.png pw_noisevol_hq.jpg blur2.png cf_main.png
+               wf_noise_lq.jpg idlem.png idleheadphones.png zz_idlem.png 9__blur1.png) do
         assert UploadCheck.texture_reserved?(name), name
       end
 
-      refute UploadCheck.texture_reserved?("mainframe.png")
+      for name <- ~w(mainframe.png fcmain.png f_main.png abc_main.png fc_.png idle.png) do
+        refute UploadCheck.texture_reserved?(name), name
+      end
     end
   end
 
@@ -212,6 +216,33 @@ defmodule UniversalProxy.MilkDrop.UploadCheckTest do
         if depth in legal[color],
           do: assert({:ok, %{format: :png}} = result),
           else: assert(result == {:error, :bad_header}, "color #{color} depth #{depth}")
+      end
+    end
+
+    test "requires the whole IHDR chunk with a matching CRC" do
+      full = png(16, 16)
+      # Signature, length, type and data but no CRC: 29 bytes.
+      assert UploadCheck.check_texture("a.png", binary_part(full, 0, 29)) == {:error, :bad_header}
+      assert {:ok, _} = UploadCheck.check_texture("a.png", binary_part(full, 0, 33))
+
+      <<head::binary-29, crc::32, rest::binary>> = full
+      bad_crc = <<head::binary, Bitwise.bxor(crc, 1)::32, rest::binary>>
+      assert UploadCheck.check_texture("a.png", bad_crc) == {:error, :bad_header}
+    end
+
+    test "requires 8-bit JPEG sample precision" do
+      good = jpeg(16, 16)
+      {pos, _} = :binary.match(good, <<0xFF, 0xC0>>)
+      # The precision byte follows the marker and its 2-byte length.
+      assert binary_part(good, pos + 4, 1) == <<8>>
+
+      for precision <- [12, 0] do
+        bad =
+          binary_part(good, 0, pos + 4) <>
+            <<precision>> <> binary_part(good, pos + 5, byte_size(good) - pos - 5)
+
+        assert UploadCheck.check_texture("a.jpg", bad) == {:error, :bad_header},
+               "precision #{precision}"
       end
     end
 

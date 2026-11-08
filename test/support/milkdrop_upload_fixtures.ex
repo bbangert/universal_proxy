@@ -87,10 +87,10 @@ defmodule UniversalProxy.MilkDropUploadFixtures do
   end
 
   @doc "Raw deflate (no zlib header), as zip method 8 stores it."
-  @spec deflate(iodata()) :: binary()
-  def deflate(data) do
+  @spec deflate(iodata(), :zlib.zlevel()) :: binary()
+  def deflate(data, level \\ :default) do
     z = :zlib.open()
-    :ok = :zlib.deflateInit(z, :default, :deflated, -15, 8, :default)
+    :ok = :zlib.deflateInit(z, level, :deflated, -15, 8, :default)
     out = :zlib.deflate(z, data, :finish)
     :ok = :zlib.deflateEnd(z)
     :zlib.close(z)

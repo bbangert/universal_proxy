@@ -267,6 +267,23 @@ defmodule UniversalProxy.MilkDrop.ZipTest do
                {:error, {:bad_sizes, "a.png"}}
     end
 
+    test "accepts an incompressible ~4 MiB entry that deflate grew" do
+      random = :crypto.strong_rand_bytes(4 * 1024 * 1024 - 4096)
+
+      for level <- [:none, :best_compression] do
+        compressed = deflate(random, level)
+        assert byte_size(compressed) > byte_size(random)
+        bin = zip([[name: "t.png", data: random, method: :deflate, compressed: compressed]])
+
+        assert {:ok, zip} = open(bin)
+        [entry] = Zip.entries(zip)
+        assert Zip.read(zip, entry) == {:ok, random}
+      end
+
+      # Level 9 on random data grows it by more than the old fixed 1 KiB.
+      assert byte_size(deflate(random, :best_compression)) - byte_size(random) > 1024
+    end
+
     test "rejects a deflate bomb by ratio" do
       zeros = :binary.copy(<<0>>, 4 * 1024 * 1024)
 

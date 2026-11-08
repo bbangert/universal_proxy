@@ -38,7 +38,8 @@ defmodule UniversalProxy.MilkDrop.Zip do
         attributes is neither regular nor directory (symlinks, devices,
         FIFOs), or contradicts the trailing `/`; type 0 (DOS) is allowed;
       * `:bad_sizes` — a stored entry whose sizes differ, a deflated one
-        more than 1 KiB larger than its content, or a directory with
+        larger than its content by more than 1/256 of it + 1 KiB (beyond
+        deflate's stored-block overhead), or a directory with
         content;
       * `:ratio` — a deflated entry declaring more than 200× its
         compressed size (+ 1 KiB);
@@ -371,7 +372,12 @@ defmodule UniversalProxy.MilkDrop.Zip do
 
   defp sizes_ok?(%{size: size}, true), do: size == 0
   defp sizes_ok?(%{method: 0} = raw, false), do: raw.compressed_size == raw.size
-  defp sizes_ok?(raw, false), do: raw.compressed_size <= raw.size + @slack
+  # A compressor that can't shrink its input falls back to stored blocks,
+  # 5 bytes per block (zlib: up to 64 KiB, 2 KiB at the smallest memLevel);
+  # 1/256 of the size plus 1 KiB covers that with room to spare, and still
+  # bounds the compressed bytes read per entry.
+  defp sizes_ok?(raw, false),
+    do: raw.compressed_size <= raw.size + div(raw.size, 256) + @slack
 
   defp check_duplicates!(records) do
     Enum.reduce(records, MapSet.new(), fn
