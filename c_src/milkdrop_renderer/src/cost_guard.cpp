@@ -45,6 +45,7 @@ size_t CostGuard::clamp_to_floor(size_t level) const {
 
 size_t CostGuard::begin(const std::string& file, size_t hint_rung) {
     file_ = file;
+    detached_ = false;
     window_.clear();
     settle_left_ = config_.settle_frames;
     last_fps_ = -1;
@@ -90,20 +91,20 @@ CostGuard::Verdict CostGuard::on_flip(int64_t interval_us, bool measurable) {
     window_.clear();
     const double fps = mean_us > 0 ? 1e6 / mean_us : 0;
     last_fps_ = fps;
-    fps_[file_] = fps;
+    if (!detached_) fps_[file_] = fps;
 
     if (fps >= levels_[level_].min_fps) {
-        settled_[file_] = level_;
+        if (!detached_) settled_[file_] = level_;
         return Verdict::Accept;
     }
     const size_t next = reachable_from(level_ + 1);
     if (next >= levels_.size()) {
-        settled_.erase(file_);
+        if (!detached_) settled_.erase(file_);
         file_.clear();
         return Verdict::Skip;
     }
     level_ = next;
-    settled_[file_] = level_;
+    if (!detached_) settled_[file_] = level_;
     settle_left_ = config_.settle_frames;
     return Verdict::StepDown;
 }
@@ -127,10 +128,25 @@ bool CostGuard::set_rung_floor(size_t rung) {
     size_t clamped = clamp_to_floor(level_);
     if (clamped == level_) return false;
     level_ = clamped;
-    if (!file_.empty()) settled_[file_] = level_;
+    if (!file_.empty() && !detached_) settled_[file_] = level_;
     settle_left_ = config_.settle_frames;
     window_.clear();
     return true;
+}
+
+void CostGuard::resume(const Run& run) {
+    file_ = run.file;
+    detached_ = run.detached;
+    level_ = clamp_to_floor(std::min(run.level, levels_.size() - 1));
+    window_.clear();
+    settle_left_ = config_.settle_frames;
+    last_fps_ = -1;
+}
+
+void CostGuard::forget(const std::string& file) {
+    settled_.erase(file);
+    fps_.erase(file);
+    if (file == file_) detached_ = true;
 }
 
 double CostGuard::measured_fps(const std::string& file) const {

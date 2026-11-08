@@ -25,11 +25,15 @@ struct Command {
         SetRotate,         // int_value: seconds
         SetHighFrequency,  // bool_value
         SetMinFps,         // number_value: frames per second
+        Play,              // string_value: preset id; bool_value: lock
+        ReloadUser,
+        ReloadSelection,
     };
     Type type = Type::Exit;
     int int_value = 0;
     bool bool_value = false;
     double number_value = 0;
+    std::string string_value;
 };
 
 // One stdin line. Unknown commands, bad values and non-JSON give nullopt
@@ -137,6 +141,16 @@ std::string event_loading(std::string_view file);
 std::string event_skip(std::string_view file, std::string_view reason, std::string_view message = {},
                        double fps = -1);
 std::string event_error(std::string_view reason, std::string_view message = {});
+// A `play` that can't happen: `reason` is "unknown", "skipped",
+// "high_frequency", "rpi3_skip" or "load_failed".
+std::string event_play_refused(std::string_view preset, std::string_view reason);
+// `reload_user` done: live user presets, ids added (new or back), ids
+// removed, manifest entries rejected.
+std::string event_user_reloaded(size_t presets, size_t added, size_t removed, size_t rejected);
+// The selection in force: its generation, the size of the rotation pool
+// and whether the playlist (or the hidden set) emptied it, so rotation
+// fell back.
+std::string event_selection(int64_t gen, size_t eligible, bool playlist_fallback, bool hidden_fallback);
 std::string event_exiting(std::string_view reason);
 
 struct StatsSnapshot {

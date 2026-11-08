@@ -76,6 +76,18 @@ public:
     Verdict set_min_fps(double min_fps);
     double min_fps() const { return config_.min_fps; }
 
+    // The preset being measured, so a failed switch can hand the guard
+    // back to it at its own level (resume()) after candidates began.
+    struct Run {
+        std::string file;
+        size_t level = 0;
+        bool detached = false;
+    };
+    Run run() const { return {file_, level_, detached_}; }
+    // Measures `run` again from a settle period, at its level (never above
+    // the thermal floor).
+    void resume(const Run& run);
+
     // Restart the settle period (after a hold such as a warm-up).
     void resettle() { settle_left_ = config_.settle_frames; window_.clear(); }
 
@@ -86,6 +98,13 @@ public:
     // current level moved.
     bool set_rung_floor(size_t rung);
     size_t rung_floor() const { return rung_floor_; }
+
+    // `file`'s content changed (an upload replaced): what was learnt about
+    // it (settled level, measured fps) goes, so its next begin() starts
+    // from the hint. If it is the preset being measured, that keeps its
+    // level and verdicts, but its windows no longer record for `file`
+    // (they measure the old content).
+    void forget(const std::string& file);
 
     // The measured fps of the last full window for `file`, or < 0.
     double measured_fps(const std::string& file) const;
@@ -98,6 +117,7 @@ private:
     std::map<std::string, size_t> settled_;  // file -> level
     std::map<std::string, double> fps_;      // file -> last window fps
     std::string file_;
+    bool detached_ = false;  // file_'s windows don't record (forget())
     size_t level_ = 0;
     size_t rung_floor_ = 0;
     int settle_left_ = 0;
