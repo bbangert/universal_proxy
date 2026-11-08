@@ -446,6 +446,23 @@ defmodule UniversalProxy.MilkDrop.IndexTest do
       assert ids(all(ctx.index)) == ["a.milk", "b.milk", "user/New.milk"]
     end
 
+    test "another pack version's skips update only the uploads' skips", ctx do
+      :ok = Store.skip(ctx.store, @version, "a.milk", "budget")
+      assert_receive {:milkdrop_index, %{changed: [_]}}, 1_000
+
+      Phoenix.PubSub.broadcast(
+        ctx.pubsub,
+        MilkDrop.settings_topic(),
+        {:milkdrop_skipped, "2025.01.0", %{"b.milk" => "hang", "user/Mine.milk" => "crashed"}}
+      )
+
+      assert_receive {:milkdrop_index, %{changed: [key]}}, 1_000
+      assert key == Index.key("user/Mine.milk")
+      assert row!(ctx.index, "a.milk").skip == "budget"
+      assert row!(ctx.index, "b.milk").skip == nil
+      assert row!(ctx.index, "user/Mine.milk").skip == "crashed"
+    end
+
     test "a replacement repaired by a library restart drops its old skip", ctx do
       id = "user/Mine.milk"
       :ok = Store.skip(ctx.store, @version, id, "hang")

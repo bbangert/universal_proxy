@@ -278,6 +278,24 @@ defmodule UniversalProxyWeb.MilkDropPresetsLiveTest do
       assert rows(view) == 50
     end
 
+    test "while searching, the totals follow index changes", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/audio/milkdrop?q=preset")
+      assert view |> element("#playlist-count") |> render() =~ "The playlist is empty."
+
+      # Off the search: only the totals (the playlist bar) change.
+      {:ok, _} = Store.playlist_add("Geiss - Flux.milk")
+
+      wait_until(fn ->
+        view |> element("#playlist-count") |> render() =~ "1 preset on the playlist"
+      end)
+
+      assert view |> element("label", "Playlist") |> render() =~ ">0<"
+
+      view |> form("#preset-search", %{q: "flux", filter: "all"}) |> render_change()
+      assert view |> element("label", "Playlist") |> render() =~ ">1<"
+      assert view |> element("#playlist-count") |> render() =~ "1 preset on the playlist"
+    end
+
     test "a filter chip patches the URL", %{conn: conn} do
       {:ok, view, _html} = live(conn, "/audio/milkdrop")
       view |> form("#preset-search", %{q: "", filter: "uploaded"}) |> render_change()
