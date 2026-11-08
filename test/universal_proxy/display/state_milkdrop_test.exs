@@ -535,7 +535,7 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
              List.last(cmds(ctx.skip_file))
   end
 
-  test "unlock resumes a running session's rotation and clears the stored lock", ctx do
+  test "unlock resumes a running session's rotation, or clears the stored lock", ctx do
     store =
       start_supervised!(
         {Store, name: nil, table: :"#{ctx.test}", dets_path: Path.join(ctx.tmp_dir, "s.dets")}
@@ -559,10 +559,14 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     assert play(ctx, "x.milk", true) == :ok
     assert %{locked: true} = md(ctx)
 
+    # A session: the renderer's owner persists the lock (its store here is
+    # a dead name), so this call writes nothing itself.
+    {:ok, _} = Store.update(store, %{locked: "kept.milk"})
     assert UniversalProxy.MilkDrop.unlock(opts) == :ok
     assert md(ctx).locked == false
     wait_until(fn -> "unlock" in cmd_names(ctx.skip_file) end)
     wait_until(fn -> UniversalProxy.MilkDrop.now_playing(display: ctx.state).locked == false end)
+    assert Store.settings(store).locked == "kept.milk"
 
     assert UniversalProxy.MilkDrop.unlock(opts) == :ok
     assert UniversalProxy.MilkDrop.unlock(display: :"#{ctx.test}.Gone", store: store) == :ok
@@ -655,6 +659,21 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     assert Task.await(pending) == :ok
     wait_until(fn -> Enum.take(cmd_names(ctx.skip_file), -2) == ["play", "unlock"] end)
     wait_until(fn -> match?(%{preset: "x.milk", locked: false}, md(ctx)) end)
+  end
+
+  test "an unlock then a remote lock during a locked play keep their order", ctx do
+    ctx = ctx |> start_ui(fake: %{play_delays: [300]}) |> presenting()
+
+    pending = Task.async(fn -> play(ctx, "x.milk", true) end)
+    wait_until(fn -> md(ctx).pending_play == "x.milk" end)
+    assert Display.milkdrop_unlock(ctx.state) == :ok
+    key(ctx, :select)
+    _ = :sys.get_state(ctx.state)
+    refute Enum.any?(cmd_names(ctx.skip_file), &(&1 in ["lock", "unlock"]))
+
+    assert Task.await(pending) == :ok
+    wait_until(fn -> Enum.take(cmd_names(ctx.skip_file), -3) == ["play", "unlock", "lock"] end)
+    wait_until(fn -> match?(%{preset: "x.milk", locked: true}, md(ctx)) end)
   end
 
   test "after a play, lock and unlock name the preset it showed", ctx do

@@ -182,31 +182,33 @@ defmodule UniversalProxy.MilkDrop do
 
   @doc """
   Release the lock: a running visualizer session resumes rotation at
-  once, and the Store's `locked` is cleared so the next session starts
-  unlocked. Idempotent. Returns the Store's answer (`{:error, reason}`
-  when it can't write). Options: `:display` and `:store`, as for
-  `play/3`.
+  once, and with no session the Store's `locked` is cleared so the next
+  one starts unlocked. Idempotent. Returns `:ok`, or the Store's
+  `{:error, reason}` when it can't write. Options: `:display` and
+  `:store`, as for `play/3`.
 
-  With no session presenting the clear raises `Store.update/3`'s fence,
-  as `play/3`'s saved lock does, so a retiring session's late lock can't
-  bring it back. With one presenting it doesn't: that session's own
-  later locks (a remote's lock key) must still count, and its `preset`
-  event for the unlock saves `nil` too.
+  A running session's lock is persisted only by its owner
+  (`UniversalProxy.Display.MilkDrop`, from the renderer's `preset`
+  event, fenced by session): writing `nil` here too could land after a
+  newer lock from the remote and leave the Store unlocked while the TV
+  is locked. With no session presenting the clear raises
+  `Store.update/3`'s fence, as `play/3`'s saved lock does, so a retiring
+  session's late lock can't bring it back.
   """
   @spec unlock(keyword()) :: :ok | {:error, term()}
   def unlock(opts \\ []) do
     # Taken first, as in play/3.
     fence = System.unique_integer([:monotonic])
 
-    update_opts =
-      case Display.milkdrop_unlock(Keyword.get(opts, :display, Display.State)) do
-        :ok -> []
-        {:error, :not_presenting} -> [fence: fence]
-      end
+    case Display.milkdrop_unlock(Keyword.get(opts, :display, Display.State)) do
+      :ok ->
+        :ok
 
-    case Store.update(Keyword.get(opts, :store, Store), %{locked: nil}, update_opts) do
-      {:ok, _settings} -> :ok
-      error -> error
+      {:error, :not_presenting} ->
+        case Store.update(Keyword.get(opts, :store, Store), %{locked: nil}, fence: fence) do
+          {:ok, _settings} -> :ok
+          error -> error
+        end
     end
   end
 

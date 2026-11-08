@@ -29,7 +29,8 @@ defmodule UniversalProxy.MilkDrop.Index do
       no pack rows). Entries the renderer would drop (an invalid id, a
       `user/` id, a duplicate) are dropped here too;
     * the uploads: `UniversalProxy.MilkDrop.UserPresets.list/1`, re-read
-      on every library change;
+      on every library change and restart, with the skips (an upload's
+      skip counts only for the content it was recorded against);
     * `UniversalProxy.MilkDrop.Store`: the skips (the ready version's and
       the uploads'), the selection and the `locked` setting, each kept
       current by its broadcast.
@@ -416,7 +417,11 @@ defmodule UniversalProxy.MilkDrop.Index do
 
   def handle_info({kind, _change}, state)
       when kind in [:milkdrop_user_presets, :milkdrop_user_presets_started] do
-    {:noreply, sync_user(state, read_user(state))}
+    # Upload skips count only for the content they were recorded against,
+    # which a library change or restart (a repaired replacement) may change
+    # without the Store announcing anything.
+    skips = Store.skipped(state.store, pack_version(state.pack_status) || "")
+    {:noreply, state |> sync_user(read_user(state)) |> apply_skips(nil, skips)}
   end
 
   def handle_info(:flush, %{pending: pending} = state) do
