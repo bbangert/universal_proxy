@@ -693,6 +693,67 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     assert md(ctx).selection_retries == 0
   end
 
+  test "a retiring session's late lock doesn't overwrite one saved after it", ctx do
+    store =
+      start_supervised!(
+        {Store,
+         name: nil,
+         table: :"#{ctx.test}",
+         dets_path: Path.join(ctx.tmp_dir, "s.dets"),
+         in_flight_grace_ms: 0}
+      )
+
+    ctx =
+      ctx
+      |> start_ui(fake: %{play_delays: [800]}, milkdrop_opts: [store: store])
+      |> presenting()
+
+    opts = [display: ctx.state, store: store]
+    pending = Task.async(fn -> UniversalProxy.MilkDrop.play("a.milk", true, opts) end)
+    wait_until(fn -> md(ctx).pending_play == "a.milk" end)
+    paused(ctx)
+    assert Task.await(pending) == {:error, :not_presenting}
+
+    assert UniversalProxy.MilkDrop.play("b.milk", true, opts) == {:error, :not_presenting}
+    assert Store.settings(store).locked == "b.milk"
+
+    # The renderer answers the play (locked: true) before `released`, so
+    # its lock write has been tried once the session is over.
+    wait_until(fn -> md(ctx).phase == nil end)
+    assert Store.settings(store).locked == "b.milk"
+  end
+
+  test "a stale selection retry doesn't fire the one armed after it", ctx do
+    selection_file = Path.join(ctx.tmp_dir, "selection.json")
+
+    ctx =
+      ctx
+      |> start_ui(
+        milkdrop_opts: [selection_file: selection_file],
+        timeouts: %{selection_retry: 60_000}
+      )
+      |> presenting()
+
+    wait_until(fn -> match?(%{selection: %{gen: 0}}, md(ctx)) end)
+    File.mkdir_p!(selection_file <> ".tmp")
+
+    capture_log(fn ->
+      selection_changed(ctx, %{gen: 2})
+      wait_until(fn -> md(ctx).selection_retries == 1 end)
+    end)
+
+    %{md: %{selection_retry: armed}} = :sys.get_state(ctx.state)
+    # A message from a retry cancelled before this one was armed.
+    send(ctx.state, {:milkdrop_selection_retry, make_ref()})
+    assert %{md: %{selection_retry: ^armed}} = :sys.get_state(ctx.state)
+
+    # The armed one's own message does resend.
+    File.rmdir!(selection_file <> ".tmp")
+    send(ctx.state, {:milkdrop_selection_retry, armed.ref})
+    wait_until(fn -> md(ctx).selection.gen == 2 end)
+    Process.cancel_timer(armed.timer)
+  end
+
   test "a play pending when the session is reclaimed or ends is answered not_presenting", ctx do
     ctx = ctx |> start_ui(fake: %{ignore: ["play"]}) |> presenting()
 

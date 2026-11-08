@@ -195,7 +195,9 @@ defmodule UniversalProxy.Display.MilkDrop do
   but protocol lines (Mesa's shader dumps in particular) off stdout.
 
   A `preset` event whose `locked` differs from the stored setting persists
-  it to the Store (`locked: file` or `nil`), so a lock survives a restart.
+  it to the Store (`locked: file` or `nil`), so a lock survives a restart;
+  the write carries this session's start (`Store.update/3`'s `:session`),
+  so a session that is retiring can't overwrite a lock saved after it.
 
   ## Device resets
 
@@ -531,6 +533,8 @@ defmodule UniversalProxy.Display.MilkDrop do
          locked: Map.get(settings, :locked),
          skip_file: config.skip_file,
          selection_file: config.selection_file,
+         # Orders this session's lock writes against later ones (Store.update/3).
+         lock_session: System.unique_integer([:monotonic]),
          discarding: false,
          pending_skips: %{},
          skip_retry_ms: Keyword.get(opts, :skip_retry_ms, @skip_retry_ms),
@@ -700,7 +704,8 @@ defmodule UniversalProxy.Display.MilkDrop do
     state = flush_skips(state)
 
     with true <- locked != state.locked,
-         {:ok, _settings} <- Store.update(state.store, %{locked: locked}) do
+         {:ok, _settings} <-
+           Store.update(state.store, %{locked: locked}, session: state.lock_session) do
       {event, %{state | locked: locked}}
     else
       false ->

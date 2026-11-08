@@ -536,12 +536,13 @@ defmodule UniversalProxy.Display.State do
       else: {:noreply, state}
   end
 
+  # Each armed retry has its own token: a cancelled one's message, already
+  # delivered, doesn't match the retry armed after it.
   def handle_info(
-        {:milkdrop_selection_retry, session},
-        %{md: %{session: session, selection_retry: %{} = retry, selection_want: want} = md} =
-          state
+        {:milkdrop_selection_retry, ref},
+        %{md: %{selection_retry: %{ref: ref} = retry, selection_want: want} = md} = state
       ) do
-    state = %{state | md: %{md | selection_retry: %{retry | timer: nil}}}
+    state = %{state | md: %{md | selection_retry: %{retry | timer: nil, ref: nil}}}
     {:noreply, send_selection(state, want)}
   end
 
@@ -1252,15 +1253,16 @@ defmodule UniversalProxy.Display.State do
       %{state | md: md}
     else
       ms = state.md_timeouts.selection_retry * Integer.pow(2, attempt)
-      timer = Process.send_after(self(), {:milkdrop_selection_retry, md.session}, ms)
-      %{state | md: %{md | selection_retry: %{timer: timer, attempt: attempt + 1}}}
+      ref = make_ref()
+      timer = Process.send_after(self(), {:milkdrop_selection_retry, ref}, ms)
+      %{state | md: %{md | selection_retry: %{timer: timer, ref: ref, attempt: attempt + 1}}}
     end
   end
 
   defp cancel_selection_retry(%{selection_retry: %{timer: timer} = retry} = md)
        when is_reference(timer) do
     Process.cancel_timer(timer)
-    %{md | selection_retry: %{retry | timer: nil}}
+    %{md | selection_retry: %{retry | timer: nil, ref: nil}}
   end
 
   defp cancel_selection_retry(md), do: md
