@@ -1,6 +1,13 @@
 // Which preset plays: filtering (skip list, high_frequency/, the rpi3
-// manifest verdict), random rotation without repeats, prev/next history
-// and lock. Pure logic; the caller loads what it returns.
+// manifest verdict), the user's selection (hidden, playlist, favourites),
+// random rotation without repeats, prev/next history, lock and explicit
+// picks (play). Pure logic; the caller loads what it returns.
+//
+// Entries never move: user presets reloaded mid-session are appended, and
+// removed ones are tombstoned (never picked again, passed over in
+// history) rather than erased, so the PresetEntry pointers the caller
+// holds stay valid for the session. An id that comes back revives its
+// entry, refreshed in place.
 //
 // high_frequency/ presets are a photosensitivity filter: while they are
 // excluded, no pick (start, rotate, next, prev, the locked one) returns
@@ -15,9 +22,12 @@
 #include "manifest.h"
 
 #include <cstdint>
+#include <deque>
+#include <map>
 #include <random>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace md {
@@ -30,13 +40,49 @@ public:
         uint64_t seed = 1;
         size_t history_limit = 64;
         double expensive_compile_ms = 600;  // presets over this rotate at half weight
+        size_t favourite_tickets = 3;       // a favourite plays this many times per deal
     };
 
     PresetManager(std::vector<PresetEntry> entries, std::set<std::string, std::less<>> skipped,
                   Config config);
 
+    // Eligible: playable at all (not removed, skipped, filtered out). An
+    // explicit pick (play, --locked) may be any eligible preset; rotation
+    // further honours the selection (rotation_pool()).
     size_t eligible_count() const;
     bool eligible(size_t index) const;
+
+    // What rotation picks from, the first non-empty of: the eligible,
+    // unhidden presets on the playlist (while it is enabled); the
+    // eligible, unhidden ones; every eligible one. A selection never
+    // empties rotation while anything is eligible.
+    enum class Pool { Playlist, Unhidden, Eligible };
+    struct PoolInfo {
+        Pool pool = Pool::Eligible;
+        size_t size = 0;
+        bool playlist_fallback = false;  // the playlist is on but has nothing to rotate
+        bool hidden_fallback = false;    // everything eligible is hidden
+    };
+    PoolInfo rotation_pool() const;
+
+    // Replaces the selection; rotation re-deals. The playing preset is
+    // left alone (it rotates away at the next switch).
+    PoolInfo set_selection(UserSelection selection);
+    const UserSelection& selection() const { return selection_; }
+
+    struct UserReload {
+        size_t presets = 0;  // live user presets after it
+        size_t added = 0;    // new or revived ids
+        size_t removed = 0;  // tombstoned
+        bool cut = false;    // as set_high_frequency(): cut away now
+        // Refreshed or revived ids whose content may have changed (no
+        // sha256, or a different one): per-content caches must go.
+        std::vector<std::string> changed;
+    };
+    // The user presets (ids under USER_PREFIX; others are ignored) become
+    // `user`: new ids are appended, present ones refreshed in place, ones
+    // no longer listed tombstoned. Rotation re-deals.
+    UserReload set_user_presets(std::vector<PresetEntry> user);
 
     // The preset to start on: `locked_file` (locked) if it is eligible,
     // else a random one (refused_lock() then says why). Null when nothing
@@ -48,11 +94,20 @@ public:
 
     // The timer's pick: the next one from the shuffle bag (new history).
     const PresetEntry* rotate();
-    // Forward in history, or a new pick at its end.
+    // Forward in history, or a new pick at its end. History passes over
+    // presets that are no longer eligible or are hidden.
     const PresetEntry* next();
-    // Back in history to the newest eligible earlier preset; null (and no
+    // Back in history to the newest such earlier preset; null (and no
     // change) if there is none.
     const PresetEntry* prev();
+
+    // An explicit pick by id: any eligible preset, hidden or off the
+    // playlist included. Null with `reason` ("unknown", "skipped",
+    // "high_frequency", "rpi3_skip") when it can't play.
+    const PresetEntry* find_playable(std::string_view id, std::string& reason) const;
+    // `entry` (find_playable's) loaded: it becomes the current preset, in
+    // history as a rotate pick would be, locked or not.
+    void played(const PresetEntry& entry, bool lock);
 
     const PresetEntry* current() const;
     bool locked() const { return locked_; }
@@ -70,7 +125,9 @@ public:
     // What projectM renders, as the caller reports it. A switch to `entry`
     // took effect, blended (the preset shown so far blends out) or cut
     // (nothing blends out). As in projectM, a switch during a blend first
-    // completes it: only the latest outgoing preset remains.
+    // completes it: only the latest outgoing preset remains. Whether each
+    // is high_frequency is fixed when it is shown: a reload clearing the
+    // tag doesn't change what projectM loaded (one setting it does count).
     void on_shown(const PresetEntry& entry, bool blend);
     // The blend is over: the outgoing preset is no longer rendered.
     void on_blend_done();
@@ -85,11 +142,19 @@ public:
     // is eligible.
     const PresetEntry* cut_target();
 
-    const std::vector<PresetEntry>& entries() const { return entries_; }
+    // Tickets left in the current deal (tests: it stays bounded).
+    size_t bag_size() const { return bag_.size(); }
+
+    // Tombstoned ones included.
+    const std::deque<PresetEntry>& entries() const { return entries_; }
+    bool removed(size_t index) const { return index < gone_.size() && gone_[index] != 0; }
 
 private:
-    std::vector<PresetEntry> entries_;
+    std::deque<PresetEntry> entries_;  // never erased or reordered
+    std::vector<uint8_t> gone_;        // per entry: tombstoned
+    std::map<std::string, size_t, std::less<>> by_id_;
     std::set<std::string, std::less<>> skipped_;
+    UserSelection selection_;
     Config config_;
     std::mt19937_64 rng_;
     std::vector<size_t> bag_;      // remaining picks, back = next
@@ -101,8 +166,17 @@ private:
     static constexpr size_t NONE = static_cast<size_t>(-1);
     size_t showing_ = NONE;   // entries_ index projectM plays
     size_t outgoing_ = NONE;  // and the one blending out
+    bool showing_hf_ = false;   // their high_frequency as loaded
+    bool outgoing_hf_ = false;
+    Pool bag_pool_ = Pool::Eligible;  // the pool bag_ was dealt from
 
     bool excluded_high_frequency(size_t index) const;
+    bool hidden(size_t index) const;
+    bool in_pool(size_t index, Pool pool) const;
+    bool in_history_walk(size_t index) const;
+    // Why entry `index` isn't eligible ("" if it is).
+    const char* refusal(size_t index) const;
+    size_t index_of(const PresetEntry& entry) const;
 
     size_t draw();
     void refill_bag();

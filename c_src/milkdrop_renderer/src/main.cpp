@@ -45,6 +45,7 @@
 #include <csignal>
 #include <cstring>
 #include <fcntl.h>
+#include <functional>
 #include <memory>
 #include <poll.h>
 #include <random>
@@ -140,6 +141,9 @@ private:
     // The pending switch; while it holds frames (a failed or hung preset
     // is showing), nothing is rendered or presented and a `take` waits.
     SwitchState sw_;
+    // What a pending Switch::Play loads.
+    std::string play_id_;
+    bool play_lock_ = false;
     int fps_ = 0;  // what projectM was told
 
     // Stats since the last `stats` event.
@@ -169,7 +173,15 @@ private:
     void on_flip(int64_t t_us);
     bool render_frame(InFlight& out);
     void apply_switch();
-    Selection switch_to(const PresetEntry* first, const char* cause, bool smooth);
+    void apply_play();
+    // `loaded` (if any) runs once a candidate has loaded, before its
+    // `preset` event.
+    Selection switch_to(const PresetEntry* first, const char* cause, bool smooth, int batch = SWITCH_BATCH,
+                        const std::function<void(const PresetEntry&)>& loaded = {});
+    void request_play(const Command& c);
+    void reload_user();
+    void reload_selection();
+    void announce_selection();
     bool warm_up(const PresetEntry& entry, bool smooth, std::string& reason, std::string& message,
                  bool& activated);
     bool apply_level();
@@ -191,7 +203,9 @@ private:
     void guard_high_frequency();
     bool stdin_hung_up() const;
 
-    std::string preset_path(const PresetEntry& e) const { return opt_.pack_dir + "/presets/" + e.file; }
+    std::string preset_path(const PresetEntry& e) const {
+        return preset_file_path(opt_.pack_dir, opt_.user_dir, e.file);
+    }
     Resolution rung_size() const { return opt_.ladder[guard_->current().rung]; }
     size_t hint_rung(const PresetEntry& e) const;
     bool expensive(const PresetEntry& e) const;
@@ -237,6 +251,19 @@ bool App::prepare() {
         fail("manifest", err);
         return false;
     }
+    if (const size_t n = drop_user_ids(manifest_); n > 0)
+        log_msg("dropped %zu pack presets in the reserved user/ namespace", n);
+    std::vector<PresetEntry> all = manifest_.presets;
+    // Uploads are optional: a bad user manifest leaves the pack playing.
+    Manifest user;
+    std::string user_err;
+    if (load_user_manifest(opt_.user_dir, user, user_err) == FileStatus::Invalid) {
+        log_msg("user manifest: %s; no user presets", user_err.c_str());
+        emit_line(event_error("user_manifest", user_err));
+    } else if (!opt_.user_dir.empty()) {
+        log_msg("%zu user presets (%zu rejected)", user.presets.size(), user.rejected);
+    }
+    all.insert(all.end(), std::make_move_iterator(user.presets.begin()), std::make_move_iterator(user.presets.end()));
     std::string skip_text;
     std::set<std::string, std::less<>> skipped;
     if (read_file(opt_.skip_file, skip_text)) skipped = parse_skip_list(skip_text);
@@ -245,7 +272,14 @@ bool App::prepare() {
     pcfg.gles2 = GLES2;
     pcfg.high_frequency = opt_.high_frequency;
     pcfg.seed = opt_.seed != 0 ? opt_.seed : std::random_device{}();
-    presets_ = std::make_unique<PresetManager>(manifest_.presets, std::move(skipped), pcfg);
+    presets_ = std::make_unique<PresetManager>(std::move(all), std::move(skipped), pcfg);
+    UserSelection selection;
+    std::string sel_err;
+    if (load_selection(opt_.selection_file, selection, sel_err) == FileStatus::Invalid) {
+        log_msg("selection: %s; none applied", sel_err.c_str());
+        emit_line(event_error("selection", sel_err));
+    }
+    presets_->set_selection(std::move(selection));
     if (presets_->eligible_count() == 0) {
         fail("no_presets", "no eligible presets in the pack");
         return false;
@@ -281,7 +315,7 @@ bool App::prepare() {
     }
     fps_ = static_cast<int>(refresh / gcfg.start_interval + 0.5);
     vis_.configure(opt_.ladder[0], opt_.mesh_width, opt_.mesh_height, fps_, opt_.blend_s);
-    vis_.set_texture_dir(opt_.pack_dir + "/textures");
+    vis_.set_texture_dirs(texture_search_paths(opt_.pack_dir, opt_.user_dir));
     vis_.set_shader_cache_dir(opt_.pack_dir + "/shaders");
 
     pcm_.maintain(monotonic_us());
@@ -324,6 +358,7 @@ bool App::prepare() {
     info.crtc_mode_valid = kms_.crtc_mode_valid();
     info.crtc_mode = kms_.crtc_mode_str();
     emit_line(event_prepared(info));
+    if (!opt_.selection_file.empty()) announce_selection();
     return true;
 }
 
@@ -446,9 +481,11 @@ bool App::warm_up(const PresetEntry& entry, bool smooth, std::string& reason, st
     return reason.empty();
 }
 
-Selection App::switch_to(const PresetEntry* first, const char* cause, bool smooth) {
+Selection App::switch_to(const PresetEntry* first, const char* cause, bool smooth, int batch,
+                         const std::function<void(const PresetEntry&)>& loaded) {
     bool activated_failure = false;
-    const Selection sel = select_preset(*presets_, first, SWITCH_BATCH, [&](const PresetEntry& entry) {
+    const CostGuard::Run playing = guard_->run();
+    const Selection sel = select_preset(*presets_, first, batch, [&](const PresetEntry& entry) {
         // The manager never picks one while they are off; this is the last
         // gate before projectM.
         if (entry.high_frequency && !presets_->high_frequency()) {
@@ -470,6 +507,7 @@ Selection App::switch_to(const PresetEntry* first, const char* cause, bool smoot
             blend_until_ = blend ? vtime_ + opt_.blend_s : vtime_;
             first_frame_ = true;
             shown_since_us_ = monotonic_us();
+            if (loaded) loaded(entry);
             announce_preset(cause, !blend);
             return Attempt::Loaded;
         }
@@ -481,10 +519,13 @@ Selection App::switch_to(const PresetEntry* first, const char* cause, bool smoot
         return Attempt::Failed;
     });
     sw_.selected(sel, activated_failure);
+    // Not presenting, the frame a `take` would show is the old preset's.
+    if (sel == Selection::Switched && phase_ != Phase::Presenting) drop_queued();
     if (sel == Selection::Deferred) {
         // Until the retry, the playing preset runs at its own level.
         if (current_ != nullptr) {
-            guard_->begin(current_->file, hint_rung(*current_));
+            if (playing.file == current_->file) guard_->resume(playing);
+            else guard_->begin(current_->file, hint_rung(*current_));
             if (!apply_level()) return Selection::Aborted;
         }
     }
@@ -574,6 +615,7 @@ void App::apply_switch() {
         case Switch::Prev: next = presets_->prev(); cause = "prev"; break;
         case Switch::Eject: next = hf ? presets_->cut_target() : presets_->rotate(); cause = "eject"; break;
         case Switch::Retry: next = presets_->rotate(); cause = sw_.retry_cause(); break;
+        case Switch::Play: apply_play(); return;
     }
     if (next == nullptr) {
         if (!hf && (s == Switch::None || s == Switch::Prev)) return;  // nothing earlier
@@ -593,6 +635,86 @@ void App::apply_switch() {
             if (exit_reason_.empty()) fail("no_presets", "preset selection aborted");
             break;
     }
+}
+
+// An explicit pick: one candidate through the usual warm-up, no rotation
+// fallback. Refused (or failed: the usual `skip` goes out too) it leaves
+// the playing preset on, unless a failure after activation holds
+// projectM's transition slot (then a retry cuts past it).
+void App::apply_play() {
+    const bool hf = presets_->high_frequency_on_screen();
+    std::string reason;
+    const PresetEntry* target = presets_->find_playable(play_id_, reason);
+    if (target == nullptr) {
+        log_msg("play %s refused (%s)", play_id_.c_str(), reason.c_str());
+        emit_line(event_play_refused(play_id_, reason));
+        sw_.play_failed();
+        return;
+    }
+    const bool lock = play_lock_;
+    const Selection sel = switch_to(target, "play", sw_.smooth() && !hf, 1,
+                                    [&](const PresetEntry& e) { presets_->played(e, lock); });
+    if (sel == Selection::Switched) {
+        sw_.play_done();
+        return;
+    }
+    if (sel == Selection::Deferred || sel == Selection::Exhausted) {
+        emit_line(event_play_refused(play_id_, "load_failed"));
+        sw_.play_failed();
+    }
+    if (sel == Selection::Exhausted) fail("no_presets", "no eligible presets left");
+    else if (sel == Selection::Aborted && exit_reason_.empty()) fail("no_presets", "preset selection aborted");
+}
+
+void App::request_play(const Command& c) {
+    std::string reason;
+    if (presets_->find_playable(c.string_value, reason) == nullptr) {
+        log_msg("play %s refused (%s)", c.string_value.c_str(), reason.c_str());
+        emit_line(event_play_refused(c.string_value, reason));
+        return;
+    }
+    // Checked again when it runs: a skip, the filter or a reload can come
+    // in between.
+    play_id_ = c.string_value;
+    play_lock_ = c.bool_value;
+    sw_.request_play();
+}
+
+// A bad user manifest keeps the user presets already loaded.
+void App::reload_user() {
+    Manifest user;
+    std::string err;
+    if (load_user_manifest(opt_.user_dir, user, err) == FileStatus::Invalid) {
+        log_msg("user manifest: %s; keeping the user presets loaded", err.c_str());
+        emit_line(event_error("user_manifest", err));
+        return;
+    }
+    const PresetManager::UserReload r = presets_->set_user_presets(std::move(user.presets));
+    // A replaced upload is measured afresh at its next load; one playing
+    // keeps its level (it is still the old content).
+    for (const std::string& id : r.changed) guard_->forget(id);
+    log_msg("user presets reloaded: %zu (%zu added, %zu removed, %zu rejected)", r.presets, r.added, r.removed,
+            user.rejected);
+    emit_line(event_user_reloaded(r.presets, r.added, r.removed, user.rejected));
+    if (r.cut) guard_high_frequency();
+}
+
+// A bad selection file keeps the selection in force.
+void App::reload_selection() {
+    UserSelection selection;
+    std::string err;
+    if (load_selection(opt_.selection_file, selection, err) == FileStatus::Invalid) {
+        log_msg("selection: %s; keeping the one in force", err.c_str());
+        emit_line(event_error("selection", err));
+        return;
+    }
+    presets_->set_selection(std::move(selection));
+    announce_selection();
+}
+
+void App::announce_selection() {
+    const PresetManager::PoolInfo pool = presets_->rotation_pool();
+    emit_line(event_selection(presets_->selection().gen, pool.size, pool.playlist_fallback, pool.hidden_fallback));
 }
 
 // ------------------------------------------------------------- frames
@@ -715,10 +837,11 @@ void App::present_step() {
 
 void App::take() {
     if (phase_ == Phase::Presenting) return;
-    // The prepared preset hung the GPU or failed: never show it. The take
-    // runs once a replacement has loaded (recover_step()).
-    if (!sw_.request_take()) {
-        log_msg("take waits for a replacement preset");
+    // A pending play loads first. The prepared preset hung the GPU or
+    // failed: never show it. The take runs once a replacement has loaded
+    // (recover_step()).
+    if (!take_ready(sw_, [this] { apply_switch(); }, [this] { return !exit_reason_.empty(); })) {
+        if (exit_reason_.empty()) log_msg("take waits for a replacement preset");
         return;
     }
     // A high_frequency preset turned off before the take: cut first (each
@@ -806,6 +929,9 @@ void App::handle_command(const Command& c) {
             if (presets_->set_high_frequency(c.bool_value)) guard_high_frequency();
             break;
         case Command::Type::SetMinFps: set_min_fps(c.number_value); break;
+        case Command::Type::Play: request_play(c); break;
+        case Command::Type::ReloadUser: reload_user(); break;
+        case Command::Type::ReloadSelection: reload_selection(); break;
     }
 }
 

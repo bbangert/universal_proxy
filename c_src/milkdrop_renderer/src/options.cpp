@@ -11,7 +11,7 @@ const char* const USAGE =
     "usage: milkdrop_renderer --mode WxH[@Hz] --pack-dir DIR --ladder WxH[,WxH...]\n"
     "                         --rotate-s N --skip-file PATH\n"
     "                         [--high-frequency] [--locked FILE] [--pcm-ring PATH]\n"
-    "                         [--connector NAME]\n"
+    "                         [--connector NAME] [--user-dir DIR] [--selection-file PATH]\n"
     "  tuning: [--card DEV] [--blend S] [--min-fps F] [--interval N] [--seed N]\n"
     "          [--av-offset-ms N] [--master-timeout-ms N] [--mesh WxH] [--stats-s N]\n"
     "  check:  [--headless-frames N]  (off-screen on --card, e.g. /dev/dri/renderD128)\n"
@@ -172,6 +172,18 @@ bool parse_options(const std::vector<std::string>& args, Options& out, std::stri
             out.locked = v;
         } else if (a == "--pcm-ring") {
             out.pcm_ring = v;
+        } else if (a == "--user-dir") {
+            if (v.empty()) {
+                error = "bad --user-dir";
+                return false;
+            }
+            out.user_dir = v;
+        } else if (a == "--selection-file") {
+            if (v.empty()) {
+                error = "bad --selection-file";
+                return false;
+            }
+            out.selection_file = v;
         } else if (a == "--connector") {
             if (!valid_connector_name(v)) {
                 error = "bad --connector";
