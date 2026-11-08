@@ -40,7 +40,12 @@ defmodule UniversalProxy.MilkDrop.Store do
       `UniversalProxy.MilkDrop.UserPresets.sha256/1`), so a skip is
       effectively keyed by `{id, sha256}`: a replaced upload starts
       afresh, and entries for changed files are dropped on the next
-      write. A skip for an id the library doesn't hold is not stored.
+      write. A skip for an id the library doesn't hold is not stored, nor
+      one for content other than the library file's: `skip/5`'s
+      `sha256:` and `mark_in_flight/5`'s name the content the renderer
+      loaded, so a skip of an upload's old content, reported after the
+      file was replaced (or recovered after a device reset), doesn't skip
+      the replacement. Without them the file's current content counts.
       `skipped/2` and `skip_entries/2` return both lists, as does every
       `{:milkdrop_skipped, ...}` broadcast; the budget readmission above
       applies to both.
@@ -66,8 +71,8 @@ defmodule UniversalProxy.MilkDrop.Store do
   `[drm] Resetting GPU.`). The renderer reports a reset it survives as a
   `gpu_hang` skip; a fatal one leaves no time for that. So
   `UniversalProxy.Display.MilkDrop` records each preset before the
-  renderer loads it (`mark_in_flight/4`, synced to disk before it
-  returns).
+  renderer loads it (`mark_in_flight/4`, `/5` with an upload's content
+  hash; synced to disk before it returns).
 
   The record carries the Linux boot id (`/proc/sys/kernel/random/boot_id`).
   When the store opens a record written during an earlier boot, the device
@@ -146,7 +151,8 @@ defmodule UniversalProxy.MilkDrop.Store do
     :owner,
     :boot_id,
     :generation,
-    :clear_at
+    :clear_at,
+    :sha256
   ]
 
   @rotate_min 10
@@ -183,7 +189,8 @@ defmodule UniversalProxy.MilkDrop.Store do
           owner: pid() | nil,
           boot_id: String.t() | nil,
           generation: term(),
-          clear_at: integer() | nil
+          clear_at: integer() | nil,
+          sha256: String.t() | nil
         }
 
   # -- Client API --
@@ -247,13 +254,15 @@ defmodule UniversalProxy.MilkDrop.Store do
   (with a `budget` skip), kept so a lower `min_fps` can bring it back. A
   `budget` skip whose fps already holds the current `min_fps` (measured
   under an earlier, higher one) is not stored, and returns `:ok`.
+  `sha256:` — for an upload, the content the renderer loaded; a skip for
+  content the library no longer holds is not stored (and returns `:ok`).
   """
   @spec skip(GenServer.server(), String.t(), String.t(), String.t() | atom(), keyword()) ::
           :ok | {:error, term()}
   def skip(server, version, preset, reason, opts)
       when is_binary(version) and is_binary(preset) and is_list(opts) do
     entry = skip_entry(reason_string(reason), Keyword.get(opts, :fps))
-    GenServer.call(server, {:skip, version, preset, entry})
+    GenServer.call(server, {:skip, version, preset, entry, Keyword.get(opts, :sha256)})
   catch
     :exit, _ -> {:error, :not_running}
   end
@@ -315,7 +324,22 @@ defmodule UniversalProxy.MilkDrop.Store do
           :ok | {:error, term()}
   def mark_in_flight(server \\ __MODULE__, session, version, preset)
       when is_binary(version) and is_binary(preset) do
-    GenServer.call(server, {:mark_in_flight, session, version, preset})
+    mark_in_flight(server, session, version, preset, [])
+  end
+
+  @doc """
+  `mark_in_flight/4` with options: `sha256:` — for an upload, the content
+  being loaded, so a device reset skips that content only (see the
+  moduledoc's `:user_skipped`).
+  """
+  @spec mark_in_flight(GenServer.server(), term(), String.t(), String.t(), keyword()) ::
+          :ok | {:error, term()}
+  def mark_in_flight(server, session, version, preset, opts)
+      when is_binary(version) and is_binary(preset) and is_list(opts) do
+    GenServer.call(
+      server,
+      {:mark_in_flight, session, version, preset, Keyword.get(opts, :sha256)}
+    )
   catch
     :exit, _ -> {:error, :not_running}
   end
@@ -481,16 +505,16 @@ defmodule UniversalProxy.MilkDrop.Store do
     end
   end
 
-  def handle_call({:skip, version, preset, reason}, _from, state) do
-    {:reply, add_skip(state, version, preset, reason), state}
+  def handle_call({:skip, version, preset, reason, sha}, _from, state) do
+    {:reply, add_skip(state, version, preset, reason, sha), state}
   end
 
   def handle_call({:forget_user, ids, unlock?}, _from, state) do
     {:reply, forget_user(state, ids, unlock?), state}
   end
 
-  def handle_call({:mark_in_flight, session, version, preset}, {owner, _tag}, state) do
-    marker = new_marker(state, owner, session, version, preset)
+  def handle_call({:mark_in_flight, session, version, preset, sha}, {owner, _tag}, state) do
+    marker = new_marker(state, owner, session, version, preset, sha)
 
     with {:ok, state} <- ensure_recovered(state),
          :ok <- persist(state, {:in_flight, marker}) do
@@ -591,7 +615,8 @@ defmodule UniversalProxy.MilkDrop.Store do
 
   defp mkdir_p(path), do: File.mkdir_p(Path.dirname(path))
 
-  defp add_skip(state, version, preset, reason) do
+  # `sha`: the upload content the skip is for (nil: whatever is installed).
+  defp add_skip(state, version, preset, reason, sha) do
     min_fps = read_settings(state.table).min_fps
 
     cond do
@@ -604,7 +629,7 @@ defmodule UniversalProxy.MilkDrop.Store do
         :ok
 
       user_id?(preset) ->
-        store_user_skip(state, preset, reason)
+        store_user_skip(state, preset, reason, sha)
 
       true ->
         store_skip(state, version, preset, reason)
@@ -708,10 +733,14 @@ defmodule UniversalProxy.MilkDrop.Store do
   defp user_id?("user/" <> _), do: true
   defp user_id?(_preset), do: false
 
-  defp store_user_skip(state, id, reason) do
+  defp store_user_skip(state, id, reason, loaded) do
     case state.user_sha.(id) do
       nil ->
         Logger.info("MilkDrop: #{id} is not in the upload library; not skipping it")
+        :ok
+
+      sha when is_binary(loaded) and loaded != sha ->
+        Logger.info("MilkDrop: #{id} was replaced since it was loaded; not skipping it")
         :ok
 
       sha ->
@@ -758,8 +787,9 @@ defmodule UniversalProxy.MilkDrop.Store do
     end)
   end
 
-  defp new_marker(state, owner, session, version, preset) do
+  defp new_marker(state, owner, session, version, preset, sha) do
     %{
+      sha256: sha,
       pack_version: version,
       preset: preset,
       at: System.os_time(:second),
@@ -771,8 +801,8 @@ defmodule UniversalProxy.MilkDrop.Store do
     }
   end
 
-  defp queue_closed({:mark_in_flight, session, version, preset}, {owner, _tag}, state) do
-    marker = new_marker(state, owner, session, version, preset)
+  defp queue_closed({:mark_in_flight, session, version, preset, sha}, {owner, _tag}, state) do
+    marker = new_marker(state, owner, session, version, preset, sha)
     pending_clears = Map.delete(state.pending_clears, session)
     monitor_owner(%{state | pending_mark: marker, pending_clears: pending_clears}, owner)
   end
@@ -830,13 +860,13 @@ defmodule UniversalProxy.MilkDrop.Store do
       %{boot_id: boot_id} when boot_id != nil and boot_id == state.boot_id ->
         :ok
 
-      %{pack_version: version, preset: preset} ->
+      %{pack_version: version, preset: preset} = marker ->
         if is_nil(state.pack_version) or state.pack_version == version or user_id?(preset) do
           Logger.warning(
             "MilkDrop preset #{preset} was running when the device last stopped; skipping it"
           )
 
-          record_device_reset(state, version, preset)
+          record_device_reset(state, version, preset, marker.sha256)
         else
           Logger.info(
             "MilkDrop preset #{preset} (pack #{version}) was running when the device last " <>
@@ -848,8 +878,8 @@ defmodule UniversalProxy.MilkDrop.Store do
     end
   end
 
-  defp record_device_reset(state, version, preset) do
-    case add_skip(state, version, preset, "device_reset") do
+  defp record_device_reset(state, version, preset, sha) do
+    case add_skip(state, version, preset, "device_reset", sha) do
       :ok ->
         delete_in_flight(state.table)
 
@@ -971,6 +1001,7 @@ defmodule UniversalProxy.MilkDrop.Store do
         |> Map.put_new(:vm, nil)
         |> Map.update(:clear_at, nil, &if(is_integer(&1), do: &1))
         |> Map.update(:clear_boot_id, nil, &if(is_binary(&1), do: &1))
+        |> Map.update(:sha256, nil, &if(is_binary(&1), do: &1))
 
       _ ->
         nil

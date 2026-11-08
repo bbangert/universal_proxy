@@ -355,6 +355,49 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
       assert Store.skipped(server, "v1") == %{"user/b.milk" => "draw"}
     end
 
+    test "a skip of content the library no longer holds is not stored", %{path: path} do
+      server = start_with_library(path, library(%{"user/a.milk" => "sha-a"}))
+
+      assert :ok = Store.skip(server, "v1", "user/a.milk", "draw", sha256: "sha-before")
+      assert Store.skipped(server, "v1") == %{}
+
+      assert :ok = Store.skip(server, "v1", "user/a.milk", "draw", sha256: "sha-a")
+      assert Store.skipped(server, "v1") == %{"user/a.milk" => "draw"}
+    end
+
+    test "a device reset on an upload's old content doesn't skip its replacement",
+         %{path: path} do
+      agent = library(%{"user/hang.milk" => "sha-new"})
+
+      opts = [
+        name: nil,
+        table: @table,
+        dets_path: path,
+        boot_id: "boot-1",
+        pack_version: "v1",
+        user_sha: &Agent.get(agent, fn shas -> shas[&1] end)
+      ]
+
+      server = start_supervised!(Supervisor.child_spec({Store, opts}, restart: :temporary))
+      :ok = Store.mark_in_flight(server, 7, "v1", "user/hang.milk", sha256: "sha-old")
+      assert %{sha256: "sha-old"} = Store.in_flight(server)
+      ref = Process.monitor(server)
+      Process.exit(server, :kill)
+      assert_receive {:DOWN, ^ref, :process, _, :killed}
+
+      {server, _log} =
+        ExUnit.CaptureLog.with_log(fn ->
+          start_supervised!(
+            Supervisor.child_spec({Store, Keyword.put(opts, :boot_id, "boot-2")},
+              restart: :temporary
+            )
+          )
+        end)
+
+      assert Store.skipped(server, "v1") == %{}
+      assert Store.in_flight(server) == nil
+    end
+
     test "a skip for an id the library doesn't hold is not stored", %{path: path} do
       server = start_with_library(path, library(%{}))
 

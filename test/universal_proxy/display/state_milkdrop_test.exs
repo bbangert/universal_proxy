@@ -465,6 +465,15 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     wait_until(fn -> List.last(cmd_names(ctx.skip_file)) == "reload_user" end)
     library_changed(ctx)
     wait_until(fn -> Enum.count(cmd_names(ctx.skip_file), &(&1 == "reload_user")) == 2 end)
+
+    # A restarted library may have repaired its manifest.
+    Phoenix.PubSub.broadcast(
+      ctx.pubsub,
+      UniversalProxy.MilkDrop.user_presets_topic(),
+      {:milkdrop_user_presets_started, %{bytes: 0, presets: 0, textures: 0}}
+    )
+
+    wait_until(fn -> Enum.count(cmd_names(ctx.skip_file), &(&1 == "reload_user")) == 3 end)
   end
 
   test "a viewport that fails to start after the release gets the renderer's exit only once it runs",
