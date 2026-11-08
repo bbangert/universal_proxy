@@ -255,6 +255,13 @@ defmodule UniversalProxy.MilkDrop.UploadCheckTest do
                png(8, 8, tail: chunk("IHDR", :binary.copy(<<0>>, 13)) <> chunk("IEND", ""))
              ) ==
                {:error, :bad_header}
+
+      # Apple's CgBI switches stb_image to raw-deflate IDAT, past the bound.
+      assert UploadCheck.check_texture(
+               "a.png",
+               png(8, 8, tail: chunk("CgBI", <<0x50, 0x00, 0x20, 0x06>>) <> chunk("IEND", ""))
+             ) ==
+               {:error, :bad_header}
     end
 
     test "rejects an IDAT decompression bomb behind tiny dimensions" do

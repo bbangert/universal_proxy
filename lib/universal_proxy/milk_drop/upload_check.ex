@@ -306,14 +306,16 @@ defmodule UniversalProxy.MilkDrop.UploadCheck do
   defp png(_), do: {:error, :bad_magic}
 
   # The chunks after IHDR, up to IEND: every CRC must match, nothing may
-  # run past the end, and a second IHDR is malformed. Returns the IDAT
-  # payloads (sub-binaries) in order.
+  # run past the end, and a second IHDR is malformed. Apple's `CgBI`
+  # switches stb_image to raw-deflate IDAT (and BGR), which the zlib check
+  # below wouldn't bound, so it is refused. Returns the IDAT payloads
+  # (sub-binaries) in order.
   defp png_chunks(<<len::32, type::binary-4, rest::binary>>, idat) do
     case rest do
       <<data::binary-size(^len), crc::32, rest::binary>> ->
         cond do
           crc != :erlang.crc32([type, data]) -> {:error, :bad_header}
-          type == "IHDR" -> {:error, :bad_header}
+          type in ["IHDR", "CgBI"] -> {:error, :bad_header}
           type == "IEND" and idat == [] -> {:error, :bad_image}
           type == "IEND" -> {:ok, Enum.reverse(idat)}
           type == "IDAT" -> png_chunks(rest, [data | idat])
