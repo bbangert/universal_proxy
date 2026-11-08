@@ -709,6 +709,81 @@ defmodule UniversalProxy.MilkDrop.UserPresetsTest do
     end
   end
 
+  describe "recovery" do
+    @tag capture_log: true
+    test "a queued removal never deletes a file installed under that name later", ctx do
+      server = start_library(ctx, retry_ms: 600_000)
+      [_] = import!(server, [upload(ctx, "Foo.milk", milk())])
+      pin_file(preset_path(ctx, "Foo.milk"))
+
+      # The removal of Foo.milk fails and is queued.
+      [%{status: :replaced}] = import!(server, [upload(ctx, "FOO.milk", milk("x=1"))])
+
+      # Gone by other means, then uploaded again under the same name.
+      unpin_file(preset_path(ctx, "Foo.milk"))
+      new = milk("y=2")
+
+      assert [%{status: :replaced, name: "Foo.milk", replaces: "Foo.milk"}] =
+               import!(server, [upload(ctx, "Foo.milk", new)])
+
+      send(server, :retry)
+      _ = :sys.get_state(server)
+      assert File.read!(preset_path(ctx, "Foo.milk")) == new
+      assert "user/Foo.milk" in Enum.map(UserPresets.list(server).presets, & &1.id)
+    end
+
+    @tag capture_log: true
+    test "Store clean-up the Store refused is retried until it is done", ctx do
+      name = :"#{ctx.table}_store"
+      path = Path.join(ctx.root, "named.dets")
+
+      named_store = fn ->
+        start_supervised!(
+          Supervisor.child_spec(
+            {Store,
+             name: name,
+             table: name,
+             dets_path: path,
+             pack_version: "v1",
+             user_sha: &UserPresets.sha256(ctx.table, &1)},
+            id: :named_store
+          )
+        )
+      end
+
+      server = start_library(ctx, store: name, retry_ms: 50)
+      [_] = import!(server, [upload(ctx, "a.milk", milk())])
+      named_store.()
+      {:ok, _} = Store.update(name, %{locked: "user/a.milk"})
+      :ok = stop_supervised(:named_store)
+
+      # Deleted while the Store is down: its lock must still go.
+      assert :ok = UserPresets.delete(server, "user/a.milk")
+      Process.sleep(120)
+      named_store.()
+      wait_until(fn -> Store.settings(name).locked == nil end)
+    end
+
+    @tag capture_log: true
+    test "a manifest repaired after a failed start-up rewrite is announced", ctx do
+      File.mkdir_p!(Path.join(ctx.user, "presets"))
+      File.write!(preset_path(ctx, "a.milk"), milk())
+      block_manifest(ctx)
+
+      start_library(ctx, retry_ms: 50)
+      assert_receive {:milkdrop_user_presets_started, %{presets: 1}}
+      refute File.exists?(Path.join(ctx.user, "manifest.json"))
+
+      unblock_manifest(ctx)
+
+      assert_receive {:milkdrop_user_presets,
+                      %{added: [], replaced: [], removed: [], updated: [], textures: []}},
+                     2_000
+
+      assert %{"presets" => [%{"file" => "a.milk"}]} = manifest(ctx)
+    end
+  end
+
   describe "restarts" do
     test "each start is announced", ctx do
       start_library(ctx)

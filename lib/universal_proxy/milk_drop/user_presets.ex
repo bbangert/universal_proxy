@@ -94,7 +94,16 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   back). The library keeps matching the disk; the manifest write is
   retried on every later write and every `:retry_ms`, an import with
   nothing to install included (uploading the same files again repairs
-  it), and the change is broadcast once it is written.
+  it), and the change is broadcast once it is written — with every list
+  empty if nothing else changed (a start-up repair), since a renderer may
+  have read the stale manifest.
+
+  The Store's clean-up (`Store.user_presets_removed/2`,
+  `Store.clear_user_skips/2`) is independent of that: ids the Store didn't
+  acknowledge are asked again on every later write and every
+  `:retry_ms`, so a stale lock or skip can't return with a re-upload. A
+  queued deletion of a superseded file is dropped once an import installs
+  a file of that exact name, or `delete/2` removes it.
 
   ## Other writes
 
@@ -365,6 +374,9 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
       # `{kind, name}` files a differently-named replacement superseded
       # that could not be deleted yet.
       cleanup: [],
+      # Ids whose Store clean-up (`removed`: skips and lock; `replaced`:
+      # skips) the Store has not acknowledged yet.
+      store_pending: %{removed: [], replaced: []},
       retry_timer: nil
     }
 
@@ -654,9 +666,18 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
     acc = %{library: state.library, failed: MapSet.new(), change: empty_change(), cleanup: []}
     acc = Enum.reduce(staged, acc, &install(state, &1, now, &2))
 
-    state = %{state | library: acc.library, cleanup: state.cleanup ++ acc.cleanup}
+    # A queued removal of a name this import just installed would delete
+    # the new file (the path is exact, so is the comparison).
+    installed =
+      for item <- staged,
+          not MapSet.member?(acc.failed, {item.kind, item.name}),
+          into: MapSet.new(),
+          do: {item.kind, item.name}
+
+    cleanup = Enum.reject(state.cleanup, &MapSet.member?(installed, &1)) ++ acc.cleanup
+    state = %{state | library: acc.library, cleanup: cleanup}
     sync_table(state, acc.change)
-    tell_store(state, acc.change)
+    state = tell_store(state, acc.change)
     {published, state} = publish(state, acc.change)
 
     results =
@@ -790,7 +811,9 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   defp delete_file(state, kind, name) do
     case rm(Path.join([state.user_dir, subdir(kind), name])) do
       :ok ->
-        {change, state} = forget(state, kind, name)
+        {change, state} =
+          forget(%{state | cleanup: List.delete(state.cleanup, {kind, name})}, kind, name)
+
         publish(state, change)
 
       {:error, reason} ->
@@ -810,8 +833,7 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
       end
 
     sync_table(state, change)
-    tell_store(state, change)
-    {change, state}
+    {change, tell_store(state, change)}
   end
 
   defp set_flag(state, name, flag) do
@@ -844,7 +866,9 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
 
     case write_manifest(state.user_dir, state.library) do
       :ok ->
-        broadcast(state, pending)
+        # A repaired manifest is news even with nothing listed: a renderer
+        # may have read the stale one.
+        if state.dirty, do: notify(state, pending), else: broadcast(state, pending)
         {:ok, %{state | dirty: false, pending: empty_change()}}
 
       {:error, reason} ->
@@ -867,12 +891,16 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
     }
   end
 
-  defp schedule_retry(%{retry_timer: nil} = state) when state.dirty or state.cleanup != [],
-    do: %{state | retry_timer: Process.send_after(self(), :retry, state.retry_ms)}
+  defp schedule_retry(%{retry_timer: nil} = state) do
+    if state.dirty or state.cleanup != [] or state.store_pending != %{removed: [], replaced: []},
+      do: %{state | retry_timer: Process.send_after(self(), :retry, state.retry_ms)},
+      else: state
+  end
 
   defp schedule_retry(state), do: state
 
-  # Superseded files whose removal failed, then the manifest.
+  # Superseded files whose removal failed, the Store's clean-up, then the
+  # manifest.
   defp retry_pending(state) do
     {change, cleanup, state} =
       Enum.reduce(state.cleanup, {empty_change(), [], state}, fn {kind, name} = file,
@@ -887,7 +915,7 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
         end
       end)
 
-    state = %{state | cleanup: cleanup}
+    state = tell_store(%{state | cleanup: cleanup}, empty_change())
 
     state =
       if state.dirty or change != empty_change(),
@@ -912,27 +940,48 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
     :ok
   end
 
+  # The change's ids join those the Store has yet to acknowledge, and all
+  # are asked again; a refusal (the Store down, a failed write) keeps them
+  # for the next write and the retry timer, so a stale lock or skip can't
+  # come back with a re-upload.
   defp tell_store(state, change) do
-    store_ask(change.removed, &Store.user_presets_removed(state.store, &1))
-    store_ask(change.replaced, &Store.clear_user_skips(state.store, &1))
+    pending = %{
+      removed: Enum.uniq(state.store_pending.removed ++ change.removed),
+      replaced: Enum.uniq(state.store_pending.replaced ++ change.replaced)
+    }
+
+    pending = %{
+      removed: store_ask(pending.removed, &Store.user_presets_removed(state.store, &1)),
+      replaced: store_ask(pending.replaced, &Store.clear_user_skips(state.store, &1))
+    }
+
+    schedule_retry(%{state | store_pending: pending})
   end
 
-  defp store_ask([], _fun), do: :ok
+  # The ids still unacknowledged.
+  defp store_ask([], _fun), do: []
 
   defp store_ask(ids, fun) do
-    with {:error, reason} <- fun.(ids) do
-      Logger.warning(
-        "MilkDrop: could not clear the Store's entries for #{inspect(ids)}: #{inspect(reason)}"
-      )
-    end
+    case fun.(ids) do
+      :ok ->
+        []
 
-    :ok
+      {:error, reason} ->
+        Logger.warning(
+          "MilkDrop: could not clear the Store's entries for #{inspect(ids)}: " <>
+            "#{inspect(reason)}; retrying"
+        )
+
+        ids
+    end
   end
 
   defp broadcast(_state, %{added: [], replaced: [], removed: [], updated: [], textures: []}),
     do: :ok
 
-  defp broadcast(state, change) do
+  defp broadcast(state, change), do: notify(state, change)
+
+  defp notify(state, change) do
     Phoenix.PubSub.broadcast(
       state.pubsub,
       MilkDrop.user_presets_topic(),
