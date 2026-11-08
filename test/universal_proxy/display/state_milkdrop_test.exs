@@ -9,6 +9,7 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
 
   import ExUnit.CaptureLog
 
+  alias UniversalProxy.Display
   alias UniversalProxy.Display.FakeRenderer
   alias UniversalProxy.Display.MilkDrop, as: Renderer
   alias UniversalProxy.Display.Mode
@@ -465,6 +466,154 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     wait_until(fn -> List.last(cmd_names(ctx.skip_file)) == "reload_user" end)
     library_changed(ctx)
     wait_until(fn -> Enum.count(cmd_names(ctx.skip_file), &(&1 == "reload_user")) == 2 end)
+  end
+
+  # ── Preset selection, play and now-playing ───────────────────────────
+
+  defp selection_changed(ctx, changes) do
+    Phoenix.PubSub.broadcast(
+      ctx.pubsub,
+      UniversalProxy.MilkDrop.selection_topic(),
+      {:milkdrop_selection, Map.merge(Store.empty_selection(), changes)}
+    )
+  end
+
+  defp reloads(ctx), do: Enum.count(cmd_names(ctx.skip_file), &(&1 == "reload_selection"))
+
+  defp play(ctx, id, lock? \\ false), do: Display.milkdrop_play(ctx.state, id, lock?)
+
+  test "a selection reaches the renderer once per generation, and only during a session", ctx do
+    selection_file = Path.join(ctx.tmp_dir, "selection.json")
+    started = %{Store.empty_selection() | gen: 7, favourites: ["a.milk"]}
+    ctx = start_ui(ctx, milkdrop_opts: [selection_file: selection_file, selection: started])
+
+    # Before a session there is nothing to tell: the renderer reads the
+    # Store's at start.
+    selection_changed(ctx, %{gen: 8})
+    _ = :sys.get_state(ctx.state)
+    ctx = presenting(ctx)
+
+    # It reports the generation it started with, which isn't sent again.
+    wait_until(fn -> match?(%{selection: %{gen: 7, eligible: 10}}, md(ctx)) end)
+    selection_changed(ctx, %{gen: 7})
+    _ = :sys.get_state(ctx.state)
+    assert reloads(ctx) == 0
+
+    selection_changed(ctx, %{gen: 9, hidden: ["p0.milk"]})
+    wait_until(fn -> md(ctx).selection.gen == 9 end)
+    assert %{eligible: 9, playlist_fallback: false} = md(ctx).selection
+
+    selection_changed(ctx, %{gen: 9, hidden: ["p0.milk"]})
+    selection_changed(ctx, %{gen: 10, playlist: ["zzz.milk"], playlist_enabled: true})
+    wait_until(fn -> md(ctx).selection.gen == 10 end)
+    assert %{eligible: 10, playlist_fallback: true} = md(ctx).selection
+    assert reloads(ctx) == 2
+
+    assert %{"gen" => 10, "playlist" => ["zzz.milk"], "playlist_enabled" => true} =
+             Jason.decode!(File.read!(selection_file))
+  end
+
+  test "play answers once the preset shows; a refusal with its reason", ctx do
+    ctx = ctx |> start_ui(fake: %{refuse: %{"bad.milk" => "high_frequency"}}) |> presenting()
+
+    assert play(ctx, "user/up.milk", true) == :ok
+    assert %{preset: "user/up.milk", locked: true, pending_play: nil} = md(ctx)
+
+    assert play(ctx, "bad.milk") == {:error, {:refused, :high_frequency}}
+    assert %{preset: "user/up.milk", pending_play: nil} = md(ctx)
+
+    assert %{"cmd" => "play", "preset" => "bad.milk", "lock" => false} =
+             List.last(cmds(ctx.skip_file))
+  end
+
+  test "play without a session is answered at once; with a lock, the lock is saved", ctx do
+    store =
+      start_supervised!(
+        {Store, name: nil, table: :"#{ctx.test}", dets_path: Path.join(ctx.tmp_dir, "s.dets")}
+      )
+
+    ctx = start_ui(ctx)
+    opts = [display: ctx.state, store: store]
+
+    assert UniversalProxy.MilkDrop.play("a.milk", false, opts) == {:error, :not_presenting}
+    assert Store.settings(store).locked == nil
+    assert UniversalProxy.MilkDrop.play("a.milk", true, opts) == {:error, :not_presenting}
+    assert Store.settings(store).locked == "a.milk"
+    assert UniversalProxy.MilkDrop.play("bad\nid", true, opts) == {:error, :invalid_id}
+
+    assert UniversalProxy.MilkDrop.play("a.milk", false, display: :"#{ctx.test}.Gone") ==
+             {:error, :not_presenting}
+
+    refute "play" in cmd_names(ctx.skip_file)
+  end
+
+  test "an unanswered play times out, and a newer one supersedes it", ctx do
+    ctx = ctx |> start_ui(fake: %{ignore: ["play"]}, timeouts: %{play: 300}) |> presenting()
+
+    assert play(ctx, "a.milk") == {:error, :timeout}
+
+    first = Task.async(fn -> play(ctx, "a.milk") end)
+    wait_until(fn -> md(ctx).pending_play == "a.milk" end)
+    second = Task.async(fn -> play(ctx, "b.milk") end)
+    assert Task.await(first) == {:error, :superseded}
+    assert Task.await(second) == {:error, :timeout}
+    assert md(ctx).pending_play == nil
+  end
+
+  test "a play pending when the session is reclaimed or ends is answered not_presenting", ctx do
+    ctx = ctx |> start_ui(fake: %{ignore: ["play"]}) |> presenting()
+
+    pending = Task.async(fn -> play(ctx, "a.milk") end)
+    wait_until(fn -> md(ctx).pending_play == "a.milk" end)
+    paused(ctx)
+    assert Task.await(pending) == {:error, :not_presenting}
+    wait_until(fn -> md(ctx).phase == nil end)
+
+    playing(ctx)
+    wait_until(fn -> md(ctx).phase == :presenting end)
+    pending = Task.async(fn -> play(ctx, "b.milk") end)
+    wait_until(fn -> md(ctx).pending_play == "b.milk" end)
+    Renderer.command(renderer(ctx), %{cmd: "crash", status: 3})
+    assert Task.await(pending) == {:error, :not_presenting}
+  end
+
+  test "now-playing is broadcast while presenting and goes idle when the session ends", ctx do
+    ctx = start_ui(ctx, fake: %{startup_preset: "s.milk"})
+    Phoenix.PubSub.subscribe(ctx.pubsub, UniversalProxy.MilkDrop.now_playing_topic())
+    assert Display.milkdrop_now_playing(ctx.state) == State.idle_now_playing()
+    ctx = presenting(ctx)
+
+    assert_receive {:milkdrop_now_playing,
+                    %{
+                      preset: "s.milk",
+                      locked: false,
+                      selection: %{
+                        gen: 0,
+                        eligible: 10,
+                        playlist_fallback: false,
+                        hidden_fallback: false
+                      }
+                    }},
+                   @timeout
+
+    assert play(ctx, "x.milk", true) == :ok
+    assert_receive {:milkdrop_now_playing, %{preset: "x.milk", locked: true}}, @timeout
+
+    assert %{preset: "x.milk", locked: true} =
+             UniversalProxy.MilkDrop.now_playing(display: ctx.state)
+
+    # Nothing changed, nothing sent.
+    Renderer.command(renderer(ctx), %{cmd: "stats", ms: 1_000_000})
+    _ = :sys.get_state(ctx.state)
+    refute_received {:milkdrop_now_playing, _}
+
+    paused(ctx)
+    assert_receive {:milkdrop_now_playing, now}, @timeout
+    assert now == State.idle_now_playing()
+    wait_until(fn -> md(ctx).phase == nil end)
+    refute_received {:milkdrop_now_playing, _}
+    assert Display.milkdrop_now_playing(ctx.state) == State.idle_now_playing()
+    assert Display.milkdrop_now_playing(:"#{ctx.test}.Gone") == State.idle_now_playing()
   end
 
   test "a viewport that fails to start after the release gets the renderer's exit only once it runs",

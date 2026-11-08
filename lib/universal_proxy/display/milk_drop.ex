@@ -57,11 +57,15 @@ defmodule UniversalProxy.Display.MilkDrop do
       `default_ladder/1` for this target);
     * `:ring_path` — the Sendspin player's PCM tap ring (optional: without
       it the renderer draws silence);
-    * `:settings`, `:skipped` — default to `UniversalProxy.MilkDrop.Store`'s
-      settings and skip list for `:pack_version`; `:store` names the Store;
+    * `:settings`, `:skipped`, `:selection` — default to
+      `UniversalProxy.MilkDrop.Store`'s settings, skip list for
+      `:pack_version` and preset selection; `:store` names the Store;
     * `:skip_file` — where the skip list is written for the renderer
       (default a unique `<tmp>/up-milkdrop-skip-N.txt`; deleted by the
       reaper however this process ends);
+    * `:selection_file` — likewise the selection (default a unique
+      `<tmp>/up-milkdrop-selection-N.json`), rewritten by
+      `reload_selection/2`;
     * `:binary` — the renderer (default `default_binary/0`);
     * `:skip_retry_ms` — how often skips, and in-flight marks and clears,
       the Store could not take are retried (default 5000);
@@ -79,7 +83,7 @@ defmodule UniversalProxy.Display.MilkDrop do
 
       milkdrop_renderer --mode 1280x720[@60] --pack-dir DIR [--user-dir DIR]
                         --ladder 640x360,480x270 --rotate-s 20
-                        --min-fps 20 --skip-file PATH
+                        --min-fps 20 --skip-file PATH [--selection-file PATH]
                         [--high-frequency] [--locked ID] [--pcm-ring PATH]
                         [--card /dev/dri/card1] [--connector HDMI-A-1]
 
@@ -103,6 +107,18 @@ defmodule UniversalProxy.Display.MilkDrop do
     * `--skip-file` — UTF-8 text, one preset id (a pack-relative file or
       a `user/` id) per line (`\\n`-separated, possibly empty): presets
       never to load;
+    * `--selection-file` — the preset selection as JSON (at most 1 MiB;
+      missing reads as empty; a malformed one keeps the previous and
+      reports `error` with reason `selection`):
+
+          {"gen":N,"favourites":[ids],"hidden":[ids],"playlist":[ids],
+           "playlist_enabled":B}
+
+      Favourites get 3 tickets per rotation deal, hidden presets never
+      rotate, and with the playlist on only playlist ∩ eligible presets
+      do (all eligible ones when that is empty). Unknown ids are kept (an
+      upload may come later). The file is always written by renaming a
+      complete temporary file over it;
     * `--high-frequency` — include `high_frequency` presets;
     * `--locked` — start locked on this preset id;
     * `--pcm-ring` — the PCM tap ring file.
@@ -124,7 +140,12 @@ defmodule UniversalProxy.Display.MilkDrop do
     * `{"cmd":"set_min_fps","value":N}` — the minimum frame rate;
     * `{"cmd":"reload_user"}` — re-read `--user-dir`'s manifest: new
       uploads join the rotation, deleted ones leave it (one showing keeps
-      showing until the next change).
+      showing until the next change);
+    * `{"cmd":"reload_selection"}` — re-read `--selection-file`;
+    * `{"cmd":"play","preset":ID,"lock":B}` — show `ID` now (warm-up then
+      a cut), then rotate on or, with `lock`, hold it; also while
+      prepared or released. A hidden or off-playlist preset can be
+      played.
 
   Events (stdout), forwarded with atom keys and an atom `:event`:
 
@@ -151,8 +172,15 @@ defmodule UniversalProxy.Display.MilkDrop do
       ARM clock);
     * `{"event":"user_reloaded","presets":N,"added":A,"removed":R,"rejected":X}`
       — the answer to `reload_user`;
-    * `{"event":"play_refused",...}`, `{"event":"selection",...}` — the
-      preset selector's (forwarded, not acted on here);
+    * `{"event":"selection","gen":N,"eligible":E,"playlist_fallback":B,"hidden_fallback":B}`
+      — the selection in effect (answering `reload_selection`, and after
+      `prepared` when `--selection-file` is given): `E` presets can
+      rotate; a fallback flag means that list left none eligible and is
+      ignored;
+    * `{"event":"play_refused","preset":ID,"reason":R}` — `play` refused:
+      `unknown`, `skipped`, `high_frequency`, `rpi3_skip` or `load_failed`
+      (also reported as the usual `skip`). A `play` that works is
+      answered with `loading` and `preset` with `cause: "play"`;
     * `{"event":"error","reason":R,...}` — a non-fatal problem;
     * `{"event":"exiting","reason":R}` — about to exit (`"requested"`,
       `"thermal"`, …).
@@ -353,6 +381,20 @@ defmodule UniversalProxy.Display.MilkDrop do
   @spec reload_user(GenServer.server()) :: :ok
   def reload_user(server), do: command(server, %{cmd: "reload_user"})
 
+  @doc """
+  Rewrite the selection file with `selection` (a
+  `UniversalProxy.MilkDrop.Store` selection) and have the renderer
+  re-read it. A file that can't be written is logged and not announced.
+  """
+  @spec reload_selection(GenServer.server(), Store.selection()) :: :ok
+  def reload_selection(server, selection) when is_map(selection),
+    do: GenServer.cast(server, {:reload_selection, selection})
+
+  @doc "Show preset `id` now, and with `lock?` hold it (see `play` above)."
+  @spec play(GenServer.server(), String.t(), boolean()) :: :ok
+  def play(server, id, lock?) when is_binary(id) and is_boolean(lock?),
+    do: command(server, %{cmd: "play", preset: id, lock: lock?})
+
   @doc false
   @spec command(GenServer.server(), map()) :: :ok
   def command(server, cmd) when is_map(cmd), do: GenServer.cast(server, {:command, cmd})
@@ -381,7 +423,7 @@ defmodule UniversalProxy.Display.MilkDrop do
   @doc """
   The renderer's argv (see "Renderer CLI contract") for `config`: `:mode`,
   `:pack_dir`, `:ladder`, `:skip_file`, `:settings` and the optional
-  `:user_dir`, `:ring_path`, `:card` and `:connector`.
+  `:user_dir`, `:selection_file`, `:ring_path`, `:card` and `:connector`.
   """
   @spec args(map()) :: [String.t()]
   def args(%{mode: mode, pack_dir: pack_dir, ladder: ladder, skip_file: skip_file} = config) do
@@ -395,6 +437,7 @@ defmodule UniversalProxy.Display.MilkDrop do
       ["--rotate-s", Integer.to_string(settings.rotate_s)],
       ["--min-fps", Integer.to_string(settings.min_fps)],
       ["--skip-file", skip_file],
+      if(config[:selection_file], do: ["--selection-file", config.selection_file], else: []),
       if(settings.include_high_frequency, do: ["--high-frequency"], else: []),
       if(settings.locked, do: ["--locked", settings.locked], else: []),
       if(config[:ring_path], do: ["--pcm-ring", config.ring_path], else: []),
@@ -413,6 +456,8 @@ defmodule UniversalProxy.Display.MilkDrop do
     store = Keyword.get(opts, :store, Store)
     settings = Keyword.get_lazy(opts, :settings, fn -> Store.settings(store) end)
     skipped = Keyword.get_lazy(opts, :skipped, fn -> Store.skipped(store, version) end)
+    selection = Keyword.get_lazy(opts, :selection, fn -> Store.selection(store) end)
+    n = System.unique_integer([:positive])
 
     config = %{
       mode: Keyword.fetch!(opts, :mode),
@@ -425,12 +470,15 @@ defmodule UniversalProxy.Display.MilkDrop do
       settings: settings,
       skip_file:
         Keyword.get_lazy(opts, :skip_file, fn ->
-          Path.join(
-            System.tmp_dir!(),
-            "up-milkdrop-skip-#{System.unique_integer([:positive])}.txt"
-          )
+          Path.join(System.tmp_dir!(), "up-milkdrop-skip-#{n}.txt")
+        end),
+      selection_file:
+        Keyword.get_lazy(opts, :selection_file, fn ->
+          Path.join(System.tmp_dir!(), "up-milkdrop-selection-#{n}.json")
         end)
     }
+
+    files = [config.skip_file, config.selection_file, selection_tmp(config.selection_file)]
 
     binary = Keyword.get_lazy(opts, :binary, &default_binary/0)
     session = System.unique_integer([:positive])
@@ -440,7 +488,8 @@ defmodule UniversalProxy.Display.MilkDrop do
 
     with :ok <- validate(config),
          :ok <- write_skip_file(config.skip_file, skipped),
-         {:ok, reaper} <- start_reaper(task_sup, owner, kill_grace_ms, config.skip_file),
+         :ok <- write_selection_file(config.selection_file, selection),
+         {:ok, reaper} <- start_reaper(task_sup, owner, kill_grace_ms, files),
          {:ok, port} <- open_port(binary, args(config)) do
       os_pid = os_pid(port)
       send(reaper, if(os_pid, do: {:os_pid, os_pid}, else: :renderer_exited))
@@ -463,6 +512,7 @@ defmodule UniversalProxy.Display.MilkDrop do
          showing: nil,
          locked: Map.get(settings, :locked),
          skip_file: config.skip_file,
+         selection_file: config.selection_file,
          discarding: false,
          pending_skips: %{},
          skip_retry_ms: Keyword.get(opts, :skip_retry_ms, @skip_retry_ms),
@@ -480,7 +530,7 @@ defmodule UniversalProxy.Display.MilkDrop do
     else
       {:error, reason} ->
         Logger.error("MilkDrop renderer did not start: #{inspect(reason)}")
-        _ = File.rm(config.skip_file)
+        Enum.each(files, &File.rm/1)
         {:stop, reason}
     end
   end
@@ -501,6 +551,17 @@ defmodule UniversalProxy.Display.MilkDrop do
   end
 
   def handle_cast({:command, _cmd}, state), do: {:noreply, state}
+
+  def handle_cast({:reload_selection, selection}, state) do
+    case write_selection_file(state.selection_file, selection) do
+      :ok ->
+        handle_cast({:command, %{cmd: "reload_selection"}}, state)
+
+      {:error, reason} ->
+        Logger.warning("MilkDrop: could not write the selection file: #{inspect(reason)}")
+        {:noreply, state}
+    end
+  end
 
   @impl true
   def handle_call({:stop_hung, blame}, _from, state) do
@@ -911,6 +972,27 @@ defmodule UniversalProxy.Display.MilkDrop do
     end
   end
 
+  # Renamed into place, so the renderer never reads a partial file.
+  defp write_selection_file(path, selection) do
+    tmp = selection_tmp(path)
+    selection = Map.merge(Store.empty_selection(), selection)
+
+    with {:ok, body} <- Jason.encode(Map.take(selection, Map.keys(Store.empty_selection()))),
+         :ok <- File.write(tmp, body),
+         :ok <- File.rename(tmp, path) do
+      :ok
+    else
+      {:error, %_{} = error} ->
+        {:error, {:encode, Exception.message(error)}}
+
+      {:error, reason} ->
+        _ = File.rm(tmp)
+        {:error, {:io, reason}}
+    end
+  end
+
+  defp selection_tmp(path), do: path <> ".tmp"
+
   defp open_port(binary, args) do
     if File.regular?(binary) do
       {:ok,
@@ -942,8 +1024,9 @@ defmodule UniversalProxy.Display.MilkDrop do
   # recycled pid is not. Once the renderer is known gone the owner is told
   # (`{:milkdrop_reaped, server}`). It traps exits so that its supervisor's
   # shutdown kills a still-running renderer rather than abandoning it. It
-  # also deletes the skip file, last, once the renderer is dead or gone.
-  defp start_reaper(task_sup, owner, grace_ms, skip_file) do
+  # also deletes the skip and selection files, last, once the renderer is
+  # dead or gone.
+  defp start_reaper(task_sup, owner, grace_ms, files) do
     server = self()
 
     case Task.Supervisor.start_child(
@@ -955,7 +1038,7 @@ defmodule UniversalProxy.Display.MilkDrop do
                if reap(Process.monitor(server), grace_ms) == :gone,
                  do: send(owner, {:milkdrop_reaped, server})
              after
-               _ = File.rm(skip_file)
+               Enum.each(files, &File.rm/1)
              end
            end,
            shutdown: @reaper_shutdown_ms

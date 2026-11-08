@@ -5,8 +5,10 @@ Speaks the line-JSON protocol documented in UniversalProxy.Display.MilkDrop
 ("Renderer CLI contract" / "Line-JSON protocol"). Stays narrow on purpose:
 only what the tests drive.
 
-  startup        → {"event":"prepared","argv":[...],"skip":[...]}
-                   (argv and the --skip-file contents are test-only fields)
+  startup        → {"event":"prepared","argv":[...],"skip":[...],"selection":S}
+                   (argv, the --skip-file contents and the decoded
+                   --selection-file, null when none, are test-only fields),
+                   then with --selection-file the selection event below
   stdin commands → stdout events
     {"cmd":"take"}    → {"event":"presenting"}
     {"cmd":"release"} → {"event":"released"}
@@ -17,6 +19,15 @@ only what the tests drive.
     {"cmd":"reload_user"}  → {"event":"user_reloaded","presets":N,"added":A,
                              "removed":R,"rejected":0}, counted from
                              <user-dir>/manifest.json (none without one)
+    {"cmd":"reload_selection"} → {"event":"selection","gen":N,"eligible":E,
+                             "playlist_fallback":B,"hidden_fallback":B}, from
+                             --selection-file over the catalog p0..p9.milk
+    {"cmd":"play","preset":F,"lock":B}
+                           → {"event":"loading","preset":F}, then
+                             {"event":"preset","file":F,"locked":B,"cause":"play"};
+                             for F in fake.json's "refuse" (F → reason)
+                             {"event":"play_refused","preset":F,"reason":R}
+                             (load_failed also emits skip, as the binary)
   test-only:
     {"cmd":"emit","line":"<raw>"} → <raw> verbatim on its own line
     {"cmd":"crash","status":N}    → exit N, no event
@@ -39,6 +50,7 @@ it) comes from an optional <pack-dir>/fake.json:
     {"startup_preset": F}         → loading F and preset F (cause start) before
                                     prepared, as the real binary's start
     {"take_hang_loading": F}      → answer take with loading F, then as stall
+    {"refuse": {F: reason}}       → play F is refused with reason
 
 It touches <skip-file>.spawned first thing, so tests can tell it was ever
 started. Every stdin line is appended to <skip-file>.cmds, so tests can
@@ -89,6 +101,38 @@ def user_files(user_dir):
         return set()
 
 
+CATALOG = ["p%d.milk" % i for i in range(10)]
+
+
+def read_selection(path):
+    if path is None:
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+# The renderer's precedence, over the fake catalog: hidden never rotate,
+# the playlist (when on) narrows what is left; an empty result falls back.
+def selection_event(sel):
+    sel = sel or {}
+    hidden = set(sel.get("hidden", []))
+    eligible = [p for p in CATALOG if p not in hidden]
+    hidden_fallback = not eligible
+    if hidden_fallback:
+        eligible = list(CATALOG)
+    playlist_fallback = False
+    if sel.get("playlist_enabled"):
+        listed = [p for p in eligible if p in set(sel.get("playlist", []))]
+        playlist_fallback = not listed
+        if listed:
+            eligible = listed
+    return {"event": "selection", "gen": sel.get("gen", 0), "eligible": len(eligible),
+            "playlist_fallback": playlist_fallback, "hidden_fallback": hidden_fallback}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", required=True)
@@ -129,8 +173,13 @@ def main():
         emit({"event": "preset", "file": "p%d.milk" % preset, "locked": locked,
               "cause": cause})
 
+    refuse = fake.get("refuse", {})
+
     def prepared():
-        emit({"event": "prepared", "argv": sys.argv[1:], "skip": skip})
+        emit({"event": "prepared", "argv": sys.argv[1:], "skip": skip,
+              "selection": read_selection(args.selection_file)})
+        if args.selection_file is not None:
+            emit(selection_event(read_selection(args.selection_file)))
 
     if "startup_preset" in fake:
         emit({"event": "loading", "preset": fake["startup_preset"]})
@@ -182,6 +231,19 @@ def main():
                   "added": len(now - uploads), "removed": len(uploads - now),
                   "rejected": 0})
             uploads = now
+        elif name == "reload_selection":
+            emit(selection_event(read_selection(args.selection_file)))
+        elif name == "play":
+            target = cmd["preset"]
+            if target in refuse:
+                if refuse[target] == "load_failed":
+                    emit({"event": "loading", "preset": target})
+                    emit({"event": "skip", "preset": target, "reason": "compile"})
+                emit({"event": "play_refused", "preset": target, "reason": refuse[target]})
+            else:
+                locked = bool(cmd.get("lock"))
+                emit({"event": "loading", "preset": target})
+                emit({"event": "preset", "file": target, "locked": locked, "cause": "play"})
         elif name in ("lock", "unlock"):
             locked = name == "lock"
             emit_preset(name)

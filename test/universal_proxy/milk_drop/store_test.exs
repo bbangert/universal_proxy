@@ -140,6 +140,121 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
     end
   end
 
+  describe "selection" do
+    defp write_selection(path, selection) do
+      {:ok, table} = :dets.open_file(@table, file: to_charlist(path), type: :set)
+      :ok = :dets.insert(table, {:selection, selection})
+      :ok = :dets.close(table)
+    end
+
+    test "starts empty; each change bumps gen, is broadcast and survives a restart",
+         %{path: path} do
+      server = start_store(path)
+      Phoenix.PubSub.subscribe(UniversalProxy.PubSub, MilkDrop.selection_topic())
+      assert Store.selection(server) == Store.empty_selection()
+
+      assert {:ok, %{gen: 1, favourites: ["a.milk"]} = sel} =
+               Store.favourite(server, "a.milk", true)
+
+      assert_receive {:milkdrop_selection, ^sel}
+      assert {:ok, %{gen: 2, hidden: ["b.milk"]}} = Store.hide(server, "b.milk", true)
+      assert {:ok, %{gen: 3}} = Store.playlist_add(server, "user/u.milk")
+      assert {:ok, %{gen: 4}} = Store.playlist_add(server, "c/d.milk")
+      assert {:ok, %{gen: 5, playlist_enabled: true}} = Store.set_playlist_enabled(server, true)
+      assert {:ok, %{gen: 6, favourites: []}} = Store.favourite(server, "a.milk", false)
+
+      expected = %{
+        gen: 6,
+        favourites: [],
+        hidden: ["b.milk"],
+        playlist: ["user/u.milk", "c/d.milk"],
+        playlist_enabled: true
+      }
+
+      assert Store.selection(server) == expected
+
+      stop_supervised!(Store)
+      server = start_store(path)
+      assert Store.selection(server) == expected
+
+      assert {:ok, %{gen: 7, playlist: ["c/d.milk"]}} =
+               Store.playlist_remove(server, "user/u.milk")
+
+      assert {:ok, %{gen: 8, playlist: [], playlist_enabled: true}} = Store.playlist_clear(server)
+    end
+
+    test "a change that changes nothing keeps gen and is not broadcast", %{path: path} do
+      server = start_store(path)
+      {:ok, %{gen: 1}} = Store.playlist_add(server, "a.milk")
+      {:ok, %{gen: 2}} = Store.playlist_add(server, "b.milk")
+      Phoenix.PubSub.subscribe(UniversalProxy.PubSub, MilkDrop.selection_topic())
+
+      # Already there: it keeps its place.
+      assert {:ok, %{gen: 2, playlist: ["a.milk", "b.milk"]}} =
+               Store.playlist_add(server, "a.milk")
+
+      assert {:ok, %{gen: 2}} = Store.favourite(server, "x.milk", false)
+      assert {:ok, %{gen: 2}} = Store.hide(server, "x.milk", false)
+      assert {:ok, %{gen: 2}} = Store.set_playlist_enabled(server, false)
+      refute_receive {:milkdrop_selection, _}, 50
+    end
+
+    test "is independent of the settings, skips and pack version", %{path: path} do
+      server = start_store(path)
+      {:ok, sel} = Store.favourite(server, "a.milk", true)
+
+      :ok = Store.skip(server, "v1", "a.milk", "draw")
+      :ok = Store.skip(server, "v2", "b.milk", "draw")
+      :ok = Store.clear_skipped(server)
+      {:ok, _} = Store.update(server, %{rotate_s: 45, locked: "a.milk"})
+
+      assert Store.selection(server) == sel
+      refute Map.has_key?(Store.settings(server), :favourites)
+    end
+
+    test "ids are checked: shape, count and the file's size", %{path: path} do
+      server = start_store(path)
+
+      for bad <- ["", "a\nb.milk", "tab\t.milk", "del\x7F.milk", <<0xFF, 0xFE>>, nil, 42] do
+        assert Store.favourite(server, bad, true) == {:error, :invalid_id}
+        assert Store.playlist_add(server, bad) == {:error, :invalid_id}
+      end
+
+      assert Store.hide(server, String.duplicate("x", 513), true) == {:error, :invalid_id}
+      assert {:ok, _} = Store.hide(server, String.duplicate("é", 256), true)
+      assert Store.valid_id?("user/Ünïcode – ok.milk")
+
+      stop_supervised!(Store)
+      many = for n <- 1..5000, do: "p#{n}.milk"
+      write_selection(path, %{Store.empty_selection() | playlist: many})
+      server = start_store(path)
+      assert Store.playlist_add(server, "one-more.milk") == {:error, :too_many}
+      assert length(Store.selection(server).playlist) == 5000
+
+      # Over the file's budget (4,000 ids of 200 bytes): nothing more goes
+      # in, but anything can come out.
+      stop_supervised!(Store)
+      long = for n <- 1..4000, do: String.pad_leading("#{n}.milk", 200, "x")
+      write_selection(path, %{Store.empty_selection() | hidden: long})
+      server = start_store(path)
+      assert Store.favourite(server, "short.milk", true) == {:error, :too_large}
+      assert {:ok, %{gen: 1, hidden: [_ | _] = hidden}} = Store.hide(server, hd(long), false)
+      assert length(hidden) == 3999
+    end
+
+    test "a malformed record reads as sanitised", %{path: path} do
+      write_selection(path, %{
+        gen: -3,
+        favourites: ["a.milk", "a.milk", 7, "b\n"],
+        hidden: :nope,
+        playlist_enabled: "yes"
+      })
+
+      server = start_store(path)
+      assert Store.selection(server) == %{Store.empty_selection() | favourites: ["a.milk"]}
+    end
+  end
+
   describe "skip list" do
     test "records skips for the current pack version", %{path: path} do
       server = start_store(path)
@@ -402,6 +517,56 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
       # Nothing left to forget: no write.
       assert :ok = Store.user_presets_removed(server, ["user/a.milk"])
       refute_receive {:milkdrop_skipped, _, _}, 50
+    end
+
+    test "user_presets_removed/2 drops the uploads' selection entries in the same write",
+         %{path: path} do
+      agent = library(%{"user/a.milk" => "sha-a"})
+      server = start_with_library(path, agent)
+      {:ok, _} = Store.favourite(server, "user/a.milk", true)
+      {:ok, _} = Store.favourite(server, "pack.milk", true)
+      {:ok, _} = Store.hide(server, "user/b.milk", true)
+      {:ok, _} = Store.playlist_add(server, "user/a.milk")
+      {:ok, _} = Store.playlist_add(server, "pack.milk")
+      {:ok, %{gen: 6}} = Store.set_playlist_enabled(server, true)
+      :ok = Store.skip(server, "v1", "user/a.milk", "draw")
+      Phoenix.PubSub.subscribe(UniversalProxy.PubSub, MilkDrop.selection_topic())
+
+      # Content replaced: only the skip goes.
+      assert :ok = Store.clear_user_skips(server, ["user/a.milk"])
+      assert %{gen: 6, favourites: ["user/a.milk", "pack.milk"]} = Store.selection(server)
+      refute_receive {:milkdrop_selection, _}, 50
+
+      assert :ok = Store.user_presets_removed(server, ["user/a.milk", "user/b.milk"])
+
+      expected = %{
+        gen: 7,
+        favourites: ["pack.milk"],
+        hidden: [],
+        playlist: ["pack.milk"],
+        playlist_enabled: true
+      }
+
+      assert_receive {:milkdrop_selection, ^expected}
+      assert Store.selection(server) == expected
+
+      # A refused write keeps the selection with the skips and the lock.
+      {:ok, _} = Store.favourite(server, "user/c.milk", true)
+      stop_supervised!(Store)
+
+      server =
+        start_with_library(path, agent,
+          insert: fn
+            _table, [{:user_skipped, _} | _] -> {:error, :disk_full}
+            table, records -> :dets.insert(table, records)
+          end
+        )
+
+      capture_log(fn ->
+        assert {:error, :disk_full} = Store.user_presets_removed(server, ["user/c.milk"])
+      end)
+
+      assert "user/c.milk" in Store.selection(server).favourites
     end
 
     test "clear_skipped/1 forgets them too", %{path: path} do
@@ -1048,6 +1213,13 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
       assert Store.clear_skipped(dead) == {:error, :not_running}
       assert Store.clear_user_skips(dead, ["user/a.milk"]) == {:error, :not_running}
       assert Store.user_presets_removed(dead, ["user/a.milk"]) == {:error, :not_running}
+      assert Store.selection(dead) == Store.empty_selection()
+      assert Store.favourite(dead, "a.milk", true) == {:error, :not_running}
+      assert Store.hide(dead, "a.milk", true) == {:error, :not_running}
+      assert Store.playlist_add(dead, "a.milk") == {:error, :not_running}
+      assert Store.playlist_remove(dead, "a.milk") == {:error, :not_running}
+      assert Store.playlist_clear(dead) == {:error, :not_running}
+      assert Store.set_playlist_enabled(dead, true) == {:error, :not_running}
       assert Store.in_flight(dead) == nil
       assert Store.mark_in_flight(dead, 1, "v1", "a.milk") == {:error, :not_running}
       assert Store.clear_in_flight(dead, 1) == {:error, :not_running}

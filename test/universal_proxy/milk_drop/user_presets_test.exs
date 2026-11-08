@@ -238,7 +238,10 @@ defmodule UniversalProxy.MilkDrop.UserPresetsTest do
       assert [%{high_frequency: true, sha256: sha}] = UserPresets.list(server).presets
       assert sha == sha(new)
 
-      # New content in another case: the old file and id go.
+      # New content in another case: the old file and id go, and with the
+      # id its selection entries.
+      {:ok, _} = Store.favourite(ctx.store, "user/Foo.milk", true)
+      {:ok, _} = Store.playlist_add(ctx.store, "user/Foo.milk")
       newer = milk("y=2\r\n")
 
       assert [%{status: :replaced, name: "FOO.milk", replaces: "Foo.milk"}] =
@@ -254,6 +257,7 @@ defmodule UniversalProxy.MilkDrop.UserPresetsTest do
       assert UserPresets.sha256(ctx.table, "user/FOO.milk") == sha(newer)
       assert %{"presets" => [%{"file" => "FOO.milk", "tags" => tags}]} = manifest(ctx)
       assert "high_frequency" in tags
+      assert %{favourites: [], playlist: []} = Store.selection(ctx.store)
     end
 
     test "replacing a preset clears its skips; the lock stays", ctx do
@@ -479,6 +483,8 @@ defmodule UniversalProxy.MilkDrop.UserPresetsTest do
       :ok = Store.skip(ctx.store, "v1", "user/b.milk", "draw")
       :ok = Store.skip(ctx.store, "v1", "pack.milk", "draw")
       {:ok, _} = Store.update(ctx.store, %{locked: "user/a.milk"})
+      {:ok, _} = Store.hide(ctx.store, "user/a.milk", true)
+      {:ok, _} = Store.favourite(ctx.store, "user/b.milk", true)
 
       assert :ok = UserPresets.delete(server, "user/a.milk")
 
@@ -489,6 +495,7 @@ defmodule UniversalProxy.MilkDrop.UserPresetsTest do
       assert Store.settings(ctx.store).locked == nil
       assert Store.skipped(ctx.store, "v1") == %{"user/b.milk" => "draw", "pack.milk" => "draw"}
       assert [%{id: "user/b.milk"}] = UserPresets.list(server).presets
+      assert %{hidden: [], favourites: ["user/b.milk"]} = Store.selection(ctx.store)
     end
 
     test "a lock on another preset stays", ctx do
