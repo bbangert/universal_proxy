@@ -330,15 +330,21 @@ defmodule UniversalProxy.MilkDrop.UploadCheck do
 
   # The body is exactly the segment (length 8 + 3 × Nf) minus its length
   # field: precision (8 bits: all stb_image decodes), height, width, Nf in
-  # 1..4, then Nf component specs.
+  # 1..4, then Nf component specs (id, sampling factors 1..4 each, table
+  # selector 0..3).
   defp jpeg_segment(m, <<8, h::16, w::16, nf, specs::binary>>, rest)
        when m in @jpeg_ok_sof and nf in 1..4 and byte_size(specs) == 3 * nf do
-    if :binary.match(rest, <<0xFF, 0xD9>>) == :nomatch,
-      do: {:error, :bad_header},
-      else: {:ok, %{format: :jpeg, width: w, height: h}}
+    if components_ok?(specs) and :binary.match(rest, <<0xFF, 0xD9>>) != :nomatch,
+      do: {:ok, %{format: :jpeg, width: w, height: h}},
+      else: {:error, :bad_header}
   end
 
   defp jpeg_segment(m, _body, _rest) when m in @jpeg_ok_sof, do: {:error, :bad_header}
   defp jpeg_segment(m, _body, _rest) when m in @jpeg_other_sof, do: {:error, :unsupported_jpeg}
   defp jpeg_segment(_m, _body, rest), do: jpeg_markers(rest)
+
+  defp components_ok?(specs) do
+    for(<<_id, hs::4, vs::4, tq <- specs>>, do: hs in 1..4 and vs in 1..4 and tq in 0..3)
+    |> Enum.all?()
+  end
 end

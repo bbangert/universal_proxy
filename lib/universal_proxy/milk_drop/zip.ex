@@ -370,7 +370,8 @@ defmodule UniversalProxy.MilkDrop.Zip do
     end
   end
 
-  defp sizes_ok?(%{size: size}, true), do: size == 0
+  # A directory holds nothing; its sizes must still agree for its method.
+  defp sizes_ok?(%{size: size} = raw, true), do: size == 0 and sizes_ok?(raw, false)
   defp sizes_ok?(%{method: 0} = raw, false), do: raw.compressed_size == raw.size
   # A compressor that can't shrink its input falls back to stored blocks,
   # 5 bytes per block (zlib: up to 64 KiB, 2 KiB at the smallest memLevel);

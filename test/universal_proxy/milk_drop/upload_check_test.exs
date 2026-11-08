@@ -257,6 +257,11 @@ defmodule UniversalProxy.MilkDrop.UploadCheckTest do
 
       assert {:ok, %{width: 1}} = UploadCheck.check_texture("a.jpg", sof.(1, <<1, 0x11, 0>>))
       assert UploadCheck.check_texture("a.jpg", sof.(0, "")) == {:error, :bad_header}
+      # Sampling factors 1..4, quantisation table selector 0..3.
+      assert UploadCheck.check_texture("a.jpg", sof.(1, <<1, 0x00, 0>>)) == {:error, :bad_header}
+      assert UploadCheck.check_texture("a.jpg", sof.(1, <<1, 0x51, 0>>)) == {:error, :bad_header}
+      assert UploadCheck.check_texture("a.jpg", sof.(1, <<1, 0x11, 4>>)) == {:error, :bad_header}
+      assert {:ok, _} = UploadCheck.check_texture("a.jpg", sof.(1, <<1, 0x44, 3>>))
 
       assert UploadCheck.check_texture("a.jpg", sof.(5, :binary.copy(<<1, 0x11, 0>>, 5))) ==
                {:error, :bad_header}
