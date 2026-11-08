@@ -52,6 +52,7 @@ it) comes from an optional <pack-dir>/fake.json:
     {"take_hang_loading": F}      → answer take with loading F, then as stall
     {"refuse": {F: reason}}       → play F is refused with reason
     {"play_delay_ms": N}          → answer each play N ms after reading it
+    {"play_delays": [N, ...]}     → the same for the first plays, in order
 
 It touches <skip-file>.spawned first thing, so tests can tell it was ever
 started. Every stdin line is appended to <skip-file>.cmds, so tests can
@@ -173,14 +174,16 @@ def main():
     ignore_eof = bool(fake.get("ignore_eof"))
 
     preset = 0
+    # The preset showing: what lock/unlock events name.
+    current = "p0.milk"
     locked = args.locked is not None
     uploads = user_files(args.user_dir)
 
     def emit_preset(cause):
-        emit({"event": "preset", "file": "p%d.milk" % preset, "locked": locked,
-              "cause": cause})
+        emit({"event": "preset", "file": current, "locked": locked, "cause": cause})
 
     refuse = fake.get("refuse", {})
+    play_delays = list(fake.get("play_delays", []))
 
     def prepared():
         emit({"event": "prepared", "argv": sys.argv[1:], "skip": skip,
@@ -189,6 +192,7 @@ def main():
             emit(selection_event(read_selection(args.selection_file)))
 
     if "startup_preset" in fake:
+        current = fake["startup_preset"]
         emit({"event": "loading", "preset": fake["startup_preset"]})
         emit({"event": "preset", "file": fake["startup_preset"], "locked": locked,
               "cause": "start"})
@@ -230,7 +234,8 @@ def main():
             prepared()
         elif name in ("next", "prev"):
             preset = preset + 1 if name == "next" else max(preset - 1, 0)
-            emit({"event": "loading", "preset": "p%d.milk" % preset})
+            current = "p%d.milk" % preset
+            emit({"event": "loading", "preset": current})
             emit_preset(name)
         elif name == "reload_user":
             now = user_files(args.user_dir)
@@ -241,7 +246,8 @@ def main():
         elif name == "reload_selection":
             emit(selection_event(read_selection(args.selection_file)))
         elif name == "play":
-            time.sleep(fake.get("play_delay_ms", 0) / 1000.0)
+            delay = play_delays.pop(0) if play_delays else fake.get("play_delay_ms", 0)
+            time.sleep(delay / 1000.0)
             target = cmd["preset"]
             if target in refuse:
                 if refuse[target] == "load_failed":
@@ -250,6 +256,7 @@ def main():
                 emit({"event": "play_refused", "preset": target, "reason": refuse[target]})
             else:
                 locked = bool(cmd.get("lock"))
+                current = target
                 emit({"event": "loading", "preset": target})
                 emit({"event": "preset", "file": target, "locked": locked, "cause": "play"})
         elif name in ("lock", "unlock"):

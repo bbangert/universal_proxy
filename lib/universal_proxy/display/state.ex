@@ -102,7 +102,9 @@ defmodule UniversalProxy.Display.State do
   (`{:milkdrop_selection_unsent, pid, gen}`) or the renderer reports
   `error` `selection` — is sent again after a backoff (`:selection_retry`
   ms, doubling), at most 5 times per selection; the renderer's
-  `selection` event with that `gen` acknowledges it.
+  `selection` event with that `gen` acknowledges it (an answer for an
+  older one doesn't, and only a renderer's first answer, before anything
+  was sent, seeds the last-sent `gen`).
 
   `{:milkdrop_play, id, lock?}` calls (`UniversalProxy.Display.milkdrop_play/3`)
   are sent as `play` from `:preparing` through `:presenting`, else
@@ -114,8 +116,13 @@ defmodule UniversalProxy.Display.State do
   :superseded}`, and a reclaim or the session's end answers it
   `{:error, :not_presenting}`. The protocol has no request token, so one
   `play` command is in flight at a time: a newer one is written only once
-  the renderer answered the older (or its caller timed out), so an answer
-  is never taken for a later play of the same id.
+  the renderer answered the older, even past its caller's timeout, so an
+  answer is never taken for a later play of the same id. A command
+  unanswered for two `:play` timeouts means the renderer doesn't answer
+  plays: the waiting caller and every later play of that session get
+  `{:error, :unresponsive}`. The renderer silently drops a pending play
+  that a `next` or `prev` replaces, so remote-key `next`/`prev` are held
+  while a play is in flight and sent once it is answered.
 
   What the TV shows is broadcast on
   `UniversalProxy.MilkDrop.now_playing_topic/0` as
@@ -378,6 +385,14 @@ defmodule UniversalProxy.Display.State do
 
   def handle_call(:milkdrop_now_playing, _from, state), do: {:reply, state.now_playing, state}
 
+  def handle_call(
+        {:milkdrop_play, _id, _lock?},
+        _from,
+        %{md: %{phase: phase, play_sent: :unresponsive}} = state
+      )
+      when phase in [:preparing, :taking, :presenting],
+      do: {:reply, {:error, :unresponsive}, state}
+
   # Answered when the renderer's answer arrives (see the moduledoc).
   def handle_call(
         {:milkdrop_play, id, lock?},
@@ -494,11 +509,25 @@ defmodule UniversalProxy.Display.State do
       when is_map(selection),
       do: {:noreply, milkdrop_selection(state, selection)}
 
-  # The command in flight, if any, is given up on too, so a renderer that
-  # never answers it can't hold back later plays.
+  # Its command, if written, stays in flight until answered, so a late
+  # answer can't be taken for a later play of the same id.
   def handle_info({:milkdrop_play_timeout, ref}, %{md: %{play: %{ref: ref} = play} = md} = state) do
     Logger.info("[Display] MilkDrop: no answer to playing #{inspect(play.id)} in time")
-    {:noreply, %{state | md: %{answer_play(md, {:error, :timeout}) | play_sent: nil}}}
+    {:noreply, %{state | md: answer_play(md, {:error, :timeout})}}
+  end
+
+  # A command unanswered for two play timeouts: the renderer doesn't answer
+  # plays, and this session refuses them from now on.
+  def handle_info(
+        {:milkdrop_play_stuck, ref},
+        %{md: %{play_sent: %{ref: ref} = sent} = md} = state
+      ) do
+    Logger.warning(
+      "[Display] MilkDrop renderer never answered playing #{inspect(sent.id)}; refusing plays this session"
+    )
+
+    md = answer_play(%{md | play_sent: :unresponsive}, {:error, :unresponsive})
+    {:noreply, %{state | md: flush_held(md)}}
   end
 
   def handle_info({:milkdrop_selection_unsent, pid, gen}, %{md: %{pid: pid, sent: sent}} = state) do
@@ -894,6 +923,8 @@ defmodule UniversalProxy.Display.State do
       selection_retry: nil,
       play: nil,
       play_sent: nil,
+      play_ms: state.md_timeouts.play,
+      held: [],
       sent: %{},
       reaped: false,
       ending: nil,
@@ -1045,11 +1076,18 @@ defmodule UniversalProxy.Display.State do
     if info.playlist_fallback or info.hidden_fallback,
       do: Logger.info("[Display] MilkDrop selection falls back: #{inspect(info)}")
 
-    sent = if info.gen, do: Map.put_new(md.sent, :selection, info.gen), else: md.sent
+    # Only a renderer's start (nothing sent yet) seeds the cache; after that
+    # only the selection wanted is acknowledged, not an older one's answer.
+    sent =
+      if info.gen && is_nil(md.selection_want),
+        do: Map.put_new(md.sent, :selection, info.gen),
+        else: md.sent
+
     md = %{md | selection: info, sent: sent}
+    wanted = if md.selection_want, do: md.selection_want.gen, else: Map.get(sent, :selection)
 
     md =
-      if info.gen == Map.get(sent, :selection),
+      if info.gen != nil and info.gen == wanted and info.gen == Map.get(sent, :selection),
         do: %{cancel_selection_retry(md) | selection_retry: nil},
         else: md
 
@@ -1114,6 +1152,11 @@ defmodule UniversalProxy.Display.State do
   defp milkdrop_cmd(%{md: %{phase: phase, pid: pid} = md} = state, cmd)
        when phase in [:preparing, :taking, :presenting] and is_pid(pid) do
     case cmd do
+      # The renderer drops a pending play that `next`/`prev` replaces,
+      # without a word: held until the play in flight is answered.
+      switch when switch in [:next, :prev] and is_map(md.play_sent) ->
+        %{state | md: %{md | held: md.held ++ [switch]}}
+
       :next ->
         Display.MilkDrop.next(pid)
         state
@@ -1224,19 +1267,34 @@ defmodule UniversalProxy.Display.State do
 
   # One `play` command is in flight at a time (`play_sent`): the protocol
   # has no request token, so answers are matched by id, and a newer play
-  # waits for the older command's answer before it is written.
+  # waits for the older command's answer before it is written. A command
+  # unanswered for two play timeouts makes the lane `:unresponsive`.
   defp send_play(%{play_sent: nil, play: %{sent?: false} = play} = md) do
     :ok = Display.MilkDrop.play(md.pid, play.id, play.lock)
-    %{md | play_sent: Map.take(play, [:id, :lock]), play: %{play | sent?: true}}
+    ref = make_ref()
+    timer = Process.send_after(self(), {:milkdrop_play_stuck, ref}, 2 * md.play_ms)
+    sent = %{id: play.id, lock: play.lock, ref: ref, timer: timer}
+    %{md | play_sent: sent, play: %{play | sent?: true}}
   end
 
   defp send_play(md), do: md
 
   # The command in flight was answered: its caller, if still waiting, gets
-  # `reply`, and a play waiting behind it goes out.
+  # `reply`, then held `next`/`prev` and a play waiting behind it go out
+  # (a play written last replaces a still-pending `next`).
   defp play_answered(md, reply) do
+    Process.cancel_timer(md.play_sent.timer)
     md = if match?(%{sent?: true}, md.play), do: answer_play(md, reply), else: md
-    send_play(%{md | play_sent: nil})
+    %{md | play_sent: nil} |> flush_held() |> send_play()
+  end
+
+  defp flush_held(%{held: held, pid: pid} = md) do
+    Enum.each(held, fn
+      :next -> Display.MilkDrop.next(pid)
+      :prev -> Display.MilkDrop.prev(pid)
+    end)
+
+    %{md | held: []}
   end
 
   # Replies to the pending play, if any.

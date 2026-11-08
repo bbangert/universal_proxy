@@ -556,21 +556,65 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     refute "play" in cmd_names(ctx.skip_file)
   end
 
-  test "an unanswered play times out, and a newer one supersedes it", ctx do
+  test "an unanswered play times out; a renderer that never answers is unresponsive", ctx do
     ctx = ctx |> start_ui(fake: %{ignore: ["play"]}, timeouts: %{play: 300}) |> presenting()
 
     assert play(ctx, "a.milk") == {:error, :timeout}
 
+    # Still in flight: a newer play waits behind it, and is superseded.
     first = Task.async(fn -> play(ctx, "a.milk") end)
     wait_until(fn -> md(ctx).pending_play == "a.milk" end)
     second = Task.async(fn -> play(ctx, "b.milk") end)
     assert Task.await(first) == {:error, :superseded}
-    assert Task.await(second) == {:error, :timeout}
-    assert md(ctx).pending_play == nil
+
+    # Two play timeouts without an answer: plays are refused from then on.
+    assert Task.await(second) == {:error, :unresponsive}
+    assert play(ctx, "c.milk") == {:error, :unresponsive}
+    assert Enum.count(cmd_names(ctx.skip_file), &(&1 == "play")) == 1
+  end
+
+  test "an answer after its caller timed out is not taken for a later play", ctx do
+    ctx =
+      ctx
+      |> start_ui(fake: %{play_delays: [700]}, timeouts: %{play: 500})
+      |> presenting()
+
+    assert play(ctx, "a.milk", true) == {:error, :timeout}
+    # Written only once the first is answered (locked: true), and answered
+    # by its own preset event.
+    assert play(ctx, "a.milk", false) == :ok
+    assert %{preset: "a.milk", locked: false, pending_play: nil} = md(ctx)
+
+    assert Enum.filter(cmds(ctx.skip_file), &(&1["cmd"] == "play")) == [
+             %{"cmd" => "play", "preset" => "a.milk", "lock" => true},
+             %{"cmd" => "play", "preset" => "a.milk", "lock" => false}
+           ]
+  end
+
+  test "next and prev wait for the play in flight", ctx do
+    ctx = ctx |> start_ui(fake: %{play_delays: [300]}) |> presenting()
+
+    pending = Task.async(fn -> play(ctx, "x.milk") end)
+    wait_until(fn -> md(ctx).pending_play == "x.milk" end)
+    key(ctx, :right)
+    _ = :sys.get_state(ctx.state)
+    refute "next" in cmd_names(ctx.skip_file)
+
+    assert Task.await(pending) == :ok
+    wait_until(fn -> md(ctx).preset == "p1.milk" end)
+    assert Enum.take(cmd_names(ctx.skip_file), -2) == ["play", "next"]
+  end
+
+  test "after a play, lock and unlock name the preset it showed", ctx do
+    ctx = ctx |> start_ui() |> presenting()
+    assert play(ctx, "x.milk") == :ok
+    key(ctx, :select)
+    wait_until(fn -> md(ctx).locked == true end)
+    assert md(ctx).preset == "x.milk"
   end
 
   test "a repeat play of the same id waits for the earlier one's answer", ctx do
-    ctx = ctx |> start_ui(fake: %{play_delay_ms: 300}) |> presenting()
+    ctx = ctx |> start_ui(fake: %{play_delays: [300]}) |> presenting()
 
     first = Task.async(fn -> play(ctx, "a.milk", true) end)
     wait_until(fn -> md(ctx).pending_play == "a.milk" end)
@@ -613,6 +657,40 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     assert reloads(ctx) == 1
     assert md(ctx).selection_retries == 0
     assert %{"gen" => 3, "favourites" => ["a.milk"]} = Jason.decode!(File.read!(selection_file))
+  end
+
+  test "an older selection's late answer doesn't acknowledge the one being retried", ctx do
+    selection_file = Path.join(ctx.tmp_dir, "selection.json")
+
+    ctx =
+      ctx
+      |> start_ui(
+        milkdrop_opts: [selection_file: selection_file],
+        timeouts: %{selection_retry: 600}
+      )
+      |> presenting()
+
+    wait_until(fn -> match?(%{selection: %{gen: 0}}, md(ctx)) end)
+    File.mkdir_p!(selection_file <> ".tmp")
+
+    capture_log(fn ->
+      selection_changed(ctx, %{gen: 2})
+      wait_until(fn -> md(ctx).selection_retries == 1 end)
+    end)
+
+    # gen 1's answer arrives late.
+    Renderer.command(renderer(ctx), %{
+      cmd: "emit",
+      line:
+        ~s({"event":"selection","gen":1,"eligible":10,"playlist_fallback":false,"hidden_fallback":false})
+    })
+
+    wait_until(fn -> md(ctx).selection.gen == 1 end)
+    assert md(ctx).selection_retries == 1
+
+    File.rmdir!(selection_file <> ".tmp")
+    wait_until(fn -> md(ctx).selection.gen == 2 end)
+    assert md(ctx).selection_retries == 0
   end
 
   test "a play pending when the session is reclaimed or ends is answered not_presenting", ctx do
