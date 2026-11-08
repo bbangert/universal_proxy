@@ -93,15 +93,51 @@ defmodule UniversalProxy.Display.State do
   (a renderer started later reads the library's manifest at start). The
   skip list is not re-sent: the renderer adds its own skips as it goes,
   and skips the Store dropped (a cleared list, a replaced upload) apply
-  from the next session, as with "Clear skipped presets".
+  from the next session, as with "Clear skipped presets". A preset
+  selection on `UniversalProxy.MilkDrop.selection_topic/0` whose `gen`
+  differs from the last one sent (or reported by the renderer's
+  `selection` event) is written to the renderer's selection file and
+  announced with `reload_selection`; a renderer started later reads the
+  Store's. One that doesn't take — the file could not be written
+  (`{:milkdrop_selection_unsent, pid, gen}`) or the renderer reports
+  `error` `selection` — is sent again after a backoff (`:selection_retry`
+  ms, doubling), at most 5 times per selection; the renderer's
+  `selection` event with that `gen` acknowledges it (an answer for an
+  older one doesn't, and only a renderer's first answer, before anything
+  was sent, seeds the last-sent `gen`).
+
+  `{:milkdrop_play, id, lock?}` calls (`UniversalProxy.Display.milkdrop_play/3`)
+  are sent as `play` from `:preparing` through `:presenting`, else
+  answered `{:error, :not_presenting}`. The answer waits, without
+  blocking State, for the renderer's `preset` event for `id` with cause
+  `play` (`:ok`) or its `play_refused` (`{:error, {:refused, reason}}`),
+  at most the `:play` timeout (then `{:error, :timeout}`). One caller
+  waits at a time: a newer play answers the older `{:error,
+  :superseded}`, and a reclaim or the session's end answers it
+  `{:error, :not_presenting}`. The protocol has no request token, so one
+  `play` command is in flight at a time: a newer one is written only once
+  the renderer answered the older, even past its caller's timeout, so an
+  answer is never taken for a later play of the same id. A command
+  unanswered for two `:play` timeouts means the renderer doesn't answer
+  plays: the waiting caller and every later play of that session get
+  `{:error, :unresponsive}`. The renderer silently drops a pending play
+  that a `next` or `prev` replaces, so remote-key `next`/`prev` are held
+  while a play is in flight and sent once it is answered.
+
+  What the TV shows is broadcast on
+  `UniversalProxy.MilkDrop.now_playing_topic/0` as
+  `{:milkdrop_now_playing, now_playing}` whenever it changes
+  (`t:now_playing/0`: the preset, its lock and the renderer's last
+  `selection` answer while `:presenting`, else `idle_now_playing/0`), and
+  read with a `:milkdrop_now_playing` call.
 
   Every phase is bounded (`:milkdrop_timeouts`, ms: tapping 10 000,
   preparing 20 000, taking 5 000, releasing 3 000, recovering 45 000 (the
   viewport's first five retries, 1 s doubling), exiting 3 000, reaping
-  3 000). A timed-out step (`:recovering` aside), a `take` the renderer
-  reports failed,
-  or a renderer that exits or crashes unasked (`{:milkdrop_exit, pid,
-  status}`, `:wedged`, `:reaper_down` and `:hang` included) stops it
+  3 000; a pending play, 15 000; the first selection retry, 1 000). A timed-out step (`:recovering`
+  aside), a `take` the renderer reports failed, or a renderer that exits
+  or crashes unasked (`{:milkdrop_exit, pid, status}`, `:wedged`,
+  `:reaper_down` and `:hang` included) stops it
   (`UniversalProxy.Display.MilkDrop.stop/1`) and, if the viewport had
   yielded, starts the viewport again; the model counts the failure toward
   its crash latch, which is logged. A renderer that stopped because it
@@ -176,10 +212,36 @@ defmodule UniversalProxy.Display.State do
     releasing: 3_000,
     recovering: 45_000,
     exiting: 3_000,
-    reaping: 3_000
+    reaping: 3_000,
+    play: 15_000,
+    selection_retry: 1_000
   }
+  @selection_retries 5
   # Renderer errors that mean `take` failed (it stays prepared, not master).
   @take_errors ["master_timeout", "take_failed"]
+
+  @idle_now_playing %{preset: nil, locked: false, selection: nil}
+
+  @refusals %{
+    "unknown" => :unknown,
+    "skipped" => :skipped,
+    "high_frequency" => :high_frequency,
+    "rpi3_skip" => :rpi3_skip,
+    "load_failed" => :load_failed
+  }
+
+  @type selection_info :: %{
+          gen: integer() | nil,
+          eligible: non_neg_integer() | nil,
+          playlist_fallback: boolean(),
+          hidden_fallback: boolean()
+        }
+
+  @type now_playing :: %{
+          preset: String.t() | nil,
+          locked: boolean(),
+          selection: selection_info() | nil
+        }
 
   @model_keys [:idle_ms, :party_idle_ms, :restart_ms, :restart_max_ms, :stable_ms]
   @viewport_keys [:layer_cache_mb, :preferred_size, :viz_tick_ms, :image_dirs]
@@ -189,6 +251,10 @@ defmodule UniversalProxy.Display.State do
     {name, opts} = Keyword.pop(opts, :name, __MODULE__)
     GenServer.start_link(__MODULE__, opts, name: name)
   end
+
+  @doc "What `now_playing` reads while no MilkDrop session presents."
+  @spec idle_now_playing() :: now_playing()
+  def idle_now_playing, do: @idle_now_playing
 
   @doc "Whether `dri_dir` holds a DRM card node."
   @spec display_card?(Path.t()) :: boolean()
@@ -239,6 +305,7 @@ defmodule UniversalProxy.Display.State do
       milkdrop?: milkdrop?,
       md: nil,
       md_last: nil,
+      now_playing: @idle_now_playing,
       md_opts:
         Keyword.put_new_lazy(Keyword.get(opts, :milkdrop_opts, []), :task_supervisor, fn ->
           Keyword.get(
@@ -268,7 +335,8 @@ defmodule UniversalProxy.Display.State do
                 do: [
                   MilkDrop.pack_topic(),
                   MilkDrop.settings_topic(),
-                  MilkDrop.user_presets_topic()
+                  MilkDrop.user_presets_topic(),
+                  MilkDrop.selection_topic()
                 ],
                 else: []
               ),
@@ -314,6 +382,34 @@ defmodule UniversalProxy.Display.State do
   def handle_call(:viewport, _from, state), do: {:reply, viewport_handle(state), state}
 
   def handle_call(:status, _from, state), do: {:reply, status(state), state}
+
+  def handle_call(:milkdrop_now_playing, _from, state), do: {:reply, state.now_playing, state}
+
+  def handle_call(
+        {:milkdrop_play, _id, _lock?},
+        _from,
+        %{md: %{phase: phase, play_sent: :unresponsive}} = state
+      )
+      when phase in [:preparing, :taking, :presenting],
+      do: {:reply, {:error, :unresponsive}, state}
+
+  # Answered when the renderer's answer arrives (see the moduledoc).
+  def handle_call(
+        {:milkdrop_play, id, lock?},
+        from,
+        %{md: %{phase: phase, pid: pid} = md} = state
+      )
+      when phase in [:preparing, :taking, :presenting] and is_pid(pid) and is_binary(id) and
+             is_boolean(lock?) do
+    md = answer_play(md, {:error, :superseded})
+    ref = make_ref()
+    timer = Process.send_after(self(), {:milkdrop_play_timeout, ref}, state.md_timeouts.play)
+    play = %{from: from, id: id, lock: lock?, ref: ref, timer: timer, sent?: false}
+    {:noreply, %{state | md: send_play(%{md | play: play})}}
+  end
+
+  def handle_call({:milkdrop_play, _id, _lock?}, _from, state),
+    do: {:reply, {:error, :not_presenting}, state}
 
   @impl true
   def handle_cast({:show, spec}, state) do
@@ -409,6 +505,47 @@ defmodule UniversalProxy.Display.State do
       when event in [:milkdrop_user_presets, :milkdrop_user_presets_started],
       do: {:noreply, milkdrop_reload_user(state)}
 
+  def handle_info({:milkdrop_selection, selection}, %{milkdrop?: true} = state)
+      when is_map(selection),
+      do: {:noreply, milkdrop_selection(state, selection)}
+
+  # Its command, if written, stays in flight until answered, so a late
+  # answer can't be taken for a later play of the same id.
+  def handle_info({:milkdrop_play_timeout, ref}, %{md: %{play: %{ref: ref} = play} = md} = state) do
+    Logger.info("[Display] MilkDrop: no answer to playing #{inspect(play.id)} in time")
+    {:noreply, %{state | md: answer_play(md, {:error, :timeout})}}
+  end
+
+  # A command unanswered for two play timeouts: the renderer doesn't answer
+  # plays, and this session refuses them from now on.
+  def handle_info(
+        {:milkdrop_play_stuck, ref},
+        %{md: %{play_sent: %{ref: ref} = sent} = md} = state
+      ) do
+    Logger.warning(
+      "[Display] MilkDrop renderer never answered playing #{inspect(sent.id)}; refusing plays this session"
+    )
+
+    md = answer_play(%{md | play_sent: :unresponsive}, {:error, :unresponsive})
+    {:noreply, %{state | md: flush_held(md)}}
+  end
+
+  def handle_info({:milkdrop_selection_unsent, pid, gen}, %{md: %{pid: pid, sent: sent}} = state) do
+    if Map.get(sent, :selection) == gen,
+      do: {:noreply, retry_selection(state)},
+      else: {:noreply, state}
+  end
+
+  # Each armed retry has its own token: a cancelled one's message, already
+  # delivered, doesn't match the retry armed after it.
+  def handle_info(
+        {:milkdrop_selection_retry, ref},
+        %{md: %{selection_retry: %{ref: ref} = retry, selection_want: want} = md} = state
+      ) do
+    state = %{state | md: %{md | selection_retry: %{retry | timer: nil, ref: nil}}}
+    {:noreply, send_selection(state, want)}
+  end
+
   def handle_info(
         {:milkdrop_ring, session, ring},
         %{md: %{session: session, phase: :tapping}} = state
@@ -416,7 +553,7 @@ defmodule UniversalProxy.Display.State do
       do: {:noreply, start_milkdrop(state, ring)}
 
   def handle_info({:milkdrop, pid, event}, %{md: %{pid: pid}} = state) when is_map(event),
-    do: {:noreply, milkdrop_event(state, event)}
+    do: {:noreply, state |> milkdrop_event(event) |> sync_now_playing()}
 
   # An exit status means the renderer process is gone; `:wedged`,
   # `:reaper_down` and `:hang` don't.
@@ -782,6 +919,13 @@ defmodule UniversalProxy.Display.State do
       preset: nil,
       locked: false,
       stats: nil,
+      selection: nil,
+      selection_want: nil,
+      selection_retry: nil,
+      play: nil,
+      play_sent: nil,
+      play_ms: state.md_timeouts.play,
+      held: [],
       sent: %{},
       reaped: false,
       ending: nil,
@@ -899,7 +1043,62 @@ defmodule UniversalProxy.Display.State do
 
   defp milkdrop_event(%{md: md} = state, %{event: :preset} = event) do
     locked = if is_boolean(event[:locked]), do: event.locked, else: md.locked
-    %{state | md: %{md | preset: event[:file], locked: locked}}
+    md = %{md | preset: event[:file], locked: locked}
+
+    case {md.play_sent, event} do
+      {%{id: id}, %{cause: "play", file: id}} -> %{state | md: play_answered(md, :ok)}
+      _other -> %{state | md: md}
+    end
+  end
+
+  defp milkdrop_event(%{md: md} = state, %{event: :play_refused} = event) do
+    reason = Map.get(@refusals, event[:reason], event[:reason])
+
+    Logger.info(
+      "[Display] MilkDrop refused to play #{inspect(event[:preset])}: #{inspect(reason)}"
+    )
+
+    case {md.play_sent, event} do
+      {%{id: id}, %{preset: id}} -> %{state | md: play_answered(md, {:error, {:refused, reason}})}
+      _other -> state
+    end
+  end
+
+  # A renderer started with the Store's selection reports its `gen` here
+  # first, so an unchanged broadcast is not sent again.
+  defp milkdrop_event(%{md: md} = state, %{event: :selection} = event) do
+    info = %{
+      gen: if(is_integer(event[:gen]), do: event.gen),
+      eligible: if(is_integer(event[:eligible]), do: event.eligible),
+      playlist_fallback: event[:playlist_fallback] == true,
+      hidden_fallback: event[:hidden_fallback] == true
+    }
+
+    if info.playlist_fallback or info.hidden_fallback,
+      do: Logger.info("[Display] MilkDrop selection falls back: #{inspect(info)}")
+
+    # Only a renderer's start (nothing sent yet) seeds the cache; after that
+    # only the selection wanted is acknowledged, not an older one's answer.
+    sent =
+      if info.gen && is_nil(md.selection_want),
+        do: Map.put_new(md.sent, :selection, info.gen),
+        else: md.sent
+
+    md = %{md | selection: info, sent: sent}
+    wanted = if md.selection_want, do: md.selection_want.gen, else: Map.get(sent, :selection)
+
+    md =
+      if info.gen != nil and info.gen == wanted and info.gen == Map.get(sent, :selection),
+        do: %{cancel_selection_retry(md) | selection_retry: nil},
+        else: md
+
+    %{state | md: md}
+  end
+
+  # The renderer could not read the file (it keeps the selection in force).
+  defp milkdrop_event(state, %{event: :error, reason: "selection"} = event) do
+    Logger.warning("[Display] MilkDrop renderer refused the selection: #{inspect(event)}")
+    retry_selection(state)
   end
 
   defp milkdrop_event(%{md: md} = state, %{event: :stats} = event),
@@ -938,15 +1137,15 @@ defmodule UniversalProxy.Display.State do
     state |> pcm_tap_off(md.tap_key) |> follow_up({:milkdrop, :ended, :requested})
   end
 
-  defp reclaim_milkdrop(%{md: %{phase: :preparing, pid: pid}} = state) do
+  defp reclaim_milkdrop(%{md: %{phase: :preparing, pid: pid} = md} = state) do
     :ok = Display.MilkDrop.exit(pid)
-    milkdrop_phase(state, :exiting)
+    milkdrop_phase(%{state | md: answer_play(md, {:error, :not_presenting})}, :exiting)
   end
 
-  defp reclaim_milkdrop(%{md: %{phase: phase, pid: pid}} = state)
+  defp reclaim_milkdrop(%{md: %{phase: phase, pid: pid} = md} = state)
        when phase in [:taking, :presenting] do
     :ok = Display.MilkDrop.release(pid)
-    milkdrop_phase(state, :releasing)
+    milkdrop_phase(%{state | md: answer_play(md, {:error, :not_presenting})}, :releasing)
   end
 
   defp reclaim_milkdrop(state), do: state
@@ -954,6 +1153,11 @@ defmodule UniversalProxy.Display.State do
   defp milkdrop_cmd(%{md: %{phase: phase, pid: pid} = md} = state, cmd)
        when phase in [:preparing, :taking, :presenting] and is_pid(pid) do
     case cmd do
+      # The renderer drops a pending play that `next`/`prev` replaces,
+      # without a word: held until the play in flight is answered.
+      switch when switch in [:next, :prev] and is_map(md.play_sent) ->
+        %{state | md: %{md | held: md.held ++ [switch]}}
+
       :next ->
         Display.MilkDrop.next(pid)
         state
@@ -1005,6 +1209,125 @@ defmodule UniversalProxy.Display.State do
   end
 
   defp milkdrop_reload_user(state), do: state
+
+  # A new selection starts its retries afresh.
+  defp milkdrop_selection(%{md: %{phase: phase, pid: pid} = md} = state, %{gen: gen} = selection)
+       when phase in [:preparing, :taking, :presenting] and is_pid(pid) and is_integer(gen) do
+    md = %{md | selection_want: selection}
+
+    md =
+      if Map.get(md.sent, :selection) == gen,
+        do: md,
+        else: %{cancel_selection_retry(md) | selection_retry: nil}
+
+    send_selection(%{state | md: md}, selection)
+  end
+
+  defp milkdrop_selection(state, _selection), do: state
+
+  defp send_selection(%{md: %{pid: pid, sent: sent} = md} = state, %{gen: gen} = selection) do
+    if Map.get(sent, :selection) == gen do
+      state
+    else
+      :ok = Display.MilkDrop.reload_selection(pid, selection)
+      %{state | md: %{md | sent: Map.put(sent, :selection, gen)}}
+    end
+  end
+
+  defp send_selection(state, nil), do: state
+
+  # The selection last sent did not take: it is sent again after a backoff
+  # (`:selection_retry` ms, doubling), at most @selection_retries times
+  # per selection.
+  defp retry_selection(%{md: %{selection_want: nil}} = state), do: state
+
+  defp retry_selection(%{md: md} = state) do
+    md = %{cancel_selection_retry(md) | sent: Map.delete(md.sent, :selection)}
+    attempt = if md.selection_retry, do: md.selection_retry.attempt, else: 0
+
+    if attempt >= @selection_retries do
+      Logger.warning(
+        "[Display] MilkDrop selection #{md.selection_want.gen} not taken after #{attempt} retries; waiting for the next change"
+      )
+
+      %{state | md: md}
+    else
+      ms = state.md_timeouts.selection_retry * Integer.pow(2, attempt)
+      ref = make_ref()
+      timer = Process.send_after(self(), {:milkdrop_selection_retry, ref}, ms)
+      %{state | md: %{md | selection_retry: %{timer: timer, ref: ref, attempt: attempt + 1}}}
+    end
+  end
+
+  defp cancel_selection_retry(%{selection_retry: %{timer: timer} = retry} = md)
+       when is_reference(timer) do
+    Process.cancel_timer(timer)
+    %{md | selection_retry: %{retry | timer: nil, ref: nil}}
+  end
+
+  defp cancel_selection_retry(md), do: md
+
+  # One `play` command is in flight at a time (`play_sent`): the protocol
+  # has no request token, so answers are matched by id, and a newer play
+  # waits for the older command's answer before it is written. A command
+  # unanswered for two play timeouts makes the lane `:unresponsive`.
+  defp send_play(%{play_sent: nil, play: %{sent?: false} = play} = md) do
+    :ok = Display.MilkDrop.play(md.pid, play.id, play.lock)
+    ref = make_ref()
+    timer = Process.send_after(self(), {:milkdrop_play_stuck, ref}, 2 * md.play_ms)
+    sent = %{id: play.id, lock: play.lock, ref: ref, timer: timer}
+    %{md | play_sent: sent, play: %{play | sent?: true}}
+  end
+
+  defp send_play(md), do: md
+
+  # The command in flight was answered: its caller, if still waiting, gets
+  # `reply`, then held `next`/`prev` and a play waiting behind it go out
+  # (a play written last replaces a still-pending `next`).
+  defp play_answered(md, reply) do
+    Process.cancel_timer(md.play_sent.timer)
+    md = if match?(%{sent?: true}, md.play), do: answer_play(md, reply), else: md
+    %{md | play_sent: nil} |> flush_held() |> send_play()
+  end
+
+  defp flush_held(%{held: held, pid: pid} = md) do
+    Enum.each(held, fn
+      :next -> Display.MilkDrop.next(pid)
+      :prev -> Display.MilkDrop.prev(pid)
+    end)
+
+    %{md | held: []}
+  end
+
+  # Replies to the pending play, if any.
+  defp answer_play(%{play: nil} = md, _reply), do: md
+
+  defp answer_play(%{play: play} = md, reply) do
+    Process.cancel_timer(play.timer)
+    GenServer.reply(play.from, reply)
+    %{md | play: nil}
+  end
+
+  defp now_playing(%{md: %{phase: :presenting} = md}),
+    do: %{preset: md.preset, locked: md.locked, selection: md.selection}
+
+  defp now_playing(_state), do: @idle_now_playing
+
+  defp sync_now_playing(state) do
+    case now_playing(state) do
+      same when same == state.now_playing ->
+        state
+
+      now ->
+        Phoenix.PubSub.broadcast(
+          state.pubsub,
+          MilkDrop.now_playing_topic(),
+          {:milkdrop_now_playing, now}
+        )
+
+        %{state | now_playing: now}
+    end
+  end
 
   defp pos_integer?(n), do: is_integer(n) and n > 0
 
@@ -1083,7 +1406,8 @@ defmodule UniversalProxy.Display.State do
   # may still hold DRM master, so the session waits in `:reaping` for its
   # reaper's `{:milkdrop_reaped, pid}` (bounded) before it is finished.
   defp end_milkdrop(%{md: md} = state, outcome, gone?) do
-    state = cancel_milkdrop_timer(state)
+    md = answer_play(md, {:error, :not_presenting})
+    state = cancel_milkdrop_timer(%{state | md: md})
     if md.ref, do: Process.demonitor(md.ref, [:flush])
 
     case outcome do
@@ -1109,6 +1433,7 @@ defmodule UniversalProxy.Display.State do
 
     state =
       %{state | md: nil, md_last: %{outcome: outcome, phase: md.ended_in}}
+      |> sync_now_playing()
       |> pcm_tap_off(md.tap_key)
       |> dispatch({:milkdrop, :ended, outcome})
 
@@ -1140,7 +1465,7 @@ defmodule UniversalProxy.Display.State do
         ms -> Process.send_after(self(), {:milkdrop_timeout, md.session, phase}, ms)
       end
 
-    %{state | md: %{md | phase: phase, timer: timer}}
+    sync_now_playing(%{state | md: %{md | phase: phase, timer: timer}})
   end
 
   defp cancel_milkdrop_timer(%{md: %{timer: timer} = md} = state) when is_reference(timer) do
@@ -1278,7 +1603,10 @@ defmodule UniversalProxy.Display.State do
           pack_version: md.version,
           preset: md.preset,
           locked: md.locked,
-          stats: md.stats
+          stats: md.stats,
+          selection: md.selection,
+          pending_play: md.play && md.play.id,
+          selection_retries: if(md.selection_retry, do: md.selection_retry.attempt, else: 0)
         }
       else
         %{phase: nil}

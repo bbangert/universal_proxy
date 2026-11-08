@@ -26,10 +26,11 @@ defmodule UniversalProxy.Display.MilkDropTest do
       )
 
     skip_file = Path.join(tmp_dir, "skip.txt")
+    selection_file = Path.join(tmp_dir, "selection.json")
     # Every fake renderer this test spawned has its (per-test) skip file in argv.
     on_exit(fn -> Enum.each(renderer_os_pids(skip_file), &kill_os_pid/1) end)
 
-    {:ok, store: store, skip_file: skip_file, pack_dir: tmp_dir}
+    {:ok, store: store, skip_file: skip_file, selection_file: selection_file, pack_dir: tmp_dir}
   end
 
   defp start_renderer(ctx, opts \\ []) do
@@ -42,6 +43,7 @@ defmodule UniversalProxy.Display.MilkDropTest do
           ladder: ["640x360", "480x270"],
           store: ctx.store,
           skip_file: ctx.skip_file,
+          selection_file: ctx.selection_file,
           user_dir: nil,
           binary: @fake_binary
         ],
@@ -51,8 +53,13 @@ defmodule UniversalProxy.Display.MilkDropTest do
     {:ok, pid} = MilkDrop.start(opts)
     on_exit(fn -> MilkDrop.stop(pid) end)
     assert_receive {:milkdrop, ^pid, %{event: :prepared} = prepared}, @timeout
+    # The renderer's answer to the selection file it started with.
+    assert_receive {:milkdrop, ^pid, %{event: :selection}}, @timeout
     {pid, prepared}
   end
+
+  defp fake(ctx, config),
+    do: File.write!(Path.join(ctx.pack_dir, "fake.json"), Jason.encode!(config))
 
   defp emit(pid, line), do: MilkDrop.command(pid, %{cmd: "emit", line: line})
 
@@ -145,6 +152,18 @@ defmodule UniversalProxy.Display.MilkDropTest do
              })
   end
 
+  test "args/1 with a selection file" do
+    assert ["--skip-file", "/s", "--selection-file", "/t/sel.json"] =
+             MilkDrop.args(%{
+               mode: @mode,
+               pack_dir: "/p",
+               ladder: ["640x360"],
+               skip_file: "/s",
+               selection_file: "/t/sel.json"
+             })
+             |> Enum.drop_while(&(&1 != "--skip-file"))
+  end
+
   test "args/1 without a refresh, and with a card and connector" do
     args =
       MilkDrop.args(%{
@@ -200,6 +219,8 @@ defmodule UniversalProxy.Display.MilkDropTest do
              "25",
              "--skip-file",
              ctx.skip_file,
+             "--selection-file",
+             ctx.selection_file,
              "--high-frequency",
              "--pcm-ring",
              "/run/up-pcm-x"
@@ -276,6 +297,124 @@ defmodule UniversalProxy.Display.MilkDropTest do
                    @timeout
 
     assert cmd_lines(ctx) == [%{"cmd" => "reload_user"}]
+  end
+
+  describe "preset selection" do
+    test "the Store's selection is written for the renderer, reloaded, and deleted with it",
+         ctx do
+      {:ok, _} = Store.favourite(ctx.store, "a.milk", true)
+      {:ok, _} = Store.hide(ctx.store, "p1.milk", true)
+      {:ok, _} = Store.playlist_add(ctx.store, "user/u.milk")
+
+      {pid, prepared} = start_renderer(ctx)
+
+      assert prepared.selection == %{
+               gen: 3,
+               favourites: ["a.milk"],
+               hidden: ["p1.milk"],
+               playlist: ["user/u.milk"],
+               playlist_enabled: false
+             }
+
+      {:ok, _} = Store.playlist_add(ctx.store, "p2.milk")
+      {:ok, sel} = Store.set_playlist_enabled(ctx.store, true)
+      :ok = MilkDrop.reload_selection(pid, sel)
+
+      # p2 is the only playlist entry in the fake's catalog.
+      assert_receive {:milkdrop, ^pid,
+                      %{event: :selection, gen: 5, eligible: 1, playlist_fallback: false}},
+                     @timeout
+
+      assert cmd_lines(ctx) == [%{"cmd" => "reload_selection"}]
+
+      assert Jason.decode!(File.read!(ctx.selection_file)) == %{
+               "gen" => 5,
+               "favourites" => ["a.milk"],
+               "hidden" => ["p1.milk"],
+               "playlist" => ["user/u.milk", "p2.milk"],
+               "playlist_enabled" => true
+             }
+
+      refute File.exists?(ctx.selection_file <> ".tmp")
+
+      # A playlist of nothing the catalog has: the renderer falls back.
+      {:ok, sel} = Store.playlist_remove(ctx.store, "p2.milk")
+      :ok = MilkDrop.reload_selection(pid, sel)
+
+      assert_receive {:milkdrop, ^pid,
+                      %{event: :selection, gen: 6, eligible: 9, playlist_fallback: true}},
+                     @timeout
+
+      # Everything hidden: hidden is ignored too, and both fallbacks show.
+      hidden = for n <- 0..9, do: "p#{n}.milk"
+      {:ok, _} = Store.playlist_add(ctx.store, "p2.milk")
+      sel = %{Store.selection(ctx.store) | hidden: hidden, gen: 99}
+      :ok = MilkDrop.reload_selection(pid, sel)
+
+      assert_receive {:milkdrop, ^pid,
+                      %{
+                        event: :selection,
+                        gen: 99,
+                        eligible: 10,
+                        playlist_fallback: true,
+                        hidden_fallback: true
+                      }},
+                     @timeout
+
+      MilkDrop.stop(pid)
+      wait_until(fn -> not File.exists?(ctx.selection_file) end)
+    end
+
+    test "a selection file that can't be written is not announced", ctx do
+      {pid, _} = start_renderer(ctx)
+      File.rm!(ctx.selection_file)
+      File.mkdir_p!(ctx.selection_file <> ".tmp")
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          :ok = MilkDrop.reload_selection(pid, Store.empty_selection())
+          _ = :sys.get_state(pid)
+        end)
+
+      assert log =~ "could not write the selection file"
+      assert_received {:milkdrop_selection_unsent, ^pid, 0}
+      MilkDrop.next(pid)
+      assert_receive {:milkdrop, ^pid, %{event: :preset}}, @timeout
+      assert cmd_lines(ctx) == [%{"cmd" => "next"}]
+    end
+
+    test "play is written as a JSON line; its preset or refusal is forwarded", ctx do
+      fake(ctx, %{refuse: %{"bad.milk" => "skipped", "broken.milk" => "load_failed"}})
+      {pid, _} = start_renderer(ctx)
+
+      :ok = MilkDrop.play(pid, "user/up.milk", true)
+
+      assert_receive {:milkdrop, ^pid,
+                      %{event: :preset, file: "user/up.milk", locked: true, cause: "play"}},
+                     @timeout
+
+      # The lock the renderer reports is saved, as any.
+      assert Store.settings(ctx.store).locked == "user/up.milk"
+
+      :ok = MilkDrop.play(pid, "bad.milk", false)
+
+      assert_receive {:milkdrop, ^pid,
+                      %{event: :play_refused, preset: "bad.milk", reason: "skipped"}},
+                     @timeout
+
+      :ok = MilkDrop.play(pid, "broken.milk", false)
+      assert_receive {:milkdrop, ^pid, %{event: :skip, preset: "broken.milk"}}, @timeout
+
+      assert_receive {:milkdrop, ^pid,
+                      %{event: :play_refused, preset: "broken.milk", reason: "load_failed"}},
+                     @timeout
+
+      assert cmd_lines(ctx) == [
+               %{"cmd" => "play", "preset" => "user/up.milk", "lock" => true},
+               %{"cmd" => "play", "preset" => "bad.milk", "lock" => false},
+               %{"cmd" => "play", "preset" => "broken.milk", "lock" => false}
+             ]
+    end
   end
 
   test "an upload's skip is recorded for its content and reaches the next renderer", ctx do

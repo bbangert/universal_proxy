@@ -33,6 +33,8 @@ defmodule UniversalProxy.Display do
   alias UniversalProxy.Display.{Mode, Spec, State}
 
   @call_timeout 30_000
+  # Past State's own bound on a play (15 s), which answers first.
+  @play_call_timeout 20_000
   @topic "display:state"
 
   @doc "Whether config enables the display subsystem."
@@ -116,6 +118,34 @@ defmodule UniversalProxy.Display do
     GenServer.call(State, :viewport)
   catch
     :exit, _ -> nil
+  end
+
+  @doc """
+  Plays MilkDrop preset `id` on the running visualizer session (see
+  `UniversalProxy.MilkDrop.play/3`, which also validates `id` and saves a
+  lock when nothing runs). `{:error, :not_presenting}` while no session
+  runs or the subsystem is off or down; `{:error, :timeout}` when State
+  does not answer in time.
+  """
+  @spec milkdrop_play(GenServer.server(), String.t(), boolean()) ::
+          :ok | {:error, UniversalProxy.MilkDrop.play_error()}
+  def milkdrop_play(server \\ State, id, lock?) when is_binary(id) and is_boolean(lock?) do
+    GenServer.call(server, {:milkdrop_play, id, lock?}, @play_call_timeout)
+  catch
+    :exit, {:timeout, _} -> {:error, :timeout}
+    :exit, _ -> {:error, :not_presenting}
+  end
+
+  @doc """
+  What the MilkDrop visualizer shows (see
+  `UniversalProxy.MilkDrop.now_playing/1`); nothing while the subsystem is
+  off or down.
+  """
+  @spec milkdrop_now_playing(GenServer.server()) :: State.now_playing()
+  def milkdrop_now_playing(server \\ State) do
+    GenServer.call(server, :milkdrop_now_playing)
+  catch
+    :exit, _ -> State.idle_now_playing()
   end
 
   @doc """

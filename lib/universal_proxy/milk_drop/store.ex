@@ -2,7 +2,7 @@ defmodule UniversalProxy.MilkDrop.Store do
   @moduledoc """
   DETS-backed MilkDrop settings and the runtime skip list.
 
-  Four records share one table:
+  Five records share one table:
 
     * `:settings` —
 
@@ -49,6 +49,27 @@ defmodule UniversalProxy.MilkDrop.Store do
       `skipped/2` and `skip_entries/2` return both lists, as does every
       `{:milkdrop_skipped, ...}` broadcast; the budget readmission above
       applies to both.
+
+    * `:selection` — the preset selector's choices, independent of the
+      pack version (a pack upgrade keeps them):
+
+          %{
+            gen: non_neg_integer(),         # bumped on every change
+            favourites: [id],               # 3 tickets per rotation deal
+            hidden: [id],                   # never rotate
+            playlist: [id],                 # in the order added
+            playlist_enabled: boolean()     # rotate only playlist ∩ eligible
+          }
+
+      Ids are pack-relative files or `user/` ids, kept whether or not the
+      pack or the library holds them (an upload may come later). Each is
+      a valid renderer preset id of at most 512 bytes (`valid_id?/1`), each list holds at most 5000 distinct ids, and
+      the record's JSON (the renderer's `--selection-file`, which it reads
+      up to 1 MiB) at most 768 KiB: an addition past a limit is refused
+      (`{:error, :invalid_id | :too_many | :too_large}`); removals always
+      go through. A change that
+      changes nothing is not written and keeps `gen`. Deleted uploads
+      leave it in the same write as their skips (`user_presets_removed/2`).
 
     * `:in_flight` — the preset the renderer was last told to load (see
       "Device resets" below).
@@ -115,8 +136,9 @@ defmodule UniversalProxy.MilkDrop.Store do
   default, `rotate_s`) and once more when its owner ends, so its flash
   wear is negligible.
 
-  Changes are broadcast on `UniversalProxy.MilkDrop.settings_topic/0` (see
-  `UniversalProxy.MilkDrop`).
+  Changes are broadcast on `UniversalProxy.MilkDrop.settings_topic/0`, the
+  selection's (`{:milkdrop_selection, selection}`, the whole record) on
+  `UniversalProxy.MilkDrop.selection_topic/0` (see `UniversalProxy.MilkDrop`).
 
   The public API follows the `catch :exit` idiom for optional subsystems:
   while the store is not running reads return defaults and writes
@@ -168,6 +190,15 @@ defmodule UniversalProxy.MilkDrop.Store do
 
   @keys Map.keys(@defaults)
 
+  @empty_selection %{gen: 0, favourites: [], hidden: [], playlist: [], playlist_enabled: false}
+  @selection_lists [:favourites, :hidden, :playlist]
+  @max_id_bytes 512
+  # UTF-8 continuation and lead bytes are all >= 0x80, so a byte scan is exact.
+  @control_bytes Enum.map(Enum.to_list(0..31) ++ [127], &<<&1>>)
+  @max_selection_ids 5000
+  # The renderer reads at most 1 MiB of --selection-file.
+  @max_selection_bytes 768 * 1024
+
   @type settings :: %{
           include_high_frequency: boolean(),
           rotate_s: 10..120,
@@ -176,6 +207,16 @@ defmodule UniversalProxy.MilkDrop.Store do
         }
 
   @type skipped :: %{String.t() => String.t()}
+
+  @type selection :: %{
+          gen: non_neg_integer(),
+          favourites: [String.t()],
+          hidden: [String.t()],
+          playlist: [String.t()],
+          playlist_enabled: boolean()
+        }
+
+  @type selection_error :: :invalid_id | :too_many | :too_large | term()
 
   @type skip_entry :: %{reason: String.t(), fps: float() | nil}
 
@@ -226,8 +267,21 @@ defmodule UniversalProxy.MilkDrop.Store do
   saved. Returns the new settings.
   """
   @spec update(GenServer.server(), map()) :: {:ok, settings()} | {:error, term()}
-  def update(server \\ __MODULE__, params) when is_map(params) do
-    GenServer.call(server, {:update, params})
+  def update(server \\ __MODULE__, params) when is_map(params), do: update(server, params, [])
+
+  @doc """
+  `update/2` with an ordering for `locked`, whose writers race (a
+  renderer session that is retiring, a lock saved for the next one).
+  `session: n` — a renderer session's write (`n` from
+  `System.unique_integer([:monotonic])` at its start): its `locked` is
+  ignored when `n` is below the fence. `fence: n` — a write made when no
+  session presents (`n` taken before checking that): later writes from
+  sessions started before `n` lose their `locked`. The fence lives in
+  memory, for this store's lifetime.
+  """
+  @spec update(GenServer.server(), map(), keyword()) :: {:ok, settings()} | {:error, term()}
+  def update(server, params, opts) when is_map(params) and is_list(opts) do
+    GenServer.call(server, {:update, params, opts})
   catch
     :exit, _ -> {:error, :not_running}
   end
@@ -309,12 +363,85 @@ defmodule UniversalProxy.MilkDrop.Store do
   end
 
   @doc """
-  These uploads (`user/` ids) were deleted: forget their skips, and the
-  `locked` setting if it names one of them, in one write.
+  These uploads (`user/` ids) were deleted: forget their skips, the
+  `locked` setting if it names one of them, and their favourite, hidden
+  and playlist entries, in one write.
   """
   @spec user_presets_removed(GenServer.server(), [String.t()]) :: :ok | {:error, term()}
   def user_presets_removed(server \\ __MODULE__, ids) when is_list(ids) do
     GenServer.call(server, {:forget_user, ids, true})
+  catch
+    :exit, _ -> {:error, :not_running}
+  end
+
+  @doc "The empty selection (`gen` 0), what `selection/1` reads while the store is not running."
+  @spec empty_selection() :: selection()
+  def empty_selection, do: @empty_selection
+
+  @doc """
+  Whether `id` can be stored in the selection or sent to the renderer:
+  the renderer's `valid_preset_file` (a relative path of at least 6
+  bytes ending in `.milk`, no `.`, `..` or empty segment, valid UTF-8
+  without control characters), at most #{@max_id_bytes} bytes (the
+  renderer allows 1024). Says nothing about whether a preset has that id.
+  """
+  @spec valid_id?(term()) :: boolean()
+  def valid_id?(id) when is_binary(id) and byte_size(id) in 6..@max_id_bytes do
+    String.valid?(id) and :binary.match(id, @control_bytes) == :nomatch and
+      String.ends_with?(id, ".milk") and
+      not Enum.any?(String.split(id, "/"), &(&1 in ["", ".", ".."]))
+  end
+
+  def valid_id?(_id), do: false
+
+  @doc "The preset selection (see the moduledoc; `empty_selection/0` while the store is not running)."
+  @spec selection(GenServer.server()) :: selection()
+  def selection(server \\ __MODULE__) do
+    GenServer.call(server, :selection)
+  catch
+    :exit, _ -> @empty_selection
+  end
+
+  @doc "Favourite (or unfavourite) preset `id`. Returns the new selection."
+  @spec favourite(GenServer.server(), String.t(), boolean()) ::
+          {:ok, selection()} | {:error, selection_error()}
+  def favourite(server \\ __MODULE__, id, flag) when is_boolean(flag),
+    do: change_selection(server, id, {:favourites, id, flag})
+
+  @doc "Hide (or unhide) preset `id` from the rotation. Returns the new selection."
+  @spec hide(GenServer.server(), String.t(), boolean()) ::
+          {:ok, selection()} | {:error, selection_error()}
+  def hide(server \\ __MODULE__, id, flag) when is_boolean(flag),
+    do: change_selection(server, id, {:hidden, id, flag})
+
+  @doc "Append preset `id` to the playlist (kept where it is if already there)."
+  @spec playlist_add(GenServer.server(), String.t()) ::
+          {:ok, selection()} | {:error, selection_error()}
+  def playlist_add(server \\ __MODULE__, id),
+    do: change_selection(server, id, {:playlist, id, true})
+
+  @doc "Remove preset `id` from the playlist."
+  @spec playlist_remove(GenServer.server(), String.t()) ::
+          {:ok, selection()} | {:error, selection_error()}
+  def playlist_remove(server \\ __MODULE__, id),
+    do: change_selection(server, id, {:playlist, id, false})
+
+  @doc "Empty the playlist (`playlist_enabled` stays as it is)."
+  @spec playlist_clear(GenServer.server()) :: {:ok, selection()} | {:error, selection_error()}
+  def playlist_clear(server \\ __MODULE__), do: selection_call(server, :playlist_clear)
+
+  @doc "Rotate only through the playlist (or not)."
+  @spec set_playlist_enabled(GenServer.server(), boolean()) ::
+          {:ok, selection()} | {:error, selection_error()}
+  def set_playlist_enabled(server \\ __MODULE__, flag) when is_boolean(flag),
+    do: selection_call(server, {:playlist_enabled, flag})
+
+  defp change_selection(server, id, change) do
+    if valid_id?(id), do: selection_call(server, change), else: {:error, :invalid_id}
+  end
+
+  defp selection_call(server, change) do
+    GenServer.call(server, {:selection, change})
   catch
     :exit, _ -> {:error, :not_running}
   end
@@ -389,6 +516,8 @@ defmodule UniversalProxy.MilkDrop.Store do
       pubsub: pubsub,
       retry_ms: Keyword.get(opts, :retry_ms, @retry_ms),
       retry_timer: nil,
+      # Renderer sessions below this may no longer write `locked` (`update/3`).
+      lock_fence: nil,
       open_error: nil,
       boot_id: Keyword.get_lazy(opts, :boot_id, &read_boot_id/0),
       # Tells this store's marks from those of another VM run in the same
@@ -453,6 +582,10 @@ defmodule UniversalProxy.MilkDrop.Store do
     {:reply, read_settings(state.table), state}
   end
 
+  def handle_call(:selection, _from, state) do
+    {:reply, read_selection(state.table), state}
+  end
+
   def handle_call(:in_flight, _from, state) do
     reply =
       case read_in_flight(state.table) do
@@ -470,6 +603,7 @@ defmodule UniversalProxy.MilkDrop.Store do
                 elem(request, 0) in [
                   :update,
                   :skip,
+                  :selection,
                   :forget_user,
                   :mark_in_flight,
                   :clear_in_flight
@@ -493,8 +627,9 @@ defmodule UniversalProxy.MilkDrop.Store do
 
   # The settings and the skip list they readmit from are one write, so a
   # failure leaves both as they were and a retry readmits again.
-  def handle_call({:update, params}, _from, state) do
+  def handle_call({:update, params, opts}, _from, state) do
     existing = read_settings(state.table)
+    params = fence_lock(state, params, opts[:session])
     merged = merge(existing, params)
     readmission = readmission(state, merged.min_fps)
 
@@ -502,7 +637,7 @@ defmodule UniversalProxy.MilkDrop.Store do
       :ok ->
         if merged != existing, do: broadcast(state, {:milkdrop_settings, merged})
         announce_readmission(state, merged.min_fps, readmission)
-        {:reply, {:ok, merged}, state}
+        {:reply, {:ok, merged}, raise_fence(state, opts[:fence])}
 
       {:error, reason} ->
         Logger.error("MilkDrop store settings update failed: #{inspect(reason)}")
@@ -514,8 +649,27 @@ defmodule UniversalProxy.MilkDrop.Store do
     {:reply, add_skip(state, version, preset, reason, sha), state}
   end
 
-  def handle_call({:forget_user, ids, unlock?}, _from, state) do
-    {:reply, forget_user(state, ids, unlock?), state}
+  def handle_call({:forget_user, ids, removed?}, _from, state) do
+    {:reply, forget_user(state, ids, removed?), state}
+  end
+
+  def handle_call({:selection, change}, _from, state) do
+    existing = read_selection(state.table)
+
+    reply =
+      case apply_selection(existing, change) do
+        {:ok, ^existing} ->
+          {:ok, existing}
+
+        {:ok, changed} ->
+          with :ok <- check_selection_size(change, changed),
+               do: save_selection(state, %{changed | gen: existing.gen + 1})
+
+        {:error, _reason} = error ->
+          error
+      end
+
+    {:reply, reply, state}
   end
 
   def handle_call({:mark_in_flight, session, version, preset, sha}, {owner, _tag}, state) do
@@ -552,6 +706,22 @@ defmodule UniversalProxy.MilkDrop.Store do
   end
 
   # -- Private --
+
+  # A retired session's late lock write, after a newer explicit one.
+  defp fence_lock(%{lock_fence: fence}, params, session)
+       when is_integer(fence) and is_integer(session) and session < fence do
+    if Params.has_key?(params, :locked),
+      do: Logger.info("MilkDrop: ignoring a retired renderer session's lock")
+
+    Map.drop(params, [:locked, "locked"])
+  end
+
+  defp fence_lock(_state, params, _session), do: params
+
+  defp raise_fence(state, fence) when is_integer(fence),
+    do: %{state | lock_fence: max(fence, state.lock_fence || fence)}
+
+  defp raise_fence(state, _fence), do: state
 
   # Opens the table into `state`. On failure the state stays closed
   # (`table: nil`) with `open_error` set.
@@ -755,22 +925,30 @@ defmodule UniversalProxy.MilkDrop.Store do
     end
   end
 
-  # Skips of these ids go, and with `unlock?` (deleted) the lock if it
-  # names one; without (replaced) only their stale skips go, which
-  # `current_user_skips/1` drops anyway.
-  defp forget_user(state, ids, unlock?) do
+  # Skips of these ids go, and with `removed?` (deleted) the lock if it
+  # names one and their selection entries; without (replaced) only their
+  # stale skips go, which `current_user_skips/1` drops anyway.
+  defp forget_user(state, ids, removed?) do
     entries = read_user_skipped(state.table)
     current = current_user_skips(state)
-    kept = if unlock?, do: Map.drop(current, ids), else: current
+    kept = if removed?, do: Map.drop(current, ids), else: current
     settings = read_settings(state.table)
-    unlock? = unlock? and settings.locked in ids
-    settings_records = if unlock?, do: [{:settings, %{settings | locked: nil}}], else: []
+    unlock? = removed? and settings.locked in ids
+    selection = read_selection(state.table)
+    pruned = if removed?, do: drop_selected(selection, ids), else: selection
+    reselect? = pruned != selection
+    pruned = %{pruned | gen: if(reselect?, do: selection.gen + 1, else: selection.gen)}
 
-    if kept == entries and not unlock? do
+    records =
+      if(unlock?, do: [{:settings, %{settings | locked: nil}}], else: []) ++
+        if reselect?, do: [{:selection, pruned}], else: []
+
+    if kept == entries and records == [] do
       :ok
     else
-      with :ok <- persist_user_skips(state, kept, settings_records, "upload clean-up") do
+      with :ok <- persist_user_skips(state, kept, records, "upload clean-up") do
         if unlock?, do: broadcast(state, {:milkdrop_settings, %{settings | locked: nil}})
+        if reselect?, do: broadcast_selection(state, pruned)
         :ok
       end
     end
@@ -794,6 +972,87 @@ defmodule UniversalProxy.MilkDrop.Store do
       state.user_sha.(id) == sha
     end)
   end
+
+  # -- Private: selection --
+
+  defp apply_selection(selection, {list, id, true}) do
+    ids = Map.fetch!(selection, list)
+
+    cond do
+      id in ids -> {:ok, selection}
+      length(ids) >= @max_selection_ids -> {:error, :too_many}
+      true -> {:ok, %{selection | list => ids ++ [id]}}
+    end
+  end
+
+  defp apply_selection(selection, {list, id, false}),
+    do: {:ok, Map.update!(selection, list, &List.delete(&1, id))}
+
+  defp apply_selection(selection, :playlist_clear), do: {:ok, %{selection | playlist: []}}
+
+  defp apply_selection(selection, {:playlist_enabled, flag}),
+    do: {:ok, %{selection | playlist_enabled: flag}}
+
+  defp drop_selected(selection, ids) do
+    drop = MapSet.new(ids)
+
+    Enum.reduce(@selection_lists, selection, fn list, acc ->
+      Map.update!(acc, list, fn kept -> Enum.reject(kept, &MapSet.member?(drop, &1)) end)
+    end)
+  end
+
+  defp save_selection(state, selection) do
+    case persist(state, {:selection, selection}) do
+      :ok ->
+        broadcast_selection(state, selection)
+        {:ok, selection}
+
+      {:error, reason} = error ->
+        Logger.error("MilkDrop store selection update failed: #{inspect(reason)}")
+        error
+    end
+  end
+
+  # Only an addition can grow the renderer's file (`UniversalProxy.Display.MilkDrop`
+  # writes these five keys as they are), so a removal always goes through.
+  defp check_selection_size({_list, _id, true}, selection) do
+    if IO.iodata_length(Jason.encode_to_iodata!(selection)) <= @max_selection_bytes,
+      do: :ok,
+      else: {:error, :too_large}
+  end
+
+  defp check_selection_size(_change, _selection), do: :ok
+
+  defp broadcast_selection(state, selection) do
+    Phoenix.PubSub.broadcast(
+      state.pubsub,
+      MilkDrop.selection_topic(),
+      {:milkdrop_selection, selection}
+    )
+  end
+
+  defp read_selection(nil), do: @empty_selection
+
+  defp read_selection(table) do
+    case :dets.lookup(table, :selection) do
+      [{:selection, stored}] when is_map(stored) -> sanitize_selection(stored)
+      _ -> @empty_selection
+    end
+  end
+
+  defp sanitize_selection(stored) do
+    gen = if is_integer(stored[:gen]) and stored[:gen] >= 0, do: stored.gen, else: 0
+    enabled? = stored[:playlist_enabled] == true
+
+    Enum.reduce(@selection_lists, %{@empty_selection | gen: gen, playlist_enabled: enabled?}, fn
+      list, acc -> %{acc | list => sanitize_ids(stored[list])}
+    end)
+  end
+
+  defp sanitize_ids(ids) when is_list(ids),
+    do: ids |> Enum.filter(&valid_id?/1) |> Enum.uniq() |> Enum.take(@max_selection_ids)
+
+  defp sanitize_ids(_ids), do: []
 
   defp new_marker(state, owner, session, version, preset, sha) do
     %{

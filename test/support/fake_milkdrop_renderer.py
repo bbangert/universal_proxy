@@ -5,8 +5,10 @@ Speaks the line-JSON protocol documented in UniversalProxy.Display.MilkDrop
 ("Renderer CLI contract" / "Line-JSON protocol"). Stays narrow on purpose:
 only what the tests drive.
 
-  startup        → {"event":"prepared","argv":[...],"skip":[...]}
-                   (argv and the --skip-file contents are test-only fields)
+  startup        → {"event":"prepared","argv":[...],"skip":[...],"selection":S}
+                   (argv, the --skip-file contents and the decoded
+                   --selection-file, null when none, are test-only fields),
+                   then with --selection-file the selection event below
   stdin commands → stdout events
     {"cmd":"take"}    → {"event":"presenting"}
     {"cmd":"release"} → {"event":"released"}
@@ -17,6 +19,15 @@ only what the tests drive.
     {"cmd":"reload_user"}  → {"event":"user_reloaded","presets":N,"added":A,
                              "removed":R,"rejected":0}, counted from
                              <user-dir>/manifest.json (none without one)
+    {"cmd":"reload_selection"} → {"event":"selection","gen":N,"eligible":E,
+                             "playlist_fallback":B,"hidden_fallback":B}, from
+                             --selection-file over the catalog p0..p9.milk
+    {"cmd":"play","preset":F,"lock":B}
+                           → {"event":"loading","preset":F}, then
+                             {"event":"preset","file":F,"locked":B,"cause":"play"};
+                             for F in fake.json's "refuse" (F → reason)
+                             {"event":"play_refused","preset":F,"reason":R}
+                             (load_failed also emits skip, as the binary)
   test-only:
     {"cmd":"emit","line":"<raw>"} → <raw> verbatim on its own line
     {"cmd":"crash","status":N}    → exit N, no event
@@ -39,6 +50,11 @@ it) comes from an optional <pack-dir>/fake.json:
     {"startup_preset": F}         → loading F and preset F (cause start) before
                                     prepared, as the real binary's start
     {"take_hang_loading": F}      → answer take with loading F, then as stall
+    {"refuse": {F: reason}}       → play F is refused with reason
+    {"play_delay_ms": N}          → answer each play N ms after reading it
+    {"play_delays": [N, ...]}     → the same for the first plays, in order
+    {"play_defer": true}          → answer them from a timer instead, reading
+                                    (and logging) later commands meanwhile
 
 It touches <skip-file>.spawned first thing, so tests can tell it was ever
 started. Every stdin line is appended to <skip-file>.cmds, so tests can
@@ -89,6 +105,44 @@ def user_files(user_dir):
         return set()
 
 
+CATALOG = ["p%d.milk" % i for i in range(10)]
+
+
+def read_selection(path):
+    if path is None:
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+# PresetManager::rotation_pool() over the fake catalog (every preset
+# eligible): the first non-empty of the unhidden playlist presets (while it
+# is enabled), the unhidden ones (playlist_fallback iff the playlist is
+# enabled), all of them (hidden_fallback).
+def selection_event(sel):
+    sel = sel or {}
+    hidden = set(sel.get("hidden", []))
+    playlist = set(sel.get("playlist", []))
+    enabled = bool(sel.get("playlist_enabled"))
+    unhidden = [p for p in CATALOG if p not in hidden]
+    listed = [p for p in unhidden if p in playlist]
+    event = {"event": "selection", "gen": sel.get("gen", 0),
+             "playlist_fallback": False, "hidden_fallback": False}
+    if enabled and listed:
+        event["eligible"] = len(listed)
+        return event
+    event["playlist_fallback"] = enabled
+    if unhidden:
+        event["eligible"] = len(unhidden)
+        return event
+    event["eligible"] = len(CATALOG)
+    event["hidden_fallback"] = len(CATALOG) > 0
+    return event
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", required=True)
@@ -122,17 +176,39 @@ def main():
     ignore_eof = bool(fake.get("ignore_eof"))
 
     preset = 0
+    # The preset showing: what lock/unlock events name.
+    current = "p0.milk"
     locked = args.locked is not None
     uploads = user_files(args.user_dir)
 
     def emit_preset(cause):
-        emit({"event": "preset", "file": "p%d.milk" % preset, "locked": locked,
-              "cause": cause})
+        emit({"event": "preset", "file": current, "locked": locked, "cause": cause})
+
+    refuse = fake.get("refuse", {})
+    play_delays = list(fake.get("play_delays", []))
+
+    def answer_play(cmd):
+        nonlocal current, locked
+        target = cmd["preset"]
+        if target in refuse:
+            if refuse[target] == "load_failed":
+                emit({"event": "loading", "preset": target})
+                emit({"event": "skip", "preset": target, "reason": "compile"})
+            emit({"event": "play_refused", "preset": target, "reason": refuse[target]})
+        else:
+            locked = bool(cmd.get("lock"))
+            current = target
+            emit({"event": "loading", "preset": target})
+            emit({"event": "preset", "file": target, "locked": locked, "cause": "play"})
 
     def prepared():
-        emit({"event": "prepared", "argv": sys.argv[1:], "skip": skip})
+        emit({"event": "prepared", "argv": sys.argv[1:], "skip": skip,
+              "selection": read_selection(args.selection_file)})
+        if args.selection_file is not None:
+            emit(selection_event(read_selection(args.selection_file)))
 
     if "startup_preset" in fake:
+        current = fake["startup_preset"]
         emit({"event": "loading", "preset": fake["startup_preset"]})
         emit({"event": "preset", "file": fake["startup_preset"], "locked": locked,
               "cause": "start"})
@@ -174,7 +250,8 @@ def main():
             prepared()
         elif name in ("next", "prev"):
             preset = preset + 1 if name == "next" else max(preset - 1, 0)
-            emit({"event": "loading", "preset": "p%d.milk" % preset})
+            current = "p%d.milk" % preset
+            emit({"event": "loading", "preset": current})
             emit_preset(name)
         elif name == "reload_user":
             now = user_files(args.user_dir)
@@ -182,6 +259,15 @@ def main():
                   "added": len(now - uploads), "removed": len(uploads - now),
                   "rejected": 0})
             uploads = now
+        elif name == "reload_selection":
+            emit(selection_event(read_selection(args.selection_file)))
+        elif name == "play":
+            delay = play_delays.pop(0) if play_delays else fake.get("play_delay_ms", 0)
+            if fake.get("play_defer"):
+                threading.Timer(delay / 1000.0, answer_play, [cmd]).start()
+            else:
+                time.sleep(delay / 1000.0)
+                answer_play(cmd)
         elif name in ("lock", "unlock"):
             locked = name == "lock"
             emit_preset(name)

@@ -33,8 +33,25 @@ defmodule UniversalProxy.MilkDrop do
       a Pack process starts;
     * `user_presets_topic/0` (`"milkdrop:user_presets"`) —
       `{:milkdrop_user_presets, change}` on every change to the upload
-      library (see `UniversalProxy.MilkDrop.UserPresets`).
+      library (see `UniversalProxy.MilkDrop.UserPresets`);
+    * `selection_topic/0` (`"milkdrop:selection"`) —
+      `{:milkdrop_selection, selection}`, the whole
+      `UniversalProxy.MilkDrop.Store` selection record, on every change;
+    * `now_playing_topic/0` (`"milkdrop:now_playing"`) —
+      `{:milkdrop_now_playing, now_playing}` (see `now_playing/1`)
+      whenever it changes, from `UniversalProxy.Display.State`.
+
+  ## Play now
+
+  `play/3` shows one preset on the TV at once, optionally locking to it,
+  through `UniversalProxy.Display.State` to the running renderer;
+  `now_playing/1` reads what is on screen.
   """
+
+  require Logger
+
+  alias UniversalProxy.Display
+  alias UniversalProxy.MilkDrop.Store
 
   @supported_targets ~w(rpi3 rpi4 rpi5)a
 
@@ -45,6 +62,8 @@ defmodule UniversalProxy.MilkDrop do
   @settings_topic "milkdrop:settings"
   @pack_topic "milkdrop:pack"
   @user_presets_topic "milkdrop:user_presets"
+  @selection_topic "milkdrop:selection"
+  @now_playing_topic "milkdrop:now_playing"
 
   # rpi3 presents on every second vblank (30 fps at 60 Hz); rpi4/rpi5 can
   # present at the refresh rate.
@@ -87,6 +106,87 @@ defmodule UniversalProxy.MilkDrop do
   @doc "PubSub topic for upload library changes (see the moduledoc)."
   @spec user_presets_topic() :: String.t()
   def user_presets_topic, do: @user_presets_topic
+
+  @doc "PubSub topic for the Store's preset selection (see the moduledoc)."
+  @spec selection_topic() :: String.t()
+  def selection_topic, do: @selection_topic
+
+  @doc "PubSub topic for what the TV shows (see the moduledoc)."
+  @spec now_playing_topic() :: String.t()
+  def now_playing_topic, do: @now_playing_topic
+
+  @type play_error ::
+          :invalid_id
+          | :not_presenting
+          | :timeout
+          | :superseded
+          | :unresponsive
+          | {:refused,
+             :unknown | :skipped | :high_frequency | :rpi3_skip | :load_failed | String.t()}
+
+  @doc """
+  Show preset `id` (a pack-relative file or a `user/` id) on the TV now,
+  and with `lock?` hold rotation on it. Hidden and off-playlist presets
+  can be played; the renderer refuses a skipped one, a `high_frequency`
+  one while those are filtered out, an rpi3 `skip` one and one it does
+  not know, or fails to load (`{:error, {:refused, reason}}`).
+
+  `:ok` once it shows (within 15 s, else `{:error, :timeout}`);
+  `{:error, :superseded}` when a newer `play/3` replaced it;
+  `{:error, :unresponsive}` once the session's renderer stopped answering
+  plays;
+  `{:error, :not_presenting}` while no visualizer session runs (or ends
+  meanwhile), in which case `lock?` still saves `id` as the Store's
+  `locked`, so the next session starts on it (and a retiring session's
+  late lock can't overwrite it: `Store.update/3`'s fence). A lock that
+  does show is saved by the renderer's own `preset` event. Only the id's shape is
+  checked here (`Store.valid_id?/1`, else `{:error, :invalid_id}`).
+
+  Options: `:display` (the `UniversalProxy.Display.State` server) and
+  `:store` (the Store).
+  """
+  @spec play(String.t(), boolean(), keyword()) :: :ok | {:error, play_error()}
+  def play(id, lock? \\ false, opts \\ []) when is_boolean(lock?) do
+    if Store.valid_id?(id) do
+      # Taken first: every renderer session that could still write a lock
+      # when nothing presents started before it.
+      fence = System.unique_integer([:monotonic])
+
+      case Display.milkdrop_play(Keyword.get(opts, :display, Display.State), id, lock?) do
+        {:error, :not_presenting} = error when lock? ->
+          save_lock(Keyword.get(opts, :store, Store), id, fence)
+          error
+
+        reply ->
+          reply
+      end
+    else
+      {:error, :invalid_id}
+    end
+  end
+
+  defp save_lock(store, id, fence) do
+    with {:error, reason} <- Store.update(store, %{locked: id}, fence: fence) do
+      Logger.warning("MilkDrop: could not save the lock on #{inspect(id)}: #{inspect(reason)}")
+    end
+  end
+
+  @doc """
+  What the TV shows, also broadcast on `now_playing_topic/0`:
+
+      %{preset: id | nil, locked: boolean(),
+        selection: %{gen:, eligible:, playlist_fallback:, hidden_fallback:} | nil}
+
+  `preset` is `nil` unless a visualizer session is presenting. `selection`
+  is the renderer's last answer to the selection it was given: how many
+  presets the rotation can pick from, and whether the playlist
+  (`playlist_fallback`) or the hidden list (`hidden_fallback`) left
+  nothing eligible, so the renderer ignores it. Option `:display` names
+  the `UniversalProxy.Display.State` server.
+  """
+  @spec now_playing(keyword()) :: Display.State.now_playing()
+  def now_playing(opts \\ []),
+    do: Display.milkdrop_now_playing(Keyword.get(opts, :display, Display.State))
 
   @doc """
   Directory holding the extracted pack(s), download temporaries, the
