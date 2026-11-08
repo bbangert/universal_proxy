@@ -106,7 +106,8 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   `{:error, {:io, reason}}` and changes nothing. `set_high_frequency/3`
   sets or clears the tag. While an import
   runs they return `{:error, :busy}`, as does another `import/2`; the reads
-  (`list/1`, `usage/1`, `sha256/2`) are served throughout.
+  (`list/1`, `usage/1`, `upload_target/1`, `sha256/2`) are served
+  throughout.
 
   ## Changes
 
@@ -234,6 +235,33 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
   @doc "Where uploads wait for `import/2` under `root`."
   @spec incoming_dir(String.t()) :: String.t()
   def incoming_dir(root \\ MilkDrop.root()), do: Path.join(root, "incoming")
+
+  @doc "The largest single upload `import/2` opens."
+  @spec max_upload_bytes() :: pos_integer()
+  def max_upload_bytes, do: @max_upload_bytes
+
+  @doc """
+  Where an upload is streamed before `import/2` and how much may land
+  there: the server's `incoming_dir/1`, its upload cap (`:max_upload_bytes`),
+  its byte quota and `room`, the free space left above the free-space
+  floor (`df`, see the moduledoc; never negative). Served while an import
+  runs; `{:error, {:free_space, reason}}` when it can't be measured,
+  `{:error, :not_running}` without a server.
+  """
+  @spec upload_target(GenServer.server()) ::
+          {:ok,
+           %{
+             dir: String.t(),
+             room: non_neg_integer(),
+             max_upload_bytes: pos_integer(),
+             quota_bytes: pos_integer()
+           }}
+          | {:error, term()}
+  def upload_target(server \\ __MODULE__) do
+    GenServer.call(server, :upload_target)
+  catch
+    :exit, _ -> {:error, :not_running}
+  end
 
   @doc "Import uploads copied into `incoming_dir/1` (see the moduledoc)."
   @spec import(GenServer.server(), [{String.t(), Path.t()}]) ::
@@ -395,6 +423,21 @@ defmodule UniversalProxy.MilkDrop.UserPresets do
 
   def handle_call(:usage, _from, state),
     do: {:reply, Map.put(usage_of(state.library), :quota, state.quota), state}
+
+  def handle_call(:upload_target, _from, state) do
+    reply =
+      with {:ok, floor, free} <- measure(state) do
+        {:ok,
+         %{
+           dir: state.incoming,
+           room: max(free - floor, 0),
+           max_upload_bytes: state.max_upload_bytes,
+           quota_bytes: state.quota.bytes
+         }}
+      end
+
+    {:reply, reply, state}
+  end
 
   def handle_call(_write, _from, %{busy: busy} = state) when busy != nil,
     do: {:reply, {:error, :busy}, state}

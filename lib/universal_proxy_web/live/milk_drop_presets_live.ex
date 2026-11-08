@@ -22,7 +22,9 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
   now-playing topics. An index change re-renders the loaded rows it
   names (or drops those that no longer match), a match among added rows
   or a rebuild reloads the list; the now-playing preset's row is
-  re-rendered when it changes.
+  re-rendered when it changes. Index changes also refresh the upload
+  component's quota line (`UniversalProxyWeb.MilkDropUploadComponent`,
+  above the search form).
 
   ## Play now
 
@@ -44,6 +46,7 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
   alias UniversalProxy.MilkDrop
   alias UniversalProxy.MilkDrop.{Index, Pack, Store, UserPresets}
   alias UniversalProxyWeb.Components.MilkDropUI
+  alias UniversalProxyWeb.MilkDropUploadComponent
 
   @page 50
   @max_rows 150
@@ -421,9 +424,13 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
   # ── PubSub ────────────────────────────────────────────────────────────
 
   @impl true
-  def handle_info({:milkdrop_index, %{rebuilt: true}}, socket), do: {:noreply, reset_list(socket)}
+  def handle_info({:milkdrop_index, %{rebuilt: true}}, socket) do
+    refresh_upload()
+    {:noreply, reset_list(socket)}
+  end
 
   def handle_info({:milkdrop_index, %{} = change}, socket) do
+    refresh_upload()
     added = Map.get(change, :added, [])
 
     if Enum.any?(added, &added_match?(socket, &1)) do
@@ -456,6 +463,9 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
   end
 
   def handle_info(_msg, socket), do: {:noreply, socket}
+
+  defp refresh_upload,
+    do: send_update(MilkDropUploadComponent, id: "milkdrop-upload", refresh: true)
 
   defp added_match?(socket, key) do
     case Index.fetch(key) do
@@ -581,6 +591,8 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
         count={@totals.playlist}
         now_playing={@now_playing}
       />
+
+      <.live_component module={MilkDropUploadComponent} id="milkdrop-upload" class="block mt-5" />
 
       <form
         id="preset-search"

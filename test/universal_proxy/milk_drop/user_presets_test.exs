@@ -771,6 +771,31 @@ defmodule UniversalProxy.MilkDrop.UserPresetsTest do
     assert UserPresets.delete(dead, "user/a.milk") == {:error, :not_running}
     assert UserPresets.delete_texture(dead, "a.png") == {:error, :not_running}
     assert UserPresets.set_high_frequency(dead, "user/a.milk", true) == {:error, :not_running}
+    assert UserPresets.upload_target(dead) == {:error, :not_running}
+  end
+
+  test "upload_target names incoming/ and the room above the free-space floor", ctx do
+    server =
+      start_library(ctx,
+        max_upload_bytes: 1000,
+        quota: %{bytes: 5000},
+        free_space: fn _ -> {:ok, %{total_bytes: 4000 * @mib, free_bytes: 500 * @mib}} end
+      )
+
+    # Floor: max(200 MiB, 10% of 4000 MiB).
+    assert UserPresets.upload_target(server) ==
+             {:ok,
+              %{dir: ctx.incoming, room: 100 * @mib, max_upload_bytes: 1000, quota_bytes: 5000}}
+
+    server =
+      restart_library(ctx,
+        free_space: fn _ -> {:ok, %{total_bytes: 1000 * @mib, free_bytes: 0}} end
+      )
+
+    assert {:ok, %{room: 0}} = UserPresets.upload_target(server)
+
+    server = restart_library(ctx, free_space: fn _ -> {:error, :df_failed} end)
+    assert UserPresets.upload_target(server) == {:error, {:free_space, :df_failed}}
   end
 
   @tag :contract
