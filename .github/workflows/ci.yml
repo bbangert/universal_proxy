@@ -235,23 +235,5 @@ jobs:
           key: ${{ runner.os }}-host-deps-${{ hashFiles('mix.lock') }}
           restore-keys: ${{ runner.os }}-host-deps-
       - run: mix deps.get
-      # `mix hex.audit` has no per-package ignore flag. cowboy 2.20.0 and
-      # cowlib 2.21.0 (transitive via plug_cowboy; latest releases) carry
-      # advisories with no fixed release upstream (EEF-CVE-2026-43971 was
-      # fixed in cowlib 2.20.0 and EEF-CVE-2026-43969 in 2.21.0, both dropped
-      # from this list); allow ONLY these IDs so the gate still fails on any
-      # other advisory (including a future req regression). Remove each ID
-      # once its fix is released; see the matching note in mix.exs.
-      - name: Hex audit (cowboy/cowlib advisories allow-listed — no upstream fix)
-        run: |
-          ALLOWED='EEF-CVE-2026-43966|EEF-CVE-2026-115701|EEF-CVE-2026-113431'
-          audit=$(mix hex.audit 2>&1) && exit 0
-          echo "$audit"
-          unexpected=$(echo "$audit" | grep -E '^  [^ ]+ [0-9]' | grep -Ev " - (${ALLOWED}) " || true)
-          if [ -n "$unexpected" ]; then
-            echo "::error::hex.audit found non-allow-listed advisories:"
-            echo "$unexpected"
-            exit 1
-          fi
-          echo "Only allow-listed cowboy/cowlib advisories present; passing."
+      - run: mix hex.audit
       - run: mix deps.unlock --check-unused
