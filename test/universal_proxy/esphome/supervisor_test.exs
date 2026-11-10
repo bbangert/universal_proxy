@@ -152,6 +152,22 @@ defmodule UniversalProxy.ESPHome.SupervisorTest do
     end
   end
 
+  describe "sendspin_opts/1" do
+    test "wires the Sendspin adapter only while an output is selected for HA pairing" do
+      assert ESPHomeSupervisor.sendspin_opts(true) == [sendspin: UniversalProxy.ESPHome.Sendspin]
+      assert ESPHomeSupervisor.sendspin_opts(false) == []
+    end
+
+    test "is not part of the init-time options (each Espex start reads it)" do
+      {:ok, {_flags, children}} = ESPHomeSupervisor.init([])
+
+      %{start: {ESPHomeSupervisor, :start_espex, [opts, _fun]}} =
+        Enum.find(children, &(&1.id == Espex))
+
+      refute Keyword.has_key?(opts, :sendspin)
+    end
+  end
+
   describe "pick_zwave_port/3" do
     alias UniversalProxy.Hardware
 

@@ -31,6 +31,12 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   provider's, the ones its entities are advertised with. Without that, a
   restart would come back with fewer sub-devices and Home Assistant would
   delete the missing ones, and their history, on the next connect.
+
+  ## Sendspin
+
+  Every Espex start also wires the `:sendspin` adapter (`Sendspin`) if an
+  output is selected for Home Assistant pairing (`sendspin_opts/1`);
+  `UniversalProxy.Audio.HomeAssistantPairing` applies changes while it runs.
   """
 
   use Supervisor
@@ -43,11 +49,13 @@ defmodule UniversalProxy.ESPHome.Supervisor do
     EntityProvider,
     Infrared,
     PskStore,
+    Sendspin,
     SerialProxy,
     ZigbeeProxy,
     ZWaveProxy
   }
 
+  alias UniversalProxy.Audio.HomeAssistantPairing
   alias UniversalProxy.Bluetooth.Settings, as: BluetoothSettings
   alias UniversalProxy.ESPHome.EntityProvider.MeshSync
   alias UniversalProxy.Hardware
@@ -152,8 +160,19 @@ defmodule UniversalProxy.ESPHome.Supervisor do
   def start_espex(espex_opts, live_devices_fun) do
     espex_opts
     |> refresh_devices(live_devices_fun.())
+    |> Keyword.merge(sendspin_opts(HomeAssistantPairing.selected?()))
     |> Espex.Supervisor.start_link()
   end
+
+  @doc """
+  The `:sendspin` adapter wiring: `Sendspin` only while an output is
+  selected for Home Assistant pairing, so without one Espex reports no
+  Sendspin capability. Read on every Espex start; changes while it runs
+  are applied by `UniversalProxy.Audio.HomeAssistantPairing`.
+  """
+  @spec sendspin_opts(boolean()) :: keyword()
+  def sendspin_opts(true), do: [sendspin: Sendspin]
+  def sendspin_opts(false), do: []
 
   @doc false
   @spec refresh_devices(keyword(), {:ok, [Espex.DeviceConfig.Device.t()]} | term()) :: keyword()

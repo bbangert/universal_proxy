@@ -275,4 +275,61 @@ defmodule UniversalProxy.Audio.StoreTest do
       assert {:ok, %{display_mode: "Off"}} = Store.get_config(reopened, hdmi)
     end
   end
+
+  describe "Home Assistant pairing selection" do
+    test "is nil until set, and nil clears it", %{server: server} do
+      assert Store.get_home_assistant_pairing(server) == {:ok, nil}
+
+      :ok = Store.put_home_assistant_pairing(server, %{key: @key, client_id: nil})
+      assert Store.get_home_assistant_pairing(server) == {:ok, %{key: @key, client_id: nil}}
+
+      :ok = Store.put_home_assistant_pairing(server, %{key: @usb_key, client_id: "abc"})
+      assert Store.get_home_assistant_pairing(server) == {:ok, %{key: @usb_key, client_id: "abc"}}
+
+      :ok = Store.put_home_assistant_pairing(server, nil)
+      assert Store.get_home_assistant_pairing(server) == {:ok, nil}
+    end
+
+    test "a malformed row reads as none, and is logged", %{server: server} do
+      :ok = :dets.insert(:sys.get_state(server).table, {:home_assistant_pairing, :garbage})
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert Store.get_home_assistant_pairing(server) == {:ok, nil}
+        end)
+
+      assert log =~ "malformed Home Assistant pairing row"
+    end
+
+    test "a read error is an error, not no selection", %{server: server, dets_path: path} do
+      :ok = Store.put_home_assistant_pairing(server, %{key: @key, client_id: "abc"})
+      # Truncating the file under the open table makes DETS reads fail.
+      File.write!(path, "")
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:error, _reason} = Store.get_home_assistant_pairing(server)
+      end)
+    end
+
+    test "is not an output row", %{server: server} do
+      :ok = Store.save_config(server, @key, %{})
+      :ok = Store.put_home_assistant_pairing(server, %{key: @key, client_id: "abc"})
+
+      assert server |> Store.get_all() |> Map.keys() == [@key]
+    end
+
+    test "survives a restart", %{dets_path: path} do
+      :ok = stop_supervised(UniversalProxy.Audio.Store)
+
+      pid = start_supervised!({Store, name: nil, table: @table, dets_path: path}, id: :first)
+      :ok = Store.put_home_assistant_pairing(pid, %{key: @usb_key, client_id: "abc"})
+      :ok = stop_supervised(:first)
+
+      reopened =
+        start_supervised!({Store, name: nil, table: @table, dets_path: path}, id: :second)
+
+      assert Store.get_home_assistant_pairing(reopened) ==
+               {:ok, %{key: @usb_key, client_id: "abc"}}
+    end
+  end
 end

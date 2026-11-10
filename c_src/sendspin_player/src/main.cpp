@@ -746,6 +746,11 @@ int main(int argc, char* argv[]) {
         std::string err;
         if (!persistence.init(err)) {
             std::fprintf(stderr, "Error: --state-dir: %s\n", err.c_str());
+            // The same event as a keypair that cannot be persisted: the BEAM
+            // side marks the output's identity as failed on it. `err` names
+            // the path, so it is bounded to keep the line under the budget.
+            emit_json("{\"event\":\"error\",\"kind\":\"state_dir\",\"msg\":\"state dir unusable: " +
+                      json_escape(sanitize_text(err, 512)) + "\"}");
             return 1;
         }
     }

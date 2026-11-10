@@ -60,6 +60,8 @@ defmodule UniversalProxy.Audio.Store do
   alias UniversalProxy.Display.Mode
 
   @default_table :audio_outputs
+  # Not an output key (those are 3-tuples), so `get_all/1` skips it.
+  @home_assistant_pairing :home_assistant_pairing
 
   @type slot_sub :: String.t()
   @type vendor_id :: non_neg_integer() | nil
@@ -131,6 +133,41 @@ defmodule UniversalProxy.Audio.Store do
     GenServer.call(server, :all)
   end
 
+  @typedoc """
+  The output reported to Home Assistant for Sendspin auto-pairing (see
+  `UniversalProxy.Audio.HomeAssistantPairing`): its key and the last
+  Sendspin `client_id` seen for it (`nil` until its player has listened).
+  """
+  @type home_assistant_pairing :: %{key: output_key(), client_id: String.t() | nil}
+
+  @doc """
+  The persisted Home Assistant pairing selection: `{:ok, nil}` when none is
+  set (a malformed row is logged and reads as none), `{:error, reason}` when
+  DETS can't be read. Kept in the same table as the output rows, under a
+  non-tuple key that `get_all/1` skips.
+  """
+  @spec get_home_assistant_pairing(GenServer.server()) ::
+          {:ok, home_assistant_pairing() | nil} | {:error, term()}
+  def get_home_assistant_pairing(server \\ __MODULE__) do
+    GenServer.call(server, :get_home_assistant_pairing)
+  end
+
+  @doc """
+  Persist the Home Assistant pairing selection; `nil` clears it. Returns
+  `{:error, reason}` if DETS rejects the write.
+  """
+  @spec put_home_assistant_pairing(GenServer.server(), home_assistant_pairing() | nil) ::
+          :ok | {:error, term()}
+  def put_home_assistant_pairing(server \\ __MODULE__, selection)
+
+  def put_home_assistant_pairing(server, nil),
+    do: GenServer.call(server, {:put_home_assistant_pairing, nil})
+
+  def put_home_assistant_pairing(server, %{key: {slot_sub, _, _}, client_id: id} = selection)
+      when is_binary(slot_sub) and (is_binary(id) or is_nil(id)) do
+    GenServer.call(server, {:put_home_assistant_pairing, Map.take(selection, [:key, :client_id])})
+  end
+
   # -- Server Callbacks --
 
   @impl true
@@ -195,6 +232,45 @@ defmodule UniversalProxy.Audio.Store do
     else
       {:error, reason} ->
         Logger.error("Audio store delete failed for #{inspect(key)}: #{inspect(reason)}")
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call(:get_home_assistant_pairing, _from, state) do
+    result =
+      case :dets.lookup(state.table, @home_assistant_pairing) do
+        [{_, %{key: {slot_sub, _, _}, client_id: id} = selection}]
+        when is_binary(slot_sub) and (is_binary(id) or is_nil(id)) ->
+          {:ok, selection}
+
+        [] ->
+          {:ok, nil}
+
+        {:error, reason} ->
+          Logger.error("Audio store Home Assistant pairing read failed: #{inspect(reason)}")
+          {:error, reason}
+
+        [_malformed] ->
+          Logger.warning("Audio store: ignoring a malformed Home Assistant pairing row")
+          {:ok, nil}
+      end
+
+    {:reply, result, state}
+  end
+
+  def handle_call({:put_home_assistant_pairing, selection}, _from, state) do
+    write =
+      case selection do
+        nil -> :dets.delete(state.table, @home_assistant_pairing)
+        _ -> :dets.insert(state.table, {@home_assistant_pairing, selection})
+      end
+
+    with :ok <- write,
+         :ok <- :dets.sync(state.table) do
+      {:reply, :ok, state}
+    else
+      {:error, reason} ->
+        Logger.error("Audio store Home Assistant pairing save failed: #{inspect(reason)}")
         {:reply, {:error, reason}, state}
     end
   end

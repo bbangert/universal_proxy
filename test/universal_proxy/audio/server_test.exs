@@ -556,6 +556,29 @@ defmodule UniversalProxy.Audio.ServerTest do
                {:sendspin_state, @hp_key, %{sendspin_client_id: "derived-id"}}
              ] = collect_messages(3)
     end
+
+    test "a state_dir error marks the identity failed until a later start listens", %{
+      server: server
+    } do
+      EnumerateStub.set(%{@hp_key => hp_hardware()})
+      :ok = Server.check_now(server)
+
+      assert {:ok, %{identity_error: false}} = Server.get_output(server, @hp_key)
+
+      # Another kind of error leaves it alone.
+      send(server, {:sendspin_state, @hp_key, %{event: "error", kind: "pairing_token", msg: "x"}})
+      assert {:ok, %{identity_error: false}} = Server.get_output(server, @hp_key)
+
+      send(server, {:sendspin_state, @hp_key, %{event: "error", kind: "state_dir", msg: "x"}})
+      assert {:ok, %{identity_error: true}} = Server.get_output(server, @hp_key)
+
+      # The respawn's shutdown reset keeps it.
+      send(server, {:sendspin_state, @hp_key, %{event: "shutdown"}})
+      assert {:ok, %{identity_error: true}} = Server.get_output(server, @hp_key)
+
+      send(server, {:sendspin_state, @hp_key, %{event: "listening", client_id: "derived-id"}})
+      assert {:ok, %{identity_error: false}} = Server.get_output(server, @hp_key)
+    end
   end
 
   describe "hotplug remove" do
