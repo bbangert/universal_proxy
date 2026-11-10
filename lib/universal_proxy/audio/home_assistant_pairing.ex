@@ -18,6 +18,11 @@ defmodule UniversalProxy.Audio.HomeAssistantPairing do
   Assistant reconnects and re-reads the device capabilities. Both steps are
   retried with backoff (Espex down or mid-restart) until they succeed.
 
+  The persisted selection is the source of truth: whenever this process
+  starts it applies it again (an earlier run may have died before it had),
+  and it monitors `Espex.Server`, which restarts with the adapters Espex was
+  started with, to apply it again to each replacement.
+
   HA reads the `client_id` only when it connects, so a new one for the
   selected output (its player listening for the first time, or with a new
   keypair) also disconnects the clients. The cached `client_id` survives
@@ -58,6 +63,7 @@ defmodule UniversalProxy.Audio.HomeAssistantPairing do
             update_adapters: nil,
             disconnect_clients: nil,
             pending: nil,
+            espex_mon: nil,
             timer: nil,
             retry_ms: @default_retry_ms,
             backoff_ms: @default_retry_ms
@@ -134,16 +140,26 @@ defmodule UniversalProxy.Audio.HomeAssistantPairing do
     }
 
     Phoenix.PubSub.subscribe(t.pubsub, @state_topic)
+    {:ok, t, {:continue, :reconcile}}
+  end
+
+  # Runs before any call is served, so the persisted selection is already
+  # loaded when `selected?/1` is first answered.
+  @impl true
+  def handle_continue(:reconcile, t) do
     t = %{t | selection: load(t)}
 
     # Catch up with a `client_id` that arrived while this process was down.
     t =
       case t.selection && live_client_id(t, t.selection.key) do
-        id when is_binary(id) -> observe_client_id(t, id)
-        _none -> t
+        id when is_binary(id) and id != t.selection.client_id -> learn_client_id(t, id)
+        _same_or_none -> t
       end
 
-    {:ok, t}
+    # A previous run may have died with an update or reconnect still pending,
+    # and Espex keeps whatever it was last given: re-apply the persisted
+    # selection, then reconnect.
+    {:noreply, apply_pending(%{t | pending: :update})}
   end
 
   @impl true
@@ -176,6 +192,11 @@ defmodule UniversalProxy.Audio.HomeAssistantPairing do
   def handle_info({:retry, token}, %{timer: token} = t),
     do: {:noreply, apply_pending(%{t | timer: nil})}
 
+  # `Espex.Server` restarts with the adapters Espex was started with, not
+  # the ones given since: give it the current selection again.
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{espex_mon: {_pid2, ref}} = t),
+    do: {:noreply, apply_pending(%{t | espex_mon: nil, pending: :update})}
+
   def handle_info(_msg, t), do: {:noreply, t}
 
   # -- Private --
@@ -205,6 +226,12 @@ defmodule UniversalProxy.Audio.HomeAssistantPairing do
   defp observe_client_id(%{selection: %{client_id: id}} = t, id), do: t
 
   defp observe_client_id(t, id) do
+    t = learn_client_id(t, id)
+    # An :update already pending reconnects once it has been applied.
+    apply_pending(%{t | pending: t.pending || :reconnect})
+  end
+
+  defp learn_client_id(t, id) do
     selection = %{t.selection | client_id: id}
 
     case store_put(t, selection) do
@@ -217,15 +244,16 @@ defmodule UniversalProxy.Audio.HomeAssistantPairing do
         )
     end
 
-    # An :update already pending reconnects once it has been applied.
-    pending = t.pending || :reconnect
-    apply_pending(%{t | selection: selection, pending: pending})
+    %{t | selection: selection}
   end
 
   defp apply_pending(%{pending: nil} = t), do: t
 
+  # The server is monitored before it is updated, so one that is replaced
+  # afterwards (restarting with its start-time adapters) is updated again.
   defp apply_pending(%{pending: :update} = t) do
     adapter = if t.selection, do: t.adapter
+    t = monitor_espex(t)
 
     case espex(fn -> t.update_adapters.(t.espex_server, sendspin: adapter) end) do
       :ok -> apply_pending(%{t | pending: :reconnect})
@@ -250,6 +278,20 @@ defmodule UniversalProxy.Audio.HomeAssistantPairing do
     token = make_ref()
     Process.send_after(self(), {:retry, token}, t.backoff_ms)
     %{t | timer: token, backoff_ms: min(t.backoff_ms * 2, @max_retry_ms)}
+  end
+
+  defp monitor_espex(t) do
+    case {GenServer.whereis(t.espex_server), t.espex_mon} do
+      {pid, {pid, _ref}} ->
+        t
+
+      {pid, previous} when is_pid(pid) ->
+        with {_old, ref} <- previous, do: Process.demonitor(ref, [:flush])
+        %{t | espex_mon: {pid, Process.monitor(pid)}}
+
+      _not_running ->
+        t
+    end
   end
 
   # Espex down or restarting: a call exits, its registry raises.

@@ -81,8 +81,43 @@ defmodule UniversalProxy.Audio.HomeAssistantPairingTest do
       end
     ]
 
+    {drain?, opts} = Keyword.pop(opts, :drain, true)
     pid = start_supervised!({HomeAssistantPairing, Keyword.merge(defaults, opts)})
+
+    # Its startup reconcile has run; its calls are dropped unless the test
+    # is about them.
+    sync(pid)
+    if drain?, do: drain()
+
     {pid, results}
+  end
+
+  defp restart_pairing!(ctx, opts) do
+    :ok = stop_supervised(HomeAssistantPairing)
+    :ok = stop_supervised(:results)
+    start_pairing!(ctx, opts)
+  end
+
+  # Stands in for a registered `Espex.Server` the process can monitor.
+  defp register_espex!(name) do
+    pid = spawn(fn -> receive(do: (:stop -> :ok)) end)
+    Process.register(pid, name)
+    on_exit(fn -> Process.exit(pid, :kill) end)
+    pid
+  end
+
+  # Like the real call: fails while no server is registered.
+  defp registered_update(test) do
+    fn server, changes ->
+      send(test, {:update_adapters, server, changes})
+      if Process.whereis(server), do: :ok, else: exit(:noproc)
+    end
+  end
+
+  defp kill_and_wait(pid) do
+    ref = Process.monitor(pid)
+    Process.exit(pid, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^pid, _}
   end
 
   defp result(:exit), do: exit(:noproc)
@@ -103,13 +138,13 @@ defmodule UniversalProxy.Audio.HomeAssistantPairingTest do
     end
   end
 
-  test "nothing is selected by default", ctx do
-    {pid, _} = start_pairing!(ctx)
+  test "nothing is selected by default, and the start applies that", ctx do
+    {pid, _} = start_pairing!(ctx, drain: false)
 
     assert HomeAssistantPairing.selection(pid) == nil
     refute HomeAssistantPairing.selected?(pid)
-    refute_received {:update_adapters, _, _}
-    refute_received {:disconnect_clients, _}
+    assert_received {:update_adapters, :espex_test, [sendspin: nil]}
+    assert_received {:disconnect_clients, :espex_test}
   end
 
   test "selected? is false while the process is down" do
@@ -185,15 +220,32 @@ defmodule UniversalProxy.Audio.HomeAssistantPairingTest do
     refute_received {:update_adapters, _, _}
   end
 
-  test "the selection survives a restart", ctx do
-    :ok = Store.put_home_assistant_pairing(ctx.store, %{key: @key, client_id: "hp-id"})
+  test "the selection survives a restart and is applied again, then HA reconnected", ctx do
     {pid, _} = start_pairing!(ctx)
+    :ok = HomeAssistantPairing.select(pid, @key)
+    drain()
+
+    {pid, _} = restart_pairing!(ctx, drain: false)
 
     assert HomeAssistantPairing.selection(pid) == %{key: @key, client_id: "hp-id"}
     assert HomeAssistantPairing.selected?(pid)
-    # Espex reads it when it starts: nothing to apply.
-    refute_received {:update_adapters, _, _}
+    assert_received {:update_adapters, :espex_test, [sendspin: UniversalProxy.ESPHome.Sendspin]}
+    assert_received {:disconnect_clients, :espex_test}
+  end
+
+  test "work a previous run left pending is done by the next one", ctx do
+    {pid, results} = start_pairing!(ctx, retry_ms: 60_000)
+    script(results, :update_adapters, [:exit])
+
+    # The update fails and its retry is far off: the process dies with it pending.
+    :ok = HomeAssistantPairing.select(pid, @key)
+    assert_received {:update_adapters, _, [sendspin: UniversalProxy.ESPHome.Sendspin]}
     refute_received {:disconnect_clients, _}
+    assert %{pending: :update} = sync(pid)
+
+    restart_pairing!(ctx, drain: false)
+    assert_received {:update_adapters, :espex_test, [sendspin: UniversalProxy.ESPHome.Sendspin]}
+    assert_received {:disconnect_clients, :espex_test}
   end
 
   test "a selection kept while its output is unplugged keeps its cached client id", ctx do
@@ -203,17 +255,63 @@ defmodule UniversalProxy.Audio.HomeAssistantPairingTest do
     {pid, _} = start_pairing!(ctx)
 
     assert HomeAssistantPairing.selection(pid) == %{key: {"Gone", nil, nil}, client_id: "old"}
-    refute_received {:disconnect_clients, _}
+    assert Store.get_home_assistant_pairing(ctx.store).client_id == "old"
   end
 
   test "a client id that changed while it was down is caught up at start", ctx do
     :ok = Store.put_home_assistant_pairing(ctx.store, %{key: @key, client_id: nil})
-    {pid, _} = start_pairing!(ctx)
+    {pid, _} = start_pairing!(ctx, drain: false)
 
     assert HomeAssistantPairing.selection(pid) == %{key: @key, client_id: "hp-id"}
     assert Store.get_home_assistant_pairing(ctx.store) == %{key: @key, client_id: "hp-id"}
+    assert_received {:update_adapters, :espex_test, [sendspin: UniversalProxy.ESPHome.Sendspin]}
     assert_received {:disconnect_clients, :espex_test}
-    refute_received {:update_adapters, _, _}
+  end
+
+  describe "an Espex.Server that is replaced" do
+    @espex :ha_pairing_test_espex
+
+    test "gets the current selection again, and HA is reconnected", ctx do
+      first = register_espex!(@espex)
+
+      {pid, _} =
+        start_pairing!(ctx, espex_server: @espex, update_adapters: registered_update(self()))
+
+      :ok = HomeAssistantPairing.select(pid, @key)
+      drain()
+
+      # Restarted with its start-time adapters: re-applied once it is back.
+      kill_and_wait(first)
+      assert_receive {:update_adapters, @espex, _}, 500
+      second = register_espex!(@espex)
+
+      assert_receive {:update_adapters, @espex, [sendspin: UniversalProxy.ESPHome.Sendspin]}, 500
+      assert_receive {:disconnect_clients, @espex}, 500
+      drain()
+
+      # The replacement is monitored too.
+      assert %{espex_mon: {^second, _ref}, pending: nil} = sync(pid)
+      kill_and_wait(second)
+      register_espex!(@espex)
+      assert_receive {:update_adapters, @espex, [sendspin: UniversalProxy.ESPHome.Sendspin]}, 500
+      assert_receive {:disconnect_clients, @espex}, 500
+    end
+
+    test "after a clear, gets no adapter again", ctx do
+      first = register_espex!(@espex)
+
+      {pid, _} =
+        start_pairing!(ctx, espex_server: @espex, update_adapters: registered_update(self()))
+
+      :ok = HomeAssistantPairing.select(pid, @key)
+      :ok = HomeAssistantPairing.clear(pid)
+      drain()
+
+      kill_and_wait(first)
+      register_espex!(@espex)
+      assert_receive {:update_adapters, @espex, [sendspin: nil]}, 500
+      assert_receive {:disconnect_clients, @espex}, 500
+    end
   end
 
   describe "the selected output's client id" do
