@@ -73,6 +73,16 @@ defmodule UniversalProxyWeb.AudioLive do
   receiver (`volume_external`). Outputs on unpaired cards, and every
   output on a build without CEC, show none of this.
 
+  ## Home Assistant pairing
+
+  Each output card has a "Pair through Home Assistant" toggle that selects
+  the one output whose Sendspin client is reported to Home Assistant
+  (`UniversalProxy.Audio.HomeAssistantPairing`), so HA can hand its
+  pairing token to Music Assistant. Turning it on for one output turns it
+  off for any other; the selection follows `{:home_assistant_pairing, key}`
+  on `HomeAssistantPairing.topic/0`. The token itself never reaches this
+  view through the toggle.
+
   ## MilkDrop visualizer
 
   While `UniversalProxy.MilkDrop.enabled?/0`, a "MilkDrop visualizer"
@@ -105,6 +115,7 @@ defmodule UniversalProxyWeb.AudioLive do
   import UniversalProxyWeb.Components.Audio
 
   alias UniversalProxy.Audio
+  alias UniversalProxy.Audio.HomeAssistantPairing
   alias UniversalProxy.Audio.Input
   alias UniversalProxy.Bluetooth
   alias UniversalProxy.Bluetooth.AudioManager
@@ -148,6 +159,7 @@ defmodule UniversalProxyWeb.AudioLive do
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:input_removed")
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, "sendspin:input_state")
       Phoenix.PubSub.subscribe(UniversalProxy.PubSub, Cec.topic())
+      Phoenix.PubSub.subscribe(UniversalProxy.PubSub, HomeAssistantPairing.topic())
 
       if milkdrop? do
         Phoenix.PubSub.subscribe(UniversalProxy.PubSub, MilkDrop.settings_topic())
@@ -196,6 +208,10 @@ defmodule UniversalProxyWeb.AudioLive do
      # pairing action armed by a first click (`{id, action}`), if any.
      |> assign(:input_more_open, MapSet.new())
      |> assign(:input_armed, nil)
+     # Encoded id of the output reported to Home Assistant, or nil. The key
+     # needn't be a shown card: a selected output that is unplugged stays
+     # selected.
+     |> assign(:ha_pairing, encode_selection(audio_facade().home_assistant_pairing()))
      # Audio inputs (capture cards), keyed by the same base64-encoded
      # `{slot_sub, vid, pid}` id the outputs map above uses.
      |> assign(:inputs, build_inputs_map(inputs))}
@@ -452,6 +468,32 @@ defmodule UniversalProxyWeb.AudioLive do
     {:noreply, update(socket, :input_pairing_tokens, &Map.delete(&1, id))}
   end
 
+  # The view's selection is updated by the broadcast, not here, so every
+  # open page shows the same one.
+  def handle_event("toggle_ha_pairing", %{"id" => id}, socket) do
+    with {:ok, _output} <- fetch_output(socket, id),
+         {:ok, key} <- decode_key(id) do
+      result =
+        if socket.assigns.ha_pairing == id,
+          do: audio_facade().clear_home_assistant_pairing(),
+          else: audio_facade().select_home_assistant_pairing(key)
+
+      case result do
+        :ok ->
+          {:noreply, socket}
+
+        {:error, reason} ->
+          Logger.warning(
+            "Audio Home Assistant pairing change failed for #{inspect(key)}: #{inspect(reason)}"
+          )
+
+          {:noreply, put_flash(socket, :error, "Home Assistant pairing change failed")}
+      end
+    else
+      _ -> {:noreply, socket}
+    end
+  end
+
   # Operator consent gesture for pairing a capture card. Opens the source's
   # time-boxed "allow pairing" window; the source stays authoritative over what
   # happens next (it still requires MA to type the derived PIN).
@@ -538,6 +580,10 @@ defmodule UniversalProxyWeb.AudioLive do
   # updates that don't change any pill (a receiver timestamp) cost nothing.
   def handle_info({:cec_adapters, adapters}, socket) when is_list(adapters) do
     {:noreply, assign(socket, :cec, cec_by_card(adapters))}
+  end
+
+  def handle_info({:home_assistant_pairing, key}, socket) do
+    {:noreply, assign(socket, :ha_pairing, encode_selection(key))}
   end
 
   def handle_info({:sendspin_input_added, input}, socket) do
@@ -632,6 +678,7 @@ defmodule UniversalProxyWeb.AudioLive do
           more_open?={MapSet.member?(@more_open, id)}
           pairing={Map.get(@pairing_tokens, id)}
           cec={Map.get(@cec, output.card_index)}
+          ha_pairing?={@ha_pairing == id}
         />
         <.reconnecting_card :for={{mac, info} <- active_reconnecting(@reconnecting, @outputs)} name={info.name} mac={mac} />
       </div>
@@ -1005,6 +1052,7 @@ defmodule UniversalProxyWeb.AudioLive do
   attr(:more_open?, :boolean, required: true)
   attr(:pairing, :any, default: nil)
   attr(:cec, :map, default: nil)
+  attr(:ha_pairing?, :boolean, default: false)
 
   # Single player card. Layout is a vertical flex with three logical
   # blocks:
@@ -1220,6 +1268,24 @@ defmodule UniversalProxyWeb.AudioLive do
                    transition-colors"
           />
         </form>
+      </div>
+
+      <%!-- Home Assistant pairing: at most one output at a time --%>
+      <div class="flex items-center gap-3 pt-3 pr-5 pb-3 pl-[22px] border-t border-border-2 bg-sunken">
+        <.toggle
+          checked={@ha_pairing?}
+          phx-click="toggle_ha_pairing"
+          phx-value-id={@id}
+          id={"ha-pairing-#{@id}"}
+          aria-label="Let Home Assistant pair this output with Music Assistant"
+        />
+        <div class="min-w-0">
+          <div class="text-sm text-fg-2">Pair through Home Assistant</div>
+          <div :if={@ha_pairing?} id={"ha-pairing-hint-#{@id}"} class="text-[11px] text-fg-4">
+            Home Assistant hands this output's pairing token to Music Assistant
+            (encrypted API connections only). One output at a time.
+          </div>
+        </div>
       </div>
 
       <%!-- Disclosure: card index, client id and pairing token, each
@@ -1886,6 +1952,9 @@ defmodule UniversalProxyWeb.AudioLive do
   defp valid_key_shape?(_), do: false
 
   defp encode_key(key), do: OpaqueKey.encode(key)
+
+  defp encode_selection(nil), do: nil
+  defp encode_selection(key), do: encode_key(key)
 
   # Strip control chars + trim + cap length. Used both in the modal's
   # live char counter and in the final commit path. Returns the raw

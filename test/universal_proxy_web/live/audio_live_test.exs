@@ -859,6 +859,8 @@ defmodule UniversalProxyWeb.AudioLiveTest do
         send(Application.get_env(:universal_proxy, :pairing_token_test_pid), {:read, key})
         Application.get_env(:universal_proxy, :pairing_token_result)
       end
+
+      def home_assistant_pairing, do: nil
     end
 
     setup do
@@ -1215,6 +1217,136 @@ defmodule UniversalProxyWeb.AudioLiveTest do
       {view, _id, _html} = mount_with_input(conn)
       refute has_element?(view, "button[phx-click=show_pairing_token]")
       refute_received {:input_read, _}
+    end
+  end
+
+  describe "Home Assistant pairing toggle" do
+    @usb_key {"USB Audio", 0x1D6B, 0x0104}
+
+    defmodule HAPairingFacade do
+      @moduledoc false
+      # Stands in for `UniversalProxy.Audio` (the `:audio_facade` seam):
+      # records the calls and answers with the scripted results.
+      def home_assistant_pairing, do: Application.get_env(:universal_proxy, :ha_pairing_selected)
+
+      def select_home_assistant_pairing(key) do
+        send(Application.get_env(:universal_proxy, :ha_pairing_test_pid), {:select, key})
+        Application.get_env(:universal_proxy, :ha_pairing_result, :ok)
+      end
+
+      def clear_home_assistant_pairing do
+        send(Application.get_env(:universal_proxy, :ha_pairing_test_pid), :clear)
+        Application.get_env(:universal_proxy, :ha_pairing_result, :ok)
+      end
+
+      def pairing_token(_key), do: {:error, :not_ready}
+    end
+
+    setup do
+      Application.put_env(:universal_proxy, :audio_facade, HAPairingFacade)
+      Application.put_env(:universal_proxy, :ha_pairing_test_pid, self())
+
+      on_exit(fn ->
+        for key <- [:audio_facade, :ha_pairing_test_pid, :ha_pairing_selected, :ha_pairing_result],
+            do: Application.delete_env(:universal_proxy, key)
+      end)
+    end
+
+    defp mount_with_outputs(conn) do
+      {:ok, view, _html} = live(conn, "/audio")
+
+      for output <- [
+            sample_output(),
+            sample_output(%{key: @usb_key, card_index: 1, friendly_name: "USB DAC"})
+          ] do
+        Phoenix.PubSub.broadcast(
+          @pubsub,
+          "sendspin:output_added",
+          {:sendspin_output_added, output}
+        )
+      end
+
+      render(view)
+      view
+    end
+
+    defp checked?(view, key),
+      do: has_element?(view, ~s(#ha-pairing-#{encode(key)}[aria-checked="true"]))
+
+    defp broadcast_selection(key) do
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        UniversalProxy.Audio.HomeAssistantPairing.topic(),
+        {:home_assistant_pairing, key}
+      )
+    end
+
+    test "every output offers it, off by default", %{conn: conn} do
+      view = mount_with_outputs(conn)
+
+      assert has_element?(view, "#ha-pairing-#{encode(@hp_key)}")
+      assert has_element?(view, "#ha-pairing-#{encode(@usb_key)}")
+      refute checked?(view, @hp_key)
+      refute checked?(view, @usb_key)
+      assert render(view) =~ "Pair through Home Assistant"
+      refute has_element?(view, "#ha-pairing-hint-#{encode(@hp_key)}")
+    end
+
+    test "shows the persisted selection at mount", %{conn: conn} do
+      Application.put_env(:universal_proxy, :ha_pairing_selected, @usb_key)
+      view = mount_with_outputs(conn)
+
+      assert checked?(view, @usb_key)
+      refute checked?(view, @hp_key)
+      assert has_element?(view, "#ha-pairing-hint-#{encode(@usb_key)}")
+    end
+
+    test "selects an output, and follows the broadcast selection", %{conn: conn} do
+      view = mount_with_outputs(conn)
+
+      view |> element("#ha-pairing-#{encode(@hp_key)}") |> render_click()
+      assert_received {:select, @hp_key}
+
+      broadcast_selection(@hp_key)
+      assert checked?(view, @hp_key)
+      refute checked?(view, @usb_key)
+
+      # Selecting another output moves it.
+      view |> element("#ha-pairing-#{encode(@usb_key)}") |> render_click()
+      assert_received {:select, @usb_key}
+      broadcast_selection(@usb_key)
+      assert checked?(view, @usb_key)
+      refute checked?(view, @hp_key)
+    end
+
+    test "clicking the selected output clears it", %{conn: conn} do
+      Application.put_env(:universal_proxy, :ha_pairing_selected, @hp_key)
+      view = mount_with_outputs(conn)
+
+      view |> element("#ha-pairing-#{encode(@hp_key)}") |> render_click()
+      assert_received :clear
+      refute_received {:select, _}
+
+      broadcast_selection(nil)
+      refute checked?(view, @hp_key)
+    end
+
+    test "a failed change flashes an error and keeps the selection", %{conn: conn} do
+      Application.put_env(:universal_proxy, :ha_pairing_result, {:error, :not_found})
+      view = mount_with_outputs(conn)
+
+      html = view |> element("#ha-pairing-#{encode(@hp_key)}") |> render_click()
+      assert html =~ "Home Assistant pairing change failed"
+      refute checked?(view, @hp_key)
+    end
+
+    test "an event for an output the page doesn't show is ignored", %{conn: conn} do
+      view = mount_with_outputs(conn)
+
+      render_hook(view, "toggle_ha_pairing", %{"id" => encode({"Gone", nil, nil})})
+      render_hook(view, "toggle_ha_pairing", %{"id" => "not-a-key"})
+      refute_received {:select, _}
+      refute_received :clear
     end
   end
 end

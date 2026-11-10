@@ -210,6 +210,7 @@ changes, and on errors.
 {"event":"pcm_tap","value":false,"ok":false,"error":"open: Permission denied"} // pcm_tap on failed
 {"event":"error","kind":"alsa_configure","msg":"..."}
 {"event":"error","kind":"pairing_token","msg":"..."}  // non-fatal; token itself never on stdout
+{"event":"error","kind":"state_dir","msg":"..."}      // fatal: the identity cannot be kept (exits 1)
 {"event":"error","kind":"oversize_line","msg":"..."}  // a line over the cap was dropped (a bug)
 {"event":"shutdown"}
 ```
@@ -306,7 +307,8 @@ X25519 public key, generates that keypair on first start, and stores it
 through the persistence provider. `FilePersistence` writes each library
 blob as one file in `--state-dir` (dir `0700`, files `0600`, written via
 temp file + fsync + rename), so the identity survives respawns and
-reboots. A state dir that cannot be created fails the process before the
+reboots. A state dir that cannot be created fails the process (with a
+`state_dir` error event, before `started`) before the
 client starts, rather than letting it mint an identity it cannot keep. The
 library only logs a failed save of a freshly generated keypair (a full or
 read-only disk) and starts anyway, so the binary checks for that after

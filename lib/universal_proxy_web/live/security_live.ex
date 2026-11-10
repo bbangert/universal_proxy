@@ -37,17 +37,18 @@ defmodule UniversalProxyWeb.SecurityLive do
     if connected?(socket),
       do: Phoenix.PubSub.subscribe(UniversalProxy.PubSub, PskStore.topic())
 
+    fingerprint = ssh_fingerprint()
+    if connected?(socket) and is_nil(fingerprint), do: schedule_fingerprint_refresh()
+
     {:ok,
      socket
      |> assign(:page_title, "Security")
      |> assign(:psk, current_psk())
      |> assign(:show_key, false)
-     |> assign(:copied, nil)
      |> assign(:pending_reset, false)
-     |> assign(:ssh_fingerprint, ssh_fingerprint())
+     |> assign(:ssh_fingerprint, fingerprint)
      |> assign(:ssh_key_type, SSHAccess.key_type())
-     |> assign(:ssh_command, ssh_command())
-     |> assign(:ssh_copied, false)}
+     |> assign(:ssh_command, ssh_command())}
   end
 
   # Tolerate the PSK store being momentarily down (e.g. restarting after a
@@ -66,31 +67,21 @@ defmodule UniversalProxyWeb.SecurityLive do
   end
 
   # Tolerate the SSHAccess server being momentarily down (e.g. restarting) so
-  # the page renders instead of crashing the LiveView.
+  # the page renders instead of crashing the LiveView. `nil` means
+  # unavailable; the template owns the placeholder text.
   defp ssh_fingerprint do
     SSHAccess.fingerprint()
   catch
-    :exit, _ -> "unavailable — key service restarting"
+    :exit, _ -> nil
+  end
+
+  defp schedule_fingerprint_refresh do
+    Process.send_after(self(), :refresh_ssh_fingerprint, 2_000)
   end
 
   @impl true
   def handle_event("toggle_show_key", _params, socket) do
     {:noreply, assign(socket, :show_key, !socket.assigns.show_key)}
-  end
-
-  # Guard against a stale client event arriving after the key was cleared
-  # server-side: Base.encode64(nil) would crash the LiveView.
-  def handle_event("copy_key", _params, %{assigns: %{psk: nil}} = socket) do
-    {:noreply, socket}
-  end
-
-  def handle_event("copy_key", _params, socket) do
-    Process.send_after(self(), :reset_copied, 2_000)
-
-    {:noreply,
-     socket
-     |> assign(:copied, true)
-     |> push_event("copy", %{text: Base.encode64(socket.assigns.psk)})}
   end
 
   def handle_event("reset_request", _params, socket) do
@@ -127,20 +118,6 @@ defmodule UniversalProxyWeb.SecurityLive do
     :exit, _ -> {:noreply, reset_failed(socket)}
   end
 
-  def handle_event("copy_fingerprint", _params, socket) do
-    # Recompute on click: the mount-time value may have been the
-    # "unavailable" placeholder if SSHAccess was momentarily down. Refresh
-    # the assign too so the on-screen readout self-corrects.
-    fingerprint = ssh_fingerprint()
-    Process.send_after(self(), :reset_ssh_copied, 1_600)
-
-    {:noreply,
-     socket
-     |> assign(:ssh_fingerprint, fingerprint)
-     |> assign(:ssh_copied, true)
-     |> push_event("copy", %{text: fingerprint})}
-  end
-
   def handle_event("download_ssh_key", _params, socket) do
     {:noreply,
      push_event(socket, "download", %{
@@ -164,12 +141,10 @@ defmodule UniversalProxyWeb.SecurityLive do
     {:noreply, assign(socket, :psk, psk)}
   end
 
-  def handle_info(:reset_copied, socket) do
-    {:noreply, assign(socket, :copied, false)}
-  end
-
-  def handle_info(:reset_ssh_copied, socket) do
-    {:noreply, assign(socket, :ssh_copied, false)}
+  def handle_info(:refresh_ssh_fingerprint, socket) do
+    fingerprint = ssh_fingerprint()
+    if is_nil(fingerprint), do: schedule_fingerprint_refresh()
+    {:noreply, assign(socket, :ssh_fingerprint, fingerprint)}
   end
 
   def handle_info(_msg, socket), do: {:noreply, socket}
@@ -217,6 +192,7 @@ defmodule UniversalProxyWeb.SecurityLive do
           </div>
           <div class="flex gap-2">
             <input
+              id="psk-input"
               type={if @show_key, do: "text", else: "password"}
               readonly
               value={Base.encode64(@psk)}
@@ -225,8 +201,19 @@ defmodule UniversalProxyWeb.SecurityLive do
             <.button variant={:secondary} size={:sm} phx-click="toggle_show_key">
               {if @show_key, do: "Hide", else: "Show"}
             </.button>
-            <.button variant={:secondary} size={:sm} phx-click="copy_key">
-              <.icon name={:check} size={14} /> {if @copied, do: "Copied", else: "Copy"}
+            <%!-- The key is already the input's value above, so carrying it in
+                 `data-clipboard` adds no exposure. A masked password field
+                 can't be copied from by hand, so the select fallback only
+                 applies once the key is shown. --%>
+            <.button
+              variant={:secondary}
+              size={:sm}
+              id="copy-psk"
+              phx-hook="CopyToClipboard"
+              data-clipboard={Base.encode64(@psk)}
+              data-select-target={@show_key && "psk-input"}
+            >
+              <.icon name={:check} size={14} /> <span data-copy-label>Copy</span>
             </.button>
           </div>
 
@@ -276,13 +263,22 @@ defmodule UniversalProxyWeb.SecurityLive do
         </div>
         <div class="flex gap-2">
           <input
+            id="ssh-fingerprint"
             type="text"
             readonly
-            value={@ssh_fingerprint}
+            value={@ssh_fingerprint || "unavailable — key service restarting"}
             class="flex-1 h-9 px-3 rounded-md text-xs font-mono outline-none bg-sunken text-fg-2 border border-border-strong"
           />
-          <.button variant={:secondary} size={:sm} phx-click="copy_fingerprint">
-            <.icon name={:check} size={14} /> {if @ssh_copied, do: "Copied", else: "Copy"}
+          <.button
+            variant={:secondary}
+            size={:sm}
+            id="copy-ssh-fingerprint"
+            phx-hook="CopyToClipboard"
+            data-clipboard={@ssh_fingerprint}
+            data-select-target="ssh-fingerprint"
+            disabled={is_nil(@ssh_fingerprint)}
+          >
+            <.icon name={:check} size={14} /> <span data-copy-label>Copy</span>
           </.button>
           <.button variant={:primary} size={:sm} phx-click="download_ssh_key">
             <.icon name={:download} size={14} /> Download key

@@ -288,6 +288,23 @@ defmodule SendspinPlayerContractTest do
     assert File.read!(keypair) == original
   end
 
+  test "reports a --state-dir it cannot create as a state_dir error, then exits", %{
+    tmp_dir: tmp_dir
+  } do
+    # A regular file where a parent directory should be: the dir can't be
+    # created, even when CI runs as root.
+    blocker = Path.join(tmp_dir, "not_a_dir")
+    File.write!(blocker, "")
+
+    port = spawn_player(state_dir: Path.join(blocker, "state"), ws_port: @ws_port + 7)
+
+    # Before `started`: nothing else has run yet.
+    assert %{"event" => "error", "kind" => "state_dir", "msg" => "state dir unusable: " <> _} =
+             next_event(port)
+
+    assert wait_for_exit(port) == 1
+  end
+
   test "exits non-zero without --state-dir" do
     port = spawn_player(state_dir: nil, ws_port: @ws_port + 3)
     assert wait_for_exit(port) != 0

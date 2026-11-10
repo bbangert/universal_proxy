@@ -45,20 +45,21 @@ defmodule UniversalProxyWeb.SecurityLiveTest do
     assert html =~ Base.encode64(key)
   end
 
-  test "Copy key pushes the base64 key and flips the label", %{conn: conn} do
+  test "Copy key button copies client-side via the hook", %{conn: conn} do
     key = :crypto.strong_rand_bytes(32)
     :ok = PskStore.store_psk(key)
 
     {:ok, view, _html} = live(conn, "/security")
 
-    html =
-      view
-      |> element("button[phx-click='copy_key']")
-      |> render_click()
+    button = view |> element("button#copy-psk") |> render()
+    assert button =~ ~s(phx-hook="CopyToClipboard")
+    assert button =~ ~s(data-clipboard="#{Base.encode64(key)}")
+    refute button =~ "phx-click"
+    # Masked: a password field can't be selected-and-copied by hand.
+    refute button =~ "data-select-target"
 
-    assert_push_event(view, "copy", %{text: text})
-    assert text == Base.encode64(key)
-    assert html =~ "Copied"
+    view |> element("button[phx-click='toggle_show_key']") |> render_click()
+    assert view |> element("button#copy-psk") |> render() =~ ~s(data-select-target="psk-input")
   end
 
   test "Show toggles the key input between password and text", %{conn: conn} do
@@ -127,16 +128,26 @@ defmodule UniversalProxyWeb.SecurityLiveTest do
     assert String.contains?(content, "BEGIN OPENSSH PRIVATE KEY")
   end
 
-  test "Copy fingerprint pushes a copy event and flips the label", %{conn: conn} do
+  test "Copy fingerprint button copies client-side via the hook", %{conn: conn} do
     {:ok, view, _html} = live(conn, "/security")
 
-    html =
-      view
-      |> element("button[phx-click='copy_fingerprint']")
-      |> render_click()
+    button = view |> element("button#copy-ssh-fingerprint") |> render()
+    assert button =~ ~s(phx-hook="CopyToClipboard")
+    assert button =~ ~s(data-clipboard="#{SSHAccess.fingerprint()}")
+    assert button =~ ~s(data-select-target="ssh-fingerprint")
+    refute button =~ "phx-click"
+    refute button =~ ~r/\sdisabled[\s=>]/
+  end
 
-    assert_push_event(view, "copy", %{text: text})
-    assert text == SSHAccess.fingerprint()
-    assert html =~ "Copied"
+  # The unavailable branch (SSHAccess down) needs the supervised server
+  # killed, which is too invasive for the shared app; this covers the
+  # retry message being harmless when the key is available.
+  test "fingerprint refresh keeps the real fingerprint", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/security")
+
+    send(view.pid, :refresh_ssh_fingerprint)
+
+    assert render(view) =~ SSHAccess.fingerprint()
+    refute render(view) =~ "unavailable"
   end
 end
