@@ -77,8 +77,12 @@ defmodule UniversalProxy.ESPHome.Sendspin do
     :exit, _reason -> :error
   end
 
+  # Down, or the selection not loaded yet: unknown, not empty.
   defp selection do
-    {:ok, HomeAssistantPairing.selection()}
+    case HomeAssistantPairing.selection() do
+      {:ok, selection} -> {:ok, selection}
+      {:error, _reason} -> :error
+    end
   catch
     :exit, _reason -> :error
   end

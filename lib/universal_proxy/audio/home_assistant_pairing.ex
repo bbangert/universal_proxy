@@ -21,7 +21,10 @@ defmodule UniversalProxy.Audio.HomeAssistantPairing do
   The persisted selection is the source of truth: whenever this process
   starts it applies it again (an earlier run may have died before it had),
   and it monitors `Espex.Server`, which restarts with the adapters Espex was
-  started with, to apply it again to each replacement.
+  started with, to apply it again to each replacement. A selection that
+  can't be loaded (the Store down) is not an empty one: the load is retried,
+  nothing is applied, and `selection/1`, `select/2` and `clear/1` answer
+  `{:error, :unavailable}` until it works.
 
   HA reads the `client_id` only when it connects, so a new one for the
   selected output (its player listening for the first time, or with a new
@@ -55,6 +58,7 @@ defmodule UniversalProxy.Audio.HomeAssistantPairing do
   @type selection :: Store.home_assistant_pairing()
 
   defstruct selection: nil,
+            loaded?: false,
             store: Store,
             audio_server: Server,
             pubsub: @pubsub,
@@ -92,17 +96,20 @@ defmodule UniversalProxy.Audio.HomeAssistantPairing do
   @spec topic() :: String.t()
   def topic, do: @topic
 
-  @doc "The current selection, or `nil` when no output is selected."
-  @spec selection(GenServer.server()) :: selection() | nil
+  @doc """
+  The current selection (`nil` when no output is selected), or
+  `{:error, :unavailable}` until the persisted one has been loaded.
+  """
+  @spec selection(GenServer.server()) :: {:ok, selection() | nil} | {:error, :unavailable}
   def selection(server \\ __MODULE__), do: GenServer.call(server, :selection)
 
   @doc """
   Whether an output is selected; `false` while this process is down (the
-  `catch :exit` idiom).
+  `catch :exit` idiom) or has not loaded the selection yet.
   """
   @spec selected?(GenServer.server()) :: boolean()
   def selected?(server \\ __MODULE__) do
-    selection(server) != nil
+    match?({:ok, %{}}, selection(server))
   catch
     :exit, _ -> false
   end
@@ -110,8 +117,9 @@ defmodule UniversalProxy.Audio.HomeAssistantPairing do
   @doc """
   Select the output `key`, replacing any other selection.
   `{:error, :not_found}` when the output isn't present,
-  `{:error, :unavailable}` while the audio subsystem is down, or
-  `{:error, reason}` if DETS rejects the write.
+  `{:error, :unavailable}` while the audio subsystem is down or the
+  persisted selection has not been loaded yet, or `{:error, reason}` if
+  DETS rejects the write.
   """
   @spec select(GenServer.server(), key()) ::
           :ok | {:error, :not_found | :unavailable | term()}
@@ -119,7 +127,10 @@ defmodule UniversalProxy.Audio.HomeAssistantPairing do
     GenServer.call(server, {:select, key})
   end
 
-  @doc "Clear the selection. `{:error, reason}` if DETS rejects the write."
+  @doc """
+  Clear the selection. `{:error, :unavailable}` until the persisted
+  selection has been loaded, `{:error, reason}` if DETS rejects the write.
+  """
   @spec clear(GenServer.server()) :: :ok | {:error, term()}
   def clear(server \\ __MODULE__), do: GenServer.call(server, :clear)
 
@@ -143,27 +154,24 @@ defmodule UniversalProxy.Audio.HomeAssistantPairing do
     {:ok, t, {:continue, :reconcile}}
   end
 
-  # Runs before any call is served, so the persisted selection is already
-  # loaded when `selected?/1` is first answered.
+  # Runs before any call is served, so the persisted selection is normally
+  # loaded when `selected?/1` is first answered. A load that fails is
+  # retried (`pending: :load`); nothing is applied to Espex until it works,
+  # since an unread selection is not an empty one.
   @impl true
-  def handle_continue(:reconcile, t) do
-    t = %{t | selection: load(t)}
-
-    # Catch up with a `client_id` that arrived while this process was down.
-    t =
-      case t.selection && live_client_id(t, t.selection.key) do
-        id when is_binary(id) and id != t.selection.client_id -> learn_client_id(t, id)
-        _same_or_none -> t
-      end
-
-    # A previous run may have died with an update or reconnect still pending,
-    # and Espex keeps whatever it was last given: re-apply the persisted
-    # selection, then reconnect.
-    {:noreply, apply_pending(%{t | pending: :update})}
-  end
+  def handle_continue(:reconcile, t), do: {:noreply, apply_pending(%{t | pending: :load})}
 
   @impl true
-  def handle_call(:selection, _from, t), do: {:reply, t.selection, t}
+  def handle_call(:selection, _from, %{loaded?: false} = t),
+    do: {:reply, {:error, :unavailable}, t}
+
+  def handle_call(:selection, _from, t), do: {:reply, {:ok, t.selection}, t}
+
+  def handle_call({:select, _key}, _from, %{loaded?: false} = t),
+    do: {:reply, {:error, :unavailable}, t}
+
+  def handle_call(:clear, _from, %{loaded?: false} = t),
+    do: {:reply, {:error, :unavailable}, t}
 
   def handle_call({:select, key}, _from, %{selection: %{key: key}} = t), do: {:reply, :ok, t}
 
@@ -194,8 +202,11 @@ defmodule UniversalProxy.Audio.HomeAssistantPairing do
 
   # `Espex.Server` restarts with the adapters Espex was started with, not
   # the ones given since: give it the current selection again.
-  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{espex_mon: {_pid2, ref}} = t),
-    do: {:noreply, apply_pending(%{t | espex_mon: nil, pending: :update})}
+  # A load still pending applies the selection once it works.
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{espex_mon: {_pid2, ref}} = t) do
+    pending = if t.pending == :load, do: :load, else: :update
+    {:noreply, apply_pending(%{t | espex_mon: nil, pending: pending})}
+  end
 
   def handle_info(_msg, t), do: {:noreply, t}
 
@@ -249,15 +260,47 @@ defmodule UniversalProxy.Audio.HomeAssistantPairing do
 
   defp apply_pending(%{pending: nil} = t), do: t
 
-  # The server is monitored before it is updated, so one that is replaced
-  # afterwards (restarting with its start-time adapters) is updated again.
+  defp apply_pending(%{pending: :load} = t) do
+    case load(t) do
+      {:ok, selection} ->
+        t = %{t | selection: selection, loaded?: true}
+        # Pages mounted before the load read no selection.
+        Phoenix.PubSub.broadcast(t.pubsub, @topic, {:home_assistant_pairing, key_of(selection)})
+
+        # Catch up with a `client_id` that arrived while this process was down.
+        t =
+          case selection && live_client_id(t, selection.key) do
+            id when is_binary(id) and id != selection.client_id -> learn_client_id(t, id)
+            _same_or_none -> t
+          end
+
+        # A previous run may have died with an update or reconnect still
+        # pending, and Espex keeps whatever it was last given: re-apply the
+        # persisted selection, then reconnect.
+        apply_pending(%{t | pending: :update})
+
+      {:error, _reason} = error ->
+        retry(t, error)
+    end
+  end
+
+  # The update goes to the very server that is monitored (resolved once, not
+  # by name), so a replacement (restarting with its start-time adapters) is
+  # always updated again. No server registered: retried.
   defp apply_pending(%{pending: :update} = t) do
     adapter = if t.selection, do: t.adapter
-    t = monitor_espex(t)
 
-    case espex(fn -> t.update_adapters.(t.espex_server, sendspin: adapter) end) do
-      :ok -> apply_pending(%{t | pending: :reconnect})
-      error -> retry(t, error)
+    case GenServer.whereis(t.espex_server) do
+      pid when is_pid(pid) ->
+        t = monitor_espex(t, pid)
+
+        case espex(fn -> t.update_adapters.(pid, sendspin: adapter) end) do
+          :ok -> apply_pending(%{t | pending: :reconnect})
+          error -> retry(t, error)
+        end
+
+      _not_running ->
+        retry(t, {:error, :not_running})
     end
   end
 
@@ -272,7 +315,7 @@ defmodule UniversalProxy.Audio.HomeAssistantPairing do
 
   defp retry(t, error) do
     Logger.debug(
-      "Home Assistant Sendspin pairing: Espex #{t.pending} failed (#{inspect(error)}); retrying"
+      "Home Assistant Sendspin pairing: #{t.pending} failed (#{inspect(error)}); retrying"
     )
 
     token = make_ref()
@@ -280,18 +323,11 @@ defmodule UniversalProxy.Audio.HomeAssistantPairing do
     %{t | timer: token, backoff_ms: min(t.backoff_ms * 2, @max_retry_ms)}
   end
 
-  defp monitor_espex(t) do
-    case {GenServer.whereis(t.espex_server), t.espex_mon} do
-      {pid, {pid, _ref}} ->
-        t
+  defp monitor_espex(%{espex_mon: {pid, _ref}} = t, pid), do: t
 
-      {pid, previous} when is_pid(pid) ->
-        with {_old, ref} <- previous, do: Process.demonitor(ref, [:flush])
-        %{t | espex_mon: {pid, Process.monitor(pid)}}
-
-      _not_running ->
-        t
-    end
+  defp monitor_espex(t, pid) do
+    with {_old, ref} <- t.espex_mon, do: Process.demonitor(ref, [:flush])
+    %{t | espex_mon: {pid, Process.monitor(pid)}}
   end
 
   # Espex down or restarting: a call exits, its registry raises.
@@ -304,9 +340,9 @@ defmodule UniversalProxy.Audio.HomeAssistantPairing do
   end
 
   defp load(t) do
-    Store.get_home_assistant_pairing(t.store)
+    {:ok, Store.get_home_assistant_pairing(t.store)}
   catch
-    :exit, _reason -> nil
+    :exit, _reason -> {:error, :unavailable}
   end
 
   defp store_put(t, selection) do

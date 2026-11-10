@@ -204,8 +204,8 @@ defmodule UniversalProxy.Audio do
   @spec home_assistant_pairing() :: key() | nil
   def home_assistant_pairing do
     case HomeAssistantPairing.selection() do
-      %{key: key} -> key
-      nil -> nil
+      {:ok, %{key: key}} -> key
+      _none_or_unavailable -> nil
     end
   catch
     :exit, _ -> nil

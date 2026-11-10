@@ -46,7 +46,7 @@ defmodule UniversalProxy.Audio.HomeAssistantPairingTest do
       )
 
     Phoenix.PubSub.subscribe(@pubsub, HomeAssistantPairing.topic())
-    {:ok, store: store, audio: audio}
+    {:ok, store: store, audio: audio, path: path, espex: register_espex!(:espex_test)}
   end
 
   # Records the Espex calls; `results` (an Agent) scripts their replies.
@@ -106,11 +106,11 @@ defmodule UniversalProxy.Audio.HomeAssistantPairingTest do
     pid
   end
 
-  # Like the real call: fails while no server is registered.
+  # Like the real call: fails on a server that is gone.
   defp registered_update(test) do
     fn server, changes ->
       send(test, {:update_adapters, server, changes})
-      if Process.whereis(server), do: :ok, else: exit(:noproc)
+      if is_pid(server) and Process.alive?(server), do: :ok, else: exit(:noproc)
     end
   end
 
@@ -141,10 +141,44 @@ defmodule UniversalProxy.Audio.HomeAssistantPairingTest do
   test "nothing is selected by default, and the start applies that", ctx do
     {pid, _} = start_pairing!(ctx, drain: false)
 
-    assert HomeAssistantPairing.selection(pid) == nil
+    assert HomeAssistantPairing.selection(pid) == {:ok, nil}
     refute HomeAssistantPairing.selected?(pid)
-    assert_received {:update_adapters, :espex_test, [sendspin: nil]}
+    # The update goes to the server's pid, the reconnect through its name.
+    espex = ctx.espex
+    assert_received {:update_adapters, ^espex, [sendspin: nil]}
     assert_received {:disconnect_clients, :espex_test}
+  end
+
+  describe "a selection that can't be loaded" do
+    test "is not taken as none: nothing is applied until the load works", ctx do
+      :ok = Store.put_home_assistant_pairing(ctx.store, %{key: @key, client_id: "hp-id"})
+      :ok = stop_supervised(Store)
+
+      # A Store that isn't running yet, under the name the process uses.
+      {pid, _} = start_pairing!(ctx, store: :ha_pairing_late_store, drain: false)
+
+      assert HomeAssistantPairing.selection(pid) == {:error, :unavailable}
+      refute HomeAssistantPairing.selected?(pid)
+      assert {:error, :unavailable} = HomeAssistantPairing.select(pid, @usb_key)
+      assert {:error, :unavailable} = HomeAssistantPairing.clear(pid)
+      refute_receive {:update_adapters, _, _}, 50
+      refute_received {:disconnect_clients, _}
+
+      start_supervised!(
+        {Store, name: :ha_pairing_late_store, table: @table, dets_path: ctx.path},
+        id: :late_store
+      )
+
+      espex = ctx.espex
+      assert_receive {:home_assistant_pairing, @key}, 2_000
+
+      assert_receive {:update_adapters, ^espex, [sendspin: UniversalProxy.ESPHome.Sendspin]},
+                     1_000
+
+      assert_receive {:disconnect_clients, :espex_test}, 2_000
+      assert HomeAssistantPairing.selection(pid) == {:ok, %{key: @key, client_id: "hp-id"}}
+      assert :ok = HomeAssistantPairing.clear(pid)
+    end
   end
 
   test "selected? is false while the process is down" do
@@ -156,11 +190,11 @@ defmodule UniversalProxy.Audio.HomeAssistantPairingTest do
 
     assert :ok = HomeAssistantPairing.select(pid, @key)
 
-    assert HomeAssistantPairing.selection(pid) == %{key: @key, client_id: "hp-id"}
+    assert HomeAssistantPairing.selection(pid) == {:ok, %{key: @key, client_id: "hp-id"}}
     assert Store.get_home_assistant_pairing(ctx.store) == %{key: @key, client_id: "hp-id"}
     assert_received {:home_assistant_pairing, @key}
 
-    assert_received {:update_adapters, :espex_test, [sendspin: UniversalProxy.ESPHome.Sendspin]}
+    assert_received {:update_adapters, _espex, [sendspin: UniversalProxy.ESPHome.Sendspin]}
 
     assert_received {:disconnect_clients, :espex_test}
   end
@@ -182,7 +216,7 @@ defmodule UniversalProxy.Audio.HomeAssistantPairingTest do
     :ok = HomeAssistantPairing.select(pid, @key)
 
     assert :ok = HomeAssistantPairing.select(pid, @usb_key)
-    assert HomeAssistantPairing.selection(pid) == %{key: @usb_key, client_id: nil}
+    assert HomeAssistantPairing.selection(pid) == {:ok, %{key: @usb_key, client_id: nil}}
     assert_received {:home_assistant_pairing, @usb_key}
   end
 
@@ -190,7 +224,7 @@ defmodule UniversalProxy.Audio.HomeAssistantPairingTest do
     {pid, _} = start_pairing!(ctx)
 
     assert {:error, :not_found} = HomeAssistantPairing.select(pid, {"Gone", nil, nil})
-    assert HomeAssistantPairing.selection(pid) == nil
+    assert HomeAssistantPairing.selection(pid) == {:ok, nil}
     refute_received {:update_adapters, _, _}
   end
 
@@ -209,10 +243,10 @@ defmodule UniversalProxy.Audio.HomeAssistantPairingTest do
 
     assert :ok = HomeAssistantPairing.clear(pid)
 
-    assert HomeAssistantPairing.selection(pid) == nil
+    assert HomeAssistantPairing.selection(pid) == {:ok, nil}
     assert Store.get_home_assistant_pairing(ctx.store) == nil
     assert_received {:home_assistant_pairing, nil}
-    assert_received {:update_adapters, :espex_test, [sendspin: nil]}
+    assert_received {:update_adapters, _espex, [sendspin: nil]}
     assert_received {:disconnect_clients, :espex_test}
 
     # Already clear.
@@ -227,9 +261,9 @@ defmodule UniversalProxy.Audio.HomeAssistantPairingTest do
 
     {pid, _} = restart_pairing!(ctx, drain: false)
 
-    assert HomeAssistantPairing.selection(pid) == %{key: @key, client_id: "hp-id"}
+    assert HomeAssistantPairing.selection(pid) == {:ok, %{key: @key, client_id: "hp-id"}}
     assert HomeAssistantPairing.selected?(pid)
-    assert_received {:update_adapters, :espex_test, [sendspin: UniversalProxy.ESPHome.Sendspin]}
+    assert_received {:update_adapters, _espex, [sendspin: UniversalProxy.ESPHome.Sendspin]}
     assert_received {:disconnect_clients, :espex_test}
   end
 
@@ -244,7 +278,7 @@ defmodule UniversalProxy.Audio.HomeAssistantPairingTest do
     assert %{pending: :update} = sync(pid)
 
     restart_pairing!(ctx, drain: false)
-    assert_received {:update_adapters, :espex_test, [sendspin: UniversalProxy.ESPHome.Sendspin]}
+    assert_received {:update_adapters, _espex, [sendspin: UniversalProxy.ESPHome.Sendspin]}
     assert_received {:disconnect_clients, :espex_test}
   end
 
@@ -254,7 +288,9 @@ defmodule UniversalProxy.Audio.HomeAssistantPairingTest do
 
     {pid, _} = start_pairing!(ctx)
 
-    assert HomeAssistantPairing.selection(pid) == %{key: {"Gone", nil, nil}, client_id: "old"}
+    assert HomeAssistantPairing.selection(pid) ==
+             {:ok, %{key: {"Gone", nil, nil}, client_id: "old"}}
+
     assert Store.get_home_assistant_pairing(ctx.store).client_id == "old"
   end
 
@@ -262,9 +298,9 @@ defmodule UniversalProxy.Audio.HomeAssistantPairingTest do
     :ok = Store.put_home_assistant_pairing(ctx.store, %{key: @key, client_id: nil})
     {pid, _} = start_pairing!(ctx, drain: false)
 
-    assert HomeAssistantPairing.selection(pid) == %{key: @key, client_id: "hp-id"}
+    assert HomeAssistantPairing.selection(pid) == {:ok, %{key: @key, client_id: "hp-id"}}
     assert Store.get_home_assistant_pairing(ctx.store) == %{key: @key, client_id: "hp-id"}
-    assert_received {:update_adapters, :espex_test, [sendspin: UniversalProxy.ESPHome.Sendspin]}
+    assert_received {:update_adapters, _espex, [sendspin: UniversalProxy.ESPHome.Sendspin]}
     assert_received {:disconnect_clients, :espex_test}
   end
 
@@ -278,23 +314,33 @@ defmodule UniversalProxy.Audio.HomeAssistantPairingTest do
         start_pairing!(ctx, espex_server: @espex, update_adapters: registered_update(self()))
 
       :ok = HomeAssistantPairing.select(pid, @key)
+      assert %{espex_mon: {^first, _ref}} = sync(pid)
       drain()
 
       # Restarted with its start-time adapters: re-applied once it is back.
+      # Nothing is sent while no server is registered.
       kill_and_wait(first)
-      assert_receive {:update_adapters, @espex, _}, 500
+      refute_receive {:update_adapters, _, _}, 50
+
+      # The one registered meanwhile is the one updated, and monitored...
       second = register_espex!(@espex)
 
-      assert_receive {:update_adapters, @espex, [sendspin: UniversalProxy.ESPHome.Sendspin]}, 500
+      assert_receive {:update_adapters, ^second, [sendspin: UniversalProxy.ESPHome.Sendspin]},
+                     1_000
+
       assert_receive {:disconnect_clients, @espex}, 500
       drain()
-
-      # The replacement is monitored too.
       assert %{espex_mon: {^second, _ref}, pending: nil} = sync(pid)
+
+      # ...so its own restart is re-applied too.
       kill_and_wait(second)
-      register_espex!(@espex)
-      assert_receive {:update_adapters, @espex, [sendspin: UniversalProxy.ESPHome.Sendspin]}, 500
+      third = register_espex!(@espex)
+
+      assert_receive {:update_adapters, ^third, [sendspin: UniversalProxy.ESPHome.Sendspin]},
+                     1_000
+
       assert_receive {:disconnect_clients, @espex}, 500
+      assert %{espex_mon: {^third, _ref}} = sync(pid)
     end
 
     test "after a clear, gets no adapter again", ctx do
@@ -309,7 +355,7 @@ defmodule UniversalProxy.Audio.HomeAssistantPairingTest do
 
       kill_and_wait(first)
       register_espex!(@espex)
-      assert_receive {:update_adapters, @espex, [sendspin: nil]}, 500
+      assert_receive {:update_adapters, _server, [sendspin: nil]}, 2_000
       assert_receive {:disconnect_clients, @espex}, 500
     end
   end
@@ -331,7 +377,7 @@ defmodule UniversalProxy.Audio.HomeAssistantPairingTest do
       )
 
       sync(pid)
-      assert HomeAssistantPairing.selection(pid) == %{key: @usb_key, client_id: "usb-id"}
+      assert HomeAssistantPairing.selection(pid) == {:ok, %{key: @usb_key, client_id: "usb-id"}}
       assert Store.get_home_assistant_pairing(store) == %{key: @usb_key, client_id: "usb-id"}
       assert_received {:disconnect_clients, :espex_test}
       refute_received {:update_adapters, _, _}
@@ -354,7 +400,7 @@ defmodule UniversalProxy.Audio.HomeAssistantPairingTest do
       )
 
       sync(pid)
-      assert HomeAssistantPairing.selection(pid).client_id == "new-id"
+      assert {:ok, %{client_id: "new-id"}} = HomeAssistantPairing.selection(pid)
       assert_received {:disconnect_clients, :espex_test}
     end
 
@@ -366,7 +412,7 @@ defmodule UniversalProxy.Audio.HomeAssistantPairingTest do
       )
 
       sync(pid)
-      assert HomeAssistantPairing.selection(pid).client_id == nil
+      assert {:ok, %{client_id: nil}} = HomeAssistantPairing.selection(pid)
       refute_received {:disconnect_clients, _}
     end
   end
@@ -380,7 +426,7 @@ defmodule UniversalProxy.Audio.HomeAssistantPairingTest do
       assert :ok = HomeAssistantPairing.select(pid, @key)
 
       # exit, {:error, _}, then :ok; the reconnect raises once, then works.
-      for _ <- 1..3, do: assert_receive({:update_adapters, :espex_test, [sendspin: _]}, 500)
+      for _ <- 1..3, do: assert_receive({:update_adapters, _espex, [sendspin: _]}, 500)
       for _ <- 1..2, do: assert_receive({:disconnect_clients, :espex_test}, 500)
 
       refute_receive {:update_adapters, _, _}, 100
