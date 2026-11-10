@@ -980,12 +980,12 @@ defmodule UniversalProxyWeb.AudioLiveTest do
 
       def unpair(key, which) do
         send(Application.get_env(:universal_proxy, :input_token_test_pid), {:unpair, key, which})
-        :ok
+        Application.get_env(:universal_proxy, :input_action_result, :ok)
       end
 
       def regenerate_pairing_token(key) do
         send(Application.get_env(:universal_proxy, :input_token_test_pid), {:regenerate, key})
-        :ok
+        Application.get_env(:universal_proxy, :input_action_result, :ok)
       end
     end
 
@@ -998,6 +998,7 @@ defmodule UniversalProxyWeb.AudioLiveTest do
         Application.delete_env(:universal_proxy, :audio_input_facade)
         Application.delete_env(:universal_proxy, :input_token_test_pid)
         Application.delete_env(:universal_proxy, :input_token_result)
+        Application.delete_env(:universal_proxy, :input_action_result)
       end)
     end
 
@@ -1106,6 +1107,56 @@ defmodule UniversalProxyWeb.AudioLiveTest do
       html = view |> element("button[phx-click=confirm_input_action]") |> render_click()
       assert_received {:regenerate, @input_key}
       refute html =~ @input_token
+    end
+
+    test "a failed Unpair keeps the prompt armed and shows an error; a retry can succeed",
+         %{conn: conn} do
+      Application.put_env(:universal_proxy, :input_action_result, {:error, :unavailable})
+      {view, id, _html} = mount_with_input(conn, paired_input())
+
+      view |> element("button[phx-value-action=unpair_all]") |> render_click()
+      view |> element("button[phx-click=confirm_input_action]") |> render_click()
+
+      assert_received {:unpair, @input_key, :all}
+      assert has_element?(view, "#input-armed-#{id}")
+      assert has_element?(view, "#input-action-error-#{id}")
+
+      Application.put_env(:universal_proxy, :input_action_result, :ok)
+      view |> element("button[phx-click=confirm_input_action]") |> render_click()
+      refute has_element?(view, "#input-armed-#{id}")
+      refute has_element?(view, "#input-action-error-#{id}")
+    end
+
+    test "a failed Unpair of one server keeps the prompt armed and shows an error",
+         %{conn: conn} do
+      Application.put_env(:universal_proxy, :input_action_result, {:error, :unavailable})
+      {view, id, _html} = mount_with_input(conn, paired_input())
+
+      view
+      |> element(~s(button[phx-value-action=unpair][phx-value-server="#{@server_a}"]))
+      |> render_click()
+
+      view |> element("button[phx-click=confirm_input_action]") |> render_click()
+      assert_received {:unpair, @input_key, @server_a}
+      assert has_element?(view, "#input-armed-#{id}", "Unpair " <> String.slice(@server_a, 0, 10))
+      assert has_element?(view, "#input-action-error-#{id}")
+
+      view |> element("button[phx-click=disarm_input_action]") |> render_click()
+      refute has_element?(view, "#input-armed-#{id}")
+    end
+
+    test "a failed Regenerate keeps the prompt and the displayed token", %{conn: conn} do
+      Application.put_env(:universal_proxy, :input_action_result, {:error, :unavailable})
+      {view, id, _html} = mount_with_input(conn)
+      view |> element("button[phx-click=show_input_pairing_token]") |> render_click()
+
+      view |> element("#regenerate-input-token-#{id}") |> render_click()
+      html = view |> element("button[phx-click=confirm_input_action]") |> render_click()
+
+      assert_received {:regenerate, @input_key}
+      assert html =~ @input_token
+      assert has_element?(view, "#input-armed-#{id}", "Regenerate the pairing token?")
+      assert has_element?(view, "#input-action-error-#{id}")
     end
 
     test "a pairings update from input_state re-renders the list", %{conn: conn} do

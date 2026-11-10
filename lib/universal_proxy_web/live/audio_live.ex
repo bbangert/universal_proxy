@@ -208,6 +208,9 @@ defmodule UniversalProxyWeb.AudioLive do
      # pairing action armed by a first click (`{id, action}`), if any.
      |> assign(:input_more_open, MapSet.new())
      |> assign(:input_armed, nil)
+     # Per-input-card failure text from a revocation action that didn't land
+     # (the input subsystem was down), so the operator can retry.
+     |> assign(:input_action_errors, %{})
      # Encoded id of the output reported to Home Assistant, or nil. The key
      # needn't be a shown card: a selected output that is unplugged stays
      # selected.
@@ -409,6 +412,7 @@ defmodule UniversalProxyWeb.AudioLive do
      socket
      |> assign(:input_more_open, toggle_member(open, id))
      |> update(:input_pairing_tokens, &Map.delete(&1, id))
+     |> update(:input_action_errors, &Map.delete(&1, id))
      |> disarm_input(id)}
   end
 
@@ -422,7 +426,10 @@ defmodule UniversalProxyWeb.AudioLive do
       end
 
     if armed && Map.has_key?(socket.assigns.inputs, id) do
-      {:noreply, assign(socket, :input_armed, {id, armed})}
+      {:noreply,
+       socket
+       |> update(:input_action_errors, &Map.delete(&1, id))
+       |> assign(:input_armed, {id, armed})}
     else
       {:noreply, socket}
     end
@@ -436,14 +443,30 @@ defmodule UniversalProxyWeb.AudioLive do
     with {^id, action} <- socket.assigns.input_armed,
          true <- Map.has_key?(socket.assigns.inputs, id),
          {:ok, key} <- decode_key(id) do
-      _ = run_input_action(key, action)
+      case run_input_action(key, action) do
+        :ok ->
+          socket =
+            if action == :regenerate,
+              do: update(socket, :input_pairing_tokens, &Map.delete(&1, id)),
+              else: socket
 
-      socket =
-        if action == :regenerate,
-          do: update(socket, :input_pairing_tokens, &Map.delete(&1, id)),
-          else: socket
+          {:noreply,
+           socket
+           |> update(:input_action_errors, &Map.delete(&1, id))
+           |> assign(:input_armed, nil)}
 
-      {:noreply, assign(socket, :input_armed, nil)}
+        {:error, _reason} ->
+          {:noreply,
+           update(
+             socket,
+             :input_action_errors,
+             &Map.put(
+               &1,
+               id,
+               "Couldn't complete that — the input service is unavailable. Try again."
+             )
+           )}
+      end
     else
       _ -> {:noreply, assign(socket, :input_armed, nil)}
     end
@@ -701,6 +724,7 @@ defmodule UniversalProxyWeb.AudioLive do
             pairing={Map.get(@input_pairing_tokens, id)}
             more_open?={MapSet.member?(@input_more_open, id)}
             armed={armed_for(@input_armed, id)}
+            action_error={Map.get(@input_action_errors, id)}
           />
         </div>
       </section>
@@ -791,6 +815,7 @@ defmodule UniversalProxyWeb.AudioLive do
   attr(:pairing, :any, default: nil)
   attr(:more_open?, :boolean, default: false)
   attr(:armed, :any, default: nil)
+  attr(:action_error, :string, default: nil)
 
   # Single input row/card. Read-only: no volume, mute, or enable control —
   # unlike an output, a present capture card always gets a source (see
@@ -996,6 +1021,15 @@ defmodule UniversalProxyWeb.AudioLive do
           >
             Confirm
           </button>
+        </div>
+
+        <div
+          :if={@action_error}
+          id={"input-action-error-#{@id}"}
+          role="alert"
+          class="col-span-3 text-danger"
+        >
+          {@action_error}
         </div>
       </div>
 

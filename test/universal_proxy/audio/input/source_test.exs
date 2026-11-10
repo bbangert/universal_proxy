@@ -327,8 +327,7 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
       {_hello, peer} = Peer.await_json!(peer, "client/hello")
 
       # 20 ms burst cadence: several ticks would have fired by now.
-      assert {:error, _conn, reason, _} = Mint.WebSocket.recv(peer.conn, 0, 300)
-      assert reason in [:timeout, %Mint.TransportError{reason: :timeout}]
+      peer = Peer.refute_frames!(peer, 100)
 
       peer = Peer.activate!(peer, roles: [], activities: [])
       {_time, _peer} = Peer.await_json!(peer, "client/time")

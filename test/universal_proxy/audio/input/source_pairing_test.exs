@@ -397,8 +397,7 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
 
       # Nor between message 2 and the server/activate that follows it: the
       # client may send nothing but the handshake until that activation.
-      assert {:error, _conn, reason, _} = Mint.WebSocket.recv(peer.conn, 0, 100)
-      assert reason in [:timeout, %Mint.TransportError{reason: :timeout}]
+      peer = Peer.refute_frames!(peer, 100)
 
       # The connection is healthy afterward, at trust user.
       _peer = activate_ready!(peer, source)
