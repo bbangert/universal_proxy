@@ -77,4 +77,20 @@ defmodule UniversalProxy.Audio.Input do
   catch
     :exit, _ -> :ok
   end
+
+  @doc """
+  Read an input's Sendspin pairing token (the `"SP:0…"` string a server such
+  as Music Assistant takes to pair with it over the Pairing PSK method),
+  minting its pairing PSK on first use.
+
+  Built on every call from the persisted identity and never cached or
+  broadcast: it is a long-lived pairing secret. `{:error, :unavailable}` when
+  the input isn't present, the subsystem is down, or the store can't answer.
+  """
+  @spec pairing_token(key()) :: {:ok, String.t()} | {:error, :unavailable}
+  def pairing_token({_, _, _} = key) do
+    Server.pairing_token(key)
+  catch
+    :exit, _ -> {:error, :unavailable}
+  end
 end

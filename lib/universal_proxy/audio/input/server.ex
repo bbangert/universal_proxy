@@ -33,9 +33,11 @@ defmodule UniversalProxy.Audio.Input.Server do
       "sendspin:input_state"    {:input_state, key, state_map}
 
   `input_map` is what `list_inputs/1` returns for a single entry: enumerate
-  info merged with the *non-secret* half of the persisted config. The PSK,
+  info merged with the *non-secret* half of the persisted config. The PSKs,
   the PSK id and the client keypair never leave this subsystem — a LiveView
-  assign is the last place long-term key material should live.
+  assign is the last place long-term key material should live. The one
+  exception is `pairing_token/2`, answered only to an explicit request (the
+  operator's "Show" on the Audio tab) and never broadcast.
 
   `state_map` is the derived live state of one input:
 
@@ -197,6 +199,17 @@ defmodule UniversalProxy.Audio.Input.Server do
     GenServer.call(server, {:allow_pairing, key})
   end
 
+  @doc """
+  The pairing token of a currently-present input (see
+  `Audio.Input.pairing_token/1`). `{:error, :unavailable}` for an absent input
+  or a store failure — the reason is never passed through.
+  """
+  @spec pairing_token(GenServer.server(), key()) :: {:ok, String.t()} | {:error, :unavailable}
+  def pairing_token(server \\ __MODULE__, {slot_sub, _vid, _pid} = key)
+      when is_binary(slot_sub) do
+    GenServer.call(server, {:pairing_token, key})
+  end
+
   # -- Server callbacks --
 
   @impl GenServer
@@ -279,6 +292,18 @@ defmodule UniversalProxy.Audio.Input.Server do
 
   def handle_call(:check_now, _from, state) do
     {:reply, :ok, refresh_inputs(state)}
+  end
+
+  def handle_call({:pairing_token, key}, _from, state) do
+    reply =
+      with true <- Map.has_key?(state.inputs, key),
+           {:ok, token} <- store_pairing_token(state.store, key) do
+        {:ok, token}
+      else
+        _ -> {:error, :unavailable}
+      end
+
+    {:reply, reply, state}
   end
 
   def handle_call({:allow_pairing, key}, _from, state) do
@@ -852,6 +877,12 @@ defmodule UniversalProxy.Audio.Input.Server do
     reason
     |> inspect()
     |> String.slice(0, @max_error_length)
+  end
+
+  defp store_pairing_token(store, key) do
+    Store.pairing_token(store, key)
+  catch
+    :exit, _ -> {:error, :unavailable}
   end
 
   # -- mDNS --

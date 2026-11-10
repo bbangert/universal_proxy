@@ -304,6 +304,17 @@ defmodule UniversalProxy.Audio.Input.ServerTest do
       refute Map.has_key?(input, :psk)
       refute Map.has_key?(input, :psk_id)
       refute Map.has_key?(input, :client_keypair)
+      refute Map.has_key?(input, :pairing_psk)
+    end
+
+    test "pairing_token/2 answers for a present input only", %{server: server, store: store} do
+      assert Server.pairing_token(server, @usb_key) == {:error, :unavailable}
+
+      add_usb_card!(server)
+
+      assert {:ok, "SP:0" <> _ = token} = Server.pairing_token(server, @usb_key)
+      assert {:ok, ^token} = Store.pairing_token(store, @usb_key)
+      refute Map.has_key?(hd(Server.list_inputs(server)), :pairing_psk)
     end
   end
 
@@ -476,7 +487,12 @@ defmodule UniversalProxy.Audio.Input.ServerTest do
       :ok = SourceStub.emit(source, :connected)
       assert_receive {:input_state, @usb_key, %{connection: :connected, status: :waiting}}
 
-      :ok = SourceStub.emit(source, {:pairing_required, %{method: :dynamic_pairing_code, format: :digits}})
+      :ok =
+        SourceStub.emit(
+          source,
+          {:pairing_required, %{method: :dynamic_pairing_code, format: :digits}}
+        )
+
       assert_receive {:input_state, @usb_key, %{status: :pairing, pin: nil}}
 
       :ok = SourceStub.emit(source, :pairing_started)
@@ -520,7 +536,12 @@ defmodule UniversalProxy.Audio.Input.ServerTest do
 
       # The offer is held for operator consent: it renders as `:pairing` with no
       # PIN, which is exactly what the LiveView keys the "Allow pairing" button on.
-      :ok = SourceStub.emit(source, {:pairing_required, %{method: :dynamic_pairing_code, format: :digits}})
+      :ok =
+        SourceStub.emit(
+          source,
+          {:pairing_required, %{method: :dynamic_pairing_code, format: :digits}}
+        )
+
       assert_receive {:input_state, @usb_key, %{status: :pairing, pin: nil}}
 
       # The consent-wait timeout elapsed with no gesture: back to connected-idle.
@@ -737,6 +758,7 @@ defmodule UniversalProxy.Audio.Input.ServerTest do
       assert Input.list_inputs() == []
       assert Input.get_input(@usb_key) == :error
       assert Input.check_now() == :ok
+      assert Input.pairing_token(@usb_key) == {:error, :unavailable}
     end
   end
 end

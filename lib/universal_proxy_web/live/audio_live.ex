@@ -43,6 +43,11 @@ defmodule UniversalProxyWeb.AudioLive do
   one of: the "Allow pairing" button (offer pending, no window), an active
   "waiting" state (window open), or the PIN (once derived).
 
+  Each input card can also reveal its Sendspin pairing token, read on demand
+  through `Audio.Input.pairing_token/1` exactly like an output's: the operator
+  pastes it into Music Assistant to pair over the Pairing PSK method, with no
+  PIN or consent gesture.
+
   ## HDMI-CEC
 
   An output whose ALSA card is paired with a CEC adapter
@@ -171,6 +176,9 @@ defmodule UniversalProxyWeb.AudioLive do
      # be read. Absent means hidden. The token is read on demand only and
      # dropped again on Hide / disclosure close / output removal.
      |> assign(:pairing_tokens, %{})
+     # The same, for input cards (a separate map: an input and an output of one
+     # USB device share a key).
+     |> assign(:input_pairing_tokens, %{})
      # Audio inputs (capture cards), keyed by the same base64-encoded
      # `{slot_sub, vid, pid}` id the outputs map above uses.
      |> assign(:inputs, build_inputs_map(inputs))}
@@ -361,6 +369,23 @@ defmodule UniversalProxyWeb.AudioLive do
     {:noreply, update(socket, :pairing_tokens, &Map.delete(&1, id))}
   end
 
+  def handle_event("show_input_pairing_token", %{"id" => id}, socket) do
+    case read_input_pairing_token(socket, id) do
+      {:ok, token} ->
+        {:noreply, put_input_pairing_token(socket, id, %RevealedToken{token: token})}
+
+      {:error, :unavailable} ->
+        {:noreply, put_input_pairing_token(socket, id, :unavailable)}
+
+      {:error, :not_found} ->
+        {:noreply, socket}
+    end
+  end
+
+  def handle_event("hide_input_pairing_token", %{"id" => id}, socket) do
+    {:noreply, update(socket, :input_pairing_tokens, &Map.delete(&1, id))}
+  end
+
   # Operator consent gesture for pairing a capture card. Opens the source's
   # time-boxed "allow pairing" window; the source stays authoritative over what
   # happens next (it still requires MA to type the derived PIN).
@@ -455,7 +480,12 @@ defmodule UniversalProxyWeb.AudioLive do
   end
 
   def handle_info({:sendspin_input_removed, %{key: key}}, socket) do
-    {:noreply, update(socket, :inputs, &Map.delete(&1, encode_key(key)))}
+    id = encode_key(key)
+
+    {:noreply,
+     socket
+     |> update(:inputs, &Map.delete(&1, id))
+     |> update(:input_pairing_tokens, &Map.delete(&1, id))}
   end
 
   # `state_map` from `Audio.Input.Server` is always the FULL derived live
@@ -537,7 +567,12 @@ defmodule UniversalProxyWeb.AudioLive do
           :if={map_size(@inputs) > 0}
           class="grid grid-cols-1 [grid-template-columns:repeat(auto-fit,minmax(360px,1fr))] gap-4"
         >
-          <.input_card :for={{id, input} <- sorted_inputs(@inputs)} id={id} input={input} />
+          <.input_card
+            :for={{id, input} <- sorted_inputs(@inputs)}
+            id={id}
+            input={input}
+            pairing={Map.get(@input_pairing_tokens, id)}
+          />
         </div>
       </section>
     </div>
@@ -601,7 +636,8 @@ defmodule UniversalProxyWeb.AudioLive do
       </h2>
       <p class="text-base text-fg-2 m-0 max-w-[640px]">
         Each USB capture card is advertised as a Sendspin source. Add it as a
-        Live Input in Music Assistant, then pair it using the PIN shown here.
+        Live Input in Music Assistant, then pair it with its pairing token or
+        the PIN shown here.
       </p>
     </div>
     """
@@ -623,6 +659,7 @@ defmodule UniversalProxyWeb.AudioLive do
 
   attr(:id, :string, required: true)
   attr(:input, :map, required: true)
+  attr(:pairing, :any, default: nil)
 
   # Single input row/card. Read-only: no volume, mute, or enable control —
   # unlike an output, a present capture card always gets a source (see
@@ -693,6 +730,57 @@ defmodule UniversalProxyWeb.AudioLive do
             Pairing allowed — waiting for Music Assistant…
           </div>
         </div>
+      </div>
+
+      <%!-- Pairing token: read only on Show, so it is in the DOM only while
+           revealed; Copy is client-side (falls back to selecting the token
+           where the clipboard is blocked on the plain-HTTP device UI). --%>
+      <div class="px-[22px] pt-2.5 pb-3.5 border-t border-border-2 bg-sunken
+                  grid grid-cols-[auto_1fr_auto] gap-x-3 gap-y-1 items-center text-[11px] text-fg-3">
+        <span class="self-start">Pairing token</span>
+        <span
+          :if={match?(%RevealedToken{}, @pairing)}
+          id={"input-pairing-token-#{@id}"}
+          class="font-mono text-fg-2 break-all select-all"
+        >
+          {@pairing.token}
+        </span>
+        <span :if={@pairing == :unavailable} class="text-fg-3">— Unavailable</span>
+        <span :if={is_nil(@pairing)} class="font-mono text-fg-3">••••••••</span>
+        <div class="flex items-center gap-2.5 self-start">
+          <button
+            :if={match?(%RevealedToken{}, @pairing)}
+            type="button"
+            phx-click="hide_input_pairing_token"
+            phx-value-id={@id}
+            class="text-accent text-[11px] cursor-pointer bg-transparent border-none p-0"
+          >
+            Hide
+          </button>
+          <button
+            :if={not match?(%RevealedToken{}, @pairing)}
+            type="button"
+            phx-click="show_input_pairing_token"
+            phx-value-id={@id}
+            class="text-accent text-[11px] cursor-pointer bg-transparent border-none p-0"
+          >
+            Show
+          </button>
+          <button
+            :if={match?(%RevealedToken{}, @pairing)}
+            type="button"
+            phx-hook="CopyToClipboard"
+            data-clipboard={@pairing.token}
+            data-select-target={"input-pairing-token-#{@id}"}
+            id={"copy-input-pairing-token-#{@id}"}
+            class="text-accent text-[11px] cursor-pointer bg-transparent border-none p-0"
+          >
+            Copy
+          </button>
+        </div>
+        <span class="col-span-3 text-fg-4">
+          Paste into Music Assistant's Sendspin "Pairing token" option to pair this input.
+        </span>
       </div>
 
       <div
@@ -1520,6 +1608,23 @@ defmodule UniversalProxyWeb.AudioLive do
   defp put_pairing_token(socket, id, value) do
     update(socket, :pairing_tokens, &Map.put(&1, id, value))
   end
+
+  # Only for an input this view still shows.
+  defp read_input_pairing_token(socket, id) do
+    with true <- Map.has_key?(socket.assigns.inputs, id),
+         {:ok, key} <- decode_key(id) do
+      input_facade().pairing_token(key)
+    else
+      _ -> {:error, :not_found}
+    end
+  end
+
+  defp put_input_pairing_token(socket, id, value) do
+    update(socket, :input_pairing_tokens, &Map.put(&1, id, value))
+  end
+
+  # Test seam, like `:audio_facade` above.
+  defp input_facade, do: Application.get_env(:universal_proxy, :audio_input_facade, Input)
 
   # Test seam, like `OverviewLive`'s `:storage_facade`: the app-tree
   # `Audio.Server` runs with no outputs in test.
