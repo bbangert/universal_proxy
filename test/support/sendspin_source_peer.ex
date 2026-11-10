@@ -42,6 +42,19 @@ defmodule UniversalProxy.SendspinSourcePeer do
 
   @default_timeout 5_000
 
+  # One fixed server identity by default, so a test can persist a pairing
+  # record bound to it (`default_server_id/0`) before the peer connects.
+  @default_server_keypair :crypto.generate_key(:ecdh, :x25519)
+
+  @doc "The server static keypair `connect!/2` uses unless given `:server_keypair`."
+  def default_server_keypair, do: @default_server_keypair
+
+  @doc "The `server_id` of `default_server_keypair/0`."
+  def default_server_id do
+    {pub, _priv} = @default_server_keypair
+    Base.url_encode64(pub, padding: false)
+  end
+
   defstruct [
     :conn,
     :ref,
@@ -53,6 +66,7 @@ defmodule UniversalProxy.SendspinSourcePeer do
     :client_id,
     :psk,
     :psk_id,
+    :psk_category,
     :suite,
     :pairing,
     clock_offset_us: 0,
@@ -68,16 +82,19 @@ defmodule UniversalProxy.SendspinSourcePeer do
   Options:
 
     * `:path` — defaults to `UniversalProxy.Audio.Input.Source.default_path/0`.
-    * `:server_keypair` — X25519 `{pub, priv}`; generated when absent.
+    * `:server_keypair` — X25519 `{pub, priv}`; `default_server_keypair/0`
+      when absent.
     * `:psk` — the PSK to hand the Noise session; defaults to the Sentinel PSK.
     * `:psk_id` — the id advertised in Noise message 1; defaults to the id of
       `:psk`.
+    * `:psk_category` — the category advertised beside it: `:sentinel` for
+      the Sentinel PSK and `:long_term` for anything else unless given.
     * `:clock_offset_us` — server clock minus client clock, in µs.
   """
   def connect!(port, opts \\ []) do
     path = Keyword.get(opts, :path, UniversalProxy.Audio.Input.Source.default_path())
     psk = Keyword.get(opts, :psk, Noise.sentinel_psk())
-    server_keypair = Keyword.get_lazy(opts, :server_keypair, &Noise.generate_static_keypair/0)
+    server_keypair = Keyword.get(opts, :server_keypair, @default_server_keypair)
     {server_pub, _priv} = server_keypair
 
     {:ok, conn} =
@@ -95,6 +112,7 @@ defmodule UniversalProxy.SendspinSourcePeer do
       server_id: Base.url_encode64(server_pub, padding: false),
       psk: psk,
       psk_id: Keyword.get_lazy(opts, :psk_id, fn -> Pairing.psk_id_for(psk) end),
+      psk_category: Keyword.get_lazy(opts, :psk_category, fn -> default_category(psk) end),
       clock_offset_us: Keyword.get(opts, :clock_offset_us, 0)
     }
   end
@@ -131,7 +149,7 @@ defmodule UniversalProxy.SendspinSourcePeer do
 
     message_1 =
       noise
-      |> Decibel.handshake_encrypt(Jason.encode!(%{"psk_id" => peer.psk_id}))
+      |> Decibel.handshake_encrypt(Wire.encode_noise_msg1_payload(peer.psk_id, peer.psk_category))
       |> IO.iodata_to_binary()
 
     peer = send_ws!(peer, {:text, Wire.encode_noise_handshake(message_1)})
@@ -151,14 +169,22 @@ defmodule UniversalProxy.SendspinSourcePeer do
 
   @doc """
   Re-run the Noise handshake **in band**, as a server does after a successful
-  pairing (ground truth §4).
+  pairing.
 
   The two `noise/handshake` messages travel as ordinary encrypted JSON under
   the *old* session, the prologue is the previous handshake's hash, and `psk`
-  (the freshly paired long-term PSK) keys the new session. On return the peer
-  talks under the new session.
+  (by default the freshly paired long-term PSK; `:category` says which kind)
+  keys the new session. On return the peer talks under the new session; the
+  next message a server sends is `server/activate` (no hellos are replayed).
+
+  `tolerate_time: true` discards `client/time` frames and audio chunks the
+  source sent before it received message 1 (a server must tolerate those); by
+  default any frame other than message 2 flunks.
   """
-  def rehandshake!(peer, psk, timeout \\ @default_timeout) do
+  def rehandshake!(peer, psk, opts \\ []) do
+    category = Keyword.get(opts, :category, :long_term)
+    timeout = Keyword.get(opts, :timeout, @default_timeout)
+
     {:ok, protocol} = Noise.protocol_name(peer.suite)
     {:ok, client_pub} = Base.url_decode64(peer.client_id, padding: false)
     psk_id = Pairing.psk_id_for(psk)
@@ -173,7 +199,7 @@ defmodule UniversalProxy.SendspinSourcePeer do
 
     message_1 =
       noise
-      |> Decibel.handshake_encrypt(Jason.encode!(%{"psk_id" => psk_id}))
+      |> Decibel.handshake_encrypt(Wire.encode_noise_msg1_payload(psk_id, category))
       |> IO.iodata_to_binary()
 
     peer = send_message!(peer, "noise/handshake", %{"data" => b64(message_1)})
@@ -186,17 +212,7 @@ defmodule UniversalProxy.SendspinSourcePeer do
     # message 2 — flunk on anything interleaved rather than tolerating it, which
     # is what makes a future regression that emits `client/time` one boundary
     # later (during re-handshake instead of pairing) fail loudly.
-    {payload, peer} =
-      case next!(peer, timeout) do
-        {{:json, "noise/handshake", payload}, peer} ->
-          {payload, peer}
-
-        {other, _peer} ->
-          flunk(
-            "expected noise/handshake message 2 but received #{inspect(other)} mid-rehandshake; " <>
-              "a real server never interleaves frames with the in-band re-handshake"
-          )
-      end
+    {payload, peer} = await_message_2!(peer, Keyword.get(opts, :tolerate_time, false), timeout)
 
     {:ok, message_2} = Base.url_decode64(payload["data"], padding: false)
     assert IO.iodata_to_binary(Decibel.handshake_decrypt(noise, message_2)) == "{}"
@@ -208,8 +224,28 @@ defmodule UniversalProxy.SendspinSourcePeer do
       | noise: noise,
         handshake_hash: Decibel.handshake_hash(noise),
         psk: psk,
-        psk_id: psk_id
+        psk_id: psk_id,
+        psk_category: category
     }
+  end
+
+  defp await_message_2!(peer, tolerate_time?, timeout) do
+    case next!(peer, timeout) do
+      {{:json, "noise/handshake", payload}, peer} ->
+        {payload, peer}
+
+      {{:json, "client/time", _payload}, peer} when tolerate_time? ->
+        await_message_2!(peer, tolerate_time?, timeout)
+
+      {{:audio, _timestamp_us, _payload}, peer} when tolerate_time? ->
+        await_message_2!(peer, tolerate_time?, timeout)
+
+      {other, _peer} ->
+        flunk(
+          "expected noise/handshake message 2 but received #{inspect(other)} mid-rehandshake; " <>
+            "a real server never interleaves frames with the in-band re-handshake"
+        )
+    end
   end
 
   @doc "Read the first (client/init) text frame without proceeding further."
@@ -252,6 +288,32 @@ defmodule UniversalProxy.SendspinSourcePeer do
     send_message!(peer, "server/activate", payload)
   end
 
+  @doc """
+  Assert the source sends nothing for `ms` (e.g. inside a re-handshake window).
+  Returns the peer unchanged.
+  """
+  def refute_frames!(peer, ms) do
+    case peer.frames do
+      [] -> :ok
+      frames -> flunk("unexpected buffered frames: #{inspect(frames)}")
+    end
+
+    case Mint.WebSocket.recv(peer.conn, 0, ms) do
+      {:error, _conn, reason, _} when reason == :timeout ->
+        peer
+
+      {:error, _conn, %Mint.TransportError{reason: :timeout}, _} ->
+        peer
+
+      {:ok, _conn, [{:data, _ref, data}]} ->
+        {:ok, _websocket, frames} = Mint.WebSocket.decode(peer.websocket, data)
+        flunk("expected silence but the source sent #{length(frames)} frame(s)")
+
+      other ->
+        flunk("unexpected receive result: #{inspect(other)}")
+    end
+  end
+
   @doc "Send `server/command` with a source `start`/`stop`."
   def command!(peer, command) when command in ["start", "stop"] do
     send_message!(peer, "server/command", %{"source" => %{"command" => command}})
@@ -280,11 +342,39 @@ defmodule UniversalProxy.SendspinSourcePeer do
         handshake_hash: peer.handshake_hash,
         pairing_index: index,
         suite: peer.suite,
-        pin_length: Keyword.get(opts, :pin_length, 6)
+        method: Keyword.get(opts, :method, :dynamic_pairing_code)
       )
 
-    {:send, messages, pairing} = PairingServer.handle(pairing, "client/pair-init", payload)
-    {index, send_pairing!(%{peer | pairing: pairing}, messages)}
+    case PairingServer.handle(pairing, "client/pair-init", payload) do
+      {:send, messages, pairing} -> {index, send_pairing!(%{peer | pairing: pairing}, messages)}
+      {:ok, pairing} -> {index, %{peer | pairing: pairing}}
+    end
+  end
+
+  @doc """
+  Serve the rest of a Pairing PSK attempt opened by `await_pair_init!/3`
+  (with `method: :pairing_psk`): `client/pair-finalize {long_term_psk}`
+  follows `client/pair-init` immediately, and is answered with
+  `server/pair-finalize`. Strict. Returns `{psk, peer}`.
+  """
+  def serve_pairing_psk_finalize!(peer, timeout \\ @default_timeout) do
+    {finalize, peer} = await_pairing_json!(peer, "client/pair-finalize", timeout)
+
+    {:send, messages, pairing} =
+      PairingServer.handle(peer.pairing, "client/pair-finalize", finalize)
+
+    peer = send_pairing!(%{peer | pairing: pairing}, messages)
+    {PairingServer.psk(pairing), peer}
+  end
+
+  @doc """
+  Wait for `client/pair-retry` (after a wrong code) and start the next round
+  with a nonce-less `server/pair-init`. Strict.
+  """
+  def serve_pair_retry!(peer, timeout \\ @default_timeout) do
+    {payload, peer} = await_pairing_json!(peer, "client/pair-retry", timeout)
+    {:send, messages, pairing} = PairingServer.handle(peer.pairing, "client/pair-retry", payload)
+    send_pairing!(%{peer | pairing: pairing}, messages)
   end
 
   @doc """
@@ -563,6 +653,10 @@ defmodule UniversalProxy.SendspinSourcePeer do
       %{status: status, headers: headers} -> {conn, status, headers}
       _incomplete -> await_upgrade(conn, ref, acc)
     end
+  end
+
+  defp default_category(psk) do
+    if psk == Noise.sentinel_psk(), do: :sentinel, else: :long_term
   end
 
   defp maybe_put(map, _key, nil), do: map

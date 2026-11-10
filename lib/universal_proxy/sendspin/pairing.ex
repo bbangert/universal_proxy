@@ -1,61 +1,76 @@
 defmodule UniversalProxy.Sendspin.Pairing do
   @moduledoc """
-  Sendspin PIN pairing — the client half (CPace party B / responder).
+  Sendspin pairing — the client half (CPace party B / responder), per
+  Sendspin 1.0.0-rc1 `pairing.md`.
 
   Pairing runs *inside* an established Noise session: the server grants the
   `pairing` activity in `server/activate`, we open the attempt, and both
-  sides end up holding a fresh 32-byte long-term PSK that promotes the next
-  handshake from trust `none` to trust `user`. `source@v1` can never
-  activate below trust `user`, so a capture-card client must pair before it
-  can stream.
+  sides end up holding a fresh 32-byte long-term PSK. Only a session keyed by
+  a long-term PSK may activate roles on a client without unpaired access, so
+  a capture-card source must pair before it can stream.
 
   This module is pure: it holds the attempt state in a struct and turns
   inbound decoded-JSON payloads into outbound ones. The connection FSM owns
   the websocket, the JSON codec, the Noise transport frames, the pairing
   counter and the 120 s attempt timeout (`attempt_timeout_ms/0`).
 
-  ## Message flow (dynamic PIN)
+  ## Methods
+
+  **Pairing PSK** (`:pairing_psk`) — the session's Noise handshake already
+  authenticated both sides with the client's pairing PSK (the secret behind
+  its pairing token), so there is no PAKE: `client/pair-init` and
+  `client/pair-finalize {long_term_psk}` go out back to back, and
+  `server/pair-finalize` completes it.
+
+  **Dynamic pairing code** (`:dynamic_pairing_code`, `digits` format):
 
       client -> client/pair-init     {pairing_index, commit_B}   start/1
-      client <- server/pair-init     {nonce_A}                   → {:pin, pin, _}
+      client <- server/pair-init     {nonce_A}                   → {:pin, code, _}
       client <- server/pair-auth     {pake_msg_1 = Ya}
       client -> client/pair-auth     {pake_msg_2 = Yb}
       client <- server/pair-confirm  {server_kc = Ta}
-      client -> client/pair-confirm  {client_kc = Tb, nonce_B}
+      client -> client/pair-confirm  {client_kc = Tb, wrapped_nonce_B}
       client -> client/pair-finalize {wrapped_psk}
       client <- server/pair-finalize {}                          → {:paired, _, _}
 
-  Static PIN is the same flow minus `server/pair-init`, `commit_B` and
-  `nonce_B`; the PIN is configured out of band and must be exactly 8 digits.
+  A `server_kc` that fails to verify (a mistyped code) answers
+  `client/pair-retry` instead of `client/pair-confirm`, and the server starts
+  another **round** with a `server/pair-init` carrying no nonce: the code is
+  unchanged, but each round runs a fresh CPace under its own `sid` (the round
+  number is part of it). At `:max_rounds` we abort with
+  `pairing_code_mismatch` instead of retrying.
 
-  ## PIN direction
+  **Static pairing code** (`:static_pairing_code`) is the same exchange
+  minus `server/pair-init`, `commit_B`, `wrapped_nonce_B` and retries; the
+  code is configured out of band and must be exactly 8 digits.
 
-  In the dynamic flow **we derive and display the PIN** and the operator
-  types it into Music Assistant — not the other way round. Both nonces and
-  the Noise handshake hash determine it (`derive_pin/4`), and our `commit_B`
-  is sent before `nonce_A` exists so we cannot grind the digits. The server
-  re-derives it from the `nonce_B` we reveal in `client/pair-confirm` and
-  compares against what the operator typed (ground truth §3, "Server-side
-  verification order"; `aiosendspin/noise/pairing.py` `run_dynamic_pin_client`
-  calls `pin_emitter(pin)`).
+  ## Code direction
+
+  In the dynamic flow **we derive and display the code** and the operator
+  types it into the server. Both nonces and the Noise handshake hash
+  determine it (`derive_pairing_code/3`), and our `commit_B` is sent before
+  `nonce_A` exists so we cannot grind the digits. The server re-derives it
+  from the `nonce_B` we reveal (sealed) in `client/pair-confirm`.
 
   ## PSK direction
 
-  **We** mint the long-term PSK, wrap it under `K_wrap` and send it in
-  `client/pair-finalize`; the server unwraps and stores it (ground truth §3,
-  "PSK wrapping"). Nothing is persisted until `server/pair-finalize` arrives.
+  **We** mint the long-term PSK and send it in `client/pair-finalize` —
+  wrapped under the CPace output in the code flows, in the clear (inside
+  the Noise channel) in the Pairing PSK flow. Nothing is persisted until
+  `server/pair-finalize` arrives.
   """
 
   alias UniversalProxy.Sendspin.CPace
 
-  # Sendspin labels — ground truth §3 "Constants". Literal ASCII, no
-  # separator and no NUL between a label and what follows it.
+  # Sendspin labels (`pairing.md`). Literal ASCII, no separator and no NUL
+  # between a label and what follows it.
   @sid_label "sendspin-pair-pake-v1"
   @ad_server "server"
   @ad_client "client"
-  @pin_derive_label "sendspin-pin-derive-v1"
+  @code_derive_label "sendspin-pairing-code-derive-v1"
   @commit_label "sendspin-pair-commit-v1"
   @psk_wrap_label "sendspin-pair-psk-wrap-v1"
+  @nonce_wrap_label "sendspin-pair-nonce-wrap-v1"
   @psk_id_label "sendspin-psk-id-v1"
 
   # CPace's own MCF label (draft-irtf-cfrg-cpace-21 Section 7.4); the generic
@@ -68,16 +83,18 @@ defmodule UniversalProxy.Sendspin.Pairing do
   @tag_bytes 64
   @psk_bytes 32
   @aead_tag_bytes 16
-  @wrapped_psk_bytes @psk_bytes + @aead_tag_bytes
+  @wrapped_bytes @psk_bytes + @aead_tag_bytes
 
-  # K_wrap is freshly derived per attempt and used once, so a fixed all-zero
-  # nonce is safe (ground truth §3, "PSK wrapping").
-  @psk_wrap_nonce :binary.copy(<<0>>, 12)
+  # Every wrap key is per-field and used once, so a fixed all-zero nonce is
+  # safe (`pairing.md` "Wrapping").
+  @wrap_nonce :binary.copy(<<0>>, 12)
 
-  @min_pin_digits 4
-  @max_pin_digits 12
-  @default_pin_digits 6
-  @static_pin_digits 8
+  @dynamic_code_digits 6
+  @static_code_digits 8
+
+  # `pairing.md` "Rounds": after 20 rounds since the last verified
+  # `server_kc` the client MUST abort rather than retry.
+  @round_limit 20
 
   @attempt_timeout_ms 120_000
 
@@ -85,18 +102,16 @@ defmodule UniversalProxy.Sendspin.Pairing do
     attempt_timeout: "attempt_timeout",
     concurrent_attempt: "concurrent_attempt",
     method_not_supported: "method_not_supported",
-    pin_length_unacceptable: "pin_length_unacceptable",
-    pin_mismatch: "pin_mismatch",
+    pairing_code_mismatch: "pairing_code_mismatch",
     user_cancelled: "user_cancelled"
   }
 
-  @type method :: :dynamic_pin | :static_pin
+  @type method :: :dynamic_pairing_code | :static_pairing_code | :pairing_psk
   @type abort_reason ::
           :attempt_timeout
           | :concurrent_attempt
           | :method_not_supported
-          | :pin_length_unacceptable
-          | :pin_mismatch
+          | :pairing_code_mismatch
           | :user_cancelled
 
   @type stage ::
@@ -116,7 +131,8 @@ defmodule UniversalProxy.Sendspin.Pairing do
   What the caller must do next.
 
     * `{:send, msgs, state}` — send each message, in order, and keep reading.
-    * `{:pin, pin, state}` — show `pin` to the user; nothing to send yet.
+    * `{:pin, code, state}` — show `code` to the user (again, on a retry
+      round); nothing to send yet.
     * `{:paired, outcome, state}` — persist the PSK; pairing is complete and
       the server will re-run the Noise handshake in band.
     * `{:abort, reason, msgs, state}` — send the `pair/abort` and stop.
@@ -137,9 +153,10 @@ defmodule UniversalProxy.Sendspin.Pairing do
           stage: stage(),
           handshake_hash: binary(),
           pairing_index: non_neg_integer(),
+          round: pos_integer(),
+          max_rounds: pos_integer(),
           sid: binary(),
           suite: String.t(),
-          pin_length: pos_integer(),
           pin: String.t() | nil,
           nonce_a: binary() | nil,
           nonce_b: binary() | nil,
@@ -152,7 +169,7 @@ defmodule UniversalProxy.Sendspin.Pairing do
         }
 
   # Redact the secret fields from any crash report / RingLogger dump / observer
-  # inspection: the minted long-term PSK, the derived PIN, the CPace
+  # inspection: the minted long-term PSK, the derived code, the CPace
   # intermediate/MAC keys, the commit/reveal nonce (secret until revealed in
   # `client/pair-confirm`) and the (test-only) CPace scalar. The live CPace
   # scalar lives inside the `:cpace` field's `%CPace{}`, which self-redacts it
@@ -175,26 +192,29 @@ defmodule UniversalProxy.Sendspin.Pairing do
     :mac_key,
     :psk,
     :cpace_scalar,
-    pin_length: @default_pin_digits
+    round: 1,
+    max_rounds: @round_limit
   ]
 
   # -- Attempt lifecycle --
 
   @doc """
-  Open a pairing attempt, returning the `client/pair-init` to send.
+  Open a pairing attempt, returning the message(s) to send.
 
   Options:
 
     * `:handshake_hash` (required) — the 32-byte Noise handshake hash of the
       session this attempt runs inside.
     * `:pairing_index` (required) — the count of pairing `server/activate`
-      messages since the last Noise handshake, first attempt being 1. It
+      messages received since the last Noise handshake, first being 1. It
       resets to 0 on every handshake, re-handshakes included.
     * `:suite` (required) — the negotiated Noise cipher suite string; it
-      selects the AEAD that wraps the PSK.
-    * `:method` — `:dynamic_pin` (default) or `:static_pin`.
-    * `:pin_length` — dynamic PIN digits, 4..12, default 6.
-    * `:pin` — required for `:static_pin`; exactly 8 decimal digits.
+      selects the AEAD that wraps the PSK and `nonce_B`.
+    * `:method` — `:dynamic_pairing_code` (default), `:static_pairing_code`
+      or `:pairing_psk`.
+    * `:max_rounds` — dynamic code rounds this attempt may run before it
+      aborts instead of retrying, 1..#{@round_limit} (default #{@round_limit}).
+    * `:pin` — required for `:static_pairing_code`; exactly 8 decimal digits.
     * `:psk` — the long-term PSK to hand the server. Freshly sampled unless
       given; supply it only in tests.
     * `:nonce_b` — our 32-byte commit/reveal nonce. Test-only, as above.
@@ -202,10 +222,11 @@ defmodule UniversalProxy.Sendspin.Pairing do
   """
   @spec start(keyword()) :: {:ok, [message()], t()} | {:error, term()}
   def start(opts) do
-    method = Keyword.get(opts, :method, :dynamic_pin)
+    method = Keyword.get(opts, :method, :dynamic_pairing_code)
 
     with {:ok, hash} <- fetch_hash(opts),
          {:ok, index} <- fetch_index(opts),
+         {:ok, max_rounds} <- fetch_max_rounds(opts),
          {:ok, _cipher} <- cipher_for(Keyword.get(opts, :suite)),
          {:ok, psk} <- fetch_psk(opts) do
       state = %__MODULE__{
@@ -213,7 +234,8 @@ defmodule UniversalProxy.Sendspin.Pairing do
         stage: :awaiting_server_init,
         handshake_hash: hash,
         pairing_index: index,
-        sid: sid(hash, index),
+        max_rounds: max_rounds,
+        sid: sid(hash, index, 1),
         suite: Keyword.fetch!(opts, :suite),
         psk: psk,
         cpace_scalar: Keyword.get(opts, :cpace_scalar)
@@ -237,25 +259,37 @@ defmodule UniversalProxy.Sendspin.Pairing do
     {:aborted, reason, fail(state, {:peer_abort, reason})}
   end
 
+  # The first round carries the server's nonce and fixes the code.
   def handle(
-        %__MODULE__{stage: :awaiting_server_init, method: :dynamic_pin} = state,
+        %__MODULE__{stage: :awaiting_server_init, method: :dynamic_pairing_code, round: 1} =
+          state,
         "server/pair-init",
         payload
       ) do
     with {:ok, nonce_a} <- decode_field(payload, "nonce_A", @nonce_bytes),
-         pin = derive_pin(state.handshake_hash, nonce_a, state.nonce_b, state.pin_length),
-         {:ok, cpace} <- start_cpace(state, pin) do
-      state = %{
-        state
-        | nonce_a: nonce_a,
-          pin: pin,
-          cpace: cpace,
-          stage: :awaiting_pair_auth
-      }
-
-      {:pin, pin, state}
+         code = derive_pairing_code(state.handshake_hash, nonce_a, state.nonce_b),
+         {:ok, cpace} <- start_cpace(state, code) do
+      {:pin, code,
+       %{state | nonce_a: nonce_a, pin: code, cpace: cpace, stage: :awaiting_pair_auth}}
     else
       {:error, reason} -> {:error, reason, fail(state, reason)}
+    end
+  end
+
+  # A retry round: same code, no nonce, a fresh CPace under the round's sid.
+  def handle(
+        %__MODULE__{stage: :awaiting_server_init, method: :dynamic_pairing_code} = state,
+        "server/pair-init",
+        payload
+      ) do
+    if Map.has_key?(payload, "nonce_A") do
+      reason = {:unexpected_field, "nonce_A"}
+      {:error, reason, fail(state, reason)}
+    else
+      case start_cpace(state, state.pin) do
+        {:ok, cpace} -> {:pin, state.pin, %{state | cpace: cpace, stage: :awaiting_pair_auth}}
+        {:error, reason} -> {:error, reason, fail(state, reason)}
+      end
     end
   end
 
@@ -280,13 +314,18 @@ defmodule UniversalProxy.Sendspin.Pairing do
   def handle(%__MODULE__{stage: :awaiting_pair_confirm} = state, "server/pair-confirm", payload) do
     case decode_field(payload, "server_kc", @tag_bytes) do
       {:ok, ta} ->
-        if server_tag_valid?(state, ta) do
-          # The server's Tb check and the PSK unwrap both happen on its side
-          # of one round trip, so confirm and finalize go out together.
-          {:send, [confirm_message(state), finalize_message(state)],
-           %{state | stage: :awaiting_pair_finalize}}
-        else
-          abort(state, :pin_mismatch)
+        cond do
+          server_tag_valid?(state, ta) ->
+            # The server's checks and the PSK unwrap all happen on its side
+            # of one round trip, so confirm and finalize go out together.
+            {:send, [confirm_message(state), finalize_message(state)],
+             %{state | stage: :awaiting_pair_finalize}}
+
+          state.method == :dynamic_pairing_code and state.round < state.max_rounds ->
+            retry(state)
+
+          true ->
+            abort(state, :pairing_code_mismatch)
         end
 
       {:error, reason} ->
@@ -321,18 +360,26 @@ defmodule UniversalProxy.Sendspin.Pairing do
   def stage(%__MODULE__{stage: stage}), do: stage
 
   @doc """
-  The PIN to display, or `nil` before `server/pair-init` in a dynamic-PIN
+  The code to display, or `nil` before `server/pair-init` in a dynamic
   attempt.
   """
   @spec pin(t()) :: String.t() | nil
   def pin(%__MODULE__{pin: pin}), do: pin
 
+  @doc "The current dynamic-pairing-code round, 1 for the first."
+  @spec round(t()) :: pos_integer()
+  def round(%__MODULE__{round: round}), do: round
+
   @doc """
   How long the client may take over the whole exchange before it must send
-  `pair/abort` with `attempt_timeout` (`aiosendspin/noise/pairing.py`).
+  `pair/abort` with `attempt_timeout` (`pairing.md` recommends 2 minutes).
   """
   @spec attempt_timeout_ms() :: pos_integer()
   def attempt_timeout_ms, do: @attempt_timeout_ms
+
+  @doc "The spec's round limit since the last verified `server_kc`."
+  @spec round_limit() :: pos_integer()
+  def round_limit, do: @round_limit
 
   # -- Protocol primitives --
   #
@@ -340,13 +387,14 @@ defmodule UniversalProxy.Sendspin.Pairing do
   # server in the tests all compute these the one documented way.
 
   @doc """
-  The CPace session id: label, the Noise handshake hash, and the pairing
-  counter as a big-endian `uint32` (ground truth §3, "`sid` construction").
+  The CPace session id: label, the Noise handshake hash, the pairing index
+  and the round, both as big-endian `uint32` (`pairing.md` "PAKE").
   """
-  @spec sid(binary(), non_neg_integer()) :: binary()
-  def sid(handshake_hash, pairing_index)
-      when byte_size(handshake_hash) == 32 and pairing_index in 0..0xFFFFFFFF do
-    @sid_label <> handshake_hash <> <<pairing_index::unsigned-big-32>>
+  @spec sid(binary(), non_neg_integer(), pos_integer()) :: binary()
+  def sid(handshake_hash, pairing_index, round)
+      when byte_size(handshake_hash) == 32 and pairing_index in 0..0xFFFFFFFF and
+             round in 1..0xFFFFFFFF do
+    @sid_label <> handshake_hash <> <<pairing_index::unsigned-big-32, round::unsigned-big-32>>
   end
 
   @doc "`commit_B` — our commitment to `nonce_B`, sent before `nonce_A` exists."
@@ -363,30 +411,31 @@ defmodule UniversalProxy.Sendspin.Pairing do
   def commit_valid?(_nonce, _commitment), do: false
 
   @doc """
-  The dynamic PIN: `SHA-256(label || h || nonce_A || nonce_B)` read as a
-  big-endian integer, reduced mod `10^length` and zero-padded to `length`
-  ASCII digits (ground truth §3, "PIN derivation").
+  The dynamic pairing code in the `digits` format:
+  `SHA-256("sendspin-pairing-code-derive-v1" || h || nonce_A || nonce_B)`
+  read as a big-endian integer, reduced mod `10^6` and zero-padded to 6 ASCII
+  digits.
   """
-  @spec derive_pin(binary(), binary(), binary(), pos_integer()) :: String.t()
-  def derive_pin(handshake_hash, nonce_a, nonce_b, length)
-      when byte_size(nonce_a) == @nonce_bytes and byte_size(nonce_b) == @nonce_bytes and
-             length in @min_pin_digits..@max_pin_digits do
+  @spec derive_pairing_code(binary(), binary(), binary()) :: String.t()
+  def derive_pairing_code(handshake_hash, nonce_a, nonce_b)
+      when byte_size(handshake_hash) == 32 and byte_size(nonce_a) == @nonce_bytes and
+             byte_size(nonce_b) == @nonce_bytes do
     <<digest::unsigned-big-256>> =
-      :crypto.hash(:sha256, @pin_derive_label <> handshake_hash <> nonce_a <> nonce_b)
+      :crypto.hash(:sha256, @code_derive_label <> handshake_hash <> nonce_a <> nonce_b)
 
     digest
-    |> rem(Integer.pow(10, length))
+    |> rem(Integer.pow(10, @dynamic_code_digits))
     |> Integer.to_string()
-    |> String.pad_leading(length, "0")
+    |> String.pad_leading(@dynamic_code_digits, "0")
   end
 
-  @doc "Whether `pin` is a well-formed static PIN — exactly 8 ASCII digits."
-  @spec valid_static_pin?(term()) :: boolean()
-  def valid_static_pin?(pin) when is_binary(pin) do
-    byte_size(pin) == @static_pin_digits and pin =~ ~r/\A[0-9]+\z/
+  @doc "Whether `code` is a well-formed static pairing code — exactly 8 ASCII digits."
+  @spec valid_static_pairing_code?(term()) :: boolean()
+  def valid_static_pairing_code?(code) when is_binary(code) do
+    byte_size(code) == @static_code_digits and code =~ ~r/\A[0-9]+\z/
   end
 
-  def valid_static_pin?(_pin), do: false
+  def valid_static_pairing_code?(_code), do: false
 
   @doc """
   The CPace MCF key, `SHA-512("CPaceMac" || sid || ISK)` — a plain
@@ -399,8 +448,7 @@ defmodule UniversalProxy.Sendspin.Pairing do
   An MCF tag, `HMAC-SHA-512(mac_key, lv_cat(share, ad))`.
 
   `Ta` covers the server's `(Ya, "server")` and `Tb` the client's
-  `(Yb, "client")`, whichever side is computing them (ground truth §3, "MCF
-  tag construction").
+  `(Yb, "client")`, whichever side is computing them.
   """
   @spec confirmation_tag(binary(), binary(), binary()) :: binary()
   def confirmation_tag(mac_key, share, ad),
@@ -415,26 +463,33 @@ defmodule UniversalProxy.Sendspin.Pairing do
   def client_ad, do: @ad_client
 
   @doc """
-  `K_wrap = SHA-256(label || sid || ISK)`, the single-use key the PSK
-  travels under.
+  `K_wrap = SHA-256("sendspin-pair-psk-wrap-v1" || sid || ISK)`, the
+  single-use key the long-term PSK travels under.
   """
   @spec wrap_key(binary(), binary()) :: binary()
   def wrap_key(sid, isk), do: :crypto.hash(:sha256, @psk_wrap_label <> sid <> isk)
 
   @doc """
-  Seal a 32-byte PSK under `K_wrap` with the connection's AEAD, an all-zero
-  nonce and empty associated data. The result is 48 bytes.
+  `K_wrap = SHA-256("sendspin-pair-nonce-wrap-v1" || sid || ISK)`, the
+  single-use key `nonce_B` is revealed under (as `wrapped_nonce_B`).
   """
-  @spec wrap_psk(binary(), binary(), binary()) :: binary()
-  def wrap_psk(suite, wrap_key, psk) when byte_size(psk) == @psk_bytes do
+  @spec nonce_wrap_key(binary(), binary()) :: binary()
+  def nonce_wrap_key(sid, isk), do: :crypto.hash(:sha256, @nonce_wrap_label <> sid <> isk)
+
+  @doc """
+  Seal a 32-byte value under a wrap key with the connection's AEAD, an
+  all-zero nonce and empty associated data. The result is 48 bytes.
+  """
+  @spec wrap(binary(), binary(), binary()) :: binary()
+  def wrap(suite, wrap_key, value) when byte_size(value) == @psk_bytes do
     {:ok, cipher} = cipher_for(suite)
 
     {ciphertext, tag} =
       :crypto.crypto_one_time_aead(
         cipher,
         wrap_key,
-        @psk_wrap_nonce,
-        psk,
+        @wrap_nonce,
+        value,
         <<>>,
         @aead_tag_bytes,
         true
@@ -444,41 +499,41 @@ defmodule UniversalProxy.Sendspin.Pairing do
   end
 
   @doc """
-  Open a wrapped PSK. An AEAD failure is a protocol error, not a wrong PIN —
-  the MCF tags have already settled that question by this point.
+  Open a wrapped value. An AEAD failure is a protocol error, not a wrong
+  code — the MCF tags have already settled that question by this point.
   """
-  @spec unwrap_psk(binary(), binary(), binary()) :: {:ok, binary()} | {:error, term()}
-  def unwrap_psk(suite, wrap_key, wrapped) when byte_size(wrapped) == @wrapped_psk_bytes do
+  @spec unwrap(binary(), binary(), binary()) :: {:ok, binary()} | {:error, term()}
+  def unwrap(suite, wrap_key, wrapped) when byte_size(wrapped) == @wrapped_bytes do
     <<ciphertext::binary-size(@psk_bytes), tag::binary-size(@aead_tag_bytes)>> = wrapped
 
     with {:ok, cipher} <- cipher_for(suite) do
       case :crypto.crypto_one_time_aead(
              cipher,
              wrap_key,
-             @psk_wrap_nonce,
+             @wrap_nonce,
              ciphertext,
              <<>>,
              tag,
              false
            ) do
-        :error -> {:error, :psk_unwrap_failed}
-        psk -> {:ok, psk}
+        :error -> {:error, :unwrap_failed}
+        value -> {:ok, value}
       end
     end
   end
 
-  def unwrap_psk(_suite, _wrap_key, _wrapped), do: {:error, {:malformed_field, "wrapped_psk"}}
+  def unwrap(_suite, _wrap_key, _wrapped), do: {:error, :malformed_wrapped_value}
 
   @doc """
   The wire identifier for a PSK: `base64url(SHA-256(label || psk))`, no
-  padding. One namespace across long-term, pairing and sentinel PSKs, so a
-  lookup by `psk_id` must be unique across all three.
+  padding. One namespace across long-term, pairing and sentinel PSKs; the
+  `psk_category` beside it in Noise message 1 says which store to look in.
   """
   @spec psk_id_for(binary()) :: String.t()
   def psk_id_for(psk) when byte_size(psk) == @psk_bytes,
     do: b64(:crypto.hash(:sha256, @psk_id_label <> psk))
 
-  @doc "A fresh long-term PSK."
+  @doc "A fresh 32-byte PSK (long-term or pairing), from the CSPRNG."
   @spec generate_psk() :: binary()
   def generate_psk, do: :crypto.strong_rand_bytes(@psk_bytes)
 
@@ -488,10 +543,9 @@ defmodule UniversalProxy.Sendspin.Pairing do
 
   # -- Attempt setup --
 
-  defp start_method(:dynamic_pin, state, opts) do
-    with {:ok, length} <- fetch_pin_length(opts),
-         {:ok, nonce_b} <- fetch_nonce(opts) do
-      state = %{state | pin_length: length, nonce_b: nonce_b}
+  defp start_method(:dynamic_pairing_code, state, opts) do
+    with {:ok, nonce_b} <- fetch_nonce(opts) do
+      state = %{state | nonce_b: nonce_b}
 
       payload = %{
         "pairing_index" => state.pairing_index,
@@ -502,11 +556,11 @@ defmodule UniversalProxy.Sendspin.Pairing do
     end
   end
 
-  defp start_method(:static_pin, state, opts) do
+  defp start_method(:static_pairing_code, state, opts) do
     pin = Keyword.get(opts, :pin)
 
-    if valid_static_pin?(pin) do
-      # No nonces and no commitment: the PIN is known to both sides up
+    if valid_static_pairing_code?(pin) do
+      # No nonces and no commitment: the code is known to both sides up
       # front, so CPace can start before the server says anything.
       case start_cpace(state, pin) do
         {:ok, cpace} ->
@@ -517,8 +571,19 @@ defmodule UniversalProxy.Sendspin.Pairing do
           {:error, reason}
       end
     else
-      {:error, {:invalid_static_pin, pin}}
+      {:error, :invalid_static_pairing_code}
     end
+  end
+
+  # The session itself was keyed by the pairing PSK, so both sides are
+  # already authenticated: pair-init then the long-term PSK, back to back.
+  defp start_method(:pairing_psk, state, _opts) do
+    messages = [
+      {"client/pair-init", %{"pairing_index" => state.pairing_index}},
+      {"client/pair-finalize", %{"long_term_psk" => b64(state.psk)}}
+    ]
+
+    {:ok, messages, %{state | stage: :awaiting_pair_finalize}}
   end
 
   defp start_method(other, _state, _opts), do: {:error, {:unsupported_method, other}}
@@ -546,21 +611,41 @@ defmodule UniversalProxy.Sendspin.Pairing do
     end
   end
 
-  # -- Message construction --
+  # Ask for another round under the same code. The next round's CPace runs
+  # under its own sid, so this round's keys are dropped.
+  defp retry(state) do
+    round = state.round + 1
 
-  defp confirm_message(%__MODULE__{method: :dynamic_pin} = state) do
-    tag = confirmation_tag(state.mac_key, CPace.public_share(state.cpace), @ad_client)
+    state = %{
+      state
+      | round: round,
+        sid: sid(state.handshake_hash, state.pairing_index, round),
+        cpace: nil,
+        peer_share: nil,
+        isk: nil,
+        mac_key: nil,
+        stage: :awaiting_server_init
+    }
 
-    {"client/pair-confirm", %{"client_kc" => b64(tag), "nonce_B" => b64(state.nonce_b)}}
+    {:send, [{"client/pair-retry", %{}}], state}
   end
 
-  defp confirm_message(%__MODULE__{method: :static_pin} = state) do
+  # -- Message construction --
+
+  defp confirm_message(%__MODULE__{method: :dynamic_pairing_code} = state) do
+    tag = confirmation_tag(state.mac_key, CPace.public_share(state.cpace), @ad_client)
+    wrapped_nonce = wrap(state.suite, nonce_wrap_key(state.sid, state.isk), state.nonce_b)
+
+    {"client/pair-confirm", %{"client_kc" => b64(tag), "wrapped_nonce_B" => b64(wrapped_nonce)}}
+  end
+
+  defp confirm_message(%__MODULE__{method: :static_pairing_code} = state) do
     tag = confirmation_tag(state.mac_key, CPace.public_share(state.cpace), @ad_client)
     {"client/pair-confirm", %{"client_kc" => b64(tag)}}
   end
 
   defp finalize_message(%__MODULE__{} = state) do
-    wrapped = wrap_psk(state.suite, wrap_key(state.sid, state.isk), state.psk)
+    wrapped = wrap(state.suite, wrap_key(state.sid, state.isk), state.psk)
     {"client/pair-finalize", %{"wrapped_psk" => b64(wrapped)}}
   end
 
@@ -596,6 +681,13 @@ defmodule UniversalProxy.Sendspin.Pairing do
     end
   end
 
+  defp fetch_max_rounds(opts) do
+    case Keyword.get(opts, :max_rounds, @round_limit) do
+      rounds when is_integer(rounds) and rounds in 1..@round_limit -> {:ok, rounds}
+      other -> {:error, {:invalid_max_rounds, other}}
+    end
+  end
+
   defp fetch_psk(opts) do
     case Keyword.get(opts, :psk, generate_psk()) do
       <<psk::binary-size(@psk_bytes)>> -> {:ok, psk}
@@ -607,13 +699,6 @@ defmodule UniversalProxy.Sendspin.Pairing do
     case Keyword.get(opts, :nonce_b, generate_nonce()) do
       <<nonce::binary-size(@nonce_bytes)>> -> {:ok, nonce}
       other -> {:error, {:invalid_nonce, byte_size_of(other)}}
-    end
-  end
-
-  defp fetch_pin_length(opts) do
-    case Keyword.get(opts, :pin_length, @default_pin_digits) do
-      length when length in @min_pin_digits..@max_pin_digits -> {:ok, length}
-      other -> {:error, {:invalid_pin_length, other}}
     end
   end
 

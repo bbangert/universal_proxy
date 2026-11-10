@@ -78,6 +78,14 @@ defmodule UniversalProxy.Audio.Input.ServerTest do
       {:ok, state}
     end
 
+    def pairings_changed(pid), do: GenServer.cast(pid, :pairings_changed)
+
+    @impl true
+    def handle_cast(:pairings_changed, state) do
+      record({:pairings_changed, state.key})
+      {:noreply, state}
+    end
+
     @impl true
     def handle_call({:emit, event}, _from, state) do
       send(state.owner, {:source_event, state.key, event})
@@ -296,7 +304,12 @@ defmodule UniversalProxy.Audio.Input.ServerTest do
     end
 
     test "never leaks pairing key material into the merged row", %{server: server, store: store} do
-      :ok = Store.save_config(store, @usb_key, %{psk: :crypto.strong_rand_bytes(32)})
+      :ok =
+        Store.save_pairing(store, @usb_key, %{
+          psk: :crypto.strong_rand_bytes(32),
+          server_id: Base.url_encode64(<<1::256>>, padding: false)
+        })
+
       {:ok, _keypair} = Store.ensure_client_keypair(store, @usb_key)
 
       input = add_usb_card!(server)
@@ -304,6 +317,61 @@ defmodule UniversalProxy.Audio.Input.ServerTest do
       refute Map.has_key?(input, :psk)
       refute Map.has_key?(input, :psk_id)
       refute Map.has_key?(input, :client_keypair)
+      refute Map.has_key?(input, :pairing_psk)
+
+      # Per record only the server's public key and when it paired.
+      assert input.paired
+      assert [%{server_id: _, paired_at: %DateTime{}} = summary] = input.pairings
+      assert Map.keys(summary) |> Enum.sort() == [:paired_at, :server_id]
+    end
+
+    test "unpair/3 removes one record or all, tells the source and publishes the summary", %{
+      server: server,
+      store: store
+    } do
+      a = Base.url_encode64(<<1::256>>, padding: false)
+      b = Base.url_encode64(<<2::256>>, padding: false)
+      assert Server.unpair(server, @usb_key, a) == {:error, :unavailable}
+
+      :ok = Store.save_pairing(store, @usb_key, %{psk: <<11::256>>, server_id: a})
+      :ok = Store.save_pairing(store, @usb_key, %{psk: <<12::256>>, server_id: b})
+      add_usb_card!(server)
+
+      assert :ok = Server.unpair(server, @usb_key, a)
+      assert_receive {:input_state, @usb_key, %{pairings: [%{server_id: ^b}]}}
+      Process.sleep(20)
+      assert {:pairings_changed, @usb_key} in SourceStubCalls.calls()
+      assert [%{pairings: [%{server_id: ^b}], paired: true}] = Server.list_inputs(server)
+
+      assert :ok = Server.unpair(server, @usb_key, :all)
+      assert_receive {:input_state, @usb_key, %{pairings: []}}
+      assert [%{pairings: [], paired: false}] = Server.list_inputs(server)
+      assert {:ok, %{pairings: []}} = Store.get_config(store, @usb_key)
+    end
+
+    test "regenerate_pairing_token/2 replaces the token and tells the source", %{
+      server: server,
+      store: store
+    } do
+      add_usb_card!(server)
+      {:ok, before} = Server.pairing_token(server, @usb_key)
+
+      assert :ok = Server.regenerate_pairing_token(server, @usb_key)
+      assert {:ok, after_token} = Server.pairing_token(server, @usb_key)
+      refute after_token == before
+      assert {:ok, ^after_token} = Store.pairing_token(store, @usb_key)
+      Process.sleep(20)
+      assert {:pairings_changed, @usb_key} in SourceStubCalls.calls()
+    end
+
+    test "pairing_token/2 answers for a present input only", %{server: server, store: store} do
+      assert Server.pairing_token(server, @usb_key) == {:error, :unavailable}
+
+      add_usb_card!(server)
+
+      assert {:ok, "SP:0" <> _ = token} = Server.pairing_token(server, @usb_key)
+      assert {:ok, ^token} = Store.pairing_token(store, @usb_key)
+      refute Map.has_key?(hd(Server.list_inputs(server)), :pairing_psk)
     end
   end
 
@@ -476,7 +544,12 @@ defmodule UniversalProxy.Audio.Input.ServerTest do
       :ok = SourceStub.emit(source, :connected)
       assert_receive {:input_state, @usb_key, %{connection: :connected, status: :waiting}}
 
-      :ok = SourceStub.emit(source, {:pairing_required, %{method: :dynamic_pin, pin_length: 6}})
+      :ok =
+        SourceStub.emit(
+          source,
+          {:pairing_required, %{method: :dynamic_pairing_code, format: :digits}}
+        )
+
       assert_receive {:input_state, @usb_key, %{status: :pairing, pin: nil}}
 
       :ok = SourceStub.emit(source, :pairing_started)
@@ -490,7 +563,12 @@ defmodule UniversalProxy.Audio.Input.ServerTest do
 
       # `:paired` lands after the Source has written the PSK, so the cached
       # row's `paired` flag has to be re-read, not left stale.
-      :ok = Store.save_pairing(store, @usb_key, %{psk: :crypto.strong_rand_bytes(32)})
+      :ok =
+        Store.save_pairing(store, @usb_key, %{
+          psk: :crypto.strong_rand_bytes(32),
+          server_id: Base.url_encode64(<<1::256>>, padding: false)
+        })
+
       :ok = SourceStub.emit(source, :paired)
       assert_receive {:input_state, @usb_key, %{status: :paired, pin: nil}}
       assert [%{paired: true}] = Server.list_inputs(server)
@@ -520,7 +598,12 @@ defmodule UniversalProxy.Audio.Input.ServerTest do
 
       # The offer is held for operator consent: it renders as `:pairing` with no
       # PIN, which is exactly what the LiveView keys the "Allow pairing" button on.
-      :ok = SourceStub.emit(source, {:pairing_required, %{method: :dynamic_pin, pin_length: 6}})
+      :ok =
+        SourceStub.emit(
+          source,
+          {:pairing_required, %{method: :dynamic_pairing_code, format: :digits}}
+        )
+
       assert_receive {:input_state, @usb_key, %{status: :pairing, pin: nil}}
 
       # The consent-wait timeout elapsed with no gesture: back to connected-idle.
@@ -737,6 +820,9 @@ defmodule UniversalProxy.Audio.Input.ServerTest do
       assert Input.list_inputs() == []
       assert Input.get_input(@usb_key) == :error
       assert Input.check_now() == :ok
+      assert Input.pairing_token(@usb_key) == {:error, :unavailable}
+      assert Input.unpair(@usb_key, :all) == {:error, :unavailable}
+      assert Input.regenerate_pairing_token(@usb_key) == {:error, :unavailable}
     end
   end
 end

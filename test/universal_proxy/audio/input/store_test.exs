@@ -49,11 +49,9 @@ defmodule UniversalProxy.Audio.Input.StoreTest do
 
       assert cfg.friendly_name == "USB Capture Card"
       assert cfg.client_keypair == nil
-      assert cfg.psk == nil
-      assert cfg.psk_id == nil
-      assert cfg.psk_category == nil
-      assert cfg.server_id == nil
-      assert cfg.paired_at == nil
+      assert cfg.pairing_psk == nil
+      assert cfg.pairings == []
+      refute Map.has_key?(cfg, :psk)
     end
 
     test "preserves a caller-supplied friendly_name", %{server: server} do
@@ -74,14 +72,14 @@ defmodule UniversalProxy.Audio.Input.StoreTest do
       :ok =
         Store.save_config(server, @key, %{
           friendly_name: "Kept Name",
-          psk_category: :long_term
+          pairing_psk: <<7::256>>
         })
 
       :ok = Store.save_config(server, @key, %{friendly_name: "Renamed"})
 
       {:ok, cfg} = Store.get_config(server, @key)
       assert cfg.friendly_name == "Renamed"
-      assert cfg.psk_category == :long_term
+      assert cfg.pairing_psk == <<7::256>>
     end
 
     test "explicit nil/false values are persisted rather than falling back to defaults",
@@ -187,6 +185,55 @@ defmodule UniversalProxy.Audio.Input.StoreTest do
     end
   end
 
+  describe "ensure_pairing_psk/2 and pairing_token/2" do
+    test "mints a 32-byte pairing PSK once and keeps it", %{server: server} do
+      {:ok, psk} = Store.ensure_pairing_psk(server, @key)
+      assert byte_size(psk) == 32
+      assert {:ok, ^psk} = Store.ensure_pairing_psk(server, @key)
+      assert {:ok, %{pairing_psk: ^psk}} = Store.get_config(server, @key)
+    end
+
+    test "is stable across a GenServer restart", %{dets_path: path} do
+      pid = restart_store!(path, :first)
+      {:ok, psk} = Store.ensure_pairing_psk(pid, @key)
+
+      reopened = restart_store!(path, :second)
+      assert {:ok, ^psk} = Store.ensure_pairing_psk(reopened, @key)
+    end
+
+    test "is distinct per input", %{server: server} do
+      {:ok, a} = Store.ensure_pairing_psk(server, @key)
+      {:ok, b} = Store.ensure_pairing_psk(server, @usb_key)
+      assert a != b
+    end
+
+    test "the token is SP:0 + base32(client key || pairing PSK)", %{server: server} do
+      {:ok, token} = Store.pairing_token(server, @key)
+      {:ok, {pub, _priv}} = Store.ensure_client_keypair(server, @key)
+      {:ok, pairing_psk} = Store.ensure_pairing_psk(server, @key)
+
+      assert "SP:0" <> body = token
+
+      assert {:ok, pub <> pairing_psk} ==
+               body |> String.replace("9", "2") |> pad() |> Base.decode32()
+
+      assert {:ok, ^token} = Store.pairing_token(server, @key)
+    end
+
+    test "survives clear_pairing (it is a credential, not pairing state)", %{server: server} do
+      {:ok, psk} = Store.ensure_pairing_psk(server, @key)
+      :ok = Store.clear_pairing(server, @key)
+      assert {:ok, %{pairing_psk: ^psk}} = Store.get_config(server, @key)
+    end
+
+    test "the table file is owner-only", %{dets_path: path} do
+      assert {:ok, %File.Stat{mode: mode}} = File.stat(path)
+      assert Bitwise.band(mode, 0o777) == 0o600
+    end
+
+    defp pad(body), do: body <> String.duplicate("=", rem(8 - rem(byte_size(body), 8), 8))
+  end
+
   describe "client_id/1" do
     test "is the url-safe, no-padding base64 encoding of the 32-byte pubkey" do
       pub = :crypto.strong_rand_bytes(32)
@@ -202,93 +249,201 @@ defmodule UniversalProxy.Audio.Input.StoreTest do
     end
   end
 
-  describe "save_pairing/3 and clear_pairing/2" do
-    test "round-trips pairing state and defaults paired_at", %{server: server} do
-      :ok =
-        Store.save_pairing(server, @key, %{
-          psk: :crypto.strong_rand_bytes(32),
-          psk_id: "some-psk-id",
-          psk_category: :long_term,
-          server_id: "some-server-id"
-        })
+  describe "pairing records" do
+    defp server_id(n), do: Base.url_encode64(<<n::256>>, padding: false)
 
-      {:ok, cfg} = Store.get_config(server, @key)
-      assert byte_size(cfg.psk) == 32
-      assert cfg.psk_id == "some-psk-id"
-      assert cfg.psk_category == :long_term
-      assert cfg.server_id == "some-server-id"
-      assert %DateTime{} = cfg.paired_at
+    defp pair!(server, n, at \\ nil) do
+      attrs = %{psk: <<n + 1000::256>>, server_id: server_id(n)}
+      attrs = if at, do: Map.put(attrs, :paired_at, at), else: attrs
+      :ok = Store.save_pairing(server, @key, attrs)
     end
 
-    test "accepts an explicit paired_at instead of defaulting", %{server: server} do
-      paired_at = ~U[2026-01-01 00:00:00Z]
-
-      :ok =
-        Store.save_pairing(server, @key, %{
-          psk: <<0::256>>,
-          psk_id: "id",
-          psk_category: :long_term,
-          server_id: "server",
-          paired_at: paired_at
-        })
-
+    test "a pairing becomes a record with a derived psk_id and paired_at", %{server: server} do
+      pair!(server, 1)
       {:ok, cfg} = Store.get_config(server, @key)
-      assert cfg.paired_at == paired_at
+
+      assert [record] = cfg.pairings
+      assert record.psk == <<1001::256>>
+      assert record.psk_id == UniversalProxy.Sendspin.Pairing.psk_id_for(<<1001::256>>)
+      assert record.server_id == server_id(1)
+      assert %DateTime{} = record.paired_at
+      assert record.last_used == record.paired_at
     end
 
-    test "preserves friendly_name and client_keypair, round-trips through clear_pairing",
+    test "accepts an explicit paired_at", %{server: server} do
+      pair!(server, 1, ~U[2026-01-01 00:00:00Z])
+      {:ok, %{pairings: [record]}} = Store.get_config(server, @key)
+      assert record.paired_at == ~U[2026-01-01 00:00:00Z]
+    end
+
+    test "re-pairing the same server replaces its record; another server adds one",
+         %{server: server} do
+      pair!(server, 1)
+      pair!(server, 2)
+      :ok = Store.save_pairing(server, @key, %{psk: <<9::256>>, server_id: server_id(1)})
+
+      {:ok, cfg} = Store.get_config(server, @key)
+      assert length(cfg.pairings) == 2
+      assert Enum.find(cfg.pairings, &(&1.server_id == server_id(1))).psk == <<9::256>>
+    end
+
+    test "keeps at least five, then evicts the least recently used but never the protected one",
+         %{server: server} do
+      for n <- 1..8, do: pair!(server, n, DateTime.add(~U[2026-01-01 00:00:00Z], n, :day))
+
+      {:ok, cfg} = Store.get_config(server, @key)
+      assert length(cfg.pairings) == 8
+      oldest = Enum.find(cfg.pairings, &(&1.server_id == server_id(1)))
+
+      # A ninth server while the oldest record backs the open connection: the
+      # next-oldest goes instead, and the pairing still succeeds.
+      :ok =
+        Store.save_pairing(server, @key, %{psk: <<99::256>>, server_id: server_id(9)},
+          protect: oldest.psk_id
+        )
+
+      {:ok, cfg} = Store.get_config(server, @key)
+      ids = Enum.map(cfg.pairings, & &1.server_id)
+      assert length(ids) == 8
+      assert server_id(9) in ids
+      assert server_id(1) in ids
+      refute server_id(2) in ids
+    end
+
+    test "touch_pairing/3 moves a record to the front of the LRU order", %{server: server} do
+      pair!(server, 1, ~U[2026-01-01 00:00:00Z])
+      pair!(server, 2, ~U[2026-01-02 00:00:00Z])
+      {:ok, cfg} = Store.get_config(server, @key)
+      assert [%{server_id: second} | _] = Store.pairings(cfg)
+      assert second == server_id(2)
+
+      first = Enum.find(cfg.pairings, &(&1.server_id == server_id(1)))
+      :ok = Store.touch_pairing(server, @key, first.psk_id)
+      {:ok, cfg} = Store.get_config(server, @key)
+      assert [%{server_id: touched} | _] = Store.pairings(cfg)
+      assert touched == server_id(1)
+    end
+
+    test "remove_pairing/3 by server_id or psk_id; clear_pairing/2 drops all, keeping identity",
          %{server: server} do
       :ok = Store.save_config(server, @key, %{friendly_name: "My Input"})
       {:ok, keypair} = Store.ensure_client_keypair(server, @key)
+      {:ok, pairing_psk} = Store.ensure_pairing_psk(server, @key)
+      pair!(server, 1)
+      pair!(server, 2)
+      pair!(server, 3)
 
-      :ok =
-        Store.save_pairing(server, @key, %{
-          psk: <<1::256>>,
-          psk_id: "id",
-          psk_category: :long_term,
-          server_id: "server"
-        })
-
-      {:ok, paired_cfg} = Store.get_config(server, @key)
-      assert paired_cfg.friendly_name == "My Input"
-      assert paired_cfg.client_keypair == keypair
-      assert paired_cfg.psk == <<1::256>>
+      :ok = Store.remove_pairing(server, @key, server_id: server_id(1))
+      {:ok, cfg} = Store.get_config(server, @key)
+      record = Enum.find(cfg.pairings, &(&1.server_id == server_id(2)))
+      :ok = Store.remove_pairing(server, @key, psk_id: record.psk_id)
+      :ok = Store.remove_pairing(server, @key, psk_id: "not-there")
+      {:ok, cfg} = Store.get_config(server, @key)
+      assert Enum.map(cfg.pairings, & &1.server_id) == [server_id(3)]
 
       :ok = Store.clear_pairing(server, @key)
+      {:ok, cleared} = Store.get_config(server, @key)
+      assert cleared.pairings == []
+      assert cleared.friendly_name == "My Input"
+      assert cleared.client_keypair == keypair
+      assert cleared.pairing_psk == pairing_psk
+    end
 
-      {:ok, cleared_cfg} = Store.get_config(server, @key)
-      assert cleared_cfg.friendly_name == "My Input"
-      assert cleared_cfg.client_keypair == keypair
-      assert cleared_cfg.psk == nil
-      assert cleared_cfg.psk_id == nil
-      assert cleared_cfg.psk_category == nil
-      assert cleared_cfg.server_id == nil
-      assert cleared_cfg.paired_at == nil
+    test "regenerate_pairing_psk/2 mints a new pairing PSK and keeps the records",
+         %{server: server} do
+      {:ok, old} = Store.ensure_pairing_psk(server, @key)
+      {:ok, old_token} = Store.pairing_token(server, @key)
+      pair!(server, 1)
+
+      :ok = Store.regenerate_pairing_psk(server, @key)
+      {:ok, cfg} = Store.get_config(server, @key)
+      assert byte_size(cfg.pairing_psk) == 32
+      refute cfg.pairing_psk == old
+      assert length(cfg.pairings) == 1
+      refute Store.pairing_token(server, @key) == {:ok, old_token}
+    end
+  end
+
+  describe "pre-rc1 rows" do
+    # The shape the pre-rc1 source wrote: one flat pairing record.
+    defp legacy_row!(path, fields) do
+      stop_supervised(UniversalProxy.Audio.Input.Store)
+      {:ok, table} = :dets.open_file(:legacy_seed, file: to_charlist(path), type: :set)
+
+      row =
+        Map.merge(
+          %{
+            friendly_name: "Old Input",
+            client_keypair: Noise.generate_static_keypair(),
+            psk: nil,
+            psk_id: nil,
+            psk_category: nil,
+            server_id: nil,
+            paired_at: nil
+          },
+          fields
+        )
+
+      :ok = :dets.insert(table, {@key, row})
+      :ok = :dets.close(table)
+      start_supervised!({Store, name: nil, table: @table, dets_path: path}, id: :reopened)
+    end
+
+    test "a flat record becomes the first pairing, its psk_id recomputed", %{dets_path: path} do
+      psk = <<42::256>>
+      server_id = Base.url_encode64(<<5::256>>, padding: false)
+
+      server =
+        legacy_row!(path, %{
+          psk: psk,
+          psk_id: "a-stale-or-differently-derived-id",
+          psk_category: :long_term,
+          server_id: server_id,
+          paired_at: ~U[2026-08-17 00:00:00Z]
+        })
+
+      {:ok, cfg} = Store.get_config(server, @key)
+      assert cfg.friendly_name == "Old Input"
+
+      assert [
+               %{
+                 psk: ^psk,
+                 server_id: ^server_id,
+                 paired_at: ~U[2026-08-17 00:00:00Z]
+               } = record
+             ] = cfg.pairings
+
+      assert record.psk_id == UniversalProxy.Sendspin.Pairing.psk_id_for(psk)
+      refute Map.has_key?(cfg, :psk) or Map.has_key?(cfg, :psk_category)
+
+      # The next write persists the new shape and keeps the record.
+      :ok = Store.save_config(server, @key, %{friendly_name: "Renamed"})
+      {:ok, cfg} = Store.get_config(server, @key)
+      assert [%{psk: ^psk}] = cfg.pairings
+      assert [{@key, raw}] = :dets.lookup(@table, @key)
+      refute Map.has_key?(raw, :psk)
+    end
+
+    test "a flat record without a usable server_id is dropped", %{dets_path: path} do
+      server = legacy_row!(path, %{psk: <<42::256>>, psk_id: "x", server_id: nil})
+      assert {:ok, %{pairings: [], friendly_name: "Old Input"}} = Store.get_config(server, @key)
+    end
+
+    test "an unpaired old row keeps its identity and gets no records", %{dets_path: path} do
+      server = legacy_row!(path, %{})
+      assert {:ok, %{pairings: [], client_keypair: {_, _}}} = Store.get_config(server, @key)
     end
   end
 
   describe "persistence across restart" do
     test "configs survive process restart", %{dets_path: path} do
       pid = restart_store!(path, :first)
-
-      :ok =
-        Store.save_pairing(pid, @key, %{
-          psk: <<2::256>>,
-          psk_id: "restart-id",
-          psk_category: :long_term,
-          server_id: "restart-server"
-        })
-
-      {:ok, %{paired_at: original_paired_at}} = Store.get_config(pid, @key)
+      server_id = Base.url_encode64(<<3::256>>, padding: false)
+      :ok = Store.save_pairing(pid, @key, %{psk: <<2::256>>, server_id: server_id})
+      {:ok, %{pairings: [original]}} = Store.get_config(pid, @key)
 
       reopened = restart_store!(path, :second)
-
-      {:ok, cfg} = Store.get_config(reopened, @key)
-
-      assert cfg.psk == <<2::256>>
-      assert cfg.psk_id == "restart-id"
-      assert cfg.server_id == "restart-server"
-      assert cfg.paired_at == original_paired_at
+      assert {:ok, %{pairings: [^original]}} = Store.get_config(reopened, @key)
     end
   end
 end

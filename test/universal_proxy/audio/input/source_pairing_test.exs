@@ -11,10 +11,10 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
 
   @table :audio_input_source_pairing_test
   @key {"USB Capture Card", 0x1D6B, 0x0105}
-  @pin_length 6
 
-  # The `pairing` object a server sends alongside the `pairing` activity.
-  @pairing_params %{"method" => "dynamic_pin", "pin_length" => @pin_length}
+  # The `pairing` objects a server sends alongside the `pairing` activity.
+  @pairing_params %{"method" => "dynamic_pairing_code", "format" => "digits"}
+  @psk_pairing_params %{"method" => "pairing_psk"}
 
   setup do
     path =
@@ -51,8 +51,7 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
     {pid, port}
   end
 
-  # Connect and get as far as `client/hello`, asserting the trust level the
-  # handshake's PSK category implies.
+  # Connect and get as far as `client/hello`.
   defp connect_hello!(port, opts \\ []) do
     peer = port |> Peer.connect!(opts) |> Peer.handshake!() |> Peer.hello!()
     {hello, peer} = Peer.await_json!(peer, "client/hello")
@@ -69,24 +68,41 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
     assert_receive {:source_event, @key, {:pairing_required, _params}}, 2_000
     assert_receive {:source_event, @key, :pairing_started}, 2_000
 
-    Peer.await_pair_init!(peer, pin_length: @pin_length)
+    Peer.await_pair_init!(peer)
   end
 
   defp await_pin! do
     assert_receive {:source_event, @key, {:pairing_pin, pin}}, 2_000
-    assert String.length(pin) == @pin_length
-    assert pin =~ ~r/\A[0-9]+\z/
+    assert pin =~ ~r/\A[0-9]{6}\z/
     pin
+  end
+
+  # After the in-band re-handshake the server's next message is server/activate
+  # (no hellos are replayed); activate source@v1 and converge to :ready.
+  defp activate_ready!(peer, source) do
+    peer = Peer.activate!(peer)
+    assert_receive {:source_event, @key, :activated}, 2_000
+    {initial, peer} = Peer.await_client_state!(peer, false)
+    assert initial == %{"available" => false, "source" => %{}}
+    {available, peer} = Peer.await_client_state!(peer, true)
+    assert available["available"] == true
+    assert Source.status(source) == :ready
+    peer
   end
 
   # The keypair record exists from the first `client/init`, so "not paired"
   # means the pairing fields are still blank rather than no record at all.
   defp refute_paired!(store) do
     assert {:ok, config} = Store.get_config(store, @key)
-    assert config.psk == nil
-    assert config.psk_id == nil
-    assert config.paired_at == nil
+    assert config.pairings == []
   end
+
+  defp records(store) do
+    {:ok, config} = Store.get_config(store, @key)
+    config.pairings
+  end
+
+  defp other_server_id, do: Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)
 
   # A different PIN of the same length — what a mistyped digit produces.
   defp mistype(pin) do
@@ -107,9 +123,11 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
       refute_receive {:source_event, @key, :pairing_started}, 300
 
       # We neither open an attempt nor send `pair/abort`: the offer is held for
-      # the operator, and the `client/time` keepalive keeps the connection up.
-      # Serving a couple of exchanges pumps everything the source has sent — no
-      # `pair/abort` is among it.
+      # the operator — the server is told so with `client/pair-pending` — and the
+      # `client/time` keepalive keeps the connection up.
+      {pending, peer} = Peer.await_json!(peer, "client/pair-pending")
+      assert pending["pairing_index"] == 1
+      assert pending["message"] =~ "Allow pairing"
       peer = Peer.serve_time!(peer, 2)
       refute Enum.any?(peer.messages, &match?({:json, "pair/abort", _}, &1))
 
@@ -133,7 +151,7 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
 
       :ok = Source.allow_pairing(source)
       assert_receive {:source_event, @key, :pairing_started}, 2_000
-      {index, _peer} = Peer.await_pair_init!(peer, pin_length: @pin_length)
+      {index, _peer} = Peer.await_pair_init!(peer)
       assert index == 1
     end
 
@@ -219,37 +237,38 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
       refute_paired!(ctx.store)
     end
 
-    test "refuses to open an attempt while a long-term PSK already exists", ctx do
+    test "a consented code pairing adds a record beside another server's", ctx do
       {source, port} = start_source!(ctx)
+      other = other_server_id()
+      :ok = Store.save_pairing(ctx.store, @key, %{psk: Pairing.generate_psk(), server_id: other})
 
-      psk = Pairing.generate_psk()
-
-      :ok =
-        Store.save_pairing(ctx.store, @key, %{
-          psk: psk,
-          psk_id: Pairing.psk_id_for(psk),
-          psk_category: :long_term,
-          server_id: "stored-server-id"
-        })
-
-      # An attacker connects with the published Sentinel PSK anyway (trust
-      # none) and, even with operator consent, must not be allowed to overwrite
-      # the stored PSK.
-      {hello, peer} = connect_hello!(port)
-      assert hello["trust_level"] == "none"
+      {_hello, peer} = connect_hello!(port)
       :ok = Source.allow_pairing(source)
+      {1, peer} = offer_pairing!(peer)
+      pin = await_pin!()
+      peer = peer |> Peer.submit_pin!(pin) |> Peer.serve_pair_auth!()
+      {psk, _peer} = Peer.serve_pair_finalize!(peer)
+      assert_receive {:source_event, @key, :paired}, 2_000
 
-      peer =
-        Peer.activate!(peer, roles: [], activities: ["pairing"], pairing: @pairing_params)
+      ids = ctx.store |> records() |> Enum.map(& &1.server_id) |> Enum.sort()
+      assert ids == Enum.sort([other, Peer.default_server_id()])
+      assert Enum.any?(records(ctx.store), &(&1.psk == psk))
+    end
 
-      assert_receive {:source_event, @key, {:pairing_required, _params}}, 2_000
-      assert_receive {:source_event, @key, {:pairing_failed, :already_paired}}, 2_000
-      {reason, _peer} = Peer.await_pair_abort!(peer)
-      assert reason == "user_cancelled"
-      refute_received {:source_event, @key, :pairing_started}
+    test "re-pairing the same server by code replaces its record", ctx do
+      {source, port} = start_source!(ctx)
+      old = Pairing.generate_psk()
+      :ok = Store.save_pairing(ctx.store, @key, %{psk: old, server_id: Peer.default_server_id()})
 
-      # The stored PSK is untouched.
-      assert {:ok, %{psk: ^psk}} = Store.get_config(ctx.store, @key)
+      {_hello, peer} = connect_hello!(port)
+      :ok = Source.allow_pairing(source)
+      {1, peer} = offer_pairing!(peer)
+      pin = await_pin!()
+      peer = peer |> Peer.submit_pin!(pin) |> Peer.serve_pair_auth!()
+      {psk, _peer} = Peer.serve_pair_finalize!(peer)
+      assert_receive {:source_event, @key, :paired}, 2_000
+
+      assert [%{psk: ^psk}] = records(ctx.store)
     end
 
     test "pairing attempts are capped at three per connection", ctx do
@@ -257,17 +276,19 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
       {_hello, peer} = connect_hello!(port)
       :ok = Source.allow_pairing(source)
 
-      # Three wrong-PIN attempts, indices 1..3. The window survives a failed
+      # Three failed attempts, indices 1..3. The window survives a failed
       # attempt, so one consent covers all three.
       peer =
         Enum.reduce(1..3, peer, fn expected_index, peer ->
           {index, peer} = offer_pairing!(peer)
           assert index == expected_index
 
-          pin = await_pin!()
-          peer = peer |> Peer.submit_pin!(mistype(pin)) |> Peer.serve_pair_auth!()
-          {"pin_mismatch", peer} = Peer.await_pair_abort!(peer)
-          assert_receive {:source_event, @key, {:pairing_failed, :pin_mismatch}}, 2_000
+          _pin = await_pin!()
+          peer = Peer.abort_pairing!(peer, "user_cancelled")
+
+          assert_receive {:source_event, @key, {:pairing_failed, {:peer_abort, :user_cancelled}}},
+                         2_000
+
           peer
         end)
 
@@ -285,14 +306,14 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
     test "pairs, persists the PSK, re-handshakes at trust user and reaches :ready", ctx do
       {source, port} = start_source!(ctx)
 
-      {hello, peer} = connect_hello!(port)
-      assert hello["trust_level"] == "none"
+      {_hello, peer} = connect_hello!(port)
+      assert :sys.get_state(source).trust == :none
 
       :ok = Source.allow_pairing(source)
       {index, peer} = offer_pairing!(peer)
       assert index == 1
 
-      # We derive and display the PIN; the operator types it into MA.
+      # We derive and display the code; the operator types it into MA.
       pin = await_pin!()
 
       peer = peer |> Peer.submit_pin!(pin) |> Peer.serve_pair_auth!()
@@ -301,32 +322,19 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
       assert_receive {:source_event, @key, :paired}, 2_000
 
       # The server unwrapped exactly the PSK we minted, and it is persisted.
-      assert {:ok, config} = Store.get_config(ctx.store, @key)
-      assert config.psk == psk
-      assert config.psk_id == Pairing.psk_id_for(psk)
-      assert config.psk_category == :long_term
-      assert config.server_id == peer.server_id
-      assert %DateTime{} = config.paired_at
+      assert [record] = records(ctx.store)
+      assert record.psk == psk
+      assert record.psk_id == Pairing.psk_id_for(psk)
+      assert record.server_id == peer.server_id
+      assert %DateTime{} = record.paired_at
 
       assert Source.status(source) == :awaiting_rehandshake
 
-      # Ground truth §4: the server re-runs the handshake in band under the
-      # new PSK, then the connection replays hello/activate.
+      # The server re-runs the handshake in band under the new PSK; its next
+      # message is a fresh server/activate, now at trust user.
       peer = Peer.rehandshake!(peer, psk)
-      peer = Peer.hello!(peer)
-
-      {hello, peer} = Peer.await_json!(peer, "client/hello")
-      assert hello["trust_level"] == "user"
-
-      peer = Peer.activate!(peer)
-      assert_receive {:source_event, @key, :activated}, 2_000
-
-      {initial, peer} = Peer.await_client_state!(peer, false)
-      assert initial["available"] == false
-
-      {available, _peer} = Peer.await_client_state!(peer, true)
-      assert available["available"] == true
-      assert Source.status(source) == :ready
+      assert %{trust: :user, psk_category: :long_term} = :sys.get_state(source)
+      _peer = activate_ready!(peer, source)
     end
 
     test "no client/time is emitted during the active pairing exchange", ctx do
@@ -356,7 +364,7 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
       {psk, peer} = Peer.serve_pair_finalize!(peer)
 
       assert_receive {:source_event, @key, :paired}, 2_000
-      assert {:ok, %{psk: ^psk}} = Store.get_config(ctx.store, @key)
+      assert [%{psk: ^psk}] = records(ctx.store)
       assert Source.status(source) == :awaiting_rehandshake
       assert peer.time_exchanges == time_exchanges_before
     end
@@ -387,11 +395,12 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
       peer = Peer.rehandshake!(peer, psk)
       assert peer.time_exchanges == time_exchanges_before
 
-      # The connection is healthy afterward: it replays hello/activate at trust
-      # user.
-      peer = Peer.hello!(peer)
-      {hello, _peer} = Peer.await_json!(peer, "client/hello")
-      assert hello["trust_level"] == "user"
+      # Nor between message 2 and the server/activate that follows it: the
+      # client may send nothing but the handshake until that activation.
+      peer = Peer.refute_frames!(peer, 100)
+
+      # The connection is healthy afterward, at trust user.
+      _peer = activate_ready!(peer, source)
     end
 
     test "client/time keepalive resumes after an aborted pairing attempt", ctx do
@@ -418,7 +427,7 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
       assert peer.time_exchanges >= time_exchanges_before + 2
     end
 
-    test "a mistyped PIN aborts the attempt and the retry pairs at index 2", ctx do
+    test "a mistyped code retries in a second round of the same attempt", ctx do
       {source, port} = start_source!(ctx)
 
       {_hello, peer} = connect_hello!(port)
@@ -426,31 +435,40 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
       {1, peer} = offer_pairing!(peer)
       pin = await_pin!()
 
-      # The server's CPace share is built from the wrong PIN, so its own MCF
-      # tag fails our check and we abort before revealing nonce_B.
+      # The server's CPace share is built from the wrong code, so its own MCF
+      # tag fails our check: we ask for another round (strict — nothing else
+      # interleaves) rather than revealing nonce_B or aborting.
       peer = peer |> Peer.submit_pin!(mistype(pin)) |> Peer.serve_pair_auth!()
+      peer = Peer.serve_pair_retry!(peer)
 
-      {reason, peer} = Peer.await_pair_abort!(peer)
-      assert reason == "pin_mismatch"
-
-      assert_receive {:source_event, @key, {:pairing_failed, :pin_mismatch}}, 2_000
-      assert Source.status(source) == :pairing_required
+      # Same attempt, same code, shown again for the second round.
+      assert ^pin = await_pin!()
+      refute_received {:source_event, @key, {:pairing_failed, _}}
       refute_paired!(ctx.store)
 
-      # The server retries by granting the pairing activity again; the consent
-      # window survives the failure so the retry proceeds at index 2.
-      {index, peer} = offer_pairing!(peer)
-      assert index == 2
-
-      retry_pin = await_pin!()
-      assert retry_pin != pin
-
-      peer = peer |> Peer.submit_pin!(retry_pin) |> Peer.serve_pair_auth!()
+      peer = peer |> Peer.submit_pin!(pin) |> Peer.serve_pair_auth!()
       {psk, _peer} = Peer.serve_pair_finalize!(peer)
 
       assert_receive {:source_event, @key, :paired}, 2_000
-      assert {:ok, %{psk: ^psk}} = Store.get_config(ctx.store, @key)
+      assert [%{psk: ^psk}] = records(ctx.store)
       assert Source.status(source) == :awaiting_rehandshake
+      # A successful pairing consumes the consent window, round count and all.
+      assert :sys.get_state(source).pairing_window == nil
+    end
+
+    test "an activation without pairing cancels a live attempt", ctx do
+      {source, port} = start_source!(ctx)
+
+      {_hello, peer} = connect_hello!(port)
+      :ok = Source.allow_pairing(source)
+      {1, peer} = offer_pairing!(peer)
+      _pin = await_pin!()
+
+      _peer = Peer.activate!(peer, roles: [], activities: [])
+
+      assert_receive {:source_event, @key, {:pairing_failed, :cancelled}}, 2_000
+      assert %{pairing: nil, fsm: :awaiting_activate} = :sys.get_state(source)
+      refute_received {:source_event, @key, :disconnected}
     end
 
     test "a pair/abort from the server ends the attempt without dropping the connection",
@@ -552,16 +570,7 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
 
       # The re-handshake completes at trust user and the source reaches :ready.
       peer = Peer.rehandshake!(peer, psk)
-      peer = Peer.hello!(peer)
-      {hello, peer} = Peer.await_json!(peer, "client/hello")
-      assert hello["trust_level"] == "user"
-
-      peer = Peer.activate!(peer)
-      assert_receive {:source_event, @key, :activated}, 2_000
-      {_initial, peer} = Peer.await_client_state!(peer, false)
-      {available, _peer} = Peer.await_client_state!(peer, true)
-      assert available["available"] == true
-      assert Source.status(source) == :ready
+      _peer = activate_ready!(peer, source)
     end
 
     test "a challenger during the consent-hold replaces the un-consented held offer", ctx do
@@ -626,8 +635,8 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
       assert Source.status(source) == :awaiting_activate
     end
 
-    test "a paired reconnect uses the stored PSK, asserts trust user and never pairs", ctx do
-      {_source, port} = start_source!(ctx)
+    test "a paired reconnect uses the stored PSK, lands at trust user and never pairs", ctx do
+      {source, port} = start_source!(ctx)
       psk = Pairing.generate_psk()
 
       :ok =
@@ -635,17 +644,174 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
           psk: psk,
           psk_id: Pairing.psk_id_for(psk),
           psk_category: :long_term,
-          server_id: "stored-server-id"
+          server_id: Peer.default_server_id()
         })
 
-      {hello, peer} = connect_hello!(port, psk: psk)
-      assert hello["trust_level"] == "user"
+      {_hello, peer} = connect_hello!(port, psk: psk)
+      assert :sys.get_state(source).trust == :user
 
       _peer = Peer.activate!(peer)
       assert_receive {:source_event, @key, :activated}, 2_000
 
       refute_received {:source_event, @key, {:pairing_required, _params}}
       refute_received {:source_event, @key, :pairing_started}
+    end
+  end
+
+  describe "Pairing PSK" do
+    # The operator pasted the input's pairing token into MA: no consent
+    # gesture, no code — the handshake under the pairing PSK authenticated both
+    # sides already.
+    defp pairing_psk!(ctx) do
+      {:ok, psk} = Store.ensure_pairing_psk(ctx.store, @key)
+      psk
+    end
+
+    defp serve_pairing_psk!(peer) do
+      peer =
+        Peer.activate!(peer, roles: [], activities: ["pairing"], pairing: @psk_pairing_params)
+
+      assert_receive {:source_event, @key, :pairing_started}, 2_000
+      {index, peer} = Peer.await_pair_init!(peer, method: :pairing_psk)
+      {long_term, peer} = Peer.serve_pairing_psk_finalize!(peer)
+      assert_receive {:source_event, @key, :paired}, 2_000
+      {index, long_term, peer}
+    end
+
+    test "a pairing dial pairs without consent and re-handshakes to the new record", ctx do
+      {source, port} = start_source!(ctx)
+      pairing_psk = pairing_psk!(ctx)
+
+      {_hello, peer} = connect_hello!(port, psk: pairing_psk, psk_category: :pairing)
+      assert %{trust: :none, psk_category: :pairing} = :sys.get_state(source)
+
+      {1, long_term, peer} = serve_pairing_psk!(peer)
+      refute_received {:source_event, @key, {:pairing_required, _}}
+
+      # A fresh long-term PSK — never the pairing PSK itself — is persisted,
+      # bound to this server, and the pairing PSK survives (it is long-lived).
+      assert long_term != pairing_psk
+      assert {:ok, config} = Store.get_config(ctx.store, @key)
+      assert [%{psk: ^long_term, server_id: server_id}] = config.pairings
+      assert server_id == peer.server_id
+      assert config.pairing_psk == pairing_psk
+
+      peer = Peer.rehandshake!(peer, long_term)
+      assert %{trust: :user, psk_category: :long_term} = :sys.get_state(source)
+      _peer = activate_ready!(peer, source)
+    end
+
+    test "a connected unpaired session re-handshakes to the pairing PSK, then pairs", ctx do
+      {source, port} = start_source!(ctx)
+      pairing_psk = pairing_psk!(ctx)
+
+      {_hello, peer} = connect_hello!(port)
+      peer = Peer.activate!(peer, roles: [], activities: [])
+      assert :sys.get_state(source).psk_category == :sentinel
+
+      peer = Peer.rehandshake!(peer, pairing_psk, category: :pairing, tolerate_time: true)
+      assert %{psk_category: :pairing, pairing_index: 0} = :sys.get_state(source)
+
+      {1, long_term, peer} = serve_pairing_psk!(peer)
+      peer = Peer.rehandshake!(peer, long_term)
+      _peer = activate_ready!(peer, source)
+    end
+
+    test "a token pairing replaces the same server's record and keeps the others", ctx do
+      {source, port} = start_source!(ctx)
+      other = other_server_id()
+      :ok = Store.save_pairing(ctx.store, @key, %{psk: Pairing.generate_psk(), server_id: other})
+
+      :ok =
+        Store.save_pairing(ctx.store, @key, %{
+          psk: Pairing.generate_psk(),
+          server_id: Peer.default_server_id()
+        })
+
+      {_hello, peer} = connect_hello!(port, psk: pairing_psk!(ctx), psk_category: :pairing)
+      {1, long_term, _peer} = serve_pairing_psk!(peer)
+
+      records = records(ctx.store)
+      assert length(records) == 2
+      assert Enum.find(records, &(&1.server_id == Peer.default_server_id())).psk == long_term
+      assert Enum.any?(records, &(&1.server_id == other))
+      assert Source.status(source) == :awaiting_rehandshake
+    end
+
+    test "pairing_psk on a Sentinel session is method_not_supported", ctx do
+      {source, port} = start_source!(ctx)
+      {_hello, peer} = connect_hello!(port)
+
+      peer =
+        Peer.activate!(peer, roles: [], activities: ["pairing"], pairing: @psk_pairing_params)
+
+      {reason, _peer} = Peer.await_pair_abort!(peer)
+      assert reason == "method_not_supported"
+
+      assert_receive {:source_event, @key,
+                      {:pairing_failed, {:unsupported_method, :pairing_psk}}},
+                     2_000
+
+      assert Source.status(source) == :pairing_required
+      refute_paired!(ctx.store)
+    end
+
+    test "a code method on a pairing-PSK session is method_not_supported", ctx do
+      {_source, port} = start_source!(ctx)
+      {_hello, peer} = connect_hello!(port, psk: pairing_psk!(ctx), psk_category: :pairing)
+
+      peer = Peer.activate!(peer, roles: [], activities: ["pairing"], pairing: @pairing_params)
+
+      {reason, _peer} = Peer.await_pair_abort!(peer)
+      assert reason == "method_not_supported"
+      refute_paired!(ctx.store)
+    end
+
+    test "an unknown method or the qr_code format is method_not_supported", ctx do
+      {_source, port} = start_source!(ctx)
+      {_hello, peer} = connect_hello!(port)
+
+      for params <- [
+            %{"method" => "dynamic_pin", "pin_length" => 6},
+            %{"method" => "dynamic_pairing_code", "format" => "qr_code"}
+          ],
+          reduce: peer do
+        peer ->
+          peer = Peer.activate!(peer, roles: [], activities: ["pairing"], pairing: params)
+          {reason, peer} = Peer.await_pair_abort!(peer)
+          assert reason == "method_not_supported"
+          peer
+      end
+    end
+
+    test "unpaired re-handshakes are capped per connection", ctx do
+      {source, port} = start_source!(ctx)
+      {_hello, peer} = connect_hello!(port)
+      peer = Peer.activate!(peer, roles: [], activities: [])
+
+      sentinel = UniversalProxy.Sendspin.Noise.sentinel_psk()
+      pairing_psk = pairing_psk!(ctx)
+
+      # Three token attempts that each switch to the pairing PSK and are
+      # cancelled back, plus the post-pairing re-key, stay within the cap.
+      peer =
+        Enum.reduce(1..8, peer, fn i, peer ->
+          {psk, category} =
+            if rem(i, 2) == 1, do: {pairing_psk, :pairing}, else: {sentinel, :sentinel}
+
+          peer = Peer.rehandshake!(peer, psk, category: category, tolerate_time: true)
+          Peer.activate!(peer, roles: [], activities: [])
+        end)
+
+      refute_received {:source_event, @key, {:error, _}}
+
+      _peer =
+        Peer.send_message!(peer, "noise/handshake", %{
+          "data" => Base.url_encode64(:crypto.strong_rand_bytes(48), padding: false)
+        })
+
+      assert_receive {:source_event, @key, {:error, {:unexpected_rehandshake, _, :none}}}, 2_000
+      assert Source.status(source) == :listening
     end
   end
 end

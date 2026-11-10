@@ -33,9 +33,13 @@ defmodule UniversalProxy.Audio.Input.Server do
       "sendspin:input_state"    {:input_state, key, state_map}
 
   `input_map` is what `list_inputs/1` returns for a single entry: enumerate
-  info merged with the *non-secret* half of the persisted config. The PSK,
+  info merged with the *non-secret* half of the persisted config (the name,
+  and a `pairings` summary of `%{server_id, paired_at}` per paired server,
+  which also rides `input_state` when it changes). The PSKs,
   the PSK id and the client keypair never leave this subsystem — a LiveView
-  assign is the last place long-term key material should live.
+  assign is the last place long-term key material should live. The one
+  exception is `pairing_token/2`, answered only to an explicit request (the
+  operator's "Show" on the Audio tab) and never broadcast.
 
   `state_map` is the derived live state of one input:
 
@@ -197,6 +201,38 @@ defmodule UniversalProxy.Audio.Input.Server do
     GenServer.call(server, {:allow_pairing, key})
   end
 
+  @doc """
+  The pairing token of a currently-present input (see
+  `Audio.Input.pairing_token/1`). `{:error, :unavailable}` for an absent input
+  or a store failure — the reason is never passed through.
+  """
+  @spec pairing_token(GenServer.server(), key()) :: {:ok, String.t()} | {:error, :unavailable}
+  def pairing_token(server \\ __MODULE__, {slot_sub, _vid, _pid} = key)
+      when is_binary(slot_sub) do
+    GenServer.call(server, {:pairing_token, key})
+  end
+
+  @doc """
+  Remove an input's pairing record for `server_id`, or all of them (`:all`),
+  closing a live session that one keyed. `{:error, :unavailable}` for an
+  absent input or a store failure.
+  """
+  @spec unpair(GenServer.server(), key(), String.t() | :all) :: :ok | {:error, :unavailable}
+  def unpair(server \\ __MODULE__, {slot_sub, _vid, _pid} = key, which)
+      when is_binary(slot_sub) and (is_binary(which) or which == :all) do
+    GenServer.call(server, {:unpair, key, which})
+  end
+
+  @doc """
+  Mint a new pairing PSK for an input, invalidating its pairing token (and
+  closing a live session keyed by the old one). Pairing records are kept.
+  """
+  @spec regenerate_pairing_token(GenServer.server(), key()) :: :ok | {:error, :unavailable}
+  def regenerate_pairing_token(server \\ __MODULE__, {slot_sub, _vid, _pid} = key)
+      when is_binary(slot_sub) do
+    GenServer.call(server, {:regenerate_pairing_token, key})
+  end
+
   # -- Server callbacks --
 
   @impl GenServer
@@ -279,6 +315,37 @@ defmodule UniversalProxy.Audio.Input.Server do
 
   def handle_call(:check_now, _from, state) do
     {:reply, :ok, refresh_inputs(state)}
+  end
+
+  def handle_call({:pairing_token, key}, _from, state) do
+    reply =
+      with true <- Map.has_key?(state.inputs, key),
+           {:ok, token} <- store_pairing_token(state.store, key) do
+        {:ok, token}
+      else
+        _ -> {:error, :unavailable}
+      end
+
+    {:reply, reply, state}
+  end
+
+  def handle_call({:unpair, key, which}, _from, state) do
+    with true <- Map.has_key?(state.inputs, key),
+         :ok <- store_unpair(state.store, key, which) do
+      {:reply, :ok,
+       state |> pairings_changed(key) |> refresh_config(key) |> publish_pairings(key)}
+    else
+      _ -> {:reply, {:error, :unavailable}, state}
+    end
+  end
+
+  def handle_call({:regenerate_pairing_token, key}, _from, state) do
+    with true <- Map.has_key?(state.inputs, key),
+         :ok <- store_regenerate(state.store, key) do
+      {:reply, :ok, pairings_changed(state, key)}
+    else
+      _ -> {:reply, {:error, :unavailable}, state}
+    end
   end
 
   def handle_call({:allow_pairing, key}, _from, state) do
@@ -491,17 +558,28 @@ defmodule UniversalProxy.Audio.Input.Server do
   defp default_friendly_name(%{name: name}), do: name
 
   @hardware_keys [:name, :alsa_device, :card_index, :vid, :pid, :usb_port]
-  # Only the non-secret half of the persisted config crosses this boundary.
-  # `psk`, `psk_id` and `client_keypair` are long-term key material and stay
-  # inside the Store / Source pair.
-  @public_config_keys [:friendly_name, :paired_at]
+  # Only the non-secret half of the persisted config crosses this boundary:
+  # the name, and per pairing record just the server's public key and when it
+  # paired. The records' PSKs and ids, the pairing PSK and `client_keypair`
+  # are key material and stay inside the Store / Source pair.
+  @public_config_keys [:friendly_name]
 
   defp merge(key, info, config) do
+    pairings = pairing_summaries(config)
+
     info
     |> Map.take(@hardware_keys)
     |> Map.put(:key, key)
     |> Map.merge(Map.take(config, @public_config_keys))
-    |> Map.put(:paired, not is_nil(Map.get(config, :paired_at)))
+    |> Map.put(:pairings, pairings)
+    |> Map.put(:paired, pairings != [])
+  end
+
+  defp pairing_summaries(config) do
+    config
+    |> Map.get(:pairings, [])
+    |> Enum.map(&Map.take(&1, [:server_id, :paired_at]))
+    |> Enum.sort_by(& &1.paired_at, {:desc, DateTime})
   end
 
   # Keys present in both cache and enumeration whose enumerated hardware fields
@@ -638,6 +716,47 @@ defmodule UniversalProxy.Audio.Input.Server do
   # Drives the source's `allow_pairing/1` consent gesture through the same
   # `:source_module` seam the rest of the lifecycle uses. Tolerant of a test
   # stub that doesn't implement it.
+  defp pairings_changed(state, key) do
+    case Map.fetch(state.sources, key) do
+      {:ok, %{pid: pid}} -> source_pairings_changed(state.source_module, pid)
+      :error -> :ok
+    end
+
+    state
+  end
+
+  defp source_pairings_changed(module, pid) do
+    module.pairings_changed(pid)
+  rescue
+    UndefinedFunctionError -> :ok
+  catch
+    :exit, _ -> :ok
+  end
+
+  # The row's non-secret pairing summary changed: tell subscribers through the
+  # live-state topic (an `input_added` upsert would reset the card's state).
+  defp publish_pairings(state, key) do
+    case Map.fetch(state.inputs, key) do
+      {:ok, %{pairings: pairings}} -> update_input_state(state, key, %{pairings: pairings})
+      _ -> state
+    end
+  end
+
+  defp store_unpair(store, key, which) do
+    case which do
+      :all -> Store.clear_pairing(store, key)
+      server_id -> Store.remove_pairing(store, key, server_id: server_id)
+    end
+  catch
+    :exit, _ -> {:error, :unavailable}
+  end
+
+  defp store_regenerate(store, key) do
+    Store.regenerate_pairing_psk(store, key)
+  catch
+    :exit, _ -> {:error, :unavailable}
+  end
+
   defp source_allow_pairing(module, pid) do
     module.allow_pairing(pid)
   rescue
@@ -738,6 +857,12 @@ defmodule UniversalProxy.Audio.Input.Server do
     state
     |> refresh_config(key)
     |> update_input_state(key, %{status: :paired, pin: nil})
+    |> publish_pairings(key)
+  end
+
+  # The server dropped its record (`server/unpair`); the source closes next.
+  defp handle_source_event(state, key, :unpaired) do
+    state |> refresh_config(key) |> publish_pairings(key)
   end
 
   # A failed attempt leaves the connection up: MA retries by offering the
@@ -852,6 +977,12 @@ defmodule UniversalProxy.Audio.Input.Server do
     reason
     |> inspect()
     |> String.slice(0, @max_error_length)
+  end
+
+  defp store_pairing_token(store, key) do
+    Store.pairing_token(store, key)
+  catch
+    :exit, _ -> {:error, :unavailable}
   end
 
   # -- mDNS --

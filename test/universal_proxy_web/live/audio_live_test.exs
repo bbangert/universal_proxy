@@ -966,6 +966,311 @@ defmodule UniversalProxyWeb.AudioLiveTest do
     end
   end
 
+  describe "input pairing token disclosure" do
+    @input_token "SP:0" <> String.duplicate("INPUTTOKEN", 10)
+
+    defmodule InputPairingTokenFacade do
+      @moduledoc false
+      # Stands in for `UniversalProxy.Audio.Input` (AudioLive's
+      # `:audio_input_facade` seam); the result is set per test.
+      def pairing_token(key) do
+        send(Application.get_env(:universal_proxy, :input_token_test_pid), {:input_read, key})
+        Application.get_env(:universal_proxy, :input_token_result)
+      end
+
+      def unpair(key, which) do
+        send(Application.get_env(:universal_proxy, :input_token_test_pid), {:unpair, key, which})
+        Application.get_env(:universal_proxy, :input_action_result, :ok)
+      end
+
+      def regenerate_pairing_token(key) do
+        send(Application.get_env(:universal_proxy, :input_token_test_pid), {:regenerate, key})
+        Application.get_env(:universal_proxy, :input_action_result, :ok)
+      end
+    end
+
+    setup do
+      Application.put_env(:universal_proxy, :audio_input_facade, InputPairingTokenFacade)
+      Application.put_env(:universal_proxy, :input_token_test_pid, self())
+      Application.put_env(:universal_proxy, :input_token_result, {:ok, @input_token})
+
+      on_exit(fn ->
+        Application.delete_env(:universal_proxy, :audio_input_facade)
+        Application.delete_env(:universal_proxy, :input_token_test_pid)
+        Application.delete_env(:universal_proxy, :input_token_result)
+        Application.delete_env(:universal_proxy, :input_action_result)
+      end)
+    end
+
+    # Mount with one input and open its "Pairing" disclosure.
+    defp mount_with_input(conn, input \\ sample_input()) do
+      {:ok, view, _html} = live(conn, "/audio")
+      Phoenix.PubSub.broadcast(@pubsub, "sendspin:input_added", {:sendspin_input_added, input})
+      id = encode(@input_key)
+      html = render_hook(view, "toggle_input_more", %{"id" => id})
+      {view, id, html}
+    end
+
+    @server_a "AAAAAAAAAAserverA" <> String.duplicate("a", 26)
+    @server_b "BBBBBBBBBBserverB" <> String.duplicate("b", 26)
+
+    defp paired_input do
+      sample_input(%{
+        paired: true,
+        pairings: [
+          %{server_id: @server_a, paired_at: ~U[2026-11-01 10:00:00Z]},
+          %{server_id: @server_b, paired_at: ~U[2026-10-01 10:00:00Z]}
+        ]
+      })
+    end
+
+    test "the disclosure starts closed and closing it drops a revealed token", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/audio")
+
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "sendspin:input_added",
+        {:sendspin_input_added, sample_input()}
+      )
+
+      html = render(view)
+      assert html =~ "Pairing · not paired"
+      refute has_element?(view, "button[phx-click=show_input_pairing_token]")
+
+      id = encode(@input_key)
+      render_hook(view, "toggle_input_more", %{"id" => id})
+      view |> element("button[phx-click=show_input_pairing_token]") |> render_click()
+      assert render(view) =~ @input_token
+
+      html = render_hook(view, "toggle_input_more", %{"id" => id})
+      refute html =~ @input_token
+      html = render_hook(view, "toggle_input_more", %{"id" => id})
+      refute html =~ @input_token
+    end
+
+    test "a revealed token hides itself after the reveal window", %{conn: conn} do
+      Application.put_env(:universal_proxy, :input_token_reveal_ms, 50)
+      on_exit(fn -> Application.delete_env(:universal_proxy, :input_token_reveal_ms) end)
+      {view, id, _html} = mount_with_input(conn)
+
+      view |> element("button[phx-click=show_input_pairing_token]") |> render_click()
+      assert has_element?(view, "#input-pairing-token-#{id}")
+      Process.sleep(120)
+      refute render(view) =~ @input_token
+      refute has_element?(view, "#input-pairing-token-#{id}")
+    end
+
+    test "lists paired servers by short id and date", %{conn: conn} do
+      {view, _id, html} = mount_with_input(conn, paired_input())
+
+      assert html =~ "Pairing · paired with 2 servers"
+      assert html =~ String.slice(@server_a, 0, 10) <> "…"
+      assert html =~ "2026-11-01"
+      assert has_element?(view, "button[phx-click=arm_input_action][phx-value-action=unpair_all]")
+    end
+
+    test "Unpair is armed by the first click and runs on Confirm", %{conn: conn} do
+      {view, id, _html} = mount_with_input(conn, paired_input())
+
+      view
+      |> element(~s(button[phx-value-action=unpair][phx-value-server="#{@server_b}"]))
+      |> render_click()
+
+      refute_received {:unpair, _, _}
+      assert has_element?(view, "#input-armed-#{id}", "Unpair " <> String.slice(@server_b, 0, 10))
+
+      view |> element("button[phx-click=confirm_input_action]") |> render_click()
+      assert_received {:unpair, @input_key, @server_b}
+      refute has_element?(view, "#input-armed-#{id}")
+    end
+
+    test "Cancel disarms without acting; Unpair all unpairs everything", %{conn: conn} do
+      {view, _id, _html} = mount_with_input(conn, paired_input())
+
+      view |> element("button[phx-value-action=unpair_all]") |> render_click()
+      view |> element("button[phx-click=disarm_input_action]") |> render_click()
+      refute_received {:unpair, _, _}
+
+      view |> element("button[phx-value-action=unpair_all]") |> render_click()
+      view |> element("button[phx-click=confirm_input_action]") |> render_click()
+      assert_received {:unpair, @input_key, :all}
+    end
+
+    test "Regenerate asks first, then mints a new token and hides the old one", %{conn: conn} do
+      {view, id, _html} = mount_with_input(conn)
+      view |> element("button[phx-click=show_input_pairing_token]") |> render_click()
+
+      view |> element("#regenerate-input-token-#{id}") |> render_click()
+      assert has_element?(view, "#input-armed-#{id}", "Regenerate the pairing token?")
+      refute_received {:regenerate, _}
+
+      html = view |> element("button[phx-click=confirm_input_action]") |> render_click()
+      assert_received {:regenerate, @input_key}
+      refute html =~ @input_token
+    end
+
+    test "a failed Unpair keeps the prompt armed and shows an error; a retry can succeed",
+         %{conn: conn} do
+      Application.put_env(:universal_proxy, :input_action_result, {:error, :unavailable})
+      {view, id, _html} = mount_with_input(conn, paired_input())
+
+      view |> element("button[phx-value-action=unpair_all]") |> render_click()
+      view |> element("button[phx-click=confirm_input_action]") |> render_click()
+
+      assert_received {:unpair, @input_key, :all}
+      assert has_element?(view, "#input-armed-#{id}")
+      assert has_element?(view, "#input-action-error-#{id}")
+
+      Application.put_env(:universal_proxy, :input_action_result, :ok)
+      view |> element("button[phx-click=confirm_input_action]") |> render_click()
+      refute has_element?(view, "#input-armed-#{id}")
+      refute has_element?(view, "#input-action-error-#{id}")
+    end
+
+    test "a failed Unpair of one server keeps the prompt armed and shows an error",
+         %{conn: conn} do
+      Application.put_env(:universal_proxy, :input_action_result, {:error, :unavailable})
+      {view, id, _html} = mount_with_input(conn, paired_input())
+
+      view
+      |> element(~s(button[phx-value-action=unpair][phx-value-server="#{@server_a}"]))
+      |> render_click()
+
+      view |> element("button[phx-click=confirm_input_action]") |> render_click()
+      assert_received {:unpair, @input_key, @server_a}
+      assert has_element?(view, "#input-armed-#{id}", "Unpair " <> String.slice(@server_a, 0, 10))
+      assert has_element?(view, "#input-action-error-#{id}")
+
+      view |> element("button[phx-click=disarm_input_action]") |> render_click()
+      refute has_element?(view, "#input-armed-#{id}")
+    end
+
+    test "a failed Regenerate keeps the prompt and the displayed token", %{conn: conn} do
+      Application.put_env(:universal_proxy, :input_action_result, {:error, :unavailable})
+      {view, id, _html} = mount_with_input(conn)
+      view |> element("button[phx-click=show_input_pairing_token]") |> render_click()
+
+      view |> element("#regenerate-input-token-#{id}") |> render_click()
+      html = view |> element("button[phx-click=confirm_input_action]") |> render_click()
+
+      assert_received {:regenerate, @input_key}
+      assert html =~ @input_token
+      assert has_element?(view, "#input-armed-#{id}", "Regenerate the pairing token?")
+      assert has_element?(view, "#input-action-error-#{id}")
+    end
+
+    test "a pairings update from input_state re-renders the list", %{conn: conn} do
+      {view, _id, _html} = mount_with_input(conn, paired_input())
+
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "sendspin:input_state",
+        {:input_state, @input_key,
+         %{
+           status: :waiting,
+           connection: :disconnected,
+           pin: nil,
+           port: 9_928,
+           last_error: nil,
+           pairings: [%{server_id: @server_a, paired_at: ~U[2026-11-01 10:00:00Z]}]
+         }}
+      )
+
+      html = render(view)
+      assert html =~ "paired with 1 server"
+      refute html =~ String.slice(@server_b, 0, 10)
+    end
+
+    test "an unpair without a server arms nothing and doesn't crash", %{conn: conn} do
+      {view, id, _html} = mount_with_input(conn)
+      render_hook(view, "arm_input_action", %{"id" => id, "action" => "unpair"})
+      render_hook(view, "confirm_input_action", %{"id" => id})
+      assert render(view) =~ "Pairing token"
+      refute_received {:unpair, _, _}
+    end
+
+    test "actions for an unknown input do nothing", %{conn: conn} do
+      {view, _id, _html} = mount_with_input(conn)
+      render_hook(view, "arm_input_action", %{"id" => "garbage", "action" => "unpair_all"})
+      render_hook(view, "confirm_input_action", %{"id" => "garbage"})
+      refute_received {:unpair, _, _}
+    end
+
+    test "is not in the rendered HTML until Show, and gone again after Hide", %{conn: conn} do
+      {view, id, html} = mount_with_input(conn)
+
+      assert html =~ "Pairing token"
+      assert html =~ "to pair this input"
+      refute html =~ @input_token
+      refute has_element?(view, "#input-pairing-token-#{id}")
+      # Nothing is read until the operator asks.
+      refute_received {:input_read, _}
+
+      html = view |> element("button[phx-click=show_input_pairing_token]") |> render_click()
+      assert_received {:input_read, @input_key}
+      assert html =~ @input_token
+      assert has_element?(view, "#input-pairing-token-#{id}", @input_token)
+
+      html = view |> element("button[phx-click=hide_input_pairing_token]") |> render_click()
+      refute html =~ @input_token
+      refute has_element?(view, "#input-pairing-token-#{id}")
+    end
+
+    test "Copy is offered only while revealed, client-side with the select fallback",
+         %{conn: conn} do
+      {view, id, _html} = mount_with_input(conn)
+      copy = "#copy-input-pairing-token-#{id}"
+
+      refute has_element?(view, copy)
+      view |> element("button[phx-click=show_input_pairing_token]") |> render_click()
+
+      assert has_element?(
+               view,
+               ~s(#{copy}[phx-hook="CopyToClipboard"][data-clipboard="#{@input_token}"]) <>
+                 ~s([data-select-target="input-pairing-token-#{id}"])
+             )
+
+      view |> element("button[phx-click=hide_input_pairing_token]") |> render_click()
+      refute has_element?(view, copy)
+    end
+
+    test "a store failure shows Unavailable and no token", %{conn: conn} do
+      Application.put_env(:universal_proxy, :input_token_result, {:error, :unavailable})
+      {view, id, _html} = mount_with_input(conn)
+
+      html = view |> element("button[phx-click=show_input_pairing_token]") |> render_click()
+      assert html =~ "Unavailable"
+      refute has_element?(view, "#copy-input-pairing-token-#{id}")
+    end
+
+    test "is dropped when the input goes away, and ignores events for unknown inputs",
+         %{conn: conn} do
+      {view, id, _html} = mount_with_input(conn)
+      render_hook(view, "show_input_pairing_token", %{"id" => id})
+      assert render(view) =~ @input_token
+      assert_received {:input_read, @input_key}
+
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "sendspin:input_removed",
+        {:sendspin_input_removed, %{key: @input_key}}
+      )
+
+      refute render(view) =~ @input_token
+
+      render_hook(view, "show_input_pairing_token", %{"id" => id})
+      render_hook(view, "show_input_pairing_token", %{"id" => "garbage"})
+      refute_received {:input_read, _}
+      refute render(view) =~ @input_token
+    end
+
+    test "an output's token controls never read an input's token", %{conn: conn} do
+      {view, _id, _html} = mount_with_input(conn)
+      refute has_element?(view, "button[phx-click=show_pairing_token]")
+      refute_received {:input_read, _}
+    end
+  end
+
   describe "Home Assistant pairing toggle" do
     @usb_key {"USB Audio", 0x1D6B, 0x0104}
 
