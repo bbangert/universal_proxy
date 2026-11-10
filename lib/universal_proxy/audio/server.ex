@@ -515,6 +515,14 @@ defmodule UniversalProxy.Audio.Server do
   end
 
   def handle_info({:sendspin_state, key, %{event: "error"} = payload}, state) do
+    # A keypair the binary could not persist makes it exit before it
+    # listens, on every respawn: sticky (a respawn's `shutdown` reset keeps
+    # it) until a later start does listen.
+    state =
+      if Map.get(payload, :kind) == "state_dir",
+        do: update_connection_state(state, key, %{identity_error: true}),
+        else: state
+
     # Bound the cached error string. The binary's `:msg` may be a
     # server-forwarded value of arbitrary size; a multi-MB string would
     # otherwise sit in Server state and ship over the LiveView socket
@@ -547,7 +555,8 @@ defmodule UniversalProxy.Audio.Server do
       broadcast_state(key, %{sendspin_client_id: id})
     end
 
-    {:noreply, update_connection_state(state, key, %{sendspin_client_id: id})}
+    {:noreply,
+     update_connection_state(state, key, %{sendspin_client_id: id, identity_error: false})}
   end
 
   def handle_info({:sendspin_state, key, %{event: "shutdown"}}, state) do
@@ -1185,7 +1194,8 @@ defmodule UniversalProxy.Audio.Server do
     connection: :unknown,
     stream: nil,
     last_error: nil,
-    sendspin_client_id: nil
+    sendspin_client_id: nil,
+    identity_error: false
   }
 
   defp update_connection_state(state, key, patch) do
