@@ -136,5 +136,18 @@ defmodule UniversalProxyWeb.SecurityLiveTest do
     assert button =~ ~s(data-clipboard="#{SSHAccess.fingerprint()}")
     assert button =~ ~s(data-select-target="ssh-fingerprint")
     refute button =~ "phx-click"
+    refute button =~ ~r/\sdisabled[\s=>]/
+  end
+
+  # The unavailable branch (SSHAccess down) needs the supervised server
+  # killed, which is too invasive for the shared app; this covers the
+  # retry message being harmless when the key is available.
+  test "fingerprint refresh keeps the real fingerprint", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/security")
+
+    send(view.pid, :refresh_ssh_fingerprint)
+
+    assert render(view) =~ SSHAccess.fingerprint()
+    refute render(view) =~ "unavailable"
   end
 end
