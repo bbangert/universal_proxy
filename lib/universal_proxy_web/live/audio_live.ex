@@ -43,10 +43,22 @@ defmodule UniversalProxyWeb.AudioLive do
   one of: the "Allow pairing" button (offer pending, no window), an active
   "waiting" state (window open), or the PIN (once derived).
 
-  Each input card can also reveal its Sendspin pairing token, read on demand
-  through `Audio.Input.pairing_token/1` exactly like an output's: the operator
-  pastes it into Music Assistant to pair over the Pairing PSK method, with no
-  PIN or consent gesture.
+  Each input card's "Pairing" disclosure can reveal its Sendspin pairing
+  token, read on demand through `Audio.Input.pairing_token/1` exactly like an
+  output's: the operator pastes it into Music Assistant to pair over the
+  Pairing PSK method, with no PIN or consent gesture. A revealed input token
+  hides itself after a minute and when the disclosure closes. The disclosure
+  also lists the servers the input is paired with (`server_id` short form and
+  when), with "Unpair" per server, "Unpair all" and "Regenerate pairing
+  token" (`Audio.Input.unpair/2`, `Audio.Input.regenerate_pairing_token/1`),
+  each armed by a first click and confirmed by a second.
+
+  Residual risk: the device UI is plain HTTP and unauthenticated, so a
+  revealed token crosses the LAN in the clear in a LiveView diff, and anyone
+  who can open this page can reveal it. Holding it lets a server pair with the
+  input and stream its live audio. Revealing is deliberate and short-lived,
+  the paired-server list makes an unexpected pairing visible, and Regenerate
+  (plus Unpair) revokes a leaked token; gating the UI itself is separate work.
 
   ## HDMI-CEC
 
@@ -80,9 +92,10 @@ defmodule UniversalProxyWeb.AudioLive do
     # crash report (which inspects the socket assigns) cannot print it.
     @derive {Inspect, except: [:token]}
     @enforce_keys [:token]
-    defstruct [:token]
+    # `ref` tags an input token's auto-hide timer.
+    defstruct [:token, :ref]
 
-    @type t :: %__MODULE__{token: String.t()}
+    @type t :: %__MODULE__{token: String.t(), ref: reference() | nil}
   end
 
   require Logger
@@ -179,6 +192,10 @@ defmodule UniversalProxyWeb.AudioLive do
      # The same, for input cards (a separate map: an input and an output of one
      # USB device share a key).
      |> assign(:input_pairing_tokens, %{})
+     # Input cards whose "Pairing" disclosure is open, and the one destructive
+     # pairing action armed by a first click (`{id, action}`), if any.
+     |> assign(:input_more_open, MapSet.new())
+     |> assign(:input_armed, nil)
      # Audio inputs (capture cards), keyed by the same base64-encoded
      # `{slot_sub, vid, pid}` id the outputs map above uses.
      |> assign(:inputs, build_inputs_map(inputs))}
@@ -369,10 +386,59 @@ defmodule UniversalProxyWeb.AudioLive do
     {:noreply, update(socket, :pairing_tokens, &Map.delete(&1, id))}
   end
 
+  def handle_event("toggle_input_more", %{"id" => id}, socket) do
+    open = socket.assigns.input_more_open
+
+    {:noreply,
+     socket
+     |> assign(:input_more_open, toggle_member(open, id))
+     |> update(:input_pairing_tokens, &Map.delete(&1, id))
+     |> disarm_input(id)}
+  end
+
+  def handle_event("arm_input_action", %{"id" => id, "action" => action} = params, socket) do
+    armed =
+      case action do
+        "unpair" -> {:unpair, Map.get(params, "server")}
+        "unpair_all" -> :unpair_all
+        "regenerate" -> :regenerate
+        _ -> nil
+      end
+
+    if armed && Map.has_key?(socket.assigns.inputs, id) do
+      {:noreply, assign(socket, :input_armed, {id, armed})}
+    else
+      {:noreply, socket}
+    end
+  end
+
+  def handle_event("disarm_input_action", _params, socket) do
+    {:noreply, assign(socket, :input_armed, nil)}
+  end
+
+  def handle_event("confirm_input_action", %{"id" => id}, socket) do
+    with {^id, action} <- socket.assigns.input_armed,
+         true <- Map.has_key?(socket.assigns.inputs, id),
+         {:ok, key} <- decode_key(id) do
+      _ = run_input_action(key, action)
+
+      socket =
+        if action == :regenerate,
+          do: update(socket, :input_pairing_tokens, &Map.delete(&1, id)),
+          else: socket
+
+      {:noreply, assign(socket, :input_armed, nil)}
+    else
+      _ -> {:noreply, assign(socket, :input_armed, nil)}
+    end
+  end
+
   def handle_event("show_input_pairing_token", %{"id" => id}, socket) do
     case read_input_pairing_token(socket, id) do
       {:ok, token} ->
-        {:noreply, put_input_pairing_token(socket, id, %RevealedToken{token: token})}
+        ref = make_ref()
+        Process.send_after(self(), {:hide_input_pairing_token, id, ref}, input_token_reveal_ms())
+        {:noreply, put_input_pairing_token(socket, id, %RevealedToken{token: token, ref: ref})}
 
       {:error, :unavailable} ->
         {:noreply, put_input_pairing_token(socket, id, :unavailable)}
@@ -485,7 +551,21 @@ defmodule UniversalProxyWeb.AudioLive do
     {:noreply,
      socket
      |> update(:inputs, &Map.delete(&1, id))
-     |> update(:input_pairing_tokens, &Map.delete(&1, id))}
+     |> update(:input_pairing_tokens, &Map.delete(&1, id))
+     |> update(:input_more_open, &MapSet.delete(&1, id))
+     |> disarm_input(id)}
+  end
+
+  # A revealed input token's auto-hide; a stale timer (the token was hidden
+  # and shown again since) carries an old ref and is ignored.
+  def handle_info({:hide_input_pairing_token, id, ref}, socket) do
+    case Map.get(socket.assigns.input_pairing_tokens, id) do
+      %RevealedToken{ref: ^ref} ->
+        {:noreply, update(socket, :input_pairing_tokens, &Map.delete(&1, id))}
+
+      _ ->
+        {:noreply, socket}
+    end
   end
 
   # `state_map` from `Audio.Input.Server` is always the FULL derived live
@@ -572,6 +652,8 @@ defmodule UniversalProxyWeb.AudioLive do
             id={id}
             input={input}
             pairing={Map.get(@input_pairing_tokens, id)}
+            more_open?={MapSet.member?(@input_more_open, id)}
+            armed={armed_for(@input_armed, id)}
           />
         </div>
       </section>
@@ -660,6 +742,8 @@ defmodule UniversalProxyWeb.AudioLive do
   attr(:id, :string, required: true)
   attr(:input, :map, required: true)
   attr(:pairing, :any, default: nil)
+  attr(:more_open?, :boolean, default: false)
+  attr(:armed, :any, default: nil)
 
   # Single input row/card. Read-only: no volume, mute, or enable control —
   # unlike an output, a present capture card always gets a source (see
@@ -732,11 +816,29 @@ defmodule UniversalProxyWeb.AudioLive do
         </div>
       </div>
 
+      <div class="flex items-center px-[22px] py-1.5 border-t border-border-2">
+        <span class="text-xs text-fg-3">Pairing · {paired_label(@input)}</span>
+        <div class="flex-1"></div>
+        <button
+          type="button"
+          phx-click="toggle_input_more"
+          phx-value-id={@id}
+          aria-label="Show pairing details"
+          aria-expanded={@more_open?}
+          class="text-fg-3 hover:text-fg-2 p-1.5 rounded-sm flex items-center cursor-pointer bg-transparent border-none"
+        >
+          <.icon name={:more} size={16} />
+        </button>
+      </div>
+
       <%!-- Pairing token: read only on Show, so it is in the DOM only while
            revealed; Copy is client-side (falls back to selecting the token
            where the clipboard is blocked on the plain-HTTP device UI). --%>
-      <div class="px-[22px] pt-2.5 pb-3.5 border-t border-border-2 bg-sunken
-                  grid grid-cols-[auto_1fr_auto] gap-x-3 gap-y-1 items-center text-[11px] text-fg-3">
+      <div
+        :if={@more_open?}
+        class="px-[22px] pt-2.5 pb-3.5 border-t border-border-2 bg-sunken
+               grid grid-cols-[auto_1fr_auto] gap-x-3 gap-y-1 items-center text-[11px] text-fg-3"
+      >
         <span class="self-start">Pairing token</span>
         <span
           :if={match?(%RevealedToken{}, @pairing)}
@@ -781,6 +883,73 @@ defmodule UniversalProxyWeb.AudioLive do
         <span class="col-span-3 text-fg-4">
           Paste into Music Assistant's Sendspin "Pairing token" option to pair this input.
         </span>
+        <span></span>
+        <span></span>
+        <button
+          type="button"
+          phx-click="arm_input_action"
+          phx-value-id={@id}
+          phx-value-action="regenerate"
+          id={"regenerate-input-token-#{@id}"}
+          class="text-accent text-[11px] cursor-pointer bg-transparent border-none p-0"
+        >
+          Regenerate
+        </button>
+
+        <span class="self-start">Paired with</span>
+        <span :if={@input.pairings == []} class="col-span-2 text-fg-3">No servers</span>
+        <%= for {pairing, index} <- Enum.with_index(@input.pairings) do %>
+          <span :if={index > 0}></span>
+          <span class="font-mono text-fg-2">
+            {short_server_id(pairing.server_id)}
+            <span class="text-fg-3">· {format_paired_at(pairing.paired_at)}</span>
+          </span>
+          <button
+            type="button"
+            phx-click="arm_input_action"
+            phx-value-id={@id}
+            phx-value-action="unpair"
+            phx-value-server={pairing.server_id}
+            class="text-accent text-[11px] cursor-pointer bg-transparent border-none p-0"
+          >
+            Unpair
+          </button>
+        <% end %>
+        <span :if={length(@input.pairings) > 1}></span>
+        <span :if={length(@input.pairings) > 1}></span>
+        <button
+          :if={length(@input.pairings) > 1}
+          type="button"
+          phx-click="arm_input_action"
+          phx-value-id={@id}
+          phx-value-action="unpair_all"
+          class="text-accent text-[11px] cursor-pointer bg-transparent border-none p-0"
+        >
+          Unpair all
+        </button>
+
+        <div
+          :if={@armed}
+          id={"input-armed-#{@id}"}
+          class="col-span-3 flex items-center gap-2.5"
+        >
+          <span class="flex-1 text-danger">{armed_sentence(@armed)}</span>
+          <button
+            type="button"
+            phx-click="disarm_input_action"
+            class="text-fg-2 text-[11px] cursor-pointer bg-transparent border-none p-0"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            phx-click="confirm_input_action"
+            phx-value-id={@id}
+            class="text-danger text-[11px] cursor-pointer bg-transparent border-none p-0"
+          >
+            Confirm
+          </button>
+        </div>
       </div>
 
       <div
@@ -1332,6 +1501,7 @@ defmodule UniversalProxyWeb.AudioLive do
       connection: Map.get(input, :connection, :disconnected),
       pin: Map.get(input, :pin),
       pairing_window: Map.get(input, :pairing_window),
+      pairings: Map.get(input, :pairings, []),
       last_error: Map.get(input, :last_error)
     }
   end
@@ -1608,6 +1778,57 @@ defmodule UniversalProxyWeb.AudioLive do
   defp put_pairing_token(socket, id, value) do
     update(socket, :pairing_tokens, &Map.put(&1, id, value))
   end
+
+  defp toggle_member(set, id) do
+    if MapSet.member?(set, id), do: MapSet.delete(set, id), else: MapSet.put(set, id)
+  end
+
+  defp disarm_input(socket, id) do
+    case socket.assigns.input_armed do
+      {^id, _action} -> assign(socket, :input_armed, nil)
+      _ -> socket
+    end
+  end
+
+  defp armed_for({id, action}, id), do: action
+  defp armed_for(_armed, _id), do: nil
+
+  defp run_input_action(key, {:unpair, server_id}) when is_binary(server_id),
+    do: input_facade().unpair(key, server_id)
+
+  defp run_input_action(key, :unpair_all), do: input_facade().unpair(key, :all)
+  defp run_input_action(key, :regenerate), do: input_facade().regenerate_pairing_token(key)
+  defp run_input_action(_key, _action), do: {:error, :invalid}
+
+  defp armed_sentence({:unpair, server_id}),
+    do: "Unpair #{short_server_id(server_id)}? It must pair again to stream this input."
+
+  defp armed_sentence(:unpair_all),
+    do: "Unpair every server? Each must pair again to stream this input."
+
+  defp armed_sentence(:regenerate),
+    do: "Regenerate the pairing token? The current token stops working; paired servers are kept."
+
+  defp armed_sentence(_action), do: ""
+
+  defp paired_label(%{pairings: [_ | _] = pairings}) do
+    count = length(pairings)
+    "paired with #{count} #{if count == 1, do: "server", else: "servers"}"
+  end
+
+  defp paired_label(_input), do: "not paired"
+
+  # A server's id is its public key; the first characters identify it.
+  defp short_server_id(server_id) when is_binary(server_id),
+    do: String.slice(server_id, 0, 10) <> "…"
+
+  defp short_server_id(_server_id), do: "—"
+
+  defp format_paired_at(%DateTime{} = at), do: Calendar.strftime(at, "%Y-%m-%d")
+  defp format_paired_at(_at), do: "—"
+
+  defp input_token_reveal_ms,
+    do: Application.get_env(:universal_proxy, :input_token_reveal_ms, 60_000)
 
   # Only for an input this view still shows.
   defp read_input_pairing_token(socket, id) do

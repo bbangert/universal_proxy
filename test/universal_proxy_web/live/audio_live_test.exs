@@ -975,6 +975,16 @@ defmodule UniversalProxyWeb.AudioLiveTest do
         send(Application.get_env(:universal_proxy, :input_token_test_pid), {:input_read, key})
         Application.get_env(:universal_proxy, :input_token_result)
       end
+
+      def unpair(key, which) do
+        send(Application.get_env(:universal_proxy, :input_token_test_pid), {:unpair, key, which})
+        :ok
+      end
+
+      def regenerate_pairing_token(key) do
+        send(Application.get_env(:universal_proxy, :input_token_test_pid), {:regenerate, key})
+        :ok
+      end
     end
 
     setup do
@@ -989,7 +999,29 @@ defmodule UniversalProxyWeb.AudioLiveTest do
       end)
     end
 
-    defp mount_with_input(conn) do
+    # Mount with one input and open its "Pairing" disclosure.
+    defp mount_with_input(conn, input \\ sample_input()) do
+      {:ok, view, _html} = live(conn, "/audio")
+      Phoenix.PubSub.broadcast(@pubsub, "sendspin:input_added", {:sendspin_input_added, input})
+      id = encode(@input_key)
+      html = render_hook(view, "toggle_input_more", %{"id" => id})
+      {view, id, html}
+    end
+
+    @server_a "AAAAAAAAAAserverA" <> String.duplicate("a", 26)
+    @server_b "BBBBBBBBBBserverB" <> String.duplicate("b", 26)
+
+    defp paired_input do
+      sample_input(%{
+        paired: true,
+        pairings: [
+          %{server_id: @server_a, paired_at: ~U[2026-11-01 10:00:00Z]},
+          %{server_id: @server_b, paired_at: ~U[2026-10-01 10:00:00Z]}
+        ]
+      })
+    end
+
+    test "the disclosure starts closed and closing it drops a revealed token", %{conn: conn} do
       {:ok, view, _html} = live(conn, "/audio")
 
       Phoenix.PubSub.broadcast(
@@ -998,7 +1030,109 @@ defmodule UniversalProxyWeb.AudioLiveTest do
         {:sendspin_input_added, sample_input()}
       )
 
-      {view, encode(@input_key), render(view)}
+      html = render(view)
+      assert html =~ "Pairing · not paired"
+      refute has_element?(view, "button[phx-click=show_input_pairing_token]")
+
+      id = encode(@input_key)
+      render_hook(view, "toggle_input_more", %{"id" => id})
+      view |> element("button[phx-click=show_input_pairing_token]") |> render_click()
+      assert render(view) =~ @input_token
+
+      html = render_hook(view, "toggle_input_more", %{"id" => id})
+      refute html =~ @input_token
+      html = render_hook(view, "toggle_input_more", %{"id" => id})
+      refute html =~ @input_token
+    end
+
+    test "a revealed token hides itself after the reveal window", %{conn: conn} do
+      Application.put_env(:universal_proxy, :input_token_reveal_ms, 50)
+      on_exit(fn -> Application.delete_env(:universal_proxy, :input_token_reveal_ms) end)
+      {view, id, _html} = mount_with_input(conn)
+
+      view |> element("button[phx-click=show_input_pairing_token]") |> render_click()
+      assert has_element?(view, "#input-pairing-token-#{id}")
+      Process.sleep(120)
+      refute render(view) =~ @input_token
+      refute has_element?(view, "#input-pairing-token-#{id}")
+    end
+
+    test "lists paired servers by short id and date", %{conn: conn} do
+      {view, _id, html} = mount_with_input(conn, paired_input())
+
+      assert html =~ "Pairing · paired with 2 servers"
+      assert html =~ String.slice(@server_a, 0, 10) <> "…"
+      assert html =~ "2026-11-01"
+      assert has_element?(view, "button[phx-click=arm_input_action][phx-value-action=unpair_all]")
+    end
+
+    test "Unpair is armed by the first click and runs on Confirm", %{conn: conn} do
+      {view, id, _html} = mount_with_input(conn, paired_input())
+
+      view
+      |> element(~s(button[phx-value-action=unpair][phx-value-server="#{@server_b}"]))
+      |> render_click()
+
+      refute_received {:unpair, _, _}
+      assert has_element?(view, "#input-armed-#{id}", "Unpair " <> String.slice(@server_b, 0, 10))
+
+      view |> element("button[phx-click=confirm_input_action]") |> render_click()
+      assert_received {:unpair, @input_key, @server_b}
+      refute has_element?(view, "#input-armed-#{id}")
+    end
+
+    test "Cancel disarms without acting; Unpair all unpairs everything", %{conn: conn} do
+      {view, _id, _html} = mount_with_input(conn, paired_input())
+
+      view |> element("button[phx-value-action=unpair_all]") |> render_click()
+      view |> element("button[phx-click=disarm_input_action]") |> render_click()
+      refute_received {:unpair, _, _}
+
+      view |> element("button[phx-value-action=unpair_all]") |> render_click()
+      view |> element("button[phx-click=confirm_input_action]") |> render_click()
+      assert_received {:unpair, @input_key, :all}
+    end
+
+    test "Regenerate asks first, then mints a new token and hides the old one", %{conn: conn} do
+      {view, id, _html} = mount_with_input(conn)
+      view |> element("button[phx-click=show_input_pairing_token]") |> render_click()
+
+      view |> element("#regenerate-input-token-#{id}") |> render_click()
+      assert has_element?(view, "#input-armed-#{id}", "Regenerate the pairing token?")
+      refute_received {:regenerate, _}
+
+      html = view |> element("button[phx-click=confirm_input_action]") |> render_click()
+      assert_received {:regenerate, @input_key}
+      refute html =~ @input_token
+    end
+
+    test "a pairings update from input_state re-renders the list", %{conn: conn} do
+      {view, _id, _html} = mount_with_input(conn, paired_input())
+
+      Phoenix.PubSub.broadcast(
+        @pubsub,
+        "sendspin:input_state",
+        {:input_state, @input_key,
+         %{
+           status: :waiting,
+           connection: :disconnected,
+           pin: nil,
+           port: 9_928,
+           last_error: nil,
+           pairings: [%{server_id: @server_a, paired_at: ~U[2026-11-01 10:00:00Z]}]
+         }}
+      )
+
+      html = render(view)
+      assert html =~ "paired with 1 server"
+      refute html =~ String.slice(@server_b, 0, 10)
+    end
+
+    test "actions for an unknown input do nothing", %{conn: conn} do
+      {view, _id, _html} = mount_with_input(conn)
+      render_hook(view, "arm_input_action", %{"id" => "garbage", "action" => "unpair_all"})
+      render_hook(view, "confirm_input_action", %{"id" => "garbage"})
+      refute_received {:unpair, _, _}
     end
 
     test "is not in the rendered HTML until Show, and gone again after Hide", %{conn: conn} do
