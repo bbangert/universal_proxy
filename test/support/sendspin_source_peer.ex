@@ -177,9 +177,9 @@ defmodule UniversalProxy.SendspinSourcePeer do
   keys the new session. On return the peer talks under the new session; the
   next message a server sends is `server/activate` (no hellos are replayed).
 
-  `tolerate_time: true` discards `client/time` frames the source sent before it
-  received message 1 (a server must tolerate those); by default any frame
-  other than message 2 flunks.
+  `tolerate_time: true` discards `client/time` frames and audio chunks the
+  source sent before it received message 1 (a server must tolerate those); by
+  default any frame other than message 2 flunks.
   """
   def rehandshake!(peer, psk, opts \\ []) do
     category = Keyword.get(opts, :category, :long_term)
@@ -237,6 +237,9 @@ defmodule UniversalProxy.SendspinSourcePeer do
       {{:json, "client/time", _payload}, peer} when tolerate_time? ->
         await_message_2!(peer, tolerate_time?, timeout)
 
+      {{:audio, _timestamp_us, _payload}, peer} when tolerate_time? ->
+        await_message_2!(peer, tolerate_time?, timeout)
+
       {other, _peer} ->
         flunk(
           "expected noise/handshake message 2 but received #{inspect(other)} mid-rehandshake; " <>
@@ -283,6 +286,32 @@ defmodule UniversalProxy.SendspinSourcePeer do
       |> maybe_put("pairing", Keyword.get(opts, :pairing))
 
     send_message!(peer, "server/activate", payload)
+  end
+
+  @doc """
+  Assert the source sends nothing for `ms` (e.g. inside a re-handshake window).
+  Returns the peer unchanged.
+  """
+  def refute_frames!(peer, ms) do
+    case peer.frames do
+      [] -> :ok
+      frames -> flunk("unexpected buffered frames: #{inspect(frames)}")
+    end
+
+    case Mint.WebSocket.recv(peer.conn, 0, ms) do
+      {:error, _conn, reason, _} when reason == :timeout ->
+        peer
+
+      {:error, _conn, %Mint.TransportError{reason: :timeout}, _} ->
+        peer
+
+      {:ok, _conn, [{:data, _ref, data}]} ->
+        {:ok, _websocket, frames} = Mint.WebSocket.decode(peer.websocket, data)
+        flunk("expected silence but the source sent #{length(frames)} frame(s)")
+
+      other ->
+        flunk("unexpected receive result: #{inspect(other)}")
+    end
   end
 
   @doc "Send `server/command` with a source `start`/`stop`."

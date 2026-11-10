@@ -87,16 +87,23 @@ defmodule UniversalProxy.Audio.Input.Source do
       the CPace exchange. If the operator never consents, a consent-wait
       timeout (also 120 s) sends `pair/abort` and returns the connection to
       idle — an un-consented offer never pairs. Attempts are capped at 3 per
-      connection with a backoff between them, mistyped codes retry in further
-      rounds up to the spec's 20-round limit per consent window, and an attempt
-      is refused outright while a long-term PSK already exists (an operator
-      must unpair first) so a Sentinel-keyed attacker can't overwrite it.
+      connection with a backoff between them, and mistyped codes retry in
+      further rounds up to the spec's 20-round limit per consent window.
+
+  Either method stores a **pairing record** for the server (up to 8 per
+  input, `Store.save_pairing/4`): it replaces that server's earlier record or
+  is added beside the others, so pairing a second server never evicts the
+  first unless storage is full. A paired server may drop its record with
+  `server/unpair` (we remove ours, say `client/goodbye` `unpaired` and close);
+  the operator can do the same per server from the Audio tab, or regenerate the
+  pairing token (`pairings_changed/1` closes a session whose record or pairing
+  PSK is gone).
 
   **We derive and display the code** — the operator types it into Music
   Assistant, not the other way round. It surfaces as `{:pairing_pin, pin}`
   once `server/pair-init` reveals the server's nonce.
 
-  A completed attempt persists the minted PSK via `Store.save_pairing/3` and
+  A completed attempt persists the minted PSK via `Store.save_pairing/4` and
   the server then re-runs the Noise handshake **in band**: two
   `noise/handshake` messages carried as ordinary encrypted JSON, prologued
   with the *previous* handshake's hash, our message 2 still encrypted under the
@@ -143,6 +150,8 @@ defmodule UniversalProxy.Audio.Input.Source do
                                   second) or closed (`nil`)
       :pairing_started            client/pair-init sent, attempt running
       {:pairing_pin, pin}         show this PIN; the user types it into MA
+      :unpaired                   the server unpaired us (`server/unpair`);
+                                  its record is removed
       :paired                     PSK minted and persisted; awaiting the
                                   post-pairing re-handshake
       :pairing_declined           a held offer expired without the operator's
@@ -258,11 +267,13 @@ defmodule UniversalProxy.Audio.Input.Source do
   # (`client/pair-pending`, at most 200 characters).
   @pair_pending_message "Open the Audio tab on the device and click Allow pairing."
 
-  # In-band re-handshakes an unpaired session may drive. The server re-keys an
-  # unpaired session to start a Pairing PSK attempt or to return to its record
-  # after a cancelled one; the cap bounds a Sentinel-keyed peer looping
-  # handshakes for the X25519 work.
-  @max_unpaired_rehandshakes 4
+  # In-band re-handshakes an unpaired session may drive per connection. Each of
+  # the `@max_pairing_attempts` (3) attempts a server may run costs at most two:
+  # into the pairing PSK and, if it is cancelled, back to its record (or the
+  # post-pairing re-key to the new record on success). Two more cover a key
+  # rotation and a retry after a dropped re-key. The cap bounds a
+  # Sentinel-keyed peer looping handshakes for the X25519 work.
+  @max_unpaired_rehandshakes 8
 
   # Code pairing is gated on an explicit local operator gesture
   # (`allow_pairing/1`): a peer-sent pairing `server/activate` never opens a
@@ -317,6 +328,15 @@ defmodule UniversalProxy.Audio.Input.Source do
   # before it reaches the log so a peer can't flood RingLogger.
   @log_reason_max 200
 
+  # Per-connection bookkeeping (see the `conn` field).
+  @conn_defaults %{
+    rekeying: false,
+    unpaired_rehandshakes: 0,
+    pairing_attempts: 0,
+    record_id: nil,
+    stream_end_pending: false
+  }
+
   @derive {Inspect, except: [:keypair]}
   defstruct [
     :key,
@@ -366,9 +386,12 @@ defmodule UniversalProxy.Audio.Input.Source do
     trust: :none,
     # Per-connection bookkeeping, reset at teardown: `rekeying` holds between
     # Noise message 1 of an in-band re-handshake and the next
-    # `server/activate` (nothing but the handshake may be sent), and the two
-    # counters bound unpaired re-handshakes and pairing attempts.
-    conn: %{rekeying: false, unpaired_rehandshakes: 0, pairing_attempts: 0},
+    # `server/activate` (nothing but the handshake may be sent), with a
+    # `client-stream/end` due at that activation in `stream_end_pending`; the
+    # two counters bound unpaired re-handshakes and pairing attempts; and
+    # `record_id` is the `psk_id` of the pairing record (or pairing PSK) keying
+    # the session, `nil` under the Sentinel.
+    conn: @conn_defaults,
     # The operator's open "allow pairing" consent window, `nil` when closed:
     # its timer and the code rounds emitted under it (`pairing.md` "Rounds" —
     # opening a window is the operator action that resets the count).
@@ -407,6 +430,7 @@ defmodule UniversalProxy.Audio.Input.Source do
           | :pairing_started
           | {:pairing_pin, String.t()}
           | :paired
+          | :unpaired
           | {:pairing_failed, term()}
           | :pairing_declined
           | :streaming
@@ -476,6 +500,14 @@ defmodule UniversalProxy.Audio.Input.Source do
   @spec allow_pairing(GenServer.server()) :: :ok
   def allow_pairing(server), do: GenServer.cast(server, :allow_pairing)
 
+  @doc """
+  The input's pairing records or pairing PSK changed outside this process (an
+  operator unpaired a server or regenerated the token). A live session keyed
+  by a record or pairing PSK that is gone is closed; the server can re-pair.
+  """
+  @spec pairings_changed(GenServer.server()) :: :ok
+  def pairings_changed(server), do: GenServer.cast(server, :pairings_changed)
+
   # -- Server callbacks --
 
   @impl GenServer
@@ -530,6 +562,22 @@ defmodule UniversalProxy.Audio.Input.Source do
   @impl GenServer
   def handle_cast(:allow_pairing, state) do
     {:noreply, open_pairing_window(state)}
+  end
+
+  def handle_cast(:pairings_changed, state) do
+    if session_key_revoked?(state) do
+      Logger.info(
+        "Audio.Input.Source #{inspect(state.key)} closing a session whose pairing was revoked"
+      )
+
+      # No `client/goodbye`: the server's next dial lands in the Sentinel
+      # Fallback, which tells it our record is gone and offers re-pairing.
+      state = teardown_connection(state, :pairing_revoked)
+      notify(state, :disconnected)
+      {:noreply, state}
+    else
+      {:noreply, state}
+    end
   end
 
   @impl GenServer
@@ -774,6 +822,21 @@ defmodule UniversalProxy.Audio.Input.Source do
     :ok
   end
 
+  defp session_key_revoked?(%__MODULE__{socket: nil}), do: false
+
+  defp session_key_revoked?(%__MODULE__{psk_category: :long_term} = state) do
+    not Enum.any?(Store.pairings(stored_pairing(state)), &(&1.psk_id == state.conn.record_id))
+  end
+
+  defp session_key_revoked?(%__MODULE__{psk_category: :pairing} = state) do
+    case stored_pairing(state) do
+      %{pairing_psk: <<_::256>> = psk} -> Pairing.psk_id_for(psk) != state.conn.record_id
+      _other -> true
+    end
+  end
+
+  defp session_key_revoked?(_state), do: false
+
   # -- Listener --
 
   defp start_listener(state) do
@@ -995,6 +1058,8 @@ defmodule UniversalProxy.Audio.Input.Source do
     else
       {:error, reason} -> {:error, {:keypair_unavailable, reason}}
     end
+  catch
+    :exit, reason -> {:error, {:keypair_unavailable, {:store_unavailable, reason}}}
   end
 
   defp handle_frame(%{fsm: :awaiting_server_init} = state, :text, text) do
@@ -1056,10 +1121,11 @@ defmodule UniversalProxy.Audio.Input.Source do
     prologue = Wire.prologue(state.client_init, state.server_init)
 
     case exchange_handshake(state, message_1, prologue, :sentinel_fallback) do
-      {:ok, session, category} ->
+      {:ok, session, category, record_id} ->
         case Noise.write_handshake(session, @noise_msg2_payload) do
           {:ok, message_2} ->
             push(state, {:text, Wire.encode_noise_handshake(message_2)})
+            touch_record(state, category, record_id)
 
             {:ok,
              %{
@@ -1069,6 +1135,7 @@ defmodule UniversalProxy.Audio.Input.Source do
                  psk_category: category,
                  trust: trust_level(category),
                  pairing_index: 0,
+                 conn: %{state.conn | record_id: record_id},
                  fsm: :awaiting_server_hello
              }}
 
@@ -1093,26 +1160,33 @@ defmodule UniversalProxy.Audio.Input.Source do
   # session it is holding; otherwise a peer that loops `connect → garbage
   # msg1 → disconnect` permanently accretes key material.
   defp exchange_handshake(state, message_1, prologue, on_miss) do
-    candidate = candidate_psk(state)
+    # One Store read per handshake; every lookup below works on this config.
+    config = stored_pairing(state)
+    candidate = candidate_psk(config)
 
     with {:ok, session, payload} <- open_session(state, candidate, message_1, prologue) do
-      finalize_session(state, {session, candidate}, payload, {message_1, prologue}, on_miss)
+      finalize_session(
+        %{state: state, config: config, on_miss: on_miss},
+        {session, candidate},
+        payload,
+        {message_1, prologue}
+      )
     end
   end
 
   # Resolves the real PSK from message 1's plaintext and, if it differs from
   # the candidate we opened with, reopens under it. Closes the session it holds
   # on any error path so nothing leaks.
-  defp finalize_session(state, {session, candidate}, payload, {message_1, prologue}, on_miss) do
+  defp finalize_session(ctx, {session, candidate}, payload, {message_1, prologue}) do
     with {:ok, reference} <- Wire.decode_noise_msg1_payload(payload),
-         {:ok, psk, category} <- resolve_psk(state, reference, on_miss) do
-      if psk == candidate do
-        {:ok, session, category}
+         {:ok, psk, category, record_id} <- resolve_psk(ctx, reference) do
+      if secure_equal?(psk, candidate) do
+        {:ok, session, category, record_id}
       else
         close_noise(session)
 
-        case open_session(state, psk, message_1, prologue) do
-          {:ok, new_session, _payload} -> {:ok, new_session, category}
+        case open_session(ctx.state, psk, message_1, prologue) do
+          {:ok, new_session, _payload} -> {:ok, new_session, category, record_id}
           {:error, reason} -> {:error, reason}
         end
       end
@@ -1152,19 +1226,20 @@ defmodule UniversalProxy.Audio.Input.Source do
   # Look the `psk_id` up among our PSKs of the declared category only. A miss
   # in the initial handshake completes under the Sentinel (`connection.md`
   # "Sentinel Fallback": the server learns we could not use the PSK it
-  # referenced); a miss during a re-handshake fails it.
-  defp resolve_psk(state, %{psk_id: psk_id, psk_category: category}, on_miss) do
-    case lookup_psk(stored_pairing(state), category, psk_id) do
-      {:ok, psk} ->
-        verify_record_server(state, category, psk)
+  # referenced); a miss during a re-handshake fails it. On a match the result
+  # carries the id of the record (or pairing PSK) now backing the session.
+  defp resolve_psk(ctx, %{psk_id: psk_id, psk_category: category}) do
+    case lookup_psk(ctx.config, category, psk_id) do
+      {:ok, psk, record} ->
+        verify_record_server(ctx.state, category, psk, record)
 
-      :miss when on_miss == :sentinel_fallback ->
+      :miss when ctx.on_miss == :sentinel_fallback ->
         Logger.info(
-          "Audio.Input.Source #{inspect(state.key)} does not hold the PSK the server " <>
+          "Audio.Input.Source #{inspect(ctx.state.key)} does not hold the PSK the server " <>
             "referenced (#{category}); completing the handshake under the Sentinel PSK"
         )
 
-        {:ok, Noise.sentinel_psk(), :sentinel}
+        {:ok, Noise.sentinel_psk(), :sentinel, nil}
 
       :miss ->
         {:error, {:unknown_psk_id, category}}
@@ -1174,46 +1249,55 @@ defmodule UniversalProxy.Audio.Input.Source do
   # `psk_id` is a public hash, so timing is a negligible leak — but a
   # constant-time compare keeps the module uniformly constant-time.
   defp lookup_psk(_config, :sentinel, psk_id) do
-    if secure_equal?(@sentinel_psk_id, psk_id), do: {:ok, Noise.sentinel_psk()}, else: :miss
+    if secure_equal?(@sentinel_psk_id, psk_id), do: {:ok, Noise.sentinel_psk(), nil}, else: :miss
   end
 
-  defp lookup_psk(%{psk: <<_::256>> = psk, psk_id: stored_id}, :long_term, psk_id)
-       when is_binary(stored_id) do
-    if secure_equal?(stored_id, psk_id), do: {:ok, psk}, else: :miss
+  defp lookup_psk(config, :long_term, psk_id) do
+    case Enum.find(Store.pairings(config), &secure_equal?(&1.psk_id, psk_id)) do
+      %{psk: psk} = record -> {:ok, psk, record}
+      nil -> :miss
+    end
   end
 
   defp lookup_psk(%{pairing_psk: <<_::256>> = psk}, :pairing, psk_id) do
-    if secure_equal?(Pairing.psk_id_for(psk), psk_id), do: {:ok, psk}, else: :miss
+    if secure_equal?(Pairing.psk_id_for(psk), psk_id), do: {:ok, psk, nil}, else: :miss
   end
 
   defp lookup_psk(_config, _category, _psk_id), do: :miss
 
   # A long-term PSK is bound to the server it was paired with: after a match,
-  # the stored `server_id` must equal the one in `server/init`, or the
+  # the record's `server_id` must equal the one in `server/init`, or the
   # handshake fails (a misbinding, not a miss — no Sentinel Fallback).
-  defp verify_record_server(state, :long_term, psk) do
-    case stored_pairing(state) do
-      %{server_id: stored} when is_binary(stored) and is_binary(state.server_id) ->
-        if secure_equal?(stored, state.server_id),
-          do: {:ok, psk, :long_term},
-          else: {:error, :pairing_record_server_mismatch}
-
-      _other ->
-        {:error, :pairing_record_server_mismatch}
-    end
+  defp verify_record_server(state, :long_term, psk, %{server_id: stored, psk_id: id}) do
+    if is_binary(state.server_id) and secure_equal?(stored, state.server_id),
+      do: {:ok, psk, :long_term, id},
+      else: {:error, :pairing_record_server_mismatch}
   end
 
-  defp verify_record_server(_state, category, psk), do: {:ok, psk, category}
+  defp verify_record_server(_state, :pairing, psk, _record),
+    do: {:ok, psk, :pairing, Pairing.psk_id_for(psk)}
+
+  defp verify_record_server(_state, category, psk, _record), do: {:ok, psk, category, nil}
 
   defp secure_equal?(a, b) when byte_size(a) == byte_size(b), do: :crypto.hash_equals(a, b)
   defp secure_equal?(_a, _b), do: false
 
-  defp candidate_psk(state) do
-    case stored_pairing(state) do
-      %{psk: <<_::256>> = psk} -> psk
-      _other -> Noise.sentinel_psk()
+  # Open the first session under the most recently used record (the likeliest
+  # server to be dialing), else the Sentinel.
+  defp candidate_psk(config) do
+    case Store.pairings(config) do
+      [%{psk: psk} | _rest] -> psk
+      [] -> Noise.sentinel_psk()
     end
   end
+
+  defp touch_record(state, :long_term, psk_id) when is_binary(psk_id) do
+    Store.touch_pairing(state.store, state.key, psk_id)
+  catch
+    :exit, _ -> :ok
+  end
+
+  defp touch_record(_state, _category, _record_id), do: :ok
 
   defp stored_pairing(state) do
     case Store.get_config(state.store, state.key) do
@@ -1243,7 +1327,10 @@ defmodule UniversalProxy.Audio.Input.Source do
   defp handle_transport_frame(state, _frame), do: {:ok, state}
 
   defp log_unknown(state, type) do
-    Logger.debug("Audio.Input.Source #{inspect(state.key)} ignoring message type #{type}")
+    Logger.debug(
+      "Audio.Input.Source #{inspect(state.key)} ignoring message type #{truncate_text(type)}"
+    )
+
     state
   end
 
@@ -1260,6 +1347,16 @@ defmodule UniversalProxy.Audio.Input.Source do
   # first, then the activation is applied like any other.
   defp handle_message(%{conn: %{rekeying: true} = conn} = state, :server_activate, payload) do
     state = ensure_time_loop(%{state | conn: %{conn | rekeying: false}})
+
+    # A stream that ended while re-keying is closed now, ahead of the
+    # activation's own effects.
+    state =
+      if state.conn.stream_end_pending do
+        _ = send_json(state, Wire.encode_client_stream_end())
+        put_in(state.conn.stream_end_pending, false)
+      else
+        state
+      end
 
     cond do
       state.fsm in @active_states and state.trust != :user ->
@@ -1300,16 +1397,12 @@ defmodule UniversalProxy.Audio.Input.Source do
     handle_source_command(state, source)
   end
 
-  # The in-band re-handshake. Expected right after a successful pairing
-  # (`:awaiting_rehandshake`), to rotate keys on an authenticated (trust
-  # `user`) session, and on an unpaired one when the server switches it to our
-  # pairing PSK or back to its record after a cancelled attempt. That last case
-  # is capped per connection so an unauthenticated peer can't drive unlimited
-  # X25519 handshakes on one connection (CPU amplification).
-  defp handle_message(%{fsm: :awaiting_rehandshake} = state, :noise_handshake, %{data: message_1}) do
-    run_rehandshake(state, message_1)
-  end
-
+  # The in-band re-handshake. Expected to rotate keys on an authenticated
+  # (trust `user`) session, which is uncapped; and on an unpaired one right
+  # after a successful pairing, when the server switches it to our pairing PSK,
+  # or back to its record after a cancelled attempt. Those are capped per
+  # connection (`@max_unpaired_rehandshakes`) so an unauthenticated peer can't
+  # drive unlimited X25519 handshakes on one connection (CPU amplification).
   defp handle_message(%{trust: :user} = state, :noise_handshake, %{data: message_1}) do
     run_rehandshake(state, message_1)
   end
@@ -1329,6 +1422,22 @@ defmodule UniversalProxy.Audio.Input.Source do
 
   defp handle_message(state, tag, payload) when tag in @server_pairing_tags do
     handle_pairing_message(state, tag, payload)
+  end
+
+  # `messaging.md` `server/unpair`: a paired server drops its own record. In a
+  # session keyed by that record we drop ours too, say so and close; in an
+  # unpaired session it is ignored.
+  defp handle_message(%{trust: :user} = state, :server_unpair, _payload) do
+    Logger.info("Audio.Input.Source #{inspect(state.key)} unpaired by the server")
+
+    case Store.remove_pairing(state.store, state.key, psk_id: state.conn.record_id) do
+      :ok -> notify(state, :unpaired)
+      {:error, reason} -> Logger.error("Audio.Input.Source unpair failed: #{inspect(reason)}")
+    end
+
+    goodbye(state, :unpaired)
+  catch
+    :exit, _ -> goodbye(state, :unpaired)
   end
 
   defp handle_message(state, :pair_abort, %{reason: reason}) do
@@ -1368,7 +1477,9 @@ defmodule UniversalProxy.Audio.Input.Source do
     state = if pairing?, do: state, else: leave_pairing(state)
 
     cond do
-      state.psk_category == :long_term and pairing? ->
+      # Not an allowed activity set for any key we hold: one we don't know, or
+      # pairing on a long-term session.
+      not allowed_activities?(state, activities) ->
         goodbye(state, :unauthorized)
 
       state.psk_category == :long_term and @source_role in roles ->
@@ -1377,7 +1488,7 @@ defmodule UniversalProxy.Audio.Input.Source do
 
       # Unpaired, and we admit no unpaired access: playback or roles would only
       # be admissible with it enabled.
-      state.psk_category != :long_term and (:playback in activities or roles != []) ->
+      unpaired_playback?(state, activities, roles) ->
         goodbye(state, :pairing_required)
 
       pairing? ->
@@ -1411,9 +1522,14 @@ defmodule UniversalProxy.Audio.Input.Source do
   #     may, for instance, offer pairing).
   defp reaffirm_activate(state, %{active_roles: roles} = payload) do
     cond do
-      :pairing in payload.activities -> goodbye(state, :unauthorized)
-      is_nil(roles) or @source_role in roles -> {:ok, state}
-      true -> handle_activate(deactivate_source(state), payload)
+      :pairing in payload.activities or unknown_activity?(payload.activities) ->
+        goodbye(state, :unauthorized)
+
+      is_nil(roles) or @source_role in roles ->
+        {:ok, state}
+
+      true ->
+        handle_activate(deactivate_source(state), payload)
     end
   end
 
@@ -1429,6 +1545,17 @@ defmodule UniversalProxy.Audio.Input.Source do
       :ok -> maybe_become_available(%{state | fsm: :syncing})
       {:error, reason} -> {:error, reason, state}
     end
+  end
+
+  defp unknown_activity?(activities), do: Enum.any?(activities, &match?({:unknown, _}, &1))
+
+  defp allowed_activities?(state, activities) do
+    not unknown_activity?(activities) and
+      not (state.psk_category == :long_term and :pairing in activities)
+  end
+
+  defp unpaired_playback?(state, activities, roles) do
+    state.psk_category != :long_term and (:playback in activities or roles != [])
   end
 
   # Full state only: every `client/state` an active source sends carries the
@@ -1482,20 +1609,15 @@ defmodule UniversalProxy.Audio.Input.Source do
   defp offered_method(_state, _params), do: :unsupported
 
   # The consent gate for the dynamic pairing code. An offer only opens an
-  # attempt when (a) no long-term PSK already exists — refusing to let a
-  # Sentinel-keyed attacker overwrite MA's stored PSK (`Store.save_pairing`
-  # clobbers) — and (b) the operator has opened a local "allow pairing" window
-  # that still has code rounds left. Absent consent we do NOT abort: we HOLD
+  # attempt when the operator has opened a local "allow pairing" window that
+  # still has code rounds left; the record it produces is added beside any the
+  # input already holds. Absent consent we do NOT abort: we HOLD
   # the offer in `:pairing_required` (surfacing the "Allow pairing" affordance)
   # and tell the server with `client/pair-pending`, which keeps its own wait
   # open for the operator's gesture. An un-consented offer just waits, then
   # times out with no pairing.
   defp maybe_start_pairing(state, params) do
-    cond do
-      already_paired?(state) -> refuse_pairing(state)
-      rounds_left(state) > 0 -> start_pairing(state, params)
-      true -> hold_for_consent(state)
-    end
+    if rounds_left(state) > 0, do: start_pairing(state, params), else: hold_for_consent(state)
   end
 
   # Code rounds the open consent window still admits; none while it is closed.
@@ -1580,29 +1702,6 @@ defmodule UniversalProxy.Audio.Input.Source do
     state
   end
 
-  defp already_paired?(state) do
-    case stored_pairing(state) do
-      %{psk: <<_::256>>} -> true
-      _other -> false
-    end
-  end
-
-  # A long-term PSK already exists: an operator must unpair first, so we refuse
-  # outright rather than let a Sentinel-keyed peer overwrite the stored PSK. The
-  # peer stays connected; only this offer is declined.
-  defp refuse_pairing(state) do
-    Logger.info(
-      "Audio.Input.Source #{inspect(state.key)} declining pairing offer (already_paired)"
-    )
-
-    notify(state, {:pairing_failed, :already_paired})
-
-    case send_json(state, Wire.encode_pair_abort(:user_cancelled)) do
-      :ok -> {:ok, state}
-      {:error, err} -> {:error, err, state}
-    end
-  end
-
   # Attempts are capped at `@max_pairing_attempts` per connection to bound an
   # online code brute force; retries back off. The attempt runs under the
   # current `pairing_index` (set when its offer arrived).
@@ -1644,8 +1743,7 @@ defmodule UniversalProxy.Audio.Input.Source do
   # appeared meanwhile.
   defp can_open_pairing?(state, params) do
     state.fsm == :pairing_required and not is_nil(state.socket) and is_nil(state.pairing) and
-      (offered_method(state, params) == :pairing_psk or
-         (not is_nil(state.pairing_window) and not already_paired?(state)))
+      (offered_method(state, params) == :pairing_psk or not is_nil(state.pairing_window))
   end
 
   # -- Pairing consent window --
@@ -1663,7 +1761,7 @@ defmodule UniversalProxy.Audio.Input.Source do
     # `pairing_index` and race two writers of `state.pairing`.
     if state.fsm == :pairing_required and not is_nil(state.socket) and
          not is_nil(state.last_pairing_params) and is_nil(state.pairing) and
-         is_nil(state.pairing_attempt_timer) and not already_paired?(state) and
+         is_nil(state.pairing_attempt_timer) and
          offered_method(state, state.last_pairing_params) == :dynamic_pairing_code do
       case start_pairing(state, state.last_pairing_params) do
         {:ok, state} -> state
@@ -1796,14 +1894,10 @@ defmodule UniversalProxy.Audio.Input.Source do
     {:error, {:pairing_error, reason}, discard_pairing(state)}
   end
 
-  defp complete_pairing(state, %{psk: psk, psk_id: psk_id, category: category}) do
-    attrs = %{
-      psk: psk,
-      psk_id: psk_id,
-      psk_category: category,
-      server_id: state.server_id,
-      paired_at: DateTime.utc_now()
-    }
+  # The new record replaces this server's, or is added beside the others
+  # (`Store.save_pairing/4`), whichever method produced it.
+  defp complete_pairing(state, %{psk: psk}) do
+    attrs = %{psk: psk, server_id: state.server_id, paired_at: DateTime.utc_now()}
 
     case save_pairing(state, attrs) do
       :ok ->
@@ -1815,7 +1909,7 @@ defmodule UniversalProxy.Audio.Input.Source do
         # the new session keys takes effect "from the next frame onwards" (ground
         # truth §4), so a `client/time` sent under the old session whose
         # `server/time` reply lands after we swap would fail to decrypt and drop
-        # the connection. The loop restarts at the replayed `server/hello`.
+        # the connection. The loop restarts at the activation that follows.
         state =
           %{
             cancel_time_timer(discard_pairing(close_pairing_window(state)))
@@ -1856,7 +1950,9 @@ defmodule UniversalProxy.Audio.Input.Source do
   # server retries by sending another pairing `server/activate`, which is also
   # what advances `pairing_index`.
   defp pairing_failed(state, reason) do
-    Logger.info("Audio.Input.Source #{inspect(state.key)} pairing failed: #{inspect(reason)}")
+    Logger.info(
+      "Audio.Input.Source #{inspect(state.key)} pairing failed: #{truncate_reason(reason)}"
+    )
 
     state = %{discard_pairing(state) | fsm: :pairing_required}
     notify(state, {:pairing_failed, reason})
@@ -1941,8 +2037,9 @@ defmodule UniversalProxy.Audio.Input.Source do
   defp resolve_pairing_step({:ok, state}), do: {:noreply, state}
   defp resolve_pairing_step({:error, reason, state}), do: {:noreply, fail(state, reason)}
 
+  # The record keying this session (if any) is the one eviction must spare.
   defp save_pairing(state, attrs) do
-    Store.save_pairing(state.store, state.key, attrs)
+    Store.save_pairing(state.store, state.key, attrs, protect: state.conn.record_id)
   catch
     :exit, reason -> {:error, {:store_unavailable, reason}}
   end
@@ -1962,7 +2059,7 @@ defmodule UniversalProxy.Audio.Input.Source do
     previous = state.noise
 
     case exchange_handshake(state, message_1, state.handshake_hash, :fail) do
-      {:ok, session, category} ->
+      {:ok, session, category, record_id} ->
         # `send_json/2` still encrypts message 2 under the *old* session
         # (`state.noise` = `previous`); the new keys take effect only from the
         # next frame. If message 2 can't be produced or sent, close the freshly
@@ -1970,7 +2067,8 @@ defmodule UniversalProxy.Audio.Input.Source do
         with {:ok, message_2} <- Noise.write_handshake(session, @noise_msg2_payload),
              :ok <- send_json(state, Wire.encode_noise_handshake(message_2)) do
           close_noise(previous)
-          {:ok, swap_session(state, session, category)}
+          touch_record(state, category, record_id)
+          {:ok, swap_session(state, session, category, record_id)}
         else
           {:error, reason} ->
             close_noise(session)
@@ -1987,19 +2085,27 @@ defmodule UniversalProxy.Audio.Input.Source do
   # clock filter — persists. No hellos are replayed: the server's next message
   # is `server/activate`, and until it arrives we send nothing (`rekeying`), so
   # the clock-sync loop pauses and capture frames are dropped.
-  defp swap_session(state, session, category) do
-    state = state |> cancel_time_timer() |> discard_pairing()
+  #
+  # Any pairing attempt or held offer ends (its consent-wait timer must not
+  # fire into the re-keyed session). A session that drops below trust `user`
+  # stops capturing at once; its `client-stream/end` waits for the activation
+  # (`end_stream/1`).
+  defp swap_session(state, session, category, record_id) do
+    downgrade? = state.trust == :user and trust_level(category) != :user
+    state = state |> cancel_time_timer() |> leave_pairing()
 
-    %{
+    state = %{
       state
       | noise: session,
         handshake_hash: Noise.handshake_hash(session),
         psk_category: category,
         trust: trust_level(category),
         pairing_index: 0,
-        conn: %{state.conn | rekeying: true, pairing_attempts: 0},
+        conn: %{state.conn | rekeying: true, record_id: record_id},
         outstanding: []
     }
+
+    if downgrade?, do: end_stream(state), else: state
   end
 
   # -- Time sync --
@@ -2220,9 +2326,19 @@ defmodule UniversalProxy.Audio.Input.Source do
 
   # Closes an open stream if there is one; a no-op otherwise, so both a
   # redundant `stop` command and a capture crash land here safely.
+  # While re-keying nothing but the handshake may go out, so the
+  # `client-stream/end` is held until the activation that follows.
   defp end_stream(%{fsm: :streaming} = state) do
     state = stop_capture(state)
-    _ = send_json(state, Wire.encode_client_stream_end())
+
+    state =
+      if state.conn.rekeying do
+        put_in(state.conn.stream_end_pending, true)
+      else
+        _ = send_json(state, Wire.encode_client_stream_end())
+        state
+      end
+
     notify(state, :stopped)
     %{state | fsm: :ready}
   end
@@ -2328,7 +2444,7 @@ defmodule UniversalProxy.Audio.Input.Source do
         remote_static: nil,
         handshake_hash: nil,
         pairing_index: 0,
-        conn: %{rekeying: false, unpaired_rehandshakes: 0, pairing_attempts: 0},
+        conn: @conn_defaults,
         last_pairing_params: nil,
         frames_dropped: 0,
         fsm: :listening,

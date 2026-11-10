@@ -94,10 +94,15 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
   # means the pairing fields are still blank rather than no record at all.
   defp refute_paired!(store) do
     assert {:ok, config} = Store.get_config(store, @key)
-    assert config.psk == nil
-    assert config.psk_id == nil
-    assert config.paired_at == nil
+    assert config.pairings == []
   end
+
+  defp records(store) do
+    {:ok, config} = Store.get_config(store, @key)
+    config.pairings
+  end
+
+  defp other_server_id, do: Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)
 
   # A different PIN of the same length — what a mistyped digit produces.
   defp mistype(pin) do
@@ -232,37 +237,38 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
       refute_paired!(ctx.store)
     end
 
-    test "refuses to open an attempt while a long-term PSK already exists", ctx do
+    test "a consented code pairing adds a record beside another server's", ctx do
       {source, port} = start_source!(ctx)
+      other = other_server_id()
+      :ok = Store.save_pairing(ctx.store, @key, %{psk: Pairing.generate_psk(), server_id: other})
 
-      psk = Pairing.generate_psk()
-
-      :ok =
-        Store.save_pairing(ctx.store, @key, %{
-          psk: psk,
-          psk_id: Pairing.psk_id_for(psk),
-          psk_category: :long_term,
-          server_id: Peer.default_server_id()
-        })
-
-      # An attacker connects with the published Sentinel PSK anyway (trust
-      # none) and, even with operator consent, must not be allowed to overwrite
-      # the stored PSK.
       {_hello, peer} = connect_hello!(port)
-      assert :sys.get_state(source).trust == :none
       :ok = Source.allow_pairing(source)
+      {1, peer} = offer_pairing!(peer)
+      pin = await_pin!()
+      peer = peer |> Peer.submit_pin!(pin) |> Peer.serve_pair_auth!()
+      {psk, _peer} = Peer.serve_pair_finalize!(peer)
+      assert_receive {:source_event, @key, :paired}, 2_000
 
-      peer =
-        Peer.activate!(peer, roles: [], activities: ["pairing"], pairing: @pairing_params)
+      ids = ctx.store |> records() |> Enum.map(& &1.server_id) |> Enum.sort()
+      assert ids == Enum.sort([other, Peer.default_server_id()])
+      assert Enum.any?(records(ctx.store), &(&1.psk == psk))
+    end
 
-      assert_receive {:source_event, @key, {:pairing_required, _params}}, 2_000
-      assert_receive {:source_event, @key, {:pairing_failed, :already_paired}}, 2_000
-      {reason, _peer} = Peer.await_pair_abort!(peer)
-      assert reason == "user_cancelled"
-      refute_received {:source_event, @key, :pairing_started}
+    test "re-pairing the same server by code replaces its record", ctx do
+      {source, port} = start_source!(ctx)
+      old = Pairing.generate_psk()
+      :ok = Store.save_pairing(ctx.store, @key, %{psk: old, server_id: Peer.default_server_id()})
 
-      # The stored PSK is untouched.
-      assert {:ok, %{psk: ^psk}} = Store.get_config(ctx.store, @key)
+      {_hello, peer} = connect_hello!(port)
+      :ok = Source.allow_pairing(source)
+      {1, peer} = offer_pairing!(peer)
+      pin = await_pin!()
+      peer = peer |> Peer.submit_pin!(pin) |> Peer.serve_pair_auth!()
+      {psk, _peer} = Peer.serve_pair_finalize!(peer)
+      assert_receive {:source_event, @key, :paired}, 2_000
+
+      assert [%{psk: ^psk}] = records(ctx.store)
     end
 
     test "pairing attempts are capped at three per connection", ctx do
@@ -316,12 +322,11 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
       assert_receive {:source_event, @key, :paired}, 2_000
 
       # The server unwrapped exactly the PSK we minted, and it is persisted.
-      assert {:ok, config} = Store.get_config(ctx.store, @key)
-      assert config.psk == psk
-      assert config.psk_id == Pairing.psk_id_for(psk)
-      assert config.psk_category == :long_term
-      assert config.server_id == peer.server_id
-      assert %DateTime{} = config.paired_at
+      assert [record] = records(ctx.store)
+      assert record.psk == psk
+      assert record.psk_id == Pairing.psk_id_for(psk)
+      assert record.server_id == peer.server_id
+      assert %DateTime{} = record.paired_at
 
       assert Source.status(source) == :awaiting_rehandshake
 
@@ -359,7 +364,7 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
       {psk, peer} = Peer.serve_pair_finalize!(peer)
 
       assert_receive {:source_event, @key, :paired}, 2_000
-      assert {:ok, %{psk: ^psk}} = Store.get_config(ctx.store, @key)
+      assert [%{psk: ^psk}] = records(ctx.store)
       assert Source.status(source) == :awaiting_rehandshake
       assert peer.time_exchanges == time_exchanges_before
     end
@@ -446,7 +451,7 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
       {psk, _peer} = Peer.serve_pair_finalize!(peer)
 
       assert_receive {:source_event, @key, :paired}, 2_000
-      assert {:ok, %{psk: ^psk}} = Store.get_config(ctx.store, @key)
+      assert [%{psk: ^psk}] = records(ctx.store)
       assert Source.status(source) == :awaiting_rehandshake
       # A successful pairing consumes the consent window, round count and all.
       assert :sys.get_state(source).pairing_window == nil
@@ -688,8 +693,8 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
       # bound to this server, and the pairing PSK survives (it is long-lived).
       assert long_term != pairing_psk
       assert {:ok, config} = Store.get_config(ctx.store, @key)
-      assert config.psk == long_term
-      assert config.server_id == peer.server_id
+      assert [%{psk: ^long_term, server_id: server_id}] = config.pairings
+      assert server_id == peer.server_id
       assert config.pairing_psk == pairing_psk
 
       peer = Peer.rehandshake!(peer, long_term)
@@ -713,22 +718,24 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
       _peer = activate_ready!(peer, source)
     end
 
-    test "a token holder may replace an existing pairing record", ctx do
+    test "a token pairing replaces the same server's record and keeps the others", ctx do
       {source, port} = start_source!(ctx)
-      old = Pairing.generate_psk()
+      other = other_server_id()
+      :ok = Store.save_pairing(ctx.store, @key, %{psk: Pairing.generate_psk(), server_id: other})
 
       :ok =
         Store.save_pairing(ctx.store, @key, %{
-          psk: old,
-          psk_id: Pairing.psk_id_for(old),
-          psk_category: :long_term,
+          psk: Pairing.generate_psk(),
           server_id: Peer.default_server_id()
         })
 
       {_hello, peer} = connect_hello!(port, psk: pairing_psk!(ctx), psk_category: :pairing)
       {1, long_term, _peer} = serve_pairing_psk!(peer)
 
-      assert {:ok, %{psk: ^long_term}} = Store.get_config(ctx.store, @key)
+      records = records(ctx.store)
+      assert length(records) == 2
+      assert Enum.find(records, &(&1.server_id == Peer.default_server_id())).psk == long_term
+      assert Enum.any?(records, &(&1.server_id == other))
       assert Source.status(source) == :awaiting_rehandshake
     end
 
@@ -784,12 +791,20 @@ defmodule UniversalProxy.Audio.Input.SourcePairingTest do
       peer = Peer.activate!(peer, roles: [], activities: [])
 
       sentinel = UniversalProxy.Sendspin.Noise.sentinel_psk()
+      pairing_psk = pairing_psk!(ctx)
 
+      # Three token attempts that each switch to the pairing PSK and are
+      # cancelled back, plus the post-pairing re-key, stay within the cap.
       peer =
-        Enum.reduce(1..4, peer, fn _i, peer ->
-          peer = Peer.rehandshake!(peer, sentinel, category: :sentinel, tolerate_time: true)
+        Enum.reduce(1..8, peer, fn i, peer ->
+          {psk, category} =
+            if rem(i, 2) == 1, do: {pairing_psk, :pairing}, else: {sentinel, :sentinel}
+
+          peer = Peer.rehandshake!(peer, psk, category: category, tolerate_time: true)
           Peer.activate!(peer, roles: [], activities: [])
         end)
+
+      refute_received {:source_event, @key, {:error, _}}
 
       _peer =
         Peer.send_message!(peer, "noise/handshake", %{

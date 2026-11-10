@@ -1,7 +1,7 @@
 defmodule UniversalProxy.Audio.Input.Store do
   @moduledoc """
   DETS-backed persistence for Sendspin audio-**input** (capture card)
-  configuration and pairing state.
+  configuration and pairing records.
 
   Keyed by `{slot_sub, vendor_id, product_id}` — the same shape as
   `UniversalProxy.Audio.Store` and `UniversalProxy.UART.Store`. For
@@ -14,11 +14,15 @@ defmodule UniversalProxy.Audio.Input.Store do
         friendly_name: String.t(),
         client_keypair: {pub :: <<_::256>>, priv :: binary()} | nil,
         pairing_psk: <<_::256>> | nil,
-        psk: <<_::256>> | nil,
-        psk_id: String.t() | nil,
-        psk_category: atom() | nil,
-        server_id: String.t() | nil,
-        paired_at: DateTime.t() | nil
+        pairings: [
+          %{
+            psk: <<_::256>>,
+            psk_id: String.t(),
+            server_id: String.t(),
+            paired_at: DateTime.t(),
+            last_used: DateTime.t()
+          }
+        ]
       }
 
   Unlike `Audio.Store`'s `client_id` (generated eagerly on every save),
@@ -35,8 +39,21 @@ defmodule UniversalProxy.Audio.Input.Store do
   Music Assistant to pair over the Pairing PSK method. Like the keypair it is
   minted lazily from the CSPRNG (`ensure_pairing_psk/2`), long-lived, and
   not pairing *state*: a pairing does not consume it and `clear_pairing/2`
-  leaves it alone. `psk`/`psk_id`/`server_id` are the pairing record — the
-  long-term PSK a completed pairing produced.
+  leaves it alone. `regenerate_pairing_psk/2` replaces it (the operator's
+  "Regenerate pairing token").
+
+  `pairings` are the input's **pairing records** (`pairing.md` "Pairing
+  Records"): one long-term PSK per server it has paired with, bound to that
+  server's `server_id`. Up to 8 are kept; a new pairing replaces the record
+  for the same server, else is added, evicting the least recently used record
+  — never the one the caller marks as backing its open connection — so a
+  pairing never fails for lack of storage.
+
+  Rows written before Sendspin 1.0.0-rc1 held one flat record (`psk`,
+  `psk_id`, `psk_category`, `server_id`, `paired_at`). They are converted on
+  read: a record with a 32-byte PSK and a `server_id` becomes the first entry
+  of `pairings` (its `psk_id` recomputed, not trusted), anything else is
+  dropped, and the flat keys are discarded on the next write.
 
   The file holds private key material, so it is kept owner-only (`0600`).
 
@@ -68,12 +85,21 @@ defmodule UniversalProxy.Audio.Input.Store do
           friendly_name: String.t(),
           client_keypair: keypair() | nil,
           pairing_psk: <<_::256>> | nil,
-          psk: <<_::256>> | nil,
-          psk_id: String.t() | nil,
-          psk_category: atom() | nil,
-          server_id: String.t() | nil,
-          paired_at: DateTime.t() | nil
+          pairings: [pairing_record()]
         }
+
+  @type pairing_record :: %{
+          psk: <<_::256>>,
+          psk_id: String.t(),
+          server_id: String.t(),
+          paired_at: DateTime.t(),
+          last_used: DateTime.t()
+        }
+
+  # `pairing.md`: a client MUST be able to store at least 5 records.
+  @max_pairings 8
+
+  @legacy_pairing_keys [:psk, :psk_id, :psk_category, :server_id, :paired_at]
 
   # -- Client API --
 
@@ -180,36 +206,80 @@ defmodule UniversalProxy.Audio.Input.Store do
   def client_id(<<pub::binary-size(32)>>), do: Base.url_encode64(pub, padding: false)
 
   @doc """
-  Persist a completed pairing: `psk`, `psk_id`, `psk_category`,
-  `server_id` (the server's static pubkey), and `paired_at`. Defaults
-  `paired_at` to `DateTime.utc_now/0` if the caller doesn't supply one.
-  Goes through the same presence-check merge as `save_config/3`, so
-  `friendly_name` and `client_keypair` are left untouched.
+  Persist a completed pairing: the new long-term `psk` for `server_id` (the
+  server's static pubkey), `paired_at` defaulting to now. The record for the
+  same server is replaced, else one is added, evicting the least recently
+  used record at capacity but never the one whose `psk_id` is `opts[:protect]`
+  (the record backing the caller's open connection). `friendly_name`, the
+  keypair and the pairing PSK are untouched.
   """
-  @spec save_pairing(GenServer.server(), input_key(), map()) :: :ok | {:error, term()}
-  def save_pairing(server \\ __MODULE__, {slot_sub, _vid, _pid} = key, attrs)
+  @spec save_pairing(GenServer.server(), input_key(), map(), keyword()) :: :ok | {:error, term()}
+  def save_pairing(server \\ __MODULE__, {slot_sub, _vid, _pid} = key, attrs, opts \\ [])
       when is_binary(slot_sub) and is_map(attrs) do
+    psk = Params.get(attrs, :psk)
     paired_at = Params.get(attrs, :paired_at, DateTime.utc_now())
-    save_config(server, key, Map.put(attrs, :paired_at, paired_at))
+
+    record = %{
+      psk: psk,
+      psk_id: Pairing.psk_id_for(psk),
+      server_id: Params.get(attrs, :server_id),
+      paired_at: paired_at,
+      last_used: paired_at
+    }
+
+    GenServer.call(server, {:save_pairing, key, record, Keyword.get(opts, :protect)})
+  end
+
+  @doc "The pairing records of a config (as `get_config/2` returns it), most recently used first."
+  @spec pairings(map()) :: [pairing_record()]
+  def pairings(config) when is_map(config) do
+    config |> Map.get(:pairings, []) |> Enum.sort_by(& &1.last_used, {:desc, DateTime})
   end
 
   @doc """
-  Clear a device's pairing state (`psk`, `psk_id`, `psk_category`,
-  `server_id`, `paired_at` all reset to `nil`), leaving `friendly_name`,
-  `client_keypair` and `pairing_psk` untouched — the keypair is an
-  identity and the pairing PSK a long-lived credential, not pairing state,
-  and both must survive an unpair.
+  Note that the record with `psk_id` just authenticated a connection, for the
+  least-recently-used eviction order. Best effort and asynchronous.
+  """
+  @spec touch_pairing(GenServer.server(), input_key(), String.t()) :: :ok
+  def touch_pairing(server \\ __MODULE__, {slot_sub, _vid, _pid} = key, psk_id)
+      when is_binary(slot_sub) and is_binary(psk_id) do
+    GenServer.cast(server, {:touch_pairing, key, psk_id})
+  end
+
+  @doc """
+  Remove the pairing record matching `server_id: id` or `psk_id: id`.
+  Removing a record that isn't there is `:ok`.
+  """
+  @spec remove_pairing(
+          GenServer.server(),
+          input_key(),
+          [server_id: String.t()] | [psk_id: String.t()]
+        ) ::
+          :ok | {:error, term()}
+  def remove_pairing(server \\ __MODULE__, {slot_sub, _vid, _pid} = key, [{field, id}])
+      when is_binary(slot_sub) and field in [:server_id, :psk_id] and is_binary(id) do
+    GenServer.call(server, {:remove_pairing, key, field, id})
+  end
+
+  @doc """
+  Clear every pairing record of a device, leaving `friendly_name`,
+  `client_keypair` and `pairing_psk` untouched — the keypair is an identity
+  and the pairing PSK a long-lived credential, not pairing state.
   """
   @spec clear_pairing(GenServer.server(), input_key()) :: :ok | {:error, term()}
   def clear_pairing(server \\ __MODULE__, {slot_sub, _vid, _pid} = key)
       when is_binary(slot_sub) do
-    save_config(server, key, %{
-      psk: nil,
-      psk_id: nil,
-      psk_category: nil,
-      server_id: nil,
-      paired_at: nil
-    })
+    save_config(server, key, %{pairings: []})
+  end
+
+  @doc """
+  Replace the input's pairing PSK with a fresh one, invalidating its pairing
+  token. Existing pairing records are unaffected.
+  """
+  @spec regenerate_pairing_psk(GenServer.server(), input_key()) :: :ok | {:error, term()}
+  def regenerate_pairing_psk(server \\ __MODULE__, {slot_sub, _vid, _pid} = key)
+      when is_binary(slot_sub) do
+    save_config(server, key, %{pairing_psk: Pairing.generate_psk()})
   end
 
   # -- Server Callbacks --
@@ -258,11 +328,23 @@ defmodule UniversalProxy.Audio.Input.Store do
   def handle_call({:get, key}, _from, state) do
     result =
       case :dets.lookup(state.table, key) do
-        [{^key, cfg}] when is_map(cfg) -> {:ok, cfg}
+        [{^key, cfg}] when is_map(cfg) -> {:ok, normalize(cfg)}
         _ -> :error
       end
 
     {:reply, result, state}
+  end
+
+  def handle_call({:save_pairing, key, record, protect}, _from, state) do
+    existing = lookup(state.table, key)
+    pairings = upsert_pairing(Map.get(existing, :pairings, []), record, protect)
+    {:reply, write(state.table, key, merge_defaults(existing, %{pairings: pairings}, key)), state}
+  end
+
+  def handle_call({:remove_pairing, key, field, id}, _from, state) do
+    existing = lookup(state.table, key)
+    pairings = Enum.reject(Map.get(existing, :pairings, []), &(Map.fetch!(&1, field) == id))
+    {:reply, write(state.table, key, merge_defaults(existing, %{pairings: pairings}, key)), state}
   end
 
   def handle_call({:delete, key}, _from, state) do
@@ -280,8 +362,11 @@ defmodule UniversalProxy.Audio.Input.Store do
     all =
       :dets.foldl(
         fn
-          {{_slot, _vid, _pid} = key, cfg}, acc when is_map(cfg) -> Map.put(acc, key, cfg)
-          _other, acc -> acc
+          {{_slot, _vid, _pid} = key, cfg}, acc when is_map(cfg) ->
+            Map.put(acc, key, normalize(cfg))
+
+          _other, acc ->
+            acc
         end,
         %{},
         state.table
@@ -347,31 +432,96 @@ defmodule UniversalProxy.Audio.Input.Store do
     end
   end
 
+  @impl true
+  def handle_cast({:touch_pairing, key, psk_id}, state) do
+    existing = lookup(state.table, key)
+    now = DateTime.utc_now()
+
+    pairings =
+      Enum.map(Map.get(existing, :pairings, []), fn
+        %{psk_id: ^psk_id} = record -> %{record | last_used: now}
+        record -> record
+      end)
+
+    _ = write(state.table, key, merge_defaults(existing, %{pairings: pairings}, key))
+    {:noreply, state}
+  end
+
   # -- Private --
 
   defp lookup(table, key) do
     case :dets.lookup(table, key) do
-      [{^key, cfg}] when is_map(cfg) -> cfg
+      [{^key, cfg}] when is_map(cfg) -> normalize(cfg)
       _ -> %{}
     end
   end
 
+  defp write(table, key, cfg) do
+    with :ok <- :dets.insert(table, {key, cfg}),
+         :ok <- :dets.sync(table) do
+      :ok
+    else
+      {:error, reason} = error ->
+        Logger.error("Audio input store write failed for #{inspect(key)}: #{inspect(reason)}")
+        error
+    end
+  end
+
+  # Replace the same server's record, else add one, evicting the least
+  # recently used unprotected records past capacity.
+  defp upsert_pairing(pairings, record, protect) do
+    others = Enum.reject(pairings, &(&1.server_id == record.server_id))
+    keep = [record | Enum.sort_by(others, & &1.last_used, {:desc, DateTime})]
+
+    if length(keep) <= @max_pairings do
+      keep
+    else
+      {protected, evictable} = Enum.split_with(tl(keep), &(&1.psk_id == protect))
+      [record | protected] ++ Enum.take(evictable, @max_pairings - 1 - length(protected))
+    end
+  end
+
+  # Convert a row written before rc1 (one flat record) to the `pairings` list.
+  defp normalize(%{pairings: pairings} = cfg) when is_list(pairings),
+    do: Map.drop(cfg, @legacy_pairing_keys)
+
+  defp normalize(cfg) do
+    cfg |> Map.drop(@legacy_pairing_keys) |> Map.put(:pairings, legacy_pairings(cfg))
+  end
+
+  defp legacy_pairings(%{psk: <<_::256>> = psk, server_id: server_id} = cfg)
+       when is_binary(server_id) and byte_size(server_id) == 43 do
+    paired_at =
+      case Map.get(cfg, :paired_at) do
+        %DateTime{} = at -> at
+        _other -> DateTime.from_unix!(0)
+      end
+
+    [
+      %{
+        psk: psk,
+        psk_id: Pairing.psk_id_for(psk),
+        server_id: server_id,
+        paired_at: paired_at,
+        last_used: paired_at
+      }
+    ]
+  end
+
+  defp legacy_pairings(_cfg), do: []
+
   # The default `friendly_name` is the capture card's slot; users can
-  # rename per input via the UI. Every pairing-related field defaults
-  # to `nil` (unpaired) rather than being synthesised, unlike
-  # `Audio.Store`'s eager `client_id` generation — the keypair and
-  # pairing state only come into existence via `ensure_client_keypair/2`
-  # and `save_pairing/3` respectively.
+  # rename per input via the UI. The keypair and pairing PSK default to
+  # `nil` and `pairings` to `[]` (unpaired) rather than being synthesised,
+  # unlike `Audio.Store`'s eager `client_id` generation — they only come into
+  # existence via `ensure_client_keypair/2`, `ensure_pairing_psk/2` and
+  # `save_pairing/4`.
   defp merge_defaults(existing, params, {slot_sub, _vid, _pid}) do
     %{
       friendly_name: pick(params, existing, :friendly_name, slot_sub),
       client_keypair: pick(params, existing, :client_keypair, nil),
       pairing_psk: pick(params, existing, :pairing_psk, nil),
-      psk: pick(params, existing, :psk, nil),
-      psk_id: pick(params, existing, :psk_id, nil),
-      psk_category: pick(params, existing, :psk_category, nil),
-      server_id: pick(params, existing, :server_id, nil),
-      paired_at: pick(params, existing, :paired_at, nil)
+      pairings: pick(params, existing, :pairings, [])
     }
   end
 

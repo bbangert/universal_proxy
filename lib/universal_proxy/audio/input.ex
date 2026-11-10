@@ -93,4 +93,29 @@ defmodule UniversalProxy.Audio.Input do
   catch
     :exit, _ -> {:error, :unavailable}
   end
+
+  @doc """
+  Unpair an input from one server (`server_id`) or from every server
+  (`:all`): the pairing record goes, and a live session it keyed is closed so
+  the server sees the change and can re-pair. `{:error, :unavailable}` when
+  the input isn't present or the subsystem is down.
+  """
+  @spec unpair(key(), String.t() | :all) :: :ok | {:error, :unavailable}
+  def unpair({_, _, _} = key, which) when is_binary(which) or which == :all do
+    Server.unpair(key, which)
+  catch
+    :exit, _ -> {:error, :unavailable}
+  end
+
+  @doc """
+  Replace an input's pairing PSK, so its old pairing token no longer pairs.
+  Existing pairing records keep working. `{:error, :unavailable}` when the
+  input isn't present or the subsystem is down.
+  """
+  @spec regenerate_pairing_token(key()) :: :ok | {:error, :unavailable}
+  def regenerate_pairing_token({_, _, _} = key) do
+    Server.regenerate_pairing_token(key)
+  catch
+    :exit, _ -> {:error, :unavailable}
+  end
 end

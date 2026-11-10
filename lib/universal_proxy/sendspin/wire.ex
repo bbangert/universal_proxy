@@ -131,7 +131,7 @@ defmodule UniversalProxy.Sendspin.Wire do
   @type pairing_format :: :digits | :qr_code
 
   @type server_activate :: %{
-          activities: [:playback | :pairing | :management],
+          activities: [:playback | :pairing | {:unknown, String.t()}],
           active_roles: [String.t()] | nil,
           pairing:
             %{
@@ -758,11 +758,14 @@ defmodule UniversalProxy.Sendspin.Wire do
 
   defp encode_activity(:playback), do: "playback"
   defp encode_activity(:pairing), do: "pairing"
-  defp encode_activity(:management), do: "management"
 
+  # An unrecognized value in a known field follows that field's rules
+  # (`messaging.md` "Forward compatibility"): an activity set holding one is not
+  # an allowed set, which the FSM answers with `client/goodbye` `unauthorized`.
+  # It decodes to `{:unknown, string}` (no new atom) so the FSM can say so.
   defp decode_activity("playback"), do: {:ok, :playback}
   defp decode_activity("pairing"), do: {:ok, :pairing}
-  defp decode_activity("management"), do: {:ok, :management}
+  defp decode_activity(other) when is_binary(other), do: {:ok, {:unknown, other}}
   defp decode_activity(other), do: {:error, {:invalid_field, {"activities", other}}}
 
   # -- client/time / server/time --
@@ -1003,6 +1006,12 @@ defmodule UniversalProxy.Sendspin.Wire do
       _other -> {:error, {:invalid_field, "codec_header"}}
     end
   end
+
+  # -- server/unpair --
+
+  @doc "Encode `server/unpair` (no payload fields): a paired server drops its record."
+  @spec encode_server_unpair() :: binary()
+  def encode_server_unpair, do: encode_message("server/unpair", %{})
 
   # -- client/goodbye --
 
@@ -1372,6 +1381,7 @@ defmodule UniversalProxy.Sendspin.Wire do
     do: {:server_pair_finalize, &parse_empty_payload/1}
 
   defp type_tag_and_parser("pair/abort"), do: {:pair_abort, &parse_pair_abort_payload/1}
+  defp type_tag_and_parser("server/unpair"), do: {:server_unpair, &parse_empty_payload/1}
   defp type_tag_and_parser(_other), do: nil
 
   defp tag_result(tag, {:ok, parsed}), do: {:ok, {tag, parsed}}

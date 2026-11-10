@@ -557,6 +557,26 @@ defmodule UniversalProxy.Sendspin.WireTest do
                Wire.decode_server_activate(text)
     end
 
+    test "an unknown activity decodes to {:unknown, string}, not an error or a new atom" do
+      text =
+        Jason.encode!(%{
+          "type" => "server/activate",
+          "payload" => %{"activities" => ["playback", "management"], "active_roles" => []}
+        })
+
+      assert {:ok, %{activities: [:playback, {:unknown, "management"}]}} =
+               Wire.decode_server_activate(text)
+    end
+
+    test "server/unpair is recognized" do
+      assert {:ok, {:server_unpair, %{}}} = Wire.decode_message(Wire.encode_server_unpair())
+
+      assert Jason.decode!(Wire.encode_server_unpair()) == %{
+               "type" => "server/unpair",
+               "payload" => %{}
+             }
+    end
+
     test "multiple activities round-trip in order" do
       fields = %{activities: [:playback, :pairing], active_roles: ["source@v1"], pairing: nil}
       text = Wire.encode_server_activate(fields)

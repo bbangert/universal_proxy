@@ -34,7 +34,7 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
         {UniversalProxy.Audio.Input.Store, name: nil, table: @table, dets_path: path}
       )
 
-    {:ok, store: store}
+    {:ok, store: store, dets_path: path}
   end
 
   # Emits `count` distinct 3,840-byte frames (20 ms of 48k/16/2 PCM) with a
@@ -97,12 +97,7 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
     psk = Pairing.generate_psk()
 
     :ok =
-      Store.save_pairing(ctx.store, @key, %{
-        psk: psk,
-        psk_id: Pairing.psk_id_for(psk),
-        psk_category: :long_term,
-        server_id: Peer.default_server_id()
-      })
+      Store.save_pairing(ctx.store, @key, %{psk: psk, server_id: Peer.default_server_id()})
 
     psk
   end
@@ -785,6 +780,221 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
       assert_receive {:source_event, @key, {:error, :malformed_handshake_payload}}, 2_000
       assert_receive {:source_event, @key, :disconnected}, 2_000
       assert Source.status(source) == :listening
+    end
+  end
+
+  describe "pairing records and revocation" do
+    defp other_server_id, do: Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)
+
+    defp records(ctx) do
+      {:ok, config} = Store.get_config(ctx.store, @key)
+      config.pairings
+    end
+
+    test "server/unpair in a paired session drops that record, says goodbye and closes", ctx do
+      psk = pair!(ctx)
+      other = other_server_id()
+      :ok = Store.save_pairing(ctx.store, @key, %{psk: Pairing.generate_psk(), server_id: other})
+      {source, port} = start_source!(ctx)
+      assert_receive {:source_event, @key, {:listener_bound, ^port}}, 2_000
+
+      peer = connect_activated!(port, psk: psk)
+      assert_receive {:source_event, @key, :activated}, 2_000
+      peer = Peer.send_message!(peer, "server/unpair")
+
+      {goodbye, _peer} = Peer.await_json!(peer, "client/goodbye")
+      assert goodbye == %{"reason" => "unpaired"}
+      assert_receive {:source_event, @key, :unpaired}, 2_000
+      assert_receive {:source_event, @key, :disconnected}, 2_000
+      assert Source.status(source) == :listening
+      assert [%{server_id: ^other}] = records(ctx)
+    end
+
+    test "server/unpair in an unpaired session is ignored", ctx do
+      {source, port} = start_source!(ctx)
+      assert_receive {:source_event, @key, {:listener_bound, ^port}}, 2_000
+
+      peer = port |> Peer.connect!() |> Peer.handshake!() |> Peer.hello!()
+      {_hello, peer} = Peer.await_json!(peer, "client/hello")
+      peer = Peer.activate!(peer, roles: [], activities: [])
+      _peer = Peer.send_message!(peer, "server/unpair")
+
+      refute_receive {:source_event, @key, :disconnected}, 300
+      assert Source.status(source) == :awaiting_activate
+    end
+
+    test "pairings_changed/1 closes only a session whose record is gone", ctx do
+      psk = pair!(ctx)
+      other = other_server_id()
+      :ok = Store.save_pairing(ctx.store, @key, %{psk: Pairing.generate_psk(), server_id: other})
+      {source, port} = start_source!(ctx)
+      assert_receive {:source_event, @key, {:listener_bound, ^port}}, 2_000
+
+      peer = connect_activated!(port, psk: psk)
+      assert_receive {:source_event, @key, :activated}, 2_000
+
+      :ok = Store.remove_pairing(ctx.store, @key, server_id: other)
+      :ok = Source.pairings_changed(source)
+      refute_receive {:source_event, @key, :disconnected}, 300
+
+      :ok = Store.remove_pairing(ctx.store, @key, server_id: Peer.default_server_id())
+      :ok = Source.pairings_changed(source)
+      assert_receive {:source_event, @key, :disconnected}, 2_000
+      assert Peer.closed?(peer, 2_000)
+    end
+
+    test "regenerating the pairing PSK closes a session keyed by the old one", ctx do
+      {source, port} = start_source!(ctx)
+      assert_receive {:source_event, @key, {:listener_bound, ^port}}, 2_000
+      {:ok, pairing_psk} = Store.ensure_pairing_psk(ctx.store, @key)
+
+      _peer = port |> Peer.connect!(psk: pairing_psk, psk_category: :pairing) |> Peer.handshake!()
+      :ok = Store.regenerate_pairing_psk(ctx.store, @key)
+      :ok = Source.pairings_changed(source)
+      assert_receive {:source_event, @key, :disconnected}, 2_000
+
+      # The old token's PSK is no longer ours: a new handshake under it misses
+      # and falls back to the Sentinel.
+      peer =
+        port
+        |> Peer.connect!(
+          psk: UniversalProxy.Sendspin.Noise.sentinel_psk(),
+          psk_id: Pairing.psk_id_for(pairing_psk),
+          psk_category: :pairing
+        )
+
+      _peer = Peer.handshake!(peer)
+      assert %{psk_category: :sentinel} = :sys.get_state(source)
+    end
+
+    test "a migrated pre-rc1 record still authenticates its server", ctx do
+      psk = Pairing.generate_psk()
+      {:ok, keypair} = Store.ensure_client_keypair(ctx.store, @key)
+      stop_supervised(UniversalProxy.Audio.Input.Store)
+      path = ctx.dets_path
+      {:ok, table} = :dets.open_file(:legacy_source_seed, file: to_charlist(path), type: :set)
+
+      :ok =
+        :dets.insert(
+          table,
+          {@key,
+           %{
+             friendly_name: "Old",
+             client_keypair: keypair,
+             psk: psk,
+             psk_id: "stale",
+             psk_category: :long_term,
+             server_id: Peer.default_server_id(),
+             paired_at: ~U[2026-08-17 00:00:00Z]
+           }}
+        )
+
+      :ok = :dets.close(table)
+      store = start_supervised!({Store, name: nil, table: @table, dets_path: path}, id: :reopened)
+      ctx = %{ctx | store: store}
+
+      {_source, port} = start_source!(ctx)
+      assert_receive {:source_event, @key, {:listener_bound, ^port}}, 2_000
+      _peer = connect_activated!(port, psk: psk)
+      assert_receive {:source_event, @key, :activated}, 2_000
+    end
+  end
+
+  describe "re-handshake on an active session" do
+    @describetag :python3
+
+    test "a key rotation keeps the stream and the clock filter", ctx do
+      arecord = write_fake_arecord!()
+      psk = pair!(ctx)
+      {source, port} = start_source!(ctx, capture_opts: [arecord_path: arecord])
+      assert_receive {:source_event, @key, {:listener_bound, ^port}}, 2_000
+
+      peer = connect_available!(port, psk: psk)
+      peer = Peer.command!(peer, "start")
+      {_stream, peer} = Peer.await_json!(peer, "client-stream/start")
+      assert_receive {:source_event, @key, :streaming}, 2_000
+      {_ts, _payload, peer} = Peer.await_audio!(peer)
+      filter = :sys.get_state(source).filter
+      capture = :sys.get_state(source).capture
+
+      peer = Peer.rehandshake!(peer, psk, tolerate_time: true)
+      # Nothing — not even captured audio — until the activation.
+      peer = Peer.refute_frames!(peer, 150)
+      peer = Peer.activate!(peer)
+
+      {_ts, payload, peer} = Peer.await_audio!(peer)
+      assert byte_size(payload) == @frame_bytes
+      refute Enum.any?(peer.messages, &match?({:json, "client-stream/end", _}, &1))
+      state = :sys.get_state(source)
+      assert state.fsm == :streaming
+      assert state.capture == capture
+      assert state.filter.count >= filter.count
+      refute_received {:source_event, @key, :stopped}
+    end
+
+    test "a downgrade stops capture at once and ends the stream after the activation", ctx do
+      arecord = write_fake_arecord!()
+      psk = pair!(ctx)
+      {source, port} = start_source!(ctx, capture_opts: [arecord_path: arecord])
+      assert_receive {:source_event, @key, {:listener_bound, ^port}}, 2_000
+
+      peer = connect_available!(port, psk: psk)
+      peer = Peer.command!(peer, "start")
+      {_stream, peer} = Peer.await_json!(peer, "client-stream/start")
+      {_ts, _payload, peer} = Peer.await_audio!(peer)
+
+      sentinel = UniversalProxy.Sendspin.Noise.sentinel_psk()
+      peer = Peer.rehandshake!(peer, sentinel, category: :sentinel, tolerate_time: true)
+      assert_receive {:source_event, @key, :stopped}, 2_000
+      assert :sys.get_state(source).capture == nil
+      peer = Peer.refute_frames!(peer, 150)
+
+      peer = Peer.activate!(peer, roles: [], activities: [])
+      {%{}, _peer} = Peer.await_json!(peer, "client-stream/end")
+      assert Source.status(source) == :awaiting_activate
+      assert :sys.get_state(source).trust == :none
+    end
+  end
+
+  describe "re-handshake during a held offer" do
+    test "cancels the consent wait so nothing fires into the re-keyed session", ctx do
+      {source, port} = start_source!(ctx, pairing_window_ms: 100)
+      assert_receive {:source_event, @key, {:listener_bound, ^port}}, 2_000
+      {:ok, pairing_psk} = Store.ensure_pairing_psk(ctx.store, @key)
+
+      peer = port |> Peer.connect!() |> Peer.handshake!() |> Peer.hello!()
+      {_hello, peer} = Peer.await_json!(peer, "client/hello")
+
+      peer =
+        Peer.activate!(peer,
+          roles: [],
+          activities: ["pairing"],
+          pairing: %{"method" => "dynamic_pairing_code", "format" => "digits"}
+        )
+
+      {_pending, peer} = Peer.await_json!(peer, "client/pair-pending")
+      peer = Peer.rehandshake!(peer, pairing_psk, category: :pairing, tolerate_time: true)
+
+      # Well past the 100 ms consent wait: no pair/abort (or anything) leaks.
+      peer = Peer.refute_frames!(peer, 300)
+      _peer = Peer.activate!(peer, roles: [], activities: [])
+      assert %{last_pairing_params: nil, consent_wait_timer: nil} = :sys.get_state(source)
+    end
+  end
+
+  describe "activities" do
+    test "an unknown activity value is not an allowed set: goodbye unauthorized", ctx do
+      psk = pair!(ctx)
+      {_source, port} = start_source!(ctx)
+      assert_receive {:source_event, @key, {:listener_bound, ^port}}, 2_000
+
+      peer = port |> Peer.connect!(psk: psk) |> Peer.handshake!() |> Peer.hello!()
+      {_hello, peer} = Peer.await_json!(peer, "client/hello")
+      peer = Peer.activate!(peer, activities: ["playback", "dancing"])
+
+      {goodbye, _peer} = Peer.await_json!(peer, "client/goodbye")
+      assert goodbye == %{"reason" => "unauthorized"}
+      assert_receive {:source_event, @key, :disconnected}, 2_000
     end
   end
 
