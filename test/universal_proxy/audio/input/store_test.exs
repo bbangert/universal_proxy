@@ -49,6 +49,7 @@ defmodule UniversalProxy.Audio.Input.StoreTest do
 
       assert cfg.friendly_name == "USB Capture Card"
       assert cfg.client_keypair == nil
+      assert cfg.pairing_psk == nil
       assert cfg.psk == nil
       assert cfg.psk_id == nil
       assert cfg.psk_category == nil
@@ -185,6 +186,55 @@ defmodule UniversalProxy.Audio.Input.StoreTest do
       {:ok, cfg} = Store.get_config(server, @key)
       assert cfg.client_keypair == {new_pub, new_priv}
     end
+  end
+
+  describe "ensure_pairing_psk/2 and pairing_token/2" do
+    test "mints a 32-byte pairing PSK once and keeps it", %{server: server} do
+      {:ok, psk} = Store.ensure_pairing_psk(server, @key)
+      assert byte_size(psk) == 32
+      assert {:ok, ^psk} = Store.ensure_pairing_psk(server, @key)
+      assert {:ok, %{pairing_psk: ^psk}} = Store.get_config(server, @key)
+    end
+
+    test "is stable across a GenServer restart", %{dets_path: path} do
+      pid = restart_store!(path, :first)
+      {:ok, psk} = Store.ensure_pairing_psk(pid, @key)
+
+      reopened = restart_store!(path, :second)
+      assert {:ok, ^psk} = Store.ensure_pairing_psk(reopened, @key)
+    end
+
+    test "is distinct per input", %{server: server} do
+      {:ok, a} = Store.ensure_pairing_psk(server, @key)
+      {:ok, b} = Store.ensure_pairing_psk(server, @usb_key)
+      assert a != b
+    end
+
+    test "the token is SP:0 + base32(client key || pairing PSK)", %{server: server} do
+      {:ok, token} = Store.pairing_token(server, @key)
+      {:ok, {pub, _priv}} = Store.ensure_client_keypair(server, @key)
+      {:ok, pairing_psk} = Store.ensure_pairing_psk(server, @key)
+
+      assert "SP:0" <> body = token
+
+      assert {:ok, pub <> pairing_psk} ==
+               body |> String.replace("9", "2") |> pad() |> Base.decode32()
+
+      assert {:ok, ^token} = Store.pairing_token(server, @key)
+    end
+
+    test "survives clear_pairing (it is a credential, not pairing state)", %{server: server} do
+      {:ok, psk} = Store.ensure_pairing_psk(server, @key)
+      :ok = Store.clear_pairing(server, @key)
+      assert {:ok, %{pairing_psk: ^psk}} = Store.get_config(server, @key)
+    end
+
+    test "the table file is owner-only", %{dets_path: path} do
+      assert {:ok, %File.Stat{mode: mode}} = File.stat(path)
+      assert Bitwise.band(mode, 0o777) == 0o600
+    end
+
+    defp pad(body), do: body <> String.duplicate("=", rem(8 - rem(byte_size(body), 8), 8))
   end
 
   describe "client_id/1" do

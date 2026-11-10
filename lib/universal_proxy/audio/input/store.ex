@@ -13,6 +13,7 @@ defmodule UniversalProxy.Audio.Input.Store do
       %{
         friendly_name: String.t(),
         client_keypair: {pub :: <<_::256>>, priv :: binary()} | nil,
+        pairing_psk: <<_::256>> | nil,
         psk: <<_::256>> | nil,
         psk_id: String.t() | nil,
         psk_category: atom() | nil,
@@ -29,6 +30,16 @@ defmodule UniversalProxy.Audio.Input.Store do
   long-lived identity, persisted across reboots, that must be stable
   across reconnections.
 
+  `pairing_psk` is the input's Sendspin **pairing PSK** — the secret behind
+  its pairing token (`pairing_token/2`), which an operator pastes into
+  Music Assistant to pair over the Pairing PSK method. Like the keypair it is
+  minted lazily from the CSPRNG (`ensure_pairing_psk/2`), long-lived, and
+  not pairing *state*: a pairing does not consume it and `clear_pairing/2`
+  leaves it alone. `psk`/`psk_id`/`server_id` are the pairing record — the
+  long-term PSK a completed pairing produced.
+
+  The file holds private key material, so it is kept owner-only (`0600`).
+
   The DETS file lives on the writable data partition on Nerves
   (`/data/audio_inputs.dets`) and in `_build/` on the host for
   development. Tests can override via the `:dets_path`, `:table`, and
@@ -41,6 +52,8 @@ defmodule UniversalProxy.Audio.Input.Store do
 
   alias UniversalProxy.Audio.Params
   alias UniversalProxy.Sendspin.Noise
+  alias UniversalProxy.Sendspin.Pairing
+  alias UniversalProxy.Sendspin.PairingToken
 
   @default_table :audio_inputs
 
@@ -54,6 +67,7 @@ defmodule UniversalProxy.Audio.Input.Store do
   @type config :: %{
           friendly_name: String.t(),
           client_keypair: keypair() | nil,
+          pairing_psk: <<_::256>> | nil,
           psk: <<_::256>> | nil,
           psk_id: String.t() | nil,
           psk_category: atom() | nil,
@@ -128,6 +142,36 @@ defmodule UniversalProxy.Audio.Input.Store do
   end
 
   @doc """
+  Get the persisted pairing PSK for `key`, minting and persisting a fresh
+  32-byte CSPRNG one if none exists yet. Stable across calls and restarts.
+
+  Returns `{:ok, psk}` or `{:error, reason}` if DETS rejects a first-use
+  write. The PSK is a long-lived pairing secret: never log or broadcast it.
+  """
+  @spec ensure_pairing_psk(GenServer.server(), input_key()) ::
+          {:ok, <<_::256>>} | {:error, term()}
+  def ensure_pairing_psk(server \\ __MODULE__, {slot_sub, _vid, _pid} = key)
+      when is_binary(slot_sub) do
+    GenServer.call(server, {:ensure_pairing_psk, key})
+  end
+
+  @doc """
+  The input's version-0 Sendspin pairing token (`"SP:0…"`), built from its
+  static public key and pairing PSK — both minted on first use.
+
+  `{:ok, token}` or `{:error, reason}`; the token never appears in any other
+  return value, so it cannot leak through a logged error tuple.
+  """
+  @spec pairing_token(GenServer.server(), input_key()) :: {:ok, String.t()} | {:error, term()}
+  def pairing_token(server \\ __MODULE__, {slot_sub, _vid, _pid} = key)
+      when is_binary(slot_sub) do
+    with {:ok, {pub, _priv}} <- ensure_client_keypair(server, key),
+         {:ok, pairing_psk} <- ensure_pairing_psk(server, key) do
+      {:ok, PairingToken.encode_psk_token(pub, pairing_psk)}
+    end
+  end
+
+  @doc """
   The Sendspin `client_id` for a static public key: base64url encoding
   (no padding) of the raw 32-byte X25519 public key, per the
   ground-truth doc's `client_id` derivation (§10).
@@ -151,9 +195,10 @@ defmodule UniversalProxy.Audio.Input.Store do
 
   @doc """
   Clear a device's pairing state (`psk`, `psk_id`, `psk_category`,
-  `server_id`, `paired_at` all reset to `nil`), leaving `friendly_name`
-  and `client_keypair` untouched — the client keypair is an identity,
-  not pairing state, and must survive an unpair.
+  `server_id`, `paired_at` all reset to `nil`), leaving `friendly_name`,
+  `client_keypair` and `pairing_psk` untouched — the keypair is an
+  identity and the pairing PSK a long-lived credential, not pairing state,
+  and both must survive an unpair.
   """
   @spec clear_pairing(GenServer.server(), input_key()) :: :ok | {:error, term()}
   def clear_pairing(server \\ __MODULE__, {slot_sub, _vid, _pid} = key)
@@ -180,6 +225,7 @@ defmodule UniversalProxy.Audio.Input.Store do
 
     case :dets.open_file(table_name, file: to_charlist(path), type: :set) do
       {:ok, table} ->
+        restrict_permissions(path)
         Logger.info("Audio input store opened at #{path}")
         {:ok, %{table: table}}
 
@@ -244,6 +290,32 @@ defmodule UniversalProxy.Audio.Input.Store do
     {:reply, all, state}
   end
 
+  def handle_call({:ensure_pairing_psk, key}, _from, state) do
+    existing = lookup(state.table, key)
+
+    case existing[:pairing_psk] do
+      <<_::256>> = psk ->
+        {:reply, {:ok, psk}, state}
+
+      _ ->
+        psk = Pairing.generate_psk()
+        merged = merge_defaults(existing, %{pairing_psk: psk}, key)
+
+        with :ok <- :dets.insert(state.table, {key, merged}),
+             :ok <- :dets.sync(state.table) do
+          {:reply, {:ok, psk}, state}
+        else
+          {:error, reason} ->
+            Logger.error(
+              "Audio input store pairing PSK generation failed for #{inspect(key)}: " <>
+                inspect(reason)
+            )
+
+            {:reply, {:error, reason}, state}
+        end
+    end
+  end
+
   def handle_call({:ensure_keypair, key}, _from, state) do
     existing = lookup(state.table, key)
 
@@ -294,6 +366,7 @@ defmodule UniversalProxy.Audio.Input.Store do
     %{
       friendly_name: pick(params, existing, :friendly_name, slot_sub),
       client_keypair: pick(params, existing, :client_keypair, nil),
+      pairing_psk: pick(params, existing, :pairing_psk, nil),
       psk: pick(params, existing, :psk, nil),
       psk_id: pick(params, existing, :psk_id, nil),
       psk_category: pick(params, existing, :psk_category, nil),
@@ -321,6 +394,18 @@ defmodule UniversalProxy.Audio.Input.Store do
 
       true ->
         default
+    end
+  end
+
+  # Owner-only: the table holds private keys and PSKs. Best effort — a
+  # filesystem without POSIX modes keeps working.
+  defp restrict_permissions(path) do
+    case File.chmod(path, 0o600) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Audio input store chmod #{path} failed: #{inspect(reason)}")
     end
   end
 

@@ -8,6 +8,7 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
   alias UniversalProxy.Audio.Input.Source
   alias UniversalProxy.Audio.Input.Store
   alias UniversalProxy.Sendspin.Pairing
+  alias UniversalProxy.Sendspin.Wire
   alias UniversalProxy.SendspinSourcePeer, as: Peer
 
   @table :audio_input_source_test
@@ -100,7 +101,7 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
         psk: psk,
         psk_id: Pairing.psk_id_for(psk),
         psk_category: :long_term,
-        server_id: "test-server-id"
+        server_id: Peer.default_server_id()
       })
 
     psk
@@ -265,28 +266,35 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
       {hello, peer} = Peer.await_json!(peer, "client/hello")
       assert hello["name"] == "USB Capture"
       assert hello["supported_roles"] == ["source@v1"]
-      # Paired: the long-term PSK's category is `long_term` → trust `user`, the
-      # prerequisite for a source to activate at all.
-      assert hello["trust_level"] == "user"
-      # Formats live in client_stream/start, never in hello.
+      # rc1: no trust_level; supported_pair_methods is an object that always
+      # offers pairing_psk, beside the dynamic code shown on the Audio tab.
+      refute Map.has_key?(hello, "trust_level")
+      # Formats live in client-stream/start, never in hello.
       assert hello["source@v1_support"] == %{"features" => %{"line_sense" => false}}
       assert hello["unpaired_access"] == %{"enabled" => false}
-      assert [%{"method" => "dynamic_pin"} | _] = hello["supported_pair_methods"]
+
+      assert hello["supported_pair_methods"] == %{
+               "pairing_psk" => %{},
+               "dynamic_pairing_code" => %{"out_channels" => ["display"], "formats" => ["digits"]}
+             }
+
       assert hello["device_info"]["manufacturer"] == "Universal Proxy"
 
       peer = Peer.activate!(peer)
       assert_receive {:source_event, @key, :activated}, 2_000
 
+      # Full state only: the activation's required update carries the source
+      # object, and so does every later one.
       {initial, peer} = Peer.await_client_state!(peer, false)
-      assert initial["available"] == false
+      assert initial == %{"available" => false, "source" => %{}}
 
       {available, peer} = Peer.await_client_state!(peer, true)
-      assert available["available"] == true
+      assert available == %{"available" => true, "source" => %{}}
       assert Source.status(source) == :ready
 
       # Nothing streams until the server asks (source@v1 defaults to stopped).
       peer = Peer.command!(peer, "start")
-      {stream, peer} = Peer.await_json!(peer, "client_stream/start")
+      {stream, peer} = Peer.await_json!(peer, "client-stream/start")
 
       assert stream["source"] == %{
                "codec" => "pcm",
@@ -308,11 +316,30 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
   end
 
   describe "connection-level time sync" do
-    # The interop fix (PR #170): the client/time loop starts at connection
-    # setup, not at role activation, so an unpaired-and-idle MA connection stays
+    # The interop fix (PR #170): the client/time loop is connection-level, not
+    # tied to role activation, so an unpaired-and-idle MA connection stays
     # alive (Cowboy idle timeout) long enough to reach the pairing controls, and
-    # the filter is already converged when the role finally activates.
-    test "time-syncs in :awaiting_activate and activates already-converged", ctx do
+    # the filter is already converged when the role finally activates. rc1 lets
+    # it start only once the first server/activate has arrived.
+    test "sends nothing between client/hello and the first server/activate", ctx do
+      psk = pair!(ctx)
+      {_source, port} = start_source!(ctx)
+      assert_receive {:source_event, @key, {:listener_bound, ^port}}, 2_000
+
+      peer = Peer.connect!(port, psk: psk)
+      peer = Peer.handshake!(peer)
+      peer = Peer.hello!(peer)
+      {_hello, peer} = Peer.await_json!(peer, "client/hello")
+
+      # 20 ms burst cadence: several ticks would have fired by now.
+      assert {:error, _conn, reason, _} = Mint.WebSocket.recv(peer.conn, 0, 300)
+      assert reason in [:timeout, %Mint.TransportError{reason: :timeout}]
+
+      peer = Peer.activate!(peer, roles: [], activities: [])
+      {_time, _peer} = Peer.await_json!(peer, "client/time")
+    end
+
+    test "time-syncs while idle-activated and activates already-converged", ctx do
       psk = pair!(ctx)
       # A slower burst than the default so serve_time!/3 answers each client/time
       # before the next tick fires: that keeps the exchange count exact for the
@@ -324,6 +351,7 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
       peer = Peer.handshake!(peer)
       peer = Peer.hello!(peer)
       {_hello, peer} = Peer.await_json!(peer, "client/hello")
+      peer = Peer.activate!(peer, roles: [], activities: [])
 
       # No role has activated, yet the source already sends client/time and
       # processes server/time: the periodic exchange keeps MA's connection alive
@@ -364,17 +392,17 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
 
       peer = connect_available!(port, psk: psk)
       peer = Peer.command!(peer, "start")
-      {_stream, peer} = Peer.await_json!(peer, "client_stream/start")
+      {_stream, peer} = Peer.await_json!(peer, "client-stream/start")
       assert_receive {:source_event, @key, :streaming}, 2_000
       {_ts, _payload, peer} = Peer.await_audio!(peer)
 
       peer = Peer.command!(peer, "stop")
-      {_end, peer} = Peer.await_json!(peer, "client_stream/end")
+      {_end, peer} = Peer.await_json!(peer, "client-stream/end")
       assert_receive {:source_event, @key, :stopped}, 2_000
       assert Source.status(source) == :ready
 
       peer = Peer.command!(peer, "start")
-      {_stream, peer} = Peer.await_json!(peer, "client_stream/start")
+      {_stream, peer} = Peer.await_json!(peer, "client-stream/start")
       assert_receive {:source_event, @key, :streaming}, 2_000
 
       {_ts, payload, _peer} = Peer.await_audio!(peer)
@@ -391,7 +419,7 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
 
       peer = connect_available!(port, psk: psk)
       peer = Peer.command!(peer, "start")
-      {_stream, peer} = Peer.await_json!(peer, "client_stream/start")
+      {_stream, peer} = Peer.await_json!(peer, "client-stream/start")
       assert_receive {:source_event, @key, :streaming}, 2_000
       {_ts, _payload, peer} = Peer.await_audio!(peer)
 
@@ -403,11 +431,11 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
       # let the restart open a second arecord while the first still holds the
       # ALSA device — the new capture is deferred until the old one's EXIT.
       peer = Peer.command!(peer, "stop")
-      {_end, peer} = Peer.await_json!(peer, "client_stream/end")
+      {_end, peer} = Peer.await_json!(peer, "client-stream/end")
       peer = Peer.command!(peer, "start")
-      {_stream, peer} = Peer.await_json!(peer, "client_stream/start")
+      {_stream, peer} = Peer.await_json!(peer, "client-stream/start")
 
-      # The restart's client_stream/start is only sent after the old capture's
+      # The restart's client-stream/start is only sent after the old capture's
       # EXIT is processed, so by the time it reaches the peer the old arecord is
       # already gone — proving the two never overlap.
       assert_received {:DOWN, ^mon, :process, ^cap1, _}
@@ -450,7 +478,7 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
 
       peer = connect_available!(port, psk: psk)
       peer = Peer.command!(peer, "start")
-      {_stream, peer} = Peer.await_json!(peer, "client_stream/start")
+      {_stream, peer} = Peer.await_json!(peer, "client-stream/start")
       assert_receive {:source_event, @key, :streaming}, 2_000
       {_ts, _payload, peer} = Peer.await_audio!(peer)
 
@@ -460,9 +488,9 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
 
       # MA revokes source@v1 mid-stream (another source took the target, an
       # admin disabled it, …). We must stop capturing and sending audio, send
-      # client_stream/end, and hold the connection so MA can re-activate later.
+      # client-stream/end, and hold the connection so MA can re-activate later.
       peer = Peer.activate!(peer, roles: [])
-      {_end, peer} = Peer.await_json!(peer, "client_stream/end")
+      {_end, peer} = Peer.await_json!(peer, "client-stream/end")
       assert_receive {:source_event, @key, :stopped}, 2_000
 
       # Capture is torn down (async), the connection stays up, and the FSM has
@@ -485,7 +513,7 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
       assert available["available"] == true
 
       peer = Peer.command!(peer, "start")
-      {_stream, peer} = Peer.await_json!(peer, "client_stream/start")
+      {_stream, peer} = Peer.await_json!(peer, "client-stream/start")
       assert_receive {:source_event, @key, :streaming}, 2_000
 
       {_ts, payload, _peer} = Peer.await_audio!(peer)
@@ -508,12 +536,11 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
         Peer.activate!(peer,
           roles: [],
           activities: ["pairing"],
-          pairing: %{"method" => "dynamic_pin", "pin_length" => 6}
+          pairing: %{"method" => "dynamic_pairing_code", "format" => "digits"}
         )
 
       assert_receive {:source_event, @key, {:pairing_required, params}}, 2_000
-      assert params.method == :dynamic_pin
-      assert params.pin_length == 6
+      assert params == %{method: :dynamic_pairing_code, format: :digits}
 
       refute_received {:source_event, @key, :activated}
       assert Source.status(source) == :pairing_required
@@ -534,7 +561,7 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
       # discovered source and sends an activate with neither a source@v1 role
       # nor a pairing activity. We must stay connected and idle (not close), so
       # MA keeps a stable connection and can later escalate to pairing.
-      peer = Peer.activate!(peer, roles: [], activities: ["playback"])
+      peer = Peer.activate!(peer, roles: [], activities: [])
 
       refute_receive {:source_event, @key, {:error, _}}, 500
       refute_received {:source_event, @key, :disconnected}
@@ -546,7 +573,7 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
         Peer.activate!(peer,
           roles: [],
           activities: ["pairing"],
-          pairing: %{"method" => "dynamic_pin", "pin_length" => 6}
+          pairing: %{"method" => "dynamic_pairing_code", "format" => "digits"}
         )
 
       assert_receive {:source_event, @key, {:pairing_required, _params}}, 2_000
@@ -603,7 +630,7 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
 
       peer = connect_available!(port, psk: psk)
       peer = Peer.command!(peer, "start")
-      {_stream, peer} = Peer.await_json!(peer, "client_stream/start")
+      {_stream, peer} = Peer.await_json!(peer, "client-stream/start")
       assert_receive {:source_event, @key, :streaming}, 2_000
 
       # An attacker merely opens a socket (no handshake). The authenticated,
@@ -621,26 +648,147 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
     end
   end
 
-  describe "hostile peer" do
-    test "refuses to activate source@v1 at trust none and closes (B1)", ctx do
+  describe "keys and admissibility" do
+    test "an unpaired session asking for source@v1 gets goodbye pairing_required (B1)", ctx do
       {source, port} = start_source!(ctx)
       assert_receive {:source_event, @key, {:listener_bound, ^port}}, 2_000
 
-      # Sentinel PSK ⇒ trust none. A spec-violating server that activates
-      # source@v1 anyway must be refused and the connection dropped, never
-      # opening capture.
+      # Sentinel PSK and no unpaired access: activating source@v1 would only be
+      # admissible with unpaired access, so we say so and close — never opening
+      # capture.
       peer = Peer.connect!(port)
       peer = Peer.handshake!(peer)
       peer = Peer.hello!(peer)
       {_hello, peer} = Peer.await_json!(peer, "client/hello")
-      _peer = Peer.activate!(peer)
+      peer = Peer.activate!(peer)
 
-      assert_receive {:source_event, @key, {:error, {:source_activated_untrusted, :none}}}, 2_000
+      {goodbye, _peer} = Peer.await_json!(peer, "client/goodbye")
+      assert goodbye == %{"reason" => "pairing_required"}
+      assert_receive {:source_event, @key, {:error, {:goodbye, :pairing_required}}}, 2_000
       assert_receive {:source_event, @key, :disconnected}, 2_000
       refute_received {:source_event, @key, :activated}
       assert Source.status(source) == :listening
     end
 
+    test "a long-term session offered pairing gets goodbye unauthorized", ctx do
+      psk = pair!(ctx)
+      {_source, port} = start_source!(ctx)
+      assert_receive {:source_event, @key, {:listener_bound, ^port}}, 2_000
+
+      peer = Peer.connect!(port, psk: psk)
+      peer = Peer.handshake!(peer)
+      peer = Peer.hello!(peer)
+      {_hello, peer} = Peer.await_json!(peer, "client/hello")
+
+      peer =
+        Peer.activate!(peer,
+          roles: [],
+          activities: ["pairing"],
+          pairing: %{"method" => "dynamic_pairing_code", "format" => "digits"}
+        )
+
+      {goodbye, _peer} = Peer.await_json!(peer, "client/goodbye")
+      assert goodbye == %{"reason" => "unauthorized"}
+      assert_receive {:source_event, @key, :disconnected}, 2_000
+    end
+
+    test "a psk_id we don't hold falls back to the Sentinel in the initial handshake", ctx do
+      {source, port} = start_source!(ctx)
+      assert_receive {:source_event, @key, {:listener_bound, ^port}}, 2_000
+
+      # The server references a long-term record we never had (or lost): we
+      # complete message 2 under the Sentinel instead of failing.
+      peer =
+        Peer.connect!(port,
+          psk: UniversalProxy.Sendspin.Noise.sentinel_psk(),
+          psk_id: Pairing.psk_id_for(Pairing.generate_psk()),
+          psk_category: :long_term
+        )
+
+      peer = Peer.handshake!(peer)
+      peer = Peer.hello!(peer)
+      {_hello, _peer} = Peer.await_json!(peer, "client/hello")
+      assert %{trust: :none, psk_category: :sentinel} = :sys.get_state(source)
+    end
+
+    test "a PSK held only under another category is a miss, not a match", ctx do
+      {source, port} = start_source!(ctx)
+      assert_receive {:source_event, @key, {:listener_bound, ^port}}, 2_000
+      {:ok, pairing_psk} = Store.ensure_pairing_psk(ctx.store, @key)
+
+      # Our pairing PSK's id, declared as a long-term one.
+      peer =
+        Peer.connect!(port,
+          psk: UniversalProxy.Sendspin.Noise.sentinel_psk(),
+          psk_id: Pairing.psk_id_for(pairing_psk),
+          psk_category: :long_term
+        )
+
+      _peer = Peer.handshake!(peer)
+      assert %{trust: :none, psk_category: :sentinel} = :sys.get_state(source)
+    end
+
+    test "the pairing PSK keys a session at its own category, still untrusted", ctx do
+      {source, port} = start_source!(ctx)
+      assert_receive {:source_event, @key, {:listener_bound, ^port}}, 2_000
+      {:ok, pairing_psk} = Store.ensure_pairing_psk(ctx.store, @key)
+
+      peer = Peer.connect!(port, psk: pairing_psk, psk_category: :pairing)
+      _peer = Peer.handshake!(peer)
+      assert %{trust: :none, psk_category: :pairing} = :sys.get_state(source)
+    end
+
+    test "a long-term PSK presented by a different server fails the handshake", ctx do
+      psk = pair!(ctx)
+      {source, port} = start_source!(ctx)
+      assert_receive {:source_event, @key, {:listener_bound, ^port}}, 2_000
+
+      peer =
+        Peer.connect!(port,
+          psk: psk,
+          server_keypair: UniversalProxy.Sendspin.Noise.generate_static_keypair()
+        )
+
+      # A misbinding, not a miss: no Sentinel Fallback, no message 2.
+      assert catch_error(Peer.handshake!(peer, 1_000))
+      assert_receive {:source_event, @key, {:error, :pairing_record_server_mismatch}}, 2_000
+      assert Source.status(source) == :listening
+    end
+
+    test "a message 1 payload without psk_category is a silent failure", ctx do
+      {source, port} = start_source!(ctx)
+      assert_receive {:source_event, @key, {:listener_bound, ^port}}, 2_000
+
+      peer = Peer.connect!(port)
+      {client_init, peer} = Peer.expect_client_init!(peer)
+      {:ok, %{client_id: client_id, suite: suite}} = Wire.decode_client_init(client_init)
+      server_init = Wire.encode_server_init(peer.server_id, 1)
+      peer = Peer.send_text!(peer, server_init)
+
+      {:ok, protocol} = UniversalProxy.Sendspin.Noise.protocol_name(suite)
+
+      noise =
+        Decibel.new(protocol, :ini, %{
+          s: peer.server_keypair,
+          rs: Base.url_decode64!(client_id, padding: false),
+          psks: [UniversalProxy.Sendspin.Noise.sentinel_psk()],
+          prologue: client_init <> server_init
+        })
+
+      message_1 =
+        noise
+        |> Decibel.handshake_encrypt(Jason.encode!(%{"psk_id" => peer.psk_id}))
+        |> IO.iodata_to_binary()
+
+      _peer = Peer.send_text!(peer, Wire.encode_noise_handshake(message_1))
+
+      assert_receive {:source_event, @key, {:error, :malformed_handshake_payload}}, 2_000
+      assert_receive {:source_event, @key, :disconnected}, 2_000
+      assert Source.status(source) == :listening
+    end
+  end
+
+  describe "hostile peer" do
     test "garbage ciphertext in transport mode drops the connection", ctx do
       {source, port} = start_source!(ctx)
       assert_receive {:source_event, @key, {:listener_bound, ^port}}, 2_000
@@ -701,7 +849,7 @@ defmodule UniversalProxy.Audio.Input.SourceTest do
 
       peer = connect_available!(port, psk: psk)
       peer = Peer.command!(peer, "start")
-      {_stream, peer} = Peer.await_json!(peer, "client_stream/start")
+      {_stream, peer} = Peer.await_json!(peer, "client-stream/start")
       assert_receive {:source_event, @key, :streaming}, 2_000
       {_ts, _payload, _peer} = Peer.await_audio!(peer)
 

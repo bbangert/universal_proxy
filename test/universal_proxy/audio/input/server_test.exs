@@ -476,7 +476,7 @@ defmodule UniversalProxy.Audio.Input.ServerTest do
       :ok = SourceStub.emit(source, :connected)
       assert_receive {:input_state, @usb_key, %{connection: :connected, status: :waiting}}
 
-      :ok = SourceStub.emit(source, {:pairing_required, %{method: :dynamic_pin, pin_length: 6}})
+      :ok = SourceStub.emit(source, {:pairing_required, %{method: :dynamic_pairing_code, format: :digits}})
       assert_receive {:input_state, @usb_key, %{status: :pairing, pin: nil}}
 
       :ok = SourceStub.emit(source, :pairing_started)
@@ -520,7 +520,7 @@ defmodule UniversalProxy.Audio.Input.ServerTest do
 
       # The offer is held for operator consent: it renders as `:pairing` with no
       # PIN, which is exactly what the LiveView keys the "Allow pairing" button on.
-      :ok = SourceStub.emit(source, {:pairing_required, %{method: :dynamic_pin, pin_length: 6}})
+      :ok = SourceStub.emit(source, {:pairing_required, %{method: :dynamic_pairing_code, format: :digits}})
       assert_receive {:input_state, @usb_key, %{status: :pairing, pin: nil}}
 
       # The consent-wait timeout elapsed with no gesture: back to connected-idle.

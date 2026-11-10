@@ -2,39 +2,39 @@ defmodule UniversalProxy.Sendspin.Wire do
   @moduledoc """
   Pure Sendspin message codecs: no process, no I/O, no crypto.
 
-  Covers every wire layer a `source@v1` client touches, per
-  `research/aiosendspin-ground-truth.md` (fetched from `Sendspin/spec` and
-  `Sendspin/aiosendspin` @ `main`, 2026-08-16):
+  Covers every wire layer a `source@v1` client touches, per Sendspin
+  1.0.0-rc1 (`Sendspin/spec` @ `1.0.0-rc1`, as implemented by aiosendspin
+  10.x):
 
     * The two cleartext JSON messages exchanged before Noise starts
       (`client/init`, `server/init`), plus the `prologue/2` helper that
       concatenates their exact wire bytes — the Noise handshake prologue must
-      be the literal bytes sent/received, not a re-serialization (ground
-      truth §2).
+      be the literal bytes sent/received, not a re-serialization.
     * `noise/handshake`'s JSON envelope (base64url `data` field), reused
-      unmodified for the in-band re-handshake (ground truth §4).
+      unmodified for the in-band re-handshake, and the inner JSON payload of
+      Noise message 1 (`psk_id` + `psk_category`, `decode_noise_msg1_payload/1`).
     * Post-handshake plaintext framing: `wrap_json/1` / `unwrap_json/1`
       prefix/strip the type-`0` byte that marks a JSON body inside one Noise
       transport plaintext (`messaging.md` "Binary Message ID Structure").
     * The source-role binary audio frame: type byte `12` (`0x0C`) + **big-endian
       signed** int64 microsecond timestamp + raw audio bytes. Only the
-      timestamp prefix is big-endian; PCM sample payloads are little-endian
-      (ground truth correction #1 and #3).
-    * Fragmentation (types `2`/`3`) via the pure `Reassembler` struct — a
-      single Noise transport message is capped at 65535 bytes minus the
-      16-byte AEAD tag, so large messages arrive as an opening fragment-more
-      frame (carrying `orig_type`), zero or more continuations, and a closing
-      fragment-end frame (`messaging.md` "Fragmentation").
+      timestamp prefix is big-endian; PCM sample payloads are little-endian.
+    * Fragmentation (type `1`, `[1][flags][orig_type][data]` then
+      `[1][flags][data]`) via the pure `Reassembler` struct — a single Noise
+      transport message is capped at 65535 bytes minus the 16-byte AEAD tag,
+      so large messages arrive split across several (`messaging.md`
+      "Fragmentation").
     * JSON payload builders/parsers for every message the source FSM needs:
       `client/hello` / `server/hello`, `server/activate`, `client/state`,
-      `client/time` / `server/time`, `server/command`, `client_stream/start` /
-      `client_stream/end`, and every pairing message that carries the CPace
-      PAKE and PSK wrap (`client/pair-init`, `server/pair-init`,
+      `client/time` / `server/time`, `server/command`, `client-stream/start` /
+      `client-stream/end`, `client/goodbye`, and every pairing message
+      (`client/pair-pending`, `client/pair-init`, `server/pair-init`,
       `server/pair-auth`, `client/pair-auth`, `server/pair-confirm`,
-      `client/pair-confirm`, `client/pair-finalize`, `server/pair-finalize`,
-      `pair/abort`). Pairing fields are typed passthrough only — base64url
-      text on the wire becomes a raw binary here, nothing more; the
-      CPace/PSK-wrap math lives in `UniversalProxy.Sendspin.{CPace,Pairing}`.
+      `client/pair-retry`, `client/pair-confirm`, `client/pair-finalize`,
+      `server/pair-finalize`, `pair/abort`). Pairing fields are typed
+      passthrough only — base64url text on the wire becomes a raw binary
+      here, nothing more; the CPace/wrap math lives in
+      `UniversalProxy.Sendspin.{CPace,Pairing}`.
 
   **`UniversalProxy.Sendspin.Pairing` does not call the typed pairing
   functions below.** It works directly with `decode_envelope/1`'s raw,
@@ -45,12 +45,8 @@ defmodule UniversalProxy.Sendspin.Wire do
   tests, and any future caller that wants atom-keyed, already-decoded
   fields — field names are kept in lockstep with what `Pairing` actually
   produces/consumes (`pake_msg_1`, `pake_msg_2`, `server_kc`, `client_kc`,
-  `wrapped_psk`, `nonce_A`/`nonce_B`, `commit_B`, `pairing_index`, `reason`).
-
-  `client/pair-pending` and `client/goodbye` are intentionally out of scope
-  for this module — neither appears in `Pairing`'s implemented flow (gesture-
-  gated attempts and connection teardown are both out of scope there too);
-  add them here the same way if a later task needs them.
+  `wrapped_psk`, `long_term_psk`, `nonce_A`, `commit_B`, `wrapped_nonce_B`,
+  `pairing_index`, `reason`).
 
   ## Decode contract
 
@@ -64,18 +60,26 @@ defmodule UniversalProxy.Sendspin.Wire do
   not an error — for anything else, so a future message type doesn't break
   an already-deployed client (forward compatibility).
 
-  Closed-enum wire strings (`trust_level`, `command`, `signal`, `codec`,
-  `activities`, pairing `method`) decode to fixed, already-existing atoms via
-  explicit `case`/function-head matching — never `String.to_atom/1` — so a
-  malicious or buggy peer can't grow the atom table.
+  Closed-enum wire strings (`command`, `signal`, `codec`, `activities`,
+  `psk_category`, pairing `method`/`format`) decode to fixed, already-existing
+  atoms via explicit `case`/function-head matching — never `String.to_atom/1`
+  — so a malicious or buggy peer can't grow the atom table. A pairing
+  `method` or `format` this module does not know decodes to
+  `{:unknown, string}`: the spec answers it with `pair/abort`
+  (`method_not_supported`), not a protocol error.
   """
 
   # Transport-mode binary message type byte (byte 0 of the Noise-decrypted
   # plaintext). `messaging.md` "Binary Message ID Structure".
   @json_body 0
-  @fragment_more 2
-  @fragment_end 3
+  @fragment 1
   @source_audio_chunk 12
+
+  # Fragment `flags` byte: bit 1 marks the first fragment, bit 0 the last;
+  # bits 2-7 are reserved and MUST be zero (`messaging.md` "Fragmentation").
+  @fragment_first 0b10
+  @fragment_last 0b01
+  @fragment_reserved 0b1111_1100
 
   # Bounds a single connection's reassembly buffer against a peer streaming
   # endless fragments (mirrors aiosendspin's `MAX_REASSEMBLED_MESSAGE_BYTES`).
@@ -85,7 +89,7 @@ defmodule UniversalProxy.Sendspin.Wire do
   # a 1 GB Pi 3 shared across however many capture-card listeners it runs.
   @max_reassembled_bytes 1024 * 1024
 
-  # A fragment-more frame can carry as little as 1 byte of payload, so the
+  # A fragment can carry as little as 1 byte of payload, so the
   # byte cap alone still permits `@max_reassembled_bytes` reduce steps
   # (again, per connection) before it trips. Capping the fragment count
   # bounds that work independent of how small the attacker makes each one.
@@ -98,36 +102,57 @@ defmodule UniversalProxy.Sendspin.Wire do
           optional(:mac_address) => String.t()
         }
 
-  @type pair_method :: :dynamic_pin | :pairing_psk | :static_pin
+  @type pair_method :: :dynamic_pairing_code | :pairing_psk | :static_pairing_code
 
+  @typedoc """
+  A pair-method descriptor (`pairing.md` "client/hello pair-method
+  descriptor"). `pairing_psk` / `static_pairing_code` take an optional
+  `locations` hint; `dynamic_pairing_code` requires non-empty `out_channels`
+  and `formats`.
+  """
   @type pair_method_descriptor :: %{
-          optional(:out_channels) => [String.t()],
-          optional(:min_pin_length) => pos_integer(),
           optional(:locations) => [String.t()],
-          method: pair_method()
+          optional(:out_channels) => [String.t()],
+          optional(:formats) => [String.t()]
         }
+
+  @typedoc "`supported_pair_methods`: an object keyed by method identifier."
+  @type supported_pair_methods :: %{optional(pair_method()) => pair_method_descriptor()}
 
   @type client_hello :: %{
           name: String.t(),
           device_info: device_info() | nil,
-          trust_level: :user | :none,
           supported_roles: [String.t()],
           source_v1_support: %{features: %{line_sense: boolean() | nil} | nil} | nil,
-          supported_pair_methods: [pair_method_descriptor()],
+          supported_pair_methods: supported_pair_methods(),
           unpaired_access: %{enabled: boolean()}
         }
+
+  @type pairing_format :: :digits | :qr_code
 
   @type server_activate :: %{
           activities: [:playback | :pairing | :management],
           active_roles: [String.t()] | nil,
           pairing:
             %{
-              method: pair_method(),
-              pin_length: pos_integer() | nil,
-              languages: [String.t()] | nil
+              method: pair_method() | {:unknown, String.t()},
+              format: pairing_format() | {:unknown, String.t()} | nil
             }
             | nil
         }
+
+  @typedoc "Which category of PSK a Noise message 1 says it references (`connection.md`)."
+  @type psk_category :: :long_term | :pairing | :sentinel
+
+  @type goodbye_reason ::
+          :another_server
+          | :shutdown
+          | :restart
+          | :user_request
+          | :unauthorized
+          | :pairing_required
+          | :concurrent_attempt
+          | :unpaired
 
   @type client_stream_start :: %{
           codec: :pcm | :opus | :flac,
@@ -249,6 +274,41 @@ defmodule UniversalProxy.Sendspin.Wire do
     end
   end
 
+  @doc """
+  Decode the inner plaintext of Noise message 1: a JSON object carrying the
+  `psk_id` the server's PSK hashes to and the `psk_category` it uses that PSK
+  as (`'lt'` long-term, `'pr'` pairing, `'sn'` Sentinel). Anything else —
+  not JSON, no `psk_id` string, a category outside the three codes — is a
+  malformed handshake payload, which the spec makes a silent failure.
+  """
+  @spec decode_noise_msg1_payload(binary()) ::
+          {:ok, %{psk_id: String.t(), psk_category: psk_category()}}
+          | {:error, :malformed_handshake_payload}
+  def decode_noise_msg1_payload(payload) when is_binary(payload) do
+    with {:ok, %{"psk_id" => psk_id, "psk_category" => code}} when is_binary(psk_id) <-
+           Jason.decode(payload),
+         {:ok, category} <- decode_psk_category(code) do
+      {:ok, %{psk_id: psk_id, psk_category: category}}
+    else
+      _other -> {:error, :malformed_handshake_payload}
+    end
+  end
+
+  @doc "Encode a Noise message 1 inner payload (the server side, for tests and peers)."
+  @spec encode_noise_msg1_payload(String.t(), psk_category()) :: binary()
+  def encode_noise_msg1_payload(psk_id, category) when is_binary(psk_id) do
+    Jason.encode!(%{"psk_id" => psk_id, "psk_category" => encode_psk_category(category)})
+  end
+
+  defp encode_psk_category(:long_term), do: "lt"
+  defp encode_psk_category(:pairing), do: "pr"
+  defp encode_psk_category(:sentinel), do: "sn"
+
+  defp decode_psk_category("lt"), do: {:ok, :long_term}
+  defp decode_psk_category("pr"), do: {:ok, :pairing}
+  defp decode_psk_category("sn"), do: {:ok, :sentinel}
+  defp decode_psk_category(_other), do: :error
+
   # -- Generic envelope --
 
   @doc """
@@ -264,7 +324,7 @@ defmodule UniversalProxy.Sendspin.Wire do
   @doc """
   Parse the generic envelope, returning the message type and its payload
   object (defaulting to `%{}` if `payload` is absent, as for messages with no
-  fields such as `client_stream/end`).
+  fields such as `client-stream/end`).
   """
   @spec decode_envelope(binary()) :: {:ok, String.t(), map()} | {:error, term()}
   def decode_envelope(text) when is_binary(text) do
@@ -357,51 +417,58 @@ defmodule UniversalProxy.Sendspin.Wire do
           {:pending, Reassembler.t()} | {:complete, frame(), Reassembler.t()} | {:error, term()}
   def decode_frame(<<>>, %Reassembler{}), do: {:error, :empty_plaintext}
 
-  def decode_frame(
-        <<@fragment_more, orig_type, data::binary>>,
-        %Reassembler{type: nil} = reassembler
-      )
-      when orig_type != @fragment_more and orig_type != @fragment_end do
-    grow_reassembly(%{reassembler | type: orig_type}, data)
+  def decode_frame(<<@fragment, flags, _rest::binary>>, %Reassembler{})
+      when Bitwise.band(flags, @fragment_reserved) != 0 do
+    {:error, :fragment_reserved_flags}
   end
 
-  # `orig_type` of 2 or 3 is an explicit protocol violation (a sender MUST NOT
-  # fragment a fragment), caught before the generic 1-byte-input clause below.
-  def decode_frame(<<@fragment_more, _orig_type, _data::binary>>, %Reassembler{type: nil}) do
-    {:error, :invalid_orig_type}
+  def decode_frame(<<@fragment, flags, rest::binary>>, %Reassembler{} = reassembler) do
+    fragment(
+      Bitwise.band(flags, @fragment_first) != 0,
+      Bitwise.band(flags, @fragment_last) != 0,
+      rest,
+      reassembler
+    )
   end
 
-  def decode_frame(<<@fragment_more>>, %Reassembler{type: nil}) do
-    {:error, :fragment_missing_orig_type}
-  end
-
-  def decode_frame(<<@fragment_more, data::binary>>, %Reassembler{type: type} = reassembler)
-      when not is_nil(type) do
-    grow_reassembly(reassembler, data)
-  end
-
-  def decode_frame(<<@fragment_end, _data::binary>>, %Reassembler{type: nil}) do
-    {:error, :fragment_end_without_start}
-  end
-
-  def decode_frame(<<@fragment_end, data::binary>>, %Reassembler{type: type} = reassembler)
-      when not is_nil(type) do
-    case grow_reassembly(reassembler, data) do
-      {:pending, %Reassembler{buffer: full_buffer}} ->
-        reassembled_frame(IO.iodata_to_binary([<<type>>, full_buffer]))
-
-      {:error, _} = error ->
-        error
-    end
-  end
+  def decode_frame(<<@fragment>>, %Reassembler{}), do: {:error, :fragment_missing_flags}
 
   # Any non-fragment frame while a fragmented message is in flight is a
-  # protocol error — only fragment-more/fragment-end may interleave.
+  # protocol error — a sender MUST finish one fragmented message first.
   def decode_frame(_plaintext, %Reassembler{type: type}) when not is_nil(type) do
     {:error, :fragment_interrupted}
   end
 
   def decode_frame(plaintext, %Reassembler{type: nil}), do: reassembled_frame(plaintext)
+
+  defp fragment(true = _first, _last, _rest, %Reassembler{type: type}) when not is_nil(type),
+    do: {:error, :fragment_restarted}
+
+  defp fragment(true, _last, <<>>, _reassembler), do: {:error, :fragment_missing_orig_type}
+
+  # A sender MUST NOT use `1` as `orig_type`.
+  defp fragment(true, _last, <<@fragment, _data::binary>>, _reassembler),
+    do: {:error, :invalid_orig_type}
+
+  defp fragment(true, last, <<orig_type, data::binary>>, reassembler) do
+    %{reassembler | type: orig_type}
+    |> grow_reassembly(data)
+    |> maybe_complete(last)
+  end
+
+  defp fragment(false, _last, _data, %Reassembler{type: nil}),
+    do: {:error, :fragment_without_start}
+
+  defp fragment(false, last, data, reassembler) do
+    reassembler
+    |> grow_reassembly(data)
+    |> maybe_complete(last)
+  end
+
+  defp maybe_complete({:pending, %Reassembler{type: type, buffer: buffer}}, true = _last),
+    do: reassembled_frame(IO.iodata_to_binary([<<type>>, buffer]))
+
+  defp maybe_complete(result, _last), do: result
 
   # Carries `size`/`fragment_count` as running totals on the struct instead
   # of recomputing `IO.iodata_length(buffer)` on every call — the latter
@@ -472,7 +539,6 @@ defmodule UniversalProxy.Sendspin.Wire do
       %{}
       |> Map.put("name", Map.fetch!(fields, :name))
       |> maybe_put("device_info", fields |> Map.get(:device_info) |> encode_device_info())
-      |> Map.put("trust_level", encode_trust_level(Map.fetch!(fields, :trust_level)))
       |> Map.put("supported_roles", Map.fetch!(fields, :supported_roles))
       |> maybe_put(
         "source@v1_support",
@@ -480,9 +546,7 @@ defmodule UniversalProxy.Sendspin.Wire do
       )
       |> Map.put(
         "supported_pair_methods",
-        fields
-        |> Map.fetch!(:supported_pair_methods)
-        |> Enum.map(&encode_pair_method_descriptor/1)
+        fields |> Map.fetch!(:supported_pair_methods) |> encode_supported_pair_methods()
       )
       |> Map.put("unpaired_access", %{
         "enabled" => fields |> Map.fetch!(:unpaired_access) |> Map.fetch!(:enabled)
@@ -499,19 +563,16 @@ defmodule UniversalProxy.Sendspin.Wire do
   defp parse_client_hello_payload(payload) do
     with {:ok, name} <- fetch_string(payload, "name"),
          {:ok, device_info} <- parse_optional_device_info(payload),
-         {:ok, trust_level_str} <- fetch_string(payload, "trust_level"),
-         {:ok, trust_level} <- decode_trust_level(trust_level_str),
          {:ok, supported_roles} <- fetch_string_list(payload, "supported_roles"),
          {:ok, source_v1_support} <- parse_optional_source_v1_support(payload),
-         {:ok, pair_methods_raw} <- fetch_list(payload, "supported_pair_methods"),
-         {:ok, pair_methods} <- map_ok(pair_methods_raw, &parse_pair_method_descriptor/1),
+         {:ok, pair_methods_raw} <- fetch_map(payload, "supported_pair_methods"),
+         {:ok, pair_methods} <- parse_supported_pair_methods(pair_methods_raw),
          {:ok, unpaired_access_raw} <- fetch_map(payload, "unpaired_access"),
          {:ok, unpaired_enabled} <- fetch_boolean(unpaired_access_raw, "enabled") do
       {:ok,
        %{
          name: name,
          device_info: device_info,
-         trust_level: trust_level,
          supported_roles: supported_roles,
          source_v1_support: source_v1_support,
          supported_pair_methods: pair_methods,
@@ -584,43 +645,59 @@ defmodule UniversalProxy.Sendspin.Wire do
     end
   end
 
+  defp encode_supported_pair_methods(methods) when is_map(methods) do
+    Map.new(methods, fn {method, descriptor} ->
+      {encode_pair_method(method), encode_pair_method_descriptor(descriptor)}
+    end)
+  end
+
   defp encode_pair_method_descriptor(descriptor) do
     %{}
-    |> Map.put("method", encode_pair_method(Map.fetch!(descriptor, :method)))
-    |> maybe_put("out_channels", Map.get(descriptor, :out_channels))
-    |> maybe_put("min_pin_length", Map.get(descriptor, :min_pin_length))
     |> maybe_put("locations", Map.get(descriptor, :locations))
+    |> maybe_put("out_channels", Map.get(descriptor, :out_channels))
+    |> maybe_put("formats", Map.get(descriptor, :formats))
   end
 
-  defp parse_pair_method_descriptor(descriptor) when is_map(descriptor) do
-    with {:ok, method_str} <- fetch_string(descriptor, "method"),
-         {:ok, method} <- decode_pair_method(method_str) do
-      {:ok,
-       %{method: method}
-       |> maybe_put(:out_channels, Map.get(descriptor, "out_channels"))
-       |> maybe_put(:min_pin_length, Map.get(descriptor, "min_pin_length"))
-       |> maybe_put(:locations, Map.get(descriptor, "locations"))}
-    end
+  # Unknown method keys are ignored, as a server must (`pairing.md`).
+  defp parse_supported_pair_methods(raw) do
+    Enum.reduce_while(raw, {:ok, %{}}, fn {key, descriptor}, {:ok, acc} ->
+      case {decode_pair_method(key), descriptor} do
+        {{:unknown, _}, _descriptor} ->
+          {:cont, {:ok, acc}}
+
+        {method, descriptor} when is_map(descriptor) ->
+          {:cont, {:ok, Map.put(acc, method, parse_pair_method_descriptor(descriptor))}}
+
+        {_method, _other} ->
+          {:halt, {:error, {:invalid_field, "supported_pair_methods"}}}
+      end
+    end)
   end
 
-  defp parse_pair_method_descriptor(_other),
-    do: {:error, {:invalid_field, "supported_pair_methods"}}
+  defp parse_pair_method_descriptor(descriptor) do
+    %{}
+    |> maybe_put(:locations, Map.get(descriptor, "locations"))
+    |> maybe_put(:out_channels, Map.get(descriptor, "out_channels"))
+    |> maybe_put(:formats, Map.get(descriptor, "formats"))
+  end
 
-  defp encode_trust_level(:user), do: "user"
-  defp encode_trust_level(:none), do: "none"
-
-  defp decode_trust_level("user"), do: {:ok, :user}
-  defp decode_trust_level("none"), do: {:ok, :none}
-  defp decode_trust_level(other), do: {:error, {:invalid_field, {"trust_level", other}}}
-
-  defp encode_pair_method(:dynamic_pin), do: "dynamic_pin"
+  defp encode_pair_method(:dynamic_pairing_code), do: "dynamic_pairing_code"
   defp encode_pair_method(:pairing_psk), do: "pairing_psk"
-  defp encode_pair_method(:static_pin), do: "static_pin"
+  defp encode_pair_method(:static_pairing_code), do: "static_pairing_code"
 
-  defp decode_pair_method("dynamic_pin"), do: {:ok, :dynamic_pin}
-  defp decode_pair_method("pairing_psk"), do: {:ok, :pairing_psk}
-  defp decode_pair_method("static_pin"), do: {:ok, :static_pin}
-  defp decode_pair_method(other), do: {:error, {:invalid_field, {"method", other}}}
+  defp decode_pair_method("dynamic_pairing_code"), do: :dynamic_pairing_code
+  defp decode_pair_method("pairing_psk"), do: :pairing_psk
+  defp decode_pair_method("static_pairing_code"), do: :static_pairing_code
+  defp decode_pair_method(other), do: {:unknown, other}
+
+  defp encode_pairing_format(:digits), do: "digits"
+  defp encode_pairing_format(:qr_code), do: "qr_code"
+
+  defp decode_pairing_format(nil), do: nil
+  defp decode_pairing_format("digits"), do: :digits
+  defp decode_pairing_format("qr_code"), do: :qr_code
+  defp decode_pairing_format(other) when is_binary(other), do: {:unknown, other}
+  defp decode_pairing_format(_other), do: :invalid
 
   # -- server/activate --
 
@@ -655,8 +732,7 @@ defmodule UniversalProxy.Sendspin.Wire do
   defp encode_pairing_params(params) do
     %{}
     |> Map.put("method", encode_pair_method(Map.fetch!(params, :method)))
-    |> maybe_put("pin_length", Map.get(params, :pin_length))
-    |> maybe_put("languages", Map.get(params, :languages))
+    |> maybe_put("format", params |> Map.get(:format) |> then(&(&1 && encode_pairing_format(&1))))
   end
 
   defp parse_optional_pairing_params(payload) do
@@ -665,14 +741,14 @@ defmodule UniversalProxy.Sendspin.Wire do
         {:ok, nil}
 
       params when is_map(params) ->
-        with {:ok, method_str} <- fetch_string(params, "method"),
-             {:ok, method} <- decode_pair_method(method_str) do
-          {:ok,
-           %{
-             method: method,
-             pin_length: Map.get(params, "pin_length"),
-             languages: Map.get(params, "languages")
-           }}
+        with {:ok, method_str} <- fetch_string(params, "method") do
+          case decode_pairing_format(Map.get(params, "format")) do
+            :invalid ->
+              {:error, {:invalid_field, "pairing.format"}}
+
+            format ->
+              {:ok, %{method: decode_pair_method(method_str), format: format}}
+          end
         end
 
       _other ->
@@ -754,9 +830,12 @@ defmodule UniversalProxy.Sendspin.Wire do
 
   @doc """
   Encode `client/state`. `source` is `nil` to omit the object entirely (no
-  `source` role, or an update that doesn't touch it), or `%{signal: nil |
-  :present | :absent}` — `signal: nil` sends `"source": {}` (line-sensing not
-  currently reported), distinct from omitting `source` altogether.
+  active `source` role), or `%{signal: nil | :present | :absent}` —
+  `signal: nil` sends `"source": {}` (line-sensing not reported), distinct
+  from omitting `source` altogether. rc1 carries full state only: every
+  message with a role object carries that object's complete state, and the
+  update an activation requires MUST include it (`messaging.md`
+  `client/state`).
   """
   @spec encode_client_state(boolean(), %{signal: :present | :absent | nil} | nil) :: binary()
   def encode_client_state(available, source \\ nil) when is_boolean(available) do
@@ -851,10 +930,10 @@ defmodule UniversalProxy.Sendspin.Wire do
     end
   end
 
-  # -- client_stream/start / client_stream/end --
+  # -- client-stream/start / client-stream/end --
 
   @doc """
-  Encode `client_stream/start`. `codec_header` uses **standard** (padded)
+  Encode `client-stream/start`. `codec_header` uses **standard** (padded)
   Base64 — a different alphabet/padding convention than every other binary
   field in this protocol, which is base64url without padding (ground truth
   §7). `nil` omits the field, correct for `pcm`/`opus`.
@@ -869,22 +948,22 @@ defmodule UniversalProxy.Sendspin.Wire do
       |> Map.put("bit_depth", Map.fetch!(fields, :bit_depth))
       |> maybe_put("codec_header", fields |> Map.get(:codec_header) |> encode_codec_header())
 
-    encode_message("client_stream/start", %{"source" => source})
+    encode_message("client-stream/start", %{"source" => source})
   end
 
-  @doc "Decode `client_stream/start`."
+  @doc "Decode `client-stream/start`."
   @spec decode_client_stream_start(binary()) :: {:ok, client_stream_start()} | {:error, term()}
   def decode_client_stream_start(text),
-    do: decode_as(text, "client_stream/start", &parse_client_stream_start_payload/1)
+    do: decode_as(text, "client-stream/start", &parse_client_stream_start_payload/1)
 
-  @doc "Encode `client_stream/end` (no payload fields)."
+  @doc "Encode `client-stream/end` (no payload fields)."
   @spec encode_client_stream_end() :: binary()
-  def encode_client_stream_end, do: encode_message("client_stream/end", %{})
+  def encode_client_stream_end, do: encode_message("client-stream/end", %{})
 
-  @doc "Decode `client_stream/end`."
+  @doc "Decode `client-stream/end`."
   @spec decode_client_stream_end(binary()) :: {:ok, %{}} | {:error, term()}
   def decode_client_stream_end(text),
-    do: decode_as(text, "client_stream/end", &parse_empty_payload/1)
+    do: decode_as(text, "client-stream/end", &parse_empty_payload/1)
 
   defp encode_codec_header(nil), do: nil
   defp encode_codec_header(data) when is_binary(data), do: base64_std_encode(data)
@@ -925,13 +1004,44 @@ defmodule UniversalProxy.Sendspin.Wire do
     end
   end
 
+  # -- client/goodbye --
+
+  @doc """
+  Encode `client/goodbye`, sent before we close a connection to say why
+  (`messaging.md` `client/goodbye`).
+  """
+  @spec encode_client_goodbye(goodbye_reason()) :: binary()
+  def encode_client_goodbye(reason) when is_atom(reason) do
+    encode_message("client/goodbye", %{"reason" => encode_goodbye_reason(reason)})
+  end
+
+  defp encode_goodbye_reason(:another_server), do: "another_server"
+  defp encode_goodbye_reason(:shutdown), do: "shutdown"
+  defp encode_goodbye_reason(:restart), do: "restart"
+  defp encode_goodbye_reason(:user_request), do: "user_request"
+  defp encode_goodbye_reason(:unauthorized), do: "unauthorized"
+  defp encode_goodbye_reason(:pairing_required), do: "pairing_required"
+  defp encode_goodbye_reason(:concurrent_attempt), do: "concurrent_attempt"
+  defp encode_goodbye_reason(:unpaired), do: "unpaired"
+
   # -- Pairing messages --
 
   @doc """
-  Encode `client/pair-init`, starting the PIN-pairing attempt. `commit_B` is
-  our commitment to `nonce_B` (`SHA-256("sendspin-pair-commit-v1" ||
-  nonce_B)`) and is present only for dynamic-PIN pairing — `nil` omits it for
-  static-PIN pairing, which has no nonce/commit round trip.
+  Encode `client/pair-pending`: we are holding the selected attempt back
+  (awaiting the operator's local gesture). `message` is an optional short
+  operator-facing sentence (at most 200 characters).
+  """
+  @spec encode_client_pair_pending(non_neg_integer(), String.t() | nil) :: binary()
+  def encode_client_pair_pending(pairing_index, message \\ nil) when is_integer(pairing_index) do
+    payload = maybe_put(%{"pairing_index" => pairing_index}, "message", message)
+    encode_message("client/pair-pending", payload)
+  end
+
+  @doc """
+  Encode `client/pair-init`, starting the pairing attempt. `commit_B` is our
+  commitment to `nonce_B` (`SHA-256("sendspin-pair-commit-v1" || nonce_B)`)
+  and is present only for the dynamic pairing code — `nil` omits it for the
+  static pairing code and the Pairing PSK flow.
   """
   @spec encode_client_pair_init(non_neg_integer(), binary() | nil) :: binary()
   def encode_client_pair_init(pairing_index, commit_b \\ nil) when is_integer(pairing_index) do
@@ -948,14 +1058,21 @@ defmodule UniversalProxy.Sendspin.Wire do
   def decode_client_pair_init(text),
     do: decode_as(text, "client/pair-init", &parse_client_pair_init_payload/1)
 
-  @doc "Encode `server/pair-init` (server's dynamic-PIN nonce contribution, `nonce_A`)."
-  @spec encode_server_pair_init(binary()) :: binary()
-  def encode_server_pair_init(nonce_a) when is_binary(nonce_a) do
-    encode_message("server/pair-init", %{"nonce_A" => b64url_encode(nonce_a)})
+  @doc """
+  Encode `server/pair-init`, which begins a dynamic-pairing-code round:
+  the server's `nonce_A` in the first round, `nil` (no field) after a
+  `client/pair-retry`.
+  """
+  @spec encode_server_pair_init(binary() | nil) :: binary()
+  def encode_server_pair_init(nonce_a) do
+    encode_message(
+      "server/pair-init",
+      maybe_put(%{}, "nonce_A", nonce_a && b64url_encode(nonce_a))
+    )
   end
 
   @doc "Decode `server/pair-init`."
-  @spec decode_server_pair_init(binary()) :: {:ok, %{nonce_a: binary()}} | {:error, term()}
+  @spec decode_server_pair_init(binary()) :: {:ok, %{nonce_a: binary() | nil}} | {:error, term()}
   def decode_server_pair_init(text),
     do: decode_as(text, "server/pair-init", &parse_server_pair_init_payload/1)
 
@@ -967,9 +1084,14 @@ defmodule UniversalProxy.Sendspin.Wire do
   end
 
   defp parse_server_pair_init_payload(payload) do
-    with {:ok, b64} <- fetch_string(payload, "nonce_A"),
-         {:ok, bin} <- b64url_decode(b64) do
-      {:ok, %{nonce_a: bin}}
+    with {:ok, nonce_a} <- parse_optional_b64url(payload, "nonce_A") do
+      {:ok, %{nonce_a: nonce_a}}
+    end
+  end
+
+  defp parse_client_pair_pending_payload(payload) do
+    with {:ok, pairing_index} <- fetch_integer(payload, "pairing_index") do
+      {:ok, %{pairing_index: pairing_index, message: Map.get(payload, "message")}}
     end
   end
 
@@ -1006,29 +1128,34 @@ defmodule UniversalProxy.Sendspin.Wire do
   def decode_server_pair_confirm(text),
     do: decode_as(text, "server/pair-confirm", &parse_server_pair_confirm_payload/1)
 
+  @doc "Encode `client/pair-retry`: ask for another dynamic-pairing-code round."
+  @spec encode_client_pair_retry() :: binary()
+  def encode_client_pair_retry, do: encode_message("client/pair-retry", %{})
+
   @doc """
-  Encode `client/pair-confirm` (client's MCF tag `Tb`, plus `nonce_B` — the
-  dynamic-PIN commitment opening — when applicable; `nil` omits it for
-  static-PIN pairing).
+  Encode `client/pair-confirm` (client's MCF tag `Tb`, plus
+  `wrapped_nonce_B` — the dynamic pairing code's commitment opening, sealed
+  under the CPace output — when applicable; `nil` omits it for the static
+  pairing code).
   """
   @spec encode_client_pair_confirm(binary(), binary() | nil) :: binary()
-  def encode_client_pair_confirm(client_kc, nonce_b \\ nil) when is_binary(client_kc) do
+  def encode_client_pair_confirm(client_kc, wrapped_nonce_b \\ nil) when is_binary(client_kc) do
     payload =
       %{"client_kc" => b64url_encode(client_kc)}
-      |> maybe_put("nonce_B", nonce_b && b64url_encode(nonce_b))
+      |> maybe_put("wrapped_nonce_B", wrapped_nonce_b && b64url_encode(wrapped_nonce_b))
 
     encode_message("client/pair-confirm", payload)
   end
 
   @doc "Decode `client/pair-confirm`."
   @spec decode_client_pair_confirm(binary()) ::
-          {:ok, %{client_kc: binary(), nonce_b: binary() | nil}} | {:error, term()}
+          {:ok, %{client_kc: binary(), wrapped_nonce_b: binary() | nil}} | {:error, term()}
   def decode_client_pair_confirm(text),
     do: decode_as(text, "client/pair-confirm", &parse_client_pair_confirm_payload/1)
 
   @doc """
   Encode `client/pair-finalize`. Exactly one of `:long_term_psk` (Pairing PSK
-  flow) or `:wrapped_psk` (PIN flows) must be present — this is the wire's
+  flow) or `:wrapped_psk` (pairing-code flows) must be present — this is the wire's
   documented XOR, so unlike every other `encode_*/1` in this module the
   result is a tagged tuple rather than a bare binary.
   """
@@ -1065,13 +1192,12 @@ defmodule UniversalProxy.Sendspin.Wire do
   def decode_server_pair_finalize(text),
     do: decode_as(text, "server/pair-finalize", &parse_empty_payload/1)
 
-  @typedoc "One of the six documented `pair/abort` reasons (`pairing.md` `pair/abort`)."
+  @typedoc "One of the five documented `pair/abort` reasons (`pairing.md` `pair/abort`)."
   @type pair_abort_reason ::
           :attempt_timeout
           | :concurrent_attempt
           | :method_not_supported
-          | :pin_length_unacceptable
-          | :pin_mismatch
+          | :pairing_code_mismatch
           | :user_cancelled
 
   @doc "Encode `pair/abort`. Either side may send this — it aborts a pairing attempt, started or not."
@@ -1099,15 +1225,13 @@ defmodule UniversalProxy.Sendspin.Wire do
   defp encode_pair_abort_reason(:attempt_timeout), do: "attempt_timeout"
   defp encode_pair_abort_reason(:concurrent_attempt), do: "concurrent_attempt"
   defp encode_pair_abort_reason(:method_not_supported), do: "method_not_supported"
-  defp encode_pair_abort_reason(:pin_length_unacceptable), do: "pin_length_unacceptable"
-  defp encode_pair_abort_reason(:pin_mismatch), do: "pin_mismatch"
+  defp encode_pair_abort_reason(:pairing_code_mismatch), do: "pairing_code_mismatch"
   defp encode_pair_abort_reason(:user_cancelled), do: "user_cancelled"
 
   defp decode_pair_abort_reason("attempt_timeout"), do: :attempt_timeout
   defp decode_pair_abort_reason("concurrent_attempt"), do: :concurrent_attempt
   defp decode_pair_abort_reason("method_not_supported"), do: :method_not_supported
-  defp decode_pair_abort_reason("pin_length_unacceptable"), do: :pin_length_unacceptable
-  defp decode_pair_abort_reason("pin_mismatch"), do: :pin_mismatch
+  defp decode_pair_abort_reason("pairing_code_mismatch"), do: :pairing_code_mismatch
   defp decode_pair_abort_reason("user_cancelled"), do: :user_cancelled
   defp decode_pair_abort_reason(other), do: {:unknown, other}
 
@@ -1135,8 +1259,8 @@ defmodule UniversalProxy.Sendspin.Wire do
   defp parse_client_pair_confirm_payload(payload) do
     with {:ok, kc_b64} <- fetch_string(payload, "client_kc"),
          {:ok, client_kc} <- b64url_decode(kc_b64),
-         {:ok, nonce_b} <- parse_optional_b64url(payload, "nonce_B") do
-      {:ok, %{client_kc: client_kc, nonce_b: nonce_b}}
+         {:ok, wrapped} <- parse_optional_b64url(payload, "wrapped_nonce_B") do
+      {:ok, %{client_kc: client_kc, wrapped_nonce_b: wrapped}}
     end
   end
 
@@ -1213,13 +1337,18 @@ defmodule UniversalProxy.Sendspin.Wire do
   defp type_tag_and_parser("server/command"),
     do: {:server_command, &parse_server_command_payload/1}
 
-  defp type_tag_and_parser("client_stream/start"),
+  defp type_tag_and_parser("client-stream/start"),
     do: {:client_stream_start, &parse_client_stream_start_payload/1}
 
-  defp type_tag_and_parser("client_stream/end"), do: {:client_stream_end, &parse_empty_payload/1}
+  defp type_tag_and_parser("client-stream/end"), do: {:client_stream_end, &parse_empty_payload/1}
+
+  defp type_tag_and_parser("client/pair-pending"),
+    do: {:client_pair_pending, &parse_client_pair_pending_payload/1}
 
   defp type_tag_and_parser("client/pair-init"),
     do: {:client_pair_init, &parse_client_pair_init_payload/1}
+
+  defp type_tag_and_parser("client/pair-retry"), do: {:client_pair_retry, &parse_empty_payload/1}
 
   defp type_tag_and_parser("server/pair-init"),
     do: {:server_pair_init, &parse_server_pair_init_payload/1}

@@ -201,17 +201,23 @@ defmodule UniversalProxy.Sendspin.WireTest do
     end
   end
 
-  describe "decode_frame/2 — fragmentation (types 2/3)" do
-    test "reassembles a message split across fragment-more + fragment-end" do
+  describe "decode_frame/2 — fragmentation (type 1)" do
+    # `[1][flags][orig_type][data]` first, `[1][flags][data]` after; flags
+    # bit 1 = first, bit 0 = last (`messaging.md` "Fragmentation").
+    @first 0b10
+    @last 0b01
+    @middle 0b00
+
+    test "reassembles a message split across a first and a last fragment" do
       body = Wire.encode_client_time(999)
       plaintext = Wire.wrap_json(body)
       <<orig_type, data::binary>> = plaintext
       {first, rest} = String.split_at(data, div(byte_size(data), 2))
 
       assert {:pending, r1} =
-               Wire.decode_frame(<<2, orig_type, first::binary>>, Reassembler.new())
+               Wire.decode_frame(<<1, @first, orig_type, first::binary>>, Reassembler.new())
 
-      assert {:complete, {:json, ^body}, r2} = Wire.decode_frame(<<3, rest::binary>>, r1)
+      assert {:complete, {:json, ^body}, r2} = Wire.decode_frame(<<1, @last, rest::binary>>, r1)
       assert r2 == Reassembler.new()
     end
 
@@ -220,49 +226,82 @@ defmodule UniversalProxy.Sendspin.WireTest do
       <<orig_type, rest::binary>> = plaintext
       <<a, b, c, d, e, f, tail::binary>> = rest
 
-      {:pending, r1} = Wire.decode_frame(<<2, orig_type, a>>, Reassembler.new())
-      {:pending, r2} = Wire.decode_frame(<<2, b, c>>, r1)
-      {:pending, r3} = Wire.decode_frame(<<2, d, e, f>>, r2)
+      {:pending, r1} = Wire.decode_frame(<<1, @first, orig_type, a>>, Reassembler.new())
+      {:pending, r2} = Wire.decode_frame(<<1, @middle, b, c>>, r1)
+      {:pending, r3} = Wire.decode_frame(<<1, @middle, d, e, f>>, r2)
 
       assert {:complete, {:audio, 55, <<1, 2, 3, 4, 5, 6>>}, _} =
-               Wire.decode_frame(<<3, tail::binary>>, r3)
+               Wire.decode_frame(<<1, @last, tail::binary>>, r3)
     end
 
-    test "a fragment-end with no fragment-more in flight is a protocol error" do
-      assert {:error, :fragment_end_without_start} =
-               Wire.decode_frame(<<3, "data">>, Reassembler.new())
+    test "a single fragment flagged both first and last dispatches at once" do
+      body = Wire.encode_client_time(1)
+
+      assert {:complete, {:json, ^body}, _} =
+               Wire.decode_frame(<<1, 0b11, 0, body::binary>>, Reassembler.new())
     end
 
-    test "a fragment-more with no orig_type byte is a protocol error" do
-      assert {:error, :fragment_missing_orig_type} = Wire.decode_frame(<<2>>, Reassembler.new())
+    test "a non-first fragment with none in flight is a protocol error" do
+      assert {:error, :fragment_without_start} =
+               Wire.decode_frame(<<1, @last, "data">>, Reassembler.new())
+
+      assert {:error, :fragment_without_start} =
+               Wire.decode_frame(<<1, @middle, "data">>, Reassembler.new())
     end
 
-    test "orig_type of a fragment type (2 or 3) is a protocol error" do
-      assert {:error, :invalid_orig_type} = Wire.decode_frame(<<2, 2, "x">>, Reassembler.new())
-      assert {:error, :invalid_orig_type} = Wire.decode_frame(<<2, 3, "x">>, Reassembler.new())
+    test "a first fragment while one is in flight is a protocol error" do
+      {:pending, r1} = Wire.decode_frame(<<1, @first, 0, "abc">>, Reassembler.new())
+      assert {:error, :fragment_restarted} = Wire.decode_frame(<<1, @first, 0, "x">>, r1)
+    end
+
+    test "a first fragment with no orig_type byte is a protocol error" do
+      assert {:error, :fragment_missing_orig_type} =
+               Wire.decode_frame(<<1, @first>>, Reassembler.new())
+
+      assert {:error, :fragment_missing_flags} = Wire.decode_frame(<<1>>, Reassembler.new())
+    end
+
+    test "an orig_type of 1 is a protocol error" do
+      assert {:error, :invalid_orig_type} =
+               Wire.decode_frame(<<1, @first, 1, "x">>, Reassembler.new())
+    end
+
+    test "a nonzero reserved flag bit is a protocol error" do
+      for flags <- [0b100, 0b1000_0010, 0xFF] do
+        assert {:error, :fragment_reserved_flags} =
+                 Wire.decode_frame(<<1, flags, 0, "x">>, Reassembler.new())
+      end
     end
 
     test "a non-fragment frame while a fragmented message is in flight is a protocol error" do
-      {:pending, r1} = Wire.decode_frame(<<2, 0, "abc">>, Reassembler.new())
+      {:pending, r1} = Wire.decode_frame(<<1, @first, 0, "abc">>, Reassembler.new())
       assert {:error, :fragment_interrupted} = Wire.decode_frame(<<0, "oops">>, r1)
+    end
+
+    test "the retired legacy IDs 2 and 3 are just unimplemented binary types now" do
+      assert {:complete, {:binary, 2, <<0, "abc">>}, _} =
+               Wire.decode_frame(<<2, 0, "abc">>, Reassembler.new())
+
+      assert {:complete, {:binary, 3, "abc"}, _} =
+               Wire.decode_frame(<<3, "abc">>, Reassembler.new())
     end
   end
 
   describe "decode_frame/2 — reassembly bounds (W4)" do
     test "the running size on the reassembler matches the actual buffer length at every step" do
-      {:pending, r1} = Wire.decode_frame(<<2, 0, "abc">>, Reassembler.new())
+      {:pending, r1} = Wire.decode_frame(<<1, 0b10, 0, "abc">>, Reassembler.new())
       assert r1.size == 3
       assert IO.iodata_length(r1.buffer) == 3
 
-      {:pending, r2} = Wire.decode_frame(<<2, "de">>, r1)
+      {:pending, r2} = Wire.decode_frame(<<1, 0, "de">>, r1)
       assert r2.size == 5
       assert IO.iodata_length(r2.buffer) == 5
 
-      {:pending, r3} = Wire.decode_frame(<<2, "fghij">>, r2)
+      {:pending, r3} = Wire.decode_frame(<<1, 0, "fghij">>, r2)
       assert r3.size == 10
       assert IO.iodata_length(r3.buffer) == 10
 
-      assert {:complete, {:json, "abcdefghij"}, r4} = Wire.decode_frame(<<3>>, r3)
+      assert {:complete, {:json, "abcdefghij"}, r4} = Wire.decode_frame(<<1, 0b01>>, r3)
       assert r4 == Reassembler.new()
     end
 
@@ -270,13 +309,13 @@ defmodule UniversalProxy.Sendspin.WireTest do
       chunk = :binary.copy(<<0>>, 65_000)
 
       # 17 chunks of 65,000 bytes = 1,105,000 bytes, past the 1 MB cap —
-      # each fed as its own fragment-more frame, well under the fragment
-      # COUNT cap, so this exercises the byte cap specifically.
-      {:pending, r1} = Wire.decode_frame(<<2, 0, chunk::binary>>, Reassembler.new())
+      # each fed as its own fragment, well under the fragment COUNT cap, so
+      # this exercises the byte cap specifically.
+      {:pending, r1} = Wire.decode_frame(<<1, 0b10, 0, chunk::binary>>, Reassembler.new())
 
       result =
         Enum.reduce_while(2..17, {:pending, r1}, fn _i, {:pending, r} ->
-          case Wire.decode_frame(<<2, chunk::binary>>, r) do
+          case Wire.decode_frame(<<1, 0, chunk::binary>>, r) do
             {:pending, _} = pending -> {:cont, pending}
             {:error, _} = error -> {:halt, error}
           end
@@ -286,11 +325,11 @@ defmodule UniversalProxy.Sendspin.WireTest do
     end
 
     test "the fragment COUNT cap trips independent of size on tiny fragments" do
-      {:pending, r1} = Wire.decode_frame(<<2, 0, 1>>, Reassembler.new())
+      {:pending, r1} = Wire.decode_frame(<<1, 0b10, 0, 1>>, Reassembler.new())
 
       result =
         Enum.reduce_while(2..5_000, {:pending, r1}, fn _i, {:pending, r} ->
-          case Wire.decode_frame(<<2, 1>>, r) do
+          case Wire.decode_frame(<<1, 0, 1>>, r) do
             {:pending, _} = pending -> {:cont, pending}
             {:error, _} = error -> {:halt, error}
           end
@@ -311,10 +350,9 @@ defmodule UniversalProxy.Sendspin.WireTest do
     @base %{
       name: "USB Capture",
       device_info: nil,
-      trust_level: :none,
       supported_roles: ["source@v1"],
       source_v1_support: %{features: %{line_sense: nil}},
-      supported_pair_methods: [%{method: :pairing_psk}],
+      supported_pair_methods: %{pairing_psk: %{}},
       unpaired_access: %{enabled: false}
     }
 
@@ -324,7 +362,7 @@ defmodule UniversalProxy.Sendspin.WireTest do
       assert decoded == @base
     end
 
-    test "round-trips with device_info and a paired trust level" do
+    test "round-trips with device_info" do
       fields = %{
         @base
         | device_info: %{
@@ -332,26 +370,100 @@ defmodule UniversalProxy.Sendspin.WireTest do
             manufacturer: "bbangert",
             software_version: "1.2.3",
             mac_address: "aa:bb:cc:dd:ee:ff"
-          },
-          trust_level: :user
+          }
       }
 
       text = Wire.encode_client_hello(fields)
       assert {:ok, ^fields} = Wire.decode_client_hello(text)
     end
 
-    test "round-trips line_sense features and a fuller pair-method descriptor" do
+    test "sends no trust_level, and supported_pair_methods as an object keyed by method" do
+      fields = %{
+        @base
+        | supported_pair_methods: %{
+            pairing_psk: %{},
+            dynamic_pairing_code: %{out_channels: ["display"], formats: ["digits"]}
+          }
+      }
+
+      {:ok, "client/hello", payload} =
+        fields |> Wire.encode_client_hello() |> Wire.decode_envelope()
+
+      refute Map.has_key?(payload, "trust_level")
+
+      assert payload["supported_pair_methods"] == %{
+               "pairing_psk" => %{},
+               "dynamic_pairing_code" => %{"out_channels" => ["display"], "formats" => ["digits"]}
+             }
+    end
+
+    test "golden payload: the source's rc1 client/hello" do
+      fields = %{
+        name: "Line In",
+        device_info: nil,
+        supported_roles: ["source@v1"],
+        source_v1_support: %{features: %{line_sense: false}},
+        supported_pair_methods: %{
+          pairing_psk: %{},
+          dynamic_pairing_code: %{out_channels: ["display"], formats: ["digits"]}
+        },
+        unpaired_access: %{enabled: false}
+      }
+
+      assert Jason.decode!(Wire.encode_client_hello(fields)) == %{
+               "type" => "client/hello",
+               "payload" => %{
+                 "name" => "Line In",
+                 "supported_roles" => ["source@v1"],
+                 "source@v1_support" => %{"features" => %{"line_sense" => false}},
+                 "supported_pair_methods" => %{
+                   "pairing_psk" => %{},
+                   "dynamic_pairing_code" => %{
+                     "out_channels" => ["display"],
+                     "formats" => ["digits"]
+                   }
+                 },
+                 "unpaired_access" => %{"enabled" => false}
+               }
+             }
+    end
+
+    test "round-trips line_sense features and fuller pair-method descriptors" do
       fields = %{
         @base
         | source_v1_support: %{features: %{line_sense: true}},
-          supported_pair_methods: [
-            %{method: :dynamic_pin, out_channels: ["display"], min_pin_length: 6},
-            %{method: :static_pin, locations: ["device"]}
-          ]
+          supported_pair_methods: %{
+            pairing_psk: %{locations: ["operator"]},
+            static_pairing_code: %{locations: ["device"]}
+          }
       }
 
       text = Wire.encode_client_hello(fields)
       assert {:ok, ^fields} = Wire.decode_client_hello(text)
+    end
+
+    test "an unrecognized pair method key is ignored, not an error or a new atom" do
+      payload =
+        build_client_hello_payload(@base)
+        |> put_in(["supported_pair_methods", "future_method"], %{"x" => 1})
+
+      text = Jason.encode!(%{"type" => "client/hello", "payload" => payload})
+
+      assert {:ok, %{supported_pair_methods: %{pairing_psk: %{}} = methods}} =
+               Wire.decode_client_hello(text)
+
+      assert map_size(methods) == 1
+    end
+
+    test "the pre-rc1 list shape is rejected" do
+      payload =
+        build_client_hello_payload(@base)
+        |> Map.put("supported_pair_methods", [%{"method" => "pairing_psk"}])
+
+      text = Jason.encode!(%{"type" => "client/hello", "payload" => payload})
+
+      assert {:error, {:invalid_field, "supported_pair_methods"}} =
+               Wire.decode_client_hello(text)
     end
 
     test "a server MUST NOT see the support object without the role listed, and vice versa" do
@@ -362,18 +474,51 @@ defmodule UniversalProxy.Sendspin.WireTest do
       assert {:ok, %{source_v1_support: nil}} = Wire.decode_client_hello(text)
     end
 
-    test "invalid trust_level is rejected without creating an atom from it" do
-      payload = build_client_hello_payload(@base) |> Map.put("trust_level", "root")
-      text = Jason.encode!(%{"type" => "client/hello", "payload" => payload})
-
-      assert {:error, {:invalid_field, {"trust_level", "root"}}} = Wire.decode_client_hello(text)
-    end
-
     defp build_client_hello_payload(fields) do
       {:ok, "client/hello", payload} =
         fields |> Wire.encode_client_hello() |> Wire.decode_envelope()
 
       payload
+    end
+  end
+
+  describe "client/goodbye" do
+    test "golden payloads for the reasons the source sends" do
+      for reason <- [:pairing_required, :unauthorized, :shutdown] do
+        assert Jason.decode!(Wire.encode_client_goodbye(reason)) == %{
+                 "type" => "client/goodbye",
+                 "payload" => %{"reason" => Atom.to_string(reason)}
+               }
+      end
+    end
+  end
+
+  describe "noise/handshake message 1 payload" do
+    test "decodes psk_id with each psk_category code" do
+      for {code, category} <- [{"lt", :long_term}, {"pr", :pairing}, {"sn", :sentinel}] do
+        payload = Jason.encode!(%{"psk_id" => "abc", "psk_category" => code})
+
+        assert {:ok, %{psk_id: "abc", psk_category: ^category}} =
+                 Wire.decode_noise_msg1_payload(payload)
+
+        assert Jason.decode!(Wire.encode_noise_msg1_payload("abc", category)) == %{
+                 "psk_id" => "abc",
+                 "psk_category" => code
+               }
+      end
+    end
+
+    test "a missing or unknown category, missing psk_id or non-JSON is malformed" do
+      for payload <- [
+            ~s({"psk_id":"abc"}),
+            ~s({"psk_id":"abc","psk_category":"xx"}),
+            ~s({"psk_category":"lt"}),
+            ~s({"psk_id":1,"psk_category":"lt"}),
+            "not json",
+            ""
+          ] do
+        assert {:error, :malformed_handshake_payload} = Wire.decode_noise_msg1_payload(payload)
+      end
     end
   end
 
@@ -384,19 +529,36 @@ defmodule UniversalProxy.Sendspin.WireTest do
       assert {:ok, ^fields} = Wire.decode_server_activate(text)
     end
 
-    test "extracts active_roles and the pairing method" do
-      fields = %{
-        activities: [:pairing],
-        active_roles: [],
-        pairing: %{method: :dynamic_pin, pin_length: 6, languages: ["en"]}
-      }
+    test "extracts active_roles and the rc1 pairing method and format" do
+      for pairing <- [
+            %{method: :dynamic_pairing_code, format: :digits},
+            %{method: :pairing_psk, format: nil},
+            %{method: :static_pairing_code, format: nil}
+          ] do
+        fields = %{activities: [:pairing], active_roles: [], pairing: pairing}
+        text = Wire.encode_server_activate(fields)
+        assert {:ok, ^fields} = Wire.decode_server_activate(text)
+      end
+    end
 
-      text = Wire.encode_server_activate(fields)
-      assert {:ok, ^fields} = Wire.decode_server_activate(text)
+    test "an unknown method or format decodes to {:unknown, string} rather than erroring" do
+      text =
+        Jason.encode!(%{
+          "type" => "server/activate",
+          "payload" => %{
+            "activities" => ["pairing"],
+            "active_roles" => [],
+            "pairing" => %{"method" => "dynamic_pin", "format" => "hologram"}
+          }
+        })
+
+      assert {:ok,
+              %{pairing: %{method: {:unknown, "dynamic_pin"}, format: {:unknown, "hologram"}}}} =
+               Wire.decode_server_activate(text)
     end
 
     test "multiple activities round-trip in order" do
-      fields = %{activities: [:playback, :management], active_roles: ["source@v1"], pairing: nil}
+      fields = %{activities: [:playback, :pairing], active_roles: ["source@v1"], pairing: nil}
       text = Wire.encode_server_activate(fields)
       assert {:ok, ^fields} = Wire.decode_server_activate(text)
     end
@@ -417,6 +579,13 @@ defmodule UniversalProxy.Sendspin.WireTest do
   end
 
   describe "client/state (source object)" do
+    test "golden payload: an active source always carries the full source object" do
+      assert Jason.decode!(Wire.encode_client_state(false, %{signal: nil})) == %{
+               "type" => "client/state",
+               "payload" => %{"available" => false, "source" => %{}}
+             }
+    end
+
     test "round-trips with no source object" do
       text = Wire.encode_client_state(true, nil)
       assert {:ok, %{available: true, source: nil}} = Wire.decode_client_state(text)
@@ -451,11 +620,28 @@ defmodule UniversalProxy.Sendspin.WireTest do
     end
   end
 
-  describe "client_stream/start and client_stream/end" do
+  describe "client-stream/start and client-stream/end" do
     test "round-trips a pcm stream with no codec_header" do
       fields = %{codec: :pcm, channels: 2, sample_rate: 48_000, bit_depth: 16, codec_header: nil}
       text = Wire.encode_client_stream_start(fields)
       assert {:ok, ^fields} = Wire.decode_client_stream_start(text)
+
+      assert Jason.decode!(text) == %{
+               "type" => "client-stream/start",
+               "payload" => %{
+                 "source" => %{
+                   "codec" => "pcm",
+                   "channels" => 2,
+                   "sample_rate" => 48_000,
+                   "bit_depth" => 16
+                 }
+               }
+             }
+    end
+
+    test "the pre-rc1 underscore name is no longer recognized" do
+      text = Wire.encode_message("client_stream/start", %{"source" => %{}})
+      assert {:unknown, "client_stream/start", _} = Wire.decode_message(text)
     end
 
     test "round-trips a flac stream whose codec_header is standard (padded) Base64" do
@@ -475,21 +661,21 @@ defmodule UniversalProxy.Sendspin.WireTest do
 
       # codec_header is standard Base64 (padded), not base64url — assert the
       # wire text actually uses that alphabet/padding convention.
-      {:ok, "client_stream/start", %{"source" => %{"codec_header" => wire_header}}} =
+      {:ok, "client-stream/start", %{"source" => %{"codec_header" => wire_header}}} =
         Wire.decode_envelope(text)
 
       assert wire_header == Base.encode64(header)
     end
 
-    test "client_stream/end has no payload fields" do
+    test "client-stream/end has no payload fields" do
       text = Wire.encode_client_stream_end()
       assert {:ok, %{}} = Wire.decode_client_stream_end(text)
-      assert {:ok, "client_stream/end", %{}} = Wire.decode_envelope(text)
+      assert {:ok, "client-stream/end", %{}} = Wire.decode_envelope(text)
     end
   end
 
   describe "pairing messages" do
-    test "client/pair-init round-trips with and without commit_B (dynamic vs static PIN)" do
+    test "client/pair-init round-trips with and without commit_B (dynamic code vs the others)" do
       commit_b = :crypto.strong_rand_bytes(32)
 
       text_static = Wire.encode_client_pair_init(1)
@@ -501,10 +687,31 @@ defmodule UniversalProxy.Sendspin.WireTest do
                Wire.decode_client_pair_init(text_dynamic)
     end
 
-    test "server/pair-init round-trips the 32-byte nonce_A" do
+    test "server/pair-init round-trips the 32-byte nonce_A, and omits it on a retry round" do
       nonce_a = :crypto.strong_rand_bytes(32)
       text = Wire.encode_server_pair_init(nonce_a)
       assert {:ok, %{nonce_a: ^nonce_a}} = Wire.decode_server_pair_init(text)
+
+      retry = Wire.encode_server_pair_init(nil)
+      assert {:ok, "server/pair-init", %{}} = Wire.decode_envelope(retry)
+      assert {:ok, %{nonce_a: nil}} = Wire.decode_server_pair_init(retry)
+    end
+
+    test "client/pair-pending and client/pair-retry golden payloads" do
+      assert Jason.decode!(Wire.encode_client_pair_pending(2, "Press the button")) == %{
+               "type" => "client/pair-pending",
+               "payload" => %{"pairing_index" => 2, "message" => "Press the button"}
+             }
+
+      assert Jason.decode!(Wire.encode_client_pair_pending(1)) == %{
+               "type" => "client/pair-pending",
+               "payload" => %{"pairing_index" => 1}
+             }
+
+      assert Jason.decode!(Wire.encode_client_pair_retry()) == %{
+               "type" => "client/pair-retry",
+               "payload" => %{}
+             }
     end
 
     test "pair/abort round-trips every documented reason" do
@@ -512,8 +719,7 @@ defmodule UniversalProxy.Sendspin.WireTest do
             :attempt_timeout,
             :concurrent_attempt,
             :method_not_supported,
-            :pin_length_unacceptable,
-            :pin_mismatch,
+            :pairing_code_mismatch,
             :user_cancelled
           ] do
         text = Wire.encode_pair_abort(reason)
@@ -546,17 +752,22 @@ defmodule UniversalProxy.Sendspin.WireTest do
                ta |> Wire.encode_server_pair_confirm() |> Wire.decode_server_pair_confirm()
     end
 
-    test "client/pair-confirm round-trips with and without nonce_B (static vs dynamic PIN)" do
+    test "client/pair-confirm round-trips with and without wrapped_nonce_B (static vs dynamic)" do
       tb = :crypto.strong_rand_bytes(64)
-      nonce_b = :crypto.strong_rand_bytes(32)
+      wrapped = :crypto.strong_rand_bytes(48)
 
       text_static = Wire.encode_client_pair_confirm(tb)
-      assert {:ok, %{client_kc: ^tb, nonce_b: nil}} = Wire.decode_client_pair_confirm(text_static)
 
-      text_dynamic = Wire.encode_client_pair_confirm(tb, nonce_b)
+      assert {:ok, %{client_kc: ^tb, wrapped_nonce_b: nil}} =
+               Wire.decode_client_pair_confirm(text_static)
 
-      assert {:ok, %{client_kc: ^tb, nonce_b: ^nonce_b}} =
+      text_dynamic = Wire.encode_client_pair_confirm(tb, wrapped)
+
+      assert {:ok, %{client_kc: ^tb, wrapped_nonce_b: ^wrapped}} =
                Wire.decode_client_pair_confirm(text_dynamic)
+
+      {:ok, "client/pair-confirm", payload} = Wire.decode_envelope(text_dynamic)
+      assert Map.keys(payload) |> Enum.sort() == ["client_kc", "wrapped_nonce_B"]
     end
 
     test "client/pair-finalize round-trips long_term_psk (Pairing PSK flow)" do
@@ -565,7 +776,7 @@ defmodule UniversalProxy.Sendspin.WireTest do
       assert {:ok, %{long_term_psk: ^psk}} = Wire.decode_client_pair_finalize(text)
     end
 
-    test "client/pair-finalize round-trips wrapped_psk (PIN flows)" do
+    test "client/pair-finalize round-trips wrapped_psk (pairing-code flows)" do
       wrapped = :crypto.strong_rand_bytes(48)
       assert {:ok, text} = Wire.encode_client_pair_finalize(%{wrapped_psk: wrapped})
       assert {:ok, %{wrapped_psk: ^wrapped}} = Wire.decode_client_pair_finalize(text)
@@ -619,7 +830,7 @@ defmodule UniversalProxy.Sendspin.WireTest do
 
     test "a real Pairing.abort/2 pair/abort round-trips through Wire's typed codec" do
       state = %{
-        method: :dynamic_pin,
+        method: :dynamic_pairing_code,
         stage: :awaiting_server_init,
         handshake_hash: :crypto.strong_rand_bytes(32),
         pairing_index: 0,
@@ -630,11 +841,11 @@ defmodule UniversalProxy.Sendspin.WireTest do
 
       state = struct(Pairing, state)
 
-      {:abort, :pin_mismatch, [{"pair/abort", payload}], _state} =
-        Pairing.abort(state, :pin_mismatch)
+      {:abort, :pairing_code_mismatch, [{"pair/abort", payload}], _state} =
+        Pairing.abort(state, :pairing_code_mismatch)
 
       text = Wire.encode_message("pair/abort", payload)
-      assert {:ok, %{reason: :pin_mismatch}} = Wire.decode_pair_abort(text)
+      assert {:ok, %{reason: :pairing_code_mismatch}} = Wire.decode_pair_abort(text)
     end
 
     test "decode_envelope's raw payload is exactly what Pairing.handle/3 expects" do
@@ -646,14 +857,13 @@ defmodule UniversalProxy.Sendspin.WireTest do
       {:ok, "server/pair-init", payload} = Wire.decode_envelope(text)
 
       state = %{
-        method: :dynamic_pin,
+        method: :dynamic_pairing_code,
         stage: :awaiting_server_init,
         handshake_hash: :crypto.strong_rand_bytes(32),
         pairing_index: 0,
-        sid: Pairing.sid(:crypto.strong_rand_bytes(32), 0),
+        sid: Pairing.sid(:crypto.strong_rand_bytes(32), 0, 1),
         suite: "25519_ChaChaPoly_SHA256",
         psk: :crypto.strong_rand_bytes(32),
-        pin_length: 6,
         nonce_b: :crypto.strong_rand_bytes(32)
       }
 
