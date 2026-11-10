@@ -150,6 +150,24 @@ defmodule UniversalProxy.Audio.HomeAssistantPairingTest do
   end
 
   describe "a selection that can't be loaded" do
+    test "a Store read error is retried like a Store that is down", ctx do
+      :ok = Store.put_home_assistant_pairing(ctx.store, %{key: @key, client_id: "hp-id"})
+      # Truncating the file under the open table makes DETS reads fail.
+      File.write!(ctx.path, "")
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        {pid, _} = start_pairing!(ctx, drain: false)
+
+        assert HomeAssistantPairing.selection(pid) == {:error, :unavailable}
+        assert {:error, :unavailable} = HomeAssistantPairing.clear(pid)
+        assert %{pending: :load, timer: timer} = sync(pid)
+        assert is_reference(timer)
+        refute_receive {:update_adapters, _, _}, 50
+        refute_received {:disconnect_clients, _}
+        assert %{pending: :load, loaded?: false} = sync(pid)
+      end)
+    end
+
     test "is not taken as none: nothing is applied until the load works", ctx do
       :ok = Store.put_home_assistant_pairing(ctx.store, %{key: @key, client_id: "hp-id"})
       :ok = stop_supervised(Store)
@@ -191,7 +209,7 @@ defmodule UniversalProxy.Audio.HomeAssistantPairingTest do
     assert :ok = HomeAssistantPairing.select(pid, @key)
 
     assert HomeAssistantPairing.selection(pid) == {:ok, %{key: @key, client_id: "hp-id"}}
-    assert Store.get_home_assistant_pairing(ctx.store) == %{key: @key, client_id: "hp-id"}
+    assert Store.get_home_assistant_pairing(ctx.store) == {:ok, %{key: @key, client_id: "hp-id"}}
     assert_received {:home_assistant_pairing, @key}
 
     assert_received {:update_adapters, _espex, [sendspin: UniversalProxy.ESPHome.Sendspin]}
@@ -244,7 +262,7 @@ defmodule UniversalProxy.Audio.HomeAssistantPairingTest do
     assert :ok = HomeAssistantPairing.clear(pid)
 
     assert HomeAssistantPairing.selection(pid) == {:ok, nil}
-    assert Store.get_home_assistant_pairing(ctx.store) == nil
+    assert Store.get_home_assistant_pairing(ctx.store) == {:ok, nil}
     assert_received {:home_assistant_pairing, nil}
     assert_received {:update_adapters, _espex, [sendspin: nil]}
     assert_received {:disconnect_clients, :espex_test}
@@ -291,7 +309,7 @@ defmodule UniversalProxy.Audio.HomeAssistantPairingTest do
     assert HomeAssistantPairing.selection(pid) ==
              {:ok, %{key: {"Gone", nil, nil}, client_id: "old"}}
 
-    assert Store.get_home_assistant_pairing(ctx.store).client_id == "old"
+    assert {:ok, %{client_id: "old"}} = Store.get_home_assistant_pairing(ctx.store)
   end
 
   test "a client id that changed while it was down is caught up at start", ctx do
@@ -299,7 +317,7 @@ defmodule UniversalProxy.Audio.HomeAssistantPairingTest do
     {pid, _} = start_pairing!(ctx, drain: false)
 
     assert HomeAssistantPairing.selection(pid) == {:ok, %{key: @key, client_id: "hp-id"}}
-    assert Store.get_home_assistant_pairing(ctx.store) == %{key: @key, client_id: "hp-id"}
+    assert Store.get_home_assistant_pairing(ctx.store) == {:ok, %{key: @key, client_id: "hp-id"}}
     assert_received {:update_adapters, _espex, [sendspin: UniversalProxy.ESPHome.Sendspin]}
     assert_received {:disconnect_clients, :espex_test}
   end
@@ -378,7 +396,10 @@ defmodule UniversalProxy.Audio.HomeAssistantPairingTest do
 
       sync(pid)
       assert HomeAssistantPairing.selection(pid) == {:ok, %{key: @usb_key, client_id: "usb-id"}}
-      assert Store.get_home_assistant_pairing(store) == %{key: @usb_key, client_id: "usb-id"}
+
+      assert Store.get_home_assistant_pairing(store) ==
+               {:ok, %{key: @usb_key, client_id: "usb-id"}}
+
       assert_received {:disconnect_clients, :espex_test}
       refute_received {:update_adapters, _, _}
 

@@ -141,11 +141,13 @@ defmodule UniversalProxy.Audio.Store do
   @type home_assistant_pairing :: %{key: output_key(), client_id: String.t() | nil}
 
   @doc """
-  The persisted Home Assistant pairing selection, or `nil` when none is
-  set. Kept in the same table as the output rows, under a non-tuple key
-  that `get_all/1` skips.
+  The persisted Home Assistant pairing selection: `{:ok, nil}` when none is
+  set (a malformed row is logged and reads as none), `{:error, reason}` when
+  DETS can't be read. Kept in the same table as the output rows, under a
+  non-tuple key that `get_all/1` skips.
   """
-  @spec get_home_assistant_pairing(GenServer.server()) :: home_assistant_pairing() | nil
+  @spec get_home_assistant_pairing(GenServer.server()) ::
+          {:ok, home_assistant_pairing() | nil} | {:error, term()}
   def get_home_assistant_pairing(server \\ __MODULE__) do
     GenServer.call(server, :get_home_assistant_pairing)
   end
@@ -239,10 +241,18 @@ defmodule UniversalProxy.Audio.Store do
       case :dets.lookup(state.table, @home_assistant_pairing) do
         [{_, %{key: {slot_sub, _, _}, client_id: id} = selection}]
         when is_binary(slot_sub) and (is_binary(id) or is_nil(id)) ->
-          selection
+          {:ok, selection}
 
-        _ ->
-          nil
+        [] ->
+          {:ok, nil}
+
+        {:error, reason} ->
+          Logger.error("Audio store Home Assistant pairing read failed: #{inspect(reason)}")
+          {:error, reason}
+
+        [_malformed] ->
+          Logger.warning("Audio store: ignoring a malformed Home Assistant pairing row")
+          {:ok, nil}
       end
 
     {:reply, result, state}

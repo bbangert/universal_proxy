@@ -340,7 +340,7 @@ defmodule UniversalProxy.Audio.HomeAssistantPairing do
   end
 
   defp load(t) do
-    {:ok, Store.get_home_assistant_pairing(t.store)}
+    Store.get_home_assistant_pairing(t.store)
   catch
     :exit, _reason -> {:error, :unavailable}
   end
