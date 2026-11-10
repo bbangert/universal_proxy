@@ -1128,6 +1128,14 @@ defmodule UniversalProxyWeb.AudioLiveTest do
       refute html =~ String.slice(@server_b, 0, 10)
     end
 
+    test "an unpair without a server arms nothing and doesn't crash", %{conn: conn} do
+      {view, id, _html} = mount_with_input(conn)
+      render_hook(view, "arm_input_action", %{"id" => id, "action" => "unpair"})
+      render_hook(view, "confirm_input_action", %{"id" => id})
+      assert render(view) =~ "Pairing token"
+      refute_received {:unpair, _, _}
+    end
+
     test "actions for an unknown input do nothing", %{conn: conn} do
       {view, _id, _html} = mount_with_input(conn)
       render_hook(view, "arm_input_action", %{"id" => "garbage", "action" => "unpair_all"})

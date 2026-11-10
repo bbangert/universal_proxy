@@ -399,7 +399,7 @@ defmodule UniversalProxyWeb.AudioLive do
   def handle_event("arm_input_action", %{"id" => id, "action" => action} = params, socket) do
     armed =
       case action do
-        "unpair" -> {:unpair, Map.get(params, "server")}
+        "unpair" -> unpair_target(Map.get(params, "server"))
         "unpair_all" -> :unpair_all
         "regenerate" -> :regenerate
         _ -> nil
@@ -1789,6 +1789,12 @@ defmodule UniversalProxyWeb.AudioLive do
       _ -> socket
     end
   end
+
+  # Only a named server can be unpaired one at a time; anything else arms nothing.
+  defp unpair_target(server_id) when is_binary(server_id) and server_id != "",
+    do: {:unpair, server_id}
+
+  defp unpair_target(_server_id), do: nil
 
   defp armed_for({id, action}, id), do: action
   defp armed_for(_armed, _id), do: nil
