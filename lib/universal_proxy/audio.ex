@@ -13,7 +13,7 @@ defmodule UniversalProxy.Audio do
   `{card_name, nil, nil}` (e.g. `{"bcm2835 Headphones", nil, nil}`).
   """
 
-  alias UniversalProxy.Audio.{PairingToken, Player, Server, Store}
+  alias UniversalProxy.Audio.{HomeAssistantPairing, PairingToken, Player, Server, Store}
 
   @typedoc """
   Composite identifier for an audio output:
@@ -192,6 +192,45 @@ defmodule UniversalProxy.Audio do
       {:ok, dir} -> PairingToken.read(dir)
       :error -> {:error, :unavailable}
     end
+  catch
+    :exit, _ -> {:error, :unavailable}
+  end
+
+  @doc """
+  The output reported to Home Assistant for Sendspin auto-pairing, or
+  `nil` when none is (or the audio subsystem is down). See
+  `UniversalProxy.Audio.HomeAssistantPairing`.
+  """
+  @spec home_assistant_pairing() :: key() | nil
+  def home_assistant_pairing do
+    case HomeAssistantPairing.selection() do
+      %{key: key} -> key
+      nil -> nil
+    end
+  catch
+    :exit, _ -> nil
+  end
+
+  @doc """
+  Report the output `key` to Home Assistant for Sendspin auto-pairing,
+  replacing any other. `{:error, :not_found}` when the output isn't
+  present, `{:error, :unavailable}` while the audio subsystem is down.
+  """
+  @spec select_home_assistant_pairing(key()) ::
+          :ok | {:error, :not_found | :unavailable | term()}
+  def select_home_assistant_pairing({_, _, _} = key) do
+    HomeAssistantPairing.select(key)
+  catch
+    :exit, _ -> {:error, :unavailable}
+  end
+
+  @doc """
+  Stop reporting any output to Home Assistant. `{:error, :unavailable}`
+  while the audio subsystem is down.
+  """
+  @spec clear_home_assistant_pairing() :: :ok | {:error, :unavailable | term()}
+  def clear_home_assistant_pairing do
+    HomeAssistantPairing.clear()
   catch
     :exit, _ -> {:error, :unavailable}
   end

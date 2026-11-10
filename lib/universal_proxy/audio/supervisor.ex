@@ -20,7 +20,9 @@ defmodule UniversalProxy.Audio.Supervisor do
     4. `UniversalProxy.Audio.Server` — the registry/orchestrator
        that polls enumeration, manages player lifecycle via the
        DynamicSupervisor above, and brokers PubSub events.
-    5. `UniversalProxy.Audio.MdnsAnnouncer` — re-announces mDNS on
+    5. `UniversalProxy.Audio.HomeAssistantPairing` — the output whose
+       Sendspin client is reported to Home Assistant for auto-pairing.
+    6. `UniversalProxy.Audio.MdnsAnnouncer` — re-announces mDNS on
        network-up so players advertised during the boot race (before
        `eth0` had an address) become discoverable.
   """
@@ -43,6 +45,10 @@ defmodule UniversalProxy.Audio.Supervisor do
       UniversalProxy.Audio.Store,
       UniversalProxy.Audio.MdnsDiscovery,
       UniversalProxy.Audio.Server,
+      # The output reported to Home Assistant for Sendspin auto-pairing.
+      # After Store (its persistence) and Server (it reads the selected
+      # output's live client id at start).
+      UniversalProxy.Audio.HomeAssistantPairing,
       # Last child: re-announces mDNS when an interface gains an IPv4 so
       # players advertised before the network was ready (boot race) become
       # discoverable. Independent of the others; placed last so its crash
