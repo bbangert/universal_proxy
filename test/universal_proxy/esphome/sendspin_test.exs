@@ -56,6 +56,20 @@ defmodule UniversalProxy.ESPHome.SendspinTest do
     end
   end
 
+  describe "the callbacks with the selection process down" do
+    setup do
+      sup = UniversalProxy.Audio.Supervisor
+      pairing = UniversalProxy.Audio.HomeAssistantPairing
+      :ok = Supervisor.terminate_child(sup, pairing)
+      on_exit(fn -> Supervisor.restart_child(sup, pairing) end)
+    end
+
+    test "answer :not_ready and no client id, not :disabled" do
+      assert Sendspin.pairing_token() == :not_ready
+      assert Sendspin.client_id() == nil
+    end
+  end
+
   describe "client_id/1" do
     test "the selection's cached client id, nil without one" do
       assert Sendspin.client_id(%{key: @key, client_id: "abc"}) == "abc"

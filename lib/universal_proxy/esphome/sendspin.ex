@@ -28,13 +28,19 @@ defmodule UniversalProxy.ESPHome.Sendspin do
   alias UniversalProxy.Audio.HomeAssistantPairing
 
   @impl true
-  def client_id, do: client_id(selection())
+  def client_id do
+    case selection() do
+      {:ok, selection} -> client_id(selection)
+      :error -> nil
+    end
+  end
 
   @impl true
   def pairing_token do
     case selection() do
-      %{key: key} -> pairing_token(key, Audio)
-      nil -> :disabled
+      {:ok, %{key: key}} -> pairing_token(key, Audio)
+      {:ok, nil} -> :disabled
+      :error -> :not_ready
     end
   end
 
@@ -72,8 +78,8 @@ defmodule UniversalProxy.ESPHome.Sendspin do
   end
 
   defp selection do
-    HomeAssistantPairing.selection()
+    {:ok, HomeAssistantPairing.selection()}
   catch
-    :exit, _reason -> nil
+    :exit, _reason -> :error
   end
 end
