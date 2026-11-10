@@ -330,21 +330,6 @@ defmodule UniversalProxyWeb.OverviewLive do
     end
   end
 
-  # Copy works while masked: the value goes straight to the clipboard via
-  # `push_event`, never through the rendered document.
-  def handle_event("drive_copy_password", _params, socket) do
-    case storage().share_credentials() do
-      %{password: password} ->
-        {:noreply,
-         socket
-         |> assign(:drive_password_copied, true)
-         |> push_event("copy", %{text: password})}
-
-      _unavailable ->
-        {:noreply, credentials_unavailable(socket)}
-    end
-  end
-
   def handle_event("drive_arm", %{"action" => "format"}, socket) do
     if format_in_flight?(socket) do
       {:noreply, format_busy_noop(socket)}
@@ -376,7 +361,6 @@ defmodule UniversalProxyWeb.OverviewLive do
            |> assign(:drive_username, username)
            |> assign(:drive_credentials?, true)
            |> assign(:drive_password, nil)
-           |> assign(:drive_password_copied, false)
            |> put_flash(:info, "Password regenerated. Update the credential in Home Assistant.")}
 
         {:error, reason} ->
@@ -1088,7 +1072,6 @@ defmodule UniversalProxyWeb.OverviewLive do
       username={@drive_username}
       credentials?={@drive_credentials?}
       password={@drive_password}
-      copied?={@drive_password_copied}
       armed={@drive_armed}
       formatting?={@drive_formatting == @selected_drive_ctx.drive.dev_path}
       ejected?={@drive_ejected == @selected_drive_ctx.drive.dev_path}
@@ -1136,7 +1119,6 @@ defmodule UniversalProxyWeb.OverviewLive do
     |> assign(:drive_username, nil)
     |> assign(:drive_credentials?, true)
     |> assign(:drive_password, nil)
-    |> assign(:drive_password_copied, false)
     |> assign(:drive_armed, nil)
     |> assign(:drive_chooser, nil)
   end

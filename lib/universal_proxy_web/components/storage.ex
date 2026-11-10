@@ -216,7 +216,6 @@ defmodule UniversalProxyWeb.Components.Storage do
   attr(:username, :string, default: nil)
   attr(:credentials?, :boolean, default: true)
   attr(:password, :string, default: nil)
-  attr(:copied?, :boolean, default: false)
   attr(:armed, :atom, default: nil)
   attr(:formatting?, :boolean, default: false)
   attr(:ejected?, :boolean, default: false)
@@ -380,6 +379,7 @@ defmodule UniversalProxyWeb.Components.Storage do
                 <div class="text-sm text-fg-3">Password</div>
                 <.text_input
                   name="storage_password"
+                  id="storage-password"
                   value={@password || "••••••••••••••••"}
                   readonly
                   mono
@@ -389,8 +389,19 @@ defmodule UniversalProxyWeb.Components.Storage do
                   <.button variant={:secondary} size={:sm} phx-click="drive_reveal_password">
                     {if @password, do: "Hide", else: "Reveal"}
                   </.button>
-                  <.button variant={:secondary} size={:sm} phx-click="drive_copy_password">
-                    {if @copied?, do: "Copied", else: "Copy"}
+                  <%!-- Offered only while revealed: the password is in the DOM
+                       only then, and the hook copies it client-side inside
+                       the click (the only way to copy over plain HTTP). --%>
+                  <.button
+                    :if={@password}
+                    variant={:secondary}
+                    size={:sm}
+                    id="storage-password-copy"
+                    phx-hook="CopyToClipboard"
+                    data-clipboard={@password}
+                    data-select-target="storage-password"
+                  >
+                    Copy
                   </.button>
                 </div>
               </div>
