@@ -86,11 +86,15 @@ const Hooks = {
   },
 
   // Copy the element's `data-clipboard` attr to the system clipboard on
-  // click. Used by the Audio tab's per-card "more" disclosure for the
-  // client_id and the revealed pairing token. Briefly mutates the
-  // button's text to "Copied" only once the write is confirmed; on
-  // failure it shows a failure cue and, when `data-select-target` names
-  // an element id, selects that element's text for a manual Ctrl/Cmd+C.
+  // click. Used by the Audio tab's per-card "more" disclosure (client_id
+  // and the revealed pairing token), the Security tab (API encryption key
+  // and SSH fingerprint) and the Overview drive drawer (server, share,
+  // username and the revealed password). Briefly mutates the button's
+  // text to "Copied" only once the write is confirmed; on failure it
+  // shows a failure cue and, when `data-select-target` names an element
+  // id, selects that element's text for a manual Ctrl/Cmd+C. A button
+  // with an icon wraps its label in `data-copy-label` so only the label
+  // text is swapped.
   CopyToClipboard: {
     mounted() {
       this.el.addEventListener("click", () => {
@@ -107,12 +111,14 @@ const Hooks = {
       })
     },
     destroyed() { if (this.timer) clearTimeout(this.timer) },
+    labelEl() { return this.el.querySelector("[data-copy-label]") || this.el },
     flash(label, ms) {
+      const el = this.labelEl()
       if (this.timer) clearTimeout(this.timer)
-      else this.original = this.el.textContent
-      this.el.textContent = label
+      else this.original = el.textContent
+      el.textContent = label
       this.timer = setTimeout(() => {
-        this.el.textContent = this.original
+        el.textContent = this.original
         this.timer = null
       }, ms)
     },
@@ -120,6 +126,11 @@ const Hooks = {
       const id = this.el.dataset.selectTarget
       const target = id && document.getElementById(id)
       if (!target) return
+      if (typeof target.select === "function") {
+        target.focus()
+        target.select()
+        return
+      }
       const range = document.createRange()
       range.selectNodeContents(target)
       const selection = window.getSelection()
@@ -187,18 +198,6 @@ const Hooks = {
     }
   }
 }
-
-// Server-side `push_event("copy", %{text: "..."})` ends up here as a
-// browser event named "phx:copy". Used by Security tab's encryption-key
-// Copy button.
-window.addEventListener("phx:copy", event => {
-  const text = event.detail && event.detail.text
-  if (text && navigator.clipboard) {
-    navigator.clipboard.writeText(text).catch(err => {
-      console.warn("Clipboard copy failed:", err)
-    })
-  }
-})
 
 // Traffic tab's Export button: server pushes the formatted log; we
 // stuff it into a Blob and trigger a same-page download.

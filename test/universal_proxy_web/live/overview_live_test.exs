@@ -739,15 +739,25 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
       assert html =~ "Reveal"
     end
 
-    test "copying the password never renders it", %{conn: conn} do
+    test "Copy is offered only once the password is revealed", %{conn: conn} do
       {:ok, view, _html} = live(conn, "/")
       push_storage(storage_state(share: :running))
-      open_drawer(view)
+      html = open_drawer(view)
 
-      html = view |> element("button[phx-click='drive_copy_password']") |> render_click()
-
-      assert html =~ "Copied"
+      refute html =~ "storage-password-copy"
       refute html =~ @password
+
+      view |> element("button[phx-click='drive_reveal_password']") |> render_click()
+      button = view |> element("button#storage-password-copy") |> render()
+
+      assert button =~ ~s(phx-hook="CopyToClipboard")
+      assert button =~ ~s(data-clipboard="#{@password}")
+      assert button =~ ~s(data-select-target="storage-password")
+      refute button =~ "phx-click"
+
+      view |> element("button[phx-click='drive_reveal_password']") |> render_click()
+      refute render(view) =~ "storage-password-copy"
+      refute render(view) =~ @password
     end
 
     test "regenerating the password arms first, then rotates and re-masks", %{conn: conn} do
