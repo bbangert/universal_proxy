@@ -1460,6 +1460,42 @@ defmodule UniversalProxy.Audio.PlayerTest do
       assert %{event: "volume", value: 44} = Player.last_event(pid)
     end
 
+    test "the binary's stderr lines are logged, not parsed or broadcast" do
+      pid = start_player!()
+      assert_receive {:sendspin_state, @key, %{event: "listening"}}, 2_000
+      before = Player.last_event(pid)
+
+      # The suite logs from :warning up; the :info lines need more.
+      level = Logger.level()
+      Logger.configure(level: :info)
+      on_exit(fn -> Logger.configure(level: level) end)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          for line <- [
+                "AlsaPipeSink: underrun, recovering",
+                "W SyncTask: Lost sync (48211us off)",
+                "E SyncTask: Failed to decode audio chunk",
+                "I SyncTask: Regained sync",
+                "AlsaPipeSink: plughw:0,0 — 44100 Hz 2 ch 16 bit"
+              ] do
+            :ok = Player.__send_command__(pid, %{cmd: "emit_stderr", line: line})
+          end
+
+          :ok = Player.set_volume(pid, 45)
+          assert_receive {:sendspin_state, @key, %{event: "volume", value: 45}}, 1_000
+        end)
+
+      assert log =~ ~r/\[warning\].*sendspin_player: AlsaPipeSink: underrun, recovering/
+      assert log =~ ~r/\[warning\].*sendspin_player: W SyncTask: Lost sync/
+      assert log =~ ~r/\[error\].*sendspin_player: E SyncTask: Failed to decode/
+      assert log =~ ~r/\[info\].*sendspin_player: I SyncTask: Regained sync/
+      assert log =~ ~r/\[info\].*sendspin_player: AlsaPipeSink: plughw:0,0/
+      refute log =~ "could not decode line"
+      refute before == Player.last_event(pid)
+      assert %{event: "volume", value: 45} = Player.last_event(pid)
+    end
+
     @tag :tmp_dir
     test "the artwork dir is emptied of artwork files before the binary starts",
          %{tmp_dir: tmp_dir} do
