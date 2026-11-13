@@ -162,15 +162,17 @@ if Code.ensure_loaded?(Emerge) do
     @spec tree(Spec.t()) :: Emerge.tree()
     def tree(:none), do: UI.none()
 
-    def tree({:column, attrs, children}),
-      do: UI.column(attrs(attrs), Enum.map(children, &tree/1))
+    # `:none` children are left out, not drawn as `UI.none()`: that element
+    # has no key, and Emerge raises when keyed and unkeyed siblings (or
+    # nearby mounts) share a parent.
+    def tree({:column, attrs, children}), do: UI.column(attrs(attrs), trees(children))
 
-    def tree({:row, attrs, children}), do: UI.row(attrs(attrs), Enum.map(children, &tree/1))
+    def tree({:row, attrs, children}), do: UI.row(attrs(attrs), trees(children))
 
     def tree({:stack, attrs, []}), do: UI.el(attrs(attrs), UI.none())
 
     def tree({:stack, attrs, [content | overlays]}) do
-      UI.el(attrs(attrs) ++ Enum.map(overlays, &Nearby.in_front(tree(&1))), tree(content))
+      UI.el(attrs(attrs) ++ Enum.map(trees(overlays), &Nearby.in_front/1), tree(content))
     end
 
     def tree({:text, attrs, string}), do: UI.el(attrs(attrs), UI.text(string))
@@ -208,6 +210,8 @@ if Code.ensure_loaded?(Emerge) do
 
       UI.row([Size.height(Size.px(max_height)) | attrs(attrs)], bars)
     end
+
+    defp trees(children), do: children |> Spec.present() |> Enum.map(&tree/1)
 
     defp bar_attrs(:height, key, width, level, _max_height, color) do
       [

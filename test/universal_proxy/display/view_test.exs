@@ -322,6 +322,101 @@ defmodule UniversalProxy.Display.ViewTest do
     end
   end
 
+  describe "sibling keys" do
+    # The sibling groups the Emerge renderer builds, which must each be all
+    # keyed or all unkeyed: a column's or row's drawn children, and a
+    # stack's drawn overlays (its nearby mounts). `drawn` is what the
+    # renderer keeps of a child list.
+    defp mixed_groups(spec, drawn \\ &Spec.present/1)
+
+    defp mixed_groups({tag, attrs, children}, drawn) when tag in [:column, :row, :stack] do
+      group =
+        case {tag, children} do
+          {:stack, [_content | overlays]} -> drawn.(overlays)
+          {:stack, []} -> []
+          _column_or_row -> drawn.(children)
+        end
+
+      mixed =
+        case group |> Enum.map(&(attr(&1, :key) != nil)) |> Enum.uniq() do
+          [_, _] -> [{Keyword.get(attrs, :key), Enum.map(group, &attr(&1, :key))}]
+          _uniform -> []
+        end
+
+      mixed ++ Enum.flat_map(children, &mixed_groups(&1, drawn))
+    end
+
+    defp mixed_groups(_leaf, _drawn), do: []
+
+    # Every key the renderer gives an element: a bars node also keys each bar.
+    defp element_keys(spec) do
+      Enum.flat_map(nodes(spec), fn
+        {:bars, attrs, heights} ->
+          key = Keyword.get(attrs, :key, "bars")
+          [key | Enum.map(0..(length(heights) - 1)//1, &"#{key}-#{&1}")]
+
+        node ->
+          List.wrap(attr(node, :key))
+      end)
+    end
+
+    @progress %{track_progress: 60_000, track_duration: 200_000, playback_speed: 1000}
+
+    defp every_screen do
+      screens =
+        for mode <- [:now_playing, :visualizer, :party_qr, :off],
+            playback <- [:stopped, :playing, :paused],
+            party <- [:off, @party, Map.put(@party, :qr_path, "/tmp/qr.png")],
+            metadata <- [
+              nil,
+              %{title: "Song"},
+              %{title: "Song", artist: "Band", received_at: 0, progress: @progress},
+              %{title: "Live", received_at: 0, progress: %{track_progress: 5_000}}
+            ],
+            artwork <- [nil, %{path: "/tmp/a.jpg"}],
+            tv_presence <- [:unknown, :present] do
+          model(
+            mode: mode,
+            playback: playback,
+            party: party,
+            metadata: metadata,
+            artwork: artwork,
+            tv_presence: tv_presence
+          )
+        end
+
+      packs =
+        for pack <- [:absent, {:downloading, 42}, {:error, :no_pack_pinned}, {:ready, "v", "/d"}],
+            notice <- [nil, 1] do
+          milkdrop(pack: pack, milkdrop: %{Model.new().milkdrop | notice: notice})
+        end
+
+      screens ++ packs ++ [model(blanked: true, playback: :playing)]
+    end
+
+    test "every screen's sibling groups are all keyed or all unkeyed, with unique keys" do
+      for model <- every_screen(), opts <- [[], [now: 400_000, size: {1920, 1080}, bars: 48]] do
+        spec = View.render(model, opts)
+        screen = inspect({Model.screen(model), model.playback, model.metadata, opts})
+
+        assert mixed_groups(spec) == [], "mixed keyed and unkeyed siblings on #{screen}"
+
+        keys = element_keys(spec)
+        assert keys -- Enum.uniq(keys) == [], "duplicate keys on #{screen}"
+      end
+
+      for spec <- [Spec.blank(), Spec.now_playing(), Spec.now_playing(art: "/tmp/a.jpg")] do
+        assert mixed_groups(spec) == []
+      end
+    end
+
+    test "Now Playing without progress relies on the renderer leaving :none out" do
+      spec = View.render(model([]))
+      assert [{"meta", _keys}] = mixed_groups(spec, & &1)
+      assert mixed_groups(spec) == []
+    end
+  end
+
   test "the party card shows the party's name and a QR image once there is one" do
     spec = View.render(model(mode: :party_qr, party: Map.put(@party, :qr_path, "/tmp/qr.png")))
     assert "Garden party" in texts(spec)
