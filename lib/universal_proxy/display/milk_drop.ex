@@ -179,8 +179,9 @@ defmodule UniversalProxy.Display.MilkDrop do
     * `{"event":"user_reloaded","presets":N,"added":A,"removed":R,"rejected":X}`
       — the answer to `reload_user`;
     * `{"event":"selection","gen":N,"eligible":E,"playlist_fallback":B,"hidden_fallback":B}`
-      — the selection in effect (answering `reload_selection`, and after
-      `prepared` when `--selection-file` is given): `E` presets can
+      — the selection in effect (answering `reload_selection`, and, when
+      `--selection-file` is given, after `prepared` and after a
+      `clear_skips` or `play` that unskipped a preset): `E` presets can
       rotate; a fallback flag means that list left none eligible and is
       ignored;
     * `{"event":"play_refused","preset":ID,"reason":R}` — `play` refused:

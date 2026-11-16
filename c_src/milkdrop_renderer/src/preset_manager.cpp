@@ -287,14 +287,17 @@ bool PresetManager::skip(const std::string& file) {
     return cur != nullptr && cur->file == file;
 }
 
-void PresetManager::unskip(const std::string& file) {
-    if (skipped_.erase(file) != 0) bag_.clear();  // re-deal: it may change the pool
+bool PresetManager::unskip(const std::string& file) {
+    if (skipped_.erase(file) == 0) return false;
+    bag_.clear();  // re-deal: it may change the pool
+    return true;
 }
 
-void PresetManager::clear_skips() {
-    if (skipped_.empty()) return;
+bool PresetManager::clear_skips() {
+    if (skipped_.empty()) return false;
     skipped_.clear();
     bag_.clear();  // re-deal with the cleared presets back in
+    return true;
 }
 
 bool PresetManager::set_high_frequency(bool include) {

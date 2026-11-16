@@ -656,10 +656,12 @@ void App::apply_play() {
     }
     // Asked for by name: a skipped one gets another try (a failure skips it
     // again).
-    presets_->unskip(target->file);
+    const bool unskipped = presets_->unskip(target->file);
     const bool lock = play_lock_;
     const Selection sel = switch_to(target, "play", sw_.smooth() && !hf, 1,
                                     [&](const PresetEntry& e) { presets_->played(e, lock); });
+    // An unskip that held may have changed the pool (a failure re-skipped it).
+    if (unskipped && !opt_.selection_file.empty()) announce_selection();
     if (sel == Selection::Switched) {
         sw_.play_done();
         return;
@@ -949,7 +951,7 @@ void App::handle_command(const Command& c) {
         case Command::Type::ReloadUser: reload_user(); break;
         case Command::Type::ReloadSelection: reload_selection(); break;
         case Command::Type::ClearSkips:
-            presets_->clear_skips();
+            if (presets_->clear_skips() && !opt_.selection_file.empty()) announce_selection();
             log_msg("skips cleared");
             break;
     }

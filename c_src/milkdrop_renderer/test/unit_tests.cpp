@@ -2111,12 +2111,12 @@ static void test_play_skipped_and_clear() {
     // dealt afresh with it.
     pm.rotate();
     CHECK(pm.bag_size() > 0);
-    pm.unskip("p3.milk");
+    CHECK(pm.unskip("p3.milk"));
     CHECK(pm.find_playable("p3.milk", why) != nullptr);
     CHECK(pm.bag_size() == 0);
     pm.rotate();
     const size_t dealt = pm.bag_size();
-    pm.unskip("p3.milk");  // not skipped: nothing
+    CHECK(!pm.unskip("p3.milk"));  // not skipped: nothing
     CHECK(pm.bag_size() == dealt);
     // A failed load skips it again.
     CHECK(select_preset(pm, pm.find_playable("p3.milk", why, true), 1,
@@ -2129,14 +2129,14 @@ static void test_play_skipped_and_clear() {
     cl.rotate();
     cl.skip("p3.milk");
     CHECK(cl.eligible_count() == 0);
-    cl.clear_skips();
+    CHECK(cl.clear_skips());
     CHECK(cl.eligible_count() == 4);
     CHECK(cl.bag_size() == 0);
     for (int i = 0; i < 4; i++) CHECK(cl.find_playable("p" + std::to_string(i) + ".milk", why) != nullptr);
     std::set<std::string> seen;
     for (int i = 0; i < 4; i++) seen.insert(cl.rotate()->file);
     CHECK(seen.size() == 4);
-    cl.clear_skips();  // nothing to clear
+    CHECK(!cl.clear_skips());  // nothing to clear
     CHECK(cl.eligible_count() == 4);
 }
 

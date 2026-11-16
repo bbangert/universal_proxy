@@ -119,10 +119,11 @@ public:
     // (the caller switches away).
     bool skip(const std::string& file);
     // `file` may play again (an explicit play of a skipped preset). A failed
-    // load skip()s it anew. The bag is re-dealt if it was skipped.
-    void unskip(const std::string& file);
+    // load skip()s it anew. True (and the bag re-dealt) if it was skipped.
+    bool unskip(const std::string& file);
     // Forget every skip, the --skip-file's included, and re-deal the bag.
-    void clear_skips();
+    // True if there were any.
+    bool clear_skips();
 
     // True if a high_frequency preset is now on screen while excluded:
     // the caller must cut away (high_frequency_on_screen()).
