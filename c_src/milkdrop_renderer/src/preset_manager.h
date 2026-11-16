@@ -103,8 +103,10 @@ public:
 
     // An explicit pick by id: any eligible preset, hidden or off the
     // playlist included. Null with `reason` ("unknown", "skipped",
-    // "high_frequency", "rpi3_skip") when it can't play.
-    const PresetEntry* find_playable(std::string_view id, std::string& reason) const;
+    // "high_frequency", "rpi3_skip") when it can't play. With
+    // `allow_skipped` a session-skipped one is playable (unskip() it as it
+    // loads).
+    const PresetEntry* find_playable(std::string_view id, std::string& reason, bool allow_skipped = false) const;
     // `entry` (find_playable's) loaded: it becomes the current preset, in
     // history as a rotate pick would be, locked or not.
     void played(const PresetEntry& entry, bool lock);
@@ -116,6 +118,12 @@ public:
     // Never play `file` again this session. True if it is the current one
     // (the caller switches away).
     bool skip(const std::string& file);
+    // `file` may play again (an explicit play of a skipped preset). A failed
+    // load skip()s it anew. True (and the bag re-dealt) if it was skipped.
+    bool unskip(const std::string& file);
+    // Forget every skip, the --skip-file's included, and re-deal the bag.
+    // True if there were any.
+    bool clear_skips();
 
     // True if a high_frequency preset is now on screen while excluded:
     // the caller must cut away (high_frequency_on_screen()).
@@ -175,7 +183,7 @@ private:
     bool in_pool(size_t index, Pool pool) const;
     bool in_history_walk(size_t index) const;
     // Why entry `index` isn't eligible ("" if it is).
-    const char* refusal(size_t index) const;
+    const char* refusal(size_t index, bool allow_skipped = false) const;
     size_t index_of(const PresetEntry& entry) const;
 
     size_t draw();

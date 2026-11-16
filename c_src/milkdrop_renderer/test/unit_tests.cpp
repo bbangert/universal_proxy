@@ -255,6 +255,7 @@ static void test_protocol() {
     CHECK(parse_command(R"({"cmd":"prev"})", err)->type == Command::Type::Prev);
     CHECK(parse_command(R"({"cmd":"lock"})", err)->type == Command::Type::Lock);
     CHECK(parse_command(R"({"cmd":"unlock"})", err)->type == Command::Type::Unlock);
+    CHECK(parse_command(R"({"cmd":"clear_skips"})", err)->type == Command::Type::ClearSkips);
     c = parse_command(R"({"value":45,"cmd":"set_rotate"})", err);
     CHECK(c && c->type == Command::Type::SetRotate && c->int_value == 45);
     CHECK(!parse_command(R"({"cmd":"set_rotate","value":2.5})", err));
@@ -2088,6 +2089,57 @@ static void test_play() {
     CHECK(pm.current()->file == first);  // the playing preset stays current
 }
 
+// An explicit play may take a skipped preset (the other refusals stand);
+// clear_skips forgets every skip, the start-up list's included.
+static void test_play_skipped_and_clear() {
+    PresetManager::Config cfg;
+    cfg.seed = 5;
+    cfg.gles2 = true;
+    auto es = entries(5);
+    es[1].high_frequency = true;
+    es[2].rpi3_skip = true;
+    PresetManager pm(es, {"p1.milk", "p2.milk", "p3.milk"}, cfg);
+    std::string why;
+    CHECK(pm.find_playable("p3.milk", why) == nullptr && why == "skipped");
+    const PresetEntry* p3 = pm.find_playable("p3.milk", why, true);
+    CHECK(p3 != nullptr && why.empty());
+    // Skipped is not the only refusal: these hold even when asked for.
+    CHECK(pm.find_playable("p1.milk", why, true) == nullptr && why == "high_frequency");
+    CHECK(pm.find_playable("p2.milk", why, true) == nullptr && why == "rpi3_skip");
+    CHECK(pm.find_playable("nope.milk", why, true) == nullptr && why == "unknown");
+    // Playing it un-skips it, so rotation may pick it again: the bag is
+    // dealt afresh with it.
+    pm.rotate();
+    CHECK(pm.bag_size() > 0);
+    CHECK(pm.unskip("p3.milk"));
+    CHECK(pm.find_playable("p3.milk", why) != nullptr);
+    CHECK(pm.bag_size() == 0);
+    pm.rotate();
+    const size_t dealt = pm.bag_size();
+    CHECK(!pm.unskip("p3.milk"));  // not skipped: nothing
+    CHECK(pm.bag_size() == dealt);
+    // A failed load skips it again.
+    CHECK(select_preset(pm, pm.find_playable("p3.milk", why, true), 1,
+                        [](const PresetEntry&) { return Attempt::Failed; }) == Selection::Deferred);
+    CHECK(pm.find_playable("p3.milk", why) == nullptr && why == "skipped");
+
+    // clear_skips: every skip goes, and the bag is dealt afresh with them.
+    PresetManager cl(entries(4), {"p0.milk", "p1.milk", "p2.milk"}, cfg);
+    CHECK(cl.eligible_count() == 1);
+    cl.rotate();
+    cl.skip("p3.milk");
+    CHECK(cl.eligible_count() == 0);
+    CHECK(cl.clear_skips());
+    CHECK(cl.eligible_count() == 4);
+    CHECK(cl.bag_size() == 0);
+    for (int i = 0; i < 4; i++) CHECK(cl.find_playable("p" + std::to_string(i) + ".milk", why) != nullptr);
+    std::set<std::string> seen;
+    for (int i = 0; i < 4; i++) seen.insert(cl.rotate()->file);
+    CHECK(seen.size() == 4);
+    CHECK(!cl.clear_skips());  // nothing to clear
+    CHECK(cl.eligible_count() == 4);
+}
+
 static void test_switch_play() {
     SwitchState sw;
     // A play replaces a plain request, and a later one replaces it.
@@ -2460,6 +2512,7 @@ int main() {
     test_favourites();
     test_user_reload();
     test_play();
+    test_play_skipped_and_clear();
     test_switch_play();
     test_play_before_take();
     test_favourites_tiny_pools();

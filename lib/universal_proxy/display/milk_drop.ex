@@ -145,10 +145,13 @@ defmodule UniversalProxy.Display.MilkDrop do
       uploads join the rotation, deleted ones leave it (one showing keeps
       showing until the next change);
     * `{"cmd":"reload_selection"}` — re-read `--selection-file`;
+    * `{"cmd":"clear_skips"}` — forget every skip (the skip file's and
+      the session's), see `clear_skips/1`;
     * `{"cmd":"play","preset":ID,"lock":B}` — show `ID` now (warm-up then
       a cut), then rotate on or, with `lock`, hold it; also while
-      prepared or released. A hidden or off-playlist preset can be
-      played.
+      prepared or released. A hidden, off-playlist or skipped preset can
+      be played (a skipped one is skipped again if it fails; once it
+      shows, its Store skip is dropped).
 
   Events (stdout), forwarded with atom keys and an atom `:event`:
 
@@ -176,8 +179,9 @@ defmodule UniversalProxy.Display.MilkDrop do
     * `{"event":"user_reloaded","presets":N,"added":A,"removed":R,"rejected":X}`
       — the answer to `reload_user`;
     * `{"event":"selection","gen":N,"eligible":E,"playlist_fallback":B,"hidden_fallback":B}`
-      — the selection in effect (answering `reload_selection`, and after
-      `prepared` when `--selection-file` is given): `E` presets can
+      — the selection in effect (answering `reload_selection`, and, when
+      `--selection-file` is given, after `prepared` and after a
+      `clear_skips` or `play` that unskipped a preset): `E` presets can
       rotate; a fallback flag means that list left none eligible and is
       ignored;
     * `{"event":"play_refused","preset":ID,"reason":R}` — `play` refused:
@@ -392,6 +396,16 @@ defmodule UniversalProxy.Display.MilkDrop do
   def set_min_fps(server, fps) when is_integer(fps) and fps > 0,
     do: command(server, %{cmd: "set_min_fps", value: fps})
 
+  @doc """
+  Forget every skip, now: the renderer drops its skip set, this process
+  drops the skips it had not yet persisted (they would put cleared presets
+  back in the Store) and the skip file is emptied. Pair it with
+  `Store.clear_skipped/1`. A skip the renderer reported before it handled
+  this (a preset that really failed) still lands.
+  """
+  @spec clear_skips(GenServer.server()) :: :ok
+  def clear_skips(server), do: GenServer.cast(server, :clear_skips)
+
   @doc "Re-read the upload library's manifest."
   @spec reload_user(GenServer.server()) :: :ok
   def reload_user(server), do: command(server, %{cmd: "reload_user"})
@@ -537,6 +551,7 @@ defmodule UniversalProxy.Display.MilkDrop do
          lock_session: System.unique_integer([:monotonic]),
          discarding: false,
          pending_skips: %{},
+         pending_unskips: MapSet.new(),
          skip_retry_ms: Keyword.get(opts, :skip_retry_ms, @skip_retry_ms),
          skip_timer: nil,
          record_timer: nil,
@@ -573,6 +588,23 @@ defmodule UniversalProxy.Display.MilkDrop do
   end
 
   def handle_cast({:command, _cmd}, state), do: {:noreply, state}
+
+  def handle_cast(:clear_skips, state) do
+    state = %{state | pending_skips: %{}, pending_unskips: MapSet.new()}
+
+    case write_skip_file(state.skip_file, %{}) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("MilkDrop: could not empty the skip file: #{inspect(reason)}")
+    end
+
+    case handle_cast({:command, %{cmd: "clear_skips"}}, state) do
+      {:noreply, state} -> {:noreply, sync_record(state)}
+      stop -> stop
+    end
+  end
 
   def handle_cast({:reload_selection, selection}, state) do
     case write_selection_file(state.selection_file, selection) do
@@ -701,7 +733,7 @@ defmodule UniversalProxy.Display.MilkDrop do
   defp persist(%{event: :preset, file: file, locked: locked?} = event, state)
        when is_binary(file) and is_boolean(locked?) do
     locked = if locked?, do: file, else: nil
-    state = flush_skips(state)
+    state = state |> unskip_played(event) |> flush_skips()
 
     with true <- locked != state.locked,
          {:ok, _settings} <-
@@ -720,6 +752,19 @@ defmodule UniversalProxy.Display.MilkDrop do
   defp persist(%{event: :loading} = event, state), do: {event, flush_skips(state)}
 
   defp persist(event, state), do: {event, state}
+
+  # A preset shown on request is no longer skipped, whatever skipped it:
+  # its unpersisted skip is dropped and the Store's is removed by the
+  # next flush (retried like a skip until the Store takes it).
+  defp unskip_played(state, %{cause: "play", file: file}) do
+    %{
+      state
+      | pending_skips: Map.delete(state.pending_skips, file),
+        pending_unskips: MapSet.put(state.pending_unskips, file)
+    }
+  end
+
+  defp unskip_played(state, _event), do: state
 
   # The upload content a `loading` is about to load. It is the showing
   # content only once its `preset` event says so: a failed load of a
@@ -762,7 +807,8 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   defp add_skip(state, preset, reason, fps \\ nil) do
     pending = Map.put(state.pending_skips, preset, {reason, fps, sha_for(state, preset)})
-    flush_skips(%{state | pending_skips: pending})
+    unskips = MapSet.delete(state.pending_unskips, preset)
+    flush_skips(%{state | pending_skips: pending, pending_unskips: unskips})
   end
 
   # The unanswered `loading`, for the watchdog and the crash check. The
@@ -955,30 +1001,55 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   defp schedule_record_retry(state), do: state
 
-  # Skips the Store refused (it is down) stay pending and are retried on
-  # the next skip/preset event or `:retry_skips` timer; the first refusal
-  # ends the pass, since the rest would be refused too.
-  defp flush_skips(%{pending_skips: pending} = state) when map_size(pending) == 0, do: state
-
+  # Skips and unskips the Store refused (it is down) stay pending and are
+  # retried on the next skip/preset event or `:retry_skips` timer; the
+  # first refusal ends the pass, since the rest would be refused too. A
+  # preset is never pending both ways: the later of the two replaces the
+  # other.
   defp flush_skips(state) do
-    pending =
-      Enum.reduce_while(state.pending_skips, state.pending_skips, fn {preset, skip}, acc ->
-        {reason, fps, sha} = skip
+    if skips_pending?(state),
+      do: state |> flush_unskips() |> flush_pending_skips() |> schedule_skip_retry(),
+      else: state
+  end
 
-        case Store.skip(state.store, state.version, preset, reason, fps: fps, sha256: sha) do
-          :ok -> {:cont, Map.delete(acc, preset)}
+  defp flush_unskips(state) do
+    unskips =
+      Enum.reduce_while(state.pending_unskips, state.pending_unskips, fn preset, acc ->
+        case Store.unskip(state.store, state.version, preset) do
+          :ok -> {:cont, MapSet.delete(acc, preset)}
           {:error, _} -> {:halt, acc}
         end
       end)
 
-    schedule_skip_retry(%{state | pending_skips: pending})
+    %{state | pending_unskips: unskips}
   end
 
-  defp schedule_skip_retry(%{pending_skips: pending} = state) when map_size(pending) == 0,
-    do: state
+  defp flush_pending_skips(state) do
+    if MapSet.size(state.pending_unskips) > 0 do
+      state
+    else
+      pending =
+        Enum.reduce_while(state.pending_skips, state.pending_skips, fn {preset, skip}, acc ->
+          {reason, fps, sha} = skip
 
-  defp schedule_skip_retry(%{skip_timer: nil} = state),
-    do: %{state | skip_timer: Process.send_after(self(), :retry_skips, state.skip_retry_ms)}
+          case Store.skip(state.store, state.version, preset, reason, fps: fps, sha256: sha) do
+            :ok -> {:cont, Map.delete(acc, preset)}
+            {:error, _} -> {:halt, acc}
+          end
+        end)
+
+      %{state | pending_skips: pending}
+    end
+  end
+
+  defp skips_pending?(state),
+    do: map_size(state.pending_skips) > 0 or MapSet.size(state.pending_unskips) > 0
+
+  defp schedule_skip_retry(%{skip_timer: nil} = state) do
+    if skips_pending?(state),
+      do: %{state | skip_timer: Process.send_after(self(), :retry_skips, state.skip_retry_ms)},
+      else: state
+  end
 
   defp schedule_skip_retry(state), do: state
 

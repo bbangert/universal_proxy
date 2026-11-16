@@ -477,6 +477,30 @@ defmodule UniversalProxy.Display.StateMilkDropTest do
     wait_until(fn -> Enum.count(cmd_names(ctx.skip_file), &(&1 == "reload_user")) == 3 end)
   end
 
+  test "cleared skips reach the presenting renderer as clear_skips", ctx do
+    ctx = start_ui(ctx)
+
+    # Before a session there is nothing to tell: the renderer reads the
+    # skip file at start.
+    Phoenix.PubSub.broadcast(
+      ctx.pubsub,
+      UniversalProxy.MilkDrop.settings_topic(),
+      :milkdrop_skips_cleared
+    )
+
+    _ = :sys.get_state(ctx.state)
+    ctx = presenting(ctx)
+    refute "clear_skips" in cmd_names(ctx.skip_file)
+
+    Phoenix.PubSub.broadcast(
+      ctx.pubsub,
+      UniversalProxy.MilkDrop.settings_topic(),
+      :milkdrop_skips_cleared
+    )
+
+    wait_until(fn -> "clear_skips" in cmd_names(ctx.skip_file) end)
+  end
+
   # ── Preset selection, play and now-playing ───────────────────────────
 
   defp selection_changed(ctx, changes) do

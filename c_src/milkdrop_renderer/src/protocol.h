@@ -28,6 +28,7 @@ struct Command {
         Play,              // string_value: preset id; bool_value: lock
         ReloadUser,
         ReloadSelection,
+        ClearSkips,
     };
     Type type = Type::Exit;
     int int_value = 0;
@@ -141,8 +142,8 @@ std::string event_loading(std::string_view file);
 std::string event_skip(std::string_view file, std::string_view reason, std::string_view message = {},
                        double fps = -1);
 std::string event_error(std::string_view reason, std::string_view message = {});
-// A `play` that can't happen: `reason` is "unknown", "skipped",
-// "high_frequency", "rpi3_skip" or "load_failed".
+// A `play` that can't happen: `reason` is "unknown", "high_frequency",
+// "rpi3_skip" or "load_failed" (a skipped preset may be played).
 std::string event_play_refused(std::string_view preset, std::string_view reason);
 // `reload_user` done: live user presets, ids added (new or back), ids
 // removed, manifest entries rejected.
