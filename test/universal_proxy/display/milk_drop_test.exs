@@ -691,6 +691,55 @@ defmodule UniversalProxy.Display.MilkDropTest do
 
       assert Store.skipped(@store_name, @version) == %{"a.milk" => "draw", "b.milk" => "budget"}
     end
+
+    test "clear_skips drops the skips not yet persisted, so they don't come back", ctx do
+      {pid, _} =
+        start_renderer(ctx,
+          store: @store_name,
+          settings: Store.defaults(),
+          skipped: %{},
+          skip_retry_ms: 600_000
+        )
+
+      emit(pid, ~s({"event":"skip","preset":"a.milk","reason":"draw"}))
+      assert_receive {:milkdrop, ^pid, %{event: :skip, persisted: false}}, @timeout
+
+      MilkDrop.clear_skips(pid)
+      wait_until(fn -> List.last(cmd_lines(ctx)) == %{"cmd" => "clear_skips"} end)
+
+      start_named_store(ctx)
+      emit(pid, ~s({"event":"skip","preset":"b.milk","reason":"budget"}))
+
+      assert_receive {:milkdrop, ^pid, %{event: :skip, preset: "b.milk", persisted: true}},
+                     @timeout
+
+      assert Store.skipped(@store_name, @version) == %{"b.milk" => "budget"}
+    end
+  end
+
+  test "clear_skips tells the renderer and empties the skip file", ctx do
+    :ok = Store.skip(ctx.store, @version, "a.milk", "draw")
+    {pid, prepared} = start_renderer(ctx)
+    assert prepared.skip == ["a.milk"]
+
+    MilkDrop.clear_skips(pid)
+
+    wait_until(fn -> cmd_lines(ctx) == [%{"cmd" => "clear_skips"}] end)
+    assert File.read!(ctx.skip_file) == ""
+  end
+
+  test "a preset shown on request is no longer skipped", ctx do
+    :ok = Store.skip(ctx.store, @version, "a.milk", "draw")
+    :ok = Store.skip(ctx.store, @version, "b.milk", "draw")
+    {pid, _} = start_renderer(ctx)
+
+    emit(pid, ~s({"event":"preset","file":"b.milk","locked":false,"cause":"rotate"}))
+    assert_receive {:milkdrop, ^pid, %{event: :preset, cause: "rotate"}}, @timeout
+    assert Store.skipped(ctx.store, @version) == %{"a.milk" => "draw", "b.milk" => "draw"}
+
+    emit(pid, ~s({"event":"preset","file":"a.milk","locked":false,"cause":"play"}))
+    assert_receive {:milkdrop, ^pid, %{event: :preset, file: "a.milk", cause: "play"}}, @timeout
+    assert Store.skipped(ctx.store, @version) == %{"b.milk" => "draw"}
   end
 
   test "persists a lock change from preset events", ctx do

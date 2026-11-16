@@ -441,7 +441,27 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
 
       assert :ok = Store.clear_skipped(server)
       assert_receive {:milkdrop_skipped, nil, %{}}
+      assert_receive :milkdrop_skips_cleared
       assert Store.skipped(server, "v1") == %{}
+    end
+
+    test "unskip/3 forgets one preset and broadcasts", %{path: path} do
+      server = start_store(path)
+      Phoenix.PubSub.subscribe(UniversalProxy.PubSub, MilkDrop.settings_topic())
+
+      :ok = Store.skip(server, "v1", "a.milk", "compile")
+      :ok = Store.skip(server, "v1", "b.milk", "budget", fps: 12.0)
+      assert_receive {:milkdrop_skipped, "v1", %{"b.milk" => "budget"}}
+
+      assert :ok = Store.unskip(server, "v1", "a.milk")
+      assert_receive {:milkdrop_skipped, "v1", %{"b.milk" => "budget"} = left}
+      assert map_size(left) == 1
+      assert Store.skipped(server, "v1") == %{"b.milk" => "budget"}
+
+      # Not skipped, or another pack version's: nothing to do.
+      assert :ok = Store.unskip(server, "v1", "a.milk")
+      assert :ok = Store.unskip(server, "v2", "b.milk")
+      assert Store.skipped(server, "v1") == %{"b.milk" => "budget"}
     end
   end
 
@@ -671,6 +691,13 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
       server = start_with_library(path, library(%{"user/a.milk" => "sha-a"}))
       :ok = Store.skip(server, "v1", "user/a.milk", "draw")
       :ok = Store.clear_skipped(server)
+      assert Store.skipped(server, "v1") == %{}
+    end
+
+    test "unskip/3 forgets an upload's skip whatever the version", %{path: path} do
+      server = start_with_library(path, library(%{"user/a.milk" => "sha-a"}))
+      :ok = Store.skip(server, "v1", "user/a.milk", "draw")
+      assert :ok = Store.unskip(server, "v9", "user/a.milk")
       assert Store.skipped(server, "v1") == %{}
     end
 

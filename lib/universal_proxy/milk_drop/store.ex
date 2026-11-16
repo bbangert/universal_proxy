@@ -346,10 +346,26 @@ defmodule UniversalProxy.MilkDrop.Store do
     :exit, _ -> %{}
   end
 
-  @doc "Forget every skipped preset, uploads included."
+  @doc """
+  Forget every skipped preset, uploads included. A running renderer is
+  told on the settings topic (`:milkdrop_skips_cleared`, after
+  the `{:milkdrop_skipped, nil, %{}}` broadcast) to drop its own skip set.
+  """
   @spec clear_skipped(GenServer.server()) :: :ok | {:error, term()}
   def clear_skipped(server \\ __MODULE__) do
     GenServer.call(server, :clear_skipped)
+  catch
+    :exit, _ -> {:error, :not_running}
+  end
+
+  @doc """
+  Forget one skipped preset (pack `version`'s, or an upload by its `user/`
+  id): the renderer showed it on request. `:ok` when it wasn't skipped.
+  """
+  @spec unskip(GenServer.server(), String.t(), String.t()) :: :ok | {:error, term()}
+  def unskip(server \\ __MODULE__, version, preset)
+      when is_binary(version) and is_binary(preset) do
+    GenServer.call(server, {:unskip, version, preset})
   catch
     :exit, _ -> {:error, :not_running}
   end
@@ -697,11 +713,16 @@ defmodule UniversalProxy.MilkDrop.Store do
     {:reply, all_skips(state, version), state}
   end
 
+  def handle_call({:unskip, version, preset}, _from, state) do
+    {:reply, remove_skip(state, version, preset), state}
+  end
+
   def handle_call(:clear_skipped, _from, state) do
     with :ok <- :dets.delete(state.table, :skipped),
          :ok <- :dets.delete(state.table, :user_skipped),
          :ok <- :dets.sync(state.table) do
       broadcast(state, {:milkdrop_skipped, nil, %{}})
+      broadcast(state, :milkdrop_skips_cleared)
       {:reply, :ok, state}
     else
       {:error, reason} = error ->
@@ -815,6 +836,32 @@ defmodule UniversalProxy.MilkDrop.Store do
 
       true ->
         store_skip(state, version, preset, reason)
+    end
+  end
+
+  defp remove_skip(state, _version, "user/" <> _ = id) do
+    entries = read_user_skipped(state.table)
+
+    if is_map_key(entries, id),
+      do: persist_user_skips(state, Map.delete(entries, id), [], "unskip"),
+      else: :ok
+  end
+
+  defp remove_skip(state, version, preset) do
+    case read_skipped(state.table) do
+      {^version, %{^preset => _} = entries} ->
+        case persist(state, {:skipped, {version, Map.delete(entries, preset)}}) do
+          :ok ->
+            broadcast_skipped(state, version)
+            :ok
+
+          {:error, reason} = error ->
+            Logger.error("MilkDrop store unskip failed: #{inspect(reason)}")
+            error
+        end
+
+      _ ->
+        :ok
     end
   end
 

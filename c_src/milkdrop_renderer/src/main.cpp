@@ -647,13 +647,16 @@ void App::apply_switch() {
 void App::apply_play() {
     const bool hf = presets_->high_frequency_on_screen();
     std::string reason;
-    const PresetEntry* target = presets_->find_playable(play_id_, reason);
+    const PresetEntry* target = presets_->find_playable(play_id_, reason, true);
     if (target == nullptr) {
         log_msg("play %s refused (%s)", play_id_.c_str(), reason.c_str());
         emit_line(event_play_refused(play_id_, reason));
         sw_.play_failed();
         return;
     }
+    // Asked for by name: a skipped one gets another try (a failure skips it
+    // again).
+    presets_->unskip(target->file);
     const bool lock = play_lock_;
     const Selection sel = switch_to(target, "play", sw_.smooth() && !hf, 1,
                                     [&](const PresetEntry& e) { presets_->played(e, lock); });
@@ -671,7 +674,7 @@ void App::apply_play() {
 
 void App::request_play(const Command& c) {
     std::string reason;
-    if (presets_->find_playable(c.string_value, reason) == nullptr) {
+    if (presets_->find_playable(c.string_value, reason, true) == nullptr) {
         log_msg("play %s refused (%s)", c.string_value.c_str(), reason.c_str());
         emit_line(event_play_refused(c.string_value, reason));
         return;
@@ -945,6 +948,10 @@ void App::handle_command(const Command& c) {
         case Command::Type::Play: request_play(c); break;
         case Command::Type::ReloadUser: reload_user(); break;
         case Command::Type::ReloadSelection: reload_selection(); break;
+        case Command::Type::ClearSkips:
+            presets_->clear_skips();
+            log_msg("skips cleared");
+            break;
     }
 }
 

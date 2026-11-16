@@ -92,8 +92,9 @@ defmodule UniversalProxy.Display.State do
   `reload_user`
   (a renderer started later reads the library's manifest at start). The
   skip list is not re-sent: the renderer adds its own skips as it goes,
-  and skips the Store dropped (a cleared list, a replaced upload) apply
-  from the next session, as with "Clear skipped presets". A preset
+  and skips the Store dropped by a replaced upload apply from the next
+  session. A cleared list (`:milkdrop_skips_cleared`) is sent at once as
+  `clear_skips`, which also drops the session's unpersisted skips. A preset
   selection on `UniversalProxy.MilkDrop.selection_topic/0` whose `gen`
   differs from the last one sent (or reported by the renderer's
   `selection` event) is written to the renderer's selection file and
@@ -532,6 +533,11 @@ defmodule UniversalProxy.Display.State do
   def handle_info({:milkdrop_settings, settings}, %{milkdrop?: true} = state)
       when is_map(settings),
       do: {:noreply, milkdrop_settings(state, settings)}
+
+  # Cleared skips apply to a running renderer at once, not only to the next
+  # session.
+  def handle_info(:milkdrop_skips_cleared, %{milkdrop?: true} = state),
+    do: {:noreply, milkdrop_clear_skips(state)}
 
   # A restarted library may have repaired the manifest the renderer read.
   def handle_info({event, _change}, %{milkdrop?: true} = state)
@@ -1250,6 +1256,14 @@ defmodule UniversalProxy.Display.State do
   end
 
   defp milkdrop_reload_user(state), do: state
+
+  defp milkdrop_clear_skips(%{md: %{phase: phase, pid: pid}} = state)
+       when phase in [:preparing, :taking, :presenting] and is_pid(pid) do
+    :ok = Display.MilkDrop.clear_skips(pid)
+    state
+  end
+
+  defp milkdrop_clear_skips(state), do: state
 
   # A new selection starts its retries afresh.
   defp milkdrop_selection(%{md: %{phase: phase, pid: pid} = md} = state, %{gen: gen} = selection)

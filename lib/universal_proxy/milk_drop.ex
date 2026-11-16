@@ -28,7 +28,9 @@ defmodule UniversalProxy.MilkDrop do
 
     * `settings_topic/0` (`"milkdrop:settings"`) —
       `{:milkdrop_settings, settings}`,
-      `{:milkdrop_skipped, version, %{preset => reason}}` and
+      `{:milkdrop_skipped, version, %{preset => reason}}`,
+      `:milkdrop_skips_cleared` (`Store.clear_skipped/1` ran: a running
+      renderer drops its skips too) and
       `{:milkdrop_store, :opened}` (the Store's table opened: re-read it);
     * `pack_topic/0` (`"milkdrop:pack"`) — `{:milkdrop_pack, status}` on
       every `UniversalProxy.MilkDrop.Pack` status change (including

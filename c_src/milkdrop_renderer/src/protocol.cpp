@@ -99,6 +99,8 @@ std::optional<Command> parse_command(std::string_view line, std::string& error) 
         c.type = Command::Type::ReloadUser;
     } else if (name == "reload_selection") {
         c.type = Command::Type::ReloadSelection;
+    } else if (name == "clear_skips") {
+        c.type = Command::Type::ClearSkips;
     } else {
         error = "unknown cmd";
         return std::nullopt;

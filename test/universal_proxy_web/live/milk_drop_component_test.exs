@@ -479,7 +479,7 @@ defmodule UniversalProxyWeb.MilkDropComponentTest do
       assert html =~ "Hung the GPU"
       assert html =~ "Froze the renderer"
       assert html =~ "Crashed the renderer"
-      assert html =~ "Cleared presets return from the next visualizer session."
+      assert html =~ "Clearing the list puts them back at once"
 
       assert view |> element("#milkdrop-browse-skipped") |> render() =~
                ~s(href="/audio/milkdrop?filter=skipped")

@@ -145,10 +145,13 @@ defmodule UniversalProxy.Display.MilkDrop do
       uploads join the rotation, deleted ones leave it (one showing keeps
       showing until the next change);
     * `{"cmd":"reload_selection"}` — re-read `--selection-file`;
+    * `{"cmd":"clear_skips"}` — forget every skip (the skip file's and
+      the session's), see `clear_skips/1`;
     * `{"cmd":"play","preset":ID,"lock":B}` — show `ID` now (warm-up then
       a cut), then rotate on or, with `lock`, hold it; also while
-      prepared or released. A hidden or off-playlist preset can be
-      played.
+      prepared or released. A hidden, off-playlist or skipped preset can
+      be played (a skipped one is skipped again if it fails; once it
+      shows, its Store skip is dropped).
 
   Events (stdout), forwarded with atom keys and an atom `:event`:
 
@@ -392,6 +395,16 @@ defmodule UniversalProxy.Display.MilkDrop do
   def set_min_fps(server, fps) when is_integer(fps) and fps > 0,
     do: command(server, %{cmd: "set_min_fps", value: fps})
 
+  @doc """
+  Forget every skip, now: the renderer drops its skip set, this process
+  drops the skips it had not yet persisted (they would put cleared presets
+  back in the Store) and the skip file is emptied. Pair it with
+  `Store.clear_skipped/1`. A skip the renderer reported before it handled
+  this (a preset that really failed) still lands.
+  """
+  @spec clear_skips(GenServer.server()) :: :ok
+  def clear_skips(server), do: GenServer.cast(server, :clear_skips)
+
   @doc "Re-read the upload library's manifest."
   @spec reload_user(GenServer.server()) :: :ok
   def reload_user(server), do: command(server, %{cmd: "reload_user"})
@@ -574,6 +587,23 @@ defmodule UniversalProxy.Display.MilkDrop do
 
   def handle_cast({:command, _cmd}, state), do: {:noreply, state}
 
+  def handle_cast(:clear_skips, state) do
+    state = %{state | pending_skips: %{}}
+
+    case write_skip_file(state.skip_file, %{}) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("MilkDrop: could not empty the skip file: #{inspect(reason)}")
+    end
+
+    case handle_cast({:command, %{cmd: "clear_skips"}}, state) do
+      {:noreply, state} -> {:noreply, sync_record(state)}
+      stop -> stop
+    end
+  end
+
   def handle_cast({:reload_selection, selection}, state) do
     case write_selection_file(state.selection_file, selection) do
       :ok ->
@@ -701,7 +731,7 @@ defmodule UniversalProxy.Display.MilkDrop do
   defp persist(%{event: :preset, file: file, locked: locked?} = event, state)
        when is_binary(file) and is_boolean(locked?) do
     locked = if locked?, do: file, else: nil
-    state = flush_skips(state)
+    state = state |> flush_skips() |> unskip_played(event)
 
     with true <- locked != state.locked,
          {:ok, _settings} <-
@@ -720,6 +750,21 @@ defmodule UniversalProxy.Display.MilkDrop do
   defp persist(%{event: :loading} = event, state), do: {event, flush_skips(state)}
 
   defp persist(event, state), do: {event, state}
+
+  # A preset shown on request is no longer skipped, whatever skipped it.
+  defp unskip_played(state, %{cause: "play", file: file}) do
+    case Store.unskip(state.store, state.version, file) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("MilkDrop: could not unskip #{inspect(file)}: #{inspect(reason)}")
+    end
+
+    state
+  end
+
+  defp unskip_played(state, _event), do: state
 
   # The upload content a `loading` is about to load. It is the showing
   # content only once its `preset` event says so: a failed load of a

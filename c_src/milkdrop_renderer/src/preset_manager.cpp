@@ -26,9 +26,9 @@ bool PresetManager::eligible(size_t index) const {
     return true;
 }
 
-const char* PresetManager::refusal(size_t index) const {
+const char* PresetManager::refusal(size_t index, bool allow_skipped) const {
     if (index >= entries_.size() || gone_[index] != 0) return "unknown";
-    if (skipped_.count(entries_[index].file) != 0) return "skipped";
+    if (!allow_skipped && skipped_.count(entries_[index].file) != 0) return "skipped";
     if (excluded_high_frequency(index)) return "high_frequency";
     if (config_.gles2 && entries_[index].rpi3_skip) return "rpi3_skip";
     return "";
@@ -267,9 +267,10 @@ const PresetEntry* PresetManager::prev() {
     return nullptr;
 }
 
-const PresetEntry* PresetManager::find_playable(std::string_view id, std::string& reason) const {
+const PresetEntry* PresetManager::find_playable(std::string_view id, std::string& reason,
+                                                bool allow_skipped) const {
     auto it = by_id_.find(id);
-    reason = it == by_id_.end() ? "unknown" : refusal(it->second);
+    reason = it == by_id_.end() ? "unknown" : refusal(it->second, allow_skipped);
     return reason.empty() ? &entries_[it->second] : nullptr;
 }
 
@@ -284,6 +285,17 @@ bool PresetManager::skip(const std::string& file) {
     skipped_.insert(file);
     const PresetEntry* cur = current();
     return cur != nullptr && cur->file == file;
+}
+
+void PresetManager::unskip(const std::string& file) {
+    auto it = skipped_.find(file);
+    if (it != skipped_.end()) skipped_.erase(it);
+}
+
+void PresetManager::clear_skips() {
+    if (skipped_.empty()) return;
+    skipped_.clear();
+    bag_.clear();  // re-deal with the cleared presets back in
 }
 
 bool PresetManager::set_high_frequency(bool include) {

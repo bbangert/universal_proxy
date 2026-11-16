@@ -32,8 +32,8 @@ defmodule UniversalProxyWeb.MilkDropComponent do
     * **Skipped presets** — the presets the renderer could not draw with
       the ready pack's version, and the uploads it could not draw as they
       are now, with their reasons, in a disclosure; "Clear" calls
-      `Store.clear_skipped/0` (both lists); a running renderer keeps its
-      own skip set, so cleared presets return from the next session;
+      `Store.clear_skipped/0` (both lists), which also makes a running
+      renderer forget its skips, so cleared presets can play at once;
       "Browse" opens the browser's skipped filter. A
       preset that was showing when the device went down (`device_reset`,
       possibly a power cut rather than a GPU hang) comes back the same way.
@@ -471,7 +471,7 @@ defmodule UniversalProxyWeb.MilkDropComponent do
               <span class="text-fg-3" title={reason}>{reason_label(reason)}</span>
             <% end %>
             <span class="col-span-2 text-fg-4 mt-1">
-              Skipped presets are left out of the rotation. Cleared presets return from the next visualizer session. A new pack version clears the list.
+              Skipped presets are left out of the rotation. Clearing the list puts them back at once, and a preset you play by name gets another try. A new pack version clears the list.
             </span>
           </div>
         </div>
