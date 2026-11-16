@@ -1280,6 +1280,24 @@ defmodule UniversalProxy.MilkDrop.StoreTest do
       assert :sys.get_state(server).table != nil
     end
 
+    @tag capture_log: true
+    test "unskip on a closed table reports the open error, then reopens", %{tmp_dir: tmp_dir} do
+      blocker = Path.join(tmp_dir, "blocker")
+      File.write!(blocker, "not a directory")
+      path = Path.join(blocker, "settings.dets")
+
+      server =
+        start_supervised!({Store, name: nil, table: @table, dets_path: path, retry_ms: 0})
+
+      assert :sys.get_state(server).table == nil
+      assert {:error, reason} = Store.unskip(server, "v1", "a.milk")
+      assert reason != :not_running
+
+      File.rm!(blocker)
+      assert :ok = Store.unskip(server, "v1", "a.milk")
+      assert :sys.get_state(server).table != nil
+    end
+
     test "malformed records read as defaults", %{path: path} do
       {:ok, table} = :dets.open_file(@table, file: to_charlist(path), type: :set)
       :ok = :dets.insert(table, {:settings, %{rotate_s: :fast, include_high_frequency: 1}})

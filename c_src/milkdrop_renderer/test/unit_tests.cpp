@@ -2107,10 +2107,17 @@ static void test_play_skipped_and_clear() {
     CHECK(pm.find_playable("p1.milk", why, true) == nullptr && why == "high_frequency");
     CHECK(pm.find_playable("p2.milk", why, true) == nullptr && why == "rpi3_skip");
     CHECK(pm.find_playable("nope.milk", why, true) == nullptr && why == "unknown");
-    // Playing it un-skips it, so rotation may pick it again.
+    // Playing it un-skips it, so rotation may pick it again: the bag is
+    // dealt afresh with it.
+    pm.rotate();
+    CHECK(pm.bag_size() > 0);
     pm.unskip("p3.milk");
     CHECK(pm.find_playable("p3.milk", why) != nullptr);
+    CHECK(pm.bag_size() == 0);
+    pm.rotate();
+    const size_t dealt = pm.bag_size();
     pm.unskip("p3.milk");  // not skipped: nothing
+    CHECK(pm.bag_size() == dealt);
     // A failed load skips it again.
     CHECK(select_preset(pm, pm.find_playable("p3.milk", why, true), 1,
                         [](const PresetEntry&) { return Attempt::Failed; }) == Selection::Deferred);

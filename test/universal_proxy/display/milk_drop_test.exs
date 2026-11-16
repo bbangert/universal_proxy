@@ -715,6 +715,76 @@ defmodule UniversalProxy.Display.MilkDropTest do
 
       assert Store.skipped(@store_name, @version) == %{"b.milk" => "budget"}
     end
+
+    test "an unskip the Store refused is retried when it is back", ctx do
+      start_named_store(ctx)
+      :ok = Store.skip(@store_name, @version, "a.milk", "draw")
+      stop_supervised!(Store)
+
+      {pid, _} =
+        start_renderer(ctx,
+          store: @store_name,
+          settings: Store.defaults(),
+          skipped: %{},
+          skip_retry_ms: 50
+        )
+
+      emit(pid, ~s({"event":"preset","file":"a.milk","locked":false,"cause":"play"}))
+      assert_receive {:milkdrop, ^pid, %{event: :preset, file: "a.milk"}}, @timeout
+
+      start_named_store(ctx)
+      wait_until(fn -> Store.skipped(@store_name, @version) == %{} end)
+    end
+
+    test "a preset shown on request drops its unpersisted skip", ctx do
+      {pid, _} =
+        start_renderer(ctx,
+          store: @store_name,
+          settings: Store.defaults(),
+          skipped: %{},
+          skip_retry_ms: 600_000
+        )
+
+      emit(pid, ~s({"event":"skip","preset":"a.milk","reason":"draw"}))
+      assert_receive {:milkdrop, ^pid, %{event: :skip, persisted: false}}, @timeout
+      emit(pid, ~s({"event":"preset","file":"a.milk","locked":false,"cause":"play"}))
+      assert_receive {:milkdrop, ^pid, %{event: :preset, file: "a.milk"}}, @timeout
+
+      start_named_store(ctx)
+      emit(pid, ~s({"event":"skip","preset":"b.milk","reason":"budget"}))
+
+      assert_receive {:milkdrop, ^pid, %{event: :skip, preset: "b.milk", persisted: true}},
+                     @timeout
+
+      assert Store.skipped(@store_name, @version) == %{"b.milk" => "budget"}
+    end
+
+    test "a skip after a refused unskip replaces it", ctx do
+      start_named_store(ctx)
+      :ok = Store.skip(@store_name, @version, "a.milk", "draw")
+      stop_supervised!(Store)
+
+      {pid, _} =
+        start_renderer(ctx,
+          store: @store_name,
+          settings: Store.defaults(),
+          skipped: %{},
+          skip_retry_ms: 600_000
+        )
+
+      emit(pid, ~s({"event":"preset","file":"a.milk","locked":false,"cause":"play"}))
+      assert_receive {:milkdrop, ^pid, %{event: :preset, file: "a.milk"}}, @timeout
+      emit(pid, ~s({"event":"skip","preset":"a.milk","reason":"budget"}))
+      assert_receive {:milkdrop, ^pid, %{event: :skip, persisted: false}}, @timeout
+
+      start_named_store(ctx)
+      emit(pid, ~s({"event":"skip","preset":"b.milk","reason":"draw"}))
+
+      assert_receive {:milkdrop, ^pid, %{event: :skip, preset: "b.milk", persisted: true}},
+                     @timeout
+
+      assert Store.skipped(@store_name, @version) == %{"a.milk" => "budget", "b.milk" => "draw"}
+    end
   end
 
   test "clear_skips tells the renderer and empties the skip file", ctx do

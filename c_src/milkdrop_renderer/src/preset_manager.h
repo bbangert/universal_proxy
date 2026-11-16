@@ -119,7 +119,7 @@ public:
     // (the caller switches away).
     bool skip(const std::string& file);
     // `file` may play again (an explicit play of a skipped preset). A failed
-    // load skip()s it anew.
+    // load skip()s it anew. The bag is re-dealt if it was skipped.
     void unskip(const std::string& file);
     // Forget every skip, the --skip-file's included, and re-deal the bag.
     void clear_skips();

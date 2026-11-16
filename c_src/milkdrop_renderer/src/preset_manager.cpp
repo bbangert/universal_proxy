@@ -288,8 +288,7 @@ bool PresetManager::skip(const std::string& file) {
 }
 
 void PresetManager::unskip(const std::string& file) {
-    auto it = skipped_.find(file);
-    if (it != skipped_.end()) skipped_.erase(it);
+    if (skipped_.erase(file) != 0) bag_.clear();  // re-deal: it may change the pool
 }
 
 void PresetManager::clear_skips() {

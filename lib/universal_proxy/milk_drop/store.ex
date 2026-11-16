@@ -624,6 +624,7 @@ defmodule UniversalProxy.MilkDrop.Store do
                 elem(request, 0) in [
                   :update,
                   :skip,
+                  :unskip,
                   :selection,
                   :forget_user,
                   :mark_in_flight,
