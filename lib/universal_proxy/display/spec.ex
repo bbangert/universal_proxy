@@ -23,7 +23,11 @@ defmodule UniversalProxy.Display.Spec do
       (default) sizes each bar; `bar_mode: :offset` keeps every bar full
       height and slides it down inside the clipping row by a paint-only
       offset, so height changes need no relayout.
-    * `:none` — renders nothing.
+    * `:none` — renders nothing: a renderer leaves it out of its parent
+      (`present/1`).
+
+  Give the children of one parent all a `:key` or none: renderers that
+  match elements by key (Emerge) refuse a mix.
 
   `:padding` is one number for every side or `{top, right, bottom, left}`.
   `:border` is `{width, color}`; its width counts towards the element's
@@ -205,9 +209,16 @@ defmodule UniversalProxy.Display.Spec do
   def element_count({:bars, _attrs, heights}), do: 1 + length(heights)
 
   def element_count({tag, _attrs, children}) when tag in [:column, :row, :stack],
-    do: Enum.reduce(children, 1, &(element_count(&1) + &2))
+    do: children |> present() |> Enum.reduce(1, &(element_count(&1) + &2))
 
   def element_count(_leaf), do: 1
+
+  @doc """
+  `children` without the `:none` ones: the children a renderer draws. A
+  `:none` left in would count as an unkeyed sibling of keyed ones.
+  """
+  @spec present([t()]) :: [t()]
+  def present(children) when is_list(children), do: Enum.reject(children, &(&1 == :none))
 
   @doc "An all-black screen, drawn while the display is blanked."
   @spec blank() :: t()

@@ -58,6 +58,17 @@ defmodule UniversalProxy.Display.SpecTest do
     end
   end
 
+  test "present/1 drops :none children, which element_count/1 doesn't count" do
+    a = {:text, [key: "a"], "a"}
+    b = {:column, [key: "b"], []}
+
+    assert Spec.present([a, :none, b, :none]) == [a, b]
+    assert Spec.present([]) == []
+
+    assert Spec.element_count({:column, [], [a, :none, b]}) ==
+             Spec.element_count({:column, [], [a, b]})
+  end
+
   test "clamp_unit/1 always returns a float" do
     assert Spec.clamp_unit(0) === 0.0
     assert Spec.clamp_unit(1) === 1.0
