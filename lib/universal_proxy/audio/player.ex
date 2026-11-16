@@ -148,6 +148,18 @@ defmodule UniversalProxy.Audio.Player do
   copy running. One lease at a time: an enable from another owner moves
   the lease to it, and a disable from anyone but the holder is ignored.
 
+  ## Stderr logs
+
+  The port is opened with `:stderr_to_stdout`, so the binary's stderr
+  shares the stdout pipe. Without that it went to the BEAM's console and
+  never reached Logger: ALSA underruns (`AlsaPipeSink: underrun,
+  recovering`) and the library's `W SyncTask: Lost sync` were invisible
+  in the logs. Every stdout line is a JSON object, so a line not starting
+  with `{` is a stderr line: it is logged (level from the library's
+  `E`/`W`/`I`/`D`/`V` prefix, else `:warning` when it reads like a
+  problem, else `:info`) and never parsed or broadcast. Both streams
+  write whole lines under `PIPE_BUF`, so they don't interleave mid-line.
+
   The binary also writes its Sendspin pairing token to `pairing_token`
   in the state dir (see `state_dir/1`); that secret never appears on
   stdout, so it never reaches PubSub or the logs.
@@ -174,6 +186,9 @@ defmodule UniversalProxy.Audio.Player do
 
   @pubsub UniversalProxy.PubSub
   @topic_state "sendspin:state"
+
+  # Unprefixed stderr lines worth a `:warning` (see `log_stderr_line/2`).
+  @stderr_problem ~r/error|underrun|cannot|fail|invalid|dropped|unsupported/i
   @topic_display "sendspin:display"
   @shutdown_grace_ms 500
 
@@ -615,6 +630,14 @@ defmodule UniversalProxy.Audio.Player do
     {:noreply, %{state | discarding: false}}
   end
 
+  # Anything that isn't a JSON object is one of the binary's stderr
+  # lines (stderr shares the pipe, see `open_port/1`).
+  def handle_info({port, {:data, {:eol, line}}}, %{port: port} = state)
+      when binary_part(line, 0, min(byte_size(line), 1)) != "{" do
+    if String.trim(line) != "", do: log_stderr_line(state, line)
+    {:noreply, state}
+  end
+
   def handle_info({port, {:data, {:eol, line}}}, %{port: port} = state) do
     # `keys: :atoms` (NOT `:atoms!`) — interns unknown keys. The C++
     # binary's `emit_json` call sites are the only producers and their
@@ -910,8 +933,29 @@ defmodule UniversalProxy.Audio.Player do
 
     Port.open(
       {:spawn_executable, String.to_charlist(state.binary_path)},
-      [:binary, :exit_status, {:line, 4096}, {:args, args}]
+      [:binary, :exit_status, :stderr_to_stdout, {:line, 4096}, {:args, args}]
     )
+  end
+
+  # A stderr line from the binary (see "Stderr logs" in the moduledoc).
+  # The library's lines carry their level as a one-letter prefix
+  # (`W SyncTask: Lost sync ...`); everything else — our own sink, the
+  # CLI errors, alsa-lib — is free-form, so it is logged at `:info`
+  # unless it reads like a problem.
+  defp log_stderr_line(state, line) do
+    level =
+      case line do
+        <<"E ", _::binary>> -> :error
+        <<"W ", _::binary>> -> :warning
+        <<"I ", _::binary>> -> :info
+        <<"D ", _::binary>> -> :debug
+        <<"V ", _::binary>> -> :debug
+        _ -> if line =~ @stderr_problem, do: :warning, else: :info
+      end
+
+    Logger.log(level, fn ->
+      "Audio.Player #{inspect(state.key)} sendspin_player: #{String.replace_invalid(line)}"
+    end)
   end
 
   defp build_cli_args(%__MODULE__{config: cfg} = state) do

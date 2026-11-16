@@ -70,6 +70,12 @@ Differences:
 
 - CLI args (`getopt_long`) replace the INI config file
 - JSON status events on **stdout** replace upstream's stderr free-form logs
+  for anything the BEAM acts on. What is still written to **stderr** (the
+  library's `E`/`W`/`I` lines such as `W SyncTask: Lost sync`, the sink's
+  `AlsaPipeSink: underrun, recovering`, alsa-lib) is diagnostics only:
+  `Audio.Player` merges it into the same pipe and logs every line that does
+  not start with `{`. So a stdout line must always be a JSON object, and a
+  stderr line must be written whole, in one call
 - JSON command lines on **stdin** for runtime volume / mute / shutdown
 - Sets `SendspinClientConfig::server_port` from `--mdns-port` so multiple
   binary instances can bind distinct ports (first-class upstream since

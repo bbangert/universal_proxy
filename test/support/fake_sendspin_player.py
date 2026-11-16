@@ -34,6 +34,7 @@ Player tests need to drive.
 
   test-only, any mode:
     {"cmd":"emit_event","event":{...}} → that event, verbatim
+    {"cmd":"emit_stderr","line":"..."} → that line on stderr
 
 Unknown commands are silently dropped, matching the real binary's
 parse_command behaviour.
@@ -238,6 +239,9 @@ def main():
             return 7
         elif kind == "emit_event" and isinstance(cmd.get("event"), dict):
             emit(cmd["event"])
+        elif kind == "emit_stderr" and isinstance(cmd.get("line"), str):
+            sys.stderr.write(cmd["line"] + "\n")
+            sys.stderr.flush()
         elif not args.display_roles:
             continue
         elif kind == "controller":
