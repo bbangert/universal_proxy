@@ -64,13 +64,14 @@ endif()
 #
 # Our fork (bbangert/projectm) adds the GLES 2.0 backend, the GLSL ES 1.00
 # translator, the pre-translated shader cache, preset preloading,
-# per-preset load results and failed preset switches reported instead of
-# thrown; the renderer needs all of them. Pinned by commit
+# per-preset load results, failed preset switches reported instead of
+# thrown, and a flush before the blur texture copy (Mesa v3d overruns the
+# texture otherwise); the renderer needs all of them. Pinned by commit
 # SHA (tags are mutable server-side); FORCE so a pin bump always wins over
 # a stale CMakeCache.txt. For scratch
 # builds against a local checkout set MILKDROP_PROJECTM_SOURCE_DIR (the mix
 # compiler forwards it as FETCHCONTENT_SOURCE_DIR_PROJECTM).
-set(PROJECTM_REF "202160a7d85b52daf9cb1767803d5e3cc2a56dce" # es2/1d-cache
+set(PROJECTM_REF "ab8857923b13ee3c1ea48ba11a6d8724b90b511c" # es2/v3d-blur-flush
     CACHE STRING "projectM fork commit SHA to pin" FORCE)
 
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
