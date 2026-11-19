@@ -125,7 +125,9 @@ defmodule UniversalProxy.Bluetooth do
   # :host keeps the role available for UI dev and host tests.
   @audio_role_targets [:rpi4, :rpi5, :host]
   @audio_role_supported Mix.target() in @audio_role_targets
-  @audio_player_available Mix.target() != :x86_64
+  # Mirrors `@supported_targets` in `Mix.Tasks.Compile.SendspinPlayer`.
+  @audio_player_targets [:rpi, :rpi0, :rpi0_2, :rpi2, :rpi3, :rpi4, :rpi5, :host]
+  @audio_player_available Mix.target() in @audio_player_targets
 
   @doc """
   Whether this target can play audio at all (it builds `sendspin_player`),
