@@ -867,14 +867,15 @@ defmodule UniversalProxyWeb.OverviewLive do
       slots ->
         # A hub occupies its receptacle even though its function devices sit
         # one level below it.
+        # Both halves of a USB 3 hub (and anything behind either) resolve to
+        # the one receptacle via the slot's aliases.
         all = devices ++ for({path, _} <- hubs, do: {path, false})
 
-        slot_of = fn path ->
-          Enum.find(slots, &(path == &1 or String.starts_with?(path, &1 <> ".")))
-        end
-
         to_slots = fn list ->
-          list |> Enum.map(fn {p, _} -> slot_of.(p) end) |> Enum.reject(&is_nil/1) |> MapSet.new()
+          list
+          |> Enum.map(fn {p, _} -> Hardware.slot_for(p, slots) end)
+          |> Enum.reject(&is_nil/1)
+          |> MapSet.new()
         end
 
         occupied = to_slots.(all)
@@ -2946,6 +2947,10 @@ defmodule UniversalProxyWeb.OverviewLive do
   # row, so it shows once and opens the control drawer. With no hubs the output
   # is identical to the prior slot-promotion behavior.
   #
+  # Slot matching uses each port's `:slot_paths` (a declared slot's alias bus
+  # paths, see `Hardware.slot_for/2`), so a device or hub on either the USB 2
+  # or the SuperSpeed path of a USB 3 receptacle lands in that one slot.
+  #
   # Public only so it can be unit-tested directly (the host test env has no
   # declared slots, so the promotion path is unreachable via a live mount).
   @doc false
@@ -2954,8 +2959,9 @@ defmodule UniversalProxyWeb.OverviewLive do
     # excludes the board's internal infrastructure hubs (ancestors of the
     # declared receptacle slots) — `usb_hubs/0` reports every class-09 device,
     # and without this filter those ancestors would swallow every declared
-    # slot as a "child" and collapse the USB 1–4 ordering.
-    port_slots = MapSet.new(ports, & &1.slot_sub)
+    # slot as a "child" and collapse the USB 1–4 ordering. A slot's alias
+    # paths count, so both halves of a USB 3 hub are roots of the same slot.
+    port_slots = ports |> Enum.flat_map(& &1.slot_paths) |> MapSet.new()
     hub_paths = hubs |> Map.keys() |> Enum.filter(&MapSet.member?(port_slots, &1))
 
     promotable =
@@ -2963,11 +2969,17 @@ defmodule UniversalProxyWeb.OverviewLive do
 
     {rows, claimed, consumed} =
       Enum.reduce(ports, {[], MapSet.new(), MapSet.new()}, fn port, {acc, claimed, consumed} ->
+        slot_hubs = Enum.filter(port.slot_paths, &Map.has_key?(hubs, &1))
+
         cond do
-          # A hub sits at this declared slot: emit the hub row + its children.
-          Map.has_key?(hubs, port.slot_sub) ->
-            {child_rows, child_paths} = hub_children(port, ports, peripherals)
-            row = {:hub, hub_row_map(port, Map.fetch!(hubs, port.slot_sub))}
+          # A hub sits at this declared slot (at one or more of its alias
+          # paths): emit ONE hub row + the children behind every half.
+          slot_hubs != [] ->
+            {child_rows, child_paths} = hub_children(slot_hubs, ports, peripherals)
+            # Name/VID:PID come from the fastest half (the SuperSpeed hub);
+            # ties and unknown speeds keep the first alias path.
+            hub_path = Enum.max_by(slot_hubs, &(hubs[&1][:speed] || -1))
+            row = {:hub, hub_row_map(port, hub_path, Map.fetch!(hubs, hub_path))}
             {acc ++ [row | child_rows], claimed, MapSet.union(consumed, child_paths)}
 
           # A device behind a hub: already emitted (or collapsed) under it.
@@ -2978,15 +2990,16 @@ defmodule UniversalProxyWeb.OverviewLive do
           port.connected ->
             {acc ++ [{:port, port}], claimed, consumed}
 
-          # Empty declared slot: a peripheral may be promoted into it.
+          # Empty declared slot: a peripheral at any of its alias paths may be
+          # promoted into it (keeping its own `slot_sub`).
           true ->
-            case Map.get(promotable, port.slot_sub) do
+            case Enum.find_value(port.slot_paths, &Map.get(promotable, &1)) do
               nil ->
                 {acc ++ [{:port, port}], claimed, consumed}
 
               peripheral ->
                 {acc ++ [{:peripheral, %{peripheral | slot: port.slot}}],
-                 MapSet.put(claimed, port.slot_sub), consumed}
+                 MapSet.put(claimed, peripheral.slot_sub), consumed}
             end
         end
       end)
@@ -3001,29 +3014,24 @@ defmodule UniversalProxyWeb.OverviewLive do
   end
 
   defp under_hub?(slot_sub, hub_paths) when is_binary(slot_sub) do
-    Enum.any?(hub_paths, &String.starts_with?(slot_sub, &1 <> "."))
+    Enum.any?(hub_paths, &Hardware.downstream_of?(slot_sub, &1))
   end
 
   defp under_hub?(_slot_sub, _hub_paths), do: false
 
-  # Devices enumerated behind the hub at `hub_port.slot_sub`, as indented
-  # (depth-1) rows. A child bus path covered by a peripheral renders only its
-  # peripheral row (collapsing a co-located serial port into it).
-  defp hub_children(hub_port, ports, peripherals) do
-    prefix = hub_port.slot_sub <> "."
+  # Devices enumerated behind any of `hub_paths` (one slot's hub, or both
+  # halves of a USB 3 hub), as indented (depth-1) rows. A child bus path
+  # covered by a peripheral renders only its peripheral row (collapsing a
+  # co-located serial port into it).
+  defp hub_children(hub_paths, ports, peripherals) do
+    behind? = fn path -> is_binary(path) and under_hub?(path, hub_paths) end
 
-    child_peripherals =
-      Enum.filter(
-        peripherals,
-        &(is_binary(&1.slot_sub) and String.starts_with?(&1.slot_sub, prefix))
-      )
-
+    child_peripherals = Enum.filter(peripherals, &behind?.(&1.slot_sub))
     peripheral_paths = MapSet.new(child_peripherals, & &1.slot_sub)
 
     child_ports =
       Enum.filter(ports, fn pt ->
-        is_binary(pt.slot_sub) and String.starts_with?(pt.slot_sub, prefix) and
-          not MapSet.member?(peripheral_paths, pt.slot_sub)
+        behind?.(pt.slot_sub) and not MapSet.member?(peripheral_paths, pt.slot_sub)
       end)
 
     # Order all children by bus path together (not peripherals-then-ports), so
@@ -3038,10 +3046,10 @@ defmodule UniversalProxyWeb.OverviewLive do
     {rows, paths}
   end
 
-  defp hub_row_map(hub_port, hub_info) do
+  defp hub_row_map(hub_port, hub_path, hub_info) do
     %{
       slot: hub_port.slot,
-      slot_sub: hub_port.slot_sub,
+      slot_sub: hub_path,
       name: hub_info.name,
       vidpid: format_vidpid_pair(hub_info.vendor_id, hub_info.product_id)
     }

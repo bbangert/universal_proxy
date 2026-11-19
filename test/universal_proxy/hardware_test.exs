@@ -711,6 +711,107 @@ defmodule UniversalProxy.HardwareTest do
     end
   end
 
+  # Pi 4 shape: the blue USB 3 receptacles are one slot reachable at two bus
+  # paths (USB 2 hub port + SuperSpeed root port).
+  @rpi4_slots [["1-1.1", "2-1"], ["1-1.2", "2-2"], "1-1.3", "1-1.4"]
+
+  defp rpi4_ports(bus_paths, opts \\ []) do
+    enumerated =
+      Map.new(bus_paths, fn {tty, _} ->
+        {tty, %{vendor_id: 0x0403, product_id: 0x6001, serial_number: "S-" <> tty}}
+      end)
+
+    Hardware.list_ports(
+      slots: @rpi4_slots,
+      enumerated: enumerated,
+      bus_paths: bus_paths,
+      saved_configs: Keyword.get(opts, :saved_configs, %{}),
+      line_settings: %{},
+      in_use_ports: MapSet.new()
+    )
+  end
+
+  describe "list_ports/1 with aliased slots (rpi4 USB 3 receptacles)" do
+    test "an empty board renders one row per receptacle at its primary path" do
+      ports = rpi4_ports(%{})
+
+      assert Enum.map(ports, & &1.slot) == ["USB 1", "USB 2", "USB 3", "USB 4"]
+      assert Enum.map(ports, & &1.slot_sub) == ["1-1.1", "1-1.2", "1-1.3", "1-1.4"]
+
+      assert Enum.map(ports, & &1.slot_paths) == [
+               ["1-1.1", "2-1"],
+               ["1-1.2", "2-2"],
+               ["1-1.3"],
+               ["1-1.4"]
+             ]
+
+      assert Enum.all?(ports, &(&1.connected == false))
+    end
+
+    test "a SuperSpeed device fills its receptacle's row, keeping its real bus path" do
+      ports = rpi4_ports(%{"ttyUSB0" => "2-2"})
+
+      assert length(ports) == 4
+      usb2 = Enum.at(ports, 1)
+      assert usb2.slot == "USB 2"
+      assert usb2.connected
+      assert usb2.slot_sub == "2-2"
+      assert usb2.id == "p_2_2"
+      assert usb2.slot_paths == ["1-1.2", "2-2"]
+    end
+
+    test "a USB 2 device in a blue receptacle fills the same row via the primary path" do
+      ports = rpi4_ports(%{"ttyUSB0" => "1-1.2"})
+
+      assert length(ports) == 4
+      assert %{slot: "USB 2", slot_sub: "1-1.2", connected: true} = Enum.at(ports, 1)
+    end
+
+    test "saved configs keep keying by the SuperSpeed path" do
+      saved = %{{"2-1", 0x0403, 0x6001} => %{port_type: :rs485, friendly_name: "Meter"}}
+      [usb1 | _] = rpi4_ports(%{"ttyUSB0" => "2-1"}, saved_configs: saved)
+
+      assert usb1.slot_sub == "2-1"
+      assert usb1.kind == :rs485
+      assert usb1.name == "Meter"
+    end
+
+    test "a device behind a hub on either path is a bonus row with its own bus path" do
+      ports = rpi4_ports(%{"ttyUSB0" => "2-1.3", "ttyUSB1" => "1-1.1.2"})
+
+      assert length(ports) == 6
+      assert Enum.take(ports, 4) |> Enum.all?(&(&1.connected == false))
+
+      assert ports |> Enum.drop(4) |> Enum.map(& &1.slot_sub) |> Enum.sort() ==
+               ["1-1.1.2", "2-1.3"]
+    end
+  end
+
+  describe "slot_for/2" do
+    test "resolves direct, aliased and behind-a-hub paths to the slot's primary path" do
+      assert Hardware.slot_for("1-1.1", @rpi4_slots) == "1-1.1"
+      assert Hardware.slot_for("2-1", @rpi4_slots) == "1-1.1"
+      assert Hardware.slot_for("2-1.4", @rpi4_slots) == "1-1.1"
+      assert Hardware.slot_for("1-1.1.2.1", @rpi4_slots) == "1-1.1"
+      assert Hardware.slot_for("2-2", @rpi4_slots) == "1-1.2"
+      assert Hardware.slot_for("1-1.4.1", @rpi4_slots) == "1-1.4"
+    end
+
+    test "board-internal hubs, unknown paths and dynamic targets resolve to nil" do
+      assert Hardware.slot_for("1-1", @rpi4_slots) == nil
+      assert Hardware.slot_for("2-3", @rpi4_slots) == nil
+      assert Hardware.slot_for("2-10", @rpi4_slots) == nil
+      assert Hardware.slot_for("1-1.1", nil) == nil
+    end
+
+    test "plain rpi3-shape string lists still work" do
+      slots = ["1-1.1.2", "1-1.1.3", "1-1.2", "1-1.3"]
+      assert Hardware.slot_for("1-1.1.3.1", slots) == "1-1.1.3"
+      assert Hardware.slot_for("1-1.1", slots) == nil
+      assert Hardware.slot_paths("1-1.2") == ["1-1.2"]
+    end
+  end
+
   describe "list_ports/1 fallback behaviour" do
     test "returns an empty list when nothing is plugged in and dynamic mode" do
       assert Hardware.list_ports(
@@ -1133,7 +1234,37 @@ defmodule UniversalProxy.HardwareTest do
       hubs = Hardware.usb_hubs(usb_devices_dir: dir)
 
       assert Map.keys(hubs) == ["1-1.1.3"]
-      assert hubs["1-1.1.3"] == %{vendor_id: 0x0A12, product_id: 0x4010, name: "USB hub"}
+
+      assert hubs["1-1.1.3"] == %{
+               vendor_id: 0x0A12,
+               product_id: 0x4010,
+               name: "USB hub",
+               speed: nil
+             }
+    end
+
+    test "parses the sysfs link speed, nil when missing or unparseable" do
+      dir = Path.join(System.tmp_dir!(), "uhub-#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf!(dir) end)
+
+      for {name, speed} <- [
+            {"1-1.1", "480\n"},
+            {"2-1", "5000\n"},
+            {"2-2", "bogus\n"},
+            {"2-3", nil}
+          ] do
+        hub = Path.join(dir, name)
+        File.mkdir_p!(hub)
+        File.write!(Path.join(hub, "bDeviceClass"), "09\n")
+        if speed, do: File.write!(Path.join(hub, "speed"), speed)
+      end
+
+      hubs = Hardware.usb_hubs(usb_devices_dir: dir)
+
+      assert hubs["1-1.1"].speed == 480
+      assert hubs["2-1"].speed == 5000
+      assert hubs["2-2"].speed == nil
+      assert hubs["2-3"].speed == nil
     end
 
     test "returns an empty map when the sysfs root is absent" do

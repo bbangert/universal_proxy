@@ -1332,7 +1332,12 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
   # exists for a peripheral to be promoted into. Drive it directly instead.
   describe "hardware_rows/2 (slot promotion + ordering)" do
     defp slot(sub, n, opts \\ []) do
-      %{slot: "USB #{n}", slot_sub: sub, connected: Keyword.get(opts, :connected, false)}
+      %{
+        slot: "USB #{n}",
+        slot_sub: sub,
+        slot_paths: Keyword.get(opts, :paths, [sub]),
+        connected: Keyword.get(opts, :connected, false)
+      }
     end
 
     defp bt(sub) do
@@ -1576,6 +1581,147 @@ defmodule UniversalProxyWeb.OverviewLiveTest do
       s = OverviewLive.slot_summary(ports, audio, bt, hubs, nil)
       # Distinct device paths: 1-1.1.3.1 (serial+audio), 1-1.2, 1-1.3, 1-1.1.2.
       assert s == %{in_use: 4, total: 4, active: 2, idle: 2}
+    end
+  end
+
+  # Pi 4 shape: each blue USB 3 receptacle is one slot reachable at its USB 2
+  # hub port (`1-1.N`) or its SuperSpeed root port (`2-N`). Ports come from the
+  # real `list_ports/1` so the rows carry genuine `:slot_paths`.
+  describe "aliased USB 3 receptacles (rpi4 slot map)" do
+    @rpi4_slots [["1-1.1", "2-1"], ["1-1.2", "2-2"], "1-1.3", "1-1.4"]
+    # VL805's internal USB 2 hub — an ancestor of every receptacle.
+    @vl805 %{vendor_id: 0x2109, product_id: 0x3431, name: "USB2.0 Hub"}
+    @usb2_half %{vendor_id: 0x05E3, product_id: 0x0610, name: "USB2.1 Hub"}
+    @ss_half %{vendor_id: 0x05E3, product_id: 0x0626, name: "USB3.1 Hub"}
+
+    defp rpi4_ports(bus_paths \\ %{}) do
+      UniversalProxy.Hardware.list_ports(
+        slots: @rpi4_slots,
+        enumerated:
+          Map.new(bus_paths, fn {tty, _} ->
+            {tty, %{vendor_id: 0x0403, product_id: 0x6001, serial_number: tty}}
+          end),
+        bus_paths: bus_paths,
+        saved_configs: %{},
+        line_settings: %{},
+        in_use_ports: MapSet.new(),
+        zwave_claim: nil,
+        zigbee_claim: nil
+      )
+    end
+
+    test "a device on the SuperSpeed path promotes into its receptacle, keeping its path" do
+      drive = %{type_label: "USB storage", slot: "USB storage", slot_sub: "2-1", name: "SSD"}
+
+      assert [
+               {:peripheral, %{slot: "USB 1", slot_sub: "2-1", name: "SSD"}},
+               {:port, %{slot: "USB 2", slot_sub: "1-1.2"}},
+               {:port, %{slot: "USB 3"}},
+               {:port, %{slot: "USB 4"}}
+             ] = OverviewLive.hardware_rows(rpi4_ports(), [drive], %{"1-1" => @vl805})
+    end
+
+    test "a device on the USB 2 path of a blue receptacle promotes into the same slot" do
+      assert [
+               {:port, %{slot: "USB 1"}},
+               {:peripheral, %{slot: "USB 2", slot_sub: "1-1.2"}},
+               {:port, %{slot: "USB 3"}},
+               {:port, %{slot: "USB 4"}}
+             ] = OverviewLive.hardware_rows(rpi4_ports(), [bt("1-1.2")], %{"1-1" => @vl805})
+    end
+
+    test "a USB 2 hub in a blue receptacle trees its devices under that slot" do
+      ports = rpi4_ports(%{"ttyUSB0" => "1-1.2.1"})
+      hubs = %{"1-1" => @vl805, "1-1.2" => @usb2_half}
+
+      assert [
+               {:port, %{slot: "USB 1"}},
+               {:hub, %{slot: "USB 2", slot_sub: "1-1.2"}},
+               {:port, %{slot_sub: "1-1.2.1", depth: 1}},
+               {:port, %{slot: "USB 3"}},
+               {:port, %{slot: "USB 4"}}
+             ] = OverviewLive.hardware_rows(ports, [], hubs)
+    end
+
+    test "a USB 3 hub (both halves) renders as ONE hub with every child under it" do
+      # USB 2 half at 1-1.1, SuperSpeed half at 2-1; a serial adapter behind
+      # the USB 2 half and a SuperSpeed drive behind the SS half.
+      ports = rpi4_ports(%{"ttyUSB0" => "1-1.1.3"})
+      hubs = %{"1-1" => @vl805, "1-1.1" => @usb2_half, "2-1" => @ss_half}
+      drive = %{type_label: "USB storage", slot: "USB storage", slot_sub: "2-1.2", name: "SSD"}
+
+      rows = OverviewLive.hardware_rows(ports, [drive], hubs)
+
+      assert [
+               {:hub, %{slot: "USB 1", slot_sub: "1-1.1", name: "USB2.1 Hub"}},
+               {:port, %{slot_sub: "1-1.1.3", depth: 1}},
+               {:peripheral, %{slot_sub: "2-1.2", depth: 1}},
+               {:port, %{slot: "USB 2", slot_sub: "1-1.2"}},
+               {:port, %{slot: "USB 3"}},
+               {:port, %{slot: "USB 4"}}
+             ] = rows
+
+      assert Enum.count(rows, &match?({:hub, _}, &1)) == 1
+    end
+
+    test "a USB 3 hub row takes its identity from the SuperSpeed half when speeds are known" do
+      ports = rpi4_ports(%{"ttyUSB0" => "1-1.1.3"})
+
+      hubs = %{
+        "1-1" => @vl805,
+        "1-1.1" => Map.put(@usb2_half, :speed, 480),
+        "2-1" => Map.put(@ss_half, :speed, 5000)
+      }
+
+      rows = OverviewLive.hardware_rows(ports, [], hubs)
+
+      assert [
+               {:hub, %{slot: "USB 1", slot_sub: "2-1", name: "USB3.1 Hub", vidpid: vidpid}},
+               {:port, %{slot_sub: "1-1.1.3", depth: 1}} | _
+             ] = rows
+
+      assert vidpid =~ "0626"
+      assert Enum.count(rows, &match?({:hub, _}, &1)) == 1
+    end
+
+    test "a SuperSpeed device in a blue receptacle is a populated row, not a bonus" do
+      rows = OverviewLive.hardware_rows(rpi4_ports(%{"ttyUSB0" => "2-2"}), [], %{})
+
+      assert [
+               {:port, %{slot: "USB 1", connected: false}},
+               {:port, %{slot: "USB 2", slot_sub: "2-2", connected: true}},
+               {:port, %{slot: "USB 3"}},
+               {:port, %{slot: "USB 4"}}
+             ] = rows
+    end
+
+    test "slot_summary counts an aliased receptacle once and totals receptacles" do
+      # USB 1: USB 3 hub (both halves) with a sound card behind the SS half and
+      # a serial adapter behind the USB 2 half. USB 2: a SuperSpeed serial
+      # adapter at 2-2 plus a BT dongle reported at its USB 2 path (one slot).
+      ports = [
+        %{connected: true, slot_sub: "1-1.1.3", in_use: false},
+        %{connected: true, slot_sub: "2-2", in_use: true}
+      ]
+
+      audio = %{a: %{key: {"2-1.1", 1, 1}, usb_port: "2-1.1", stream: nil}}
+      bt = [%{bus: :usb, port: "1-1.2", hci: "hci1", in_use?: false}]
+      hubs = %{"1-1" => %{}, "1-1.1" => %{}, "2-1" => %{}}
+
+      s = OverviewLive.slot_summary(ports, audio, bt, hubs, @rpi4_slots)
+      assert s == %{in_use: 2, total: 4, active: 1, idle: 1}
+    end
+
+    test "slot_summary: a lone SuperSpeed device occupies its receptacle" do
+      ports = [%{connected: true, slot_sub: "2-1", in_use: false}]
+
+      assert OverviewLive.slot_summary(ports, %{}, [], %{"1-1" => %{}}, @rpi4_slots) ==
+               %{in_use: 1, total: 4, active: 0, idle: 1}
+    end
+
+    test "an empty board reads 0/4 (VL805 internal hub does not occupy a slot)" do
+      assert OverviewLive.slot_summary([], %{}, [], %{"1-1" => %{}}, @rpi4_slots) ==
+               %{in_use: 0, total: 4, active: 0, idle: 0}
     end
   end
 end
