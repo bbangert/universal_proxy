@@ -38,12 +38,29 @@ defmodule UniversalProxy.Hardware do
   # leaf in the topology (`1-1.4`) is advertised by the hub controller
   # but not wired to a physical connector.
   #
-  # INVARIANT: no slot path may be a prefix of another (a device behind a hub
-  # enumerates as `<slot>.<n>`, and consumers map it back to its slot by a
-  # `<slot>.`-prefix match — so e.g. listing both `1-1.1` and `1-1.1.2` would
-  # make the former wrongly claim the latter's devices).
+  # Pi 4 Model B routes all 4 USB-A receptacles through the VL805 xHCI. Its
+  # USB 2 side is an internal hub at `1-1` whose ports `1-1.1`…`1-1.4` are the
+  # receptacles; the two blue USB 3 receptacles additionally appear on the
+  # SuperSpeed root hub as `2-1` / `2-2`. (`usb3` is the dwc_otg USB-C port —
+  # not a receptacle.)
+  #
+  # ALIASES: a slot is either one bus path or a list of bus paths that are the
+  # SAME physical receptacle (primary first). A USB 3 receptacle enumerates a
+  # device at its USB 2 path or its SuperSpeed path depending on the device's
+  # speed, and a USB 3 hub plugged into it shows up as two hubs — one per path —
+  # with its downstream devices behind either. Aliasing only decides which
+  # receptacle (row position, "USB N" label, slot counts) a bus path belongs
+  # to; a populated device keeps its real bus path as `slot_sub` (a persistence
+  # key), and an empty slot row uses the primary path. Resolve paths to slots
+  # with `slot_for/2`, never by matching these literals directly.
+  #
+  # INVARIANT: no slot path (aliases included) may be a prefix of another (a
+  # device behind a hub enumerates as `<slot>.<n>`, and consumers map it back
+  # to its slot by a `<slot>.`-prefix match — so e.g. listing both `1-1.1` and
+  # `1-1.1.2` would make the former wrongly claim the latter's devices).
   @external_slots %{
-    rpi3: ["1-1.1.2", "1-1.1.3", "1-1.2", "1-1.3"]
+    rpi3: ["1-1.1.2", "1-1.1.3", "1-1.2", "1-1.3"],
+    rpi4: [["1-1.1", "2-1"], ["1-1.2", "2-2"], "1-1.3", "1-1.4"]
   }
 
   # Captured at compile time so it works in releases without :mix.
@@ -325,7 +342,9 @@ defmodule UniversalProxy.Hardware do
   (`0a12:4010`), so it plugs into one receptacle but its functions enumerate
   at `<slot>.1`. Root hubs (`usbN`) are skipped.
 
-  `hub_info` is `%{vendor_id, product_id, name}`.
+  `hub_info` is `%{vendor_id, product_id, name, speed}`; `speed` is the sysfs
+  link speed in Mbit/s (480 for a USB 2 hub, 5000 for its SuperSpeed twin) or
+  `nil` when unreadable.
 
   ## Options
 
@@ -335,7 +354,8 @@ defmodule UniversalProxy.Hardware do
           String.t() => %{
             vendor_id: non_neg_integer() | nil,
             product_id: non_neg_integer() | nil,
-            name: String.t()
+            name: String.t(),
+            speed: non_neg_integer() | nil
           }
         }
   def usb_hubs(opts \\ []) do
@@ -363,7 +383,8 @@ defmodule UniversalProxy.Hardware do
                      read_sysfs_attr(base, "manufacturer"),
                      vid,
                      pid
-                   )
+                   ),
+                 speed: parse_speed(read_sysfs_attr(base, "speed"))
                }}
             ]
           else
@@ -421,6 +442,15 @@ defmodule UniversalProxy.Hardware do
     end
   end
 
+  defp parse_speed(nil), do: nil
+
+  defp parse_speed(str) do
+    case Integer.parse(str) do
+      {n, _} -> n
+      _ -> nil
+    end
+  end
+
   defp parse_hex_id(nil), do: nil
 
   defp parse_hex_id(str) do
@@ -443,13 +473,46 @@ defmodule UniversalProxy.Hardware do
     end
   end
 
-  @doc """
-  Declared physical USB-A slot bus paths for the running target, in order, or
-  `nil` when the target has no slot map (dynamic enumeration). Consumers use
-  this to map any USB device's bus path back to the receptacle it occupies.
+  @typedoc """
+  One declared physical receptacle: a bus path, or a non-empty list of alias
+  bus paths for the same receptacle (primary first) — see `@external_slots`.
   """
-  @spec physical_slots() :: [String.t()] | nil
+  @type slot :: String.t() | [String.t(), ...]
+
+  @doc """
+  Declared physical USB-A slots for the running target, in order, or `nil`
+  when the target has no slot map (dynamic enumeration). Consumers map a USB
+  device's bus path back to the receptacle it occupies with `slot_for/2`.
+  """
+  @spec physical_slots() :: [slot()] | nil
   def physical_slots, do: target_slots()
+
+  @doc "Every bus path of a declared slot, primary first."
+  @spec slot_paths(slot()) :: [String.t(), ...]
+  def slot_paths([_ | _] = paths), do: paths
+  def slot_paths(path) when is_binary(path), do: [path]
+
+  @doc """
+  The declared slot a bus path occupies — directly, at any of the slot's alias
+  paths, or behind a hub plugged into it — identified by the slot's primary
+  path. `nil` when it matches no slot, or `slots` is `nil` (dynamic target).
+  """
+  @spec slot_for(String.t(), [slot()] | nil) :: String.t() | nil
+  def slot_for(_bus_path, nil), do: nil
+
+  def slot_for(bus_path, slots) when is_binary(bus_path) do
+    Enum.find_value(slots, fn slot ->
+      [primary | _] = paths = slot_paths(slot)
+      if Enum.any?(paths, &(bus_path == &1 or downstream_of?(bus_path, &1))), do: primary
+    end)
+  end
+
+  @doc """
+  True when `bus_path` enumerates behind the USB device at `parent` (a hub at
+  `1-1.3` puts its devices at `1-1.3.<n>`, and theirs one level deeper).
+  """
+  @spec downstream_of?(String.t(), String.t()) :: boolean()
+  def downstream_of?(bus_path, parent), do: String.starts_with?(bus_path, parent <> ".")
 
   # `@target` is a compile-time literal; on :host it's not a key in
   # `@external_slots` (host has no static slots — the caller's `nil ->` branch
@@ -460,22 +523,31 @@ defmodule UniversalProxy.Hardware do
 
   # -- Slot mode (per-target, every port shows) ------------------------
 
+  # A declared row carries its slot's alias paths in `:slot_paths`; a populated
+  # row's `slot_sub` is the path the tty actually enumerated at (persistence
+  # key), an empty row's is the slot's primary path.
   defp slot_listing(slots, enumerated, bus_paths, saved, usage, line_settings) do
     tty_by_bus_path = Map.new(bus_paths, fn {tty, bus} -> {bus, tty} end)
-    known_slots = MapSet.new(slots)
+    known_slots = slots |> Enum.flat_map(&slot_paths/1) |> MapSet.new()
 
     declared =
       slots
       |> Enum.with_index(1)
-      |> Enum.map(fn {slot_sub, idx} ->
-        case Map.get(tty_by_bus_path, slot_sub) do
-          nil ->
-            empty_port(slot_sub, idx)
+      |> Enum.map(fn {slot, idx} ->
+        [primary | _] = paths = slot_paths(slot)
 
-          tty_name ->
-            info = Map.get(enumerated, tty_name, %{})
-            build_port(tty_name, info, slot_sub, saved, usage, line_settings, idx)
-        end
+        port =
+          case Enum.find(paths, &Map.has_key?(tty_by_bus_path, &1)) do
+            nil ->
+              empty_port(primary, idx)
+
+            slot_sub ->
+              tty_name = Map.fetch!(tty_by_bus_path, slot_sub)
+              info = Map.get(enumerated, tty_name, %{})
+              build_port(tty_name, info, slot_sub, saved, usage, line_settings, idx)
+          end
+
+        %{port | slot_paths: paths}
       end)
 
     # Surface anything plugged in that didn't match a known slot — it
@@ -588,6 +660,9 @@ defmodule UniversalProxy.Hardware do
       id: port_id(slot_sub),
       slot: "USB #{idx}",
       slot_sub: slot_sub,
+      # Every bus path of the receptacle this row stands for; `slot_listing/6`
+      # widens it to a declared slot's aliases.
+      slot_paths: [slot_sub],
       detection: classification.detection,
       name: name,
       vendor: vendor,
@@ -720,6 +795,7 @@ defmodule UniversalProxy.Hardware do
       id: port_id(slot_sub),
       slot: "USB #{idx}",
       slot_sub: slot_sub,
+      slot_paths: [slot_sub],
       detection: nil,
       name: nil,
       vendor: nil,
