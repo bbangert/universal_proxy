@@ -119,9 +119,23 @@ defmodule UniversalProxy.Bluetooth do
   # RTL8761BU that plays flawlessly on rpi4's xHCI). Dedicated BT-audio
   # dongles (Sennheiser BTD 700, FlooGoo FMA120) are NOT affected — they
   # enumerate as USB sound cards, so they bypass the audio role entirely.
+  # x86_64 is excluded too: it has no `sendspin_player` build (see
+  # `Mix.Tasks.Compile.SendspinPlayer`), so a paired speaker would have no
+  # player behind it — and neither would a USB transmitter's output.
   # :host keeps the role available for UI dev and host tests.
-  @audio_role_targets [:rpi4, :rpi5, :x86_64, :host]
+  @audio_role_targets [:rpi4, :rpi5, :host]
   @audio_role_supported Mix.target() in @audio_role_targets
+  # Mirrors `@supported_targets` in `Mix.Tasks.Compile.SendspinPlayer`.
+  @audio_player_targets [:rpi, :rpi0, :rpi0_2, :rpi2, :rpi3, :rpi4, :rpi5, :host]
+  @audio_player_available Mix.target() in @audio_player_targets
+
+  @doc """
+  Whether this target can play audio at all (it builds `sendspin_player`),
+  which decides if the UI may point at USB Bluetooth-audio transmitters as
+  the alternative to the `:audio` role. Compile-time constant.
+  """
+  @spec audio_player_available?() :: boolean()
+  def audio_player_available?, do: @audio_player_available
 
   @doc """
   Whether BlueZ radios may take the `:audio` role on this hardware
