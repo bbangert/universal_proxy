@@ -179,9 +179,7 @@ defmodule UniversalProxyWeb.MockData do
   @discovery_defaults %{
     friendly: "Universal Proxy (Rack)",
     service: "_hassever-proxy._tcp",
-    esphome_id: "universal_proxy_a1",
-    area: "Server rack",
-    advertise: true
+    esphome_id: "universal_proxy_a1"
   }
 
   @doc "Mock connected ports."
