@@ -1,9 +1,8 @@
 defmodule UniversalProxyWeb.DiscoveryLive do
   @moduledoc """
-  Discovery tab — friendly name, hostname, ESPHome device id, area,
-  mDNS advertise toggle. Wires to UniversalProxy.ESPHome where fields
-  overlap; UI-only fields (friendly name, area, advertise) are mocked
-  for now.
+  Discovery tab — friendly name, hostname and ESPHome device id. The
+  friendly name and device id are saved through UniversalProxy.ESPHome;
+  hostname and service are derived/read-only.
   """
 
   use UniversalProxyWeb, :live_view
@@ -15,8 +14,6 @@ defmodule UniversalProxyWeb.DiscoveryLive do
   alias UniversalProxy.ESPHome.MdnsAdapter
   alias UniversalProxyWeb.MockData
 
-  @areas ["Living room", "Office", "Garage", "Basement", "Server rack"]
-
   @impl true
   def mount(_params, _session, socket) do
     initial = build_form()
@@ -25,30 +22,21 @@ defmodule UniversalProxyWeb.DiscoveryLive do
      socket
      |> assign(:page_title, "Discovery")
      |> assign(:form, initial)
-     |> assign(:original, initial)
-     |> assign(:areas, @areas)}
+     |> assign(:original, initial)}
   end
 
   @impl true
   def handle_event("change", %{"discovery" => params}, socket) do
-    advertise = Map.get(params, "advertise") in ["true", true, "on"]
-
     esphome_id = params["esphome_id"] || socket.assigns.form.esphome_id
 
     form = %{
       friendly: params["friendly"] || socket.assigns.form.friendly,
       hostname: hostname_for(esphome_id),
       service: socket.assigns.form.service,
-      esphome_id: esphome_id,
-      area: params["area"] || socket.assigns.form.area,
-      advertise: advertise
+      esphome_id: esphome_id
     }
 
     {:noreply, assign(socket, :form, form)}
-  end
-
-  def handle_event("toggle_advertise", _params, socket) do
-    {:noreply, update(socket, :form, fn f -> %{f | advertise: !f.advertise} end)}
   end
 
   def handle_event("save", _params, socket) do
@@ -80,9 +68,7 @@ defmodule UniversalProxyWeb.DiscoveryLive do
       friendly: Map.get(cfg, :friendly_name) || defaults.friendly,
       hostname: hostname_for(esphome_id),
       service: defaults.service,
-      esphome_id: esphome_id,
-      area: defaults.area,
-      advertise: defaults.advertise
+      esphome_id: esphome_id
     }
   end
 
@@ -148,40 +134,20 @@ defmodule UniversalProxyWeb.DiscoveryLive do
           <.field label="ESPHome device name" help="Used as the device_id in ESPHome config.">
             <.text_input name="discovery[esphome_id]" value={@form.esphome_id} mono />
           </.field>
-
-          <.field label="Area">
-            <select
-              name="discovery[area]"
-              class="h-9 px-3 w-full rounded-md text-base border border-border-strong bg-surface text-fg-1 outline-none focus:border-accent focus:shadow-focus"
-            >
-              <option :for={a <- @areas} value={a} selected={a == @form.area}>{a}</option>
-            </select>
-          </.field>
-
-          <.field label="Advertise on network">
-            <div class="flex items-center gap-3 py-1">
-              <.toggle checked={@form.advertise} phx-click="toggle_advertise" />
-              <span class="text-sm text-fg-2">
-                {if @form.advertise,
-                  do: "Other devices can find us via mDNS",
-                  else: "Hidden — integrations must be added manually"}
-              </span>
-            </div>
-          </.field>
         </form>
       </.card>
 
       <%!-- Discovery preview --%>
       <div class="mt-6">
         <.eyebrow class="mb-2.5">Discovery preview</.eyebrow>
-        <.card class="!p-[18px] flex gap-4 items-center">
+        <.card id="discovery-preview" class="!p-[18px] flex gap-4 items-center">
           <div class="w-12 h-12 rounded-md bg-accent-soft text-accent flex items-center justify-center flex-none">
             <.icon name={:plug} size={26} />
           </div>
           <div class="flex-1 min-w-0">
             <div class="text-md font-semibold">{@form.friendly}</div>
             <div class="text-sm text-fg-3 mt-0.5">
-              <span class="font-mono">{@form.hostname}</span> · {@form.area}
+              <span class="font-mono">{@form.hostname}</span>
             </div>
           </div>
           <.button variant={:primary} size={:sm}>Add to Home Assistant</.button>
