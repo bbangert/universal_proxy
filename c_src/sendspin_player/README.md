@@ -1,8 +1,9 @@
 # sendspin_player
 
 Small C++ binary that connects to a [Sendspin](https://github.com/Sendspin)
-server, decodes audio (FLAC / Opus / PCM at 44.1 kHz and 48 kHz, stereo,
-16-bit), and plays it through ALSA. One process per ALSA output. PCM never
+server, decodes audio (FLAC / Opus / PCM, stereo: 16-bit at 44.1 kHz and
+48 kHz, plus the hi-res FLAC/PCM formats a hardware card accepts; see
+*Stdout events*), and plays it through ALSA. One process per ALSA output. PCM never
 crosses the BEAM boundary — Elixir talks to this binary only via
 line-delimited JSON on stdin/stdout.
 
@@ -23,6 +24,8 @@ c_src/sendspin_player/
 └── src/
     ├── alsa_pipe_sink.h     vendored from LeoLTM/sendspin-armv6
     ├── alsa_pipe_sink.cpp   vendored from LeoLTM/sendspin-armv6
+    ├── alsa_caps.{h,cpp}    ours — probes a card's rates/bit depths for `formats`
+    ├── file_persistence.{h,cpp} ours — identity + pairing state in --state-dir
     ├── display_roles.{h,cpp} ours — display roles (--display-roles)
     ├── artwork_store.{h,cpp} ours — artwork files and their retention
     ├── started_event.{h,cpp} ours — advertised formats + the `started` line
@@ -30,6 +33,7 @@ c_src/sendspin_player/
     ├── sha256.{h,cpp}       ours — artwork file names
     ├── pcm_tap.h            ours — PCM tap ring layout + reader (renderer copies it)
     ├── pcm_tap_writer.h     ours — PCM tap writer + S16 conversion
+    ├── viz_gate.h           ours — orders viz frames against stream boundaries
     └── main.cpp             ours — CLI args + JSON stdout/stdin
 test/unit_tests.cpp          host unit tests (target sendspin_player_unit_tests,
                              run by test/sendspin_player_unit_test.exs)
@@ -90,8 +94,8 @@ Differences:
 ## sendspin-cpp pin
 
 Pinned via `FetchContent` to a **commit SHA** in `CMakeLists.txt`
-(`SENDSPIN_CPP_REF` cache var). Currently `b95cf854...`, upstream
-`v0.9.5`. We pin to a SHA rather
+(`SENDSPIN_CPP_REF` cache var). Currently `78b13d5e...`, upstream `main`
+after `v0.9.5` (at #263). We pin to a SHA rather
 than a tag because git tags are mutable server-side; a retagged upstream
 would otherwise silently flow into firmware. The friendly tag name (or
 nearest-release note) lives in a comment beside the SHA for traceability.
