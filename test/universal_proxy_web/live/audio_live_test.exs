@@ -35,6 +35,8 @@ defmodule UniversalProxyWeb.AudioLiveTest do
   test "renders the empty state when no inputs are present", %{conn: conn} do
     {:ok, _view, html} = live(conn, "/audio")
     assert html =~ "Audio inputs"
+    assert html =~ "click Allow pairing here, then enter the PIN shown"
+    refute html =~ "pair it with its pairing token"
     assert html =~ "No audio inputs detected"
   end
 
@@ -219,7 +221,7 @@ defmodule UniversalProxyWeb.AudioLiveTest do
     )
 
     html = render(view)
-    assert html =~ "Allow pairing"
+    assert has_element?(view, "button[phx-click=allow_pairing]", "Allow pairing")
     refute html =~ "waiting for Music Assistant"
 
     # Consent window open (expiry in the future): active waiting state, no button.
@@ -238,7 +240,7 @@ defmodule UniversalProxyWeb.AudioLiveTest do
     )
 
     html = render(view)
-    refute html =~ "Allow pairing"
+    refute has_element?(view, "button[phx-click=allow_pairing]")
     assert html =~ "Pairing allowed"
   end
 
@@ -1200,7 +1202,9 @@ defmodule UniversalProxyWeb.AudioLiveTest do
       {view, id, html} = mount_with_input(conn)
 
       assert html =~ "Pairing token"
-      assert html =~ "to pair this input"
+      assert html =~ "For automated pairing by a client that supplies the token"
+      assert html =~ "use Allow pairing above"
+      refute html =~ "to pair this input"
       refute html =~ @input_token
       refute has_element?(view, "#input-pairing-token-#{id}")
       # Nothing is read until the operator asks.

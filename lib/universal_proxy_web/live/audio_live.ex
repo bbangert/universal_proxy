@@ -789,8 +789,8 @@ defmodule UniversalProxyWeb.AudioLive do
       </h2>
       <p class="text-base text-fg-2 m-0 max-w-[640px]">
         Each USB capture card is advertised as a Sendspin source. Add it as a
-        Live Input in Music Assistant, then pair it with its pairing token or
-        the PIN shown here.
+        Live Input in Music Assistant: start setup for it under Settings >
+        Players, click Allow pairing here, then enter the PIN shown.
       </p>
     </div>
     """
@@ -953,7 +953,8 @@ defmodule UniversalProxyWeb.AudioLive do
           </button>
         </div>
         <span class="col-span-3 text-fg-4">
-          Paste into Music Assistant's Sendspin "Pairing token" option to pair this input.
+          For automated pairing by a client that supplies the token. Music Assistant pairs
+          with the PIN instead: use Allow pairing above.
         </span>
         <span></span>
         <span></span>
