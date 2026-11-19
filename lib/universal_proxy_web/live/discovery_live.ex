@@ -140,7 +140,7 @@ defmodule UniversalProxyWeb.DiscoveryLive do
       <%!-- Discovery preview --%>
       <div class="mt-6">
         <.eyebrow class="mb-2.5">Discovery preview</.eyebrow>
-        <.card class="!p-[18px] flex gap-4 items-center">
+        <.card id="discovery-preview" class="!p-[18px] flex gap-4 items-center">
           <div class="w-12 h-12 rounded-md bg-accent-soft text-accent flex items-center justify-center flex-none">
             <.icon name={:plug} size={26} />
           </div>

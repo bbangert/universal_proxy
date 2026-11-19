@@ -35,12 +35,11 @@ defmodule UniversalProxyWeb.DiscoveryLiveTest do
 
     {:ok, view, _html} = live(conn, "/discovery")
 
-    html =
-      view
-      |> element("form")
-      |> render_change(%{"discovery" => %{"friendly" => "Rack Proxy Test"}})
+    view
+    |> element("form")
+    |> render_change(%{"discovery" => %{"friendly" => "Rack Proxy Test"}})
 
-    assert html =~ "Rack Proxy Test"
+    assert view |> element("#discovery-preview") |> render() =~ "Rack Proxy Test"
 
     view |> element("button", "Save changes") |> render_click()
     assert render(view) =~ "Saved."
