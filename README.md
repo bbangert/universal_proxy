@@ -109,7 +109,7 @@ persist across reboots and replugs.
 | **Zigbee coordinators** | Home Assistant Connect ZBT-2 | Exposed as a USB serial proxy with its USB identity, so Home Assistant discovers it and runs ZHA over it; ASH ACKs are sent locally (PROTOCOL mode). Host-tested only, not yet validated on hardware. |
 | **Infrared transceivers** | IRdroid IR Toy | Auto-detected and exposed to Home Assistant as **Infrared** entities for IR send/receive. |
 | **Bluetooth (HCI) adapters** | Any `btusb`-supported dongle | Selectable radio for the **Bluetooth proxy** (BLE advertisement relay + active GATT connections) -- adds Bluetooth to boards without a usable onboard radio (`rpi`, `rpi2`, `x86_64`) or replaces a weak onboard one. |
-| **USB DACs / sound cards** | Any class-compliant (`snd-usb-audio`) device, including hi-res DACs (up to 24-bit/96 kHz where supported) | Each output becomes an independently discoverable **Sendspin** player for synchronized multi-room audio; a capture (line-in) input becomes a **Sendspin** source. |
+| **USB DACs / sound cards** | Any class-compliant (`snd-usb-audio`) device, including hi-res DACs (up to 32-bit/384 kHz when the DAC accepts it) | Each output becomes an independently discoverable **Sendspin** player for synchronized multi-room audio; a capture (line-in) input becomes a **Sendspin** source. |
 | **Bluetooth-audio transmitters** | FlooGoo FMA120, Sennheiser BTD 700 | Sendspin players (via their sound-card half) **plus a device control drawer** on the Overview -- details below. |
 | **USB storage drives** | Any USB flash drive or SSD (ext4, exFAT, NTFS, FAT32) | Mounted as the device's **backup drive**, with an opt-in **SMB share** Home Assistant can use as a network backup target. Folder selection, formatting (to ext4), safe eject, and the share credentials all live in the drive's Overview drawer. |
 | **USB hubs** | -- | Devices behind a hub render as an indented tree at the hub's slot; branded hubs are named. |
@@ -284,21 +284,34 @@ earlier releases can't use them.
 The **Audio** tab (`/audio`) has a card per output: rename (which briefly
 re-advertises the player, so Music Assistant reconnects), volume, mute and
 enable/disable. Music Assistant can use a player without pairing. To pair one
-explicitly, open the card's details, **Show** its pairing token and paste it
-into Music Assistant's Sendspin "Pairing token" option. Turning on **Pair
-through Home Assistant** on one output instead lets Home Assistant hand that
-output's token to Music Assistant over an encrypted API connection; only one
-output can be selected at a time. On an HDMI output with a CEC receiver,
+explicitly, open the card's details and **Show** its pairing token, then in
+Music Assistant run the player's setup (**Settings > Players**), choose to pair
+and paste the token. Alternatively, turn on **Pair through Home Assistant** on
+one output (only one at a time): Home Assistant 2026.11 or later reads that
+output's token over the encrypted ESPHome API connection and Music Assistant
+2.10.9 or later, connected to Home Assistant with an administrator account,
+pairs the player with it automatically. On an HDMI output with a CEC receiver,
 **Auto-wake receiver on playback** sends One Touch Play when a stream starts,
 and **Control receiver volume** makes the output's volume and mute follow the
 receiver's, up to a **Max volume**.
 
 USB capture cards (line-in) are listed under **Audio inputs**, each as a
-Sendspin source Music Assistant can play from. A source must be paired first,
-either with its pairing token (in the card's details) or with a PIN: start
-pairing in Music Assistant, click **Allow pairing** when it appears on the
-input card, and type the PIN the card then shows into Music Assistant. The details also list the servers the input is paired with, with
-**Unpair**, **Unpair all** and **Regenerate** (a new pairing token).
+Sendspin source. A source plays only once it is paired, and Music Assistant
+pairs it with a PIN:
+
+1. In Music Assistant, the input shows under **Settings > Players** as
+   needing setup. Click **Start setup** (and choose to pair the audio input
+   if asked). Music Assistant waits for the pairing gesture on the device.
+2. On the input card in the **Audio** tab, click **Allow pairing**. The card
+   shows a PIN.
+3. Type the PIN into Music Assistant. Once paired, the input appears in Music
+   Assistant's **Live Inputs** and can be played on any player.
+
+The input card also has a pairing token, but Music Assistant's setup offers
+token entry only for devices without a PIN method, so it can't be used from
+the Music Assistant UI. The card's details list the servers the input is
+paired with, with **Unpair**, **Unpair all** and **Regenerate** (a new pairing
+token).
 
 The web UI is plain HTTP with no login: anyone who can open it can reveal a
 pairing token, and a revealed token crosses the network in the clear. Holding
@@ -491,7 +504,7 @@ Out of the box the device name is `universal-proxy-<mac>` and the friendly
 name `Universal Proxy <MAC>`, where `<mac>` is the last three bytes of the
 device's MAC address, so several devices on one network don't collide in Home
 Assistant. `universal_proxy.local` also works while there is only one device
-on the network. The Area and Advertise controls on the tab are not saved yet.
+on the network.
 
 ### Adding to Home Assistant
 
@@ -739,9 +752,9 @@ use the stock Nerves systems. Feature availability by target:
 **Bluetooth** is available on every target that ships the custom BlueZ-enabled
 Nerves system: the onboard-BT Pis (`rpi0`, `rpi0_2`, `rpi3`, `rpi4`, `rpi5`)
 and -- via a USB BT dongle -- `rpi`, `rpi2`, and `x86_64`, which have no onboard
-radio. Only `rpi3` is hardware-validated so far; the rest share its design but
-are unverified (`rpi4`/`rpi5` device trees; the USB-dongle-only targets have no
-bench hardware). On a board with no radio yet, the subsystem idles in a benign
+radio. `rpi3` and `rpi4` are hardware-validated; the rest share their design
+but are only build-tested (the `rpi5` device tree; the USB-dongle-only targets
+have no bench hardware). On a board with no radio yet, the subsystem idles in a benign
 retry loop and binds a USB dongle when one is plugged in. The remaining targets
 (`bbb`, `mangopi_mq_pro`, `qemu_aarch64`) compile the Bluetooth subsystem out
 and run the rest normally.
