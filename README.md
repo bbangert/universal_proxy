@@ -58,9 +58,9 @@ range -- without needing a dedicated ESPHome microcontroller for each one.
 - **Sendspin audio input** -- a USB capture card (line-in) becomes a Sendspin
   source that Music Assistant can pair with and play from (see
   [Sendspin audio](#sendspin-audio))
-- **Bluetooth speakers and headphones** -- on `rpi4`, `rpi5` and `x86_64`, a
-  radio set to the Audio role on the **Bluetooth** tab pairs A2DP speakers and
-  headsets, which then play as Sendspin outputs
+- **Bluetooth speakers and headphones** -- on `rpi4` and `rpi5`, a radio set
+  to the Audio role on the **Bluetooth** tab pairs A2DP speakers and headsets,
+  which then play as Sendspin outputs
 - **HDMI-CEC receiver control** -- on `rpi0_2`, `rpi3`, `rpi4` and `rpi5`, the
   Pi is a CEC playback device on each HDMI port (native `/dev/cecN` access via
   the in-repo `circuits_cec` library, no `cec-ctl`). A Sendspin stream starting
@@ -295,9 +295,9 @@ receiver's, up to a **Max volume**.
 
 USB capture cards (line-in) are listed under **Audio inputs**, each as a
 Sendspin source Music Assistant can play from. A source must be paired first,
-either with its pairing token (in the card's details) or with a PIN: click
-**Allow pairing**, start pairing in Music Assistant, and type in the PIN the
-card shows. The details also list the servers the input is paired with, with
+either with its pairing token (in the card's details) or with a PIN: start
+pairing in Music Assistant, click **Allow pairing** when it appears on the
+input card, and type the PIN the card then shows into Music Assistant. The details also list the servers the input is paired with, with
 **Unpair**, **Unpair all** and **Regenerate** (a new pairing token).
 
 The web UI is plain HTTP with no login: anyone who can open it can reveal a
@@ -376,8 +376,10 @@ skipped, fast-flashing) kept in the URL. Each preset can be:
 - added to a **playlist** -- with the playlist on, rotation picks only from it
   (falling back to everything, with a warning, if nothing on it can play).
 
-A skipped preset played from the browser gets another try (it is skipped
-again if it fails). Fast-flashing presets can't be played while **Include
+A skipped preset played from the browser while MilkDrop is on screen gets
+another try (it is skipped again if it fails). Play and lock with nothing on
+screen still won't start the next session on a skipped preset: clear the
+skipped presets first. Fast-flashing presets can't be played while **Include
 fast-flashing presets** is off.
 
 #### Uploading presets
@@ -681,6 +683,7 @@ On first boot the device also generates its own SSH access key; download the
 private key from the **Security** tab and log in with it from any machine:
 
 ```bash
+chmod 600 universal_proxy   # OpenSSH refuses a key others can read
 ssh -i universal_proxy universal_proxy.local
 ```
 
@@ -727,7 +730,7 @@ use the stock Nerves systems. Feature availability by target:
 | Serial, Z-Wave, Zigbee and IR proxies | all |
 | Bluetooth proxy, Tuya mesh lights | `rpi`, `rpi0`, `rpi0_2`, `rpi2`, `rpi3`, `rpi4`, `rpi5`, `x86_64` |
 | Sendspin audio players | `rpi`, `rpi0`, `rpi0_2`, `rpi2`, `rpi3`, `rpi4`, `rpi5` |
-| Bluetooth speakers (Audio radio role) | `rpi4`, `rpi5`, `x86_64` |
+| Bluetooth speakers (Audio radio role) | `rpi4`, `rpi5` |
 | HDMI-CEC and the TV screen | `rpi0_2`, `rpi3`, `rpi4`, `rpi5` |
 | MilkDrop visualizer | `rpi3`, `rpi4`, `rpi5` |
 | USB backup drive SMB share | `rpi`, `rpi0`, `rpi0_2`, `rpi2`, `rpi3`, `rpi4`, `rpi5` |
