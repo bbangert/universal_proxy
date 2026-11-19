@@ -6,8 +6,11 @@ manifest signature, enforces a monotonic counter, then verifies the
 per-target `sha256` of the one asset it downloads. Firmware bytes are
 never signed directly — the manifest pins them by hash.
 
-This document is the wire contract. It will move to the
-`nerves_github_updater` README when the library is carved out.
+This document is the wire contract as this app's releases use it. The
+updater now lives in the
+[`nerves_github_updater`](https://hex.pm/packages/nerves_github_updater)
+library, whose `guides/manifest-format.md` is the library-side copy of this
+contract.
 
 ## Assets on each release
 

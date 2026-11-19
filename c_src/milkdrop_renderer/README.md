@@ -7,8 +7,9 @@ display over from Emerge (DRM master handover), renders presets driven by
 the HDMI Sendspin player's PCM tap, and gives the display back.
 
 Targets: **rpi3** (Mesa vc4, GLES 2.0 through our projectM fork's ES2
-backend), **rpi4** and **rpi5** (Mesa v3d, the fork's unchanged GLES 3
-path). The host builds only the GL-free core and its unit tests.
+backend), **rpi4** and **rpi5** (Mesa v3d, the fork's GLES 3 path: upstream's,
+except that blur passes render directly into the blur textures, since v3d
+overruns the texture on upstream's framebuffer-to-texture copy). The host builds only the GL-free core and its unit tests.
 
 ## Command line
 
@@ -88,7 +89,7 @@ with every byte escaped) fits.
 | `user_reloaded` | `presets` (live user presets), `added` (new ids, or ids back after a removal), `removed`, `rejected` (manifest entries dropped as malformed): `reload_user` done. |
 | `selection` | `gen` (the file's), `eligible` (presets rotation picks from now), `playlist_fallback` (the playlist is on but nothing on it can rotate, so rotation uses every unhidden eligible preset), `hidden_fallback` (every eligible preset is hidden, so rotation ignores hidden): after each `reload_selection`, and, when there is a `--selection-file`, after `prepared` and after a `clear_skips` or `play` that unskipped a preset. |
 | `error` | `reason`, optional `message`: a non-fatal problem (`bad_command`, `master_timeout`, `take_failed`, `driver`, `register_allocate`, `thermal_drop`, `locked_refused`, `user_manifest`, `selection`, …), or the cause just before a failing `exiting`. |
-| `exiting` | `reason`: `requested`, `eof`, `signal`, `thermal` (exit 0), or a failure — `manifest`, `no_presets`, `output`, `gl`, `projectm`, `kms`, `output_lost` (exit 1), `usage` (exit 2). |
+| `exiting` | `reason`: `requested`, `eof`, `signal`, `thermal`, `headless_done` (`--headless-frames`; exit 0), or a failure — `manifest`, `no_presets`, `output`, `gl`, `projectm`, `kms`, `output_lost`, `poll` (exit 1), `usage` (exit 2). |
 
 ### Handover
 
@@ -458,7 +459,8 @@ clock (`scaling_cur_freq`). A heatsink is recommended on rpi3.
 host: `-DMILKDROP_CORE_ONLY=ON`). projectM comes from
 `bbangert/projectm` via FetchContent, pinned by SHA in `CMakeLists.txt`,
 built static at -O2 with the playlist library off. The renderer needs the
-fork's es2/1d APIs (shader cache, preload, load results).
+fork's APIs (shader cache, preload, load results) and, on rpi4/rpi5, its
+direct-render blur passes.
 
 To build against a local fork checkout instead of the pin:
 
