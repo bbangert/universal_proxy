@@ -121,10 +121,19 @@ defmodule UniversalProxy.Bluetooth do
   # enumerate as USB sound cards, so they bypass the audio role entirely.
   # x86_64 is excluded too: it has no `sendspin_player` build (see
   # `Mix.Tasks.Compile.SendspinPlayer`), so a paired speaker would have no
-  # player behind it.
+  # player behind it — and neither would a USB transmitter's output.
   # :host keeps the role available for UI dev and host tests.
   @audio_role_targets [:rpi4, :rpi5, :host]
   @audio_role_supported Mix.target() in @audio_role_targets
+  @audio_player_available Mix.target() != :x86_64
+
+  @doc """
+  Whether this target can play audio at all (it builds `sendspin_player`),
+  which decides if the UI may point at USB Bluetooth-audio transmitters as
+  the alternative to the `:audio` role. Compile-time constant.
+  """
+  @spec audio_player_available?() :: boolean()
+  def audio_player_available?, do: @audio_player_available
 
   @doc """
   Whether BlueZ radios may take the `:audio` role on this hardware

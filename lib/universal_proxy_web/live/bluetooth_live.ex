@@ -82,6 +82,7 @@ defmodule UniversalProxyWeb.BluetoothLive do
       socket
       |> assign(:page_title, "Bluetooth")
       |> assign(:audio_role_supported, Bluetooth.audio_role_supported?())
+      |> assign(:audio_player_available, Bluetooth.audio_player_available?())
       |> assign(:status, Bluetooth.status())
       |> assign(:improv, Improv.status())
       |> assign(:stats, Bluetooth.stats())
@@ -607,7 +608,7 @@ defmodule UniversalProxyWeb.BluetoothLive do
 
       <%!-- rpi3-and-below: BlueZ radios can't sustain glitch-free A2DP, so
             point at the dedicated-dongle path instead of offering the role. --%>
-      <div :if={not @audio_role_supported} class="mt-7">
+      <div :if={not @audio_role_supported and @audio_player_available} class="mt-7">
         <.eyebrow>Bluetooth audio</.eyebrow>
         <.card padding={:lg} class="!p-6 mt-2.5">
           <p class="text-sm text-fg-2 m-0 leading-normal">
