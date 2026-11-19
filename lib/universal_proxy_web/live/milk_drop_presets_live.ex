@@ -340,17 +340,17 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
 
   def handle_event("unlock", _params, socket), do: {:noreply, submit(socket, %{kind: :unlock})}
 
-  def handle_event(event, %{"key" => key, "value" => value}, socket)
-      when event in ["favourite", "hide", "playlist"] and value in ["true", "false"] do
-    flag = value == "true"
+  def handle_event(event, %{"key" => key, "flag" => flag}, socket)
+      when event in ["favourite", "hide", "playlist"] and flag in ["true", "false"] do
+    flag = flag == "true"
     {:noreply, with_row(socket, key, &select(&1, &2, event, flag))}
   end
 
-  def handle_event("set_hf", %{"key" => key, "value" => value}, socket)
-      when value in ["true", "false"] do
+  def handle_event("set_hf", %{"key" => key, "flag" => flag}, socket)
+      when flag in ["true", "false"] do
     {:noreply,
      with_row(socket, key, fn
-       socket, %{source: :user} = row when value == "true" -> set_hf(socket, row, true)
+       socket, %{source: :user} = row when flag == "true" -> set_hf(socket, row, true)
        socket, %{source: :user} = row -> assign(socket, :confirm, {:clear_hf, row})
        socket, _pack_row -> socket
      end)}
@@ -915,7 +915,7 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
         id={"favourite-#{@row.key}"}
         event="favourite"
         key={@row.key}
-        value={"#{!@row.favourite}"}
+        flag={"#{!@row.favourite}"}
         icon={:star}
         pressed={@row.favourite}
         label={"Favourite #{@row.name}"}
@@ -924,7 +924,7 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
         id={"playlist-#{@row.key}"}
         event="playlist"
         key={@row.key}
-        value={"#{!@row.playlist}"}
+        flag={"#{!@row.playlist}"}
         icon={:list}
         pressed={@row.playlist}
         label={"#{@row.name} on the playlist"}
@@ -933,7 +933,7 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
         id={"hide-#{@row.key}"}
         event="hide"
         key={@row.key}
-        value={"#{!@row.hidden}"}
+        flag={"#{!@row.hidden}"}
         icon={:eye_off}
         pressed={@row.hidden}
         label={"Hide #{@row.name} from the rotation"}
@@ -943,7 +943,7 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
         id={"hf-#{@row.key}"}
         event="set_hf"
         key={@row.key}
-        value={"#{!@row.high_frequency}"}
+        flag={"#{!@row.high_frequency}"}
         icon={:zap}
         pressed={@row.high_frequency}
         label={"#{@row.name} is fast-flashing"}
@@ -964,7 +964,9 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
   attr(:id, :string, required: true)
   attr(:event, :string, required: true)
   attr(:key, :string, required: true)
-  attr(:value, :string, default: nil)
+  # Not `phx-value-value`: the LiveView client overwrites a click's `value`
+  # with the element's own `value` property, "" on a button.
+  attr(:flag, :string, default: nil)
   attr(:icon, :atom, required: true)
   attr(:label, :string, required: true)
   attr(:pressed, :any, default: nil)
@@ -977,7 +979,7 @@ defmodule UniversalProxyWeb.MilkDropPresetsLive do
       id={@id}
       phx-click={@event}
       phx-value-key={@key}
-      phx-value-value={@value}
+      phx-value-flag={@flag}
       aria-label={@label}
       title={@label}
       aria-pressed={if is_boolean(@pressed), do: "#{@pressed}"}

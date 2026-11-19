@@ -159,6 +159,20 @@ defmodule UniversalProxyWeb.MilkDropPresetsLiveTest do
 
   defp row_html(view, id), do: view |> element(row_sel(id)) |> render()
 
+  # Pushes the payload the LiveView client builds for a click, which
+  # `render_click/1` doesn't: the `phx-value-*` attributes, then `value`
+  # set to the element's `value` property ("" for a button without one).
+  defp browser_click(view, selector) do
+    [attrs] = doc(view) |> LazyHTML.query(selector) |> LazyHTML.attributes()
+    attrs = Map.new(attrs)
+
+    payload =
+      for({"phx-value-" <> name, value} <- attrs, into: %{}, do: {name, value})
+      |> Map.put("value", Map.get(attrs, "value", ""))
+
+    render_click(view, Map.fetch!(attrs, "phx-click"), payload)
+  end
+
   describe "gating and the dead render" do
     test "navigates to /audio while MilkDrop is disabled", %{conn: conn} do
       Application.put_env(:universal_proxy, :milkdrop_ui_override, false)
@@ -358,7 +372,7 @@ defmodule UniversalProxyWeb.MilkDropPresetsLiveTest do
       assert id in Store.selection().favourites
       wait_until(fn -> pressed?(view, "favourite", id) end)
 
-      render_click(view, "favourite", %{"key" => key(id), "value" => "true"})
+      render_click(view, "favourite", %{"key" => key(id), "flag" => "true"})
       assert id in Store.selection().favourites
     end
 
@@ -392,16 +406,37 @@ defmodule UniversalProxyWeb.MilkDropPresetsLiveTest do
       wait_until(fn -> not has_row?(view, id) end)
     end
 
+    test "the toggles work with the payload a browser sends", %{conn: conn} do
+      id = "Preset 004.milk"
+      {:ok, view, _html} = live(conn, "/audio/milkdrop")
+
+      browser_click(view, "#favourite-#{key(id)}")
+      assert Store.selection().favourites == [id]
+      wait_until(fn -> pressed?(view, "favourite", id) end)
+      browser_click(view, "#favourite-#{key(id)}")
+      assert Store.selection().favourites == []
+
+      browser_click(view, "#playlist-#{key(id)}")
+      assert Store.selection().playlist == [id]
+
+      browser_click(view, "#hide-#{key(id)}")
+      assert Store.selection().hidden == [id]
+
+      upload = "user/Mine.milk"
+      browser_click(view, "#hf-#{key(upload)}")
+      assert [%{high_frequency: true}] = UserPresets.list().presets
+    end
+
     test "unknown keys are ignored", %{conn: conn} do
       {:ok, view, _html} = live(conn, "/audio/milkdrop")
 
       for key <- ["zzzzzzzzzzzz", "Preset 001.milk", "../../etc/passwd", ""] do
-        render_click(view, "favourite", %{"key" => key, "value" => "true"})
+        render_click(view, "favourite", %{"key" => key, "flag" => "true"})
         render_click(view, "play", %{"key" => key})
         render_click(view, "ask_delete", %{"key" => key})
       end
 
-      render_click(view, "favourite", %{"key" => key("Preset 001.milk"), "value" => "yes"})
+      render_click(view, "favourite", %{"key" => key("Preset 001.milk"), "flag" => "yes"})
       assert Store.selection().favourites == []
       refute_received {:play, _, _}
       refute has_element?(view, "#confirm-delete")
