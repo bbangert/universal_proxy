@@ -681,6 +681,7 @@ defmodule UniversalProxyWeb.Components.Storage do
 
             <form
               :if={@chooser.creating?}
+              id="drive-chooser-create-form"
               phx-submit="drive_chooser_create"
               phx-change="drive_chooser_name"
               class="flex items-center gap-2.5 border-t border-border-2 px-3.5 py-1.5"

@@ -1204,7 +1204,16 @@ defmodule UniversalProxyWeb.AudioLive do
               level={speaker_level(@output.volume)}
             />
           </button>
-          <form phx-change="set_volume" class="flex-1 min-w-0">
+          <%!--
+          `phx-change` here applies the volume immediately, so form
+          recovery must not replay a stale slider value on reconnect.
+          --%>
+          <form
+            id={"volume-form-#{@id}"}
+            phx-change="set_volume"
+            phx-auto-recover="ignore"
+            class="flex-1 min-w-0"
+          >
             <input type="hidden" name="key" value={@id} />
             <input
               type="range"
@@ -1539,7 +1548,12 @@ defmodule UniversalProxyWeb.AudioLive do
         update its display from this rename. To change the name there too, rename the
         player from inside Music Assistant's settings.
       </p>
-      <form phx-submit="confirm_rename" phx-change="rename_draft" class="space-y-2">
+      <form
+        id="rename-form"
+        phx-submit="confirm_rename"
+        phx-change="rename_draft"
+        class="space-y-2"
+      >
         <div class="flex items-center justify-between text-xs">
           <label for="rename-input" class="font-medium text-fg-2">Friendly name</label>
           <span class="text-fg-3 font-mono tabular-nums">

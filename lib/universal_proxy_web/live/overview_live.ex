@@ -2759,7 +2759,15 @@ defmodule UniversalProxyWeb.OverviewLive do
       not `phx-change`, which is why the bare select didn't carry the
       port id.)
       --%>
-      <form phx-change="request_kind_change">
+      <%!--
+      `phx-auto-recover="ignore"`: the change reconfigures the port, so
+      form recovery must not replay a stale selection on reconnect.
+      --%>
+      <form
+        id={"port-kind-form-#{@port.id}"}
+        phx-change="request_kind_change"
+        phx-auto-recover="ignore"
+      >
         <input type="hidden" name="port" value={@port.id} />
         <select
           name="kind"
