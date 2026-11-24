@@ -112,7 +112,7 @@ defmodule UniversalProxyWeb.DiscoveryLive do
       </div>
 
       <.card padding={:lg}>
-        <form phx-change="change" class="space-y-5">
+        <form id="discovery-form" phx-change="change" class="space-y-5">
           <.field label="Friendly name" help="Shown on the Home Assistant integrations page.">
             <.text_input name="discovery[friendly]" value={@form.friendly} />
           </.field>
